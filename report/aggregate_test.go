@@ -208,7 +208,7 @@ func TestWriteMarkdownRoundTrip(t *testing.T) {
 		},
 	}
 	meta := Meta{
-		GitRef: "testref",
+		GitRef:     "testref",
 		StartedAt:  time.Unix(1700000000, 0).UTC(),
 		FinishedAt: time.Unix(1700001000, 0).UTC(),
 		Host:       "unit-test",

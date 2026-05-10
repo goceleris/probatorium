@@ -350,4 +350,3 @@ func (s *store) byNameLookup(name string) (string, bool) {
 	id, ok := s.byName[name]
 	return id, ok
 }
-

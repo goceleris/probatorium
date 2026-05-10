@@ -244,7 +244,7 @@ func probeOne(ctx context.Context, client *http.Client, base string, ep common.E
 	if err != nil {
 		return &EndpointFailure{Path: ep.Path, Method: ep.Method, Reason: err.Error()}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return &EndpointFailure{Path: ep.Path, Method: ep.Method, Status: resp.StatusCode, Reason: "read body: " + err.Error()}
@@ -280,7 +280,7 @@ func probeUsers(ctx context.Context, client *http.Client, base string) *Endpoint
 	if err != nil {
 		return &EndpointFailure{Path: "/users/:id", Method: "GET", Reason: err.Error()}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return &EndpointFailure{
@@ -313,7 +313,7 @@ func probeUpload(ctx context.Context, client *http.Client, base string) *Endpoin
 	if err != nil {
 		return &EndpointFailure{Path: "/upload", Method: "POST", Reason: err.Error()}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	got, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return &EndpointFailure{
@@ -335,9 +335,9 @@ func probeUpload(ctx context.Context, client *http.Client, base string) *Endpoin
 // writeSummary prints a fixed-width pass/fail table to w.
 func writeSummary(w io.Writer, reports []AdapterReport) {
 	sort.Slice(reports, func(i, j int) bool { return reports[i].Adapter < reports[j].Adapter })
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "%-40s %-6s %s\n", "adapter", "ok", "detail")
-	fmt.Fprintln(w, strings.Repeat("-", 80))
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintf(w, "%-40s %-6s %s\n", "adapter", "ok", "detail")
+	_, _ = fmt.Fprintln(w, strings.Repeat("-", 80))
 	for _, r := range reports {
 		ok := "PASS"
 		detail := r.BindAddr
@@ -353,7 +353,7 @@ func writeSummary(w io.Writer, reports []AdapterReport) {
 				detail = strings.Join(paths, ", ")
 			}
 		}
-		fmt.Fprintf(w, "%-40s %-6s %s\n", r.Adapter, ok, detail)
+		_, _ = fmt.Fprintf(w, "%-40s %-6s %s\n", r.Adapter, ok, detail)
 	}
 }
 
@@ -363,7 +363,7 @@ func freePort(bindBase string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 

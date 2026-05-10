@@ -5,7 +5,7 @@
 //
 //   - iouring-h1-async        — celeris.IOUring + Protocol=HTTP1 + AsyncHandlers
 //   - iouring-auto+upg-async  — celeris.IOUring + Protocol=Auto    + AsyncHandlers
-//                               (Auto includes implicit H1→H2C upgrade)
+//     (Auto includes implicit H1→H2C upgrade)
 //   - epoll-h1-sync           — celeris.Epoll   + Protocol=HTTP1   + AsyncHandlers=false
 //   - std-h1                  — celeris.Std     + Protocol=HTTP1   + AsyncHandlers=false
 //
@@ -78,13 +78,13 @@ func main() {
 	}
 
 	srv := celeris.New(celeris.Config{
-		Addr:           *bind,
-		Engine:         spec.engineType,
-		Protocol:       spec.protocol,
-		AsyncHandlers:  spec.async,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    120 * time.Second,
+		Addr:            *bind,
+		Engine:          spec.engineType,
+		Protocol:        spec.protocol,
+		AsyncHandlers:   spec.async,
+		ReadTimeout:     30 * time.Second,
+		WriteTimeout:    30 * time.Second,
+		IdleTimeout:     120 * time.Second,
 		ShutdownTimeout: 10 * time.Second,
 	})
 	registerRoutes(srv)

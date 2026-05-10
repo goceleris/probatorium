@@ -147,8 +147,8 @@ type Orchestrator struct {
 	plan *Plan
 
 	// Pre-loaded artifacts. nil values are loaded on demand.
-	matrix    *markov.Matrix
-	seeds     []corpus.Seed
+	matrix     *markov.Matrix
+	seeds      []corpus.Seed
 	predicates []properties.Spec
 }
 
@@ -312,18 +312,18 @@ func replaySeedsFor(d time.Duration) int {
 // field, which encoding/json refuses to handle. planToJSON projects
 // every Spec to its (ID, Description, Tier) triple.
 type planJSON struct {
-	Target             string         `json:"target"`
-	Arch               string         `json:"arch"`
-	CelerisCommit      string         `json:"celeris_commit"`
-	Duration           time.Duration  `json:"duration"`
-	CheckpointInterval time.Duration  `json:"checkpoint_interval"`
-	SoakMode           bool           `json:"soak_mode"`
-	OpenAPIPath        string         `json:"openapi_path"`
-	CelerisListenAddr  string         `json:"celeris_listen_addr"`
-	CorpusSize         int            `json:"corpus_size"`
-	MatrixStates       []string       `json:"matrix_states"`
-	Properties         []specJSON     `json:"properties"`
-	Tiers              []TierPlan     `json:"tiers"`
+	Target             string        `json:"target"`
+	Arch               string        `json:"arch"`
+	CelerisCommit      string        `json:"celeris_commit"`
+	Duration           time.Duration `json:"duration"`
+	CheckpointInterval time.Duration `json:"checkpoint_interval"`
+	SoakMode           bool          `json:"soak_mode"`
+	OpenAPIPath        string        `json:"openapi_path"`
+	CelerisListenAddr  string        `json:"celeris_listen_addr"`
+	CorpusSize         int           `json:"corpus_size"`
+	MatrixStates       []string      `json:"matrix_states"`
+	Properties         []specJSON    `json:"properties"`
+	Tiers              []TierPlan    `json:"tiers"`
 }
 
 type specJSON struct {
@@ -355,20 +355,20 @@ func planToJSON(p *Plan) planJSON {
 // PrintPlan writes a human-readable version of the orchestrator's
 // plan to w. Used by cmd/validator -dry-run.
 func PrintPlan(w io.Writer, p *Plan) {
-	fmt.Fprintf(w, "validator plan\n")
-	fmt.Fprintf(w, "  target=%s arch=%s celeris=%s duration=%s soak=%t\n",
+	_, _ = fmt.Fprintf(w, "validator plan\n")
+	_, _ = fmt.Fprintf(w, "  target=%s arch=%s celeris=%s duration=%s soak=%t\n",
 		p.Target, p.Arch, p.CelerisCommit, p.Duration, p.SoakMode)
-	fmt.Fprintf(w, "  bind=%s openapi=%s\n", p.CelerisListenAddr, p.OpenAPIPath)
-	fmt.Fprintf(w, "  corpus=%d seed(s) | markov=%d state(s)\n", p.CorpusSize, len(p.MatrixStates))
-	fmt.Fprintf(w, "  properties (%d):\n", len(p.Properties))
+	_, _ = fmt.Fprintf(w, "  bind=%s openapi=%s\n", p.CelerisListenAddr, p.OpenAPIPath)
+	_, _ = fmt.Fprintf(w, "  corpus=%d seed(s) | markov=%d state(s)\n", p.CorpusSize, len(p.MatrixStates))
+	_, _ = fmt.Fprintf(w, "  properties (%d):\n", len(p.Properties))
 	for _, s := range p.Properties {
-		fmt.Fprintf(w, "    %-18s [%s] %s\n", s.ID, s.Tier, s.Description)
+		_, _ = fmt.Fprintf(w, "    %-18s [%s] %s\n", s.ID, s.Tier, s.Description)
 	}
-	fmt.Fprintf(w, "  tiers:\n")
+	_, _ = fmt.Fprintf(w, "  tiers:\n")
 	for _, t := range p.Tiers {
-		fmt.Fprintf(w, "    %s\n", t.Tier)
-		fmt.Fprintf(w, "      %s\n", t.Description)
-		fmt.Fprintf(w, "      cadence=%s budget=%s\n", t.Cadence, t.BudgetUnits)
+		_, _ = fmt.Fprintf(w, "    %s\n", t.Tier)
+		_, _ = fmt.Fprintf(w, "      %s\n", t.Description)
+		_, _ = fmt.Fprintf(w, "      cadence=%s budget=%s\n", t.Cadence, t.BudgetUnits)
 	}
 }
 
@@ -497,16 +497,16 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 		return err
 	}
 	dossier := map[string]any{
-		"tier":         inc.Tier.String(),
-		"seed":         fmt.Sprintf("0x%x", inc.Seed),
-		"predicate":    inc.PredicateID,
-		"message":      inc.Message,
-		"observed_at":  inc.ObservedAt.UTC().Format(time.RFC3339Nano),
-		"snapshot":     inc.Snapshot,
-		"commit":       o.cfg.CelerisCommit,
-		"arch":         o.cfg.Arch,
-		"target":       o.cfg.Target,
-		"go_versions":  []string{"runtime+target"},
+		"tier":        inc.Tier.String(),
+		"seed":        fmt.Sprintf("0x%x", inc.Seed),
+		"predicate":   inc.PredicateID,
+		"message":     inc.Message,
+		"observed_at": inc.ObservedAt.UTC().Format(time.RFC3339Nano),
+		"snapshot":    inc.Snapshot,
+		"commit":      o.cfg.CelerisCommit,
+		"arch":        o.cfg.Arch,
+		"target":      o.cfg.Target,
+		"go_versions": []string{"runtime+target"},
 	}
 	if err := writeJSON(filepath.Join(dir, "incident.json"), dossier); err != nil {
 		return err
@@ -620,10 +620,10 @@ type ReplayedSeed struct {
 
 // PrintReplayPlan writes a human-readable plan to w.
 func PrintReplayPlan(w io.Writer, rs ReplayedSeed) {
-	fmt.Fprintf(w, "replay plan for seed 0x%x\n", rs.Seed)
-	fmt.Fprintf(w, "  markov_steps=%d startup_jitter=%s\n", rs.MarkovSteps, rs.StartupJitter)
-	fmt.Fprintf(w, "  fault schedule (%d entries):\n", len(rs.Schedule))
-	fmt.Fprint(w, rs.Schedule.String())
+	_, _ = fmt.Fprintf(w, "replay plan for seed 0x%x\n", rs.Seed)
+	_, _ = fmt.Fprintf(w, "  markov_steps=%d startup_jitter=%s\n", rs.MarkovSteps, rs.StartupJitter)
+	_, _ = fmt.Fprintf(w, "  fault schedule (%d entries):\n", len(rs.Schedule))
+	_, _ = fmt.Fprint(w, rs.Schedule.String())
 }
 
 // writeJSON marshals v to path with 2-space indent. Mirrors the helper
@@ -638,4 +638,3 @@ func writeJSON(path string, v any) error {
 	}
 	return os.WriteFile(path, buf, 0o644)
 }
-

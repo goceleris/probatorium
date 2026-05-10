@@ -10,10 +10,10 @@
 //   - /proc/<pid>/status      — RSS, threads.
 //   - /proc/<pid>/fd          — open FD count (entry count of the dir).
 //   - /proc/<pid>/limits      — soft FD limit (changes are rare; persisted
-//                               so postmortems can correlate against caps).
+//     so postmortems can correlate against caps).
 //   - <metrics-url>           — celeris's expvar endpoint, for goroutine
-//                               count, heap_inuse, gc pause p99, accepted /
-//                               closed conn counters, panic count.
+//     count, heap_inuse, gc pause p99, accepted /
+//     closed conn counters, panic count.
 //
 // Schema (one table, `observations`):
 //
@@ -154,7 +154,7 @@ func run(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", cfg.Out, err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if _, err := db.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
@@ -162,7 +162,7 @@ func run(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("prepare insert: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -280,7 +280,7 @@ func fetchMetrics(ctx context.Context, httpc *http.Client, url string) metricsVa
 	if err != nil {
 		return metricsValues{}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return metricsValues{}

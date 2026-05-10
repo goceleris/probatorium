@@ -160,7 +160,7 @@ func runConformanceCell(t *testing.T, bunPath, distBin, framework string) {
 			if err != nil {
 				t.Fatalf("%s %s: %v", ep.Method, path, err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			body, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode != 200 {
 				t.Fatalf("%s %s: status %d, body=%q", ep.Method, path, resp.StatusCode, body)

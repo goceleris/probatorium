@@ -153,10 +153,10 @@ type ValidationResults struct {
 // when the orchestrator runs in `mage Validate` mode with
 // VALIDATE_DURATION ≥ 6h.
 type SoakSummary struct {
-	Duration             time.Duration `json:"duration"`
-	RestartedProcesses   int           `json:"restarted_processes"`
+	Duration              time.Duration `json:"duration"`
+	RestartedProcesses    int           `json:"restarted_processes"`
 	GoroutineLeakDetected bool          `json:"goroutine_leak_detected"`
-	HeapGrowthMB         float64       `json:"heap_growth_mb"`
+	HeapGrowthMB          float64       `json:"heap_growth_mb"`
 
 	// PerHourErrorRate is the average non-2xx rate observed during the
 	// soak, expressed as a percentage of total requests.

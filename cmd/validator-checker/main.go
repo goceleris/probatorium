@@ -80,10 +80,10 @@ const insertSQL = `INSERT OR REPLACE INTO evaluations (ts, predicate, ok, messag
 
 // Incident is the on-stdout JSON record emitted on hard fail.
 type Incident struct {
-	TS          int64                `json:"ts"`
-	PredicateID string               `json:"predicate"`
-	Message     string               `json:"message"`
-	Snapshot    properties.Snapshot  `json:"snapshot"`
+	TS          int64               `json:"ts"`
+	PredicateID string              `json:"predicate"`
+	Message     string              `json:"message"`
+	Snapshot    properties.Snapshot `json:"snapshot"`
 }
 
 func main() {
@@ -107,7 +107,7 @@ func run(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", cfg.Out, err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if _, err := db.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
@@ -115,7 +115,7 @@ func run(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("prepare insert: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -202,7 +202,7 @@ func poll(ctx context.Context, hc *http.Client, url string, t time.Time) propert
 	if err != nil {
 		return snap
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return snap

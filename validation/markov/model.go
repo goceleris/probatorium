@@ -188,9 +188,9 @@ func LoadMatrix(r io.Reader) (*Matrix, error) {
 	scan.Buffer(make([]byte, 0, 64*1024), 1<<20)
 
 	var (
-		m            = &Matrix{Transitions: map[string][]Edge{}}
-		currentFrom  string
-		lineNo       int
+		m           = &Matrix{Transitions: map[string][]Edge{}}
+		currentFrom string
+		lineNo      int
 	)
 	for scan.Scan() {
 		lineNo++
@@ -275,7 +275,7 @@ func LoadMatrixFile(path string) (*Matrix, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return LoadMatrix(f)
 }
 
