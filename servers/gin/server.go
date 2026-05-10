@@ -20,8 +20,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 
 	"github.com/goceleris/probatorium/servers/common"
 )
@@ -36,12 +34,17 @@ func main() {
 	r.UseRawPath = true
 	registerRoutes(r)
 
-	var handler http.Handler = r
+	srv := &http.Server{Addr: *bind, Handler: r}
+	// h2c mode accepts HTTP/1.1 AND HTTP/2-over-cleartext (matches what
+	// the pre-Go 1.24 `h2c.NewHandler` wrapper did: the handler fell
+	// through to the inner router for h1 requests and upgraded h2c
+	// prior-knowledge / cleartext requests in place).
 	if *engine == "h2c" {
-		handler = h2c.NewHandler(r, &http2.Server{})
+		p := new(http.Protocols)
+		p.SetHTTP1(true)
+		p.SetUnencryptedHTTP2(true)
+		srv.Protocols = p
 	}
-
-	srv := &http.Server{Addr: *bind, Handler: handler}
 	ln, err := net.Listen("tcp", *bind)
 	if err != nil {
 		log.Fatalf("gin: listen %s: %v", *bind, err)

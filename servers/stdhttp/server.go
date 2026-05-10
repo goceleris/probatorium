@@ -3,12 +3,14 @@
 //
 // Three runtime modes are selected via -engine:
 //
-//   - h1     — plain HTTP/1.1 (no h2c handler).
-//   - h2c    — HTTP/2 cleartext only (h2c.NewHandler with maxConcurrent
-//     streams = 1000, max read frame = 1 MiB).
-//   - hybrid — HTTP/1.1 fall-through plus H2C upgrade. Same h2c handler
-//     as the h2c mode; the underlying server still serves H1 to clients
-//     that don't speak H2.
+//   - h1     — plain HTTP/1.1.
+//   - h2c    — HTTP/2 cleartext only (rejects HTTP/1.x).
+//   - hybrid — HTTP/1.1 plus H2C upgrade. Falls through to H1 for
+//     clients that don't speak H2.
+//
+// Modes map directly onto `http.Server.Protocols` (Go 1.24+):
+// SetHTTP1 + SetUnencryptedHTTP2. The deprecated `h2c.NewHandler`
+// wrapper is no longer needed.
 //
 // The contract endpoints are served from servers/common (Endpoints +
 // helpers) so the body bytes match every other adapter exactly. Path
@@ -29,9 +31,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
-
 	"github.com/goceleris/probatorium/servers/common"
 )
 
@@ -44,15 +43,6 @@ const (
 	engineHybrid runtimeEngine = "hybrid"
 )
 
-// h2cMaxConcurrentStreams matches the value shipped by golang.org/x/net
-// for production-style benchmarks. Lowering this throttles H2 fan-out;
-// raising it incurs more goroutines per connection.
-const h2cMaxConcurrentStreams uint32 = 1000
-
-// h2cMaxReadFrameSize bounds the per-frame DATA payload size; 1 MiB is
-// the common upper bound for benchmark-grade workloads.
-const h2cMaxReadFrameSize uint32 = 1 << 20
-
 func main() {
 	bind := flag.String("bind", "0.0.0.0:8080", "address:port to listen on")
 	engine := flag.String("engine", string(engineH1), "runtime engine: h1, h2c, or hybrid")
@@ -61,24 +51,26 @@ func main() {
 	mux := http.NewServeMux()
 	registerRoutes(mux)
 
-	var handler http.Handler = mux
+	srv := &http.Server{
+		Addr:           *bind,
+		Handler:        mux,
+		MaxHeaderBytes: 1 << 20,
+	}
+	p := new(http.Protocols)
 	switch runtimeEngine(*engine) {
 	case engineH1:
-		// Plain HTTP/1.1.
-	case engineH2C, engineHybrid:
-		handler = h2c.NewHandler(mux, &http2.Server{
-			MaxConcurrentStreams: h2cMaxConcurrentStreams,
-			MaxReadFrameSize:     h2cMaxReadFrameSize,
-		})
+		p.SetHTTP1(true)
+	case engineH2C:
+		// h2c-only: clients that send HTTP/1.x get rejected at protocol
+		// negotiation. This is the strict interpretation of the mode.
+		p.SetUnencryptedHTTP2(true)
+	case engineHybrid:
+		p.SetHTTP1(true)
+		p.SetUnencryptedHTTP2(true)
 	default:
 		log.Fatalf("stdhttp: unknown -engine %q (want h1|h2c|hybrid)", *engine)
 	}
-
-	srv := &http.Server{
-		Addr:           *bind,
-		Handler:        handler,
-		MaxHeaderBytes: 1 << 20,
-	}
+	srv.Protocols = p
 
 	ln, err := net.Listen("tcp", *bind)
 	if err != nil {

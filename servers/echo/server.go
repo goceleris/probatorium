@@ -16,8 +16,6 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 
 	"github.com/goceleris/probatorium/servers/common"
 )
@@ -32,12 +30,15 @@ func main() {
 	e.HidePort = true
 	registerRoutes(e)
 
-	var handler http.Handler = e
+	srv := &http.Server{Addr: *bind, Handler: e}
+	// h2c mode accepts HTTP/1.1 AND HTTP/2-over-cleartext (matches the
+	// pre-Go 1.24 `h2c.NewHandler` semantics).
 	if *engine == "h2c" {
-		handler = h2c.NewHandler(e, &http2.Server{})
+		p := new(http.Protocols)
+		p.SetHTTP1(true)
+		p.SetUnencryptedHTTP2(true)
+		srv.Protocols = p
 	}
-
-	srv := &http.Server{Addr: *bind, Handler: handler}
 	ln, err := net.Listen("tcp", *bind)
 	if err != nil {
 		log.Fatalf("echo: listen %s: %v", *bind, err)
