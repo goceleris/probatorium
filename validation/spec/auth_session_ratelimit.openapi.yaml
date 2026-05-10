@@ -1,0 +1,249 @@
+# OpenAPI 3.1 spec for the auth_session_ratelimit refapp.
+#
+# Consumed by the validation tier's Tier-2 RESTler-style stateful
+# fuzzer to infer dependency edges (login -> /me; create_user -> id
+# captured -> /api/users/{id}). Path parameter capture rules:
+#
+#   - {id} on /api/users/{id}: depends on a prior POST /api/users 201
+#     response carrying an "id" field (also accepts the Location
+#     header — fuzzer falls back automatically).
+#
+#   - Session cookie "sid" is set by POST /login; every subsequent
+#     authenticated path requires the cookie.
+#
+# Schemas live under components/schemas; the refapp validates request
+# bodies against them and returns 400 on mismatch (the validator's
+# property-stress driver uses the 400 path to ensure the schema isn't
+# the empty set).
+openapi: 3.1.0
+
+info:
+  title: probatorium-refapp-auth-session-ratelimit
+  version: "1.0.0"
+  description: |
+    Reference application for validation-tier soak runs. Composes
+    celeris's session + ratelimit + jwt middlewares around a CRUD
+    surface over an in-memory User store. Used by Tier 1 (Markov
+    traffic), Tier 2 (RESTler fuzzer), and Tier 3 (replay) targets.
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: local-loopback bind used by the validator-replay harness
+
+paths:
+  /login:
+    post:
+      operationId: login
+      summary: authenticate and set the sid cookie
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthRequest"
+      responses:
+        "200":
+          description: session established
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: sets the sid cookie used by every authenticated path
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "401": { description: bad credentials }
+        "429": { description: rate-limit exceeded }
+
+  /logout:
+    post:
+      operationId: logout
+      summary: invalidate the current session
+      security: [ { cookieAuth: [] } ]
+      responses:
+        "204": { description: session destroyed }
+        "401": { description: no session }
+
+  /me:
+    get:
+      operationId: me
+      summary: current authenticated user
+      security: [ { cookieAuth: [] } ]
+      responses:
+        "200":
+          description: user record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { description: unauthenticated }
+        "429": { description: rate-limit exceeded }
+
+  /api/users:
+    get:
+      operationId: listUsers
+      summary: list users
+      security: [ { cookieAuth: [] } ]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: page of users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items: { $ref: "#/components/schemas/User" }
+                  next_cursor:
+                    type: string
+        "401": { description: unauthenticated }
+        "429": { description: rate-limit exceeded }
+    post:
+      operationId: createUser
+      summary: create a new user
+      security: [ { cookieAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateUserRequest" }
+      responses:
+        "201":
+          description: created
+          headers:
+            Location:
+              schema: { type: string }
+              description: relative URL of the new record (e.g. /api/users/42)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400": { description: schema validation failed }
+        "401": { description: unauthenticated }
+        "429": { description: rate-limit exceeded }
+
+  /api/users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+        description: id captured from a prior POST /api/users 201 response
+    get:
+      operationId: getUser
+      summary: fetch a user by id
+      security: [ { cookieAuth: [] } ]
+      responses:
+        "200":
+          description: user record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "404": { description: not found }
+        "401": { description: unauthenticated }
+        "429": { description: rate-limit exceeded }
+    put:
+      operationId: updateUser
+      summary: replace a user record
+      security: [ { cookieAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/User" }
+      responses:
+        "200":
+          description: updated record
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400": { description: schema validation failed }
+        "404": { description: not found }
+        "401": { description: unauthenticated }
+        "429": { description: rate-limit exceeded }
+    delete:
+      operationId: deleteUser
+      summary: delete a user record
+      security: [ { cookieAuth: [] } ]
+      responses:
+        "204": { description: deleted }
+        "404": { description: not found }
+        "401": { description: unauthenticated }
+        "429": { description: rate-limit exceeded }
+
+  /api/users/{id}/posts:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: listUserPosts
+      summary: posts attributed to one user
+      security: [ { cookieAuth: [] } ]
+      responses:
+        "200":
+          description: page of posts
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Post" }
+        "404": { description: user not found }
+        "401": { description: unauthenticated }
+        "429": { description: rate-limit exceeded }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sid
+
+  schemas:
+    AuthRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, minLength: 1, maxLength: 64 }
+        password: { type: string, minLength: 1, maxLength: 256 }
+
+    Session:
+      type: object
+      required: [sid, user_id, expires_at]
+      properties:
+        sid:        { type: string }
+        user_id:    { type: string }
+        expires_at: { type: string, format: date-time }
+
+    User:
+      type: object
+      required: [id, username]
+      properties:
+        id:         { type: string }
+        username:   { type: string, minLength: 1, maxLength: 64 }
+        email:      { type: string, format: email }
+        created_at: { type: string, format: date-time, readOnly: true }
+        updated_at: { type: string, format: date-time, readOnly: true }
+
+    CreateUserRequest:
+      type: object
+      required: [username]
+      properties:
+        username: { type: string, minLength: 1, maxLength: 64 }
+        email:    { type: string, format: email }
+
+    Post:
+      type: object
+      required: [id, author_id, body]
+      properties:
+        id:        { type: string }
+        author_id: { type: string }
+        body:      { type: string, maxLength: 4096 }
+        posted_at: { type: string, format: date-time }
