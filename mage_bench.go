@@ -138,12 +138,147 @@ func Bench() error {
 		return fmt.Errorf("bench: %w", err)
 	}
 
+	// The playbook produced per-cell loadgen.json files under
+	// resultsDir/<TS>-bench-<bench_target>/<RR>-<comp>/loadgen.json.
+	// Roll those up into per-host raw payloads under resultsDir/raw/
+	// so mergeBenchResults below can assemble the v5.0 results.json.
+	if err := aggregatePerCellResults(resultsDir); err != nil {
+		return fmt.Errorf("aggregate per-cell results: %w", err)
+	}
+
 	merged, err := mergeBenchResults(resultsDir, version, target)
 	if err != nil {
 		return fmt.Errorf("merge results: %w", err)
 	}
 	fmt.Printf("\n=== Bench complete: %s ===\n", merged)
 	return nil
+}
+
+// aggregatePerCellResults walks every per-cell loadgen.json the bench
+// playbook produced and folds them into one raw/<host>.json per
+// bench_target host. The directory layout the playbook emits is:
+//
+//	resultsDir/
+//	  <TS>-bench-<bench_target>/    ← one dir per `mage Bench` (or two
+//	                                   when BENCH_TARGET=both, one per
+//	                                   target)
+//	    <RR>-<competitor>/
+//	      loadgen.json              ← what we ingest
+//	      server.log, cpu.log, ...  ← side-channel artefacts
+//
+// Output shape (one file per bench_target):
+//
+//	{
+//	  "host": "msa2-server",
+//	  "celeris_version": "...",
+//	  "cells": [
+//	    {"run_index": 0, "competitor": "gin", "loadgen": <raw>},
+//	    ...
+//	  ]
+//	}
+//
+// Pre-aggregator the runner produced rich per-scenario v5.0 payloads;
+// this is a deliberately thin first pass that keeps the schema lossy-
+// but-honest (every cell carries the full loadgen.Result so downstream
+// tooling can compute LatencyAtSLO / HdrHistogram merges itself).
+// Lifting to the rich v5.0 schema is tracked separately.
+func aggregatePerCellResults(resultsDir string) error {
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		return err
+	}
+
+	entries, err := os.ReadDir(resultsDir)
+	if err != nil {
+		return err
+	}
+	type cell struct {
+		RunIndex   int             `json:"run_index"`
+		Competitor string          `json:"competitor"`
+		Loadgen    json.RawMessage `json:"loadgen"`
+	}
+	hostCells := make(map[string][]cell)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Top-level dirs we created (`raw/`) are skipped; bench dirs
+		// match the timestamp-bench-host pattern from the playbook.
+		const sep = "-bench-"
+		idx := strings.Index(name, sep)
+		if idx < 0 {
+			continue
+		}
+		host := name[idx+len(sep):]
+		cellEntries, err := os.ReadDir(filepath.Join(resultsDir, name))
+		if err != nil {
+			return err
+		}
+		for _, c := range cellEntries {
+			if !c.IsDir() {
+				continue
+			}
+			// Cell dirs look like "00-gin", "01-stdhttp", ...
+			parts := strings.SplitN(c.Name(), "-", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			runIdx, err := parseRunIndex(parts[0])
+			if err != nil {
+				continue
+			}
+			loadgenPath := filepath.Join(resultsDir, name, c.Name(), "loadgen.json")
+			data, err := os.ReadFile(loadgenPath)
+			if err != nil {
+				// Missing loadgen.json means the cell never ran (e.g.
+				// server failed to bind). Skip; the merged report will
+				// just be short a cell, which is louder than guessing.
+				continue
+			}
+			hostCells[host] = append(hostCells[host], cell{
+				RunIndex:   runIdx,
+				Competitor: parts[1],
+				Loadgen:    data,
+			})
+		}
+	}
+
+	celerisVer, _ := celerisVersion()
+	for host, cells := range hostCells {
+		payload := map[string]any{
+			"host":            host,
+			"celeris_version": celerisVer,
+			"cells":           cells,
+		}
+		buf, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(
+			filepath.Join(rawDir, host+".json"),
+			buf, 0o644,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parseRunIndex extracts the integer run-index from a cell-dir prefix
+// like "00", "01", "12". Two-digit zero-padded by the playbook so it
+// sorts lexically; we just need the number for the JSON payload.
+func parseRunIndex(s string) (int, error) {
+	// Strip any leading zeros without using strconv.Atoi's leading-
+	// zero behaviour (which is fine; the playbook emits ascii decimal).
+	for len(s) > 1 && s[0] == '0' {
+		s = s[1:]
+	}
+	var n int
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return 0, fmt.Errorf("parse run-index %q: %w", s, err)
+	}
+	return n, nil
 }
 
 // BenchSince runs Bench then diffs the produced results against a
