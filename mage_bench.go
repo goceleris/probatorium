@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -171,17 +172,31 @@ func Bench() error {
 //	{
 //	  "host": "msa2-server",
 //	  "celeris_version": "...",
+//	  "summary": {
+//	    "<competitor>": {
+//	      "runs":            <int>,
+//	      "median_rps":      <float>,
+//	      "median_p99_ns":   <int>,
+//	      "total_requests":  <int>,
+//	      "total_errors":    <int>
+//	    }, ...
+//	  },
 //	  "cells": [
 //	    {"run_index": 0, "competitor": "gin", "loadgen": <raw>},
 //	    ...
 //	  ]
 //	}
 //
-// Pre-aggregator the runner produced rich per-scenario v5.0 payloads;
-// this is a deliberately thin first pass that keeps the schema lossy-
-// but-honest (every cell carries the full loadgen.Result so downstream
-// tooling can compute LatencyAtSLO / HdrHistogram merges itself).
-// Lifting to the rich v5.0 schema is tracked separately.
+// `summary` is the headline view a human (or a regression-diff tool)
+// reads first. Median across runs (rather than mean) hardens the
+// numbers against single-cell outliers — a transient GC pause or a
+// neighbour-noise blip on the cluster won't shift the median if it's
+// only one of three+ runs.
+//
+// `cells` is preserved verbatim so downstream tooling can still
+// compute richer aggregations (HdrHistogram merging, LatencyAtSLO
+// rated-mode sweeps, time-series stitching) without re-running bench.
+// Lifting to the full v5.0 schema lives separately.
 func aggregatePerCellResults(resultsDir string) error {
 	rawDir := filepath.Join(resultsDir, "raw")
 	if err := os.MkdirAll(rawDir, 0o755); err != nil {
@@ -192,12 +207,7 @@ func aggregatePerCellResults(resultsDir string) error {
 	if err != nil {
 		return err
 	}
-	type cell struct {
-		RunIndex   int             `json:"run_index"`
-		Competitor string          `json:"competitor"`
-		Loadgen    json.RawMessage `json:"loadgen"`
-	}
-	hostCells := make(map[string][]cell)
+	hostCells := make(map[string][]cellRecord)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -236,7 +246,7 @@ func aggregatePerCellResults(resultsDir string) error {
 				// just be short a cell, which is louder than guessing.
 				continue
 			}
-			hostCells[host] = append(hostCells[host], cell{
+			hostCells[host] = append(hostCells[host], cellRecord{
 				RunIndex:   runIdx,
 				Competitor: parts[1],
 				Loadgen:    data,
@@ -246,9 +256,14 @@ func aggregatePerCellResults(resultsDir string) error {
 
 	celerisVer, _ := celerisVersion()
 	for host, cells := range hostCells {
+		summary, err := summarizeCells(cells)
+		if err != nil {
+			return fmt.Errorf("summarize %s: %w", host, err)
+		}
 		payload := map[string]any{
 			"host":            host,
 			"celeris_version": celerisVer,
+			"summary":         summary,
 			"cells":           cells,
 		}
 		buf, err := json.MarshalIndent(payload, "", "  ")
@@ -263,6 +278,103 @@ func aggregatePerCellResults(resultsDir string) error {
 		}
 	}
 	return nil
+}
+
+// competitorStats is the per-competitor headline view emitted in
+// `summary` for each host. Field names use snake_case for JSON
+// readability; the totals fields make it easy to grep for the
+// classic "any errors?" question without scanning every cell.
+type competitorStats struct {
+	Runs          int     `json:"runs"`
+	MedianRPS     float64 `json:"median_rps"`
+	MedianP99Ns   int64   `json:"median_p99_ns"`
+	TotalRequests int64   `json:"total_requests"`
+	TotalErrors   int64   `json:"total_errors"`
+}
+
+// cellRecord is one row in `cells` — the per-cell view written to
+// raw/<host>.json. Carried as a value type so summarizeCells can
+// operate on the same slice without an extra parse pass.
+type cellRecord struct {
+	RunIndex   int             `json:"run_index"`
+	Competitor string          `json:"competitor"`
+	Loadgen    json.RawMessage `json:"loadgen"`
+}
+
+// summarizeCells folds the per-cell loadgen.Result blobs into one
+// stats record per competitor.
+//
+// Median is chosen over mean because a single GC pause / scheduler
+// blip on the cluster can shift the mean by 5% while the median
+// shrugs off any one outlier — and our smallest bench profile is
+// 3 runs (BENCH_RUNS default), where the median is well-defined and
+// robust.
+func summarizeCells(cells []cellRecord) (map[string]competitorStats, error) {
+	type loadgenLite struct {
+		Requests       int64   `json:"requests"`
+		Errors         int64   `json:"errors"`
+		RequestsPerSec float64 `json:"requests_per_sec"`
+		Latency        struct {
+			P99 int64 `json:"p99"`
+		} `json:"latency"`
+	}
+	// First pass: bucket cells by competitor.
+	rps := map[string][]float64{}
+	p99 := map[string][]int64{}
+	reqs := map[string]int64{}
+	errs := map[string]int64{}
+	runs := map[string]int{}
+	for _, c := range cells {
+		var lg loadgenLite
+		if err := json.Unmarshal(c.Loadgen, &lg); err != nil {
+			return nil, fmt.Errorf("parse cell %s run=%d: %w", c.Competitor, c.RunIndex, err)
+		}
+		rps[c.Competitor] = append(rps[c.Competitor], lg.RequestsPerSec)
+		p99[c.Competitor] = append(p99[c.Competitor], lg.Latency.P99)
+		reqs[c.Competitor] += lg.Requests
+		errs[c.Competitor] += lg.Errors
+		runs[c.Competitor]++
+	}
+	// Second pass: compute median per bucket.
+	out := make(map[string]competitorStats, len(runs))
+	for comp, n := range runs {
+		out[comp] = competitorStats{
+			Runs:          n,
+			MedianRPS:     medianFloat(rps[comp]),
+			MedianP99Ns:   medianInt(p99[comp]),
+			TotalRequests: reqs[comp],
+			TotalErrors:   errs[comp],
+		}
+	}
+	return out, nil
+}
+
+// medianFloat returns the median of xs. xs is mutated (sorted in
+// place) — callers should pass a fresh slice, which every call site
+// in this file does.
+func medianFloat(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	sort.Float64s(xs)
+	mid := len(xs) / 2
+	if len(xs)%2 == 1 {
+		return xs[mid]
+	}
+	return (xs[mid-1] + xs[mid]) / 2
+}
+
+// medianInt is medianFloat for int64.
+func medianInt(xs []int64) int64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	sort.Slice(xs, func(i, j int) bool { return xs[i] < xs[j] })
+	mid := len(xs) / 2
+	if len(xs)%2 == 1 {
+		return xs[mid]
+	}
+	return (xs[mid-1] + xs[mid]) / 2
 }
 
 // parseRunIndex extracts the integer run-index from a cell-dir prefix
