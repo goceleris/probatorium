@@ -1,0 +1,83 @@
+---
+# Database services: postgres / redis / memcached run as docker
+# containers — the ONLY place docker is used in probatorium. Framework
+# binaries always run natively (see deploy.yml).
+#
+# Contract:
+#   - install docker.io if missing (manifest-tracked → cleanup apt-purges)
+#   - chmod 666 /var/run/docker.sock so the bench user can `docker run`
+#     without group membership (avoids the reset_connection sudo race
+#     documented in cluster-go-gate.yml's preflight).
+#   - pull the three images we need (always-latest tag-suffixed pins
+#     so a quiet upstream rebuild doesn't change the bench under us
+#     mid-run; tags are the latest stable as of authoring).
+#
+# Containers themselves are NOT started here — the runner spins them up
+# per-cell so each scenario gets a clean DB. Cleanup playbook docker-
+# kills any containers we left running.
+
+- name: dbservices | detect whether docker.io is installed
+  ansible.builtin.shell: |
+    dpkg -s docker.io >/dev/null 2>&1 && echo present || echo missing
+  register: docker_check
+  changed_when: false
+
+- name: dbservices | install docker.io
+  become: true
+  ansible.builtin.apt:
+    name:
+      - docker.io
+    state: present
+    update_cache: true
+  when: docker_check.stdout == 'missing'
+
+- name: dbservices | append docker.io to manifest
+  ansible.builtin.set_fact:
+    installed_packages: "{{ installed_packages + ['docker.io'] }}"
+  when: docker_check.stdout == 'missing'
+
+- name: dbservices | ensure docker daemon is running
+  become: true
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: false
+
+# Group membership only takes effect on NEXT login — forcing
+# `meta: reset_connection` here would race against ansible's privilege-
+# escalation timeout under SSH ControlMaster (12s). chmod 666 the
+# socket on this run only — systemd recreates it with default mode
+# (660) when docker restarts, so no permanent mutation.
+# Cluster bench targets are dedicated; world-writable docker.sock for
+# the duration of the run is benign.
+- name: dbservices | open docker socket for the bench user (no group / no reconnect)
+  become: true
+  ansible.builtin.file:
+    path: /var/run/docker.sock
+    mode: '0666'
+
+# Always-latest stable images, but pinned to a major-minor so a daemon
+# restart can't pull a breaking upstream change between deploy and bench.
+# Update these as upstream majors land (postgres 18, redis 9, ...).
+- name: dbservices | pull database images (postgres + redis + memcached)
+  ansible.builtin.command: "docker pull {{ item }}"
+  loop:
+    - "postgres:17-alpine"
+    - "redis:8.2-alpine"
+    - "memcached:1.6.41-alpine"
+  register: docker_pull
+  changed_when: "'Downloaded newer image' in docker_pull.stdout or 'Pull complete' in docker_pull.stdout"
+
+- name: dbservices | record fetched image digests
+  ansible.builtin.shell: |
+    for img in postgres:17-alpine redis:8.2-alpine memcached:1.6.41-alpine; do
+      docker image inspect --format '{{ "{{" }} index .RepoDigests 0 {{ "}}" }}' "$img" 2>/dev/null || echo "$img:unknown"
+    done
+  register: db_image_digests
+  changed_when: false
+
+- name: dbservices | append digests to fetched_versions
+  ansible.builtin.set_fact:
+    fetched_versions: >-
+      {{ fetched_versions
+         | combine({ 'db_images': db_image_digests.stdout_lines }) }}
