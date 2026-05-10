@@ -23,6 +23,19 @@
 /servers/iris/iris
 /servers/stdhttp/stdhttp
 
+# Bun-on-TS competitor adapters (wave 4b). Build outputs and the
+# package manager's resolved-deps cache stay out of git so the
+# always-latest deploy policy is enforced — every cluster deploy
+# does a fresh `bun install` against upstream registry HEAD.
+/servers/hono/node_modules/
+/servers/hono/dist/
+/servers/hono/bun.lock
+/servers/hono/bun.lockb
+/servers/elysia/node_modules/
+/servers/elysia/dist/
+/servers/elysia/bun.lock
+/servers/elysia/bun.lockb
+
 go.work
 go.work.sum
 .magefile/
