@@ -26,6 +26,12 @@ const (
 	validatePlaybook = "validate.yml"
 	fuzzPlaybook     = "fuzz.yml"
 	manifestRemote   = "/tmp/celeris-bench-manifest.json"
+	// sshUser mirrors `ansible_user` in inventory.yml. The cluster nodes
+	// only have a `mini` account, so any direct SSH must specify it
+	// explicitly — Tailscale SSH otherwise tries to map the dev Mac's
+	// current login (`fuming`) onto the target and fails with
+	// "tailscale: failed to look up local user".
+	sshUser = "mini"
 )
 
 // lanIPs maps inventory hostname to the LAN-pinned DHCP reservation
@@ -158,20 +164,32 @@ type Manifest struct {
 
 // manifestRead ssh's into host and dumps the bench manifest. Returns
 // (zero, nil) if the file does not exist (a freshly provisioned host
-// won't have one), and (zero, err) for any other failure. Uses the
-// same SSH path ansible would (no -o overrides — relies on
-// ~/.ssh/config + ControlMaster).
+// won't have one), and (zero, err) for any other failure.
+//
+// Routing:
+//   - Always logs in as `mini` (matches inventory.yml ansible_user) —
+//     bare-hostname SSH would inherit the current Mac user and fail
+//     Tailscale SSH's local-user lookup.
+//   - When CLUSTER_USE_LAN=1, targets the LAN IP directly (LACP fabric)
+//     so Status() works even if Tailscale is offline / re-auth-pending.
 func manifestRead(host string) (Manifest, error) {
 	var m Manifest
+	target := sshUser + "@" + host
+	if os.Getenv("CLUSTER_USE_LAN") == "1" {
+		if ip := lanIPForHost(host); ip != "" {
+			target = sshUser + "@" + ip
+		}
+	}
 	cmd := exec.Command("ssh",
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
-		host,
+		"-o", "StrictHostKeyChecking=accept-new",
+		target,
 		"cat "+manifestRemote+" 2>/dev/null || true",
 	)
 	out, err := cmd.Output()
 	if err != nil {
-		return m, fmt.Errorf("ssh %s: %w", host, err)
+		return m, fmt.Errorf("ssh %s: %w", target, err)
 	}
 	raw := strings.TrimSpace(string(out))
 	if raw == "" {
