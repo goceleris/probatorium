@@ -36,6 +36,14 @@
 /servers/elysia/bun.lock
 /servers/elysia/bun.lockb
 
+# Python adapter local-dev artefacts. The cluster builds the venv under
+# {{ bench_root }}/competitors/<name>/.venv via the python ansible role
+# — both the in-repo .venv and the bytecode caches are dev-only debris.
+/servers/*/.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
 go.work
 go.work.sum
 .magefile/
