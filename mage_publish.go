@@ -1,0 +1,151 @@
+//go:build mage
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+)
+
+// Publish targets. Publish dispatches the latest results.json to
+// goceleris/docs via repository_dispatch — the docs repo's GitHub
+// Action picks up the payload and rebuilds the bench page from the
+// canonical v5.0 schema. BenchAndValidate composes the gate that
+// release branches actually run end-to-end.
+
+// Publish reads the latest results/<...>-bench-<ver>/results.json and
+// POSTs it to goceleris/docs as a repository_dispatch event of type
+// "celeris-bench". The docs repo's workflow consumes the payload to
+// regenerate the bench dashboard.
+//
+// Auth: DOCS_TOKEN env var if set, otherwise `gh auth token` — same
+// behaviour as gh's own commands so a logged-in dev needs zero extra
+// setup.
+//
+// Env knobs:
+//
+//	PUBLISH_VERSION=        override go.mod auto-detect (rare; the
+//	                        bench run that produced results.json
+//	                        already encodes the version, but a
+//	                        manual republish may want to relabel).
+//	DOCS_TOKEN=             GitHub token with repo scope on
+//	                        goceleris/docs. Falls back to gh CLI.
+func Publish() error {
+	version := os.Getenv("PUBLISH_VERSION")
+	if version == "" {
+		v, err := celerisVersion()
+		if err != nil {
+			return err
+		}
+		version = v
+	}
+
+	resultsPath, err := latestBenchResults(version)
+	if err != nil {
+		// Fall back to the most recent run regardless of version
+		// when no version-specific match exists. The user's intent
+		// when running Publish without a fresh same-version bench
+		// is "ship what I have."
+		resultsPath, err = latestBenchResults("")
+		if err != nil {
+			return fmt.Errorf("no bench results to publish: %w", err)
+		}
+	}
+
+	data, err := os.ReadFile(resultsPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", resultsPath, err)
+	}
+	var resultsDoc any
+	if err := json.Unmarshal(data, &resultsDoc); err != nil {
+		return fmt.Errorf("parse %s: %w", resultsPath, err)
+	}
+
+	token, err := resolveDocsToken()
+	if err != nil {
+		return err
+	}
+
+	// repository_dispatch payload shape — `event_type` is the key the
+	// docs workflow filters on; `client_payload` carries arbitrary
+	// JSON. We pass the full results.json plus a version tag so the
+	// workflow doesn't have to re-derive it from the payload tree.
+	payload := map[string]any{
+		"event_type": "celeris-bench",
+		"client_payload": map[string]any{
+			"version": version,
+			"results": resultsDoc,
+			"source":  resultsPath,
+		},
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Publishing %s (%s) → goceleris/docs...\n", resultsPath, version)
+	cmd := exec.Command("gh", "api",
+		"-X", "POST",
+		"/repos/goceleris/docs/dispatches",
+		"-H", "Accept: application/vnd.github+json",
+		"-H", "Authorization: token "+token,
+		"--input", "-",
+	)
+	cmd.Stdin = bytes.NewReader(payloadJSON)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("gh api dispatch: %w", err)
+	}
+	fmt.Println("Published.")
+	return nil
+}
+
+// BenchAndValidate is the release-gate composition: Validate first
+// (long-running invariant + property suite), then on success a fresh
+// Bench, then Publish. Failure at any step short-circuits — a release
+// that can't pass Validate has no business shipping a bench number,
+// and a publish that runs without a fresh bench is misleading.
+//
+// Reuses every BENCH_*, VALIDATE_*, CELERIS_VERSION, CLUSTER_USE_LAN,
+// and DOCS_TOKEN env knob from the underlying targets — set them
+// once in the caller's shell and they flow through.
+func BenchAndValidate() error {
+	fmt.Println("=== BenchAndValidate: Validate ===")
+	if err := Validate(); err != nil {
+		return fmt.Errorf("validate: %w", err)
+	}
+	fmt.Println("\n=== BenchAndValidate: Bench ===")
+	if err := Bench(); err != nil {
+		return fmt.Errorf("bench: %w", err)
+	}
+	fmt.Println("\n=== BenchAndValidate: Publish ===")
+	if err := Publish(); err != nil {
+		return fmt.Errorf("publish: %w", err)
+	}
+	fmt.Println("\n=== BenchAndValidate: complete ===")
+	return nil
+}
+
+// resolveDocsToken returns the token used for the docs dispatch.
+// DOCS_TOKEN env wins; falls back to `gh auth token`. We never log
+// the token (just stamp whether it came from env or CLI) so a stray
+// CI log dump doesn't leak credentials.
+func resolveDocsToken() (string, error) {
+	if t := os.Getenv("DOCS_TOKEN"); t != "" {
+		return t, nil
+	}
+	out, err := exec.Command("gh", "auth", "token").Output()
+	if err != nil {
+		return "", fmt.Errorf("gh auth token (set DOCS_TOKEN env or run `gh auth login`): %w", err)
+	}
+	tok := strings.TrimSpace(string(out))
+	if tok == "" {
+		return "", fmt.Errorf("gh auth token returned empty (set DOCS_TOKEN env or run `gh auth login`)")
+	}
+	return tok, nil
+}
