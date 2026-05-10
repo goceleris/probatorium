@@ -90,6 +90,10 @@ func startGoAdapter(ctx context.Context, a Adapter, _ GoBinary, bindAddr string)
 //	{bind}   → bindAddr
 //	{engine} → a.Engine (empty string for non-celeris adapters)
 //	{name}   → a.Name
+//	{bench}  → PROBATORIUM_BENCH_ROOT (or DefaultBenchRoot if unset).
+//	           Lets the RunCmd template reference the staged launcher
+//	           script under {bench}/competitors/<name>/ without
+//	           hard-coding /tmp/celeris-bench.
 //
 // If the executable token (parts[0]) — after substitution — equals the
 // adapter name, it is resolved through [resolveAdapterBinary] so the
@@ -105,11 +109,16 @@ func startNativeAdapter(ctx context.Context, a Adapter, spec NativeBinary, bindA
 	if err != nil {
 		return nil, err
 	}
+	bench := os.Getenv(BenchRootEnv)
+	if bench == "" {
+		bench = DefaultBenchRoot
+	}
 	expanded := expandTemplate(spec.RunCmd, map[string]string{
 		"bin":    bin,
 		"bind":   bindAddr,
 		"engine": a.Engine,
 		"name":   a.Name,
+		"bench":  bench,
 	})
 	parts := strings.Fields(expanded)
 	if len(parts) == 0 {

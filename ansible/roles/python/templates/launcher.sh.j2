@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Launcher for the {{ competitor_name }} python adapter.
+#
+# The orchestrator (servers.StartAdapter) execs this path with:
+#     server -bind <host:port>
+# We translate that into a uvicorn invocation under the project venv.
+#
+# Performance knobs (always on):
+#   --loop uvloop        — uvloop event loop (uvicorn[standard] dep)
+#   --http httptools     — httptools parser (uvicorn[standard] dep)
+#   --no-access-log      — log per-request line cost killed
+#   --log-level warning  — uvicorn's default is info; we want quiet
+#   --workers $(nproc)   — one worker per logical CPU (only valid in
+#                          non-reload mode, which is implicit here)
+#
+# Free-threaded python: PYTHON_GIL=0 disabled — uvloop's C extension
+# in current stable releases is NOT free-thread-safe (verify on next
+# stable bump). Re-enable by adding `export PYTHON_GIL=0` below once
+# uvloop ships a free-thread-safe build. TODO.
+#
+# After uvicorn binds, this script polls the bound address from the
+# outside and prints `ready addr=<host:port>` ONCE to stdout. With
+# multiple workers, uvicorn's lifespan runs per-worker, so a banner
+# emitted from inside the app would print N times — the polling
+# approach gives a single banner regardless of worker count.
+
+set -euo pipefail
+
+VENV_DIR="$(cd "$(dirname "$0")" && pwd)/.venv"
+SRC_DIR="{{ competitor_src_path }}"
+APP_TARGET="{{ competitor_module_target }}"
+
+bind=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -bind|--bind)
+            bind="$2"
+            shift 2
+            ;;
+        -bind=*|--bind=*)
+            bind="${1#*=}"
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$bind" ]]; then
+    bind="127.0.0.1:8080"
+fi
+
+# IPv6 literal handling: [::1]:8080 → host=::1 port=8080.
+if [[ "$bind" =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+else
+    host="${bind%:*}"
+    port="${bind##*:}"
+fi
+
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+# Keep uvicorn from spinning up the watcher (which `uvicorn[standard]`
+# pulls in via watchfiles); our launcher is one-shot.
+export WATCHFILES_FORCE_POLLING=false
+
+# Let python find the adapter package. The source tree was extracted
+# read-only at SRC_DIR — we point PYTHONPATH at it so the venv's site-
+# packages doesn't need an editable install.
+export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+workers="$(nproc 2>/dev/null || echo 1)"
+
+# Emit `ready addr=...` ONCE after uvicorn binds. Polls the TCP port
+# in a tight loop until accept succeeds, then prints. The probe runs
+# in the background; uvicorn keeps the foreground.
+(
+    for _ in $(seq 1 600); do
+        if (exec 3<>/dev/tcp/"${host}"/"${port}") 2>/dev/null; then
+            exec 3<&-
+            exec 3>&-
+            echo "ready addr=${host}:${port}"
+            exit 0
+        fi
+        sleep 0.05
+    done
+) &
+ready_probe=$!
+# Detach so a uvicorn crash doesn't leave the probe orphaned past the
+# parent's exit.
+disown "$ready_probe" 2>/dev/null || true
+
+exec "${VENV_DIR}/bin/python" -m uvicorn "${APP_TARGET}" \
+    --host "${host}" \
+    --port "${port}" \
+    --workers "${workers}" \
+    --loop uvloop \
+    --http httptools \
+    --no-access-log \
+    --log-level warning

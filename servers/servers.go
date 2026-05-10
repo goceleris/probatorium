@@ -206,11 +206,6 @@ var Registry = map[string]Adapter{
 	// `ready addr=<addr>` on stdout. SIGTERM triggers graceful shutdown
 	// inside servers/start.go's 5-second grace window. H2 cell-columns
 	// land later — these three are H1-only for wave 4a.
-	//
-	// BuildSteps is informational (the ansible task in tasks/build_
-	// native_competitor.yml is the authoritative builder); we still
-	// record the steps so a dev-Mac reproducer is one cd + copy-paste
-	// away.
 	"axum": {
 		Name: "axum", Category: "rust-tower", Language: "rust", Framework: "axum", Engine: "h1",
 		Bin: NativeBinary{
@@ -242,6 +237,21 @@ var Registry = map[string]Adapter{
 				"cd $SRC && cargo build --profile release-fat",
 			},
 			RunCmd: "{bin} -bind {bind}",
+		},
+	},
+
+	// fastapi — python adapter, native (NO docker). The launcher script
+	// at {bench}/competitors/fastapi/server is rendered by the python
+	// ansible role's build_competitor.yml; it activates the per-adapter
+	// venv and execs uvicorn with uvloop+httptools and one worker per
+	// CPU. Blessed FastAPI fast-path: async def handlers +
+	// ORJSONResponse default class. See servers/fastapi/pyproject.toml
+	// for the always-latest dep set (no upper pins).
+	"fastapi": {
+		Name: "fastapi", Category: "python-fastapi", Language: "python", Framework: "fastapi", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:   "python",
+			RunCmd: "{bench}/competitors/{name}/server -bind {bind}",
 		},
 	},
 

@@ -1,0 +1,87 @@
+---
+# Build a single python competitor's venv and stage the launcher script.
+#
+# Caller contract:
+#
+#   - import_tasks (or include_tasks) this file with:
+#       competitor_name:        canonical adapter slug ("fastapi")
+#       competitor_src_dir:     absolute path to the extracted source
+#                               tree (typically
+#                               {{ bench_root }}/competitors-src/{{ slug }})
+#       competitor_module:      uvicorn import target ("app.server:app")
+#
+#   - The source tree MUST contain a top-level pyproject.toml whose
+#     dependencies include ``fastapi``, ``uvicorn[standard]`` and
+#     ``orjson`` (or whatever the adapter actually uses). uv will
+#     resolve always-latest stable at this point because pyproject.toml
+#     uses ``>=`` floors with no upper pins.
+#
+# Side effects:
+#
+#   - Creates a project-local venv at
+#     {{ bench_root }}/competitors/{{ competitor_name }}/.venv
+#   - Installs the adapter's pyproject deps into that venv (no
+#     editable install — the source tree is read-only after this).
+#   - Writes the launcher script at
+#     {{ bench_root }}/competitors/{{ competitor_name }}/server.
+#     The orchestrator (``servers.StartAdapter``) execs this path
+#     with ``-bind <host:port>`` to launch the adapter.
+#
+# The launcher itself is the canonical "binary" — once it exists, the
+# generic build_native_competitor.yml's symlink step is a no-op overwrite
+# (the launcher and the symlink live at the same path; ``state: link``
+# with ``force: true`` will replace the file with the symlink, so the
+# caller MUST set binary_rel to a path INSIDE the source tarball that
+# resolves to the same launcher we wrote here, OR omit the symlink step
+# for python adapters).
+#
+# We sidestep that by writing the launcher to a path the symlink step
+# does NOT touch when binary_rel is empty: this task is the sole writer
+# of competitors/{{ competitor_name }}/server for python adapters, and
+# build_native_competitor.yml's symlink is gated on binary_rel being
+# non-empty.
+
+- name: "{{ competitor_name }} | ensure launcher dir exists"
+  ansible.builtin.file:
+    path: "{{ bench_root }}/competitors/{{ competitor_name }}"
+    state: directory
+    mode: '0755'
+
+# `uv venv` is idempotent — re-running upgrades the in-venv python if
+# the system-python under uv has moved. UV_PROJECT_ENVIRONMENT lets us
+# pick the venv path explicitly so we don't accumulate .venv inside
+# the source tree (which would survive past `cleanup.yml` if a user
+# poked the source dir manually).
+- name: "{{ competitor_name }} | create venv via uv"
+  environment:
+    UV_CACHE_DIR: "{{ bench_root }}/uv-cache"
+    UV_PYTHON_INSTALL_DIR: "{{ bench_root }}/uv-python"
+    UV_PROJECT_ENVIRONMENT: "{{ bench_root }}/competitors/{{ competitor_name }}/.venv"
+  ansible.builtin.command:
+    cmd: "{{ bench_root }}/uv/bin/uv venv --python 3.13 {{ bench_root }}/competitors/{{ competitor_name }}/.venv"
+    creates: "{{ bench_root }}/competitors/{{ competitor_name }}/.venv/bin/python"
+
+# `uv pip install --python <venv-py> .` resolves and installs every
+# dep listed in pyproject.toml's [project.dependencies] using the
+# always-latest semantics encoded in the `>=` floors. No lockfile is
+# committed — we WANT each deploy to pick up newer wheels.
+- name: "{{ competitor_name }} | install adapter deps into venv"
+  environment:
+    UV_CACHE_DIR: "{{ bench_root }}/uv-cache"
+    UV_PYTHON_INSTALL_DIR: "{{ bench_root }}/uv-python"
+    XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
+    XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
+  ansible.builtin.command:
+    cmd: "{{ bench_root }}/uv/bin/uv pip install --python {{ bench_root }}/competitors/{{ competitor_name }}/.venv/bin/python {{ competitor_src_dir }}"
+
+# The launcher is a tiny shell shim: parse `-bind <addr>`, split into
+# host+port, exec uvicorn under the venv with the always-on perf flags.
+# Free-threaded python: see the comment in templates/launcher.sh.j2.
+- name: "{{ competitor_name }} | render launcher script"
+  ansible.builtin.template:
+    src: launcher.sh.j2
+    dest: "{{ bench_root }}/competitors/{{ competitor_name }}/server"
+    mode: '0755'
+  vars:
+    competitor_module_target: "{{ competitor_module | default('app.server:app') }}"
+    competitor_src_path: "{{ competitor_src_dir }}"

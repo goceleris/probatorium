@@ -6,11 +6,19 @@
 #                      tarball: <local path to .tar.gz on dev Mac>,
 #                      build_cmd: <shell command to run in extracted dir>,
 #                      binary_rel: <path to the produced binary, relative
-#                                   to the extracted source root> } }
+#                                   to the extracted source root>,
+#                      module_target: <python only — uvicorn import target
+#                                       like "app.server:app"; defaults
+#                                       to that exact string in the role> } }
 #
 # Stages everything under {{ bench_root }}/competitors-src/<slug>/ and
 # symlinks the produced binary into {{ bench_root }}/competitors/<slug>
 # so the bench playbook can launch it identically to Go competitors.
+#
+# Python adapters are special-cased: the python role's build_competitor.yml
+# owns venv creation, dep install, and launcher rendering. For python we
+# skip both the generic build_cmd shell and the binary_rel symlink — the
+# launcher is written directly at competitors/<slug>/server by the role.
 
 - name: "{{ comp.key }} | ensure source dir exists"
   ansible.builtin.file:
@@ -57,9 +65,10 @@
   ansible.builtin.shell: |
     set -euo pipefail
     cd {{ bench_root }}/competitors-src/{{ comp.key }}
-    {{ comp.value.build_cmd }}
+    {{ comp.value.build_cmd | default('true') }}
   args:
     executable: /bin/bash
+  when: comp.value.lang != 'python'
 
 - name: "{{ comp.key }} | symlink built binary into competitors/"
   ansible.builtin.file:
@@ -67,3 +76,18 @@
     dest: "{{ bench_root }}/competitors/{{ comp.key }}"
     state: link
     force: true
+  when: comp.value.lang != 'python'
+
+# Python adapters: dispatch to the python role's parameterized
+# build_competitor task list. It creates the venv, installs deps via uv,
+# and renders the launcher script — no symlink needed (the launcher
+# lives directly at competitors/<slug>/server).
+- name: "{{ comp.key }} | build python competitor (venv + launcher)"
+  ansible.builtin.include_role:
+    name: python
+    tasks_from: build_competitor.yml
+  vars:
+    competitor_name: "{{ comp.key }}"
+    competitor_src_dir: "{{ bench_root }}/competitors-src/{{ comp.key }}"
+    competitor_module: "{{ comp.value.module_target | default('app.server:app') }}"
+  when: comp.value.lang == 'python'
