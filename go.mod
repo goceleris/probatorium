@@ -6,7 +6,9 @@ require (
 	github.com/HdrHistogram/hdrhistogram-go v1.1.2
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf
 	github.com/goceleris/loadgen v1.4.3
+	github.com/google/gofuzz v1.2.0
 	github.com/jackc/pgx/v5 v5.9.2
+	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/redis/go-redis/v9 v9.19.0
 	modernc.org/sqlite v1.50.0
 )
