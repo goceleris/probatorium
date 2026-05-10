@@ -112,7 +112,7 @@ func Bench() error {
 		"-i", "inventory.yml",
 		benchPlaybook,
 		"--extra-vars", "bench_target=" + target,
-		"--extra-vars", "bench_competitors=" + competitors,
+		"--extra-vars", "competitor_set=" + competitors,
 		"--extra-vars", "bench_duration=" + duration,
 		"--extra-vars", "bench_warmup=" + warmup,
 		"--extra-vars", "bench_connections=" + conns,
