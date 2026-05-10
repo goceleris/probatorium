@@ -68,10 +68,10 @@ func fakeExpvar(t *testing.T, doc map[string]any) *httptest.Server {
 
 func TestFetchMetrics_FlatCelerisCounters(t *testing.T) {
 	srv := fakeExpvar(t, map[string]any{
-		"goroutines":                   123.0,
-		"celeris.accepted_conn_total":  4567.0,
-		"celeris.closed_conn_total":    4500.0,
-		"celeris.panic_count":          0.0,
+		"goroutines":                  123.0,
+		"celeris.accepted_conn_total": 4567.0,
+		"celeris.closed_conn_total":   4500.0,
+		"celeris.panic_count":         0.0,
 	})
 	httpc := &http.Client{Timeout: time.Second}
 	v := fetchMetrics(context.Background(), httpc, srv.URL)
