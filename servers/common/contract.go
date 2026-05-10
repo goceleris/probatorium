@@ -88,16 +88,26 @@ var Endpoints = []Endpoint{
 	},
 }
 
+// init wires the deterministic 1k / 64k payloads into the contract
+// slice so external consumers (test fixtures, conformance probes) get
+// the exact bytes a live server would return.
+//
+// generateJSONPayload is invoked here directly rather than via the
+// JSON1KPayload / JSON64KPayload accessors so this init does NOT
+// depend on payload.go's init having already populated the
+// package-level json1KPayload / json64KPayload buffers. Go runs init
+// funcs across files in alphabetical filename order; contract.go
+// sorts before payload.go, so the accessor path would observe empty
+// slices on every fresh process. Computing the bytes here is
+// idempotent — payload.go's init then overwrites the package buffers
+// with the same values and the accessors return them thereafter.
 func init() {
-	// Wire the deterministic 1k / 64k payloads into the contract slice
-	// so external consumers (test fixtures, conformance probes) get the
-	// exact bytes a live server would return.
 	for i := range Endpoints {
 		switch Endpoints[i].Path {
 		case "/json-1k":
-			Endpoints[i].ResponseBody = JSON1KPayload()
+			Endpoints[i].ResponseBody = generateJSONPayload(1024)
 		case "/json-64k":
-			Endpoints[i].ResponseBody = JSON64KPayload()
+			Endpoints[i].ResponseBody = generateJSONPayload(65536)
 		}
 	}
 }
