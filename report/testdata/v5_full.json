@@ -1,0 +1,119 @@
+{
+  "schema_version": "5.0",
+  "host_arch_pair": "linux_arm64",
+  "environment": {
+    "kernel_sysctls_applied": [
+      "net.core.netdev_max_backlog=250000",
+      "net.core.rmem_max=33554432",
+      "net.core.somaxconn=65535",
+      "net.core.wmem_max=33554432",
+      "net.ipv4.tcp_fin_timeout=10",
+      "net.ipv4.tcp_max_syn_backlog=131072",
+      "net.ipv4.tcp_rmem=4096 1048576 33554432",
+      "net.ipv4.tcp_tw_reuse=1",
+      "net.ipv4.tcp_wmem=4096 1048576 33554432"
+    ],
+    "loadgen_host": "msa2-client",
+    "fabric": "3-host LACP 20G"
+  },
+  "benchmark_config": {
+    "started_at": "2026-05-10T01:00:00Z",
+    "finished_at": "2026-05-10T07:30:00Z",
+    "runs": 3,
+    "duration": 120000000000,
+    "warmup": 30000000000,
+    "git_ref": "main@cafef00d",
+    "loadgen_version": "v1.4.3",
+    "celeris_version": "v1.4.3",
+    "scenarios_filter": "get-json,post-echo",
+    "adapters_filter": "celeris-std-h1,fasthttp,gin"
+  },
+  "benchmarks": [
+    {
+      "name": "celeris-std-h1",
+      "category": "celeris",
+      "language": "go",
+      "language_version": "1.26.3",
+      "framework": "celeris",
+      "framework_version": "v1.4.3",
+      "engine": "std",
+      "compile_options": [
+        "CGO_ENABLED=0",
+        "GOAMD64=v3",
+        "tags=jsoniter"
+      ],
+      "saturation_mode_rps": {
+        "get-json": 312000.0,
+        "post-echo": 198000.0
+      },
+      "rated_mode_p99_at_target_rps": {
+        "get-json": 420000,
+        "post-echo": 980000
+      },
+      "latency_at_slo": {
+        "get-json": { "10": 180000, "50": 270000, "100": 305000, "500": 312000, "1000": 312000 },
+        "post-echo": { "10": 90000, "50": 170000, "100": 195000, "500": 198000, "1000": 198000 }
+      },
+      "hdr_histogram_b64": {
+        "get-json": "HISTFAAAACx4nJNgYGCQAAAAJAAH",
+        "post-echo": "HISTFAAAACx4nJNgYGCQBAAAJAAJ"
+      },
+      "loadgen_cpu_p95": {
+        "get-json": 0.78,
+        "post-echo": 0.41
+      },
+      "sent_vs_handled_delta_pct": {
+        "get-json": 0.001,
+        "post-echo": 0.002
+      }
+    },
+    {
+      "name": "fasthttp",
+      "category": "competitor",
+      "language": "go",
+      "language_version": "1.26.3",
+      "framework": "fasthttp",
+      "framework_version": "v1.58.0",
+      "compile_options": ["CGO_ENABLED=0"],
+      "saturation_mode_rps": {
+        "get-json": 295000.0,
+        "post-echo": 191000.0
+      },
+      "rated_mode_p99_at_target_rps": {
+        "get-json": 540000,
+        "post-echo": 1100000
+      },
+      "latency_at_slo": {
+        "get-json": { "10": 160000, "50": 260000, "100": 290000, "500": 295000, "1000": 295000 },
+        "post-echo": { "10": 80000, "50": 165000, "100": 188000, "500": 191000, "1000": 191000 }
+      },
+      "hdr_histogram_b64": {
+        "get-json": "HISTFAAAACx4nJNgYGCQDAAAJAAA",
+        "post-echo": "HISTFAAAACx4nJNgYGCQEAAAJAAA"
+      },
+      "loadgen_cpu_p95": {
+        "get-json": 0.82,
+        "post-echo": 0.44
+      },
+      "sent_vs_handled_delta_pct": {
+        "get-json": 0.003,
+        "post-echo": 0.004
+      }
+    }
+  ],
+  "validation_results": {
+    "started_at": "2026-05-10T00:00:00Z",
+    "finished_at": "2026-05-10T00:55:00Z",
+    "properties_passed": 47,
+    "properties_failed": 0,
+    "failure_summaries": {},
+    "fault_injection_seed": "1746835200"
+  },
+  "soak_summary": {
+    "duration": 21600000000000,
+    "restarted_processes": 0,
+    "goroutine_leak_detected": false,
+    "heap_growth_mb": 1.4,
+    "per_hour_error_rate": 0.0008
+  }
+}

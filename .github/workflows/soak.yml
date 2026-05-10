@@ -1,0 +1,55 @@
+name: Soak
+
+# Weekly 24h soak on the self-hosted cluster. Sundays 02:00 UTC keeps
+# it out of the bench/validate path entirely — by the time the
+# autonomous loop wakes up Monday morning, the soak either passed and
+# published its own headline, or it failed and we know about it
+# before the next bench fires.
+#
+# Publish uses a `soak-results-` prefix so the soak headline never
+# overwrites the daily bench number on the docs site.
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Celeris version to soak (defaults to latest tag in state branch)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: mage Soak + Publish
+    runs-on: [self-hosted, celeris-cluster]
+    timeout-minutes: 2160
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: mage Soak
+        env:
+          SOAK_DURATION: 24h
+          CELERIS_VERSION: ${{ env.VERSION }}
+        run: go run github.com/magefile/mage Soak
+
+      - name: mage Publish (soak-results-* prefix)
+        if: success()
+        env:
+          PUBLISH_VERSION: ${{ env.VERSION }}
+          PUBLISH_PREFIX: soak-results-
+        run: go run github.com/magefile/mage Publish
+
+      - name: mage Cleanup
+        if: always()
+        run: go run github.com/magefile/mage Cleanup

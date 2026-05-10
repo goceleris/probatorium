@@ -1,0 +1,49 @@
+name: Publish results
+
+# Standalone trigger that hands the latest bench results off to the
+# goceleris/docs repo via repository_dispatch. The dispatch payload
+# carries (version, arch, results_url) so the docs site can render the
+# new run without re-fetching the artifact catalogue.
+#
+# Normally invoked from bench.yml's success path; the workflow_dispatch
+# trigger here is for ad-hoc republishes (typo fix, broken link, …).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Celeris version that produced the results
+        required: true
+        type: string
+      arch:
+        description: Host arch tag (amd64 | arm64)
+        required: true
+        type: string
+        default: amd64
+      results_url:
+        description: Direct URL to the results.json artifact
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch results-updated to docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch results-updated
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN || github.token }}
+          VERSION: ${{ inputs.version }}
+          ARCH: ${{ inputs.arch }}
+          RESULTS_URL: ${{ inputs.results_url }}
+        run: |
+          set -euo pipefail
+          gh api repos/goceleris/docs/dispatches \
+            -f event_type=results-updated \
+            -f "client_payload[version]=${VERSION}" \
+            -f "client_payload[arch]=${ARCH}" \
+            -f "client_payload[results_url]=${RESULTS_URL}"
+          echo "Dispatched results-updated: ${VERSION} (${ARCH}) -> ${RESULTS_URL}"

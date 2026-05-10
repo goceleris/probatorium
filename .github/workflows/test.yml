@@ -1,0 +1,56 @@
+name: Test
+
+# Runs `go test -race` against the root module and every per-adapter
+# go.mod under servers/. The rust / bun / fastapi conformance tests
+# live in the root module (servers/rust_test.go etc.) and SKIP
+# gracefully when their toolchain isn't installed — so a vanilla
+# GitHub-hosted runner needs no special handling.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  root:
+    name: root module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: go test
+        run: go test -count=1 -race -timeout=5m ./...
+
+  adapters:
+    name: servers/${{ matrix.adapter }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter:
+          - celeris
+          - chi
+          - echo
+          - fasthttp
+          - fiber
+          - gin
+          - hertz
+          - iris
+          - stdhttp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: servers/${{ matrix.adapter }}/go.sum
+      - name: go test
+        working-directory: servers/${{ matrix.adapter }}
+        run: go test -count=1 -race -timeout=5m ./...

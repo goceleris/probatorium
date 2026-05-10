@@ -1,0 +1,106 @@
+version: 2
+updates:
+  # ----- Go modules -----
+  # `directories:` (plural) lets a single ecosystem entry watch every
+  # go.mod in the repo: root + every per-adapter sub-module under
+  # servers/. Combined with `groups.*.patterns: "*"` all gomod bumps
+  # collapse into ONE pull request per scheduled run — a daily x/net
+  # bump produces a single PR touching every module instead of nine
+  # racing PRs. Add a path here whenever a new go.mod lands in the
+  # tree (run `find . -name go.mod` to verify coverage).
+  - package-ecosystem: gomod
+    directories:
+      - /
+      - /servers/celeris
+      - /servers/chi
+      - /servers/echo
+      - /servers/fasthttp
+      - /servers/fiber
+      - /servers/gin
+      - /servers/hertz
+      - /servers/iris
+      - /servers/stdhttp
+    schedule:
+      interval: daily
+    groups:
+      all-go-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps"
+
+  # ----- GitHub Actions -----
+  # Watches every workflow under .github/workflows. Group all action
+  # version bumps into ONE PR per scheduled run.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      all-actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "ci"
+
+  # ----- Cargo (Rust adapters) -----
+  # One entry per Cargo.toml; the `groups` block still collapses all
+  # rust dep updates across the three crates into ONE PR per run.
+  - package-ecosystem: cargo
+    directories:
+      - /servers/actix-web
+      - /servers/axum
+      - /servers/ntex
+    schedule:
+      interval: daily
+    groups:
+      all-cargo-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps(cargo)"
+
+  # ----- npm / bun adapters -----
+  # Bun has no first-class dependabot ecosystem yet, but `npm` reads
+  # the same package.json so the bumps land cleanly. The launchers run
+  # under bun at execution time — this only touches the dependency
+  # graph dependabot can already see.
+  - package-ecosystem: npm
+    directories:
+      - /servers/elysia
+      - /servers/hono
+    schedule:
+      interval: daily
+    groups:
+      all-bun-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps(bun)"
+
+  # ----- pip (FastAPI adapter) -----
+  - package-ecosystem: pip
+    directory: /servers/fastapi
+    schedule:
+      interval: daily
+    groups:
+      all-pip-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps(pip)"
