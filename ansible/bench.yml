@@ -123,7 +123,7 @@
         # Native competitor processes are launched by their slug name
         # (we set argv[0] via cmdline); kill anything under competitors/
         # by matching the staging path prefix.
-        pkill -f "{{ bench_root }}/competitors/" 2>/dev/null
+        pkill -f "[/]tmp/celeris-bench/competitors/" 2>/dev/null
         true
       changed_when: false
       register: stop_result

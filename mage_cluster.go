@@ -53,17 +53,21 @@ func Status() error {
 	hosts := []string{"msa2-server", "msa2-client", "msr1"}
 	fmt.Printf("\n=== Manifest state ===\n")
 	for _, h := range hosts {
-		m, err := manifestRead(h)
+		present, m, err := manifestRead(h)
 		if err != nil {
 			fmt.Printf("  %-12s  unreachable: %v\n", h, err)
 			continue
 		}
-		if m.Host == "" && len(m.AptPackages) == 0 && len(m.Binaries) == 0 {
-			fmt.Printf("  %-12s  no manifest (clean)\n", h)
+		if !present {
+			fmt.Printf("  %-12s  no manifest (pristine)\n", h)
 			continue
 		}
-		fmt.Printf("  %-12s  apt=%d binaries=%d ts=%s\n",
-			h, len(m.AptPackages), len(m.Binaries), m.Timestamp)
+		if m.IsEmpty() {
+			fmt.Printf("  %-12s  manifest present, no installs (Go-only deploy)\n", h)
+			continue
+		}
+		fmt.Printf("  %-12s  apt=%d toolchains=%d sysctls=%d\n",
+			h, len(m.InstalledPackages), len(m.InstalledToolchains), len(m.PriorSysctl))
 	}
 	return nil
 }
@@ -109,15 +113,33 @@ func Deploy() error {
 	}
 
 	var jobs []bin
-	// Probatorium's own four binaries — every cmd/ is part of this
-	// module so moduleDir is "." for all of them.
-	for _, name := range []string{"runner", "loadgen", "observer", "validator"} {
-		for _, arch := range []string{"amd64", "arm64"} {
+	// Core binaries land at {{ bench_root }}/<name> on the cluster.
+	// The deploy playbook keys off the per-binary, per-arch extra-vars
+	// listed below (e.g. runner_binary_amd64), so the set here MUST
+	// stay in lockstep with `ansible/deploy.yml`'s push-* tasks.
+	//
+	// loadgen is amd64-only because msa2-client (the loadgen host)
+	// is amd64. Multi-host loadgen federation (msr1 sidecar) is in
+	// the v1.5 backlog; when it lands, add "arm64" here.
+	coreBins := []struct {
+		name  string
+		archs []string
+	}{
+		{"runner", []string{"amd64", "arm64"}},
+		{"loadgen", []string{"amd64"}},
+		{"observer", []string{"amd64", "arm64"}},
+		{"validator", []string{"amd64", "arm64"}},
+		{"conformance", []string{"amd64", "arm64"}},
+		{"validator-checker", []string{"amd64", "arm64"}},
+		{"validator-replay", []string{"amd64", "arm64"}},
+	}
+	for _, b := range coreBins {
+		for _, arch := range b.archs {
 			jobs = append(jobs, bin{
-				label:  name + " linux/" + arch,
+				label:  b.name + " linux/" + arch,
 				module: ".",
-				pkg:    "./cmd/" + name,
-				out:    filepath.Join(stagingDir, name+"-"+arch),
+				pkg:    "./cmd/" + b.name,
+				out:    filepath.Join(stagingDir, b.name+"-"+arch),
 				arch:   arch,
 			})
 		}
@@ -150,44 +172,75 @@ func Deploy() error {
 		}
 	}
 
-	// Render the staged manifest as JSON for the playbook so a single
-	// extra-var carries every binary path. deploy.yml iterates the
-	// list and copies each entry under bench_root.
-	type stagedBin struct {
-		Name string `json:"name"`
-		Arch string `json:"arch"`
-		Path string `json:"path"`
+	// The deploy playbook reads two surfaces:
+	//
+	//   1. Flat per-binary/per-arch vars for core binaries, e.g.
+	//        runner_binary_amd64=<host path>
+	//        runner_binary_arm64=<host path>
+	//      Hyphens in binary names map to underscores (validator-checker
+	//      -> validator_checker_binary_amd64) per Ansible/Jinja2
+	//      identifier rules.
+	//
+	//   2. A `competitor_binaries` dict for Go competitors:
+	//        {"gin": {"amd64": "...", "arm64": "..."}, ...}
+	//      plus `competitor_set` echoed through so the playbook can
+	//      filter (go-only | all | csv).
+	//
+	// We pass everything through a single JSON vars-file (`@vars.json`)
+	// rather than many `key=value` --extra-vars. Ansible's `key=value`
+	// form is string-only — passing a dict literal like
+	// `competitor_binaries={"gin":...}` is silently coerced to a string
+	// and `dict | list` on that string returns its characters, which is
+	// exactly the failure mode we hit before this rewrite.
+	coreSet := make(map[string]bool, len(coreBins))
+	for _, b := range coreBins {
+		coreSet[b.name] = true
 	}
-	var staged []stagedBin
+	vars := map[string]any{
+		"competitor_set": competitorsArg,
+	}
+	competitorBinaries := make(map[string]map[string]string)
 	for _, j := range jobs {
-		// Recover the logical name from the output filename so the
-		// playbook can place the binary deterministically on the
-		// remote (e.g. competitor-foo-amd64 → foo for arch amd64).
 		base := filepath.Base(j.out)
-		staged = append(staged, stagedBin{
-			Name: strings.TrimSuffix(base, "-"+j.arch),
-			Arch: j.arch,
-			Path: j.out,
-		})
+		logical := strings.TrimSuffix(base, "-"+j.arch)
+		if coreSet[logical] {
+			// runner / loadgen / observer / validator / conformance /
+			// validator-checker / validator-replay
+			varName := strings.ReplaceAll(logical, "-", "_") + "_binary_" + j.arch
+			vars[varName] = j.out
+			continue
+		}
+		// Competitor: strip the "competitor-" prefix to recover the slug.
+		slug := strings.TrimPrefix(logical, "competitor-")
+		if competitorBinaries[slug] == nil {
+			competitorBinaries[slug] = make(map[string]string)
+		}
+		competitorBinaries[slug][j.arch] = j.out
 	}
-	stagedJSON, err := json.Marshal(staged)
+	if len(competitorBinaries) > 0 {
+		vars["competitor_binaries"] = competitorBinaries
+	}
+	if os.Getenv("CLUSTER_USE_LAN") == "1" {
+		vars["use_lan"] = true
+		// Pin each host's ansible_host to its LAN IP for this run.
+		for h, ip := range lanIPs {
+			vars["ansible_host_"+strings.ReplaceAll(h, "-", "_")] = ip
+		}
+	}
+
+	varsJSON, err := json.MarshalIndent(vars, "", "  ")
 	if err != nil {
+		return err
+	}
+	varsFile := filepath.Join(stagingDir, "deploy-vars.json")
+	if err := os.WriteFile(varsFile, varsJSON, 0o600); err != nil {
 		return err
 	}
 
 	args := []string{
 		"-i", "inventory.yml",
 		deployPlaybook,
-		"--extra-vars", "staged_binaries=" + string(stagedJSON),
-		"--extra-vars", "deploy_competitors=" + competitorsArg,
-	}
-	if os.Getenv("CLUSTER_USE_LAN") == "1" {
-		args = append(args, "--extra-vars", "use_lan=true")
-		// Pin each host's ansible_host to its LAN IP for this run.
-		for h, ip := range lanIPs {
-			args = append(args, "--extra-vars",
-				fmt.Sprintf("ansible_host_%s=%s", strings.ReplaceAll(h, "-", "_"), ip))
-		}
+		"--extra-vars", "@" + varsFile,
 	}
 
 	cmd := exec.Command("ansible-playbook", args...)
@@ -197,7 +250,8 @@ func Deploy() error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("deploy: %w", err)
 	}
-	fmt.Printf("\n=== Deploy complete (%d binaries staged) ===\n", len(staged))
+	fmt.Printf("\n=== Deploy complete (%d binaries cross-compiled, %d competitors) ===\n",
+		len(jobs), len(competitorBinaries))
 	return nil
 }
 
