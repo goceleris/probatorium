@@ -97,11 +97,11 @@ func fakeValidationSocket(t *testing.T, body []byte) string {
 
 func TestPollValidationSocket_PopulatesSnapshot(t *testing.T) {
 	body, _ := json.Marshal(map[string]int64{
-		"panic_count":                 0,
-		"ratelimit_token_violations":  3,
-		"session_owner_mismatches":    1,
-		"jwt_late_admits":             0,
-		"iouring_sqe_corruptions":     2,
+		"panic_count":                0,
+		"ratelimit_token_violations": 3,
+		"session_owner_mismatches":   1,
+		"jwt_late_admits":            0,
+		"iouring_sqe_corruptions":    2,
 	})
 	sock := fakeValidationSocket(t, body)
 
