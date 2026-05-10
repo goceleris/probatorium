@@ -1,0 +1,128 @@
+// Command celeris serves the probatorium contract endpoints with the
+// celeris HTTP engine. Four runtime configurations are exposed via
+// -engine, matching the cell-columns the probatorium matrix
+// distinguishes:
+//
+//   - iouring-h1-async        — celeris.IOUring + Protocol=HTTP1 + AsyncHandlers
+//   - iouring-auto+upg-async  — celeris.IOUring + Protocol=Auto    + AsyncHandlers
+//                               (Auto includes implicit H1→H2C upgrade)
+//   - epoll-h1-sync           — celeris.Epoll   + Protocol=HTTP1   + AsyncHandlers=false
+//   - std-h1                  — celeris.Std     + Protocol=HTTP1   + AsyncHandlers=false
+//
+// The handler set mirrors servers/common.Endpoints; static-body cells
+// write the pre-baked bytes via Context.Blob/String, /users/:id echoes
+// the path param, /upload drains the body and replies "OK".
+//
+// Always-latest version policy: this module pulls the celeris release
+// at build time via `go mod tidy` (see go.mod). No version is pinned in
+// the source — bumps are landed by re-running tidy.
+package main
+
+import (
+	"context"
+	"flag"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/goceleris/celeris"
+
+	"github.com/goceleris/probatorium/servers/common"
+)
+
+// engineSpec is the celeris-side knob set selected by -engine.
+type engineSpec struct {
+	engineType celeris.EngineType
+	protocol   celeris.Protocol
+	async      bool
+}
+
+// engineSpecs maps every probatorium cell-column name to its celeris
+// runtime config. Adding a column means a new entry here AND a sister
+// entry in the registry's Adapter map.
+var engineSpecs = map[string]engineSpec{
+	"iouring-h1-async": {
+		engineType: celeris.IOUring,
+		protocol:   celeris.HTTP1,
+		async:      true,
+	},
+	"iouring-auto+upg-async": {
+		engineType: celeris.IOUring,
+		// Auto exposes both H1 and H2C; the engine accepts the H1→H2C
+		// Upgrade handshake implicitly when Protocol=Auto.
+		protocol: celeris.Auto,
+		async:    true,
+	},
+	"epoll-h1-sync": {
+		engineType: celeris.Epoll,
+		protocol:   celeris.HTTP1,
+		async:      false,
+	},
+	"std-h1": {
+		engineType: celeris.Std,
+		protocol:   celeris.HTTP1,
+		async:      false,
+	},
+}
+
+func main() {
+	bind := flag.String("bind", "0.0.0.0:8080", "address:port to listen on")
+	engineName := flag.String("engine", "iouring-h1-async", "runtime engine (see source for the canonical 4)")
+	flag.Parse()
+
+	spec, ok := engineSpecs[*engineName]
+	if !ok {
+		log.Fatalf("celeris: unknown -engine %q", *engineName)
+	}
+
+	srv := celeris.New(celeris.Config{
+		Addr:           *bind,
+		Engine:         spec.engineType,
+		Protocol:       spec.protocol,
+		AsyncHandlers:  spec.async,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		ShutdownTimeout: 10 * time.Second,
+	})
+	registerRoutes(srv)
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+		<-sig
+		log.Printf("celeris: signal received, shutting down")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	if err := srv.Start(); err != nil {
+		log.Fatalf("celeris: start: %v", err)
+	}
+}
+
+func registerRoutes(srv *celeris.Server) {
+	srv.GET("/", func(c *celeris.Context) error {
+		return c.String(200, "Hello, World!")
+	})
+	srv.GET("/json", func(c *celeris.Context) error {
+		return c.Blob(200, "application/json", []byte(`{"message":"Hello, World!"}`))
+	})
+	srv.GET("/json-1k", func(c *celeris.Context) error {
+		return c.Blob(200, "application/json", common.JSON1KPayload())
+	})
+	srv.GET("/json-64k", func(c *celeris.Context) error {
+		return c.Blob(200, "application/json", common.JSON64KPayload())
+	})
+	srv.GET("/users/:id", func(c *celeris.Context) error {
+		id := c.Param("id")
+		return c.String(200, "User ID: %s", id)
+	})
+	srv.POST("/upload", func(c *celeris.Context) error {
+		_ = c.Body()
+		return c.String(200, "OK")
+	})
+}
