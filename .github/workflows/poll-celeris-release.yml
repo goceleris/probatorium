@@ -115,10 +115,15 @@ jobs:
         env:
           NEW: ${{ steps.resolve.outputs.version }}
           GH_TOKEN: ${{ github.token }}
+          # Identity needs to live in env so the freshly-init'd repo
+          # below picks it up — `git config` on the outer checkout
+          # doesn't inherit into the new repo created by `git init`.
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: |
           set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
           tmp=$(mktemp -d)
           mkdir -p "${tmp}/.state"
           echo "${NEW}" > "${tmp}/.state/last-seen-celeris.txt"
