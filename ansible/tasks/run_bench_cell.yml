@@ -88,19 +88,23 @@
   when: inventory_hostname == "msa2-client"
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | run loadgen against bench target"
+  # Flag names must match the loadgen CLI in cmd/loadgen/main.go:
+  #   -target / -duration / -warmup / -connections / -workers
+  #   -http2 / -h2c-upgrade / -out
+  # The (competitor, run-index) tuple is carried out-of-band via the
+  # per-cell output directory naming convention (00-<slug>/...), so the
+  # binary doesn't need a CLI knob for them.
   ansible.builtin.shell: |
     cd {{ bench_root }}
     ./loadgen \
-      -url http://{{ target_ip }}:{{ bench_port | default(8080) }}{{ bench_url_path | default('/') }} \
+      -target http://{{ target_ip }}:{{ bench_port | default(8080) }}{{ bench_url_path | default('/') }} \
       -duration {{ bench_duration | default('30s') }} \
       -warmup {{ bench_warmup | default('5s') }} \
       -connections {{ bench_connections | default(256) }} \
       {% if bench_workers | default(0) | int > 0 %}-workers {{ bench_workers }}{% endif %} \
-      {% if bench_h2 | default(false) | bool %}-h2{% endif %} \
+      {% if bench_h2 | default(false) | bool %}-http2{% endif %} \
       {% if bench_h2c_upgrade | default(false) | bool %}-h2c-upgrade{% endif %} \
-      -competitor {{ cell.1 }} \
-      -run-index {{ cell.0 }} \
-      > {{ cell_dir }}/loadgen.json \
+      -out {{ cell_dir }}/loadgen.json \
       2> {{ cell_dir }}/loadgen.stderr
   args:
     executable: /bin/bash
