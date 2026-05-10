@@ -13,6 +13,7 @@
 /validator-checker
 /validator-replay
 
+/validation/refapp/auth_session_ratelimit/auth_session_ratelimit
 /servers/celeris/celeris
 /servers/chi/chi
 /servers/echo/echo
