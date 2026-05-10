@@ -1,0 +1,59 @@
+---
+# Build a single non-Go competitor adapter natively on the bench host.
+#
+# Loop var: comp = { key: <slug>, value: {
+#                      lang: rust|bun|python,
+#                      tarball: <local path to .tar.gz on dev Mac>,
+#                      build_cmd: <shell command to run in extracted dir>,
+#                      binary_rel: <path to the produced binary, relative
+#                                   to the extracted source root> } }
+#
+# Stages everything under {{ bench_root }}/competitors-src/<slug>/ and
+# symlinks the produced binary into {{ bench_root }}/competitors/<slug>
+# so the bench playbook can launch it identically to Go competitors.
+
+- name: "{{ comp.key }} | ensure source dir exists"
+  ansible.builtin.file:
+    path: "{{ bench_root }}/competitors-src/{{ comp.key }}"
+    state: directory
+    mode: '0755'
+
+- name: "{{ comp.key }} | push source tarball"
+  ansible.builtin.copy:
+    src: "{{ comp.value.tarball }}"
+    dest: "{{ bench_root }}/competitors-src/{{ comp.key }}.tar.gz"
+    mode: '0644'
+
+- name: "{{ comp.key }} | extract source"
+  ansible.builtin.unarchive:
+    src: "{{ bench_root }}/competitors-src/{{ comp.key }}.tar.gz"
+    dest: "{{ bench_root }}/competitors-src/{{ comp.key }}/"
+    remote_src: true
+
+# Each language gets its toolchain dir on PATH plus the env vars its
+# package manager expects. We do NOT touch HOME — every cache must
+# resolve under {{ bench_root }} so cleanup wipes it cleanly.
+- name: "{{ comp.key }} | run build command"
+  environment:
+    PATH: >-
+      {{ bench_root }}/rustup/cargo/bin:{{ bench_root }}/bun/bin:{{ bench_root }}/uv/bin:{{ ansible_env.PATH }}
+    CARGO_HOME: "{{ bench_root }}/rustup/cargo"
+    RUSTUP_HOME: "{{ bench_root }}/rustup/rustup"
+    BUN_INSTALL: "{{ bench_root }}/bun"
+    UV_CACHE_DIR: "{{ bench_root }}/uv-cache"
+    UV_PYTHON_INSTALL_DIR: "{{ bench_root }}/uv-python"
+    XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
+    XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cd {{ bench_root }}/competitors-src/{{ comp.key }}
+    {{ comp.value.build_cmd }}
+  args:
+    executable: /bin/bash
+
+- name: "{{ comp.key }} | symlink built binary into competitors/"
+  ansible.builtin.file:
+    src: "{{ bench_root }}/competitors-src/{{ comp.key }}/{{ comp.value.binary_rel }}"
+    dest: "{{ bench_root }}/competitors/{{ comp.key }}"
+    state: link
+    force: true

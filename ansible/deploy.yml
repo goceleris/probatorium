@@ -1,0 +1,295 @@
+---
+# Stage probatorium binaries + native toolchains on the cluster.
+#
+# Idempotent stage-and-leave. Cross-compiled Go artefacts (runner,
+# loadgen, observer, validator, conformance, validator-checker,
+# validator-replay, plus any Go competitor adapters) are pushed under
+# {{ bench_root }}. Non-Go competitor frameworks (rust/axum, rust/actix-
+# web, rust/ntex, bun/hono, bun/elysia, python/fastapi, etc.) are built
+# natively on the cluster node via per-language toolchain roles.
+#
+# Hard rule: ONLY the dbservices role may install docker. Frameworks
+# under test MUST run as native processes — docker would distort
+# scheduler / cgroup / netfilter behaviour and invalidate the bench.
+#
+# Required extra-vars (typically passed by `mage Deploy`):
+#   competitor_set         comma-separated list of competitor adapter
+#                          slugs to deploy. Examples:
+#                            "celeris,nethttp,fasthttp,gin,fiber,chi,echo"
+#                            "go-only"  - all Go adapters, skip native roles
+#                            "all"      - everything (Go + Rust + Bun + Python)
+#                          Each slug maps to a binary path on the dev Mac
+#                          via the `competitor_binaries` dict, OR to a
+#                          source-tarball path for native roles via the
+#                          `competitor_sources` dict.
+#   competitor_binaries    dict { slug: { amd64: path, arm64: path } }
+#                          for Go-built competitors (already cross-
+#                          compiled on the dev Mac).
+#   competitor_sources     dict { slug: { lang: rust|bun|python,
+#                                         tarball: path,
+#                                         build_cmd: "cargo build --release",
+#                                         binary_rel: "target/release/server" } }
+#                          for native-built competitors. tarball is a
+#                          tar.gz of the adapter's source tree.
+#   runner_binary_amd64,
+#   runner_binary_arm64,
+#   loadgen_binary_amd64,
+#   loadgen_binary_arm64,
+#   observer_binary_amd64,
+#   observer_binary_arm64,
+#   validator_binary_amd64,
+#   validator_binary_arm64    optional cross-compiled core artefacts.
+#                             Skipped silently if the var is undefined,
+#                             so a deploy can stage just a subset.
+#   bench_targets_filter      same semantics as cluster-bench.yml.
+#   gate_needs_docker         true → install docker for dbservices
+#                             (dbservices role is invoked unconditionally
+#                              when gate_needs_docker is true; otherwise
+#                              skipped, leaving a pristine host).
+
+- name: Deploy probatorium artefacts + native toolchains
+  hosts: cluster
+  gather_facts: true
+  tasks:
+    - name: Filter to selected hosts (bench_targets only — loadgen always staged)
+      ansible.builtin.meta: end_host
+      when: >
+        (bench_targets_filter is defined) and
+        (bench_targets_filter != "both") and
+        (bench_targets_filter != "all") and
+        (inventory_hostname in groups['bench_targets']) and
+        (inventory_hostname not in bench_targets_filter.split(','))
+
+    - name: Ensure transient dirs exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ bench_root }}"
+        - "{{ results_root }}"
+        - "{{ bench_root }}/competitors"
+
+    # Drop a marker so the cleanup playbook can mtime-diff ~ for leaks.
+    - name: Drop deploy-start marker for mtime diff
+      ansible.builtin.file:
+        path: "{{ bench_root }}/deploy-start.marker"
+        state: touch
+        mode: '0644'
+
+    # ---------- manifest preflight ----------
+    # Same pattern as celeris/ansible/cluster-go-gate.yml: read prior
+    # manifest if any, restore the in-memory facts so this run can append
+    # to them, and write back. Keys we track:
+    #   installed_packages    - apt packages WE installed
+    #   prior_sysctl          - snapshot of sysctl values we mutated
+    #   installed_toolchains  - per-language toolchain dirs WE created
+    #                           (rust, bun, python-uv, python-apt, etc.)
+    #                           Each entry: { lang: str, path: str,
+    #                                         apt_pkgs: [str] }
+    #   fetched_versions      - what `latest` resolved to at deploy time
+    #                           (rustc, bun, python3.13, uv, ...). Pure
+    #                           informational — replayed in the bench log.
+    - name: Read existing dep manifest if present
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: deploy_manifest_slurp
+      failed_when: false
+
+    - name: Initialize empty manifest facts
+      ansible.builtin.set_fact:
+        installed_packages: []
+        prior_sysctl: {}
+        installed_toolchains: []
+        fetched_versions: {}
+
+    - name: Restore manifest state from disk
+      ansible.builtin.set_fact:
+        installed_packages: "{{ (deploy_manifest_slurp.content | b64decode | from_json).installed_packages | default([]) }}"
+        prior_sysctl: "{{ (deploy_manifest_slurp.content | b64decode | from_json).prior_sysctl | default({}) }}"
+        installed_toolchains: "{{ (deploy_manifest_slurp.content | b64decode | from_json).installed_toolchains | default([]) }}"
+        fetched_versions: "{{ (deploy_manifest_slurp.content | b64decode | from_json).fetched_versions | default({}) }}"
+      when: deploy_manifest_slurp is defined and deploy_manifest_slurp.content is defined
+
+    # ---------- core Go artefacts ----------
+    # Each is conditionally pushed only if the corresponding extra-var is
+    # defined, so a partial deploy (e.g. just runner+loadgen) is valid.
+    # Loadgen always lands on msa2-client; everything else lands on
+    # bench_targets. observer/validator can land on either.
+
+    - name: Push runner binary (bench_targets)
+      ansible.builtin.copy:
+        src: "{{ runner_binary_amd64 if arch == 'amd64' else runner_binary_arm64 }}"
+        dest: "{{ bench_root }}/runner"
+        mode: '0755'
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - (arch == 'amd64' and runner_binary_amd64 is defined) or
+          (arch == 'arm64' and runner_binary_arm64 is defined)
+
+    - name: Push loadgen binary (msa2-client)
+      ansible.builtin.copy:
+        src: "{{ loadgen_binary_amd64 }}"
+        dest: "{{ bench_root }}/loadgen"
+        mode: '0755'
+      when:
+        - inventory_hostname == "msa2-client"
+        - loadgen_binary_amd64 is defined
+
+    - name: Push observer binary
+      ansible.builtin.copy:
+        src: "{{ observer_binary_amd64 if arch == 'amd64' else observer_binary_arm64 }}"
+        dest: "{{ bench_root }}/observer"
+        mode: '0755'
+      when:
+        - (arch == 'amd64' and observer_binary_amd64 is defined) or
+          (arch == 'arm64' and observer_binary_arm64 is defined)
+
+    - name: Push validator binary
+      ansible.builtin.copy:
+        src: "{{ validator_binary_amd64 if arch == 'amd64' else validator_binary_arm64 }}"
+        dest: "{{ bench_root }}/validator"
+        mode: '0755'
+      when:
+        - (arch == 'amd64' and validator_binary_amd64 is defined) or
+          (arch == 'arm64' and validator_binary_arm64 is defined)
+
+    - name: Push conformance binary
+      ansible.builtin.copy:
+        src: "{{ conformance_binary_amd64 if arch == 'amd64' else conformance_binary_arm64 }}"
+        dest: "{{ bench_root }}/conformance"
+        mode: '0755'
+      when:
+        - (arch == 'amd64' and conformance_binary_amd64 is defined) or
+          (arch == 'arm64' and conformance_binary_arm64 is defined)
+
+    - name: Push validator-checker binary
+      ansible.builtin.copy:
+        src: "{{ validator_checker_binary_amd64 if arch == 'amd64' else validator_checker_binary_arm64 }}"
+        dest: "{{ bench_root }}/validator-checker"
+        mode: '0755'
+      when:
+        - (arch == 'amd64' and validator_checker_binary_amd64 is defined) or
+          (arch == 'arm64' and validator_checker_binary_arm64 is defined)
+
+    - name: Push validator-replay binary
+      ansible.builtin.copy:
+        src: "{{ validator_replay_binary_amd64 if arch == 'amd64' else validator_replay_binary_arm64 }}"
+        dest: "{{ bench_root }}/validator-replay"
+        mode: '0755'
+      when:
+        - (arch == 'amd64' and validator_replay_binary_amd64 is defined) or
+          (arch == 'arm64' and validator_replay_binary_arm64 is defined)
+
+    # ---------- Go competitor adapters ----------
+    # competitor_binaries entries are pre-built on the dev Mac and pushed
+    # whole — no native build step. Only iterates the slugs that appear
+    # in competitor_set (or all of them if competitor_set == "all").
+    - name: Compute effective competitor list
+      ansible.builtin.set_fact:
+        competitor_list: >-
+          {{ (competitor_binaries | default({}) | list + competitor_sources | default({}) | list) | unique
+             if (competitor_set | default('') in ['all', 'go-only', '']) else
+             competitor_set.split(',') }}
+
+    - name: Push Go competitor binaries
+      ansible.builtin.copy:
+        src: "{{ (competitor_binaries[item][arch] if arch in competitor_binaries[item] else competitor_binaries[item]['amd64']) }}"
+        dest: "{{ bench_root }}/competitors/{{ item }}"
+        mode: '0755'
+      loop: "{{ competitor_list }}"
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - competitor_binaries is defined
+        - item in competitor_binaries
+        - (competitor_set | default('all')) != 'go-only' or item in (competitor_binaries | list)
+
+    # ---------- per-language toolchain roles ----------
+    # Each role is invoked iff at least one competitor in competitor_list
+    # claims that language in competitor_sources[<slug>].lang. The role
+    # is responsible for:
+    #   1. installing into {{ bench_root }}/<lang>/ (pristine, never ~)
+    #   2. resolving "always-latest" stable at deploy time
+    #   3. appending an entry to installed_toolchains in the manifest
+    #   4. recording the resolved version into fetched_versions
+    # Roles only run on bench_targets (the loadgen host doesn't need
+    # framework toolchains, only the loadgen binary).
+
+    - name: Determine which toolchains are needed
+      ansible.builtin.set_fact:
+        need_rust: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'rust')
+              | list | length) > 0 }}
+        need_bun: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'bun')
+              | list | length) > 0 }}
+        need_python: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'python')
+              | list | length) > 0 }}
+
+    - name: Install rust toolchain (only when a rust competitor is in scope)
+      ansible.builtin.include_role:
+        name: rust
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_rust | bool
+
+    - name: Install bun toolchain (only when a bun competitor is in scope)
+      ansible.builtin.include_role:
+        name: bun
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_bun | bool
+
+    - name: Install python toolchain (only when a python competitor is in scope)
+      ansible.builtin.include_role:
+        name: python
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_python | bool
+
+    # ---------- native competitor builds ----------
+    # For each non-Go competitor, push the source tarball, extract under
+    # {{ bench_root }}/competitors-src/<slug>/, then run build_cmd inside
+    # it with the matching toolchain on PATH. The resulting binary is
+    # symlinked into {{ bench_root }}/competitors/<slug> so the bench
+    # playbook can launch it the same way as Go competitors.
+    - name: Build native (non-Go) competitors
+      ansible.builtin.include_tasks: tasks/build_native_competitor.yml
+      loop: >-
+        {{ (competitor_sources | default({}) | dict2items
+            | selectattr('key', 'in', competitor_list)
+            | list) }}
+      loop_control:
+        loop_var: comp
+        label: "{{ comp.key }}"
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - competitor_sources is defined
+
+    # ---------- dbservices (only role allowed to install docker) ----------
+    - name: Install dbservices (postgres / redis / memcached containers)
+      ansible.builtin.include_role:
+        name: dbservices
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - gate_needs_docker | default(false) | bool
+
+    # ---------- write final manifest ----------
+    - name: Persist deploy manifest
+      ansible.builtin.copy:
+        content: |
+          {{ {
+            'installed_packages': installed_packages,
+            'prior_sysctl': prior_sysctl,
+            'installed_toolchains': installed_toolchains,
+            'fetched_versions': fetched_versions,
+          } | to_nice_json }}
+        dest: "{{ manifest_path }}"
+        mode: '0644'
