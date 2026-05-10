@@ -4,6 +4,15 @@
 *.out
 *.prof
 
+# Top-level binaries produced by `go build ./...` for cmd/<name>/main.go
+/runner
+/loadgen
+/observer
+/conformance
+/validator
+/validator-checker
+/validator-replay
+
 /servers/celeris/celeris
 /servers/chi/chi
 /servers/echo/echo
