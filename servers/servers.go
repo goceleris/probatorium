@@ -196,6 +196,55 @@ var Registry = map[string]Adapter{
 		Bin: GoBinary{ModuleDir: "servers/fiber"},
 	},
 
+	// rust adapters (wave 4a) — three frameworks built natively on the
+	// bench host by ansible/roles/rust + ansible/tasks/build_native_
+	// competitor.yml. The build pushes a tarball of servers/<name>/ to
+	// the cluster, runs `cargo build --profile release-fat` with
+	// RUSTFLAGS="-C target-cpu=native", and symlinks the produced
+	// release-fat binary into ${bench_root}/competitors/<name>. The
+	// runner invokes that symlink with `-bind <addr>` and waits for
+	// `ready addr=<addr>` on stdout. SIGTERM triggers graceful shutdown
+	// inside servers/start.go's 5-second grace window. H2 cell-columns
+	// land later — these three are H1-only for wave 4a.
+	//
+	// BuildSteps is informational (the ansible task in tasks/build_
+	// native_competitor.yml is the authoritative builder); we still
+	// record the steps so a dev-Mac reproducer is one cd + copy-paste
+	// away.
+	"axum": {
+		Name: "axum", Category: "rust-tower", Language: "rust", Framework: "axum", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "rust",
+			BuildSteps: []string{
+				"source $RUSTUP_HOME/env",
+				"cd $SRC && cargo build --profile release-fat",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+	},
+	"actix-web": {
+		Name: "actix-web", Category: "rust-actix", Language: "rust", Framework: "actix-web", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "rust",
+			BuildSteps: []string{
+				"source $RUSTUP_HOME/env",
+				"cd $SRC && cargo build --profile release-fat",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+	},
+	"ntex": {
+		Name: "ntex", Category: "rust-ntex", Language: "rust", Framework: "ntex", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "rust",
+			BuildSteps: []string{
+				"source $RUSTUP_HOME/env",
+				"cd $SRC && cargo build --profile release-fat",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+	},
+
 	// celeris — 4 engine modes selected at runtime via -engine. The
 	// binary is the same; entries differ only in Engine + Name.
 	"celeris-iouring-h1-async": {

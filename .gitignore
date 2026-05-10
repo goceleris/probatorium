@@ -45,6 +45,17 @@ go.work.sum
 /tmp-staging/
 servers/_docker/**/*.tar
 
+# Rust adapter build artefacts (wave 4a). target/ holds intermediate
+# objects + the compiled binary; Cargo.lock is regenerated on every
+# build because the always-latest version policy means each cluster
+# deploy resolves dependencies freshly via `cargo update`.
+/servers/axum/target/
+/servers/axum/Cargo.lock
+/servers/actix-web/target/
+/servers/actix-web/Cargo.lock
+/servers/ntex/target/
+/servers/ntex/Cargo.lock
+
 .idea/
 .vscode/
 .DS_Store

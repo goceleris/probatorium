@@ -1,0 +1,54 @@
+# probatorium actix-web adapter — wave 4a (rust-actix).
+#
+# Build / run / lifecycle reference (no markdown docs):
+#
+#   build (cluster, ansible-driven, RUSTFLAGS="-C target-cpu=native"):
+#       cargo build --profile release-fat
+#
+#   produced binary:
+#       target/release-fat/probatorium-actix-server
+#       (ansible/tasks/build_native_competitor.yml symlinks this to
+#        ${bench_root}/competitors/actix-web so servers.StartAdapter
+#        resolves it via the standard staging path.)
+#
+#   run (the runner invokes the symlink with):
+#       probatorium-actix-server -bind 127.0.0.1:8080
+#       The binary prints `ready addr=<final-bind-addr>` on stdout once
+#       the listener is up; SIGTERM triggers graceful shutdown within 5s.
+#
+# Always-latest version policy: every dependency is a `>=` floor with
+# no upper bound, resolved at deploy time.
+
+[package]
+name = "probatorium-actix-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "probatorium-actix-server"
+path = "src/main.rs"
+
+[dependencies]
+# actix-web — Actor-style HTTP framework. Brings its own Tokio runtime
+# (actix-rt under the hood) so we do NOT add a separate #[tokio::main];
+# instead the entrypoint is #[actix_web::main]. HttpServer installs
+# its own SIGTERM/SIGINT handler, so we don't depend on tokio::signal
+# either — running two signal handlers in parallel races on shutdown.
+actix-web = ">=4"
+# serde_json — see comment in src/payload.rs; we hand-emit the
+# deterministic corpus, but keep the dep around so that future
+# extensions (e.g. /db driver responses in wave 6) have it.
+serde_json = ">=1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[profile.release-fat]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
