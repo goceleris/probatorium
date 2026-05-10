@@ -5,6 +5,42 @@
 # Manifest contract: appends to installed_toolchains an entry of
 #   { lang: 'bun', path: <abs path>, apt_pkgs: [<pkgs we apt-installed>] }
 # and records the resolved bun version into fetched_versions.
+#
+# ----------------------------------------------------------------------
+# Bun-on-TS competitor adapters (wave 4b: hono, elysia, ...).
+# ----------------------------------------------------------------------
+# This role only INSTALLS bun. The per-competitor bundling step lives
+# in tasks/build_competitor.yml — included by the shared
+# tasks/build_native_competitor.yml when competitor_sources[<slug>].lang
+# is "bun". The canonical competitor_sources entry shape is:
+#
+#   competitor_sources:
+#     hono:
+#       lang: bun
+#       tarball: /local/path/servers-hono.tar.gz
+#       # build_cmd is invoked inside competitors-src/hono/ with PATH
+#       # containing {{ bench_root }}/bun/bin and NODE_ENV=production.
+#       # The command must produce a launcher at ./server that the
+#       # shared symlink step can target.
+#       build_cmd: >-
+#         bun install --production &&
+#         bun build --target=bun --minify --sourcemap=none
+#                   ./src/server.ts --outfile=./dist/server &&
+#         printf '%s\n' '#!/bin/sh'
+#                       'exec "{{ bench_root }}/bun/bin/bun" run
+#                              "$(dirname "$0")/dist/server" "$@"'
+#         > server &&
+#         chmod +x server
+#       binary_rel: server
+#     elysia:
+#       lang: bun
+#       tarball: /local/path/servers-elysia.tar.gz
+#       build_cmd: <same as hono>
+#       binary_rel: server
+#
+# Operators preferring the structured task-list path can replace
+# build_cmd with a `bun build_competitor` include — see
+# tasks/build_competitor.yml for the parameterised version.
 
 - name: bun | ensure bun install root exists
   ansible.builtin.file:
