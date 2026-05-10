@@ -218,6 +218,36 @@ var Registry = map[string]Adapter{
 		Engine: "std-h1",
 		Bin:    GoBinary{ModuleDir: "servers/celeris"},
 	},
+
+	// hono / elysia — wave 4b. TypeScript adapters running natively
+	// under Bun (no docker, no node). The "binary" the runner exec's
+	// is a small POSIX-sh launcher (servers/<framework>/server, written
+	// by ansible/roles/bun/tasks/build_competitor.yml) that does
+	// `exec bun run dist/server "$@"`. RunCmd's {name} token expands to
+	// the adapter slug, which startNativeAdapter then routes through
+	// resolveAdapterBinary so PROBATORIUM_BENCH_ROOT override and the
+	// local-dev fallback apply uniformly across language families.
+	//
+	// Both Bun adapters call Bun.serve directly with the framework's
+	// .fetch handler — Hono via app.fetch (the documented fast path,
+	// skipping @hono/node-server) and Elysia via app.fetch (skipping
+	// Elysia's .listen wrapper). H1-only because Bun.serve does not
+	// expose H2C without the experimental --tls path, which the H1-
+	// only competitor cells don't exercise.
+	"hono": {
+		Name: "hono", Category: "bun-ts", Language: "bun", Framework: "hono", Engine: "",
+		Bin: NativeBinary{
+			Lang:   "bun",
+			RunCmd: "{name} -bind {bind}",
+		},
+	},
+	"elysia": {
+		Name: "elysia", Category: "bun-ts", Language: "bun", Framework: "elysia", Engine: "",
+		Bin: NativeBinary{
+			Lang:   "bun",
+			RunCmd: "{name} -bind {bind}",
+		},
+	},
 }
 
 // Names returns every registered adapter name in stable sorted order.
