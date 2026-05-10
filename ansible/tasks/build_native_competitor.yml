@@ -33,12 +33,22 @@
 # Each language gets its toolchain dir on PATH plus the env vars its
 # package manager expects. We do NOT touch HOME — every cache must
 # resolve under {{ bench_root }} so cleanup wipes it cleanly.
+#
+# Rust competitors compile with RUSTFLAGS="-C target-cpu=native" so the
+# bench measures the codegen the framework's authors intended for the
+# host CPU (AVX2 / NEON intrinsics, branch-prediction tuning, etc.).
+# CARGO_TARGET_DIR pins the build output under {{ bench_root }} so
+# cleanup wipes every byte cargo wrote. Other languages don't read
+# RUSTFLAGS / CARGO_TARGET_DIR so leaving them set unconditionally is a
+# no-op for them.
 - name: "{{ comp.key }} | run build command"
   environment:
     PATH: >-
       {{ bench_root }}/rustup/cargo/bin:{{ bench_root }}/bun/bin:{{ bench_root }}/uv/bin:{{ ansible_env.PATH }}
     CARGO_HOME: "{{ bench_root }}/rustup/cargo"
     RUSTUP_HOME: "{{ bench_root }}/rustup/rustup"
+    CARGO_TARGET_DIR: "{{ bench_root }}/competitors-src/{{ comp.key }}/target"
+    RUSTFLAGS: "-C target-cpu=native"
     BUN_INSTALL: "{{ bench_root }}/bun"
     UV_CACHE_DIR: "{{ bench_root }}/uv-cache"
     UV_PYTHON_INSTALL_DIR: "{{ bench_root }}/uv-python"
