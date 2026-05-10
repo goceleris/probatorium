@@ -88,9 +88,12 @@ func startGoAdapter(ctx context.Context, a Adapter, _ GoBinary, bindAddr string)
 //	{engine} → a.Engine (empty string for non-celeris adapters)
 //	{name}   → a.Name
 //
-// Wave 4 adapters define their own RunCmd template; wave 3 does not
-// register any NativeBinary entries so this path is exercised only by
-// future waves.
+// If the executable token (parts[0]) — after substitution — equals the
+// adapter name, it is resolved through [resolveAdapterBinary] so the
+// PROBATORIUM_BENCH_ROOT env var override and the local-dev fallback
+// apply identically to GoBinary and NativeBinary adapters. RunCmd
+// authors who want to bypass that resolution (absolute path, custom
+// staging) can write the literal path into RunCmd directly.
 func startNativeAdapter(ctx context.Context, a Adapter, spec NativeBinary, bindAddr string) (AdapterStop, error) {
 	if spec.RunCmd == "" {
 		return nil, fmt.Errorf("probatorium/servers: %s: NativeBinary.RunCmd is empty", a.Name)
@@ -104,7 +107,15 @@ func startNativeAdapter(ctx context.Context, a Adapter, spec NativeBinary, bindA
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("probatorium/servers: %s: empty RunCmd after expansion", a.Name)
 	}
-	return spawn(ctx, parts[0], parts[1:], nil)
+	exe := parts[0]
+	if exe == a.Name {
+		resolved, err := resolveAdapterBinary(a.Name)
+		if err != nil {
+			return nil, err
+		}
+		exe = resolved
+	}
+	return spawn(ctx, exe, parts[1:], nil)
 }
 
 // resolveAdapterBinary walks the staging-path candidate list and returns
