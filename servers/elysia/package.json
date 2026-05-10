@@ -1,0 +1,19 @@
+{
+  "name": "probatorium-elysia-server",
+  "private": true,
+  "type": "module",
+  "//build": "Bundles src/server.ts into a single dist/server file via Bun's native bundler. --target=bun keeps Bun built-ins external; --minify shaves bytes. The launcher symlink the ansible build_native_competitor task creates execs `bun run dist/server` so the runtime is Bun, not node.",
+  "//run": "`bun run dist/server` is the canonical entry — invoked by the launcher symlink. CLI args after `--` are forwarded to the script (process.argv).",
+  "//versions": "Always-latest policy: deps use unbounded `latest` so `bun install` resolves the newest cut at deploy time. Do NOT pin — the bench is meant to track upstream as-is.",
+  "scripts": {
+    "build": "bun build --target=bun --minify --sourcemap=none ./src/server.ts --outfile=./dist/server",
+    "start": "bun run dist/server"
+  },
+  "dependencies": {
+    "elysia": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
