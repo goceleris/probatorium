@@ -455,8 +455,8 @@ type adapterServer struct {
 	features servers.FeatureSet
 }
 
-func (s *adapterServer) Name() string                { return s.adapter.Name }
-func (s *adapterServer) Kind() string                { return s.adapter.Category }
+func (s *adapterServer) Name() string                 { return s.adapter.Name }
+func (s *adapterServer) Kind() string                 { return s.adapter.Category }
 func (s *adapterServer) Features() servers.FeatureSet { return s.features }
 
 // featureSetFor maps an Adapter to the FeatureSet the scheduler uses to

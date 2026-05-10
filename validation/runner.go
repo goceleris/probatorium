@@ -147,8 +147,8 @@ type Orchestrator struct {
 	plan *Plan
 
 	// Pre-loaded artifacts. nil values are loaded on demand.
-	matrix    *markov.Matrix
-	seeds     []corpus.Seed
+	matrix     *markov.Matrix
+	seeds      []corpus.Seed
 	predicates []properties.Spec
 }
 
@@ -312,18 +312,18 @@ func replaySeedsFor(d time.Duration) int {
 // field, which encoding/json refuses to handle. planToJSON projects
 // every Spec to its (ID, Description, Tier) triple.
 type planJSON struct {
-	Target             string         `json:"target"`
-	Arch               string         `json:"arch"`
-	CelerisCommit      string         `json:"celeris_commit"`
-	Duration           time.Duration  `json:"duration"`
-	CheckpointInterval time.Duration  `json:"checkpoint_interval"`
-	SoakMode           bool           `json:"soak_mode"`
-	OpenAPIPath        string         `json:"openapi_path"`
-	CelerisListenAddr  string         `json:"celeris_listen_addr"`
-	CorpusSize         int            `json:"corpus_size"`
-	MatrixStates       []string       `json:"matrix_states"`
-	Properties         []specJSON     `json:"properties"`
-	Tiers              []TierPlan     `json:"tiers"`
+	Target             string        `json:"target"`
+	Arch               string        `json:"arch"`
+	CelerisCommit      string        `json:"celeris_commit"`
+	Duration           time.Duration `json:"duration"`
+	CheckpointInterval time.Duration `json:"checkpoint_interval"`
+	SoakMode           bool          `json:"soak_mode"`
+	OpenAPIPath        string        `json:"openapi_path"`
+	CelerisListenAddr  string        `json:"celeris_listen_addr"`
+	CorpusSize         int           `json:"corpus_size"`
+	MatrixStates       []string      `json:"matrix_states"`
+	Properties         []specJSON    `json:"properties"`
+	Tiers              []TierPlan    `json:"tiers"`
 }
 
 type specJSON struct {
@@ -497,16 +497,16 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 		return err
 	}
 	dossier := map[string]any{
-		"tier":         inc.Tier.String(),
-		"seed":         fmt.Sprintf("0x%x", inc.Seed),
-		"predicate":    inc.PredicateID,
-		"message":      inc.Message,
-		"observed_at":  inc.ObservedAt.UTC().Format(time.RFC3339Nano),
-		"snapshot":     inc.Snapshot,
-		"commit":       o.cfg.CelerisCommit,
-		"arch":         o.cfg.Arch,
-		"target":       o.cfg.Target,
-		"go_versions":  []string{"runtime+target"},
+		"tier":        inc.Tier.String(),
+		"seed":        fmt.Sprintf("0x%x", inc.Seed),
+		"predicate":   inc.PredicateID,
+		"message":     inc.Message,
+		"observed_at": inc.ObservedAt.UTC().Format(time.RFC3339Nano),
+		"snapshot":    inc.Snapshot,
+		"commit":      o.cfg.CelerisCommit,
+		"arch":        o.cfg.Arch,
+		"target":      o.cfg.Target,
+		"go_versions": []string{"runtime+target"},
 	}
 	if err := writeJSON(filepath.Join(dir, "incident.json"), dossier); err != nil {
 		return err
@@ -638,4 +638,3 @@ func writeJSON(path string, v any) error {
 	}
 	return os.WriteFile(path, buf, 0o644)
 }
-

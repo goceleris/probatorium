@@ -48,9 +48,9 @@ type Snapshot struct {
 	OldestOpenConnLastByteAgeMs int64
 
 	// Process resources
-	FDCount      int64
-	RSSBytes     int64
-	SoftFDLimit  int64
+	FDCount     int64
+	RSSBytes    int64
+	SoftFDLimit int64
 
 	// Race + checkptr signal counters. Populated by the validator-checker
 	// itself when it observes the celeris stderr stream (-race / -checkptr

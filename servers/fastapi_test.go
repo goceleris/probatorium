@@ -96,10 +96,10 @@ func TestFastAPIPayload(t *testing.T) {
 
 // pythonExe returns the path to a python interpreter that has the
 // adapter's deps importable. Preference order:
-//   1. .venv/bin/python under the adapter dir (matches what the
-//      cluster launcher uses);
-//   2. `python3` on PATH (dev-mac fallback — the test will further
-//      verify orjson is importable by trying the actual expression).
+//  1. .venv/bin/python under the adapter dir (matches what the
+//     cluster launcher uses);
+//  2. `python3` on PATH (dev-mac fallback — the test will further
+//     verify orjson is importable by trying the actual expression).
 //
 // Returns "" if neither yields a working interpreter.
 func pythonExe(t *testing.T, fastapiDir string) string {

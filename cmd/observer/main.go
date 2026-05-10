@@ -10,10 +10,10 @@
 //   - /proc/<pid>/status      — RSS, threads.
 //   - /proc/<pid>/fd          — open FD count (entry count of the dir).
 //   - /proc/<pid>/limits      — soft FD limit (changes are rare; persisted
-//                               so postmortems can correlate against caps).
+//     so postmortems can correlate against caps).
 //   - <metrics-url>           — celeris's expvar endpoint, for goroutine
-//                               count, heap_inuse, gc pause p99, accepted /
-//                               closed conn counters, panic count.
+//     count, heap_inuse, gc pause p99, accepted /
+//     closed conn counters, panic count.
 //
 // Schema (one table, `observations`):
 //

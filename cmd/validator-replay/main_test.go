@@ -8,11 +8,11 @@ import (
 
 func TestParseSeed_Hex(t *testing.T) {
 	cases := map[string]uint64{
-		"0x1":            1,
-		"0X10":           16,
-		"0xdeadbeef":     0xdeadbeef,
-		"1":              1,
-		"42":             42,
+		"0x1":                  1,
+		"0X10":                 16,
+		"0xdeadbeef":           0xdeadbeef,
+		"1":                    1,
+		"42":                   42,
 		"18446744073709551615": 18446744073709551615,
 	}
 	for in, want := range cases {

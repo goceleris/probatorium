@@ -80,10 +80,10 @@ const insertSQL = `INSERT OR REPLACE INTO evaluations (ts, predicate, ok, messag
 
 // Incident is the on-stdout JSON record emitted on hard fail.
 type Incident struct {
-	TS          int64                `json:"ts"`
-	PredicateID string               `json:"predicate"`
-	Message     string               `json:"message"`
-	Snapshot    properties.Snapshot  `json:"snapshot"`
+	TS          int64               `json:"ts"`
+	PredicateID string              `json:"predicate"`
+	Message     string              `json:"message"`
+	Snapshot    properties.Snapshot `json:"snapshot"`
 }
 
 func main() {

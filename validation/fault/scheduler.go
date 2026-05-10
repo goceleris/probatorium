@@ -108,8 +108,8 @@ func Generate(cfg GenerateConfig) Schedule {
 	for len(sched) < target {
 		kind := rng.IntN(5)
 		var (
-			f       Fault
-			dur     time.Duration
+			f   Fault
+			dur time.Duration
 		)
 		switch kind {
 		case 0: // tc-netem delay/jitter
