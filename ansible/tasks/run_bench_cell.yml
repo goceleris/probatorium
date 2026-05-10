@@ -58,6 +58,33 @@
   changed_when: false
   when: inventory_hostname == bench_target
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | resolve real server PID"
+  # `echo $!` in the previous task captures the bash subshell that
+  # backgrounded nohup, NOT the competitor binary itself. On bash 5.x
+  # the subshell forks once more to exec the binary, so server.pid is
+  # one PID off and the observer / teardown samples a dead PID.
+  #
+  # After the port has bound, use `pgrep -nf` with a regex anchored to
+  # the START of /proc/<pid>/cmdline so we match ONLY the competitor
+  # binary's argv (which begins with `./competitors/<slug>`), never
+  # the ansible-spawned bash session whose argv begins with `bash`
+  # but contains the same substring further on.
+  #
+  # -n = newest, -f = match full cmdline.
+  become: true
+  ansible.builtin.shell: |
+    real_pid=$(pgrep -nf "^\./competitors/{{ cell.1 }} -bind 0.0.0.0:{{ bench_port | default(8080) }}")
+    if [ -z "$real_pid" ]; then
+      echo "could not find server pid via pgrep; server may have failed to bind" >&2
+      tail -50 {{ cell_dir }}/server.log >&2
+      exit 1
+    fi
+    echo "$real_pid" > {{ cell_dir }}/server.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: inventory_hostname == bench_target
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (server side)"
   ansible.builtin.shell: |
     nohup mpstat -P ALL 1 \
@@ -67,6 +94,35 @@
       > {{ cell_dir }}/cpu.log 2>&1 &
     disown
     echo $! > {{ cell_dir }}/mpstat.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | start observer sampler (server side)"
+  # The observer sidecars the server during the cell and emits a 1Hz
+  # SQLite time series of FD count, RSS, goroutine count, GC pause,
+  # and accept/close totals. Server adapters under test don't expose
+  # /debug/vars themselves (only celeris does), so the metrics-URL
+  # flag is intentionally empty here — /proc-derived fields (RSS,
+  # FDs) carry the leak-detection signal.
+  #
+  # Runs as root (`become: true`) because the bench server above is
+  # started under root (it needs `ulimit -l unlimited` to lift
+  # memlock for io_uring). Without root, /proc/<pid>/fd is read-
+  # protected against the cross-user reader and countFDs silently
+  # returns 0.
+  become: true
+  ansible.builtin.shell: |
+    cd {{ bench_root }}
+    nohup ./observer \
+      -pid $(cat {{ cell_dir }}/server.pid) \
+      -metrics-url '' \
+      -out {{ cell_dir }}/observer.sqlite \
+      -interval 1s \
+      > {{ cell_dir }}/observer.log 2>&1 &
+    disown
+    echo $! > {{ cell_dir }}/observer.pid
   args:
     executable: /bin/bash
   changed_when: false
@@ -111,6 +167,28 @@
   when: inventory_hostname == "msa2-client"
 
 # ---------- teardown for this cell ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop observer (server side)"
+  # Drain the observer's SQLite write buffer before killing it. The
+  # pid file was written when nohup forked the sampler under root
+  # (so the observer can read /proc/<pid>/fd cross-user). The kill
+  # must also run under root to deliver the signal.
+  become: true
+  ansible.builtin.shell: |
+    if [ -f {{ cell_dir }}/observer.pid ]; then
+      pid=$(cat {{ cell_dir }}/observer.pid)
+      kill -TERM "$pid" 2>/dev/null
+      for i in $(seq 1 10); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+      done
+      kill -KILL "$pid" 2>/dev/null
+    fi
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: inventory_hostname == bench_target
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop server"
   become: true
   ansible.builtin.shell: |
