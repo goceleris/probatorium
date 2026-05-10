@@ -65,9 +65,13 @@ const trailerTag = "<EOF>"
 // Write encodes seeds to w as a gob+lz4 stream. The function always
 // writes a leading [Header] and a trailing sentinel record so a
 // partial-decode reader can tell a truncated file from a clean EOF.
-func Write(w io.Writer, seeds []Seed) error {
+func Write(w io.Writer, seeds []Seed) (err error) {
 	lz := lz4.NewWriter(w)
-	defer lz.Close()
+	defer func() {
+		if cerr := lz.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 	enc := gob.NewEncoder(lz)
 	hdr := Header{
 		Magic:     Magic,
@@ -100,9 +104,9 @@ func WriteFile(path string, seeds []Seed) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
+	defer func() { _ = os.Remove(tmp.Name()) }()
 	if err := Write(tmp, seeds); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -158,7 +162,7 @@ func ReadFile(path string) (Header, []Seed, error) {
 	if err != nil {
 		return Header{}, nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return Read(f)
 }
 

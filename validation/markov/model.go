@@ -275,7 +275,7 @@ func LoadMatrixFile(path string) (*Matrix, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return LoadMatrix(f)
 }
 

@@ -33,7 +33,7 @@ jobs:
     name: Poll proxy.golang.org
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Resolve target version
         id: resolve
@@ -114,6 +114,7 @@ jobs:
         if: steps.resolve.outputs.update_state == 'true'
         env:
           NEW: ${{ steps.resolve.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
@@ -129,8 +130,6 @@ jobs:
             git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git push -f origin state
           )
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Dispatch celeris-release
         if: steps.decide.outputs.dispatch == 'true'

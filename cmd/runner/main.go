@@ -248,10 +248,10 @@ func run(cfg Config) error {
 	schedule := interleave.Schedule(cfg.Runs, effSc, srvs)
 
 	if cfg.DryRun {
-		fmt.Fprintf(os.Stderr, "probatorium-runner: dry-run; %d cells across %d scenarios × %d adapters × %d runs\n",
+		_, _ = fmt.Fprintf(os.Stderr, "probatorium-runner: dry-run; %d cells across %d scenarios × %d adapters × %d runs\n",
 			len(schedule), len(effSc), len(effAdv), cfg.Runs)
 		for _, cell := range schedule {
-			fmt.Fprintf(os.Stdout, "run%d %s/%s\n",
+			_, _ = fmt.Fprintf(os.Stdout, "run%d %s/%s\n",
 				cell.RunIdx, cell.Scenario.Name(), cell.Server.Name())
 		}
 		return nil
@@ -607,7 +607,7 @@ func freePort() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
@@ -798,7 +798,7 @@ func writeReports(cfg Config, doc *report.Document, agg map[string]report.CellAg
 	if err != nil {
 		return fmt.Errorf("create %s: %w", mdPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	meta := report.Meta{
 		GitRef:     shortGitSHA(),
 		StartedAt:  started,
