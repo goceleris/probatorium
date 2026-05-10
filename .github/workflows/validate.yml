@@ -1,0 +1,63 @@
+name: Validate
+
+# Drives the validation tier (property tests + RESTler + 6h soak) on
+# the self-hosted cluster. Triggered automatically by the poll
+# workflow whenever a new celeris release is detected, or manually via
+# workflow_dispatch for re-runs / hot-fix validation.
+#
+# On success the workflow dispatches `celeris-validate-passed`, which
+# bench.yml listens for — keeps the gate strict (no bench without a
+# clean validate run).
+
+on:
+  repository_dispatch:
+    types: [celeris-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Celeris version to validate (e.g. v1.4.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: mage Validate
+    runs-on: [self-hosted, celeris-cluster]
+    timeout-minutes: 480
+    env:
+      VERSION: ${{ inputs.version || github.event.client_payload.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: mage Validate
+        env:
+          VALIDATE_DURATION: 6h
+          VALIDATE_TARGET: both
+          CELERIS_VERSION: ${{ env.VERSION }}
+        run: go run github.com/magefile/mage Validate
+
+      - name: Dispatch celeris-validate-passed
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f event_type=celeris-validate-passed \
+            -f "client_payload[version]=${VERSION}"
+          echo "Dispatched celeris-validate-passed for ${VERSION}"
+
+      # Always run cleanup so we don't leak cluster state when validate
+      # fails — services left running on msa2-server/msa2-client will
+      # contaminate the next run.
+      - name: mage Cleanup
+        if: always()
+        run: go run github.com/magefile/mage Cleanup
