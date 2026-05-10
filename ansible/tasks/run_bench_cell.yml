@@ -1,0 +1,118 @@
+---
+# One bench cell: (run_index, competitor_slug). Wraps a server start +
+# mpstat samplers on both sides + loadgen invocation + clean teardown.
+#
+# Loop var: cell = [run_index, competitor_slug]
+#
+# Two-host coordinated. Tasks gate themselves with `when: inventory_hostname ...`
+# rather than re-running the same playbook on a smaller `hosts:` set,
+# because that would lose the fact context (target_ip, bench_run_dir).
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | per-cell output dir"
+  ansible.builtin.set_fact:
+    cell_dir: "{{ bench_run_dir }}/{{ '%02d' | format(cell.0 | int) }}-{{ cell.1 }}"
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
+  ansible.builtin.file:
+    path: "{{ cell_dir }}"
+    state: directory
+    mode: '0755'
+
+# ---------- bench target side: start server + mpstat ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop any prior server"
+  become: true
+  ansible.builtin.shell: |
+    pkill -f "{{ bench_root }}/competitors/" 2>/dev/null
+    pkill -x server 2>/dev/null
+    sleep 0.2
+    pkill -KILL -f "{{ bench_root }}/competitors/" 2>/dev/null
+    true
+  changed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | start competitor server in background"
+  become: true
+  ansible.builtin.shell: |
+    cd {{ bench_root }}
+    ulimit -l unlimited
+    nohup ./competitors/{{ cell.1 }} \
+      -bind 0.0.0.0:{{ bench_port | default(8080) }} \
+      > {{ cell_dir }}/server.log 2>&1 &
+    echo $! > {{ cell_dir }}/server.pid
+    disown
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | wait for server to bind"
+  ansible.builtin.shell: |
+    for i in $(seq 1 40); do
+      ss -ltn 2>/dev/null | grep -q ':{{ bench_port | default(8080) }} ' && exit 0
+      sleep 0.25
+    done
+    echo "server did not bind in 10s" >&2
+    tail -50 {{ cell_dir }}/server.log >&2
+    exit 1
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (server side)"
+  ansible.builtin.shell: |
+    nohup mpstat -P ALL 1 \
+      {{ ((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
+         + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)
+         + 5 }} \
+      > {{ cell_dir }}/cpu.log 2>&1 &
+    disown
+    echo $! > {{ cell_dir }}/mpstat.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: inventory_hostname == bench_target
+
+# ---------- loadgen side: mpstat + loadgen ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (loadgen side)"
+  ansible.builtin.shell: |
+    nohup mpstat -P ALL 1 \
+      {{ ((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
+         + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)
+         + 5 }} \
+      > {{ cell_dir }}/cpu.log 2>&1 &
+    disown
+    echo $! > {{ cell_dir }}/mpstat.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: inventory_hostname == "msa2-client"
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | run loadgen against bench target"
+  ansible.builtin.shell: |
+    cd {{ bench_root }}
+    ./loadgen \
+      -url http://{{ target_ip }}:{{ bench_port | default(8080) }}{{ bench_url_path | default('/') }} \
+      -duration {{ bench_duration | default('30s') }} \
+      -warmup {{ bench_warmup | default('5s') }} \
+      -connections {{ bench_connections | default(256) }} \
+      {% if bench_workers | default(0) | int > 0 %}-workers {{ bench_workers }}{% endif %} \
+      {% if bench_h2 | default(false) | bool %}-h2{% endif %} \
+      {% if bench_h2c_upgrade | default(false) | bool %}-h2c-upgrade{% endif %} \
+      -competitor {{ cell.1 }} \
+      -run-index {{ cell.0 }} \
+      > {{ cell_dir }}/loadgen.json \
+      2> {{ cell_dir }}/loadgen.stderr
+  args:
+    executable: /bin/bash
+  when: inventory_hostname == "msa2-client"
+
+# ---------- teardown for this cell ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop server"
+  become: true
+  ansible.builtin.shell: |
+    pkill -TERM -f "{{ bench_root }}/competitors/" 2>/dev/null
+    sleep 1
+    pkill -KILL -f "{{ bench_root }}/competitors/" 2>/dev/null
+    true
+  changed_when: false
+  when: inventory_hostname == bench_target
