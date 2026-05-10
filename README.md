@@ -12,11 +12,43 @@ Drives a 3-host cluster (msa2-client + msa2-server + msr1) via ansible. msa2-cli
 ## Quick start
 
 ```sh
-mage Status                                    # cluster reachability + manifest state
-mage Deploy DEPLOY_COMPETITORS=go-only         # cross-compile + stage binaries
-mage Bench BENCH_DURATION=30s BENCH_TARGET=msa2-server
-mage Validate VALIDATE_DURATION=6h
-mage Cleanup
+# Cluster reachability + manifest state. Prints "no manifest (pristine)" on
+# a freshly provisioned host, or "manifest present, no installs (Go-only
+# deploy)" right after a Go-only deploy.
+mage Status
+
+# Cross-compile every binary and ship it. DEPLOY_COMPETITORS=go-only skips
+# the native (rust/bun/python) toolchains so the deploy stays under a minute.
+CLUSTER_USE_LAN=1 DEPLOY_COMPETITORS=go-only mage Deploy
+
+# Smoke bench: 2 servers × 1 run × 15s on the amd64 target. The runner
+# auto-deploys if no manifest is present, so you can skip `Deploy` if you
+# just want one shot.
+CLUSTER_USE_LAN=1 \
+  BENCH_TARGET=msa2-server \
+  BENCH_COMPETITORS=stdhttp,gin \
+  BENCH_DURATION=15s BENCH_WARMUP=3s BENCH_RUNS=1 \
+  mage Bench
+
+# Always-on cluster pristine reset. Reverses every install the manifest
+# tracked + removes /tmp/celeris-bench/ + the manifest itself.
+CLUSTER_USE_LAN=1 mage Cleanup
+```
+
+`CLUSTER_USE_LAN=1` pins traffic to the 20G LACP fabric (192.168.50.0/24)
+instead of the Tailscale overlay. Recommended for any actual bench — Tailscale
+adds a ~30µs latency floor that swamps the smaller cells.
+
+Bench results land under `results/<ts>-bench-<version>/`:
+
+```
+results.json                            # cross-host v5.0 roll-up
+raw/<host>.json                         # per-host summary + every cell
+<TS>-bench-<host>/<RR>-<comp>/
+  loadgen.json                          # full loadgen.Result (saturation mode)
+  observer.sqlite                       # 1Hz /proc + runtime time series
+  cpu.log                               # mpstat -P ALL
+  server.log
 ```
 
 ## Cluster
