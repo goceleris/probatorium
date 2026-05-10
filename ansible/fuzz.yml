@@ -1,0 +1,196 @@
+---
+# Hostile-input fuzz. Short (default 30 minutes) high-pressure run that
+# pumps malformed/edge-case HTTP through the server-under-test. Distinct
+# from validate.yml — fuzz targets the parser/state-machine; validate
+# targets long-tail timing invariants.
+#
+# Required extra-vars (typically `mage Fuzz`):
+#   bench_target          single host name from [bench_targets]
+#   competitor            slug of the server-under-test (default: celeris)
+#   fuzz_duration         total fuzz length, e.g. "30m" / "2h"
+#                         (default: "30m")
+#   fuzz_seed             RNG seed for reproducibility (default: 1)
+#   fuzz_concurrency      validator -concurrency (default: 64)
+#   fuzz_corpus           optional path on dev Mac to a seed-corpus
+#                         tar.gz; pushed to {{ bench_root }}/corpus/
+#                         and passed as -corpus to the validator.
+#   bench_port            port the server binds (default: 8080)
+#   results_local_dir     where to fetch outputs back to on the Mac
+
+- name: Hostile-input fuzz
+  hosts: cluster
+  gather_facts: true
+  tasks:
+    - name: Filter to selected hosts
+      ansible.builtin.meta: end_host
+      when: >
+        (inventory_hostname != bench_target) and
+        (inventory_hostname != "msa2-client")
+
+    - name: Ensure transient dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ bench_root }}"
+        - "{{ results_root }}"
+
+    - name: Drop fuzz-start marker for mtime diff
+      ansible.builtin.file:
+        path: "{{ bench_root }}/fuzz-start.marker"
+        state: touch
+        mode: '0644'
+
+    - name: Per-run output dir
+      ansible.builtin.set_fact:
+        fuzz_run_dir: "{{ results_root }}/{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}-fuzz-{{ bench_target }}-{{ competitor | default('celeris') }}"
+
+    - name: Create per-run output dir
+      ansible.builtin.file:
+        path: "{{ fuzz_run_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Push fuzz corpus tarball (if provided)
+      ansible.builtin.copy:
+        src: "{{ fuzz_corpus }}"
+        dest: "{{ bench_root }}/corpus.tar.gz"
+        mode: '0644'
+      when:
+        - inventory_hostname == "msa2-client"
+        - fuzz_corpus is defined
+        - fuzz_corpus | length > 0
+
+    - name: Extract fuzz corpus
+      ansible.builtin.unarchive:
+        src: "{{ bench_root }}/corpus.tar.gz"
+        dest: "{{ bench_root }}/"
+        remote_src: true
+      when:
+        - inventory_hostname == "msa2-client"
+        - fuzz_corpus is defined
+        - fuzz_corpus | length > 0
+
+    - name: Resolve bench target LAN IP from inventory (loadgen side only)
+      ansible.builtin.set_fact:
+        target_ip: "{{ hostvars[bench_target].lan_ip }}"
+      when: inventory_hostname == "msa2-client"
+
+    - name: Compute fuzz timeout in seconds
+      ansible.builtin.set_fact:
+        fuzz_seconds: >-
+          {{ ((fuzz_duration | default('30m') | regex_replace('[^0-9]', '') | int)
+              * (
+                86400 if 'd' in (fuzz_duration | default('30m')) else
+                3600  if 'h' in (fuzz_duration | default('30m')) else
+                60    if 'm' in (fuzz_duration | default('30m')) else
+                1
+              )) + 120 }}
+
+    - block:
+        - name: Stop any prior server-under-test
+          become: true
+          ansible.builtin.shell: |
+            pkill -f "{{ bench_root }}/competitors/" 2>/dev/null
+            pkill -x server 2>/dev/null
+            true
+          changed_when: false
+          when: inventory_hostname == bench_target
+
+        - name: Start server-under-test in background
+          become: true
+          ansible.builtin.shell: |
+            cd {{ bench_root }}
+            ulimit -l unlimited
+            nohup ./competitors/{{ competitor | default('celeris') }} \
+              -bind 0.0.0.0:{{ bench_port | default(8080) }} \
+              > {{ fuzz_run_dir }}/server.log 2>&1 &
+            echo $! > {{ fuzz_run_dir }}/server.pid
+            disown
+          args:
+            executable: /bin/bash
+          when: inventory_hostname == bench_target
+
+        - name: Wait for server-under-test to bind
+          ansible.builtin.shell: |
+            for i in $(seq 1 40); do
+              ss -ltn 2>/dev/null | grep -q ':{{ bench_port | default(8080) }} ' && exit 0
+              sleep 0.25
+            done
+            echo "server did not bind in 10s" >&2
+            tail -100 {{ fuzz_run_dir }}/server.log >&2
+            exit 1
+          args:
+            executable: /bin/bash
+          changed_when: false
+          when: inventory_hostname == bench_target
+
+        - name: Run fuzzer (validator -mode=fuzz)
+          ansible.builtin.shell: |
+            cd {{ bench_root }}
+            ./validator \
+              -mode fuzz \
+              -url http://{{ target_ip }}:{{ bench_port | default(8080) }} \
+              -duration {{ fuzz_duration | default('30m') }} \
+              -concurrency {{ fuzz_concurrency | default(64) }} \
+              -seed {{ fuzz_seed | default(1) }} \
+              {% if fuzz_corpus is defined and fuzz_corpus | length > 0 %}-corpus {{ bench_root }}/corpus{% endif %} \
+              -out {{ fuzz_run_dir }}/fuzz.jsonl \
+              > {{ fuzz_run_dir }}/fuzz.stdout \
+              2> {{ fuzz_run_dir }}/fuzz.stderr
+          args:
+            executable: /bin/bash
+          async: "{{ fuzz_seconds | int }}"
+          poll: 15
+          register: fuzz_result
+          when: inventory_hostname == "msa2-client"
+
+      always:
+        - name: Stop server-under-test
+          become: true
+          ansible.builtin.shell: |
+            pkill -TERM -f "{{ bench_root }}/competitors/" 2>/dev/null
+            sleep 1
+            pkill -KILL -f "{{ bench_root }}/competitors/" 2>/dev/null
+            pkill -x server 2>/dev/null
+            pkill -x validator 2>/dev/null
+            true
+          changed_when: false
+
+        - name: Fetch fuzz artefacts
+          ansible.builtin.synchronize:
+            mode: pull
+            src: "{{ fuzz_run_dir }}/"
+            dest: "{{ results_local_dir }}/{{ inventory_hostname }}/"
+            recursive: true
+            rsync_opts:
+              - "--prune-empty-dirs"
+          register: fetch_result
+          until: fetch_result is succeeded
+          retries: 3
+          delay: 5
+
+        - name: Find paths in ~ created/modified during the run
+          ansible.builtin.shell: |
+            find ~ -maxdepth 4 \
+              -newer {{ bench_root }}/fuzz-start.marker \
+              -not -path "${HOME}/.bash_history*" \
+              -not -path "${HOME}/.viminfo*" \
+              -not -path "${HOME}/.lesshst*" \
+              -not -path "${HOME}/.cache/ansible*" \
+              -not -path "${HOME}/.ansible*" \
+              -not -path "${HOME}/.ansible_async*" \
+              -not -path "${HOME}/.ssh/known_hosts*" \
+              -not -path "${HOME}/.magefile*" \
+              2>/dev/null \
+              || true
+          register: mtime_diff
+          changed_when: false
+
+        - name: Warn if anything leaked into ~
+          ansible.builtin.debug:
+            msg: |
+              Pristine warning — files in ~ newer than the fuzz-start marker:
+              {{ mtime_diff.stdout }}
+          when: mtime_diff.stdout is defined and mtime_diff.stdout | trim | length > 0

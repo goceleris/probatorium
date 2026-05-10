@@ -1,0 +1,81 @@
+---
+# Native rust toolchain via rustup, installed pristinely under
+# {{ bench_root }}/rustup. Always-latest stable resolved at deploy time.
+#
+# Manifest contract: appends to installed_toolchains a record of shape
+#   { lang: 'rust', path: <abs path>, apt_pkgs: [<pkgs we apt-installed>] }
+# and records the resolved rustc/cargo version into fetched_versions.
+#
+# Cleanup is centralised in cleanup.yml — it rm -rf's installed_toolchains[*].path
+# and apt-purges installed_packages, which together fully reverse this role.
+
+- name: rust | ensure rustup install root exists
+  ansible.builtin.file:
+    path: "{{ bench_root }}/rustup"
+    state: directory
+    mode: '0755'
+
+# rustup-init needs curl + ca-certificates + a working C linker (gcc) to
+# bootstrap stable. Detect what's missing rather than install
+# unconditionally — most cluster nodes already have curl + ca-certs.
+- name: rust | detect missing system packages (curl + ca-certificates + build-essential)
+  ansible.builtin.shell: |
+    for pkg in curl ca-certificates build-essential pkg-config; do
+      dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+    done
+  register: rust_missing_pkgs
+  changed_when: false
+
+- name: rust | install missing apt packages
+  become: true
+  ansible.builtin.apt:
+    name: "{{ rust_missing_pkgs.stdout_lines }}"
+    state: present
+    update_cache: true
+  when: rust_missing_pkgs.stdout_lines | length > 0
+
+- name: rust | append apt packages to manifest fact
+  ansible.builtin.set_fact:
+    installed_packages: "{{ installed_packages + rust_missing_pkgs.stdout_lines }}"
+  when: rust_missing_pkgs.stdout_lines | length > 0
+
+# rustup-init is idempotent on re-run: -y --default-toolchain stable
+# updates an existing install in place, no-op if already at latest.
+# The two env vars below are the entire pristine contract — every cargo
+# / rustc / target dir resolves under {{ bench_root }}/rustup/.
+- name: rust | install rustup + stable toolchain (always-latest)
+  environment:
+    CARGO_HOME: "{{ bench_root }}/rustup/cargo"
+    RUSTUP_HOME: "{{ bench_root }}/rustup/rustup"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if [ ! -x "{{ bench_root }}/rustup/cargo/bin/rustup" ]; then
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal
+    else
+      "{{ bench_root }}/rustup/cargo/bin/rustup" update stable
+    fi
+    "{{ bench_root }}/rustup/cargo/bin/rustup" default stable
+  args:
+    executable: /bin/bash
+
+- name: rust | resolve installed rustc + cargo versions
+  environment:
+    CARGO_HOME: "{{ bench_root }}/rustup/cargo"
+    RUSTUP_HOME: "{{ bench_root }}/rustup/rustup"
+  ansible.builtin.shell: |
+    "{{ bench_root }}/rustup/cargo/bin/rustc" --version
+    "{{ bench_root }}/rustup/cargo/bin/cargo" --version
+  register: rust_versions
+  changed_when: false
+
+- name: rust | append toolchain entry to manifest
+  ansible.builtin.set_fact:
+    installed_toolchains: >-
+      {{ installed_toolchains
+         + [{ 'lang': 'rust',
+              'path': bench_root + '/rustup',
+              'apt_pkgs': rust_missing_pkgs.stdout_lines }] }}
+    fetched_versions: >-
+      {{ fetched_versions
+         | combine({ 'rust': rust_versions.stdout_lines | join(' / ') }) }}

@@ -1,0 +1,160 @@
+---
+# Distributed bench: server (celeris OR competitor) on bench_target,
+# loadgen on msa2-client, traffic over the 20G LACP fabric (lan_ip,
+# NEVER tailnet/Tailscale). Loops the loadgen across every entry in
+# competitor_set, interleaving the launches so a transient cluster blip
+# does not bias one framework over another.
+#
+# Required extra-vars:
+#   bench_target          single host name from [bench_targets]
+#                         (msa2-server | msr1) — for both archs, run
+#                         the playbook twice with different bench_target.
+#   competitor_set        comma-separated list of competitor slugs to
+#                         exercise this bench. Each slug must already be
+#                         staged under {{ bench_root }}/competitors/<slug>
+#                         by `ansible-playbook deploy.yml`.
+#   bench_port            port the server binds (default: 8080)
+#   bench_url_path        path component of loadgen -url (default: /)
+#   bench_duration        loadgen -duration (default: 30s)
+#   bench_warmup          loadgen -warmup (default: 5s)
+#   bench_connections     loadgen -connections (default: 256)
+#   bench_workers         loadgen -workers (0 → loadgen default)
+#   bench_h2              loadgen -h2 flag value (default: false)
+#   bench_runs            number of repetitions per competitor (default: 3)
+#   results_local_dir     where to fetch outputs back to on the Mac
+#
+# Interleaving rationale: rather than run all N runs of competitor A
+# back-to-back then all of B, we cycle [A,B,C,...,A,B,C,...] so each
+# competitor sees the same coarse-grained slice of cluster state
+# (kernel cache warmth, port-pool depletion, neighbour interference).
+# Failure to interleave was responsible for the v1.4.1 ranking flip
+# between fasthttp and gnet on msr1.
+
+- name: Stage bench-run state
+  hosts: cluster
+  gather_facts: true
+  tags: stage
+  tasks:
+    - name: Filter to selected hosts
+      ansible.builtin.meta: end_host
+      when: >
+        (inventory_hostname != bench_target) and
+        (inventory_hostname != "msa2-client")
+
+    - name: Ensure transient dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ bench_root }}"
+        - "{{ results_root }}"
+
+    - name: Resolve effective competitor list
+      ansible.builtin.set_fact:
+        bench_competitors: "{{ competitor_set.split(',') | map('trim') | list }}"
+
+    - name: Per-run output dir (one per playbook invocation)
+      ansible.builtin.set_fact:
+        bench_run_dir: "{{ results_root }}/{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}-bench-{{ bench_target }}"
+
+    - name: Create per-run output dir
+      ansible.builtin.file:
+        path: "{{ bench_run_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Resolve bench target LAN IP from inventory (loadgen side only)
+      # lan_ip is the DHCP-pinned 20G fabric address. Using a hostname
+      # here would resolve via Tailscale MagicDNS to the tailnet IP and
+      # route over WireGuard, defeating the cluster fabric. NEVER use
+      # the inventory hostname here.
+      ansible.builtin.set_fact:
+        target_ip: "{{ hostvars[bench_target].lan_ip }}"
+      when: inventory_hostname == "msa2-client"
+
+# Outer loop over [run_index × competitor] cycles is driven from the
+# control node via include_tasks. This block runs once per (run, comp)
+# pair — server starts on bench_target, mpstat samplers spin up on both
+# sides, loadgen runs to completion on msa2-client, then everything
+# winds down before the next pair begins.
+- name: Run interleaved bench (per-iteration server lifecycle)
+  hosts: cluster
+  gather_facts: false
+  tags: run
+  tasks:
+    - name: Filter to selected hosts
+      ansible.builtin.meta: end_host
+      when: >
+        (inventory_hostname != bench_target) and
+        (inventory_hostname != "msa2-client")
+
+    - name: Build interleaved schedule (run_index x competitor)
+      ansible.builtin.set_fact:
+        # [(0,A),(0,B),...,(0,Z),(1,A),(1,B),...]
+        bench_schedule: >-
+          {{ range(0, bench_runs | default(3) | int) | list
+             | product(bench_competitors) | list }}
+
+    - name: Iterate bench cells
+      ansible.builtin.include_tasks: tasks/run_bench_cell.yml
+      loop: "{{ bench_schedule }}"
+      loop_control:
+        loop_var: cell
+        label: "run={{ cell.0 }} comp={{ cell.1 }}"
+
+- name: Collect bench artefacts
+  hosts: cluster
+  gather_facts: false
+  tags: cleanup
+  tasks:
+    - name: Filter to selected hosts
+      ansible.builtin.meta: end_host
+      when: >
+        (inventory_hostname != bench_target) and
+        (inventory_hostname != "msa2-client")
+
+    - name: Stop any leftover server processes (bench target only)
+      become: true
+      ansible.builtin.shell: |
+        for name in server runner loadgen observer; do
+          pkill -x "$name" 2>/dev/null
+        done
+        # Native competitor processes are launched by their slug name
+        # (we set argv[0] via cmdline); kill anything under competitors/
+        # by matching the staging path prefix.
+        pkill -f "{{ bench_root }}/competitors/" 2>/dev/null
+        true
+      changed_when: false
+      register: stop_result
+      until: stop_result is succeeded
+      retries: 3
+      delay: 5
+
+    - name: Wait for mpstat samplers to finish writing
+      ansible.builtin.shell: |
+        for pidfile in {{ bench_run_dir }}/*/mpstat.pid; do
+          [ -f "$pidfile" ] || continue
+          pid=$(cat "$pidfile")
+          for i in $(seq 1 10); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+          done
+        done
+        true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Fetch bench artefacts back to dev machine
+      ansible.builtin.synchronize:
+        mode: pull
+        src: "{{ bench_run_dir }}/"
+        dest: "{{ results_local_dir }}/{{ inventory_hostname }}/"
+        recursive: true
+        rsync_opts:
+          - "--prune-empty-dirs"
+      register: fetch_result
+      until: fetch_result is succeeded
+      retries: 3
+      delay: 5

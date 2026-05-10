@@ -1,0 +1,70 @@
+---
+# Native bun runtime via the official installer, into
+# {{ bench_root }}/bun. Always-latest stable at deploy time.
+#
+# Manifest contract: appends to installed_toolchains an entry of
+#   { lang: 'bun', path: <abs path>, apt_pkgs: [<pkgs we apt-installed>] }
+# and records the resolved bun version into fetched_versions.
+
+- name: bun | ensure bun install root exists
+  ansible.builtin.file:
+    path: "{{ bench_root }}/bun"
+    state: directory
+    mode: '0755'
+
+# bun installer needs curl + unzip; ca-certificates is pulled in
+# transitively by curl on Debian/Ubuntu so we don't list it explicitly.
+- name: bun | detect missing system packages (curl + unzip)
+  ansible.builtin.shell: |
+    for pkg in curl unzip; do
+      dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+    done
+  register: bun_missing_pkgs
+  changed_when: false
+
+- name: bun | install missing apt packages
+  become: true
+  ansible.builtin.apt:
+    name: "{{ bun_missing_pkgs.stdout_lines }}"
+    state: present
+    update_cache: true
+  when: bun_missing_pkgs.stdout_lines | length > 0
+
+- name: bun | append apt packages to manifest fact
+  ansible.builtin.set_fact:
+    installed_packages: "{{ installed_packages + bun_missing_pkgs.stdout_lines }}"
+  when: bun_missing_pkgs.stdout_lines | length > 0
+
+# BUN_INSTALL is the only knob the installer respects; everything bun
+# downloads (the binary, the cache, the registry index) lands under it.
+# The installer is idempotent — re-running upgrades to latest in place.
+- name: bun | install bun (always-latest)
+  environment:
+    BUN_INSTALL: "{{ bench_root }}/bun"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if [ ! -x "{{ bench_root }}/bun/bin/bun" ]; then
+      curl -fsSL https://bun.sh/install | bash
+    else
+      "{{ bench_root }}/bun/bin/bun" upgrade
+    fi
+  args:
+    executable: /bin/bash
+
+- name: bun | resolve installed bun version
+  environment:
+    BUN_INSTALL: "{{ bench_root }}/bun"
+  ansible.builtin.command: "{{ bench_root }}/bun/bin/bun --version"
+  register: bun_version
+  changed_when: false
+
+- name: bun | append toolchain entry to manifest
+  ansible.builtin.set_fact:
+    installed_toolchains: >-
+      {{ installed_toolchains
+         + [{ 'lang': 'bun',
+              'path': bench_root + '/bun',
+              'apt_pkgs': bun_missing_pkgs.stdout_lines }] }}
+    fetched_versions: >-
+      {{ fetched_versions
+         | combine({ 'bun': bun_version.stdout | trim }) }}

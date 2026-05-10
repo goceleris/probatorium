@@ -1,0 +1,143 @@
+---
+# Force teardown of all probatorium state on cluster nodes.
+#
+# Idempotent — safe to run any number of times. Reverses every change
+# the deploy/bench/validate/fuzz playbooks recorded in the manifest:
+#   1. apt-purge any packages WE installed (manifest.installed_packages)
+#   2. restore sysctl values WE snapshotted (manifest.prior_sysctl)
+#   3. rm -rf each toolchain dir WE installed (manifest.installed_toolchains)
+#   4. stop any docker containers we spawned (only if WE installed docker)
+#   5. rm -rf {{ bench_root }} entirely
+#   6. drop the manifest file itself
+#
+# `purge_results=true` extra-var ALSO removes {{ results_root }} (default
+# is to leave it so the user can re-fetch local artefacts after the fact).
+
+- name: Force cleanup of probatorium state on cluster nodes
+  hosts: cluster
+  gather_facts: false
+  tasks:
+    # ---------- kill processes first ----------
+    # Match by exact process name to avoid pkill self-killing
+    # (pkill -f matches argv, including its own command line).
+    - name: Stop any lingering probatorium processes
+      become: true
+      # Native competitor processes (rust/bun/python) live under
+      # {{ bench_root }}/competitors/ - we match them by absolute path
+      # in pkill -f below so no other workload on the host is touched.
+      ansible.builtin.shell: |
+        for name in runner loadgen observer validator validator-checker validator-replay conformance server; do
+          pkill -x "$name" 2>/dev/null
+        done
+        pkill -f "{{ bench_root }}/competitors/" 2>/dev/null
+        pkill -f "{{ bench_root }}/competitors-src/" 2>/dev/null
+        true
+      changed_when: false
+
+    # ---------- read manifest ----------
+    - name: Read dep manifest if present
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: cleanup_manifest
+      failed_when: false
+
+    - name: Decode manifest
+      ansible.builtin.set_fact:
+        to_remove: "{{ (cleanup_manifest.content | b64decode | from_json).installed_packages | default([]) }}"
+        sysctl_to_restore: "{{ (cleanup_manifest.content | b64decode | from_json).prior_sysctl | default({}) }}"
+        toolchains_to_remove: "{{ (cleanup_manifest.content | b64decode | from_json).installed_toolchains | default([]) }}"
+      when: cleanup_manifest is defined and cleanup_manifest.content is defined
+
+    # ---------- docker container teardown (only if WE installed docker) ----------
+    - name: Stop any docker containers we spawned (only if we installed docker)
+      become: true
+      ansible.builtin.shell: |
+        ids=$(docker ps -q 2>/dev/null)
+        if [ -n "$ids" ]; then
+          docker kill $ids 2>/dev/null || true
+        fi
+        # Also remove any stopped containers that were not auto-removed
+        # (e.g. memcached:1.6-alpine launched without --rm).
+        docker container prune -f 2>/dev/null || true
+        true
+      args:
+        executable: /bin/bash
+      when:
+        - to_remove is defined
+        - "'docker.io' in to_remove"
+      changed_when: false
+
+    # ---------- toolchain teardown ----------
+    # rm -rf each toolchain dir we installed. The role-recorded entries
+    # have shape: { lang: rust|bun|python, path: <abs path>, apt_pkgs: [...] }
+    # We rm -rf the path here; apt_pkgs are folded into to_remove so the
+    # apt-purge step below catches them.
+    - name: Remove installed toolchain directories
+      become: true
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ toolchains_to_remove | default([]) }}"
+      loop_control:
+        label: "{{ item.lang }}@{{ item.path }}"
+      when: toolchains_to_remove is defined and toolchains_to_remove | length > 0
+
+    # ---------- sysctl restore ----------
+    - name: Restore prior sysctl values
+      become: true
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: false
+      loop: "{{ sysctl_restore_pairs | default([]) }}"
+      vars:
+        sysctl_restore_pairs:
+          - name: net.ipv4.tcp_tw_reuse
+            value: "{{ sysctl_to_restore.tcp_tw_reuse | default('') }}"
+          - name: net.ipv4.ip_local_port_range
+            value: "{{ sysctl_to_restore.ip_local_port_range | default('') }}"
+      when:
+        - sysctl_to_restore is defined
+        - sysctl_to_restore | length > 0
+        - item.value != ''
+
+    # ---------- apt teardown ----------
+    - name: Stop docker daemon before purge
+      become: true
+      ansible.builtin.service:
+        name: docker
+        state: stopped
+      when: to_remove is defined and ('docker.io' in to_remove)
+      failed_when: false
+
+    - name: Apt-purge packages we installed
+      become: true
+      ansible.builtin.apt:
+        name: "{{ to_remove }}"
+        state: absent
+        purge: true
+        autoremove: true
+      when: to_remove is defined and to_remove | length > 0
+
+    # ---------- final filesystem sweep ----------
+    - name: Drop bench staging dir (rm -rf {{ bench_root }})
+      become: true
+      ansible.builtin.shell: |
+        chmod -R u+w {{ bench_root }} 2>/dev/null || true
+        rm -rf {{ bench_root }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Remove manifest file
+      ansible.builtin.file:
+        path: "{{ manifest_path }}"
+        state: absent
+
+    - name: Optionally remove results dir (set --extra-vars purge_results=true)
+      ansible.builtin.file:
+        path: "{{ results_root }}"
+        state: absent
+      when: purge_results | default(false) | bool
