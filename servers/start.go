@@ -84,6 +84,9 @@ func startGoAdapter(ctx context.Context, a Adapter, _ GoBinary, bindAddr string)
 
 // startNativeAdapter exec's the spec's RunCmd. Substitutions:
 //
+//	{bin}    → resolved binary path (same lookup as Go adapters use:
+//	           PROBATORIUM_BENCH_ROOT/competitors/<name>, then
+//	           PROBATORIUM_BENCH_ROOT/<name>, then ./<name>)
 //	{bind}   → bindAddr
 //	{engine} → a.Engine (empty string for non-celeris adapters)
 //	{name}   → a.Name
@@ -98,7 +101,12 @@ func startNativeAdapter(ctx context.Context, a Adapter, spec NativeBinary, bindA
 	if spec.RunCmd == "" {
 		return nil, fmt.Errorf("probatorium/servers: %s: NativeBinary.RunCmd is empty", a.Name)
 	}
+	bin, err := resolveAdapterBinary(a.Name)
+	if err != nil {
+		return nil, err
+	}
 	expanded := expandTemplate(spec.RunCmd, map[string]string{
+		"bin":    bin,
 		"bind":   bindAddr,
 		"engine": a.Engine,
 		"name":   a.Name,
