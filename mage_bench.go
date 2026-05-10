@@ -68,21 +68,23 @@ func Bench() error {
 		return err
 	}
 
-	// Auto-deploy when neither bench target has a manifest. Cheap
-	// pre-flight: ssh to msa2-server and msr1 in series; if both
-	// come back empty we kick off Deploy. A partial deploy (one
-	// target missing) is treated as already-deployed since
-	// re-running Deploy is idempotent anyway and the user's intent
-	// is "bench what's there".
-	needDeploy := true
+	// Auto-deploy when neither bench target has a manifest yet. Cheap
+	// pre-flight: SSH to both bench_targets; if neither has the
+	// manifest file, kick off Deploy. A partial deploy (one target
+	// missing) is treated as already-deployed because re-running
+	// Deploy is idempotent and the user's intent is "bench what's
+	// there." Note: we can't gate on binaries-present because the
+	// manifest schema deliberately doesn't track staged binaries —
+	// the playbook's `copy` task is the source of truth for those.
+	hasManifest := false
 	for _, h := range []string{"msa2-server", "msr1"} {
-		if m, err := manifestRead(h); err == nil && len(m.Binaries) > 0 {
-			needDeploy = false
+		if present, _, err := manifestRead(h); err == nil && present {
+			hasManifest = true
 			break
 		}
 	}
-	if needDeploy {
-		fmt.Println("=== No staged binaries detected; running Deploy first ===")
+	if !hasManifest {
+		fmt.Println("=== No bench manifest detected; running Deploy first ===")
 		if err := Deploy(); err != nil {
 			return fmt.Errorf("auto-deploy: %w", err)
 		}

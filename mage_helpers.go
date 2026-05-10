@@ -147,24 +147,45 @@ func findLoadgenSibling() (string, bool) {
 }
 
 // Manifest mirrors the JSON written to /tmp/celeris-bench-manifest.json
-// on each cluster node by the deploy playbook. It records every apt
-// package the playbook installed plus any staged binary path, so the
-// cleanup playbook can uninstall/remove them in reverse order.
+// on each cluster node by the deploy playbook. The playbook is the
+// source of truth for the on-disk shape — the field names here match
+// `ansible/deploy.yml`'s `Persist deploy manifest` task verbatim.
 //
-// Fields stay loose (string-keyed map for extras) — the playbook is
-// the source of truth for shape; this struct only needs to round-trip
-// the parts Status() prints.
+//   - installed_packages: apt packages the playbook installed (so
+//     cleanup can apt-purge them).
+//   - prior_sysctl:       map of sysctl key → previous value, used to
+//     restore kernel knobs the bench mutated.
+//   - installed_toolchains: per-language toolchain dirs the playbook
+//     created under bench_root (rust, bun, python, etc.). Each entry
+//     is { lang, path, apt_pkgs }. Stored as a generic any so this
+//     struct doesn't have to track the full schema as it evolves.
+//   - fetched_versions:   pure-informational map of "always-latest"
+//     resolutions (rustc, bun, python3.13, uv, ...) at deploy time.
 type Manifest struct {
-	Host        string            `json:"host"`
-	Timestamp   string            `json:"timestamp"`
-	AptPackages []string          `json:"apt_packages,omitempty"`
-	Binaries    []string          `json:"binaries,omitempty"`
-	Extras      map[string]string `json:"extras,omitempty"`
+	InstalledPackages   []string          `json:"installed_packages,omitempty"`
+	PriorSysctl         map[string]string `json:"prior_sysctl,omitempty"`
+	InstalledToolchains []any             `json:"installed_toolchains,omitempty"`
+	FetchedVersions     map[string]string `json:"fetched_versions,omitempty"`
+}
+
+// IsEmpty reports whether the manifest carries no installs / no
+// sysctl mutations — i.e. the host is pristine from the bench's
+// perspective even if the manifest file itself is present. A Go-only
+// deploy on a fresh node produces an empty manifest because no
+// toolchains/packages/sysctls are needed.
+func (m Manifest) IsEmpty() bool {
+	return len(m.InstalledPackages) == 0 &&
+		len(m.PriorSysctl) == 0 &&
+		len(m.InstalledToolchains) == 0 &&
+		len(m.FetchedVersions) == 0
 }
 
 // manifestRead ssh's into host and dumps the bench manifest. Returns
-// (zero, nil) if the file does not exist (a freshly provisioned host
-// won't have one), and (zero, err) for any other failure.
+// (false, zero, nil) when the manifest file is absent — that's how a
+// freshly provisioned host looks. Returns (true, manifest, nil) when
+// the file is present (which a Go-only deploy still produces, just
+// with every field empty — call m.IsEmpty() to distinguish that
+// case). Any SSH / JSON failure is surfaced as (false, zero, err).
 //
 // Routing:
 //   - Always logs in as `mini` (matches inventory.yml ansible_user) —
@@ -172,7 +193,7 @@ type Manifest struct {
 //     Tailscale SSH's local-user lookup.
 //   - When CLUSTER_USE_LAN=1, targets the LAN IP directly (LACP fabric)
 //     so Status() works even if Tailscale is offline / re-auth-pending.
-func manifestRead(host string) (Manifest, error) {
+func manifestRead(host string) (bool, Manifest, error) {
 	var m Manifest
 	target := sshUser + "@" + host
 	if os.Getenv("CLUSTER_USE_LAN") == "1" {
@@ -180,25 +201,31 @@ func manifestRead(host string) (Manifest, error) {
 			target = sshUser + "@" + ip
 		}
 	}
+	// Use a sentinel marker so we can disambiguate "file absent" from
+	// "file present but empty" — `cat … || true` collapses both to an
+	// empty body without it.
+	const marker = "__MANIFEST_ABSENT__"
+	script := fmt.Sprintf("if [ -f %s ]; then cat %s; else printf '%%s' %s; fi",
+		manifestRemote, manifestRemote, marker)
 	cmd := exec.Command("ssh",
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
 		"-o", "StrictHostKeyChecking=accept-new",
 		target,
-		"cat "+manifestRemote+" 2>/dev/null || true",
+		script,
 	)
 	out, err := cmd.Output()
 	if err != nil {
-		return m, fmt.Errorf("ssh %s: %w", target, err)
+		return false, m, fmt.Errorf("ssh %s: %w", target, err)
 	}
 	raw := strings.TrimSpace(string(out))
-	if raw == "" {
-		return m, nil
+	if raw == marker || raw == "" {
+		return false, m, nil
 	}
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
-		return m, fmt.Errorf("parse manifest from %s: %w", host, err)
+		return false, m, fmt.Errorf("parse manifest from %s: %w", host, err)
 	}
-	return m, nil
+	return true, m, nil
 }
 
 // forwardEnvAsExports renders every os.Environ() entry whose key

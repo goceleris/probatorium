@@ -23,14 +23,22 @@
     - name: Stop any lingering probatorium processes
       become: true
       # Native competitor processes (rust/bun/python) live under
-      # {{ bench_root }}/competitors/ - we match them by absolute path
-      # in pkill -f below so no other workload on the host is touched.
+      # {{ bench_root }}/competitors/ — match them by absolute path
+      # via pkill -f so no other workload on the host is touched.
+      #
+      # CRITICAL: `pkill -f` matches every process's full command line,
+      # INCLUDING the bash session running this very pkill. The
+      # literal path appears in our own argv, so a naïve `pkill -f`
+      # self-terminates (rc=-15). The `[/]tmp/...` regex-character-
+      # class idiom solves this: the pattern matches real processes
+      # whose argv contains `/tmp/...`, but doesn't match its own
+      # argv (which begins with `[`, not `/`).
       ansible.builtin.shell: |
         for name in runner loadgen observer validator validator-checker validator-replay conformance server; do
           pkill -x "$name" 2>/dev/null
         done
-        pkill -f "{{ bench_root }}/competitors/" 2>/dev/null
-        pkill -f "{{ bench_root }}/competitors-src/" 2>/dev/null
+        pkill -f "[/]tmp/celeris-bench/competitors/" 2>/dev/null
+        pkill -f "[/]tmp/celeris-bench/competitors-src/" 2>/dev/null
         true
       changed_when: false
 
