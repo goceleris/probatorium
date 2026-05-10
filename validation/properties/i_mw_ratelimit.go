@@ -8,24 +8,31 @@ import "fmt"
 // checker compares the rejection rate against the ratelimit config
 // and hard-fails on unbounded admission.
 //
-// Wave 6 STUB: until the -tags=validation build of celeris exports
-// per-key rate-limit counters (wave 7), the predicate only enforces
-// the trivial "RateLimitRejected counter is non-negative" check via
-// the int64 type itself. The TODO below tracks the real assertion.
+// Plus the validation-build (celeris v1.4.3+) emits a hard-assertion
+// counter for token-bucket invariants: any non-zero
+// RatelimitTokenViolations means the token bucket went negative or
+// exceeded its capacity — a structural bug in the ratelimit allocator
+// regardless of the offered-vs-allowed rate. Either is grounds to
+// halt the run.
 var IMWRateLimit = Spec{
 	ID:          "I-MW-RATELIMIT",
 	Description: "rate-limit middleware admits/denies per configured policy",
 	Tier:        "middleware",
 	Predicate: func(snap *Snapshot, _ Context) (bool, string) {
-		// TODO(wave-7): assert that under controlled over-RPS load the
-		// RateLimitRejected counter grows >= (offered - allowed) per
-		// window; for now we only verify the counters are sane.
+		if snap.RatelimitTokenViolations > 0 {
+			return false, fmt.Sprintf(
+				"I-MW-RATELIMIT violated: %d token-bucket assertion(s) fired (validation build)",
+				snap.RatelimitTokenViolations)
+		}
 		if snap.RateLimitAllowed < 0 {
 			return false, fmt.Sprintf("I-MW-RATELIMIT violated: allowed counter went negative (%d)", snap.RateLimitAllowed)
 		}
 		if snap.RateLimitRejected < 0 {
 			return false, fmt.Sprintf("I-MW-RATELIMIT violated: rejected counter went negative (%d)", snap.RateLimitRejected)
 		}
+		// TODO(wave-9+): once the traffic generator records offered-RPS
+		// per window, also assert that RateLimitRejected grows >=
+		// (offered - allowed) under sustained over-limit load.
 		return true, ""
 	},
 }

@@ -217,6 +217,33 @@ func TestIDRV_passesClean(t *testing.T) {
 	}
 }
 
+// Validation-socket counters (celeris v1.4.3+) fire on any non-zero
+// value — they're hard "assertion fired" signals from the validation
+// build of celeris. Each must be wired into the corresponding spec.
+func TestMWValidationCounters_FailOnNonZero(t *testing.T) {
+	cases := []struct {
+		name string
+		s    Snapshot
+		spec Spec
+	}{
+		{"ratelimit-token-violation", Snapshot{RatelimitTokenViolations: 1}, IMWRateLimit},
+		{"session-owner-mismatch", Snapshot{SessionOwnerMismatches: 1}, IMWSession},
+		{"jwt-late-admit", Snapshot{JWTLateAdmits: 1}, IMWJWT},
+		{"iouring-sqe-corruption", Snapshot{IouringSQECorruptions: 1}, IENGIOURing},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, msg := tc.spec.Predicate(&tc.s, ctxWith(0, nil, false))
+			if ok {
+				t.Fatalf("%s expected violation on %+v", tc.spec.ID, tc.s)
+			}
+			if msg == "" {
+				t.Fatalf("%s violation must carry a non-empty message", tc.spec.ID)
+			}
+		})
+	}
+}
+
 func TestRegistry_AllSorted(t *testing.T) {
 	specs := All()
 	if len(specs) == 0 {
