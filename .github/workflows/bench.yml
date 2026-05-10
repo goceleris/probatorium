@@ -1,0 +1,53 @@
+name: Bench
+
+# Runs the full bench matrix on the self-hosted cluster after validate
+# has signed off. On success the headline numbers are pushed to
+# goceleris/docs via mage Publish.
+#
+# Manual trigger lets us re-bench a known-good validate without
+# re-running the 6h soak.
+
+on:
+  repository_dispatch:
+    types: [celeris-validate-passed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Celeris version to benchmark (e.g. v1.4.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: mage Bench + Publish
+    runs-on: [self-hosted, celeris-cluster]
+    timeout-minutes: 240
+    env:
+      VERSION: ${{ inputs.version || github.event.client_payload.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: mage Bench
+        env:
+          BENCH_TARGET: both
+          BENCH_DURATION: 120s
+          CELERIS_VERSION: ${{ env.VERSION }}
+        run: go run github.com/magefile/mage Bench
+
+      - name: mage Publish
+        if: success()
+        env:
+          PUBLISH_VERSION: ${{ env.VERSION }}
+        run: go run github.com/magefile/mage Publish
+
+      - name: mage Cleanup
+        if: always()
+        run: go run github.com/magefile/mage Cleanup
