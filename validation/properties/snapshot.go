@@ -92,6 +92,18 @@ type Snapshot struct {
 	ResponsesCRLFInHeader    int64
 	ResponsesNULInHeader     int64
 	ResponsesMissingChunkEnd int64
+
+	// Validation-build counters (celeris v1.4.3+, -tags=validation).
+	// Sourced from the Unix-domain socket at /tmp/celeris-validation.sock.
+	// Each is an "assertion fired" count — non-zero means the celeris
+	// runtime detected a violation it would normally panic on; the
+	// validation build accumulates the count so the checker can capture
+	// the seed/commit/arch tuple before the run aborts. All five
+	// MUST stay at zero through every soak run.
+	RatelimitTokenViolations int64
+	SessionOwnerMismatches   int64
+	JWTLateAdmits            int64
+	IouringSQECorruptions    int64
 }
 
 // Context carries rolling-window state needed by predicates that look
