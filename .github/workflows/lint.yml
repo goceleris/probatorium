@@ -1,0 +1,43 @@
+name: Lint
+
+# Always-latest policy: setup-go uses `stable`, actions are pinned to a
+# major tag so dependabot can bump us to the latest minor/patch without
+# us having to touch the workflow.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: go vet + golangci-lint + gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+      # gofmt -l prints offending files and emits no output on success.
+      # Fail the job if anything appears on stdout — preserves the
+      # "any drift breaks the build" invariant the SDD calls out.
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$out"
+            exit 1
+          fi
