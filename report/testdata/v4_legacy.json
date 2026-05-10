@@ -1,0 +1,39 @@
+{
+  "schema_version": "4.0",
+  "host_arch_pair": "linux_amd64",
+  "environment": {
+    "kernel_sysctls_applied": ["net.core.somaxconn=65535"],
+    "loadgen_host": "msa2-client",
+    "fabric": "3-host LACP 20G"
+  },
+  "benchmark_config": {
+    "started_at": "2026-02-01T00:00:00Z",
+    "finished_at": "2026-02-01T00:30:00Z",
+    "runs": 3,
+    "duration": 120000000000,
+    "warmup": 10000000000,
+    "git_ref": "main@feedface",
+    "loadgen_version": "v1.4.2",
+    "celeris_version": "v1.4.2"
+  },
+  "benchmarks": [
+    {
+      "name": "celeris-std-h1",
+      "category": "celeris",
+      "language": "go",
+      "language_version": "1.26.3",
+      "framework": "celeris",
+      "framework_version": "v1.4.2",
+      "engine": "std",
+      "compile_options": ["GOAMD64=v3"],
+      "saturation_mode_rps": { "get-json": 240000.0 },
+      "rated_mode_p99_at_target_rps": { "get-json": 360000 },
+      "latency_at_slo": {
+        "get-json": { "10": 150000, "50": 220000, "100": 240000 }
+      },
+      "hdr_histogram_b64": { "get-json": "" },
+      "loadgen_cpu_p95": { "get-json": 0.72 },
+      "sent_vs_handled_delta_pct": { "get-json": 0.0 }
+    }
+  ]
+}

@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/goceleris/probatorium/main/report/schema_v5.json",
+  "title": "Probatorium results document",
+  "description": "v5.0 schema for probatorium per-run results files. Additive over v4: every v4 field is still present, plus latency_at_slo, hdr_histogram_b64, validation_results and soak_summary. A v4 reader sees a strict superset of the fields it knows.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "host_arch_pair",
+    "environment",
+    "benchmark_config",
+    "benchmarks"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Schema generation tag. v5.0 readers parse 4.x and 5.x; future readers will gate on the major version.",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "host_arch_pair": {
+      "type": "string",
+      "description": "Lowercased <os>_<arch> tag (e.g. linux_amd64) — the canonical key for cross-host artifact catalogues."
+    },
+    "environment": {
+      "type": "object",
+      "required": ["kernel_sysctls_applied", "loadgen_host", "fabric"],
+      "properties": {
+        "kernel_sysctls_applied": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Sorted list of key=value pairs the ansible role wrote before the run started."
+        },
+        "loadgen_host": { "type": "string" },
+        "fabric": { "type": "string" }
+      }
+    },
+    "benchmark_config": {
+      "type": "object",
+      "required": [
+        "started_at",
+        "finished_at",
+        "runs",
+        "duration",
+        "warmup",
+        "git_ref",
+        "loadgen_version",
+        "celeris_version"
+      ],
+      "properties": {
+        "started_at": { "type": "string", "format": "date-time" },
+        "finished_at": { "type": "string", "format": "date-time" },
+        "runs": { "type": "integer", "minimum": 1 },
+        "duration": { "type": "integer", "description": "time.Duration encoded as nanoseconds." },
+        "warmup": { "type": "integer", "description": "time.Duration encoded as nanoseconds." },
+        "git_ref": { "type": "string" },
+        "loadgen_version": { "type": "string" },
+        "celeris_version": { "type": "string" },
+        "scenarios_filter": { "type": "string" },
+        "adapters_filter": { "type": "string" }
+      }
+    },
+    "benchmarks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/serverResult" }
+    },
+    "validation_results": { "$ref": "#/$defs/validationResults" },
+    "soak_summary": { "$ref": "#/$defs/soakSummary" }
+  },
+  "$defs": {
+    "serverResult": {
+      "type": "object",
+      "required": [
+        "name",
+        "category",
+        "language",
+        "language_version",
+        "framework",
+        "framework_version",
+        "compile_options",
+        "saturation_mode_rps",
+        "rated_mode_p99_at_target_rps",
+        "latency_at_slo",
+        "hdr_histogram_b64",
+        "loadgen_cpu_p95",
+        "sent_vs_handled_delta_pct"
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "category": { "type": "string" },
+        "language": { "type": "string" },
+        "language_version": { "type": "string" },
+        "framework": { "type": "string" },
+        "framework_version": { "type": "string" },
+        "engine": { "type": "string" },
+        "compile_options": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "saturation_mode_rps": {
+          "type": "object",
+          "additionalProperties": { "type": "number" }
+        },
+        "rated_mode_p99_at_target_rps": {
+          "type": "object",
+          "description": "Per-scenario merged-across-runs P99 latency, encoded as time.Duration (nanoseconds).",
+          "additionalProperties": { "type": "integer" }
+        },
+        "latency_at_slo": {
+          "type": "object",
+          "description": "Outer key: scenario name. Inner key: SLO threshold in milliseconds. Inner value: max sustained RPS at which merged P99 stays below the SLO.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": { "type": "integer" }
+          }
+        },
+        "hdr_histogram_b64": {
+          "type": "object",
+          "description": "Per-scenario merged-across-runs HdrHistogram (V2-compressed base64). Empty string allowed when a loadgen build did not emit a per-run histogram.",
+          "additionalProperties": { "type": "string" }
+        },
+        "loadgen_cpu_p95": {
+          "type": "object",
+          "additionalProperties": { "type": "number" }
+        },
+        "sent_vs_handled_delta_pct": {
+          "type": "object",
+          "additionalProperties": { "type": "number" }
+        }
+      }
+    },
+    "validationResults": {
+      "type": "object",
+      "required": ["started_at", "finished_at", "properties_passed", "properties_failed"],
+      "properties": {
+        "started_at": { "type": "string", "format": "date-time" },
+        "finished_at": { "type": "string", "format": "date-time" },
+        "properties_passed": { "type": "integer", "minimum": 0 },
+        "properties_failed": { "type": "integer", "minimum": 0 },
+        "failure_summaries": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "fault_injection_seed": { "type": "string" }
+      }
+    },
+    "soakSummary": {
+      "type": "object",
+      "required": [
+        "duration",
+        "restarted_processes",
+        "goroutine_leak_detected",
+        "heap_growth_mb",
+        "per_hour_error_rate"
+      ],
+      "properties": {
+        "duration": { "type": "integer", "description": "time.Duration encoded as nanoseconds." },
+        "restarted_processes": { "type": "integer", "minimum": 0 },
+        "goroutine_leak_detected": { "type": "boolean" },
+        "heap_growth_mb": { "type": "number" },
+        "per_hour_error_rate": { "type": "number" }
+      }
+    }
+  }
+}
