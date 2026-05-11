@@ -213,19 +213,40 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3
 	// remote.Driver. (Even when the orchestrator drives celeris via
 	// SSH, validator-replay runs on the same host as the refapp so
 	// its fault-injection commands hit the right /proc namespace.)
+	//
+	// Two timeouts in play, both critical:
+	//
+	//   - `replayInternalDuration` is what we pass to the replay
+	//     binary's `-duration` flag. The replay's own context is
+	//     bounded by this; fault.Run returns cleanly when it expires.
+	//   - the exec.CommandContext deadline is replayInternalDuration
+	//     + 2s grace. SIGKILL is only delivered if the replay refuses
+	//     to exit within the grace window — which would itself be a
+	//     bug worth surfacing (T3-DRIVE), not the per-seed timing
+	//     race we used to hit.
+	//
+	// WaitDelay (Go 1.20+) tightens the grace: stdout/stderr pipes are
+	// forcibly closed after the delay even if the process is stuck.
 	pidStr := strconv.Itoa(res.RefappPID)
-	replayCtx, replayCancel := context.WithTimeout(seedCtx, cfg.PerSeedDuration)
+	const replayGrace = 2 * time.Second
+	replayInternalDuration := cfg.PerSeedDuration
+	if replayInternalDuration > replayGrace {
+		replayInternalDuration -= replayGrace
+	}
+	replayCtx, replayCancel := context.WithTimeout(seedCtx,
+		replayInternalDuration+replayGrace)
 	defer replayCancel()
 	args := []string{
 		"-seed", fmt.Sprintf("0x%x", seed.Value),
 		"-celeris-pid", pidStr,
 		"-celeris-port", strconv.Itoa(cfg.CelerisListenPort),
-		"-duration", cfg.PerSeedDuration.String(),
+		"-duration", replayInternalDuration.String(),
 	}
 	if cfg.CelerisCommit != "" {
 		args = append(args, "-commit", cfg.CelerisCommit)
 	}
 	cmd := exec.CommandContext(replayCtx, cfg.ReplayBin, args...)
+	cmd.WaitDelay = replayGrace
 	out, err := cmd.CombinedOutput()
 	res.Duration = time.Since(started)
 	res.Stdout = string(out)
