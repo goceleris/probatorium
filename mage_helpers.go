@@ -165,7 +165,12 @@ type Manifest struct {
 	InstalledPackages   []string          `json:"installed_packages,omitempty"`
 	PriorSysctl         map[string]string `json:"prior_sysctl,omitempty"`
 	InstalledToolchains []any             `json:"installed_toolchains,omitempty"`
-	FetchedVersions     map[string]string `json:"fetched_versions,omitempty"`
+	// FetchedVersions values are heterogeneous — each role writes
+	// whatever the host's resolver returned. rustc / bun / uv stash
+	// a version string; dbservices stashes a []string of image
+	// digests. Decode loosely with `any` so Status doesn't choke
+	// on either shape.
+	FetchedVersions     map[string]any `json:"fetched_versions,omitempty"`
 }
 
 // IsEmpty reports whether the manifest carries no installs / no

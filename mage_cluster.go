@@ -327,15 +327,19 @@ func Deploy() error {
 	}
 	if len(competitorSources) > 0 {
 		vars["competitor_sources"] = competitorSources
-		// gate_needs_docker is what deploy.yml uses to decide whether
-		// to install the dbservices role. Toolchain roles (rust / bun /
-		// python) install themselves under bench_root unconditionally
-		// when their `competitors_with_lang_*` set is non-empty.
-		// Driver-* scenarios that need postgres/redis/memcached set
-		// this knob explicitly through DEPLOY_NEEDS_DBSERVICES.
-		if os.Getenv("DEPLOY_NEEDS_DBSERVICES") == "1" {
-			vars["gate_needs_docker"] = true
-		}
+	}
+	// gate_needs_docker is what deploy.yml's dbservices role guard
+	// keys on. Driver-* scenarios (driver-pg-read / driver-redis-get /
+	// driver-mc-get / driver-session-rw) need postgres + redis +
+	// memcached containers; the bench/validate playbook flips
+	// DEPLOY_NEEDS_DBSERVICES=1 on those runs to install + pull.
+	//
+	// Toolchain roles (rust / bun / python) install themselves under
+	// bench_root unconditionally when their `competitors_with_lang_*`
+	// set is non-empty — those have nothing to do with docker; they
+	// gate on `competitor_sources` instead.
+	if os.Getenv("DEPLOY_NEEDS_DBSERVICES") == "1" {
+		vars["gate_needs_docker"] = true
 	}
 	if os.Getenv("CLUSTER_USE_LAN") == "1" {
 		// inventory.yml's ansible_host template picks up `use_lan` and
