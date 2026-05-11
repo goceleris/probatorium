@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -597,9 +598,30 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// on a 6h period. For short runs we cap at 10 to keep the cell
 	// small enough to bisect on hard fail; production soak picks up
 	// the full sweep via the cadence ramp.
+	//
+	// Walker-budget activation thresholds (see driveTier1):
+	//   adv:     >= 1  (always at least one walker)
+	//   h2c:     >= 10 (one walker per 10)
+	//   ws:      >= 20 (one walker per 20)
+	//   sse:     >= 20 (one walker per 20)
+	//
+	// → Default of 10 leaves WS + SSE slices inactive. Long soaks
+	// (>= 1h) bump to 50 so all five slices fire. Short smoke runs
+	// (<5min) drop to 1 for fast iteration.
+	//
+	// VALIDATE_CONCURRENCY env override wins over the duration-tiered
+	// default — ops can manually tune for capacity tests.
 	concurrency := 10
-	if o.cfg.Duration < 5*time.Minute {
+	switch {
+	case o.cfg.Duration < 5*time.Minute:
 		concurrency = 1
+	case o.cfg.Duration >= time.Hour:
+		concurrency = 50
+	}
+	if v := os.Getenv("VALIDATE_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			concurrency = n
+		}
 	}
 
 	pidCh := make(chan int, 1)
