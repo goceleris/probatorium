@@ -42,6 +42,7 @@ type Config struct {
 	MetricsURL         string
 	PropertyTier       string
 	CelerisCommit      string
+	ReplayBin          string
 }
 
 // DefaultConfig returns the fresh-flag defaults.
@@ -75,6 +76,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.MetricsURL, "metrics-url", c.MetricsURL, "celeris metrics endpoint; default http://<celeris-addr>/debug/vars")
 	fs.StringVar(&c.PropertyTier, "property-tier", c.PropertyTier, "comma-separated tier filter (core,middleware,engine,driver); empty = all")
 	fs.StringVar(&c.CelerisCommit, "celeris-commit", c.CelerisCommit, "celeris commit SHA; recorded in incidents")
+	fs.StringVar(&c.ReplayBin, "replay-bin", c.ReplayBin, "cmd/validator-replay binary; empty disables Tier 3")
 }
 
 // ParseArgs parses argv (without the program name).
@@ -126,6 +128,7 @@ func run(cfg Config) error {
 		CelerisListenAddr:  cfg.CelerisListenAddr,
 		MetricsURL:         cfg.MetricsURL,
 		PropertyTier:       cfg.PropertyTier,
+		ReplayBin:          cfg.ReplayBin,
 	})
 	if err != nil {
 		return err

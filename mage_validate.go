@@ -87,6 +87,12 @@ func Soak() error {
 // runValidatePlaybook is the shared body of Validate and Soak. The
 // soakMode bool toggles validate_soak_mode=1 in the extra-vars; the
 // playbook keys off it to enable the extended invariant set.
+//
+// target=both expands into two ansible-playbook invocations (one per
+// bench_target). Each invocation drives the validator on ONE host
+// — single-host validator drives single-host refapp via the local
+// Driver — so "both" semantically means "run the soak twice in
+// series, once per arch."
 func runValidatePlaybook(duration, target, version string, soakMode bool) error {
 	ts := time.Now().UTC().Format("20060102-150405")
 	kind := "validate"
@@ -102,34 +108,44 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		return err
 	}
 
+	var targets []string
+	switch target {
+	case "both":
+		targets = []string{"msa2-server", "msr1"}
+	default:
+		targets = []string{target}
+	}
+
 	fmt.Printf("\n=== %s ===\n", titleCase(kind))
-	fmt.Printf("  target:       %s\n", target)
+	fmt.Printf("  targets:      %v\n", targets)
 	fmt.Printf("  duration:     %s\n", duration)
 	fmt.Printf("  celeris ver:  %s\n", version)
 	fmt.Printf("  soak mode:    %t\n", soakMode)
 	fmt.Printf("  results:      %s\n\n", resultsDir)
 
-	args := []string{
-		"-i", "inventory.yml",
-		validatePlaybook,
-		"--extra-vars", "validate_target=" + target,
-		"--extra-vars", "validate_duration=" + duration,
-		"--extra-vars", "celeris_version=" + version,
-		"--extra-vars", "results_local_dir=" + resultsDir,
-	}
-	if soakMode {
-		args = append(args, "--extra-vars", "validate_soak_mode=1")
-	}
-	if os.Getenv("CLUSTER_USE_LAN") == "1" {
-		args = append(args, "--extra-vars", "use_lan=true")
-	}
-
-	cmd := exec.Command("ansible-playbook", args...)
-	cmd.Dir = ansibleDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %w", kind, err)
+	for _, t := range targets {
+		args := []string{
+			"-i", "inventory.yml",
+			validatePlaybook,
+			"--extra-vars", "bench_target=" + t,
+			"--extra-vars", "validate_duration=" + duration,
+			"--extra-vars", "celeris_version=" + version,
+			"--extra-vars", "results_local_dir=" + resultsDir,
+		}
+		if soakMode {
+			args = append(args, "--extra-vars", "validate_soak_mode=1")
+		}
+		if os.Getenv("CLUSTER_USE_LAN") == "1" {
+			args = append(args, "--extra-vars", "use_lan=true")
+		}
+		fmt.Printf("\n=== %s on %s ===\n", titleCase(kind), t)
+		cmd := exec.Command("ansible-playbook", args...)
+		cmd.Dir = ansibleDir
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("%s on %s: %w", kind, t, err)
+		}
 	}
 	fmt.Printf("\n=== %s complete: %s ===\n", titleCase(kind), resultsDir)
 	return nil

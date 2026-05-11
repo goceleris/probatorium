@@ -152,6 +152,37 @@ func Deploy() error {
 		}
 	}
 
+	// Validation refapps. Lives in its own go.mod (separate from the
+	// root module because the refapp depends on a specific celeris
+	// version via its own go.mod's `require` line) — we cross-compile
+	// the binary so validate.yml can run it on bench_target alongside
+	// the validator orchestrator.
+	//
+	// Each refapp produces a `refapp-<slug>-<arch>` binary the deploy
+	// playbook pushes to {{ bench_root }}/refapps/<slug>.
+	refappModules := []struct {
+		slug   string
+		module string
+		archs  []string
+	}{
+		{
+			slug:   "auth_session_ratelimit",
+			module: "validation/refapp/auth_session_ratelimit",
+			archs:  []string{"amd64", "arm64"},
+		},
+	}
+	for _, r := range refappModules {
+		for _, arch := range r.archs {
+			jobs = append(jobs, bin{
+				label:  "refapp " + r.slug + " linux/" + arch,
+				module: r.module,
+				pkg:    ".",
+				out:    filepath.Join(stagingDir, "refapp-"+r.slug+"-"+arch),
+				arch:   arch,
+			})
+		}
+	}
+
 	// Go competitors live under servers/<name>/ as their own modules
 	// (matches mage_helpers.go celerisVersion logic — competitor
 	// modules track their own deps). Filter via DEPLOY_COMPETITORS.
@@ -262,6 +293,7 @@ func Deploy() error {
 		"competitor_set": competitorsArg,
 	}
 	competitorBinaries := make(map[string]map[string]string)
+	refappBinaries := make(map[string]map[string]string)
 	for _, j := range jobs {
 		base := filepath.Base(j.out)
 		logical := strings.TrimSuffix(base, "-"+j.arch)
@@ -270,6 +302,14 @@ func Deploy() error {
 			// validator-checker / validator-replay
 			varName := strings.ReplaceAll(logical, "-", "_") + "_binary_" + j.arch
 			vars[varName] = j.out
+			continue
+		}
+		if strings.HasPrefix(logical, "refapp-") {
+			slug := strings.TrimPrefix(logical, "refapp-")
+			if refappBinaries[slug] == nil {
+				refappBinaries[slug] = make(map[string]string)
+			}
+			refappBinaries[slug][j.arch] = j.out
 			continue
 		}
 		// Competitor: strip the "competitor-" prefix to recover the slug.
@@ -281,6 +321,9 @@ func Deploy() error {
 	}
 	if len(competitorBinaries) > 0 {
 		vars["competitor_binaries"] = competitorBinaries
+	}
+	if len(refappBinaries) > 0 {
+		vars["refapp_binaries"] = refappBinaries
 	}
 	if len(competitorSources) > 0 {
 		vars["competitor_sources"] = competitorSources
