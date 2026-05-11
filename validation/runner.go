@@ -97,15 +97,30 @@ type Config struct {
 	// OpenAPIPath is the path to the OpenAPI 3.1 spec for the refapp.
 	OpenAPIPath string
 	// CelerisBin is the path to the validation-build celeris executable
-	// (the refapp binary). Empty means "skip process management" —
-	// useful for the unit tests, where the validator does not actually
-	// launch a server.
+	// (the refapp binary). On the local driver this is a path on the
+	// orchestrator host; on the SSH driver it's a path on the remote
+	// host. Empty means "skip process management" — useful for the
+	// unit tests, where the validator does not actually launch a
+	// server.
 	CelerisBin string
 	// ReplayBin is the path to cmd/validator-replay. Tier 3 forks
 	// this per seed with -seed -celeris-pid -celeris-port -duration.
 	// Empty disables Tier 3 (the orchestrator still keeps the goroutine
 	// alive on ctx but emits no replays).
 	ReplayBin string
+	// DriverMode picks between "local" (default — exec.Cmd-backed
+	// remote.Local) and "ssh" (golang.org/x/crypto/ssh, requires
+	// SSH_AUTH_SOCK + DriverSSHHost). The orchestrator constructs
+	// the driver from these fields at Tier 1 / Tier 3 entry; tests
+	// can stub a custom Driver via the New(...) options surface
+	// when one lands.
+	DriverMode string
+	// DriverSSHUser is the SSH login user. Required when DriverMode
+	// is "ssh"; ignored otherwise.
+	DriverSSHUser string
+	// DriverSSHHost is the SSH host:port (or just host). Required
+	// when DriverMode is "ssh"; ignored otherwise.
+	DriverSSHHost string
 	// CelerisListenAddr is the addr to bind celeris to inside the
 	// orchestrator's lifecycle. Default "127.0.0.1:8080".
 	CelerisListenAddr string
@@ -492,6 +507,38 @@ type Incident struct {
 	RefappPID int
 }
 
+// buildDriver constructs the remote.Driver per the orchestrator's
+// Config.DriverMode. Default is "local" (exec.Cmd-backed). "ssh"
+// uses golang.org/x/crypto/ssh against DriverSSHUser@DriverSSHHost;
+// the binary path lives on the REMOTE host. ssh-agent (SSH_AUTH_SOCK)
+// is the only supported auth surface.
+//
+// The same Driver instance serves both Tier 1 and Tier 3; they
+// share the underlying ssh.Client connection because each tier
+// constructs its own Driver via this helper at entry time.
+func (o *Orchestrator) buildDriver() (remote.Driver, error) {
+	mode := o.cfg.DriverMode
+	if mode == "" {
+		mode = "local"
+	}
+	switch mode {
+	case "local":
+		return remote.NewLocal(o.cfg.CelerisBin), nil
+	case "ssh":
+		if o.cfg.DriverSSHUser == "" || o.cfg.DriverSSHHost == "" {
+			return nil, fmt.Errorf("ssh driver requires DriverSSHUser + DriverSSHHost")
+		}
+		return remote.NewSSH(
+			o.cfg.DriverSSHUser,
+			o.cfg.DriverSSHHost,
+			o.cfg.CelerisBin,
+			remote.SSHConfig{},
+		), nil
+	default:
+		return nil, fmt.Errorf("unknown driver mode %q (want local|ssh)", mode)
+	}
+}
+
 // runTierProperty is the always-on Tier 1 driver. Stub for wave 6 —
 // the production driver lives in a separate subprocess (the loadgen +
 // the validator-checker), here we only set up the rendezvous so the
@@ -511,7 +558,16 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		<-ctx.Done()
 		return
 	}
-	driver := remote.NewLocal(o.cfg.CelerisBin)
+	driver, err := o.buildDriver()
+	if err != nil {
+		violations <- Incident{
+			Tier:        TierProperty,
+			PredicateID: "T1-DRIVE",
+			Message:     fmt.Sprintf("build driver: %v", err),
+			ObservedAt:  time.Now().UTC(),
+		}
+		return
+	}
 	defer func() { _ = driver.Close() }()
 
 	// Tier 1 concurrency sweep cycles 1 -> 10 -> 100 -> 1k -> 10k -> 1
@@ -600,7 +656,16 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 		<-ctx.Done()
 		return
 	}
-	driver := remote.NewLocal(o.cfg.CelerisBin)
+	driver, err := o.buildDriver()
+	if err != nil {
+		violations <- Incident{
+			Tier:        TierReplay,
+			PredicateID: "T3-DRIVE",
+			Message:     fmt.Sprintf("build driver: %v", err),
+			ObservedAt:  time.Now().UTC(),
+		}
+		return
+	}
 	defer func() { _ = driver.Close() }()
 
 	results := make(chan tier3Result, 16)
