@@ -14,20 +14,20 @@ import (
 // adversarialMode names one shape of bad request the walker generates.
 // Each is engineered to find a specific RFC-violation bug class:
 //   - ModeBadChunks       — Transfer-Encoding: chunked with garbage
-//                           framing (negative length, missing terminator,
-//                           CRLF in chunk size).
+//     framing (negative length, missing terminator,
+//     CRLF in chunk size).
 //   - ModeOversizedHeader — single header value > 64KiB. Catches naive
-//                           strncpy / fixed-buffer parsers.
+//     strncpy / fixed-buffer parsers.
 //   - ModeNULInHeader     — embedded \x00 in a header name or value.
-//                           Must be rejected per RFC 9110.
+//     Must be rejected per RFC 9110.
 //   - ModeCRLFInjection   — extra "\r\nX-Smuggled: yes" injected into
-//                           a header value. Catches response-splitting
-//                           bugs.
+//     a header value. Catches response-splitting
+//     bugs.
 //   - ModeSlowloris       — partial request with arbitrarily slow
-//                           subsequent reads. Validates the read timeout
-//                           is bounded.
+//     subsequent reads. Validates the read timeout
+//     is bounded.
 //   - ModeDoubleCL        — two Content-Length headers with different
-//                           values. RFC 9110 §6.4 — must reject.
+//     values. RFC 9110 §6.4 — must reject.
 type adversarialMode int
 
 const (

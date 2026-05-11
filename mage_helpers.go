@@ -170,7 +170,7 @@ type Manifest struct {
 	// a version string; dbservices stashes a []string of image
 	// digests. Decode loosely with `any` so Status doesn't choke
 	// on either shape.
-	FetchedVersions     map[string]any `json:"fetched_versions,omitempty"`
+	FetchedVersions map[string]any `json:"fetched_versions,omitempty"`
 }
 
 // IsEmpty reports whether the manifest carries no installs / no

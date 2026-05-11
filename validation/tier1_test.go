@@ -34,11 +34,11 @@ states:
 
 func TestMarkovStateToPath_KnownStates(t *testing.T) {
 	cases := map[string]string{
-		"home":       "/",
-		"login":      "/api/login",
-		"list_users": "/api/users",
+		"home":        "/",
+		"login":       "/api/login",
+		"list_users":  "/api/users",
 		"user_detail": "/api/users/u1",
-		"logout":     "/api/logout",
+		"logout":      "/api/logout",
 		// Silent states (POST flows reserved for Tier 2 fuzzer).
 		"create_user": "",
 		"update_user": "",

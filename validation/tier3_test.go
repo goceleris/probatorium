@@ -19,13 +19,13 @@ import (
 
 // Helper binaries are built ONCE per `go test` invocation via
 // TestMain so:
-//   1. Concurrent subtests don't trigger the fork-exec storm we'd
-//      hit if each test re-invoked `go build` ("resource
-//      temporarily unavailable" under load).
-//   2. The cached paths stay valid for every test in the package
-//      (t.Cleanup wouldn't work because it'd nuke the binary
-//      after the first test, leaving later ones stuck on missing
-//      files).
+//  1. Concurrent subtests don't trigger the fork-exec storm we'd
+//     hit if each test re-invoked `go build` ("resource
+//     temporarily unavailable" under load).
+//  2. The cached paths stay valid for every test in the package
+//     (t.Cleanup wouldn't work because it'd nuke the binary
+//     after the first test, leaving later ones stuck on missing
+//     files).
 var (
 	cachedPassingReplayPath string
 	cachedFailingReplayPath string
