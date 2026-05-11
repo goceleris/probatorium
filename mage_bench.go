@@ -500,28 +500,52 @@ func mergeBenchResults(resultsDir, celerisVer, target string) (string, error) {
 // returns the most recent bench run regardless of version. Returns
 // an error if no matching run exists — callers (BenchSince) treat
 // that as a hard failure rather than silently passing.
+//
+// Bench results sit DIRECTLY inside the per-run dir (the bench mage
+// target writes the aggregated JSON itself before tarballing); the
+// nested path mode below (used for validate) doesn't apply here.
 func latestBenchResults(version string) (string, error) {
-	return latestResultsByPattern("-bench-", "results.json", version)
+	return latestResultsByPattern("-bench-", "results.json", version, false)
 }
 
 // latestValidateResults returns the path to the most recent
-// results/<ts>-validate-<version>/validate-results.json. Same
-// fallback semantics as latestBenchResults.
+// validate-results.json under results/<ts>-validate-<version>/.
+//
+// The ansible playbook's fetch+extract dance creates one extra level
+// of nesting (the remote-side validate_run_dir name lands inside
+// resultsDir), so this walks one level deeper than latestBenchResults.
+// Same version fallback semantics.
 func latestValidateResults(version string) (string, error) {
-	return latestResultsByPattern("-validate-", "validate-results.json", version)
+	return latestResultsByPattern("-validate-", "validate-results.json", version, true)
 }
 
 // latestResultsByPattern is the shared scan-results-dir helper. dirInfix
-// matches a substring of the dirname ("-bench-" / "-validate-");
-// fileName names the canonical results file inside each matching dir.
-// version, if non-empty, requires the dirname to end with -<infix>-<version>.
-func latestResultsByPattern(dirInfix, fileName, version string) (string, error) {
+// matches a substring of the per-run dirname ("-bench-" / "-validate-");
+// fileName names the canonical results file. version, if non-empty,
+// requires the per-run dirname to end with <infix><version>.
+//
+// When nested is true, the helper also recurses one level into each
+// matching per-run dir — needed for validate runs where the ansible
+// playbook drops a `<ts>-validate-<host>-<refapp>/` directory INSIDE
+// resultsDir as part of fetch+extract. Bench results sit flat, so
+// pass nested=false there.
+func latestResultsByPattern(dirInfix, fileName, version string, nested bool) (string, error) {
 	entries, err := os.ReadDir("results")
 	if err != nil {
 		return "", err
 	}
 	var best string
 	var bestTime time.Time
+	consider := func(path string) {
+		st, err := os.Stat(path)
+		if err != nil {
+			return
+		}
+		if st.ModTime().After(bestTime) {
+			bestTime = st.ModTime()
+			best = path
+		}
+	}
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -533,14 +557,23 @@ func latestResultsByPattern(dirInfix, fileName, version string) (string, error) 
 		if version != "" && !strings.HasSuffix(name, dirInfix+version) {
 			continue
 		}
-		path := filepath.Join("results", name, fileName)
-		st, err := os.Stat(path)
+		runDir := filepath.Join("results", name)
+		// Flat layout: <runDir>/<fileName>.
+		consider(filepath.Join(runDir, fileName))
+		if !nested {
+			continue
+		}
+		// Nested layout: <runDir>/<subdir>/<fileName>. The ansible
+		// playbook can drop one subdir per fetched host, so scan all.
+		subs, err := os.ReadDir(runDir)
 		if err != nil {
 			continue
 		}
-		if st.ModTime().After(bestTime) {
-			bestTime = st.ModTime()
-			best = path
+		for _, sub := range subs {
+			if !sub.IsDir() {
+				continue
+			}
+			consider(filepath.Join(runDir, sub.Name(), fileName))
 		}
 	}
 	if best == "" {
