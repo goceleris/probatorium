@@ -32,6 +32,8 @@ import (
 	"github.com/goceleris/celeris/middleware/ratelimit"
 	"github.com/goceleris/celeris/middleware/recovery"
 	"github.com/goceleris/celeris/middleware/session"
+	"github.com/goceleris/celeris/middleware/sse"
+	"github.com/goceleris/celeris/middleware/websocket"
 )
 
 // User is the in-memory record served at /api/users/{id}. The JSON
@@ -148,6 +150,7 @@ func main() {
 	bind := flag.String("bind", "127.0.0.1:8080", "address:port to listen on")
 	rps := flag.Float64("rps", 1000, "ratelimit RPS per key")
 	burst := flag.Int("burst", 200, "ratelimit burst per key")
+	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto (picks iouring on Linux, std elsewhere)")
 	flag.Parse()
 
 	users := newStore()
@@ -158,9 +161,15 @@ func main() {
 	users.create("alice", "alice@example.com")
 	users.create("bob", "bob@example.com")
 
+	// Engine selection. Production deploys to Linux and wants iouring,
+	// but local dev / CI lint hosts (macOS, Windows) can't load that
+	// engine — config validation rejects it. "auto" picks iouring on
+	// linux, std elsewhere, so this same binary runs both places.
+	engineType := resolveEngine(*engineFlag)
+
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
-		Engine:          celeris.IOUring,
+		Engine:          engineType,
 		Protocol:        celeris.HTTP1,
 		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,
@@ -338,6 +347,68 @@ func registerRoutes(srv *celeris.Server, users *store) {
 			return c.JSON(200, posts)
 		})
 	})
+
+	// /ws — echo WebSocket endpoint. Tier 1's WS torture walker dials
+	// here with malformed frames (fragmented continuation, oversize,
+	// ping floods, unmasked client→server) and asserts the engine
+	// closes the conn with the appropriate close code (1002 / 1003 /
+	// 1009) rather than accepting + echoing the bad bytes.
+	//
+	// CheckOrigin returns true so the validator can dial without a
+	// matching Origin header. Same-origin enforcement is exercised by
+	// the auth-flow tests, not WS torture.
+	srv.GET("/ws", websocket.New(websocket.Config{
+		CheckOrigin: func(c *celeris.Context) bool { return true },
+		// 256 KiB read limit is generous — large enough that legitimate
+		// large messages don't trip it during normal traffic, small
+		// enough that the oversize-payload torture mode (which declares
+		// a 1 GiB length) actually fires the limit check.
+		ReadLimit: 256 * 1024,
+		Handler: func(c *websocket.Conn) {
+			for {
+				mt, msg, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+				if err := c.WriteMessage(mt, msg); err != nil {
+					return
+				}
+			}
+		},
+	}))
+
+	// /events — SSE long-poll endpoint. Tier 1's SSE walker dials
+	// here, holds for a randomised duration, then RSTs the conn
+	// mid-stream. The broker MUST clean up the client slot (no
+	// goroutine leak, no FD leak). The validator's I-CONN-2 invariant
+	// (accepted − closed − active == 0) catches a stuck broker.
+	//
+	// Stream tick is 100ms — fast enough that even a 1s-held client
+	// reliably sees a few events, slow enough that the connection
+	// isn't bottlenecked on broker throughput.
+	srv.GET("/events", sse.New(sse.Config{
+		HeartbeatInterval: 1 * time.Second,
+		Handler: func(client *sse.Client) {
+			tick := time.NewTicker(100 * time.Millisecond)
+			defer tick.Stop()
+			n := 0
+			ctx := client.Context()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					n++
+					if err := client.Send(sse.Event{
+						Event: "tick",
+						Data:  strconv.Itoa(n),
+					}); err != nil {
+						return
+					}
+				}
+			}
+		},
+	}))
 }
 
 // byNameLookup exposes the byName map under a read lock. Placed here
@@ -349,4 +420,28 @@ func (s *store) byNameLookup(name string) (string, bool) {
 	defer s.mu.RUnlock()
 	id, ok := s.byName[name]
 	return id, ok
+}
+
+// resolveEngine maps the -engine flag value to a celeris.EngineType.
+// "auto" preserves the cluster's Linux→iouring default while letting
+// the same binary run on the dev Mac (Std) for smoke tests.
+func resolveEngine(name string) celeris.EngineType {
+	switch name {
+	case "iouring":
+		return celeris.IOUring
+	case "epoll":
+		return celeris.Epoll
+	case "std":
+		return celeris.Std
+	case "adaptive":
+		return celeris.Adaptive
+	case "auto":
+		if isLinux() {
+			return celeris.IOUring
+		}
+		return celeris.Std
+	}
+	// Unknown value — fall back to std rather than crash; the engine
+	// validation will succeed on every platform.
+	return celeris.Std
 }
