@@ -66,6 +66,22 @@ type tier1Config struct {
 	// uses this to fan the PID into forensics capture on hard fail
 	// without having to introspect Driver internals.
 	PIDChan chan<- int
+
+	// TallyCallback, when non-nil, is invoked at a fixed cadence with
+	// the current tally snapshot. The orchestrator uses this to watch
+	// HIGH-severity sub-counters (adv.WrongAccepted, h2c.Crashed,
+	// ws.AcceptedBadFrame) and emit Incidents the FIRST time any of
+	// them goes non-zero — without waiting for the run to end. Keeps
+	// the auto-bisect + forensics pipeline reactive to in-band traffic
+	// findings, not just out-of-band predicate violations.
+	//
+	// Callback is called from a single goroutine; implementations don't
+	// need to be safe for concurrent invocation.
+	TallyCallback func(tier1TallySnapshot)
+
+	// TallyCallbackInterval is how often TallyCallback fires. Zero
+	// defaults to 2 seconds; only used when TallyCallback is non-nil.
+	TallyCallbackInterval time.Duration
 }
 
 // tier1Tally accumulates Tier 1 progress across walker goroutines.
@@ -256,6 +272,27 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			// not to maximise throughput.
 			runSSEKillWalker(ctx, hostPort, "/events", seed, 200*time.Millisecond, sseTallyPtr)
 		}(i)
+	}
+	// Optional periodic tally-callback for reactive incident emission.
+	// Stops when ctx is done; doesn't participate in wg because the
+	// callback is best-effort observation, not workload.
+	if cfg.TallyCallback != nil {
+		interval := cfg.TallyCallbackInterval
+		if interval <= 0 {
+			interval = 2 * time.Second
+		}
+		go func() {
+			tick := time.NewTicker(interval)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					cfg.TallyCallback(tally.snapshot())
+				}
+			}
+		}()
 	}
 	wg.Wait()
 	return tally.snapshot(), nil

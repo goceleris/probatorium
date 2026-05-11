@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -169,6 +170,60 @@ func TestDriveTier1_EndToEnd(t *testing.T) {
 		t.Errorf("error rate too high: %d errors / %d sent (>1%%)", s.RequestsError, s.RequestsSent)
 	}
 	t.Logf("end-to-end tally: %s", s)
+}
+
+// TestDriveTier1_TallyCallbackFires verifies the periodic callback
+// installed by the orchestrator runs at the configured interval and
+// receives a snapshot containing the current counter values. This is
+// the wiring that makes mid-run incident emission possible: the
+// callback fires every few seconds, the orchestrator wraps it with
+// "emit Incident on first non-zero HIGH counter", and `handleIncident`
+// + auto-bisect kick in immediately rather than at end-of-run.
+func TestDriveTier1_TallyCallbackFires(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	var (
+		mu        sync.Mutex
+		callCount int
+		lastSnap  tier1TallySnapshot
+	)
+	cfg := tier1Config{
+		Driver: remote.NewLocal("/bin/sh"),
+		RefappArgs: []string{
+			"-c",
+			`echo "ready addr=` + srv.URL + `"; sleep 10`,
+		},
+		BaseURL:        srv.URL,
+		Matrix:         minimalMatrix(t),
+		Seed:           42,
+		Concurrency:    1,
+		ReadyTimeout:   2 * time.Second,
+		RequestTimeout: time.Second,
+		TallyCallback: func(snap tier1TallySnapshot) {
+			mu.Lock()
+			defer mu.Unlock()
+			callCount++
+			lastSnap = snap
+		},
+		TallyCallbackInterval: 100 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	if _, err := driveTier1(ctx, cfg); err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if callCount < 2 {
+		t.Errorf("TallyCallback called %d times, want >= 2 over 600ms with 100ms interval", callCount)
+	}
+	if lastSnap.RequestsSent == 0 {
+		t.Errorf("last snapshot has zero RequestsSent — callback didn't see live state")
+	}
 }
 
 // TestDriveTier1_AdversarialSliceFires verifies driveTier1's
