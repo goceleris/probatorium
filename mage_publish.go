@@ -218,6 +218,15 @@ func BenchAndValidate() error {
 	} else {
 		fmt.Println("\n=== BenchAndValidate: ValidateDiff (skipped — VALIDATE_TARGET != both) ===")
 	}
+	// PublishValidate runs BEFORE Bench so the validation data lands
+	// on the docs panel even when bench fails downstream. A failing
+	// bench doesn't invalidate the validation findings — they're
+	// independent gates. Best-effort: docs token missing or transient
+	// API failure is not a release blocker.
+	fmt.Println("\n=== BenchAndValidate: PublishValidate ===")
+	if err := PublishValidate(); err != nil {
+		fmt.Printf("warning: PublishValidate failed (best-effort): %v\n", err)
+	}
 	fmt.Println("\n=== BenchAndValidate: Bench ===")
 	if err := Bench(); err != nil {
 		return fmt.Errorf("bench: %w", err)
@@ -225,14 +234,6 @@ func BenchAndValidate() error {
 	fmt.Println("\n=== BenchAndValidate: Publish ===")
 	if err := Publish(); err != nil {
 		return fmt.Errorf("publish: %w", err)
-	}
-	// PublishValidate is best-effort: docs panel for the validation
-	// tier is informational, not gating. A missing validate-results.json
-	// (e.g. an old run that pre-dates the v5 emitter) shouldn't fail
-	// the whole release-gate.
-	fmt.Println("\n=== BenchAndValidate: PublishValidate ===")
-	if err := PublishValidate(); err != nil {
-		fmt.Printf("warning: PublishValidate failed (best-effort): %v\n", err)
 	}
 	fmt.Println("\n=== BenchAndValidate: complete ===")
 	return nil
