@@ -27,6 +27,16 @@ func All() []Spec {
 		IDRV,
 		IENGIOURing,
 		IENGAdaptive,
+		// tier-1-walker predicates — driven by the orchestrator's
+		// TallyCallback (validation/runner.go), NOT this snapshot
+		// loop. Their Predicate is a no-op (always returns true);
+		// the real signal arrives via the orchestrator's violations
+		// channel. Registered here so dry-run output lists them
+		// alongside the snapshot-driven set.
+		IADVAccepted,
+		IH2CCrashed,
+		IWSAccepted,
+		IWSHang,
 	}
 	out := make([]Spec, len(specs))
 	copy(out, specs)

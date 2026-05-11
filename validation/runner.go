@@ -635,16 +635,16 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 				// handling a hard fail; nothing more to do.
 			}
 		}
-		fire("I-ADV-ACCEPTED",
+		fire(properties.IADVAccepted.ID,
 			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
 			snap.Adversarial.WrongAccepted > 0)
-		fire("I-H2C-CRASHED",
+		fire(properties.IH2CCrashed.ID,
 			fmt.Sprintf("h2c churn returned non-HTTP babble (count=%d) — engine crash on upgrade", snap.H2CChurn.Crashed),
 			snap.H2CChurn.Crashed > 0)
-		fire("I-WS-ACCEPTED",
+		fire(properties.IWSAccepted.ID,
 			fmt.Sprintf("server accepted bad WebSocket frame (count=%d) — RFC 6455 violation", snap.WSTorture.AcceptedBadFrame),
 			snap.WSTorture.AcceptedBadFrame > 0)
-		fire("I-WS-HANG",
+		fire(properties.IWSHang.ID,
 			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
 			snap.WSTorture.HangNoClose > 0)
 	}
