@@ -202,18 +202,21 @@ func BenchAndValidate() error {
 	if err := Validate(); err != nil {
 		return fmt.Errorf("validate: %w", err)
 	}
-	// Cross-arch divergence check runs only when BENCH_TARGET=both
-	// (otherwise there's only one side to diff). Best-effort: a
-	// missing second-arch run leaves <2 validate-results.json files
-	// under results/, and ValidateDiff returns "need at least two"
-	// — we log that as a soft skip rather than failing the gate.
-	if os.Getenv("BENCH_TARGET") == "both" {
+	// Cross-arch divergence check runs only when the Validate step
+	// ran against both arches (i.e. VALIDATE_TARGET defaulted to or
+	// was set to "both"). BENCH_TARGET would be the wrong gate here
+	// — that controls the bench step, which happens AFTER the diff
+	// and can legitimately target a single arch even when the
+	// validate cross-checked both. envOrDefault matches the same
+	// fallback Validate / Soak use, so the gate stays consistent
+	// when the user omits the var entirely.
+	if envOrDefault("VALIDATE_TARGET", "both") == "both" {
 		fmt.Println("\n=== BenchAndValidate: ValidateDiff ===")
 		if err := ValidateDiff(); err != nil {
 			return fmt.Errorf("validate-diff: %w", err)
 		}
 	} else {
-		fmt.Println("\n=== BenchAndValidate: ValidateDiff (skipped — BENCH_TARGET != both) ===")
+		fmt.Println("\n=== BenchAndValidate: ValidateDiff (skipped — VALIDATE_TARGET != both) ===")
 	}
 	fmt.Println("\n=== BenchAndValidate: Bench ===")
 	if err := Bench(); err != nil {
