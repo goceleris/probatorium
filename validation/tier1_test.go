@@ -254,6 +254,80 @@ func TestDriveTier1_H2CChurnSliceFires(t *testing.T) {
 	t.Logf("end-to-end h2c churn: %+v", s.H2CChurn)
 }
 
+// TestDriveTier1_WSTortureSliceFires verifies the WS torture walker
+// fans alongside Markov + adversarial + h2c churn. The slice
+// activates at concurrency >= 20; asserts ws.Sent > 0 after the run.
+//
+// The httptest server doesn't speak WS — handshake will 400 — so
+// outcomes will all classify as HandshakeFail. Sent > 0 is the only
+// signal the walker is actually firing.
+func TestDriveTier1_WSTortureSliceFires(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	d := remote.NewLocal("/bin/sh")
+	cfg := tier1Config{
+		Driver: d,
+		RefappArgs: []string{
+			"-c",
+			`echo "ready addr=` + srv.URL + `"; sleep 10`,
+		},
+		BaseURL:        srv.URL,
+		Matrix:         minimalMatrix(t),
+		Seed:           42,
+		Concurrency:    20, // ≥ 20 so one walker is WS torture
+		ReadyTimeout:   2 * time.Second,
+		RequestTimeout: time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	s, err := driveTier1(ctx, cfg)
+	if err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	if s.WSTorture.Sent < 1 {
+		t.Errorf("ws torture walker didn't fire — Sent=%d", s.WSTorture.Sent)
+	}
+	t.Logf("end-to-end ws torture: %+v", s.WSTorture)
+}
+
+// TestDriveTier1_WSDormantBelowThreshold confirms the WS slice stays
+// dormant when concurrency < 20.
+func TestDriveTier1_WSDormantBelowThreshold(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	d := remote.NewLocal("/bin/sh")
+	cfg := tier1Config{
+		Driver: d,
+		RefappArgs: []string{
+			"-c",
+			`echo "ready addr=` + srv.URL + `"; sleep 10`,
+		},
+		BaseURL:        srv.URL,
+		Matrix:         minimalMatrix(t),
+		Seed:           42,
+		Concurrency:    10, // below WS threshold (but above h2c)
+		ReadyTimeout:   2 * time.Second,
+		RequestTimeout: time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	s, err := driveTier1(ctx, cfg)
+	if err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	if s.WSTorture.Sent != 0 {
+		t.Errorf("ws torture fired below threshold — Sent=%d, want 0", s.WSTorture.Sent)
+	}
+}
+
 // TestDriveTier1_H2CDormantBelowThreshold confirms the h2c slice
 // stays dormant when concurrency < 10 — small smoke runs shouldn't
 // pay the h2c churn budget.
