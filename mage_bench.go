@@ -86,6 +86,16 @@ func Bench() error {
 	}
 	if !hasManifest {
 		fmt.Println("=== No bench manifest detected; running Deploy first ===")
+		// Auto-deploy mirrors the bench scope. Without this, the
+		// implicit Deploy installs every toolchain (rust + bun +
+		// python) even for a Go-only bench, which pulls in expensive
+		// network IO (deadsnakes PPA gpg fetch can fail on flaky
+		// hosts) and breaks BENCH_COMPETITORS=axum because it tries
+		// to install python too.
+		if os.Getenv("DEPLOY_COMPETITORS") == "" {
+			_ = os.Setenv("DEPLOY_COMPETITORS", competitors)
+			defer func() { _ = os.Unsetenv("DEPLOY_COMPETITORS") }()
+		}
 		if err := Deploy(); err != nil {
 			return fmt.Errorf("auto-deploy: %w", err)
 		}

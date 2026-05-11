@@ -43,6 +43,14 @@ all:
     bench_root: /tmp/celeris-bench
     results_root: /tmp/celeris-results
     manifest_path: /tmp/celeris-bench-manifest.json
+    # When `use_lan` is passed as an extra-var (mage Deploy / Bench /
+    # Validate / Cleanup all set it under CLUSTER_USE_LAN=1) every host
+    # routes its ansible SSH through the 20G LACP fabric instead of the
+    # Tailscale overlay. Without `use_lan` we fall back to MagicDNS,
+    # which resolves the hostname to the tailnet IP. This is the ONE
+    # place that decision lives — playbooks never compute their own
+    # ansible_host.
+    ansible_host: "{{ lan_ip if (use_lan | default(false) | bool) else inventory_hostname }}"
   children:
     bench_targets:
       hosts:

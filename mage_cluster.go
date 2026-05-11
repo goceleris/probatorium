@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -41,6 +42,12 @@ func Status() error {
 		"-i", "inventory.yml", "all",
 		"-m", "shell",
 		"-a", "uptime -p",
+	}
+	// CLUSTER_USE_LAN=1 routes via the 20G LACP fabric instead of
+	// Tailscale. inventory.yml's `ansible_host` template gates on
+	// `use_lan`, so we just need to pass that flag through.
+	if os.Getenv("CLUSTER_USE_LAN") == "1" {
+		args = append(args, "--extra-vars", "use_lan=true")
 	}
 	cmd := exec.Command("ansible", args...)
 	cmd.Dir = ansibleDir
@@ -165,6 +172,61 @@ func Deploy() error {
 		}
 	}
 
+	// Native competitors (rust / bun / python) compile on the bench
+	// host because we cannot cross-compile a Rust crate that links
+	// system C deps without a sysroot setup we don't have, and bun /
+	// python aren't AOT-compiled at all. The dev Mac's job is to
+	// tarball their source trees + describe how the cluster should
+	// build each one.
+	nativeComps, err := selectNativeCompetitors(competitorsArg)
+	if err != nil {
+		return err
+	}
+	// Union check: any CSV name that resolved to neither a Go nor a
+	// native competitor is a typo / stale label and should fail the
+	// deploy loudly rather than silently doing nothing.
+	if competitorsArg != "" && competitorsArg != "all" && competitorsArg != "go-only" {
+		seen := make(map[string]bool, len(goComps)+len(nativeComps))
+		for _, n := range goComps {
+			seen[n] = true
+		}
+		for _, n := range nativeComps {
+			seen[n] = true
+		}
+		for _, raw := range strings.Split(competitorsArg, ",") {
+			n := strings.TrimSpace(raw)
+			if n != "" && !seen[n] {
+				return fmt.Errorf("DEPLOY_COMPETITORS: %q resolves to neither a Go competitor nor a native one", n)
+			}
+		}
+	}
+	competitorSources := make(map[string]map[string]any, len(nativeComps))
+	for _, c := range nativeComps {
+		spec, ok := nativeBuildSpecs[c]
+		if !ok {
+			return fmt.Errorf("native competitor %q has no build spec in nativeBuildSpecs", c)
+		}
+		tarball := filepath.Join(stagingDir, "native-"+c+".tar.gz")
+		if err := tarballNativeSource(c, tarball); err != nil {
+			return fmt.Errorf("tarball %s: %w", c, err)
+		}
+		entry := map[string]any{
+			"lang":    spec.lang,
+			"tarball": tarball,
+		}
+		if spec.buildCmd != "" {
+			entry["build_cmd"] = spec.buildCmd
+		}
+		if spec.binaryRel != "" {
+			entry["binary_rel"] = spec.binaryRel
+		}
+		if spec.moduleTarget != "" {
+			entry["module_target"] = spec.moduleTarget
+		}
+		competitorSources[c] = entry
+		fmt.Printf("Tarballed native source for %s (%s)...\n", c, spec.lang)
+	}
+
 	for _, j := range jobs {
 		fmt.Printf("Cross-compiling %s...\n", j.label)
 		if err := crossCompileGoBinary(j.module, j.pkg, j.out, j.arch); err != nil {
@@ -220,12 +282,23 @@ func Deploy() error {
 	if len(competitorBinaries) > 0 {
 		vars["competitor_binaries"] = competitorBinaries
 	}
-	if os.Getenv("CLUSTER_USE_LAN") == "1" {
-		vars["use_lan"] = true
-		// Pin each host's ansible_host to its LAN IP for this run.
-		for h, ip := range lanIPs {
-			vars["ansible_host_"+strings.ReplaceAll(h, "-", "_")] = ip
+	if len(competitorSources) > 0 {
+		vars["competitor_sources"] = competitorSources
+		// gate_needs_docker is what deploy.yml uses to decide whether
+		// to install the dbservices role. Toolchain roles (rust / bun /
+		// python) install themselves under bench_root unconditionally
+		// when their `competitors_with_lang_*` set is non-empty.
+		// Driver-* scenarios that need postgres/redis/memcached set
+		// this knob explicitly through DEPLOY_NEEDS_DBSERVICES.
+		if os.Getenv("DEPLOY_NEEDS_DBSERVICES") == "1" {
+			vars["gate_needs_docker"] = true
 		}
+	}
+	if os.Getenv("CLUSTER_USE_LAN") == "1" {
+		// inventory.yml's ansible_host template picks up `use_lan` and
+		// routes every host through its lan_ip. No per-host overrides
+		// needed here.
+		vars["use_lan"] = true
 	}
 
 	varsJSON, err := json.MarshalIndent(vars, "", "  ")
@@ -250,8 +323,8 @@ func Deploy() error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("deploy: %w", err)
 	}
-	fmt.Printf("\n=== Deploy complete (%d binaries cross-compiled, %d competitors) ===\n",
-		len(jobs), len(competitorBinaries))
+	fmt.Printf("\n=== Deploy complete (%d binaries cross-compiled, %d Go competitors, %d native competitors) ===\n",
+		len(jobs), len(competitorBinaries), len(competitorSources))
 	return nil
 }
 
@@ -276,6 +349,9 @@ func Cleanup() error {
 		cleanupPlaybook,
 		"--limit", hosts,
 	}
+	if os.Getenv("CLUSTER_USE_LAN") == "1" {
+		args = append(args, "--extra-vars", "use_lan=true")
+	}
 	cmd := exec.Command("ansible-playbook", args...)
 	cmd.Dir = ansibleDir
 	cmd.Stdout = os.Stdout
@@ -294,7 +370,12 @@ func Cleanup() error {
 //	"<csv>"     — comma-separated list of names; each must exist
 //	              under servers/ with a go.mod.
 //
-// Empty input behaves like "all" (matches the Deploy default).
+// Empty input behaves like "all" (matches the Deploy default). A CSV
+// that names a non-Go competitor (axum, hono, fastapi, ...) silently
+// drops it from THIS list because the native-competitor selector
+// (selectNativeCompetitors) handles those entries on the parallel
+// path. Names that exist in neither selector are caught by the union
+// check in Deploy.
 func selectGoCompetitors(spec string) ([]string, error) {
 	all, err := scanGoCompetitors()
 	if err != nil {
@@ -304,23 +385,21 @@ func selectGoCompetitors(spec string) ([]string, error) {
 	case "", "all", "go-only":
 		return all, nil
 	}
-	want := make(map[string]bool)
-	for _, name := range strings.Split(spec, ",") {
-		if name = strings.TrimSpace(name); name != "" {
-			want[name] = true
-		}
-	}
 	have := make(map[string]bool, len(all))
 	for _, n := range all {
 		have[n] = true
 	}
 	var out []string
-	for name := range want {
-		if !have[name] {
-			return nil, fmt.Errorf("DEPLOY_COMPETITORS: %q not found under servers/ (or missing go.mod)", name)
+	for _, name := range strings.Split(spec, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
 		}
-		out = append(out, name)
+		if have[name] {
+			out = append(out, name)
+		}
 	}
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -354,6 +433,143 @@ func scanGoCompetitors() ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// nativeBuildSpec captures the deploy-time recipe for one non-Go
+// adapter. The fields mirror what `ansible/tasks/build_native_
+// competitor.yml` reads off `competitor_sources[<slug>]`:
+//
+//   - lang         — picks the dispatch path (rust → shell + symlink,
+//     bun / python → role's build_competitor.yml).
+//   - buildCmd     — generic shell run for rust; empty for bun /
+//     python (their roles own the build).
+//   - binaryRel    — path inside the source tree to the produced
+//     artefact, used by the rust symlink step. Empty
+//     for bun (role hardcodes `<src>/server`) and
+//     python (no symlink, launcher lives at the
+//     destination directly).
+//   - moduleTarget — uvicorn import target for python adapters.
+//     Defaulted to "app.server:app" in the role if
+//     unset, but we set it explicitly for clarity.
+type nativeBuildSpec struct {
+	lang         string
+	buildCmd     string
+	binaryRel    string
+	moduleTarget string
+}
+
+// nativeBuildSpecs is the deploy-time recipe table for every non-Go
+// adapter under servers/. Keep in lockstep with servers/servers.go's
+// Registry — a new NativeBinary adapter without an entry here will be
+// rejected by Deploy with a clear error.
+//
+// binary_rel for rust adapters matches the per-adapter Cargo.toml
+// `[[bin]] name` (cargo writes the binary as `target/<profile>/<name>`).
+// The bench cluster always uses the release-fat profile defined in
+// each Cargo.toml; -Ctarget-cpu=native goes via the ansible env block.
+var nativeBuildSpecs = map[string]nativeBuildSpec{
+	"axum": {
+		lang:      "rust",
+		buildCmd:  "cargo build --profile release-fat",
+		binaryRel: "target/release-fat/probatorium-axum-server",
+	},
+	"actix-web": {
+		lang:      "rust",
+		buildCmd:  "cargo build --profile release-fat",
+		binaryRel: "target/release-fat/probatorium-actix-server",
+	},
+	"ntex": {
+		lang:      "rust",
+		buildCmd:  "cargo build --profile release-fat",
+		binaryRel: "target/release-fat/probatorium-ntex-server",
+	},
+	"hono":    {lang: "bun"},
+	"elysia":  {lang: "bun"},
+	"fastapi": {lang: "python", moduleTarget: "app.server:app"},
+}
+
+// selectNativeCompetitors returns the list of non-Go competitor slugs
+// matching DEPLOY_COMPETITORS, mirroring selectGoCompetitors for
+// nativeBuildSpecs. Recognised values:
+//
+//	"all"       — every entry in nativeBuildSpecs.
+//	"go-only"   — empty list (no native competitors).
+//	"<csv>"     — only the names that appear in nativeBuildSpecs.
+//	              Names that DON'T appear are silently dropped here
+//	              because they're handled by selectGoCompetitors.
+//	              That keeps DEPLOY_COMPETITORS=gin,axum doing the
+//	              expected thing (gin via Go path, axum via native).
+//
+// Empty input behaves like "all" (matches Deploy default).
+func selectNativeCompetitors(spec string) ([]string, error) {
+	if spec == "go-only" {
+		return nil, nil
+	}
+	all := make([]string, 0, len(nativeBuildSpecs))
+	for name := range nativeBuildSpecs {
+		all = append(all, name)
+	}
+	sort.Strings(all)
+	if spec == "" || spec == "all" {
+		return all, nil
+	}
+	have := make(map[string]bool, len(all))
+	for _, n := range all {
+		have[n] = true
+	}
+	var out []string
+	for _, name := range strings.Split(spec, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if have[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// tarballNativeSource gzip-tars the *contents* of servers/<slug>/
+// into dest. Important: the tarball has NO top-level directory entry
+// — `ansible.builtin.unarchive` extracts into the configured dest
+// without stripping a leading dir, so packaging `servers/axum/...`
+// would land Cargo.toml at `competitors-src/axum/axum/Cargo.toml`.
+// Using `-C servers/<slug> .` instead drops Cargo.toml at the right
+// level (`competitors-src/axum/Cargo.toml`).
+//
+// Excludes caches we'd never want to ship:
+//
+//   - node_modules/  (bun resolves these fresh on the cluster)
+//   - dist/          (bun build output; built per-host)
+//   - target/        (cargo build cache; built per-host)
+//   - .venv/         (uv venv; built per-host)
+//   - .git/, *.pyc, __pycache__/ (general noise)
+//
+// Uses `tar` directly because the stdlib archive/tar doesn't speak
+// gzip and the macOS BSD tar handles the exclude patterns we need.
+func tarballNativeSource(slug, dest string) error {
+	src := filepath.Join("servers", slug)
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("native source dir %s: %w", src, err)
+	}
+	// The destination tarball must not exist yet — tar will overwrite
+	// it but we want a clean state.
+	_ = os.Remove(dest)
+	cmd := exec.Command("tar", "czf", dest,
+		"--exclude=node_modules",
+		"--exclude=dist",
+		"--exclude=target",
+		"--exclude=.venv",
+		"--exclude=.git",
+		"--exclude=__pycache__",
+		"--exclude=*.pyc",
+		"-C", src,
+		".",
+	)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // runHostsParallel fans out fn over hosts and returns the first

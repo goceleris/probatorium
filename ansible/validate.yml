@@ -84,7 +84,7 @@
         - name: Stop any prior server-under-test
           become: true
           ansible.builtin.shell: |
-            pkill -f "[/]tmp/celeris-bench/competitors/" 2>/dev/null
+            pkill -f "[c]ompetitors/" 2>/dev/null
             pkill -x server 2>/dev/null
             true
           changed_when: false
@@ -153,9 +153,9 @@
         - name: Stop server-under-test
           become: true
           ansible.builtin.shell: |
-            pkill -TERM -f "[/]tmp/celeris-bench/competitors/" 2>/dev/null
+            pkill -TERM -f "[c]ompetitors/" 2>/dev/null
             sleep 2
-            pkill -KILL -f "[/]tmp/celeris-bench/competitors/" 2>/dev/null
+            pkill -KILL -f "[c]ompetitors/" 2>/dev/null
             pkill -x server 2>/dev/null
             pkill -x validator 2>/dev/null
             pkill -x validator-checker 2>/dev/null

@@ -37,7 +37,7 @@
         for name in runner loadgen observer validator validator-checker validator-replay conformance server; do
           pkill -x "$name" 2>/dev/null
         done
-        pkill -f "[/]tmp/celeris-bench/competitors/" 2>/dev/null
+        pkill -f "[c]ompetitors/" 2>/dev/null
         pkill -f "[/]tmp/celeris-bench/competitors-src/" 2>/dev/null
         true
       changed_when: false
