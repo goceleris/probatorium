@@ -134,7 +134,7 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 	if os.Getenv("PROBATORIUM_VALIDATE_DRIVER") == "ssh" {
 		playbook = "validate-ssh.yml"
 	}
-	for _, t := range targets {
+	runOne := func(t string) error {
 		args := []string{
 			"-i", "inventory.yml",
 			playbook,
@@ -156,6 +156,28 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("%s on %s: %w", kind, t, err)
+		}
+		return nil
+	}
+
+	// VALIDATE_PARALLEL=1 fans the targets over their own goroutines
+	// so a two-arch soak takes wall-clock N hours instead of 2N. The
+	// validator binary on msa2-client multiplexes — one process per
+	// target — and each target writes to a distinct validate_run_dir
+	// on the remote, so the two streams don't collide.
+	//
+	// Default (sequential) keeps stdout interleaving readable for
+	// dev-iteration runs; PARALLEL is for the 3-day cluster soak.
+	if os.Getenv("VALIDATE_PARALLEL") == "1" && len(targets) > 1 {
+		fmt.Printf("\n=== %s targets running in parallel (VALIDATE_PARALLEL=1) ===\n", titleCase(kind))
+		if err := runHostsParallel(targets, runOne); err != nil {
+			return err
+		}
+	} else {
+		for _, t := range targets {
+			if err := runOne(t); err != nil {
+				return err
+			}
 		}
 	}
 	fmt.Printf("\n=== %s complete: %s ===\n", titleCase(kind), resultsDir)
