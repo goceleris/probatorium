@@ -26,7 +26,10 @@
 
 set -euo pipefail
 
-VENV_DIR="$(cd "$(dirname "$0")" && pwd)/.venv"
+# Hardcoded paths because the launcher's $0 is the competitors/<slug>
+# file under bench_root — the venv lives at a sibling top-level dir
+# (python-venvs/<slug>) so we can't derive it from $0 portably.
+VENV_DIR="{{ competitor_venv_path }}"
 SRC_DIR="{{ competitor_src_path }}"
 APP_TARGET="{{ competitor_module_target }}"
 

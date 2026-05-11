@@ -79,4 +79,9 @@
       # build was bundled with — Bun's built-in conditionals (e.g.
       # framework dev-mode toggles) honour it at runtime, not just at
       # bundle time.
-      exec "{{ bench_root }}/bun/bin/bun" run "$(dirname "$0")/dist/server" "$@"
+      #
+      # readlink -f resolves the symlink in {{ bench_root }}/competitors/
+      # so dirname lands on the source dir (where dist/server actually
+      # exists), not the symlink's parent dir (which has no dist/).
+      SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+      exec "{{ bench_root }}/bun/bin/bun" run "$SCRIPT_DIR/dist/server" "$@"
