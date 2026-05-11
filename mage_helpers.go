@@ -60,13 +60,6 @@ func envOrDefault(k, d string) string {
 	return d
 }
 
-// shellQuote wraps s in single quotes safely for /bin/sh, so a value
-// containing spaces or shell metacharacters survives a literal `eval`
-// or `export` line. Embedded single quotes are split-and-re-escaped.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
 // requireAnsible returns a friendly error if ansible-playbook is not
 // on PATH. Every cluster-driven target calls this first so the dev
 // gets a one-line install hint instead of an opaque exec error.
@@ -103,47 +96,6 @@ func crossCompileGoBinary(moduleDir, pkgRel, outputPath, arch string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
-}
-
-// buildSourceTarball runs `git archive HEAD | gzip > dst` to capture
-// the current branch state. Tracked files only — no /vendor, no
-// .git, no local artifacts. Identical to what dependabot or the
-// GitHub PR diff observes.
-func buildSourceTarball(dst string) error {
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	cmd := exec.Command("git", "archive", "--format=tar.gz", "HEAD")
-	cmd.Stdout = out
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-// findLoadgenSibling walks up from cwd looking for a directory at any
-// ancestor level that contains a "loadgen/cmd/loadgen/main.go" file.
-// Returns the absolute path to the loadgen repo root if found.
-// Used by Deploy to locate the goceleris/loadgen sibling clone for
-// cross-compile (sibling layout is the dev default; CI fetches via
-// temp module instead).
-func findLoadgenSibling() (string, bool) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", false
-	}
-	dir := cwd
-	for {
-		candidate := filepath.Join(dir, "loadgen", "cmd", "loadgen", "main.go")
-		if _, err := os.Stat(candidate); err == nil {
-			return filepath.Join(dir, "loadgen"), true
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", false
-		}
-		dir = parent
-	}
 }
 
 // Manifest mirrors the JSON written to /tmp/celeris-bench-manifest.json
@@ -231,33 +183,6 @@ func manifestRead(host string) (bool, Manifest, error) {
 		return false, m, fmt.Errorf("parse manifest from %s: %w", host, err)
 	}
 	return true, m, nil
-}
-
-// forwardEnvAsExports renders every os.Environ() entry whose key
-// matches one of prefixes as a `export k='v'` line. Used to forward
-// dev-machine env knobs (BENCH_*, VALIDATE_*, FUZZ_*) into a remote
-// shell via an extra-vars exports block.
-//
-// A prefix matches if the key is exactly the prefix, has the prefix
-// followed by an underscore, or — when the prefix itself ends in `_`
-// — has the prefix as a literal substring at the start. Values are
-// shell-quoted so spaces and metacharacters survive eval.
-func forwardEnvAsExports(prefixes []string) string {
-	var sb strings.Builder
-	for _, kv := range os.Environ() {
-		eq := strings.IndexByte(kv, '=')
-		if eq < 0 {
-			continue
-		}
-		k := kv[:eq]
-		for _, p := range prefixes {
-			if k == p || strings.HasPrefix(k, p+"_") || (strings.HasSuffix(p, "_") && strings.HasPrefix(k, p)) {
-				fmt.Fprintf(&sb, "export %s=%s\n", k, shellQuote(kv[eq+1:]))
-				break
-			}
-		}
-	}
-	return sb.String()
 }
 
 // celerisVersion auto-detects the celeris release tag pinned in the

@@ -109,7 +109,7 @@ func Deploy() error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(stagingDir)
+	defer func() { _ = os.RemoveAll(stagingDir) }()
 
 	type bin struct {
 		label  string
