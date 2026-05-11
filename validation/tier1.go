@@ -59,6 +59,13 @@ type tier1Config struct {
 	// design — the timeout caps individual victim requests, not the
 	// adversary's send loop.
 	RequestTimeout time.Duration
+
+	// PIDChan, when non-nil, receives the refapp's OS pid exactly
+	// once — after Driver.Start succeeds and waitForReady returns.
+	// Capacity 1; driveTier1 non-blocking sends. The orchestrator
+	// uses this to fan the PID into forensics capture on hard fail
+	// without having to introspect Driver internals.
+	PIDChan chan<- int
 }
 
 // tier1Tally accumulates Tier 1 progress across walker goroutines.
@@ -114,6 +121,16 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 
 	if err := waitForReady(ctx, proc, cfg.ReadyTimeout); err != nil {
 		return tally.snapshot(), fmt.Errorf("tier1: refapp not ready: %w", err)
+	}
+
+	// Refapp is bound; surface its PID for the orchestrator's
+	// forensics path. Non-blocking — if the channel is full (the
+	// orchestrator only ever reads once) we drop silently.
+	if cfg.PIDChan != nil {
+		select {
+		case cfg.PIDChan <- proc.PID():
+		default:
+		}
 	}
 
 	// Tier 1 production-step #1: fan walkers.
