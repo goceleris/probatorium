@@ -171,6 +171,47 @@ func TestDriveTier1_EndToEnd(t *testing.T) {
 	t.Logf("end-to-end tally: %s", s)
 }
 
+// TestDriveTier1_AdversarialSliceFires verifies driveTier1's
+// adversarial walker fans alongside the Markov walker — the Tier 1
+// fan-out at concurrency >= 5 reserves one walker for adversarial
+// traffic, which targets the same hostPort with malformed bytes.
+//
+// Asserts that adversarial Sent > 0 after the run; the well-rejected
+// vs accepted balance is a separate predicate concern handled by the
+// orchestrator (not under test here).
+func TestDriveTier1_AdversarialSliceFires(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	d := remote.NewLocal("/bin/sh")
+	cfg := tier1Config{
+		Driver: d,
+		RefappArgs: []string{
+			"-c",
+			`echo "ready addr=` + srv.URL + `"; sleep 10`,
+		},
+		BaseURL:        srv.URL,
+		Matrix:         minimalMatrix(t),
+		Seed:           42,
+		Concurrency:    5, // ≥ 5 so one walker is adversarial
+		ReadyTimeout:   2 * time.Second,
+		RequestTimeout: time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	s, err := driveTier1(ctx, cfg)
+	if err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	if s.Adversarial.Sent < 1 {
+		t.Errorf("adversarial walker didn't fire — Sent=%d", s.Adversarial.Sent)
+	}
+	t.Logf("end-to-end adversarial: %+v", s.Adversarial)
+}
+
 func TestDriveTier1_RefappNeverReadyTimesOut(t *testing.T) {
 	// Driver prints nothing — waitForReady should time out.
 	d := remote.NewLocal("/bin/sh")
