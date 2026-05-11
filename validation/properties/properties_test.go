@@ -311,3 +311,34 @@ func TestHeapSlope_Degenerate(t *testing.T) {
 		t.Fatal("zero TS variance should yield 0 slope")
 	}
 }
+
+func TestTier1Walker_PredicatesRegistered(t *testing.T) {
+	for _, want := range []string{"I-ADV-ACCEPTED", "I-H2C-CRASHED", "I-WS-ACCEPTED", "I-WS-HANG"} {
+		spec, ok := ByID(want)
+		if !ok {
+			t.Errorf("Spec %q missing from registry", want)
+			continue
+		}
+		if spec.Tier != "tier-1-walker" {
+			t.Errorf("Spec %q tier: got %q, want tier-1-walker", want, spec.Tier)
+		}
+		// Predicate must be a no-op that returns true — the real
+		// evaluation happens in the orchestrator's TallyCallback.
+		ok, msg := spec.Predicate(&Snapshot{}, Context{})
+		if !ok {
+			t.Errorf("Spec %q Predicate returned !ok with msg %q; want always-true no-op", want, msg)
+		}
+	}
+}
+
+func TestTier1Walker_ByTierFiltersCorrectly(t *testing.T) {
+	got := ByTier("tier-1-walker")
+	if len(got) != 4 {
+		t.Errorf("ByTier(tier-1-walker): got %d specs, want 4", len(got))
+	}
+	for _, s := range got {
+		if s.Tier != "tier-1-walker" {
+			t.Errorf("ByTier returned %q with wrong tier %q", s.ID, s.Tier)
+		}
+	}
+}
