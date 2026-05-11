@@ -156,3 +156,82 @@ func equalStringSlices(a, b []string) bool {
 
 // readFile is a tiny wrapper used only by tests.
 func readFile(p string) ([]byte, error) { return osReadFile(p) }
+
+// TestRunTierProperty_EmptyCelerisBinIsNoop verifies the orchestrator
+// short-circuits Tier 1 when no refapp binary is configured — the
+// unit-test default. Without this guard every test that calls Run()
+// would fail trying to exec an empty path.
+func TestRunTierProperty_EmptyCelerisBinIsNoop(t *testing.T) {
+	cfg := Default()
+	cfg.Duration = 50 * time.Millisecond
+	cfg.OutDir = t.TempDir()
+	// CelerisBin left empty: Tier 1 should park.
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	violations := make(chan Incident, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	// Drain runs synchronously — Tier 1 must return on ctx.Done().
+	o.runTierProperty(ctx, violations)
+	if len(violations) != 0 {
+		t.Errorf("unexpected violation in empty-bin mode: %+v", <-violations)
+	}
+}
+
+// TestRunTierProperty_NilMatrixIsNoop verifies Tier 1 parks (not
+// errors) when CelerisBin is set but the matrix didn't load — the
+// orchestrator should never run un-replayable traffic.
+func TestRunTierProperty_NilMatrixIsNoop(t *testing.T) {
+	cfg := Default()
+	cfg.Duration = 50 * time.Millisecond
+	cfg.OutDir = t.TempDir()
+	cfg.CelerisBin = "/usr/bin/true" // present but matrix missing
+	// MarkovPath empty -> o.matrix stays nil.
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	violations := make(chan Incident, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	o.runTierProperty(ctx, violations)
+	if len(violations) != 0 {
+		t.Errorf("nil matrix should park silently, not emit a violation")
+	}
+}
+
+// TestRunTierProperty_BinaryNotFoundEmitsIncident verifies Tier 1
+// surfaces driver Start failures as synthetic incidents (not silent
+// noops) so the orchestrator's incident pipeline captures the cause.
+func TestRunTierProperty_BinaryNotFoundEmitsIncident(t *testing.T) {
+	cfg := Default()
+	cfg.Duration = time.Second
+	cfg.OutDir = t.TempDir()
+	cfg.CelerisBin = "/this/path/does/not/exist/probatorium-test"
+	cfg.MarkovPath = "markov/auth_session_ratelimit.yaml"
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	violations := make(chan Incident, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	o.runTierProperty(ctx, violations)
+	select {
+	case inc := <-violations:
+		if inc.PredicateID != "T1-DRIVE" {
+			t.Errorf("PredicateID: got %q, want T1-DRIVE", inc.PredicateID)
+		}
+		if inc.Tier != TierProperty {
+			t.Errorf("Tier: got %v, want TierProperty", inc.Tier)
+		}
+		if !strings.Contains(strings.ToLower(inc.Message), "no such file") &&
+			!strings.Contains(strings.ToLower(inc.Message), "not found") {
+			t.Errorf("Message should mention missing binary, got %q", inc.Message)
+		}
+	default:
+		t.Fatal("expected incident on missing binary, got none")
+	}
+}
