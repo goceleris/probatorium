@@ -440,17 +440,17 @@ func scanGoCompetitors() ([]string, error) {
 // competitor.yml` reads off `competitor_sources[<slug>]`:
 //
 //   - lang         — picks the dispatch path (rust → shell + symlink,
-//                    bun / python → role's build_competitor.yml).
+//     bun / python → role's build_competitor.yml).
 //   - buildCmd     — generic shell run for rust; empty for bun /
-//                    python (their roles own the build).
+//     python (their roles own the build).
 //   - binaryRel    — path inside the source tree to the produced
-//                    artefact, used by the rust symlink step. Empty
-//                    for bun (role hardcodes `<src>/server`) and
-//                    python (no symlink, launcher lives at the
-//                    destination directly).
+//     artefact, used by the rust symlink step. Empty
+//     for bun (role hardcodes `<src>/server`) and
+//     python (no symlink, launcher lives at the
+//     destination directly).
 //   - moduleTarget — uvicorn import target for python adapters.
-//                    Defaulted to "app.server:app" in the role if
-//                    unset, but we set it explicitly for clarity.
+//     Defaulted to "app.server:app" in the role if
+//     unset, but we set it explicitly for clarity.
 type nativeBuildSpec struct {
 	lang         string
 	buildCmd     string
