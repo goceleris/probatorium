@@ -11,11 +11,14 @@ import (
 	"strings"
 )
 
-// Publish targets. Publish dispatches the latest results.json to
-// goceleris/docs via repository_dispatch — the docs repo's GitHub
-// Action picks up the payload and rebuilds the bench page from the
-// canonical v5.0 schema. BenchAndValidate composes the gate that
-// release branches actually run end-to-end.
+// Publish targets. Publish dispatches the latest bench results.json
+// to goceleris/docs via repository_dispatch — the docs repo's
+// GitHub Action picks up the payload and rebuilds the bench page
+// from the canonical v5.0 schema. PublishValidate does the same for
+// the most recent Validate run's validate-results.json (different
+// event_type so the docs workflow can fan to a different panel).
+// BenchAndValidate composes the gate that release branches actually
+// run end-to-end.
 
 // Publish reads the latest results/<...>-bench-<ver>/results.json and
 // POSTs it to goceleris/docs as a repository_dispatch event of type
@@ -105,11 +108,82 @@ func Publish() error {
 	return nil
 }
 
+// PublishValidate reads the latest results/<ts>-validate-<ver>/
+// validate-results.json and POSTs it to goceleris/docs as a
+// repository_dispatch event of type "celeris-validate". The docs
+// workflow consumes the payload to regenerate the validation panel
+// (tier-1 workload mix counts, tier-3 seed-corpus pass/fail rate).
+//
+// Same auth contract as Publish: DOCS_TOKEN env or `gh auth token`.
+func PublishValidate() error {
+	version := os.Getenv("PUBLISH_VERSION")
+	if version == "" {
+		v, err := celerisVersion()
+		if err != nil {
+			return err
+		}
+		version = v
+	}
+
+	resultsPath, err := latestValidateResults(version)
+	if err != nil {
+		resultsPath, err = latestValidateResults("")
+		if err != nil {
+			return fmt.Errorf("no validate results to publish: %w", err)
+		}
+	}
+
+	data, err := os.ReadFile(resultsPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", resultsPath, err)
+	}
+	var doc any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return fmt.Errorf("parse %s: %w", resultsPath, err)
+	}
+
+	token, err := resolveDocsToken()
+	if err != nil {
+		return err
+	}
+
+	payload := map[string]any{
+		"event_type": "celeris-validate",
+		"client_payload": map[string]any{
+			"version": version,
+			"results": doc,
+			"source":  resultsPath,
+		},
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Publishing %s (%s) → goceleris/docs (validate)...\n", resultsPath, version)
+	cmd := exec.Command("gh", "api",
+		"-X", "POST",
+		"/repos/goceleris/docs/dispatches",
+		"-H", "Accept: application/vnd.github+json",
+		"-H", "Authorization: token "+token,
+		"--input", "-",
+	)
+	cmd.Stdin = bytes.NewReader(payloadJSON)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("gh api dispatch: %w", err)
+	}
+	fmt.Println("Published.")
+	return nil
+}
+
 // BenchAndValidate is the release-gate composition: Validate first
 // (long-running invariant + property suite), then on success a fresh
-// Bench, then Publish. Failure at any step short-circuits — a release
-// that can't pass Validate has no business shipping a bench number,
-// and a publish that runs without a fresh bench is misleading.
+// Bench, then Publish + PublishValidate. Failure at any step
+// short-circuits — a release that can't pass Validate has no
+// business shipping a bench number, and a publish that runs without
+// a fresh bench is misleading.
 //
 // Reuses every BENCH_*, VALIDATE_*, CELERIS_VERSION, CLUSTER_USE_LAN,
 // and DOCS_TOKEN env knob from the underlying targets — set them
@@ -126,6 +200,14 @@ func BenchAndValidate() error {
 	fmt.Println("\n=== BenchAndValidate: Publish ===")
 	if err := Publish(); err != nil {
 		return fmt.Errorf("publish: %w", err)
+	}
+	// PublishValidate is best-effort: docs panel for the validation
+	// tier is informational, not gating. A missing validate-results.json
+	// (e.g. an old run that pre-dates the v5 emitter) shouldn't fail
+	// the whole release-gate.
+	fmt.Println("\n=== BenchAndValidate: PublishValidate ===")
+	if err := PublishValidate(); err != nil {
+		fmt.Printf("warning: PublishValidate failed (best-effort): %v\n", err)
 	}
 	fmt.Println("\n=== BenchAndValidate: complete ===")
 	return nil

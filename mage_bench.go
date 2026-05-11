@@ -501,6 +501,21 @@ func mergeBenchResults(resultsDir, celerisVer, target string) (string, error) {
 // an error if no matching run exists — callers (BenchSince) treat
 // that as a hard failure rather than silently passing.
 func latestBenchResults(version string) (string, error) {
+	return latestResultsByPattern("-bench-", "results.json", version)
+}
+
+// latestValidateResults returns the path to the most recent
+// results/<ts>-validate-<version>/validate-results.json. Same
+// fallback semantics as latestBenchResults.
+func latestValidateResults(version string) (string, error) {
+	return latestResultsByPattern("-validate-", "validate-results.json", version)
+}
+
+// latestResultsByPattern is the shared scan-results-dir helper. dirInfix
+// matches a substring of the dirname ("-bench-" / "-validate-");
+// fileName names the canonical results file inside each matching dir.
+// version, if non-empty, requires the dirname to end with -<infix>-<version>.
+func latestResultsByPattern(dirInfix, fileName, version string) (string, error) {
 	entries, err := os.ReadDir("results")
 	if err != nil {
 		return "", err
@@ -512,13 +527,13 @@ func latestBenchResults(version string) (string, error) {
 			continue
 		}
 		name := e.Name()
-		if !strings.Contains(name, "-bench-") {
+		if !strings.Contains(name, dirInfix) {
 			continue
 		}
-		if version != "" && !strings.HasSuffix(name, "-bench-"+version) {
+		if version != "" && !strings.HasSuffix(name, dirInfix+version) {
 			continue
 		}
-		path := filepath.Join("results", name, "results.json")
+		path := filepath.Join("results", name, fileName)
 		st, err := os.Stat(path)
 		if err != nil {
 			continue
@@ -529,10 +544,11 @@ func latestBenchResults(version string) (string, error) {
 		}
 	}
 	if best == "" {
+		flavor := strings.TrimSuffix(strings.TrimPrefix(dirInfix, "-"), "-")
 		if version == "" {
-			return "", fmt.Errorf("no bench results under results/")
+			return "", fmt.Errorf("no %s results under results/", flavor)
 		}
-		return "", fmt.Errorf("no bench results for version %s under results/", version)
+		return "", fmt.Errorf("no %s results for version %s under results/", flavor, version)
 	}
 	return best, nil
 }

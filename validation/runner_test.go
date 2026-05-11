@@ -14,6 +14,108 @@ import (
 // adding a wrapper for synthetic testing later only changes one line.
 func osReadFile(p string) ([]byte, error) { return os.ReadFile(p) }
 
+func TestWriteValidateResults_NeitherTierRan_NoFile(t *testing.T) {
+	cfg := Default()
+	cfg.OutDir = t.TempDir()
+	cfg.CelerisBin = "/usr/bin/true"
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Neither tier ran. writeValidateResults should be a no-op:
+	// no file created, no error.
+	if err := o.writeValidateResults(time.Now()); err != nil {
+		t.Fatalf("writeValidateResults: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.OutDir, "validate-results.json")); !os.IsNotExist(err) {
+		t.Errorf("expected no validate-results.json, got err=%v", err)
+	}
+}
+
+func TestWriteValidateResults_Tier1OnlyEmitsDocument(t *testing.T) {
+	cfg := Default()
+	cfg.OutDir = t.TempDir()
+	cfg.CelerisBin = "/usr/bin/true"
+	cfg.Target = "msa2-server"
+	cfg.Arch = "amd64"
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Synthesise a populated tier1 snapshot — the kind the
+	// orchestrator would stash on clean exit.
+	o.tier1Snapshot = tier1TallySnapshot{
+		RequestsSent: 1000,
+		Requests2xx:  900,
+		Requests4xx:  50,
+		Requests5xx:  10,
+		Adversarial:  adversarialSnapshot{Sent: 100, WellRejected: 95, WrongAccepted: 5},
+		H2CChurn:     h2cSnapshot{Sent: 50, Declined: 50},
+		WSTorture:    wsSnapshot{Sent: 10, ClosedCorrectly: 10},
+		SSEKill:      sseSnapshot{Sent: 5, KilledMidStream: 5},
+	}
+	o.tier1Ran = true
+
+	if err := o.writeValidateResults(time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("writeValidateResults: %v", err)
+	}
+	// File must exist + contain the canonical schema_version + the
+	// adv/h2c/ws/sse sub-tallies.
+	raw, err := osReadFile(filepath.Join(cfg.OutDir, "validate-results.json"))
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	for _, want := range []string{
+		`"schema_version": "5.0"`,
+		`"host_arch_pair": "msa2-server-amd64"`,
+		`"adv_sent": 100`,
+		`"adv_wrong_accepted": 5`,
+		`"h2c_sent": 50`,
+		`"ws_sent": 10`,
+		`"sse_killed_mid_stream": 5`,
+	} {
+		if !bytes.Contains(raw, []byte(want)) {
+			t.Errorf("missing %q in document, got:\n%s", want, raw)
+		}
+	}
+	// Tier3 should NOT be present (didn't run).
+	if bytes.Contains(raw, []byte(`"tier_3"`)) {
+		t.Errorf("tier_3 should be absent when Tier 3 didn't run, got:\n%s", raw)
+	}
+}
+
+func TestWriteValidateResults_BothTiersEmitFull(t *testing.T) {
+	cfg := Default()
+	cfg.OutDir = t.TempDir()
+	cfg.CelerisBin = "/usr/bin/true"
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	o.tier1Ran = true
+	o.tier1Snapshot = tier1TallySnapshot{RequestsSent: 1}
+	o.tier3Ran = true
+	o.tier3Snapshot = tier3TallySnapshot{SeedsAttempted: 42, SeedsPassed: 40, SeedsFailed: 1, SeedsErrored: 1}
+
+	if err := o.writeValidateResults(time.Now()); err != nil {
+		t.Fatalf("writeValidateResults: %v", err)
+	}
+	raw, err := osReadFile(filepath.Join(cfg.OutDir, "validate-results.json"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	for _, want := range []string{
+		`"seeds_attempted": 42`,
+		`"seeds_passed": 40`,
+		`"seeds_failed": 1`,
+		`"seeds_errored": 1`,
+	} {
+		if !bytes.Contains(raw, []byte(want)) {
+			t.Errorf("missing %q in document, got:\n%s", want, raw)
+		}
+	}
+}
+
 func TestPlan_NonEmptyAfterNew(t *testing.T) {
 	cfg := Default()
 	cfg.Duration = time.Hour
