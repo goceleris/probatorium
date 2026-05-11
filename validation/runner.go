@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/goceleris/probatorium/report"
 	"github.com/goceleris/probatorium/validation/corpus"
 	"github.com/goceleris/probatorium/validation/fault"
 	"github.com/goceleris/probatorium/validation/markov"
@@ -171,6 +172,15 @@ type Orchestrator struct {
 	matrix     *markov.Matrix
 	seeds      []corpus.Seed
 	predicates []properties.Spec
+
+	// Final tier tallies, stashed by the tier funcs on clean exit so
+	// Run() can compose the v5 validation document. Both stay
+	// zero-value when the tier didn't run (e.g. dry-run, empty seeds).
+	// Accessed only after wg.Wait() returns, so no mutex needed.
+	tier1Snapshot tier1TallySnapshot
+	tier3Snapshot tier3TallySnapshot
+	tier1Ran      bool
+	tier3Ran      bool
 }
 
 // Plan is the deterministic schedule [Orchestrator.Run] would execute.
@@ -413,6 +423,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		return nil
 	}
 
+	startedAt := time.Now().UTC()
 	rootCtx, cancel := context.WithTimeout(ctx, o.cfg.Duration)
 	defer cancel()
 
@@ -456,11 +467,23 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			}
 			cancel()
 			wg.Wait()
+			// Hard-fail path: emit the validate-results doc with
+			// whatever partial tallies the tiers managed to stash
+			// before the violation triggered abort. The incident
+			// dossier carries the bug specifics; the v5 doc gives
+			// dashboards the same shape as a clean exit.
+			_ = o.writeValidateResults(startedAt)
 			return o.handleIncident(rootCtx, inc)
 		case <-checkpoint.C:
 			_ = o.writeCheckpoint()
 		case <-rootCtx.Done():
 			wg.Wait()
+			// Compose the canonical v5 validation document from the
+			// per-tier snapshots stashed on the orchestrator. The
+			// publish flow picks this up; the sidecar tier1_tally.json
+			// / tier3_tally.json stay in the OutDir for postmortem
+			// inspection.
+			_ = o.writeValidateResults(startedAt)
 			return nil
 		}
 	}
@@ -612,7 +635,11 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		return
 	}
 	// Clean exit (ctx done). The final tally lands in the run
-	// directory for postmortem inspection.
+	// directory for postmortem inspection AND is stashed on the
+	// orchestrator so Run() can compose the canonical v5 document
+	// at the end of the run.
+	o.tier1Snapshot = tally
+	o.tier1Ran = true
 	_ = writeJSON(filepath.Join(o.cfg.OutDir, "tier1_tally.json"), tally)
 }
 
@@ -714,6 +741,8 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 		}
 		return
 	}
+	o.tier3Snapshot = tally
+	o.tier3Ran = true
 	_ = writeJSON(filepath.Join(o.cfg.OutDir, "tier3_tally.json"), tally)
 }
 
@@ -810,6 +839,78 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 // and shrink_plan.json so the orchestrator can act on what it has.
 func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Incident) error {
 	return captureForensicsLive(ctx, dir, inc.RefappPID, o.cfg.CelerisListenAddr)
+}
+
+// writeValidateResults composes the canonical v5 validation document
+// from per-tier snapshots stashed by the tier funcs on clean exit,
+// and writes it to OutDir/validate-results.json. The publish flow
+// picks this up; per-tier sidecar JSONs (tier1_tally.json,
+// tier3_tally.json) stay in OutDir for postmortem inspection.
+//
+// Returns nil silently when neither tier ran (dry-run / empty seeds),
+// so callers can `defer o.writeValidateResults(...)` without
+// branching.
+func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
+	if !o.tier1Ran && !o.tier3Ran {
+		return nil
+	}
+	doc := report.Document{
+		SchemaVersion: report.SchemaVersion,
+		HostArchPair:  o.cfg.Target + "-" + o.cfg.Arch,
+		Validation: &report.ValidationResults{
+			StartedAt:  startedAt,
+			FinishedAt: time.Now().UTC(),
+		},
+	}
+	if o.tier1Ran {
+		s := o.tier1Snapshot
+		doc.Validation.Tier1 = &report.Tier1Summary{
+			RequestsSent:  s.RequestsSent,
+			Requests2xx:   s.Requests2xx,
+			Requests4xx:   s.Requests4xx,
+			Requests5xx:   s.Requests5xx,
+			RequestsError: s.RequestsError,
+			Adversarial: map[string]int64{
+				"adv_sent":               s.Adversarial.Sent,
+				"adv_well_rejected":      s.Adversarial.WellRejected,
+				"adv_wrong_accepted":     s.Adversarial.WrongAccepted,
+				"adv_hang_until_timeout": s.Adversarial.HangUntilTimeout,
+			},
+			H2CChurn: map[string]int64{
+				"h2c_sent":     s.H2CChurn.Sent,
+				"h2c_upgraded": s.H2CChurn.Upgraded,
+				"h2c_declined": s.H2CChurn.Declined,
+				"h2c_crashed":  s.H2CChurn.Crashed,
+				"h2c_hang":     s.H2CChurn.Hang,
+			},
+			WSTorture: map[string]int64{
+				"ws_sent":               s.WSTorture.Sent,
+				"ws_upgraded":           s.WSTorture.Upgraded,
+				"ws_handshake_fail":     s.WSTorture.HandshakeFail,
+				"ws_closed_correctly":   s.WSTorture.ClosedCorrectly,
+				"ws_accepted_bad_frame": s.WSTorture.AcceptedBadFrame,
+				"ws_hang_no_close":      s.WSTorture.HangNoClose,
+			},
+			SSEKill: map[string]int64{
+				"sse_sent":                s.SSEKill.Sent,
+				"sse_established":         s.SSEKill.Established,
+				"sse_events_read":         s.SSEKill.EventsRead,
+				"sse_killed_mid_stream":   s.SSEKill.KilledMidStream,
+				"sse_server_closed_early": s.SSEKill.ServerClosedEarly,
+				"sse_handshake_fail":      s.SSEKill.HandshakeFail,
+			},
+		}
+	}
+	if o.tier3Ran {
+		s := o.tier3Snapshot
+		doc.Validation.Tier3 = &report.Tier3Summary{
+			SeedsAttempted: s.SeedsAttempted,
+			SeedsPassed:    s.SeedsPassed,
+			SeedsFailed:    s.SeedsFailed,
+			SeedsErrored:   s.SeedsErrored,
+		}
+	}
+	return writeJSON(filepath.Join(o.cfg.OutDir, "validate-results.json"), doc)
 }
 
 // writeCheckpoint persists a JSON snapshot of orchestrator state. The

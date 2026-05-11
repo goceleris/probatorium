@@ -147,6 +147,53 @@ type ValidationResults struct {
 	// harness. Empty when the fault-injection tier was disabled for
 	// this run.
 	FaultInjectionSeed string `json:"fault_injection_seed,omitempty"`
+
+	// Tier1 and Tier3 are the per-tier final tallies emitted by the
+	// validator orchestrator. Optional — pure-bench runs leave both
+	// unset; validate runs always populate Tier1 (the always-on
+	// workload), and additionally populate Tier3 when a seed corpus
+	// is present. Tier 2 (RESTler) doesn't have a stable summary
+	// shape yet; once it stabilises we'll add a Tier2 field here.
+	Tier1 *Tier1Summary `json:"tier_1,omitempty"`
+	Tier3 *Tier3Summary `json:"tier_3,omitempty"`
+}
+
+// Tier1Summary mirrors the validator's tier1TallySnapshot in the
+// canonical v5 shape. The struct is duplicated (not imported from the
+// validation package) to keep report/ a leaf node — it owns the wire
+// shape, nothing else.
+//
+// New per-slice sub-tallies land as optional nested struct fields so
+// older readers can ignore unknown keys.
+type Tier1Summary struct {
+	RequestsSent  int64 `json:"requests_sent"`
+	Requests2xx   int64 `json:"requests_2xx"`
+	Requests4xx   int64 `json:"requests_4xx"`
+	Requests5xx   int64 `json:"requests_5xx"`
+	RequestsError int64 `json:"requests_error"`
+
+	// Per-slice sub-tallies (one per workload-mix slice from
+	// validator-prod issue #55). Each is a plain `map[string]int64`
+	// rather than a typed struct so this schema doesn't have to
+	// re-version every time the validator adds a counter.
+	//
+	// Canonical keys (validator package writes these):
+	//   adversarial  → adv_sent, adv_well_rejected, adv_wrong_accepted, adv_hang_until_timeout
+	//   h2c_churn    → h2c_sent, h2c_upgraded, h2c_declined, h2c_crashed, h2c_hang
+	//   ws_torture   → ws_sent, ws_upgraded, ws_handshake_fail, ws_closed_correctly, ws_accepted_bad_frame, ws_hang_no_close
+	//   sse_kill     → sse_sent, sse_established, sse_events_read, sse_killed_mid_stream, sse_server_closed_early, sse_handshake_fail
+	Adversarial map[string]int64 `json:"adversarial,omitempty"`
+	H2CChurn    map[string]int64 `json:"h2c_churn,omitempty"`
+	WSTorture   map[string]int64 `json:"ws_torture,omitempty"`
+	SSEKill     map[string]int64 `json:"sse_kill,omitempty"`
+}
+
+// Tier3Summary mirrors the validator's tier3TallySnapshot.
+type Tier3Summary struct {
+	SeedsAttempted int64 `json:"seeds_attempted"`
+	SeedsPassed    int64 `json:"seeds_passed"`
+	SeedsFailed    int64 `json:"seeds_failed"`
+	SeedsErrored   int64 `json:"seeds_errored"`
 }
 
 // SoakSummary captures the long-running soak metrics. Populated only
