@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -223,6 +224,51 @@ func TestDriveTier1_TallyCallbackFires(t *testing.T) {
 	}
 	if lastSnap.RequestsSent == 0 {
 		t.Errorf("last snapshot has zero RequestsSent — callback didn't see live state")
+	}
+}
+
+// TestDriveTier1_SnapshotPathWritesPeriodically verifies the new
+// SnapshotPath knob persists a fresh tier1_tally.json on every
+// callback tick, so long-running soaks have mid-run visibility
+// without waiting for the orchestrator's end-of-run flush.
+func TestDriveTier1_SnapshotPathWritesPeriodically(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	snapPath := dir + "/tier1_tally.json"
+	cfg := tier1Config{
+		Driver: remote.NewLocal("/bin/sh"),
+		RefappArgs: []string{
+			"-c",
+			`echo "ready addr=` + srv.URL + `"; sleep 10`,
+		},
+		BaseURL:               srv.URL,
+		Matrix:                minimalMatrix(t),
+		Seed:                  42,
+		Concurrency:           1,
+		ReadyTimeout:          2 * time.Second,
+		RequestTimeout:        time.Second,
+		SnapshotPath:          snapPath,
+		TallyCallbackInterval: 100 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	if _, err := driveTier1(ctx, cfg); err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	data, err := os.ReadFile(snapPath)
+	if err != nil {
+		t.Fatalf("snapshot path not written: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("snapshot file empty")
+	}
+	if !strings.Contains(string(data), `"requests_sent"`) {
+		t.Errorf("snapshot missing canonical field; got:\n%s", data)
 	}
 }
 

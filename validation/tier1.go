@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,6 +84,14 @@ type tier1Config struct {
 	// TallyCallbackInterval is how often TallyCallback fires. Zero
 	// defaults to 2 seconds; only used when TallyCallback is non-nil.
 	TallyCallbackInterval time.Duration
+
+	// SnapshotPath, when non-empty, names the path the tier writes the
+	// current tally snapshot to on every TallyCallback tick. Letting
+	// long-running soaks (24h, 72h, 10d) surface mid-run progress to
+	// monitoring tools that ssh in + cat the file. Best-effort: a
+	// write failure logs nothing — the in-memory tally is still
+	// authoritative.
+	SnapshotPath string
 }
 
 // tier1Tally accumulates Tier 1 progress across walker goroutines.
@@ -273,10 +283,11 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			runSSEKillWalker(ctx, hostPort, "/events", seed, 200*time.Millisecond, sseTallyPtr)
 		}(i)
 	}
-	// Optional periodic tally-callback for reactive incident emission.
-	// Stops when ctx is done; doesn't participate in wg because the
-	// callback is best-effort observation, not workload.
-	if cfg.TallyCallback != nil {
+	// Optional periodic tally-callback + snapshot-to-disk for reactive
+	// incident emission AND mid-run progress visibility. Stops when ctx
+	// is done; doesn't participate in wg because the observation work
+	// is best-effort, not workload.
+	if cfg.TallyCallback != nil || cfg.SnapshotPath != "" {
 		interval := cfg.TallyCallbackInterval
 		if interval <= 0 {
 			interval = 2 * time.Second
@@ -284,12 +295,23 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		go func() {
 			tick := time.NewTicker(interval)
 			defer tick.Stop()
+			emit := func() {
+				snap := tally.snapshot()
+				if cfg.TallyCallback != nil {
+					cfg.TallyCallback(snap)
+				}
+				if cfg.SnapshotPath != "" {
+					if data, err := json.MarshalIndent(snap, "", "  "); err == nil {
+						_ = os.WriteFile(cfg.SnapshotPath, data, 0o644)
+					}
+				}
+			}
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-tick.C:
-					cfg.TallyCallback(tally.snapshot())
+					emit()
 				}
 			}
 		}()
