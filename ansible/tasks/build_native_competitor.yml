@@ -49,7 +49,10 @@
 # cleanup wipes every byte cargo wrote. Other languages don't read
 # RUSTFLAGS / CARGO_TARGET_DIR so leaving them set unconditionally is a
 # no-op for them.
-- name: "{{ comp.key }} | run build command"
+# Rust path: run the generic build_cmd shell (cargo build ...) under
+# the right env and symlink the produced binary. Bun/python adapters
+# skip this — their language-specific role takes over below.
+- name: "{{ comp.key }} | run rust build command"
   environment:
     PATH: >-
       {{ bench_root }}/rustup/cargo/bin:{{ bench_root }}/bun/bin:{{ bench_root }}/uv/bin:{{ ansible_env.PATH }}
@@ -57,9 +60,6 @@
     RUSTUP_HOME: "{{ bench_root }}/rustup/rustup"
     CARGO_TARGET_DIR: "{{ bench_root }}/competitors-src/{{ comp.key }}/target"
     RUSTFLAGS: "-C target-cpu=native"
-    BUN_INSTALL: "{{ bench_root }}/bun"
-    UV_CACHE_DIR: "{{ bench_root }}/uv-cache"
-    UV_PYTHON_INSTALL_DIR: "{{ bench_root }}/uv-python"
     XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
     XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
   ansible.builtin.shell: |
@@ -68,15 +68,38 @@
     {{ comp.value.build_cmd | default('true') }}
   args:
     executable: /bin/bash
-  when: comp.value.lang != 'python'
+  when: comp.value.lang == 'rust'
 
-- name: "{{ comp.key }} | symlink built binary into competitors/"
+- name: "{{ comp.key }} | symlink built rust binary into competitors/"
   ansible.builtin.file:
     src: "{{ bench_root }}/competitors-src/{{ comp.key }}/{{ comp.value.binary_rel }}"
     dest: "{{ bench_root }}/competitors/{{ comp.key }}"
     state: link
     force: true
-  when: comp.value.lang != 'python'
+  when: comp.value.lang == 'rust'
+
+# Bun adapters: dispatch to the bun role's parameterized
+# build_competitor task list. It runs `bun install --production`,
+# `bun build --target=bun --minify` to produce dist/server (a single-file
+# bundle), and writes a POSIX-sh launcher next to it. The shared
+# build_native_competitor.yml then symlinks the launcher into
+# competitors/<slug>.
+- name: "{{ comp.key }} | build bun competitor (deps + bundle + launcher)"
+  ansible.builtin.include_role:
+    name: bun
+    tasks_from: build_competitor.yml
+  vars:
+    competitor_name: "{{ comp.key }}"
+    competitor_src: "{{ bench_root }}/competitors-src/{{ comp.key }}"
+  when: comp.value.lang == 'bun'
+
+- name: "{{ comp.key }} | symlink bun launcher into competitors/"
+  ansible.builtin.file:
+    src: "{{ bench_root }}/competitors-src/{{ comp.key }}/server"
+    dest: "{{ bench_root }}/competitors/{{ comp.key }}"
+    state: link
+    force: true
+  when: comp.value.lang == 'bun'
 
 # Python adapters: dispatch to the python role's parameterized
 # build_competitor task list. It creates the venv, installs deps via uv,
