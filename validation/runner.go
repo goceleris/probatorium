@@ -440,6 +440,12 @@ type Incident struct {
 	Message     string
 	Snapshot    properties.Snapshot
 	ObservedAt  time.Time
+	// RefappPID, when > 0, identifies the refapp process the
+	// orchestrator should sample /proc + pprof from during forensics
+	// capture. Tier 1 captures this at refapp Start; Tier 3 captures
+	// it per-seed. Zero suppresses /proc-dependent forensics (the
+	// dossier still records what we have).
+	RefappPID int
 }
 
 // runTierProperty is the always-on Tier 1 driver. Stub for wave 6 —
@@ -473,6 +479,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		concurrency = 1
 	}
 
+	pidCh := make(chan int, 1)
 	cfg := tier1Config{
 		Driver:      driver,
 		RefappArgs:  []string{"-bind", o.cfg.CelerisListenAddr},
@@ -480,7 +487,15 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		Matrix:      o.matrix,
 		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
 		Concurrency: concurrency,
+		// Driver.Start happens inside driveTier1 so the PID isn't
+		// available until after waitForReady. The PIDChan callback
+		// fires once the refapp is bound; the orchestrator stashes
+		// the value so handleIncident can drive /proc + pprof
+		// forensics against the same process Tier 1 is exercising.
+		PIDChan: pidCh,
 	}
+	var pid int
+	go func() { pid = <-pidCh }() // best-effort: stays 0 until startup
 	tally, err := driveTier1(ctx, cfg)
 	if err != nil && ctx.Err() == nil {
 		// driveTier1 failure that isn't the parent-cancel — surface
@@ -492,6 +507,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 			PredicateID: "T1-DRIVE",
 			Message:     err.Error(),
 			ObservedAt:  time.Now().UTC(),
+			RefappPID:   pid,
 		}
 		return
 	}
@@ -563,6 +579,7 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 				PredicateID: predicate,
 				Message:     summariseTier3Stderr(res),
 				ObservedAt:  time.Now().UTC(),
+				RefappPID:   res.RefappPID,
 			}:
 			case <-ctx.Done():
 				return
@@ -637,7 +654,7 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 	if err := writeJSON(filepath.Join(dir, "incident.json"), dossier); err != nil {
 		return err
 	}
-	if err := o.captureForensics(ctx, dir); err != nil {
+	if err := o.captureForensics(ctx, dir, inc); err != nil {
 		// Don't propagate — the incident is already recorded.
 		fmt.Fprintf(os.Stderr, "validation: forensics: %v\n", err)
 	}
@@ -655,36 +672,18 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 	return fmt.Errorf("validation: %s violated by %s: %s", inc.PredicateID, inc.Tier, inc.Message)
 }
 
-// captureForensics gathers gcore, /proc/<pid>/{maps,status,smaps,fd,stack}
-// snapshots, and pprof profiles into dir. Best-effort: every step is
-// independently fault-tolerant.
-func (o *Orchestrator) captureForensics(ctx context.Context, dir string) error {
-	// Lookup the celeris pid we launched (left at o.cfg.CelerisListenAddr).
-	// For wave 6 we just emit a forensics manifest with the commands
-	// the operator would run; wave 7 (which owns the pidfile) does
-	// the real capture.
-	manifest := []string{
-		"gcore -o " + filepath.Join(dir, "celeris.core") + " <celeris-pid>",
-		"cat /proc/<celeris-pid>/maps > " + filepath.Join(dir, "maps"),
-		"cat /proc/<celeris-pid>/status > " + filepath.Join(dir, "status"),
-		"cat /proc/<celeris-pid>/smaps > " + filepath.Join(dir, "smaps"),
-		"ls /proc/<celeris-pid>/fd > " + filepath.Join(dir, "fd.txt"),
-		"cat /proc/<celeris-pid>/stack > " + filepath.Join(dir, "stack"),
-		"curl -s http://<addr>/debug/pprof/heap     > " + filepath.Join(dir, "heap.pprof"),
-		"curl -s http://<addr>/debug/pprof/goroutine > " + filepath.Join(dir, "goroutine.pprof"),
-		"curl -s http://<addr>/debug/pprof/block    > " + filepath.Join(dir, "block.pprof"),
-		"curl -s http://<addr>/debug/pprof/mutex    > " + filepath.Join(dir, "mutex.pprof"),
-	}
-	return os.WriteFile(filepath.Join(dir, "forensics_commands.txt"),
-		[]byte(joinLines(manifest)), 0o644)
-}
-
-func joinLines(lines []string) string {
-	out := ""
-	for _, l := range lines {
-		out += l + "\n"
-	}
-	return out
+// captureForensics gathers gcore, /proc/<pid>/{maps,status,smaps,
+// fd,stack} snapshots, pprof profiles, and dmesg into dir. Delegates
+// to captureForensicsLive (validation/forensics.go); per-file errors
+// are turned into `.missing` markers so a partial capture still
+// produces a usable dossier.
+//
+// inc.RefappPID drives the /proc + gcore legs. Zero (or a stale PID
+// from a process that died before forensics fired) writes a
+// forensics_status.txt stub; the dossier still includes incident.json
+// and shrink_plan.json so the orchestrator can act on what it has.
+func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Incident) error {
+	return captureForensicsLive(ctx, dir, inc.RefappPID, o.cfg.CelerisListenAddr)
 }
 
 // writeCheckpoint persists a JSON snapshot of orchestrator state. The

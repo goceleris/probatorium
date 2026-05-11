@@ -102,6 +102,12 @@ type tier3Result struct {
 	Stderr   string
 	Stdout   string
 	Duration time.Duration
+	// RefappPID is the OS pid of the refapp that hosted this seed.
+	// Recorded so the orchestrator's forensics path can sample /proc
+	// + pprof from the same process the failing replay observed —
+	// even if the refapp has since been SIGTERMed, the dossier
+	// records the PID for postmortem cross-reference.
+	RefappPID int
 }
 
 // driveTier3 walks the seed corpus until ctx is done. For each seed:
@@ -197,13 +203,17 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3
 		return res
 	}
 
+	// Refapp is bound; record its PID so the orchestrator's
+	// forensics layer can target it on a non-zero replay exit.
+	res.RefappPID = proc.PID()
+
 	// Fork validator-replay against the now-bound refapp. We use
 	// exec.CommandContext directly here — the validator-replay binary
 	// is a probatorium-owned tool we always run locally, never via
 	// remote.Driver. (Even when the orchestrator drives celeris via
 	// SSH, validator-replay runs on the same host as the refapp so
 	// its fault-injection commands hit the right /proc namespace.)
-	pidStr := strconv.Itoa(proc.PID())
+	pidStr := strconv.Itoa(res.RefappPID)
 	replayCtx, replayCancel := context.WithTimeout(seedCtx, cfg.PerSeedDuration)
 	defer replayCancel()
 	args := []string{
