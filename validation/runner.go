@@ -101,6 +101,11 @@ type Config struct {
 	// useful for the unit tests, where the validator does not actually
 	// launch a server.
 	CelerisBin string
+	// ReplayBin is the path to cmd/validator-replay. Tier 3 forks
+	// this per seed with -seed -celeris-pid -celeris-port -duration.
+	// Empty disables Tier 3 (the orchestrator still keeps the goroutine
+	// alive on ctx but emits no replays).
+	ReplayBin string
 	// CelerisListenAddr is the addr to bind celeris to inside the
 	// orchestrator's lifecycle. Default "127.0.0.1:8080".
 	CelerisListenAddr string
@@ -504,36 +509,107 @@ func (o *Orchestrator) runTierRESTler(ctx context.Context, violations chan<- Inc
 }
 
 // runTierReplay is Tier 3. Walks the seed corpus, replaying each
-// seed deterministically on a fresh celeris. The replay loop is in
-// cmd/validator-replay; this method's job is to feed seeds at the
-// configured cadence and surface violations.
+// seed deterministically on a fresh celeris. Per-seed lifecycle
+// lives in driveTier3 (validation/tier3.go); this method's job is
+// to set up the (Driver, ReplayBin, Seeds) tuple and surface every
+// failing seed as an Incident on the orchestrator's channel.
+//
+// Same short-circuits as runTierProperty: empty CelerisBin parks
+// (unit-test / dry-run mode), empty seeds parks (corpus loading
+// must have failed; the dry-run plan already surfaced that). A
+// missing ReplayBin (cmd/validator-replay) is also fatal because
+// per-seed determinism depends on the replay binary's deterministic
+// expansion of the fault schedule.
 func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Incident) {
+	if o.cfg.CelerisBin == "" {
+		<-ctx.Done()
+		return
+	}
 	if len(o.seeds) == 0 {
 		<-ctx.Done()
 		return
 	}
-	// 200 seeds/h = 18s between seeds. Cap the ticker for short runs.
-	cadence := 18 * time.Second
-	if o.cfg.Duration < 10*time.Minute {
-		cadence = o.cfg.Duration / time.Duration(len(o.seeds)+1)
-		if cadence < 100*time.Millisecond {
-			cadence = 100 * time.Millisecond
-		}
+	replayBin := o.cfg.ReplayBin
+	if replayBin == "" {
+		// Conventional install layout: validator-replay sits beside
+		// the validator binary itself, under bench_root in the
+		// production playbook. The orchestrator can't infer that
+		// path on its own, so the absence is a (logged) noop rather
+		// than a hard error — keeps Tier 1 running even if Tier 3
+		// can't.
+		<-ctx.Done()
+		return
 	}
-	idx := 0
-	tick := time.NewTicker(cadence)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-			seed := o.seeds[idx%len(o.seeds)]
-			// Wave 6: we record the seed we WOULD have replayed; the
-			// real subprocess fork lives in cmd/validator-replay.
-			_ = seed
-			idx++
+	driver := remote.NewLocal(o.cfg.CelerisBin)
+	defer func() { _ = driver.Close() }()
+
+	results := make(chan tier3Result, 16)
+	// Funnel non-zero exits into the orchestrator's incident channel
+	// in a background goroutine so driveTier3 itself stays focused
+	// on the per-seed loop.
+	go func() {
+		for res := range results {
+			if res.ExitCode == 0 {
+				continue
+			}
+			predicate := "T3-SEED-FAIL"
+			if res.ExitCode < 0 {
+				predicate = "T3-DRIVE"
+			}
+			select {
+			case violations <- Incident{
+				Tier:        TierReplay,
+				Seed:        res.Seed,
+				PredicateID: predicate,
+				Message:     summariseTier3Stderr(res),
+				ObservedAt:  time.Now().UTC(),
+			}:
+			case <-ctx.Done():
+				return
+			}
 		}
+	}()
+
+	cfg := tier3Config{
+		Driver:        driver,
+		RefappArgs:    []string{"-bind", o.cfg.CelerisListenAddr},
+		ReplayBin:     replayBin,
+		Seeds:         o.seeds,
+		CelerisCommit: o.cfg.CelerisCommit,
+	}
+	tally, err := driveTier3(ctx, cfg, results)
+	close(results)
+	if err != nil && ctx.Err() == nil {
+		violations <- Incident{
+			Tier:        TierReplay,
+			PredicateID: "T3-DRIVE",
+			Message:     err.Error(),
+			ObservedAt:  time.Now().UTC(),
+		}
+		return
+	}
+	_ = writeJSON(filepath.Join(o.cfg.OutDir, "tier3_tally.json"), tally)
+}
+
+// summariseTier3Stderr collapses a tier3Result into the one-line
+// Message stored on the Incident. Prefer stderr (where the helper
+// binaries log violations) over stdout when both are present;
+// CombinedOutput stuffs both into Stdout so we fall back to a
+// truncated stdout when stderr is empty.
+func summariseTier3Stderr(res tier3Result) string {
+	switch {
+	case res.Stderr != "":
+		if len(res.Stderr) > 256 {
+			return res.Stderr[:256] + "..."
+		}
+		return res.Stderr
+	case res.Stdout != "":
+		if len(res.Stdout) > 256 {
+			return res.Stdout[:256] + "..."
+		}
+		return res.Stdout
+	default:
+		return fmt.Sprintf("exit=%d (no output)", res.ExitCode)
 	}
 }
 
