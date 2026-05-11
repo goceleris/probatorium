@@ -664,6 +664,12 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		PIDChan:               pidCh,
 		TallyCallback:         tallyCB,
 		TallyCallbackInterval: 2 * time.Second,
+		// Periodic snapshot to disk so long-running soaks (24h, 72h,
+		// 10d) surface mid-run progress without waiting for the
+		// orchestrator's end-of-run flush. Same path as the final
+		// snapshot — the periodic writer just overwrites it as the
+		// run advances.
+		SnapshotPath: filepath.Join(o.cfg.OutDir, "tier1_tally.json"),
 	}
 	tally, err := driveTier1(ctx, cfg)
 	if err != nil && ctx.Err() == nil {
@@ -775,6 +781,10 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 		ReplayBin:     replayBin,
 		Seeds:         o.seeds,
 		CelerisCommit: o.cfg.CelerisCommit,
+		// Mid-run snapshot to disk — same path the orchestrator
+		// overwrites at run end. Long-running soaks get visibility
+		// into seed-loop progress without waiting for ctx-cancel.
+		SnapshotPath: filepath.Join(o.cfg.OutDir, "tier3_tally.json"),
 	}
 	tally, err := driveTier3(ctx, cfg, results)
 	close(results)

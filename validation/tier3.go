@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"sync/atomic"
@@ -60,6 +61,15 @@ type tier3Config struct {
 	// exhaustion (so 6h runs against a 100-seed corpus replay 12
 	// rounds, not 100 cells).
 	Seeds []corpus.Seed
+
+	// SnapshotPath, when non-empty, names the path the tier writes the
+	// current tally snapshot to after every seed completion (so the
+	// disk view stays at most one seed-cycle behind in-memory state).
+	// Letting long-running soaks surface mid-run progress without
+	// having to wait for the orchestrator's final flush. Best-effort:
+	// a write failure is silently ignored — the in-memory tally is
+	// authoritative.
+	SnapshotPath string
 }
 
 // tier3Tally accumulates per-seed result counts.
@@ -182,6 +192,16 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 			select {
 			case <-ctx.Done():
 			case <-time.After(100 * time.Millisecond):
+			}
+		}
+
+		// Best-effort snapshot to disk for mid-run progress
+		// monitoring. Writes after every seed (or seed-error) so the
+		// view stays at most one seed-cycle behind. Failure is
+		// silent; in-memory tally remains authoritative.
+		if cfg.SnapshotPath != "" {
+			if data, err := json.MarshalIndent(tally.snapshot(), "", "  "); err == nil {
+				_ = os.WriteFile(cfg.SnapshotPath, data, 0o644)
 			}
 		}
 	}
