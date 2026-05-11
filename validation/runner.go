@@ -603,6 +603,52 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	}
 
 	pidCh := make(chan int, 1)
+	var pid int
+	go func() { pid = <-pidCh }() // best-effort: stays 0 until startup
+
+	// alertedCounters tracks which sub-tally counters we've already
+	// emitted an Incident for, so the periodic callback fires AT MOST
+	// ONCE per counter per run. Without this, a steady-rate adversarial
+	// bug (server accepts every malformed request) would generate
+	// hundreds of incidents per second once the bug catches.
+	alertedCounters := make(map[string]bool)
+	tallyCB := func(snap tier1TallySnapshot) {
+		// HIGH-severity sub-counters: anything non-zero is a bug.
+		// Mirror the canonical list from report.invariantCounters so
+		// the per-arch incident emission stays in sync with the
+		// cross-arch DiffValidation gate.
+		fire := func(counter, msg string, ok bool) {
+			if !ok || alertedCounters[counter] {
+				return
+			}
+			alertedCounters[counter] = true
+			select {
+			case violations <- Incident{
+				Tier:        TierProperty,
+				PredicateID: counter,
+				Message:     msg,
+				ObservedAt:  time.Now().UTC(),
+				RefappPID:   pid,
+			}:
+			default:
+				// Channel full or closed — orchestrator already
+				// handling a hard fail; nothing more to do.
+			}
+		}
+		fire("I-ADV-ACCEPTED",
+			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
+			snap.Adversarial.WrongAccepted > 0)
+		fire("I-H2C-CRASHED",
+			fmt.Sprintf("h2c churn returned non-HTTP babble (count=%d) — engine crash on upgrade", snap.H2CChurn.Crashed),
+			snap.H2CChurn.Crashed > 0)
+		fire("I-WS-ACCEPTED",
+			fmt.Sprintf("server accepted bad WebSocket frame (count=%d) — RFC 6455 violation", snap.WSTorture.AcceptedBadFrame),
+			snap.WSTorture.AcceptedBadFrame > 0)
+		fire("I-WS-HANG",
+			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
+			snap.WSTorture.HangNoClose > 0)
+	}
+
 	cfg := tier1Config{
 		Driver:      driver,
 		RefappArgs:  []string{"-bind", o.cfg.CelerisListenAddr},
@@ -615,10 +661,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// fires once the refapp is bound; the orchestrator stashes
 		// the value so handleIncident can drive /proc + pprof
 		// forensics against the same process Tier 1 is exercising.
-		PIDChan: pidCh,
+		PIDChan:               pidCh,
+		TallyCallback:         tallyCB,
+		TallyCallbackInterval: 2 * time.Second,
 	}
-	var pid int
-	go func() { pid = <-pidCh }() // best-effort: stays 0 until startup
 	tally, err := driveTier1(ctx, cfg)
 	if err != nil && ctx.Err() == nil {
 		// driveTier1 failure that isn't the parent-cancel — surface
