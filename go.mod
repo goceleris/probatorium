@@ -11,6 +11,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.26
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
+	golang.org/x/crypto v0.51.0
 	modernc.org/sqlite v1.50.0
 )
 
