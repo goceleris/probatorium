@@ -60,7 +60,16 @@ func ValidateDiff() error {
 	}
 
 	divs := report.DiffValidation(docA.Validation, docB.Validation, hostA, hostB)
-	fmt.Println(report.FormatDivergences(divs, hostA, hostB))
+	textReport := report.FormatDivergences(divs, hostA, hostB)
+	fmt.Println(textReport)
+
+	// Persist the diff alongside the validate-results.json files so a
+	// CI workflow can upload it as an artifact and a postmortem reader
+	// has the divergence list without having to re-run the diff.
+	// Best-effort: a write failure shouldn't mask a real divergence.
+	if err := persistDivergenceReport(paths, divs, textReport, hostA, hostB); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: persist diff report: %v\n", err)
+	}
 
 	strict := os.Getenv("VALIDATE_DIFF_STRICT") == "1"
 	for _, d := range divs {
@@ -72,6 +81,63 @@ func ValidateDiff() error {
 		}
 	}
 	return nil
+}
+
+// persistDivergenceReport writes the divergence findings to a
+// validate-diff/ subdir under the SHARED parent of the two compared
+// validate-results.json paths. When both paths are siblings under the
+// same results/<ts>-validate-<ver>/ run (the production case), this
+// lands the diff inside the same run dir so postmortem readers see
+// it alongside the inputs. When the paths diverge (manual re-run
+// against an older run), the report lands under results/.
+//
+// Both diff.txt and diff.json are written so dashboards can consume
+// either form.
+func persistDivergenceReport(srcPaths []string, divs []report.Divergence,
+	textReport, hostA, hostB string,
+) error {
+	parent := commonResultsParent(srcPaths)
+	if parent == "" {
+		parent = "results"
+	}
+	outDir := filepath.Join(parent, "validate-diff")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "diff.txt"),
+		[]byte(textReport+"\n"), 0o644); err != nil {
+		return err
+	}
+	payload := map[string]any{
+		"host_a":       hostA,
+		"host_b":       hostB,
+		"source_a":     srcPaths[0],
+		"source_b":     srcPaths[1],
+		"divergences":  divs,
+		"divergence_n": len(divs),
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(outDir, "diff.json"), data, 0o644)
+}
+
+// commonResultsParent returns the shallowest common ancestor of two
+// paths that's under results/ — typically results/<ts>-validate-<ver>/
+// in production runs where both inputs live in the same run.
+//
+// Returns "" if the paths don't share a results/<run>/ parent.
+func commonResultsParent(paths []string) string {
+	if len(paths) < 2 {
+		return ""
+	}
+	a := filepath.Dir(filepath.Dir(paths[0])) // strip the <host-refapp>/<file> tail
+	b := filepath.Dir(filepath.Dir(paths[1]))
+	if a == b {
+		return a
+	}
+	return ""
 }
 
 // twoLatestValidateResults walks results/ and returns the two most
