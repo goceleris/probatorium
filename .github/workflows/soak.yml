@@ -6,8 +6,9 @@ name: Soak
 # published its own headline, or it failed and we know about it
 # before the next bench fires.
 #
-# Publish uses a `soak-results-` prefix so the soak headline never
-# overwrites the daily bench number on the docs site.
+# All publishing here uses event_type=celeris-soak (validation panel
+# uses celeris-soak-validate) so the daily bench number on the docs
+# site is never overwritten — the soak runs own their own panels.
 
 on:
   schedule:
@@ -24,7 +25,7 @@ permissions:
 
 jobs:
   soak:
-    name: mage Soak + Publish
+    name: mage Soak + Publish + ValidateDiff
     runs-on: [self-hosted, celeris-cluster]
     timeout-minutes: 2160
     env:
@@ -43,12 +44,26 @@ jobs:
           CELERIS_VERSION: ${{ env.VERSION }}
         run: go run github.com/magefile/mage Soak
 
-      - name: mage Publish (soak-results-* prefix)
+      # Cross-arch divergence check on the soak's both-arch output.
+      # Hard-fails the workflow on any HIGH severity finding, so a
+      # divergent soak never silently publishes.
+      - name: mage ValidateDiff
+        if: success()
+        run: go run github.com/magefile/mage ValidateDiff
+
+      - name: mage Publish (event_type=celeris-soak)
         if: success()
         env:
           PUBLISH_VERSION: ${{ env.VERSION }}
-          PUBLISH_PREFIX: soak-results-
+          PUBLISH_EVENT_TYPE: celeris-soak
         run: go run github.com/magefile/mage Publish
+
+      - name: mage PublishValidate (event_type=celeris-soak-validate)
+        if: success()
+        env:
+          PUBLISH_VERSION: ${{ env.VERSION }}
+          PUBLISH_EVENT_TYPE: celeris-soak-validate
+        run: go run github.com/magefile/mage PublishValidate
 
       - name: mage Cleanup
         if: always()

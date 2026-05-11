@@ -22,8 +22,10 @@ import (
 
 // Publish reads the latest results/<...>-bench-<ver>/results.json and
 // POSTs it to goceleris/docs as a repository_dispatch event of type
-// "celeris-bench". The docs repo's workflow consumes the payload to
-// regenerate the bench dashboard.
+// "celeris-bench" (overridable via PUBLISH_EVENT_TYPE). The docs
+// repo's workflow consumes the payload to regenerate the bench
+// dashboard; separate event_types let the soak workflow publish to
+// a different docs panel without overwriting the daily bench number.
 //
 // Auth: DOCS_TOKEN env var if set, otherwise `gh auth token` — same
 // behaviour as gh's own commands so a logged-in dev needs zero extra
@@ -35,6 +37,11 @@ import (
 //	                        bench run that produced results.json
 //	                        already encodes the version, but a
 //	                        manual republish may want to relabel).
+//	PUBLISH_EVENT_TYPE=     override the repository_dispatch
+//	                        event_type. Default "celeris-bench"
+//	                        for daily runs; soak.yml sets
+//	                        "celeris-soak" so the weekly headline
+//	                        lands on its own docs panel.
 //	DOCS_TOKEN=             GitHub token with repo scope on
 //	                        goceleris/docs. Falls back to gh CLI.
 func Publish() error {
@@ -77,8 +84,9 @@ func Publish() error {
 	// docs workflow filters on; `client_payload` carries arbitrary
 	// JSON. We pass the full results.json plus a version tag so the
 	// workflow doesn't have to re-derive it from the payload tree.
+	eventType := envOrDefault("PUBLISH_EVENT_TYPE", "celeris-bench")
 	payload := map[string]any{
-		"event_type": "celeris-bench",
+		"event_type": eventType,
 		"client_payload": map[string]any{
 			"version": version,
 			"results": resultsDoc,
@@ -147,8 +155,9 @@ func PublishValidate() error {
 		return err
 	}
 
+	eventType := envOrDefault("PUBLISH_EVENT_TYPE", "celeris-validate")
 	payload := map[string]any{
-		"event_type": "celeris-validate",
+		"event_type": eventType,
 		"client_payload": map[string]any{
 			"version": version,
 			"results": doc,

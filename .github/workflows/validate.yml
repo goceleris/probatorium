@@ -44,6 +44,24 @@ jobs:
           CELERIS_VERSION: ${{ env.VERSION }}
         run: go run github.com/magefile/mage Validate
 
+      # Cross-arch divergence check — hard-fails the workflow if
+      # either arch hits a predicate violation the other arch missed.
+      # That's an arch-only bug (likely engine/iouring/sqe.go), worth
+      # blocking the release gate on.
+      - name: mage ValidateDiff
+        if: success()
+        run: go run github.com/magefile/mage ValidateDiff
+
+      # Publish the validation document to the docs panel so the
+      # workflow's findings show up alongside the bench numbers.
+      # Best-effort: a missing docs token shouldn't block the gate.
+      - name: mage PublishValidate
+        if: success()
+        continue-on-error: true
+        env:
+          PUBLISH_VERSION: ${{ env.VERSION }}
+        run: go run github.com/magefile/mage PublishValidate
+
       - name: Dispatch celeris-validate-passed
         if: success()
         env:
