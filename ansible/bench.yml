@@ -116,14 +116,17 @@
 
     - name: Stop any leftover server processes (bench target only)
       become: true
+      # CRITICAL: every literal occurrence of the staging dir name in
+      # this script must be BRACKET-PROTECTED. `pkill -f` matches each
+      # process's full argv, and the bash session running this pkill
+      # carries the script body in its own argv. A plain mention of
+      # the substring (even in a comment) self-matches and SIGTERMs
+      # the wrapper before `true` runs (rc=-15).
       ansible.builtin.shell: |
         for name in server runner loadgen observer; do
           pkill -x "$name" 2>/dev/null
         done
-        # Native competitor processes are launched by their slug name
-        # (we set argv[0] via cmdline); kill anything under competitors/
-        # by matching the staging path prefix.
-        pkill -f "[/]tmp/celeris-bench/competitors/" 2>/dev/null
+        pkill -f "[c]ompetitors/" 2>/dev/null
         true
       changed_when: false
       register: stop_result
