@@ -29,6 +29,7 @@ import (
 var (
 	cachedPassingReplayPath string
 	cachedFailingReplayPath string
+	cachedSlowReplayPath    string
 )
 
 func TestMain(m *testing.M) {
@@ -50,6 +51,32 @@ func main() {
 `); err == nil {
 		cachedFailingReplayPath = pp
 	}
+	// "slow" replay parses the same -duration flag the real
+	// validator-replay does, then exits cleanly after a sleep equal
+	// to that duration. Used to verify the grace-window fix: the
+	// replay should be allowed to complete normally inside its
+	// declared -duration window, without exec.CommandContext sending
+	// SIGKILL the moment the parent's per-seed deadline expires.
+	if pp, err := compileHelperBin("slow-replay-*.go", `package main
+import (
+    "flag"
+    "fmt"
+    "time"
+)
+func main() {
+    var dur time.Duration
+    flag.DurationVar(&dur, "duration", time.Second, "")
+    flag.String("seed", "", "")
+    flag.String("celeris-pid", "", "")
+    flag.String("celeris-port", "", "")
+    flag.String("commit", "", "")
+    flag.Parse()
+    time.Sleep(dur)
+    fmt.Println("slow-replay clean exit")
+}
+`); err == nil {
+		cachedSlowReplayPath = pp
+	}
 	code := m.Run()
 	if cachedPassingReplayPath != "" {
 		_ = os.Remove(cachedPassingReplayPath)
@@ -58,6 +85,10 @@ func main() {
 	if cachedFailingReplayPath != "" {
 		_ = os.Remove(cachedFailingReplayPath)
 		_ = os.Remove(cachedFailingReplayPath + ".go")
+	}
+	if cachedSlowReplayPath != "" {
+		_ = os.Remove(cachedSlowReplayPath)
+		_ = os.Remove(cachedSlowReplayPath + ".go")
 	}
 	os.Exit(code)
 }
@@ -76,6 +107,14 @@ func buildFailingReplay(t *testing.T) string {
 		t.Skip("helper binary not compiled (likely no `go` on PATH)")
 	}
 	return cachedFailingReplayPath
+}
+
+func buildSlowReplay(t *testing.T) string {
+	t.Helper()
+	if cachedSlowReplayPath == "" {
+		t.Skip("helper binary not compiled (likely no `go` on PATH)")
+	}
+	return cachedSlowReplayPath
 }
 
 func compileHelperBin(namePat, src string) (string, error) {
@@ -285,6 +324,53 @@ func TestReplayOneSeed_ShortCircuitsDriverStartError(t *testing.T) {
 	}
 	if !strings.Contains(res.Stderr, "start refapp") {
 		t.Errorf("Stderr should mention refapp start, got %q", res.Stderr)
+	}
+}
+
+// Regression for #77 — validator-replay was getting SIGKILLed by
+// exec.CommandContext at the per-seed deadline because the replay's
+// `-duration` and the exec ctx had the same expiry. The fix gives
+// the replay 2s less internal time so it can exit cleanly before
+// the exec deadline fires.
+//
+// This test uses the "slow" helper that simulates the real replay's
+// pattern: sleep for the `-duration` value, print, exit 0. With the
+// grace-window fix the slow replay completes inside the per-seed
+// budget and the cell counts as a pass; without the fix it would
+// be SIGKILLed and counted as T3-DRIVE errored.
+func TestDriveTier3_SlowReplayClassedAsPassed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	cfg := tier3Config{
+		Driver:          remote.NewLocal("/bin/sh"),
+		RefappArgs:      fakeRefappArgs(srv),
+		ReplayBin:       buildSlowReplay(t),
+		PerSeedDuration: 3 * time.Second,
+		ReadyTimeout:    2 * time.Second,
+		Seeds:           []corpus.Seed{{Value: 0x1, Tag: "slow-but-clean"}},
+	}
+	results := make(chan tier3Result, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	tally, err := driveTier3(ctx, cfg, results)
+	if err != nil {
+		t.Fatalf("driveTier3: %v", err)
+	}
+	// The slow replay sleeps for replayInternalDuration =
+	// PerSeedDuration - 2s grace = 1s, then exits clean. The seed
+	// loop runs ~3 iterations in 12s; expect at least one passed
+	// cell. The LAST iteration may catch a parent-ctx cancel
+	// mid-flight (legitimately classified as errored) — passed
+	// must dominate or the grace window isn't working.
+	if tally.SeedsPassed == 0 {
+		t.Errorf("expected SeedsPassed >= 1, got tally=%+v", tally)
+	}
+	if tally.SeedsPassed <= tally.SeedsErrored {
+		t.Errorf("grace window not catching most cells: passed=%d errored=%d (before fix: 0 vs N)",
+			tally.SeedsPassed, tally.SeedsErrored)
 	}
 }
 
