@@ -235,3 +235,76 @@ func TestRunTierProperty_BinaryNotFoundEmitsIncident(t *testing.T) {
 		t.Fatal("expected incident on missing binary, got none")
 	}
 }
+
+func TestOrchestratorBuildDriver_LocalDefault(t *testing.T) {
+	cfg := Default()
+	cfg.CelerisBin = "/usr/bin/true"
+	cfg.OutDir = t.TempDir()
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d, err := o.buildDriver()
+	if err != nil {
+		t.Fatalf("buildDriver: %v", err)
+	}
+	if d == nil {
+		t.Fatal("nil driver")
+	}
+	_ = d.Close()
+}
+
+func TestOrchestratorBuildDriver_SSHRequiresHostAndUser(t *testing.T) {
+	cfg := Default()
+	cfg.CelerisBin = "/usr/bin/true"
+	cfg.OutDir = t.TempDir()
+	cfg.DriverMode = "ssh"
+	// Missing DriverSSHUser + DriverSSHHost.
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = o.buildDriver()
+	if err == nil {
+		t.Fatal("expected error for ssh-without-host-or-user")
+	}
+}
+
+func TestOrchestratorBuildDriver_SSHWithHostAndUser(t *testing.T) {
+	cfg := Default()
+	cfg.CelerisBin = "/usr/bin/true"
+	cfg.OutDir = t.TempDir()
+	cfg.DriverMode = "ssh"
+	cfg.DriverSSHUser = "test"
+	cfg.DriverSSHHost = "127.0.0.1"
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	d, err := o.buildDriver()
+	if err != nil {
+		t.Fatalf("buildDriver(ssh): %v", err)
+	}
+	if d == nil {
+		t.Fatal("nil ssh driver")
+	}
+	_ = d.Close()
+}
+
+func TestOrchestratorBuildDriver_UnknownMode(t *testing.T) {
+	cfg := Default()
+	cfg.CelerisBin = "/usr/bin/true"
+	cfg.OutDir = t.TempDir()
+	cfg.DriverMode = "make-believe"
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = o.buildDriver()
+	if err == nil {
+		t.Fatal("expected error for unknown driver mode")
+	}
+	if !strings.Contains(err.Error(), "unknown driver mode") {
+		t.Errorf("error: %v", err)
+	}
+}
