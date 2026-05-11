@@ -294,6 +294,80 @@ func TestDriveTier1_WSTortureSliceFires(t *testing.T) {
 	t.Logf("end-to-end ws torture: %+v", s.WSTorture)
 }
 
+// TestDriveTier1_SSEKillSliceFires verifies the SSE long-poll
+// kill-mid-stream walker fans alongside the other slices. Slice
+// activates at concurrency >= 20; asserts sse.Sent > 0 after the run.
+//
+// The httptest server doesn't emit text/event-stream so the walker
+// will classify outcomes as HandshakeFail. Sent > 0 confirms the
+// walker fired.
+func TestDriveTier1_SSEKillSliceFires(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	d := remote.NewLocal("/bin/sh")
+	cfg := tier1Config{
+		Driver: d,
+		RefappArgs: []string{
+			"-c",
+			`echo "ready addr=` + srv.URL + `"; sleep 10`,
+		},
+		BaseURL:        srv.URL,
+		Matrix:         minimalMatrix(t),
+		Seed:           42,
+		Concurrency:    20, // ≥ 20 so one walker is SSE kill
+		ReadyTimeout:   2 * time.Second,
+		RequestTimeout: time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	s, err := driveTier1(ctx, cfg)
+	if err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	if s.SSEKill.Sent < 1 {
+		t.Errorf("sse kill walker didn't fire — Sent=%d", s.SSEKill.Sent)
+	}
+	t.Logf("end-to-end sse kill: %+v", s.SSEKill)
+}
+
+// TestDriveTier1_SSEDormantBelowThreshold confirms the SSE slice
+// stays dormant when concurrency < 20.
+func TestDriveTier1_SSEDormantBelowThreshold(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	d := remote.NewLocal("/bin/sh")
+	cfg := tier1Config{
+		Driver: d,
+		RefappArgs: []string{
+			"-c",
+			`echo "ready addr=` + srv.URL + `"; sleep 10`,
+		},
+		BaseURL:        srv.URL,
+		Matrix:         minimalMatrix(t),
+		Seed:           42,
+		Concurrency:    10, // below SSE threshold
+		ReadyTimeout:   2 * time.Second,
+		RequestTimeout: time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	s, err := driveTier1(ctx, cfg)
+	if err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	if s.SSEKill.Sent != 0 {
+		t.Errorf("sse kill fired below threshold — Sent=%d, want 0", s.SSEKill.Sent)
+	}
+}
+
 // TestDriveTier1_WSDormantBelowThreshold confirms the WS slice stays
 // dormant when concurrency < 20.
 func TestDriveTier1_WSDormantBelowThreshold(t *testing.T) {
