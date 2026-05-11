@@ -27,6 +27,7 @@ import (
 	"github.com/goceleris/probatorium/validation/fault"
 	"github.com/goceleris/probatorium/validation/markov"
 	"github.com/goceleris/probatorium/validation/properties"
+	"github.com/goceleris/probatorium/validation/remote"
 )
 
 // Tier identifies which of the three concurrent property-stress
@@ -441,8 +442,57 @@ type Incident struct {
 // the validator-checker), here we only set up the rendezvous so the
 // dry-run plan reflects reality.
 func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- Incident) {
-	<-ctx.Done()
-	_ = violations // wave 7 wires the real driver.
+	// CelerisBin empty = unit-test / dry-run-style mode: no refapp
+	// fork, no real traffic. Tier 1 still has to keep the goroutine
+	// alive for the orchestrator's WaitGroup, so it park on ctx.
+	if o.cfg.CelerisBin == "" {
+		<-ctx.Done()
+		return
+	}
+	if o.matrix == nil {
+		// Missing Markov matrix means the refapp can't be exercised
+		// deterministically. Park rather than synthesise random
+		// traffic — every Tier 1 result must be replayable.
+		<-ctx.Done()
+		return
+	}
+	driver := remote.NewLocal(o.cfg.CelerisBin)
+	defer func() { _ = driver.Close() }()
+
+	// Tier 1 concurrency sweep cycles 1 -> 10 -> 100 -> 1k -> 10k -> 1
+	// on a 6h period. For short runs we cap at 10 to keep the cell
+	// small enough to bisect on hard fail; production soak picks up
+	// the full sweep via the cadence ramp.
+	concurrency := 10
+	if o.cfg.Duration < 5*time.Minute {
+		concurrency = 1
+	}
+
+	cfg := tier1Config{
+		Driver:      driver,
+		RefappArgs:  []string{"-bind", o.cfg.CelerisListenAddr},
+		BaseURL:     "http://" + o.cfg.CelerisListenAddr,
+		Matrix:      o.matrix,
+		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
+		Concurrency: concurrency,
+	}
+	tally, err := driveTier1(ctx, cfg)
+	if err != nil && ctx.Err() == nil {
+		// driveTier1 failure that isn't the parent-cancel — surface
+		// as a synthetic incident so the orchestrator captures
+		// forensics and aborts. The "predicate" name is a coarse
+		// classifier; the message carries the real cause.
+		violations <- Incident{
+			Tier:        TierProperty,
+			PredicateID: "T1-DRIVE",
+			Message:     err.Error(),
+			ObservedAt:  time.Now().UTC(),
+		}
+		return
+	}
+	// Clean exit (ctx done). The final tally lands in the run
+	// directory for postmortem inspection.
+	_ = writeJSON(filepath.Join(o.cfg.OutDir, "tier1_tally.json"), tally)
 }
 
 // runTierRESTler is Tier 2 — RESTler-style stateful fuzzer over the
