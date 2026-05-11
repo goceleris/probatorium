@@ -36,7 +36,11 @@ func (l *Local) Start(ctx context.Context, args []string) (Process, error) {
 		return nil, fmt.Errorf("stderr pipe: %w", err)
 	}
 	// Capture stdout too — many candidate binaries dump panic traces
-	// to stdout, not stderr. We tee both into the same buffer.
+	// to stdout, not stderr. Goroutines fan both pipes into a shared
+	// pipe so a Scanner over the result sees interleaved output as
+	// it arrives. io.MultiReader is the wrong shape here: it serialises
+	// the streams (waits for the first to EOF before reading the
+	// second), which deadlocks on a long-running candidate.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
@@ -44,9 +48,15 @@ func (l *Local) Start(ctx context.Context, args []string) (Process, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s: %w", l.binary, err)
 	}
+	mergedR, mergedW := io.Pipe()
+	var copyWG sync.WaitGroup
+	copyWG.Add(2)
+	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, stderr) }()
+	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, stdout) }()
+	go func() { copyWG.Wait(); _ = mergedW.Close() }()
 	p := &localProcess{
 		cmd:       cmd,
-		errReader: io.MultiReader(stderr, stdout),
+		errReader: mergedR,
 		done:      make(chan struct{}),
 	}
 	return p, nil

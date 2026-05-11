@@ -60,23 +60,27 @@
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | resolve real server PID"
   # `echo $!` in the previous task captures the bash subshell that
-  # backgrounded nohup, NOT the competitor binary itself. On bash 5.x
-  # the subshell forks once more to exec the binary, so server.pid is
-  # one PID off and the observer / teardown samples a dead PID.
+  # backgrounded nohup, NOT the competitor binary itself, AND for
+  # bun / python adapters the launcher script execs into a language
+  # runtime whose argv doesn't match the launcher path at all
+  # (the bun process is `bun run dist/server`, not
+  # `./competitors/hono`). server.pid would be wrong for any of
+  # those reasons.
   #
-  # After the port has bound, use `pgrep -nf` with a regex anchored to
-  # the START of /proc/<pid>/cmdline so we match ONLY the competitor
-  # binary's argv (which begins with `./competitors/<slug>`), never
-  # the ansible-spawned bash session whose argv begins with `bash`
-  # but contains the same substring further on.
-  #
-  # -n = newest, -f = match full cmdline.
+  # Use `ss -ltnp` instead: who's listening on the bench port? That's
+  # the actual server regardless of language. Parse out the PID from
+  # the users:(("name",pid=N,fd=...)) field.
   become: true
   ansible.builtin.shell: |
-    real_pid=$(pgrep -nf "^\./competitors/{{ cell.1 }} -bind 0.0.0.0:{{ bench_port | default(8080) }}")
-    if [ -z "$real_pid" ]; then
-      echo "could not find server pid via pgrep; server may have failed to bind" >&2
+    pid_line=$(ss -ltnp "sport = :{{ bench_port | default(8080) }}" 2>/dev/null | tail -n +2 | head -1)
+    if [ -z "$pid_line" ]; then
+      echo "no listener on port {{ bench_port | default(8080) }}" >&2
       tail -50 {{ cell_dir }}/server.log >&2
+      exit 1
+    fi
+    real_pid=$(echo "$pid_line" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+    if [ -z "$real_pid" ]; then
+      echo "could not extract pid from ss output: $pid_line" >&2
       exit 1
     fi
     echo "$real_pid" > {{ cell_dir }}/server.pid

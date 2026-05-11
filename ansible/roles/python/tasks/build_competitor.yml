@@ -18,32 +18,26 @@
 #
 # Side effects:
 #
-#   - Creates a project-local venv at
-#     {{ bench_root }}/competitors/{{ competitor_name }}/.venv
+#   - Creates a venv at
+#     {{ bench_root }}/python-venvs/{{ competitor_name }}
 #   - Installs the adapter's pyproject deps into that venv (no
 #     editable install — the source tree is read-only after this).
-#   - Writes the launcher script at
-#     {{ bench_root }}/competitors/{{ competitor_name }}/server.
-#     The orchestrator (``servers.StartAdapter``) execs this path
-#     with ``-bind <host:port>`` to launch the adapter.
-#
-# The launcher itself is the canonical "binary" — once it exists, the
-# generic build_native_competitor.yml's symlink step is a no-op overwrite
-# (the launcher and the symlink live at the same path; ``state: link``
-# with ``force: true`` will replace the file with the symlink, so the
-# caller MUST set binary_rel to a path INSIDE the source tarball that
-# resolves to the same launcher we wrote here, OR omit the symlink step
-# for python adapters).
-#
-# We sidestep that by writing the launcher to a path the symlink step
-# does NOT touch when binary_rel is empty: this task is the sole writer
-# of competitors/{{ competitor_name }}/server for python adapters, and
-# build_native_competitor.yml's symlink is gated on binary_rel being
-# non-empty.
+#   - Writes the launcher binary at
+#     {{ bench_root }}/competitors/{{ competitor_name }}  (a FILE, not
+#     a directory). The orchestrator's run_bench_cell does
+#     `./competitors/<slug> -bind <addr>` — calling a directory there
+#     would fail, so the python launcher lives at the same flat path
+#     as the Go competitor binaries / Rust symlinks.
 
-- name: "{{ competitor_name }} | ensure launcher dir exists"
+- name: "{{ competitor_name }} | ensure python-venvs root exists"
   ansible.builtin.file:
-    path: "{{ bench_root }}/competitors/{{ competitor_name }}"
+    path: "{{ bench_root }}/python-venvs"
+    state: directory
+    mode: '0755'
+
+- name: "{{ competitor_name }} | ensure competitors/ exists"
+  ansible.builtin.file:
+    path: "{{ bench_root }}/competitors"
     state: directory
     mode: '0755'
 
@@ -56,10 +50,10 @@
   environment:
     UV_CACHE_DIR: "{{ bench_root }}/uv-cache"
     UV_PYTHON_INSTALL_DIR: "{{ bench_root }}/uv-python"
-    UV_PROJECT_ENVIRONMENT: "{{ bench_root }}/competitors/{{ competitor_name }}/.venv"
+    UV_PROJECT_ENVIRONMENT: "{{ bench_root }}/python-venvs/{{ competitor_name }}"
   ansible.builtin.command:
-    cmd: "{{ bench_root }}/uv/bin/uv venv --python 3.13 {{ bench_root }}/competitors/{{ competitor_name }}/.venv"
-    creates: "{{ bench_root }}/competitors/{{ competitor_name }}/.venv/bin/python"
+    cmd: "{{ bench_root }}/uv/bin/uv venv --python 3.13 {{ bench_root }}/python-venvs/{{ competitor_name }}"
+    creates: "{{ bench_root }}/python-venvs/{{ competitor_name }}/bin/python"
 
 # `uv pip install --python <venv-py> .` resolves and installs every
 # dep listed in pyproject.toml's [project.dependencies] using the
@@ -72,7 +66,7 @@
     XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
     XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
   ansible.builtin.command:
-    cmd: "{{ bench_root }}/uv/bin/uv pip install --python {{ bench_root }}/competitors/{{ competitor_name }}/.venv/bin/python {{ competitor_src_dir }}"
+    cmd: "{{ bench_root }}/uv/bin/uv pip install --python {{ bench_root }}/python-venvs/{{ competitor_name }}/bin/python {{ competitor_src_dir }}"
 
 # The launcher is a tiny shell shim: parse `-bind <addr>`, split into
 # host+port, exec uvicorn under the venv with the always-on perf flags.
@@ -80,8 +74,9 @@
 - name: "{{ competitor_name }} | render launcher script"
   ansible.builtin.template:
     src: launcher.sh.j2
-    dest: "{{ bench_root }}/competitors/{{ competitor_name }}/server"
+    dest: "{{ bench_root }}/competitors/{{ competitor_name }}"
     mode: '0755'
   vars:
     competitor_module_target: "{{ competitor_module | default('app.server:app') }}"
     competitor_src_path: "{{ competitor_src_dir }}"
+    competitor_venv_path: "{{ bench_root }}/python-venvs/{{ competitor_name }}"
