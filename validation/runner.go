@@ -702,16 +702,33 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 		// Don't propagate — the incident is already recorded.
 		fmt.Fprintf(os.Stderr, "validation: forensics: %v\n", err)
 	}
-	// Shrinker hand-off (wave 7): for now we record the seed and the
-	// last 2h of the corpus would be the replay band.
-	shrinkPlan := map[string]any{
-		"strategy":      "replay-last-2h-bisect-by-prefix",
-		"seed":          inc.Seed,
-		"max_attempts":  256,
-		"prefix_halver": "split-at-floor(n/2)",
-	}
-	if err := writeJSON(filepath.Join(dir, "shrink_plan.json"), shrinkPlan); err != nil {
-		return err
+	// Seed shrinker: bisect the replay duration to find the smallest
+	// window that still reproduces. Only fires for Tier 3 seed
+	// failures (T3-SEED-FAIL); other incidents don't have a seed +
+	// duration tuple to shrink. Best-effort: any shrink failure is
+	// logged in shrink_log.json, never propagated.
+	if inc.PredicateID == "T3-SEED-FAIL" && inc.Seed != 0 && o.cfg.ReplayBin != "" {
+		shrinkDir := filepath.Join(dir, "shrink")
+		if err := os.MkdirAll(shrinkDir, 0o755); err == nil {
+			scfg := shrinkCfg{
+				ReplayBin:        o.cfg.ReplayBin,
+				RefappBin:        o.cfg.CelerisBin,
+				RefappListenAddr: o.cfg.CelerisListenAddr,
+				CelerisCommit:    o.cfg.CelerisCommit,
+				// Shrink up to the configured Duration; can't be
+				// larger because we don't know the actual original.
+				// 15s mirrors tier3Config.PerSeedDuration default —
+				// the seed replay always ran for at most that.
+				OriginalDuration: 15 * time.Second,
+				MaxAttempts:      6,
+			}
+			// Run on a fresh ctx with its own deadline so a long
+			// shrink (worst case ~6 × 15s = 90s) doesn't block
+			// the outer Run from returning.
+			shrinkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			_ = shrinkFailingSeed(shrinkCtx, shrinkDir, inc.Seed, scfg)
+			cancel()
+		}
 	}
 	return fmt.Errorf("validation: %s violated by %s: %s", inc.PredicateID, inc.Tier, inc.Message)
 }
