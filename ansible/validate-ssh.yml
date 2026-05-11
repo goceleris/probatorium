@@ -1,0 +1,196 @@
+---
+# Cross-host validation soak. Validator runs on msa2-client, drives
+# the refapp on bench_target via the SSH driver
+# (validation/remote/ssh.go). This is the production-style topology
+# the 10-day soak will eventually run under.
+#
+# Difference from validate.yml:
+#   validate.yml      → validator + refapp + replay ALL on bench_target
+#                       (single-host; uses remote.Local driver)
+#   validate-ssh.yml  → validator on msa2-client; refapp + replay on
+#                       bench_target (cross-host; uses remote.SSH)
+#
+# The validator binary still manages refapp lifecycle internally —
+# only the Driver implementation differs. cmd/validator's
+# -driver=ssh / -ssh-user / -ssh-host flags select it.
+#
+# Required extra-vars (mage Validate with PROBATORIUM_VALIDATE_DRIVER=ssh):
+#   bench_target              msa2-server | msr1
+#   refapp                    slug (default "auth_session_ratelimit")
+#   validate_duration         soak window (default "10m")
+#   validate_property_tier    -property-tier filter (default "core,middleware")
+#   bench_port                refapp bind port (default 8080)
+#   celeris_version           recorded in incident dossiers
+#   results_local_dir         where to fetch outputs back to dev Mac
+
+- name: Cross-host validation soak (SSH driver)
+  hosts: cluster
+  gather_facts: true
+  tasks:
+    - name: Filter to selected hosts (msa2-client + bench_target)
+      ansible.builtin.meta: end_host
+      when: >
+        (inventory_hostname != "msa2-client") and
+        (inventory_hostname != bench_target)
+
+    - name: Ensure transient dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ bench_root }}"
+        - "{{ results_root }}"
+
+    - name: Drop validate-ssh-start marker for mtime diff
+      ansible.builtin.file:
+        path: "{{ bench_root }}/validate-ssh-start.marker"
+        state: touch
+        mode: '0644'
+
+    - name: Per-run output dir
+      ansible.builtin.set_fact:
+        validate_run_dir: "{{ results_root }}/{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}-validatessh-{{ bench_target }}-{{ refapp | default('auth_session_ratelimit') }}"
+      when: inventory_hostname == "msa2-client"
+
+    - name: Create per-run output dir
+      ansible.builtin.file:
+        path: "{{ validate_run_dir }}"
+        state: directory
+        mode: '0755'
+      when: inventory_hostname == "msa2-client"
+
+    # Convert "10m" / "6h" / "1d" → seconds + 300s slack.
+    - name: Compute timeout-seconds for the validate run
+      ansible.builtin.set_fact:
+        validate_seconds: >-
+          {{ ((validate_duration | default('10m') | regex_replace('[^0-9]', '') | int)
+              * (
+                86400 if 'd' in (validate_duration | default('10m')) else
+                3600  if 'h' in (validate_duration | default('10m')) else
+                60    if 'm' in (validate_duration | default('10m')) else
+                1
+              )) + 300 }}
+      when: inventory_hostname == "msa2-client"
+
+    - block:
+        # bench_target hosts the refapp + validator-replay binaries.
+        # The validator on msa2-client drives them via SSH.
+        - name: Confirm refapp binary is staged on bench_target
+          ansible.builtin.stat:
+            path: "{{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }}"
+          register: refapp_stat
+          failed_when: not refapp_stat.stat.exists
+          when: inventory_hostname == bench_target
+
+        - name: Confirm validator-replay is staged on bench_target
+          ansible.builtin.stat:
+            path: "{{ bench_root }}/validator-replay"
+          register: replay_stat
+          failed_when: not replay_stat.stat.exists
+          when: inventory_hostname == bench_target
+
+        # The validator binary runs on msa2-client. ssh-agent on
+        # msa2-client (SSH_AUTH_SOCK) authenticates the -driver=ssh
+        # connection to bench_target. The dev environment + cluster
+        # runner host both expose SSH_AUTH_SOCK by default; if it's
+        # absent the SSH driver fails fast with a clear "agent has
+        # no identities" error and this task surfaces rc=1.
+        - name: Run validator on msa2-client (drives refapp via SSH)
+          ansible.builtin.shell: |
+            cd {{ bench_root }}
+            ./validator \
+              -target={{ bench_target }} \
+              -driver=ssh \
+              -ssh-user={{ ssh_user | default('mini') }} \
+              -ssh-host={{ hostvars[bench_target].lan_ip if (use_lan | default(false) | bool) else bench_target }} \
+              -duration={{ validate_duration | default('10m') }} \
+              -celeris-bin={{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }} \
+              -celeris-addr=127.0.0.1:{{ bench_port | default(8080) }} \
+              -markov={{ bench_root }}/markov/{{ refapp | default('auth_session_ratelimit') }}.yaml \
+              -replay-bin={{ bench_root }}/validator-replay \
+              -property-tier={{ validate_property_tier | default('core,middleware') }} \
+              -celeris-commit={{ celeris_version | default('') }} \
+              -out={{ validate_run_dir }} \
+              > {{ validate_run_dir }}/validator.stdout \
+              2> {{ validate_run_dir }}/validator.stderr
+          args:
+            executable: /bin/bash
+          async: "{{ validate_seconds | int }}"
+          poll: 30
+          register: validator_result
+          when: inventory_hostname == "msa2-client"
+
+      always:
+        # bench_target cleanup: kill any leftover refapp/replay
+        # processes the SSH driver might have started.
+        - name: Stop leftover refapp / replay processes on bench_target
+          become: true
+          ansible.builtin.shell: |
+            pkill -f "[/]refapps/" 2>/dev/null
+            pkill -x validator-replay 2>/dev/null
+            pkill -x validator-checker 2>/dev/null
+            true
+          changed_when: false
+          when: inventory_hostname == bench_target
+
+        - name: Stop the validator on msa2-client
+          ansible.builtin.shell: |
+            pkill -x validator 2>/dev/null
+            true
+          changed_when: false
+          when: inventory_hostname == "msa2-client"
+
+        - name: Tar validation artefacts on msa2-client
+          ansible.builtin.shell: |
+            cd {{ validate_run_dir | dirname }}
+            tar czf /tmp/validatessh-{{ inventory_hostname }}.tgz {{ validate_run_dir | basename }}/
+          args:
+            executable: /bin/bash
+          changed_when: true
+          when: inventory_hostname == "msa2-client"
+
+        - name: Fetch tarball back to dev machine
+          ansible.builtin.fetch:
+            src: "/tmp/validatessh-{{ inventory_hostname }}.tgz"
+            dest: "{{ results_local_dir }}/{{ inventory_hostname }}.tgz"
+            flat: true
+          register: fetch_result
+          until: fetch_result is succeeded
+          retries: 3
+          delay: 5
+          when: inventory_hostname == "msa2-client"
+
+        - name: Remove remote tarball after fetch
+          ansible.builtin.file:
+            path: "/tmp/validatessh-{{ inventory_hostname }}.tgz"
+            state: absent
+          when: inventory_hostname == "msa2-client"
+
+        - name: Extract fetched tarball locally
+          delegate_to: localhost
+          become: false
+          ansible.builtin.command:
+            cmd: tar xzf {{ results_local_dir }}/msa2-client.tgz -C {{ results_local_dir }}/
+          changed_when: true
+          run_once: true
+
+        - name: Drop the local tarball
+          delegate_to: localhost
+          become: false
+          ansible.builtin.file:
+            path: "{{ results_local_dir }}/msa2-client.tgz"
+            state: absent
+          run_once: true
+
+        - name: Surface non-zero validator exit as a playbook failure
+          ansible.builtin.fail:
+            msg: |
+              validator exited non-zero (rc={{ validator_result.rc | default('n/a') }}). Check
+                {{ results_local_dir }}/{{ validate_run_dir | basename }}/validator.stderr
+              for the cause.
+          when:
+            - inventory_hostname == "msa2-client"
+            - validator_result is defined
+            - validator_result.rc is defined
+            - validator_result.rc != 0

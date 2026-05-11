@@ -123,10 +123,21 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 	fmt.Printf("  soak mode:    %t\n", soakMode)
 	fmt.Printf("  results:      %s\n\n", resultsDir)
 
+	// Playbook selection:
+	//   default     → ansible/validate.yml      (validator + refapp
+	//                                            both on bench_target)
+	//   PROBATORIUM_VALIDATE_DRIVER=ssh
+	//               → ansible/validate-ssh.yml  (validator on
+	//                                            msa2-client; SSH
+	//                                            into bench_target)
+	playbook := validatePlaybook
+	if os.Getenv("PROBATORIUM_VALIDATE_DRIVER") == "ssh" {
+		playbook = "validate-ssh.yml"
+	}
 	for _, t := range targets {
 		args := []string{
 			"-i", "inventory.yml",
-			validatePlaybook,
+			playbook,
 			"--extra-vars", "bench_target=" + t,
 			"--extra-vars", "validate_duration=" + duration,
 			"--extra-vars", "celeris_version=" + version,
@@ -138,7 +149,7 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if os.Getenv("CLUSTER_USE_LAN") == "1" {
 			args = append(args, "--extra-vars", "use_lan=true")
 		}
-		fmt.Printf("\n=== %s on %s ===\n", titleCase(kind), t)
+		fmt.Printf("\n=== %s on %s (playbook=%s) ===\n", titleCase(kind), t, playbook)
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir
 		cmd.Stdout = os.Stdout
