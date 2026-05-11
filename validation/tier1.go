@@ -70,12 +70,15 @@ type tier1Config struct {
 
 // tier1Tally accumulates Tier 1 progress across walker goroutines.
 // Atomic counters because every walker writes to them concurrently.
+// The adversarial sub-tally is a pointer so the snapshot projection
+// can read it without copying atomic.Int64 (govet copylocks).
 type tier1Tally struct {
 	requestsSent  atomic.Int64
 	requests2xx   atomic.Int64
 	requests4xx   atomic.Int64
 	requests5xx   atomic.Int64
 	requestsError atomic.Int64
+	adv           *adversarialTally
 }
 
 // driveTier1 is the production Tier 1 entry point. Starts the refapp,
@@ -133,23 +136,51 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		}
 	}
 
-	// Tier 1 production-step #1: fan walkers.
+	// Tier 1 fan-out. Two slices today:
 	//
-	// The 60% Markov / 20% adversarial / 10% h2c-upgrade / 5% WS /
-	// 5% SSE workload mix lives in driveTier1's full implementation.
-	// This first cut wires only the 60% Markov slice — the adversarial
-	// walker is enough independent code to live in its own follow-up
-	// (issue #55, follow-up scope). Concurrency sweeps stay
-	// representative because the workload-mix split is per-tick not
-	// per-walker.
+	//   60% Markov-shaped traffic — runMarkovWalker, BaseURL.
+	//   20% adversarial            — runAdversarialWalker, hostPort.
+	//
+	// Remaining 20% (10% h2c-upgrade churn + 5% WS frame torture +
+	// 5% SSE long-poll holders) lands as separate slices once the
+	// refapp grows the corresponding endpoints; the workload mix is
+	// goroutine-share, not per-tick.
+	//
+	// hostPort is BaseURL with the "http://" stripped — adversarial
+	// traffic speaks raw TCP, not HTTP, so it can send malformed
+	// bytes that Go's net/http would otherwise rewrite on the wire.
+	hostPort := strings.TrimPrefix(strings.TrimPrefix(cfg.BaseURL, "http://"), "https://")
 	httpc := &http.Client{Timeout: cfg.RequestTimeout}
 	var wg sync.WaitGroup
-	for i := 0; i < cfg.Concurrency; i++ {
+	advTally := &adversarialTally{}
+	tally.adv = advTally
+	// 80% of walkers run Markov; 20% run adversarial. Floors at 1
+	// adversarial walker so even single-concurrency runs exercise
+	// the slice.
+	advCount := cfg.Concurrency / 5
+	if advCount < 1 && cfg.Concurrency >= 1 {
+		advCount = 1
+	}
+	markovCount := cfg.Concurrency - advCount
+	if markovCount < 1 {
+		markovCount = 1
+	}
+	for i := 0; i < markovCount; i++ {
 		wg.Add(1)
 		go func(walkerID int) {
 			defer wg.Done()
 			seed := cfg.Seed ^ uint64(walkerID)*0x9e3779b97f4a7c15
 			runMarkovWalker(ctx, httpc, cfg.BaseURL, cfg.Matrix, seed, tally)
+		}(i)
+	}
+	for i := 0; i < advCount; i++ {
+		wg.Add(1)
+		go func(walkerID int) {
+			defer wg.Done()
+			seed := cfg.Seed ^ uint64(0xdead0000+walkerID)*0x9e3779b97f4a7c15
+			// Adversarial fires slower than Markov so it stays inside
+			// its budget share (~1/5 of the total request volume).
+			runAdversarialWalker(ctx, hostPort, seed, 50*time.Millisecond, advTally)
 		}(i)
 	}
 	wg.Wait()
@@ -290,23 +321,28 @@ func markovStateToPath(state string) string {
 // snapshot returns the current tally as a value. Used by tests and
 // by the orchestrator's per-tick reporter.
 func (t *tier1Tally) snapshot() tier1TallySnapshot {
-	return tier1TallySnapshot{
+	s := tier1TallySnapshot{
 		RequestsSent:  t.requestsSent.Load(),
 		Requests2xx:   t.requests2xx.Load(),
 		Requests4xx:   t.requests4xx.Load(),
 		Requests5xx:   t.requests5xx.Load(),
 		RequestsError: t.requestsError.Load(),
 	}
+	if t.adv != nil {
+		s.Adversarial = t.adv.snapshot()
+	}
+	return s
 }
 
 // tier1TallySnapshot is the value-typed projection of tier1Tally
 // (atomic counters loaded at one instant).
 type tier1TallySnapshot struct {
-	RequestsSent  int64 `json:"requests_sent"`
-	Requests2xx   int64 `json:"requests_2xx"`
-	Requests4xx   int64 `json:"requests_4xx"`
-	Requests5xx   int64 `json:"requests_5xx"`
-	RequestsError int64 `json:"requests_error"`
+	RequestsSent  int64               `json:"requests_sent"`
+	Requests2xx   int64               `json:"requests_2xx"`
+	Requests4xx   int64               `json:"requests_4xx"`
+	Requests5xx   int64               `json:"requests_5xx"`
+	RequestsError int64               `json:"requests_error"`
+	Adversarial   adversarialSnapshot `json:"adversarial,omitempty"`
 }
 
 // String formats a tally for the run summary log line.

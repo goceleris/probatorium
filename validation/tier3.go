@@ -172,6 +172,18 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 			default:
 			}
 		}
+
+		// Backoff on infra-flake to avoid pathological spin. Real fork
+		// or SSH failures can fire at ~kHz; without this the loop burns
+		// CPU and floods seedsErrored at thousands per second. 100ms is
+		// fast enough to recover quickly when the issue clears, slow
+		// enough that 12s of fork contention doesn't bury the tally.
+		if res.ExitCode < 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
 	}
 	return tally.snapshot(), nil
 }

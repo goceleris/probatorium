@@ -445,7 +445,7 @@ func sshSignalCode(name string) int {
 // shellQuote wraps s in single quotes and escapes embedded single
 // quotes. Mirrors `shlex.quote` semantics so we can build remote
 // commands without worrying about whitespace or metacharacters in
-// argv. Standard idiom: `'foo'\''bar'` → "foo'bar".
+// argv. Standard idiom: `'foo'\”bar'` → "foo'bar".
 func shellQuote(s string) string {
 	if s == "" {
 		return "''"
