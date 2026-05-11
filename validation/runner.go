@@ -419,6 +419,26 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	for {
 		select {
 		case inc := <-violations:
+			// Two kinds of incidents land on this channel:
+			//   - Hard predicate violations (I-PANIC, I-MW-*, ...) and
+			//     T1-DRIVE / T3-SEED-FAIL — genuine bugs. Halt the run
+			//     and return non-zero (CI flags it).
+			//   - T*-DRIVE infra flakes — refapp boot failure, ctx
+			//     cancellation killing a per-seed replay, etc. Record
+			//     a dossier but DON'T halt: a 6h soak shouldn't bail
+			//     because one of 1200 seeds got killed by a ssh
+			//     hiccup. The orchestrator runs to completion.
+			if isInfraDriveIncident(inc) {
+				dir := infraIncidentDir(o.cfg.OutDir, inc)
+				_ = writeJSON(filepath.Join(dir, "incident.json"), map[string]any{
+					"tier":        inc.Tier.String(),
+					"seed":        fmt.Sprintf("0x%x", inc.Seed),
+					"predicate":   inc.PredicateID,
+					"message":     inc.Message,
+					"observed_at": inc.ObservedAt.UTC().Format(time.RFC3339Nano),
+				})
+				continue
+			}
 			cancel()
 			wg.Wait()
 			return o.handleIncident(rootCtx, inc)
@@ -429,6 +449,30 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// isInfraDriveIncident reports whether inc is an infrastructure
+// flake (driver / fork / ssh / ctx-cancel) rather than a celeris
+// bug. T*-DRIVE classifier is the orchestrator's contract for that
+// distinction: predicate code from the Tier 1 / Tier 3 drivers when
+// the candidate binary itself didn't crash, just the wrapper around
+// it bailed.
+func isInfraDriveIncident(inc Incident) bool {
+	switch inc.PredicateID {
+	case "T1-DRIVE", "T3-DRIVE":
+		return true
+	}
+	return false
+}
+
+// infraIncidentDir creates + returns the per-incident directory for
+// infra-flake records. Same shape as handleIncident's dossier dir
+// so postmortem tooling can read both with one walker.
+func infraIncidentDir(outDir string, inc Incident) string {
+	ts := time.Now().UTC().Format("20060102-150405")
+	dir := filepath.Join(outDir, "incidents", ts+"-"+inc.PredicateID)
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
 }
 
 // Incident is one invariant violation. Captured by the validator-

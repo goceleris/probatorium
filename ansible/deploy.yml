@@ -181,6 +181,55 @@
         - (arch == 'amd64' and validator_replay_binary_amd64 is defined) or
           (arch == 'arm64' and validator_replay_binary_arm64 is defined)
 
+    # ---------- validation refapps ----------
+    # The refapp binaries (validation/refapp/<slug>) are what the
+    # validator orchestrator drives via remote.Driver as the
+    # server-under-test. mage Deploy cross-compiles each refapp and
+    # passes refapp_binaries as { slug: { amd64: ..., arm64: ... } }.
+    # We land each per-arch binary at {{ bench_root }}/refapps/<slug>
+    # so validate.yml can launch them with a flat path.
+    - name: Ensure refapps/ dir exists on bench targets
+      ansible.builtin.file:
+        path: "{{ bench_root }}/refapps"
+        state: directory
+        mode: '0755'
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - refapp_binaries is defined
+
+    - name: Push refapp binaries (bench_targets only)
+      ansible.builtin.copy:
+        src: "{{ (refapp_binaries[item][arch] if arch in refapp_binaries[item] else refapp_binaries[item]['amd64']) }}"
+        dest: "{{ bench_root }}/refapps/{{ item }}"
+        mode: '0755'
+      loop: "{{ refapp_binaries | default({}) | list }}"
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - refapp_binaries is defined
+
+    # The Markov matrix is plain YAML — read by the validator at runtime
+    # via -markov=<path>. Validator + matrix live side-by-side under
+    # bench_root so the validate.yml command can hardcode the path
+    # without parameterising every per-refapp knob.
+    - name: Ensure markov/ dir exists on bench targets
+      ansible.builtin.file:
+        path: "{{ bench_root }}/markov"
+        state: directory
+        mode: '0755'
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - refapp_binaries is defined
+
+    - name: Push Markov matrices (one yaml per refapp slug)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../validation/markov/{{ item }}.yaml"
+        dest: "{{ bench_root }}/markov/{{ item }}.yaml"
+        mode: '0644'
+      loop: "{{ refapp_binaries | default({}) | list }}"
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - refapp_binaries is defined
+
     # ---------- Go competitor adapters ----------
     # competitor_binaries entries are pre-built on the dev Mac and pushed
     # whole — no native build step. Only iterates the slugs that appear

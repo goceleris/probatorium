@@ -1,37 +1,36 @@
 ---
-# Long-running validation soak. Runs the validator harness against the
-# server-under-test for `validate_duration` (default 6h) on a chosen
-# bench target. Two-host coordinated:
+# Validation tier orchestration. Runs the validator binary on the
+# chosen bench_target, driving a refapp it manages itself via the
+# remote.Local driver (validation/remote/local.go). The validator
+# handles tier-1 traffic + tier-3 replay + forensics capture
+# internally; this playbook's job is binary placement + lifecycle
+# bracketing + result fetch.
 #
-#   bench_target (msa2-server | msr1) — runs the celeris (or competitor)
-#                                       server under test.
-#   msa2-client                       — runs the validator + checker.
+# Single-host execution: validator + refapp + validator-checker all
+# run on bench_target. msa2-client doesn't host any validator state.
+# The cross-host SSH driver lands in a separate playbook
+# (validate-ssh.yml) once issue #54 cluster integration ships.
 #
-# Block/always wraps everything so the always-block fires regardless of
-# how the soak terminates: validator failure, ansible timeout, ssh drop,
-# kernel panic on the target. Always-block fetches logs back, kills any
-# leftover validator/server processes, drops the staging dir, and runs
-# the same mtime-based ~ leak check as cluster-go-gate.yml.
-#
-# Required extra-vars (typically `mage Validate`):
-#   bench_target              single host name from [bench_targets]
-#   competitor                slug of the server-under-test (default: celeris)
-#   validate_duration         total soak length, e.g. "6h" / "24h" /
-#                             "10d" (default: "6h")
-#   validate_concurrency      validator -concurrency (default: 32)
-#   validate_seed             RNG seed for reproducibility (default: 1)
-#   bench_port                port the server binds (default: 8080)
-#   results_local_dir         where to fetch outputs back to on the Mac
+# Required extra-vars (mage Validate normally sets these):
+#   bench_target              msa2-server | msr1
+#   refapp                    slug of the refapp to run (default
+#                             "auth_session_ratelimit")
+#   validate_duration         soak window, e.g. "10m" / "6h"
+#                             (default "10m")
+#   validate_property_tier    -property-tier filter (default
+#                             "core,middleware")
+#   validate_seed             reserved for future per-run seed knob
+#   bench_port                refapp bind port (default 8080)
+#   celeris_version           recorded in incident dossiers
+#   results_local_dir         where to fetch outputs back to dev Mac
 
-- name: Long-running validation soak
+- name: Validation soak
   hosts: cluster
   gather_facts: true
   tasks:
-    - name: Filter to selected hosts
+    - name: Filter to selected host (bench_target only)
       ansible.builtin.meta: end_host
-      when: >
-        (inventory_hostname != bench_target) and
-        (inventory_hostname != "msa2-client")
+      when: inventory_hostname != bench_target
 
     - name: Ensure transient dirs
       ansible.builtin.file:
@@ -50,7 +49,7 @@
 
     - name: Per-run output dir
       ansible.builtin.set_fact:
-        validate_run_dir: "{{ results_root }}/{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}-validate-{{ bench_target }}-{{ competitor | default('celeris') }}"
+        validate_run_dir: "{{ results_root }}/{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}-validate-{{ bench_target }}-{{ refapp | default('auth_session_ratelimit') }}"
 
     - name: Create per-run output dir
       ansible.builtin.file:
@@ -58,76 +57,52 @@
         state: directory
         mode: '0755'
 
-    - name: Resolve bench target LAN IP from inventory (loadgen side only)
-      ansible.builtin.set_fact:
-        target_ip: "{{ hostvars[bench_target].lan_ip }}"
-      when: inventory_hostname == "msa2-client"
-
+    # Convert "10m" / "6h" / "1d" → seconds + 300s slack. ansible's
+    # async timeout MUST be greater than the validator's natural exit
+    # window or we lose the final results fetch.
     - name: Compute timeout-seconds for the validate run
-      # Convert a duration string ("6h", "30m", "10d") into seconds, plus
-      # 300s slack so ansible's async deadline is always ahead of the
-      # validator's natural exit. Without slack a 6h validator and a
-      # 6h ansible deadline race; ansible wins ~50% of the time and we
-      # lose the final results pickup.
       ansible.builtin.set_fact:
         validate_seconds: >-
-          {{ ((validate_duration | default('6h') | regex_replace('[^0-9]', '') | int)
+          {{ ((validate_duration | default('10m') | regex_replace('[^0-9]', '') | int)
               * (
-                86400 if 'd' in (validate_duration | default('6h')) else
-                3600  if 'h' in (validate_duration | default('6h')) else
-                60    if 'm' in (validate_duration | default('6h')) else
+                86400 if 'd' in (validate_duration | default('10m')) else
+                3600  if 'h' in (validate_duration | default('10m')) else
+                60    if 'm' in (validate_duration | default('10m')) else
                 1
               )) + 300 }}
 
     - block:
-        # ---------- bench target: server-under-test ----------
-        - name: Stop any prior server-under-test
-          become: true
-          ansible.builtin.shell: |
-            pkill -f "[c]ompetitors/" 2>/dev/null
-            pkill -x server 2>/dev/null
-            true
-          changed_when: false
-          when: inventory_hostname == bench_target
+        - name: Confirm refapp binary is staged
+          ansible.builtin.stat:
+            path: "{{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }}"
+          register: refapp_stat
+          failed_when: not refapp_stat.stat.exists
 
-        - name: Start server-under-test in background
+        - name: Run validator (drives refapp + Tier 1 + Tier 3)
+          # Validator manages the refapp lifecycle internally via
+          # remote.Local. The refapp binds 127.0.0.1:<port> so the
+          # validator can drive it without going through the LAN
+          # fabric (Tier 1's Markov walker fires HTTP requests from
+          # the same host the refapp runs on; we're benchmarking
+          # validation predicates, not loadgen throughput).
+          #
+          # become: true because the refapp / celeris validation build
+          # needs `ulimit -l unlimited` for io_uring memlock. The
+          # validator passes that through to its Driver child.
           become: true
           ansible.builtin.shell: |
             cd {{ bench_root }}
             ulimit -l unlimited
-            nohup ./competitors/{{ competitor | default('celeris') }} \
-              -bind 0.0.0.0:{{ bench_port | default(8080) }} \
-              > {{ validate_run_dir }}/server.log 2>&1 &
-            echo $! > {{ validate_run_dir }}/server.pid
-            disown
-          args:
-            executable: /bin/bash
-          when: inventory_hostname == bench_target
-
-        - name: Wait for server-under-test to bind
-          ansible.builtin.shell: |
-            for i in $(seq 1 40); do
-              ss -ltn 2>/dev/null | grep -q ':{{ bench_port | default(8080) }} ' && exit 0
-              sleep 0.25
-            done
-            echo "server did not bind in 10s" >&2
-            tail -100 {{ validate_run_dir }}/server.log >&2
-            exit 1
-          args:
-            executable: /bin/bash
-          changed_when: false
-          when: inventory_hostname == bench_target
-
-        # ---------- loadgen host: validator + checker ----------
-        - name: Run validator (writes events to validator.jsonl)
-          ansible.builtin.shell: |
-            cd {{ bench_root }}
             ./validator \
-              -url http://{{ target_ip }}:{{ bench_port | default(8080) }} \
-              -duration {{ validate_duration | default('6h') }} \
-              -concurrency {{ validate_concurrency | default(32) }} \
-              -seed {{ validate_seed | default(1) }} \
-              -out {{ validate_run_dir }}/validator.jsonl \
+              -target=localhost \
+              -duration={{ validate_duration | default('10m') }} \
+              -celeris-bin={{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }} \
+              -celeris-addr=127.0.0.1:{{ bench_port | default(8080) }} \
+              -markov={{ bench_root }}/markov/{{ refapp | default('auth_session_ratelimit') }}.yaml \
+              -replay-bin={{ bench_root }}/validator-replay \
+              -property-tier={{ validate_property_tier | default('core,middleware') }} \
+              -celeris-commit={{ celeris_version | default('') }} \
+              -out={{ validate_run_dir }} \
               > {{ validate_run_dir }}/validator.stdout \
               2> {{ validate_run_dir }}/validator.stderr
           args:
@@ -135,49 +110,64 @@
           async: "{{ validate_seconds | int }}"
           poll: 30
           register: validator_result
-          when: inventory_hostname == "msa2-client"
-
-        - name: Run validator-checker offline against the captured trace
-          ansible.builtin.shell: |
-            cd {{ bench_root }}
-            ./validator-checker \
-              -in {{ validate_run_dir }}/validator.jsonl \
-              -out {{ validate_run_dir }}/checker.report.json \
-              > {{ validate_run_dir }}/checker.stdout \
-              2> {{ validate_run_dir }}/checker.stderr
-          args:
-            executable: /bin/bash
-          when: inventory_hostname == "msa2-client"
 
       always:
-        - name: Stop server-under-test
+        - name: Stop any leftover validator / refapp processes
           become: true
           ansible.builtin.shell: |
-            pkill -TERM -f "[c]ompetitors/" 2>/dev/null
-            sleep 2
-            pkill -KILL -f "[c]ompetitors/" 2>/dev/null
-            pkill -x server 2>/dev/null
             pkill -x validator 2>/dev/null
             pkill -x validator-checker 2>/dev/null
+            pkill -x validator-replay 2>/dev/null
+            pkill -f "[/]refapps/" 2>/dev/null
             true
           changed_when: false
 
-        - name: Fetch validation artefacts
-          ansible.builtin.synchronize:
-            mode: pull
-            src: "{{ validate_run_dir }}/"
-            dest: "{{ results_local_dir }}/{{ inventory_hostname }}/"
-            recursive: true
-            rsync_opts:
-              - "--prune-empty-dirs"
+        - name: Snapshot directory contents for the postmortem
+          ansible.builtin.shell: |
+            ls -la {{ validate_run_dir }} > {{ validate_run_dir }}/dir.txt 2>&1
+            echo "validator exit: {{ validator_result.rc | default('n/a') }}" >> {{ validate_run_dir }}/dir.txt
+            true
+          changed_when: false
+
+        - name: Tar validation artefacts on remote
+          ansible.builtin.shell: |
+            cd {{ validate_run_dir | dirname }}
+            tar czf /tmp/validate-{{ inventory_hostname }}.tgz {{ validate_run_dir | basename }}/
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Fetch tarball back to dev machine
+          ansible.builtin.fetch:
+            src: "/tmp/validate-{{ inventory_hostname }}.tgz"
+            dest: "{{ results_local_dir }}/{{ inventory_hostname }}.tgz"
+            flat: true
           register: fetch_result
           until: fetch_result is succeeded
           retries: 3
           delay: 5
 
-        # mtime-based leak check — anything in ~ newer than the marker
-        # we dropped at validate-start is something we (or a child of
-        # the server) created. Same exclusions as cluster-go-gate.yml.
+        - name: Remove remote tarball after fetch
+          ansible.builtin.file:
+            path: "/tmp/validate-{{ inventory_hostname }}.tgz"
+            state: absent
+
+        - name: Extract fetched tarball locally
+          delegate_to: localhost
+          become: false
+          ansible.builtin.command:
+            cmd: tar xzf {{ results_local_dir }}/{{ inventory_hostname }}.tgz -C {{ results_local_dir }}/
+          changed_when: true
+
+        - name: Drop the local tarball
+          delegate_to: localhost
+          become: false
+          ansible.builtin.file:
+            path: "{{ results_local_dir }}/{{ inventory_hostname }}.tgz"
+            state: absent
+
+        # mtime-based ~ leak check (matches bench.yml + cluster-go-gate.yml).
+        # Non-fatal — we want the trace + any leak warning side-by-side.
         - name: Find paths in ~ created/modified during the run
           ansible.builtin.shell: |
             find ~ -maxdepth 4 \
@@ -195,9 +185,33 @@
           register: mtime_diff
           changed_when: false
 
-        - name: Warn if anything leaked into ~ (validate is non-fatal — we want the trace)
+        - name: Warn if anything leaked into ~ (informational)
           ansible.builtin.debug:
             msg: |
               Pristine warning — files in ~ newer than the validate-start marker:
               {{ mtime_diff.stdout }}
           when: mtime_diff.stdout is defined and mtime_diff.stdout | trim | length > 0
+
+        # Validator exit policy:
+        #
+        #   rc == 0 → clean soak (no hard-fail predicate fired).
+        #   rc == 1 → a hard-fail predicate fired. The incident
+        #             dossier is already in the run dir — but we
+        #             want the playbook to fail loudly so CI flags
+        #             the run.
+        #
+        # We deliberately do NOT fail the playbook on T3-DRIVE
+        # incidents (infra-flake exit from a too-short ctx); those
+        # show up in incidents/ as evidence but the soak as a whole
+        # still passed. The validator exits 0 in that case — only
+        # genuine I-* violations bubble rc=1.
+        - name: Surface non-zero validator exit as a playbook failure
+          ansible.builtin.fail:
+            msg: |
+              validator exited non-zero (rc={{ validator_result.rc | default('n/a') }}). Check
+                {{ results_local_dir }}/{{ validate_run_dir | basename }}/validator.stderr
+              for the cause.
+          when: >
+            validator_result is defined
+            and validator_result.rc is defined
+            and validator_result.rc != 0
