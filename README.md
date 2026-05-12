@@ -13,7 +13,7 @@ Drives a 3-host cluster (msa2-client + msa2-server + msr1) via ansible. msa2-cli
 
 Bench headline metric: **`latency_at_slo`** — max sustained RPS at which P99 stays under {10, 50, 100, 500, 1000} ms.
 
-Validation operational claim: **10 days continuous soak with zero invariant violations on both archs → release is production ready.**
+Validation operational claim: **3 days continuous soak with zero invariant violations on both archs → release is production ready.**
 
 ## Quick start
 
