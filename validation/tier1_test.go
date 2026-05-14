@@ -3,7 +3,9 @@ package validation
 import (
 	"context"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -101,6 +103,87 @@ func TestDoMarkovRequest_NetworkErrorIncrementsError(t *testing.T) {
 	}
 	if s.RequestsSent != 1 {
 		t.Errorf("RequestsSent: got %d, want 1", s.RequestsSent)
+	}
+}
+
+// TestWalkerLogin_SetsCookie verifies the per-walker login path
+// drops a session cookie into the client's jar. Without this, every
+// subsequent authed-endpoint GET 401s — exactly the gap that turned
+// the 3-day soak's requests_2xx counter into a 9B-record zero.
+func TestWalkerLogin_SetsCookie(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login" && r.Method == "POST" {
+			http.SetCookie(w, &http.Cookie{Name: "sid", Value: "test-session", Path: "/"})
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"sid":"test-session"}`))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+	jar, _ := cookiejar.New(nil)
+	hc := &http.Client{Timeout: time.Second, Jar: jar}
+	if err := walkerLogin(context.Background(), hc, srv.URL, "alice", "pw"); err != nil {
+		t.Fatalf("walkerLogin: %v", err)
+	}
+	u, _ := url.Parse(srv.URL)
+	cookies := jar.Cookies(u)
+	if len(cookies) == 0 {
+		t.Fatal("jar got no cookie after login")
+	}
+	if cookies[0].Name != "sid" || cookies[0].Value != "test-session" {
+		t.Errorf("cookie mismatch: %+v", cookies[0])
+	}
+}
+
+// TestRunMarkovWalker_LoginThenCookieFlow verifies the full walker
+// loop: POSTs /login first, then carries the cookie through state
+// transitions and gets 2xx on subsequent GETs. This was the
+// 3-day-soak gap.
+func TestRunMarkovWalker_LoginThenCookieFlow(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		loginPosts  int
+		authedReqs  int
+		got2xxAfter bool
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path == "/login" && r.Method == "POST" {
+			loginPosts++
+			http.SetCookie(w, &http.Cookie{Name: "sid", Value: "abc", Path: "/"})
+			w.WriteHeader(200)
+			return
+		}
+		// Other paths: 401 without cookie, 200 with.
+		c, err := r.Cookie("sid")
+		if err != nil || c.Value == "" {
+			w.WriteHeader(401)
+			return
+		}
+		authedReqs++
+		got2xxAfter = true
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	var tally tier1Tally
+	parent := &http.Client{Timeout: time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	runMarkovWalker(ctx, parent, srv.URL, minimalMatrix(t), 0xa11ce, &tally)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if loginPosts < 1 {
+		t.Errorf("walker didn't POST /login (loginPosts=%d)", loginPosts)
+	}
+	if !got2xxAfter {
+		t.Errorf("no authed 2xx — cookie not flowing")
+	}
+	if authedReqs < 1 {
+		t.Errorf("expected several authed requests after login, got %d", authedReqs)
 	}
 }
 

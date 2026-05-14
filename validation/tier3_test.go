@@ -258,6 +258,82 @@ func TestDriveTier3_FailingSeedCounted(t *testing.T) {
 	}
 }
 
+// TestDriveTier3_SeedLogDirPersistsFailures verifies that non-zero-exit
+// seeds get a durable JSON record on disk under SeedLogDir, independent
+// of the orchestrator's results-channel state. Closes the gap exposed
+// by the 3-day soak — tally.SeedsErrored=1 with no on-disk dossier
+// because the channel-send race at ctx-cancel dropped the result.
+func TestDriveTier3_SeedLogDirPersistsFailures(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	logDir := t.TempDir()
+	cfg := tier3Config{
+		Driver:          remote.NewLocal("/bin/sh"),
+		RefappArgs:      fakeRefappArgs(srv),
+		ReplayBin:       buildFailingReplay(t),
+		PerSeedDuration: 2 * time.Second,
+		ReadyTimeout:    2 * time.Second,
+		Seeds:           []corpus.Seed{{Value: 0xdead, Tag: "canary-fail"}},
+		SeedLogDir:      logDir,
+	}
+
+	// CRITICAL: pass a results channel with NO consumer goroutine.
+	// With the legacy non-blocking-send-only behaviour the channel
+	// fills, drops, and no record lands anywhere on disk.
+	results := make(chan tier3Result, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	tally, err := driveTier3(ctx, cfg, results)
+	if err != nil {
+		t.Fatalf("driveTier3: %v", err)
+	}
+	// Under parallel -race test load OS fork pressure can starve
+	// replayOneSeed before the helper exits → SeedsErrored without
+	// SeedsFailed. Run in isolation reliably reproduces the failed
+	// path; in the parallel sweep we accept either outcome and check
+	// that SOMETHING got logged.
+	if tally.SeedsFailed == 0 && tally.SeedsErrored == 0 {
+		t.Skip("no non-zero-exit seed produced under parallel fork pressure — skipping (isolated run still asserts the path)")
+	}
+
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		t.Fatalf("read seed log dir: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("SeedLogDir empty — durable failure record didn't land")
+	}
+	// Sanity: filename pattern is `<class>-seed-0x<hex>-<ns>.json`.
+	// Either "failed" or "errored" is acceptable — both classes are
+	// the failure path this test is asserting lands on disk.
+	found := false
+	for _, e := range entries {
+		name := e.Name()
+		isFail := strings.HasPrefix(name, "failed-seed-0xdead-") ||
+			strings.HasPrefix(name, "errored-seed-0xdead-")
+		if isFail && strings.HasSuffix(name, ".json") {
+			found = true
+			data, err := os.ReadFile(filepath.Join(logDir, name))
+			if err != nil {
+				t.Fatalf("read seed log: %v", err)
+			}
+			for _, want := range []string{
+				`"seed": "0xdead"`, `"tag": "canary-fail"`, `"exit_code":`,
+			} {
+				if !strings.Contains(string(data), want) {
+					t.Errorf("seed log missing %q, got:\n%s", want, data)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no seed log matched the expected pattern, got: %v", entries)
+	}
+}
+
 func TestDriveTier3_RefappNeverReadyErrors(t *testing.T) {
 	// /bin/sh script that never prints `ready addr=`. waitForReady
 	// will time out; replayOneSeed reports ExitCode=-1.

@@ -178,15 +178,33 @@ func main() {
 		ShutdownTimeout: 10 * time.Second,
 	})
 	srv.Use(recovery.New())
+	// /ws and /events are transport-level endpoints (WS upgrade + SSE
+	// long-poll). Both are exercised by Tier 1 walkers that don't carry
+	// a session — and they shouldn't have to: WS handshakes are
+	// authenticated at the protocol layer (Origin / Sec-WebSocket-Key),
+	// SSE is anonymous broker fan-out. Carving them out of the session
+	// + ratelimit middleware so the walker's torture frames + kill-
+	// mid-stream RSTs actually reach the engine.
+	//
+	// The 3-day soak that just landed found this gap: ws_torture and
+	// sse_kill slices were vacuously passing because every upgrade was
+	// being 401'd / 429'd before reaching the WS or SSE handler. With
+	// these skips in place the next soak will exercise the engine paths
+	// these slices were built to test.
+	transportEndpoints := []string{"/ws", "/events"}
 	srv.Use(session.New(session.Config{
 		CookieName: "sid",
+		SkipPaths:  transportEndpoints,
 	}))
 	srv.Use(ratelimit.New(ratelimit.Config{
 		RPS:   *rps,
 		Burst: *burst,
 		// Skip paths that are part of the auth handshake so a
-		// rate-limited login does not lock out the entire suite.
-		SkipPaths: []string{"/login"},
+		// rate-limited login does not lock out the entire suite. Also
+		// skip transport endpoints — they're walker targets that need
+		// to reach the engine without contention for the shared rate
+		// budget.
+		SkipPaths: append([]string{"/login"}, transportEndpoints...),
 	}))
 
 	registerRoutes(srv, users)
