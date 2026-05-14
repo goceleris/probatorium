@@ -955,11 +955,12 @@ func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
 				"adv_hang_until_timeout": s.Adversarial.HangUntilTimeout,
 			},
 			H2CChurn: map[string]int64{
-				"h2c_sent":     s.H2CChurn.Sent,
-				"h2c_upgraded": s.H2CChurn.Upgraded,
-				"h2c_declined": s.H2CChurn.Declined,
-				"h2c_crashed":  s.H2CChurn.Crashed,
-				"h2c_hang":     s.H2CChurn.Hang,
+				"h2c_sent":            s.H2CChurn.Sent,
+				"h2c_upgraded":        s.H2CChurn.Upgraded,
+				"h2c_declined":        s.H2CChurn.Declined,
+				"h2c_crashed":         s.H2CChurn.Crashed,
+				"h2c_hang":            s.H2CChurn.Hang,
+				"h2c_intentional_rst": s.H2CChurn.IntentionalRST,
 			},
 			WSTorture: map[string]int64{
 				"ws_sent":               s.WSTorture.Sent,

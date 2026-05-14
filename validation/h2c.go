@@ -64,28 +64,45 @@ type h2cTally struct {
 	// crashed — server gave a malformed status line or 5xx in response
 	// to a well-formed upgrade. Bug shape.
 	crashed atomic.Int64
-	// hang — conn stayed open past timeout with no bytes sent. Server
-	// blocked, possibly inside PauseAccept.
+	// hang — server-side hang: we sent a valid upgrade request AND
+	// tried to read the response, but no bytes returned within the
+	// 2s walker timeout. Signals the server may be wedged inside
+	// PauseAccept or otherwise stuck. Bug-adjacent.
 	hang atomic.Int64
+	// intentionalRST — walker-side close-without-read: the
+	// ChurnRSTBeforeRead mode deliberately closes the conn after
+	// writing the preamble, before reading any response. The server's
+	// response (if any) is intentionally discarded by the walker.
+	// NOT a bug signal — it's the workload itself. Tracked separately
+	// so the `hang` counter retains its server-wedge semantics.
+	//
+	// Pre-split (before this counter existed), every ChurnRSTBeforeRead
+	// fire either silently disappeared from outcome accounting OR was
+	// later folded into `hang` — both wrong. The 3-day soak showed
+	// h2c_hang=317K on amd64 which was almost entirely this workload
+	// noise rather than real server hangs.
+	intentionalRST atomic.Int64
 }
 
 // h2cSnapshot is the value-typed projection emitted into the tally
 // JSON. Prefix `h2c_` keeps the keys unambiguous next to adversarial.
 type h2cSnapshot struct {
-	Sent     int64 `json:"h2c_sent"`
-	Upgraded int64 `json:"h2c_upgraded"`
-	Declined int64 `json:"h2c_declined"`
-	Crashed  int64 `json:"h2c_crashed"`
-	Hang     int64 `json:"h2c_hang"`
+	Sent           int64 `json:"h2c_sent"`
+	Upgraded       int64 `json:"h2c_upgraded"`
+	Declined       int64 `json:"h2c_declined"`
+	Crashed        int64 `json:"h2c_crashed"`
+	Hang           int64 `json:"h2c_hang"`
+	IntentionalRST int64 `json:"h2c_intentional_rst"`
 }
 
 func (t *h2cTally) snapshot() h2cSnapshot {
 	return h2cSnapshot{
-		Sent:     t.sent.Load(),
-		Upgraded: t.upgraded.Load(),
-		Declined: t.declined.Load(),
-		Crashed:  t.crashed.Load(),
-		Hang:     t.hang.Load(),
+		Sent:           t.sent.Load(),
+		Upgraded:       t.upgraded.Load(),
+		Declined:       t.declined.Load(),
+		Crashed:        t.crashed.Load(),
+		Hang:           t.hang.Load(),
+		IntentionalRST: t.intentionalRST.Load(),
 	}
 }
 
@@ -160,6 +177,12 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 		// Slam the socket shut without reading. Server's PauseAccept
 		// path is mid-flight; we want it to see RST during the H2 dial.
 		// The deferred Close() handles the RST.
+		//
+		// Tracked as intentionalRST — this is workload intent, NOT a
+		// server-side hang. Keeping `hang` reserved for the case where
+		// we DID attempt a read and got nothing (a real server-wedge
+		// signal).
+		tally.intentionalRST.Add(1)
 		return
 	}
 
