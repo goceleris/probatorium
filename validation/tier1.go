@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"strings"
 	"sync"
@@ -361,9 +362,34 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 // runMarkovWalker walks the Markov chain until ctx is cancelled,
 // sending one HTTP request per state visit. The endpoint URL is
 // derived from the state name via [markovStateToPath].
-func runMarkovWalker(ctx context.Context, hc *http.Client, base string,
+//
+// Each walker gets its own [http.CookieJar] + [http.Client] so the
+// N concurrent walkers exercise N parallel session lifecycles
+// against the refapp's session middleware. At walker start, it POSTs
+// `/login` with deterministic-per-seed credentials; subsequent
+// requests carry the resulting cookie, hitting the 2xx handler
+// paths instead of the 401 reject path.
+//
+// On a 401 mid-run (session expired by idle timeout) the walker
+// re-logs in transparently. Soak runs at 72h with 30-min session
+// idle timeout would otherwise drift into all-401 territory after
+// the first idle window.
+func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 	m *markov.Matrix, seed uint64, tally *tier1Tally,
 ) {
+	// Per-walker cookie jar. nil error per cookiejar.New's contract
+	// when options is nil.
+	jar, _ := cookiejar.New(nil)
+	hc := &http.Client{
+		Timeout: parent.Timeout,
+		Jar:     jar,
+	}
+	// Deterministic credentials so re-running with the same seed
+	// produces identical wire traffic.
+	username := fmt.Sprintf("walker-%016x", seed)
+	password := fmt.Sprintf("pw-%016x", ^seed)
+	_ = walkerLogin(ctx, hc, base, username, password)
+
 	chain := markov.New(m, seed)
 	rng := rand.New(rand.NewPCG(seed, ^seed))
 	_ = rng // reserved for adversarial-slice follow-up
@@ -374,7 +400,12 @@ func runMarkovWalker(ctx context.Context, hc *http.Client, base string,
 		state := chain.Current()
 		path := markovStateToPath(state)
 		if path != "" {
-			doMarkovRequest(ctx, hc, base+path, tally)
+			status := doMarkovRequest(ctx, hc, base+path, tally)
+			if status == 401 {
+				// Session likely expired — re-login and keep walking.
+				// The next request will pick up the fresh cookie.
+				_ = walkerLogin(ctx, hc, base, username, password)
+			}
 		}
 		if _, ok := chain.Next(); !ok {
 			// Terminal state; reset and continue. Soak workloads are
@@ -384,20 +415,51 @@ func runMarkovWalker(ctx context.Context, hc *http.Client, base string,
 	}
 }
 
+// walkerLogin POSTs /login with the given username + password. The
+// refapp's policy is "any non-empty (username, password)
+// authenticates" — see registerRoutes — so this always succeeds when
+// the server is healthy. Failure is silently swallowed; the walker's
+// 401-retry path handles the case where the eventual GET reveals
+// auth is missing.
+//
+// Response cookie is stored in hc.Jar; subsequent hc.Do() calls
+// carry it automatically.
+func walkerLogin(ctx context.Context, hc *http.Client, base, username, password string) error {
+	body := fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)
+	req, err := http.NewRequestWithContext(ctx, "POST", base+"/login",
+		strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("login %s: status %d", username, resp.StatusCode)
+	}
+	return nil
+}
+
 // doMarkovRequest issues one GET against base+path and folds the
 // result into tally. Errors are folded into requestsError, not
 // returned — Tier 1's contract is "keep firing until ctx is done."
-func doMarkovRequest(ctx context.Context, hc *http.Client, url string, tally *tier1Tally) {
+// Returns the response status code (0 on transport error) so the
+// caller can react to session-expiry 401s with a re-login.
+func doMarkovRequest(ctx context.Context, hc *http.Client, url string, tally *tier1Tally) int {
 	tally.requestsSent.Add(1)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		tally.requestsError.Add(1)
-		return
+		return 0
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
 		tally.requestsError.Add(1)
-		return
+		return 0
 	}
 	defer func() { _ = resp.Body.Close() }()
 	// Drain body — keep-alive requires it.
@@ -410,6 +472,7 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, url string, tally *ti
 	default:
 		tally.requests2xx.Add(1)
 	}
+	return resp.StatusCode
 }
 
 // markovStateToPath maps a Markov state name to the corresponding

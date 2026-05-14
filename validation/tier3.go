@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -70,6 +71,19 @@ type tier3Config struct {
 	// a write failure is silently ignored — the in-memory tally is
 	// authoritative.
 	SnapshotPath string
+
+	// SeedLogDir, when non-empty, is the directory under which the
+	// tier writes one JSON record per non-zero-exit seed
+	// (`<exit-class>-seed-<value>-<ts>.json`).
+	//
+	// Closes a gap the 3-day soak exposed: the non-blocking send to
+	// the `results` channel below silently drops failures when the
+	// consumer goroutine has exited (ctx-cancel race) or the buffer
+	// is saturated. The counter still increments, so the run reports
+	// "N errored seeds" but no on-disk dossier exists for postmortem.
+	// SeedLogDir writes the record SYNCHRONOUSLY — independent of
+	// channel state — so the durable record always lands.
+	SeedLogDir string
 }
 
 // tier3Tally accumulates per-seed result counts.
@@ -161,6 +175,7 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 
 		res := replayOneSeed(ctx, cfg, seed)
 		tally.seedsAttempted.Add(1)
+		exitClass := "passed"
 		switch {
 		case res.ExitCode == 0:
 			tally.seedsPassed.Add(1)
@@ -169,13 +184,24 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 			// failure). Count separately so postmortem can tell
 			// infra flake from genuine seed-found bug.
 			tally.seedsErrored.Add(1)
+			exitClass = "errored"
 		default:
 			tally.seedsFailed.Add(1)
+			exitClass = "failed"
+		}
+
+		// Durable per-failure log — written synchronously so the
+		// on-disk record survives the orchestrator's channel-state
+		// races at ctx-cancel. Closed the 3-day-soak gap where
+		// seedsErrored counter ticked but no dossier existed on disk.
+		if exitClass != "passed" && cfg.SeedLogDir != "" {
+			writeSeedFailureLog(cfg.SeedLogDir, exitClass, res)
 		}
 
 		// Non-blocking send — if the orchestrator's incident pipeline
 		// is full or absent (nil channel) we drop the result. The
-		// tally still counts it, so postmortem still sees the failure.
+		// tally still counts it, AND the seed log above durably
+		// records non-zero exits regardless of channel state.
 		if results != nil {
 			select {
 			case results <- res:
@@ -344,4 +370,57 @@ func toJSON(r tier3Result) durationOnlyResult {
 		DurationNS: r.Duration.Nanoseconds(),
 		Stderr:     r.Stderr,
 	}
+}
+
+// writeSeedFailureLog persists one tier3Result to a per-seed JSON
+// file under dir. File name is `<class>-seed-<hex>-<ns>.json` —
+// class is "errored" or "failed", <hex> is the seed value, <ns> is
+// the unix nanos timestamp (so duplicates from corpus loops don't
+// overwrite each other).
+//
+// Best-effort: any failure (MkdirAll, WriteFile) is silently
+// ignored. In-memory tally + the results channel remain the
+// authoritative violation count; this file is the durable
+// postmortem record.
+func writeSeedFailureLog(dir, class string, r tier3Result) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	rec := struct {
+		Class      string `json:"class"`
+		Seed       string `json:"seed"`
+		Tag        string `json:"tag,omitempty"`
+		ExitCode   int    `json:"exit_code"`
+		DurationNS int64  `json:"duration_ns"`
+		RefappPID  int    `json:"refapp_pid,omitempty"`
+		Stderr     string `json:"stderr,omitempty"`
+		Stdout     string `json:"stdout,omitempty"`
+		LoggedAt   string `json:"logged_at"`
+	}{
+		Class:      class,
+		Seed:       fmt.Sprintf("0x%x", r.Seed),
+		Tag:        r.Tag,
+		ExitCode:   r.ExitCode,
+		DurationNS: r.Duration.Nanoseconds(),
+		RefappPID:  r.RefappPID,
+		Stderr:     truncateAt(r.Stderr, 4096),
+		Stdout:     truncateAt(r.Stdout, 4096),
+		LoggedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return
+	}
+	name := fmt.Sprintf("%s-seed-0x%x-%d.json", class, r.Seed, time.Now().UnixNano())
+	_ = os.WriteFile(filepath.Join(dir, name), data, 0o644)
+}
+
+// truncateAt caps s to maxLen bytes. Used to bound seed-failure log
+// records — Stdout/Stderr from a wedged refapp can otherwise grow
+// unbounded. A truncation marker keeps the file diff-friendly.
+func truncateAt(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "...(truncated)"
 }

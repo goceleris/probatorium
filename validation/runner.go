@@ -807,6 +807,12 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 		// overwrites at run end. Long-running soaks get visibility
 		// into seed-loop progress without waiting for ctx-cancel.
 		SnapshotPath: filepath.Join(o.cfg.OutDir, "tier3_tally.json"),
+		// Durable per-seed failure log — closes the channel-drop
+		// gap exposed by the 3-day soak (counter=1 errored but no
+		// dossier on disk). One JSON per non-zero exit, written
+		// synchronously before the orchestrator-side incident
+		// channel send.
+		SeedLogDir: filepath.Join(o.cfg.OutDir, "tier3_failures"),
 	}
 	tally, err := driveTier3(ctx, cfg, results)
 	close(results)
