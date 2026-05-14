@@ -191,6 +191,30 @@ func TestFireH2CChurn_SilentServerCountsHang(t *testing.T) {
 	}
 }
 
+// TestFireH2CChurn_RSTBeforeReadCountsIntentional verifies that
+// ChurnRSTBeforeRead increments the intentionalRST counter (workload
+// intent) and NOT the hang counter (server-wedge signal). Pre-split,
+// these were conflated in `h2c_hang` — the 3-day soak's 317K h2c_hang
+// count on amd64 was almost entirely walker-intentional RSTs rather
+// than real server hangs.
+func TestFireH2CChurn_RSTBeforeReadCountsIntentional(t *testing.T) {
+	srv := newFakeH2CServer(t, func(c net.Conn) {
+		// Drain the preamble + 101 reply (irrelevant — walker closes
+		// before reading anything).
+		defer func() { _ = c.Close() }()
+		_, _ = c.Read(make([]byte, 4096))
+	})
+	var tally h2cTally
+	fireH2CChurn(context.Background(), srv.HostPort(), ChurnRSTBeforeRead, &tally)
+	s := tally.snapshot()
+	if s.IntentionalRST != 1 {
+		t.Errorf("IntentionalRST: got %d, want 1", s.IntentionalRST)
+	}
+	if s.Hang != 0 {
+		t.Errorf("Hang: got %d, want 0 (this should NOT count as a server hang)", s.Hang)
+	}
+}
+
 func TestFireH2CChurn_DialFailureDoesNotIncrementOutcomes(t *testing.T) {
 	// No server listening — every dial fails. Sent IS incremented (we
 	// tried) but Upgraded/Declined/Crashed/Hang must all stay zero.
