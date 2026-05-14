@@ -325,9 +325,32 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 // emits the canonical `ready addr=<addr>` line (see
 // validation/refapp/auth_session_ratelimit/main.go:10). Returns
 // non-nil error on timeout or process death before ready.
+//
+// The scanner goroutine selects on readyCtx for EVERY channel send,
+// not just the loop boundary. This closes the leak the 3-day soak
+// found: pre-fix, when waitForReady returned early on a successful
+// ready line, the scanner goroutine kept running, eventually blocked
+// on lineCh because nobody read it, and retained its 64 KiB buffer
+// + the bufio.Scanner state forever. Tier 3 calls waitForReady once
+// per seed → ~20K orphan goroutines + ~1.4 GB retained over a 72h
+// soak. (Soak data: validator RSS climbed 60 MB/h linear-fit; this
+// goroutine leak accounts for the bulk of it.)
+//
+// Post-fix:
+//   - readyCtx cancels on function return (deferred above) AND on
+//     timeout
+//   - every channel send selects on readyCtx, so the goroutine
+//     observes cancel even when blocked on a full lineCh
+//   - lineCh is closed when the goroutine exits so a concurrent
+//     reader doesn't deadlock either
 func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duration) error {
-	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	readyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if timeout > 0 {
+		var timeoutCancel context.CancelFunc
+		readyCtx, timeoutCancel = context.WithTimeout(readyCtx, timeout)
+		defer timeoutCancel()
+	}
 
 	scanner := bufio.NewScanner(proc.Stderr())
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -335,13 +358,24 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 	lineCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 	go func() {
+		// Close lineCh on exit so any concurrent reader (none today,
+		// but defensive against future refactors) doesn't deadlock.
+		defer close(lineCh)
 		for scanner.Scan() {
-			lineCh <- scanner.Text()
+			select {
+			case lineCh <- scanner.Text():
+			case <-readyCtx.Done():
+				return
+			}
 		}
-		if err := scanner.Err(); err != nil {
-			errCh <- err
-		} else {
-			errCh <- io.EOF
+		select {
+		case errCh <- func() error {
+			if err := scanner.Err(); err != nil {
+				return err
+			}
+			return io.EOF
+		}():
+		case <-readyCtx.Done():
 		}
 	}()
 
@@ -349,7 +383,10 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 		select {
 		case <-readyCtx.Done():
 			return fmt.Errorf("ready timeout: %w", readyCtx.Err())
-		case line := <-lineCh:
+		case line, ok := <-lineCh:
+			if !ok {
+				return fmt.Errorf("refapp exited before ready: %w", io.EOF)
+			}
 			if strings.HasPrefix(line, "ready addr=") {
 				return nil
 			}

@@ -103,6 +103,7 @@
               -property-tier={{ validate_property_tier | default('core,middleware') }} \
               -celeris-commit={{ celeris_version | default('') }} \
               -out={{ validate_run_dir }} \
+              {% if validate_pprof_addr | default('') %}-pprof-addr={{ validate_pprof_addr }} \{% endif %}
               > {{ validate_run_dir }}/validator.stdout \
               2> {{ validate_run_dir }}/validator.stderr
           args:

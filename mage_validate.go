@@ -149,6 +149,14 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if os.Getenv("CLUSTER_USE_LAN") == "1" {
 			args = append(args, "--extra-vars", "use_lan=true")
 		}
+		// VALIDATE_PPROF_ADDR=127.0.0.1:6060 exposes the validator's
+		// pprof handlers on the target host. ssh in + curl
+		// /debug/pprof/heap > heap.pb.gz for live diagnosis. Empty
+		// = disabled (production default). 127.0.0.1-bound so the
+		// endpoint isn't reachable from outside the host.
+		if v := os.Getenv("VALIDATE_PPROF_ADDR"); v != "" {
+			args = append(args, "--extra-vars", "validate_pprof_addr="+v)
+		}
 		fmt.Printf("\n=== %s on %s (playbook=%s) ===\n", titleCase(kind), t, playbook)
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir
