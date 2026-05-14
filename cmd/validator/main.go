@@ -15,6 +15,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	_ "net/http/pprof" // exposes /debug/pprof/* handlers on http.DefaultServeMux
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -46,6 +48,16 @@ type Config struct {
 	DriverMode         string
 	DriverSSHUser      string
 	DriverSSHHost      string
+
+	// PprofAddr, when non-empty, binds the standard /debug/pprof/*
+	// handlers on this address. Used for live leak / CPU diagnosis
+	// during long soaks — `ssh into the host; curl /debug/pprof/heap >
+	// heap.pb.gz`. Empty disables (production default).
+	//
+	// Bind to 127.0.0.1:<port> in any deployment that's reachable
+	// from outside the host — pprof handlers expose raw process
+	// memory and have no auth.
+	PprofAddr string
 }
 
 // DefaultConfig returns the fresh-flag defaults.
@@ -83,6 +95,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.DriverMode, "driver", c.DriverMode, "process driver (local|ssh); default local")
 	fs.StringVar(&c.DriverSSHUser, "ssh-user", c.DriverSSHUser, "SSH login user (only with -driver=ssh)")
 	fs.StringVar(&c.DriverSSHHost, "ssh-host", c.DriverSSHHost, "SSH host:port (only with -driver=ssh)")
+	fs.StringVar(&c.PprofAddr, "pprof-addr", c.PprofAddr, "expose /debug/pprof/* on this addr (e.g. 127.0.0.1:6060); empty disables")
 }
 
 // ParseArgs parses argv (without the program name).
@@ -152,6 +165,24 @@ func run(cfg Config) error {
 		fmt.Fprintln(os.Stderr, "validator: interrupted")
 		cancel()
 	}()
+
+	// pprof server, when requested. Runs on a separate goroutine so it
+	// doesn't compete with the orchestrator for the main event loop.
+	// Best-effort: bind failure logs but doesn't fail the run — pprof
+	// is diagnostic infrastructure, the soak itself comes first.
+	if cfg.PprofAddr != "" {
+		go func() {
+			srv := &http.Server{
+				Addr:              cfg.PprofAddr,
+				Handler:           http.DefaultServeMux,
+				ReadHeaderTimeout: 10 * time.Second,
+			}
+			fmt.Fprintf(os.Stderr, "validator: pprof listening on %s/debug/pprof/\n", cfg.PprofAddr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				fmt.Fprintf(os.Stderr, "validator: pprof server error: %v\n", err)
+			}
+		}()
+	}
 
 	return o.Run(ctx)
 }

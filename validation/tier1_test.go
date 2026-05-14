@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -184,6 +185,61 @@ func TestRunMarkovWalker_LoginThenCookieFlow(t *testing.T) {
 	}
 	if authedReqs < 1 {
 		t.Errorf("expected several authed requests after login, got %d", authedReqs)
+	}
+}
+
+// TestWaitForReady_NoGoroutineLeak repeatedly calls waitForReady
+// against a refapp that prints `ready addr=` then continues spamming
+// log lines indefinitely. Pre-fix, the scanner goroutine inside
+// waitForReady would block on a full lineCh and leak forever — Tier 3
+// calls this once per seed, so a 72h soak with ~20K seeds was
+// retaining ~1.4 GB of orphan-goroutine state. Post-fix the goroutine
+// selects on readyCtx for every send, so deferred cancel reaps it.
+//
+// The test asserts goroutine count stays bounded after many calls.
+func TestWaitForReady_NoGoroutineLeak(t *testing.T) {
+	// Drop GOMAXPROCS-dependent flakiness by sampling AFTER GC.
+	settle := func() {
+		for i := 0; i < 3; i++ {
+			runtime.GC()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	settle()
+	base := runtime.NumGoroutine()
+
+	d := remote.NewLocal("/bin/sh")
+	const iterations = 30
+	for i := 0; i < iterations; i++ {
+		// Script prints `ready addr=foo` then loops printing more lines
+		// fast enough that the scanner goroutine's lineCh buffer fills
+		// — recreating the pre-fix deadlock scenario.
+		args := []string{
+			"-c",
+			`echo "ready addr=127.0.0.1:0"; for i in $(seq 1 200); do echo "log line $i"; done; sleep 1`,
+		}
+		proc, err := d.Start(context.Background(), args)
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		if err := waitForReady(context.Background(), proc, time.Second); err != nil {
+			t.Fatalf("waitForReady iter %d: %v", i, err)
+		}
+		// SIGTERM the refapp to free its pipe goroutines.
+		_ = proc.Signal(0xf)
+	}
+	// Allow background reaping.
+	settle()
+
+	final := runtime.NumGoroutine()
+	growth := final - base
+	// Some growth is normal (Go scheduler workers, test framework
+	// goroutines). Pre-fix this test would show ~`iterations` worth of
+	// orphans (~30 goroutines linearly accumulated). Cap at 10 — a
+	// generous bound that still detects a per-iteration linear leak.
+	if growth > 10 {
+		t.Errorf("goroutine count grew by %d over %d iterations (base=%d final=%d) — likely leak",
+			growth, iterations, base, final)
 	}
 }
 
