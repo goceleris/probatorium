@@ -157,6 +157,14 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_PPROF_ADDR"); v != "" {
 			args = append(args, "--extra-vars", "validate_pprof_addr="+v)
 		}
+		// VALIDATE_REFAPP_ENGINE pins the celeris engine the refapp
+		// runs on (iouring | epoll | std | adaptive). Empty leaves
+		// the refapp's `auto` resolution alone. Per issue #103 —
+		// engine matrix coverage. Single-engine form for now; a
+		// comma-list runner is a follow-up.
+		if v := os.Getenv("VALIDATE_REFAPP_ENGINE"); v != "" {
+			args = append(args, "--extra-vars", "validate_refapp_engine="+v)
+		}
 		fmt.Printf("\n=== %s on %s (playbook=%s) ===\n", titleCase(kind), t, playbook)
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir
