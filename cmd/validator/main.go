@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"syscall"
 	"time"
 
@@ -58,6 +59,18 @@ type Config struct {
 	// from outside the host — pprof handlers expose raw process
 	// memory and have no auth.
 	PprofAddr string
+
+	// HeapDumpDir, when non-empty, names a directory the validator
+	// writes a heap profile to every HeapDumpInterval (default 60s).
+	// File names: `heap-<unix-ns>.pb.gz`. Diff with
+	// `go tool pprof -base heap-EARLY.pb.gz heap-LATE.pb.gz`.
+	//
+	// Disk-based alternative to the pprof HTTP endpoint for
+	// environments where outgoing local network from a separate
+	// process is blocked (e.g. macOS dev sandbox). Survives
+	// ctx-cancel cleanly so the last samples reflect end-of-run state.
+	HeapDumpDir      string
+	HeapDumpInterval time.Duration
 }
 
 // DefaultConfig returns the fresh-flag defaults.
@@ -95,6 +108,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.DriverMode, "driver", c.DriverMode, "process driver (local|ssh); default local")
 	fs.StringVar(&c.DriverSSHUser, "ssh-user", c.DriverSSHUser, "SSH login user (only with -driver=ssh)")
 	fs.StringVar(&c.DriverSSHHost, "ssh-host", c.DriverSSHHost, "SSH host:port (only with -driver=ssh)")
+	fs.StringVar(&c.HeapDumpDir, "heap-dump-dir", c.HeapDumpDir, "directory to write periodic heap profiles to; empty disables")
+	fs.DurationVar(&c.HeapDumpInterval, "heap-dump-interval", 60*time.Second, "interval between heap dumps when -heap-dump-dir is set")
 	fs.StringVar(&c.PprofAddr, "pprof-addr", c.PprofAddr, "expose /debug/pprof/* on this addr (e.g. 127.0.0.1:6060); empty disables")
 }
 
@@ -184,5 +199,53 @@ func run(cfg Config) error {
 		}()
 	}
 
+	// Periodic heap dumps to disk, when requested. Same diagnostic
+	// purpose as pprof HTTP but file-based — works in environments
+	// where outgoing local network from another process is blocked.
+	if cfg.HeapDumpDir != "" {
+		if err := os.MkdirAll(cfg.HeapDumpDir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "validator: heap-dump-dir mkdir: %v\n", err)
+		} else {
+			interval := cfg.HeapDumpInterval
+			if interval <= 0 {
+				interval = 60 * time.Second
+			}
+			go runHeapDumper(ctx, cfg.HeapDumpDir, interval)
+			fmt.Fprintf(os.Stderr, "validator: heap dumps every %s → %s\n", interval, cfg.HeapDumpDir)
+		}
+	}
+
 	return o.Run(ctx)
+}
+
+// runHeapDumper writes a runtime/pprof.WriteHeapProfile snapshot to
+// dir every interval. File name is `heap-<unix-ns>.pb.gz`. Exits when
+// ctx is cancelled. Best-effort: any write failure is logged to
+// stderr but doesn't halt the run.
+func runHeapDumper(ctx context.Context, dir string, interval time.Duration) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	dump := func() {
+		runtime.GC() // capture a clean post-GC heap snapshot
+		path := filepath.Join(dir, fmt.Sprintf("heap-%d.pb.gz", time.Now().UnixNano()))
+		f, err := os.Create(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "validator: heap dump create: %v\n", err)
+			return
+		}
+		defer func() { _ = f.Close() }()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			fmt.Fprintf(os.Stderr, "validator: heap dump write: %v\n", err)
+		}
+	}
+	dump() // initial sample at t=0
+	for {
+		select {
+		case <-ctx.Done():
+			dump() // final sample on shutdown
+			return
+		case <-tick.C:
+			dump()
+		}
+	}
 }
