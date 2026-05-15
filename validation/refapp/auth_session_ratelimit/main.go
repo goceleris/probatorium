@@ -441,8 +441,23 @@ func (s *store) byNameLookup(name string) (string, bool) {
 }
 
 // resolveEngine maps the -engine flag value to a celeris.EngineType.
-// "auto" preserves the cluster's Linux→iouring default while letting
-// the same binary run on the dev Mac (Std) for smoke tests.
+//
+// `auto` picks std on every platform — TEMPORARY until celeris fixes
+// goceleris/celeris#273 (iouring + epoll engines hang on WS hijack
+// + SSE streaming responses; std handles both correctly). Before #273
+// the auto-on-Linux default was iouring, but that made the Tier 1
+// WS torture + SSE kill walkers vacuously pass — they never reached
+// the engine because every upgrade hung at the hijack/streaming
+// boundary.
+//
+// Once celeris ships the fix, the `auto` branch flips back to
+// `iouring` on Linux. The engine matrix runner (probatorium#103) will
+// still exercise iouring/epoll/adaptive explicitly via `-engine` —
+// the workaround is only for the default soak path.
+//
+// The explicit `iouring`/`epoll`/`adaptive` flag values still work
+// — operators wanting to reproduce #273 or exercise those engines
+// for non-streaming workloads can opt in via the flag.
 func resolveEngine(name string) celeris.EngineType {
 	switch name {
 	case "iouring":
@@ -454,9 +469,8 @@ func resolveEngine(name string) celeris.EngineType {
 	case "adaptive":
 		return celeris.Adaptive
 	case "auto":
-		if isLinux() {
-			return celeris.IOUring
-		}
+		// TEMPORARY: pick std on every platform until celeris#273
+		// (iouring/epoll hang on WS hijack + SSE streaming) is fixed.
 		return celeris.Std
 	}
 	// Unknown value — fall back to std rather than crash; the engine

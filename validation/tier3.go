@@ -174,6 +174,22 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 		idx++
 
 		res := replayOneSeed(ctx, cfg, seed)
+		// If the parent ctx cancelled DURING the replay (run deadline
+		// hit, SIGTERM, etc.), the replay's exec.CommandContext
+		// SIGKILLs the validator-replay subprocess → ExitCode=-1 +
+		// stderr="signal: killed". That's not an infra flake on our
+		// side; it's normal end-of-run shutdown catching a seed mid-
+		// flight. Don't count this as an attempt — exit the loop.
+		//
+		// Without this guard, every soak ended with `seedsErrored=1`
+		// PER ARCH (whichever seed happened to be in flight when the
+		// duration deadline tripped). The 12h soak's two "errored"
+		// seeds (amd64 0x1a h1-bare-lf-in-header @ 3.7s, arm64 0x17
+		// h1-oversize-uri @ 9.4s — both well under the 13s budget)
+		// were exactly this artifact.
+		if ctx.Err() != nil && res.ExitCode < 0 {
+			return tally.snapshot(), nil
+		}
 		tally.seedsAttempted.Add(1)
 		exitClass := "passed"
 		switch {
