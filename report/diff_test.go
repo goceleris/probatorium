@@ -181,3 +181,96 @@ func TestIsZeroAsymmetric(t *testing.T) {
 		}
 	}
 }
+
+func TestDiffCells_EmptyOrSingleReturnsNil(t *testing.T) {
+	if got := DiffCells(nil); got != nil {
+		t.Errorf("nil cells: got %d, want nil", len(got))
+	}
+	one := []ValidationCellResult{{Refapp: "x", Engine: "iouring", Arch: "amd64"}}
+	if got := DiffCells(one); got != nil {
+		t.Errorf("single cell: got %d, want nil", len(got))
+	}
+}
+
+func TestDiffCells_CrossEngineSameArchDetectsDivergence(t *testing.T) {
+	cells := []ValidationCellResult{
+		{Refapp: "auth_session_ratelimit", Engine: "iouring", Arch: "amd64",
+			Tier1: &Tier1Summary{
+				Adversarial: map[string]int64{"adv_wrong_accepted": 5},
+			}},
+		{Refapp: "auth_session_ratelimit", Engine: "epoll", Arch: "amd64",
+			Tier1: &Tier1Summary{
+				Adversarial: map[string]int64{"adv_wrong_accepted": 0},
+			}},
+	}
+	divs := DiffCells(cells)
+	if len(divs) != 1 {
+		t.Fatalf("got %d divergences, want 1: %+v", len(divs), divs)
+	}
+	// DiffCells sorts cells alphabetically by engine within each
+	// (refapp, arch) group, so HostA=epoll, HostB=iouring.
+	if divs[0].HostA != "epoll-amd64" || divs[0].HostB != "iouring-amd64" {
+		t.Errorf("expected cross-engine labels epoll-amd64 / iouring-amd64 (alpha-sorted), got %s / %s",
+			divs[0].HostA, divs[0].HostB)
+	}
+	if divs[0].Severity != SeverityHigh {
+		t.Errorf("severity: got %s, want HIGH", divs[0].Severity)
+	}
+}
+
+func TestDiffCells_CrossArchSameEngineDetectsDivergence(t *testing.T) {
+	cells := []ValidationCellResult{
+		{Refapp: "auth_session_ratelimit", Engine: "iouring", Arch: "amd64",
+			Tier1: &Tier1Summary{
+				H2CChurn: map[string]int64{"h2c_crashed": 3},
+			}},
+		{Refapp: "auth_session_ratelimit", Engine: "iouring", Arch: "arm64",
+			Tier1: &Tier1Summary{
+				H2CChurn: map[string]int64{"h2c_crashed": 0},
+			}},
+	}
+	divs := DiffCells(cells)
+	if len(divs) != 1 {
+		t.Fatalf("got %d divergences, want 1", len(divs))
+	}
+	if divs[0].HostA != "iouring-amd64" || divs[0].HostB != "iouring-arm64" {
+		t.Errorf("expected cross-arch labels, got %s / %s", divs[0].HostA, divs[0].HostB)
+	}
+}
+
+func TestDiffCells_FullMatrixDetectsAll(t *testing.T) {
+	// 2 refapps × 2 engines × 2 arches = 8 cells. All clean EXCEPT one
+	// (auth_session_ratelimit, iouring, amd64) which has 1 wrong-
+	// accepted adversarial.
+	mkCell := func(refapp, engine, arch string, advWrong int64) ValidationCellResult {
+		return ValidationCellResult{
+			Refapp: refapp, Engine: engine, Arch: arch,
+			Tier1: &Tier1Summary{Adversarial: map[string]int64{"adv_wrong_accepted": advWrong}},
+		}
+	}
+	cells := []ValidationCellResult{
+		mkCell("auth", "iouring", "amd64", 1),
+		mkCell("auth", "iouring", "arm64", 0),
+		mkCell("auth", "epoll", "amd64", 0),
+		mkCell("auth", "epoll", "arm64", 0),
+		mkCell("kitchen", "iouring", "amd64", 0),
+		mkCell("kitchen", "iouring", "arm64", 0),
+		mkCell("kitchen", "epoll", "amd64", 0),
+		mkCell("kitchen", "epoll", "arm64", 0),
+	}
+	divs := DiffCells(cells)
+	// Cross-engine on (auth, amd64): 1 divergence (iouring vs epoll)
+	// Cross-arch on (auth, iouring): 1 divergence (amd64 vs arm64)
+	// No others (every other cell is 0)
+	if len(divs) != 2 {
+		t.Fatalf("got %d divergences, want 2: %+v", len(divs), divs)
+	}
+	for _, d := range divs {
+		if d.Severity != SeverityHigh {
+			t.Errorf("severity: got %s, want HIGH", d.Severity)
+		}
+		if d.Counter != "adv_wrong_accepted" {
+			t.Errorf("counter: got %s, want adv_wrong_accepted", d.Counter)
+		}
+	}
+}

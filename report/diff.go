@@ -170,6 +170,92 @@ func isZeroAsymmetric(a, b int64) bool {
 	return (a == 0) != (b == 0)
 }
 
+// DiffCells groups cells by (refapp, arch) and runs DiffValidation
+// between every (engineA, engineB) pair within each group, then
+// also runs DiffValidation across arches per (refapp, engine). The
+// resulting Divergence slice covers BOTH cross-engine and cross-arch
+// findings in a single multi-cell matrix run.
+//
+// HostA/HostB labels encode the (engine, arch) pair so the rendered
+// table is unambiguous: e.g. "iouring-amd64" vs "epoll-amd64" for a
+// cross-engine row, "iouring-amd64" vs "iouring-arm64" for cross-
+// arch.
+//
+// Added in v5.1 per probatorium#103. Single-cell runs still use
+// DiffValidation directly on top-level Tier1/Tier3 — this function
+// is a no-op when cells is empty.
+func DiffCells(cells []ValidationCellResult) []Divergence {
+	if len(cells) < 2 {
+		return nil
+	}
+	var out []Divergence
+	// Convenience: project a CellResult into a transient
+	// ValidationResults so we can reuse DiffValidation.
+	toVR := func(c ValidationCellResult) *ValidationResults {
+		return &ValidationResults{Tier1: c.Tier1, Tier3: c.Tier3}
+	}
+	label := func(c ValidationCellResult) string {
+		// engine-arch pair (refapp is fixed within each group below
+		// for cross-engine; the group key itself names refapp+arch).
+		return c.Engine + "-" + c.Arch
+	}
+
+	// Group by (refapp, arch); diff every (engine, engine) pair.
+	type key struct{ refapp, arch string }
+	byArch := map[key][]ValidationCellResult{}
+	for _, c := range cells {
+		k := key{c.Refapp, c.Arch}
+		byArch[k] = append(byArch[k], c)
+	}
+	for _, group := range byArch {
+		// Stable order: sort cells by engine name so the diff output
+		// is deterministic across runs.
+		sort.SliceStable(group, func(i, j int) bool {
+			return group[i].Engine < group[j].Engine
+		})
+		for i := 0; i < len(group); i++ {
+			for j := i + 1; j < len(group); j++ {
+				divs := DiffValidation(toVR(group[i]), toVR(group[j]),
+					label(group[i]), label(group[j]))
+				out = append(out, divs...)
+			}
+		}
+	}
+
+	// Group by (refapp, engine); diff cross-arch within each.
+	type aKey struct{ refapp, engine string }
+	byEngine := map[aKey][]ValidationCellResult{}
+	for _, c := range cells {
+		k := aKey{c.Refapp, c.Engine}
+		byEngine[k] = append(byEngine[k], c)
+	}
+	for _, group := range byEngine {
+		sort.SliceStable(group, func(i, j int) bool {
+			return group[i].Arch < group[j].Arch
+		})
+		for i := 0; i < len(group); i++ {
+			for j := i + 1; j < len(group); j++ {
+				divs := DiffValidation(toVR(group[i]), toVR(group[j]),
+					label(group[i]), label(group[j]))
+				out = append(out, divs...)
+			}
+		}
+	}
+
+	// Re-sort the combined slice by severity / slice / counter so
+	// the report is severity-first across the whole matrix.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Severity != out[j].Severity {
+			return severityRank(out[i].Severity) < severityRank(out[j].Severity)
+		}
+		if out[i].Slice != out[j].Slice {
+			return out[i].Slice < out[j].Slice
+		}
+		return out[i].Counter < out[j].Counter
+	})
+	return out
+}
+
 // severityRank maps severity strings to a sort priority. Lower
 // number = higher priority.
 func severityRank(s string) int {
