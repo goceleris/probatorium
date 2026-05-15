@@ -68,3 +68,8 @@ servers/_docker/**/*.tar
 .idea/
 .vscode/
 .DS_Store
+/validation/refapp/*/kitchen_sink
+
+# Refapp local-build binaries (named after their dir slug)
+/validation/refapp/kitchen_sink/kitchen_sink
+/validation/refapp/auth_session_ratelimit/auth_session_ratelimit

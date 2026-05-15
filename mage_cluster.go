@@ -170,6 +170,16 @@ func Deploy() error {
 			module: "validation/refapp/auth_session_ratelimit",
 			archs:  []string{"amd64", "arm64"},
 		},
+		{
+			// kitchen_sink covers 16+ stateless middlewares (recovery,
+			// requestid, secure, cors, bodylimit, methodoverride,
+			// rewrite, redirect, healthcheck, ratelimit, timeout,
+			// circuitbreaker, idempotency, singleflight, basicauth +
+			// per-route etag, cache). Added per probatorium#103.
+			slug:   "kitchen_sink",
+			module: "validation/refapp/kitchen_sink",
+			archs:  []string{"amd64", "arm64"},
+		},
 	}
 	for _, r := range refappModules {
 		for _, arch := range r.archs {
