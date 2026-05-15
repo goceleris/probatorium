@@ -180,6 +180,14 @@ func Deploy() error {
 			module: "validation/refapp/kitchen_sink",
 			archs:  []string{"amd64", "arm64"},
 		},
+		{
+			// auth_jwt_csrf covers the alternative-auth surface
+			// (jwt, csrf, keyauth) that conflicts with kitchen_sink's
+			// basicauth path. Added per probatorium#103.
+			slug:   "auth_jwt_csrf",
+			module: "validation/refapp/auth_jwt_csrf",
+			archs:  []string{"amd64", "arm64"},
+		},
 	}
 	for _, r := range refappModules {
 		for _, arch := range r.archs {
