@@ -393,6 +393,32 @@ func TestOrchestratorBuildDriver_SSHWithHostAndUser(t *testing.T) {
 	_ = d.Close()
 }
 
+func TestBuildRefappArgs_NoEngine(t *testing.T) {
+	got := buildRefappArgs("127.0.0.1:8080", "")
+	want := []string{"-bind", "127.0.0.1:8080"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBuildRefappArgs_WithEngine(t *testing.T) {
+	got := buildRefappArgs("127.0.0.1:8080", "iouring")
+	want := []string{"-bind", "127.0.0.1:8080", "-engine", "iouring"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestOrchestratorBuildDriver_UnknownMode(t *testing.T) {
 	cfg := Default()
 	cfg.CelerisBin = "/usr/bin/true"

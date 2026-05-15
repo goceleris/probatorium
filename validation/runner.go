@@ -134,6 +134,15 @@ type Config struct {
 	// every registered predicate. Wave 6 default = "core" + "middleware"
 	// (the engine + driver tiers wait for wave 7's instrumentation).
 	PropertyTier string
+
+	// RefappEngine, when non-empty, is appended to the refapp's
+	// process argv as `-engine <value>`. Used to exercise specific
+	// celeris engines (iouring / epoll / std / adaptive) under the
+	// engine matrix runner — instead of trusting the refapp's
+	// `auto` default. Empty leaves the refapp's default in place.
+	//
+	// Tracked under issue #103 — engine matrix coverage.
+	RefappEngine string
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -673,7 +682,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 
 	cfg := tier1Config{
 		Driver:      driver,
-		RefappArgs:  []string{"-bind", o.cfg.CelerisListenAddr},
+		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine),
 		BaseURL:     "http://" + o.cfg.CelerisListenAddr,
 		Matrix:      o.matrix,
 		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
@@ -799,7 +808,7 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 
 	cfg := tier3Config{
 		Driver:        driver,
-		RefappArgs:    []string{"-bind", o.cfg.CelerisListenAddr},
+		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine),
 		ReplayBin:     replayBin,
 		Seeds:         o.seeds,
 		CelerisCommit: o.cfg.CelerisCommit,
@@ -1061,6 +1070,23 @@ func PrintReplayPlan(w io.Writer, rs ReplayedSeed) {
 	_, _ = fmt.Fprintf(w, "  markov_steps=%d startup_jitter=%s\n", rs.MarkovSteps, rs.StartupJitter)
 	_, _ = fmt.Fprintf(w, "  fault schedule (%d entries):\n", len(rs.Schedule))
 	_, _ = fmt.Fprint(w, rs.Schedule.String())
+}
+
+// buildRefappArgs builds the argv for a refapp invocation. Every
+// refapp accepts `-bind <addr>`; when an explicit engine is requested
+// (engine matrix runner) the helper also appends `-engine <name>` so
+// the refapp's auto-default is bypassed.
+//
+// Per issue #103 (engine matrix coverage): the orchestrator threads
+// the engine choice through Config.RefappEngine so a single mage
+// Validate run can pin to a specific celeris engine without rebuilding
+// the refapp.
+func buildRefappArgs(addr, engine string) []string {
+	args := []string{"-bind", addr}
+	if engine != "" {
+		args = append(args, "-engine", engine)
+	}
+	return args
 }
 
 // writeJSON marshals v to path with 2-space indent. Mirrors the helper

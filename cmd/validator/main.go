@@ -60,6 +60,12 @@ type Config struct {
 	// memory and have no auth.
 	PprofAddr string
 
+	// RefappEngine, when non-empty, is appended to the refapp argv
+	// as `-engine <value>`. Used by the engine matrix runner (issue
+	// #103) to pin celeris engine choice without rebuilding the
+	// refapp. Empty leaves the refapp's `auto` default in place.
+	RefappEngine string
+
 	// HeapDumpDir, when non-empty, names a directory the validator
 	// writes a heap profile to every HeapDumpInterval (default 60s).
 	// File names: `heap-<unix-ns>.pb.gz`. Diff with
@@ -108,6 +114,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.DriverMode, "driver", c.DriverMode, "process driver (local|ssh); default local")
 	fs.StringVar(&c.DriverSSHUser, "ssh-user", c.DriverSSHUser, "SSH login user (only with -driver=ssh)")
 	fs.StringVar(&c.DriverSSHHost, "ssh-host", c.DriverSSHHost, "SSH host:port (only with -driver=ssh)")
+	fs.StringVar(&c.RefappEngine, "refapp-engine", c.RefappEngine, "celeris engine to pin for the refapp (iouring|epoll|std|adaptive); empty leaves refapp default")
 	fs.StringVar(&c.HeapDumpDir, "heap-dump-dir", c.HeapDumpDir, "directory to write periodic heap profiles to; empty disables")
 	fs.DurationVar(&c.HeapDumpInterval, "heap-dump-interval", 60*time.Second, "interval between heap dumps when -heap-dump-dir is set")
 	fs.StringVar(&c.PprofAddr, "pprof-addr", c.PprofAddr, "expose /debug/pprof/* on this addr (e.g. 127.0.0.1:6060); empty disables")
@@ -163,6 +170,7 @@ func run(cfg Config) error {
 		MetricsURL:         cfg.MetricsURL,
 		PropertyTier:       cfg.PropertyTier,
 		ReplayBin:          cfg.ReplayBin,
+		RefappEngine:       cfg.RefappEngine,
 		DriverMode:         cfg.DriverMode,
 		DriverSSHUser:      cfg.DriverSSHUser,
 		DriverSSHHost:      cfg.DriverSSHHost,
