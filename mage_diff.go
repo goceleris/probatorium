@@ -59,7 +59,24 @@ func ValidateDiff() error {
 		}
 	}
 
-	divs := report.DiffValidation(docA.Validation, docB.Validation, hostA, hostB)
+	// Schema v5.1 (probatorium#103): if either doc carries a Cells
+	// slice (matrix run), prefer the cell-aware diff. Falls back to
+	// the top-level DiffValidation when both docs are single-cell.
+	//
+	// Mixed mode (one doc has cells, the other doesn't) is handled
+	// gracefully: DiffCells operates on the cells from EITHER doc
+	// in turn; pure single-cell runs use DiffValidation.
+	var divs []report.Divergence
+	if hasMatrixCells(docA) || hasMatrixCells(docB) {
+		// Concatenate the two docs' cells (often this means one
+		// matrix doc per arch; merging gives the cross-arch view
+		// alongside cross-engine).
+		cells := append([]report.ValidationCellResult{}, docA.Validation.Cells...)
+		cells = append(cells, docB.Validation.Cells...)
+		divs = report.DiffCells(cells)
+	} else {
+		divs = report.DiffValidation(docA.Validation, docB.Validation, hostA, hostB)
+	}
 	textReport := report.FormatDivergences(divs, hostA, hostB)
 	fmt.Println(textReport)
 
@@ -208,4 +225,11 @@ func loadValidateDoc(path string) (*report.Document, error) {
 		return nil, fmt.Errorf("%s: missing validation_results", path)
 	}
 	return &doc, nil
+}
+
+// hasMatrixCells reports whether a validate-results.json carries a
+// per-cell breakdown (schema v5.1+ matrix runs). Single-cell runs
+// leave Cells empty and populate Tier1/Tier3 at the top level.
+func hasMatrixCells(doc *report.Document) bool {
+	return doc != nil && doc.Validation != nil && len(doc.Validation.Cells) > 0
 }

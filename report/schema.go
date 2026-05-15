@@ -5,10 +5,18 @@ import (
 )
 
 // SchemaVersion is the on-disk JSON schema identifier emitted by every
-// probatorium results file. Kept additive over the v4 schema in
-// goceleris/benchmarks so older readers can fall back to the fields
-// they recognise.
-const SchemaVersion = "5.0"
+// probatorium results file.
+//
+// History:
+//   - 5.0 — first probatorium schema; additive over the v4 schema in
+//     goceleris/benchmarks. Tier1Summary + Tier3Summary on the
+//     top-level ValidationResults.
+//   - 5.1 — per-cell breakdown for matrix runs
+//     (probatorium#103). Adds ValidationResults.Cells; single-
+//     cell runs unchanged. ValidationCellResult keys (refapp, engine,
+//     arch) triple. Older readers ignore the Cells field and
+//     fall back to top-level Tier1/Tier3 when present.
+const SchemaVersion = "5.1"
 
 // Document is the top-level v5.0 results JSON shape. One file per
 // probatorium run; emit by JSON-encoding from the orchestrator.
@@ -149,13 +157,42 @@ type ValidationResults struct {
 	FaultInjectionSeed string `json:"fault_injection_seed,omitempty"`
 
 	// Tier1 and Tier3 are the per-tier final tallies emitted by the
-	// validator orchestrator. Optional — pure-bench runs leave both
-	// unset; validate runs always populate Tier1 (the always-on
-	// workload), and additionally populate Tier3 when a seed corpus
-	// is present. Tier 2 (RESTler) doesn't have a stable summary
-	// shape yet; once it stabilises we'll add a Tier2 field here.
+	// validator orchestrator for SINGLE-cell runs. Optional — pure-
+	// bench runs leave both unset; single-cell validate runs always
+	// populate Tier1 and (when a corpus is present) Tier3.
+	//
+	// For MULTI-cell matrix runs (refapp × engine × arch — see
+	// probatorium#103), prefer the Cells slice below: each entry
+	// keys the (refapp, engine, arch) triple and carries its own
+	// Tier1Summary + Tier3Summary. The top-level Tier1/Tier3 are
+	// left nil in multi-cell mode for back-compat: pre-v5.1 readers
+	// won't see misleading top-level numbers when the truth is per
+	// cell.
 	Tier1 *Tier1Summary `json:"tier_1,omitempty"`
 	Tier3 *Tier3Summary `json:"tier_3,omitempty"`
+
+	// Cells is the per-cell breakdown for matrix runs (schema v5.1+).
+	// Single-cell runs leave this empty and populate Tier1/Tier3 at
+	// the top level instead.
+	//
+	// The cross-engine ValidateDiff in mage_diff.go walks this slice
+	// to compute per-(refapp, arch) engine-divergence findings; the
+	// existing cross-arch diff continues to work from the top-level
+	// (or first Cells entry) snapshot.
+	Cells []ValidationCellResult `json:"cells,omitempty"`
+}
+
+// ValidationCellResult is one (refapp × engine × arch) cell from a matrix
+// validate run. Mirrors what a single-cell ValidationResults would
+// carry, plus the keying fields that distinguish it.
+//
+// Added in schema v5.1 per probatorium#103.
+type ValidationCellResult struct {
+	Refapp string        `json:"refapp"`
+	Engine string        `json:"engine"`
+	Arch   string        `json:"arch"`
+	Tier1  *Tier1Summary `json:"tier_1,omitempty"`
+	Tier3  *Tier3Summary `json:"tier_3,omitempty"`
 }
 
 // Tier1Summary mirrors the validator's tier1TallySnapshot in the
