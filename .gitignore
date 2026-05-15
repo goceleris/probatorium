@@ -73,3 +73,4 @@ servers/_docker/**/*.tar
 # Refapp local-build binaries (named after their dir slug)
 /validation/refapp/kitchen_sink/kitchen_sink
 /validation/refapp/auth_session_ratelimit/auth_session_ratelimit
+/validation/refapp/auth_jwt_csrf/auth_jwt_csrf
