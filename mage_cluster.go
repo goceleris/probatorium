@@ -221,6 +221,15 @@ func Deploy() error {
 			module: "validation/refapp/observability",
 			archs:  []string{"amd64", "arm64"},
 		},
+		{
+			// static_swagger_proxy: static (embed.FS) + swagger
+			// (OpenAPI spec + UI) + proxy (X-Forwarded-For trust).
+			// Covers the last untested middleware band.
+			// Added per #112.
+			slug:   "static_swagger_proxy",
+			module: "validation/refapp/static_swagger_proxy",
+			archs:  []string{"amd64", "arm64"},
+		},
 	}
 	for _, r := range refappModules {
 		for _, arch := range r.archs {

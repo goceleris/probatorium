@@ -78,3 +78,4 @@ servers/_docker/**/*.tar
 /validation/refapp/driver_redis/driver_redis
 /validation/refapp/driver_memcached/driver_memcached
 /validation/refapp/observability/observability
+/validation/refapp/static_swagger_proxy/static_swagger_proxy
