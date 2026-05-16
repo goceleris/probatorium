@@ -58,21 +58,30 @@ jobs:
           go-version: stable
           cache: true
 
+      - name: Install mage
+        # mage isn't in the root go.mod; install it into GOPATH/bin
+        # ahead of every mage invocation. Cheap (~5s) and avoids
+        # `go run github.com/magefile/mage` which needs mage in
+        # go.mod.
+        run: |
+          go install github.com/magefile/mage@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
-        run: go run github.com/magefile/mage Deploy
+        run: mage Deploy
 
       - name: mage Soak (matrix mode, both archs)
         env:
           SOAK_DURATION: ${{ inputs.duration || '24h' }}
           VALIDATE_TARGET: both
           VALIDATE_MATRIX: "1"
-        run: go run github.com/magefile/mage Soak
+        run: mage Soak
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
         if: success()
-        run: go run github.com/magefile/mage ValidateDiff
+        run: mage ValidateDiff
 
       - name: Upload results
         if: always()
@@ -84,7 +93,7 @@ jobs:
 
       - name: mage Cleanup
         if: always()
-        run: go run github.com/magefile/mage Cleanup
+        run: mage Cleanup
 
   teardown:
     name: teardown cluster runners
