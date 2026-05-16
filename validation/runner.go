@@ -283,6 +283,40 @@ func splitComma(s string) []string {
 	return out
 }
 
+// CellResult is the per-cell projection of an orchestrator's
+// post-Run state, used by the matrix runner (cmd/validator -matrix)
+// to assemble report.ValidationResults.Cells[] across (refapp,
+// engine, arch) cartesian sweeps.
+//
+// Either Tier1 or Tier3 (or both) may be non-nil, mirroring the
+// single-cell document shape. A cell whose Tier 1 walker ran and
+// whose Tier 3 replay didn't (no corpus, no replay binary, etc.)
+// returns a result with Tier1 set and Tier3 nil — same as the
+// existing single-cell flow.
+type CellResult struct {
+	Tier1Ran bool
+	Tier3Ran bool
+	Tier1    tier1TallySnapshot
+	Tier3    tier3TallySnapshot
+}
+
+// Result returns a value-typed snapshot of the per-tier tallies
+// after Run returns. Safe to call without locking — the snapshots
+// are populated under the orchestrator's own mutex during the
+// tier-completion callbacks; Result must only be called after Run
+// has returned.
+//
+// Used by the matrix runner to extract per-cell results without
+// reaching into orchestrator internals.
+func (o *Orchestrator) Result() CellResult {
+	return CellResult{
+		Tier1Ran: o.tier1Ran,
+		Tier3Ran: o.tier3Ran,
+		Tier1:    o.tier1Snapshot,
+		Tier3:    o.tier3Snapshot,
+	}
+}
+
 // Plan returns the dry-run plan without executing anything.
 func (o *Orchestrator) Plan() *Plan {
 	if o.plan != nil {
@@ -932,6 +966,62 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 // and shrink_plan.json so the orchestrator can act on what it has.
 func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Incident) error {
 	return captureForensicsLive(ctx, dir, inc.RefappPID, o.cfg.CelerisListenAddr)
+}
+
+// Tier1Summary projects a tier1TallySnapshot into the public
+// report.Tier1Summary shape the matrix runner emits in
+// ValidationResults.Cells[]. Mirrors the inline projection in
+// writeValidateResults; kept exported here so callers outside the
+// validation package don't have to duplicate the map keys.
+func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
+	return &report.Tier1Summary{
+		RequestsSent:  s.RequestsSent,
+		Requests2xx:   s.Requests2xx,
+		Requests4xx:   s.Requests4xx,
+		Requests5xx:   s.Requests5xx,
+		RequestsError: s.RequestsError,
+		Adversarial: map[string]int64{
+			"adv_sent":               s.Adversarial.Sent,
+			"adv_well_rejected":      s.Adversarial.WellRejected,
+			"adv_wrong_accepted":     s.Adversarial.WrongAccepted,
+			"adv_hang_until_timeout": s.Adversarial.HangUntilTimeout,
+		},
+		H2CChurn: map[string]int64{
+			"h2c_sent":            s.H2CChurn.Sent,
+			"h2c_upgraded":        s.H2CChurn.Upgraded,
+			"h2c_declined":        s.H2CChurn.Declined,
+			"h2c_crashed":         s.H2CChurn.Crashed,
+			"h2c_hang":            s.H2CChurn.Hang,
+			"h2c_intentional_rst": s.H2CChurn.IntentionalRST,
+		},
+		WSTorture: map[string]int64{
+			"ws_sent":               s.WSTorture.Sent,
+			"ws_upgraded":           s.WSTorture.Upgraded,
+			"ws_handshake_fail":     s.WSTorture.HandshakeFail,
+			"ws_closed_correctly":   s.WSTorture.ClosedCorrectly,
+			"ws_accepted_bad_frame": s.WSTorture.AcceptedBadFrame,
+			"ws_hang_no_close":      s.WSTorture.HangNoClose,
+		},
+		SSEKill: map[string]int64{
+			"sse_sent":                s.SSEKill.Sent,
+			"sse_established":         s.SSEKill.Established,
+			"sse_events_read":         s.SSEKill.EventsRead,
+			"sse_killed_mid_stream":   s.SSEKill.KilledMidStream,
+			"sse_server_closed_early": s.SSEKill.ServerClosedEarly,
+			"sse_handshake_fail":      s.SSEKill.HandshakeFail,
+		},
+	}
+}
+
+// Tier3Summary projects a tier3TallySnapshot into the public
+// report.Tier3Summary shape.
+func (s tier3TallySnapshot) Tier3Summary() *report.Tier3Summary {
+	return &report.Tier3Summary{
+		SeedsAttempted: s.SeedsAttempted,
+		SeedsPassed:    s.SeedsPassed,
+		SeedsFailed:    s.SeedsFailed,
+		SeedsErrored:   s.SeedsErrored,
+	}
 }
 
 // writeValidateResults composes the canonical v5 validation document
