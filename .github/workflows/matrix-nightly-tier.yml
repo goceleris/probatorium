@@ -107,6 +107,12 @@ jobs:
           VALIDATE_DURATION: ${{ inputs.duration || '1h' }}
           VALIDATE_TARGET: both
           VALIDATE_MATRIX: "1"
+          # The two bench_targets (msa2-server amd64, msr1 arm64) are
+          # independent hosts driven by separate validator instances
+          # on msa2-client — they have no shared state. Run them in
+          # parallel so the per-tier wall-clock matches inputs.duration
+          # instead of 2× it.
+          VALIDATE_PARALLEL: "1"
         run: mage Validate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)

@@ -108,6 +108,9 @@ jobs:
           SOAK_DURATION: ${{ inputs.duration || '24h' }}
           VALIDATE_TARGET: both
           VALIDATE_MATRIX: "1"
+          # See matrix-nightly-tier.yml. Parallel msa2-server +
+          # msr1 keeps wall-clock at inputs.duration instead of 2× it.
+          VALIDATE_PARALLEL: "1"
         run: mage Soak
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
