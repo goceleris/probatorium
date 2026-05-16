@@ -68,12 +68,16 @@ jobs:
 
       - name: Use bootstrap-provisioned ansible
         # runner-setup.yml provisioned an ansible-core venv at
-        # /tmp/actions-runner-<host>/ansible-venv/. The runner-side
-        # PATH export in nohup ./run.sh covers it, but writing
-        # GITHUB_PATH here is the explicit belt-and-braces guarantee
-        # that subsequent steps' shells find ansible-playbook.
+        # /tmp/actions-runner-<host>/ansible-venv/ and a collections
+        # path with ansible.posix at .../ansible-collections/. The
+        # runner-side env exports in nohup ./run.sh cover both, but
+        # writing GITHUB_PATH + GITHUB_ENV here is the explicit
+        # belt-and-braces guarantee that subsequent steps' shells
+        # find ansible-playbook + the collections it needs.
         run: |
-          echo "/tmp/actions-runner-$(hostname -s)/ansible-venv/bin" >> "$GITHUB_PATH"
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          echo "${RUNNER_ROOT}/ansible-venv/bin" >> "$GITHUB_PATH"
+          echo "ANSIBLE_COLLECTIONS_PATH=${RUNNER_ROOT}/ansible-collections" >> "$GITHUB_ENV"
 
       - name: mage Deploy (stage refapps + validator)
         env:

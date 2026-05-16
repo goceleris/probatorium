@@ -171,15 +171,34 @@
           ansible-core
         creates: "{{ runner_root }}/ansible-venv/bin/ansible-playbook"
 
+    - name: Install ansible.posix collection
+      # cleanup.yml + deploy.yml reference ansible.posix.sysctl /
+      # ansible.posix.synchronize. ansible-core ships without bundled
+      # collections, so install into a runner-scoped collections dir
+      # (kept under runner_root for teardown wipe). ANSIBLE_COLLECTIONS_PATH
+      # gets exported in the Start runner task so the playbooks find it.
+      ansible.builtin.command:
+        cmd: >-
+          {{ runner_root }}/ansible-venv/bin/ansible-galaxy collection install
+          --collections-path {{ runner_root }}/ansible-collections
+          ansible.posix
+        creates: "{{ runner_root }}/ansible-collections/ansible_collections/ansible/posix"
+
     - name: Start runner (nohup)
       # Prepend the runner-scoped ansible venv to PATH so any job
       # that lands on this runner finds ansible-playbook without
       # needing an explicit per-job install step. The export goes
       # into the runner's process environment because run.sh
       # inherits the shell's PATH.
+      #
+      # ANSIBLE_COLLECTIONS_PATH points ansible-playbook at the
+      # runner-scoped collections dir (ansible.posix lives there) —
+      # without it ansible-galaxy's collection install is invisible
+      # to ansible-playbook at runtime.
       ansible.builtin.shell: |
         cd {{ runner_root }}
         export PATH="{{ runner_root }}/ansible-venv/bin:$PATH"
+        export ANSIBLE_COLLECTIONS_PATH="{{ runner_root }}/ansible-collections"
         nohup ./run.sh > runner.stdout 2> runner.stderr < /dev/null &
         echo $!
       changed_when: true
