@@ -41,16 +41,40 @@
     effective_runner_name: "{{ runner_name | default('celeris-' + inventory_hostname) }}"
     effective_runner_group: "{{ runner_group | default('Default') }}"
   tasks:
+    # Always start from a fully pristine runner dir. The previous
+    # idempotent-skip-on-.runner-marker scheme is unsafe: a prior
+    # failed run leaves a .runner config that pins the runner to a
+    # registration ID GitHub has since deleted, and the subsequent
+    # run.sh exits with "Failed to create a session. The runner
+    # registration has been deleted from the server, please
+    # re-configure." Wiping the dir up-front guarantees every run
+    # re-downloads + re-registers with a fresh token.
+    #
+    # Kill any leftover Runner.Listener / run.sh before the rm so a
+    # ghost listener doesn't hold open file descriptors that block
+    # the wipe.
+    - name: Kill any leftover runner process
+      # pkill -f matches against the full argv of every process —
+      # which includes the bash shell that's running the pkill
+      # command. Using -f with the runner path therefore SIGKILLs
+      # this very task (observed: rc=-9 on every host). Match by
+      # exact process name instead.
+      ansible.builtin.shell: |
+        pkill -KILL -x Runner.Listener 2>/dev/null
+        pkill -KILL -x run.sh 2>/dev/null
+        true
+      changed_when: false
+
+    - name: Wipe stale runner dir
+      ansible.builtin.file:
+        path: "{{ runner_root }}"
+        state: absent
+
     - name: Ensure runner root dir
       ansible.builtin.file:
         path: "{{ runner_root }}"
         state: directory
         mode: '0755'
-
-    - name: Check if runner already configured (idempotent skip)
-      ansible.builtin.stat:
-        path: "{{ runner_root }}/.runner"
-      register: runner_marker
 
     - name: Download actions-runner tarball
       ansible.builtin.get_url:
@@ -58,7 +82,6 @@
         dest: "{{ runner_root }}/{{ runner_tarball }}"
         mode: '0644'
         force: false
-      when: not runner_marker.stat.exists
 
     - name: Extract tarball
       ansible.builtin.unarchive:
@@ -66,7 +89,6 @@
         dest: "{{ runner_root }}"
         remote_src: true
         creates: "{{ runner_root }}/config.sh"
-      when: not runner_marker.stat.exists
 
     - name: Register runner with GitHub (config.sh --unattended)
       # Note: NOT using --ephemeral.
@@ -94,7 +116,6 @@
           --labels self-hosted,{{ runner_labels }},{{ inventory_hostname }}
           --work _work
         chdir: "{{ runner_root }}"
-      when: not runner_marker.stat.exists
       changed_when: true
       register: configure_result
       # config.sh leaks the token to stdout in some failure modes;
@@ -103,32 +124,11 @@
       # as a secret regardless.
       no_log: true
 
-    - name: Check for existing Runner.Listener pidfile
-      ansible.builtin.stat:
-        path: "{{ runner_root }}/runner.pid"
-      register: pidfile_stat
-
-    - name: Verify any existing pid is still alive
-      ansible.builtin.shell: |
-        if [ -f "{{ runner_root }}/runner.pid" ] && kill -0 "$(cat {{ runner_root }}/runner.pid)" 2>/dev/null; then
-          echo running
-        else
-          echo dead
-        fi
-      register: pid_alive
-      changed_when: false
-
-    - name: Start runner (nohup, single-shot ephemeral)
-      # --ephemeral runners self-deregister after one job, so we
-      # spawn one listener per call. The wrapper workflow takes care
-      # of re-provisioning on subsequent runs. Keeps the cluster
-      # truly pristine between jobs (no daemons, no PID hanging
-      # around once the workflow lands).
+    - name: Start runner (nohup)
       ansible.builtin.shell: |
         cd {{ runner_root }}
         nohup ./run.sh > runner.stdout 2> runner.stderr < /dev/null &
         echo $!
-      when: pid_alive.stdout != "running"
       changed_when: true
       register: runner_pid_result
 
