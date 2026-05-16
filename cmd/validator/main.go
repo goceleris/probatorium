@@ -67,14 +67,20 @@ type Config struct {
 	RefappEngine string
 
 	// HeapDumpDir, when non-empty, names a directory the validator
-	// writes a heap profile to every HeapDumpInterval (default 60s).
-	// File names: `heap-<unix-ns>.pb.gz`. Diff with
+	// writes a heap profile to every HeapDumpInterval (default 1h —
+	// relaxed from 60s post-#115 because the validator RSS leak
+	// that motivated frequent dumps was fixed in #102). File names:
+	// `heap-<unix-ns>.pb.gz`. Diff with
 	// `go tool pprof -base heap-EARLY.pb.gz heap-LATE.pb.gz`.
 	//
 	// Disk-based alternative to the pprof HTTP endpoint for
 	// environments where outgoing local network from a separate
 	// process is blocked (e.g. macOS dev sandbox). Survives
 	// ctx-cancel cleanly so the last samples reflect end-of-run state.
+	//
+	// Tighten the interval for active leak hunts via
+	// PROBATORIUM_HEAP_DUMP_INTERVAL=5m (or any time.ParseDuration
+	// value) or by passing -heap-dump-interval=5m explicitly.
 	HeapDumpDir      string
 	HeapDumpInterval time.Duration
 
@@ -83,6 +89,22 @@ type Config struct {
 	// a v5.1 validate-results.json with Cells[] populated instead
 	// of the single-cell document. Per #103 / #113.
 	Matrix MatrixConfig
+}
+
+// defaultHeapDumpInterval resolves the default for -heap-dump-interval.
+// Relaxed from 60s → 1h after probatorium#102 closed the validator
+// RSS leak. Active leak hunts re-tighten via the
+// PROBATORIUM_HEAP_DUMP_INTERVAL env var (parsed with time.ParseDuration)
+// or by passing -heap-dump-interval explicitly. Invalid env values
+// fall back to 1h silently — the flag is diagnostic infrastructure,
+// the soak itself comes first.
+func defaultHeapDumpInterval() time.Duration {
+	if v := os.Getenv("PROBATORIUM_HEAP_DUMP_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return time.Hour
 }
 
 // DefaultConfig returns the fresh-flag defaults.
@@ -122,7 +144,11 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.DriverSSHHost, "ssh-host", c.DriverSSHHost, "SSH host:port (only with -driver=ssh)")
 	fs.StringVar(&c.RefappEngine, "refapp-engine", c.RefappEngine, "celeris engine to pin for the refapp (iouring|epoll|std|adaptive); empty leaves refapp default")
 	fs.StringVar(&c.HeapDumpDir, "heap-dump-dir", c.HeapDumpDir, "directory to write periodic heap profiles to; empty disables")
-	fs.DurationVar(&c.HeapDumpInterval, "heap-dump-interval", 60*time.Second, "interval between heap dumps when -heap-dump-dir is set")
+	// Default cadence relaxed to 1h after the validator RSS leak that
+	// motivated this diagnostic (probatorium#102) was fixed. Active
+	// leak chases re-tighten via PROBATORIUM_HEAP_DUMP_INTERVAL or
+	// the explicit flag. Per #115.
+	fs.DurationVar(&c.HeapDumpInterval, "heap-dump-interval", defaultHeapDumpInterval(), "interval between heap dumps when -heap-dump-dir is set; env: PROBATORIUM_HEAP_DUMP_INTERVAL")
 	fs.StringVar(&c.PprofAddr, "pprof-addr", c.PprofAddr, "expose /debug/pprof/* on this addr (e.g. 127.0.0.1:6060); empty disables")
 	c.Matrix.Bind(fs)
 }
