@@ -1,0 +1,83 @@
+---
+# Tears down whatever runner-setup.yml provisioned. Idempotent —
+# missing runner_root or dead PID is treated as success. The
+# `--ephemeral` registration means GitHub auto-removes a runner that
+# has completed its single job, so the de-register call here is a
+# safety net for runners that started but never got dispatched a job
+# (e.g. workflow cancelled).
+#
+# Required extra-vars:
+#   gh_repo_url           same as runner-setup.yml
+#   gh_runner_remove_token   repo-scoped removal token, obtained from
+#                            POST /repos/<owner>/<repo>/actions/runners/remove-token
+#
+# Per probatorium#103 / wave-12 ladder bootstrap.
+
+- name: Tear down actions-runner per cluster host
+  hosts: cluster
+  gather_facts: false
+  vars:
+    runner_root: "/tmp/actions-runner-{{ inventory_hostname }}"
+  tasks:
+    - name: Probe for runner dir
+      ansible.builtin.stat:
+        path: "{{ runner_root }}"
+      register: runner_dir
+
+    - block:
+        - name: Kill Runner.Listener if still alive
+          # `--ephemeral` runners self-exit after one job, so the
+          # common case is the dir exists but the process is gone.
+          # SIGTERM gives the runner a chance to flush its log;
+          # SIGKILL after 5s if it hangs.
+          ansible.builtin.shell: |
+            if [ -f {{ runner_root }}/runner.pid ]; then
+              PID=$(cat {{ runner_root }}/runner.pid)
+              if kill -0 "$PID" 2>/dev/null; then
+                kill -TERM "$PID" 2>/dev/null || true
+                for i in $(seq 1 5); do
+                  if ! kill -0 "$PID" 2>/dev/null; then break; fi
+                  sleep 1
+                done
+                kill -KILL "$PID" 2>/dev/null || true
+              fi
+            fi
+            # Belt and braces — there shouldn't be any orphans but
+            # the pristine rule means we leave nothing behind.
+            pkill -f "Runner.Listener" 2>/dev/null || true
+            pkill -f "run.sh"          2>/dev/null || true
+            true
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: De-register runner from GitHub
+          # config.sh remove --unattended needs the removal-token.
+          # If --ephemeral already self-de-registered (the runner
+          # completed a job) this exits 0 with a "not found" message,
+          # which we accept. Any other failure isn't fatal — the
+          # teardown still runs.
+          ansible.builtin.command:
+            cmd: ./config.sh remove --unattended --token {{ gh_runner_remove_token }}
+            chdir: "{{ runner_root }}"
+          register: deregister_result
+          failed_when: false
+          changed_when: deregister_result.rc == 0
+          no_log: true
+
+        - name: Wipe runner dir
+          ansible.builtin.file:
+            path: "{{ runner_root }}"
+            state: absent
+
+      when: runner_dir.stat.exists
+
+    - name: Confirm pristine state
+      ansible.builtin.stat:
+        path: "{{ runner_root }}"
+      register: post_teardown
+      failed_when: post_teardown.stat.exists
+
+    - name: Summarise teardown
+      ansible.builtin.debug:
+        msg: "Runner removed from {{ inventory_hostname }} (dir wiped, registration cleared)."

@@ -1,0 +1,111 @@
+name: Cluster runner down
+description: >-
+  Mints a removal-token from the GitHub API, joins the tailnet as an
+  ephemeral Tailscale node, then SSH-driven ansible kills every
+  Runner.Listener, de-registers from GitHub, and rm -rf's
+  /tmp/actions-runner-<host>/ on all three cluster hosts. Pristine.
+
+  Pair with cluster-runner-up/. Designed to run as a teardown job
+  with `if: always()` so cluster state is cleaned up even when the
+  middle (matrix) job failed or was cancelled.
+
+inputs:
+  tailscale-oauth-client-id:
+    description: Tailscale OAuth client ID.
+    required: true
+  tailscale-oauth-secret:
+    description: Tailscale OAuth client secret.
+    required: true
+  tailscale-tags:
+    description: Tailscale tags applied to the ephemeral node.
+    required: false
+    default: tag:ci
+  gh-runner-pat:
+    description: GitHub PAT used to mint the removal token.
+    required: true
+  repo-url:
+    description: Repository URL the runner registered with.
+    required: false
+    default: https://github.com/${{ github.repository }}
+  repo-owner-and-name:
+    description: owner/repo for the removal-token API call.
+    required: false
+    default: ${{ github.repository }}
+  inventory-path:
+    description: Path to the ansible inventory.
+    required: false
+    default: ansible/inventory.yml
+
+runs:
+  using: composite
+  steps:
+    - name: Join tailnet (ephemeral)
+      uses: tailscale/github-action@v3
+      with:
+        oauth-client-id: ${{ inputs.tailscale-oauth-client-id }}
+        oauth-secret:    ${{ inputs.tailscale-oauth-secret }}
+        tags:            ${{ inputs.tailscale-tags }}
+        version:         latest
+
+    - name: Install ansible-core
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends ansible-core
+
+    - name: Configure SSH
+      shell: bash
+      env:
+        SSH_KEY: ${{ env.CLUSTER_SSH_KEY }}
+      run: |
+        if [ -z "${SSH_KEY}" ]; then
+          echo "::error::CLUSTER_SSH_KEY env var is empty — set it in the calling workflow"
+          exit 1
+        fi
+        mkdir -p ~/.ssh
+        printf '%s\n' "${SSH_KEY}" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+        ssh-keyscan -H msa2-server msa2-client msr1 >> ~/.ssh/known_hosts 2>/dev/null || true
+
+    - name: Mint removal token
+      id: remtoken
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-runner-pat }}
+        REPO: ${{ inputs.repo-owner-and-name }}
+      run: |
+        TOKEN=$(gh api -X POST "/repos/${REPO}/actions/runners/remove-token" --jq .token)
+        if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+          echo "::warning::Failed to mint removal token; teardown will skip the de-register step"
+          TOKEN=""
+        fi
+        echo "::add-mask::${TOKEN}"
+        echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Run ansible runner-teardown
+      shell: bash
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: "False"
+      run: |
+        ansible-playbook \
+          -i ${{ inputs.inventory-path }} \
+          ansible/runner-teardown.yml \
+          --extra-vars "gh_repo_url=${{ inputs.repo-url }}" \
+          --extra-vars "gh_runner_remove_token=${{ steps.remtoken.outputs.token }}"
+
+    - name: Sweep any orphan runner registrations
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-runner-pat }}
+        REPO: ${{ inputs.repo-owner-and-name }}
+      run: |
+        # If a runner crashed before reaching the de-register step,
+        # GH leaves it as "offline" in the API. Delete all
+        # celeris-cluster runners that are offline so the next
+        # cluster-runner-up starts from a clean slate.
+        gh api "/repos/${REPO}/actions/runners" \
+          --jq '.runners[] | select(.status=="offline" and (.labels | map(.name) | index("celeris-cluster"))) | .id' \
+          | while read -r id; do
+              echo "Sweeping orphan runner id=${id}"
+              gh api -X DELETE "/repos/${REPO}/actions/runners/${id}" || true
+            done

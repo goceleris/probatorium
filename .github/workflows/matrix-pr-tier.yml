@@ -1,18 +1,28 @@
 name: Matrix Tier — PR
 
 # PR-tier matrix-mode validate run: every refapp × every engine,
-# 10-minute budget, ~200 Tier-3 seeds. Acts as the merge gate for
-# regressions in the validator + refapp surface against the current
-# celeris version.
+# 10-minute budget. Acts as the merge gate for regressions in the
+# validator + refapp surface against the current celeris version.
 #
-# Triggered on PRs that touch refapp / validator / mage / ansible
-# code; bypasses doc-only PRs to keep cluster minutes from going to
-# waste on README tweaks. workflow_dispatch lets a human run it
-# against any branch.
+# Three-stage flow:
+#   1. setup     — ubuntu-latest + Tailscale + ansible. Provisions
+#                  ephemeral GH Actions runners on all three cluster
+#                  hosts (msa2-server, msa2-client, msr1). Mints a
+#                  short-lived registration token; runners self-
+#                  deregister after one job (--ephemeral).
+#   2. matrix    — self-hosted celeris-cluster. Drives mage Validate
+#                  with VALIDATE_MATRIX=1 against the cluster.
+#   3. teardown  — ubuntu-latest + Tailscale + ansible. Kills any
+#                  Runner.Listener still alive, de-registers
+#                  whatever the matrix job didn't auto-clear, and
+#                  rm -rf's /tmp/actions-runner-<host>/. Runs
+#                  `if: always()` so cleanup happens even on cancel.
 #
-# Per probatorium#114. The longer-cadence tiers (nightly, weekend)
-# live in matrix-nightly-tier.yml + matrix-weekend-tier.yml; this is
-# the fast one.
+# Concurrency: matrix-tier-cluster groups every tier workflow so
+# they serialize on the shared cluster. cancel-in-progress=false
+# queues incoming PR-tier runs behind any in-flight nightly/weekend
+# run — explicitly required: wait if other cluster work is in
+# progress.
 
 on:
   pull_request:
@@ -28,6 +38,8 @@ on:
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/matrix-pr-tier.yml'
+      - '.github/actions/cluster-runner-up/**'
+      - '.github/actions/cluster-runner-down/**'
   workflow_dispatch:
     inputs:
       duration:
@@ -39,9 +51,33 @@ on:
 permissions:
   contents: read
 
+# All cluster-touching workflows share the same group so they run
+# strictly in series. Queued runs wait, they're never cancelled.
+concurrency:
+  group: matrix-tier-cluster
+  cancel-in-progress: false
+
+env:
+  CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+
 jobs:
+  setup:
+    name: bootstrap cluster runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/cluster-runner-up
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          wait-for-manifest-clear:   "true"
+          wait-timeout-seconds:      "1800"
+
   matrix:
     name: matrix validate (PR tier)
+    needs: setup
     runs-on: [self-hosted, celeris-cluster]
     timeout-minutes: 30
     steps:
@@ -79,3 +115,17 @@ jobs:
       - name: mage Cleanup
         if: always()
         run: go run github.com/magefile/mage Cleanup
+
+  teardown:
+    name: teardown cluster runners
+    needs: [setup, matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/cluster-runner-down
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
