@@ -188,6 +188,30 @@ func Deploy() error {
 			module: "validation/refapp/auth_jwt_csrf",
 			archs:  []string{"amd64", "arm64"},
 		},
+		{
+			// driver_postgres: native postgres driver + session
+			// + ratelimit on top. Tier 1 covers I-DRV-1 read-after-
+			// write and pool-cap invariants. Added per #110.
+			slug:   "driver_postgres",
+			module: "validation/refapp/driver_postgres",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// driver_redis: same shape as driver_postgres but for
+			// redis. Exercises CAS-free token-bucket via EVALSHA.
+			// Added per #110.
+			slug:   "driver_redis",
+			module: "validation/refapp/driver_redis",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// driver_memcached: same shape for memcached. Token-
+			// bucket uses CAS-loop retries since memcached has no
+			// scripting. Added per #110.
+			slug:   "driver_memcached",
+			module: "validation/refapp/driver_memcached",
+			archs:  []string{"amd64", "arm64"},
+		},
 	}
 	for _, r := range refappModules {
 		for _, arch := range r.archs {
