@@ -1,0 +1,70 @@
+name: Matrix Tier — Weekend
+
+# Weekend matrix-mode soak: every refapp × every engine, 24h budget,
+# Tier-3 seeds at soak-mode cadence. The full-matrix soak the
+# nightly tier doesn't have time for — exercises the heap-trajectory
+# / goroutine-stability / FD-leak invariants that need overnight
+# volume on the production engine path.
+#
+# Cron is Sundays 02:00 UTC: finishes Monday 02:00 UTC, leaves the
+# bench/validate paths free for the rest of the week.
+# workflow_dispatch lets a human run it against any branch.
+#
+# Per probatorium#114. The monthly tier from the original plan was
+# dropped — too long to act on signal; nightly + weekend give enough
+# coverage.
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: per-tier-total duration (default 24h)
+        required: false
+        type: string
+        default: 24h
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: matrix soak (weekend tier)
+    runs-on: [self-hosted, celeris-cluster]
+    timeout-minutes: 1740
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: mage Deploy (stage refapps + validator)
+        env:
+          DEPLOY_COMPETITORS: none
+        run: go run github.com/magefile/mage Deploy
+
+      - name: mage Soak (matrix mode, both archs)
+        env:
+          SOAK_DURATION: ${{ inputs.duration || '24h' }}
+          VALIDATE_TARGET: both
+          VALIDATE_MATRIX: "1"
+        run: go run github.com/magefile/mage Soak
+
+      - name: mage ValidateDiff (cross-engine + cross-arch gate)
+        if: success()
+        run: go run github.com/magefile/mage ValidateDiff
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-weekend-results-${{ github.run_id }}
+          path: results/
+          retention-days: 90
+
+      - name: mage Cleanup
+        if: always()
+        run: go run github.com/magefile/mage Cleanup

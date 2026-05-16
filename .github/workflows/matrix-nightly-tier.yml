@@ -1,0 +1,67 @@
+name: Matrix Tier — Nightly
+
+# Nightly matrix-mode validate run: every refapp × every engine, 1h
+# budget, ~1000 Tier-3 seeds. Catches slow regressions the 10-minute
+# PR tier doesn't have time to surface (heap drift, goroutine creep,
+# the 99th-percentile invariant violations that need volume).
+#
+# Cron is 02:00 UTC (cluster is quiet, finishes before working hours
+# even with 1h budget × both arches). workflow_dispatch lets a human
+# rerun against any branch.
+#
+# Per probatorium#114.
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: per-tier-total duration (default 1h)
+        required: false
+        type: string
+        default: 1h
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: matrix validate (nightly tier)
+    runs-on: [self-hosted, celeris-cluster]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: mage Deploy (stage refapps + validator)
+        env:
+          DEPLOY_COMPETITORS: none
+        run: go run github.com/magefile/mage Deploy
+
+      - name: mage Validate (matrix mode, both archs)
+        env:
+          VALIDATE_DURATION: ${{ inputs.duration || '1h' }}
+          VALIDATE_TARGET: both
+          VALIDATE_MATRIX: "1"
+        run: go run github.com/magefile/mage Validate
+
+      - name: mage ValidateDiff (cross-engine + cross-arch gate)
+        if: success()
+        run: go run github.com/magefile/mage ValidateDiff
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-nightly-results-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+
+      - name: mage Cleanup
+        if: always()
+        run: go run github.com/magefile/mage Cleanup

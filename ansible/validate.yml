@@ -96,14 +96,13 @@
             ./validator \
               -target=localhost \
               -duration={{ validate_duration | default('10m') }} \
-              -celeris-bin={{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }} \
-              -celeris-addr=127.0.0.1:{{ bench_port | default(8080) }} \
-              -markov={{ bench_root }}/markov/{{ refapp | default('auth_session_ratelimit') }}.yaml \
+              {% if validate_matrix | default('') == '1' %}-matrix -matrix-refapp-root={{ bench_root }}/validation/refapp -matrix-bin-dir={{ bench_root }}/refapps {% if validate_matrix_refapps | default('') %}-matrix-refapps={{ validate_matrix_refapps }}{% endif %} {% if validate_matrix_engines | default('') %}-matrix-engines={{ validate_matrix_engines }}{% endif %} \
+              {% else %}-celeris-bin={{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }} -celeris-addr=127.0.0.1:{{ bench_port | default(8080) }} -markov={{ bench_root }}/markov/{{ refapp | default('auth_session_ratelimit') }}.yaml {% if validate_refapp_engine | default('') %}-refapp-engine={{ validate_refapp_engine }}{% endif %} \
+              {% endif %}
               -replay-bin={{ bench_root }}/validator-replay \
               -property-tier={{ validate_property_tier | default('core,middleware') }} \
               -celeris-commit={{ celeris_version | default('') }} \
               -out={{ validate_run_dir }} \
-              {% if validate_refapp_engine | default('') %}-refapp-engine={{ validate_refapp_engine }} \{% endif %}
               {% if validate_pprof_addr | default('') %}-pprof-addr={{ validate_pprof_addr }} \{% endif %}
               > {{ validate_run_dir }}/validator.stdout \
               2> {{ validate_run_dir }}/validator.stderr

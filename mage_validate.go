@@ -165,6 +165,20 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_REFAPP_ENGINE"); v != "" {
 			args = append(args, "--extra-vars", "validate_refapp_engine="+v)
 		}
+		// VALIDATE_MATRIX=1 flips the validator into matrix mode:
+		// iterate (refapp × engine) cells, emit v5.1 Cells[].
+		// Per #113 / #114. Optional VALIDATE_MATRIX_REFAPPS and
+		// VALIDATE_MATRIX_ENGINES override the discovery defaults
+		// (auto-discover refapps, OS production engine set).
+		if os.Getenv("VALIDATE_MATRIX") == "1" {
+			args = append(args, "--extra-vars", "validate_matrix=1")
+			if v := os.Getenv("VALIDATE_MATRIX_REFAPPS"); v != "" {
+				args = append(args, "--extra-vars", "validate_matrix_refapps="+v)
+			}
+			if v := os.Getenv("VALIDATE_MATRIX_ENGINES"); v != "" {
+				args = append(args, "--extra-vars", "validate_matrix_engines="+v)
+			}
+		}
 		fmt.Printf("\n=== %s on %s (playbook=%s) ===\n", titleCase(kind), t, playbook)
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir
