@@ -101,12 +101,26 @@ func resolveMatrixPlan(m MatrixConfig) ([]matrixCell, error) {
 	}
 	var refapps []string
 	if want == "all" {
+		// Try the source tree first (dev-Mac workflow). When that's
+		// missing or empty — the cluster case, where mage Deploy
+		// stages binaries only — fall back to scanning BinDir for
+		// executables. Each <BinDir>/<slug> file represents a
+		// pre-built refapp.
 		discovered, err := discoverRefapps(root)
+		if err != nil || len(discovered) == 0 {
+			if m.BinDir != "" {
+				binDiscovered, binErr := discoverRefappBins(m.BinDir)
+				if binErr == nil && len(binDiscovered) > 0 {
+					discovered = binDiscovered
+					err = nil
+				}
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
 		if len(discovered) == 0 {
-			return nil, fmt.Errorf("matrix: no refapps discovered under %s", root)
+			return nil, fmt.Errorf("matrix: no refapps discovered under %s (and BinDir %q has no binaries)", root, m.BinDir)
 		}
 		refapps = discovered
 	} else {
@@ -115,11 +129,21 @@ func resolveMatrixPlan(m MatrixConfig) ([]matrixCell, error) {
 			if slug == "" {
 				continue
 			}
-			path := filepath.Join(root, slug, "main.go")
-			if _, err := os.Stat(path); err != nil {
-				return nil, fmt.Errorf("matrix: refapp %q: %w", slug, err)
+			// Source-tree lookup first; cluster fallback picks the
+			// slug up from BinDir if the source tree isn't staged.
+			sourcePath := filepath.Join(root, slug, "main.go")
+			if _, err := os.Stat(sourcePath); err == nil {
+				refapps = append(refapps, slug)
+				continue
 			}
-			refapps = append(refapps, slug)
+			if m.BinDir != "" {
+				binPath := filepath.Join(m.BinDir, slug)
+				if st, err := os.Stat(binPath); err == nil && !st.IsDir() {
+					refapps = append(refapps, slug)
+					continue
+				}
+			}
+			return nil, fmt.Errorf("matrix: refapp %q: not found under %s or %s", slug, root, m.BinDir)
 		}
 	}
 	sort.Strings(refapps)
@@ -158,6 +182,35 @@ func discoverRefapps(root string) ([]string, error) {
 		if _, err := os.Stat(main); err == nil {
 			slugs = append(slugs, e.Name())
 		}
+	}
+	sort.Strings(slugs)
+	return slugs, nil
+}
+
+// discoverRefappBins returns the sorted slug list of every executable
+// file directly under binDir. Used as the cluster-side fallback when
+// the validation/refapp source tree isn't staged (mage Deploy copies
+// the built binaries only — there's no main.go to discover from).
+func discoverRefappBins(binDir string) ([]string, error) {
+	entries, err := os.ReadDir(binDir)
+	if err != nil {
+		return nil, fmt.Errorf("matrix: read %s: %w", binDir, err)
+	}
+	var slugs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		// Pre-built refapp binaries are named after their slug (see
+		// mage_cluster.go's refapp staging — dest=refapps/<slug>).
+		// Skip hidden / dot files; everything else is treated as a
+		// candidate binary. Caller validates each one is executable
+		// before launch via findRefappBin.
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		slugs = append(slugs, name)
 	}
 	sort.Strings(slugs)
 	return slugs, nil
