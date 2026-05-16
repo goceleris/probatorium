@@ -110,6 +110,31 @@ jobs:
           echo "${RUNNER_ROOT}/ansible-venv/bin" >> "$GITHUB_PATH"
           echo "ANSIBLE_COLLECTIONS_PATH=${RUNNER_ROOT}/ansible-collections" >> "$GITHUB_ENV"
 
+      - name: Configure cluster SSH
+        # The matrix job runs ON one of the cluster hosts. ansible
+        # needs three things to reach the inventory hosts from there:
+        #   1. CLUSTER_USE_LAN=1 — route through the 20G LACP fabric
+        #      using lan_ip from inventory.yml. Avoids the Tailscale
+        #      SSH tag:cluster → tag:cluster ACL we'd otherwise need.
+        #   2. The CLUSTER_SSH_KEY private half on disk + ANSIBLE_PRIVATE_KEY_FILE
+        #      so ansible authenticates to peer cluster hosts (the
+        #      public half is already in mini's authorized_keys on
+        #      each host per the README setup).
+        #   3. PROBATORIUM_LOCAL_HOST=$(hostname -s) — inventory.yml
+        #      flips ansible_connection=local for the matching host,
+        #      so we don't try to SSH from msa2-server to msa2-server.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          mkdir -p "${RUNNER_ROOT}/.ssh"
+          chmod 700 "${RUNNER_ROOT}/.ssh"
+          printf '%s\n' "$CLUSTER_SSH_KEY" > "${RUNNER_ROOT}/.ssh/id_ed25519"
+          chmod 600 "${RUNNER_ROOT}/.ssh/id_ed25519"
+          echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519" >> "$GITHUB_ENV"
+          echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)" >> "$GITHUB_ENV"
+          echo "CLUSTER_USE_LAN=1" >> "$GITHUB_ENV"
+
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none

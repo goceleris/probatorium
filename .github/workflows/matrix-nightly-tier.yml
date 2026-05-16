@@ -79,6 +79,24 @@ jobs:
           echo "${RUNNER_ROOT}/ansible-venv/bin" >> "$GITHUB_PATH"
           echo "ANSIBLE_COLLECTIONS_PATH=${RUNNER_ROOT}/ansible-collections" >> "$GITHUB_ENV"
 
+      - name: Configure cluster SSH
+        # See matrix-pr-tier.yml for the full rationale. tl;dr:
+        # CLUSTER_USE_LAN=1 routes through the LACP fabric, the
+        # CLUSTER_SSH_KEY private half lets ansible reach peer hosts,
+        # PROBATORIUM_LOCAL_HOST switches inventory_hostname == self
+        # to ansible_connection=local.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          mkdir -p "${RUNNER_ROOT}/.ssh"
+          chmod 700 "${RUNNER_ROOT}/.ssh"
+          printf '%s\n' "$CLUSTER_SSH_KEY" > "${RUNNER_ROOT}/.ssh/id_ed25519"
+          chmod 600 "${RUNNER_ROOT}/.ssh/id_ed25519"
+          echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519" >> "$GITHUB_ENV"
+          echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)" >> "$GITHUB_ENV"
+          echo "CLUSTER_USE_LAN=1" >> "$GITHUB_ENV"
+
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
