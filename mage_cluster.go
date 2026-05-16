@@ -212,6 +212,15 @@ func Deploy() error {
 			module: "validation/refapp/driver_memcached",
 			archs:  []string{"amd64", "arm64"},
 		},
+		{
+			// observability: logger + metrics + otel mounted
+			// together. Exposes /metrics in Prometheus text-plain
+			// format + obs_log_drops gauge for the Tier 1 walker
+			// to scrape. Added per #111.
+			slug:   "observability",
+			module: "validation/refapp/observability",
+			archs:  []string{"amd64", "arm64"},
+		},
 	}
 	for _, r := range refappModules {
 		for _, arch := range r.archs {
