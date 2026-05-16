@@ -115,9 +115,17 @@
       ansible.builtin.shell: |
         cd {{ runner_root }}
         nohup ./run.sh > runner.stdout 2> runner.stderr < /dev/null &
-        echo $! > runner.pid
+        echo $!
       when: pid_alive.stdout != "running"
       changed_when: true
+      register: runner_pid_result
+
+    - name: Persist PID to runner.pid for teardown
+      ansible.builtin.copy:
+        dest: "{{ runner_root }}/runner.pid"
+        content: "{{ runner_pid_result.stdout | default('') }}\n"
+        mode: '0644'
+      when: runner_pid_result.stdout is defined and runner_pid_result.stdout | length > 0
 
     - name: Wait for runner to register and start listening
       # The runner registers with GitHub immediately after starting,
@@ -143,11 +151,17 @@
       register: ready_check
 
     - name: Summarise runner state
+      # Note: don't use `lookup('file', ...)` for runner.pid here —
+      # ansible lookups run on the controller, not the remote host,
+      # and the controller doesn't have the per-host PID file
+      # mounted. The PID was already echoed by the "Start runner"
+      # task above; use the registered result instead, which falls
+      # back to "n/a" if the runner was idempotently skipped.
       ansible.builtin.debug:
         msg: |
           Runner provisioned on {{ inventory_hostname }}:
             dir:    {{ runner_root }}
             name:   {{ effective_runner_name }}
             labels: self-hosted,{{ runner_labels }},{{ inventory_hostname }}
-            pid:    {{ lookup('file', runner_root + '/runner.pid') }}
+            pid:    {{ runner_pid_result.stdout | default('n/a (idempotent re-run)') }}
             ready:  {{ ready_check.stdout }}
