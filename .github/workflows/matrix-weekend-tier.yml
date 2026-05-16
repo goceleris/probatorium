@@ -58,21 +58,61 @@ jobs:
           go-version: stable
           cache: true
 
+      - name: Install mage
+        # mage isn't in the root go.mod; install it into GOPATH/bin
+        # ahead of every mage invocation. Cheap (~5s) and avoids
+        # `go run github.com/magefile/mage` which needs mage in
+        # go.mod.
+        run: |
+          go install github.com/magefile/mage@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Use bootstrap-provisioned ansible
+        # runner-setup.yml provisioned an ansible-core venv at
+        # /tmp/actions-runner-<host>/ansible-venv/ and a collections
+        # path with ansible.posix at .../ansible-collections/. The
+        # runner-side env exports in nohup ./run.sh cover both, but
+        # writing GITHUB_PATH + GITHUB_ENV here is the explicit
+        # belt-and-braces guarantee that subsequent steps' shells
+        # find ansible-playbook + the collections it needs.
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          echo "${RUNNER_ROOT}/ansible-venv/bin" >> "$GITHUB_PATH"
+          echo "ANSIBLE_COLLECTIONS_PATH=${RUNNER_ROOT}/ansible-collections" >> "$GITHUB_ENV"
+
+      - name: Configure cluster SSH
+        # See matrix-pr-tier.yml for the full rationale. tl;dr:
+        # CLUSTER_USE_LAN=1 routes through the LACP fabric, the
+        # CLUSTER_SSH_KEY private half lets ansible reach peer hosts,
+        # PROBATORIUM_LOCAL_HOST switches inventory_hostname == self
+        # to ansible_connection=local.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          mkdir -p "${RUNNER_ROOT}/.ssh"
+          chmod 700 "${RUNNER_ROOT}/.ssh"
+          printf '%s\n' "$CLUSTER_SSH_KEY" > "${RUNNER_ROOT}/.ssh/id_ed25519"
+          chmod 600 "${RUNNER_ROOT}/.ssh/id_ed25519"
+          echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519" >> "$GITHUB_ENV"
+          echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)" >> "$GITHUB_ENV"
+          echo "CLUSTER_USE_LAN=1" >> "$GITHUB_ENV"
+
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
-        run: go run github.com/magefile/mage Deploy
+        run: mage Deploy
 
       - name: mage Soak (matrix mode, both archs)
         env:
           SOAK_DURATION: ${{ inputs.duration || '24h' }}
           VALIDATE_TARGET: both
           VALIDATE_MATRIX: "1"
-        run: go run github.com/magefile/mage Soak
+        run: mage Soak
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
         if: success()
-        run: go run github.com/magefile/mage ValidateDiff
+        run: mage ValidateDiff
 
       - name: Upload results
         if: always()
@@ -84,7 +124,7 @@ jobs:
 
       - name: mage Cleanup
         if: always()
-        run: go run github.com/magefile/mage Cleanup
+        run: mage Cleanup
 
   teardown:
     name: teardown cluster runners

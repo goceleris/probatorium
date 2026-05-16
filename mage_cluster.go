@@ -86,8 +86,9 @@ func Status() error {
 //     observer, validator) for {linux/amd64, linux/arm64}.
 //  2. For each Go competitor under servers/<name>/, cross-compile the
 //     same two arches. DEPLOY_COMPETITORS controls the set:
-//     "all" (default), "go-only" (skip non-Go), or a comma-separated
-//     list of competitor names.
+//     "all" (default), "go-only" (skip non-Go), "none" (skip every
+//     competitor — useful for validate-only matrix-tier jobs that
+//     don't run bench), or a comma-separated list of competitor names.
 //  3. ansible-playbook deploy.yml, passing every staged binary path
 //     as an extra-var. The playbook copies binaries into
 //     {{ bench_root }} on each host and writes the manifest.
@@ -276,7 +277,7 @@ func Deploy() error {
 	// Union check: any CSV name that resolved to neither a Go nor a
 	// native competitor is a typo / stale label and should fail the
 	// deploy loudly rather than silently doing nothing.
-	if competitorsArg != "" && competitorsArg != "all" && competitorsArg != "go-only" {
+	if competitorsArg != "" && competitorsArg != "all" && competitorsArg != "go-only" && competitorsArg != "none" {
 		seen := make(map[string]bool, len(goComps)+len(nativeComps))
 		for _, n := range goComps {
 			seen[n] = true
@@ -491,6 +492,8 @@ func selectGoCompetitors(spec string) ([]string, error) {
 	switch spec {
 	case "", "all", "go-only":
 		return all, nil
+	case "none":
+		return nil, nil
 	}
 	have := make(map[string]bool, len(all))
 	for _, n := range all {
@@ -609,7 +612,7 @@ var nativeBuildSpecs = map[string]nativeBuildSpec{
 //
 // Empty input behaves like "all" (matches Deploy default).
 func selectNativeCompetitors(spec string) ([]string, error) {
-	if spec == "go-only" {
+	if spec == "go-only" || spec == "none" {
 		return nil, nil
 	}
 	all := make([]string, 0, len(nativeBuildSpecs))

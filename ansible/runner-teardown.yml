@@ -26,13 +26,23 @@
 
     - block:
         - name: Kill Runner.Listener if still alive
-          # `--ephemeral` runners self-exit after one job, so the
-          # common case is the dir exists but the process is gone.
-          # SIGTERM gives the runner a chance to flush its log;
-          # SIGKILL after 5s if it hangs.
+          # The common teardown case is the dir exists but the
+          # listener already exited (job completed). Belt and braces
+          # SIGTERM → wait 5s → SIGKILL the PID, then sweep by name.
+          #
+          # All {{ runner_root }} interpolations are explicitly
+          # double-quoted: unquoted Jinja-inside-bash trips
+          # ansible 2.18+'s argument splitter with "failed at
+          # splitting arguments, either an unbalanced jinja2 block
+          # or quotes."
+          #
+          # pkill uses -x (exact name) not -f (full argv); -f would
+          # SIGKILL this very shell because the pattern appears in
+          # the script being executed.
           ansible.builtin.shell: |
-            if [ -f {{ runner_root }}/runner.pid ]; then
-              PID=$(cat {{ runner_root }}/runner.pid)
+            PIDFILE="{{ runner_root }}/runner.pid"
+            if [ -f "$PIDFILE" ]; then
+              PID=$(cat "$PIDFILE")
               if kill -0 "$PID" 2>/dev/null; then
                 kill -TERM "$PID" 2>/dev/null || true
                 for i in $(seq 1 5); do
@@ -42,10 +52,8 @@
                 kill -KILL "$PID" 2>/dev/null || true
               fi
             fi
-            # Belt and braces — there shouldn't be any orphans but
-            # the pristine rule means we leave nothing behind.
-            pkill -f "Runner.Listener" 2>/dev/null || true
-            pkill -f "run.sh"          2>/dev/null || true
+            pkill -KILL -x Runner.Listener 2>/dev/null
+            pkill -KILL -x run.sh          2>/dev/null
             true
           args:
             executable: /bin/bash

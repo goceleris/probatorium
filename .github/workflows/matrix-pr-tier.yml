@@ -88,21 +88,68 @@ jobs:
           go-version: stable
           cache: true
 
+      - name: Install mage
+        # mage isn't in the root go.mod; install it into GOPATH/bin
+        # ahead of every mage invocation. Cheap (~5s) and avoids
+        # `go run github.com/magefile/mage` which needs mage in
+        # go.mod.
+        run: |
+          go install github.com/magefile/mage@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Use bootstrap-provisioned ansible
+        # runner-setup.yml provisioned an ansible-core venv at
+        # /tmp/actions-runner-<host>/ansible-venv/ and a collections
+        # path with ansible.posix at .../ansible-collections/. The
+        # runner-side env exports in nohup ./run.sh cover both, but
+        # writing GITHUB_PATH + GITHUB_ENV here is the explicit
+        # belt-and-braces guarantee that subsequent steps' shells
+        # find ansible-playbook + the collections it needs.
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          echo "${RUNNER_ROOT}/ansible-venv/bin" >> "$GITHUB_PATH"
+          echo "ANSIBLE_COLLECTIONS_PATH=${RUNNER_ROOT}/ansible-collections" >> "$GITHUB_ENV"
+
+      - name: Configure cluster SSH
+        # The matrix job runs ON one of the cluster hosts. ansible
+        # needs three things to reach the inventory hosts from there:
+        #   1. CLUSTER_USE_LAN=1 — route through the 20G LACP fabric
+        #      using lan_ip from inventory.yml. Avoids the Tailscale
+        #      SSH tag:cluster → tag:cluster ACL we'd otherwise need.
+        #   2. The CLUSTER_SSH_KEY private half on disk + ANSIBLE_PRIVATE_KEY_FILE
+        #      so ansible authenticates to peer cluster hosts (the
+        #      public half is already in mini's authorized_keys on
+        #      each host per the README setup).
+        #   3. PROBATORIUM_LOCAL_HOST=$(hostname -s) — inventory.yml
+        #      flips ansible_connection=local for the matching host,
+        #      so we don't try to SSH from msa2-server to msa2-server.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          mkdir -p "${RUNNER_ROOT}/.ssh"
+          chmod 700 "${RUNNER_ROOT}/.ssh"
+          printf '%s\n' "$CLUSTER_SSH_KEY" > "${RUNNER_ROOT}/.ssh/id_ed25519"
+          chmod 600 "${RUNNER_ROOT}/.ssh/id_ed25519"
+          echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519" >> "$GITHUB_ENV"
+          echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)" >> "$GITHUB_ENV"
+          echo "CLUSTER_USE_LAN=1" >> "$GITHUB_ENV"
+
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
-        run: go run github.com/magefile/mage Deploy
+        run: mage Deploy
 
       - name: mage Validate (matrix mode)
         env:
           VALIDATE_DURATION: ${{ inputs.duration || '10m' }}
           VALIDATE_TARGET: msa2-server
           VALIDATE_MATRIX: "1"
-        run: go run github.com/magefile/mage Validate
+        run: mage Validate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
         if: success()
-        run: go run github.com/magefile/mage ValidateDiff
+        run: mage ValidateDiff
 
       - name: Upload results
         if: always()
@@ -114,7 +161,7 @@ jobs:
 
       - name: mage Cleanup
         if: always()
-        run: go run github.com/magefile/mage Cleanup
+        run: mage Cleanup
 
   teardown:
     name: teardown cluster runners

@@ -41,16 +41,40 @@
     effective_runner_name: "{{ runner_name | default('celeris-' + inventory_hostname) }}"
     effective_runner_group: "{{ runner_group | default('Default') }}"
   tasks:
+    # Always start from a fully pristine runner dir. The previous
+    # idempotent-skip-on-.runner-marker scheme is unsafe: a prior
+    # failed run leaves a .runner config that pins the runner to a
+    # registration ID GitHub has since deleted, and the subsequent
+    # run.sh exits with "Failed to create a session. The runner
+    # registration has been deleted from the server, please
+    # re-configure." Wiping the dir up-front guarantees every run
+    # re-downloads + re-registers with a fresh token.
+    #
+    # Kill any leftover Runner.Listener / run.sh before the rm so a
+    # ghost listener doesn't hold open file descriptors that block
+    # the wipe.
+    - name: Kill any leftover runner process
+      # pkill -f matches against the full argv of every process —
+      # which includes the bash shell that's running the pkill
+      # command. Using -f with the runner path therefore SIGKILLs
+      # this very task (observed: rc=-9 on every host). Match by
+      # exact process name instead.
+      ansible.builtin.shell: |
+        pkill -KILL -x Runner.Listener 2>/dev/null
+        pkill -KILL -x run.sh 2>/dev/null
+        true
+      changed_when: false
+
+    - name: Wipe stale runner dir
+      ansible.builtin.file:
+        path: "{{ runner_root }}"
+        state: absent
+
     - name: Ensure runner root dir
       ansible.builtin.file:
         path: "{{ runner_root }}"
         state: directory
         mode: '0755'
-
-    - name: Check if runner already configured (idempotent skip)
-      ansible.builtin.stat:
-        path: "{{ runner_root }}/.runner"
-      register: runner_marker
 
     - name: Download actions-runner tarball
       ansible.builtin.get_url:
@@ -58,7 +82,6 @@
         dest: "{{ runner_root }}/{{ runner_tarball }}"
         mode: '0644'
         force: false
-      when: not runner_marker.stat.exists
 
     - name: Extract tarball
       ansible.builtin.unarchive:
@@ -66,15 +89,26 @@
         dest: "{{ runner_root }}"
         remote_src: true
         creates: "{{ runner_root }}/config.sh"
-      when: not runner_marker.stat.exists
 
     - name: Register runner with GitHub (config.sh --unattended)
+      # Note: NOT using --ephemeral.
+      # --ephemeral asks GitHub to auto-delete the registration after
+      # one job. In practice that has a tight heartbeat window: if
+      # the runner is registered but doesn't enter "Listening for
+      # Jobs" within ~30s, GH considers the registration stale and
+      # deletes it, after which run.sh exits with "registration has
+      # been deleted from the server, please re-configure." Observed
+      # on every cluster boot pre-fix.
+      #
+      # Instead the runner stays a normal long-lived registration;
+      # the companion runner-teardown.yml de-registers explicitly
+      # at end-of-workflow. --replace lets re-runs cleanly replace
+      # a stale registration with the same name.
       ansible.builtin.command:
         cmd: >-
           ./config.sh
           --unattended
           --replace
-          --ephemeral
           --url {{ gh_repo_url }}
           --token {{ gh_runner_token }}
           --name {{ effective_runner_name }}
@@ -82,7 +116,6 @@
           --labels self-hosted,{{ runner_labels }},{{ inventory_hostname }}
           --work _work
         chdir: "{{ runner_root }}"
-      when: not runner_marker.stat.exists
       changed_when: true
       register: configure_result
       # config.sh leaks the token to stdout in some failure modes;
@@ -91,33 +124,92 @@
       # as a secret regardless.
       no_log: true
 
-    - name: Check for existing Runner.Listener pidfile
-      ansible.builtin.stat:
-        path: "{{ runner_root }}/runner.pid"
-      register: pidfile_stat
-
-    - name: Verify any existing pid is still alive
+    - name: Install uv (static binary, self-contained)
+      # mage Deploy / Validate / Soak shell out to ansible-playbook.
+      # The cluster hosts don't have ansible system-installed (the
+      # pristine rule forbids). Plain `python3 -m venv` fails on the
+      # cluster because Ubuntu 26.04 ships python3.14 without
+      # python3.14-venv / ensurepip, and there's no system pip either.
+      #
+      # Use uv instead — single static binary that bootstraps its own
+      # python + venv without depending on system python-venv. The
+      # installer drops uv + uvx directly into UV_INSTALL_DIR (NOT a
+      # bin/ subdir), so the binary lives at <UV_INSTALL_DIR>/uv.
+      #
+      # Lives inside runner_root so runner-teardown.yml wipes it
+      # along with the rest of the runner dir.
       ansible.builtin.shell: |
-        if [ -f "{{ runner_root }}/runner.pid" ] && kill -0 "$(cat {{ runner_root }}/runner.pid)" 2>/dev/null; then
-          echo running
-        else
-          echo dead
+        set -e
+        if [ -x "{{ runner_root }}/uv/uv" ]; then
+          echo "uv already present"
+          exit 0
         fi
-      register: pid_alive
-      changed_when: false
+        curl -LsSf https://astral.sh/uv/install.sh \
+          | env UV_INSTALL_DIR="{{ runner_root }}/uv" \
+                UV_NO_MODIFY_PATH=1 \
+                INSTALLER_NO_MODIFY_PATH=1 \
+                sh
+      args:
+        executable: /bin/bash
+      changed_when: true
 
-    - name: Start runner (nohup, single-shot ephemeral)
-      # --ephemeral runners self-deregister after one job, so we
-      # spawn one listener per call. The wrapper workflow takes care
-      # of re-provisioning on subsequent runs. Keeps the cluster
-      # truly pristine between jobs (no daemons, no PID hanging
-      # around once the workflow lands).
+    - name: Create ansible venv via uv (auto-downloads python if needed)
+      # uv venv brings its own python distribution if the system lacks
+      # one with ensurepip — exactly the cluster's situation.
+      ansible.builtin.command:
+        cmd: >-
+          {{ runner_root }}/uv/uv venv
+          --python 3.13
+          {{ runner_root }}/ansible-venv
+        creates: "{{ runner_root }}/ansible-venv/bin/python"
+
+    - name: Install ansible-core into the venv via uv pip
+      ansible.builtin.command:
+        cmd: >-
+          {{ runner_root }}/uv/uv pip install
+          --python {{ runner_root }}/ansible-venv/bin/python
+          ansible-core
+        creates: "{{ runner_root }}/ansible-venv/bin/ansible-playbook"
+
+    - name: Install ansible.posix collection
+      # cleanup.yml + deploy.yml reference ansible.posix.sysctl /
+      # ansible.posix.synchronize. ansible-core ships without bundled
+      # collections, so install into a runner-scoped collections dir
+      # (kept under runner_root for teardown wipe). ANSIBLE_COLLECTIONS_PATH
+      # gets exported in the Start runner task so the playbooks find it.
+      ansible.builtin.command:
+        cmd: >-
+          {{ runner_root }}/ansible-venv/bin/ansible-galaxy collection install
+          --collections-path {{ runner_root }}/ansible-collections
+          ansible.posix
+        creates: "{{ runner_root }}/ansible-collections/ansible_collections/ansible/posix"
+
+    - name: Start runner (nohup)
+      # Prepend the runner-scoped ansible venv to PATH so any job
+      # that lands on this runner finds ansible-playbook without
+      # needing an explicit per-job install step. The export goes
+      # into the runner's process environment because run.sh
+      # inherits the shell's PATH.
+      #
+      # ANSIBLE_COLLECTIONS_PATH points ansible-playbook at the
+      # runner-scoped collections dir (ansible.posix lives there) —
+      # without it ansible-galaxy's collection install is invisible
+      # to ansible-playbook at runtime.
       ansible.builtin.shell: |
         cd {{ runner_root }}
+        export PATH="{{ runner_root }}/ansible-venv/bin:$PATH"
+        export ANSIBLE_COLLECTIONS_PATH="{{ runner_root }}/ansible-collections"
         nohup ./run.sh > runner.stdout 2> runner.stderr < /dev/null &
-        echo $! > runner.pid
-      when: pid_alive.stdout != "running"
+        echo $!
       changed_when: true
+      register: runner_pid_result
+
+    - name: Persist PID to runner.pid for teardown
+      ansible.builtin.copy:
+        dest: "{{ runner_root }}/runner.pid"
+        content: "{{ runner_pid_result.stdout | default('') }}\n"
+        mode: '0644'
+      when: runner_pid_result.stdout is defined and runner_pid_result.stdout | length > 0
 
     - name: Wait for runner to register and start listening
       # The runner registers with GitHub immediately after starting,
@@ -143,11 +235,17 @@
       register: ready_check
 
     - name: Summarise runner state
+      # Note: don't use `lookup('file', ...)` for runner.pid here —
+      # ansible lookups run on the controller, not the remote host,
+      # and the controller doesn't have the per-host PID file
+      # mounted. The PID was already echoed by the "Start runner"
+      # task above; use the registered result instead, which falls
+      # back to "n/a" if the runner was idempotently skipped.
       ansible.builtin.debug:
         msg: |
           Runner provisioned on {{ inventory_hostname }}:
             dir:    {{ runner_root }}
             name:   {{ effective_runner_name }}
             labels: self-hosted,{{ runner_labels }},{{ inventory_hostname }}
-            pid:    {{ lookup('file', runner_root + '/runner.pid') }}
+            pid:    {{ runner_pid_result.stdout | default('n/a (idempotent re-run)') }}
             ready:  {{ ready_check.stdout }}

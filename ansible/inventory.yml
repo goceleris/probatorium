@@ -51,6 +51,13 @@ all:
     # place that decision lives — playbooks never compute their own
     # ansible_host.
     ansible_host: "{{ lan_ip if (use_lan | default(false) | bool) else inventory_hostname }}"
+    # When the playbook is run FROM one of the cluster hosts (the
+    # self-hosted matrix-tier runners), ansible needs to connect to
+    # the current host through ansible_connection=local instead of
+    # SSHing to itself. PROBATORIUM_LOCAL_HOST is exported by the
+    # tier workflow's "Configure cluster SSH" step; on the dev Mac
+    # it's unset and every host stays on SSH.
+    ansible_connection: "{{ 'local' if inventory_hostname == (lookup('env', 'PROBATORIUM_LOCAL_HOST') | default('', true)) else 'ssh' }}"
   children:
     bench_targets:
       hosts:

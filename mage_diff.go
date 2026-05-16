@@ -35,6 +35,15 @@ import (
 func ValidateDiff() error {
 	paths, err := twoLatestValidateResults()
 	if err != nil {
+		// PR-tier / single-target soak: one host produces one
+		// validate-results.json, there's nothing to cross-compare.
+		// Treat as a no-op success instead of failing the gate —
+		// the diff only makes sense for multi-host (cross-arch) or
+		// repeat runs of the same matrix.
+		if strings.Contains(err.Error(), "need at least two") {
+			fmt.Println("ValidateDiff: only one validate-results.json found — skipping cross-host diff.")
+			return nil
+		}
 		return err
 	}
 	docA, err := loadValidateDoc(paths[0])
