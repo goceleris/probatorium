@@ -1,18 +1,13 @@
 name: Matrix Tier — Weekend
 
-# Weekend matrix-mode soak: every refapp × every engine, 24h budget,
-# Tier-3 seeds at soak-mode cadence. The full-matrix soak the
-# nightly tier doesn't have time for — exercises the heap-trajectory
-# / goroutine-stability / FD-leak invariants that need overnight
-# volume on the production engine path.
+# Weekend matrix-mode soak: every refapp × every engine, 24h budget.
+# The full-matrix soak the nightly tier doesn't have time for —
+# exercises the heap-trajectory / goroutine-stability / FD-leak
+# invariants that need overnight volume on the production engine
+# path.
 #
-# Cron is Sundays 02:00 UTC: finishes Monday 02:00 UTC, leaves the
-# bench/validate paths free for the rest of the week.
-# workflow_dispatch lets a human run it against any branch.
-#
-# Per probatorium#114. The monthly tier from the original plan was
-# dropped — too long to act on signal; nightly + weekend give enough
-# coverage.
+# Three-stage flow with cluster-runner bootstrap (see
+# matrix-pr-tier.yml for the architecture comment).
 
 on:
   schedule:
@@ -28,9 +23,31 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: matrix-tier-cluster
+  cancel-in-progress: false
+
+env:
+  CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+
 jobs:
+  setup:
+    name: bootstrap cluster runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/cluster-runner-up
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          wait-for-manifest-clear:   "true"
+          wait-timeout-seconds:      "1800"
+
   matrix:
     name: matrix soak (weekend tier)
+    needs: setup
     runs-on: [self-hosted, celeris-cluster]
     timeout-minutes: 1740
     steps:
@@ -68,3 +85,17 @@ jobs:
       - name: mage Cleanup
         if: always()
         run: go run github.com/magefile/mage Cleanup
+
+  teardown:
+    name: teardown cluster runners
+    needs: [setup, matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/cluster-runner-down
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}

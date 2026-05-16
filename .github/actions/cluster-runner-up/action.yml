@@ -1,0 +1,173 @@
+name: Cluster runner up
+description: >-
+  Joins the goceleris tailnet as an ephemeral Tailscale node, then
+  SSH-driven ansible provisions a per-host self-hosted GitHub Actions
+  runner on every cluster host (msa2-server, msa2-client, msr1).
+  Runners are registered as --ephemeral, so each one self-exits after
+  completing a single job; cluster-runner-down/ rm -rf's whatever
+  state is left.
+
+  Composite, not reusable workflow: keeps every tier workflow
+  self-contained (one workflow run = one bootstrap → matrix →
+  teardown cycle, no cross-workflow handoff).
+
+inputs:
+  tailscale-oauth-client-id:
+    description: Tailscale OAuth client ID (tag:ci scope).
+    required: true
+  tailscale-oauth-secret:
+    description: Tailscale OAuth client secret.
+    required: true
+  tailscale-tags:
+    description: Tailscale tags applied to the ephemeral node.
+    required: false
+    default: tag:ci
+  gh-runner-pat:
+    description: >-
+      GitHub PAT (or app-installation token) with repo scope; used to
+      mint a registration-token via the Actions API. The token itself
+      isn't shipped to the cluster, only the short-lived registration
+      token is.
+    required: true
+  repo-url:
+    description: Repository URL the runner registers with.
+    required: false
+    default: https://github.com/${{ github.repository }}
+  repo-owner-and-name:
+    description: owner/repo for the registration-token API call.
+    required: false
+    default: ${{ github.repository }}
+  runner-labels:
+    description: Comma-separated labels added to "self-hosted" + host.
+    required: false
+    default: celeris-cluster
+  runner-version:
+    description: actions-runner release tag (without leading "v").
+    required: false
+    default: "2.327.1"
+  inventory-path:
+    description: Path to the ansible inventory.
+    required: false
+    default: ansible/inventory.yml
+  wait-for-manifest-clear:
+    description: >-
+      Wait for /tmp/celeris-bench-manifest.json on every host to
+      vanish (i.e. no active bench/validate is holding the cluster).
+      Off by default — the workflow's concurrency-group serialises
+      cluster workflows so the manifest is the safety net for
+      manually-launched experiments.
+    required: false
+    default: "false"
+  wait-timeout-seconds:
+    description: Max wait when wait-for-manifest-clear is true.
+    required: false
+    default: "1800"
+
+runs:
+  using: composite
+  steps:
+    - name: Join tailnet (ephemeral)
+      uses: tailscale/github-action@v3
+      with:
+        oauth-client-id: ${{ inputs.tailscale-oauth-client-id }}
+        oauth-secret:    ${{ inputs.tailscale-oauth-secret }}
+        tags:            ${{ inputs.tailscale-tags }}
+        version:         latest
+
+    - name: Install ansible-core
+      shell: bash
+      run: |
+        # apt is the cheapest path on ubuntu-latest; install pinned
+        # ansible-core only (we don't need community collections).
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends ansible-core
+
+    - name: Configure SSH (private key for cluster login)
+      shell: bash
+      env:
+        SSH_KEY: ${{ env.CLUSTER_SSH_KEY }}
+      run: |
+        # The cluster SSH key is provisioned by the caller workflow
+        # via the CLUSTER_SSH_KEY env var (typically from a repo
+        # secret). The composite action itself stays secret-free so
+        # the YAML can be reviewed in isolation.
+        if [ -z "${SSH_KEY}" ]; then
+          echo "::error::CLUSTER_SSH_KEY env var is empty — set it in the calling workflow"
+          exit 1
+        fi
+        mkdir -p ~/.ssh
+        printf '%s\n' "${SSH_KEY}" > ~/.ssh/id_ed25519
+        chmod 600 ~/.ssh/id_ed25519
+        ssh-keyscan -H msa2-server msa2-client msr1 >> ~/.ssh/known_hosts 2>/dev/null || true
+
+    - name: Wait for cluster manifest to clear
+      if: inputs.wait-for-manifest-clear == 'true'
+      shell: bash
+      run: |
+        set -e
+        deadline=$(( $(date +%s) + ${{ inputs.wait-timeout-seconds }} ))
+        for host in msa2-server msa2-client msr1; do
+          while ssh -o StrictHostKeyChecking=no -o BatchMode=yes mini@${host} \
+              "test -f /tmp/celeris-bench-manifest.json" 2>/dev/null; do
+            if [ $(date +%s) -ge $deadline ]; then
+              echo "::error::Timeout waiting for /tmp/celeris-bench-manifest.json on ${host}"
+              exit 1
+            fi
+            echo "$(date -Is) ${host}: manifest present, waiting…"
+            sleep 30
+          done
+          echo "$(date -Is) ${host}: pristine."
+        done
+
+    - name: Mint registration token
+      id: regtoken
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-runner-pat }}
+        REPO: ${{ inputs.repo-owner-and-name }}
+      run: |
+        # POST /repos/{owner}/{repo}/actions/runners/registration-token
+        # returns {token, expires_at}. Token is valid for 1h, plenty
+        # for ansible to register all three hosts.
+        TOKEN=$(gh api -X POST "/repos/${REPO}/actions/runners/registration-token" --jq .token)
+        if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+          echo "::error::Failed to mint registration token"
+          exit 1
+        fi
+        echo "::add-mask::${TOKEN}"
+        echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+
+    - name: Run ansible runner-setup
+      shell: bash
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: "False"
+      run: |
+        ansible-playbook \
+          -i ${{ inputs.inventory-path }} \
+          ansible/runner-setup.yml \
+          --extra-vars "gh_repo_url=${{ inputs.repo-url }}" \
+          --extra-vars "gh_runner_token=${{ steps.regtoken.outputs.token }}" \
+          --extra-vars "runner_version=${{ inputs.runner-version }}" \
+          --extra-vars "runner_labels=${{ inputs.runner-labels }}"
+
+    - name: Confirm runners visible to GitHub
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-runner-pat }}
+        REPO: ${{ inputs.repo-owner-and-name }}
+      run: |
+        # The runner registers itself within seconds of `./run.sh`
+        # starting, so by the time the playbook returns the API
+        # should already see the three runners. We retry briefly to
+        # absorb GH's eventual-consistency window.
+        for attempt in 1 2 3 4 5; do
+          ONLINE=$(gh api "/repos/${REPO}/actions/runners" --jq '[.runners[] | select(.status=="online" and (.labels | map(.name) | index("celeris-cluster")))] | length')
+          if [ "${ONLINE}" -ge 3 ]; then
+            echo "OK: ${ONLINE} celeris-cluster runners online"
+            exit 0
+          fi
+          echo "attempt ${attempt}: ${ONLINE} runners online; retrying"
+          sleep 10
+        done
+        echo "::warning::Expected ≥3 celeris-cluster runners online; got ${ONLINE}"
+        gh api "/repos/${REPO}/actions/runners" --jq '.runners[] | {name, status, busy, labels: [.labels[].name]}' || true

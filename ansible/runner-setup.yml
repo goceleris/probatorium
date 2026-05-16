@@ -1,0 +1,153 @@
+---
+# Provisions a per-host GitHub Actions self-hosted runner under
+# /tmp/actions-runner-<host>/. Pristine-by-design: nothing lands
+# outside /tmp, no system packages installed, no user shell rc
+# changes. The companion runner-teardown.yml wipes the directory and
+# de-registers from GitHub.
+#
+# This playbook follows the cluster-pristine rule: the runner ships
+# its own runtime tarball + supervises itself with `nohup ./run.sh`
+# (no systemd unit, no user lingering). When teardown runs the
+# process is killed by name and the dir is rm -rf'd; reboot would
+# clear /tmp anyway.
+#
+# Required extra-vars:
+#   gh_repo_url           e.g. https://github.com/goceleris/probatorium
+#   gh_runner_token       repo-scoped registration token, obtained
+#                         from GH API just before the run via
+#                         POST /repos/<owner>/<repo>/actions/runners/registration-token
+#   runner_version        actions-runner release tag, e.g. "2.327.1"
+#   runner_labels         comma-separated labels added to self-hosted,
+#                         e.g. "celeris-cluster,msa2-client"
+#
+# Optional extra-vars:
+#   runner_name           override runner display name; default
+#                         celeris-cluster-<hostname>
+#   runner_group          runner-group; default "Default"
+#
+# Per probatorium#103 / wave-12 ladder bootstrap.
+
+- name: Provision actions-runner per cluster host
+  hosts: cluster
+  gather_facts: true
+  vars:
+    runner_root: "/tmp/actions-runner-{{ inventory_hostname }}"
+    runner_arch_map:
+      x86_64: x64
+      aarch64: arm64
+    runner_arch: "{{ runner_arch_map[ansible_architecture] }}"
+    runner_tarball: "actions-runner-linux-{{ runner_arch }}-{{ runner_version }}.tar.gz"
+    runner_tarball_url: "https://github.com/actions/runner/releases/download/v{{ runner_version }}/{{ runner_tarball }}"
+    effective_runner_name: "{{ runner_name | default('celeris-' + inventory_hostname) }}"
+    effective_runner_group: "{{ runner_group | default('Default') }}"
+  tasks:
+    - name: Ensure runner root dir
+      ansible.builtin.file:
+        path: "{{ runner_root }}"
+        state: directory
+        mode: '0755'
+
+    - name: Check if runner already configured (idempotent skip)
+      ansible.builtin.stat:
+        path: "{{ runner_root }}/.runner"
+      register: runner_marker
+
+    - name: Download actions-runner tarball
+      ansible.builtin.get_url:
+        url: "{{ runner_tarball_url }}"
+        dest: "{{ runner_root }}/{{ runner_tarball }}"
+        mode: '0644'
+        force: false
+      when: not runner_marker.stat.exists
+
+    - name: Extract tarball
+      ansible.builtin.unarchive:
+        src: "{{ runner_root }}/{{ runner_tarball }}"
+        dest: "{{ runner_root }}"
+        remote_src: true
+        creates: "{{ runner_root }}/config.sh"
+      when: not runner_marker.stat.exists
+
+    - name: Register runner with GitHub (config.sh --unattended)
+      ansible.builtin.command:
+        cmd: >-
+          ./config.sh
+          --unattended
+          --replace
+          --ephemeral
+          --url {{ gh_repo_url }}
+          --token {{ gh_runner_token }}
+          --name {{ effective_runner_name }}
+          --runnergroup {{ effective_runner_group }}
+          --labels self-hosted,{{ runner_labels }},{{ inventory_hostname }}
+          --work _work
+        chdir: "{{ runner_root }}"
+      when: not runner_marker.stat.exists
+      changed_when: true
+      register: configure_result
+      # config.sh leaks the token to stdout in some failure modes;
+      # suppress logging unless this task actually fails. The token
+      # is short-lived (1h) so it's not catastrophic, but treat it
+      # as a secret regardless.
+      no_log: true
+
+    - name: Check for existing Runner.Listener pidfile
+      ansible.builtin.stat:
+        path: "{{ runner_root }}/runner.pid"
+      register: pidfile_stat
+
+    - name: Verify any existing pid is still alive
+      ansible.builtin.shell: |
+        if [ -f "{{ runner_root }}/runner.pid" ] && kill -0 "$(cat {{ runner_root }}/runner.pid)" 2>/dev/null; then
+          echo running
+        else
+          echo dead
+        fi
+      register: pid_alive
+      changed_when: false
+
+    - name: Start runner (nohup, single-shot ephemeral)
+      # --ephemeral runners self-deregister after one job, so we
+      # spawn one listener per call. The wrapper workflow takes care
+      # of re-provisioning on subsequent runs. Keeps the cluster
+      # truly pristine between jobs (no daemons, no PID hanging
+      # around once the workflow lands).
+      ansible.builtin.shell: |
+        cd {{ runner_root }}
+        nohup ./run.sh > runner.stdout 2> runner.stderr < /dev/null &
+        echo $! > runner.pid
+      when: pid_alive.stdout != "running"
+      changed_when: true
+
+    - name: Wait for runner to register and start listening
+      # The runner registers with GitHub immediately after starting,
+      # then enters its job-pull loop. We tail runner.stdout for the
+      # canonical "Listening for Jobs" line so the dispatching
+      # workflow knows the runner is ready before it queues jobs.
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          if grep -q "Listening for Jobs" {{ runner_root }}/runner.stdout 2>/dev/null; then
+            echo ready
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "runner.stdout tail:"
+        tail -20 {{ runner_root }}/runner.stdout 2>/dev/null || true
+        echo "runner.stderr tail:"
+        tail -20 {{ runner_root }}/runner.stderr 2>/dev/null || true
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: ready_check
+
+    - name: Summarise runner state
+      ansible.builtin.debug:
+        msg: |
+          Runner provisioned on {{ inventory_hostname }}:
+            dir:    {{ runner_root }}
+            name:   {{ effective_runner_name }}
+            labels: self-hosted,{{ runner_labels }},{{ inventory_hostname }}
+            pid:    {{ lookup('file', runner_root + '/runner.pid') }}
+            ready:  {{ ready_check.stdout }}

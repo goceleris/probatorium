@@ -1,15 +1,12 @@
 name: Matrix Tier — Nightly
 
 # Nightly matrix-mode validate run: every refapp × every engine, 1h
-# budget, ~1000 Tier-3 seeds. Catches slow regressions the 10-minute
-# PR tier doesn't have time to surface (heap drift, goroutine creep,
-# the 99th-percentile invariant violations that need volume).
+# budget. Catches slow regressions the 10-minute PR tier doesn't
+# have time to surface (heap drift, goroutine creep, the 99th-
+# percentile invariant violations that need volume).
 #
-# Cron is 02:00 UTC (cluster is quiet, finishes before working hours
-# even with 1h budget × both arches). workflow_dispatch lets a human
-# rerun against any branch.
-#
-# Per probatorium#114.
+# Three-stage flow with cluster-runner bootstrap (see
+# matrix-pr-tier.yml for the architecture comment).
 
 on:
   schedule:
@@ -25,9 +22,31 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: matrix-tier-cluster
+  cancel-in-progress: false
+
+env:
+  CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+
 jobs:
+  setup:
+    name: bootstrap cluster runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/cluster-runner-up
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          wait-for-manifest-clear:   "true"
+          wait-timeout-seconds:      "1800"
+
   matrix:
     name: matrix validate (nightly tier)
+    needs: setup
     runs-on: [self-hosted, celeris-cluster]
     timeout-minutes: 180
     steps:
@@ -65,3 +84,17 @@ jobs:
       - name: mage Cleanup
         if: always()
         run: go run github.com/magefile/mage Cleanup
+
+  teardown:
+    name: teardown cluster runners
+    needs: [setup, matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/cluster-runner-down
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
