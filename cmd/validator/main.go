@@ -77,6 +77,12 @@ type Config struct {
 	// ctx-cancel cleanly so the last samples reflect end-of-run state.
 	HeapDumpDir      string
 	HeapDumpInterval time.Duration
+
+	// Matrix carries the matrix-mode knobs. When Matrix.Enabled is
+	// true the validator iterates (refapp × engine) cells and emits
+	// a v5.1 validate-results.json with Cells[] populated instead
+	// of the single-cell document. Per #103 / #113.
+	Matrix MatrixConfig
 }
 
 // DefaultConfig returns the fresh-flag defaults.
@@ -118,6 +124,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.HeapDumpDir, "heap-dump-dir", c.HeapDumpDir, "directory to write periodic heap profiles to; empty disables")
 	fs.DurationVar(&c.HeapDumpInterval, "heap-dump-interval", 60*time.Second, "interval between heap dumps when -heap-dump-dir is set")
 	fs.StringVar(&c.PprofAddr, "pprof-addr", c.PprofAddr, "expose /debug/pprof/* on this addr (e.g. 127.0.0.1:6060); empty disables")
+	c.Matrix.Bind(fs)
 }
 
 // ParseArgs parses argv (without the program name).
@@ -145,6 +152,22 @@ func main() {
 
 // run is the orchestrator entry point.
 func run(cfg Config) error {
+	// Matrix mode: defer to the matrix runner. It manages OutDir +
+	// per-cell sub-orchestrators itself, so we don't fall through to
+	// the single-cell setup below.
+	if cfg.Matrix.Enabled {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			fmt.Fprintln(os.Stderr, "validator: interrupted (matrix)")
+			cancel()
+		}()
+		return runMatrix(ctx, cfg, cfg.Matrix)
+	}
+
 	if cfg.OutDir == "" {
 		ts := time.Now().UTC().Format("20060102-150405")
 		cfg.OutDir = filepath.Join("results", ts+"-validate-"+cfg.Arch)
