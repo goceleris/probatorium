@@ -350,7 +350,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		tempBin = built
 	}
 	if tempBin != "" {
-		defer os.Remove(tempBin)
+		defer func() { _ = os.Remove(tempBin) }()
 	}
 
 	// Allocate a unique loopback port for the cell so concurrent
