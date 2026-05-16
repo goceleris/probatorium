@@ -69,12 +69,24 @@
       when: not runner_marker.stat.exists
 
     - name: Register runner with GitHub (config.sh --unattended)
+      # Note: NOT using --ephemeral.
+      # --ephemeral asks GitHub to auto-delete the registration after
+      # one job. In practice that has a tight heartbeat window: if
+      # the runner is registered but doesn't enter "Listening for
+      # Jobs" within ~30s, GH considers the registration stale and
+      # deletes it, after which run.sh exits with "registration has
+      # been deleted from the server, please re-configure." Observed
+      # on every cluster boot pre-fix.
+      #
+      # Instead the runner stays a normal long-lived registration;
+      # the companion runner-teardown.yml de-registers explicitly
+      # at end-of-workflow. --replace lets re-runs cleanly replace
+      # a stale registration with the same name.
       ansible.builtin.command:
         cmd: >-
           ./config.sh
           --unattended
           --replace
-          --ephemeral
           --url {{ gh_repo_url }}
           --token {{ gh_runner_token }}
           --name {{ effective_runner_name }}
