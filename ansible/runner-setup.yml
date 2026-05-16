@@ -124,26 +124,52 @@
       # as a secret regardless.
       no_log: true
 
-    - name: Install ansible into a runner-scoped venv
+    - name: Install uv (static binary, self-contained)
       # mage Deploy / Validate / Soak shell out to ansible-playbook.
       # The cluster hosts don't have ansible system-installed (the
-      # pristine rule forbids), so the runner needs its own.
-      # Provision into a venv inside runner_root so it's wiped along
-      # with everything else by runner-teardown.yml.
+      # pristine rule forbids). Plain `python3 -m venv` fails on the
+      # cluster because Ubuntu 26.04 ships python3.14 without
+      # python3.14-venv / ensurepip, and there's no system pip either.
       #
-      # PATH injection happens in the tier workflow's matrix job —
-      # see "Use bootstrap-provisioned ansible" step in each
-      # .github/workflows/matrix-*-tier.yml file.
+      # Use uv instead — single static binary that bootstraps its own
+      # python + venv without depending on system python-venv. The
+      # installer drops uv + uvx directly into UV_INSTALL_DIR (NOT a
+      # bin/ subdir), so the binary lives at <UV_INSTALL_DIR>/uv.
+      #
+      # Lives inside runner_root so runner-teardown.yml wipes it
+      # along with the rest of the runner dir.
+      ansible.builtin.shell: |
+        set -e
+        if [ -x "{{ runner_root }}/uv/uv" ]; then
+          echo "uv already present"
+          exit 0
+        fi
+        curl -LsSf https://astral.sh/uv/install.sh \
+          | env UV_INSTALL_DIR="{{ runner_root }}/uv" \
+                UV_NO_MODIFY_PATH=1 \
+                INSTALLER_NO_MODIFY_PATH=1 \
+                sh
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Create ansible venv via uv (auto-downloads python if needed)
+      # uv venv brings its own python distribution if the system lacks
+      # one with ensurepip — exactly the cluster's situation.
       ansible.builtin.command:
         cmd: >-
-          python3 -m venv {{ runner_root }}/ansible-venv
-        creates: "{{ runner_root }}/ansible-venv/bin/python3"
+          {{ runner_root }}/uv/uv venv
+          --python 3.13
+          {{ runner_root }}/ansible-venv
+        creates: "{{ runner_root }}/ansible-venv/bin/python"
 
-    - name: Install ansible-core into the venv
-      ansible.builtin.pip:
-        name: ansible-core
-        virtualenv: "{{ runner_root }}/ansible-venv"
-        virtualenv_command: python3 -m venv
+    - name: Install ansible-core into the venv via uv pip
+      ansible.builtin.command:
+        cmd: >-
+          {{ runner_root }}/uv/uv pip install
+          --python {{ runner_root }}/ansible-venv/bin/python
+          ansible-core
+        creates: "{{ runner_root }}/ansible-venv/bin/ansible-playbook"
 
     - name: Start runner (nohup)
       # Prepend the runner-scoped ansible venv to PATH so any job
