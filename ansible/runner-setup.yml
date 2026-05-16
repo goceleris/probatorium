@@ -124,9 +124,36 @@
       # as a secret regardless.
       no_log: true
 
+    - name: Install ansible into a runner-scoped venv
+      # mage Deploy / Validate / Soak shell out to ansible-playbook.
+      # The cluster hosts don't have ansible system-installed (the
+      # pristine rule forbids), so the runner needs its own.
+      # Provision into a venv inside runner_root so it's wiped along
+      # with everything else by runner-teardown.yml.
+      #
+      # PATH injection happens in the tier workflow's matrix job —
+      # see "Use bootstrap-provisioned ansible" step in each
+      # .github/workflows/matrix-*-tier.yml file.
+      ansible.builtin.command:
+        cmd: >-
+          python3 -m venv {{ runner_root }}/ansible-venv
+        creates: "{{ runner_root }}/ansible-venv/bin/python3"
+
+    - name: Install ansible-core into the venv
+      ansible.builtin.pip:
+        name: ansible-core
+        virtualenv: "{{ runner_root }}/ansible-venv"
+        virtualenv_command: python3 -m venv
+
     - name: Start runner (nohup)
+      # Prepend the runner-scoped ansible venv to PATH so any job
+      # that lands on this runner finds ansible-playbook without
+      # needing an explicit per-job install step. The export goes
+      # into the runner's process environment because run.sh
+      # inherits the shell's PATH.
       ansible.builtin.shell: |
         cd {{ runner_root }}
+        export PATH="{{ runner_root }}/ansible-venv/bin:$PATH"
         nohup ./run.sh > runner.stdout 2> runner.stderr < /dev/null &
         echo $!
       changed_when: true

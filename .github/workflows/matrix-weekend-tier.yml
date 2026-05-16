@@ -67,6 +67,15 @@ jobs:
           go install github.com/magefile/mage@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      - name: Use bootstrap-provisioned ansible
+        # runner-setup.yml provisioned an ansible-core venv at
+        # /tmp/actions-runner-<host>/ansible-venv/. The runner-side
+        # PATH export in nohup ./run.sh covers it, but writing
+        # GITHUB_PATH here is the explicit belt-and-braces guarantee
+        # that subsequent steps' shells find ansible-playbook.
+        run: |
+          echo "/tmp/actions-runner-$(hostname -s)/ansible-venv/bin" >> "$GITHUB_PATH"
+
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
