@@ -74,3 +74,6 @@ servers/_docker/**/*.tar
 /validation/refapp/kitchen_sink/kitchen_sink
 /validation/refapp/auth_session_ratelimit/auth_session_ratelimit
 /validation/refapp/auth_jwt_csrf/auth_jwt_csrf
+/validation/refapp/driver_postgres/driver_postgres
+/validation/refapp/driver_redis/driver_redis
+/validation/refapp/driver_memcached/driver_memcached
