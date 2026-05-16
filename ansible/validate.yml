@@ -96,7 +96,7 @@
             ./validator \
               -target=localhost \
               -duration={{ validate_duration | default('10m') }} \
-              {% if validate_matrix | default('') == '1' %}-matrix -matrix-refapp-root={{ bench_root }}/validation/refapp -matrix-bin-dir={{ bench_root }}/refapps {% if validate_matrix_refapps | default('') %}-matrix-refapps={{ validate_matrix_refapps }}{% endif %} {% if validate_matrix_engines | default('') %}-matrix-engines={{ validate_matrix_engines }}{% endif %} \
+              {% if validate_matrix | default('') == '1' %}-matrix -matrix-refapp-root={{ bench_root }}/validation/refapp -matrix-bin-dir={{ bench_root }}/refapps -markov={{ bench_root }}/markov/auth_session_ratelimit.yaml {% if validate_matrix_refapps | default('') %}-matrix-refapps={{ validate_matrix_refapps }}{% endif %} {% if validate_matrix_engines | default('') %}-matrix-engines={{ validate_matrix_engines }}{% endif %} \
               {% else %}-celeris-bin={{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }} -celeris-addr=127.0.0.1:{{ bench_port | default(8080) }} -markov={{ bench_root }}/markov/{{ refapp | default('auth_session_ratelimit') }}.yaml {% if validate_refapp_engine | default('') %}-refapp-engine={{ validate_refapp_engine }}{% endif %} \
               {% endif %}
               -replay-bin={{ bench_root }}/validator-replay \

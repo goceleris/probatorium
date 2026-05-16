@@ -419,6 +419,20 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		return cell, fmt.Errorf("mkdir cell out: %w", err)
 	}
 
+	// Pick the per-refapp Markov yaml. Look next to the global default
+	// MarkovPath first (e.g. validation/markov/<slug>.yaml or
+	// /tmp/celeris-bench/markov/<slug>.yaml), falling back to
+	// cfg.MarkovPath verbatim if the slug-specific file is missing —
+	// preserves the single-cell default when matrix mode runs with
+	// just one refapp.
+	markovPath := cfg.MarkovPath
+	if cfg.MarkovPath != "" {
+		candidate := filepath.Join(filepath.Dir(cfg.MarkovPath), mc.Refapp+".yaml")
+		if _, err := os.Stat(candidate); err == nil {
+			markovPath = candidate
+		}
+	}
+
 	cellCfg := validation.Config{
 		Target:             cfg.Target,
 		Arch:               cfg.Arch,
@@ -429,7 +443,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		DryRun:             cfg.DryRun,
 		OutDir:             cellOut,
 		CorpusPath:         cfg.CorpusPath,
-		MarkovPath:         cfg.MarkovPath,
+		MarkovPath:         markovPath,
 		OpenAPIPath:        cfg.OpenAPIPath,
 		CelerisBin:         binPath,
 		CelerisListenAddr:  addr,
