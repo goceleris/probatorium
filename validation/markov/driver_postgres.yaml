@@ -1,0 +1,61 @@
+# Transition matrix for the driver_postgres refapp.
+#
+# States model a typical CRUD workflow against the PG-backed user
+# store, plus the side-channel key/value store: probe health, create,
+# read, update, occasional KV writes.
+
+start: healthz
+
+states:
+  # /healthz — liveness probe. The first interaction with every fresh
+  # session, then most clients move on to actual work.
+  healthz:
+    create_user:  6.0  # 60% start a new user creation
+    list_users:   3.0  # 30% read the existing user list
+    healthz:      1.0  # 10% repeat the probe (load-balancer style)
+
+  # POST /users — creation endpoint. Returns a row, naturally feeds
+  # into a GET /users/:id.
+  create_user:
+    get_user:     7.0  # 70% read back the freshly-created user
+    list_users:   2.0  # 20% return to index
+    create_user:  1.0  # 10% bulk-create more rows
+
+  # GET /users — index endpoint. Pagination + self-loop, eventually
+  # opens a row.
+  list_users:
+    get_user:     6.0  # 60% open a record
+    list_users:   3.0  # 30% paginate / refilter
+    create_user:  1.0  # 10% start a new row from the list
+
+  # GET /users/:id — single-row read. Most often followed by an
+  # update; occasional jump back to the index.
+  get_user:
+    update_user:  5.0  # 50% mutate the record
+    get_user:     2.0  # 20% reload
+    list_users:   2.0  # 20% back to index
+    store_kv:     1.0  # 10% set a side-channel KV entry
+
+  # PUT /users/:id — update endpoint. Realistically the user verifies
+  # the change by re-reading or moves on.
+  update_user:
+    get_user:     6.0
+    list_users:   2.0
+    store_kv:     1.0
+    done:         1.0
+
+  # POST /store/:key — write to the KV side channel. Followed by a
+  # corresponding read.
+  store_kv:
+    fetch_kv:     8.0
+    store_kv:     1.0
+    done:         1.0
+
+  # GET /store/:key — KV read. Most reads terminate the session.
+  fetch_kv:
+    store_kv:     2.0
+    get_user:     2.0
+    done:         6.0
+
+  # Terminal.
+  done: {}

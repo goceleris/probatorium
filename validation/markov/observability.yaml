@@ -1,0 +1,59 @@
+# Transition matrix for the observability refapp.
+#
+# Drives the OpenTelemetry / Prometheus / structured-log pipelines:
+# normal success, induced error, induced slowness, then scrape the
+# /metrics + /obs/log-stats counters to verify exporters tracked it.
+
+start: healthz
+
+states:
+  # /healthz — liveness probe.
+  healthz:
+    api_ok:       5.0  # 50% baseline successful call
+    api_slow:     2.0  # 20% slow path (latency exporter check)
+    api_error:    2.0  # 20% error path (error counter check)
+    metrics:      1.0  # 10% scrape immediately
+
+  # /api/ok — success path. Realistic call patterns mix in slow +
+  # error to load the exporters.
+  api_ok:
+    api_ok:       4.0
+    api_slow:     2.0
+    api_error:    2.0
+    metrics:      1.0
+    log_stats:    1.0
+
+  # /api/slow — induced-latency endpoint. Drives p99 + histogram
+  # bucketing. After a slow call clients commonly retry.
+  api_slow:
+    api_ok:       3.0
+    api_slow:     2.0  # 20% retry the slow path
+    metrics:      3.0  # 30% scrape to verify the buckets
+    log_stats:    2.0
+
+  # /api/error — induced 5xx. After an error the client typically
+  # scrapes metrics + retries.
+  api_error:
+    metrics:      4.0  # 40% scrape to confirm error counter
+    api_ok:       3.0
+    api_error:    1.0  # 10% retry the failing call
+    log_stats:    2.0
+
+  # /metrics — Prometheus scrape. After scraping, the workload either
+  # continues exercising the API or terminates.
+  metrics:
+    api_ok:       3.0
+    api_slow:     2.0
+    api_error:    2.0
+    log_stats:    1.0
+    done:         2.0
+
+  # /obs/log-stats — structured-log counter scrape. Realistic clients
+  # scrape both metrics + log-stats in tandem.
+  log_stats:
+    metrics:      4.0
+    api_ok:       2.0
+    done:         4.0
+
+  # Terminal.
+  done: {}

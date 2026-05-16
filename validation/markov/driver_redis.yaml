@@ -1,0 +1,55 @@
+# Transition matrix for the driver_redis refapp.
+#
+# States model the redis-backed KV + atomic-INCR workflows: GET/PUT
+# typical KV traffic, plus a counter-increment loop that exercises the
+# atomic path, plus the side store.
+
+start: healthz
+
+states:
+  # /healthz — liveness probe.
+  healthz:
+    put_kv:       5.0  # 50% start by writing a key
+    get_kv:       3.0  # 30% read an existing key
+    incr_key:     1.0  # 10% atomic counter increment
+    healthz:      1.0  # 10% repeat the probe
+
+  # PUT /kv/:key — write a value. Realistic clients read it back
+  # immediately or move on to the next key.
+  put_kv:
+    get_kv:       6.0  # 60% read back the value just written
+    put_kv:       2.0  # 20% write a different key
+    incr_key:     1.0
+    store_kv:     1.0
+
+  # GET /kv/:key — read a value. Self-loops moderately, often follows
+  # with another write.
+  get_kv:
+    put_kv:       3.0
+    get_kv:       3.0
+    incr_key:     2.0
+    fetch_store:  1.0
+    done:         1.0
+
+  # POST /incr/:key — atomic counter increment. Tight loops are
+  # realistic for counter workloads, so self-loop is high.
+  incr_key:
+    incr_key:     5.0  # 50% bump the counter again
+    get_kv:       2.0
+    put_kv:       2.0
+    done:         1.0
+
+  # POST /store/:key — write to the side-store namespace.
+  store_kv:
+    fetch_store:  7.0
+    store_kv:     2.0
+    done:         1.0
+
+  # GET /store/:key — read from the side-store namespace.
+  fetch_store:
+    store_kv:     2.0
+    get_kv:       2.0
+    done:         6.0
+
+  # Terminal.
+  done: {}
