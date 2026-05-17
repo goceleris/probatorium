@@ -100,6 +100,10 @@ jobs:
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
+          # Provision docker + pull postgres/redis/memcached images so
+          # the validate step (below) can start them for driver_*
+          # refapps. Pull-only — containers start in validate.yml.
+          DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
 
       - name: mage Validate (matrix mode, both archs)
@@ -120,6 +124,12 @@ jobs:
           # 30 so all five slices fire on every cell:
           #   adv=6, h2c=3, ws=1, sse=1, markov=19.
           VALIDATE_CONCURRENCY: "30"
+          # Start postgres / redis / memcached containers on fixed
+          # ports so the driver_* refapps in matrix mode can connect
+          # to real backends. Without this, driver_postgres /
+          # driver_redis / driver_memcached cells produce 100% Tier 3
+          # errored (refapp exits before ready).
+          VALIDATE_DBSERVICES: "1"
         run: mage Validate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)

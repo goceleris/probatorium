@@ -78,6 +78,62 @@
           register: refapp_stat
           failed_when: not refapp_stat.stat.exists
 
+        # ---------- driver dbservices (start containers) ----------
+        # The dbservices role in deploy.yml installs docker.io + pulls
+        # the postgres/redis/memcached images but doesn't start them
+        # (bench runs spawn containers per-cell). For matrix-mode
+        # validate runs we need long-lived containers on fixed ports
+        # so the driver_* refapps can reach their backends. Containers
+        # bind to the same ports the driver refapps default to:
+        #   postgres 127.0.0.1:54321 (bench/bench/bench)
+        #   redis    127.0.0.1:63791
+        #   memcached 127.0.0.1:21211
+        # cleanup.yml stops any docker containers we leave running.
+        - name: dbservices | start postgres
+          ansible.builtin.shell: |
+            docker rm -f probatorium-pg 2>/dev/null
+            docker run -d --rm --name probatorium-pg \
+              -p 127.0.0.1:54321:5432 \
+              -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
+              postgres:17-alpine
+          register: dbsvc_pg
+          changed_when: dbsvc_pg.rc == 0
+          failed_when: false
+          when: validate_dbservices | default('') == '1'
+
+        - name: dbservices | start redis
+          ansible.builtin.shell: |
+            docker rm -f probatorium-redis 2>/dev/null
+            docker run -d --rm --name probatorium-redis -p 127.0.0.1:63791:6379 redis:8.2-alpine
+          register: dbsvc_redis
+          changed_when: dbsvc_redis.rc == 0
+          failed_when: false
+          when: validate_dbservices | default('') == '1'
+
+        - name: dbservices | start memcached
+          ansible.builtin.shell: |
+            docker rm -f probatorium-mc 2>/dev/null
+            docker run -d --rm --name probatorium-mc -p 127.0.0.1:21211:11211 memcached:1.6.41-alpine
+          register: dbsvc_mc
+          changed_when: dbsvc_mc.rc == 0
+          failed_when: false
+          when: validate_dbservices | default('') == '1'
+
+        # Postgres takes ~3-5s to finish initdb + accept connections.
+        # Wait via pg_isready (in-container) so the validator's
+        # driver_postgres refapp doesn't error on its first dial.
+        - name: dbservices | wait for postgres ready
+          ansible.builtin.shell: |
+            for i in $(seq 1 30); do
+              docker exec probatorium-pg pg_isready -U bench -d bench >/dev/null 2>&1 && exit 0
+              sleep 1
+            done
+            exit 1
+          register: pg_wait
+          changed_when: false
+          failed_when: false
+          when: validate_dbservices | default('') == '1'
+
         - name: Run validator (drives refapp + Tier 1 + Tier 3)
           # Validator manages the refapp lifecycle internally via
           # remote.Local. The refapp binds 127.0.0.1:<port> so the
@@ -99,6 +155,15 @@
             # default (concurrency=1 for cells under 5min) leaves the
             # h2c / WS / SSE walker slices dormant on every cell.
             VALIDATE_CONCURRENCY: "{{ validate_concurrency | default('') }}"
+            # Driver-refapp backend addresses. The driver_postgres /
+            # driver_redis / driver_memcached refapps look up these env
+            # vars (or their -postgres-dsn / -redis-addr / -mc-addr
+            # flags) to connect to the docker-spawned services started
+            # above. Matching the refapp defaults so a non-dbservices
+            # run is a no-op.
+            PROBATORIUM_PG_DSN: "postgres://bench:bench@127.0.0.1:54321/bench?sslmode=disable"
+            PROBATORIUM_REDIS_ADDR: "127.0.0.1:63791"
+            PROBATORIUM_MC_ADDR: "127.0.0.1:21211"
           ansible.builtin.shell: |
             cd {{ bench_root }}
             ulimit -l unlimited

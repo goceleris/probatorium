@@ -101,6 +101,9 @@ jobs:
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
+          # Pull postgres/redis/memcached images so the soak step can
+          # start them for driver_* refapps.
+          DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
 
       - name: mage Soak (matrix mode, both archs)
@@ -115,6 +118,9 @@ jobs:
           # the WS / SSE slices (thresholds 20) get plenty of walkers
           # and we exercise the full long-soak workload mix.
           VALIDATE_CONCURRENCY: "50"
+          # Start dbservice containers so driver_* cells validate
+          # against real postgres/redis/memcached backends.
+          VALIDATE_DBSERVICES: "1"
         run: mage Soak
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
