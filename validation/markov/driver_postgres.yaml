@@ -2,7 +2,8 @@
 #
 # States model a typical CRUD workflow against the PG-backed user
 # store, plus the side-channel key/value store: probe health, create,
-# read, update, occasional KV writes.
+# read, update, occasional KV writes. Each non-terminal state declares
+# the HTTP request the Tier 1 walker fires when entering it.
 
 start: healthz
 
@@ -10,6 +11,7 @@ states:
   # /healthz — liveness probe. The first interaction with every fresh
   # session, then most clients move on to actual work.
   healthz:
+    request: GET /healthz
     create_user:  6.0  # 60% start a new user creation
     list_users:   3.0  # 30% read the existing user list
     healthz:      1.0  # 10% repeat the probe (load-balancer style)
@@ -17,6 +19,7 @@ states:
   # POST /users — creation endpoint. Returns a row, naturally feeds
   # into a GET /users/:id.
   create_user:
+    request: POST /users
     get_user:     7.0  # 70% read back the freshly-created user
     list_users:   2.0  # 20% return to index
     create_user:  1.0  # 10% bulk-create more rows
@@ -24,6 +27,7 @@ states:
   # GET /users — index endpoint. Pagination + self-loop, eventually
   # opens a row.
   list_users:
+    request: GET /users
     get_user:     6.0  # 60% open a record
     list_users:   3.0  # 30% paginate / refilter
     create_user:  1.0  # 10% start a new row from the list
@@ -31,6 +35,7 @@ states:
   # GET /users/:id — single-row read. Most often followed by an
   # update; occasional jump back to the index.
   get_user:
+    request: GET /users/walker-u1
     update_user:  5.0  # 50% mutate the record
     get_user:     2.0  # 20% reload
     list_users:   2.0  # 20% back to index
@@ -39,6 +44,7 @@ states:
   # PUT /users/:id — update endpoint. Realistically the user verifies
   # the change by re-reading or moves on.
   update_user:
+    request: PUT /users/walker-u1
     get_user:     6.0
     list_users:   2.0
     store_kv:     1.0
@@ -47,15 +53,17 @@ states:
   # POST /store/:key — write to the KV side channel. Followed by a
   # corresponding read.
   store_kv:
+    request: POST /store/walker-k1
     fetch_kv:     8.0
     store_kv:     1.0
     done:         1.0
 
   # GET /store/:key — KV read. Most reads terminate the session.
   fetch_kv:
+    request: GET /store/walker-k1
     store_kv:     2.0
     get_user:     2.0
     done:         6.0
 
-  # Terminal.
+  # Terminal — silent.
   done: {}

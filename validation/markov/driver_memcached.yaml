@@ -1,6 +1,6 @@
 # Transition matrix for the driver_memcached refapp.
 #
-# memcached's only operation is set/get on the cache. The store/:key
+# memcached's only operations are set/get on the cache. The store/:key
 # endpoints expose a parallel namespace. No counter increment here
 # (memcached `incr` not exposed in this refapp).
 
@@ -9,6 +9,7 @@ start: healthz
 states:
   # /healthz — liveness probe.
   healthz:
+    request: GET /healthz
     set_kv:       5.0  # 50% start by writing a cache entry
     get_kv:       3.0  # 30% read an existing key
     store_kv:     1.0  # 10% side store
@@ -16,6 +17,7 @@ states:
 
   # PUT /kv/:key — write to memcached. Reads usually follow.
   set_kv:
+    request: PUT /kv/walker-k1
     get_kv:       6.0
     set_kv:       2.0
     store_kv:     1.0
@@ -24,6 +26,7 @@ states:
   # GET /kv/:key — read from memcached. Self-loop is high because
   # cache reads dominate in realistic workloads.
   get_kv:
+    request: GET /kv/walker-k1
     get_kv:       4.0
     set_kv:       3.0
     fetch_store:  1.0
@@ -31,15 +34,17 @@ states:
 
   # POST /store/:key — side namespace write.
   store_kv:
+    request: POST /store/walker-k1
     fetch_store:  7.0
     store_kv:     2.0
     done:         1.0
 
   # GET /store/:key — side namespace read.
   fetch_store:
+    request: GET /store/walker-k1
     store_kv:     2.0
     get_kv:       2.0
     done:         6.0
 
-  # Terminal.
+  # Terminal — silent.
   done: {}

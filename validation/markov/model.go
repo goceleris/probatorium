@@ -43,6 +43,25 @@ type Matrix struct {
 	// edges. Edges within a row are sorted by destination name so
 	// sampling is deterministic across map iteration orders.
 	Transitions map[string][]Edge
+	// Requests maps a state name to the HTTP request the Tier 1 walker
+	// fires when it enters that state. States without a Requests entry
+	// are silent — the chain still walks through them, but no HTTP
+	// request is sent. Silent states model "logical" transitions that
+	// don't correspond to a refapp endpoint (terminal "done" states,
+	// pure session bookkeeping, etc.).
+	Requests map[string]Request
+}
+
+// Request describes the HTTP call associated with one Markov state.
+// Parsed from the `request: METHOD path` line under each state in
+// the YAML.
+type Request struct {
+	// Method is the HTTP verb (GET, POST, PUT, DELETE, PATCH). Empty
+	// when the state has no `request:` directive.
+	Method string
+	// Path is the URL path beginning with `/`. Empty when the state
+	// has no `request:` directive.
+	Path string
 }
 
 // Edge is one weighted outgoing transition.
@@ -188,7 +207,7 @@ func LoadMatrix(r io.Reader) (*Matrix, error) {
 	scan.Buffer(make([]byte, 0, 64*1024), 1<<20)
 
 	var (
-		m           = &Matrix{Transitions: map[string][]Edge{}}
+		m           = &Matrix{Transitions: map[string][]Edge{}, Requests: map[string]Request{}}
 		currentFrom string
 		lineNo      int
 	)
@@ -230,6 +249,24 @@ func LoadMatrix(r io.Reader) (*Matrix, error) {
 			}
 			if currentFrom == "" {
 				return nil, fmt.Errorf("markov: line %d: edge before state header", lineNo)
+			}
+			// Special-case `request: METHOD path` — these aren't edges,
+			// they're the HTTP request the Tier 1 walker fires when it
+			// enters this state. The split is on the first space:
+			// "GET /api/me" → Method=GET, Path=/api/me.
+			if name == "request" {
+				method, path, ok := strings.Cut(val, " ")
+				if !ok || method == "" || path == "" {
+					return nil, fmt.Errorf("markov: line %d: request %q must be \"METHOD path\"", lineNo, val)
+				}
+				if !strings.HasPrefix(path, "/") {
+					return nil, fmt.Errorf("markov: line %d: request path %q must start with /", lineNo, path)
+				}
+				m.Requests[currentFrom] = Request{
+					Method: strings.ToUpper(method),
+					Path:   path,
+				}
+				break
 			}
 			w, err := strconv.ParseFloat(val, 64)
 			if err != nil {

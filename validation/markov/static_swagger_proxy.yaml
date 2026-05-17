@@ -9,6 +9,7 @@ start: healthz
 states:
   # /healthz — liveness probe.
   healthz:
+    request: GET /healthz
     whoami:       4.0  # 40% start by identifying the deployed service
     static:       3.0  # 30% load a static asset (homepage etc.)
     docs:         2.0  # 20% jump straight to the docs index
@@ -17,14 +18,16 @@ states:
   # /api/whoami — service identity. Followed by docs browsing or
   # static asset fetches in realistic dev workflows.
   whoami:
+    request: GET /api/whoami
     docs:         5.0
     static:       3.0
     docs_file:    1.0
     done:         1.0
 
-  # /static/*filepath — generic static asset. Long browsing sessions
+  # /static/index.html — generic static asset. Long browsing sessions
   # are realistic, so self-loop is high.
   static:
+    request: GET /static/index.html
     static:       5.0  # 50% another asset (multiple resources)
     docs:         2.0
     whoami:       1.0
@@ -33,18 +36,20 @@ states:
   # /docs — swagger UI index. From there clients explore individual
   # docs files (CSS, JS, openapi.yaml).
   docs:
+    request: GET /docs
     docs_file:    7.0  # 70% load asset under /docs/
     docs:         1.0
     static:       1.0
     done:         1.0
 
-  # /docs/*filepath — swagger asset. Multiple fetches per session,
+  # /docs/openapi.yaml — swagger asset. Multiple fetches per session,
   # eventually terminates.
   docs_file:
+    request: GET /docs/openapi.yaml
     docs_file:    6.0  # 60% load another swagger asset
     docs:         2.0
     static:       1.0
     done:         1.0
 
-  # Terminal.
+  # Terminal — silent.
   done: {}
