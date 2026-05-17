@@ -60,6 +60,12 @@
 # restart can't pull a breaking upstream change between deploy and bench.
 # Update these as upstream majors land (postgres 18, redis 9, ...).
 - name: dbservices | pull database images (postgres + redis + memcached)
+  # `docker pull` against Docker Hub's Cloudflare R2 CDN can transiently
+  # time out (probatorium nightly 26001025906 failed pulling
+  # postgres:17-alpine with `dial tcp 172.64.66.2:443: i/o timeout`).
+  # Three attempts with 10s backoff covers the typical R2 hiccup
+  # window without making a real network outage hang the deploy for
+  # minutes.
   ansible.builtin.command: "docker pull {{ item }}"
   loop:
     - "postgres:17-alpine"
@@ -67,6 +73,9 @@
     - "memcached:1.6.41-alpine"
   register: docker_pull
   changed_when: "'Downloaded newer image' in docker_pull.stdout or 'Pull complete' in docker_pull.stdout"
+  retries: 3
+  delay: 10
+  until: docker_pull is succeeded
 
 - name: dbservices | record fetched image digests
   ansible.builtin.shell: |
