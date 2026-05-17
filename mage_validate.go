@@ -179,6 +179,17 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 				args = append(args, "--extra-vars", "validate_matrix_engines="+v)
 			}
 		}
+		// VALIDATE_CONCURRENCY tunes the per-cell walker fan-out
+		// (see validation/runner.go). Threaded through to the
+		// validator on the remote host via ansible's `environment:`
+		// — env vars set on this mage process don't otherwise cross
+		// the SSH boundary. Without this passthrough every cell
+		// runs with concurrency=1 (the duration-tiered default for
+		// 150s per-cell budgets), leaving h2c / WS / SSE walker
+		// slices dormant.
+		if v := os.Getenv("VALIDATE_CONCURRENCY"); v != "" {
+			args = append(args, "--extra-vars", "validate_concurrency="+v)
+		}
 		fmt.Printf("\n=== %s on %s (playbook=%s) ===\n", titleCase(kind), t, playbook)
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir
