@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
@@ -421,10 +422,51 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 	// Per-walker cookie jar. nil error per cookiejar.New's contract
 	// when options is nil.
 	jar, _ := cookiejar.New(nil)
-	hc := &http.Client{
-		Timeout: parent.Timeout,
-		Jar:     jar,
+	// Per-walker [http.Transport] with a single-conn keep-alive pool.
+	//
+	// Pre-fix: every walker built `&http.Client{Timeout, Jar}` with no
+	// Transport set → all walkers shared [http.DefaultTransport], whose
+	// `MaxIdleConnsPerHost` defaults to 2. With N (default 19–30)
+	// concurrent markov walkers racing for those 2 idle slots, ~N-2
+	// connections close per "round of N finishing simultaneously",
+	// each closure consuming an ephemeral port on the validator host.
+	// msa2-client runs `tcp_tw_reuse=2` (loopback-only on Linux ≥4.12),
+	// so non-loopback (client→bench_target:8080) 4-tuples cannot reuse
+	// TIME_WAIT slots; the kernel cycles through the full 28K ephemeral
+	// range, then `connect()` starts returning EADDRNOTAVAIL — the
+	// matrix nightly's std-engine "connection storm" with no obvious
+	// celeris-side cause (cells 02/05/17/23 across both archs, 35–86%
+	// transport-error rates uncorrelated with the refapp's actual
+	// failure surface).
+	//
+	// Isolation probe verified the diagnosis: shared-DefaultTransport
+	// shape exhausts ephemeral ports at ~t=80s on BOTH std and iouring
+	// (5.3–9.9% err, 28k TIME_WAIT). Per-walker `MaxIdleConnsPerHost=1`
+	// gives each walker its own keep-alive conn that never overflows
+	// the idle pool: 0.00% err, 14x throughput, 30 TIME_WAIT at end.
+	//
+	// Why `MaxConnsPerHost=1`: walkers are strictly sequential
+	// (chain.Next → doMarkovRequest → repeat), so a single conn per
+	// walker is sufficient. Capping it eliminates the dial-then-close
+	// race when walkerLogin and the first chain request happen to
+	// overlap with idle-pool eviction.
+	tr := &http.Transport{
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		MaxConnsPerHost:     1,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 	}
+	hc := &http.Client{
+		Timeout:   parent.Timeout,
+		Jar:       jar,
+		Transport: tr,
+	}
+	defer tr.CloseIdleConnections()
 	// Deterministic credentials so re-running with the same seed
 	// produces identical wire traffic.
 	username := fmt.Sprintf("walker-%016x", seed)
