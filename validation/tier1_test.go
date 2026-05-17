@@ -23,9 +23,14 @@ import (
 // alternates deterministically. Each state declares a request
 // directive so the data-driven walker actually fires HTTP traffic
 // (post-#125, walkers are silent on states without a request entry).
+// A top-level `login:` directive is included so cookie-flow tests
+// exercise walkerLogin via the same data-driven path real refapps
+// use (post-route-fix, walkerLogin is skipped entirely when login
+// is absent).
 func minimalMatrix(t *testing.T) *markov.Matrix {
 	t.Helper()
-	const yaml = `start: home
+	const yaml = `login: POST /login
+start: home
 states:
   home:
     request: GET /
@@ -57,14 +62,24 @@ func TestAuthSessionRatelimit_StateRequestCoverage(t *testing.T) {
 			t.Fatalf("load auth_session_ratelimit.yaml: %v", err)
 		}
 	}
+	// Yaml updated post-nightly-25977080887 analysis: the old paths
+	// (/, /api/login, /api/logout, /api/users/u1) did not match the
+	// refapp's actual routes. The current yaml uses the real routes
+	// from validation/refapp/auth_session_ratelimit/main.go and adds
+	// a top-level `login:` directive.
+	wantLogin := markov.Request{Method: "POST", Path: "/login"}
+	if m.Login != wantLogin {
+		t.Errorf("login: got %+v, want %+v", m.Login, wantLogin)
+	}
 	want := map[string]struct{ Method, Path string }{
-		"home":        {"GET", "/"},
-		"login":       {"POST", "/api/login"},
+		"me":          {"GET", "/me"},
 		"list_users":  {"GET", "/api/users"},
-		"user_detail": {"GET", "/api/users/u1"},
+		"user_detail": {"GET", "/api/users/walker-u1"},
 		"create_user": {"POST", "/api/users"},
-		"update_user": {"PUT", "/api/users/u1"},
-		"logout":      {"POST", "/api/logout"},
+		"update_user": {"PUT", "/api/users/walker-u1"},
+		"user_delete": {"DELETE", "/api/users/walker-u1"},
+		"user_posts":  {"GET", "/api/users/walker-u1/posts"},
+		"logout":      {"POST", "/logout"},
 	}
 	for state, w := range want {
 		got, ok := m.Requests[state]
@@ -145,7 +160,8 @@ func TestWalkerLogin_SetsCookie(t *testing.T) {
 	defer srv.Close()
 	jar, _ := cookiejar.New(nil)
 	hc := &http.Client{Timeout: time.Second, Jar: jar}
-	if err := walkerLogin(context.Background(), hc, srv.URL, "alice", "pw"); err != nil {
+	login := markov.Request{Method: "POST", Path: "/login"}
+	if err := walkerLogin(context.Background(), hc, srv.URL, login, "alice", "pw"); err != nil {
 		t.Fatalf("walkerLogin: %v", err)
 	}
 	u, _ := url.Parse(srv.URL)

@@ -15,9 +15,10 @@ states:
     store_kv:     1.0  # 10% side store
     healthz:      1.0  # 10% repeat the probe
 
-  # PUT /kv/:key — write to memcached. Reads usually follow.
+  # POST /kv/:key — write to memcached. Reads usually follow.
+  # (The refapp registers POST, not PUT, on /kv/:key.)
   set_kv:
-    request: PUT /kv/walker-k1
+    request: POST /kv/walker-k1
     get_kv:       6.0
     set_kv:       2.0
     store_kv:     1.0

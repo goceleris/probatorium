@@ -15,10 +15,11 @@ states:
     incr_key:     1.0  # 10% atomic counter increment
     healthz:      1.0  # 10% repeat the probe
 
-  # PUT /kv/:key — write a value. Realistic clients read it back
+  # POST /kv/:key — write a value. Realistic clients read it back
   # immediately or move on to the next key.
+  # (The refapp registers POST, not PUT, on /kv/:key.)
   put_kv:
-    request: PUT /kv/walker-k1
+    request: POST /kv/walker-k1
     get_kv:       6.0  # 60% read back the value just written
     put_kv:       2.0  # 20% write a different key
     incr_key:     1.0

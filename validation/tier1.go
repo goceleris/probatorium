@@ -397,20 +397,24 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 }
 
 // runMarkovWalker walks the Markov chain until ctx is cancelled,
-// sending one HTTP request per state visit. The endpoint URL is
-// derived from the state name via [markovStateToPath].
+// sending one HTTP request per state visit. The endpoint URL for each
+// state comes from the matrix's data-driven Requests map.
 //
 // Each walker gets its own [http.CookieJar] + [http.Client] so the
 // N concurrent walkers exercise N parallel session lifecycles
-// against the refapp's session middleware. At walker start, it POSTs
-// `/login` with deterministic-per-seed credentials; subsequent
-// requests carry the resulting cookie, hitting the 2xx handler
-// paths instead of the 401 reject path.
+// against the refapp's session middleware. If the matrix declares a
+// top-level `login: METHOD path` directive, the walker POSTs that
+// endpoint with deterministic-per-seed credentials BEFORE the chain
+// starts, and again whenever a chain request returns 401.
 //
-// On a 401 mid-run (session expired by idle timeout) the walker
-// re-logs in transparently. Soak runs at 72h with 30-min session
-// idle timeout would otherwise drift into all-401 territory after
-// the first idle window.
+// Refapps without auth (kitchen_sink, observability, static_swagger_proxy,
+// driver_*) omit the login directive — walker skips authentication
+// entirely. Pre-fix: walkerLogin hardcoded to /login → for refapps
+// without that route, every initial request returned 404 from the
+// "login" call (silently swallowed) and there was no auth-flow
+// realism; refapps WITH login at a non-/login path (auth_session_ratelimit
+// serves /login but some others serve /api/login) had silent
+// path-mismatch bugs.
 func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 	m *markov.Matrix, seed uint64, tally *tier1Tally,
 ) {
@@ -425,7 +429,10 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 	// produces identical wire traffic.
 	username := fmt.Sprintf("walker-%016x", seed)
 	password := fmt.Sprintf("pw-%016x", ^seed)
-	_ = walkerLogin(ctx, hc, base, username, password)
+	hasLogin := m.Login.Method != "" && m.Login.Path != ""
+	if hasLogin {
+		_ = walkerLogin(ctx, hc, base, m.Login, username, password)
+	}
 
 	chain := markov.New(m, seed)
 	rng := rand.New(rand.NewPCG(seed, ^seed))
@@ -442,10 +449,10 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 		// See validation/markov/<refapp>.yaml.
 		if req, ok := m.Requests[state]; ok {
 			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, tally)
-			if status == 401 {
+			if status == 401 && hasLogin {
 				// Session likely expired — re-login and keep walking.
 				// The next request will pick up the fresh cookie.
-				_ = walkerLogin(ctx, hc, base, username, password)
+				_ = walkerLogin(ctx, hc, base, m.Login, username, password)
 			}
 		}
 		if _, ok := chain.Next(); !ok {
@@ -456,18 +463,23 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 	}
 }
 
-// walkerLogin POSTs /login with the given username + password. The
-// refapp's policy is "any non-empty (username, password)
+// walkerLogin fires the matrix's configured login request with the
+// given username + password (JSON body). The refapp's policy for our
+// auth_session_ratelimit refapp is "any non-empty (username, password)
 // authenticates" — see registerRoutes — so this always succeeds when
 // the server is healthy. Failure is silently swallowed; the walker's
-// 401-retry path handles the case where the eventual GET reveals
-// auth is missing.
+// 401-retry path handles the case where a later request reveals auth
+// is missing.
+//
+// The login request shape (method + path) comes from the matrix's
+// top-level `login:` directive, so this function works for any refapp
+// regardless of where login lives in its URL space.
 //
 // Response cookie is stored in hc.Jar; subsequent hc.Do() calls
 // carry it automatically.
-func walkerLogin(ctx context.Context, hc *http.Client, base, username, password string) error {
+func walkerLogin(ctx context.Context, hc *http.Client, base string, login markov.Request, username, password string) error {
 	body := fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)
-	req, err := http.NewRequestWithContext(ctx, "POST", base+"/login",
+	req, err := http.NewRequestWithContext(ctx, login.Method, base+login.Path,
 		strings.NewReader(body))
 	if err != nil {
 		return err
