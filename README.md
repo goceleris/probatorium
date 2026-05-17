@@ -1,7 +1,7 @@
 # probatorium
 
-[![Matrix Tier — Nightly](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml/badge.svg?branch=main&event=schedule)](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml?query=event%3Aschedule+branch%3Amain)
-[![Matrix Tier — Weekend](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml/badge.svg?branch=main&event=schedule)](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml?query=event%3Aschedule+branch%3Amain)
+[![Nightly Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml/badge.svg?branch=main)](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml?query=branch%3Amain)
+[![Weekend Soak](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml/badge.svg?branch=main)](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml?query=branch%3Amain)
 [![Test](https://github.com/goceleris/probatorium/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/goceleris/probatorium/actions/workflows/test.yml)
 [![Lint](https://github.com/goceleris/probatorium/actions/workflows/lint.yml/badge.svg?branch=main)](https://github.com/goceleris/probatorium/actions/workflows/lint.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)

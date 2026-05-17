@@ -1,4 +1,4 @@
-name: Matrix Tier — PR
+name: PR Validation
 
 # PR-tier matrix-mode validate run: every refapp × every engine,
 # 10-minute budget. Acts as the merge gate for regressions in the

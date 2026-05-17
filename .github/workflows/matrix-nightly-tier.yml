@@ -1,4 +1,4 @@
-name: Matrix Tier — Nightly
+name: Nightly Validation
 
 # Nightly matrix-mode validate run: every refapp × every engine, 1h
 # budget. Catches slow regressions the 10-minute PR tier doesn't

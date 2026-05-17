@@ -116,7 +116,7 @@ finish.
 
 1. Set the four secrets in repo Settings.
 2. Update the Tailscale ACL.
-3. From the GitHub UI: **Actions** → **Matrix Tier — Nightly** →
+3. From the GitHub UI: **Actions** → **Nightly Validation** →
    **Run workflow** → main → duration=10m.
 4. Watch the three jobs progress: `setup` (~3 min) → `matrix`
    (10 min) → `teardown` (~2 min).
