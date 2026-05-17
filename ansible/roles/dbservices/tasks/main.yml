@@ -59,13 +59,32 @@
 # Always-latest stable images, but pinned to a major-minor so a daemon
 # restart can't pull a breaking upstream change between deploy and bench.
 # Update these as upstream majors land (postgres 18, redis 9, ...).
+# Docker Hub fronts image blobs via Cloudflare R2 at the host
+# `docker-images-prod.<id>.r2.cloudflarestorage.com`. The cluster's
+# upstream routing has a persistent black-hole on 172.64.66.1 and
+# 172.64.66.2 — the only two IPs the R2 host's DNS A-record currently
+# returns (verified May 2026). 172.64.66.3 + 172.64.66.4 are reachable
+# and serve the same blobs (any Cloudflare edge can serve any signed
+# blob URL). Pin the host to 172.64.66.3 via /etc/hosts so `docker
+# pull` doesn't hit the dead IPs. The cleanup task below removes the
+# pin so the host file goes back to vanilla.
+#
+# Why not switch registries: the rest of the deploy expects
+# vanilla docker.io image names. Pinning is the minimally-invasive
+# fix that keeps the role's contract identical.
+- name: dbservices | pin R2 host to a reachable IP (cluster routing blackhole workaround)
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "172.64.66.3 docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"
+    state: present
+    create: false
+    backup: false
+    insertafter: EOF
+
 - name: dbservices | pull database images (postgres + redis + memcached)
-  # `docker pull` against Docker Hub's Cloudflare R2 CDN can transiently
-  # time out (probatorium nightly 26001025906 failed pulling
-  # postgres:17-alpine with `dial tcp 172.64.66.2:443: i/o timeout`).
-  # Three attempts with 10s backoff covers the typical R2 hiccup
-  # window without making a real network outage hang the deploy for
-  # minutes.
+  # Three attempts with 10 s backoff covers a real-but-transient hiccup
+  # without making a stale-route outage hang the deploy for minutes.
   ansible.builtin.command: "docker pull {{ item }}"
   loop:
     - "postgres:17-alpine"
@@ -76,6 +95,18 @@
   retries: 3
   delay: 10
   until: docker_pull is succeeded
+
+# Remove the /etc/hosts pin immediately after the pulls — the rest of
+# the deploy / validate flow doesn't need it, and leaving the
+# override risks masking a legitimate Cloudflare reshuffle later.
+# (cleanup.yml's manifest-driven teardown does NOT cover /etc/hosts
+# edits, which is why this is local-scoped here.)
+- name: dbservices | remove R2 host pin after pull
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "172.64.66.3 docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com"
+    state: absent
 
 - name: dbservices | record fetched image digests
   ansible.builtin.shell: |
