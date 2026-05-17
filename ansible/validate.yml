@@ -90,6 +90,15 @@
           # needs `ulimit -l unlimited` for io_uring memlock. The
           # validator passes that through to its Driver child.
           become: true
+          environment:
+            # VALIDATE_CONCURRENCY is read by validation/runner.go at
+            # orchestrator init. Propagated via the ansible task env
+            # because env vars set in the mage / GH-Actions outer
+            # processes don't otherwise cross the SSH boundary into
+            # the remote validator. Without this, the duration-tiered
+            # default (concurrency=1 for cells under 5min) leaves the
+            # h2c / WS / SSE walker slices dormant on every cell.
+            VALIDATE_CONCURRENCY: "{{ validate_concurrency | default('') }}"
           ansible.builtin.shell: |
             cd {{ bench_root }}
             ulimit -l unlimited
