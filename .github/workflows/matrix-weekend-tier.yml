@@ -111,6 +111,10 @@ jobs:
           # See matrix-nightly-tier.yml. Parallel msa2-server +
           # msr1 keeps wall-clock at inputs.duration instead of 2× it.
           VALIDATE_PARALLEL: "1"
+          # 24h / 24 cells = ~1h per cell. Bump concurrency to 50 so
+          # the WS / SSE slices (thresholds 20) get plenty of walkers
+          # and we exercise the full long-soak workload mix.
+          VALIDATE_CONCURRENCY: "50"
         run: mage Soak
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)

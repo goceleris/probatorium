@@ -174,16 +174,27 @@ func TestLoadMatrixFile_AuthSessionRatelimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load yaml file: %v", err)
 	}
-	if m.Start != "home" {
-		t.Fatalf("expected start=home, got %q", m.Start)
+	// Post-#126 + route-fix rewrite — chain now starts at `me` since
+	// the refapp has no `/` route and the walker bootstraps the
+	// session via the top-level `login:` directive before stepping.
+	if m.Start != "me" {
+		t.Fatalf("expected start=me, got %q", m.Start)
 	}
-	wantStates := []string{"home", "login", "list_users", "user_detail", "create_user", "update_user", "logout"}
+	// Top-level login directive must point at the real refapp endpoint.
+	if m.Login.Method != "POST" || m.Login.Path != "/login" {
+		t.Fatalf("expected login=POST /login, got %s %s", m.Login.Method, m.Login.Path)
+	}
+	wantStates := []string{"me", "list_users", "user_detail", "create_user", "update_user", "user_delete", "user_posts", "logout"}
 	for _, s := range wantStates {
 		if _, ok := m.Transitions[s]; !ok {
 			t.Errorf("missing state %q", s)
 		}
 	}
-	// logout must be terminal.
+	// logout is still terminal (no outgoing edges). The walker's
+	// outer loop sees Next() return ("", false) and calls
+	// chain.Reset() — the next iteration starts back at `me` and
+	// the walker's 401-retry path re-logs in via the `login:`
+	// directive. Soak workloads stay unbounded.
 	if len(m.Transitions["logout"]) != 0 {
 		t.Fatalf("logout should be terminal; has %d edges", len(m.Transitions["logout"]))
 	}

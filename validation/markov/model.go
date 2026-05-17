@@ -50,6 +50,15 @@ type Matrix struct {
 	// don't correspond to a refapp endpoint (terminal "done" states,
 	// pure session bookkeeping, etc.).
 	Requests map[string]Request
+	// Login, if set, names the HTTP request the Tier 1 walker should
+	// fire BEFORE the Markov chain begins, and again whenever an
+	// in-walk request returns 401. Parsed from a top-level
+	// `login: METHOD path` line in the YAML. Walker uses
+	// deterministic-per-seed username + password JSON body for the
+	// POST/PUT case. Empty/zero Login means the refapp has no auth
+	// (kitchen_sink, observability, static_swagger_proxy, driver_*)
+	// — walker skips login entirely.
+	Login Request
 }
 
 // Request describes the HTTP call associated with one Markov state.
@@ -224,6 +233,18 @@ func LoadMatrix(r io.Reader) (*Matrix, error) {
 		switch {
 		case indent == 0 && strings.HasPrefix(body, "start:"):
 			m.Start = strings.TrimSpace(strings.TrimPrefix(body, "start:"))
+		case indent == 0 && strings.HasPrefix(body, "login:"):
+			// Top-level `login: METHOD path` directive. Same shape as
+			// the per-state request line — METHOD<space>path.
+			spec := strings.TrimSpace(strings.TrimPrefix(body, "login:"))
+			method, path, ok := strings.Cut(spec, " ")
+			if !ok || method == "" || path == "" {
+				return nil, fmt.Errorf("markov: line %d: login %q must be \"METHOD path\"", lineNo, spec)
+			}
+			if !strings.HasPrefix(path, "/") {
+				return nil, fmt.Errorf("markov: line %d: login path %q must start with /", lineNo, path)
+			}
+			m.Login = Request{Method: strings.ToUpper(method), Path: path}
 		case indent == 0 && body == "states:":
 			// header; nothing to do.
 		case indent == 2:

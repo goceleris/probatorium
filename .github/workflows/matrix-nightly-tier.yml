@@ -113,6 +113,13 @@ jobs:
           # parallel so the per-tier wall-clock matches inputs.duration
           # instead of 2× it.
           VALIDATE_PARALLEL: "1"
+          # Per-cell budget in matrix mode is ~150s (1h / 24 cells),
+          # which the duration-tiered default treats as "short smoke
+          # run" → concurrency=1. That leaves the h2c / ws / sse
+          # walker slices DORMANT (thresholds 10/20/20). Override to
+          # 30 so all five slices fire on every cell:
+          #   adv=6, h2c=3, ws=1, sse=1, markov=19.
+          VALIDATE_CONCURRENCY: "30"
         run: mage Validate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
