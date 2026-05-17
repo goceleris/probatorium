@@ -190,6 +190,15 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_CONCURRENCY"); v != "" {
 			args = append(args, "--extra-vars", "validate_concurrency="+v)
 		}
+		// VALIDATE_DBSERVICES=1 starts the postgres/redis/memcached
+		// containers (assumed pre-pulled by deploy.yml's dbservices
+		// role) so the driver_* refapps in matrix-mode validate can
+		// connect to real backends. Without this, driver_* cells get
+		// 100% Tier 3 errored (refapp exits before ready) — the
+		// nightly's known driver-refapps-all-error pattern.
+		if v := os.Getenv("VALIDATE_DBSERVICES"); v != "" {
+			args = append(args, "--extra-vars", "validate_dbservices="+v)
+		}
 		fmt.Printf("\n=== %s on %s (playbook=%s) ===\n", titleCase(kind), t, playbook)
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir
