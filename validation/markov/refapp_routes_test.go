@@ -84,13 +84,15 @@ func TestMarkovPaths_MatchRefappRoutes(t *testing.T) {
 // returns the set of (method, path) routes the refapp registers. It
 // understands the four canonical patterns used in the refapps:
 //
-//   srv.GET("/path", ...)           → (GET, /path)
-//   apiGroup.GET("/sub", ...)       → (GET, $apiGroup_prefix/sub)
-//   srv.Use(healthcheck.New())      → (GET, /healthz) + (GET, /livez)
-//   srv.Use(redirect.RemoveTrailingSlashRedirect()) → no routes
+//	srv.GET("/path", ...)           → (GET, /path)
+//	apiGroup.GET("/sub", ...)       → (GET, $apiGroup_prefix/sub)
+//	srv.Use(healthcheck.New())      → (GET, /healthz) + (GET, /livez)
+//	srv.Use(redirect.RemoveTrailingSlashRedirect()) → no routes
 //
 // Group prefixes are resolved by a sibling pass that matches
-//   <ident> := srv.Group("/prefix",
+//
+//	<ident> := srv.Group("/prefix",
+//
 // declarations and substitutes them into <ident>.METHOD calls.
 func extractRegisteredRoutes(dir string) ([]route, error) {
 	entries, err := os.ReadDir(dir)
