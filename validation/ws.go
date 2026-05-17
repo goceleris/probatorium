@@ -230,7 +230,14 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 
 	// Classify the server's response. Read up to the first frame
 	// header (2-14 bytes). We're looking for a Close frame
-	// (opcode 0x8); anything else is suspect.
+	// (opcode 0x8); anything else is suspect — with one exception:
+	// ModePingFlood is a DoS-shaped resilience check, not a frame
+	// validity check. RFC 6455 §5.5.2 requires endpoints to respond
+	// to a Ping with a Pong, so a healthy server replying with one
+	// or more Pong frames before closing is correct behaviour, not
+	// a violation. We accept opcode 0xA (Pong) or 0x8 (Close) for
+	// ping-flood; everything else (Text echo, Continuation, etc.)
+	// remains a flag.
 	header := make([]byte, 2)
 	_, err = br.Read(header)
 	if err != nil {
@@ -244,6 +251,16 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 	opcode := header[0] & 0x0F
 	if opcode == 0x8 {
 		// Close frame. Healthy.
+		tally.closedCorrectly.Add(1)
+		return
+	}
+	if mode == ModePingFlood && opcode == 0xA {
+		// Pong response to a ping — RFC 6455 §5.5.2 compliant.
+		// The DoS-resistance angle of this torture mode is whether
+		// the server fans goroutines unboundedly; the I-CONN-2 +
+		// I-MEM-2 predicates catch resource leaks elsewhere — this
+		// classifier only cares about frame-level compliance, and
+		// pong is the spec-mandated reply.
 		tally.closedCorrectly.Add(1)
 		return
 	}

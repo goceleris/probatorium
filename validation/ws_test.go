@@ -270,6 +270,52 @@ func TestFireWSTorture_EchoServerCountsAcceptedBadFrame(t *testing.T) {
 	}
 }
 
+// TestFireWSTorture_PongOnPingFloodCountsClosed pins the
+// pong-is-not-a-violation rule for ModePingFlood. Pre-fix nightly
+// 25993346060 hard-failed because auth_session_ratelimit-std's WS
+// middleware replied to the flood with a Pong (RFC 6455 §5.5.2 —
+// "the receiver of the Ping frame MUST send a Pong frame in
+// response") before closing the connection. The walker was
+// classifying any non-Close opcode as AcceptedBadFrame, mis-flagging
+// spec-compliant Pong responses.
+func TestFireWSTorture_PongOnPingFloodCountsClosed(t *testing.T) {
+	// Policy: after upgrade, drain the client's ping flood, send a
+	// single Pong back, then close. Pong is RFC-mandated.
+	srv := newFakeWSServer(t, false, func(c net.Conn) {
+		_, _ = c.Read(make([]byte, 4096))
+		_, _ = c.Write([]byte{0x8A, 0x01, 'p'}) // FIN|pong, len=1, payload "p"
+		_ = c.Close()
+	})
+	var tally wsTally
+	fireWSTorture(context.Background(), srv.HostPort(), "/ws", ModePingFlood, &tally)
+	s := tally.snapshot()
+	if s.ClosedCorrectly != 1 {
+		t.Errorf("ClosedCorrectly: got %d, want 1 (pong-to-ping is spec-compliant)", s.ClosedCorrectly)
+	}
+	if s.AcceptedBadFrame != 0 {
+		t.Errorf("AcceptedBadFrame: got %d, want 0 (pong is not a bad frame)", s.AcceptedBadFrame)
+	}
+}
+
+// TestFireWSTorture_PongOnNonPingModeStillCountsBad confirms the
+// carve-out is narrow: pong-as-response only excuses ModePingFlood.
+// If the server emits a Pong frame in reply to, say, an unmasked
+// client frame, that IS still suspicious — the spec response is a
+// Close 1002, not a Pong.
+func TestFireWSTorture_PongOnNonPingModeStillCountsBad(t *testing.T) {
+	srv := newFakeWSServer(t, false, func(c net.Conn) {
+		_, _ = c.Read(make([]byte, 4096))
+		_, _ = c.Write([]byte{0x8A, 0x01, 'p'})
+		_ = c.Close()
+	})
+	var tally wsTally
+	fireWSTorture(context.Background(), srv.HostPort(), "/ws", ModeUnmaskedClient, &tally)
+	s := tally.snapshot()
+	if s.AcceptedBadFrame != 1 {
+		t.Errorf("AcceptedBadFrame: got %d, want 1 (pong is not a valid reply to unmasked-client)", s.AcceptedBadFrame)
+	}
+}
+
 func TestFireWSTorture_AbruptCloseCountsClosed(t *testing.T) {
 	// Policy: after upgrade, close the conn without sending anything.
 	// Walker counts this as ClosedCorrectly (acceptable behaviour for
