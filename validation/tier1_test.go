@@ -20,14 +20,18 @@ import (
 
 // minimalMatrix builds the smallest valid Matrix the Markov walker
 // can step through. Two states, one edge each way, so the walker
-// alternates deterministically.
+// alternates deterministically. Each state declares a request
+// directive so the data-driven walker actually fires HTTP traffic
+// (post-#125, walkers are silent on states without a request entry).
 func minimalMatrix(t *testing.T) *markov.Matrix {
 	t.Helper()
 	const yaml = `start: home
 states:
   home:
+    request: GET /
     list_users: 1.0
   list_users:
+    request: GET /api/users
     home: 1.0
 `
 	m, err := markov.LoadMatrix(strings.NewReader(yaml))
@@ -37,22 +41,39 @@ states:
 	return m
 }
 
-func TestMarkovStateToPath_KnownStates(t *testing.T) {
-	cases := map[string]string{
-		"home":        "/",
-		"login":       "/api/login",
-		"list_users":  "/api/users",
-		"user_detail": "/api/users/u1",
-		"logout":      "/api/logout",
-		// Silent states (POST flows reserved for Tier 2 fuzzer).
-		"create_user": "",
-		"update_user": "",
-		// Unknown state — defensive default.
-		"never-seen": "",
+// TestAuthSessionRatelimit_StateRequestCoverage verifies the
+// auth_session_ratelimit.yaml Markov matrix declares a `request: ...`
+// directive for every non-terminal state. The walker is data-driven
+// off this map; a state missing a request entry is silently skipped
+// — exactly the regression we shipped on probatorium#125 where six
+// of eight refapps had effectively no Tier 1 traffic.
+func TestAuthSessionRatelimit_StateRequestCoverage(t *testing.T) {
+	m, err := markov.LoadMatrixFile("../validation/markov/auth_session_ratelimit.yaml")
+	if err != nil {
+		// Fall back to relative-from-package path when run via
+		// `go test ./...` from the repo root.
+		m, err = markov.LoadMatrixFile("markov/auth_session_ratelimit.yaml")
+		if err != nil {
+			t.Fatalf("load auth_session_ratelimit.yaml: %v", err)
+		}
 	}
-	for state, want := range cases {
-		if got := markovStateToPath(state); got != want {
-			t.Errorf("markovStateToPath(%q): got %q, want %q", state, got, want)
+	want := map[string]struct{ Method, Path string }{
+		"home":        {"GET", "/"},
+		"login":       {"POST", "/api/login"},
+		"list_users":  {"GET", "/api/users"},
+		"user_detail": {"GET", "/api/users/u1"},
+		"create_user": {"POST", "/api/users"},
+		"update_user": {"PUT", "/api/users/u1"},
+		"logout":      {"POST", "/api/logout"},
+	}
+	for state, w := range want {
+		got, ok := m.Requests[state]
+		if !ok {
+			t.Errorf("state %q: missing request directive", state)
+			continue
+		}
+		if got.Method != w.Method || got.Path != w.Path {
+			t.Errorf("state %q: got %s %s, want %s %s", state, got.Method, got.Path, w.Method, w.Path)
 		}
 	}
 }
@@ -77,7 +98,7 @@ func TestDoMarkovRequest_Counters(t *testing.T) {
 	var tally tier1Tally
 	hc := &http.Client{Timeout: time.Second}
 	for i := 0; i < 3; i++ {
-		doMarkovRequest(context.Background(), hc, srv.URL, &tally)
+		doMarkovRequest(context.Background(), hc, "GET", srv.URL, &tally)
 	}
 	s := tally.snapshot()
 	if s.RequestsSent != 3 {
@@ -97,7 +118,7 @@ func TestDoMarkovRequest_Counters(t *testing.T) {
 func TestDoMarkovRequest_NetworkErrorIncrementsError(t *testing.T) {
 	var tally tier1Tally
 	hc := &http.Client{Timeout: 100 * time.Millisecond}
-	doMarkovRequest(context.Background(), hc, "http://127.0.0.1:1/never-listens", &tally)
+	doMarkovRequest(context.Background(), hc, "GET", "http://127.0.0.1:1/never-listens", &tally)
 	s := tally.snapshot()
 	if s.RequestsError != 1 {
 		t.Errorf("RequestsError: got %d, want 1", s.RequestsError)

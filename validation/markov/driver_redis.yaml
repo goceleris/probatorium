@@ -9,6 +9,7 @@ start: healthz
 states:
   # /healthz — liveness probe.
   healthz:
+    request: GET /healthz
     put_kv:       5.0  # 50% start by writing a key
     get_kv:       3.0  # 30% read an existing key
     incr_key:     1.0  # 10% atomic counter increment
@@ -17,6 +18,7 @@ states:
   # PUT /kv/:key — write a value. Realistic clients read it back
   # immediately or move on to the next key.
   put_kv:
+    request: PUT /kv/walker-k1
     get_kv:       6.0  # 60% read back the value just written
     put_kv:       2.0  # 20% write a different key
     incr_key:     1.0
@@ -25,6 +27,7 @@ states:
   # GET /kv/:key — read a value. Self-loops moderately, often follows
   # with another write.
   get_kv:
+    request: GET /kv/walker-k1
     put_kv:       3.0
     get_kv:       3.0
     incr_key:     2.0
@@ -34,6 +37,7 @@ states:
   # POST /incr/:key — atomic counter increment. Tight loops are
   # realistic for counter workloads, so self-loop is high.
   incr_key:
+    request: POST /incr/walker-counter
     incr_key:     5.0  # 50% bump the counter again
     get_kv:       2.0
     put_kv:       2.0
@@ -41,15 +45,17 @@ states:
 
   # POST /store/:key — write to the side-store namespace.
   store_kv:
+    request: POST /store/walker-k1
     fetch_store:  7.0
     store_kv:     2.0
     done:         1.0
 
   # GET /store/:key — read from the side-store namespace.
   fetch_store:
+    request: GET /store/walker-k1
     store_kv:     2.0
     get_kv:       2.0
     done:         6.0
 
-  # Terminal.
+  # Terminal — silent.
   done: {}

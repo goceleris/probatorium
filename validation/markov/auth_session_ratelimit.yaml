@@ -2,9 +2,9 @@
 #
 # States model a realistic user-facing app: arrive at /home, log in,
 # browse / mutate user records, log out. Weights are unnormalized; the
-# loader normalizes each row at load time. Rationale per edge is in
-# the inline comments — these are the knobs validation authors tune
-# when adapting the model to a new realistic workload.
+# loader normalizes each row at load time. Each non-terminal state
+# carries a `request: METHOD path` line — the Tier 1 walker fires
+# that request when the chain enters that state.
 
 start: home
 
@@ -12,6 +12,7 @@ states:
   # home is the landing page. Most arriving traffic logs in; a steady
   # minority bounces (terminal state via logout).
   home:
+    request: GET /
     login: 8.0       # 80% of cold arrivals try to authenticate
     home:  1.0       # 10% reload home (still no session)
     logout: 1.0      # 10% bounce — terminal via the logout path
@@ -20,6 +21,7 @@ states:
   # to the user list; a small slice goes straight to a deep link
   # (user_detail).
   login:
+    request: POST /api/login
     list_users:  9.0 # 90% of successful logins start at the index page
     user_detail: 1.0 # 10% deep-link to a single user
 
@@ -27,6 +29,7 @@ states:
   # the dominant transition is opening a user detail page; a minority
   # of admins ratchet into create_user.
   list_users:
+    request: GET /api/users
     user_detail: 6.0 # 60% open one record at a time
     list_users:  3.0 # 30% re-read the index (pagination, filter)
     create_user: 1.0 # 10% staff create a new user
@@ -35,6 +38,7 @@ states:
   # update the record, jump to another user (via the back-and-forth
   # list_users transition), or log out.
   user_detail:
+    request: GET /api/users/u1
     update_user: 5.0 # 50% edit the record
     list_users:  3.0 # 30% back to index
     user_detail: 1.0 # 10% reload the detail page (browser refresh)
@@ -43,13 +47,17 @@ states:
   # create_user transitions back to the index 100% of the time — the
   # refapp's create_user endpoint always 302s to /api/users.
   create_user:
+    request: POST /api/users
     list_users: 1.0
 
   # update_user is similar — the refapp's update endpoint replies with
   # the updated record so the natural next step is user_detail.
   update_user:
+    request: PUT /api/users/u1
     user_detail: 8.0 # 80% stay on the detail page
     list_users:  2.0 # 20% return to index
 
-  # logout is terminal — the refapp has no further endpoints to drive.
-  logout: {}
+  # logout is the terminal endpoint — exercised once, then the chain
+  # resets to home.
+  logout:
+    request: POST /api/logout

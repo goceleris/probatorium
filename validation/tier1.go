@@ -435,9 +435,13 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 			return
 		}
 		state := chain.Current()
-		path := markovStateToPath(state)
-		if path != "" {
-			status := doMarkovRequest(ctx, hc, base+path, tally)
+		// Look up the HTTP request the walker should fire for this
+		// state from the matrix's data-driven Requests map. The
+		// schema requires each non-terminal state to declare
+		// `request: METHOD path`; states without an entry are silent.
+		// See validation/markov/<refapp>.yaml.
+		if req, ok := m.Requests[state]; ok {
+			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, tally)
 			if status == 401 {
 				// Session likely expired — re-login and keep walking.
 				// The next request will pick up the fresh cookie.
@@ -481,14 +485,21 @@ func walkerLogin(ctx context.Context, hc *http.Client, base, username, password 
 	return nil
 }
 
-// doMarkovRequest issues one GET against base+path and folds the
-// result into tally. Errors are folded into requestsError, not
+// doMarkovRequest issues one HTTP request (method + url) and folds
+// the result into tally. Errors are folded into requestsError, not
 // returned — Tier 1's contract is "keep firing until ctx is done."
 // Returns the response status code (0 on transport error) so the
 // caller can react to session-expiry 401s with a re-login.
-func doMarkovRequest(ctx context.Context, hc *http.Client, url string, tally *tier1Tally) int {
+//
+// POST/PUT/PATCH requests fire with an empty body for now. Body
+// generation is the Tier 2 RESTler fuzzer's job; Tier 1's purpose
+// here is volume + endpoint coverage, not payload variation.
+func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, tally *tier1Tally) int {
 	tally.requestsSent.Add(1)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if method == "" {
+		method = "GET"
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		tally.requestsError.Add(1)
 		return 0
@@ -510,45 +521,6 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, url string, tally *ti
 		tally.requests2xx.Add(1)
 	}
 	return resp.StatusCode
-}
-
-// markovStateToPath maps a Markov state name to the corresponding
-// refapp endpoint path. Empty string = "this state issues no HTTP
-// request" (terminal states like `logout` that conceptually fire one
-// path are mapped explicitly here so the walker treats them as
-// regular request states; truly silent states return "").
-//
-// Keep in lockstep with validation/markov/auth_session_ratelimit.yaml.
-// Adding a state in the yaml without an entry here is fine — the
-// walker just doesn't fire a request for it, which preserves the
-// chain shape. Removing an entry that the yaml still references is
-// the loud failure case.
-func markovStateToPath(state string) string {
-	switch state {
-	case "home":
-		return "/"
-	case "login":
-		return "/api/login"
-	case "list_users":
-		return "/api/users"
-	case "user_detail":
-		// Pick a deterministic id within the seeded range. We don't
-		// vary it per request — the orchestrator's Tier 3 replay
-		// generates the user fixtures, and a single canonical id
-		// keeps Tier 1 traffic legible in cell-completion reports.
-		return "/api/users/u1"
-	case "create_user":
-		// POST handler — Tier 1 doesn't currently mutate (preserves
-		// the Markov walker's idempotency). Treat as silent for now;
-		// the RESTler-style fuzzer (Tier 2) is the proper place for
-		// stateful create/update flows.
-		return ""
-	case "update_user":
-		return ""
-	case "logout":
-		return "/api/logout"
-	}
-	return ""
 }
 
 // snapshot returns the current tally as a value. Used by tests and

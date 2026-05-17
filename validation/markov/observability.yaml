@@ -9,6 +9,7 @@ start: healthz
 states:
   # /healthz — liveness probe.
   healthz:
+    request: GET /healthz
     api_ok:       5.0  # 50% baseline successful call
     api_slow:     2.0  # 20% slow path (latency exporter check)
     api_error:    2.0  # 20% error path (error counter check)
@@ -17,6 +18,7 @@ states:
   # /api/ok — success path. Realistic call patterns mix in slow +
   # error to load the exporters.
   api_ok:
+    request: GET /api/ok
     api_ok:       4.0
     api_slow:     2.0
     api_error:    2.0
@@ -26,6 +28,7 @@ states:
   # /api/slow — induced-latency endpoint. Drives p99 + histogram
   # bucketing. After a slow call clients commonly retry.
   api_slow:
+    request: GET /api/slow
     api_ok:       3.0
     api_slow:     2.0  # 20% retry the slow path
     metrics:      3.0  # 30% scrape to verify the buckets
@@ -34,6 +37,7 @@ states:
   # /api/error — induced 5xx. After an error the client typically
   # scrapes metrics + retries.
   api_error:
+    request: GET /api/error
     metrics:      4.0  # 40% scrape to confirm error counter
     api_ok:       3.0
     api_error:    1.0  # 10% retry the failing call
@@ -42,6 +46,7 @@ states:
   # /metrics — Prometheus scrape. After scraping, the workload either
   # continues exercising the API or terminates.
   metrics:
+    request: GET /metrics
     api_ok:       3.0
     api_slow:     2.0
     api_error:    2.0
@@ -51,9 +56,10 @@ states:
   # /obs/log-stats — structured-log counter scrape. Realistic clients
   # scrape both metrics + log-stats in tandem.
   log_stats:
+    request: GET /obs/log-stats
     metrics:      4.0
     api_ok:       2.0
     done:         4.0
 
-  # Terminal.
+  # Terminal — silent.
   done: {}

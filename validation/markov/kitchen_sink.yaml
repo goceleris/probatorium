@@ -9,6 +9,7 @@ start: status
 states:
   # /status — health/readiness probe entry point.
   status:
+    request: GET /status
     echo:         5.0  # 50% start with an echo round-trip
     short:        2.0  # 20% short-circuit endpoint (early-exit chain)
     post:         2.0  # 20% start with a body POST
@@ -17,6 +18,7 @@ states:
   # /api/echo — request/response echo. Common follow-ups: a POST or
   # another echo (latency calibration).
   echo:
+    request: GET /api/echo
     echo:         4.0  # 40% retry/repeat
     post:         3.0
     short:        2.0
@@ -25,6 +27,7 @@ states:
   # /api/short — chain that short-circuits early (no body). Realistic
   # clients hit this once and move on.
   short:
+    request: GET /api/short
     status:       4.0
     echo:         3.0
     post:         2.0
@@ -33,10 +36,11 @@ states:
   # /api/post — body-carrying POST endpoint. After a write clients
   # typically verify with an echo or terminate.
   post:
+    request: POST /api/post
     echo:         5.0
     short:        2.0
     post:         2.0
     done:         1.0
 
-  # Terminal.
+  # Terminal — silent.
   done: {}

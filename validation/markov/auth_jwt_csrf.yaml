@@ -4,6 +4,8 @@
 #   - public probe → JWT auth attempts → CSRF token mint → CSRF submit
 #   - API-key path runs in parallel to JWT
 # Weights are unnormalized; the loader normalizes each row at load time.
+# Each non-terminal state has a `request: METHOD path` directive — the
+# Tier 1 walker fires that request when entering the state.
 
 start: public
 
@@ -13,6 +15,7 @@ states:
   # small slice fetches the JWT public key or hits the API-key endpoint
   # directly.
   public:
+    request: GET /public
     api_me:       6.0  # 60% start by checking their own JWT
     jwt_public:   2.0  # 20% pre-fetch the JWKS / public key
     key_whoami:   1.0  # 10% go straight to API-key auth
@@ -21,12 +24,14 @@ states:
   # /jwt-public — no-auth public-key fetch. Most clients follow up with
   # an authenticated call.
   jwt_public:
+    request: GET /jwt-public
     api_me:       8.0  # 80% next call uses the JWT
     api_users:    2.0  # 20% list users
 
-  # /api/me — exercises JWT validation happy path. Common follow-up is
+  # /api/me — exercises JWT validation happy path. Common follow-ups:
   # /api/users (browse) or a CSRF-protected mutation.
   api_me:
+    request: GET /api/me
     api_users:    5.0  # 50% browse user list
     csrf_token:   3.0  # 30% start a CSRF-protected workflow
     api_me:       1.0  # 10% re-check identity (token-refresh path)
@@ -35,6 +40,7 @@ states:
   # /api/users — listing endpoint. Self-loops moderately, eventually
   # ends up at /api/me again or a CSRF write.
   api_users:
+    request: GET /api/users
     api_me:       3.0
     api_users:    2.0
     csrf_token:   3.0
@@ -43,6 +49,7 @@ states:
   # /key/whoami — API-key auth path, parallel universe to JWT. Once a
   # client is on this path it tends to stay there before terminating.
   key_whoami:
+    request: GET /key/whoami
     key_whoami:   4.0  # 40% repeat lookups
     api_me:       2.0  # 20% hop into JWT path
     logout:       4.0  # 40% terminate
@@ -50,16 +57,18 @@ states:
   # /csrf-token — GET that mints the CSRF cookie + token. Always
   # followed by an attempt at the protected POST.
   csrf_token:
+    request: GET /csrf-token
     csrf_protected: 1.0
 
   # /csrf-protected — POST that the CSRF token gates. Realistic
   # sessions either continue browsing or terminate.
   csrf_protected:
+    request: POST /csrf-protected
     api_me:       4.0
     api_users:    3.0
     csrf_token:   2.0  # 20% submit again (multi-step form)
     logout:       1.0
 
-  # Terminal state — the refapp has no /logout endpoint; this just
-  # marks the end of a Markov walk.
+  # Terminal state — auth_jwt_csrf has no /logout endpoint; this state
+  # is silent (chain resets without firing a request).
   logout: {}
