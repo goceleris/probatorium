@@ -2,7 +2,7 @@ module github.com/goceleris/probatorium/validation/refapp/driver_redis
 
 go 1.26.3
 
-require github.com/goceleris/celeris v1.4.5
+require github.com/goceleris/celeris v1.4.6
 
 require (
 	golang.org/x/net v0.54.0 // indirect
