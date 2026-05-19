@@ -272,20 +272,10 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3
 
 	if err := waitForReady(seedCtx, proc, cfg.ReadyTimeout); err != nil {
 		res.ExitCode = -1
-		// Capture whatever the refapp wrote to stdout/stderr before
-		// dying. Without this, every "refapp not ready" failure ended
-		// up with stderr=="tier3: refapp not ready: EOF" — actionable
-		// nowhere — and the postmortem record had no trace of the
-		// log.Fatalf line / panic / bind error / postgres.Open
-		// failure that actually killed the process. drainRemainingOutput
-		// reads up to refappOutputCapMax bytes with a tight deadline so
-		// a runaway log-loop refapp can't stall the seed loop.
-		tail := drainRemainingOutput(proc, 200*time.Millisecond, refappOutputCapMax)
-		if tail != "" {
-			res.Stderr = fmt.Sprintf("tier3: refapp not ready: %v\n--- refapp stdout/stderr ---\n%s", err, tail)
-		} else {
-			res.Stderr = fmt.Sprintf("tier3: refapp not ready: %v", err)
-		}
+		// waitForReady already embeds any captured refapp stderr lines
+		// in the returned error string (see tier1.go), so the dossier
+		// records WHY the refapp died, not just THAT it did.
+		res.Stderr = fmt.Sprintf("tier3: refapp not ready: %v", err)
 		res.Duration = time.Since(started)
 		return res
 	}

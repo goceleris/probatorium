@@ -352,42 +352,6 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 // or fill incident dossiers indefinitely.
 const refappOutputCapMax = 64 * 1024
 
-// drainRemainingOutput reads up to maxBytes of stdout/stderr from a
-// refapp Process within a tight deadline. Called by tier3.go (and any
-// future caller) when waitForReady has already returned an error, so we
-// can include the refapp's actual log output in the failure dossier
-// rather than the bare "EOF" / "timeout" string. Best-effort: if the
-// deadline trips before maxBytes arrives, returns whatever has
-// accumulated so far.
-//
-// The deadline is critical — without it, a refapp that's in an
-// infinite log-loop (or whose stdout/stderr pipe is still arming a
-// writer goroutine after the process supposedly died) would stall the
-// validator's seed loop. 200ms is enough to flush a typical log.Fatalf
-// line + panic trace over a local pipe; remote-driver overhead is the
-// rare case where the trace might be truncated, which is acceptable —
-// the trace tail is still more useful than nothing.
-func drainRemainingOutput(proc remote.Process, deadline time.Duration, maxBytes int) string {
-	if proc == nil {
-		return ""
-	}
-	type result struct {
-		data []byte
-	}
-	ch := make(chan result, 1)
-	go func() {
-		buf := make([]byte, maxBytes)
-		n, _ := io.ReadFull(proc.Stderr(), buf)
-		ch <- result{data: buf[:n]}
-	}()
-	select {
-	case r := <-ch:
-		return string(r.data)
-	case <-time.After(deadline):
-		return ""
-	}
-}
-
 func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duration) error {
 	readyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
