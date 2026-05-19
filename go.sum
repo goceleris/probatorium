@@ -15,8 +15,8 @@ github.com/dlclark/regexp2 v1.11.0 h1:G/nrcoOa7ZXlpoa/91N3X7mM3r8eIlMBBJZvsz/mxK
 github.com/dlclark/regexp2 v1.11.0/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
-github.com/goceleris/loadgen v1.4.3 h1:J+mgMfc5q0Ag8jkQ8Nx6T9zkVgVHu2T3i40WiRGgDGI=
-github.com/goceleris/loadgen v1.4.3/go.mod h1:2IODxQU8S7eYu2w7aI6lHcJ9Qpqlgi9+TR8+l0WVGzI=
+github.com/goceleris/loadgen v1.4.4 h1:HtL/yekyQcJyh4vavyytSyRgOzioKRDjv4jWFEe84mY=
+github.com/goceleris/loadgen v1.4.4/go.mod h1:jtA8kkYOTcYoCZijyFg2/DIUvE/YklsKFDsAJJvHsy4=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/google/gofuzz v1.2.0 h1:xRy4A+RhZaiKjJ1bPfwQ8sedCA+YS2YcCHW6ec7JMi0=
