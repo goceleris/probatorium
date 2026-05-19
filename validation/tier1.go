@@ -344,6 +344,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 //     observes cancel even when blocked on a full lineCh
 //   - lineCh is closed when the goroutine exits so a concurrent
 //     reader doesn't deadlock either
+//
 // refappOutputCapMax bounds the buffered refapp output retained on
 // readiness failure. Big enough to capture a typical Go panic + stack
 // trace (~32 KiB on a fresh runtime) plus the celeris startup banner;
