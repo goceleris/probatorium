@@ -424,19 +424,44 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 		}
 	}()
 
+	// Accumulate every non-ready line the refapp wrote, capped at
+	// refappOutputCapMax. When the refapp exits before printing
+	// "ready addr=" (cell-09 driver_postgres-iouring seed 0x1, where
+	// the refapp died in 14 ms with zero diagnostic surface), the
+	// returned error embeds these lines so the seed-failure dossier
+	// records WHY the refapp died, not just THAT it did. drainRemaining
+	// Output above (which reads pipes AFTER the process exits) never
+	// fires here because the refapp's pipes are already closed by
+	// the time the caller looks at them.
+	var captured strings.Builder
+	captureLine := func(line string) {
+		if captured.Len() >= refappOutputCapMax {
+			return
+		}
+		captured.WriteString(line)
+		captured.WriteByte('\n')
+	}
+	appendCaptured := func(err error) error {
+		if captured.Len() == 0 {
+			return err
+		}
+		return fmt.Errorf("%w\n--- refapp stderr ---\n%s", err, captured.String())
+	}
+
 	for {
 		select {
 		case <-readyCtx.Done():
-			return fmt.Errorf("ready timeout: %w", readyCtx.Err())
+			return appendCaptured(fmt.Errorf("ready timeout: %w", readyCtx.Err()))
 		case line, ok := <-lineCh:
 			if !ok {
-				return fmt.Errorf("refapp exited before ready: %w", io.EOF)
+				return appendCaptured(fmt.Errorf("refapp exited before ready: %w", io.EOF))
 			}
 			if strings.HasPrefix(line, "ready addr=") {
 				return nil
 			}
+			captureLine(line)
 		case err := <-errCh:
-			return fmt.Errorf("refapp exited before ready: %w", err)
+			return appendCaptured(fmt.Errorf("refapp exited before ready: %w", err))
 		}
 	}
 }
