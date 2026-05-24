@@ -124,6 +124,24 @@ func runAdversarialWalker(ctx context.Context, hostPort string,
 	}
 }
 
+// slowlorisDripBudget caps how long the slowloris drip-walker keeps a
+// conn alive before declaring "server didn't close = bug". Must be
+// longer than celeris's default ReadHeaderTimeout (10s) so a correctly-
+// configured server has time to enforce its own header-read timeout
+// before the walker gives up.
+//
+// Pre-fix this was 2s (the same timeout used for dial + non-slowloris
+// reads), which meant the walker counted any refapp with the celeris
+// default config as buggy: the conn was indeed still open at 2s, but
+// only because celeris's ReadHeaderTimeout hadn't fired yet (it's
+// scheduled for ~10s). Surfaced by soak 26333090001 as 664K false-
+// positive adv_hang_until_timeout events across 24h.
+//
+// 12s gives headroom over the 10s default; refapps that set a longer
+// ReadHeaderTimeout will still legitimately trip the hang counter,
+// which is correct (they disabled their slowloris defence).
+const slowlorisDripBudget = 12 * time.Second
+
 // fireAdversarial opens one raw TCP conn, writes the mode's bad-bytes
 // payload, reads up to one short response, and classifies the result.
 // timeout caps how long any individual victim request can stall.
@@ -154,14 +172,20 @@ func fireAdversarial(ctx context.Context, hostPort string,
 
 	// Slowloris has a special read pattern: we WANT the conn to
 	// stay open while we slow-drip subsequent bytes. The server's
-	// read-header-timeout should kick in within seconds and close.
+	// read-header-timeout should kick in within slowlorisDripBudget
+	// (longer than celeris's default 10s ReadHeaderTimeout).
 	if mode == ModeSlowloris {
+		// Extend the conn deadline beyond the dial/read 2s budget —
+		// otherwise the SetDeadline above would fire 10s before we
+		// give celeris its full 10s ReadHeaderTimeout window.
+		_ = conn.SetDeadline(time.Now().Add(slowlorisDripBudget + time.Second))
+
 		// Write a single header byte every 200ms until the server
-		// closes or we hit the 2s budget. A correct server closes
-		// within its own read-header-timeout (~5s typical) — if
-		// the conn is still readable after our timeout, that's
-		// the bug (server doesn't enforce a header-read timeout).
-		slowDripDeadline := time.After(timeout)
+		// closes or we hit the drip budget. A correct server closes
+		// within its own read-header-timeout (celeris default: 10s);
+		// the budget here is 12s, giving 2s slack for clock skew +
+		// network latency before declaring a hang.
+		slowDripDeadline := time.After(slowlorisDripBudget)
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
 	slowloop:
@@ -170,8 +194,8 @@ func fireAdversarial(ctx context.Context, hostPort string,
 			case <-ctx.Done():
 				return
 			case <-slowDripDeadline:
-				// Conn still open after timeout = server didn't close
-				// = bug.
+				// Conn still open after the full drip budget = server
+				// didn't enforce its ReadHeaderTimeout = bug.
 				tally.hang.Add(1)
 				return
 			case <-t.C:
