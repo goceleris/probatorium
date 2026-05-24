@@ -2,7 +2,7 @@ module github.com/goceleris/probatorium/validation/refapp/auth_session_ratelimit
 
 go 1.26.3
 
-require github.com/goceleris/celeris v1.4.10
+require github.com/goceleris/celeris v1.4.11-0.20260524162356-d1b4fac417c4
 
 require (
 	golang.org/x/net v0.54.0 // indirect
