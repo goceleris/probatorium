@@ -159,21 +159,23 @@ func runAdversarialWalker(ctx context.Context, hostPort string,
 
 // slowlorisDripBudget caps how long the slowloris drip-walker keeps a
 // conn alive before declaring "server didn't close = bug". Must be
-// longer than celeris's default ReadHeaderTimeout (10s) so a correctly-
-// configured server has time to enforce its own header-read timeout
-// before the walker gives up.
+// longer than celeris's default ReadHeaderTimeout (10s) AND have
+// enough slack to absorb kernel accept-queue delay under load.
 //
-// Pre-fix this was 2s (the same timeout used for dial + non-slowloris
-// reads), which meant the walker counted any refapp with the celeris
-// default config as buggy: the conn was indeed still open at 2s, but
-// only because celeris's ReadHeaderTimeout hadn't fired yet (it's
-// scheduled for ~10s). Surfaced by soak 26333090001 as 664K false-
-// positive adv_hang_until_timeout events across 24h.
+// Pre-fix this was 2s, then 12s. 12s wasn't quite enough on slow-
+// refapp cells: under heavy concurrent traffic, kernel can take 1-3s
+// to dispatch new accept events to busy SO_REUSEPORT workers. The
+// walker's drip-budget timer starts after the preamble Write
+// (which succeeds locally before kernel-level accept completes), so
+// the engine's HeaderDeadline starts ticking LATER than the walker's
+// budget. With 12s budget + 10s engine deadline = only 2s slack, a
+// 3s accept delay tips into hang territory even though the engine
+// closes correctly. 20s budget gives 10s slack over the 10s engine
+// default — comfortably more than any realistic accept delay.
 //
-// 12s gives headroom over the 10s default; refapps that set a longer
-// ReadHeaderTimeout will still legitimately trip the hang counter,
-// which is correct (they disabled their slowloris defence).
-const slowlorisDripBudget = 12 * time.Second
+// Refapps that set a longer ReadHeaderTimeout will still legitimately
+// trip the hang counter (i.e., they disabled their slowloris defence).
+const slowlorisDripBudget = 20 * time.Second
 
 // fireAdversarial opens one raw TCP conn, writes the mode's bad-bytes
 // payload, reads up to one short response, and classifies the result.
