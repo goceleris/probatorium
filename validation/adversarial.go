@@ -2,14 +2,47 @@ package validation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
+
+// isCloseObservation reports whether err — returned from a Read on a
+// drip-mode slowloris conn — definitively indicates the server has
+// closed the connection. Used by the slowloris walker to detect close
+// via the read path rather than waiting for write-side buffer pressure.
+//
+// Includes io.EOF (graceful FIN), ECONNRESET (RST), EPIPE (broken pipe).
+// Excludes timeout errors — the walker calls SetReadDeadline(now) for
+// non-blocking semantics, so a deadline-exceeded result means "no data
+// AND not closed (yet)" which is the keep-dripping case.
+func isCloseObservation(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	// Wrapped os.PathError or net.OpError around any of the above.
+	var oe *os.SyscallError
+	if errors.As(err, &oe) {
+		if errors.Is(oe.Err, syscall.ECONNRESET) || errors.Is(oe.Err, syscall.EPIPE) {
+			return true
+		}
+	}
+	return false
+}
 
 // adversarialMode names one shape of bad request the walker generates.
 // Each is engineered to find a specific RFC-violation bug class:
@@ -185,9 +218,21 @@ func fireAdversarial(ctx context.Context, hostPort string,
 		// within its own read-header-timeout (celeris default: 10s);
 		// the budget here is 12s, giving 2s slack for clock skew +
 		// network latency before declaring a hang.
+		//
+		// After each write, attempt a non-blocking 1-byte read.
+		// celeris-side close (FIN/RST) is observable via Read way
+		// before TCP send-buffer-back-pressure shows up via Write.
+		// Without this Read probe, walker can keep dripping into a
+		// closed conn's local kernel send buffer for hundreds of ms
+		// past the FIN, eating into the 2s slack budget and producing
+		// false-positive hangs on slow refapps. Validated by the
+		// v1.4.11 celeris-side fixes that bring iouring close to
+		// kernel-precision: residual hangs are walker-observation
+		// lag, not engine close failure.
 		slowDripDeadline := time.After(slowlorisDripBudget)
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
+		readBuf := make([]byte, 1)
 	slowloop:
 		for {
 			select {
@@ -203,6 +248,18 @@ func fireAdversarial(ctx context.Context, hostPort string,
 					tally.wellReject.Add(1)
 					break slowloop
 				}
+				// Non-blocking read probe: if the server already FIN/RST'd,
+				// Read returns immediately with EOF / ECONNRESET / 0 bytes.
+				// SetReadDeadline(now) means "fail fast" on any pending
+				// read state without blocking. Restore the longer drip
+				// deadline afterwards so subsequent writes/reads still
+				// have a sensible budget.
+				_ = conn.SetReadDeadline(time.Now())
+				if _, err := conn.Read(readBuf); err == nil || isCloseObservation(err) {
+					tally.wellReject.Add(1)
+					break slowloop
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(slowlorisDripBudget + time.Second))
 			}
 		}
 		return
