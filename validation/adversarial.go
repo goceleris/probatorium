@@ -248,13 +248,18 @@ func fireAdversarial(ctx context.Context, hostPort string,
 					tally.wellReject.Add(1)
 					break slowloop
 				}
-				// Non-blocking read probe: if the server already FIN/RST'd,
-				// Read returns immediately with EOF / ECONNRESET / 0 bytes.
-				// SetReadDeadline(now) means "fail fast" on any pending
-				// read state without blocking. Restore the longer drip
-				// deadline afterwards so subsequent writes/reads still
-				// have a sensible budget.
-				_ = conn.SetReadDeadline(time.Now())
+				// Brief blocking read probe — gives the kernel up to 50ms
+				// to deliver any pending FIN/RST from the server side.
+				// SetReadDeadline(now) was too aggressive: any close that
+				// arrived in the 50ms-window between probe iterations
+				// missed observation, eating into the 12s drip budget on
+				// slow refapps where worker scheduling adds jitter.
+				//
+				// 50ms × 60 ticks = 3s total Read budget over the drip
+				// — comfortably under the 2s slack window (12s - 10s),
+				// and the loop exits early once close is observed so the
+				// cost is amortized across just a few iterations.
+				_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 				if _, err := conn.Read(readBuf); err == nil || isCloseObservation(err) {
 					tally.wellReject.Add(1)
 					break slowloop
