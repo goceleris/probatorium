@@ -118,7 +118,11 @@ func TestFireSSEKill_NonSSEServerCountsHandshakeFail(t *testing.T) {
 	}
 }
 
-func TestFireSSEKill_404CountsHandshakeFail(t *testing.T) {
+func TestFireSSEKill_404CountsEndpointAbsent(t *testing.T) {
+	// 404 means the refapp doesn't expose /events — config absence,
+	// not a server bug. Counted under endpointAbsent so SSE walkers
+	// can run against every refapp in the matrix without flagging
+	// refapps that simply don't ship the SSE route.
 	srv := newFakeSSEServer(t, func(c net.Conn) {
 		defer func() { _ = c.Close() }()
 		drainRequest(c)
@@ -126,8 +130,12 @@ func TestFireSSEKill_404CountsHandshakeFail(t *testing.T) {
 	})
 	var tally sseTally
 	fireSSEKill(context.Background(), srv.HostPort(), "/events", 100*time.Millisecond, &tally)
-	if tally.snapshot().HandshakeFail != 1 {
-		t.Errorf("HandshakeFail: got %d, want 1 (404 response)", tally.snapshot().HandshakeFail)
+	s := tally.snapshot()
+	if s.EndpointAbsent != 1 {
+		t.Errorf("EndpointAbsent: got %d, want 1 (404 response)", s.EndpointAbsent)
+	}
+	if s.HandshakeFail != 0 {
+		t.Errorf("HandshakeFail: got %d, want 0 (404 should not pollute the bug-oracle counter)", s.HandshakeFail)
 	}
 }
 

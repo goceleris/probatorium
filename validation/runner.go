@@ -1009,6 +1009,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"sse_killed_mid_stream":   s.SSEKill.KilledMidStream,
 			"sse_server_closed_early": s.SSEKill.ServerClosedEarly,
 			"sse_handshake_fail":      s.SSEKill.HandshakeFail,
+			"sse_endpoint_absent":     s.SSEKill.EndpointAbsent,
 		},
 	}
 }

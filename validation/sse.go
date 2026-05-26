@@ -31,7 +31,16 @@ import (
 //   - serverClosedEarly — server hung up before we killed (FINE,
 //     just means broker closed naturally — record
 //     for traceability but don't treat as bug)
-//   - handshakeFail   — non-200 or no event-stream Content-Type
+//   - handshakeFail   — non-200 or no event-stream Content-Type for
+//     a server that LOOKS like it has an SSE
+//     endpoint. 404 ("no /events here") is recorded
+//     under endpointAbsent instead so refapps that
+//     don't ship an SSE route don't pollute the
+//     bug-oracle handshake_fail counter.
+//   - endpointAbsent  — server returned 404 for the SSE GET; counted
+//     separately so the matrix can run SSE walkers
+//     against every refapp without flagging refapps
+//     that simply don't expose /events as "broken."
 type sseTally struct {
 	sent              atomic.Int64
 	established       atomic.Int64
@@ -39,6 +48,7 @@ type sseTally struct {
 	killedMidStream   atomic.Int64
 	serverClosedEarly atomic.Int64
 	handshakeFail     atomic.Int64
+	endpointAbsent    atomic.Int64
 }
 
 type sseSnapshot struct {
@@ -48,6 +58,7 @@ type sseSnapshot struct {
 	KilledMidStream   int64 `json:"sse_killed_mid_stream"`
 	ServerClosedEarly int64 `json:"sse_server_closed_early"`
 	HandshakeFail     int64 `json:"sse_handshake_fail"`
+	EndpointAbsent    int64 `json:"sse_endpoint_absent"`
 }
 
 func (t *sseTally) snapshot() sseSnapshot {
@@ -58,6 +69,7 @@ func (t *sseTally) snapshot() sseSnapshot {
 		KilledMidStream:   t.killedMidStream.Load(),
 		ServerClosedEarly: t.serverClosedEarly.Load(),
 		HandshakeFail:     t.handshakeFail.Load(),
+		EndpointAbsent:    t.endpointAbsent.Load(),
 	}
 }
 
@@ -136,7 +148,17 @@ func fireSSEKill(ctx context.Context, hostPort, path string,
 		return
 	}
 	if !strings.HasPrefix(statusLine, "HTTP/1.1 200") && !strings.HasPrefix(statusLine, "HTTP/1.0 200") {
-		// Non-200 — server didn't accept the stream.
+		// 404 means the refapp doesn't expose /events — not a bug,
+		// just a config absence. Count separately so refapps without
+		// SSE routes don't pollute the handshake_fail bug-oracle.
+		// Mirrors how h2c_churn separates h2c_declined (server doesn't
+		// speak h2c) from h2c_crashed (server speaks h2c but
+		// crashed). Any other non-200 (405/500/etc.) IS a server
+		// behavior bug under the SSE GET and stays in handshake_fail.
+		if strings.HasPrefix(statusLine, "HTTP/1.1 404") || strings.HasPrefix(statusLine, "HTTP/1.0 404") {
+			tally.endpointAbsent.Add(1)
+			return
+		}
 		tally.handshakeFail.Add(1)
 		return
 	}
