@@ -6,6 +6,8 @@ github.com/goceleris/celeris v1.4.11-0.20260526012035-3b9d643e817a h1:ROGaH1yc3t
 github.com/goceleris/celeris v1.4.11-0.20260526012035-3b9d643e817a/go.mod h1:GT6foafNObnmOIfSoPcrojPGGkv/F/GMF8sLNHqxRoA=
 github.com/goceleris/celeris v1.4.11-0.20260526012555-d42fb2c9d55d h1:Ry6bCVoEzq8UdN0Jjjv11kssYzZxv3dpriMHfMXDuvk=
 github.com/goceleris/celeris v1.4.11-0.20260526012555-d42fb2c9d55d/go.mod h1:GT6foafNObnmOIfSoPcrojPGGkv/F/GMF8sLNHqxRoA=
+github.com/goceleris/celeris v1.4.11-0.20260526023925-e1d326bbfe4f h1:KbgzG9s+3awiVcEhM6FB9GTL6MdabAgfFS2okxGeQdA=
+github.com/goceleris/celeris v1.4.11-0.20260526023925-e1d326bbfe4f/go.mod h1:GT6foafNObnmOIfSoPcrojPGGkv/F/GMF8sLNHqxRoA=
 golang.org/x/net v0.54.0 h1:2zJIZAxAHV/OHCDTCOHAYehQzLfSXuf/5SoL/Dv6w/w=
 golang.org/x/net v0.54.0/go.mod h1:Sj4oj8jK6XmHpBZU/zWHw3BV3abl4Kvi+Ut7cQcY+cQ=
 golang.org/x/sys v0.44.0 h1:ildZl3J4uzeKP07r2F++Op7E9B29JRUy+a27EibtBTQ=

@@ -2,7 +2,7 @@ module github.com/goceleris/probatorium/validation/refapp/kitchen_sink
 
 go 1.26.3
 
-require github.com/goceleris/celeris v1.4.11-0.20260526012555-d42fb2c9d55d
+require github.com/goceleris/celeris v1.4.11-0.20260526023925-e1d326bbfe4f
 
 require (
 	golang.org/x/net v0.54.0 // indirect
