@@ -122,7 +122,17 @@ func main() {
 		ShutdownTimeout: 10 * time.Second,
 	})
 
-	srv.Use(recovery.New())
+	// Recovery middleware logger: route through the same in-memory
+	// ringHandler the logger middleware uses, NOT slog.Default(). The
+	// stdlib default routes through Go's text handler whose
+	// defaultHandler mutex serializes a blocking os.Stderr.Write across
+	// every conn + worker; under iouring/epoll's per-conn async-dispatch
+	// model that stderr lock is held inside cs.detachMu (around
+	// ProcessH1), which gates the entire worker thread and lets
+	// concurrent slowloris-conn header deadlines slip past. Diagnosed
+	// from nightly 26438393561 (~14× throughput regression vs std on
+	// this refapp + ~18 slowloris hangs/cell concentrated here).
+	srv.Use(recovery.New(recovery.Config{Logger: reqLog}))
 	srv.Use(requestid.New())
 	srv.Use(logger.New(logger.Config{Output: reqLog}))
 	srv.Use(metrics.New(metrics.Config{Registry: reg}))
