@@ -27,7 +27,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -70,7 +72,15 @@ func main() {
 	})
 
 	// Always-on middlewares.
-	srv.Use(recovery.New())
+	// Recovery middleware logger: explicit io.Discard sink, NOT
+	// slog.Default(). The stdlib default routes through Go's text
+	// handler whose defaultHandler mutex serializes a blocking
+	// os.Stderr.Write across every conn + worker; under iouring/epoll's
+	// per-conn async-dispatch model that stderr lock is held inside
+	// cs.detachMu (around ProcessH1), gating the worker thread and
+	// letting concurrent slowloris header-deadlines slip past.
+	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
 	srv.Use(requestid.New())
 	srv.Use(secure.New())
 
