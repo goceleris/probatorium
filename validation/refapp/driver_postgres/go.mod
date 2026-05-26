@@ -2,7 +2,7 @@ module github.com/goceleris/probatorium/validation/refapp/driver_postgres
 
 go 1.26.3
 
-require github.com/goceleris/celeris v1.4.11-0.20260525220316-887293ce82c4
+require github.com/goceleris/celeris v1.4.11-0.20260526011131-6dbbf021d57d
 
 require (
 	golang.org/x/net v0.54.0 // indirect
