@@ -162,27 +162,27 @@ func runAdversarialWalker(ctx context.Context, hostPort string,
 // longer than celeris's default ReadHeaderTimeout (10s) AND have
 // enough slack to absorb kernel accept-queue delay under load.
 //
-// Evolution:
-//   - 2s: original. Insufficient on any refapp under load.
-//   - 12s: covered most cells; tripped on observability under panic-
-//     heavy markov where accept-queue waits ran 3-5s.
-//   - 20s: covered all engines on healthy refapps; left ~5-7% residual
-//     hangs on observability where async-dispatch goroutine pile-up
-//     from panic-recovery middleware (≈20% of /api/error in the
-//     markov) delays the SO_REUSEPORT accept dispatch by 10-15s. The
-//     server-side close timer still fires correctly, just LATE from
-//     the walker's wall-clock perspective.
-//   - 30s: drives the slack to ≥20s over the 10s engine deadline.
-//     Even on observability with its goroutine-pile-up dynamics, the
-//     accept-dispatch + close-deliver round-trip stays well within
-//     budget. Refapps that legitimately exceed 30s of accept delay
-//     are broken in a way the slowloris defence can't reasonably
-//     paper over; that scenario would surface in I-CONN-1 / IdleTime
-//     properties separately.
+// Pre-fix this was 2s, then 12s. 12s wasn't quite enough on slow-
+// refapp cells: under heavy concurrent traffic, kernel can take 1-3s
+// to dispatch new accept events to busy SO_REUSEPORT workers. The
+// walker's drip-budget timer starts after the preamble Write
+// (which succeeds locally before kernel-level accept completes), so
+// the engine's HeaderDeadline starts ticking LATER than the walker's
+// budget. With 12s budget + 10s engine deadline = only 2s slack, a
+// 3s accept delay tips into hang territory even though the engine
+// closes correctly. 20s budget gives 10s slack over the 10s engine
+// default — comfortably more than any realistic accept delay.
+//
+// (A 30s variant was tested in nightly 26438393561 against the
+// observability refapp residual; it did not reduce hang counts but DID
+// reduce overall adv_sent (each hung attempt costs 30s of walker time
+// instead of 20s, eating into the cell's total walker budget). Reverted
+// to 20s — the residual is server-side behavior we still need to root-
+// cause, not a walker-tolerance issue.)
 //
 // Refapps that set a longer ReadHeaderTimeout will still legitimately
 // trip the hang counter (i.e., they disabled their slowloris defence).
-const slowlorisDripBudget = 30 * time.Second
+const slowlorisDripBudget = 20 * time.Second
 
 // fireAdversarial opens one raw TCP conn, writes the mode's bad-bytes
 // payload, reads up to one short response, and classifies the result.
