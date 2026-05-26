@@ -19,6 +19,8 @@ github.com/goceleris/celeris v1.4.11-0.20260526012555-d42fb2c9d55d h1:Ry6bCVoEzq
 github.com/goceleris/celeris v1.4.11-0.20260526012555-d42fb2c9d55d/go.mod h1:GT6foafNObnmOIfSoPcrojPGGkv/F/GMF8sLNHqxRoA=
 github.com/goceleris/celeris v1.4.11-0.20260526023925-e1d326bbfe4f h1:KbgzG9s+3awiVcEhM6FB9GTL6MdabAgfFS2okxGeQdA=
 github.com/goceleris/celeris v1.4.11-0.20260526023925-e1d326bbfe4f/go.mod h1:GT6foafNObnmOIfSoPcrojPGGkv/F/GMF8sLNHqxRoA=
+github.com/goceleris/celeris v1.4.11-0.20260526041626-4382283c8054 h1:mVWnemU9VpQG42Kg+DDqzV/iyR5bsd7H8wQ485H3AmY=
+github.com/goceleris/celeris v1.4.11-0.20260526041626-4382283c8054/go.mod h1:GT6foafNObnmOIfSoPcrojPGGkv/F/GMF8sLNHqxRoA=
 github.com/goceleris/celeris/middleware/metrics v1.4.4 h1:9oinXaxGxbE8p1zFXiqr3/9SJ42eUyWFOsasXVoNhT8=
 github.com/goceleris/celeris/middleware/metrics v1.4.4/go.mod h1:Ld5SrcTpgmqXpECTw0ldFQsXrp89lGf15W5UHddH1AQ=
 github.com/goceleris/celeris/middleware/otel v1.4.4 h1:EKJLSvEatprCW4EQv3ygyTlgq/BugjalkgpWJ6WWW2M=
