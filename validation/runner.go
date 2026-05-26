@@ -1083,6 +1083,7 @@ func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
 				"sse_killed_mid_stream":   s.SSEKill.KilledMidStream,
 				"sse_server_closed_early": s.SSEKill.ServerClosedEarly,
 				"sse_handshake_fail":      s.SSEKill.HandshakeFail,
+				"sse_endpoint_absent":     s.SSEKill.EndpointAbsent,
 			},
 		}
 	}
@@ -1093,6 +1094,50 @@ func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
 			SeedsPassed:    s.SeedsPassed,
 			SeedsFailed:    s.SeedsFailed,
 			SeedsErrored:   s.SeedsErrored,
+		}
+	}
+	// Populate SoakSummary when the run was driven in soak mode
+	// (`mage Soak` flips Config.SoakMode=true) OR when Duration
+	// exceeds 6h (the documented soak threshold from schema.go).
+	// Empty / brief Validate runs leave doc.Soak nil so the report
+	// stays minimal.
+	//
+	// Fields currently populated:
+	//   - Duration:         elapsed wall time from tier-start.
+	//   - PerHourErrorRate: (RequestsError / RequestsSent) × 100,
+	//     averaged across the entire window — close
+	//     enough to "per-hour" for the docs intent
+	//     (long soaks dampen short-term spikes).
+	//
+	// Fields left zero pending follow-up infrastructure:
+	//   - RestartedProcesses:    needs an orchestrator-level counter
+	//     incremented by the per-tier driver
+	//     restart path (none currently restarts
+	//     a refapp inside a single run).
+	//   - GoroutineLeakDetected: needs heap-slope-vs-baseline
+	//     comparison from the validator-checker
+	//     /debug/vars stream (Snapshot history
+	//     in properties.Context).
+	//   - HeapGrowthMB:          same Snapshot-history dependency.
+	//
+	// Per probatorium#103-followup: keeping the Soak block written
+	// (with the easy fields) lets downstream report-diff tooling
+	// distinguish soak from non-soak runs; the missing fields are
+	// flagged as known-pending in the schema-test fixture.
+	elapsed := time.Since(startedAt)
+	const soakThreshold = 6 * time.Hour
+	if o.cfg.SoakMode || elapsed >= soakThreshold {
+		var errRate float64
+		if o.tier1Ran && o.tier1Snapshot.RequestsSent > 0 {
+			errRate = float64(o.tier1Snapshot.RequestsError) /
+				float64(o.tier1Snapshot.RequestsSent) * 100.0
+		}
+		doc.Soak = &report.SoakSummary{
+			Duration:         elapsed,
+			PerHourErrorRate: errRate,
+			// RestartedProcesses, GoroutineLeakDetected, HeapGrowthMB:
+			// zero until per-tier driver-restart counter + per-snapshot
+			// heap/goroutine-history tracking are wired in.
 		}
 	}
 	return writeJSON(filepath.Join(o.cfg.OutDir, "validate-results.json"), doc)
