@@ -250,18 +250,21 @@ func fireAdversarial(ctx context.Context, hostPort string,
 					tally.wellReject.Add(1)
 					break slowloop
 				}
-				// Brief blocking read probe — gives the kernel up to 50ms
-				// to deliver any pending FIN/RST from the server side.
-				// SetReadDeadline(now) was too aggressive: any close that
-				// arrived in the 50ms-window between probe iterations
-				// missed observation, eating into the 12s drip budget on
-				// slow refapps where worker scheduling adds jitter.
+				// Blocking read probe — gives the kernel time to deliver
+				// any pending FIN/RST from the server side. 200ms matches
+				// the drip tick, so the walker effectively becomes
+				// "write→read until tick" rather than "write→tick→read".
+				// Earlier 50ms still missed close events under heavy
+				// concurrent traffic on slow refapps (where the walker
+				// thread itself was being scheduled with multi-100ms
+				// gaps between iterations). 200ms gives the kernel one
+				// full drip period to flush close detection.
 				//
-				// 50ms × 60 ticks = 3s total Read budget over the drip
-				// — comfortably under the 2s slack window (12s - 10s),
-				// and the loop exits early once close is observed so the
-				// cost is amortized across just a few iterations.
-				_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				// The loop exits early once close is observed so the
+				// cost is amortized: typical walker now blocks for
+				// ~10-200ms on the iteration that catches the close,
+				// not 200ms × N drips.
+				_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 				if _, err := conn.Read(readBuf); err == nil || isCloseObservation(err) {
 					tally.wellReject.Add(1)
 					break slowloop
