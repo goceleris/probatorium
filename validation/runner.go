@@ -1001,6 +1001,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"ws_closed_correctly":   s.WSTorture.ClosedCorrectly,
 			"ws_accepted_bad_frame": s.WSTorture.AcceptedBadFrame,
 			"ws_hang_no_close":      s.WSTorture.HangNoClose,
+			"ws_endpoint_absent":    s.WSTorture.EndpointAbsent,
 		},
 		SSEKill: map[string]int64{
 			"sse_sent":                s.SSEKill.Sent,
@@ -1075,6 +1076,7 @@ func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
 				"ws_closed_correctly":   s.WSTorture.ClosedCorrectly,
 				"ws_accepted_bad_frame": s.WSTorture.AcceptedBadFrame,
 				"ws_hang_no_close":      s.WSTorture.HangNoClose,
+				"ws_endpoint_absent":    s.WSTorture.EndpointAbsent,
 			},
 			SSEKill: map[string]int64{
 				"sse_sent":                s.SSEKill.Sent,
