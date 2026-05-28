@@ -2,14 +2,47 @@ package validation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
+
+// isCloseObservation reports whether err — returned from a Read on a
+// drip-mode slowloris conn — definitively indicates the server has
+// closed the connection. Used by the slowloris walker to detect close
+// via the read path rather than waiting for write-side buffer pressure.
+//
+// Includes io.EOF (graceful FIN), ECONNRESET (RST), EPIPE (broken pipe).
+// Excludes timeout errors — the walker calls SetReadDeadline(now) for
+// non-blocking semantics, so a deadline-exceeded result means "no data
+// AND not closed (yet)" which is the keep-dripping case.
+func isCloseObservation(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	// Wrapped os.PathError or net.OpError around any of the above.
+	var oe *os.SyscallError
+	if errors.As(err, &oe) {
+		if errors.Is(oe.Err, syscall.ECONNRESET) || errors.Is(oe.Err, syscall.EPIPE) {
+			return true
+		}
+	}
+	return false
+}
 
 // adversarialMode names one shape of bad request the walker generates.
 // Each is engineered to find a specific RFC-violation bug class:
@@ -124,6 +157,33 @@ func runAdversarialWalker(ctx context.Context, hostPort string,
 	}
 }
 
+// slowlorisDripBudget caps how long the slowloris drip-walker keeps a
+// conn alive before declaring "server didn't close = bug". Must be
+// longer than celeris's default ReadHeaderTimeout (10s) AND have
+// enough slack to absorb kernel accept-queue delay under load.
+//
+// Pre-fix this was 2s, then 12s. 12s wasn't quite enough on slow-
+// refapp cells: under heavy concurrent traffic, kernel can take 1-3s
+// to dispatch new accept events to busy SO_REUSEPORT workers. The
+// walker's drip-budget timer starts after the preamble Write
+// (which succeeds locally before kernel-level accept completes), so
+// the engine's HeaderDeadline starts ticking LATER than the walker's
+// budget. With 12s budget + 10s engine deadline = only 2s slack, a
+// 3s accept delay tips into hang territory even though the engine
+// closes correctly. 20s budget gives 10s slack over the 10s engine
+// default — comfortably more than any realistic accept delay.
+//
+// (A 30s variant was tested in nightly 26438393561 against the
+// observability refapp residual; it did not reduce hang counts but DID
+// reduce overall adv_sent (each hung attempt costs 30s of walker time
+// instead of 20s, eating into the cell's total walker budget). Reverted
+// to 20s — the residual is server-side behavior we still need to root-
+// cause, not a walker-tolerance issue.)
+//
+// Refapps that set a longer ReadHeaderTimeout will still legitimately
+// trip the hang counter (i.e., they disabled their slowloris defence).
+const slowlorisDripBudget = 20 * time.Second
+
 // fireAdversarial opens one raw TCP conn, writes the mode's bad-bytes
 // payload, reads up to one short response, and classifies the result.
 // timeout caps how long any individual victim request can stall.
@@ -154,24 +214,42 @@ func fireAdversarial(ctx context.Context, hostPort string,
 
 	// Slowloris has a special read pattern: we WANT the conn to
 	// stay open while we slow-drip subsequent bytes. The server's
-	// read-header-timeout should kick in within seconds and close.
+	// read-header-timeout should kick in within slowlorisDripBudget
+	// (longer than celeris's default 10s ReadHeaderTimeout).
 	if mode == ModeSlowloris {
+		// Extend the conn deadline beyond the dial/read 2s budget —
+		// otherwise the SetDeadline above would fire 10s before we
+		// give celeris its full 10s ReadHeaderTimeout window.
+		_ = conn.SetDeadline(time.Now().Add(slowlorisDripBudget + time.Second))
+
 		// Write a single header byte every 200ms until the server
-		// closes or we hit the 2s budget. A correct server closes
-		// within its own read-header-timeout (~5s typical) — if
-		// the conn is still readable after our timeout, that's
-		// the bug (server doesn't enforce a header-read timeout).
-		slowDripDeadline := time.After(timeout)
+		// closes or we hit the drip budget. A correct server closes
+		// within its own read-header-timeout (celeris default: 10s);
+		// the budget here is 12s, giving 2s slack for clock skew +
+		// network latency before declaring a hang.
+		//
+		// After each write, attempt a non-blocking 1-byte read.
+		// celeris-side close (FIN/RST) is observable via Read way
+		// before TCP send-buffer-back-pressure shows up via Write.
+		// Without this Read probe, walker can keep dripping into a
+		// closed conn's local kernel send buffer for hundreds of ms
+		// past the FIN, eating into the 2s slack budget and producing
+		// false-positive hangs on slow refapps. Validated by the
+		// v1.4.11 celeris-side fixes that bring iouring close to
+		// kernel-precision: residual hangs are walker-observation
+		// lag, not engine close failure.
+		slowDripDeadline := time.After(slowlorisDripBudget)
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
+		readBuf := make([]byte, 1)
 	slowloop:
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-slowDripDeadline:
-				// Conn still open after timeout = server didn't close
-				// = bug.
+				// Conn still open after the full drip budget = server
+				// didn't enforce its ReadHeaderTimeout = bug.
 				tally.hang.Add(1)
 				return
 			case <-t.C:
@@ -179,6 +257,26 @@ func fireAdversarial(ctx context.Context, hostPort string,
 					tally.wellReject.Add(1)
 					break slowloop
 				}
+				// Blocking read probe — gives the kernel time to deliver
+				// any pending FIN/RST from the server side. 200ms matches
+				// the drip tick, so the walker effectively becomes
+				// "write→read until tick" rather than "write→tick→read".
+				// Earlier 50ms still missed close events under heavy
+				// concurrent traffic on slow refapps (where the walker
+				// thread itself was being scheduled with multi-100ms
+				// gaps between iterations). 200ms gives the kernel one
+				// full drip period to flush close detection.
+				//
+				// The loop exits early once close is observed so the
+				// cost is amortized: typical walker now blocks for
+				// ~10-200ms on the iteration that catches the close,
+				// not 200ms × N drips.
+				_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+				if _, err := conn.Read(readBuf); err == nil || isCloseObservation(err) {
+					tally.wellReject.Add(1)
+					break slowloop
+				}
+				_ = conn.SetReadDeadline(time.Now().Add(slowlorisDripBudget + time.Second))
 			}
 		}
 		return

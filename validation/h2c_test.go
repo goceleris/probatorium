@@ -191,6 +191,35 @@ func TestFireH2CChurn_SilentServerCountsHang(t *testing.T) {
 	}
 }
 
+// TestFireH2CChurn_SlowButCorrectServerNotHang pins the v1.4.10
+// follow-up fix: a refapp that responds slowly (e.g. observability
+// /api/error under load on arm64, taking ~5s) must NOT be flagged as
+// h2c_hang. Pre-fix the walker only waited 2s, so soak 26333090001
+// recorded 18K+ false-positive hang events on observability/
+// static_swagger_proxy arm64 cells. Post-fix the read budget is 10s.
+//
+// Server takes 4s to respond — well within the 10s budget. Walker
+// should classify as declined (200 OK to the upgrade request), NOT
+// hang.
+func TestFireH2CChurn_SlowButCorrectServerNotHang(t *testing.T) {
+	srv := newFakeH2CServer(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		_, _ = c.Read(make([]byte, 4096))
+		// 4s delay: longer than the OLD 2s budget, well inside the new 10s.
+		time.Sleep(4 * time.Second)
+		_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+	})
+	var tally h2cTally
+	fireH2CChurn(context.Background(), srv.HostPort(), ChurnRSTAfter101, &tally)
+	s := tally.snapshot()
+	if s.Hang != 0 {
+		t.Errorf("slow-but-correct server must NOT count as hang, got %d", s.Hang)
+	}
+	if s.Declined != 1 {
+		t.Errorf("slow 200 response should count as declined, got %d", s.Declined)
+	}
+}
+
 // TestFireH2CChurn_RSTBeforeReadCountsIntentional verifies that
 // ChurnRSTBeforeRead increments the intentionalRST counter (workload
 // intent) and NOT the hang counter (server-wedge signal). Pre-split,

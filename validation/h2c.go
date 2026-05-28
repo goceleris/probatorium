@@ -141,6 +141,19 @@ func runH2CChurnWalker(ctx context.Context, hostPort string,
 	}
 }
 
+// h2cChurnDialTimeout and h2cChurnReadTimeout split what used to be a
+// single 2s budget. Dial stays at 2s — refapps should accept quickly.
+// Read budget is 10s — sized to celeris's default ReadTimeout (30s)
+// minus generous slack, so a slow-but-correct refapp (observability,
+// static_swagger_proxy under load) has time to respond before we
+// declare h2c_hang. Pre-fix the 2s read budget produced ~18K false-
+// positive hang events per soak on arm64 slow refapps, where the
+// server WAS responding correctly but took 2-5s.
+const (
+	h2cChurnDialTimeout = 2 * time.Second
+	h2cChurnReadTimeout = 10 * time.Second
+)
+
 // fireH2CChurn opens one raw TCP conn, writes a valid h2c upgrade
 // preamble, then either RSTs immediately, RSTs after the 101 line, or
 // sends a truncated H2 preface and RSTs — depending on mode.
@@ -153,8 +166,7 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 	mode h2cChurnMode, tally *h2cTally,
 ) {
 	tally.sent.Add(1)
-	const timeout = 2 * time.Second
-	d := net.Dialer{Timeout: timeout}
+	d := net.Dialer{Timeout: h2cChurnDialTimeout}
 	conn, err := d.DialContext(ctx, "tcp", hostPort)
 	if err != nil {
 		// Dial failure is infra (server down, port unreachable); don't
@@ -162,7 +174,8 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 		return
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	// Dial-window deadline for the upgrade write; reset before the read.
+	_ = conn.SetDeadline(time.Now().Add(h2cChurnDialTimeout))
 
 	preamble := h2cUpgradePreamble(hostPort)
 	if _, err := conn.Write(preamble); err != nil {
@@ -185,6 +198,13 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 		tally.intentionalRST.Add(1)
 		return
 	}
+
+	// Reset the deadline to a longer read budget — slow refapps
+	// (observability /api/error, static_swagger_proxy proxy handler
+	// on arm64 under load) take longer than the 2s dial budget to
+	// respond. Without this, every slow-but-correct response counted
+	// as h2c_hang.
+	_ = conn.SetDeadline(time.Now().Add(h2cChurnReadTimeout))
 
 	// Read up to the first 256 bytes to find the status line. We
 	// intentionally don't drain — the 101 path produces SETTINGS

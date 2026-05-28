@@ -19,7 +19,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sort"
@@ -177,7 +179,15 @@ func main() {
 		IdleTimeout:     120 * time.Second,
 		ShutdownTimeout: 10 * time.Second,
 	})
-	srv.Use(recovery.New())
+	// Recovery middleware logger: explicit io.Discard sink, NOT
+	// slog.Default(). The stdlib default routes through Go's text
+	// handler whose defaultHandler mutex serializes a blocking
+	// os.Stderr.Write across every conn + worker; under iouring/epoll's
+	// per-conn async-dispatch model that stderr lock is held inside
+	// cs.detachMu (around ProcessH1), gating the worker thread and
+	// letting concurrent slowloris header-deadlines slip past.
+	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
 	// /ws and /events are transport-level endpoints (WS upgrade + SSE
 	// long-poll). Both are exercised by Tier 1 walkers that don't carry
 	// a session — and they shouldn't have to: WS handshakes are

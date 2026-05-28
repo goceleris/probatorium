@@ -77,6 +77,10 @@ func (m wsTortureMode) String() string {
 //     kept the conn open >2s after it. Bug shape.
 //   - hangNoClose      — conn stayed half-open past timeout without
 //     a Close frame OR a clean RST. Likely server goroutine wedged.
+//   - endpointAbsent   — server returned 404 to the upgrade GET; the
+//     refapp simply doesn't expose /ws. Counted separately so the
+//     matrix can run WS walkers against every refapp without
+//     polluting handshake_fail. Mirrors sse_endpoint_absent.
 type wsTally struct {
 	sent             atomic.Int64
 	upgraded         atomic.Int64
@@ -84,6 +88,7 @@ type wsTally struct {
 	closedCorrectly  atomic.Int64
 	acceptedBadFrame atomic.Int64
 	hangNoClose      atomic.Int64
+	endpointAbsent   atomic.Int64
 }
 
 // wsSnapshot is the value-typed projection emitted into the tally
@@ -95,6 +100,7 @@ type wsSnapshot struct {
 	ClosedCorrectly  int64 `json:"ws_closed_correctly"`
 	AcceptedBadFrame int64 `json:"ws_accepted_bad_frame"`
 	HangNoClose      int64 `json:"ws_hang_no_close"`
+	EndpointAbsent   int64 `json:"ws_endpoint_absent"`
 }
 
 func (t *wsTally) snapshot() wsSnapshot {
@@ -105,6 +111,7 @@ func (t *wsTally) snapshot() wsSnapshot {
 		ClosedCorrectly:  t.closedCorrectly.Load(),
 		AcceptedBadFrame: t.acceptedBadFrame.Load(),
 		HangNoClose:      t.hangNoClose.Load(),
+		EndpointAbsent:   t.endpointAbsent.Load(),
 	}
 }
 
@@ -176,7 +183,16 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 		return
 	}
 	if !strings.HasPrefix(statusLine, "HTTP/1.1 101") {
-		// Server rejected the upgrade. Drain to EOF; not bug-shaped.
+		// 404 means the refapp doesn't expose /ws — not a bug, just a
+		// config absence. Counted separately so refapps without a /ws
+		// route don't pollute the handshake_fail bug-oracle counter.
+		// Mirrors sse_endpoint_absent. Any other non-101 (400/403/etc.)
+		// IS a real server-side rejection and stays under
+		// handshake_fail.
+		if strings.HasPrefix(statusLine, "HTTP/1.1 404") {
+			tally.endpointAbsent.Add(1)
+			return
+		}
 		tally.handshakeFail.Add(1)
 		return
 	}

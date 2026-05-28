@@ -197,6 +197,60 @@ func TestRunAdversarialWalker_FiresMultipleRequests(t *testing.T) {
 	}
 }
 
+// TestFireAdversarial_SlowlorisCloseWithinReadHeaderTimeoutNotHang pins
+// the v1.4.10 follow-up fix: a refapp that's correctly enforcing the
+// celeris default ReadHeaderTimeout (10s) should NOT be counted as a
+// hang by the slowloris walker. Pre-fix the walker only waited 2s, so
+// every correctly-configured server got flagged. Soak 26333090001
+// recorded 664K of these false-positive events over 24h.
+//
+// Server closes ~4s after upgrade write — well within the 12s drip
+// budget. Walker should classify as wellRejected, NOT hang.
+func TestFireAdversarial_SlowlorisCloseWithinReadHeaderTimeoutNotHang(t *testing.T) {
+	srv := newFakeAdversarialServer(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		// Accept the initial preamble write but otherwise stay silent —
+		// then close after the simulated ReadHeaderTimeout. 4s is well
+		// inside celeris's 10s default but illustrates the bug.
+		_, _ = c.Read(make([]byte, 4096))
+		time.Sleep(4 * time.Second)
+	})
+	var tally adversarialTally
+	fireAdversarial(context.Background(), srv.HostPort(), ModeSlowloris, &tally)
+	s := tally.snapshot()
+	if s.HangUntilTimeout != 0 {
+		t.Errorf("server closing within ReadHeaderTimeout must NOT count as hang, got %d", s.HangUntilTimeout)
+	}
+	if s.WellRejected != 1 {
+		t.Errorf("server-close mid-drip should classify as wellRejected, got %d", s.WellRejected)
+	}
+}
+
+// TestFireAdversarial_SlowlorisServerNeverClosesIsHang complements the
+// above: a server that holds the conn open past the full drip budget
+// IS a hang (the bug the counter is meant to catch).
+func TestFireAdversarial_SlowlorisServerNeverClosesIsHang(t *testing.T) {
+	if testing.Short() {
+		t.Skip("12s drip budget; skipped under -short")
+	}
+	srv := newFakeAdversarialServer(t, func(c net.Conn) {
+		defer func() { _ = c.Close() }()
+		// Slow-drain incoming bytes forever; never close.
+		buf := make([]byte, 1)
+		for {
+			if _, err := c.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+	var tally adversarialTally
+	fireAdversarial(context.Background(), srv.HostPort(), ModeSlowloris, &tally)
+	s := tally.snapshot()
+	if s.HangUntilTimeout != 1 {
+		t.Errorf("never-closing server must count as hang, got %d", s.HangUntilTimeout)
+	}
+}
+
 func TestFireAdversarial_DialFailureDoesNotIncrement(t *testing.T) {
 	// No server listening on the chosen port. The walker shouldn't
 	// fold dial-failure into wellRejected/accepted — that would

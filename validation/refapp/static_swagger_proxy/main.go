@@ -28,8 +28,10 @@ import (
 	"embed"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -83,7 +85,19 @@ func main() {
 		ShutdownTimeout: 10 * time.Second,
 	})
 
-	srv.Use(recovery.New())
+	// Recovery middleware logger: explicit io.Discard sink, NOT
+	// slog.Default(). The stdlib default routes through Go's text
+	// handler whose defaultHandler mutex serializes a blocking
+	// os.Stderr.Write across every conn + worker; under iouring/epoll's
+	// per-conn async-dispatch model that stderr lock is held inside
+	// cs.detachMu (around ProcessH1), which gates the worker thread.
+	// stat_swag's markov doesn't intentionally panic, but adversarial
+	// walkers (CRLF injection, oversized header, etc.) can trip
+	// occasional panics in proxy/static/swagger middleware — diagnosed
+	// from nightly 26444562273 which still showed 17-25 slowloris
+	// hangs/cell on this refapp despite observability now at 0.
+	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
 	srv.Use(requestid.New())
 
 	// proxy middleware — trusts loopback only. Walker traffic from

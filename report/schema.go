@@ -217,8 +217,8 @@ type Tier1Summary struct {
 	// Canonical keys (validator package writes these):
 	//   adversarial  → adv_sent, adv_well_rejected, adv_wrong_accepted, adv_hang_until_timeout
 	//   h2c_churn    → h2c_sent, h2c_upgraded, h2c_declined, h2c_crashed, h2c_hang
-	//   ws_torture   → ws_sent, ws_upgraded, ws_handshake_fail, ws_closed_correctly, ws_accepted_bad_frame, ws_hang_no_close
-	//   sse_kill     → sse_sent, sse_established, sse_events_read, sse_killed_mid_stream, sse_server_closed_early, sse_handshake_fail
+	//   ws_torture   → ws_sent, ws_upgraded, ws_handshake_fail, ws_closed_correctly, ws_accepted_bad_frame, ws_hang_no_close, ws_endpoint_absent
+	//   sse_kill     → sse_sent, sse_established, sse_events_read, sse_killed_mid_stream, sse_server_closed_early, sse_handshake_fail, sse_endpoint_absent
 	Adversarial map[string]int64 `json:"adversarial,omitempty"`
 	H2CChurn    map[string]int64 `json:"h2c_churn,omitempty"`
 	WSTorture   map[string]int64 `json:"ws_torture,omitempty"`

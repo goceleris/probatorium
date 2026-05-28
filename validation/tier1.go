@@ -183,6 +183,41 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	// complete handshakes we explicitly want to RST mid-flight).
 	hostPort := strings.TrimPrefix(strings.TrimPrefix(cfg.BaseURL, "http://"), "https://")
 	httpc := &http.Client{Timeout: cfg.RequestTimeout}
+
+	// Warm-up phase: hit /healthz repeatedly for 30s before launching
+	// the bug-oracle walkers. Lets the kernel's IRQ balance + softirq
+	// routing settle, the conn pool reach equilibrium, and the engine's
+	// internal pools warm. Without this, the matrix-nightly tier's
+	// short-per-cell (2.5min) cold start dominates the error rate on
+	// hardware without hardware-RSS NICs — diagnosed from the
+	// driver_redis-iouring-msr1 49% transport_err pattern (nightly
+	// 26449972230) that disappeared to 0.005% under the 24h soak's
+	// steady-state operation (26459413667). On long-budget runs (>10min
+	// per cell) the warm-up is a small constant overhead with no impact
+	// on bug detection; on short-budget runs (<60s of total ctx budget)
+	// it's skipped entirely so smoke / unit tests aren't starved.
+	if dl, ok := ctx.Deadline(); !ok || time.Until(dl) >= time.Minute {
+		const warmupBudget = 30 * time.Second
+		warmupCtx, cancelWarmup := context.WithTimeout(ctx, warmupBudget)
+		req, werr := http.NewRequestWithContext(warmupCtx, "GET", cfg.BaseURL+"/healthz", nil)
+		if werr == nil {
+			for warmupCtx.Err() == nil {
+				resp, derr := httpc.Do(req.Clone(warmupCtx))
+				if derr == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+				}
+				// 5ms pace — keeps the kernel/IRQ-routing warming up
+				// without saturating the listener (the goal is settling,
+				// not stress-testing).
+				select {
+				case <-warmupCtx.Done():
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		}
+		cancelWarmup()
+	}
 	var wg sync.WaitGroup
 	advTally := &adversarialTally{}
 	tally.adv = advTally
