@@ -111,11 +111,18 @@ func main() {
 	}, func() float64 { return float64(ring.writes.Load()) })
 	reg.MustRegister(logDropsGauge, logWritesGauge)
 
+	// Per-handler async (celeris #300): this refapp uses a SYNC server
+	// default and opts the I/O-shaped routes (slow, induced-panic) into
+	// async dispatch via Route.Async(), while the fast scrape/health/ok
+	// routes stay sync (inline on the worker). Exercises the
+	// "sync-default + per-route .Async()" direction across the matrix.
+	// (The engine still stands up the async dispatch infrastructure
+	// because some routes are async, so slowloris/close behavior is
+	// unchanged from the prior all-async config.)
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
 		Protocol:        celeris.HTTP1,
-		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,
 		WriteTimeout:    30 * time.Second,
 		IdleTimeout:     120 * time.Second,
@@ -156,7 +163,7 @@ func main() {
 	// don't break monotonic histogram bucket counts.
 	srv.GET("/api/error", func(_ *celeris.Context) error {
 		panic("observability refapp: induced panic")
-	})
+	}).Async() // async: exercises recovery on the async dispatch path
 
 	// /api/slow — 5 ms sleep so the histogram bucket span includes
 	// a sample > 1 ms. The walker scrapes /metrics afterwards and
@@ -165,7 +172,7 @@ func main() {
 	srv.GET("/api/slow", func(c *celeris.Context) error {
 		time.Sleep(5 * time.Millisecond)
 		return c.JSON(http.StatusOK, map[string]string{"status": "slow"})
-	})
+	}).Async() // async: slow/blocking handler runs off the worker
 
 	// /metrics needs a registered route or celeris's router 404s
 	// before the metrics-middleware chain runs. The handler body

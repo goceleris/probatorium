@@ -3,7 +3,7 @@ module github.com/goceleris/probatorium/validation/refapp/observability
 go 1.26.3
 
 require (
-	github.com/goceleris/celeris v1.4.11
+	github.com/goceleris/celeris v1.4.12-0.20260529231127-85f4d50135d7
 	github.com/goceleris/celeris/middleware/metrics v1.4.4
 	github.com/goceleris/celeris/middleware/otel v1.4.4
 	github.com/prometheus/client_golang v1.23.2
@@ -23,8 +23,8 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
-	golang.org/x/net v0.54.0 // indirect
-	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
