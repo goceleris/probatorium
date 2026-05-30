@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/goceleris/probatorium/main/report/timeseries_v1.json",
+  "title": "Probatorium time-series sidecar",
+  "description": "timeseries/1 schema for the decompressed timeseries.json.gz sidecar (probatorium#153). Separate from results.json (schema_v5.json): per (scenario, server) it keeps each run's raw 1 Hz rps series PLUS a cross-run min/p50/p99/max/mean band over per-elapsed-second RPS. The band is a small-sample envelope over per-bucket RPS, NOT an HDR-merged latency percentile. p99_ms / errors bands are emitted only once the loadgen seam populates per-bucket P99/errors.",
+  "type": "object",
+  "required": ["generated_at", "schema_version", "scenarios"],
+  "properties": {
+    "generated_at": { "type": "string", "format": "date-time" },
+    "schema_version": {
+      "type": "string",
+      "description": "Sidecar schema tag, versioned independently of results.json.",
+      "const": "timeseries/1"
+    },
+    "scenarios": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/scenarioSeries" }
+    }
+  },
+  "$defs": {
+    "scenarioSeries": {
+      "type": "object",
+      "required": ["scenario", "server", "runs", "band"],
+      "properties": {
+        "scenario": { "type": "string" },
+        "server": { "type": "string" },
+        "category": { "type": "string" },
+        "runs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/runSeries" }
+        },
+        "band": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/bucketBand" }
+        }
+      }
+    },
+    "runSeries": {
+      "type": "object",
+      "required": ["run", "samples"],
+      "properties": {
+        "run": { "type": "integer", "minimum": 1, "description": "1-based run index." },
+        "samples": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sampleRow" }
+        }
+      }
+    },
+    "sampleRow": {
+      "type": "object",
+      "required": ["t_s", "rps"],
+      "properties": {
+        "t_s": { "type": "number", "description": "Elapsed measurement time in seconds (0-based)." },
+        "rps": { "type": "number", "description": "Instantaneous request rate over the prior 1-second bucket." },
+        "p99_ms": { "type": "number", "description": "Per-bucket P99 latency (ms). Reserved seam; omitted until loadgen fills it." },
+        "errors": { "type": "integer", "description": "Per-bucket error count. Forward slot; omitted until loadgen emits it." }
+      }
+    },
+    "bucketBand": {
+      "type": "object",
+      "required": ["t_s", "rps"],
+      "properties": {
+        "t_s": { "type": "integer", "description": "Elapsed-second bucket key." },
+        "rps": { "$ref": "#/$defs/bandStat" },
+        "p99_ms": { "$ref": "#/$defs/bandStat" },
+        "errors": { "$ref": "#/$defs/bandStat" }
+      }
+    },
+    "bandStat": {
+      "type": "object",
+      "required": ["min", "p50", "p99", "max", "mean"],
+      "properties": {
+        "min": { "type": "number" },
+        "p50": { "type": "number" },
+        "p99": { "type": "number" },
+        "max": { "type": "number" },
+        "mean": { "type": "number" }
+      }
+    }
+  }
+}

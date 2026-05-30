@@ -32,6 +32,19 @@
 // without a deploy fails at step 5a with a clean "binary not found"
 // error from servers.StartAdapter, which is the contract the bench
 // playbook depends on.
+//
+// Remote-target mode (-target): on the cluster the SUT runs on a
+// separate host (bench_target) and the runner runs on the loadgen host,
+// so there is no in-process adapter to spawn. When -target is set the
+// runner skips freePort / StartAdapter / waitForTCP / the FD-leak scope
+// and drives loadgen straight against the already-running remote base
+// URL. The schedule collapses to scenarios × one synthetic server (the
+// -server-name slug) × runs, so ansible can keep its outer
+// (run_index × competitor) interleaving and call the runner once per
+// cell with -runs 1 — the runner expands the scenario inner loop. A
+// permissive synthetic FeatureSet makes every scenario applicable; a
+// SUT that cannot speak a given protocol surfaces as a zero-request
+// cell rather than a silently-skipped one.
 package main
 
 import (
@@ -49,6 +62,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -76,22 +90,66 @@ type Config struct {
 	FDTrace  bool
 	Seed     int64
 
+	// Timeseries is the path for the gzip time-series sidecar. Empty
+	// means <Out>/timeseries.json.gz. The sidecar carries the per-run
+	// 1 Hz rps series + a cross-run band, kept out of results.json so
+	// the summary stays small and byte-stable.
+	Timeseries string
+
+	// Target, when non-empty, switches the runner into remote-target
+	// mode: instead of spawning each adapter on a free loopback port,
+	// every cell drives loadgen against this already-running base URL
+	// (e.g. "http://10.0.0.2:8080"). This is the mode the cluster bench
+	// uses — the SUT runs on bench_target and the runner on the loadgen
+	// host, so there is no in-process adapter to start.
+	Target string
+	// ServerName is the friendly competitor slug recorded as the cell's
+	// server in remote-target mode (e.g. "celeris-iouring-h1-async").
+	// Ignored when Target is empty.
+	ServerName string
+
 	// DryRun, when true, prints the resolved schedule and exits without
 	// starting any adapter. Convenient for CI smoke tests and for
 	// validating the -cells glob without requiring a deploy.
 	DryRun bool
+
+	// RatedMode enables the Gil-Tene rated (closed-loop, coordinated-
+	// omission-corrected) sweep after each cell's saturation pass. OFF by
+	// default — rated multiplies per-cell wall-clock by len(RatedFractions)
+	// extra passes, so it is opt-in (BENCH_RATED=1 / -rated) and curated by
+	// the budget issue (#166). Rated adds PASSES within a cell, never extra
+	// schedule cells, so the cell count is identical whether on or off.
+	RatedMode bool
+
+	// RatedDuration is the measurement window for each rated pass. Kept
+	// short relative to the saturation Duration since rated drives a fixed
+	// offered load and converges faster.
+	RatedDuration time.Duration
+
+	// RatedFractions are the offered loads for the rated sweep, expressed as
+	// fractions of the measured saturation RPS (adapter-relative so the
+	// targets stay comparable across servers of wildly different throughput).
+	RatedFractions []float64
 }
+
+// defaultRatedFractions is the saturation-relative sweep used when none is
+// supplied. 25/50/75/90% brackets the SLO knee without probing past
+// saturation (where coordinated-omission correction stops being meaningful).
+var defaultRatedFractions = []float64{0.25, 0.5, 0.75, 0.9}
 
 // DefaultConfig returns the fresh-flag defaults. Mirrors perfmatrix's
 // runner so muscle-memory carries over.
 func DefaultConfig() Config {
 	return Config{
-		Runs:     5,
-		Duration: 120 * time.Second,
-		Warmup:   30 * time.Second,
-		Cooldown: 5 * time.Second,
-		Services: "local",
-		Seed:     0,
+		Runs:           5,
+		Duration:       120 * time.Second,
+		Warmup:         30 * time.Second,
+		Cooldown:       5 * time.Second,
+		Services:       "local",
+		Seed:           0,
+		RatedMode:      false,
+		RatedDuration:  30 * time.Second,
+		RatedFractions: defaultRatedFractions,
 	}
 }
 
@@ -105,11 +163,54 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.Cells, "cells", c.Cells,
 		`glob filter over "<scenario>/<server>" (e.g. "get-simple/*", "*/celeris-*"; supports "!neg" exclusions)`)
 	fs.StringVar(&c.Out, "out", c.Out, "output directory; default results/<timestamp>-<git-ref>/")
+	fs.StringVar(&c.Timeseries, "timeseries", c.Timeseries,
+		"gzip time-series sidecar path; empty = <out>/timeseries.json.gz")
 	fs.StringVar(&c.Services, "services", c.Services, `"local" (Docker on same host) | "none" (skip driver services)`)
 	fs.BoolVar(&c.FailFast, "fail-fast", c.FailFast, "abort at the first cell error")
 	fs.BoolVar(&c.FDTrace, "fd-trace", c.FDTrace, "log per-cell FD counts even when the delta is zero")
 	fs.Int64Var(&c.Seed, "seed", c.Seed, "rng seed for reproducibility echo; 0 = time.Now().UnixNano()")
+	fs.StringVar(&c.Target, "target", c.Target,
+		"remote base URL (http://host:port) to bench against; empty = spawn local loopback adapters")
+	fs.StringVar(&c.ServerName, "server-name", c.ServerName,
+		"friendly server slug recorded in per-cell JSON / report when -target is set")
 	fs.BoolVar(&c.DryRun, "dry-run", c.DryRun, "print the resolved schedule and exit without starting adapters")
+	fs.BoolVar(&c.RatedMode, "rated", c.RatedMode,
+		"run a Gil-Tene rated (closed-loop, CO-corrected) sweep after each saturation pass (opt-in; multiplies per-cell time)")
+	fs.DurationVar(&c.RatedDuration, "rated-duration", c.RatedDuration, "measurement window for each rated pass")
+	fs.Func("rated-fractions",
+		"comma-separated saturation fractions for the rated sweep (default 0.25,0.5,0.75,0.9)",
+		func(s string) error {
+			fr, err := parseRatedFractions(s)
+			if err != nil {
+				return err
+			}
+			c.RatedFractions = fr
+			return nil
+		})
+}
+
+// parseRatedFractions parses a comma-separated list of saturation fractions
+// (each in (0,1]) for the rated sweep.
+func parseRatedFractions(s string) ([]float64, error) {
+	var out []float64
+	for _, part := range strings.Split(s, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		f, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return nil, fmt.Errorf("rated fraction %q: %w", p, err)
+		}
+		if f <= 0 || f > 1 {
+			return nil, fmt.Errorf("rated fraction %q out of range (0,1]", p)
+		}
+		out = append(out, f)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid rated fractions in %q", s)
+	}
+	return out, nil
 }
 
 // ParseArgs parses argv (without the program name). out receives flag
@@ -140,6 +241,21 @@ type cellResultFile struct {
 	FDsBefore    int             `json:"fds_before,omitempty"`
 	FDsAfterStop int             `json:"fds_after_stop,omitempty"`
 	FDsLeaked    int             `json:"fds_leaked,omitempty"`
+
+	// SaturationModeRPS echoes the open-loop saturation pass's RPS so the
+	// rated targets below are interpretable as a fraction of it.
+	SaturationModeRPS float64 `json:"saturation_mode_rps,omitempty"`
+
+	// RatedPasses is the per-cell rated sweep: one entry per offered load,
+	// each carrying the target RPS and the CO-corrected P99 at that load.
+	// Empty unless rated mode ran.
+	RatedPasses []ratedPassFile `json:"rated_passes,omitempty"`
+}
+
+// ratedPassFile is one rated pass recorded in the per-cell JSON.
+type ratedPassFile struct {
+	TargetRPS float64       `json:"target_rps"`
+	P99       time.Duration `json:"p99"`
 }
 
 // runManifest is the top-level summary written next to per-cell files.
@@ -180,6 +296,16 @@ func run(cfg Config) error {
 	if cfg.Seed == 0 {
 		cfg.Seed = time.Now().UnixNano()
 	}
+	// BENCH_RATED env wins over the flag so the mage Bench path can forward
+	// it as an extra-var without rewriting the runner invocation. "1"/"true"
+	// turns rated on; any other value (or unset) leaves the flag default.
+	if v := os.Getenv("BENCH_RATED"); v == "1" || v == "true" {
+		cfg.RatedMode = true
+	}
+	if cfg.RatedMode {
+		fmt.Fprintf(os.Stderr, "probatorium-runner: rated mode ON (fractions=%v duration=%s)\n",
+			cfg.RatedFractions, cfg.RatedDuration)
+	}
 	fmt.Fprintf(os.Stderr, "probatorium-runner: seed=%d\n", cfg.Seed)
 
 	if cfg.Out == "" {
@@ -197,7 +323,16 @@ func run(cfg Config) error {
 	}
 
 	scs := scenarios.Registry()
+
+	// In remote-target mode the cross-product of adapters is replaced by
+	// a single synthetic server named after the competitor slug, so the
+	// schedule is scenarios × 1 × runs. The synthetic adapter is still
+	// fed through filterCells so the "<scenario>/<slug>" -cells globs
+	// match the slug ansible passes.
 	advs := servers.AdaptersSorted()
+	if cfg.Target != "" {
+		advs = []servers.Adapter{{Name: remoteServerName(cfg), Category: "remote"}}
+	}
 
 	effSc, effAdv, err := filterCells(scs, advs, cfg.Cells)
 	if err != nil {
@@ -210,7 +345,14 @@ func run(cfg Config) error {
 	// to the scheduler so applicability gating still fires.
 	srvs := make([]servers.Server, 0, len(effAdv))
 	for _, a := range effAdv {
-		srvs = append(srvs, &adapterServer{adapter: a, features: featureSetFor(a)})
+		fs := featureSetFor(a)
+		if cfg.Target != "" {
+			// The runner cannot probe the remote SUT's real capabilities,
+			// so advertise everything and let unsupported protocols surface
+			// as zero-request cells instead of being silently skipped.
+			fs = remoteFeatureSet()
+		}
+		srvs = append(srvs, &adapterServer{adapter: a, features: fs})
 	}
 
 	svcKinds := requiredServiceKinds(effSc)
@@ -292,6 +434,9 @@ func run(cfg Config) error {
 			}
 			cr.Samples = append(cr.Samples, *res.Result)
 			cr.HistogramsB64 = append(cr.HistogramsB64, res.HistogramB64)
+			if cfg.RatedMode {
+				cr.RatedSamples = append(cr.RatedSamples, res.RatedSamples)
+			}
 		}
 		if cerr != nil {
 			fmt.Fprintf(os.Stderr, "  cell error: %v\n", cerr)
@@ -328,9 +473,10 @@ func run(cfg Config) error {
 		cells = append(cells, *collected[k])
 	}
 	agg := report.Aggregate(cells)
+	ts := report.BuildTimeseries(cells)
 
 	doc := buildDocument(cfg, agg, manifestStart)
-	if err := writeReports(cfg, doc, agg, manifestStart); err != nil {
+	if err := writeReports(cfg, doc, agg, ts, manifestStart); err != nil {
 		return fmt.Errorf("write reports: %w", err)
 	}
 
@@ -349,12 +495,38 @@ func run(cfg Config) error {
 type cellOutcome struct {
 	Result       *loadgen.Result
 	HistogramB64 string
+
+	// RatedSamples is the rated sweep for this run (target RPS → P99),
+	// empty when rated mode was off. Threaded into report.CellResult so
+	// Aggregate can reduce it into LatencyAtSLO.
+	RatedSamples []report.RatedSample
 }
 
-// executeCell boots the adapter, drives loadgen, and writes the per-cell
-// JSON file. Returns the loadgen result on success and a synthesised
-// error otherwise; the per-cell JSON is written either way so a partial
-// matrix still produces inspectable artefacts.
+// buildCellConfig maps a scenario's Workload onto baseURL and overlays
+// the run-wide duration / warmup / worker defaults. Pure (no I/O, no
+// live server), so the scenario→loadgen.Config mapping is unit-testable
+// without booting an adapter. Both the local and remote executeCell
+// paths funnel through here.
+func buildCellConfig(cell interleave.Cell, baseURL string, cfg Config) loadgen.Config {
+	lgCfg := cell.Scenario.Workload(baseURL)
+	if lgCfg.URL == "" {
+		lgCfg.URL = baseURL + "/"
+	}
+	lgCfg.Duration = cfg.Duration
+	lgCfg.Warmup = cfg.Warmup
+	if lgCfg.Workers == 0 {
+		lgCfg.Workers = 64
+	}
+	return lgCfg
+}
+
+// executeCell drives loadgen for one cell and writes the per-cell JSON
+// file. In local mode it boots the adapter on a free loopback port and
+// records FD-leak deltas around it; in remote-target mode (cfg.Target
+// set) it skips the adapter lifecycle entirely and drives loadgen at the
+// already-running remote base URL. Returns the loadgen result on success
+// and a synthesised error otherwise; the per-cell JSON is written either
+// way so a partial matrix still produces inspectable artefacts.
 func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cellOutcome, error) {
 	outDir := filepath.Join(cfg.Out, fmt.Sprintf("run%d", cell.RunIdx), cell.Scenario.Name())
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -376,51 +548,53 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 		}
 	}()
 
-	cellRes.FDsBefore = countProcessFDs()
+	var lgURL string
+	if cfg.Target != "" {
+		// Remote-target mode: the SUT is already running on another host.
+		// Skip freePort / StartAdapter / waitForTCP and the FD-leak scope —
+		// the runner's /proc/self/fd is unrelated to the remote SUT, whose
+		// FD/RSS is covered by the cluster-side CPU/observer sidecar.
+		cellRes.TargetAddr = cfg.Target
+		lgURL = cfg.Target
+	} else {
+		cellRes.FDsBefore = countProcessFDs()
 
-	port, err := freePort()
-	if err != nil {
-		cellRes.Error = "free port: " + err.Error()
-		return cellOutcome{}, err
-	}
-	bindAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	cellRes.TargetAddr = bindAddr
-
-	startCtx, startCancel := context.WithTimeout(parent, 10*time.Second)
-	stop, err := servers.StartAdapter(startCtx, cell.Server.Name(), bindAddr)
-	startCancel()
-	if err != nil {
-		cellRes.Error = "adapter start: " + err.Error()
-		return cellOutcome{}, err
-	}
-	defer func() {
-		if serr := stop(); serr != nil {
-			fmt.Fprintf(os.Stderr, "  adapter stop: %v\n", serr)
+		port, err := freePort()
+		if err != nil {
+			cellRes.Error = "free port: " + err.Error()
+			return cellOutcome{}, err
 		}
-		cellRes.FDsAfterStop = countProcessFDs()
-		cellRes.FDsLeaked = cellRes.FDsAfterStop - cellRes.FDsBefore
-		if cellRes.FDsLeaked != 0 || cfg.FDTrace {
-			fmt.Fprintf(os.Stderr, "  cell-fd: scenario=%s server=%s before=%d after=%d diff=%+d\n",
-				cell.Scenario.Name(), cell.Server.Name(),
-				cellRes.FDsBefore, cellRes.FDsAfterStop, cellRes.FDsLeaked)
+		bindAddr := fmt.Sprintf("127.0.0.1:%d", port)
+		cellRes.TargetAddr = bindAddr
+		lgURL = "http://" + bindAddr
+
+		startCtx, startCancel := context.WithTimeout(parent, 10*time.Second)
+		stop, err := servers.StartAdapter(startCtx, cell.Server.Name(), bindAddr)
+		startCancel()
+		if err != nil {
+			cellRes.Error = "adapter start: " + err.Error()
+			return cellOutcome{}, err
 		}
-	}()
+		defer func() {
+			if serr := stop(); serr != nil {
+				fmt.Fprintf(os.Stderr, "  adapter stop: %v\n", serr)
+			}
+			cellRes.FDsAfterStop = countProcessFDs()
+			cellRes.FDsLeaked = cellRes.FDsAfterStop - cellRes.FDsBefore
+			if cellRes.FDsLeaked != 0 || cfg.FDTrace {
+				fmt.Fprintf(os.Stderr, "  cell-fd: scenario=%s server=%s before=%d after=%d diff=%+d\n",
+					cell.Scenario.Name(), cell.Server.Name(),
+					cellRes.FDsBefore, cellRes.FDsAfterStop, cellRes.FDsLeaked)
+			}
+		}()
 
-	if err := waitForTCP(parent, bindAddr, 10*time.Second); err != nil {
-		cellRes.Error = "ready-check: " + err.Error()
-		return cellOutcome{}, err
+		if err := waitForTCP(parent, bindAddr, 10*time.Second); err != nil {
+			cellRes.Error = "ready-check: " + err.Error()
+			return cellOutcome{}, err
+		}
 	}
 
-	lgURL := "http://" + bindAddr
-	lgCfg := cell.Scenario.Workload(lgURL)
-	if lgCfg.URL == "" {
-		lgCfg.URL = lgURL + "/"
-	}
-	lgCfg.Duration = cfg.Duration
-	lgCfg.Warmup = cfg.Warmup
-	if lgCfg.Workers == 0 {
-		lgCfg.Workers = 64
-	}
+	lgCfg := buildCellConfig(cell, lgURL, cfg)
 
 	timeout := 5*cfg.Warmup + 2*cfg.Duration + 60*time.Second
 	cellCtx, cellCancel := context.WithTimeout(parent, timeout)
@@ -443,7 +617,57 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 		cellRes.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s", res.Errors, res.Duration)
 		return out, errors.New(cellRes.Error)
 	}
+
+	// Rated sweep: after the open-loop saturation pass, drive loadgen at
+	// fractions of the measured saturation RPS in closed-loop (CO-corrected)
+	// mode. Each pass sets loadgen.Config.Rate so coordinated-omission
+	// correction is applied by loadgen itself — never hand-roll a pacer here,
+	// which would defeat the correction. The saturation pass is reused as the
+	// scale anchor, so the targets stay adapter-relative.
+	if cfg.RatedMode && res != nil && res.RequestsPerSec > 0 {
+		cellRes.SaturationModeRPS = res.RequestsPerSec
+		samples, passes := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
+		out.RatedSamples = samples
+		cellRes.RatedPasses = passes
+	}
 	return out, nil
+}
+
+// runRatedSweep drives one rated (closed-loop, CO-corrected) pass per
+// configured fraction of saturationRPS, returning the (target, P99) samples
+// for aggregation plus the on-disk pass records. A pass that errors or returns
+// zero requests is skipped rather than failing the cell — a partial sweep is
+// still useful, and the saturation pass already succeeded.
+func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, saturationRPS float64) ([]report.RatedSample, []ratedPassFile) {
+	var samples []report.RatedSample
+	var passes []ratedPassFile
+	for _, frac := range cfg.RatedFractions {
+		target := saturationRPS * frac
+		if target <= 0 {
+			continue
+		}
+		lgCfg := base
+		lgCfg.Rate = target
+		lgCfg.Duration = cfg.RatedDuration
+
+		timeout := 5*cfg.Warmup + 2*cfg.RatedDuration + 60*time.Second
+		ctx, cancel := context.WithTimeout(parent, timeout)
+		bm, err := loadgen.New(lgCfg)
+		if err != nil {
+			cancel()
+			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: loadgen.New: %v\n", target, err)
+			continue
+		}
+		rres, err := bm.Run(ctx)
+		cancel()
+		if err != nil || rres == nil || rres.Requests == 0 {
+			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: skipped (err=%v)\n", target, err)
+			continue
+		}
+		samples = append(samples, report.RatedSample{TargetRPS: target, P99: rres.Latency.P99})
+		passes = append(passes, ratedPassFile{TargetRPS: target, P99: rres.Latency.P99})
+	}
+	return samples, passes
 }
 
 // adapterServer adapts an [servers.Adapter] to the in-process
@@ -499,6 +723,32 @@ func featureSetFor(a servers.Adapter) servers.FeatureSet {
 		fs.Middleware = true
 	}
 	return fs
+}
+
+// remoteServerName resolves the synthetic server name used in
+// remote-target mode: the -server-name slug when set, else the bare
+// target URL so the cell is still attributable.
+func remoteServerName(cfg Config) string {
+	if cfg.ServerName != "" {
+		return cfg.ServerName
+	}
+	return cfg.Target
+}
+
+// remoteFeatureSet is the permissive capability set advertised for the
+// synthetic remote server. Every facet is on so no scenario is gated
+// out before reaching the SUT; protocols the SUT cannot speak surface as
+// zero-request cells (the executeCell guard) rather than missing rows.
+func remoteFeatureSet() servers.FeatureSet {
+	return servers.FeatureSet{
+		HTTP1:         true,
+		HTTP2C:        true,
+		H2CUpgrade:    true,
+		Auto:          true,
+		Drivers:       true,
+		Middleware:    true,
+		AsyncHandlers: true,
+	}
 }
 
 // filterCells applies the comma-separated -cells glob (with optional "!"
@@ -701,11 +951,23 @@ func writeManifest(cfg Config, scs []scenarios.Scenario, srvs []servers.Server, 
 	return writeJSON(filepath.Join(cfg.Out, "manifest.json"), &m)
 }
 
-// buildDocument folds the per-cell aggregate map into a v5.0 Document.
-// Per-server fields (Category / Language / Framework / Engine) are read
-// from the registry so the output schema is grounded against the
-// adapter table rather than the on-disk JSON.
+// buildDocument folds the per-cell aggregate map into the canonical v5.1
+// Document via report.BuildDocument. Per-server metadata + the run's
+// Environment / BenchmarkConfig are projected here so report/ stays a
+// leaf node that never imports servers/ or scenarios/.
 func buildDocument(cfg Config, agg map[string]report.CellAggregate, started time.Time) *report.Document {
+	env := report.Environment{
+		// In-process runs drive loopback against the local host; the
+		// kernel-sysctl capture is a cluster-only concern, so the
+		// runner emits an empty (non-nil) slice to satisfy the schema's
+		// required environment block.
+		KernelSysctlsApplied: []string{},
+		Fabric:               "loopback",
+	}
+	if hn, err := os.Hostname(); err == nil {
+		env.LoadgenHost = hn
+	}
+
 	bench := report.BenchmarkConfig{
 		StartedAt:       started,
 		FinishedAt:      time.Now().UTC(),
@@ -713,84 +975,79 @@ func buildDocument(cfg Config, agg map[string]report.CellAggregate, started time
 		Duration:        cfg.Duration,
 		Warmup:          cfg.Warmup,
 		GitRef:          shortGitSHA(),
-		LoadgenVer:      "",
-		CelerisVer:      "",
+		LoadgenVer:      modRequireVersion("github.com/goceleris/loadgen"),
+		CelerisVer:      modRequireVersion("github.com/goceleris/celeris"),
 		ScenariosFilter: "",
 		AdaptersFilter:  cfg.Cells,
 	}
 
-	// Bucket aggregates by adapter so each entry in Benchmarks covers
-	// every scenario for one server.
-	byAdapter := map[string]*report.ServerResult{}
-	for _, c := range agg {
-		sr := byAdapter[c.ServerName]
-		if sr == nil {
-			a, ok := servers.Registry[c.ServerName]
-			sr = &report.ServerResult{
-				Name:                    c.ServerName,
-				SaturationModeRPS:       map[string]float64{},
-				RatedModeP99AtTargetRPS: map[string]time.Duration{},
-				LatencyAtSLO:            map[string]map[int]int{},
-				HdrHistogramB64:         map[string]string{},
-				LoadgenCPUP95:           map[string]float64{},
-				SentVsHandledDeltaPct:   map[string]float64{},
-			}
-			if ok {
-				sr.Category = a.Category
-				sr.Language = a.Language
-				sr.Framework = a.Framework
-				sr.Engine = a.Engine
-			}
-			byAdapter[c.ServerName] = sr
-		}
-		sr.SaturationModeRPS[c.ScenarioName] = c.RPSMedian
-		// LatencyMerged is exact when present; fall back to the median
-		// snapshot otherwise.
-		lat := c.LatencyMerged
-		if lat == (report.Percentiles{}) {
-			lat = c.LatencyMedian
-		}
-		sr.RatedModeP99AtTargetRPS[c.ScenarioName] = lat.P99
-		// LatencyAtSLO synthesised by sliding the merged P99 against the
-		// canonical thresholds in report.SLOThresholds: if P99 ≤ N ms, the
-		// adapter sustained the median RPS at N. Wave 4 / 5 will replace
-		// this with proper rated-load probing per threshold.
-		if _, ok := sr.LatencyAtSLO[c.ScenarioName]; !ok {
-			sr.LatencyAtSLO[c.ScenarioName] = map[int]int{}
-		}
-		for _, ms := range report.SLOThresholds {
-			if lat.P99 <= time.Duration(ms)*time.Millisecond {
-				sr.LatencyAtSLO[c.ScenarioName][ms] = int(c.RPSMedian)
-			}
-		}
-		if c.MergedHistogramB64 != "" {
-			sr.HdrHistogramB64[c.ScenarioName] = c.MergedHistogramB64
-		}
-	}
-
-	out := &report.Document{
-		SchemaVersion:   report.SchemaVersion,
+	return report.BuildDocument(report.BuildInput{
 		HostArchPair:    runtime.GOOS + "/" + runtime.GOARCH,
+		Environment:     env,
 		BenchmarkConfig: bench,
-	}
-	names := make([]string, 0, len(byAdapter))
-	for k := range byAdapter {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		out.Benchmarks = append(out.Benchmarks, *byAdapter[n])
+		Servers:         serverMetaFromRegistry(),
+		Agg:             agg,
+	})
+}
+
+// serverMetaFromRegistry projects servers.Registry into the report-side
+// ServerMeta map BuildDocument consumes. LanguageVersion is the runner's
+// own toolchain for Go adapters; CompileOptions mirror the canonical
+// build path (crossCompileGoBinary for Go, the native role flags for
+// rust/python/bun).
+func serverMetaFromRegistry() map[string]report.ServerMeta {
+	out := make(map[string]report.ServerMeta, len(servers.Registry))
+	for name, a := range servers.Registry {
+		m := report.ServerMeta{
+			Category:       a.Category,
+			Language:       a.Language,
+			Framework:      a.Framework,
+			Engine:         a.Engine,
+			CompileOptions: report.CompileOptionsFor(a.Language, runtime.GOARCH),
+		}
+		if a.Language == "go" {
+			m.LanguageVersion = runtime.Version()
+		}
+		out[name] = m
 	}
 	return out
 }
 
+// modRequireVersion returns the version pinned for modPath in the
+// caller's go.mod require block, or "" when absent. Mirrors
+// celerisVersion's go.mod parse without the env-override / "dev"
+// fallback so the field stays empty (rather than misleading) when the
+// dependency isn't present.
+func modRequireVersion(modPath string) string {
+	data, err := os.ReadFile("go.mod")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 2 && fields[0] == modPath {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
 // writeReports persists the v5.0 results.json + report.md in the run's
-// output directory. Both renderers tolerate empty inputs so a run with
-// zero successful cells still produces files for the CI gate to read.
-func writeReports(cfg Config, doc *report.Document, agg map[string]report.CellAggregate, started time.Time) error {
+// output directory, plus the gzip time-series sidecar. The summary
+// renderers tolerate empty inputs so a run with zero successful cells
+// still produces files for the CI gate to read.
+func writeReports(cfg Config, doc *report.Document, agg map[string]report.CellAggregate, ts *report.TimeseriesDoc, started time.Time) error {
 	jsonPath := filepath.Join(cfg.Out, "results.json")
 	if err := writeJSON(jsonPath, doc); err != nil {
 		return fmt.Errorf("write %s: %w", jsonPath, err)
+	}
+
+	tsPath := cfg.Timeseries
+	if tsPath == "" {
+		tsPath = filepath.Join(cfg.Out, "timeseries.json.gz")
+	}
+	if err := writeTimeseries(tsPath, ts); err != nil {
+		return fmt.Errorf("write %s: %w", tsPath, err)
 	}
 
 	mdPath := filepath.Join(cfg.Out, "report.md")
@@ -813,7 +1070,29 @@ func writeReports(cfg Config, doc *report.Document, agg map[string]report.CellAg
 	if err := report.WriteMarkdown(f, doc, agg, meta); err != nil {
 		return fmt.Errorf("write %s: %w", mdPath, err)
 	}
+	if section := report.MarkdownTimeseries(ts); section != "" {
+		if _, err := io.WriteString(f, section); err != nil {
+			return fmt.Errorf("write timeseries section %s: %w", mdPath, err)
+		}
+	}
 	return nil
+}
+
+// writeTimeseries persists the gzip time-series sidecar. A nil or
+// empty-scenario doc is tolerated (still written) so downstream tooling
+// can rely on the file existing after any run.
+func writeTimeseries(p string, ts *report.TimeseriesDoc) error {
+	if ts == nil {
+		ts = report.BuildTimeseries(nil)
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	data, err := ts.MarshalGzip()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, data, 0o644)
 }
 
 // shortGitSHA returns the abbreviated HEAD SHA, or "" if git is not

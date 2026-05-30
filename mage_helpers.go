@@ -212,3 +212,22 @@ func celerisVersion() (string, error) {
 	}
 	return "dev", nil
 }
+
+// goModRequireVersion returns the version pinned for modPath in the
+// caller's go.mod, or "" when absent. Used to populate the v5.1
+// BenchmarkConfig.loadgen_version from the require block without the
+// env-override / "dev" fallback celerisVersion applies — an absent
+// dependency should leave the field empty rather than misleading.
+func goModRequireVersion(modPath string) string {
+	data, err := os.ReadFile("go.mod")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 2 && fields[0] == modPath {
+			return fields[1]
+		}
+	}
+	return ""
+}

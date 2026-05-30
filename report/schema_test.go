@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +107,28 @@ func TestSchemaRoundTrip(t *testing.T) {
 				SentVsHandledDeltaPct: map[string]float64{
 					"get-json": 0.001,
 				},
+				Resources: map[string]*ResourceStats{
+					"get-json": {
+						Summary: ResourceSummary{
+							PeakRSSBytes:   ptrI64(150 * 1024 * 1024),
+							SteadyRSSBytes: ptrI64(140 * 1024 * 1024),
+							MeanCPUPct:     ptrF64(42.5),
+							GCPauseP99Ns:   ptrI64(300000),
+							GoroutineHWM:   ptrI64(512),
+							FDHWM:          ptrI64(48),
+						},
+						Series: []ResourcePoint{
+							{
+								TSUnix:         100,
+								RSSBytes:       ptrI64(150 * 1024 * 1024),
+								CPUPct:         ptrF64(42.5),
+								Goroutines:     ptrI64(512),
+								HeapInuseBytes: ptrI64(36 * 1024 * 1024),
+								FDCount:        ptrI64(48),
+							},
+						},
+					},
+				},
 			},
 		},
 		Validation: &ValidationResults{
@@ -149,6 +172,21 @@ func TestSchemaRoundTrip(t *testing.T) {
 	}
 	if rt.Soak == nil || rt.Soak.Duration != 6*time.Hour {
 		t.Errorf("Soak: drift, got %+v", rt.Soak)
+	}
+	// Resources (#154): the nullable metric pointers and the series must
+	// survive the JSON round-trip and the schema validation above.
+	res := rt.Benchmarks[0].Resources["get-json"]
+	if res == nil {
+		t.Fatal("Resources[get-json]: dropped on decode")
+	}
+	if res.Summary.PeakRSSBytes == nil || *res.Summary.PeakRSSBytes != 150*1024*1024 {
+		t.Errorf("Resources PeakRSSBytes: drift, got %v", res.Summary.PeakRSSBytes)
+	}
+	if res.Summary.GoroutineHWM == nil || *res.Summary.GoroutineHWM != 512 {
+		t.Errorf("Resources GoroutineHWM: drift, got %v", res.Summary.GoroutineHWM)
+	}
+	if len(res.Series) != 1 || res.Series[0].TSUnix != 100 {
+		t.Errorf("Resources Series: drift, got %+v", res.Series)
 	}
 }
 
@@ -261,5 +299,140 @@ func TestSchemaBackCompatV4(t *testing.T) {
 	}
 	if doc.Soak != nil {
 		t.Errorf("Soak: want nil for v4 doc, got %+v", doc.Soak)
+	}
+}
+
+// TestBuildDocument feeds a synthetic aggregate + environment +
+// benchmark config + server-meta map into BuildDocument and asserts the
+// returned *Document marshals, validates against schema_v5.json, is
+// sorted by Name, carries the canonical SchemaVersion, and emits NONE of
+// the retired loose v5.0 keys ("hosts" / top-level "version").
+func TestBuildDocument(t *testing.T) {
+	t.Parallel()
+	sch := loadSchema(t)
+
+	started := time.Date(2026, 5, 30, 9, 0, 0, 0, time.UTC)
+	agg := map[string]CellAggregate{
+		CellID("get-json", "celeris-std-h1"): {
+			ScenarioName:  "get-json",
+			ServerName:    "celeris-std-h1",
+			Category:      "static",
+			N:             3,
+			RPSMedian:     312000,
+			LatencyMerged: Percentiles{P50: 200 * time.Microsecond, P99: 8 * time.Millisecond},
+			// Measured rated sweep (probatorium#156): LatencyAtSLO comes ONLY
+			// from real rated probing now, not slid off the saturation P99. A
+			// single 312000-RPS rated pass at P99 8ms clears every SLO budget.
+			RatedP99ByTarget: map[int]time.Duration{312000: 8 * time.Millisecond},
+			LatencyAtSLO:     map[int]int{10: 312000, 50: 312000, 100: 312000, 500: 312000, 1000: 312000},
+		},
+		CellID("get-text", "celeris-std-h1"): {
+			ScenarioName:  "get-text",
+			ServerName:    "celeris-std-h1",
+			Category:      "static",
+			N:             3,
+			RPSMedian:     410000,
+			LatencyMerged: Percentiles{P50: 150 * time.Microsecond, P99: 40 * time.Millisecond},
+			// 410000-RPS rated pass at P99 40ms clears 50/100/500/1000 ms but
+			// NOT the 10ms budget.
+			RatedP99ByTarget: map[int]time.Duration{410000: 40 * time.Millisecond},
+			LatencyAtSLO:     map[int]int{50: 410000, 100: 410000, 500: 410000, 1000: 410000},
+		},
+		// Second server so Benchmarks-sorting is observable.
+		CellID("get-json", "gin-h1"): {
+			ScenarioName:  "get-json",
+			ServerName:    "gin-h1",
+			Category:      "static",
+			N:             3,
+			RPSMedian:     120000,
+			LatencyMedian: Percentiles{P99: 120 * time.Millisecond},
+		},
+	}
+
+	doc := BuildDocument(BuildInput{
+		HostArchPair: "linux/amd64",
+		Environment: Environment{
+			KernelSysctlsApplied: []string{},
+			LoadgenHost:          "msa2-client",
+			Fabric:               "3-host LACP 20G",
+		},
+		BenchmarkConfig: BenchmarkConfig{
+			StartedAt:  started,
+			FinishedAt: started.Add(2 * time.Minute),
+			Runs:       3,
+			Duration:   2 * time.Minute,
+			Warmup:     10 * time.Second,
+			GitRef:     "v1.4.12",
+			LoadgenVer: "v1.4.4",
+			CelerisVer: "v1.4.12",
+		},
+		Servers: map[string]ServerMeta{
+			"celeris-std-h1": {
+				Category:        "celeris",
+				Language:        "go",
+				LanguageVersion: "go1.26.3",
+				Framework:       "celeris",
+				Engine:          "std-h1",
+				CompileOptions:  CompileOptionsFor("go", "amd64"),
+			},
+			"gin-h1": {
+				Category:       "go-net-http",
+				Language:       "go",
+				Framework:      "gin",
+				Engine:         "h1",
+				CompileOptions: CompileOptionsFor("go", "amd64"),
+			},
+		},
+		Agg: agg,
+	})
+
+	if doc.SchemaVersion != SchemaVersion {
+		t.Errorf("SchemaVersion: want %q got %q", SchemaVersion, doc.SchemaVersion)
+	}
+	if doc.SchemaVersion != "5.2" {
+		t.Errorf("SchemaVersion drift: want 5.2 got %q", doc.SchemaVersion)
+	}
+	if len(doc.Benchmarks) != 2 {
+		t.Fatalf("Benchmarks: want 2 got %d", len(doc.Benchmarks))
+	}
+	// Sorted by Name: "celeris-std-h1" < "gin-h1".
+	if doc.Benchmarks[0].Name != "celeris-std-h1" || doc.Benchmarks[1].Name != "gin-h1" {
+		t.Errorf("Benchmarks not sorted by Name: %q, %q",
+			doc.Benchmarks[0].Name, doc.Benchmarks[1].Name)
+	}
+	// Per-server metadata projected from ServerMeta.
+	if got := doc.Benchmarks[0].CompileOptions; len(got) == 0 {
+		t.Errorf("CompileOptions: want non-empty for go adapter")
+	}
+	if got := doc.Benchmarks[0].LanguageVersion; got != "go1.26.3" {
+		t.Errorf("LanguageVersion: want go1.26.3 got %q", got)
+	}
+	// LatencyAtSLO measured (probatorium#156): the rated sweep's get-json
+	// pass (P99 8ms) clears every SLO; get-text (P99 40ms) clears
+	// 50/100/500/1000 ms but NOT 10 ms.
+	cel := doc.Benchmarks[0]
+	if got := cel.LatencyAtSLO["get-json"][10]; got != 312000 {
+		t.Errorf("LatencyAtSLO[get-json][10]: want 312000 got %d", got)
+	}
+	if _, present := cel.LatencyAtSLO["get-text"][10]; present {
+		t.Errorf("LatencyAtSLO[get-text][10]: want absent (P99=40ms > 10ms)")
+	}
+	if got := cel.LatencyAtSLO["get-text"][50]; got != 410000 {
+		t.Errorf("LatencyAtSLO[get-text][50]: want 410000 got %d", got)
+	}
+
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	validateAny(t, sch, raw)
+
+	// The retired loose v5.0 shape must NOT appear in the canonical output.
+	s := string(raw)
+	if strings.Contains(s, `"hosts"`) {
+		t.Errorf("output carries retired loose key \"hosts\"")
+	}
+	if strings.Contains(s, `"version":"5.0"`) || strings.Contains(s, `"version": "5.0"`) {
+		t.Errorf("output carries retired top-level \"version\":\"5.0\"")
 	}
 }

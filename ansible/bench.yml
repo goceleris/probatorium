@@ -1,9 +1,18 @@
 ---
-# Distributed bench: server (celeris OR competitor) on bench_target,
-# loadgen on msa2-client, traffic over the 20G LACP fabric (lan_ip,
-# NEVER tailnet/Tailscale). Loops the loadgen across every entry in
-# competitor_set, interleaving the launches so a transient cluster blip
-# does not bias one framework over another.
+# Distributed bench: server (celeris OR competitor) on bench_target, the
+# Go runner (driving loadgen in-process) on msa2-client, traffic over the
+# 20G LACP fabric (lan_ip, NEVER tailnet/Tailscale). Loops over every
+# entry in competitor_set, interleaving the launches so a transient
+# cluster blip does not bias one framework over another. Each cell runs
+# the runner once (-runs 1) and the runner expands the scenario catalogue
+# against the remote SUT.
+#
+# Each cell drives the Go runner (cmd/runner) once against the remote
+# SUT; the runner expands the full scenario catalogue itself (method /
+# path / protocol / connections / body are derived per scenario), so the
+# old single-scenario loadgen knobs (bench_url_path / bench_h2 /
+# bench_h2c_upgrade / bench_connections) no longer apply on the bench
+# path and have been dropped.
 #
 # Required extra-vars:
 #   bench_target          single host name from [bench_targets]
@@ -14,12 +23,18 @@
 #                         staged under {{ bench_root }}/competitors/<slug>
 #                         by `ansible-playbook deploy.yml`.
 #   bench_port            port the server binds (default: 8080)
-#   bench_url_path        path component of loadgen -url (default: /)
-#   bench_duration        loadgen -duration (default: 30s)
-#   bench_warmup          loadgen -warmup (default: 5s)
-#   bench_connections     loadgen -connections (default: 256)
-#   bench_workers         loadgen -workers (0 → loadgen default)
-#   bench_h2              loadgen -h2 flag value (default: false)
+#   bench_duration        runner -duration, per scenario (default: 30s)
+#   bench_warmup          runner -warmup, per scenario (default: 5s)
+#   bench_cells           cell glob forwarded to runner -cells over
+#                         "<scenario>/<competitor>" (default: *). The
+#                         server half is the competitor slug.
+#   bench_rated           when true (1), the runner also drives a Gil-Tene
+#                         rated (closed-loop, CO-corrected) sweep per cell and
+#                         emits latency_at_slo for the regression gate. Default
+#                         false; opt-in via BENCH_RATED=1 (budget issue #166).
+#   bench_rated_duration  measurement window per rated pass (default: 30s).
+#   bench_scenario_count  upper bound on scenarios per cell, used only to
+#                         size the mpstat samplers (default: 28).
 #   bench_runs            number of repetitions per competitor (default: 3)
 #   results_local_dir     where to fetch outputs back to on the Mac
 #
@@ -28,7 +43,11 @@
 # competitor sees the same coarse-grained slice of cluster state
 # (kernel cache warmth, port-pool depletion, neighbour interference).
 # Failure to interleave was responsible for the v1.4.1 ranking flip
-# between fasthttp and gnet on msr1.
+# between fasthttp and gnet on msr1. The runner is deliberately invoked
+# with -runs 1 per cell so run repetition stays in THIS outer loop —
+# folding runs into one runner pass (-runs N) would run all of
+# competitor A's runs back-to-back and regress that guarantee. The
+# runner adds only the scenario inner loop within each cell.
 
 - name: Stage bench-run state
   hosts: cluster

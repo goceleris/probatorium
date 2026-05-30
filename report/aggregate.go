@@ -48,6 +48,20 @@ type CellResult struct {
 	Category      string
 	Samples       []loadgen.Result
 	HistogramsB64 []string
+
+	// RatedSamples is a parallel slice — index i pairs with Samples[i] —
+	// of the rated (closed-loop, coordinated-omission-corrected) sweep for
+	// that run: one (target RPS, P99) per rated pass. Nil when rated mode
+	// was off, in which case LatencyAtSLO stays nil and the regression gate
+	// sees no signal for this cell.
+	RatedSamples [][]RatedSample
+}
+
+// RatedSample is one rated pass: a target offered load and the
+// coordinated-omission-corrected P99 measured at that load.
+type RatedSample struct {
+	TargetRPS float64
+	P99       time.Duration
 }
 
 // Percentiles captures the latency percentile snapshot used by
@@ -91,6 +105,17 @@ type CellAggregate struct {
 
 	Errors      int64
 	BytesMedian float64
+
+	// RatedP99ByTarget maps an integer target-RPS bucket to the median
+	// (across runs) coordinated-omission-corrected P99 measured at that
+	// offered load. Nil when rated mode was off.
+	RatedP99ByTarget map[int]time.Duration
+
+	// LatencyAtSLO maps each SLO budget (ms, from SLOThresholds) to the
+	// maximum target RPS whose median P99 stayed under that budget. Bigger
+	// is better — this is the leaf the regression gate keys on. Nil when
+	// rated mode was off, so a non-rated run emits no fake gate signal.
+	LatencyAtSLO map[int]int
 }
 
 // ErrNotImplemented is returned by scaffold stubs that have not yet been
@@ -146,8 +171,79 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 			agg.MergedHistogramB64 = b64
 		}
 
+		reduceRated(cell.RatedSamples, &agg)
+
 		out[CellID(cell.ScenarioName, cell.ServerName)] = agg
 	}
+	return out
+}
+
+// reduceRated folds the per-run rated sweeps into RatedP99ByTarget (median
+// P99 per integer target RPS, across runs) and LatencyAtSLO (the max
+// sustained target RPS whose median P99 stays under each SLO budget). Both
+// maps stay nil when no rated samples are present, so a non-rated cell emits
+// no latency_at_slo leaf and the regression gate sees nothing to compare.
+//
+// LatencyAtSLO is a throughput-at-SLO metric (bigger is better) — never a
+// raw latency — which is what keeps the gate's bigger-is-better sign correct.
+func reduceRated(runs [][]RatedSample, agg *CellAggregate) {
+	byTarget := map[int][]int64{}
+	for _, run := range runs {
+		for _, rs := range run {
+			t := int(rs.TargetRPS + 0.5)
+			byTarget[t] = append(byTarget[t], int64(rs.P99))
+		}
+	}
+	if len(byTarget) == 0 {
+		return
+	}
+
+	medByTarget := make(map[int]time.Duration, len(byTarget))
+	for t, ps := range byTarget {
+		medByTarget[t] = time.Duration(medianInt64(ps))
+	}
+	agg.RatedP99ByTarget = medByTarget
+
+	slo := make(map[int]int, len(SLOThresholds))
+	for _, ms := range SLOThresholds {
+		budget := time.Duration(ms) * time.Millisecond
+		best := 0
+		for t, p99 := range medByTarget {
+			if p99 <= budget && t > best {
+				best = t
+			}
+		}
+		if best > 0 {
+			slo[ms] = best
+		}
+	}
+	if len(slo) > 0 {
+		agg.LatencyAtSLO = slo
+	}
+}
+
+// BuildTimeseries folds the SAME []CellResult that [Aggregate] consumes
+// into a standalone time-series sidecar [TimeseriesDoc]. CellResult
+// already carries the per-run loadgen.Timeseries on its Samples, so no
+// struct change is needed and the summary Document is untouched.
+//
+// Scenarios are sorted by (Scenario, Server) so the sidecar (modulo its
+// GeneratedAt stamp) is byte-stable across permutations of the input.
+func BuildTimeseries(cells []CellResult) *TimeseriesDoc {
+	out := &TimeseriesDoc{
+		GeneratedAt:   time.Now().UTC(),
+		SchemaVersion: TimeseriesSchemaVersion,
+	}
+	for _, c := range cells {
+		out.Scenarios = append(out.Scenarios,
+			BuildScenarioSeries(c.ScenarioName, c.ServerName, c.Category, c.Samples))
+	}
+	sort.Slice(out.Scenarios, func(i, j int) bool {
+		if out.Scenarios[i].Scenario != out.Scenarios[j].Scenario {
+			return out.Scenarios[i].Scenario < out.Scenarios[j].Scenario
+		}
+		return out.Scenarios[i].Server < out.Scenarios[j].Server
+	})
 	return out
 }
 

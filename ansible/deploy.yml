@@ -114,16 +114,21 @@
     # ---------- core Go artefacts ----------
     # Each is conditionally pushed only if the corresponding extra-var is
     # defined, so a partial deploy (e.g. just runner+loadgen) is valid.
-    # Loadgen always lands on msa2-client; everything else lands on
-    # bench_targets. observer/validator can land on either.
+    # Loadgen always lands on msa2-client; observer/validator can land on
+    # either. Since #152 the bench path RUNS the runner on the loadgen
+    # host (it drives loadgen in-process against the remote SUT), so the
+    # runner must land on msa2-client too — it is also pushed to
+    # bench_targets so the in-process / local-adapter mode still works
+    # there for ad-hoc runs.
 
-    - name: Push runner binary (bench_targets)
+    - name: Push runner binary (bench_targets + loadgen host)
       ansible.builtin.copy:
         src: "{{ runner_binary_amd64 if arch == 'amd64' else runner_binary_arm64 }}"
         dest: "{{ bench_root }}/runner"
         mode: '0755'
       when:
-        - inventory_hostname in groups['bench_targets']
+        - inventory_hostname in groups['bench_targets'] or
+          inventory_hostname == "msa2-client"
         - (arch == 'amd64' and runner_binary_amd64 is defined) or
           (arch == 'arm64' and runner_binary_arm64 is defined)
 

@@ -1,8 +1,18 @@
 ---
 # One bench cell: (run_index, competitor_slug). Wraps a server start +
-# mpstat samplers on both sides + loadgen invocation + clean teardown.
+# mpstat samplers on both sides + a single runner invocation + clean
+# teardown.
 #
 # Loop var: cell = [run_index, competitor_slug]
+#
+# Since #152 the bench path drives the Go runner (not the bare loadgen
+# binary): the runner is invoked once per cell on msa2-client with
+# -runs 1 and expands the full scenario catalogue itself against the
+# already-running remote SUT. So a single cell now runs N_scenarios
+# back-to-back rather than one "/" GET. Ansible keeps the outer
+# (run_index x competitor) interleaving (see bench.yml); the runner adds
+# the scenario inner loop and writes run0/<scenario>/<server>.json under
+# the cell dir.
 #
 # Two-host coordinated. Tasks gate themselves with `when: inventory_hostname ...`
 # rather than re-running the same playbook on a smaller `hosts:` set,
@@ -17,6 +27,22 @@
     path: "{{ cell_dir }}"
     state: directory
     mode: '0755'
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | size mpstat for the whole runner pass"
+  # The runner now runs N scenarios back-to-back inside one cell, so the
+  # mpstat samplers must cover the WHOLE pass, not a single
+  # (warmup+duration) window. Size = n_scenarios x (warmup + duration) +
+  # pad. bench_scenario_count defaults to a safe upper bound (the static
+  # + concurrency catalogue is ~16 cells; 28 covers the full catalogue
+  # with chain/driver), and BENCH_CELLS filtering only ever shrinks the
+  # real count, so over-sizing is harmless — mpstat is killed in
+  # teardown once the runner returns.
+  ansible.builtin.set_fact:
+    mpstat_seconds: >-
+      {{ ((bench_scenario_count | default(28) | int)
+          * (((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
+             + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)))
+         + 10 }}
 
 # ---------- bench target side: start server + mpstat ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop any prior server"
@@ -91,10 +117,7 @@
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (server side)"
   ansible.builtin.shell: |
-    nohup mpstat -P ALL 1 \
-      {{ ((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
-         + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)
-         + 5 }} \
+    nohup mpstat -P ALL 1 {{ mpstat_seconds }} \
       > {{ cell_dir }}/cpu.log 2>&1 &
     disown
     echo $! > {{ cell_dir }}/mpstat.pid
@@ -132,13 +155,10 @@
   changed_when: false
   when: inventory_hostname == bench_target
 
-# ---------- loadgen side: mpstat + loadgen ----------
+# ---------- loadgen side: mpstat + runner ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (loadgen side)"
   ansible.builtin.shell: |
-    nohup mpstat -P ALL 1 \
-      {{ ((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
-         + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)
-         + 5 }} \
+    nohup mpstat -P ALL 1 {{ mpstat_seconds }} \
       > {{ cell_dir }}/cpu.log 2>&1 &
     disown
     echo $! > {{ cell_dir }}/mpstat.pid
@@ -147,25 +167,42 @@
   changed_when: false
   when: inventory_hostname == "msa2-client"
 
-- name: "{{ cell.1 }} run={{ cell.0 }} | run loadgen against bench target"
-  # Flag names must match the loadgen CLI in cmd/loadgen/main.go:
-  #   -target / -duration / -warmup / -connections / -workers
-  #   -http2 / -h2c-upgrade / -out
-  # The (competitor, run-index) tuple is carried out-of-band via the
-  # per-cell output directory naming convention (00-<slug>/...), so the
-  # binary doesn't need a CLI knob for them.
+- name: "{{ cell.1 }} run={{ cell.0 }} | run runner against bench target"
+  # Flag names must match the runner CLI in cmd/runner/main.go:
+  #   -target / -server-name / -runs / -duration / -warmup /
+  #   -cells / -services / -out
+  # The runner expands the full scenario catalogue (filtered by -cells)
+  # for THIS one (run_index, competitor) cell, driving loadgen in-process
+  # against the remote SUT over the 20G fabric. -runs 1 keeps run
+  # repetition in ansible's outer loop so the cross-competitor x run
+  # interleaving is preserved. -services none because the loadgen box has
+  # no docker; driver/chain backends are wired on the SUT side. The
+  # runner writes run0/<scenario>/<server>.json plus its own
+  # results.json/report.md under the cell dir; mage_bench.go ingests the
+  # per-scenario JSON.
+  #
+  # NOTE: there is intentionally no -connections flag — connection count
+  # is a per-scenario property (each scenario's Workload() sets it, e.g.
+  # 128 for get-json, 32 for the H2 variants, 1 for single-conn). The
+  # legacy bench_connections knob applied only to the old single-scenario
+  # loadgen path and no longer maps onto the runner's per-scenario model.
+  #
+  # The -cells server-half matches the competitor slug (the runner's
+  # synthetic remote server is named via -server-name), so e.g.
+  # BENCH_CELLS='get-*/*' or '*/celeris-*' both work.
   ansible.builtin.shell: |
     cd {{ bench_root }}
-    ./loadgen \
-      -target http://{{ target_ip }}:{{ bench_port | default(8080) }}{{ bench_url_path | default('/') }} \
+    ./runner \
+      -target http://{{ target_ip }}:{{ bench_port | default(8080) }} \
+      -server-name {{ cell.1 }} \
+      -runs 1 \
       -duration {{ bench_duration | default('30s') }} \
       -warmup {{ bench_warmup | default('5s') }} \
-      -connections {{ bench_connections | default(256) }} \
-      {% if bench_workers | default(0) | int > 0 %}-workers {{ bench_workers }}{% endif %} \
-      {% if bench_h2 | default(false) | bool %}-http2{% endif %} \
-      {% if bench_h2c_upgrade | default(false) | bool %}-h2c-upgrade{% endif %} \
-      -out {{ cell_dir }}/loadgen.json \
-      2> {{ cell_dir }}/loadgen.stderr
+      -cells '{{ bench_cells | default('*') }}' \
+      {% if bench_rated | default(false) | bool %}-rated -rated-duration {{ bench_rated_duration | default('30s') }} {% endif %}\
+      -services none \
+      -out {{ cell_dir }} \
+      2> {{ cell_dir }}/runner.stderr
   args:
     executable: /bin/bash
   when: inventory_hostname == "msa2-client"

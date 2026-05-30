@@ -32,6 +32,9 @@ func TestParseArgs_DefaultsMatchLoadgenLibrary(t *testing.T) {
 	if cfg.Rate != 0 {
 		t.Errorf("Rate: got %d, want 0 (saturation)", cfg.Rate)
 	}
+	if cfg.Rated {
+		t.Errorf("Rated: rated sweep must default OFF")
+	}
 }
 
 func TestParseArgs_FlagOverrides(t *testing.T) {
@@ -90,14 +93,30 @@ func TestParseArgs_RejectsUnknownFlag(t *testing.T) {
 	}
 }
 
-func TestRun_RejectsRatedMode(t *testing.T) {
-	// Rated mode is reserved for loadgen v2; the CLI must refuse with
-	// a clear message instead of silently faking saturation numbers.
-	cfg := DefaultConfig()
-	cfg.Rate = 50
-	err := run(cfg)
-	if err == nil {
-		t.Fatal("expected error for -rate >0")
+// TestParseArgs_RateNoLongerRejected confirms -rate >0 parses cleanly
+// (probatorium#156 removed the loadgen-v2 reservation; -rate now drives a
+// direct constant-rate pass rather than erroring).
+func TestParseArgs_RateNoLongerRejected(t *testing.T) {
+	cfg, err := ParseArgs([]string{"-rate", "250"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("ParseArgs(-rate 250): %v", err)
+	}
+	if cfg.Rate != 250 {
+		t.Errorf("Rate = %d, want 250", cfg.Rate)
+	}
+}
+
+// TestParseArgs_RatedFlags confirms the Gil-Tene rated sweep flags parse.
+func TestParseArgs_RatedFlags(t *testing.T) {
+	cfg, err := ParseArgs([]string{"-rated", "-rated-duration", "3s"}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("ParseArgs(-rated): %v", err)
+	}
+	if !cfg.Rated {
+		t.Errorf("expected Rated=true")
+	}
+	if cfg.RatedDuration != 3*time.Second {
+		t.Errorf("RatedDuration = %s, want 3s", cfg.RatedDuration)
 	}
 }
 
@@ -105,7 +124,7 @@ func TestEmit_WritesJSONToFile(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "result.json")
 	res := &loadgen.Result{Requests: 42, Errors: 0}
-	if err := emit(res, out); err != nil {
+	if err := emit(res, nil, out); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
 	body, err := os.ReadFile(out)
@@ -124,11 +143,36 @@ func TestEmit_WritesJSONToFile(t *testing.T) {
 func TestEmit_TrailingNewlineForJqFriendliness(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "result.json")
-	if err := emit(&loadgen.Result{}, out); err != nil {
+	if err := emit(&loadgen.Result{}, nil, out); err != nil {
 		t.Fatalf("emit: %v", err)
 	}
 	body, _ := os.ReadFile(out)
 	if len(body) == 0 || body[len(body)-1] != '\n' {
 		t.Error("output missing trailing newline (breaks `jq` / line-orientated tools)")
+	}
+}
+
+// TestSpliceLatencyAtSLO confirms the latency_at_slo block is added additively
+// to a serialized loadgen.Result without disturbing existing fields, with the
+// ms keys stringified for JSON.
+func TestSpliceLatencyAtSLO(t *testing.T) {
+	resJSON := []byte(`{"requests":10,"requests_per_sec":5.0,"latency":{"p99":1000}}`)
+	out, err := spliceLatencyAtSLO(resJSON, map[int]int{100: 9000, 500: 12000})
+	if err != nil {
+		t.Fatalf("spliceLatencyAtSLO: %v", err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("re-decode: %v", err)
+	}
+	if obj["requests_per_sec"].(float64) != 5.0 {
+		t.Errorf("saturation field disturbed: %v", obj["requests_per_sec"])
+	}
+	slo, ok := obj["latency_at_slo"].(map[string]any)
+	if !ok {
+		t.Fatalf("latency_at_slo missing or wrong type: %T", obj["latency_at_slo"])
+	}
+	if slo["100"].(float64) != 9000 {
+		t.Errorf("latency_at_slo[100] = %v, want 9000", slo["100"])
 	}
 }
