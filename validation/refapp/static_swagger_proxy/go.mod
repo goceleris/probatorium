@@ -2,7 +2,7 @@ module github.com/goceleris/probatorium/validation/refapp/static_swagger_proxy
 
 go 1.26.3
 
-require github.com/goceleris/celeris v1.4.12-0.20260529231127-85f4d50135d7
+require github.com/goceleris/celeris v1.4.12-0.20260530003821-afe7fb8acf1d
 
 require (
 	golang.org/x/net v0.55.0 // indirect
