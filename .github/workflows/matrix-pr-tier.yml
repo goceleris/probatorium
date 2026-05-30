@@ -23,9 +23,18 @@ name: PR Validation
 # queues incoming PR-tier runs behind any in-flight nightly/weekend
 # run — explicitly required: wait if other cluster work is in
 # progress.
+#
+# Security gate (cluster-ok label): self-hosted runners on
+# pull_request would let any contributor with write access (or any
+# future collaborator) execute arbitrary code on the cluster hosts.
+# This workflow ONLY runs when a maintainer explicitly adds the
+# `cluster-ok` label to the PR (or kicks it via workflow_dispatch).
+# The label must be re-added after every push the maintainer wants
+# to re-validate — there is no `synchronize` trigger by design.
 
 on:
   pull_request:
+    types: [labeled]
     branches: [main]
     paths:
       - 'cmd/**'
@@ -61,8 +70,28 @@ env:
   CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
 
 jobs:
+  guard:
+    # Label gate. Runs the cluster ONLY if a maintainer added the
+    # `cluster-ok` label (or kicked the workflow manually). All
+    # downstream jobs need this — if the gate is skipped/fails, the
+    # cluster-touching jobs do not run and no secrets are exposed.
+    name: cluster-ok label gate
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'cluster-ok')
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Approved
+        env:
+          EVENT: ${{ github.event_name }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          echo "approved by event=$EVENT label=${LABEL:-none}"
+
   setup:
     name: bootstrap cluster runners
+    needs: guard
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -77,7 +106,7 @@ jobs:
 
   matrix:
     name: matrix validate (PR tier)
-    needs: setup
+    needs: [guard, setup]
     runs-on: [self-hosted, celeris-cluster]
     timeout-minutes: 30
     steps:
@@ -165,8 +194,9 @@ jobs:
 
   teardown:
     name: teardown cluster runners
-    needs: [setup, matrix]
-    if: always()
+    needs: [guard, setup, matrix]
+    # always() but only if the gate let the run start in the first place
+    if: always() && needs.guard.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
