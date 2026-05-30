@@ -160,9 +160,11 @@ jobs:
           chmod 700 "${RUNNER_ROOT}/.ssh"
           printf '%s\n' "$CLUSTER_SSH_KEY" > "${RUNNER_ROOT}/.ssh/id_ed25519"
           chmod 600 "${RUNNER_ROOT}/.ssh/id_ed25519"
-          echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519" >> "$GITHUB_ENV"
-          echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)" >> "$GITHUB_ENV"
-          echo "CLUSTER_USE_LAN=1" >> "$GITHUB_ENV"
+          {
+            echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519"
+            echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)"
+            echo "CLUSTER_USE_LAN=1"
+          } >> "$GITHUB_ENV"
 
       - name: mage Deploy (stage refapps + validator)
         env:
