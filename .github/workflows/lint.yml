@@ -3,6 +3,11 @@ name: Lint
 # Always-latest policy: setup-go uses `stable`, actions are pinned to a
 # major tag so dependabot can bump us to the latest minor/patch without
 # us having to touch the workflow.
+#
+# Includes actionlint as a workflow-level lint so this repo's own GH
+# Actions YAML is sanity-checked on every PR (catches script-injection
+# vectors, unknown runner labels, malformed shell, etc.). Custom
+# self-hosted labels declared in .github/actionlint.yaml.
 
 on:
   push:
@@ -41,3 +46,7 @@ jobs:
             echo "$out"
             exit 1
           fi
+      - name: actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@latest
+          actionlint -color
