@@ -1,0 +1,6 @@
+self-hosted-runner:
+  # `celeris-cluster` is the label our ephemeral cluster runners
+  # register themselves with (see .github/actions/cluster-runner-up).
+  # Declaring it here silences actionlint's runner-label warning.
+  labels:
+    - celeris-cluster
