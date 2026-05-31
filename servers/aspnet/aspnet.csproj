@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>aspnet</AssemblyName>
+    <RootNamespace>AspnetAdapter</RootNamespace>
+
+    <!-- Throughput build: server GC + concurrent, tiered PGO, ready-to-run.
+         InvariantGlobalization drops ICU load so startup is lean and the
+         deterministic ToLower below stays culture-free (matches the Go/Rust
+         adapters byte-for-byte). -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <TieredCompilation>true</TieredCompilation>
+    <TieredPGO>true</TieredPGO>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <PublishReadyToRun>true</PublishReadyToRun>
+
+    <!-- No dev-time noise: the Kestrel server is configured in Program.cs
+         with logging fully off. -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+</Project>

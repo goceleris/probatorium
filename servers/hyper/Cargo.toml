@@ -1,0 +1,78 @@
+# probatorium hyper adapter — wave 4a (rust-hyper).
+#
+# hyper is the raw Rust baseline every higher-level Rust framework
+# (axum, actix-web, ntex) is built on or measured against. This adapter
+# drives hyper directly — no router crate, no tower stack — so its cell
+# is the floor the tower/actix/ntex columns are interpreted against.
+#
+# Build / run / lifecycle reference (no markdown docs; everything the
+# operator needs lives here or in the source).
+#
+#   build (cluster, ansible-driven, RUSTFLAGS="-C target-cpu=native"):
+#       cargo build --profile release-fat
+#
+#   produced binary:
+#       target/release-fat/probatorium-hyper-server
+#       (ansible/tasks/build_native_competitor.yml symlinks this to
+#        ${bench_root}/competitors/hyper so servers.StartAdapter resolves
+#        it via the standard staging path.)
+#
+#   run (the runner invokes the symlink with):
+#       probatorium-hyper-server -bind 127.0.0.1:8080
+#       The binary prints `ready addr=<final-bind-addr>` on stdout once
+#       the listener is up; SIGTERM triggers graceful shutdown within 5s.
+#
+# Always-latest version policy: every dependency is expressed as a `>=`
+# floor with no upper bound so `cargo update` resolves the newest
+# compatible release at deploy time. Do NOT pin to exact versions — the
+# whole probatorium contract is to bench whatever stable cuts the
+# upstream world has at the moment the cluster runs.
+
+[package]
+name = "probatorium-hyper-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "probatorium-hyper-server"
+path = "src/main.rs"
+
+[dependencies]
+# hyper — the raw HTTP/1 server. We drive http1::Builder::serve_connection
+# directly on accepted sockets, so the only hyper features we need are the
+# H1 server stack. No router, no tower, no axum layer — this is the
+# baseline competitors above it are measured against.
+hyper = { version = ">=1", features = ["http1", "server"] }
+# hyper-util — the small glue layer hyper 1.x split out: TokioIo (adapts a
+# tokio TcpStream to hyper's I/O traits) and the graceful-shutdown watcher.
+# The `http1` feature is what makes hyper's H1 Connection implement
+# GracefulConnection, which GracefulShutdown::watch requires.
+hyper-util = { version = ">=0.1", features = ["tokio", "server", "server-graceful", "http1"] }
+# http-body-util — Full<Bytes> body type for fixed-size response bodies and
+# BodyExt::collect for draining the /upload request body.
+http-body-util = ">=0.1"
+# bytes — Bytes payloads shared by hyper's body types.
+bytes = ">=1"
+# tokio — async runtime. multi-thread + signal + macros (#[tokio::main]).
+tokio = { version = ">=1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
+# serde_json — reserved for wave 6 driver responses; not used by the
+# deterministic 1k/64k corpus (which is hand-emitted in src/payload.rs).
+serde_json = ">=1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# release-fat is the profile the cluster uses for benching. It trades
+# compile time for the tightest codegen (full LTO, single codegen unit,
+# panic=abort, strip). Cargo command at deploy time:
+#     cargo build --profile release-fat
+# with RUSTFLAGS="-C target-cpu=native" set by the ansible role.
+[profile.release-fat]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

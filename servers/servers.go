@@ -263,6 +263,19 @@ var Registry = map[string]Adapter{
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 
+	// gnet — the canonical Go event-loop server (panjf2000/gnet), the closest
+	// architectural peer to celeris's epoll engine: a fixed pool of event loops
+	// over epoll/kqueue parsing HTTP off a zero-copy inbound ring buffer. No
+	// HTTP codec ships with gnet, so the adapter carries a minimal HTTP/1.1
+	// framer and serves only the six static contract endpoints — hence the
+	// Static-only capability manifest (no Drivers / Middleware / WS / SSE /
+	// TLS). H1-only.
+	"gnet-h1": {
+		Name: "gnet-h1", Category: "go-gnet", Language: "go", Framework: "gnet", Engine: "h1",
+		Bin:          GoBinary{ModuleDir: "servers/gnet"},
+		Capabilities: Capabilities{Static: true},
+	},
+
 	// fasthttp + fiber — H1-only. fiber wraps fasthttp.
 	"fasthttp-h1": {
 		Name: "fasthttp-h1", Category: "go-fasthttp", Language: "go", Framework: "fasthttp", Engine: "h1",
@@ -322,6 +335,51 @@ var Registry = map[string]Adapter{
 		Capabilities: Capabilities{Static: true},
 	},
 
+	// hyper — the raw Rust baseline axum / actix-web / ntex are all built
+	// on or measured against. No router crate, no tower stack: the adapter
+	// drives hyper's H1 server directly with a hand-rolled (method, path)
+	// match, so this column is the floor the framework columns add their
+	// abstraction cost on top of. Same wave-4a build/run/lifecycle contract
+	// as the other three Rust adapters (release-fat + target-cpu=native,
+	// `-bind`, `ready addr=` on stdout, SIGTERM graceful drain). H1-only.
+	"hyper": {
+		Name: "hyper", Category: "rust-hyper", Language: "rust", Framework: "hyper", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "rust",
+			BuildSteps: []string{
+				"source $RUSTUP_HOME/env",
+				"cd $SRC && cargo build --profile release-fat",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+
+	// drogon — the top C++ contender. Built natively on the bench host via
+	// CMake against libdrogon (drogon + trantor + jsoncpp + OpenSSL), the
+	// same staging shape as the Rust competitors: a tarball of
+	// servers/drogon/ lands at $SRC, configures + compiles in-tree, and the
+	// produced build/drogon-adapter binary is symlinked into
+	// ${bench_root}/competitors/drogon. The runner invokes it with
+	// `-bind <addr>` and waits for `ready addr=<addr>` on stdout.
+	// CMAKE_PREFIX_PATH points at the brew Drogon CMake package so the
+	// Drogon::Drogon imported target resolves every transitive dep.
+	// Capabilities are all-false: drogon is benched on the static +
+	// concurrency scenarios only, so driver / middleware / streaming cells
+	// are never scheduled against it.
+	"drogon": {
+		Name: "drogon", Category: "cpp-drogon", Language: "cpp", Framework: "drogon", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "cpp",
+			BuildSteps: []string{
+				"cd $SRC && cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/homebrew -DCMAKE_BUILD_TYPE=Release",
+				"cd $SRC && cmake --build build -j",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{},
+	},
+
 	// fastapi — python adapter, native (NO docker). The launcher script
 	// at {bench}/competitors/fastapi/server is rendered by the python
 	// ansible role's build_competitor.yml; it activates the per-adapter
@@ -334,6 +392,58 @@ var Registry = map[string]Adapter{
 		Bin: NativeBinary{
 			Lang:   "python",
 			RunCmd: "{bench}/competitors/{name}/server -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+
+	// aspnet — ASP.NET Core (Kestrel, minimal APIs) on .NET 10, built
+	// natively on the bench host like the Rust adapters. `dotnet publish
+	// -c Release` emits a framework-dependent app under {src}/publish/
+	// whose native apphost binary is named `aspnet` (AssemblyName); the
+	// build symlinks that apphost into {bench}/competitors/aspnet, and the
+	// runner invokes it with `-bind <addr>`, waiting for `ready addr=<addr>`
+	// on stdout. Kestrel is tuned for throughput in Program.cs (server GC +
+	// concurrent, tiered PGO, ReadyToRun, no logging providers, no dev
+	// middleware, AddServerHeader=false). The JSON payloads come from the
+	// same deterministic generator as every other adapter so /json-1k and
+	// /json-64k are byte-identical across languages. SIGTERM triggers
+	// Kestrel's graceful shutdown inside the runner's grace window. H1-only
+	// for this wave.
+	"aspnet": {
+		Name: "aspnet", Category: "dotnet-aspnetcore", Language: "csharp", Framework: "aspnet", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "dotnet",
+			BuildSteps: []string{
+				"cd $SRC && dotnet publish -c Release -o publish",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+
+	// zig_zap — the Zig event-loop competitor column, a direct architectural
+	// peer to celeris's iouring / epoll engines: a fixed pool of OS threads,
+	// each running a blocking accept + HTTP/1.1 serve loop over the same
+	// SO_REUSEPORT listener so the kernel load-balances connections across
+	// cores with no userspace contention. Built natively on the bench host
+	// like the Rust/dotnet adapters: `zig build -Doptimize=ReleaseFast` emits
+	// zig-out/bin/zig_zap, which the build symlinks into
+	// {bench}/competitors/zig_zap; the runner invokes it with `-bind <addr>`
+	// and waits for `ready addr=<addr>` on stdout.
+	//
+	// The HTTP codec is the Zig standard library's std.http.Server (the
+	// from-scratch HTTP/1.1 server that ships with Zig 0.16), NOT zigzap/zap:
+	// zap 0.10.7 declares minimum_zig_version 0.15.0 and bundles facil.io (C),
+	// whose sources fail to build under the installed Zig 0.16 C toolchain.
+	// Static-only contract — no Drivers / Middleware / WS / SSE / TLS. H1-only.
+	"zig_zap": {
+		Name: "zig_zap", Category: "zig-stdhttp", Language: "zig", Framework: "zig_zap", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "zig",
+			BuildSteps: []string{
+				"cd $SRC && zig build -Doptimize=ReleaseFast",
+			},
+			RunCmd: "{bin} -bind {bind}",
 		},
 		Capabilities: Capabilities{Static: true},
 	},

@@ -593,6 +593,36 @@ var nativeBuildSpecs = map[string]nativeBuildSpec{
 		buildCmd:  "cargo build --profile release-fat",
 		binaryRel: "target/release-fat/probatorium-ntex-server",
 	},
+	// hyper — same rust toolchain + release-fat profile as the framework
+	// crates above; binary name from servers/hyper/Cargo.toml's [[bin]].
+	"hyper": {
+		lang:      "rust",
+		buildCmd:  "cargo build --profile release-fat",
+		binaryRel: "target/release-fat/probatorium-hyper-server",
+	},
+	// drogon — C++ built on the bench host via the cpp role + libdrogon.
+	// CMAKE_PREFIX_PATH / Drogon_DIR (env in build_native_competitor.yml)
+	// point find_package(Drogon) at the bench-built prefix, so the
+	// adapter's CMakeLists.txt needs no hard-coded prefix here.
+	"drogon": {
+		lang:      "cpp",
+		buildCmd:  "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j",
+		binaryRel: "build/drogon-adapter",
+	},
+	// aspnet — .NET SDK (dotnet role). Framework-dependent publish; the
+	// apphost binary is named via the csproj AssemblyName (aspnet).
+	"aspnet": {
+		lang:      "dotnet",
+		buildCmd:  "dotnet publish -c Release -o publish",
+		binaryRel: "publish/aspnet",
+	},
+	// zig_zap — Zig toolchain (zig role). ReleaseFast build emits the
+	// binary under zig-out/bin/<exe name from build.zig>.
+	"zig_zap": {
+		lang:      "zig",
+		buildCmd:  "zig build -Doptimize=ReleaseFast",
+		binaryRel: "zig-out/bin/zig_zap",
+	},
 	"hono":    {lang: "bun"},
 	"elysia":  {lang: "bun"},
 	"fastapi": {lang: "python", moduleTarget: "app.server:app"},

@@ -2,7 +2,7 @@
 # Build a single non-Go competitor adapter natively on the bench host.
 #
 # Loop var: comp = { key: <slug>, value: {
-#                      lang: rust|bun|python,
+#                      lang: rust|cpp|dotnet|zig|bun|python,
 #                      tarball: <local path to .tar.gz on dev Mac>,
 #                      build_cmd: <shell command to run in extracted dir>,
 #                      binary_rel: <path to the produced binary, relative
@@ -15,10 +15,20 @@
 # symlinks the produced binary into {{ bench_root }}/competitors/<slug>
 # so the bench playbook can launch it identically to Go competitors.
 #
-# Python adapters are special-cased: the python role's build_competitor.yml
-# owns venv creation, dep install, and launcher rendering. For python we
-# skip both the generic build_cmd shell and the binary_rel symlink — the
-# launcher is written directly at competitors/<slug>/server by the role.
+# Two dispatch families:
+#
+#   1. COMPILED-BINARY langs (rust, cpp, dotnet, zig) — run the generic
+#      build_cmd shell under that language's toolchain env, then symlink
+#      the produced binary_rel into competitors/<slug>. Identical shape
+#      across the four; only the PATH + per-language env vars differ.
+#      hyper (rust) rides the rust path with no new toolchain.
+#
+#   2. SCRIPT/launcher langs (bun, python) — special-cased: the language
+#      role's build_competitor.yml owns dep install + launcher rendering.
+#      For these we skip both the generic build_cmd shell and the
+#      binary_rel symlink — the launcher is written directly at
+#      competitors/<slug> (python) or competitors-src/<slug>/server
+#      then symlinked (bun) by the role.
 
 - name: "{{ comp.key }} | ensure source dir exists"
   ansible.builtin.file:
@@ -38,28 +48,54 @@
     dest: "{{ bench_root }}/competitors-src/{{ comp.key }}/"
     remote_src: true
 
-# Each language gets its toolchain dir on PATH plus the env vars its
-# package manager expects. We do NOT touch HOME — every cache must
-# resolve under {{ bench_root }} so cleanup wipes it cleanly.
+# COMPILED-BINARY dispatch (rust, cpp, dotnet, zig). Every toolchain dir
+# goes on PATH plus the env vars its build expects. We do NOT touch HOME —
+# every cache resolves under {{ bench_root }} so cleanup wipes it cleanly.
 #
-# Rust competitors compile with RUSTFLAGS="-C target-cpu=native" so the
-# bench measures the codegen the framework's authors intended for the
-# host CPU (AVX2 / NEON intrinsics, branch-prediction tuning, etc.).
-# CARGO_TARGET_DIR pins the build output under {{ bench_root }} so
-# cleanup wipes every byte cargo wrote. Other languages don't read
-# RUSTFLAGS / CARGO_TARGET_DIR so leaving them set unconditionally is a
-# no-op for them.
-# Rust path: run the generic build_cmd shell (cargo build ...) under
-# the right env and symlink the produced binary. Bun/python adapters
-# skip this — their language-specific role takes over below.
-- name: "{{ comp.key }} | run rust build command"
+# The four langs share ONE build+symlink pair (DRY): build_cmd is the
+# per-adapter shell (cargo / cmake / dotnet publish / zig build) carried
+# in competitor_sources[<slug>].build_cmd, and binary_rel is the produced
+# artefact. Only env differs, and the per-language knobs below are
+# inert for the other langs (cargo ignores DOTNET_ROOT, dotnet ignores
+# RUSTFLAGS, etc.), so setting them unconditionally is safe — same idiom
+# the role already used for RUSTFLAGS.
+#
+# Per-language env:
+#   rust   — CARGO_HOME/RUSTUP_HOME under bench_root; RUSTFLAGS=-C
+#            target-cpu=native (host-tuned codegen the framework authors
+#            intended); CARGO_TARGET_DIR pins output under bench_root.
+#   cpp    — CMAKE_PREFIX_PATH + Drogon_DIR point the adapter's
+#            find_package(Drogon) at the bench-built libdrogon prefix
+#            (roles/cpp). CXXFLAGS=-march=native for the same host-tuned
+#            codegen rationale as rust.
+#   dotnet — DOTNET_ROOT + PATH expose the bench-installed SDK; telemetry
+#            + first-run logo off so the build stays quiet/offline-clean;
+#            NUGET/DOTNET caches under bench_root so cleanup wipes them.
+#   zig    — {{ bench_root }}/zig/current on PATH; ZIG_GLOBAL/LOCAL cache
+#            under bench_root.
+- name: "{{ comp.key }} | run compiled-native build command ({{ comp.value.lang }})"
   environment:
     PATH: >-
-      {{ bench_root }}/rustup/cargo/bin:{{ bench_root }}/bun/bin:{{ bench_root }}/uv/bin:{{ ansible_env.PATH }}
+      {{ bench_root }}/rustup/cargo/bin:{{ bench_root }}/dotnet:{{ bench_root }}/zig/current:{{ bench_root }}/bun/bin:{{ bench_root }}/uv/bin:{{ ansible_env.PATH }}
+    # rust
     CARGO_HOME: "{{ bench_root }}/rustup/cargo"
     RUSTUP_HOME: "{{ bench_root }}/rustup/rustup"
     CARGO_TARGET_DIR: "{{ bench_root }}/competitors-src/{{ comp.key }}/target"
     RUSTFLAGS: "-C target-cpu=native"
+    # cpp / drogon
+    CMAKE_PREFIX_PATH: "{{ bench_root }}/drogon/prefix"
+    Drogon_DIR: "{{ bench_root }}/drogon/prefix/lib/cmake/Drogon"
+    CXXFLAGS: "-march=native"
+    # dotnet
+    DOTNET_ROOT: "{{ bench_root }}/dotnet"
+    DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    DOTNET_NOLOGO: "1"
+    DOTNET_CLI_HOME: "{{ bench_root }}/dotnet-home"
+    NUGET_PACKAGES: "{{ bench_root }}/nuget-packages"
+    # zig
+    ZIG_GLOBAL_CACHE_DIR: "{{ bench_root }}/zig-cache/global"
+    ZIG_LOCAL_CACHE_DIR: "{{ bench_root }}/zig-cache/local"
+    # shared
     XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
     XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
   ansible.builtin.shell: |
@@ -68,15 +104,15 @@
     {{ comp.value.build_cmd | default('true') }}
   args:
     executable: /bin/bash
-  when: comp.value.lang == 'rust'
+  when: comp.value.lang in ['rust', 'cpp', 'dotnet', 'zig']
 
-- name: "{{ comp.key }} | symlink built rust binary into competitors/"
+- name: "{{ comp.key }} | symlink compiled binary into competitors/"
   ansible.builtin.file:
     src: "{{ bench_root }}/competitors-src/{{ comp.key }}/{{ comp.value.binary_rel }}"
     dest: "{{ bench_root }}/competitors/{{ comp.key }}"
     state: link
     force: true
-  when: comp.value.lang == 'rust'
+  when: comp.value.lang in ['rust', 'cpp', 'dotnet', 'zig']
 
 # Bun adapters: dispatch to the bun role's parameterized
 # build_competitor task list. It runs `bun install --production`,
