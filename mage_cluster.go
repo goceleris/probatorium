@@ -618,7 +618,7 @@ var nativeBuildSpecs = map[string]nativeBuildSpec{
 	// apphost binary is named via the csproj AssemblyName (aspnet).
 	"aspnet": {
 		lang:      "dotnet",
-		buildCmd:  "dotnet publish -c Release -o publish",
+		buildCmd:  "dotnet publish aspnet.csproj -c Release -o publish",
 		binaryRel: "publish/aspnet",
 	},
 	// zig_zap — Zig toolchain (zig role). ReleaseFast build emits the
@@ -702,6 +702,16 @@ func tarballNativeSource(slug, dest string) error {
 	// The destination tarball must not exist yet — tar will overwrite
 	// it but we want a clean state.
 	_ = os.Remove(dest)
+
+	// Purge any on-disk macOS AppleDouble files under the source tree first.
+	// COPYFILE_DISABLE (below) only stops tar SYNTHESIZING `._*` from xattrs;
+	// `._*` files that already exist on disk (left by a Finder/cp operation)
+	// would still be archived and then break the on-Linux build (the C#
+	// compiler globs `._Program.cs` as a binary .cs source → CS2015).
+	prune := exec.Command("find", src, "-name", "._*", "-delete")
+	prune.Stderr = os.Stderr
+	_ = prune.Run()
+
 	cmd := exec.Command("tar", "czf", dest,
 		"--exclude=node_modules",
 		"--exclude=dist",
@@ -710,10 +720,29 @@ func tarballNativeSource(slug, dest string) error {
 		"--exclude=.git",
 		"--exclude=__pycache__",
 		"--exclude=*.pyc",
+		// Compiled-language build outputs: never ship stale local artefacts
+		// (a leaked dotnet publish/ tree triggers MSB1011 "more than one
+		// project file"; stale zig-out/build dirs confuse fresh builds).
+		"--exclude=bin",
+		"--exclude=obj",
+		"--exclude=publish",
+		"--exclude=build",
+		"--exclude=zig-out",
+		"--exclude=.zig-cache",
+		// macOS AppleDouble resource-fork files (`._Program.cs`, …). BSD tar
+		// embeds them by default; on Linux they extract as real files and the
+		// C# compiler globs `._*.cs` as binary source → CS2015. Belt: the
+		// --exclude pattern; suspenders: COPYFILE_DISABLE below stops tar
+		// emitting them at all.
+		"--exclude=._*",
 		"-C", src,
 		".",
 	)
 	cmd.Stderr = os.Stderr
+	// COPYFILE_DISABLE=1 tells macOS BSD tar not to write AppleDouble (`._*`)
+	// entries — the canonical fix for "binary file instead of a text file"
+	// breakage when a mac-built tarball is extracted + compiled on Linux.
+	cmd.Env = append(os.Environ(), "COPYFILE_DISABLE=1")
 	return cmd.Run()
 }
 

@@ -22,6 +22,19 @@
   ansible.builtin.set_fact:
     cell_dir: "{{ bench_run_dir }}/{{ '%02d' | format(cell.0 | int) }}-{{ cell.1 }}"
 
+# Resolve the matrix column slug (cell.1, e.g. "gin-h2" /
+# "celeris-epoll-h1-sync") to the staged binary dir it runs from and the
+# -engine flag the binary needs. competitor_columns is the slug→{bin,engine}
+# map mage Bench passes (built from servers.Registry). A single binary backs
+# several columns (gin → gin-h1/gin-h2), so the binary half is NOT the same
+# as the column slug. Falls back to the bare slug + no engine when the map is
+# absent (a direct ansible-playbook invocation without mage), preserving the
+# pre-mode-matrix behaviour for ad-hoc single-binary runs.
+- name: "{{ cell.1 }} run={{ cell.0 }} | resolve column → binary + engine"
+  ansible.builtin.set_fact:
+    cell_bin: "{{ competitor_columns[cell.1].bin if (competitor_columns is defined and cell.1 in competitor_columns) else cell.1 }}"
+    cell_engine: "{{ competitor_columns[cell.1].engine if (competitor_columns is defined and cell.1 in competitor_columns) else '' }}"
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
   ansible.builtin.file:
     path: "{{ cell_dir }}"
@@ -58,12 +71,39 @@
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start competitor server in background"
   become: true
+  # The binary is {{ cell_bin }} (the dir under competitors/), launched with
+  # the column's -engine when one applies. gorilla_ws + native adapters carry
+  # an empty cell_engine, so the `-engine` arg is omitted entirely — passing
+  # it to a binary that doesn't define the flag would abort with "flag
+  # provided but not defined". One-line nohup (no backslash continuations) so
+  # the conditional engine arg can't leave a dangling line-continuation.
+  environment:
+    # Driver-* backends live in loopback containers on the bench host
+    # (dbservices role). Every driver-capable competitor reads its backend
+    # address from these PROBATORIUM_* vars; an unset var leaves that client
+    # nil and the driver cell 404s (→ capability-lie hard error). gin/celeris
+    # read PROBATORIUM_MEMCACHED_ADDR, echo reads PROBATORIUM_MC_ADDR, so we
+    # set both spellings. Harmless for static-only competitors (they ignore
+    # them). Creds/ports match ansible/roles/dbservices/tasks/main.yml.
+    PROBATORIUM_PG_DSN: "postgres://bench:bench@127.0.0.1:5432/bench?sslmode=disable"
+    PROBATORIUM_REDIS_ADDR: "127.0.0.1:6379"
+    PROBATORIUM_MEMCACHED_ADDR: "127.0.0.1:11211"
+    PROBATORIUM_MC_ADDR: "127.0.0.1:11211"
+    # aspnet (.NET) is a FRAMEWORK-DEPENDENT publish: the native apphost
+    # (competitors/aspnet) must locate the shared .NET runtime at launch. We
+    # installed the SDK (which carries the runtime) pristinely under
+    # {{ bench_root }}/dotnet, NOT system-wide, so without DOTNET_ROOT the
+    # apphost aborts with "You must install .NET to run this application" and
+    # never binds. DOTNET_ROOT is the documented runtime-discovery knob.
+    # Globalization-invariant belt-and-suspenders (the csproj already sets it,
+    # but the env override skips the ICU probe unconditionally on a minimal
+    # host). Both inert for every non-.NET binary.
+    DOTNET_ROOT: "{{ bench_root }}/dotnet"
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
   ansible.builtin.shell: |
     cd {{ bench_root }}
     ulimit -l unlimited
-    nohup ./competitors/{{ cell.1 }} \
-      -bind 0.0.0.0:{{ bench_port | default(8080) }} \
-      > {{ cell_dir }}/server.log 2>&1 &
+    nohup ./competitors/{{ cell_bin }} -bind 0.0.0.0:{{ bench_port | default(8080) }} {{ ('-engine ' + cell_engine) if cell_engine else '' }} > {{ cell_dir }}/server.log 2>&1 &
     echo $! > {{ cell_dir }}/server.pid
     disown
   args:
@@ -71,6 +111,11 @@
   when: inventory_hostname == bench_target
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | wait for server to bind"
+  # FAILURE ISOLATION: a competitor that fails to bind (a crash on start, a
+  # missing runtime dep, a bad flag) must NOT abort the whole 31-column grid.
+  # We capture the probe result (failed_when: false) and gate the rest of the
+  # cell on it; an unbound column is recorded + skipped and the loop moves on,
+  # so one flaky adapter costs exactly its own column, not the entire run.
   ansible.builtin.shell: |
     for i in $(seq 1 40); do
       ss -ltn 2>/dev/null | grep -q ':{{ bench_port | default(8080) }} ' && exit 0
@@ -82,7 +127,23 @@
   args:
     executable: /bin/bash
   changed_when: false
+  register: bind_probe
+  failed_when: false
   when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | record bind status"
+  ansible.builtin.set_fact:
+    cell_bound: "{{ (bind_probe.rc | default(1)) == 0 }}"
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | WARN unbound column (skipped; grid continues)"
+  ansible.builtin.debug:
+    msg: >-
+      CELL SKIPPED — {{ cell.1 }} failed to bind on {{ bench_target }};
+      this column is ABSENT from the results, grid continues with the next.
+  when:
+    - inventory_hostname == bench_target
+    - not (cell_bound | bool)
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | resolve real server PID"
   # `echo $!` in the previous task captures the bash subshell that
@@ -113,7 +174,9 @@
   args:
     executable: /bin/bash
   changed_when: false
-  when: inventory_hostname == bench_target
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (server side)"
   ansible.builtin.shell: |
@@ -124,7 +187,9 @@
   args:
     executable: /bin/bash
   changed_when: false
-  when: inventory_hostname == bench_target
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start observer sampler (server side)"
   # The observer sidecars the server during the cell and emits a 1Hz
@@ -153,7 +218,9 @@
   args:
     executable: /bin/bash
   changed_when: false
-  when: inventory_hostname == bench_target
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
 
 # ---------- loadgen side: mpstat + runner ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (loadgen side)"
@@ -165,7 +232,9 @@
   args:
     executable: /bin/bash
   changed_when: false
-  when: inventory_hostname == "msa2-client"
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | run runner against bench target"
   # Flag names must match the runner CLI in cmd/runner/main.go:
@@ -190,9 +259,19 @@
   # The -cells server-half matches the competitor slug (the runner's
   # synthetic remote server is named via -server-name), so e.g.
   # BENCH_CELLS='get-*/*' or '*/celeris-*' both work.
+  # HANG GUARD: a bound-but-wedged SUT (a competitor that accepts the
+  # connection but never completes responses — e.g. an event-loop server that
+  # deadlocks under concurrency) makes loadgen's workers block on socket reads
+  # the runner's own per-cell context timeout can't always interrupt (a
+  # blocked read syscall isn't ctx-cancellable). An unguarded runner then
+  # wedges the WHOLE 31-column grid on one bad adapter. `timeout` caps the
+  # whole runner invocation at a generous per-cell wall-clock (the mpstat
+  # window — n_scenarios × (warmup+duration) — doubled, + 120s slack), then
+  # SIGKILLs 30s later if it ignores SIGTERM. A timed-out cell (exit 124) is
+  # recorded + skipped via failed_when:false below; the grid continues.
   ansible.builtin.shell: |
     cd {{ bench_root }}
-    ./runner \
+    timeout -k 30 {{ (mpstat_seconds | int) * 2 + 120 }} ./runner \
       -target http://{{ target_ip }}:{{ bench_port | default(8080) }} \
       -server-name {{ cell.1 }} \
       -runs 1 \
@@ -205,7 +284,22 @@
       2> {{ cell_dir }}/runner.stderr
   args:
     executable: /bin/bash
-  when: inventory_hostname == "msa2-client"
+  register: runner_run
+  failed_when: false
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | WARN runner timed out / errored (cell skipped)"
+  ansible.builtin.debug:
+    msg: >-
+      RUNNER {{ 'TIMED OUT' if (runner_run.rc | default(0)) == 124 else 'ERRORED (rc=' + (runner_run.rc | default(0) | string) + ')' }}
+      for {{ cell.1 }} — likely a hung/broken SUT; this cell's data is partial
+      or absent, grid continues.
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
+    - (runner_run.rc | default(0)) != 0
 
 # ---------- teardown for this cell ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop observer (server side)"

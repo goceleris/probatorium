@@ -29,124 +29,143 @@
 #      binary_rel symlink — the launcher is written directly at
 #      competitors/<slug> (python) or competitors-src/<slug>/server
 #      then symlinked (bun) by the role.
-
-- name: "{{ comp.key }} | ensure source dir exists"
-  ansible.builtin.file:
-    path: "{{ bench_root }}/competitors-src/{{ comp.key }}"
-    state: directory
-    mode: '0755'
-
-- name: "{{ comp.key }} | push source tarball"
-  ansible.builtin.copy:
-    src: "{{ comp.value.tarball }}"
-    dest: "{{ bench_root }}/competitors-src/{{ comp.key }}.tar.gz"
-    mode: '0644'
-
-- name: "{{ comp.key }} | extract source"
-  ansible.builtin.unarchive:
-    src: "{{ bench_root }}/competitors-src/{{ comp.key }}.tar.gz"
-    dest: "{{ bench_root }}/competitors-src/{{ comp.key }}/"
-    remote_src: true
-
-# COMPILED-BINARY dispatch (rust, cpp, dotnet, zig). Every toolchain dir
-# goes on PATH plus the env vars its build expects. We do NOT touch HOME —
-# every cache resolves under {{ bench_root }} so cleanup wipes it cleanly.
 #
-# The four langs share ONE build+symlink pair (DRY): build_cmd is the
-# per-adapter shell (cargo / cmake / dotnet publish / zig build) carried
-# in competitor_sources[<slug>].build_cmd, and binary_rel is the produced
-# artefact. Only env differs, and the per-language knobs below are
-# inert for the other langs (cargo ignores DOTNET_ROOT, dotnet ignores
-# RUSTFLAGS, etc.), so setting them unconditionally is safe — same idiom
-# the role already used for RUSTFLAGS.
-#
-# Per-language env:
-#   rust   — CARGO_HOME/RUSTUP_HOME under bench_root; RUSTFLAGS=-C
-#            target-cpu=native (host-tuned codegen the framework authors
-#            intended); CARGO_TARGET_DIR pins output under bench_root.
-#   cpp    — CMAKE_PREFIX_PATH + Drogon_DIR point the adapter's
-#            find_package(Drogon) at the bench-built libdrogon prefix
-#            (roles/cpp). CXXFLAGS=-march=native for the same host-tuned
-#            codegen rationale as rust.
-#   dotnet — DOTNET_ROOT + PATH expose the bench-installed SDK; telemetry
-#            + first-run logo off so the build stays quiet/offline-clean;
-#            NUGET/DOTNET caches under bench_root so cleanup wipes them.
-#   zig    — {{ bench_root }}/zig/current on PATH; ZIG_GLOBAL/LOCAL cache
-#            under bench_root.
-- name: "{{ comp.key }} | run compiled-native build command ({{ comp.value.lang }})"
-  environment:
-    PATH: >-
-      {{ bench_root }}/rustup/cargo/bin:{{ bench_root }}/dotnet:{{ bench_root }}/zig/current:{{ bench_root }}/bun/bin:{{ bench_root }}/uv/bin:{{ ansible_env.PATH }}
-    # rust
-    CARGO_HOME: "{{ bench_root }}/rustup/cargo"
-    RUSTUP_HOME: "{{ bench_root }}/rustup/rustup"
-    CARGO_TARGET_DIR: "{{ bench_root }}/competitors-src/{{ comp.key }}/target"
-    RUSTFLAGS: "-C target-cpu=native"
-    # cpp / drogon
-    CMAKE_PREFIX_PATH: "{{ bench_root }}/drogon/prefix"
-    Drogon_DIR: "{{ bench_root }}/drogon/prefix/lib/cmake/Drogon"
-    CXXFLAGS: "-march=native"
-    # dotnet
-    DOTNET_ROOT: "{{ bench_root }}/dotnet"
-    DOTNET_CLI_TELEMETRY_OPTOUT: "1"
-    DOTNET_NOLOGO: "1"
-    DOTNET_CLI_HOME: "{{ bench_root }}/dotnet-home"
-    NUGET_PACKAGES: "{{ bench_root }}/nuget-packages"
-    # zig
-    ZIG_GLOBAL_CACHE_DIR: "{{ bench_root }}/zig-cache/global"
-    ZIG_LOCAL_CACHE_DIR: "{{ bench_root }}/zig-cache/local"
-    # shared
-    XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
-    XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
-  ansible.builtin.shell: |
-    set -euo pipefail
-    cd {{ bench_root }}/competitors-src/{{ comp.key }}
-    {{ comp.value.build_cmd | default('true') }}
-  args:
-    executable: /bin/bash
-  when: comp.value.lang in ['rust', 'cpp', 'dotnet', 'zig']
+# FAILURE ISOLATION: every per-competitor build runs inside a block/rescue.
+# A single native that fails to build (a toolchain quirk, a source-level
+# break) records its slug in `failed_natives` and is skipped — it does NOT
+# abort the whole deploy. The competitor is simply absent from the bench
+# (no symlink in competitors/), and the bench naturally skips an adapter
+# with no staged binary. This keeps one fragile non-Go adapter from
+# sinking the entire grid + dbservices on a fresh cluster.
 
-- name: "{{ comp.key }} | symlink compiled binary into competitors/"
-  ansible.builtin.file:
-    src: "{{ bench_root }}/competitors-src/{{ comp.key }}/{{ comp.value.binary_rel }}"
-    dest: "{{ bench_root }}/competitors/{{ comp.key }}"
-    state: link
-    force: true
-  when: comp.value.lang in ['rust', 'cpp', 'dotnet', 'zig']
+- name: "{{ comp.key }} | build + stage native competitor (isolated)"
+  block:
+    - name: "{{ comp.key }} | ensure source dir exists"
+      ansible.builtin.file:
+        path: "{{ bench_root }}/competitors-src/{{ comp.key }}"
+        state: directory
+        mode: '0755'
 
-# Bun adapters: dispatch to the bun role's parameterized
-# build_competitor task list. It runs `bun install --production`,
-# `bun build --target=bun --minify` to produce dist/server (a single-file
-# bundle), and writes a POSIX-sh launcher next to it. The shared
-# build_native_competitor.yml then symlinks the launcher into
-# competitors/<slug>.
-- name: "{{ comp.key }} | build bun competitor (deps + bundle + launcher)"
-  ansible.builtin.include_role:
-    name: bun
-    tasks_from: build_competitor.yml
-  vars:
-    competitor_name: "{{ comp.key }}"
-    competitor_src: "{{ bench_root }}/competitors-src/{{ comp.key }}"
-  when: comp.value.lang == 'bun'
+    - name: "{{ comp.key }} | push source tarball"
+      ansible.builtin.copy:
+        src: "{{ comp.value.tarball }}"
+        dest: "{{ bench_root }}/competitors-src/{{ comp.key }}.tar.gz"
+        mode: '0644'
 
-- name: "{{ comp.key }} | symlink bun launcher into competitors/"
-  ansible.builtin.file:
-    src: "{{ bench_root }}/competitors-src/{{ comp.key }}/server"
-    dest: "{{ bench_root }}/competitors/{{ comp.key }}"
-    state: link
-    force: true
-  when: comp.value.lang == 'bun'
+    - name: "{{ comp.key }} | extract source"
+      ansible.builtin.unarchive:
+        src: "{{ bench_root }}/competitors-src/{{ comp.key }}.tar.gz"
+        dest: "{{ bench_root }}/competitors-src/{{ comp.key }}/"
+        remote_src: true
 
-# Python adapters: dispatch to the python role's parameterized
-# build_competitor task list. It creates the venv, installs deps via uv,
-# and renders the launcher script — no symlink needed (the launcher
-# lives directly at competitors/<slug>/server).
-- name: "{{ comp.key }} | build python competitor (venv + launcher)"
-  ansible.builtin.include_role:
-    name: python
-    tasks_from: build_competitor.yml
-  vars:
-    competitor_name: "{{ comp.key }}"
-    competitor_src_dir: "{{ bench_root }}/competitors-src/{{ comp.key }}"
-    competitor_module: "{{ comp.value.module_target | default('app.server:app') }}"
-  when: comp.value.lang == 'python'
+    # COMPILED-BINARY dispatch (rust, cpp, dotnet, zig). Every toolchain dir
+    # goes on PATH plus the env vars its build expects. We do NOT touch HOME —
+    # every cache resolves under {{ bench_root }} so cleanup wipes it cleanly.
+    #
+    # The four langs share ONE build+symlink pair (DRY): build_cmd is the
+    # per-adapter shell (cargo / cmake / dotnet publish / zig build) carried
+    # in competitor_sources[<slug>].build_cmd, and binary_rel is the produced
+    # artefact. Only env differs, and the per-language knobs below are
+    # inert for the other langs (cargo ignores DOTNET_ROOT, dotnet ignores
+    # RUSTFLAGS, etc.), so setting them unconditionally is safe.
+    #
+    # Per-language env:
+    #   rust   — CARGO_HOME/RUSTUP_HOME under bench_root; RUSTFLAGS=-C
+    #            target-cpu=native; CARGO_TARGET_DIR pins output under bench_root.
+    #   cpp    — CMAKE_PREFIX_PATH + Drogon_DIR point find_package(Drogon) at
+    #            the bench-built libdrogon prefix. CXXFLAGS=-march=native.
+    #   dotnet — DOTNET_ROOT + PATH expose the bench-installed SDK; telemetry
+    #            + first-run logo off; NUGET/DOTNET caches under bench_root.
+    #   zig    — {{ bench_root }}/zig/current on PATH; ZIG_GLOBAL/LOCAL cache
+    #            under bench_root.
+    - name: "{{ comp.key }} | run compiled-native build command ({{ comp.value.lang }})"
+      environment:
+        PATH: >-
+          {{ bench_root }}/rustup/cargo/bin:{{ bench_root }}/dotnet:{{ bench_root }}/zig/current:{{ bench_root }}/bun/bin:{{ bench_root }}/uv/bin:{{ ansible_env.PATH }}
+        # rust
+        CARGO_HOME: "{{ bench_root }}/rustup/cargo"
+        RUSTUP_HOME: "{{ bench_root }}/rustup/rustup"
+        CARGO_TARGET_DIR: "{{ bench_root }}/competitors-src/{{ comp.key }}/target"
+        RUSTFLAGS: "-C target-cpu=native"
+        # cpp / drogon
+        CMAKE_PREFIX_PATH: "{{ bench_root }}/drogon/prefix"
+        Drogon_DIR: "{{ bench_root }}/drogon/prefix/lib/cmake/Drogon"
+        CXXFLAGS: "-march=native"
+        # dotnet
+        DOTNET_ROOT: "{{ bench_root }}/dotnet"
+        DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+        DOTNET_NOLOGO: "1"
+        DOTNET_CLI_HOME: "{{ bench_root }}/dotnet-home"
+        NUGET_PACKAGES: "{{ bench_root }}/nuget-packages"
+        # zig
+        ZIG_GLOBAL_CACHE_DIR: "{{ bench_root }}/zig-cache/global"
+        ZIG_LOCAL_CACHE_DIR: "{{ bench_root }}/zig-cache/local"
+        # shared
+        XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
+        XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd {{ bench_root }}/competitors-src/{{ comp.key }}
+        {{ comp.value.build_cmd | default('true') }}
+      args:
+        executable: /bin/bash
+      when: comp.value.lang in ['rust', 'cpp', 'dotnet', 'zig']
+
+    - name: "{{ comp.key }} | symlink compiled binary into competitors/"
+      ansible.builtin.file:
+        src: "{{ bench_root }}/competitors-src/{{ comp.key }}/{{ comp.value.binary_rel }}"
+        dest: "{{ bench_root }}/competitors/{{ comp.key }}"
+        state: link
+        force: true
+      when: comp.value.lang in ['rust', 'cpp', 'dotnet', 'zig']
+
+    # Bun adapters: dispatch to the bun role's parameterized
+    # build_competitor task list (bun install + bun build → dist/server +
+    # launcher). The shared file then symlinks the launcher into competitors/.
+    - name: "{{ comp.key }} | build bun competitor (deps + bundle + launcher)"
+      ansible.builtin.include_role:
+        name: bun
+        tasks_from: build_competitor.yml
+      vars:
+        competitor_name: "{{ comp.key }}"
+        competitor_src: "{{ bench_root }}/competitors-src/{{ comp.key }}"
+      when: comp.value.lang == 'bun'
+
+    - name: "{{ comp.key }} | symlink bun launcher into competitors/"
+      ansible.builtin.file:
+        src: "{{ bench_root }}/competitors-src/{{ comp.key }}/server"
+        dest: "{{ bench_root }}/competitors/{{ comp.key }}"
+        state: link
+        force: true
+      when: comp.value.lang == 'bun'
+
+    # Python adapters: dispatch to the python role's parameterized
+    # build_competitor task list (venv + uv install + launcher). No symlink
+    # needed — the launcher lives directly at competitors/<slug>/server.
+    - name: "{{ comp.key }} | build python competitor (venv + launcher)"
+      ansible.builtin.include_role:
+        name: python
+        tasks_from: build_competitor.yml
+      vars:
+        competitor_name: "{{ comp.key }}"
+        competitor_src_dir: "{{ bench_root }}/competitors-src/{{ comp.key }}"
+        competitor_module: "{{ comp.value.module_target | default('app.server:app') }}"
+      when: comp.value.lang == 'python'
+
+  rescue:
+    - name: "{{ comp.key }} | NATIVE BUILD FAILED — record slug + continue"
+      ansible.builtin.set_fact:
+        failed_natives: "{{ (failed_natives | default([])) + [comp.key] }}"
+
+    - name: "{{ comp.key }} | warn that the competitor is skipped"
+      ansible.builtin.debug:
+        msg: >-
+          NATIVE BUILD FAILED for {{ comp.key }} ({{ comp.value.lang }}) —
+          competitor will be ABSENT from the bench. Deploy continues.
+
+    # Never leave a stale/dangling symlink for a failed competitor — the
+    # bench must see "no binary" and skip the adapter cleanly.
+    - name: "{{ comp.key }} | drop any stale competitor symlink"
+      ansible.builtin.file:
+        path: "{{ bench_root }}/competitors/{{ comp.key }}"
+        state: absent

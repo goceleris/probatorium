@@ -357,10 +357,23 @@ func run(cfg Config) error {
 	for _, a := range effAdv {
 		fs := featureSetFor(a, tlsReady)
 		if cfg.Target != "" {
-			// The runner cannot probe the remote SUT's real capabilities,
-			// so advertise everything and let unsupported protocols surface
-			// as zero-request cells instead of being silently skipped.
-			fs = remoteFeatureSet()
+			// Remote-target mode: the synthetic adapter `a` carries only the
+			// -server-name slug, not a capability manifest. But that slug is a
+			// servers.Registry column key (the cluster bench expands the matrix
+			// straight from the registry), so we look the REAL adapter up and
+			// gate scenarios on its DECLARED capabilities — identical to local
+			// mode. Without this, capability-gated scenarios (driver / chain /
+			// ws / sse / tls) get scheduled against a static-only competitor
+			// that can't serve them, burning a full measurement window on a
+			// 404-storm zero-request cell (a static-only adapter would spend
+			// ~20s/route × every gated scenario producing nothing but errors).
+			// A -server-name that is NOT a registry key (an ad-hoc manual run)
+			// falls back to the permissive set so nothing is silently dropped.
+			if real, ok := servers.Registry[a.Name]; ok {
+				fs = featureSetFor(real, tlsReady)
+			} else {
+				fs = remoteFeatureSet()
+			}
 		}
 		srvs = append(srvs, &adapterServer{adapter: a, features: fs})
 	}

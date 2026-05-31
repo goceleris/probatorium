@@ -137,37 +137,85 @@ func Bench() error {
 	fmt.Printf("  celeris ver:  %s\n", version)
 	fmt.Printf("  results:      %s\n\n", resultsDir)
 
-	args := []string{
-		"-i", "inventory.yml",
-		benchPlaybook,
-		"--extra-vars", "bench_target=" + target,
-		"--extra-vars", "competitor_set=" + competitors,
-		"--extra-vars", "bench_duration=" + duration,
-		"--extra-vars", "bench_warmup=" + warmup,
-		"--extra-vars", "bench_connections=" + conns,
-		"--extra-vars", "bench_cells=" + cells,
-		"--extra-vars", "bench_runs=" + runs,
-		"--extra-vars", "celeris_version=" + version,
-		"--extra-vars", "results_local_dir=" + resultsDir,
+	// Expand the competitor arg into the matrix COLUMNS (one per registry
+	// adapter), each carrying the staged binary dir it runs from and the
+	// -engine flag the binary needs. A single binary (e.g. servers/gin)
+	// backs multiple columns (gin-h1, gin-h2) that differ only by -engine,
+	// so the bench loop must iterate columns — NOT binary dirs — and start
+	// each binary with the right mode. competitor_columns is the slug→
+	// {bin,engine} map run_bench_cell.yml resolves; competitor_set is the
+	// comma-joined column slugs the playbook splits into its schedule.
+	columns, err := resolveBenchColumns(competitors)
+	if err != nil {
+		return err
 	}
-	if seed != "" {
-		args = append(args, "--extra-vars", "bench_seed="+seed)
+	colSlugs := make([]string, len(columns))
+	colMap := make(map[string]map[string]string, len(columns))
+	for i, c := range columns {
+		colSlugs[i] = c.Slug
+		colMap[c.Slug] = map[string]string{"bin": c.Bin, "engine": c.Engine}
 	}
-	if ratedOn {
-		args = append(args,
-			"--extra-vars", "bench_rated=1",
-			"--extra-vars", "bench_rated_duration="+ratedDuration)
+	competitorSetCSV := strings.Join(colSlugs, ",")
+	benchVars := map[string]any{"competitor_columns": colMap}
+	benchVarsJSON, err := json.MarshalIndent(benchVars, "", "  ")
+	if err != nil {
+		return err
 	}
-	if os.Getenv("CLUSTER_USE_LAN") == "1" {
-		args = append(args, "--extra-vars", "use_lan=true")
+	benchVarsFile := filepath.Join(resultsDir, "bench-vars.json")
+	if err := os.WriteFile(benchVarsFile, benchVarsJSON, 0o600); err != nil {
+		return err
 	}
+	fmt.Printf("  columns:      %d (%s)\n", len(colSlugs), competitorSetCSV)
 
-	cmd := exec.Command("ansible-playbook", args...)
-	cmd.Dir = ansibleDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("bench: %w", err)
+	// Expand "both" into the two concrete arch hosts and invoke the playbook
+	// once per arch. bench.yml resolves hostvars[bench_target].lan_ip, so it
+	// needs a REAL host — "both" is not an inventory host (passing it yields
+	// hostvars['both'] → undefined). This matches bench.yml's documented
+	// contract ("the mage Bench 'both' path invokes this playbook once per
+	// target"). Each pass writes its own <TS>-bench-<host>/ dir under the
+	// shared resultsDir, which aggregatePerCellResults + mergeBenchResults
+	// below fold together (merge already handles target=="both").
+	playbookTargets := []string{target}
+	if target == "both" {
+		playbookTargets = []string{"msa2-server", "msr1"}
+	}
+	for _, pt := range playbookTargets {
+		if len(playbookTargets) > 1 {
+			fmt.Printf("\n=== Bench arch pass: %s ===\n", pt)
+		}
+		args := []string{
+			"-i", "inventory.yml",
+			benchPlaybook,
+			"--extra-vars", "bench_target=" + pt,
+			"--extra-vars", "competitor_set=" + competitorSetCSV,
+			"--extra-vars", "@" + benchVarsFile,
+			"--extra-vars", "bench_duration=" + duration,
+			"--extra-vars", "bench_warmup=" + warmup,
+			"--extra-vars", "bench_connections=" + conns,
+			"--extra-vars", "bench_cells=" + cells,
+			"--extra-vars", "bench_runs=" + runs,
+			"--extra-vars", "celeris_version=" + version,
+			"--extra-vars", "results_local_dir=" + resultsDir,
+		}
+		if seed != "" {
+			args = append(args, "--extra-vars", "bench_seed="+seed)
+		}
+		if ratedOn {
+			args = append(args,
+				"--extra-vars", "bench_rated=1",
+				"--extra-vars", "bench_rated_duration="+ratedDuration)
+		}
+		if os.Getenv("CLUSTER_USE_LAN") == "1" {
+			args = append(args, "--extra-vars", "use_lan=true")
+		}
+
+		cmd := exec.Command("ansible-playbook", args...)
+		cmd.Dir = ansibleDir
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("bench (%s): %w", pt, err)
+		}
 	}
 
 	// Each ansible cell ran the Go runner once against the remote SUT,
@@ -192,6 +240,77 @@ func Bench() error {
 	}
 	fmt.Printf("\n=== Bench complete: %s ===\n", merged)
 	return nil
+}
+
+// benchColumn is one matrix column: the report slug (a servers.Registry
+// adapter name, e.g. "gin-h2" or "celeris-epoll-h1-sync"), the staged
+// binary directory it runs from under competitors/<bin>, and the -engine
+// flag value the binary needs. Engine is empty for adapters whose binary
+// takes only -bind (gorilla_ws + every NativeBinary), so run_bench_cell.yml
+// omits the flag and never trips a "flag provided but not defined" abort.
+type benchColumn struct {
+	Slug   string
+	Bin    string
+	Engine string
+}
+
+// resolveBenchColumns expands the BENCH_COMPETITORS arg into the matrix
+// columns. "all"/"" yields every registered adapter; a CSV yields exactly
+// those adapter names (each MUST exist in servers.Registry — an unknown
+// name fails loudly rather than silently dropping a column). The crucial
+// job this does that a bare CSV split cannot: a single staged binary backs
+// several columns (servers/gin → gin-h1 + gin-h2), so it maps each column
+// slug to (binary dir, -engine value) using the registry as the source of
+// truth. Engine == the registry Adapter.Engine field for Go adapters (the
+// two are identical by construction); gorilla_ws is the lone Go binary with
+// no -engine flag, and natives are launched with -bind only.
+func resolveBenchColumns(arg string) ([]benchColumn, error) {
+	all := servers.Names() // sorted, stable
+	names := all
+	if arg != "" && arg != "all" {
+		known := make(map[string]bool, len(all))
+		for _, n := range all {
+			known[n] = true
+		}
+		want := make(map[string]bool)
+		for _, raw := range strings.Split(arg, ",") {
+			n := strings.TrimSpace(raw)
+			if n == "" {
+				continue
+			}
+			if !known[n] {
+				return nil, fmt.Errorf("BENCH_COMPETITORS: %q is not a registered adapter column (see servers.Registry)", n)
+			}
+			want[n] = true
+		}
+		names = make([]string, 0, len(want))
+		for _, n := range all {
+			if want[n] {
+				names = append(names, n)
+			}
+		}
+	}
+	cols := make([]benchColumn, 0, len(names))
+	for _, n := range names {
+		a := servers.Registry[n]
+		col := benchColumn{Slug: n}
+		if gb, ok := a.Bin.(servers.GoBinary); ok {
+			col.Bin = filepath.Base(gb.ModuleDir) // "servers/gin" → "gin"
+			// gorilla_ws is the only Go binary with no -engine flag; every
+			// other Go binary either consumes -engine (stdhttp/gin/echo/chi/
+			// iris/hertz/celeris) or accepts-and-ignores it (gnet/fasthttp/
+			// fiber), so passing the registry Engine value is always safe there.
+			if col.Bin != "gorilla_ws" {
+				col.Engine = a.Engine
+			}
+		} else {
+			// NativeBinary (rust/cpp/dotnet/zig/bun/python) — staged under
+			// competitors/<slug>, launched with -bind only.
+			col.Bin = n
+		}
+		cols = append(cols, col)
+	}
+	return cols, nil
 }
 
 // aggregatePerCellResults walks the per-cell output the bench playbook's
