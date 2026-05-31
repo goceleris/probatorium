@@ -33,6 +33,8 @@ func main() {
 	r := gin.New()
 	r.UseRawPath = true
 	registerRoutes(r)
+	mountDriverHandlers(r)
+	mountChainHandlers(r)
 
 	srv := &http.Server{Addr: *bind, Handler: r}
 	// h2c mode accepts HTTP/1.1 AND HTTP/2-over-cleartext (matches what

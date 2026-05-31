@@ -89,11 +89,28 @@ func main() {
 	})
 	registerRoutes(srv)
 
+	// lifetime bounds background goroutines owned by the chain middleware
+	// (ratelimit's eviction sweeper); cancelled on shutdown so repeat
+	// adapter processes don't leak goroutines.
+	lifetime, cancelLifetime := context.WithCancel(context.Background())
+	defer cancelLifetime()
+
+	// Phase-2 routes: driver-backed (/db, /cache, /mc, /session), the four
+	// middleware chains (/chain/<stack>/{json,upload}), and the streaming
+	// surface (WS /ws, SSE /events). The streaming Hub/Broker background loops
+	// are bounded by lifetime so repeat cells don't leak goroutines.
+	clients := mountDriverHandlers(srv)
+	mountChainHandlers(srv, lifetime)
+	streaming := mountStreamingHandlers(srv, lifetime)
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		<-sig
 		log.Printf("celeris: signal received, shutting down")
+		cancelLifetime()
+		streaming.close()
+		clients.close()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)

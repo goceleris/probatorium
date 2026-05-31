@@ -618,6 +618,24 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 		return out, errors.New(cellRes.Error)
 	}
 
+	// Capability-lie guard: a scheduled scenario whose class is gated on a
+	// declared capability (driver / chain / ws / sse / tls) MUST return mostly
+	// 2xx/3xx. A high error ratio here means the adapter claimed the capability
+	// (so the scheduler ran the cell) but did not actually serve the route —
+	// loadgen counts the resulting 404/501 storm as errors. Surface it as a
+	// HARD error rather than letting a near-zero-RPS cell masquerade as a real
+	// datapoint. With -fail-fast this aborts the matrix; otherwise the cell
+	// records a non-nil error and the run exits non-zero (firstErr is set).
+	if res != nil && res.Requests > 0 && capabilityGatedClass(cell.Scenario.Category()) {
+		const maxErrRatio = 0.01
+		if float64(res.Errors)/float64(res.Requests) > maxErrRatio {
+			cellRes.Error = fmt.Sprintf(
+				"capability-lie: scheduled %s scenario %q got high error ratio from %s (errors=%d/requests=%d) — adapter declared the capability but did not serve the route",
+				cell.Scenario.Category(), cell.Scenario.Name(), cell.Server.Name(), res.Errors, res.Requests)
+			return out, errors.New(cellRes.Error)
+		}
+	}
+
 	// Rated sweep: after the open-loop saturation pass, drive loadgen at
 	// fractions of the measured saturation RPS in closed-loop (CO-corrected)
 	// mode. Each pass sets loadgen.Config.Rate so coordinated-omission
@@ -684,10 +702,19 @@ func (s *adapterServer) Kind() string                 { return s.adapter.Categor
 func (s *adapterServer) Features() servers.FeatureSet { return s.features }
 
 // featureSetFor maps an Adapter to the FeatureSet the scheduler uses to
-// gate (scenario, server) pairs. The mapping is conservative: H1 is on
-// for every adapter that does not declare h2c-only, H2C is on for every
-// adapter whose Engine name signals an H2C path, and Drivers /
-// Middleware track Category.
+// gate (scenario, server) pairs.
+//
+// Wire-protocol facets (HTTP1 / HTTP2C / Auto / H2CUpgrade / AsyncHandlers)
+// are derived from the Engine name — that is legitimate, the engine literally
+// determines which protocols the listener speaks. The scenario-class facets
+// (Drivers / Middleware / WS / SSE / TLS) are read from the adapter's DECLARED
+// [servers.Capabilities] manifest, NOT guessed from the Category name. The old
+// by-name guess was a lie: it granted Drivers / Middleware to every Go adapter
+// whether or not it actually mounted those routes. Trusting the manifest means
+// a scenario is only scheduled against an adapter that claims the matching
+// class; a claim the adapter then fails to honour at run time becomes a hard
+// error in executeCell (the capability-lie guard) instead of a silent
+// 0-RPS / all-404 cell.
 func featureSetFor(a servers.Adapter) servers.FeatureSet {
 	fs := servers.FeatureSet{HTTP1: true}
 	switch {
@@ -711,18 +738,32 @@ func featureSetFor(a servers.Adapter) servers.FeatureSet {
 	if strings.Contains(a.Engine, "async") {
 		fs.AsyncHandlers = true
 	}
-	// Driver and middleware features are gated on Category — every adapter
-	// in the registry currently carries the contract endpoints, but the
-	// driver / chain scenarios stub-out via 501 in this wave.
-	switch a.Category {
-	case "celeris":
-		fs.Drivers = true
-		fs.Middleware = true
-	case "go-net-http", "go-fasthttp", "go-netpoll":
-		fs.Drivers = true
-		fs.Middleware = true
-	}
+	// Scenario-class facets come from the declared manifest — the single
+	// source of truth the scheduler trusts.
+	fs.Drivers = a.Capabilities.Drivers
+	fs.Middleware = a.Capabilities.Middleware
+	fs.WS = a.Capabilities.WS
+	fs.SSE = a.Capabilities.SSE
+	fs.TLS = a.Capabilities.TLS
 	return fs
+}
+
+// capabilityGatedClass reports whether a scenario category is gated on a
+// declared adapter capability (and therefore subject to the executeCell
+// capability-lie guard). Static and concurrency scenarios drive the universal
+// contract endpoints and are NOT capability-gated, so a non-2xx there is a real
+// performance / correctness signal handled by the normal result path, not a lie.
+func capabilityGatedClass(category string) bool {
+	switch category {
+	case scenarios.CategoryDriver,
+		scenarios.CategoryChain,
+		scenarios.CategoryWS,
+		scenarios.CategorySSE,
+		scenarios.CategoryTLS:
+		return true
+	default:
+		return false
+	}
 }
 
 // remoteServerName resolves the synthetic server name used in
@@ -747,6 +788,9 @@ func remoteFeatureSet() servers.FeatureSet {
 		Auto:          true,
 		Drivers:       true,
 		Middleware:    true,
+		WS:            true,
+		SSE:           true,
+		TLS:           true,
 		AsyncHandlers: true,
 	}
 }

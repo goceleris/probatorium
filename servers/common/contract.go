@@ -111,3 +111,77 @@ func init() {
 		}
 	}
 }
+
+// ============================================================================
+// Phase-2 declared routes (driver + chain).
+//
+// These are NOT part of [Endpoints]: the conformance harness byte-compares
+// every entry in Endpoints against a fixed ResponseBody, and these routes are
+// dynamic (DB-backed, middleware-gated). They live here so the contract stays
+// the single source of truth for paths and content-types, but they carry no
+// ResponseBody — adapters and probes shape-check them instead of byte-matching.
+//
+// Availability is capability-gated: an adapter only mounts these when its
+// [servers.Capabilities] declares Drivers / Middleware. A declared-but-unserved
+// route is a hard error at run time (the runner's per-cell guard), never a
+// silent 0-RPS cell.
+// ============================================================================
+
+// DriverEndpoints are the four driver-backed routes (PG / Redis / memcached /
+// session). Path templates use the colon-prefix convention; adapters translate
+// to their router's syntax ({id} / {key}) once at registration. The benched
+// requests pin id=42 and a fixed demo key (see scenarios/driver.go).
+var DriverEndpoints = []Endpoint{
+	{Method: "GET", Path: "/db/user/:id", ResponseContentType: "application/json"},
+	{Method: "GET", Path: "/cache/:key", ResponseContentType: "application/octet-stream"},
+	{Method: "GET", Path: "/mc/:key", ResponseContentType: "application/octet-stream"},
+	{Method: "POST", Path: "/session", ResponseContentType: "application/json"},
+}
+
+// ChainStacks is the ordered list of middleware stacks, each mounted under
+// /chain/<stack>/. It mirrors scenarios.ChainProfiles so the loadgen side and
+// the adapter side cannot drift. For each stack an adapter serves a GET
+// .../json and a POST .../upload route.
+var ChainStacks = []string{"api", "auth", "security", "fullstack"}
+
+// ChainStackPrefix returns the HTTP path prefix for a chain stack, e.g.
+// "api" -> "/chain/api/". Both the adapter chain_handlers.go and the
+// scenarios package mount/dial through this single source of truth.
+func ChainStackPrefix(stack string) string { return "/chain/" + stack + "/" }
+
+// ChainEndpoints expands ChainStacks into the concrete declared routes
+// (GET <prefix>json + POST <prefix>upload per stack). Like DriverEndpoints,
+// these are capability-gated and carry no fixed ResponseBody.
+var ChainEndpoints = func() []Endpoint {
+	eps := make([]Endpoint, 0, len(ChainStacks)*2)
+	for _, stack := range ChainStacks {
+		prefix := ChainStackPrefix(stack)
+		eps = append(eps,
+			Endpoint{Method: "GET", Path: prefix + "json", ResponseContentType: "application/json"},
+			Endpoint{Method: "POST", Path: prefix + "upload", ResponseContentType: "text/plain"},
+		)
+	}
+	return eps
+}()
+
+// Shared wire-parity constants for the chain (middleware) scenarios. Every
+// adapter and the loadgen side reference these so the auth / session / csrf
+// behaviour is byte-identical across frameworks and languages — a chain
+// throughput delta then reflects middleware cost, never a credential or
+// cookie-name mismatch.
+const (
+	// BasicAuthUser / BasicAuthPass are the shared credential the auth,
+	// security, and fullstack stacks expect.
+	BasicAuthUser = "bench"
+	BasicAuthPass = "bench"
+	// BasicAuthHeader is the RFC 7617 Authorization value for bench:bench
+	// (base64("bench:bench")). Adapters validate against it; loadgen sends it.
+	BasicAuthHeader = "Basic YmVuY2g6YmVuY2g="
+	// BasicAuthRealm is the WWW-Authenticate realm, kept for wire parity.
+	BasicAuthRealm = "perfmatrix"
+
+	// SessionCookieName / CSRFCookieName are the cookie names the session and
+	// security stacks emit.
+	SessionCookieName = "pmsid"
+	CSRFCookieName    = "_csrf"
+)

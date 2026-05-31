@@ -37,6 +37,15 @@ func main() {
 	})
 	registerRoutes(app)
 
+	// Phase-2 routes. The fiber-h1 adapter declares Drivers + Middleware in
+	// the registry, so the driver (/db,/cache,/mc,/session) and chain
+	// (/chain/<stack>/{json,upload}) routes are always mounted; an
+	// unconfigured backend answers 503 rather than 404 so the runner's
+	// cell guard sees a served-but-degraded route, not a missing one.
+	drivers := buildDriverState()
+	mountDriverHandlers(app, drivers)
+	mountChainHandlers(app)
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
@@ -45,6 +54,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = app.ShutdownWithContext(ctx)
+		shutdownDriverState(drivers)
 	}()
 
 	if err := app.Listen(*bind); err != nil {

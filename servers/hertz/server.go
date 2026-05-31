@@ -44,12 +44,22 @@ func main() {
 	}
 	registerRoutes(h)
 
+	// Phase-2 routes. The hertz adapter declares Drivers + Middleware in the
+	// registry, so the driver (/db,/cache,/mc,/session) and chain
+	// (/chain/<stack>/{json,upload}) routes are always mounted; an
+	// unconfigured backend answers 503 rather than 404 so the runner's cell
+	// guard sees a served-but-degraded route, not a missing one.
+	drivers := buildDriverState()
+	mountDriverHandlers(h, drivers)
+	mountChainHandlers(h)
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		<-sig
 		log.Printf("hertz: signal received, shutting down")
 		_ = h.Shutdown(context.Background())
+		shutdownDriverState(drivers)
 	}()
 
 	h.Spin()

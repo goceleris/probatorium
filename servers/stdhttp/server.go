@@ -125,4 +125,10 @@ func registerRoutes(mux *http.ServeMux) {
 			})
 		}
 	}
+
+	// Phase-2 capability routes. stdhttp declares Drivers + Middleware in the
+	// registry, so both are mounted unconditionally here; the driver handlers
+	// self-gate to 503 when a backend is unconfigured.
+	mountDriverHandlers(mux)
+	mountChainHandlers(mux)
 }
