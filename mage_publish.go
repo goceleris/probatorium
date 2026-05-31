@@ -37,8 +37,9 @@ const benchmarkPublishedEvent = "benchmark-published"
 // docsRepo is the GitHub owner/repo the tree is published to.
 const docsRepo = "goceleris/docs"
 
-// defaultRunID is the canonical run for a date. Phase 5's multi-run loop
-// increments this (run-2, run-3); Phase 4 always publishes run-1.
+// defaultRunID is the canonical run for a date. Phase 5's back-to-back
+// loop (BenchTier, #167) overrides this per pass via PUBLISH_RUN_ID
+// (run-1..run-N); absent that env, every publish is run-1.
 const defaultRunID = "run-1"
 
 // archTag maps a Go GOARCH to the canonical on-disk / dispatch arch
@@ -175,7 +176,7 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, error) {
 		Version:        version,
 		Arch:           archTag(benchTargetGOARCH()),
 		Date:           now.Format("20060102"),
-		RunID:          defaultRunID,
+		RunID:          envOrDefault("PUBLISH_RUN_ID", defaultRunID),
 		GitSHA:         gitRefOr(),
 		GitRef:         os.Getenv("GITHUB_REF"),
 		CelerisVersion: version,

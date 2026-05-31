@@ -1,0 +1,210 @@
+name: Benchmark Tier
+
+# Curated benchmark sweep on the cluster within a 24h budget
+# (probatorium#172/#166/#167). Runs AFTER the Weekend Soak completes so it
+# never contends for the cluster, plus a manual workflow_dispatch.
+#
+# Job graph: gate -> detect -> setup -> matrix -> teardown.
+#   - gate:     only proceed after a SUCCESSFUL soak (workflow_run fires on
+#               success AND failure); manual dispatch always passes.
+#   - detect:   is the go.mod celeris pin newer than the newest benchmarked
+#               version in the docs index.json? Cheap, ubuntu, no cluster.
+#   - setup:    provision FRESH ephemeral cluster runners.
+#   - matrix:   deploy -> mage BenchTier (curated matrix, both arches, xN
+#               back-to-back when new release, publish run-1..run-N).
+#   - teardown: retire the runners.
+#
+# Concurrency: shares the matrix-tier-cluster group with the PR / nightly /
+# weekend tiers and cancel-in-progress:false, so it QUEUES behind the soak
+# and never overlaps the cluster. (workflow_run also fires only after the
+# soak fully completes, so the shared group is the real serialization
+# guarantee; the trigger ordering is belt-and-braces.)
+#
+# Schedule / maintainer-owned: no cluster-ok label gate (the PR tier needs
+# one; this never runs from an untrusted PR surface).
+
+on:
+  workflow_run:
+    workflows: ["Weekend Soak"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: headline | full curated matrix
+        required: false
+        type: string
+        default: headline
+      force_new_release:
+        description: force the N back-to-back release runs ("true"/"false")
+        required: false
+        type: string
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-tier-cluster
+  cancel-in-progress: false
+
+env:
+  CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+
+jobs:
+  gate:
+    name: gate (soak success or manual)
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Log trigger
+        run: |
+          echo "trigger=${{ github.event_name }}"
+          echo "soak_conclusion=${{ github.event.workflow_run.conclusion }}"
+
+  detect:
+    name: detect new release
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      is_new_release: ${{ steps.d.outputs.is_new_release }}
+      version: ${{ steps.d.outputs.version }}
+      newest_benchmarked: ${{ steps.d.outputs.newest_benchmarked }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install mage
+        run: |
+          go install github.com/magefile/mage@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Detect release (go.mod pin vs docs index.json)
+        id: d
+        env:
+          DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+        run: mage DetectRelease >> "$GITHUB_OUTPUT"
+
+  setup:
+    name: bootstrap cluster runners
+    needs: [gate, detect]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/cluster-runner-up
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          wait-for-manifest-clear:   "true"
+          # The soak just finished; give the cluster generous drain time.
+          wait-timeout-seconds:      "3600"
+
+  matrix:
+    name: benchmark tier (curated, both arches)
+    needs: [detect, setup]
+    runs-on: [self-hosted, celeris-cluster]
+    timeout-minutes: 1440
+    env:
+      BENCH_PROFILE: ${{ github.event.inputs.profile || 'headline' }}
+      IS_NEW_RELEASE: ${{ needs.detect.outputs.is_new_release }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Install mage
+        # mage isn't in the root go.mod; install it into GOPATH/bin ahead
+        # of every mage invocation. Cheap (~5s) and avoids `go run` which
+        # needs mage in go.mod.
+        run: |
+          go install github.com/magefile/mage@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Use bootstrap-provisioned ansible
+        # runner-setup.yml provisioned an ansible-core venv + collections
+        # path under /tmp/actions-runner-<host>/. Writing GITHUB_PATH +
+        # GITHUB_ENV here guarantees subsequent shells find ansible-playbook
+        # and the collections it needs.
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          echo "${RUNNER_ROOT}/ansible-venv/bin" >> "$GITHUB_PATH"
+          echo "ANSIBLE_COLLECTIONS_PATH=${RUNNER_ROOT}/ansible-collections" >> "$GITHUB_ENV"
+
+      - name: Configure cluster SSH
+        # CLUSTER_USE_LAN=1 routes through the LACP fabric; the
+        # CLUSTER_SSH_KEY private half lets ansible reach peer hosts;
+        # PROBATORIUM_LOCAL_HOST switches inventory_hostname == self to
+        # ansible_connection=local. See matrix-pr-tier.yml for the full
+        # rationale.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          mkdir -p "${RUNNER_ROOT}/.ssh"
+          chmod 700 "${RUNNER_ROOT}/.ssh"
+          printf '%s\n' "$CLUSTER_SSH_KEY" > "${RUNNER_ROOT}/.ssh/id_ed25519"
+          chmod 600 "${RUNNER_ROOT}/.ssh/id_ed25519"
+          {
+            echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519"
+            echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)"
+            echo "CLUSTER_USE_LAN=1"
+          } >> "$GITHUB_ENV"
+
+      - name: mage Deploy (competitors + db services for the profile)
+        env:
+          # Bench needs the competitor binaries staged.
+          DEPLOY_COMPETITORS: all
+          # driver-* cells in the profile need postgres/redis/memcached.
+          DEPLOY_NEEDS_DBSERVICES: "1"
+        run: mage Deploy
+
+      - name: mage BenchTier (curated matrix, both arches, xN, publish each run)
+        env:
+          CLUSTER_USE_LAN: "1"
+          BENCH_TARGET: both
+          DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+          # N = 3 back-to-back run-K cells when a new release is detected
+          # (or forced via dispatch), else 1. Orthogonal to BENCH_RUNS (the
+          # per-cell median basis inside each publish).
+          BENCH_BACK_TO_BACK: >-
+            ${{ (needs.detect.outputs.is_new_release == 'true' ||
+                 github.event.inputs.force_new_release == 'true') && '3' || '1' }}
+        run: mage BenchTier
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-tier-results-${{ github.run_id }}
+          path: results/
+          retention-days: 90
+
+      - name: mage Cleanup
+        if: always()
+        run: mage Cleanup
+
+  teardown:
+    name: teardown cluster runners
+    needs: [setup, matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/cluster-runner-down
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}

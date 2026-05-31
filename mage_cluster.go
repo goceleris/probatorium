@@ -126,15 +126,20 @@ func Deploy() error {
 	// listed below (e.g. runner_binary_amd64), so the set here MUST
 	// stay in lockstep with `ansible/deploy.yml`'s push-* tasks.
 	//
-	// loadgen is amd64-only because msa2-client (the loadgen host)
-	// is amd64. Multi-host loadgen federation (msr1 sidecar) is in
-	// the v1.5 backlog; when it lands, add "arm64" here.
+	// loadgen is amd64-only by default because msa2-client (the sole
+	// loadgen host today) is amd64. The arm64 staging + per-arch
+	// federation seam is gated behind arm64LoadgenEnabled() — see the
+	// TODO(#168) block on that helper below.
+	loadgenArchs := []string{"amd64"}
+	if arm64LoadgenEnabled() {
+		loadgenArchs = []string{"amd64", "arm64"}
+	}
 	coreBins := []struct {
 		name  string
 		archs []string
 	}{
 		{"runner", []string{"amd64", "arm64"}},
-		{"loadgen", []string{"amd64"}},
+		{"loadgen", loadgenArchs},
 		{"observer", []string{"amd64", "arm64"}},
 		{"validator", []string{"amd64", "arm64"}},
 		{"conformance", []string{"amd64", "arm64"}},
@@ -743,4 +748,111 @@ func runHostsParallel(hosts []string, fn func(host string) error) error {
 			len(failed), strings.Join(failed, "; "))
 	}
 	return nil
+}
+
+// ── arm64 loadgen federation seam (#168) ────────────────────────────
+//
+// Today the bench fabric drives BOTH arch targets from a single amd64
+// loadgen host (msa2-client): the amd64 server (msa2-server) is driven
+// natively, but the arm64 server (msr1) is also driven by that amd64
+// client over the 20G fabric, and the two arch passes run SERIALLY
+// (BENCH_TARGET=both = two bench.yml passes back-to-back). That
+// serialization is the ~2× wall-clock the 24h budget (#166) fights.
+//
+// The fix is to stand up a SECOND, arm64-native loadgen instance so
+// each arch is driven by a same-arch client, and to run the two passes
+// CONCURRENTLY (one playbook run per arch, fanned out via
+// runHostsParallel). Each instance produces its own per-cell
+// loadgen.Result with a V2-compressed HDR histogram; mergeBenchResults
+// (mage_bench.go) already base64-encodes each run's histogram and
+// report.Aggregate / report.mergeHistograms (report/aggregate.go:258)
+// merges them ACROSS RUNS within an arch. Arches stay SEPARATE cells in
+// the docs tree (arch is a tree dimension), so no cross-arch merge is
+// needed — the federation's only job is to produce arm64 histograms
+// with an arm64 driver instead of amd64-driven-arm64 data.
+//
+// TODO(#168): this seam is INERT by default and BLOCKED on the
+// loadgen-repo (goceleris/loadgen) building a linux/arm64 binary.
+// crossCompileGoBinary already cross-compiles ./cmd/loadgen for any
+// GOARCH, but loadgen's own deps must build clean under GOARCH=arm64
+// first. The four seam steps, all gated behind arm64LoadgenEnabled():
+//
+//   1. Stage an arm64 loadgen binary (the loadgenArchs branch in
+//      Deploy above adds "arm64" when the flag is on; deploy.yml must
+//      grow a loadgen_binary_arm64 push to msr1 to match).
+//   2. Run two independent loadgen instances, one per arch, each
+//      driving a SAME-arch target (recommended over a 2-node
+//      single-peer federation: no peer-coordination protocol, and the
+//      merge primitive already exists). The v1 topology co-locates the
+//      arm64 driver on msr1 itself (documented measurement caveat:
+//      driver+SUT contention); the clean topology is a dedicated arm64
+//      driver box.
+//   3. Drive the two arch passes CONCURRENTLY via loadgenFederation
+//      below (mirrors the VALIDATE_PARALLEL fan-out precedent).
+//   4. Reuse report.mergeHistograms UNCHANGED for across-run merge.
+//
+// Flipping budget.Profile.ArchParallel=true (the #168 wall-clock win)
+// is GATED on this seam being live — until loadgen ships linux/arm64,
+// the budget calculator must run with ArchParallel=false (serial).
+
+// arm64LoadgenEnabled reports whether the arm64-native loadgen
+// federation seam is active. It is OFF by default so deploy/bench keep
+// today's amd64-driven behaviour byte-for-byte; the loadgen-repo arm64
+// build (TODO #168 above) flips this on via PROBATORIUM_ARM64_LOADGEN=1
+// once goceleris/loadgen ships a working linux/arm64 binary.
+func arm64LoadgenEnabled() bool {
+	return os.Getenv("PROBATORIUM_ARM64_LOADGEN") == "1"
+}
+
+// archLoadgenHost maps a bench target host to the loadgen host that
+// drives it. With the federation seam OFF, every target is driven by
+// the single amd64 loadgen host (today's behaviour). With it ON, the
+// arm64 target (msr1) is driven by a same-arch instance — co-located on
+// msr1 in the v1 seam (see TODO #168 measurement caveat).
+func archLoadgenHost(target string) string {
+	const amd64Loadgen = "msa2-client"
+	if !arm64LoadgenEnabled() {
+		return amd64Loadgen
+	}
+	switch target {
+	case "msr1":
+		// TODO(#168): co-located driver+SUT on msr1 pollutes the
+		// measurement; swap for a dedicated arm64 driver box when one
+		// joins the fabric.
+		return "msr1"
+	default:
+		return amd64Loadgen
+	}
+}
+
+// loadgenFederation runs the per-arch bench passes for BENCH_TARGET=both
+// either SERIALLY (today, federation seam off) or CONCURRENTLY (one
+// loadgen instance per arch, federation seam on — the #168 win). It is
+// the single fan-out point so mage_bench.go's "both" branch can call it
+// without knowing whether the seam is live.
+//
+// runPass drives one arch target end-to-end (deploy-already-done,
+// playbook + fetch + per-arch merge). The two passes write to SEPARATE
+// per-arch results dirs, so concurrent execution never races on output
+// and the existing per-arch Publish path ships one tree per arch.
+//
+// NOTE: this helper is the structural seam; mage_bench.go's "both"
+// branch keeps its current serial loop until the loadgen-repo arm64
+// dependency lands and arm64LoadgenEnabled() returns true. Keeping it
+// here (rather than inlined) means the parallel path is reviewable and
+// testable independently of flipping the flag.
+func loadgenFederation(targets []string, runPass func(target string) error) error {
+	if !arm64LoadgenEnabled() {
+		// Serial: preserve today's exact wall-clock + ordering so the
+		// seam is fully inert until the arm64 loadgen build lands.
+		for _, t := range targets {
+			if err := runPass(t); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// Concurrent: each arch driven by its own same-arch loadgen
+	// instance (archLoadgenHost) — mirrors runHostsParallel's fan-out.
+	return runHostsParallel(targets, runPass)
 }
