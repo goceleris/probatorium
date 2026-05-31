@@ -11,9 +11,16 @@ import (
 
 // makeSeries attaches a synthetic 1 Hz time-series to a loadgen.Result.
 // rps[i] is the RequestsPerSec for elapsed second i; p99[i], when the
-// slice is non-nil, is the per-bucket P99Ms (the loadgen seam). A nil
-// p99 leaves every point's P99Ms at 0 (the stock loadgen case).
+// slice is non-nil, is the per-bucket P99Ms. A nil p99 leaves every
+// point's P99Ms at 0 (a legitimate measured value loadgen can emit).
+// Errors default to 0; use makeSeriesErr to set per-bucket error deltas.
 func makeSeries(rps []float64, p99 []float64) loadgen.Result {
+	return makeSeriesErr(rps, p99, nil)
+}
+
+// makeSeriesErr is makeSeries plus a per-bucket Errors slice (nil leaves
+// every point's Errors at 0).
+func makeSeriesErr(rps []float64, p99 []float64, errs []int64) loadgen.Result {
 	pts := make([]loadgen.TimeseriesPoint, len(rps))
 	for i, r := range rps {
 		pts[i] = loadgen.TimeseriesPoint{
@@ -22,6 +29,9 @@ func makeSeries(rps []float64, p99 []float64) loadgen.Result {
 		}
 		if p99 != nil {
 			pts[i].P99Ms = p99[i]
+		}
+		if errs != nil {
+			pts[i].Errors = errs[i]
 		}
 	}
 	return loadgen.Result{
@@ -93,13 +103,19 @@ func TestMergeBand_RaggedRuns(t *testing.T) {
 		t.Errorf("bucket10 (single run) band = %+v, want all 300", b10)
 	}
 
-	// No run carried P99Ms, so the band must omit it everywhere.
+	// loadgen always feeds P99Ms/Errors, so the bands are always emitted;
+	// here every point carried 0, so every band is an all-zero BandStat.
+	zero := BandStat{}
 	for i, b := range band {
-		if b.P99Ms != nil {
-			t.Errorf("band[%d].P99Ms = %+v, want nil (seam unfed)", i, *b.P99Ms)
+		if b.P99Ms == nil {
+			t.Errorf("band[%d].P99Ms = nil, want populated", i)
+		} else if *b.P99Ms != zero {
+			t.Errorf("band[%d].P99Ms = %+v, want all-zero", i, *b.P99Ms)
 		}
-		if b.Errors != nil {
-			t.Errorf("band[%d].Errors = %+v, want nil (seam unfed)", i, *b.Errors)
+		if b.Errors == nil {
+			t.Errorf("band[%d].Errors = nil, want populated", i)
+		} else if *b.Errors != zero {
+			t.Errorf("band[%d].Errors = %+v, want all-zero", i, *b.Errors)
 		}
 	}
 }
@@ -136,45 +152,35 @@ func TestBuildScenarioSeries_PerRunRetention(t *testing.T) {
 	}
 }
 
-// TestSeam_P99AndErrorsUnfed proves the P99Ms band stays nil when loadgen
-// does not fill P99Ms, and fires once a run carries a nonzero P99Ms.
-// Errors stay nil in both cases (no loadgen source yet).
-func TestSeam_P99AndErrorsUnfed(t *testing.T) {
-	// Case 1: stock loadgen (P99Ms == 0 everywhere) -> band omits P99Ms.
-	stock := []loadgen.Result{
-		makeSeries([]float64{100, 100}, nil),
-		makeSeries([]float64{100, 100}, nil),
+// TestMergeBand_P99AndErrorsFed proves the cross-run P99Ms and Errors
+// bands populate from the per-bucket values loadgen (>= v1.4.5) feeds on
+// every tick, with the same min/p50/p99/max/mean envelope as the RPS band.
+func TestMergeBand_P99AndErrorsFed(t *testing.T) {
+	fed := []loadgen.Result{
+		makeSeriesErr([]float64{100, 100}, []float64{1.0, 2.0}, []int64{10, 20}),
+		makeSeriesErr([]float64{100, 100}, []float64{3.0, 4.0}, []int64{30, 40}),
 	}
-	ss := BuildScenarioSeries("s", "v", "", stock)
-	for i, b := range ss.Band {
-		if b.P99Ms != nil {
-			t.Errorf("stock band[%d].P99Ms = %+v, want nil", i, *b.P99Ms)
-		}
-		if b.Errors != nil {
-			t.Errorf("stock band[%d].Errors = %+v, want nil", i, *b.Errors)
-		}
+	ss := BuildScenarioSeries("s", "v", "", fed)
+	if len(ss.Band) != 2 {
+		t.Fatalf("len(band) = %d, want 2", len(ss.Band))
 	}
 
-	// Case 2: loadgen fills P99Ms -> band populates the P99Ms envelope.
-	fed := []loadgen.Result{
-		makeSeries([]float64{100, 100}, []float64{1.0, 2.0}),
-		makeSeries([]float64{100, 100}, []float64{3.0, 4.0}),
-	}
-	ss2 := BuildScenarioSeries("s", "v", "", fed)
-	if len(ss2.Band) != 2 {
-		t.Fatalf("len(band) = %d, want 2", len(ss2.Band))
-	}
-	if ss2.Band[0].P99Ms == nil {
-		t.Fatalf("fed band[0].P99Ms = nil, want populated once seam fires")
-	}
 	// Bucket 0 P99Ms values {1.0, 3.0}: min 1, max 3, mean 2.
-	p := ss2.Band[0].P99Ms
-	if !approxEq(p.Min, 1.0) || !approxEq(p.Max, 3.0) || !approxEq(p.Mean, 2.0) {
-		t.Errorf("fed band[0].P99Ms = %+v, want min=1 max=3 mean=2", *p)
+	p := ss.Band[0].P99Ms
+	if p == nil {
+		t.Fatalf("band[0].P99Ms = nil, want populated")
 	}
-	// Errors still has no loadgen source.
-	if ss2.Band[0].Errors != nil {
-		t.Errorf("fed band[0].Errors = %+v, want nil (no loadgen source)", *ss2.Band[0].Errors)
+	if !approxEq(p.Min, 1.0) || !approxEq(p.Max, 3.0) || !approxEq(p.Mean, 2.0) || !approxEq(p.P50, 2.0) {
+		t.Errorf("band[0].P99Ms = %+v, want min=1 p50=2 max=3 mean=2", *p)
+	}
+
+	// Bucket 0 Errors values {10, 30}: min 10, max 30, mean 20.
+	e := ss.Band[0].Errors
+	if e == nil {
+		t.Fatalf("band[0].Errors = nil, want populated")
+	}
+	if !approxEq(e.Min, 10) || !approxEq(e.Max, 30) || !approxEq(e.Mean, 20) || !approxEq(e.P50, 20) {
+		t.Errorf("band[0].Errors = %+v, want min=10 p50=20 max=30 mean=20", *e)
 	}
 }
 

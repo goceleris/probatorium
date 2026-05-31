@@ -14,8 +14,9 @@
 //
 // Each scenario keeps every run's raw series PLUS a cross-run band: a
 // per-elapsed-second min/p50/p99/max/mean envelope over the per-bucket
-// RPS. Alignment is by ELAPSED second (TimestampSec), never wall clock,
-// because interleave.Schedule time-multiplexes the runs.
+// RPS, windowed P99 latency and per-window error delta. Alignment is by
+// ELAPSED second (TimestampSec), never wall clock, because
+// interleave.Schedule time-multiplexes the runs.
 package report
 
 import (
@@ -59,9 +60,10 @@ type RunSeries struct {
 	Samples []SampleRow `json:"samples"`
 }
 
-// SampleRow mirrors [loadgen.TimeseriesPoint] (elapsed-second + RPS,
-// plus the reserved per-bucket P99) and adds a forward-slot Errors
-// count. See the seam note on [sampleRowFrom].
+// SampleRow mirrors [loadgen.TimeseriesPoint]: elapsed-second, RPS, the
+// per-bucket P99 latency (ms) and the per-bucket error delta. loadgen
+// (>= v1.4.5) fills all four on every tick. P99Ms/Errors keep omitempty
+// so a measured 0 (no errors / sub-ms p99) shrinks the on-disk JSON.
 type SampleRow struct {
 	TSec   float64 `json:"t_s"`
 	RPS    float64 `json:"rps"`
@@ -69,9 +71,11 @@ type SampleRow struct {
 	Errors int64   `json:"errors,omitempty"`
 }
 
-// BucketBand is the cross-run envelope for one elapsed-second bucket.
-// P99Ms and Errors are pointers so they serialise to nothing (omitempty)
-// until the loadgen seam actually feeds them — see [mergeBand].
+// BucketBand is the cross-run envelope for one elapsed-second bucket. RPS
+// is always present; P99Ms and Errors are pointers so a bucket with no
+// contributing points (an empty union slot) can omit them, but loadgen
+// (>= v1.4.5) feeds every point's P99Ms/Errors so they populate in
+// practice — see [mergeBand].
 type BucketBand struct {
 	TSec   int64     `json:"t_s"`
 	RPS    BandStat  `json:"rps"`
@@ -97,21 +101,15 @@ func bucketKey(p loadgen.TimeseriesPoint) int64 {
 	return int64(math.Floor(p.TimestampSec))
 }
 
-// sampleRowFrom projects a loadgen point into a SampleRow.
-//
-// TODO(#153)/TODO(loadgen): loadgen.TimeseriesPoint exposes
-// {TimestampSec, RequestsPerSec, P99Ms}, but loadgen.bench.go currently
-// fills only the first two — P99Ms is always 0 (so it omits) and there
-// is NO per-bucket errors field yet. When loadgen populates P99Ms and
-// adds a per-bucket error count (tracked in loadgen, NOT here), wire
-// them in here and in mergeBand; every consumer below picks them up
-// unchanged. Do NOT edit ../loadgen to populate these.
+// sampleRowFrom projects a loadgen point into a SampleRow, carrying all
+// four fields loadgen (>= v1.4.5) emits per tick: elapsed-second, RPS,
+// windowed P99 latency (ms) and the per-window error delta.
 func sampleRowFrom(p loadgen.TimeseriesPoint) SampleRow {
 	return SampleRow{
-		TSec:  p.TimestampSec,
-		RPS:   p.RequestsPerSec,
-		P99Ms: p.P99Ms,
-		// Errors: <- forward slot; loadgen does not emit per-bucket errors yet.
+		TSec:   p.TimestampSec,
+		RPS:    p.RequestsPerSec,
+		P99Ms:  p.P99Ms,
+		Errors: p.Errors,
 	}
 }
 
@@ -127,21 +125,20 @@ func runSeriesFrom(run int, pts []loadgen.TimeseriesPoint) RunSeries {
 
 // mergeBand aligns every run's points by elapsed-second bucket and emits
 // one BucketBand per bucket present in any run (ragged runs handled by
-// union iteration). The RPS band is always populated; the P99Ms band is
-// emitted only when at least one run carries a nonzero P99Ms (the seam
-// fires once loadgen fills it). Errors stay nil until loadgen feeds them.
+// union iteration). RPS, P99Ms and Errors bands all populate from the
+// per-bucket values loadgen (>= v1.4.5) feeds on every tick; a measured
+// 0 is a legitimate value, so the bands are emitted unconditionally for
+// every bucket that has at least one contributing point.
 func mergeBand(runs [][]loadgen.TimeseriesPoint) []BucketBand {
 	rpsByBucket := map[int64][]float64{}
 	p99ByBucket := map[int64][]float64{}
-	anyP99 := false
+	errByBucket := map[int64][]float64{}
 	for _, pts := range runs {
 		for _, p := range pts {
 			k := bucketKey(p)
 			rpsByBucket[k] = append(rpsByBucket[k], p.RequestsPerSec)
 			p99ByBucket[k] = append(p99ByBucket[k], p.P99Ms)
-			if p.P99Ms != 0 {
-				anyP99 = true
-			}
+			errByBucket[k] = append(errByBucket[k], float64(p.Errors))
 		}
 	}
 	if len(rpsByBucket) == 0 {
@@ -156,12 +153,14 @@ func mergeBand(runs [][]loadgen.TimeseriesPoint) []BucketBand {
 
 	out := make([]BucketBand, 0, len(keys))
 	for _, k := range keys {
-		band := BucketBand{TSec: k, RPS: bandStatOf(rpsByBucket[k])}
-		if anyP99 {
-			s := bandStatOf(p99ByBucket[k])
-			band.P99Ms = &s
-		}
-		out = append(out, band)
+		p99 := bandStatOf(p99ByBucket[k])
+		errs := bandStatOf(errByBucket[k])
+		out = append(out, BucketBand{
+			TSec:   k,
+			RPS:    bandStatOf(rpsByBucket[k]),
+			P99Ms:  &p99,
+			Errors: &errs,
+		})
 	}
 	return out
 }

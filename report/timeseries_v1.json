@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/goceleris/probatorium/main/report/timeseries_v1.json",
   "title": "Probatorium time-series sidecar",
-  "description": "timeseries/1 schema for the decompressed timeseries.json.gz sidecar (probatorium#153). Separate from results.json (schema_v5.json): per (scenario, server) it keeps each run's raw 1 Hz rps series PLUS a cross-run min/p50/p99/max/mean band over per-elapsed-second RPS. The band is a small-sample envelope over per-bucket RPS, NOT an HDR-merged latency percentile. p99_ms / errors bands are emitted only once the loadgen seam populates per-bucket P99/errors.",
+  "description": "timeseries/1 schema for the decompressed timeseries.json.gz sidecar (probatorium#153). Separate from results.json (schema_v5.json): per (scenario, server) it keeps each run's raw 1 Hz series PLUS a cross-run min/p50/p99/max/mean band over per-elapsed-second RPS, windowed P99 latency and per-window error delta. The band is a small-sample envelope over per-bucket values, NOT an HDR-merged latency percentile. loadgen (>= v1.4.5) feeds p99_ms and errors on every tick, so the p99_ms and errors bands are always present alongside rps.",
   "type": "object",
   "required": ["generated_at", "schema_version", "scenarios"],
   "properties": {
@@ -52,8 +52,8 @@
       "properties": {
         "t_s": { "type": "number", "description": "Elapsed measurement time in seconds (0-based)." },
         "rps": { "type": "number", "description": "Instantaneous request rate over the prior 1-second bucket." },
-        "p99_ms": { "type": "number", "description": "Per-bucket P99 latency (ms). Reserved seam; omitted until loadgen fills it." },
-        "errors": { "type": "integer", "description": "Per-bucket error count. Forward slot; omitted until loadgen emits it." }
+        "p99_ms": { "type": "number", "description": "Per-bucket windowed P99 latency (ms). Fed by loadgen (>= v1.4.5); omitted only when a measured 0." },
+        "errors": { "type": "integer", "description": "Per-bucket error delta over the prior 1-second window. Fed by loadgen (>= v1.4.5); omitted only when a measured 0." }
       }
     },
     "bucketBand": {
@@ -61,9 +61,9 @@
       "required": ["t_s", "rps"],
       "properties": {
         "t_s": { "type": "integer", "description": "Elapsed-second bucket key." },
-        "rps": { "$ref": "#/$defs/bandStat" },
-        "p99_ms": { "$ref": "#/$defs/bandStat" },
-        "errors": { "$ref": "#/$defs/bandStat" }
+        "rps": { "$ref": "#/$defs/bandStat", "description": "Cross-run band over per-bucket RPS. Always present." },
+        "p99_ms": { "$ref": "#/$defs/bandStat", "description": "Cross-run band over per-bucket windowed P99 latency (ms). Present for every bucket with a contributing point (loadgen >= v1.4.5)." },
+        "errors": { "$ref": "#/$defs/bandStat", "description": "Cross-run band over per-bucket error deltas. Present for every bucket with a contributing point (loadgen >= v1.4.5)." }
       }
     },
     "bandStat": {

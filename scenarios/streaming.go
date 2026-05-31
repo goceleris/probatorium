@@ -80,11 +80,10 @@ func (s *StreamScenario) Category() string { return s.category }
 // Mode returns the streaming mode (one of the StreamMode* constants).
 func (s *StreamScenario) Mode() string { return s.mode }
 
-// Workload returns the loadgen.Config for this streaming scenario. Because
-// loadgen has no streaming client yet, this sets the target URL and connection
-// count only — forward-compatible with the loadgen WS/SSE client that will
-// consume the path + mode. The runner skips the cell when the loadgen build
-// cannot speak the streaming protocol.
+// Workload returns the loadgen.Config for this streaming scenario. loadgen
+// v1.4.5 drives the WS/SSE protocols via Config.Mode (one of the StreamMode*
+// values), reusing the standard worker/latency/timeseries pipeline: each
+// completed WS round-trip or delivered SSE event counts as one request.
 func (s *StreamScenario) Workload(target string) loadgen.Config {
 	conns := s.Connections
 	if conns <= 0 {
@@ -94,6 +93,7 @@ func (s *StreamScenario) Workload(target string) loadgen.Config {
 		URL:         target + s.path,
 		Method:      "GET",
 		Connections: conns,
+		Mode:        s.mode,
 	}
 }
 
