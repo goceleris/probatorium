@@ -10,6 +10,7 @@ import (
 
 	"github.com/goceleris/probatorium/interleave"
 	"github.com/goceleris/probatorium/scenarios"
+	"github.com/goceleris/probatorium/servers"
 )
 
 func TestParseArgs_Defaults(t *testing.T) {
