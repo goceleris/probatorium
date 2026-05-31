@@ -247,3 +247,30 @@ func captureStdout(t *testing.T, fn func()) []string {
 	_ = w.Close()
 	return <-done
 }
+
+// TestFeatureSetTLSGating locks the #160/#161 contract: an adapter that
+// declares Capabilities.TLS only advertises fs.TLS when a shared terminator
+// is wired (-tls-terminator). Without one, tls-* cells must NOT be scheduled
+// (they would otherwise trip the executeCell capability-lie guard).
+func TestFeatureSetTLSGating(t *testing.T) {
+	tlsCapable := servers.Adapter{
+		Name:         "celeris-tls",
+		Engine:       "h1",
+		Capabilities: servers.Capabilities{Static: true, TLS: true},
+	}
+	noTLS := servers.Adapter{
+		Name:         "plain",
+		Engine:       "h1",
+		Capabilities: servers.Capabilities{Static: true},
+	}
+
+	if got := featureSetFor(tlsCapable, false).TLS; got {
+		t.Fatalf("TLS-capable adapter must NOT advertise fs.TLS without a terminator; got true")
+	}
+	if got := featureSetFor(tlsCapable, true).TLS; !got {
+		t.Fatalf("TLS-capable adapter must advertise fs.TLS when a terminator is wired; got false")
+	}
+	if got := featureSetFor(noTLS, true).TLS; got {
+		t.Fatalf("non-TLS adapter must never advertise fs.TLS even with a terminator; got true")
+	}
+}

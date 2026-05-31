@@ -177,6 +177,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.BoolVar(&c.RatedMode, "rated", c.RatedMode,
 		"run a Gil-Tene rated (closed-loop, CO-corrected) sweep after each saturation pass (opt-in; multiplies per-cell time)")
 	fs.DurationVar(&c.RatedDuration, "rated-duration", c.RatedDuration, "measurement window for each rated pass")
+	fs.StringVar(&c.TLSTerminator, "tls-terminator", c.TLSTerminator,
+		"https base URL of the shared TLS terminator fronting the adapters; empty disables all tls-* scenarios")
 	fs.Func("rated-fractions",
 		"comma-separated saturation fractions for the rated sweep (default 0.25,0.5,0.75,0.9)",
 		func(s string) error {
@@ -715,7 +717,7 @@ func (s *adapterServer) Features() servers.FeatureSet { return s.features }
 // class; a claim the adapter then fails to honour at run time becomes a hard
 // error in executeCell (the capability-lie guard) instead of a silent
 // 0-RPS / all-404 cell.
-func featureSetFor(a servers.Adapter) servers.FeatureSet {
+func featureSetFor(a servers.Adapter, tlsReady bool) servers.FeatureSet {
 	fs := servers.FeatureSet{HTTP1: true}
 	switch {
 	case strings.Contains(a.Engine, "h2c"):
@@ -744,7 +746,13 @@ func featureSetFor(a servers.Adapter) servers.FeatureSet {
 	fs.Middleware = a.Capabilities.Middleware
 	fs.WS = a.Capabilities.WS
 	fs.SSE = a.Capabilities.SSE
-	fs.TLS = a.Capabilities.TLS
+	// TLS is only advertised when a shared terminator is actually wired
+	// (-tls-terminator). Adapters declare Capabilities.TLS=true for "could
+	// be fronted by a terminator", but without one the cleartext loopback
+	// can't serve https, so a scheduled tls-* cell would trip the
+	// capability-lie guard. Gating here keeps tls-* unscheduled until the
+	// terminator infra lands (scenarios/tls.go).
+	fs.TLS = a.Capabilities.TLS && tlsReady
 	return fs
 }
 
