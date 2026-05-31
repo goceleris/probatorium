@@ -353,8 +353,9 @@ func run(cfg Config) error {
 	// them. The wrapper carries the adapter's FeatureSet and Name through
 	// to the scheduler so applicability gating still fires.
 	srvs := make([]servers.Server, 0, len(effAdv))
+	tlsReady := cfg.TLSTerminator != ""
 	for _, a := range effAdv {
-		fs := featureSetFor(a)
+		fs := featureSetFor(a, tlsReady)
 		if cfg.Target != "" {
 			// The runner cannot probe the remote SUT's real capabilities,
 			// so advertise everything and let unsupported protocols surface
