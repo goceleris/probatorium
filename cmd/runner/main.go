@@ -130,6 +130,13 @@ type Config struct {
 	// fractions of the measured saturation RPS (adapter-relative so the
 	// targets stay comparable across servers of wildly different throughput).
 	RatedFractions []float64
+
+	// TLSTerminator is the https base URL of the shared TLS terminator that
+	// fronts the cleartext adapters for the tls-* scenarios. Empty (default)
+	// means no terminator is wired, so TLS-capable adapters do NOT advertise
+	// fs.TLS and no tls-* cell is scheduled (it would otherwise trip the
+	// executeCell capability-lie guard). See scenarios/tls.go.
+	TLSTerminator string
 }
 
 // defaultRatedFractions is the saturation-relative sweep used when none is
