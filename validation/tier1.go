@@ -209,6 +209,13 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		}
 	}
 
+	// Responsiveness watcher (I-HANG): the crash watchers above catch a refapp
+	// that DIES; this catches one that stays alive but stops answering — a
+	// deadlock / wedge (celeris#311) the per-request walkers read as mere
+	// connection errors. Health-probe timeouts trip it; cancelRun winds the
+	// run down so driveTier1 returns promptly with Hung set.
+	go watchResponsiveness(runCtx, cfg.BaseURL, tally.liveness, cancelRun)
+
 	// Tier 1 fan-out. Five slices today (matches the full workload
 	// mix called out in issue #55):
 	//
@@ -406,11 +413,12 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	}
 	wg.Wait()
 	snap := tally.snapshot()
-	// If the refapp crashed, the periodic ticker stopped at cancelRun and may
-	// not have ticked between the crash and here. Fire the callback once more,
-	// synchronously, so the I-LIVENESS incident is guaranteed to reach the
-	// orchestrator (its fire() is deduped, so a double tick is harmless).
-	if snap.Liveness.Crashed && cfg.TallyCallback != nil {
+	// If the refapp crashed OR hung, the periodic ticker stopped at cancelRun
+	// and may not have ticked between the event and here. Fire the callback
+	// once more, synchronously, so the I-LIVENESS / I-HANG incident is
+	// guaranteed to reach the orchestrator (fire() is deduped, so a double tick
+	// is harmless).
+	if (snap.Liveness.Crashed || snap.Liveness.Hung) && cfg.TallyCallback != nil {
 		cfg.TallyCallback(snap)
 	}
 	return snap, nil

@@ -3,11 +3,15 @@ package validation
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/goceleris/probatorium/validation/remote"
 )
@@ -36,9 +40,25 @@ type livenessTally struct {
 	signal   atomic.Int64 // terminating signal number, 0 if none
 	exited   atomic.Bool  // true once a real (non-ctx) process exit was observed
 
+	// hung is the SECOND failure mode the per-request walkers are blind to: a
+	// process that stays ALIVE but stops servicing requests (a deadlock / wedge
+	// — e.g. the iouring auto+upg drainRecvBuffer hang, celeris#311). The crash
+	// watchers above never fire (the process never exits); only an independent
+	// health probe that times out while the process is up can see it.
+	hung      atomic.Bool
+	hangFails atomic.Int64 // consecutive health-probe timeouts that tripped it
+
 	mu        sync.Mutex
 	signature string // first crash-signature line scraped from stderr
 	trace     string // bounded stderr tail captured around the crash
+}
+
+// recordHang marks the refapp as wedged: alive but unresponsive (health probe
+// timed out fails consecutive times). Distinct from a crash — the process is
+// still running, so it needs its own oracle (I-HANG).
+func (l *livenessTally) recordHang(fails int) {
+	l.hangFails.Store(int64(fails))
+	l.hung.Store(true)
 }
 
 // recordExit marks an unexpected process exit (the watcher only calls this
@@ -83,6 +103,8 @@ func (l *livenessTally) snapshot() livenessSnapshot {
 		Signal:    int(l.signal.Load()),
 		Signature: sig,
 		Trace:     tr,
+		Hung:      l.hung.Load(),
+		HangFails: int(l.hangFails.Load()),
 	}
 }
 
@@ -104,6 +126,11 @@ type livenessSnapshot struct {
 	Signature string `json:"signature,omitempty"`
 	// Trace is a bounded tail of the stderr output following the signature.
 	Trace string `json:"trace,omitempty"`
+	// Hung is the deadlock oracle: the process stayed alive but stopped
+	// answering a periodic health probe. A true value is a hard failure.
+	Hung bool `json:"hung,omitempty"`
+	// HangFails is the consecutive probe-timeout count that tripped Hung.
+	HangFails int `json:"hang_fails,omitempty"`
 }
 
 // Reason renders a one-line human-readable cause for the incident message.
@@ -118,9 +145,84 @@ func (s livenessSnapshot) Reason() string {
 		return fmt.Sprintf("process killed by signal %d", s.Signal)
 	case s.Exited:
 		return fmt.Sprintf("process exited unexpectedly (code=%d)", s.ExitCode)
+	case s.Hung:
+		return fmt.Sprintf("process alive but unresponsive — %d consecutive health-probe timeouts (deadlock/wedge)", s.HangFails)
 	default:
 		return "process died mid-run"
 	}
+}
+
+// Hang-probe tuning. The probe must tolerate genuine load spikes / GC pauses
+// (a slow but live server) yet still catch a real wedge well before the run
+// ends. hangThreshold consecutive timeouts of hangProbeTimeout each, spaced
+// hangProbeInterval apart, means the server has to be unresponsive for ~tens of
+// seconds — far beyond any load blip, far below a multi-minute deadlock. Vars
+// (not consts) so tests can tighten them; production never changes them.
+var (
+	hangProbeInterval = 2 * time.Second
+	hangProbeTimeout  = 5 * time.Second
+	hangThreshold     = 4
+)
+
+// watchResponsiveness periodically probes the refapp's /healthz endpoint. A
+// crash makes the probe fail FAST (connection refused) — handled by the crash
+// watchers, and explicitly NOT counted here. A wedge makes the probe TIME OUT
+// (the kernel accepts the connection but no worker ever answers — exactly the
+// celeris#311 state of ~580 held connections serviced by nobody). hangThreshold
+// consecutive timeouts while the process is alive flips Hung and cancels the
+// run via onHang.
+func watchResponsiveness(ctx context.Context, baseURL string, l *livenessTally, onHang func()) {
+	url := strings.TrimRight(baseURL, "/") + "/healthz"
+	client := &http.Client{Timeout: hangProbeTimeout}
+	ticker := time.NewTicker(hangProbeInterval)
+	defer ticker.Stop()
+	fails := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				return
+			}
+			resp, derr := client.Do(req)
+			if derr == nil {
+				_ = resp.Body.Close()
+				fails = 0
+				continue
+			}
+			// Only a TIMEOUT counts as a hang signal: the server accepted us
+			// but never answered. A fast failure (connection refused = crash,
+			// or ctx cancellation = clean shutdown) is someone else's job.
+			if ctx.Err() != nil {
+				return
+			}
+			if isProbeTimeout(derr) {
+				fails++
+			} else {
+				fails = 0
+			}
+			if fails >= hangThreshold {
+				l.recordHang(fails)
+				onHang()
+				return
+			}
+		}
+	}
+}
+
+// isProbeTimeout reports whether a health-probe error is a timeout (server
+// accepted but did not answer = wedge) rather than a fast refusal (= crash).
+func isProbeTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return ne.Timeout()
+	}
+	return false
 }
 
 const (

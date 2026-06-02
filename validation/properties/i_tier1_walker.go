@@ -58,6 +58,18 @@ var (
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}
+	// IHang is the deadlock oracle, the complement of I-LIVENESS: the refapp
+	// must stay RESPONSIVE, not merely alive. A process that wedges — alive but
+	// servicing nothing (e.g. the iouring auto+upg drainRecvBuffer hang,
+	// celeris#311) — never trips I-LIVENESS (it never exits); only a health
+	// probe that times out while the process is up catches it. Emitted by the
+	// orchestrator's TallyCallback when Tier 1's liveness tally reports Hung.
+	IHang = Spec{
+		ID:          "I-HANG",
+		Description: "refapp must stay responsive for the whole run (Tier 1 liveness.hung == false)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
 )
 
 // alwaysOK is the placeholder Predicate for tier-1-walker entries.

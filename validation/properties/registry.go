@@ -38,6 +38,7 @@ func All() []Spec {
 		IWSAccepted,
 		IWSHang,
 		ILiveness,
+		IHang,
 	}
 	out := make([]Spec, len(specs))
 	copy(out, specs)

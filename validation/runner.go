@@ -718,6 +718,11 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		fire(properties.ILiveness.ID,
 			fmt.Sprintf("refapp process died mid-run: %s", snap.Liveness.Reason()),
 			snap.Liveness.Crashed)
+		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
+		// connection errors). Complements I-LIVENESS for the hang class.
+		fire(properties.IHang.ID,
+			fmt.Sprintf("refapp wedged mid-run: %s", snap.Liveness.Reason()),
+			snap.Liveness.Hung)
 	}
 
 	cfg := tier1Config{
