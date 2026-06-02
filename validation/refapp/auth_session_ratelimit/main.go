@@ -192,15 +192,6 @@ func main() {
 	// letting concurrent slowloris header-deadlines slip past.
 	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
-	// /async-data is a trivial .Async() route. Its mere presence flips the
-	// engine's hasAsyncRoutes() to true, so even with -async-handlers=false the
-	// listener runs async — the EXACT derivation the bench epoll-h1-sync config
-	// uses, and the one that crashed in celeris#309 when a SYNC ws/sse handler
-	// ran inline and Detached. Without it, validation only ever exercised the
-	// AsyncHandlers=true variant and could never reproduce #309.
-	srv.GET("/async-data", func(c *celeris.Context) error {
-		return c.JSON(200, map[string]string{"mode": "async-route"})
-	}).Async()
 	// /ws and /events are transport-level endpoints (WS upgrade + SSE
 	// long-poll). Both are exercised by Tier 1 walkers that don't carry
 	// a session — and they shouldn't have to: WS handshakes are
@@ -254,6 +245,15 @@ func main() {
 // the in-memory store, with one twist: every handler short-circuits
 // to 401 if no session is established (except /login itself).
 func registerRoutes(srv *celeris.Server, users *store) {
+	// /async-data is a trivial .Async() route. Its mere presence flips the
+	// engine's hasAsyncRoutes() to true, so even with -async-handlers=false the
+	// listener runs async — the EXACT derivation the bench epoll-h1-sync config
+	// uses, and the one that crashed in celeris#309 when a SYNC ws/sse handler
+	// ran inline and Detached. Registered here (with the other routes, after all
+	// Use middleware) so it never trips the Use-after-route guard.
+	srv.GET("/async-data", func(c *celeris.Context) error {
+		return c.JSON(200, map[string]string{"mode": "async-route"})
+	}).Async()
 	srv.POST("/login", func(c *celeris.Context) error {
 		var req struct {
 			Username string `json:"username"`
