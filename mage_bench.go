@@ -57,6 +57,30 @@ import (
 //	BENCH_RUNS=5                   median over N runs
 //	CELERIS_VERSION=               override go.mod auto-detect
 //	CLUSTER_USE_LAN=1              LAN fabric instead of Tailscale
+// benchNeedsDBServices asks the runner itself whether the resolved -cells glob
+// (scoped to the in-scope competitor columns) schedules any driver-* cell, and
+// therefore whether the bench playbook must start + seed the pg/redis/mc
+// fixture containers on the bench target. Delegating to the runner's
+// -print-required-services mode keeps a SINGLE source of truth: the same
+// filterCells + requiredServiceKinds the real schedule uses. Reimplementing the
+// glob/category match here would silently drift the moment a driver scenario is
+// renamed or added. A Go-only / static bench prints nothing → containers stay
+// down (the "docker-free unless needed" invariant); any driver cell → true.
+func benchNeedsDBServices(cells, competitors string) (bool, error) {
+	args := []string{"run", "./cmd/runner", "-print-required-services", "-cells", cells}
+	if strings.TrimSpace(competitors) != "" {
+		args = append(args, "-competitors", competitors)
+	}
+	out, err := exec.Command("go", args...).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return false, fmt.Errorf("resolve required services: %w (stderr: %s)", err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return false, fmt.Errorf("resolve required services: %w", err)
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
 func Bench() error {
 	if err := requireAnsible(); err != nil {
 		return err
@@ -110,6 +134,18 @@ func Bench() error {
 		if os.Getenv("DEPLOY_COMPETITORS") == "" {
 			_ = os.Setenv("DEPLOY_COMPETITORS", competitors)
 			defer func() { _ = os.Unsetenv("DEPLOY_COMPETITORS") }()
+		}
+		// If the cell glob could schedule any driver-* cell, the auto-deploy
+		// must also install docker + pre-pull the pg/redis/mc images, or the
+		// bench playbook's fixture-container start has nothing to run. Without
+		// this a fresh-cluster driver bench would silently 404 every driver
+		// cell. Over-approximate against the full registry (no -competitors
+		// scope) so we never UNDER-install. Skipped for a static-only bench.
+		if os.Getenv("DEPLOY_NEEDS_DBSERVICES") == "" {
+			if need, derr := benchNeedsDBServices(cells, ""); derr == nil && need {
+				_ = os.Setenv("DEPLOY_NEEDS_DBSERVICES", "1")
+				defer func() { _ = os.Unsetenv("DEPLOY_NEEDS_DBSERVICES") }()
+			}
 		}
 		if err := Deploy(); err != nil {
 			return fmt.Errorf("auto-deploy: %w", err)
@@ -167,6 +203,16 @@ func Bench() error {
 	}
 	fmt.Printf("  columns:      %d (%s)\n", len(colSlugs), competitorSetCSV)
 
+	// Resolve whether driver-* cells are in scope (→ start+seed pg/redis/mc on
+	// the bench target). Asked once here, not per arch — the cell glob and
+	// column set are arch-invariant. Reuses the runner's own resolution so the
+	// decision can't drift from the schedule.
+	needsDB, err := benchNeedsDBServices(cells, competitorSetCSV)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  dbservices:   %v\n", needsDB)
+
 	// Expand "both" into the two concrete arch hosts and invoke the playbook
 	// once per arch. bench.yml resolves hostvars[bench_target].lan_ip, so it
 	// needs a REAL host — "both" is not an inventory host (passing it yields
@@ -196,6 +242,7 @@ func Bench() error {
 			"--extra-vars", "bench_runs=" + runs,
 			"--extra-vars", "celeris_version=" + version,
 			"--extra-vars", "results_local_dir=" + resultsDir,
+			"--extra-vars", fmt.Sprintf("bench_needs_dbservices=%t", needsDB),
 		}
 		if seed != "" {
 			args = append(args, "--extra-vars", "bench_seed="+seed)

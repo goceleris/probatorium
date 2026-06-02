@@ -160,6 +160,37 @@ func (h *Handles) Stop(ctx context.Context) error {
 	return firstErr
 }
 
+// SeedExternal loads the fixture set into services that are ALREADY running
+// at known addresses (started out-of-band, e.g. by the distributed bench
+// playbook's dbservices step on the bench target rather than by Start). It is
+// the connect-and-seed counterpart to Start+Seed: the cluster bench cannot
+// use Start (the runner that would call it lives on the loadgen host, which
+// has no docker; the containers live on the bench target), so the playbook
+// starts the containers itself and the bench-target-side runner calls this to
+// load the SAME fixture set the in-process path seeds. An empty address skips
+// that backend (so a Go-only bench with no driver cells is a clean no-op).
+//
+// Reuses the exact seedPostgres/seedRedis/seedMemcached fixtures so a remote
+// driver cell hits byte-identical seeded data to a local in-process run.
+func SeedExternal(ctx context.Context, pgDSN, redisAddr, mcAddr string) error {
+	if pgDSN != "" {
+		if err := seedPostgres(ctx, pgDSN); err != nil {
+			return fmt.Errorf("seed postgres %s: %w", pgDSN, err)
+		}
+	}
+	if redisAddr != "" {
+		if err := seedRedis(ctx, redisAddr); err != nil {
+			return fmt.Errorf("seed redis %s: %w", redisAddr, err)
+		}
+	}
+	if mcAddr != "" {
+		if err := seedMemcached(mcAddr); err != nil {
+			return fmt.Errorf("seed memcached %s: %w", mcAddr, err)
+		}
+	}
+	return nil
+}
+
 // Seed loads the fixture set into every provisioned service:
 //
 //   - Postgres: users table (id, name, email, score) with 10 000 rows.

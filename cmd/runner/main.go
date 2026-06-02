@@ -137,6 +137,33 @@ type Config struct {
 	// fs.TLS and no tls-* cell is scheduled (it would otherwise trip the
 	// executeCell capability-lie guard). See scenarios/tls.go.
 	TLSTerminator string
+
+	// SeedServices, when non-empty, switches the runner into a one-shot
+	// seed-and-exit mode: it connects to the already-running pg/redis/mc
+	// backends (started out-of-band by the distributed bench playbook on the
+	// bench target — the runner cannot Start them itself because driver
+	// fixtures must live where the SUT can reach them) and loads the same
+	// fixture set services.Seed loads, then exits. Value is a comma list of
+	// "kind=addr" pairs, e.g.
+	//   "postgres=postgres://bench:bench@127.0.0.1:54321/bench?sslmode=disable,redis=127.0.0.1:63791,memcached=127.0.0.1:21211"
+	// Any omitted kind is skipped. No bench schedule runs in this mode.
+	SeedServices string
+
+	// PrintRequiredServices switches the runner into a one-shot mode that
+	// resolves the -cells glob against the scenario catalogue (optionally
+	// scoped by -competitors) and prints, one per line, the docker service
+	// kinds the bench must provision (postgres / redis / memcached) — or
+	// nothing when no driver cell is in scope. The distributed-bench
+	// orchestrator (mage Bench) calls this to decide whether to start + seed
+	// the fixture containers, so the decision reuses the SAME filterCells +
+	// requiredServiceKinds the real run uses and can never drift from it.
+	PrintRequiredServices bool
+
+	// Competitors is the comma list of competitor column slugs in scope,
+	// consulted ONLY by -print-required-services so the "<scenario>/<slug>"
+	// match mirrors the per-cell ids the bench actually schedules. Empty =
+	// full local adapter registry.
+	Competitors string
 }
 
 // defaultRatedFractions is the saturation-relative sweep used when none is
@@ -186,6 +213,12 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.DurationVar(&c.RatedDuration, "rated-duration", c.RatedDuration, "measurement window for each rated pass")
 	fs.StringVar(&c.TLSTerminator, "tls-terminator", c.TLSTerminator,
 		"https base URL of the shared TLS terminator fronting the adapters; empty disables all tls-* scenarios")
+	fs.StringVar(&c.SeedServices, "seed-services", c.SeedServices,
+		`one-shot seed-and-exit: comma list of "kind=addr" (postgres=<dsn>,redis=<host:port>,memcached=<host:port>) to seed already-running backends, then exit`)
+	fs.BoolVar(&c.PrintRequiredServices, "print-required-services", c.PrintRequiredServices,
+		"resolve -cells (scoped by -competitors) and print the docker service kinds the bench needs, one per line, then exit")
+	fs.StringVar(&c.Competitors, "competitors", c.Competitors,
+		"comma list of competitor column slugs scoping -print-required-services; empty = full adapter registry")
 	fs.Func("rated-fractions",
 		"comma-separated saturation fractions for the rated sweep (default 0.25,0.5,0.75,0.9)",
 		func(s string) error {
@@ -293,10 +326,107 @@ func main() {
 	if err != nil {
 		os.Exit(2)
 	}
+	// One-shot seed-and-exit mode (distributed bench driver-backend seeding).
+	// Runs before any schedule resolution so it is a pure connect-seed-exit.
+	if cfg.SeedServices != "" {
+		if err := seedServicesAndExit(cfg.SeedServices); err != nil {
+			fmt.Fprintf(os.Stderr, "probatorium-runner: seed-services: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// One-shot capability query: print the docker service kinds the resolved
+	// -cells glob needs, then exit. No schedule runs. Lets mage Bench gate the
+	// fixture-container start on the runner's own resolution (single source of
+	// truth — see Config.PrintRequiredServices).
+	if cfg.PrintRequiredServices {
+		if err := printRequiredServicesAndExit(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "probatorium-runner: print-required-services: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "probatorium-runner: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// seedServicesAndExit parses the -seed-services "kind=addr" list and loads the
+// driver fixture set into the named already-running backends via
+// services.SeedExternal. Used by the distributed bench: the playbook starts
+// pg/redis/mc on the bench target, then invokes the bench-target-side runner
+// with -seed-services so the driver-* scenarios hit byte-identical seeded data
+// to a local in-process run.
+func seedServicesAndExit(spec string) error {
+	var pgDSN, redisAddr, mcAddr string
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kind, addr, ok := strings.Cut(part, "=")
+		if !ok {
+			return fmt.Errorf("bad -seed-services entry %q (want kind=addr)", part)
+		}
+		switch strings.TrimSpace(kind) {
+		case "postgres", "pg":
+			pgDSN = strings.TrimSpace(addr)
+		case "redis":
+			redisAddr = strings.TrimSpace(addr)
+		case "memcached", "mc":
+			mcAddr = strings.TrimSpace(addr)
+		default:
+			return fmt.Errorf("unknown -seed-services kind %q", kind)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	fmt.Fprintf(os.Stderr, "probatorium-runner: seeding services (pg=%t redis=%t mc=%t)...\n",
+		pgDSN != "", redisAddr != "", mcAddr != "")
+	if err := services.SeedExternal(ctx, pgDSN, redisAddr, mcAddr); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "probatorium-runner: seed complete")
+	return nil
+}
+
+// printRequiredServicesAndExit resolves the -cells glob against the scenario
+// catalogue (scoped by -competitors when given) and prints the docker service
+// kinds the bench must provision, one per line, to stdout. It deliberately
+// reuses the SAME filterCells + requiredServiceKinds the real schedule uses, so
+// the orchestrator's container-start decision can never diverge from what the
+// runner would actually execute.
+//
+// -competitors mirrors the per-cell "<scenario>/<slug>" ids the distributed
+// bench schedules: each slug becomes a synthetic adapter so a glob like
+// "driver-pg-read/celeris-*" matches exactly as it will at run time. Empty
+// falls back to the full local adapter registry (the in-process bench path).
+// Capability gating is intentionally NOT applied here — requiredServiceKinds is
+// purely scenario-driven, and if a driver scenario is scheduled at all the
+// backend must exist (the celeris SUT is always driver-capable).
+func printRequiredServicesAndExit(cfg Config) error {
+	scs := scenarios.Registry()
+	var advs []servers.Adapter
+	if strings.TrimSpace(cfg.Competitors) != "" {
+		for _, s := range strings.Split(cfg.Competitors, ",") {
+			name := strings.TrimSpace(s)
+			if name == "" {
+				continue
+			}
+			advs = append(advs, servers.Adapter{Name: name, Category: "remote"})
+		}
+	} else {
+		advs = servers.AdaptersSorted()
+	}
+	effSc, _, err := filterCells(scs, advs, cfg.Cells)
+	if err != nil {
+		return err
+	}
+	for _, k := range requiredServiceKinds(effSc) {
+		fmt.Println(k)
+	}
+	return nil
 }
 
 // run is the orchestrator entry point, separated from main so it can be

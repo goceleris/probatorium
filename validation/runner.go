@@ -712,6 +712,12 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		fire(properties.IWSHang.ID,
 			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
 			snap.WSTorture.HangNoClose > 0)
+		// Engine-agnostic crash oracle: the refapp process died mid-run. This
+		// is the catch-all that the per-protocol counters above can't see — a
+		// dead server just looks like connection-refused to every walker.
+		fire(properties.ILiveness.ID,
+			fmt.Sprintf("refapp process died mid-run: %s", snap.Liveness.Reason()),
+			snap.Liveness.Crashed)
 	}
 
 	cfg := tier1Config{
