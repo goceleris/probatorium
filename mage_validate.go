@@ -165,6 +165,13 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_REFAPP_ENGINE"); v != "" {
 			args = append(args, "--extra-vars", "validate_refapp_engine="+v)
 		}
+		// VALIDATE_REFAPP_ASYNC passes -async-handlers=<v> to the refapp
+		// (true|false). The sync/async coverage axis (validation gap C):
+		// "false" + a .Async() route reproduces the bench epoll-h1-sync
+		// derivation that crashed in celeris#309.
+		if v := os.Getenv("VALIDATE_REFAPP_ASYNC"); v != "" {
+			args = append(args, "--extra-vars", "validate_refapp_async="+v)
+		}
 		// VALIDATE_MATRIX=1 flips the validator into matrix mode:
 		// iterate (refapp × engine) cells, emit v5.1 Cells[].
 		// Per #113 / #114. Optional VALIDATE_MATRIX_REFAPPS and

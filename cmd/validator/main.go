@@ -66,6 +66,11 @@ type Config struct {
 	// refapp. Empty leaves the refapp's `auto` default in place.
 	RefappEngine string
 
+	// RefappAsyncHandlers, when non-empty ("true"/"false"), is passed to the
+	// refapp as `-async-handlers=<v>` (sync/async coverage axis; "false" + a
+	// .Async() route reproduces the celeris#309 epoll-h1-sync derivation).
+	RefappAsyncHandlers string
+
 	// HeapDumpDir, when non-empty, names a directory the validator
 	// writes a heap profile to every HeapDumpInterval (default 1h —
 	// relaxed from 60s post-#115 because the validator RSS leak
@@ -143,6 +148,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.DriverSSHUser, "ssh-user", c.DriverSSHUser, "SSH login user (only with -driver=ssh)")
 	fs.StringVar(&c.DriverSSHHost, "ssh-host", c.DriverSSHHost, "SSH host:port (only with -driver=ssh)")
 	fs.StringVar(&c.RefappEngine, "refapp-engine", c.RefappEngine, "celeris engine to pin for the refapp (iouring|epoll|std|adaptive); empty leaves refapp default")
+	fs.StringVar(&c.RefappAsyncHandlers, "refapp-async-handlers", c.RefappAsyncHandlers, "pass -async-handlers=<v> to the refapp (true|false); empty leaves refapp default")
 	fs.StringVar(&c.HeapDumpDir, "heap-dump-dir", c.HeapDumpDir, "directory to write periodic heap profiles to; empty disables")
 	// Default cadence relaxed to 1h after the validator RSS leak that
 	// motivated this diagnostic (probatorium#102) was fixed. Active
@@ -203,26 +209,27 @@ func run(cfg Config) error {
 	}
 
 	o, err := validation.New(validation.Config{
-		Target:             cfg.Target,
-		Arch:               cfg.Arch,
-		CelerisCommit:      cfg.CelerisCommit,
-		Duration:           cfg.Duration,
-		CheckpointInterval: cfg.CheckpointInterval,
-		SoakMode:           cfg.SoakMode,
-		DryRun:             cfg.DryRun,
-		OutDir:             cfg.OutDir,
-		CorpusPath:         cfg.CorpusPath,
-		MarkovPath:         cfg.MarkovPath,
-		OpenAPIPath:        cfg.OpenAPIPath,
-		CelerisBin:         cfg.CelerisBin,
-		CelerisListenAddr:  cfg.CelerisListenAddr,
-		MetricsURL:         cfg.MetricsURL,
-		PropertyTier:       cfg.PropertyTier,
-		ReplayBin:          cfg.ReplayBin,
-		RefappEngine:       cfg.RefappEngine,
-		DriverMode:         cfg.DriverMode,
-		DriverSSHUser:      cfg.DriverSSHUser,
-		DriverSSHHost:      cfg.DriverSSHHost,
+		Target:              cfg.Target,
+		Arch:                cfg.Arch,
+		CelerisCommit:       cfg.CelerisCommit,
+		Duration:            cfg.Duration,
+		CheckpointInterval:  cfg.CheckpointInterval,
+		SoakMode:            cfg.SoakMode,
+		DryRun:              cfg.DryRun,
+		OutDir:              cfg.OutDir,
+		CorpusPath:          cfg.CorpusPath,
+		MarkovPath:          cfg.MarkovPath,
+		OpenAPIPath:         cfg.OpenAPIPath,
+		CelerisBin:          cfg.CelerisBin,
+		CelerisListenAddr:   cfg.CelerisListenAddr,
+		MetricsURL:          cfg.MetricsURL,
+		PropertyTier:        cfg.PropertyTier,
+		ReplayBin:           cfg.ReplayBin,
+		RefappEngine:        cfg.RefappEngine,
+		RefappAsyncHandlers: cfg.RefappAsyncHandlers,
+		DriverMode:          cfg.DriverMode,
+		DriverSSHUser:       cfg.DriverSSHUser,
+		DriverSSHHost:       cfg.DriverSSHHost,
 	})
 	if err != nil {
 		return err

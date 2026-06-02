@@ -143,6 +143,14 @@ type Config struct {
 	//
 	// Tracked under issue #103 — engine matrix coverage.
 	RefappEngine string
+
+	// RefappAsyncHandlers, when non-empty ("true"/"false"), is passed to the
+	// refapp as `-async-handlers=<v>`; empty leaves the refapp default. The
+	// sync/async coverage axis: AsyncHandlers=false WITH a .Async() route forces
+	// l.async via hasAsyncRoutes — the bench epoll-h1-sync derivation that
+	// crashed in celeris#309 and that the AsyncHandlers=true refapps never
+	// exercised (validation gap C).
+	RefappAsyncHandlers string
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -727,7 +735,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 
 	cfg := tier1Config{
 		Driver:      driver,
-		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine),
+		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers),
 		BaseURL:     "http://" + o.cfg.CelerisListenAddr,
 		Matrix:      o.matrix,
 		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
@@ -853,7 +861,7 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 
 	cfg := tier3Config{
 		Driver:        driver,
-		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine),
+		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers),
 		ReplayBin:     replayBin,
 		Seeds:         o.seeds,
 		CelerisCommit: o.cfg.CelerisCommit,
@@ -1230,10 +1238,13 @@ func PrintReplayPlan(w io.Writer, rs ReplayedSeed) {
 // the engine choice through Config.RefappEngine so a single mage
 // Validate run can pin to a specific celeris engine without rebuilding
 // the refapp.
-func buildRefappArgs(addr, engine string) []string {
+func buildRefappArgs(addr, engine, asyncHandlers string) []string {
 	args := []string{"-bind", addr}
 	if engine != "" {
 		args = append(args, "-engine", engine)
+	}
+	if asyncHandlers != "" {
+		args = append(args, "-async-handlers="+asyncHandlers)
 	}
 	return args
 }
