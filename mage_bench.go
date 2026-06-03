@@ -86,7 +86,7 @@ func Bench() error {
 		return err
 	}
 
-	target := envOrDefault("BENCH_TARGET", "both")
+	target := envOrDefault("BENCH_TARGET", defaultClusterTarget)
 	if target != "both" && target != "msa2-server" && target != "msr1" {
 		return fmt.Errorf("BENCH_TARGET must be msa2-server, msr1, or both (got %q)", target)
 	}
@@ -579,6 +579,14 @@ type runnerCellFile struct {
 	ServerName   string          `json:"server"`
 	Result       json.RawMessage `json:"result"`
 
+	// Error is the synthesised per-cell error string the runner recorded
+	// when a cell did not produce a real number. Status is the runner's
+	// own classification of it ("ok"/"not_applicable"/"dnf"), schema v5.3.
+	// We honour Status when present and fall back to classifying Error so
+	// older per-cell JSON (no status field) still buckets correctly.
+	Error  string `json:"error,omitempty"`
+	Status string `json:"status,omitempty"`
+
 	// RatedPasses is the rated sweep emitted by the runner only when rated
 	// mode ran (probatorium#156); the BenchSince latency_at_slo gate is
 	// derived from it. SaturationModeRPS echoes the saturation scale anchor.
@@ -601,8 +609,12 @@ type ratedPassWire struct {
 // it with -runs 1, so we deliberately ignore it.
 //
 // Cells whose runner JSON carries no `result` (the SUT failed to answer,
-// e.g. an H2-only scenario against an H1-only server) are skipped: a
-// missing row is louder in the merged report than a zero-valued guess.
+// e.g. an H2-only scenario against an H1-only server) are NOT skipped:
+// they are emitted as classified cellRecords (status not_applicable /
+// dnf) carrying the runner's error string, so a not-implemented or
+// crashed cell surfaces as an honest N/A / DNF row in the merged report
+// instead of vanishing (and being indistinguishable from "never ran") or
+// being ranked as a zero-RPS also-ran (schema v5.3).
 func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cellRecord, error) {
 	runEntries, err := os.ReadDir(cellDir)
 	if err != nil {
@@ -641,19 +653,33 @@ func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cel
 				if err := json.Unmarshal(data, &cf); err != nil {
 					return nil, fmt.Errorf("parse %s: %w", jf.Name(), err)
 				}
-				if len(cf.Result) == 0 || string(cf.Result) == "null" {
-					continue
-				}
 				scenario := cf.ScenarioName
 				if scenario == "" {
 					scenario = scE.Name()
 				}
-				out = append(out, cellRecord{
+				// Effective status: honour the runner's persisted
+				// classification when present, otherwise classify the error
+				// string with the SAME report.ClassifyCellError the runner
+				// uses so the in-process and cluster paths agree on field
+				// width. An empty error with a result is OK.
+				status := report.CellStatus(cf.Status)
+				if status == "" {
+					status = report.ClassifyCellError(cf.Error)
+				}
+				rec := cellRecord{
 					RunIndex:   runIdx,
 					Competitor: competitor,
 					Scenario:   scenario,
-					Loadgen:    cf.Result,
-				})
+					Status:     string(status),
+					Error:      cf.Error,
+				}
+				// Only an OK cell carries a loadgen payload to rank. A
+				// cell with no `result` (the SUT failed to answer) is emitted
+				// as a classified N/A / DNF record rather than dropped.
+				if status == report.CellOK && len(cf.Result) > 0 && string(cf.Result) != "null" {
+					rec.Loadgen = cf.Result
+				}
+				out = append(out, rec)
 			}
 		}
 	}
@@ -697,6 +723,14 @@ type cellRecord struct {
 	Competitor string          `json:"competitor"`
 	Scenario   string          `json:"scenario"`
 	Loadgen    json.RawMessage `json:"loadgen"`
+
+	// Status is the per-cell outcome classification (schema v5.3) and
+	// Error the synthesised string it was classified from, carried so a
+	// cell that did not produce a loadgen.Result still travels through the
+	// merge as an N/A / DNF record rather than being dropped. Empty Status
+	// on a record with a Loadgen payload means OK.
+	Status string `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
 
 	// Resources is the server-side resource aggregate (#154) parsed from
 	// the cell's observer.sqlite + cpu.log. Nil when the cell ran without
@@ -754,6 +788,14 @@ func summarizeCells(cells []cellRecord) (map[string]competitorStats, error) {
 	res := map[string][]*report.ResourceStats{}
 	rated := map[string][][]ratedPassWire{}
 	for _, c := range cells {
+		// Non-OK cells (not_applicable / dnf) carry no loadgen payload — they
+		// were recorded for classification and live on in the raw `cells`
+		// array for the document merge, but there is nothing to summarise.
+		// Skip them so this unconditional unmarshal never hits empty input
+		// (readRunnerCellResults only sets Loadgen for CellOK cells).
+		if len(c.Loadgen) == 0 || string(c.Loadgen) == "null" {
+			continue
+		}
 		var lg loadgenLite
 		if err := json.Unmarshal(c.Loadgen, &lg); err != nil {
 			return nil, fmt.Errorf("parse cell %s/%s run=%d: %w",
@@ -1045,10 +1087,12 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 			return "", fmt.Errorf("parse %s: %w", e.Name(), err)
 		}
 		for _, cell := range payload.Cells {
-			var res loadgen.Result
-			if err := json.Unmarshal(cell.Loadgen, &res); err != nil {
-				return "", fmt.Errorf("parse cell %s run=%d in %s: %w",
-					cell.Competitor, cell.RunIndex, e.Name(), err)
+			// Effective status: honour the record's classification, else
+			// classify its error string with the SAME report.ClassifyCellError
+			// the in-process path uses so both paths agree on field width.
+			status := report.CellStatus(cell.Status)
+			if status == "" {
+				status = report.ClassifyCellError(cell.Error)
 			}
 			cr := collected[cell.Competitor]
 			if cr == nil {
@@ -1058,7 +1102,25 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 				}
 				collected[cell.Competitor] = cr
 			}
+			if status != report.CellOK {
+				// A cell that did not run (or produced no real number): record
+				// the classified status + error and SKIP the Sample append
+				// rather than unmarshaling a zero Result into a ranked sample.
+				// An OK record on any run still promotes the cell below.
+				if len(cr.Samples) == 0 && cr.Status != report.CellOK {
+					cr.Status = status
+					cr.ErrorMsg = cell.Error
+				}
+				continue
+			}
+			var res loadgen.Result
+			if err := json.Unmarshal(cell.Loadgen, &res); err != nil {
+				return "", fmt.Errorf("parse cell %s run=%d in %s: %w",
+					cell.Competitor, cell.RunIndex, e.Name(), err)
+			}
 			cr.Samples = append(cr.Samples, res)
+			cr.Status = report.CellOK
+			cr.ErrorMsg = ""
 			// loadgen.Result.Histogram is the V2-compressed HdrHistogram
 			// payload as raw bytes; CellResult wants base64 strings so
 			// report.Aggregate can decode + merge them across runs.

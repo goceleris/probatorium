@@ -454,7 +454,7 @@ func BenchAndValidate() error {
 	if err := Validate(); err != nil {
 		return fmt.Errorf("validate: %w", err)
 	}
-	if envOrDefault("VALIDATE_TARGET", "both") == "both" {
+	if envOrDefault("VALIDATE_TARGET", defaultClusterTarget) == "both" {
 		fmt.Println("\n=== BenchAndValidate: ValidateDiff ===")
 		if err := ValidateDiff(); err != nil {
 			return fmt.Errorf("validate-diff: %w", err)

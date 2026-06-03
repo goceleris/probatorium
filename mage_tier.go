@@ -134,7 +134,7 @@ func BenchTier() error {
 	p.Runs = atoiOr(envOrDefault("BENCH_RUNS", "3"), 3)
 	// Arch count drives the cost model: BENCH_TARGET=both is two arches
 	// (serial today — #168 ArchParallel is blocked on loadgen arm64).
-	if envOrDefault("BENCH_TARGET", "both") == "both" {
+	if envOrDefault("BENCH_TARGET", defaultClusterTarget) == "both" {
 		p.Arches = 2
 	} else {
 		p.Arches = 1

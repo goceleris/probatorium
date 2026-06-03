@@ -278,6 +278,13 @@ type cellResultFile struct {
 	StartedAt    time.Time       `json:"started_at"`
 	CompletedAt  time.Time       `json:"completed_at"`
 	Error        string          `json:"error,omitempty"`
+
+	// Status is the classified per-cell outcome ("ok"/"not_applicable"/
+	// "dnf"), schema v5.3. Persisted so the cluster merge path can read it
+	// back verbatim and the in-process and cluster paths agree on field
+	// width. Derived from Error via report.ClassifyCellError; empty on the
+	// rare pre-loadgen mkdir-failure path (treated as OK by readers).
+	Status       string          `json:"status,omitempty"`
 	Result       *loadgen.Result `json:"result,omitempty"`
 	HistogramB64 string          `json:"hdr_histogram_b64,omitempty"`
 	FDsBefore    int             `json:"fds_before,omitempty"`
@@ -574,22 +581,46 @@ func run(cfg Config) error {
 			i+1, len(schedule), cell.RunIdx, cell.Scenario.Name(), cell.Server.Name())
 
 		res, cerr := executeCell(rootCtx, cfg, cell)
-		if res.Result != nil {
-			key := report.CellID(cell.Scenario.Name(), cell.Server.Name())
-			cr := collected[key]
-			if cr == nil {
-				cr = &report.CellResult{
-					ScenarioName: cell.Scenario.Name(),
-					ServerName:   cell.Server.Name(),
-					Category:     cell.Scenario.Category(),
-				}
-				collected[key] = cr
+		status := res.Status
+		if status == "" {
+			status = report.ClassifyCellError(res.ErrorMsg)
+		}
+		// Look up (or create) the collected cell for EVERY outcome so a
+		// not-applicable / did-not-finish cell survives into the report
+		// instead of vanishing (the old `if res.Result != nil` gate
+		// silently dropped DNF cells and ranked N/A cells as 0-RPS rows).
+		key := report.CellID(cell.Scenario.Name(), cell.Server.Name())
+		cr := collected[key]
+		if cr == nil {
+			cr = &report.CellResult{
+				ScenarioName: cell.Scenario.Name(),
+				ServerName:   cell.Server.Name(),
+				Category:     cell.Scenario.Category(),
 			}
+			collected[key] = cr
+		}
+		if status == report.CellOK && res.Result != nil {
+			// A real measurement: append the sample exactly as before. An
+			// OK run promotes the cell to OK even if an earlier run of the
+			// same cell did not finish — a cell that produced a real number
+			// on any run is a real datapoint, so clear any prior non-OK mark
+			// and let Aggregate see Samples + an empty (OK) status.
 			cr.Samples = append(cr.Samples, *res.Result)
 			cr.HistogramsB64 = append(cr.HistogramsB64, res.HistogramB64)
 			if cfg.RatedMode {
 				cr.RatedSamples = append(cr.RatedSamples, res.RatedSamples)
 			}
+			cr.Status = report.CellOK
+			cr.ErrorMsg = ""
+		} else if len(cr.Samples) == 0 && cr.Status != report.CellOK {
+			// A cell that did not run (or produced no real number) AND has no
+			// OK sample yet: record the classified status + error string but
+			// DO NOT append a bogus 0-RPS Sample. Aggregate gates headline
+			// inclusion on Status==CellOK, so this becomes an N/A / DNF row,
+			// not a ranked also-ran. A later OK run still upgrades it via the
+			// branch above.
+			cr.Status = status
+			cr.ErrorMsg = res.ErrorMsg
 		}
 		if cerr != nil {
 			fmt.Fprintf(os.Stderr, "  cell error: %v\n", cerr)
@@ -653,6 +684,15 @@ type cellOutcome struct {
 	// empty when rated mode was off. Threaded into report.CellResult so
 	// Aggregate can reduce it into LatencyAtSLO.
 	RatedSamples []report.RatedSample
+
+	// Status is the classified outcome of this cell (schema v5.3).
+	// ErrorMsg is the synthesised per-cell error string it was classified
+	// from (empty for an OK cell). Both survive even when Result is nil
+	// (a DNF cell never produced a loadgen.Result), so the collection loop
+	// can record a not-applicable / did-not-finish cell instead of
+	// dropping it or ranking it as a 0-RPS also-ran.
+	Status   report.CellStatus
+	ErrorMsg string
 }
 
 // buildCellConfig maps a scenario's Workload onto baseURL and overlays
@@ -680,7 +720,7 @@ func buildCellConfig(cell interleave.Cell, baseURL string, cfg Config) loadgen.C
 // already-running remote base URL. Returns the loadgen result on success
 // and a synthesised error otherwise; the per-cell JSON is written either
 // way so a partial matrix still produces inspectable artefacts.
-func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cellOutcome, error) {
+func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out cellOutcome, _ error) {
 	outDir := filepath.Join(cfg.Out, fmt.Sprintf("run%d", cell.RunIdx), cell.Scenario.Name())
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return cellOutcome{}, fmt.Errorf("mkdir %s: %w", outDir, err)
@@ -696,6 +736,15 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 	}
 	defer func() {
 		cellRes.CompletedAt = time.Now().UTC()
+		// Classify the outcome from the single error string the body
+		// recorded, so the in-process collection loop and the cluster
+		// merge path (which re-reads this JSON's `error` field) agree on
+		// the same CellStatus. The classification is persisted on the
+		// per-cell JSON so the cluster path can read it back verbatim
+		// rather than re-deriving and risking a field-width disagreement.
+		cellRes.Status = string(report.ClassifyCellError(cellRes.Error))
+		out.Status = report.CellStatus(cellRes.Status)
+		out.ErrorMsg = cellRes.Error
 		if werr := writeJSON(outFile, &cellRes); werr != nil {
 			fmt.Fprintf(os.Stderr, "  write %s: %v\n", outFile, werr)
 		}
@@ -764,11 +813,11 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 		return cellOutcome{}, err
 	}
 	cellRes.Result = res
-	out := cellOutcome{Result: res}
+	oc := cellOutcome{Result: res}
 
 	if res != nil && res.Requests == 0 {
 		cellRes.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s", res.Errors, res.Duration)
-		return out, errors.New(cellRes.Error)
+		return oc, errors.New(cellRes.Error)
 	}
 
 	// Capability-lie guard: a scheduled scenario whose class is gated on a
@@ -785,7 +834,7 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 			cellRes.Error = fmt.Sprintf(
 				"capability-lie: scheduled %s scenario %q got high error ratio from %s (errors=%d/requests=%d) — adapter declared the capability but did not serve the route",
 				cell.Scenario.Category(), cell.Scenario.Name(), cell.Server.Name(), res.Errors, res.Requests)
-			return out, errors.New(cellRes.Error)
+			return oc, errors.New(cellRes.Error)
 		}
 	}
 
@@ -798,10 +847,10 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 	if cfg.RatedMode && res != nil && res.RequestsPerSec > 0 {
 		cellRes.SaturationModeRPS = res.RequestsPerSec
 		samples, passes := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
-		out.RatedSamples = samples
+		oc.RatedSamples = samples
 		cellRes.RatedPasses = passes
 	}
-	return out, nil
+	return oc, nil
 }
 
 // runRatedSweep drives one rated (closed-loop, CO-corrected) pass per

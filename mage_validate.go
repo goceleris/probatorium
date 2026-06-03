@@ -46,7 +46,7 @@ func Validate() error {
 		return err
 	}
 	duration := envOrDefault("VALIDATE_DURATION", "6h")
-	target := envOrDefault("VALIDATE_TARGET", "both")
+	target := envOrDefault("VALIDATE_TARGET", defaultClusterTarget)
 	if target != "both" && target != "msa2-server" && target != "msr1" {
 		return fmt.Errorf("VALIDATE_TARGET must be msa2-server, msr1, or both (got %q)", target)
 	}
@@ -73,7 +73,7 @@ func Soak() error {
 		return err
 	}
 	duration := envOrDefault("SOAK_DURATION", "24h")
-	target := envOrDefault("VALIDATE_TARGET", "both")
+	target := envOrDefault("VALIDATE_TARGET", defaultClusterTarget)
 	if target != "both" && target != "msa2-server" && target != "msr1" {
 		return fmt.Errorf("VALIDATE_TARGET must be msa2-server, msr1, or both (got %q)", target)
 	}

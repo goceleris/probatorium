@@ -152,6 +152,31 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 		if _, err := fmt.Fprintf(w, "### %s\n\n", sc); err != nil {
 			return err
 		}
+
+		// Field-width note: how many adapters actually ran this scenario
+		// vs how many were not-applicable / did-not-finish. Counted before
+		// the table so a wide field of N/A cells (chain/driver scenarios
+		// only ~3 servers implement) is honest about the real competitor
+		// count rather than implying a ~19-wide ranking.
+		var ran, na, dnf int
+		for _, a := range adapters {
+			switch cellStatusFor(a, sc) {
+			case CellNotApplicable:
+				na++
+			case CellDNF:
+				dnf++
+			default:
+				if _, ok := a.LatencyAtSLO[sc]; ok {
+					ran++
+				} else if _, ok := a.SaturationModeRPS[sc]; ok {
+					ran++
+				}
+			}
+		}
+		if _, err := fmt.Fprintf(w, "_field: ran=%d n/a=%d dnf=%d_\n\n", ran, na, dnf); err != nil {
+			return err
+		}
+
 		// Header row: adapter | 10ms | 50ms | 100ms | 500ms | 1000ms
 		header := []string{"adapter"}
 		for _, ms := range SLOThresholds {
@@ -168,9 +193,14 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 			return err
 		}
 
-		// Per-column max so we can bold the leader.
+		// Per-column max so we can bold the leader. Non-OK cells are
+		// excluded from the leader computation entirely — a 0-RPS N/A or
+		// DNF cell must never set or win a column.
 		colMax := make(map[int]int, len(SLOThresholds))
 		for _, a := range adapters {
+			if cellStatusFor(a, sc) != CellOK {
+				continue
+			}
 			row, ok := a.LatencyAtSLO[sc]
 			if !ok {
 				continue
@@ -184,6 +214,18 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 
 		for _, a := range adapters {
 			row := []string{a.Name}
+			// Non-OK cells render a single status token spanning every SLO
+			// column — never "0 rps" / "—" — and are excluded from bolding.
+			if st := cellStatusFor(a, sc); st != CellOK {
+				token := cellStatusToken(st)
+				for range SLOThresholds {
+					row = append(row, token)
+				}
+				if _, err := io.WriteString(w, "| "+strings.Join(row, " | ")+" |\n"); err != nil {
+					return err
+				}
+				continue
+			}
 			slo, ok := a.LatencyAtSLO[sc]
 			for _, ms := range SLOThresholds {
 				if !ok {
@@ -210,6 +252,38 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 		}
 	}
 	return nil
+}
+
+// cellStatusFor returns the classified outcome of one (adapter,
+// scenario) cell from the adapter's CellStatuses map. A scenario absent
+// from the map is CellOK (it ran, or simply was not scheduled — the
+// caller distinguishes those via the headline maps).
+func cellStatusFor(a ServerResult, scenario string) CellStatus {
+	if a.CellStatuses == nil {
+		return CellOK
+	}
+	switch a.CellStatuses[scenario] {
+	case string(CellNotApplicable):
+		return CellNotApplicable
+	case string(CellDNF):
+		return CellDNF
+	default:
+		return CellOK
+	}
+}
+
+// cellStatusToken is the markdown token rendered for a non-OK cell:
+// "N/A" for not-applicable, "DNF" for did-not-finish. Never "0 rps" or
+// "—", which would mislead either as a real number or an absent cell.
+func cellStatusToken(st CellStatus) string {
+	switch st {
+	case CellNotApplicable:
+		return "N/A"
+	case CellDNF:
+		return "DNF"
+	default:
+		return "—"
+	}
 }
 
 // writeDetailSection emits the per-scenario detail block: median RPS
@@ -300,6 +374,11 @@ func writeTailLatencySection(w io.Writer, agg map[string]CellAggregate) error {
 
 	flat := make([]CellAggregate, 0, len(agg))
 	for _, v := range agg {
+		// Non-OK cells (N/A / DNF) carry no real latency — skip them so
+		// the tail-latency table ranks only cells that actually ran.
+		if v.Status != "" && v.Status != CellOK {
+			continue
+		}
 		flat = append(flat, v)
 	}
 	sort.Slice(flat, func(i, j int) bool {
@@ -552,10 +631,16 @@ func scenariosFromDoc(doc *Document) []string {
 }
 
 // groupByCategory buckets aggregates by Scenario category. Aggregates
-// that lack a category are bucketed under "other".
+// that lack a category are bucketed under "other". Non-OK cells (N/A /
+// DNF) are skipped: the detail table reports real measurements, so a
+// cell that did not run must not appear as a 0-RPS / "—" row — the
+// Latency-at-SLO section already records it as N/A / DNF (schema v5.3).
 func groupByCategory(agg map[string]CellAggregate) map[string][]CellAggregate {
 	out := make(map[string][]CellAggregate)
 	for _, c := range agg {
+		if c.Status != "" && c.Status != CellOK {
+			continue
+		}
 		cat := c.Category
 		if cat == "" {
 			cat = "other"
