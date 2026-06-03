@@ -270,14 +270,14 @@ func ParseArgs(args []string, out io.Writer) (Config, error) {
 
 // cellResultFile is the per-cell on-disk JSON shape.
 type cellResultFile struct {
-	RunIdx       int             `json:"run_idx"`
-	ScenarioName string          `json:"scenario"`
-	ServerName   string          `json:"server"`
-	Category     string          `json:"category"`
-	TargetAddr   string          `json:"target_addr"`
-	StartedAt    time.Time       `json:"started_at"`
-	CompletedAt  time.Time       `json:"completed_at"`
-	Error        string          `json:"error,omitempty"`
+	RunIdx       int       `json:"run_idx"`
+	ScenarioName string    `json:"scenario"`
+	ServerName   string    `json:"server"`
+	Category     string    `json:"category"`
+	TargetAddr   string    `json:"target_addr"`
+	StartedAt    time.Time `json:"started_at"`
+	CompletedAt  time.Time `json:"completed_at"`
+	Error        string    `json:"error,omitempty"`
 
 	// Status is the classified per-cell outcome ("ok"/"not_applicable"/
 	// "dnf"), schema v5.3. Persisted so the cluster merge path can read it

@@ -57,6 +57,7 @@ import (
 //	BENCH_RUNS=5                   median over N runs
 //	CELERIS_VERSION=               override go.mod auto-detect
 //	CLUSTER_USE_LAN=1              LAN fabric instead of Tailscale
+//
 // benchNeedsDBServices asks the runner itself whether the resolved -cells glob
 // (scoped to the in-scope competitor columns) schedules any driver-* cell, and
 // therefore whether the bench playbook must start + seed the pg/redis/mc
@@ -791,8 +792,13 @@ func summarizeCells(cells []cellRecord) (map[string]competitorStats, error) {
 		// Non-OK cells (not_applicable / dnf) carry no loadgen payload — they
 		// were recorded for classification and live on in the raw `cells`
 		// array for the document merge, but there is nothing to summarise.
-		// Skip them so this unconditional unmarshal never hits empty input
-		// (readRunnerCellResults only sets Loadgen for CellOK cells).
+		// Gate on the classified status (the SAME predicate the document-merge
+		// path uses) so both cluster-path aggregations share one inclusion
+		// rule; the Loadgen-emptiness check stays as a defensive backstop so
+		// the unmarshal below never hits empty input.
+		if st := report.CellStatus(c.Status); st != "" && st != report.CellOK {
+			continue
+		}
 		if len(c.Loadgen) == 0 || string(c.Loadgen) == "null" {
 			continue
 		}

@@ -62,21 +62,27 @@ const (
 // ClassifyCellError maps a per-cell error string to a [CellStatus].
 // An empty error means the cell ran (CellOK).
 //
-// The split: "zero-request" / "capability-lie" / "read server
-// settings" mean the adapter does not implement the route or speak the
-// protocol (the H2 prior-knowledge preface going unanswered surfaces as
-// a "read server settings" client error) → CellNotApplicable.
-// Everything else (adapter start, ready-check, address-already-in-use,
-// loadgen.New / loadgen.Run, dial / reset / EOF / timeout) is an infra
-// failure → CellDNF. Ambiguous errors default to CellDNF, never to
-// CellNotApplicable: a real crash must not be silently excused as N/A.
+// The split: "zero-request" / "capability-lie" mean the adapter does not
+// implement the route → CellNotApplicable. "read server settings" (the H2
+// prior-knowledge preface going unanswered) is N/A ONLY when it TIMED OUT —
+// the server simply never spoke H2; a reset / EOF / broken pipe on that
+// handshake means the connection was actively torn down (an H2 server that
+// crashed mid-handshake) and is a DNF, not N/A. Everything else (adapter
+// start, ready-check, address-already-in-use, loadgen.New / loadgen.Run,
+// dial / reset / EOF / timeout) is an infra failure → CellDNF. Ambiguous
+// errors default to CellDNF, never to CellNotApplicable: a real crash must
+// not be silently excused as N/A.
 func ClassifyCellError(errMsg string) CellStatus {
 	switch {
 	case errMsg == "":
 		return CellOK
+	case strings.Contains(errMsg, "read server settings"):
+		if strings.Contains(errMsg, "i/o timeout") || strings.Contains(errMsg, "deadline exceeded") {
+			return CellNotApplicable
+		}
+		return CellDNF
 	case strings.Contains(errMsg, "zero-request cell"),
-		strings.Contains(errMsg, "capability-lie"),
-		strings.Contains(errMsg, "read server settings"):
+		strings.Contains(errMsg, "capability-lie"):
 		return CellNotApplicable
 	default:
 		return CellDNF

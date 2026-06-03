@@ -276,6 +276,13 @@ func BuildTimeseries(cells []CellResult) *TimeseriesDoc {
 		SchemaVersion: TimeseriesSchemaVersion,
 	}
 	for _, c := range cells {
+		// Skip non-OK cells (not_applicable / dnf): they carry no samples, so
+		// they would only append empty ScenarioSeries entries and bloat the
+		// sidecar — matching Aggregate / the markdown reducers, which all
+		// exclude non-OK cells (schema v5.3).
+		if c.Status != "" && c.Status != CellOK {
+			continue
+		}
 		out.Scenarios = append(out.Scenarios,
 			BuildScenarioSeries(c.ScenarioName, c.ServerName, c.Category, c.Samples))
 	}

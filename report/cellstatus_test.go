@@ -11,9 +11,11 @@ import (
 // TestClassifyCellError pins the error→status mapping that BOTH merge
 // paths (the in-process runner and the cluster mage Bench path) call so
 // they agree on field width. The split is load-bearing: "zero-request" /
-// "capability-lie" / "read server settings" are the adapter not
-// implementing the route/protocol (N/A); everything else is an infra
-// failure (DNF); ambiguous defaults to DNF, never N/A.
+// "capability-lie" are the adapter not implementing the route (N/A);
+// "read server settings" is N/A only when it timed out (server never spoke
+// H2), but DNF on reset/EOF (an H2 server that crashed mid-handshake);
+// everything else is an infra failure (DNF); ambiguous defaults to DNF,
+// never N/A.
 func TestClassifyCellError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -23,7 +25,9 @@ func TestClassifyCellError(t *testing.T) {
 		{"empty is ok", "", CellOK},
 		{"zero-request is n/a", "zero-request cell: errors=10 duration=20s", CellNotApplicable},
 		{"capability-lie is n/a", `capability-lie: scheduled chain scenario "chain-mw5" got high error ratio from gin-h1 (errors=999000/requests=1000000) — adapter declared the capability but did not serve the route`, CellNotApplicable},
-		{"read server settings is n/a", "loadgen.Run: loadgen: dial: h2client: connect: read server settings: i/o timeout", CellNotApplicable},
+		{"read server settings timeout is n/a", "loadgen.Run: loadgen: dial: h2client: connect: read server settings: i/o timeout", CellNotApplicable},
+		{"read server settings reset is dnf (crash mid-handshake)", "loadgen.New: loadgen: dial: h2client: dial conn[0]: read server settings: read tcp 10.0.0.2:5->10.0.0.1:8080: read: connection reset by peer", CellDNF},
+		{"read server settings EOF is dnf (crash mid-handshake)", "loadgen.New: loadgen: dial: h2client: dial conn[0]: read server settings: unexpected EOF", CellDNF},
 		{"address already in use is dnf", "adapter start: listen tcp 127.0.0.1:8080: bind: address already in use", CellDNF},
 		{"adapter start is dnf", "adapter start: context deadline exceeded", CellDNF},
 		{"ready-check is dnf", "ready-check: dial tcp 127.0.0.1:8080: connect: connection refused", CellDNF},
