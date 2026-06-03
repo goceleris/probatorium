@@ -58,14 +58,33 @@
          + 10 }}
 
 # ---------- bench target side: start server + mpstat ----------
-- name: "{{ cell.1 }} run={{ cell.0 }} | stop any prior server"
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop any prior server + wait for bench port free"
   become: true
+  # The previous column's teardown is best-effort (failed_when:false) and its
+  # port sweep is time-boxed (~3s), so a server that drains slowly (graceful
+  # http.Server.Shutdown keeps the listen socket bound for up to 10s) can still
+  # own the bench port when the next column launches → "bind: address already
+  # in use" → the new server dies and the readiness gate below would otherwise
+  # lock onto the LINGERING predecessor (e.g. the column's own -h1 sibling,
+  # which serves H1 fine but RESETS an H2 preface — the documented cause of the
+  # H2 + WS/SSE wrong-process benches). Reap every holder of the bench port
+  # (SIGKILL each pass) and wait until it is genuinely free before starting.
+  # Best-effort (always exits 0): if the port still can't be freed, the
+  # process-identity readiness gate records the cell as a clean skip and the
+  # grid continues, so per-column failure isolation is preserved.
   ansible.builtin.shell: |
-    pkill -f "[c]ompetitors/" 2>/dev/null
+    bp={{ bench_port | default(8080) }}
+    pkill -TERM -f "[c]ompetitors/" 2>/dev/null
     pkill -x server 2>/dev/null
-    sleep 0.2
-    pkill -KILL -f "[c]ompetitors/" 2>/dev/null
+    for i in $(seq 1 40); do
+      pids=$(ss -ltnp "sport = :${bp}" 2>/dev/null | tail -n +2 | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+      [ -z "$pids" ] && break
+      for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+      sleep 0.5
+    done
     true
+  args:
+    executable: /bin/bash
   changed_when: false
   when: inventory_hostname == bench_target
 
@@ -116,18 +135,54 @@
     executable: /bin/bash
   when: inventory_hostname == bench_target
 
-- name: "{{ cell.1 }} run={{ cell.0 }} | wait for server to bind"
-  # FAILURE ISOLATION: a competitor that fails to bind (a crash on start, a
-  # missing runtime dep, a bad flag) must NOT abort the whole 31-column grid.
-  # We capture the probe result (failed_when: false) and gate the rest of the
-  # cell on it; an unbound column is recorded + skipped and the loop moves on,
-  # so one flaky adapter costs exactly its own column, not the entire run.
+- name: "{{ cell.1 }} run={{ cell.0 }} | wait for OUR server to own the bench port"
+  # FAILURE ISOLATION + CORRECT-PROCESS GATE. Two jobs:
+  #   1. A competitor that fails to bind (crash on start, missing dep, bad flag)
+  #      must NOT abort the whole 31-column grid — captured via failed_when:false
+  #      and gated on cell_bound, so one flaky adapter costs only its own column.
+  #   2. We must never bench a LINGERING previous server that still holds the
+  #      port. The old probe accepted ANY listener on :PORT, so a slow-draining
+  #      predecessor satisfied it and the cell was silently measured against the
+  #      wrong process (the H2 cells against an H1-only sibling that resets the
+  #      h2c preface; gorilla_ws against gnet-h1 with no /ws routes). Now we
+  #      require the listener to be the process WE launched: the right binary,
+  #      and the right -engine when one applies.
+  # become:true so `ss -ltnp` + /proc/<pid>/cmdline can see every process.
+  # Language-runtime adapters (bun/python: hono, elysia, fastapi) listen under a
+  # runtime argv ("bun run dist/server", "python -m uvicorn ...") that never
+  # contains competitors/, so the shared-binary/-engine wrong-process hazard
+  # cannot apply to them — accept any listener for those (the port-free reap
+  # above already cleared any lingering predecessor).
+  become: true
   ansible.builtin.shell: |
+    bp={{ bench_port | default(8080) }}
+    want_bin="competitors/{{ cell_bin }}"
+    want_engine="{{ cell_engine | default('') }}"
     for i in $(seq 1 40); do
-      ss -ltn 2>/dev/null | grep -q ':{{ bench_port | default(8080) }} ' && exit 0
+      pids=$(ss -ltnp "sport = :${bp}" 2>/dev/null | tail -n +2 | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+      for holder in $pids; do
+        cmd=$(tr '\0' ' ' < /proc/$holder/cmdline 2>/dev/null)
+        case "$cmd" in
+          *competitors/*)
+            # Go competitor launched directly from competitors/: require the
+            # exact binary, and the exact -engine when the column carries one
+            # (trailing space pins it to a whole argv token, so -engine h1 is
+            # never accepted for an -engine h2c column).
+            if printf '%s' "$cmd" | grep -qF -- "$want_bin"; then
+              if [ -z "$want_engine" ] || printf '%s' "$cmd" | grep -qF -- "-engine $want_engine "; then
+                exit 0
+              fi
+            fi
+            ;;
+          ?*)
+            # Non-competitors/ listener = language-runtime adapter; accept.
+            exit 0
+            ;;
+        esac
+      done
       sleep 0.25
     done
-    echo "server did not bind in 10s" >&2
+    echo "our server ({{ cell.1 }}: $want_bin${want_engine:+ -engine $want_engine}) did not own :${bp} within 10s" >&2
     tail -50 {{ cell_dir }}/server.log >&2
     exit 1
   args:
