@@ -1,6 +1,6 @@
 module github.com/goceleris/probatorium
 
-go 1.26.3
+go 1.26.4
 
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
