@@ -34,6 +34,18 @@ const (
 	sshUser = "mini"
 )
 
+// defaultClusterTarget is the default BENCH_TARGET / VALIDATE_TARGET when the
+// user doesn't set one.
+//
+// arm64 benchmarking is TEMPORARILY DISABLED (2026-06): the sole arm64 cluster
+// node (msr1 — a CIX Sky1 / CD8180 board) hard-hangs the entire host under
+// sustained NIC load due to an immature SoC/firmware defect (celeris#312), NOT a
+// celeris bug — both celeris and gnet trigger it and no OS-level workaround
+// exists. Until a stable arm64 host replaces it, the benchmark + validation of
+// record is amd64-only. Re-enable arm64 by setting BENCH_TARGET=both /
+// VALIDATE_TARGET=both (or =msr1) once a reliable arm64 node is in the fabric.
+const defaultClusterTarget = "msa2-server" // was "both"
+
 // lanIPs maps inventory hostname to the LAN-pinned DHCP reservation
 // used when CLUSTER_USE_LAN=1 forces traffic over the 20G LACP fabric
 // instead of Tailscale's overlay. Update here AND in

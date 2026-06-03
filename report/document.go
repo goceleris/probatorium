@@ -102,6 +102,20 @@ func BuildDocument(in BuildInput) *Document {
 			byAdapter[c.ServerName] = sr
 		}
 
+		// A non-OK cell did not produce a real number: it is route/protocol
+		// not-implemented (not_applicable) or an infra failure (dnf). Record
+		// it in CellStatuses and skip every headline map so it is never
+		// ranked as a 0-RPS also-ran (schema v5.3). An empty-string Status
+		// is treated as OK for back-compat with callers that pre-date the
+		// classification (they only ever hand OK cells anyway).
+		if c.Status != "" && c.Status != CellOK {
+			if sr.CellStatuses == nil {
+				sr.CellStatuses = map[string]string{}
+			}
+			sr.CellStatuses[c.ScenarioName] = string(c.Status)
+			continue
+		}
+
 		sr.SaturationModeRPS[c.ScenarioName] = c.RPSMedian
 
 		// LatencyAtSLO + RatedModeP99AtTargetRPS come from the real rated

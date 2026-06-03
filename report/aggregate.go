@@ -55,6 +55,20 @@ type CellResult struct {
 	// was off, in which case LatencyAtSLO stays nil and the regression gate
 	// sees no signal for this cell.
 	RatedSamples [][]RatedSample
+
+	// Status is the per-cell outcome classification (schema v5.3+). The
+	// zero value ("") is treated as [CellOK] when Samples are present —
+	// [Aggregate] derives the effective status from ErrorMsg via
+	// [ClassifyCellError] when Status is unset. A non-OK status means the
+	// cell did not produce a real number and must not be ranked.
+	Status CellStatus
+
+	// ErrorMsg is the synthesised per-cell error string the orchestrator
+	// recorded (e.g. "zero-request cell: …", "adapter start: …"). Empty
+	// for an OK cell. [Aggregate] classifies it into Status when Status
+	// is unset, so either path (in-process runner or cluster merge) can
+	// hand a cell either pre-classified or as a raw error string.
+	ErrorMsg string
 }
 
 // RatedSample is one rated pass: a target offered load and the
@@ -80,6 +94,16 @@ type CellAggregate struct {
 	ServerKind   string
 	Category     string
 	N            int
+
+	// Status is the per-cell outcome (schema v5.3+). Only Status==CellOK
+	// cells carry headline numbers (RPS / latency / histogram); for a
+	// non-OK cell those fields are left zero and BuildDocument records
+	// the cell in ServerResult.CellStatuses instead of ranking it.
+	Status CellStatus
+
+	// ErrorMsg is the per-cell error string that produced a non-OK
+	// Status, surfaced for JSON detail / debugging. Empty for CellOK.
+	ErrorMsg string
 
 	RPSMedian float64
 	RPSP5     float64 // 5th percentile bound of the per-run RPS distribution
@@ -133,12 +157,29 @@ func CellID(scenarioName, serverName string) string {
 func Aggregate(cells []CellResult) map[string]CellAggregate {
 	out := make(map[string]CellAggregate, len(cells))
 	for _, cell := range cells {
+		// Effective status: honour a pre-classified Status when the
+		// caller set one, otherwise derive it from the error string. An
+		// unset Status on a cell with samples and no error is CellOK.
+		status := cell.Status
+		if status == "" {
+			status = ClassifyCellError(cell.ErrorMsg)
+		}
+
 		agg := CellAggregate{
 			ScenarioName: cell.ScenarioName,
 			ServerName:   cell.ServerName,
 			ServerKind:   cell.ServerKind,
 			Category:     cell.Category,
 			N:            len(cell.Samples),
+			Status:       status,
+			ErrorMsg:     cell.ErrorMsg,
+		}
+		// A cell that did not run (or ran but produced no real number) is
+		// never emitted as a ranked datapoint: leave every headline field
+		// zero so BuildDocument records it in CellStatuses instead.
+		if status != CellOK {
+			out[CellID(cell.ScenarioName, cell.ServerName)] = agg
+			continue
 		}
 		if len(cell.Samples) == 0 {
 			out[CellID(cell.ScenarioName, cell.ServerName)] = agg
@@ -235,6 +276,13 @@ func BuildTimeseries(cells []CellResult) *TimeseriesDoc {
 		SchemaVersion: TimeseriesSchemaVersion,
 	}
 	for _, c := range cells {
+		// Skip non-OK cells (not_applicable / dnf): they carry no samples, so
+		// they would only append empty ScenarioSeries entries and bloat the
+		// sidecar — matching Aggregate / the markdown reducers, which all
+		// exclude non-OK cells (schema v5.3).
+		if c.Status != "" && c.Status != CellOK {
+			continue
+		}
 		out.Scenarios = append(out.Scenarios,
 			BuildScenarioSeries(c.ScenarioName, c.ServerName, c.Category, c.Samples))
 	}

@@ -22,6 +22,13 @@ import (
 	"github.com/goceleris/probatorium/validation/remote"
 )
 
+// streamingWalkerMinConcurrency is the concurrency at/above which the WS
+// torture and SSE kill walker slices activate. Set LOW (4) so every non-smoke
+// Tier 1 run — including the matrix's per-cell default of 10 — drives the
+// engine's WebSocket/SSE (and inline-Detach) path. See the walker-budget note
+// in driveTier1 for why this used to be 20 and why that hid celeris#309.
+const streamingWalkerMinConcurrency = 4
+
 // tier1Config parameterises a single Tier 1 (always-on property
 // stress) run. Built from the orchestrator's [Config] but kept as a
 // struct so testing can stub each piece independently.
@@ -111,6 +118,7 @@ type tier1Tally struct {
 	h2c           *h2cTally
 	ws            *wsTally
 	sse           *sseTally
+	liveness      *livenessTally
 }
 
 // driveTier1 is the production Tier 1 entry point. Starts the refapp,
@@ -142,6 +150,11 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		cfg.RequestTimeout = 5 * time.Second
 	}
 
+	// Liveness oracle: tracks whether the refapp PROCESS survives the run.
+	// Wired before Start so the watchers below can feed it from the first
+	// instant. See liveness.go for why the walkers alone can't see a death.
+	tally.liveness = &livenessTally{}
+
 	// Start the refapp. Driver.Start is non-blocking; the binary is
 	// alive but may not have bound its port yet. Wait for the
 	// "ready addr=" line on stdout next.
@@ -150,12 +163,40 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		return tally.snapshot(), fmt.Errorf("tier1: start refapp: %w", err)
 	}
 	// SIGTERM the refapp on return, regardless of how we exited.
-	// Driver.Wait inside Stderr() drains until the process actually
-	// dies; we don't block on it here so the caller can escalate.
 	defer func() { _ = proc.Signal(0xf) /* SIGTERM */ }()
 
-	if err := waitForReady(ctx, proc, cfg.ReadyTimeout); err != nil {
+	// runCtx scopes the walkers (plus warmup + the periodic snapshot). It is
+	// cancelled by the parent ctx (clean end of run) OR by the liveness
+	// watchers the instant the refapp dies — so a crash stops the walkers
+	// immediately instead of letting them hammer a dead port until the parent
+	// deadline, and lets driveTier1 return promptly with Crashed set.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
+	// superviseStderr is the SINGLE owner of the refapp's stdout+stderr for
+	// the whole run: ready detection + crash-signature scan + drain. A second
+	// reader would corrupt it, which is exactly why Tier 1 no longer calls
+	// waitForReady (that spawned its own competing reader). watchProcessExit
+	// is the authoritative death detector (catches silent SIGKILL/OOM too).
+	// Both cancelRun on crash so the walkers wind down at once.
+	readyCh := make(chan struct{})
+	readyErrCh := make(chan error, 1)
+	var readyOnce sync.Once
+	go superviseStderr(proc.Stderr(), tally.liveness,
+		func() { readyOnce.Do(func() { close(readyCh) }) },
+		func(err error) { select { case readyErrCh <- err: default: } },
+		cancelRun)
+	go watchProcessExit(ctx, proc, tally.liveness, cancelRun)
+
+	select {
+	case <-readyCh:
+		// refapp bound — proceed to fan out walkers.
+	case err := <-readyErrCh:
 		return tally.snapshot(), fmt.Errorf("tier1: refapp not ready: %w", err)
+	case <-time.After(cfg.ReadyTimeout):
+		return tally.snapshot(), fmt.Errorf("tier1: refapp not ready: timeout after %s", cfg.ReadyTimeout)
+	case <-ctx.Done():
+		return tally.snapshot(), ctx.Err()
 	}
 
 	// Refapp is bound; surface its PID for the orchestrator's
@@ -167,6 +208,13 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		default:
 		}
 	}
+
+	// Responsiveness watcher (I-HANG): the crash watchers above catch a refapp
+	// that DIES; this catches one that stays alive but stops answering — a
+	// deadlock / wedge (celeris#311) the per-request walkers read as mere
+	// connection errors. Health-probe timeouts trip it; cancelRun winds the
+	// run down so driveTier1 returns promptly with Hung set.
+	go watchResponsiveness(runCtx, cfg.BaseURL, tally.liveness, cancelRun)
 
 	// Tier 1 fan-out. Five slices today (matches the full workload
 	// mix called out in issue #55):
@@ -196,9 +244,9 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	// per cell) the warm-up is a small constant overhead with no impact
 	// on bug detection; on short-budget runs (<60s of total ctx budget)
 	// it's skipped entirely so smoke / unit tests aren't starved.
-	if dl, ok := ctx.Deadline(); !ok || time.Until(dl) >= time.Minute {
+	if dl, ok := runCtx.Deadline(); !ok || time.Until(dl) >= time.Minute {
 		const warmupBudget = 30 * time.Second
-		warmupCtx, cancelWarmup := context.WithTimeout(ctx, warmupBudget)
+		warmupCtx, cancelWarmup := context.WithTimeout(runCtx, warmupBudget)
 		req, werr := http.NewRequestWithContext(warmupCtx, "GET", cfg.BaseURL+"/healthz", nil)
 		if werr == nil {
 			for warmupCtx.Err() == nil {
@@ -228,12 +276,22 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	sseTallyPtr := &sseTally{}
 	tally.sse = sseTallyPtr
 	// Walker budget. Higher-overhead slices activate only at higher
-	// concurrencies so small smoke tests don't pay for them:
+	// concurrencies so single-walker smoke tests don't pay for them:
 	//   adv     — at concurrency >= 1 (always at least 1 walker)
 	//   h2c     — at concurrency >= 10
-	//   ws      — at concurrency >= 20 (full WS handshake per fire)
-	//   sse     — at concurrency >= 20 (each fire holds a stream for
-	//             up to ~1.5s before RST'ing)
+	//   ws      — at concurrency >= streamingWalkerMinConcurrency (full WS
+	//             handshake per fire)
+	//   sse     — at concurrency >= streamingWalkerMinConcurrency (each fire
+	//             holds a stream for up to ~1.5s before RST'ing)
+	//
+	// ws/sse fire from a LOW threshold (4) on purpose: the engine's inline
+	// streaming-Detach path (and any future WS/SSE corner) must be exercised
+	// on EVERY non-smoke run, including the matrix's per-cell concurrency of
+	// 10. They used to gate at 20 — above the per-cell default — so the epoll
+	// engine was validated for hours without a single WebSocket/SSE upgrade,
+	// which is exactly how the inline detachMu double-unlock (celeris#309)
+	// reached a release. The liveness oracle then turns any resulting crash
+	// into a hard failure. Smoke runs (concurrency 1-3) still skip them.
 	advCount := cfg.Concurrency / 5
 	if advCount < 1 && cfg.Concurrency >= 1 {
 		advCount = 1
@@ -246,14 +304,14 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		}
 	}
 	wsCount := 0
-	if cfg.Concurrency >= 20 {
+	if cfg.Concurrency >= streamingWalkerMinConcurrency {
 		wsCount = cfg.Concurrency / 20
 		if wsCount < 1 {
 			wsCount = 1
 		}
 	}
 	sseCount := 0
-	if cfg.Concurrency >= 20 {
+	if cfg.Concurrency >= streamingWalkerMinConcurrency {
 		sseCount = cfg.Concurrency / 20
 		if sseCount < 1 {
 			sseCount = 1
@@ -268,7 +326,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		go func(walkerID int) {
 			defer wg.Done()
 			seed := cfg.Seed ^ uint64(walkerID)*0x9e3779b97f4a7c15
-			runMarkovWalker(ctx, httpc, cfg.BaseURL, cfg.Matrix, seed, tally)
+			runMarkovWalker(runCtx, httpc, cfg.BaseURL, cfg.Matrix, seed, tally)
 		}(i)
 	}
 	for i := 0; i < advCount; i++ {
@@ -278,7 +336,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			seed := cfg.Seed ^ uint64(0xdead0000+walkerID)*0x9e3779b97f4a7c15
 			// Adversarial fires slower than Markov so it stays inside
 			// its budget share (~1/5 of the total request volume).
-			runAdversarialWalker(ctx, hostPort, seed, 50*time.Millisecond, advTally)
+			runAdversarialWalker(runCtx, hostPort, seed, 50*time.Millisecond, advTally)
 		}(i)
 	}
 	for i := 0; i < h2cCount; i++ {
@@ -292,7 +350,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			// rate below the engine's own listener turnover so we're
 			// racing the engine's state machine, not just creating
 			// backlog.
-			runH2CChurnWalker(ctx, hostPort, seed, 100*time.Millisecond, h2cTallyPtr)
+			runH2CChurnWalker(runCtx, hostPort, seed, 100*time.Millisecond, h2cTallyPtr)
 		}(i)
 	}
 	for i := 0; i < wsCount; i++ {
@@ -304,7 +362,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			// upgrade + read 101 + send torture frame + classify. At
 			// 150ms tick and 2s per-fire timeout the worst-case rate
 			// is ~6 fires/sec per walker.
-			runWSTortureWalker(ctx, hostPort, "/ws", seed, 150*time.Millisecond, wsTallyPtr)
+			runWSTortureWalker(runCtx, hostPort, "/ws", seed, 150*time.Millisecond, wsTallyPtr)
 		}(i)
 	}
 	for i := 0; i < sseCount; i++ {
@@ -317,7 +375,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			// stream-kill per few hundred ms. The point is to keep
 			// fresh disconnect events flowing to the I-CONN-2 oracle,
 			// not to maximise throughput.
-			runSSEKillWalker(ctx, hostPort, "/events", seed, 200*time.Millisecond, sseTallyPtr)
+			runSSEKillWalker(runCtx, hostPort, "/events", seed, 200*time.Millisecond, sseTallyPtr)
 		}(i)
 	}
 	// Optional periodic tally-callback + snapshot-to-disk for reactive
@@ -345,7 +403,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			}
 			for {
 				select {
-				case <-ctx.Done():
+				case <-runCtx.Done():
 					return
 				case <-tick.C:
 					emit()
@@ -354,7 +412,16 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		}()
 	}
 	wg.Wait()
-	return tally.snapshot(), nil
+	snap := tally.snapshot()
+	// If the refapp crashed OR hung, the periodic ticker stopped at cancelRun
+	// and may not have ticked between the event and here. Fire the callback
+	// once more, synchronously, so the I-LIVENESS / I-HANG incident is
+	// guaranteed to reach the orchestrator (fire() is deduped, so a double tick
+	// is harmless).
+	if (snap.Liveness.Crashed || snap.Liveness.Hung) && cfg.TallyCallback != nil {
+		cfg.TallyCallback(snap)
+	}
+	return snap, nil
 }
 
 // waitForReady tails the refapp's combined stderr+stdout until it
@@ -667,6 +734,9 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 	if t.sse != nil {
 		s.SSEKill = t.sse.snapshot()
 	}
+	if t.liveness != nil {
+		s.Liveness = t.liveness.snapshot()
+	}
 	return s
 }
 
@@ -682,6 +752,7 @@ type tier1TallySnapshot struct {
 	H2CChurn      h2cSnapshot         `json:"h2c_churn,omitempty"`
 	WSTorture     wsSnapshot          `json:"ws_torture,omitempty"`
 	SSEKill       sseSnapshot         `json:"sse_kill,omitempty"`
+	Liveness      livenessSnapshot    `json:"liveness,omitempty"`
 }
 
 // String formats a tally for the run summary log line.
@@ -689,5 +760,8 @@ func (s tier1TallySnapshot) String() string {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "sent=%d 2xx=%d 4xx=%d 5xx=%d err=%d",
 		s.RequestsSent, s.Requests2xx, s.Requests4xx, s.Requests5xx, s.RequestsError)
+	if s.Liveness.Crashed {
+		fmt.Fprintf(&b, " CRASHED[%s]", s.Liveness.Reason())
+	}
 	return b.String()
 }

@@ -137,6 +137,33 @@ type Config struct {
 	// fs.TLS and no tls-* cell is scheduled (it would otherwise trip the
 	// executeCell capability-lie guard). See scenarios/tls.go.
 	TLSTerminator string
+
+	// SeedServices, when non-empty, switches the runner into a one-shot
+	// seed-and-exit mode: it connects to the already-running pg/redis/mc
+	// backends (started out-of-band by the distributed bench playbook on the
+	// bench target — the runner cannot Start them itself because driver
+	// fixtures must live where the SUT can reach them) and loads the same
+	// fixture set services.Seed loads, then exits. Value is a comma list of
+	// "kind=addr" pairs, e.g.
+	//   "postgres=postgres://bench:bench@127.0.0.1:54321/bench?sslmode=disable,redis=127.0.0.1:63791,memcached=127.0.0.1:21211"
+	// Any omitted kind is skipped. No bench schedule runs in this mode.
+	SeedServices string
+
+	// PrintRequiredServices switches the runner into a one-shot mode that
+	// resolves the -cells glob against the scenario catalogue (optionally
+	// scoped by -competitors) and prints, one per line, the docker service
+	// kinds the bench must provision (postgres / redis / memcached) — or
+	// nothing when no driver cell is in scope. The distributed-bench
+	// orchestrator (mage Bench) calls this to decide whether to start + seed
+	// the fixture containers, so the decision reuses the SAME filterCells +
+	// requiredServiceKinds the real run uses and can never drift from it.
+	PrintRequiredServices bool
+
+	// Competitors is the comma list of competitor column slugs in scope,
+	// consulted ONLY by -print-required-services so the "<scenario>/<slug>"
+	// match mirrors the per-cell ids the bench actually schedules. Empty =
+	// full local adapter registry.
+	Competitors string
 }
 
 // defaultRatedFractions is the saturation-relative sweep used when none is
@@ -186,6 +213,12 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.DurationVar(&c.RatedDuration, "rated-duration", c.RatedDuration, "measurement window for each rated pass")
 	fs.StringVar(&c.TLSTerminator, "tls-terminator", c.TLSTerminator,
 		"https base URL of the shared TLS terminator fronting the adapters; empty disables all tls-* scenarios")
+	fs.StringVar(&c.SeedServices, "seed-services", c.SeedServices,
+		`one-shot seed-and-exit: comma list of "kind=addr" (postgres=<dsn>,redis=<host:port>,memcached=<host:port>) to seed already-running backends, then exit`)
+	fs.BoolVar(&c.PrintRequiredServices, "print-required-services", c.PrintRequiredServices,
+		"resolve -cells (scoped by -competitors) and print the docker service kinds the bench needs, one per line, then exit")
+	fs.StringVar(&c.Competitors, "competitors", c.Competitors,
+		"comma list of competitor column slugs scoping -print-required-services; empty = full adapter registry")
 	fs.Func("rated-fractions",
 		"comma-separated saturation fractions for the rated sweep (default 0.25,0.5,0.75,0.9)",
 		func(s string) error {
@@ -237,14 +270,21 @@ func ParseArgs(args []string, out io.Writer) (Config, error) {
 
 // cellResultFile is the per-cell on-disk JSON shape.
 type cellResultFile struct {
-	RunIdx       int             `json:"run_idx"`
-	ScenarioName string          `json:"scenario"`
-	ServerName   string          `json:"server"`
-	Category     string          `json:"category"`
-	TargetAddr   string          `json:"target_addr"`
-	StartedAt    time.Time       `json:"started_at"`
-	CompletedAt  time.Time       `json:"completed_at"`
-	Error        string          `json:"error,omitempty"`
+	RunIdx       int       `json:"run_idx"`
+	ScenarioName string    `json:"scenario"`
+	ServerName   string    `json:"server"`
+	Category     string    `json:"category"`
+	TargetAddr   string    `json:"target_addr"`
+	StartedAt    time.Time `json:"started_at"`
+	CompletedAt  time.Time `json:"completed_at"`
+	Error        string    `json:"error,omitempty"`
+
+	// Status is the classified per-cell outcome ("ok"/"not_applicable"/
+	// "dnf"), schema v5.3. Persisted so the cluster merge path can read it
+	// back verbatim and the in-process and cluster paths agree on field
+	// width. Derived from Error via report.ClassifyCellError; empty on the
+	// rare pre-loadgen mkdir-failure path (treated as OK by readers).
+	Status       string          `json:"status,omitempty"`
 	Result       *loadgen.Result `json:"result,omitempty"`
 	HistogramB64 string          `json:"hdr_histogram_b64,omitempty"`
 	FDsBefore    int             `json:"fds_before,omitempty"`
@@ -293,10 +333,107 @@ func main() {
 	if err != nil {
 		os.Exit(2)
 	}
+	// One-shot seed-and-exit mode (distributed bench driver-backend seeding).
+	// Runs before any schedule resolution so it is a pure connect-seed-exit.
+	if cfg.SeedServices != "" {
+		if err := seedServicesAndExit(cfg.SeedServices); err != nil {
+			fmt.Fprintf(os.Stderr, "probatorium-runner: seed-services: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// One-shot capability query: print the docker service kinds the resolved
+	// -cells glob needs, then exit. No schedule runs. Lets mage Bench gate the
+	// fixture-container start on the runner's own resolution (single source of
+	// truth — see Config.PrintRequiredServices).
+	if cfg.PrintRequiredServices {
+		if err := printRequiredServicesAndExit(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "probatorium-runner: print-required-services: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "probatorium-runner: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// seedServicesAndExit parses the -seed-services "kind=addr" list and loads the
+// driver fixture set into the named already-running backends via
+// services.SeedExternal. Used by the distributed bench: the playbook starts
+// pg/redis/mc on the bench target, then invokes the bench-target-side runner
+// with -seed-services so the driver-* scenarios hit byte-identical seeded data
+// to a local in-process run.
+func seedServicesAndExit(spec string) error {
+	var pgDSN, redisAddr, mcAddr string
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kind, addr, ok := strings.Cut(part, "=")
+		if !ok {
+			return fmt.Errorf("bad -seed-services entry %q (want kind=addr)", part)
+		}
+		switch strings.TrimSpace(kind) {
+		case "postgres", "pg":
+			pgDSN = strings.TrimSpace(addr)
+		case "redis":
+			redisAddr = strings.TrimSpace(addr)
+		case "memcached", "mc":
+			mcAddr = strings.TrimSpace(addr)
+		default:
+			return fmt.Errorf("unknown -seed-services kind %q", kind)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	fmt.Fprintf(os.Stderr, "probatorium-runner: seeding services (pg=%t redis=%t mc=%t)...\n",
+		pgDSN != "", redisAddr != "", mcAddr != "")
+	if err := services.SeedExternal(ctx, pgDSN, redisAddr, mcAddr); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "probatorium-runner: seed complete")
+	return nil
+}
+
+// printRequiredServicesAndExit resolves the -cells glob against the scenario
+// catalogue (scoped by -competitors when given) and prints the docker service
+// kinds the bench must provision, one per line, to stdout. It deliberately
+// reuses the SAME filterCells + requiredServiceKinds the real schedule uses, so
+// the orchestrator's container-start decision can never diverge from what the
+// runner would actually execute.
+//
+// -competitors mirrors the per-cell "<scenario>/<slug>" ids the distributed
+// bench schedules: each slug becomes a synthetic adapter so a glob like
+// "driver-pg-read/celeris-*" matches exactly as it will at run time. Empty
+// falls back to the full local adapter registry (the in-process bench path).
+// Capability gating is intentionally NOT applied here — requiredServiceKinds is
+// purely scenario-driven, and if a driver scenario is scheduled at all the
+// backend must exist (the celeris SUT is always driver-capable).
+func printRequiredServicesAndExit(cfg Config) error {
+	scs := scenarios.Registry()
+	var advs []servers.Adapter
+	if strings.TrimSpace(cfg.Competitors) != "" {
+		for _, s := range strings.Split(cfg.Competitors, ",") {
+			name := strings.TrimSpace(s)
+			if name == "" {
+				continue
+			}
+			advs = append(advs, servers.Adapter{Name: name, Category: "remote"})
+		}
+	} else {
+		advs = servers.AdaptersSorted()
+	}
+	effSc, _, err := filterCells(scs, advs, cfg.Cells)
+	if err != nil {
+		return err
+	}
+	for _, k := range requiredServiceKinds(effSc) {
+		fmt.Println(k)
+	}
+	return nil
 }
 
 // run is the orchestrator entry point, separated from main so it can be
@@ -357,10 +494,23 @@ func run(cfg Config) error {
 	for _, a := range effAdv {
 		fs := featureSetFor(a, tlsReady)
 		if cfg.Target != "" {
-			// The runner cannot probe the remote SUT's real capabilities,
-			// so advertise everything and let unsupported protocols surface
-			// as zero-request cells instead of being silently skipped.
-			fs = remoteFeatureSet()
+			// Remote-target mode: the synthetic adapter `a` carries only the
+			// -server-name slug, not a capability manifest. But that slug is a
+			// servers.Registry column key (the cluster bench expands the matrix
+			// straight from the registry), so we look the REAL adapter up and
+			// gate scenarios on its DECLARED capabilities — identical to local
+			// mode. Without this, capability-gated scenarios (driver / chain /
+			// ws / sse / tls) get scheduled against a static-only competitor
+			// that can't serve them, burning a full measurement window on a
+			// 404-storm zero-request cell (a static-only adapter would spend
+			// ~20s/route × every gated scenario producing nothing but errors).
+			// A -server-name that is NOT a registry key (an ad-hoc manual run)
+			// falls back to the permissive set so nothing is silently dropped.
+			if real, ok := servers.Registry[a.Name]; ok {
+				fs = featureSetFor(real, tlsReady)
+			} else {
+				fs = remoteFeatureSet()
+			}
 		}
 		srvs = append(srvs, &adapterServer{adapter: a, features: fs})
 	}
@@ -431,22 +581,46 @@ func run(cfg Config) error {
 			i+1, len(schedule), cell.RunIdx, cell.Scenario.Name(), cell.Server.Name())
 
 		res, cerr := executeCell(rootCtx, cfg, cell)
-		if res.Result != nil {
-			key := report.CellID(cell.Scenario.Name(), cell.Server.Name())
-			cr := collected[key]
-			if cr == nil {
-				cr = &report.CellResult{
-					ScenarioName: cell.Scenario.Name(),
-					ServerName:   cell.Server.Name(),
-					Category:     cell.Scenario.Category(),
-				}
-				collected[key] = cr
+		status := res.Status
+		if status == "" {
+			status = report.ClassifyCellError(res.ErrorMsg)
+		}
+		// Look up (or create) the collected cell for EVERY outcome so a
+		// not-applicable / did-not-finish cell survives into the report
+		// instead of vanishing (the old `if res.Result != nil` gate
+		// silently dropped DNF cells and ranked N/A cells as 0-RPS rows).
+		key := report.CellID(cell.Scenario.Name(), cell.Server.Name())
+		cr := collected[key]
+		if cr == nil {
+			cr = &report.CellResult{
+				ScenarioName: cell.Scenario.Name(),
+				ServerName:   cell.Server.Name(),
+				Category:     cell.Scenario.Category(),
 			}
+			collected[key] = cr
+		}
+		if status == report.CellOK && res.Result != nil {
+			// A real measurement: append the sample exactly as before. An
+			// OK run promotes the cell to OK even if an earlier run of the
+			// same cell did not finish — a cell that produced a real number
+			// on any run is a real datapoint, so clear any prior non-OK mark
+			// and let Aggregate see Samples + an empty (OK) status.
 			cr.Samples = append(cr.Samples, *res.Result)
 			cr.HistogramsB64 = append(cr.HistogramsB64, res.HistogramB64)
 			if cfg.RatedMode {
 				cr.RatedSamples = append(cr.RatedSamples, res.RatedSamples)
 			}
+			cr.Status = report.CellOK
+			cr.ErrorMsg = ""
+		} else if len(cr.Samples) == 0 && cr.Status != report.CellOK {
+			// A cell that did not run (or produced no real number) AND has no
+			// OK sample yet: record the classified status + error string but
+			// DO NOT append a bogus 0-RPS Sample. Aggregate gates headline
+			// inclusion on Status==CellOK, so this becomes an N/A / DNF row,
+			// not a ranked also-ran. A later OK run still upgrades it via the
+			// branch above.
+			cr.Status = status
+			cr.ErrorMsg = res.ErrorMsg
 		}
 		if cerr != nil {
 			fmt.Fprintf(os.Stderr, "  cell error: %v\n", cerr)
@@ -510,6 +684,15 @@ type cellOutcome struct {
 	// empty when rated mode was off. Threaded into report.CellResult so
 	// Aggregate can reduce it into LatencyAtSLO.
 	RatedSamples []report.RatedSample
+
+	// Status is the classified outcome of this cell (schema v5.3).
+	// ErrorMsg is the synthesised per-cell error string it was classified
+	// from (empty for an OK cell). Both survive even when Result is nil
+	// (a DNF cell never produced a loadgen.Result), so the collection loop
+	// can record a not-applicable / did-not-finish cell instead of
+	// dropping it or ranking it as a 0-RPS also-ran.
+	Status   report.CellStatus
+	ErrorMsg string
 }
 
 // buildCellConfig maps a scenario's Workload onto baseURL and overlays
@@ -537,7 +720,7 @@ func buildCellConfig(cell interleave.Cell, baseURL string, cfg Config) loadgen.C
 // already-running remote base URL. Returns the loadgen result on success
 // and a synthesised error otherwise; the per-cell JSON is written either
 // way so a partial matrix still produces inspectable artefacts.
-func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cellOutcome, error) {
+func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out cellOutcome, _ error) {
 	outDir := filepath.Join(cfg.Out, fmt.Sprintf("run%d", cell.RunIdx), cell.Scenario.Name())
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return cellOutcome{}, fmt.Errorf("mkdir %s: %w", outDir, err)
@@ -553,6 +736,15 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 	}
 	defer func() {
 		cellRes.CompletedAt = time.Now().UTC()
+		// Classify the outcome from the single error string the body
+		// recorded, so the in-process collection loop and the cluster
+		// merge path (which re-reads this JSON's `error` field) agree on
+		// the same CellStatus. The classification is persisted on the
+		// per-cell JSON so the cluster path can read it back verbatim
+		// rather than re-deriving and risking a field-width disagreement.
+		cellRes.Status = string(report.ClassifyCellError(cellRes.Error))
+		out.Status = report.CellStatus(cellRes.Status)
+		out.ErrorMsg = cellRes.Error
 		if werr := writeJSON(outFile, &cellRes); werr != nil {
 			fmt.Fprintf(os.Stderr, "  write %s: %v\n", outFile, werr)
 		}
@@ -621,11 +813,11 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 		return cellOutcome{}, err
 	}
 	cellRes.Result = res
-	out := cellOutcome{Result: res}
+	oc := cellOutcome{Result: res}
 
 	if res != nil && res.Requests == 0 {
 		cellRes.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s", res.Errors, res.Duration)
-		return out, errors.New(cellRes.Error)
+		return oc, errors.New(cellRes.Error)
 	}
 
 	// Capability-lie guard: a scheduled scenario whose class is gated on a
@@ -642,7 +834,7 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 			cellRes.Error = fmt.Sprintf(
 				"capability-lie: scheduled %s scenario %q got high error ratio from %s (errors=%d/requests=%d) — adapter declared the capability but did not serve the route",
 				cell.Scenario.Category(), cell.Scenario.Name(), cell.Server.Name(), res.Errors, res.Requests)
-			return out, errors.New(cellRes.Error)
+			return oc, errors.New(cellRes.Error)
 		}
 	}
 
@@ -655,10 +847,10 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (cell
 	if cfg.RatedMode && res != nil && res.RequestsPerSec > 0 {
 		cellRes.SaturationModeRPS = res.RequestsPerSec
 		samples, passes := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
-		out.RatedSamples = samples
+		oc.RatedSamples = samples
 		cellRes.RatedPasses = passes
 	}
-	return out, nil
+	return oc, nil
 }
 
 // runRatedSweep drives one rated (closed-loop, CO-corrected) pass per

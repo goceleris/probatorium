@@ -1,6 +1,6 @@
 module github.com/goceleris/probatorium/servers/iris
 
-go 1.26.3
+go 1.26.4
 
 require (
 	github.com/bradfitz/gomemcache v0.0.0-20260422231931-4d751bb6e37c

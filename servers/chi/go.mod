@@ -1,6 +1,6 @@
 module github.com/goceleris/probatorium/servers/chi
 
-go 1.26.3
+go 1.26.4
 
 require (
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf

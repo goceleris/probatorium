@@ -57,12 +57,37 @@ import (
 //	BENCH_RUNS=5                   median over N runs
 //	CELERIS_VERSION=               override go.mod auto-detect
 //	CLUSTER_USE_LAN=1              LAN fabric instead of Tailscale
+//
+// benchNeedsDBServices asks the runner itself whether the resolved -cells glob
+// (scoped to the in-scope competitor columns) schedules any driver-* cell, and
+// therefore whether the bench playbook must start + seed the pg/redis/mc
+// fixture containers on the bench target. Delegating to the runner's
+// -print-required-services mode keeps a SINGLE source of truth: the same
+// filterCells + requiredServiceKinds the real schedule uses. Reimplementing the
+// glob/category match here would silently drift the moment a driver scenario is
+// renamed or added. A Go-only / static bench prints nothing → containers stay
+// down (the "docker-free unless needed" invariant); any driver cell → true.
+func benchNeedsDBServices(cells, competitors string) (bool, error) {
+	args := []string{"run", "./cmd/runner", "-print-required-services", "-cells", cells}
+	if strings.TrimSpace(competitors) != "" {
+		args = append(args, "-competitors", competitors)
+	}
+	out, err := exec.Command("go", args...).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return false, fmt.Errorf("resolve required services: %w (stderr: %s)", err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return false, fmt.Errorf("resolve required services: %w", err)
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
 func Bench() error {
 	if err := requireAnsible(); err != nil {
 		return err
 	}
 
-	target := envOrDefault("BENCH_TARGET", "both")
+	target := envOrDefault("BENCH_TARGET", defaultClusterTarget)
 	if target != "both" && target != "msa2-server" && target != "msr1" {
 		return fmt.Errorf("BENCH_TARGET must be msa2-server, msr1, or both (got %q)", target)
 	}
@@ -111,6 +136,18 @@ func Bench() error {
 			_ = os.Setenv("DEPLOY_COMPETITORS", competitors)
 			defer func() { _ = os.Unsetenv("DEPLOY_COMPETITORS") }()
 		}
+		// If the cell glob could schedule any driver-* cell, the auto-deploy
+		// must also install docker + pre-pull the pg/redis/mc images, or the
+		// bench playbook's fixture-container start has nothing to run. Without
+		// this a fresh-cluster driver bench would silently 404 every driver
+		// cell. Over-approximate against the full registry (no -competitors
+		// scope) so we never UNDER-install. Skipped for a static-only bench.
+		if os.Getenv("DEPLOY_NEEDS_DBSERVICES") == "" {
+			if need, derr := benchNeedsDBServices(cells, ""); derr == nil && need {
+				_ = os.Setenv("DEPLOY_NEEDS_DBSERVICES", "1")
+				defer func() { _ = os.Unsetenv("DEPLOY_NEEDS_DBSERVICES") }()
+			}
+		}
 		if err := Deploy(); err != nil {
 			return fmt.Errorf("auto-deploy: %w", err)
 		}
@@ -137,37 +174,96 @@ func Bench() error {
 	fmt.Printf("  celeris ver:  %s\n", version)
 	fmt.Printf("  results:      %s\n\n", resultsDir)
 
-	args := []string{
-		"-i", "inventory.yml",
-		benchPlaybook,
-		"--extra-vars", "bench_target=" + target,
-		"--extra-vars", "competitor_set=" + competitors,
-		"--extra-vars", "bench_duration=" + duration,
-		"--extra-vars", "bench_warmup=" + warmup,
-		"--extra-vars", "bench_connections=" + conns,
-		"--extra-vars", "bench_cells=" + cells,
-		"--extra-vars", "bench_runs=" + runs,
-		"--extra-vars", "celeris_version=" + version,
-		"--extra-vars", "results_local_dir=" + resultsDir,
+	// Expand the competitor arg into the matrix COLUMNS (one per registry
+	// adapter), each carrying the staged binary dir it runs from and the
+	// -engine flag the binary needs. A single binary (e.g. servers/gin)
+	// backs multiple columns (gin-h1, gin-h2) that differ only by -engine,
+	// so the bench loop must iterate columns — NOT binary dirs — and start
+	// each binary with the right mode. competitor_columns is the slug→
+	// {bin,engine} map run_bench_cell.yml resolves; competitor_set is the
+	// comma-joined column slugs the playbook splits into its schedule.
+	columns, err := resolveBenchColumns(competitors)
+	if err != nil {
+		return err
 	}
-	if seed != "" {
-		args = append(args, "--extra-vars", "bench_seed="+seed)
+	colSlugs := make([]string, len(columns))
+	colMap := make(map[string]map[string]string, len(columns))
+	for i, c := range columns {
+		colSlugs[i] = c.Slug
+		colMap[c.Slug] = map[string]string{"bin": c.Bin, "engine": c.Engine}
 	}
-	if ratedOn {
-		args = append(args,
-			"--extra-vars", "bench_rated=1",
-			"--extra-vars", "bench_rated_duration="+ratedDuration)
+	competitorSetCSV := strings.Join(colSlugs, ",")
+	benchVars := map[string]any{"competitor_columns": colMap}
+	benchVarsJSON, err := json.MarshalIndent(benchVars, "", "  ")
+	if err != nil {
+		return err
 	}
-	if os.Getenv("CLUSTER_USE_LAN") == "1" {
-		args = append(args, "--extra-vars", "use_lan=true")
+	benchVarsFile := filepath.Join(resultsDir, "bench-vars.json")
+	if err := os.WriteFile(benchVarsFile, benchVarsJSON, 0o600); err != nil {
+		return err
 	}
+	fmt.Printf("  columns:      %d (%s)\n", len(colSlugs), competitorSetCSV)
 
-	cmd := exec.Command("ansible-playbook", args...)
-	cmd.Dir = ansibleDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("bench: %w", err)
+	// Resolve whether driver-* cells are in scope (→ start+seed pg/redis/mc on
+	// the bench target). Asked once here, not per arch — the cell glob and
+	// column set are arch-invariant. Reuses the runner's own resolution so the
+	// decision can't drift from the schedule.
+	needsDB, err := benchNeedsDBServices(cells, competitorSetCSV)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  dbservices:   %v\n", needsDB)
+
+	// Expand "both" into the two concrete arch hosts and invoke the playbook
+	// once per arch. bench.yml resolves hostvars[bench_target].lan_ip, so it
+	// needs a REAL host — "both" is not an inventory host (passing it yields
+	// hostvars['both'] → undefined). This matches bench.yml's documented
+	// contract ("the mage Bench 'both' path invokes this playbook once per
+	// target"). Each pass writes its own <TS>-bench-<host>/ dir under the
+	// shared resultsDir, which aggregatePerCellResults + mergeBenchResults
+	// below fold together (merge already handles target=="both").
+	playbookTargets := []string{target}
+	if target == "both" {
+		playbookTargets = []string{"msa2-server", "msr1"}
+	}
+	for _, pt := range playbookTargets {
+		if len(playbookTargets) > 1 {
+			fmt.Printf("\n=== Bench arch pass: %s ===\n", pt)
+		}
+		args := []string{
+			"-i", "inventory.yml",
+			benchPlaybook,
+			"--extra-vars", "bench_target=" + pt,
+			"--extra-vars", "competitor_set=" + competitorSetCSV,
+			"--extra-vars", "@" + benchVarsFile,
+			"--extra-vars", "bench_duration=" + duration,
+			"--extra-vars", "bench_warmup=" + warmup,
+			"--extra-vars", "bench_connections=" + conns,
+			"--extra-vars", "bench_cells=" + cells,
+			"--extra-vars", "bench_runs=" + runs,
+			"--extra-vars", "celeris_version=" + version,
+			"--extra-vars", "results_local_dir=" + resultsDir,
+			"--extra-vars", fmt.Sprintf("bench_needs_dbservices=%t", needsDB),
+		}
+		if seed != "" {
+			args = append(args, "--extra-vars", "bench_seed="+seed)
+		}
+		if ratedOn {
+			args = append(args,
+				"--extra-vars", "bench_rated=1",
+				"--extra-vars", "bench_rated_duration="+ratedDuration)
+		}
+		if os.Getenv("CLUSTER_USE_LAN") == "1" {
+			args = append(args, "--extra-vars", "use_lan=true")
+		}
+
+		cmd := exec.Command("ansible-playbook", args...)
+		cmd.Dir = ansibleDir
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("bench (%s): %w", pt, err)
+		}
 	}
 
 	// Each ansible cell ran the Go runner once against the remote SUT,
@@ -192,6 +288,77 @@ func Bench() error {
 	}
 	fmt.Printf("\n=== Bench complete: %s ===\n", merged)
 	return nil
+}
+
+// benchColumn is one matrix column: the report slug (a servers.Registry
+// adapter name, e.g. "gin-h2" or "celeris-epoll-h1-sync"), the staged
+// binary directory it runs from under competitors/<bin>, and the -engine
+// flag value the binary needs. Engine is empty for adapters whose binary
+// takes only -bind (gorilla_ws + every NativeBinary), so run_bench_cell.yml
+// omits the flag and never trips a "flag provided but not defined" abort.
+type benchColumn struct {
+	Slug   string
+	Bin    string
+	Engine string
+}
+
+// resolveBenchColumns expands the BENCH_COMPETITORS arg into the matrix
+// columns. "all"/"" yields every registered adapter; a CSV yields exactly
+// those adapter names (each MUST exist in servers.Registry — an unknown
+// name fails loudly rather than silently dropping a column). The crucial
+// job this does that a bare CSV split cannot: a single staged binary backs
+// several columns (servers/gin → gin-h1 + gin-h2), so it maps each column
+// slug to (binary dir, -engine value) using the registry as the source of
+// truth. Engine == the registry Adapter.Engine field for Go adapters (the
+// two are identical by construction); gorilla_ws is the lone Go binary with
+// no -engine flag, and natives are launched with -bind only.
+func resolveBenchColumns(arg string) ([]benchColumn, error) {
+	all := servers.Names() // sorted, stable
+	names := all
+	if arg != "" && arg != "all" {
+		known := make(map[string]bool, len(all))
+		for _, n := range all {
+			known[n] = true
+		}
+		want := make(map[string]bool)
+		for _, raw := range strings.Split(arg, ",") {
+			n := strings.TrimSpace(raw)
+			if n == "" {
+				continue
+			}
+			if !known[n] {
+				return nil, fmt.Errorf("BENCH_COMPETITORS: %q is not a registered adapter column (see servers.Registry)", n)
+			}
+			want[n] = true
+		}
+		names = make([]string, 0, len(want))
+		for _, n := range all {
+			if want[n] {
+				names = append(names, n)
+			}
+		}
+	}
+	cols := make([]benchColumn, 0, len(names))
+	for _, n := range names {
+		a := servers.Registry[n]
+		col := benchColumn{Slug: n}
+		if gb, ok := a.Bin.(servers.GoBinary); ok {
+			col.Bin = filepath.Base(gb.ModuleDir) // "servers/gin" → "gin"
+			// gorilla_ws is the only Go binary with no -engine flag; every
+			// other Go binary either consumes -engine (stdhttp/gin/echo/chi/
+			// iris/hertz/celeris) or accepts-and-ignores it (gnet/fasthttp/
+			// fiber), so passing the registry Engine value is always safe there.
+			if col.Bin != "gorilla_ws" {
+				col.Engine = a.Engine
+			}
+		} else {
+			// NativeBinary (rust/cpp/dotnet/zig/bun/python) — staged under
+			// competitors/<slug>, launched with -bind only.
+			col.Bin = n
+		}
+		cols = append(cols, col)
+	}
+	return cols, nil
 }
 
 // aggregatePerCellResults walks the per-cell output the bench playbook's
@@ -413,6 +580,14 @@ type runnerCellFile struct {
 	ServerName   string          `json:"server"`
 	Result       json.RawMessage `json:"result"`
 
+	// Error is the synthesised per-cell error string the runner recorded
+	// when a cell did not produce a real number. Status is the runner's
+	// own classification of it ("ok"/"not_applicable"/"dnf"), schema v5.3.
+	// We honour Status when present and fall back to classifying Error so
+	// older per-cell JSON (no status field) still buckets correctly.
+	Error  string `json:"error,omitempty"`
+	Status string `json:"status,omitempty"`
+
 	// RatedPasses is the rated sweep emitted by the runner only when rated
 	// mode ran (probatorium#156); the BenchSince latency_at_slo gate is
 	// derived from it. SaturationModeRPS echoes the saturation scale anchor.
@@ -435,8 +610,12 @@ type ratedPassWire struct {
 // it with -runs 1, so we deliberately ignore it.
 //
 // Cells whose runner JSON carries no `result` (the SUT failed to answer,
-// e.g. an H2-only scenario against an H1-only server) are skipped: a
-// missing row is louder in the merged report than a zero-valued guess.
+// e.g. an H2-only scenario against an H1-only server) are NOT skipped:
+// they are emitted as classified cellRecords (status not_applicable /
+// dnf) carrying the runner's error string, so a not-implemented or
+// crashed cell surfaces as an honest N/A / DNF row in the merged report
+// instead of vanishing (and being indistinguishable from "never ran") or
+// being ranked as a zero-RPS also-ran (schema v5.3).
 func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cellRecord, error) {
 	runEntries, err := os.ReadDir(cellDir)
 	if err != nil {
@@ -475,19 +654,33 @@ func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cel
 				if err := json.Unmarshal(data, &cf); err != nil {
 					return nil, fmt.Errorf("parse %s: %w", jf.Name(), err)
 				}
-				if len(cf.Result) == 0 || string(cf.Result) == "null" {
-					continue
-				}
 				scenario := cf.ScenarioName
 				if scenario == "" {
 					scenario = scE.Name()
 				}
-				out = append(out, cellRecord{
+				// Effective status: honour the runner's persisted
+				// classification when present, otherwise classify the error
+				// string with the SAME report.ClassifyCellError the runner
+				// uses so the in-process and cluster paths agree on field
+				// width. An empty error with a result is OK.
+				status := report.CellStatus(cf.Status)
+				if status == "" {
+					status = report.ClassifyCellError(cf.Error)
+				}
+				rec := cellRecord{
 					RunIndex:   runIdx,
 					Competitor: competitor,
 					Scenario:   scenario,
-					Loadgen:    cf.Result,
-				})
+					Status:     string(status),
+					Error:      cf.Error,
+				}
+				// Only an OK cell carries a loadgen payload to rank. A
+				// cell with no `result` (the SUT failed to answer) is emitted
+				// as a classified N/A / DNF record rather than dropped.
+				if status == report.CellOK && len(cf.Result) > 0 && string(cf.Result) != "null" {
+					rec.Loadgen = cf.Result
+				}
+				out = append(out, rec)
 			}
 		}
 	}
@@ -531,6 +724,14 @@ type cellRecord struct {
 	Competitor string          `json:"competitor"`
 	Scenario   string          `json:"scenario"`
 	Loadgen    json.RawMessage `json:"loadgen"`
+
+	// Status is the per-cell outcome classification (schema v5.3) and
+	// Error the synthesised string it was classified from, carried so a
+	// cell that did not produce a loadgen.Result still travels through the
+	// merge as an N/A / DNF record rather than being dropped. Empty Status
+	// on a record with a Loadgen payload means OK.
+	Status string `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
 
 	// Resources is the server-side resource aggregate (#154) parsed from
 	// the cell's observer.sqlite + cpu.log. Nil when the cell ran without
@@ -588,6 +789,19 @@ func summarizeCells(cells []cellRecord) (map[string]competitorStats, error) {
 	res := map[string][]*report.ResourceStats{}
 	rated := map[string][][]ratedPassWire{}
 	for _, c := range cells {
+		// Non-OK cells (not_applicable / dnf) carry no loadgen payload — they
+		// were recorded for classification and live on in the raw `cells`
+		// array for the document merge, but there is nothing to summarise.
+		// Gate on the classified status (the SAME predicate the document-merge
+		// path uses) so both cluster-path aggregations share one inclusion
+		// rule; the Loadgen-emptiness check stays as a defensive backstop so
+		// the unmarshal below never hits empty input.
+		if st := report.CellStatus(c.Status); st != "" && st != report.CellOK {
+			continue
+		}
+		if len(c.Loadgen) == 0 || string(c.Loadgen) == "null" {
+			continue
+		}
 		var lg loadgenLite
 		if err := json.Unmarshal(c.Loadgen, &lg); err != nil {
 			return nil, fmt.Errorf("parse cell %s/%s run=%d: %w",
@@ -879,10 +1093,12 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 			return "", fmt.Errorf("parse %s: %w", e.Name(), err)
 		}
 		for _, cell := range payload.Cells {
-			var res loadgen.Result
-			if err := json.Unmarshal(cell.Loadgen, &res); err != nil {
-				return "", fmt.Errorf("parse cell %s run=%d in %s: %w",
-					cell.Competitor, cell.RunIndex, e.Name(), err)
+			// Effective status: honour the record's classification, else
+			// classify its error string with the SAME report.ClassifyCellError
+			// the in-process path uses so both paths agree on field width.
+			status := report.CellStatus(cell.Status)
+			if status == "" {
+				status = report.ClassifyCellError(cell.Error)
 			}
 			cr := collected[cell.Competitor]
 			if cr == nil {
@@ -892,7 +1108,25 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 				}
 				collected[cell.Competitor] = cr
 			}
+			if status != report.CellOK {
+				// A cell that did not run (or produced no real number): record
+				// the classified status + error and SKIP the Sample append
+				// rather than unmarshaling a zero Result into a ranked sample.
+				// An OK record on any run still promotes the cell below.
+				if len(cr.Samples) == 0 && cr.Status != report.CellOK {
+					cr.Status = status
+					cr.ErrorMsg = cell.Error
+				}
+				continue
+			}
+			var res loadgen.Result
+			if err := json.Unmarshal(cell.Loadgen, &res); err != nil {
+				return "", fmt.Errorf("parse cell %s run=%d in %s: %w",
+					cell.Competitor, cell.RunIndex, e.Name(), err)
+			}
 			cr.Samples = append(cr.Samples, res)
+			cr.Status = report.CellOK
+			cr.ErrorMsg = ""
 			// loadgen.Result.Histogram is the V2-compressed HdrHistogram
 			// payload as raw bytes; CellResult wants base64 strings so
 			// report.Aggregate can decode + merge them across runs.

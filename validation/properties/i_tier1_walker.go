@@ -45,6 +45,31 @@ var (
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}
+	// ILiveness is the engine-agnostic crash oracle: the refapp PROCESS must
+	// survive the whole run. Unlike the other walker predicates (which key on
+	// a protocol-specific torture counter), this fires on ANY process death —
+	// a Go fatal throw, an escaped panic, a SIGSEGV, an OOM kill — because the
+	// walkers themselves are blind to it (a dead server just looks like
+	// connection-refused). Emitted by the orchestrator's TallyCallback when
+	// Tier 1's liveness tally reports Crashed. See validation/liveness.go.
+	ILiveness = Spec{
+		ID:          "I-LIVENESS",
+		Description: "refapp process must stay alive for the whole run (Tier 1 liveness.crashed == false)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
+	// IHang is the deadlock oracle, the complement of I-LIVENESS: the refapp
+	// must stay RESPONSIVE, not merely alive. A process that wedges — alive but
+	// servicing nothing (e.g. the iouring auto+upg drainRecvBuffer hang,
+	// celeris#311) — never trips I-LIVENESS (it never exits); only a health
+	// probe that times out while the process is up catches it. Emitted by the
+	// orchestrator's TallyCallback when Tier 1's liveness tally reports Hung.
+	IHang = Spec{
+		ID:          "I-HANG",
+		Description: "refapp must stay responsive for the whole run (Tier 1 liveness.hung == false)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
 )
 
 // alwaysOK is the placeholder Predicate for tier-1-walker entries.

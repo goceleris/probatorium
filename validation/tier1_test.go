@@ -612,7 +612,8 @@ func TestDriveTier1_SSEKillSliceFires(t *testing.T) {
 }
 
 // TestDriveTier1_SSEDormantBelowThreshold confirms the SSE slice
-// stays dormant when concurrency < 20.
+// stays dormant on smoke-sized runs (concurrency <
+// streamingWalkerMinConcurrency) so single-walker iteration stays cheap.
 func TestDriveTier1_SSEDormantBelowThreshold(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
@@ -629,7 +630,7 @@ func TestDriveTier1_SSEDormantBelowThreshold(t *testing.T) {
 		BaseURL:        srv.URL,
 		Matrix:         minimalMatrix(t),
 		Seed:           42,
-		Concurrency:    10, // below SSE threshold
+		Concurrency:    streamingWalkerMinConcurrency - 1, // smoke: below threshold
 		ReadyTimeout:   2 * time.Second,
 		RequestTimeout: time.Second,
 	}
@@ -646,7 +647,8 @@ func TestDriveTier1_SSEDormantBelowThreshold(t *testing.T) {
 }
 
 // TestDriveTier1_WSDormantBelowThreshold confirms the WS slice stays
-// dormant when concurrency < 20.
+// dormant on smoke-sized runs (concurrency <
+// streamingWalkerMinConcurrency).
 func TestDriveTier1_WSDormantBelowThreshold(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
@@ -663,7 +665,7 @@ func TestDriveTier1_WSDormantBelowThreshold(t *testing.T) {
 		BaseURL:        srv.URL,
 		Matrix:         minimalMatrix(t),
 		Seed:           42,
-		Concurrency:    10, // below WS threshold (but above h2c)
+		Concurrency:    streamingWalkerMinConcurrency - 1, // smoke: below threshold
 		ReadyTimeout:   2 * time.Second,
 		RequestTimeout: time.Second,
 	}
@@ -677,6 +679,97 @@ func TestDriveTier1_WSDormantBelowThreshold(t *testing.T) {
 	if s.WSTorture.Sent != 0 {
 		t.Errorf("ws torture fired below threshold — Sent=%d, want 0", s.WSTorture.Sent)
 	}
+}
+
+// TestDriveTier1_StreamingActiveAtDefaultConcurrency locks in the GAP-A fix:
+// at the matrix's per-cell / default concurrency of 10, BOTH the WS and SSE
+// slices must fire. This is the regression guard that keeps the engine's
+// inline streaming-Detach path exercised on every non-smoke validation run —
+// the coverage hole that let celeris#309 reach a release.
+func TestDriveTier1_StreamingActiveAtDefaultConcurrency(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	d := remote.NewLocal("/bin/sh")
+	cfg := tier1Config{
+		Driver: d,
+		RefappArgs: []string{
+			"-c",
+			`echo "ready addr=` + srv.URL + `"; sleep 10`,
+		},
+		BaseURL:        srv.URL,
+		Matrix:         minimalMatrix(t),
+		Seed:           42,
+		Concurrency:    10, // the matrix per-cell default
+		ReadyTimeout:   2 * time.Second,
+		RequestTimeout: time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	s, err := driveTier1(ctx, cfg)
+	if err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	if s.WSTorture.Sent < 1 {
+		t.Errorf("ws torture dormant at default concurrency 10 — Sent=%d, want >=1", s.WSTorture.Sent)
+	}
+	if s.SSEKill.Sent < 1 {
+		t.Errorf("sse kill dormant at default concurrency 10 — Sent=%d, want >=1", s.SSEKill.Sent)
+	}
+}
+
+// TestDriveTier1_LivenessDetectsCrash is the GAP-B regression guard: a refapp
+// that prints `ready addr=` and then dies with a Go runtime `fatal error:`
+// (exactly the shape of celeris#309) must be reported as Crashed, with the
+// signature scraped and a non-zero exit observed. Before the liveness oracle,
+// this death was invisible — the walkers saw only connection-refused.
+func TestDriveTier1_LivenessDetectsCrash(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	d := remote.NewLocal("/bin/sh")
+	// Bind-and-die: announce ready, serve briefly, then emit a fatal-error
+	// banner + stack and exit 2 — the canonical Go unrecoverable-failure shape.
+	script := `echo "ready addr=` + srv.URL + `"
+sleep 0.3
+echo "fatal error: sync: unlock of unlocked mutex" >&2
+echo "" >&2
+echo "goroutine 42 [running]:" >&2
+echo "runtime.throw(...)" >&2
+exit 2`
+	cfg := tier1Config{
+		Driver:         d,
+		RefappArgs:     []string{"-c", script},
+		BaseURL:        srv.URL,
+		Matrix:         minimalMatrix(t),
+		Seed:           42,
+		Concurrency:    10,
+		ReadyTimeout:   2 * time.Second,
+		RequestTimeout: time.Second,
+	}
+
+	// Generous ctx so the crash (not the deadline) is what ends the run.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := driveTier1(ctx, cfg)
+	if err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	if !s.Liveness.Crashed {
+		t.Fatalf("liveness oracle missed the crash — Liveness=%+v", s.Liveness)
+	}
+	if !strings.Contains(s.Liveness.Signature, "unlock of unlocked mutex") {
+		t.Errorf("crash signature not scraped — got %q", s.Liveness.Signature)
+	}
+	if !s.Liveness.Exited || s.Liveness.ExitCode != 2 {
+		t.Errorf("expected observed exit code 2, got Exited=%v ExitCode=%d", s.Liveness.Exited, s.Liveness.ExitCode)
+	}
+	t.Logf("liveness: %+v", s.Liveness)
 }
 
 // TestDriveTier1_H2CDormantBelowThreshold confirms the h2c slice
