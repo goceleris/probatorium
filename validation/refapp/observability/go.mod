@@ -3,9 +3,9 @@ module github.com/goceleris/probatorium/validation/refapp/observability
 go 1.26.4
 
 require (
-	github.com/goceleris/celeris v1.4.13
-	github.com/goceleris/celeris/middleware/metrics v1.4.13
-	github.com/goceleris/celeris/middleware/otel v1.4.13
+	github.com/goceleris/celeris v1.4.14
+	github.com/goceleris/celeris/middleware/metrics v1.4.14
+	github.com/goceleris/celeris/middleware/otel v1.4.14
 	github.com/prometheus/client_golang v1.23.2
 )
 
@@ -16,7 +16,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.68.0 // indirect
+	github.com/prometheus/common v0.68.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect

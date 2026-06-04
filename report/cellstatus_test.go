@@ -292,7 +292,7 @@ func TestSplitMergeRoundTripWithCellStatuses(t *testing.T) {
 		t.Errorf("MergeSplit(SplitDocument(doc)) != doc\n want: %s\n got:  %s", want, got)
 	}
 	// CellStatuses specifically survives the round-trip.
-	var mergedByName map[string]ServerResult = map[string]ServerResult{}
+	mergedByName := map[string]ServerResult{}
 	for _, b := range merged.Benchmarks {
 		mergedByName[b.Name] = b
 	}

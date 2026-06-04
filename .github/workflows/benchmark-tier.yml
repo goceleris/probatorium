@@ -78,7 +78,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: stable
+          go-version: "1.26.4"
           cache: true
 
       - name: Install mage
@@ -121,7 +121,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version: stable
+          go-version: "1.26.4"
           cache: true
 
       - name: Install mage
