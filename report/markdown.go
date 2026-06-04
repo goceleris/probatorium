@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -73,6 +74,12 @@ func WriteMarkdown(w io.Writer, doc *Document, agg map[string]CellAggregate, met
 			return err
 		}
 		if err := writeTailLatencySection(w, agg); err != nil {
+			return err
+		}
+	}
+
+	if doc != nil {
+		if err := writeResourceSection(w, doc); err != nil {
 			return err
 		}
 	}
@@ -145,6 +152,31 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 		if _, err := fmt.Fprintf(w, "### %s\n\n", sc); err != nil {
 			return err
 		}
+
+		// Field-width note: how many adapters actually ran this scenario
+		// vs how many were not-applicable / did-not-finish. Counted before
+		// the table so a wide field of N/A cells (chain/driver scenarios
+		// only ~3 servers implement) is honest about the real competitor
+		// count rather than implying a ~19-wide ranking.
+		var ran, na, dnf int
+		for _, a := range adapters {
+			switch cellStatusFor(a, sc) {
+			case CellNotApplicable:
+				na++
+			case CellDNF:
+				dnf++
+			default:
+				if _, ok := a.LatencyAtSLO[sc]; ok {
+					ran++
+				} else if _, ok := a.SaturationModeRPS[sc]; ok {
+					ran++
+				}
+			}
+		}
+		if _, err := fmt.Fprintf(w, "_field: ran=%d n/a=%d dnf=%d_\n\n", ran, na, dnf); err != nil {
+			return err
+		}
+
 		// Header row: adapter | 10ms | 50ms | 100ms | 500ms | 1000ms
 		header := []string{"adapter"}
 		for _, ms := range SLOThresholds {
@@ -161,9 +193,14 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 			return err
 		}
 
-		// Per-column max so we can bold the leader.
+		// Per-column max so we can bold the leader. Non-OK cells are
+		// excluded from the leader computation entirely — a 0-RPS N/A or
+		// DNF cell must never set or win a column.
 		colMax := make(map[int]int, len(SLOThresholds))
 		for _, a := range adapters {
+			if cellStatusFor(a, sc) != CellOK {
+				continue
+			}
 			row, ok := a.LatencyAtSLO[sc]
 			if !ok {
 				continue
@@ -177,6 +214,18 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 
 		for _, a := range adapters {
 			row := []string{a.Name}
+			// Non-OK cells render a single status token spanning every SLO
+			// column — never "0 rps" / "—" — and are excluded from bolding.
+			if st := cellStatusFor(a, sc); st != CellOK {
+				token := cellStatusToken(st)
+				for range SLOThresholds {
+					row = append(row, token)
+				}
+				if _, err := io.WriteString(w, "| "+strings.Join(row, " | ")+" |\n"); err != nil {
+					return err
+				}
+				continue
+			}
 			slo, ok := a.LatencyAtSLO[sc]
 			for _, ms := range SLOThresholds {
 				if !ok {
@@ -203,6 +252,38 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 		}
 	}
 	return nil
+}
+
+// cellStatusFor returns the classified outcome of one (adapter,
+// scenario) cell from the adapter's CellStatuses map. A scenario absent
+// from the map is CellOK (it ran, or simply was not scheduled — the
+// caller distinguishes those via the headline maps).
+func cellStatusFor(a ServerResult, scenario string) CellStatus {
+	if a.CellStatuses == nil {
+		return CellOK
+	}
+	switch a.CellStatuses[scenario] {
+	case string(CellNotApplicable):
+		return CellNotApplicable
+	case string(CellDNF):
+		return CellDNF
+	default:
+		return CellOK
+	}
+}
+
+// cellStatusToken is the markdown token rendered for a non-OK cell:
+// "N/A" for not-applicable, "DNF" for did-not-finish. Never "0 rps" or
+// "—", which would mislead either as a real number or an absent cell.
+func cellStatusToken(st CellStatus) string {
+	switch st {
+	case CellNotApplicable:
+		return "N/A"
+	case CellDNF:
+		return "DNF"
+	default:
+		return "—"
+	}
 }
 
 // writeDetailSection emits the per-scenario detail block: median RPS
@@ -293,6 +374,11 @@ func writeTailLatencySection(w io.Writer, agg map[string]CellAggregate) error {
 
 	flat := make([]CellAggregate, 0, len(agg))
 	for _, v := range agg {
+		// Non-OK cells (N/A / DNF) carry no real latency — skip them so
+		// the tail-latency table ranks only cells that actually ran.
+		if v.Status != "" && v.Status != CellOK {
+			continue
+		}
 		flat = append(flat, v)
 	}
 	sort.Slice(flat, func(i, j int) bool {
@@ -340,6 +426,108 @@ func writeTailLatencySection(w io.Writer, agg map[string]CellAggregate) error {
 		}
 	}
 	return nil
+}
+
+// writeResourceSection renders the server-side resource summary (#154):
+// one row per (adapter, scenario) whose ServerResult.Resources entry is
+// non-nil. The downsampled time-series stays JSON-only — too dense for a
+// markdown table — so this section is the scalar headline. Nil metric
+// pointers render as "—" (non-Go competitors have no goroutine/GC).
+//
+// Emits nothing when no adapter carried resource data, so reports from
+// runs without observer capture are unchanged.
+func writeResourceSection(w io.Writer, doc *Document) error {
+	type row struct {
+		adapter, scenario string
+		r                 *ResourceStats
+	}
+	var rows []row
+	for _, a := range doc.Benchmarks {
+		for sc, r := range a.Resources {
+			if r == nil {
+				continue
+			}
+			rows = append(rows, row{adapter: a.Name, scenario: sc, r: r})
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].scenario != rows[j].scenario {
+			return rows[i].scenario < rows[j].scenario
+		}
+		return rows[i].adapter < rows[j].adapter
+	})
+
+	if _, err := io.WriteString(w, "\n## Server resources — peak/steady RSS, CPU, GC, goroutine & FD high-water\n\n"); err != nil {
+		return err
+	}
+	header := []string{"scenario", "adapter", "Peak RSS (MB)", "Steady RSS (MB)", "Mean CPU%", "GC p99 (µs)", "Goroutine HWM", "FD HWM"}
+	if _, err := io.WriteString(w, "| "+strings.Join(header, " | ")+" |\n"); err != nil {
+		return err
+	}
+	sep := make([]string, len(header))
+	for i := range sep {
+		sep[i] = "---"
+	}
+	if _, err := io.WriteString(w, "| "+strings.Join(sep, " | ")+" |\n"); err != nil {
+		return err
+	}
+	for _, rw := range rows {
+		s := rw.r.Summary
+		cells := []string{
+			rw.scenario,
+			rw.adapter,
+			fmtBytesMB(s.PeakRSSBytes),
+			fmtBytesMB(s.SteadyRSSBytes),
+			fmtF64p(s.MeanCPUPct, "%.1f"),
+			fmtNsUs(s.GCPauseP99Ns),
+			fmtI64p(s.GoroutineHWM),
+			fmtI64p(s.FDHWM),
+		}
+		if _, err := io.WriteString(w, "| "+strings.Join(cells, " | ")+" |\n"); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(w, "\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// fmtI64p renders a nullable int64 pointer, "—" for nil.
+func fmtI64p(p *int64) string {
+	if p == nil {
+		return "—"
+	}
+	return strconv.FormatInt(*p, 10)
+}
+
+// fmtF64p renders a nullable float64 pointer with the given verb, "—"
+// for nil.
+func fmtF64p(p *float64, verb string) string {
+	if p == nil {
+		return "—"
+	}
+	return fmt.Sprintf(verb, *p)
+}
+
+// fmtBytesMB renders a nullable byte count as megabytes, "—" for nil.
+func fmtBytesMB(p *int64) string {
+	if p == nil {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f", float64(*p)/(1024*1024))
+}
+
+// fmtNsUs renders a nullable nanosecond count as microseconds, "—" for
+// nil.
+func fmtNsUs(p *int64) string {
+	if p == nil {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f", float64(*p)/1000)
 }
 
 // writeRegressionSection compares the current Document against a v5.0
@@ -443,10 +631,16 @@ func scenariosFromDoc(doc *Document) []string {
 }
 
 // groupByCategory buckets aggregates by Scenario category. Aggregates
-// that lack a category are bucketed under "other".
+// that lack a category are bucketed under "other". Non-OK cells (N/A /
+// DNF) are skipped: the detail table reports real measurements, so a
+// cell that did not run must not appear as a 0-RPS / "—" row — the
+// Latency-at-SLO section already records it as N/A / DNF (schema v5.3).
 func groupByCategory(agg map[string]CellAggregate) map[string][]CellAggregate {
 	out := make(map[string][]CellAggregate)
 	for _, c := range agg {
+		if c.Status != "" && c.Status != CellOK {
+			continue
+		}
 		cat := c.Category
 		if cat == "" {
 			cat = "other"
@@ -470,6 +664,67 @@ func categoryTitle(cat string) string {
 	default:
 		return "Other"
 	}
+}
+
+// MarkdownTimeseries renders a compact per-scenario summary of the
+// time-series sidecar: run count, bucket count, and the peak-bucket band
+// (the elapsed second whose merged P50 RPS is highest). Additive and
+// gated on ts != nil with at least one non-empty scenario, so the
+// existing report.md sections — and TestWriteMarkdownRoundTrip — are
+// untouched. Returns "" when there is nothing to show.
+func MarkdownTimeseries(ts *TimeseriesDoc) string {
+	if ts == nil {
+		return ""
+	}
+	var rows []ScenarioSeries
+	for _, s := range ts.Scenarios {
+		if len(s.Runs) > 0 || len(s.Band) > 0 {
+			rows = append(rows, s)
+		}
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n## Time-series (rps over run length)\n\n")
+	sb.WriteString("Per-run 1 Hz series captured to `timeseries.json.gz`; ")
+	sb.WriteString("the band below is a cross-run min/p50/p99/max envelope over per-elapsed-second RPS (not a latency percentile).\n\n")
+
+	header := []string{"scenario", "server", "runs", "buckets", "peak-bucket p50 RPS", "peak-bucket p99 RPS"}
+	sb.WriteString("| " + strings.Join(header, " | ") + " |\n")
+	sep := make([]string, len(header))
+	for i := range sep {
+		sep[i] = "---"
+	}
+	sb.WriteString("| " + strings.Join(sep, " | ") + " |\n")
+
+	for _, s := range rows {
+		var peak BucketBand
+		var havePeak bool
+		for _, b := range s.Band {
+			if !havePeak || b.RPS.P50 > peak.RPS.P50 {
+				peak = b
+				havePeak = true
+			}
+		}
+		p50, p99 := "—", "—"
+		if havePeak {
+			p50 = formatRPSFloat(peak.RPS.P50)
+			p99 = formatRPSFloat(peak.RPS.P99)
+		}
+		row := []string{
+			s.Scenario,
+			s.Server,
+			fmt.Sprintf("%d", len(s.Runs)),
+			fmt.Sprintf("%d", len(s.Band)),
+			p50,
+			p99,
+		}
+		sb.WriteString("| " + strings.Join(row, " | ") + " |\n")
+	}
+	sb.WriteString("\n")
+	return sb.String()
 }
 
 // formatRPSFloat renders an RPS value with k/M suffixes.

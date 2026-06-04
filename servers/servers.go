@@ -36,6 +36,15 @@ import (
 //     memcached round-trips behind /db, /cache, /mc, /session).
 //   - Middleware    — can host the chain-* scenarios (the 4 stacks
 //     mounted under /chain/<chain>/).
+//   - WS            — can host the streaming WebSocket scenarios (ws-echo,
+//     ws-large-echo, ws-hub-broadcast-N) under /ws.
+//   - SSE           — can host the streaming Server-Sent-Events scenarios
+//     (sse-fanout-N) under /events.
+//   - TLS           — reachable over HTTPS for the tls-* scenarios. In
+//     Phase 2 every adapter is benched behind a shared TLS terminator (see
+//     scenarios/tls.go), so this flag tracks reachability through that
+//     terminator rather than native in-process TLS — which celeris lacks
+//     entirely.
 //   - AsyncHandlers — celeris-specific. The async handler dispatcher is
 //     enabled. Affects only celeris cell-columns.
 type FeatureSet struct {
@@ -45,6 +54,9 @@ type FeatureSet struct {
 	H2CUpgrade    bool
 	Drivers       bool
 	Middleware    bool
+	WS            bool
+	SSE           bool
+	TLS           bool
 	AsyncHandlers bool
 }
 
@@ -106,6 +118,42 @@ type Adapter struct {
 	Framework string
 	Engine    string
 	Bin       BuildSpec
+
+	// Capabilities is the declared Phase-2 capability manifest for this
+	// adapter — the single source of truth the scheduler trusts instead of
+	// guessing driver / middleware / streaming support from the Category
+	// or Engine name. featureSetFor projects these flags into the
+	// [FeatureSet] so a scenario is only ever scheduled against an adapter
+	// that actually declares the matching class; a declared-but-unserved
+	// route then surfaces as a hard error at run time (the runner's cell
+	// guard) rather than a silent 0-RPS / all-404 cell. Wire-protocol
+	// facets (HTTP1 / HTTP2C / …) stay engine-derived and are NOT part of
+	// this manifest.
+	Capabilities Capabilities
+}
+
+// Capabilities is an adapter's declared Phase-2 capability manifest. Each
+// flag asserts the adapter mounts the routes for that scenario class:
+//
+//   - Static     — the 6 canonical [common.Endpoints]. Every adapter sets
+//     this; it is the baseline contract.
+//   - Drivers    — the driver-* routes (/db, /cache, /mc, /session).
+//   - Middleware — the chain-* routes (/chain/<stack>/{json,upload}).
+//   - WS         — the streaming WebSocket routes under /ws.
+//   - SSE        — the streaming Server-Sent-Events routes under /events.
+//   - TLS        — reachable for the tls-* scenarios (in Phase 2, via the
+//     shared terminator). Left false until the terminator infra lands so
+//     no TLS cell is scheduled prematurely.
+//
+// The manifest is intentionally declarative: it is the claim. The runtime
+// cell guard is the proof — the two must agree or the bench fails loudly.
+type Capabilities struct {
+	Static     bool
+	Drivers    bool
+	Middleware bool
+	WS         bool
+	SSE        bool
+	TLS        bool
 }
 
 // Registry is the set of every adapter known to probatorium, keyed by
@@ -117,83 +165,127 @@ var Registry = map[string]Adapter{
 	// stdhttp baseline — 3 modes (H1, H2C-only, hybrid). Treated as
 	// three distinct cell-columns because performance differs by mode.
 	"stdhttp-h1": {
-		Name:      "stdhttp-h1",
-		Category:  "go-net-http",
-		Language:  "go",
-		Framework: "stdhttp",
-		Engine:    "h1",
-		Bin:       GoBinary{ModuleDir: "servers/stdhttp"},
+		Name:         "stdhttp-h1",
+		Category:     "go-net-http",
+		Language:     "go",
+		Framework:    "stdhttp",
+		Engine:       "h1",
+		Bin:          GoBinary{ModuleDir: "servers/stdhttp"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"stdhttp-h2": {
-		Name:      "stdhttp-h2",
-		Category:  "go-net-http",
-		Language:  "go",
-		Framework: "stdhttp",
-		Engine:    "h2c",
-		Bin:       GoBinary{ModuleDir: "servers/stdhttp"},
+		Name:         "stdhttp-h2",
+		Category:     "go-net-http",
+		Language:     "go",
+		Framework:    "stdhttp",
+		Engine:       "h2c",
+		Bin:          GoBinary{ModuleDir: "servers/stdhttp"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"stdhttp-hybrid": {
-		Name:      "stdhttp-hybrid",
-		Category:  "go-net-http",
-		Language:  "go",
-		Framework: "stdhttp",
-		Engine:    "hybrid",
-		Bin:       GoBinary{ModuleDir: "servers/stdhttp"},
+		Name:         "stdhttp-hybrid",
+		Category:     "go-net-http",
+		Language:     "go",
+		Framework:    "stdhttp",
+		Engine:       "hybrid",
+		Bin:          GoBinary{ModuleDir: "servers/stdhttp"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
+	},
+
+	// gorilla_ws — the WS/SSE reference adapter. A net/http server whose
+	// streaming surface is hand-rolled on gorilla/websocket (RWMutex
+	// connection-set broadcast) plus a flusher-based SSE broker — the naive
+	// baseline the celeris middleware/websocket Hub and middleware/sse Broker
+	// are designed to replace. It serves the static contract too so it is a
+	// fully valid adapter, but its purpose is the WS/SSE comparison: this is
+	// the column the matrix pairs against celeris's streaming cells. H1-only
+	// (the WS upgrade + SSE long-poll both ride HTTP/1.1); no driver /
+	// middleware-chain support. TLS is reachable via the shared terminator
+	// like every other adapter.
+	"gorilla_ws": {
+		Name: "gorilla_ws", Category: "go-net-http", Language: "go", Framework: "gorilla", Engine: "h1",
+		Bin:          GoBinary{ModuleDir: "servers/gorilla_ws"},
+		Capabilities: Capabilities{Static: true, WS: true, SSE: true, TLS: true},
 	},
 
 	// gin / echo / chi / iris — net/http-based routers. Each carries an
 	// h1 and an h2c (h2c.NewHandler-wrapped) variant.
 	"gin-h1": {
 		Name: "gin-h1", Category: "go-net-http", Language: "go", Framework: "gin", Engine: "h1",
-		Bin: GoBinary{ModuleDir: "servers/gin"},
+		Bin:          GoBinary{ModuleDir: "servers/gin"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"gin-h2": {
 		Name: "gin-h2", Category: "go-net-http", Language: "go", Framework: "gin", Engine: "h2c",
-		Bin: GoBinary{ModuleDir: "servers/gin"},
+		Bin:          GoBinary{ModuleDir: "servers/gin"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"echo-h1": {
 		Name: "echo-h1", Category: "go-net-http", Language: "go", Framework: "echo", Engine: "h1",
-		Bin: GoBinary{ModuleDir: "servers/echo"},
+		Bin:          GoBinary{ModuleDir: "servers/echo"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"echo-h2": {
 		Name: "echo-h2", Category: "go-net-http", Language: "go", Framework: "echo", Engine: "h2c",
-		Bin: GoBinary{ModuleDir: "servers/echo"},
+		Bin:          GoBinary{ModuleDir: "servers/echo"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"chi-h1": {
 		Name: "chi-h1", Category: "go-net-http", Language: "go", Framework: "chi", Engine: "h1",
-		Bin: GoBinary{ModuleDir: "servers/chi"},
+		Bin:          GoBinary{ModuleDir: "servers/chi"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"chi-h2": {
 		Name: "chi-h2", Category: "go-net-http", Language: "go", Framework: "chi", Engine: "h2c",
-		Bin: GoBinary{ModuleDir: "servers/chi"},
+		Bin:          GoBinary{ModuleDir: "servers/chi"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"iris-h1": {
 		Name: "iris-h1", Category: "go-net-http", Language: "go", Framework: "iris", Engine: "h1",
-		Bin: GoBinary{ModuleDir: "servers/iris"},
+		Bin:          GoBinary{ModuleDir: "servers/iris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"iris-h2": {
 		Name: "iris-h2", Category: "go-net-http", Language: "go", Framework: "iris", Engine: "h2c",
-		Bin: GoBinary{ModuleDir: "servers/iris"},
+		Bin:          GoBinary{ModuleDir: "servers/iris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 
 	// hertz — netpoll-backed. H1 + native H2 via hertz-contrib.
 	"hertz-h1": {
 		Name: "hertz-h1", Category: "go-netpoll", Language: "go", Framework: "hertz", Engine: "h1",
-		Bin: GoBinary{ModuleDir: "servers/hertz"},
+		Bin:          GoBinary{ModuleDir: "servers/hertz"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"hertz-h2": {
 		Name: "hertz-h2", Category: "go-netpoll", Language: "go", Framework: "hertz", Engine: "h2c",
-		Bin: GoBinary{ModuleDir: "servers/hertz"},
+		Bin:          GoBinary{ModuleDir: "servers/hertz"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
+	},
+
+	// gnet — the canonical Go event-loop server (panjf2000/gnet), the closest
+	// architectural peer to celeris's epoll engine: a fixed pool of event loops
+	// over epoll/kqueue parsing HTTP off a zero-copy inbound ring buffer. No
+	// HTTP codec ships with gnet, so the adapter carries a minimal HTTP/1.1
+	// framer and serves only the six static contract endpoints — hence the
+	// Static-only capability manifest (no Drivers / Middleware / WS / SSE /
+	// TLS). H1-only.
+	"gnet-h1": {
+		Name: "gnet-h1", Category: "go-gnet", Language: "go", Framework: "gnet", Engine: "h1",
+		Bin:          GoBinary{ModuleDir: "servers/gnet"},
+		Capabilities: Capabilities{Static: true},
 	},
 
 	// fasthttp + fiber — H1-only. fiber wraps fasthttp.
 	"fasthttp-h1": {
 		Name: "fasthttp-h1", Category: "go-fasthttp", Language: "go", Framework: "fasthttp", Engine: "h1",
-		Bin: GoBinary{ModuleDir: "servers/fasthttp"},
+		Bin:          GoBinary{ModuleDir: "servers/fasthttp"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"fiber-h1": {
 		Name: "fiber-h1", Category: "go-fasthttp", Language: "go", Framework: "fiber", Engine: "h1",
-		Bin: GoBinary{ModuleDir: "servers/fiber"},
+		Bin:          GoBinary{ModuleDir: "servers/fiber"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 
 	// rust adapters (wave 4a) — three frameworks built natively on the
@@ -216,6 +308,7 @@ var Registry = map[string]Adapter{
 			},
 			RunCmd: "{bin} -bind {bind}",
 		},
+		Capabilities: Capabilities{Static: true},
 	},
 	"actix-web": {
 		Name: "actix-web", Category: "rust-actix", Language: "rust", Framework: "actix-web", Engine: "h1",
@@ -227,6 +320,7 @@ var Registry = map[string]Adapter{
 			},
 			RunCmd: "{bin} -bind {bind}",
 		},
+		Capabilities: Capabilities{Static: true},
 	},
 	"ntex": {
 		Name: "ntex", Category: "rust-ntex", Language: "rust", Framework: "ntex", Engine: "h1",
@@ -238,6 +332,52 @@ var Registry = map[string]Adapter{
 			},
 			RunCmd: "{bin} -bind {bind}",
 		},
+		Capabilities: Capabilities{Static: true},
+	},
+
+	// hyper — the raw Rust baseline axum / actix-web / ntex are all built
+	// on or measured against. No router crate, no tower stack: the adapter
+	// drives hyper's H1 server directly with a hand-rolled (method, path)
+	// match, so this column is the floor the framework columns add their
+	// abstraction cost on top of. Same wave-4a build/run/lifecycle contract
+	// as the other three Rust adapters (release-fat + target-cpu=native,
+	// `-bind`, `ready addr=` on stdout, SIGTERM graceful drain). H1-only.
+	"hyper": {
+		Name: "hyper", Category: "rust-hyper", Language: "rust", Framework: "hyper", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "rust",
+			BuildSteps: []string{
+				"source $RUSTUP_HOME/env",
+				"cd $SRC && cargo build --profile release-fat",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+
+	// drogon — the top C++ contender. Built natively on the bench host via
+	// CMake against libdrogon (drogon + trantor + jsoncpp + OpenSSL), the
+	// same staging shape as the Rust competitors: a tarball of
+	// servers/drogon/ lands at $SRC, configures + compiles in-tree, and the
+	// produced build/drogon-adapter binary is symlinked into
+	// ${bench_root}/competitors/drogon. The runner invokes it with
+	// `-bind <addr>` and waits for `ready addr=<addr>` on stdout.
+	// CMAKE_PREFIX_PATH points at the brew Drogon CMake package so the
+	// Drogon::Drogon imported target resolves every transitive dep.
+	// Capabilities are all-false: drogon is benched on the static +
+	// concurrency scenarios only, so driver / middleware / streaming cells
+	// are never scheduled against it.
+	"drogon": {
+		Name: "drogon", Category: "cpp-drogon", Language: "cpp", Framework: "drogon", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "cpp",
+			BuildSteps: []string{
+				"cd $SRC && cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/homebrew -DCMAKE_BUILD_TYPE=Release",
+				"cd $SRC && cmake --build build -j",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{},
 	},
 
 	// fastapi — python adapter, native (NO docker). The launcher script
@@ -253,29 +393,86 @@ var Registry = map[string]Adapter{
 			Lang:   "python",
 			RunCmd: "{bench}/competitors/{name}/server -bind {bind}",
 		},
+		Capabilities: Capabilities{Static: true},
+	},
+
+	// aspnet — ASP.NET Core (Kestrel, minimal APIs) on .NET 10, built
+	// natively on the bench host like the Rust adapters. `dotnet publish
+	// -c Release` emits a framework-dependent app under {src}/publish/
+	// whose native apphost binary is named `aspnet` (AssemblyName); the
+	// build symlinks that apphost into {bench}/competitors/aspnet, and the
+	// runner invokes it with `-bind <addr>`, waiting for `ready addr=<addr>`
+	// on stdout. Kestrel is tuned for throughput in Program.cs (server GC +
+	// concurrent, tiered PGO, ReadyToRun, no logging providers, no dev
+	// middleware, AddServerHeader=false). The JSON payloads come from the
+	// same deterministic generator as every other adapter so /json-1k and
+	// /json-64k are byte-identical across languages. SIGTERM triggers
+	// Kestrel's graceful shutdown inside the runner's grace window. H1-only
+	// for this wave.
+	"aspnet": {
+		Name: "aspnet", Category: "dotnet-aspnetcore", Language: "csharp", Framework: "aspnet", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "dotnet",
+			BuildSteps: []string{
+				"cd $SRC && dotnet publish -c Release -o publish",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+
+	// zig_zap — the Zig event-loop competitor column, a direct architectural
+	// peer to celeris's iouring / epoll engines: a fixed pool of OS threads,
+	// each running a blocking accept + HTTP/1.1 serve loop over the same
+	// SO_REUSEPORT listener so the kernel load-balances connections across
+	// cores with no userspace contention. Built natively on the bench host
+	// like the Rust/dotnet adapters: `zig build -Doptimize=ReleaseFast` emits
+	// zig-out/bin/zig_zap, which the build symlinks into
+	// {bench}/competitors/zig_zap; the runner invokes it with `-bind <addr>`
+	// and waits for `ready addr=<addr>` on stdout.
+	//
+	// The HTTP codec is the Zig standard library's std.http.Server (the
+	// from-scratch HTTP/1.1 server that ships with Zig 0.16), NOT zigzap/zap:
+	// zap 0.10.7 declares minimum_zig_version 0.15.0 and bundles facil.io (C),
+	// whose sources fail to build under the installed Zig 0.16 C toolchain.
+	// Static-only contract — no Drivers / Middleware / WS / SSE / TLS. H1-only.
+	"zig_zap": {
+		Name: "zig_zap", Category: "zig-stdhttp", Language: "zig", Framework: "zig_zap", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "zig",
+			BuildSteps: []string{
+				"cd $SRC && zig build -Doptimize=ReleaseFast",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
 	},
 
 	// celeris — 4 engine modes selected at runtime via -engine. The
 	// binary is the same; entries differ only in Engine + Name.
 	"celeris-iouring-h1-async": {
 		Name: "celeris-iouring-h1-async", Category: "celeris", Language: "go", Framework: "celeris",
-		Engine: "iouring-h1-async",
-		Bin:    GoBinary{ModuleDir: "servers/celeris"},
+		Engine:       "iouring-h1-async",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
 	},
 	"celeris-iouring-auto+upg-async": {
 		Name: "celeris-iouring-auto+upg-async", Category: "celeris", Language: "go", Framework: "celeris",
-		Engine: "iouring-auto+upg-async",
-		Bin:    GoBinary{ModuleDir: "servers/celeris"},
+		Engine:       "iouring-auto+upg-async",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
 	},
 	"celeris-epoll-h1-sync": {
 		Name: "celeris-epoll-h1-sync", Category: "celeris", Language: "go", Framework: "celeris",
-		Engine: "epoll-h1-sync",
-		Bin:    GoBinary{ModuleDir: "servers/celeris"},
+		Engine:       "epoll-h1-sync",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
 	},
 	"celeris-std-h1": {
 		Name: "celeris-std-h1", Category: "celeris", Language: "go", Framework: "celeris",
-		Engine: "std-h1",
-		Bin:    GoBinary{ModuleDir: "servers/celeris"},
+		Engine:       "std-h1",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
 	},
 
 	// hono / elysia — wave 4b. TypeScript adapters running natively

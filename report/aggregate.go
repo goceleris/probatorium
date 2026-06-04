@@ -48,6 +48,34 @@ type CellResult struct {
 	Category      string
 	Samples       []loadgen.Result
 	HistogramsB64 []string
+
+	// RatedSamples is a parallel slice — index i pairs with Samples[i] —
+	// of the rated (closed-loop, coordinated-omission-corrected) sweep for
+	// that run: one (target RPS, P99) per rated pass. Nil when rated mode
+	// was off, in which case LatencyAtSLO stays nil and the regression gate
+	// sees no signal for this cell.
+	RatedSamples [][]RatedSample
+
+	// Status is the per-cell outcome classification (schema v5.3+). The
+	// zero value ("") is treated as [CellOK] when Samples are present —
+	// [Aggregate] derives the effective status from ErrorMsg via
+	// [ClassifyCellError] when Status is unset. A non-OK status means the
+	// cell did not produce a real number and must not be ranked.
+	Status CellStatus
+
+	// ErrorMsg is the synthesised per-cell error string the orchestrator
+	// recorded (e.g. "zero-request cell: …", "adapter start: …"). Empty
+	// for an OK cell. [Aggregate] classifies it into Status when Status
+	// is unset, so either path (in-process runner or cluster merge) can
+	// hand a cell either pre-classified or as a raw error string.
+	ErrorMsg string
+}
+
+// RatedSample is one rated pass: a target offered load and the
+// coordinated-omission-corrected P99 measured at that load.
+type RatedSample struct {
+	TargetRPS float64
+	P99       time.Duration
 }
 
 // Percentiles captures the latency percentile snapshot used by
@@ -66,6 +94,16 @@ type CellAggregate struct {
 	ServerKind   string
 	Category     string
 	N            int
+
+	// Status is the per-cell outcome (schema v5.3+). Only Status==CellOK
+	// cells carry headline numbers (RPS / latency / histogram); for a
+	// non-OK cell those fields are left zero and BuildDocument records
+	// the cell in ServerResult.CellStatuses instead of ranking it.
+	Status CellStatus
+
+	// ErrorMsg is the per-cell error string that produced a non-OK
+	// Status, surfaced for JSON detail / debugging. Empty for CellOK.
+	ErrorMsg string
 
 	RPSMedian float64
 	RPSP5     float64 // 5th percentile bound of the per-run RPS distribution
@@ -91,6 +129,17 @@ type CellAggregate struct {
 
 	Errors      int64
 	BytesMedian float64
+
+	// RatedP99ByTarget maps an integer target-RPS bucket to the median
+	// (across runs) coordinated-omission-corrected P99 measured at that
+	// offered load. Nil when rated mode was off.
+	RatedP99ByTarget map[int]time.Duration
+
+	// LatencyAtSLO maps each SLO budget (ms, from SLOThresholds) to the
+	// maximum target RPS whose median P99 stayed under that budget. Bigger
+	// is better — this is the leaf the regression gate keys on. Nil when
+	// rated mode was off, so a non-rated run emits no fake gate signal.
+	LatencyAtSLO map[int]int
 }
 
 // ErrNotImplemented is returned by scaffold stubs that have not yet been
@@ -108,12 +157,29 @@ func CellID(scenarioName, serverName string) string {
 func Aggregate(cells []CellResult) map[string]CellAggregate {
 	out := make(map[string]CellAggregate, len(cells))
 	for _, cell := range cells {
+		// Effective status: honour a pre-classified Status when the
+		// caller set one, otherwise derive it from the error string. An
+		// unset Status on a cell with samples and no error is CellOK.
+		status := cell.Status
+		if status == "" {
+			status = ClassifyCellError(cell.ErrorMsg)
+		}
+
 		agg := CellAggregate{
 			ScenarioName: cell.ScenarioName,
 			ServerName:   cell.ServerName,
 			ServerKind:   cell.ServerKind,
 			Category:     cell.Category,
 			N:            len(cell.Samples),
+			Status:       status,
+			ErrorMsg:     cell.ErrorMsg,
+		}
+		// A cell that did not run (or ran but produced no real number) is
+		// never emitted as a ranked datapoint: leave every headline field
+		// zero so BuildDocument records it in CellStatuses instead.
+		if status != CellOK {
+			out[CellID(cell.ScenarioName, cell.ServerName)] = agg
+			continue
 		}
 		if len(cell.Samples) == 0 {
 			out[CellID(cell.ScenarioName, cell.ServerName)] = agg
@@ -146,8 +212,86 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 			agg.MergedHistogramB64 = b64
 		}
 
+		reduceRated(cell.RatedSamples, &agg)
+
 		out[CellID(cell.ScenarioName, cell.ServerName)] = agg
 	}
+	return out
+}
+
+// reduceRated folds the per-run rated sweeps into RatedP99ByTarget (median
+// P99 per integer target RPS, across runs) and LatencyAtSLO (the max
+// sustained target RPS whose median P99 stays under each SLO budget). Both
+// maps stay nil when no rated samples are present, so a non-rated cell emits
+// no latency_at_slo leaf and the regression gate sees nothing to compare.
+//
+// LatencyAtSLO is a throughput-at-SLO metric (bigger is better) — never a
+// raw latency — which is what keeps the gate's bigger-is-better sign correct.
+func reduceRated(runs [][]RatedSample, agg *CellAggregate) {
+	byTarget := map[int][]int64{}
+	for _, run := range runs {
+		for _, rs := range run {
+			t := int(rs.TargetRPS + 0.5)
+			byTarget[t] = append(byTarget[t], int64(rs.P99))
+		}
+	}
+	if len(byTarget) == 0 {
+		return
+	}
+
+	medByTarget := make(map[int]time.Duration, len(byTarget))
+	for t, ps := range byTarget {
+		medByTarget[t] = time.Duration(medianInt64(ps))
+	}
+	agg.RatedP99ByTarget = medByTarget
+
+	slo := make(map[int]int, len(SLOThresholds))
+	for _, ms := range SLOThresholds {
+		budget := time.Duration(ms) * time.Millisecond
+		best := 0
+		for t, p99 := range medByTarget {
+			if p99 <= budget && t > best {
+				best = t
+			}
+		}
+		if best > 0 {
+			slo[ms] = best
+		}
+	}
+	if len(slo) > 0 {
+		agg.LatencyAtSLO = slo
+	}
+}
+
+// BuildTimeseries folds the SAME []CellResult that [Aggregate] consumes
+// into a standalone time-series sidecar [TimeseriesDoc]. CellResult
+// already carries the per-run loadgen.Timeseries on its Samples, so no
+// struct change is needed and the summary Document is untouched.
+//
+// Scenarios are sorted by (Scenario, Server) so the sidecar (modulo its
+// GeneratedAt stamp) is byte-stable across permutations of the input.
+func BuildTimeseries(cells []CellResult) *TimeseriesDoc {
+	out := &TimeseriesDoc{
+		GeneratedAt:   time.Now().UTC(),
+		SchemaVersion: TimeseriesSchemaVersion,
+	}
+	for _, c := range cells {
+		// Skip non-OK cells (not_applicable / dnf): they carry no samples, so
+		// they would only append empty ScenarioSeries entries and bloat the
+		// sidecar — matching Aggregate / the markdown reducers, which all
+		// exclude non-OK cells (schema v5.3).
+		if c.Status != "" && c.Status != CellOK {
+			continue
+		}
+		out.Scenarios = append(out.Scenarios,
+			BuildScenarioSeries(c.ScenarioName, c.ServerName, c.Category, c.Samples))
+	}
+	sort.Slice(out.Scenarios, func(i, j int) bool {
+		if out.Scenarios[i].Scenario != out.Scenarios[j].Scenario {
+			return out.Scenarios[i].Scenario < out.Scenarios[j].Scenario
+		}
+		return out.Scenarios[i].Server < out.Scenarios[j].Server
+	})
 	return out
 }
 

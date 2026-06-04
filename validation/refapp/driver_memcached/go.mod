@@ -1,8 +1,8 @@
 module github.com/goceleris/probatorium/validation/refapp/driver_memcached
 
-go 1.26.3
+go 1.26.4
 
-require github.com/goceleris/celeris v1.4.12
+require github.com/goceleris/celeris v1.4.14
 
 require (
 	golang.org/x/net v0.55.0 // indirect

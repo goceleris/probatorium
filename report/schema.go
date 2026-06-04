@@ -1,6 +1,7 @@
 package report
 
 import (
+	"strings"
 	"time"
 )
 
@@ -16,7 +17,77 @@ import (
 //     cell runs unchanged. ValidationCellResult keys (refapp, engine,
 //     arch) triple. Older readers ignore the Cells field and
 //     fall back to top-level Tier1/Tier3 when present.
-const SchemaVersion = "5.1"
+//   - 5.2 — per-(adapter, scenario) server resource aggregates +
+//     time-series (probatorium#154). Adds ServerResult.Resources.
+//     Additive and fully nullable: every metric leaf is a pointer
+//     so non-Go competitors (no goroutine/GC/heap) serialize as
+//     JSON null while RSS/CPU/FD stay populated. Older readers
+//     ignore the field.
+//   - 5.3 — per-cell OUTCOME classification (probatorium). Adds
+//     ServerResult.CellStatuses: scenario → "not_applicable" | "dnf"
+//     for cells that did not produce a real number. A cell that did
+//     not run (route/protocol not implemented, or dial/port/crash)
+//     no longer leaks into saturation_mode_rps / latency_at_slo as a
+//     0-RPS also-ran; it is recorded here instead. Additive — older
+//     readers ignore the field and a v5.2 document (no cell_statuses)
+//     still decodes.
+const SchemaVersion = "5.3"
+
+// CellStatus classifies the OUTCOME of a single (scenario, server)
+// cell. It is the single source of truth for whether a cell ran and
+// produced a real number, and it travels with the cell through both
+// result-merge paths (the in-process runner and the cluster mage Bench
+// path) into the renderer.
+//
+// Only [CellOK] cells contribute a ranked datapoint to the headline
+// maps (saturation_mode_rps / latency_at_slo / hdr_histogram_b64).
+// [CellNotApplicable] and [CellDNF] cells are recorded in
+// ServerResult.CellStatuses and rendered as "N/A" / "DNF" — never as a
+// 0-RPS row, which would overstate the field of real competitors.
+type CellStatus string
+
+const (
+	// CellOK is a cell that ran and produced a real measurement.
+	CellOK CellStatus = "ok"
+	// CellNotApplicable is a cell the adapter could not serve because
+	// it does not implement the route or speak the protocol — a
+	// capability the scheduler trusted but the adapter does not honour.
+	CellNotApplicable CellStatus = "not_applicable"
+	// CellDNF is a cell that failed to run for infrastructure reasons
+	// (dial / port / crash / timeout). Loud by design: a real server
+	// crash must surface, never be silently bucketed as not-applicable.
+	CellDNF CellStatus = "dnf"
+)
+
+// ClassifyCellError maps a per-cell error string to a [CellStatus].
+// An empty error means the cell ran (CellOK).
+//
+// The split: "zero-request" / "capability-lie" mean the adapter does not
+// implement the route → CellNotApplicable. "read server settings" (the H2
+// prior-knowledge preface going unanswered) is N/A ONLY when it TIMED OUT —
+// the server simply never spoke H2; a reset / EOF / broken pipe on that
+// handshake means the connection was actively torn down (an H2 server that
+// crashed mid-handshake) and is a DNF, not N/A. Everything else (adapter
+// start, ready-check, address-already-in-use, loadgen.New / loadgen.Run,
+// dial / reset / EOF / timeout) is an infra failure → CellDNF. Ambiguous
+// errors default to CellDNF, never to CellNotApplicable: a real crash must
+// not be silently excused as N/A.
+func ClassifyCellError(errMsg string) CellStatus {
+	switch {
+	case errMsg == "":
+		return CellOK
+	case strings.Contains(errMsg, "read server settings"):
+		if strings.Contains(errMsg, "i/o timeout") || strings.Contains(errMsg, "deadline exceeded") {
+			return CellNotApplicable
+		}
+		return CellDNF
+	case strings.Contains(errMsg, "zero-request cell"),
+		strings.Contains(errMsg, "capability-lie"):
+		return CellNotApplicable
+	default:
+		return CellDNF
+	}
+}
 
 // Document is the top-level v5.0 results JSON shape. One file per
 // probatorium run; emit by JSON-encoding from the orchestrator.
@@ -135,6 +206,25 @@ type ServerResult struct {
 	// percentage of sent. Per scenario. >2% indicates the server is
 	// dropping connections / replies — release-gate signal.
 	SentVsHandledDeltaPct map[string]float64 `json:"sent_vs_handled_delta_pct"`
+
+	// Resources carries the server-side resource aggregate (RSS, CPU,
+	// GC pause, goroutine / FD high-water) sampled at 1 Hz alongside the
+	// run by cmd/observer + mpstat, keyed by Scenario.Name(). Schema
+	// v5.2+ (probatorium#154). Nil/omitted when a run captured no
+	// observer data (e.g. the local-loopback runner). Within an entry
+	// every metric is a nullable pointer: non-Go competitors expose
+	// RSS/CPU/FD only, leaving goroutine/GC/heap null.
+	Resources map[string]*ResourceStats `json:"resources,omitempty"`
+
+	// CellStatuses records the non-OK outcome of every scenario this
+	// adapter did NOT produce a real number for, keyed by
+	// Scenario.Name(); the value is "not_applicable" (route/protocol
+	// unimplemented) or "dnf" (dial/port/crash/timeout). Schema v5.3+.
+	// A scenario present here is deliberately absent from
+	// SaturationModeRPS / LatencyAtSLO / HdrHistogramB64 — it did not
+	// run, so it is never ranked as a 0-RPS row. Omitted when every
+	// cell for this adapter ran (CellOK). Older readers ignore it.
+	CellStatuses map[string]string `json:"cell_statuses,omitempty"`
 }
 
 // ValidationResults captures the fixture-graph property tests and the
@@ -245,4 +335,45 @@ type SoakSummary struct {
 	// PerHourErrorRate is the average non-2xx rate observed during the
 	// soak, expressed as a percentage of total requests.
 	PerHourErrorRate float64 `json:"per_hour_error_rate"`
+}
+
+// ResourceStats is the server-side resource aggregate for one
+// (adapter, scenario) cell: a scalar summary plus a downsampled
+// time-series. Schema v5.2+ (probatorium#154). Built from one per-cell
+// observer.sqlite (`observations` table) + one per-cell mpstat cpu.log.
+//
+// Every metric is a pointer so each can serialize as JSON null
+// independently: non-Go competitors expose RSS/CPU/FD only, leaving the
+// runtime-derived metrics (goroutine/GC/heap) null.
+type ResourceStats struct {
+	Summary ResourceSummary `json:"summary"`
+
+	// Series is the downsampled (≤60-point) resource trajectory. Joined
+	// positionally between the observer's unix-second rows and mpstat's
+	// wall-clock rows; both sample at ~1 Hz over the same window.
+	Series []ResourcePoint `json:"series,omitempty"`
+}
+
+// ResourceSummary is the scalar headline of a cell's resource usage.
+// Pointers are nil when the metric was treated as absent (a competitor
+// with no Go runtime, or no CPU sampler row).
+type ResourceSummary struct {
+	PeakRSSBytes   *int64   `json:"peak_rss_bytes,omitempty"`
+	SteadyRSSBytes *int64   `json:"steady_rss_bytes,omitempty"`
+	MeanCPUPct     *float64 `json:"mean_cpu_pct,omitempty"`
+	GCPauseP99Ns   *int64   `json:"gc_pause_p99_ns,omitempty"`
+	GoroutineHWM   *int64   `json:"goroutine_hwm,omitempty"`
+	FDHWM          *int64   `json:"fd_hwm,omitempty"`
+}
+
+// ResourcePoint is one downsampled sample in a ResourceStats.Series.
+// TSUnix is the observer's unix-second timestamp; the remaining metrics
+// are nullable for the same reasons as ResourceSummary.
+type ResourcePoint struct {
+	TSUnix         int64    `json:"ts_unix"`
+	RSSBytes       *int64   `json:"rss_bytes,omitempty"`
+	CPUPct         *float64 `json:"cpu_pct,omitempty"`
+	Goroutines     *int64   `json:"goroutines,omitempty"`
+	HeapInuseBytes *int64   `json:"heap_inuse_bytes,omitempty"`
+	FDCount        *int64   `json:"fd_count,omitempty"`
 }

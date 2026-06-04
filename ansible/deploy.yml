@@ -114,16 +114,21 @@
     # ---------- core Go artefacts ----------
     # Each is conditionally pushed only if the corresponding extra-var is
     # defined, so a partial deploy (e.g. just runner+loadgen) is valid.
-    # Loadgen always lands on msa2-client; everything else lands on
-    # bench_targets. observer/validator can land on either.
+    # Loadgen always lands on msa2-client; observer/validator can land on
+    # either. Since #152 the bench path RUNS the runner on the loadgen
+    # host (it drives loadgen in-process against the remote SUT), so the
+    # runner must land on msa2-client too — it is also pushed to
+    # bench_targets so the in-process / local-adapter mode still works
+    # there for ad-hoc runs.
 
-    - name: Push runner binary (bench_targets)
+    - name: Push runner binary (bench_targets + loadgen host)
       ansible.builtin.copy:
         src: "{{ runner_binary_amd64 if arch == 'amd64' else runner_binary_arm64 }}"
         dest: "{{ bench_root }}/runner"
         mode: '0755'
       when:
-        - inventory_hostname in groups['bench_targets']
+        - inventory_hostname in groups['bench_targets'] or
+          inventory_hostname == "msa2-client"
         - (arch == 'amd64' and runner_binary_amd64 is defined) or
           (arch == 'arm64' and runner_binary_arm64 is defined)
 
@@ -264,12 +269,31 @@
     # Roles only run on bench_targets (the loadgen host doesn't need
     # framework toolchains, only the loadgen binary).
 
+    # need_<lang> is true iff at least one in-scope competitor declares
+    # that language. hyper rides need_rust (Lang: rust) — no separate
+    # toolchain. cpp/dotnet/zig added for the wave-5 #171 competitors
+    # (drogon / aspnet / zig_zap).
     - name: Determine which toolchains are needed
       ansible.builtin.set_fact:
         need_rust: >-
           {{ (competitor_sources | default({}) | dict2items
               | selectattr('key', 'in', competitor_list)
               | selectattr('value.lang', 'equalto', 'rust')
+              | list | length) > 0 }}
+        need_cpp: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'cpp')
+              | list | length) > 0 }}
+        need_dotnet: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'dotnet')
+              | list | length) > 0 }}
+        need_zig: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'zig')
               | list | length) > 0 }}
         need_bun: >-
           {{ (competitor_sources | default({}) | dict2items
@@ -282,12 +306,33 @@
               | selectattr('value.lang', 'equalto', 'python')
               | list | length) > 0 }}
 
-    - name: Install rust toolchain (only when a rust competitor is in scope)
+    - name: Install rust toolchain (only when a rust competitor is in scope — incl. hyper)
       ansible.builtin.include_role:
         name: rust
       when:
         - inventory_hostname in groups['bench_targets']
         - need_rust | bool
+
+    - name: Install cpp toolchain + libdrogon (only when a cpp competitor is in scope)
+      ansible.builtin.include_role:
+        name: cpp
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_cpp | bool
+
+    - name: Install .NET SDK (only when a dotnet competitor is in scope)
+      ansible.builtin.include_role:
+        name: dotnet
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_dotnet | bool
+
+    - name: Install zig toolchain (only when a zig competitor is in scope)
+      ansible.builtin.include_role:
+        name: zig
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_zig | bool
 
     - name: Install bun toolchain (only when a bun competitor is in scope)
       ansible.builtin.include_role:

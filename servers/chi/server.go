@@ -80,4 +80,10 @@ func registerRoutes(r chi.Router) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		common.WriteBody(w)
 	})
+
+	// Phase-2 capability routes. chi-h1/chi-h2 declare Drivers + Middleware
+	// in the registry, so both are mounted unconditionally here; the driver
+	// handlers self-gate to 503 when a backend is unconfigured.
+	mountDriverHandlers(r)
+	mountChainHandlers(r)
 }

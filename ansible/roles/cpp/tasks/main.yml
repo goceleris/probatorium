@@ -1,0 +1,151 @@
+---
+# Native C++ toolchain + libdrogon, for the drogon adapter. Unlike the
+# rust/zig/dotnet roles there is no single relocatable tarball: a C++
+# framework links against system libraries, so the cluster's own
+# gcc/g++ + apt build-deps are the toolchain, and libdrogon is compiled
+# from source into a pristine prefix under {{ bench_root }}/drogon.
+#
+# Pristine accounting (what cleanup.yml reverses):
+#   - apt build-deps WE installed → installed_packages (apt-purge).
+#     We probe each with dpkg -s and only request the missing ones, so a
+#     node that already ships e.g. cmake/libssl-dev keeps them on cleanup.
+#   - the libdrogon build tree + install prefix → installed_toolchains
+#     entry { lang: 'cpp-drogon', path: {{ bench_root }}/drogon }
+#     (rm -rf). The adapter's own build/ dir lives under
+#     competitors-src/drogon and is wiped by the bench_root sweep.
+#
+# Why build libdrogon from source (not apt libdrogon-dev): drogon is not
+# in Ubuntu's default repos on the cluster's release, and the few PPAs
+# that carry it would add an apt source to /etc — a permanent mutation
+# the pristine rule forbids. A from-source build into a bench_root prefix
+# is the minimally-invasive path: only the (already-tracked) generic C++
+# apt deps touch the system, everything drogon-specific stays under
+# bench_root. Always-latest stable is the newest libdrogon git tag at
+# deploy time (mirrors the always-latest policy of the other roles).
+#
+# CMAKE_PREFIX_PATH / drogon_DIR (exported by build_native_competitor.yml
+# for cpp adapters) point the adapter's own `cmake -S . -B build` at this
+# prefix so find_package(Drogon) resolves the bench-built libdrogon.
+
+- name: cpp | ensure drogon prefix root exists
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ bench_root }}/drogon"
+    - "{{ bench_root }}/drogon/src"
+    - "{{ bench_root }}/drogon/prefix"
+
+# drogon's hard build deps: a C++17 compiler (build-essential → g++),
+# cmake, git (to fetch the source), and the libraries drogon links:
+#   jsoncpp (JSON), libuuid (request ids), zlib (gzip), OpenSSL (TLS +
+#   hashing), c-ares (async DNS), brotli (optional compression). pkg-config
+#   lets drogon's CMake locate them. Probe each so we only apt-install —
+#   and therefore only later apt-purge — the genuinely-missing ones.
+- name: cpp | detect missing system packages (compiler + cmake + drogon libs)
+  ansible.builtin.shell: |
+    for pkg in build-essential cmake git pkg-config ca-certificates \
+               libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev \
+               libc-ares-dev libbrotli-dev; do
+      dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+    done
+  register: cpp_missing_pkgs
+  changed_when: false
+
+- name: cpp | install missing apt packages
+  become: true
+  ansible.builtin.apt:
+    name: "{{ cpp_missing_pkgs.stdout_lines }}"
+    state: present
+    update_cache: true
+  when: cpp_missing_pkgs.stdout_lines | length > 0
+
+- name: cpp | append apt packages to manifest fact
+  ansible.builtin.set_fact:
+    installed_packages: "{{ installed_packages + cpp_missing_pkgs.stdout_lines }}"
+  when: cpp_missing_pkgs.stdout_lines | length > 0
+
+# Resolve always-latest stable libdrogon: the newest semver tag in the
+# upstream repo (tags are vN.M.P; we sort by the numeric tuple and take
+# the max, skipping any pre-release suffix). Done via ls-remote so we
+# never clone history we don't need.
+- name: cpp | resolve latest stable libdrogon tag
+  ansible.builtin.shell: |
+    set -euo pipefail
+    git ls-remote --tags --refs https://github.com/drogonframework/drogon.git \
+      | sed 's#.*refs/tags/##' \
+      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -V \
+      | tail -1
+  register: drogon_tag
+  changed_when: false
+
+- name: cpp | record resolved libdrogon tag
+  ansible.builtin.set_fact:
+    drogon_version: "{{ drogon_tag.stdout | trim }}"
+
+# Idempotency: skip the whole clone+build when the resolved version's
+# CMake package file already exists in the prefix. find_package(Drogon)
+# keys off lib/cmake/Drogon/DrogonConfig.cmake, so its presence is the
+# canonical "already built" marker.
+- name: cpp | check whether resolved libdrogon is already built
+  ansible.builtin.stat:
+    path: "{{ bench_root }}/drogon/prefix/lib/cmake/Drogon/DrogonConfig.cmake"
+  register: drogon_built
+
+- name: cpp | shallow-clone libdrogon at the resolved tag (with submodules)
+  ansible.builtin.command:
+    cmd: >-
+      git clone --depth 1 --branch {{ drogon_version }} --recurse-submodules
+      https://github.com/drogonframework/drogon.git
+      {{ bench_root }}/drogon/src/drogon-{{ drogon_version }}
+    creates: "{{ bench_root }}/drogon/src/drogon-{{ drogon_version }}/CMakeLists.txt"
+  when: not drogon_built.stat.exists
+
+# Configure + build + install libdrogon into the bench_root prefix.
+# -DCMAKE_BUILD_TYPE=Release matches the adapter's own build type. We
+# disable drogon's ORM backends (postgres/mysql/sqlite) and its test/ctl
+# suites: the drogon adapter is benched on the static + JSON columns only
+# (Capabilities{Static:true}), so the ORM deps would add build cost +
+# extra apt packages for nothing.
+- name: cpp | configure + build + install libdrogon into bench_root prefix
+  environment:
+    CMAKE_BUILD_PARALLEL_LEVEL: "{{ ansible_processor_vcpus | default(ansible_processor_count) | default(4) }}"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cd "{{ bench_root }}/drogon/src/drogon-{{ drogon_version }}"
+    cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX="{{ bench_root }}/drogon/prefix" \
+      -DBUILD_CTL=OFF \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_TESTING=OFF \
+      -DBUILD_POSTGRESQL=OFF \
+      -DBUILD_MYSQL=OFF \
+      -DBUILD_SQLITE=OFF \
+      -DBUILD_REDIS=OFF
+    cmake --build build -j
+    cmake --install build
+  args:
+    executable: /bin/bash
+    creates: "{{ bench_root }}/drogon/prefix/lib/cmake/Drogon/DrogonConfig.cmake"
+  when: not drogon_built.stat.exists
+
+- name: cpp | resolve installed g++ + cmake versions
+  ansible.builtin.shell: |
+    g++ --version 2>/dev/null | head -1 || true
+    cmake --version 2>/dev/null | head -1 || true
+  register: cpp_versions
+  changed_when: false
+
+- name: cpp | append toolchain entry to manifest
+  ansible.builtin.set_fact:
+    installed_toolchains: >-
+      {{ installed_toolchains
+         + [{ 'lang': 'cpp-drogon',
+              'path': bench_root + '/drogon',
+              'apt_pkgs': cpp_missing_pkgs.stdout_lines }] }}
+    fetched_versions: >-
+      {{ fetched_versions
+         | combine({ 'cpp': (cpp_versions.stdout_lines | join(' / ')) + ' / libdrogon ' + drogon_version }) }}

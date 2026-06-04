@@ -1,49 +1,90 @@
-name: Publish results
+name: publish-results
 
-# Standalone trigger that hands the latest bench results off to the
-# goceleris/docs repo via repository_dispatch. The dispatch payload
-# carries (version, arch, results_url) so the docs site can render the
-# new run without re-fetching the artifact catalogue.
+# Manual re-notify. The real publish path is `mage Publish` on the
+# release branch: it writes the four-file tree (summary.json +
+# timeseries.json.gz + histograms.json.gz + env.json) into
+# goceleris/docs, pushes it, then fires a tiny `benchmark-published`
+# repository_dispatch carrying only a POINTER to the pushed cell. The
+# docs `sync-benchmarks` workflow is the single writer of index.json and
+# latest/ — it validates the tree, upserts the manifest, and refreshes
+# latest/.
 #
-# Normally invoked from bench.yml's success path; the workflow_dispatch
-# trigger here is for ad-hoc republishes (typo fix, broken link, …).
+# Two entry points land here:
+#   - workflow_dispatch: a human re-sends the pointer for a cell that is
+#     already pushed (e.g. the docs ingest failed and needs a retry)
+#     WITHOUT re-running the bench.
+#   - repository_dispatch (benchmark-published): logging/observability
+#     only; the docs repo's own listener does the ingest.
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Celeris version that produced the results
+        description: celeris version tag (e.g. v1.4.13)
         required: true
         type: string
       arch:
-        description: Host arch tag (amd64 | arm64)
+        description: arch tag (x86_64 | arm64)
         required: true
         type: string
-        default: amd64
-      results_url:
-        description: Direct URL to the results.json artifact
+        default: x86_64
+      date:
+        description: run date yyyymmdd (UTC, on-disk dir name)
         required: true
         type: string
+      run_id:
+        description: run id (run-1 is canonical)
+        required: false
+        type: string
+        default: run-1
+      path:
+        description: repo-root-relative cell path under results/ (blank = derive)
+        required: false
+        type: string
+        default: ""
+  repository_dispatch:
+    types: [benchmark-published]
 
 permissions:
   contents: read
 
 jobs:
-  dispatch:
-    name: Dispatch results-updated to docs
+  renotify:
+    name: Re-notify goceleris/docs
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch results-updated
+      - name: Log dispatch
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "action=${{ github.event.action }}"
+          echo "version=${{ github.event.client_payload.version || github.event.inputs.version }}"
+          echo "arch=${{ github.event.client_payload.arch || github.event.inputs.arch }}"
+          echo "date=${{ github.event.client_payload.date || github.event.inputs.date }}"
+          echo "run_id=${{ github.event.client_payload.run_id || github.event.inputs.run_id }}"
+          echo "path=${{ github.event.client_payload.path || github.event.inputs.path }}"
+          echo "Ingest is handled by goceleris/docs sync-benchmarks (single writer of index.json + latest/)."
+
+      - name: Re-emit pointer to goceleris/docs (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN || github.token }}
-          VERSION: ${{ inputs.version }}
-          ARCH: ${{ inputs.arch }}
-          RESULTS_URL: ${{ inputs.results_url }}
+          VERSION: ${{ github.event.inputs.version }}
+          ARCH: ${{ github.event.inputs.arch }}
+          DATE: ${{ github.event.inputs.date }}
+          RUN_ID: ${{ github.event.inputs.run_id }}
+          IN_PATH: ${{ github.event.inputs.path }}
         run: |
           set -euo pipefail
-          gh api repos/goceleris/docs/dispatches \
-            -f event_type=results-updated \
-            -f "client_payload[version]=${VERSION}" \
-            -f "client_payload[arch]=${ARCH}" \
-            -f "client_payload[results_url]=${RESULTS_URL}"
-          echo "Dispatched results-updated: ${VERSION} (${ARCH}) -> ${RESULTS_URL}"
+          CELL_PATH="${IN_PATH:-results/${VERSION}/${DATE}/${ARCH}}"
+          payload=$(jq -n \
+            --arg version "$VERSION" \
+            --arg arch "$ARCH" \
+            --arg date "$DATE" \
+            --arg run_id "$RUN_ID" \
+            --arg path "$CELL_PATH" \
+            '{event_type:"benchmark-published",
+              client_payload:{version:$version,arch:$arch,date:$date,run_id:$run_id,path:$path}}')
+          echo "$payload" | gh api -X POST repos/goceleris/docs/dispatches \
+            -H "Accept: application/vnd.github+json" \
+            --input -
+          echo "Re-emitted benchmark-published pointer for ${CELL_PATH}"

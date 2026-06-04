@@ -1,8 +1,18 @@
 ---
 # One bench cell: (run_index, competitor_slug). Wraps a server start +
-# mpstat samplers on both sides + loadgen invocation + clean teardown.
+# mpstat samplers on both sides + a single runner invocation + clean
+# teardown.
 #
 # Loop var: cell = [run_index, competitor_slug]
+#
+# Since #152 the bench path drives the Go runner (not the bare loadgen
+# binary): the runner is invoked once per cell on msa2-client with
+# -runs 1 and expands the full scenario catalogue itself against the
+# already-running remote SUT. So a single cell now runs N_scenarios
+# back-to-back rather than one "/" GET. Ansible keeps the outer
+# (run_index x competitor) interleaving (see bench.yml); the runner adds
+# the scenario inner loop and writes run0/<scenario>/<server>.json under
+# the cell dir.
 #
 # Two-host coordinated. Tasks gate themselves with `when: inventory_hostname ...`
 # rather than re-running the same playbook on a smaller `hosts:` set,
@@ -12,51 +22,189 @@
   ansible.builtin.set_fact:
     cell_dir: "{{ bench_run_dir }}/{{ '%02d' | format(cell.0 | int) }}-{{ cell.1 }}"
 
+# Resolve the matrix column slug (cell.1, e.g. "gin-h2" /
+# "celeris-epoll-h1-sync") to the staged binary dir it runs from and the
+# -engine flag the binary needs. competitor_columns is the slug→{bin,engine}
+# map mage Bench passes (built from servers.Registry). A single binary backs
+# several columns (gin → gin-h1/gin-h2), so the binary half is NOT the same
+# as the column slug. Falls back to the bare slug + no engine when the map is
+# absent (a direct ansible-playbook invocation without mage), preserving the
+# pre-mode-matrix behaviour for ad-hoc single-binary runs.
+- name: "{{ cell.1 }} run={{ cell.0 }} | resolve column → binary + engine"
+  ansible.builtin.set_fact:
+    cell_bin: "{{ competitor_columns[cell.1].bin if (competitor_columns is defined and cell.1 in competitor_columns) else cell.1 }}"
+    cell_engine: "{{ competitor_columns[cell.1].engine if (competitor_columns is defined and cell.1 in competitor_columns) else '' }}"
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
   ansible.builtin.file:
     path: "{{ cell_dir }}"
     state: directory
     mode: '0755'
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | size mpstat for the whole runner pass"
+  # The runner now runs N scenarios back-to-back inside one cell, so the
+  # mpstat samplers must cover the WHOLE pass, not a single
+  # (warmup+duration) window. Size = n_scenarios x (warmup + duration) +
+  # pad. bench_scenario_count defaults to a safe upper bound (the static
+  # + concurrency catalogue is ~16 cells; 28 covers the full catalogue
+  # with chain/driver), and BENCH_CELLS filtering only ever shrinks the
+  # real count, so over-sizing is harmless — mpstat is killed in
+  # teardown once the runner returns.
+  ansible.builtin.set_fact:
+    mpstat_seconds: >-
+      {{ ((bench_scenario_count | default(28) | int)
+          * (((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
+             + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)))
+         + 10 }}
+
 # ---------- bench target side: start server + mpstat ----------
-- name: "{{ cell.1 }} run={{ cell.0 }} | stop any prior server"
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop any prior server + wait for bench port free"
   become: true
+  # The previous column's teardown is best-effort (failed_when:false) and its
+  # port sweep is time-boxed (~3s), so a server that drains slowly (graceful
+  # http.Server.Shutdown keeps the listen socket bound for up to 10s) can still
+  # own the bench port when the next column launches → "bind: address already
+  # in use" → the new server dies and the readiness gate below would otherwise
+  # lock onto the LINGERING predecessor (e.g. the column's own -h1 sibling,
+  # which serves H1 fine but RESETS an H2 preface — the documented cause of the
+  # H2 + WS/SSE wrong-process benches). Reap every holder of the bench port
+  # (SIGKILL each pass) and wait until it is genuinely free before starting.
+  # Best-effort (always exits 0): if the port still can't be freed, the
+  # process-identity readiness gate records the cell as a clean skip and the
+  # grid continues, so per-column failure isolation is preserved.
   ansible.builtin.shell: |
-    pkill -f "[c]ompetitors/" 2>/dev/null
+    bp={{ bench_port | default(8080) }}
+    pkill -TERM -f "[c]ompetitors/" 2>/dev/null
     pkill -x server 2>/dev/null
-    sleep 0.2
-    pkill -KILL -f "[c]ompetitors/" 2>/dev/null
+    for i in $(seq 1 40); do
+      pids=$(ss -ltnp "sport = :${bp}" 2>/dev/null | tail -n +2 | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+      [ -z "$pids" ] && break
+      for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+      sleep 0.5
+    done
     true
+  args:
+    executable: /bin/bash
   changed_when: false
   when: inventory_hostname == bench_target
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start competitor server in background"
   become: true
+  # The binary is {{ cell_bin }} (the dir under competitors/), launched with
+  # the column's -engine when one applies. gorilla_ws + native adapters carry
+  # an empty cell_engine, so the `-engine` arg is omitted entirely — passing
+  # it to a binary that doesn't define the flag would abort with "flag
+  # provided but not defined". One-line nohup (no backslash continuations) so
+  # the conditional engine arg can't leave a dangling line-continuation.
+  environment:
+    # Driver-* backends live in loopback containers on the bench host,
+    # started + seeded by bench.yml's "dbservices | start …" stage step (the
+    # dbservices role only installs docker + pulls images; it never runs a
+    # container). Every driver-capable competitor reads its backend address
+    # from these PROBATORIUM_* vars; an unset var leaves that client nil and
+    # the driver cell 404s (→ capability-lie hard error). gin/celeris read
+    # PROBATORIUM_MEMCACHED_ADDR, echo reads PROBATORIUM_MC_ADDR, so we set
+    # both spellings. Harmless for static-only competitors (they ignore them).
+    # Ports MUST match bench.yml's container -p mappings AND validate.yml:
+    #   postgres 54321  redis 63791  memcached 21211  (remapped off the
+    # defaults so a stray system postgres/redis on the bench host can't shadow
+    # the fixture containers). Mismatch here = every driver-* cell silently
+    # connects nowhere and 404s.
+    PROBATORIUM_PG_DSN: "postgres://bench:bench@127.0.0.1:54321/bench?sslmode=disable"
+    PROBATORIUM_REDIS_ADDR: "127.0.0.1:63791"
+    PROBATORIUM_MEMCACHED_ADDR: "127.0.0.1:21211"
+    PROBATORIUM_MC_ADDR: "127.0.0.1:21211"
+    # aspnet (.NET) is a FRAMEWORK-DEPENDENT publish: the native apphost
+    # (competitors/aspnet) must locate the shared .NET runtime at launch. We
+    # installed the SDK (which carries the runtime) pristinely under
+    # {{ bench_root }}/dotnet, NOT system-wide, so without DOTNET_ROOT the
+    # apphost aborts with "You must install .NET to run this application" and
+    # never binds. DOTNET_ROOT is the documented runtime-discovery knob.
+    # Globalization-invariant belt-and-suspenders (the csproj already sets it,
+    # but the env override skips the ICU probe unconditionally on a minimal
+    # host). Both inert for every non-.NET binary.
+    DOTNET_ROOT: "{{ bench_root }}/dotnet"
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
   ansible.builtin.shell: |
     cd {{ bench_root }}
     ulimit -l unlimited
-    nohup ./competitors/{{ cell.1 }} \
-      -bind 0.0.0.0:{{ bench_port | default(8080) }} \
-      > {{ cell_dir }}/server.log 2>&1 &
+    nohup ./competitors/{{ cell_bin }} -bind 0.0.0.0:{{ bench_port | default(8080) }} {{ ('-engine ' + cell_engine) if cell_engine else '' }} > {{ cell_dir }}/server.log 2>&1 &
     echo $! > {{ cell_dir }}/server.pid
     disown
   args:
     executable: /bin/bash
   when: inventory_hostname == bench_target
 
-- name: "{{ cell.1 }} run={{ cell.0 }} | wait for server to bind"
+- name: "{{ cell.1 }} run={{ cell.0 }} | wait for OUR server to own the bench port"
+  # FAILURE ISOLATION + CORRECT-PROCESS GATE. Two jobs:
+  #   1. A competitor that fails to bind (crash on start, missing dep, bad flag)
+  #      must NOT abort the whole 31-column grid — captured via failed_when:false
+  #      and gated on cell_bound, so one flaky adapter costs only its own column.
+  #   2. We must never bench a LINGERING previous server that still holds the
+  #      port. The old probe accepted ANY listener on :PORT, so a slow-draining
+  #      predecessor satisfied it and the cell was silently measured against the
+  #      wrong process (the H2 cells against an H1-only sibling that resets the
+  #      h2c preface; gorilla_ws against gnet-h1 with no /ws routes). Now we
+  #      require the listener to be the process WE launched: the right binary,
+  #      and the right -engine when one applies.
+  # become:true so `ss -ltnp` + /proc/<pid>/cmdline can see every process.
+  # Language-runtime adapters (bun/python: hono, elysia, fastapi) listen under a
+  # runtime argv ("bun run dist/server", "python -m uvicorn ...") that never
+  # contains competitors/, so the shared-binary/-engine wrong-process hazard
+  # cannot apply to them — accept any listener for those (the port-free reap
+  # above already cleared any lingering predecessor).
+  become: true
   ansible.builtin.shell: |
+    bp={{ bench_port | default(8080) }}
+    want_bin="competitors/{{ cell_bin }}"
+    want_engine="{{ cell_engine | default('') }}"
     for i in $(seq 1 40); do
-      ss -ltn 2>/dev/null | grep -q ':{{ bench_port | default(8080) }} ' && exit 0
+      pids=$(ss -ltnp "sport = :${bp}" 2>/dev/null | tail -n +2 | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+      for holder in $pids; do
+        cmd=$(tr '\0' ' ' < /proc/$holder/cmdline 2>/dev/null)
+        case "$cmd" in
+          *competitors/*)
+            # Go competitor launched directly from competitors/: require the
+            # exact binary, and the exact -engine when the column carries one
+            # (trailing space pins it to a whole argv token, so -engine h1 is
+            # never accepted for an -engine h2c column).
+            if printf '%s' "$cmd" | grep -qF -- "$want_bin"; then
+              if [ -z "$want_engine" ] || printf '%s' "$cmd" | grep -qF -- "-engine $want_engine "; then
+                exit 0
+              fi
+            fi
+            ;;
+          ?*)
+            # Non-competitors/ listener = language-runtime adapter; accept.
+            exit 0
+            ;;
+        esac
+      done
       sleep 0.25
     done
-    echo "server did not bind in 10s" >&2
+    echo "our server ({{ cell.1 }}: $want_bin${want_engine:+ -engine $want_engine}) did not own :${bp} within 10s" >&2
     tail -50 {{ cell_dir }}/server.log >&2
     exit 1
   args:
     executable: /bin/bash
   changed_when: false
+  register: bind_probe
+  failed_when: false
   when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | record bind status"
+  ansible.builtin.set_fact:
+    cell_bound: "{{ (bind_probe.rc | default(1)) == 0 }}"
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | WARN unbound column (skipped; grid continues)"
+  ansible.builtin.debug:
+    msg: >-
+      CELL SKIPPED — {{ cell.1 }} failed to bind on {{ bench_target }};
+      this column is ABSENT from the results, grid continues with the next.
+  when:
+    - inventory_hostname == bench_target
+    - not (cell_bound | bool)
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | resolve real server PID"
   # `echo $!` in the previous task captures the bash subshell that
@@ -87,21 +235,22 @@
   args:
     executable: /bin/bash
   changed_when: false
-  when: inventory_hostname == bench_target
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (server side)"
   ansible.builtin.shell: |
-    nohup mpstat -P ALL 1 \
-      {{ ((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
-         + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)
-         + 5 }} \
+    nohup mpstat -P ALL 1 {{ mpstat_seconds }} \
       > {{ cell_dir }}/cpu.log 2>&1 &
     disown
     echo $! > {{ cell_dir }}/mpstat.pid
   args:
     executable: /bin/bash
   changed_when: false
-  when: inventory_hostname == bench_target
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start observer sampler (server side)"
   # The observer sidecars the server during the cell and emits a 1Hz
@@ -130,45 +279,88 @@
   args:
     executable: /bin/bash
   changed_when: false
-  when: inventory_hostname == bench_target
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
 
-# ---------- loadgen side: mpstat + loadgen ----------
+# ---------- loadgen side: mpstat + runner ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (loadgen side)"
   ansible.builtin.shell: |
-    nohup mpstat -P ALL 1 \
-      {{ ((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
-         + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)
-         + 5 }} \
+    nohup mpstat -P ALL 1 {{ mpstat_seconds }} \
       > {{ cell_dir }}/cpu.log 2>&1 &
     disown
     echo $! > {{ cell_dir }}/mpstat.pid
   args:
     executable: /bin/bash
   changed_when: false
-  when: inventory_hostname == "msa2-client"
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
 
-- name: "{{ cell.1 }} run={{ cell.0 }} | run loadgen against bench target"
-  # Flag names must match the loadgen CLI in cmd/loadgen/main.go:
-  #   -target / -duration / -warmup / -connections / -workers
-  #   -http2 / -h2c-upgrade / -out
-  # The (competitor, run-index) tuple is carried out-of-band via the
-  # per-cell output directory naming convention (00-<slug>/...), so the
-  # binary doesn't need a CLI knob for them.
+- name: "{{ cell.1 }} run={{ cell.0 }} | run runner against bench target"
+  # Flag names must match the runner CLI in cmd/runner/main.go:
+  #   -target / -server-name / -runs / -duration / -warmup /
+  #   -cells / -services / -out
+  # The runner expands the full scenario catalogue (filtered by -cells)
+  # for THIS one (run_index, competitor) cell, driving loadgen in-process
+  # against the remote SUT over the 20G fabric. -runs 1 keeps run
+  # repetition in ansible's outer loop so the cross-competitor x run
+  # interleaving is preserved. -services none because the loadgen box has
+  # no docker; driver/chain backends are wired on the SUT side. The
+  # runner writes run0/<scenario>/<server>.json plus its own
+  # results.json/report.md under the cell dir; mage_bench.go ingests the
+  # per-scenario JSON.
+  #
+  # NOTE: there is intentionally no -connections flag — connection count
+  # is a per-scenario property (each scenario's Workload() sets it, e.g.
+  # 128 for get-json, 32 for the H2 variants, 1 for single-conn). The
+  # legacy bench_connections knob applied only to the old single-scenario
+  # loadgen path and no longer maps onto the runner's per-scenario model.
+  #
+  # The -cells server-half matches the competitor slug (the runner's
+  # synthetic remote server is named via -server-name), so e.g.
+  # BENCH_CELLS='get-*/*' or '*/celeris-*' both work.
+  # HANG GUARD: a bound-but-wedged SUT (a competitor that accepts the
+  # connection but never completes responses — e.g. an event-loop server that
+  # deadlocks under concurrency) makes loadgen's workers block on socket reads
+  # the runner's own per-cell context timeout can't always interrupt (a
+  # blocked read syscall isn't ctx-cancellable). An unguarded runner then
+  # wedges the WHOLE 31-column grid on one bad adapter. `timeout` caps the
+  # whole runner invocation at a generous per-cell wall-clock (the mpstat
+  # window — n_scenarios × (warmup+duration) — doubled, + 120s slack), then
+  # SIGKILLs 30s later if it ignores SIGTERM. A timed-out cell (exit 124) is
+  # recorded + skipped via failed_when:false below; the grid continues.
   ansible.builtin.shell: |
     cd {{ bench_root }}
-    ./loadgen \
-      -target http://{{ target_ip }}:{{ bench_port | default(8080) }}{{ bench_url_path | default('/') }} \
+    timeout -k 30 {{ (mpstat_seconds | int) * 2 + 120 }} ./runner \
+      -target http://{{ target_ip }}:{{ bench_port | default(8080) }} \
+      -server-name {{ cell.1 }} \
+      -runs 1 \
       -duration {{ bench_duration | default('30s') }} \
       -warmup {{ bench_warmup | default('5s') }} \
-      -connections {{ bench_connections | default(256) }} \
-      {% if bench_workers | default(0) | int > 0 %}-workers {{ bench_workers }}{% endif %} \
-      {% if bench_h2 | default(false) | bool %}-http2{% endif %} \
-      {% if bench_h2c_upgrade | default(false) | bool %}-h2c-upgrade{% endif %} \
-      -out {{ cell_dir }}/loadgen.json \
-      2> {{ cell_dir }}/loadgen.stderr
+      -cells '{{ bench_cells | default('*') }}' \
+      {% if bench_rated | default(false) | bool %}-rated -rated-duration {{ bench_rated_duration | default('30s') }} {% endif %}\
+      -services none \
+      -out {{ cell_dir }} \
+      2> {{ cell_dir }}/runner.stderr
   args:
     executable: /bin/bash
-  when: inventory_hostname == "msa2-client"
+  register: runner_run
+  failed_when: false
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | WARN runner timed out / errored (cell skipped)"
+  ansible.builtin.debug:
+    msg: >-
+      RUNNER {{ 'TIMED OUT' if (runner_run.rc | default(0)) == 124 else 'ERRORED (rc=' + (runner_run.rc | default(0) | string) + ')' }}
+      for {{ cell.1 }} — likely a hung/broken SUT; this cell's data is partial
+      or absent, grid continues.
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
+    - (runner_run.rc | default(0)) != 0
 
 # ---------- teardown for this cell ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop observer (server side)"
@@ -194,11 +386,68 @@
   when: inventory_hostname == bench_target
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop server"
+  # Three-layer teardown — argv-pattern pkill alone is NOT enough. bun/python
+  # adapters exec into a language runtime whose argv is e.g. "bun run
+  # dist/server", matching neither "competitors/" nor the launcher path, and on
+  # exit the runtime reparents to PID 1 and keeps holding the bench port. A
+  # leaked listener makes the NEXT cell fail to bind → silently recorded as an
+  # absent column → grid data loss. So we kill defensively, by three independent
+  # handles, ending with a port-holder sweep that doesn't care about argv or
+  # process lineage at all:
+  #   1. the RESOLVED listener PID (server.pid, set via `ss -ltnp` above) and its
+  #      child group — correct for bun/python where the launcher != the runtime;
+  #   2. the classic "[c]ompetitors/" argv sweep — correct for the Go binaries;
+  #   3. whatever STILL holds :{{ bench_port | default(8080) }} — the definitive
+  #      guard, catching any orphan that reparented to init regardless of name.
+  # The layer-3 sweep must kill ALL holders + their PARENTS each pass: fastapi/
+  # uvicorn (and gunicorn) run a supervisor master that RESPAWNS killed workers,
+  # so killing one worker per pass never converges (observed: 17 uvicorn workers
+  # holding :8080 survived a one-pid sweep). Killing each holder's parent takes
+  # out the respawning master; the ppid>1 guard avoids ever signalling init.
   become: true
   ansible.builtin.shell: |
+    bench_port={{ bench_port | default(8080) }}
+    # 1) resolved listener pid + its immediate children (runtime launchers fork)
+    if [ -f {{ cell_dir }}/server.pid ]; then
+      spid=$(cat {{ cell_dir }}/server.pid 2>/dev/null)
+      if [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null; then
+        pkill -TERM -P "$spid" 2>/dev/null
+        kill -TERM "$spid" 2>/dev/null
+        for i in $(seq 1 10); do kill -0 "$spid" 2>/dev/null || break; sleep 0.3; done
+        pkill -KILL -P "$spid" 2>/dev/null
+        kill -KILL "$spid" 2>/dev/null
+      fi
+    fi
+    # 2) classic argv sweep for the Go competitors + the python/bun supervisors
+    #    (bracket-protected so this pkill cannot match the shell running it).
     pkill -TERM -f "[c]ompetitors/" 2>/dev/null
+    pkill -KILL -f "[u]vicorn" 2>/dev/null
+    pkill -KILL -f "[g]unicorn" 2>/dev/null
     sleep 1
     pkill -KILL -f "[c]ompetitors/" 2>/dev/null
+    # 3) port-holder sweep — kill EVERY pid still bound to the bench port, repeat
+    #    until free. The respawning [u]vicorn/[g]unicorn master is already handled
+    #    by the name-pkill in step 2 (it matches the master AND every worker). The
+    #    bracket form in comments is deliberate: ansible runs the block via sh -c,
+    #    so the whole script (comments included) sits in the shell argv, and a
+    #    bare process name here would be matched by its own pkill -f and SIGKILL
+    #    this task (rc=-9). We also do NOT kill the parents of holders: a server
+    #    started by ansible can reparent to the ansible session, so killing that
+    #    parent SIGKILLs the playbook connection (rc=-9) and corrupts every
+    #    subsequent column.
+    for i in $(seq 1 6); do
+      pids=$(ss -ltnp "sport = :${bench_port}" 2>/dev/null | tail -n +2 | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+      [ -z "$pids" ] && break
+      for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+      sleep 0.5
+    done
     true
+  args:
+    executable: /bin/bash
   changed_when: false
+  # Teardown is best-effort: a non-zero rc here (e.g. a pkill quirk) must NEVER
+  # fail the task, because a failed per-cell task drops the bench target from
+  # the play and silently zeros every subsequent column. The next cell's
+  # "stop any prior server" + bind-failure isolation handle any leftover.
+  failed_when: false
   when: inventory_hostname == bench_target

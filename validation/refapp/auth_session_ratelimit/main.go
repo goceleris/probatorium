@@ -153,6 +153,10 @@ func main() {
 	rps := flag.Float64("rps", 1000, "ratelimit RPS per key")
 	burst := flag.Int("burst", 200, "ratelimit burst per key")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto (picks iouring on Linux, std elsewhere)")
+	asyncHandlers := flag.Bool("async-handlers", true,
+		"celeris.Config.AsyncHandlers. Set false to exercise the hasAsyncRoutes() derivation: "+
+			"AsyncHandlers off, but the .Async() route below still forces async dispatch — the bench "+
+			"epoll-h1-sync config that crashed in celeris#309 when a sync ws/sse handler ran inline.")
 	flag.Parse()
 
 	users := newStore()
@@ -173,7 +177,7 @@ func main() {
 		Addr:            *bind,
 		Engine:          engineType,
 		Protocol:        celeris.HTTP1,
-		AsyncHandlers:   true,
+		AsyncHandlers:   *asyncHandlers,
 		ReadTimeout:     30 * time.Second,
 		WriteTimeout:    30 * time.Second,
 		IdleTimeout:     120 * time.Second,
@@ -241,6 +245,15 @@ func main() {
 // the in-memory store, with one twist: every handler short-circuits
 // to 401 if no session is established (except /login itself).
 func registerRoutes(srv *celeris.Server, users *store) {
+	// /async-data is a trivial .Async() route. Its mere presence flips the
+	// engine's hasAsyncRoutes() to true, so even with -async-handlers=false the
+	// listener runs async — the EXACT derivation the bench epoll-h1-sync config
+	// uses, and the one that crashed in celeris#309 when a SYNC ws/sse handler
+	// ran inline and Detached. Registered here (with the other routes, after all
+	// Use middleware) so it never trips the Use-after-route guard.
+	srv.GET("/async-data", func(c *celeris.Context) error {
+		return c.JSON(200, map[string]string{"mode": "async-route"})
+	}).Async()
 	srv.POST("/login", func(c *celeris.Context) error {
 		var req struct {
 			Username string `json:"username"`

@@ -57,9 +57,14 @@
     set -euo pipefail
     if [ ! -x "{{ bench_root }}/uv/bin/uv" ]; then
       curl -fsSL https://astral.sh/uv/install.sh | sh
-    else
-      "{{ bench_root }}/uv/bin/uv" self update
     fi
+    # Already present (a re-deploy within the same cluster lifecycle): leave
+    # it. `uv self update` is REFUSED for an UV_UNMANAGED_INSTALL binary
+    # (which is exactly how we stage it under bench_root) — it exits non-zero
+    # with "Self-update is only available for uv binaries installed via the
+    # standalone installation scripts", aborting the whole deploy on the 2nd
+    # run. "always-latest" is satisfied by the fresh install on the first
+    # deploy; cleanup wipes bench_root so the next pristine deploy re-fetches.
   args:
     executable: /bin/bash
 

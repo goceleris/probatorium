@@ -28,6 +28,15 @@ func main() {
 	app := iris.New()
 	app.Logger().SetLevel("warn")
 	registerRoutes(app)
+
+	// Phase-2 routes: driver round-trips (PG/Redis/memcached/session) and
+	// the four middleware chains. Driver clients are opened lazily from
+	// env-configured endpoints; unset services degrade to 503.
+	dc := newDriverClients()
+	defer closeDriverClients(dc)
+	mountDriverHandlers(app, dc)
+	mountChainHandlers(app)
+
 	if err := app.Build(); err != nil {
 		log.Fatalf("iris: build: %v", err)
 	}

@@ -19,6 +19,9 @@ const (
 	CategoryConcurrency = "concurrency"
 	CategoryChain       = "chain"
 	CategoryDriver      = "driver"
+	CategoryWS          = "ws"
+	CategorySSE         = "sse"
+	CategoryTLS         = "tls"
 )
 
 // Scenario is one benchable workload — it knows how to configure loadgen

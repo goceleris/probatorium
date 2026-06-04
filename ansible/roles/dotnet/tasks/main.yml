@@ -1,0 +1,111 @@
+---
+# Native .NET SDK via the official dotnet-install.sh, installed
+# pristinely under {{ bench_root }}/dotnet. Always-latest stable channel
+# (LTS) resolved at deploy time by the install script itself.
+#
+# Why dotnet-install.sh (not apt / not the packages.microsoft.com repo):
+# the apt path adds a Microsoft apt source + GPG key to /etc/apt — a
+# permanent, hard-to-fully-reverse system mutation that violates the
+# pristine rule. dotnet-install.sh drops a self-contained SDK tree under
+# any DOTNET_ROOT we name and touches NOTHING else, so cleanup.yml's
+# rm -rf reverses it whole. The SDK is fetched per-node for the node's
+# GOARCH (`arch` from inventory): x64 on msa2-server, arm64 on msr1.
+#
+# The aspnet adapter is built ON the node (dotnet publish -c Release),
+# not cross-compiled on the Mac: a self-contained publish needs the
+# target-RID runtime pack, and building on the node guarantees the
+# Kestrel apphost matches the node's libc/CPU. The build artefacts land
+# under bench_root (competitors-src/aspnet) so cleanup wipes them.
+#
+# Manifest contract: appends to installed_toolchains an entry of
+#   { lang: 'dotnet', path: <abs path>, apt_pkgs: [<pkgs we apt-installed>] }
+# and records the resolved dotnet SDK version into fetched_versions.
+#
+# Cleanup is centralised in cleanup.yml — it rm -rf's
+# installed_toolchains[*].path and apt-purges installed_packages, which
+# together fully reverse this role.
+
+- name: dotnet | ensure dotnet install root exists
+  ansible.builtin.file:
+    path: "{{ bench_root }}/dotnet"
+    state: directory
+    mode: '0755'
+
+# dotnet-install.sh needs curl + ca-certificates. The .NET runtime links
+# libicu (globalization) + libssl at run time; both ship on every Ubuntu
+# base image, but libicu is occasionally absent on -minimal images, so we
+# probe for it. Detect what's missing rather than install
+# unconditionally.
+- name: dotnet | detect missing system packages (curl + ca-certificates + libicu)
+  ansible.builtin.shell: |
+    for pkg in curl ca-certificates; do
+      dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+    done
+    # libicu is versioned (libicu70, libicu74, ...); match any installed
+    # variant via the `libicu` virtual-ish prefix, else request the
+    # unversioned metapackage `libicu-dev`-free runtime via `libicu`.
+    dpkg -l 'libicu[0-9]*' 2>/dev/null | grep -q '^ii' || echo "libicu"
+  register: dotnet_missing_pkgs
+  changed_when: false
+
+- name: dotnet | install missing apt packages
+  become: true
+  ansible.builtin.apt:
+    name: "{{ dotnet_missing_pkgs.stdout_lines }}"
+    state: present
+    update_cache: true
+  when: dotnet_missing_pkgs.stdout_lines | length > 0
+
+- name: dotnet | append apt packages to manifest fact
+  ansible.builtin.set_fact:
+    installed_packages: "{{ installed_packages + dotnet_missing_pkgs.stdout_lines }}"
+  when: dotnet_missing_pkgs.stdout_lines | length > 0
+
+# Map inventory GOARCH to the dotnet-install --architecture token.
+- name: dotnet | map GOARCH to dotnet-install architecture
+  ansible.builtin.set_fact:
+    dotnet_arch: "{{ 'x64' if arch == 'amd64' else 'arm64' }}"
+
+# dotnet-install.sh is idempotent: --install-dir pins the SDK tree under
+# bench_root, and re-running with the same channel is a no-op when the
+# resolved SDK is already present (it skips the download). --channel LTS
+# resolves always-latest LTS at fetch time (mirrors the always-latest
+# policy of the rust/bun/python roles). --no-path stops it editing any
+# profile/rc file — a critical pristine-violation guard, equivalent to
+# rustup's --no-modify-path / uv's UV_NO_MODIFY_PATH.
+- name: dotnet | install .NET SDK (always-latest LTS) via dotnet-install.sh
+  environment:
+    DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    DOTNET_NOLOGO: "1"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    curl -fsSL https://dot.net/v1/dotnet-install.sh -o "{{ bench_root }}/dotnet/dotnet-install.sh"
+    chmod +x "{{ bench_root }}/dotnet/dotnet-install.sh"
+    "{{ bench_root }}/dotnet/dotnet-install.sh" \
+      --channel LTS \
+      --architecture {{ dotnet_arch }} \
+      --install-dir "{{ bench_root }}/dotnet" \
+      --no-path
+  args:
+    executable: /bin/bash
+    creates: "{{ bench_root }}/dotnet/dotnet"
+
+- name: dotnet | resolve installed SDK version
+  environment:
+    DOTNET_ROOT: "{{ bench_root }}/dotnet"
+    DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    DOTNET_NOLOGO: "1"
+  ansible.builtin.command: "{{ bench_root }}/dotnet/dotnet --version"
+  register: dotnet_version
+  changed_when: false
+
+- name: dotnet | append toolchain entry to manifest
+  ansible.builtin.set_fact:
+    installed_toolchains: >-
+      {{ installed_toolchains
+         + [{ 'lang': 'dotnet',
+              'path': bench_root + '/dotnet',
+              'apt_pkgs': dotnet_missing_pkgs.stdout_lines }] }}
+    fetched_versions: >-
+      {{ fetched_versions
+         | combine({ 'dotnet': dotnet_version.stdout | trim }) }}

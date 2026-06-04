@@ -1,9 +1,18 @@
 ---
-# Distributed bench: server (celeris OR competitor) on bench_target,
-# loadgen on msa2-client, traffic over the 20G LACP fabric (lan_ip,
-# NEVER tailnet/Tailscale). Loops the loadgen across every entry in
-# competitor_set, interleaving the launches so a transient cluster blip
-# does not bias one framework over another.
+# Distributed bench: server (celeris OR competitor) on bench_target, the
+# Go runner (driving loadgen in-process) on msa2-client, traffic over the
+# 20G LACP fabric (lan_ip, NEVER tailnet/Tailscale). Loops over every
+# entry in competitor_set, interleaving the launches so a transient
+# cluster blip does not bias one framework over another. Each cell runs
+# the runner once (-runs 1) and the runner expands the scenario catalogue
+# against the remote SUT.
+#
+# Each cell drives the Go runner (cmd/runner) once against the remote
+# SUT; the runner expands the full scenario catalogue itself (method /
+# path / protocol / connections / body are derived per scenario), so the
+# old single-scenario loadgen knobs (bench_url_path / bench_h2 /
+# bench_h2c_upgrade / bench_connections) no longer apply on the bench
+# path and have been dropped.
 #
 # Required extra-vars:
 #   bench_target          single host name from [bench_targets]
@@ -14,12 +23,18 @@
 #                         staged under {{ bench_root }}/competitors/<slug>
 #                         by `ansible-playbook deploy.yml`.
 #   bench_port            port the server binds (default: 8080)
-#   bench_url_path        path component of loadgen -url (default: /)
-#   bench_duration        loadgen -duration (default: 30s)
-#   bench_warmup          loadgen -warmup (default: 5s)
-#   bench_connections     loadgen -connections (default: 256)
-#   bench_workers         loadgen -workers (0 → loadgen default)
-#   bench_h2              loadgen -h2 flag value (default: false)
+#   bench_duration        runner -duration, per scenario (default: 30s)
+#   bench_warmup          runner -warmup, per scenario (default: 5s)
+#   bench_cells           cell glob forwarded to runner -cells over
+#                         "<scenario>/<competitor>" (default: *). The
+#                         server half is the competitor slug.
+#   bench_rated           when true (1), the runner also drives a Gil-Tene
+#                         rated (closed-loop, CO-corrected) sweep per cell and
+#                         emits latency_at_slo for the regression gate. Default
+#                         false; opt-in via BENCH_RATED=1 (budget issue #166).
+#   bench_rated_duration  measurement window per rated pass (default: 30s).
+#   bench_scenario_count  upper bound on scenarios per cell, used only to
+#                         size the mpstat samplers (default: 28).
 #   bench_runs            number of repetitions per competitor (default: 3)
 #   results_local_dir     where to fetch outputs back to on the Mac
 #
@@ -28,7 +43,11 @@
 # competitor sees the same coarse-grained slice of cluster state
 # (kernel cache warmth, port-pool depletion, neighbour interference).
 # Failure to interleave was responsible for the v1.4.1 ranking flip
-# between fasthttp and gnet on msr1.
+# between fasthttp and gnet on msr1. The runner is deliberately invoked
+# with -runs 1 per cell so run repetition stays in THIS outer loop —
+# folding runs into one runner pass (-runs N) would run all of
+# competitor A's runs back-to-back and regress that guarantee. The
+# runner adds only the scenario inner loop within each cell.
 
 - name: Stage bench-run state
   hosts: cluster
@@ -72,6 +91,86 @@
       ansible.builtin.set_fact:
         target_ip: "{{ hostvars[bench_target].lan_ip }}"
       when: inventory_hostname == "msa2-client"
+
+    # ---------- driver-backend services (bench target only) ----------
+    # Driver-* scenarios (driver-pg-read / driver-redis-get / driver-mc-get /
+    # driver-session-rw) need pg/redis/mc reachable from the SUT, which runs on
+    # the bench target. The dbservices role (deploy.yml) only INSTALLS docker +
+    # pulls images; nobody starts the containers on the bench path (the runner
+    # is invoked with -services none because it lives on the loadgen host, which
+    # has no docker). So start + seed them here, on the bench target, mirroring
+    # validate.yml's fixed-port containers. The SUT env (run_bench_cell.yml)
+    # points the driver clients at these same ports.
+    #
+    # Gated on bench_needs_dbservices (mage Bench sets it when a driver-* cell
+    # is in scope) so a Go-only / non-driver bench stays docker-free. Fixed
+    # ports match validate.yml + the driver refapp defaults:
+    #   postgres 127.0.0.1:54321  redis 127.0.0.1:63791  memcached 127.0.0.1:21211
+    - name: dbservices | open docker socket for the bench user
+      become: true
+      ansible.builtin.file:
+        path: /var/run/docker.sock
+        mode: '0666'
+      when:
+        - inventory_hostname == bench_target
+        - bench_needs_dbservices | default(false) | bool
+
+    - name: dbservices | start postgres + redis + memcached (fixed ports)
+      ansible.builtin.shell: |
+        docker rm -f probatorium-pg probatorium-redis probatorium-mc 2>/dev/null
+        docker run -d --rm --name probatorium-pg -p 127.0.0.1:54321:5432 \
+          -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
+          postgres:17-alpine
+        docker run -d --rm --name probatorium-redis -p 127.0.0.1:63791:6379 redis:8.2-alpine
+        docker run -d --rm --name probatorium-mc -p 127.0.0.1:21211:11211 memcached:1.6.41-alpine
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when:
+        - inventory_hostname == bench_target
+        - bench_needs_dbservices | default(false) | bool
+
+    - name: dbservices | wait for postgres ready
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          docker exec probatorium-pg pg_isready -U bench -d bench >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        echo "postgres not ready in 30s" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when:
+        - inventory_hostname == bench_target
+        - bench_needs_dbservices | default(false) | bool
+
+    - name: dbservices | seed the driver fixture set (runner one-shot mode)
+      # Reuses the EXACT services.Seed fixtures (10k-row users table, demo-key,
+      # per-user sessions) via the runner's -seed-services mode, so remote
+      # driver cells hit byte-identical data to a local in-process run. Runs on
+      # the bench target where both the containers and the staged runner live.
+      #
+      # Retried: pg_isready (the wait step above) reports ready as soon as the
+      # postmaster accepts connections, but a freshly-initialised postgres
+      # RESTARTS once after running its init scripts, so the first real auth
+      # connection can get "connection reset by peer" — especially on the slower
+      # arm64 box where that init window is wider. Retrying the actual seed
+      # connection (not just the probe) closes that gap deterministically.
+      ansible.builtin.shell: |
+        cd {{ bench_root }}
+        ./runner -seed-services \
+          "postgres=postgres://bench:bench@127.0.0.1:54321/bench?sslmode=disable,redis=127.0.0.1:63791,memcached=127.0.0.1:21211"
+      args:
+        executable: /bin/bash
+      register: seed_result
+      until: seed_result.rc == 0
+      retries: 10
+      delay: 3
+      changed_when: true
+      when:
+        - inventory_hostname == bench_target
+        - bench_needs_dbservices | default(false) | bool
 
 # Outer loop over [run_index × competitor] cycles is driven from the
 # control node via include_tasks. This block runs once per (run, comp)
@@ -127,12 +226,44 @@
           pkill -x "$name" 2>/dev/null
         done
         pkill -f "[c]ompetitors/" 2>/dev/null
+        pkill -KILL -f "[u]vicorn" 2>/dev/null
+        pkill -KILL -f "[g]unicorn" 2>/dev/null
+        # Final port-holder sweep: kill EVERY pid still bound to the bench port,
+        # repeat until free. The respawning [u]vicorn/[g]unicorn master is handled
+        # by the name-pkill above (matches master + all workers). Bracket form is
+        # deliberate: the whole script sits in the shell argv, so a bare process
+        # name in a comment would be matched by its own pkill -f. We do NOT kill
+        # the parents of holders: an ansible-started server can be reparented to
+        # the ansible session, and killing that parent SIGKILLs this task (rc=-9).
+        for i in $(seq 1 6); do
+          pids=$(ss -ltnp "sport = :{{ bench_port | default(8080) }}" 2>/dev/null | tail -n +2 | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+          [ -z "$pids" ] && break
+          for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+          sleep 0.5
+        done
         true
+      args:
+        executable: /bin/bash
       changed_when: false
       register: stop_result
       until: stop_result is succeeded
       retries: 3
       delay: 5
+
+    - name: dbservices | stop fixture containers (bench target only)
+      # Symmetric teardown for the start step in the Stage play. --rm means a
+      # stop is enough to remove them; -f covers a still-running container. Never
+      # fail the cleanup play on this — a missing container (Go-only bench, or an
+      # earlier crash) is fine.
+      ansible.builtin.shell: |
+        docker rm -f probatorium-pg probatorium-redis probatorium-mc 2>/dev/null
+        true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when:
+        - inventory_hostname == bench_target
+        - bench_needs_dbservices | default(false) | bool
 
     - name: Wait for mpstat samplers to finish writing
       ansible.builtin.shell: |

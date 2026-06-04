@@ -143,6 +143,14 @@ type Config struct {
 	//
 	// Tracked under issue #103 — engine matrix coverage.
 	RefappEngine string
+
+	// RefappAsyncHandlers, when non-empty ("true"/"false"), is passed to the
+	// refapp as `-async-handlers=<v>`; empty leaves the refapp default. The
+	// sync/async coverage axis: AsyncHandlers=false WITH a .Async() route forces
+	// l.async via hasAsyncRoutes — the bench epoll-h1-sync derivation that
+	// crashed in celeris#309 and that the AsyncHandlers=true refapps never
+	// exercised (validation gap C).
+	RefappAsyncHandlers string
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -712,11 +720,22 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		fire(properties.IWSHang.ID,
 			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
 			snap.WSTorture.HangNoClose > 0)
+		// Engine-agnostic crash oracle: the refapp process died mid-run. This
+		// is the catch-all that the per-protocol counters above can't see — a
+		// dead server just looks like connection-refused to every walker.
+		fire(properties.ILiveness.ID,
+			fmt.Sprintf("refapp process died mid-run: %s", snap.Liveness.Reason()),
+			snap.Liveness.Crashed)
+		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
+		// connection errors). Complements I-LIVENESS for the hang class.
+		fire(properties.IHang.ID,
+			fmt.Sprintf("refapp wedged mid-run: %s", snap.Liveness.Reason()),
+			snap.Liveness.Hung)
 	}
 
 	cfg := tier1Config{
 		Driver:      driver,
-		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine),
+		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers),
 		BaseURL:     "http://" + o.cfg.CelerisListenAddr,
 		Matrix:      o.matrix,
 		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
@@ -842,7 +861,7 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 
 	cfg := tier3Config{
 		Driver:        driver,
-		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine),
+		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers),
 		ReplayBin:     replayBin,
 		Seeds:         o.seeds,
 		CelerisCommit: o.cfg.CelerisCommit,
@@ -1219,10 +1238,13 @@ func PrintReplayPlan(w io.Writer, rs ReplayedSeed) {
 // the engine choice through Config.RefappEngine so a single mage
 // Validate run can pin to a specific celeris engine without rebuilding
 // the refapp.
-func buildRefappArgs(addr, engine string) []string {
+func buildRefappArgs(addr, engine, asyncHandlers string) []string {
 	args := []string{"-bind", addr}
 	if engine != "" {
 		args = append(args, "-engine", engine)
+	}
+	if asyncHandlers != "" {
+		args = append(args, "-async-handlers="+asyncHandlers)
 	}
 	return args
 }

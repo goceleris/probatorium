@@ -1,0 +1,149 @@
+---
+# Native Zig toolchain via the official prebuilt tarball, unpacked
+# pristinely under {{ bench_root }}/zig. Always-latest stable resolved
+# at deploy time from the ziglang.org download index.
+#
+# Why a prebuilt tarball (not apt / not snap): Ubuntu's apt zig is years
+# stale and snap mutates ~ + /var. The upstream tarball is a single
+# self-contained tree (the `zig` binary + its bundled lib/ std + a
+# vendored clang/lld for the C backend) — it needs ZERO system packages
+# and drops cleanly under bench_root, so cleanup.yml's rm -rf reverses
+# it whole. Zig is itself a cross-compiler, but each bench node still
+# builds its OWN adapter natively here (the build_native path), so we
+# fetch the tarball matching the node's GOARCH (`arch` from inventory):
+# x86_64 on msa2-server, aarch64 on msr1.
+#
+# Manifest contract: appends to installed_toolchains an entry of
+#   { lang: 'zig', path: <abs path>, apt_pkgs: [<pkgs we apt-installed>] }
+# and records the resolved zig version into fetched_versions.
+#
+# Cleanup is centralised in cleanup.yml — it rm -rf's
+# installed_toolchains[*].path and apt-purges installed_packages, which
+# together fully reverse this role.
+
+- name: zig | ensure zig install root exists
+  ansible.builtin.file:
+    path: "{{ bench_root }}/zig"
+    state: directory
+    mode: '0755'
+
+# The tarball is .tar.xz; unarchive needs `xz` (xz-utils). curl + ca-
+# certificates fetch the JSON index + tarball. Detect what's missing
+# rather than install unconditionally — most nodes already have curl +
+# ca-certs; xz-utils is the only frequent gap.
+- name: zig | detect missing system packages (curl + ca-certificates + xz-utils)
+  ansible.builtin.shell: |
+    for pkg in curl ca-certificates xz-utils; do
+      dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+    done
+  register: zig_missing_pkgs
+  changed_when: false
+
+- name: zig | install missing apt packages
+  become: true
+  ansible.builtin.apt:
+    name: "{{ zig_missing_pkgs.stdout_lines }}"
+    state: present
+    update_cache: true
+  when: zig_missing_pkgs.stdout_lines | length > 0
+
+- name: zig | append apt packages to manifest fact
+  ansible.builtin.set_fact:
+    installed_packages: "{{ installed_packages + zig_missing_pkgs.stdout_lines }}"
+  when: zig_missing_pkgs.stdout_lines | length > 0
+
+# Map the inventory GOARCH to the ziglang.org tarball arch token.
+- name: zig | map GOARCH to ziglang download arch
+  ansible.builtin.set_fact:
+    zig_dl_arch: "{{ 'x86_64' if arch == 'amd64' else 'aarch64' }}"
+
+# Resolve "always-latest stable" from the official download index. The
+# index.json schema is { "<version>": { "<arch>-linux": { "tarball": url,
+# "shasum": sha256 } }, ... } with a top-level "master" key we skip — we
+# want the newest *released* version, i.e. the max non-"master" key by
+# semver. jq does the version pick + url/shasum extraction in one shot so
+# the playbook never hard-codes a version (mirrors rust/bun/python
+# always-latest policy).
+- name: zig | resolve latest stable version + tarball url from download index
+  ansible.builtin.shell: |
+    set -euo pipefail
+    idx="$(curl -fsSL https://ziglang.org/download/index.json)"
+    ver="$(printf '%s' "$idx" | python3 -c '
+    import json,sys
+    d=json.load(sys.stdin)
+    cands=[k for k in d if k!="master"]
+    # newest by semver tuple (major,minor,patch); dev/pre suffixes absent in releases
+    cands.sort(key=lambda v: [int(x) for x in v.split(".")])
+    print(cands[-1])')"
+    url="$(printf '%s' "$idx" | python3 -c "import json,sys; print(json.load(sys.stdin)['$ver']['{{ zig_dl_arch }}-linux']['tarball'])")"
+    sha="$(printf '%s' "$idx" | python3 -c "import json,sys; print(json.load(sys.stdin)['$ver']['{{ zig_dl_arch }}-linux']['shasum'])")"
+    printf '%s\t%s\t%s\n' "$ver" "$url" "$sha"
+  register: zig_index
+  changed_when: false
+
+- name: zig | set resolved version / url / shasum facts
+  ansible.builtin.set_fact:
+    zig_version: "{{ zig_index.stdout.split('\t')[0] }}"
+    zig_url: "{{ zig_index.stdout.split('\t')[1] }}"
+    zig_sha256: "{{ zig_index.stdout.split('\t')[2] }}"
+
+# Idempotency: only (re)install when the resolved-latest binary isn't
+# already present under bench_root/zig/<version>/. The download is
+# checksum-verified against the index shasum so a truncated/MITM tarball
+# never silently installs. We unpack into a versioned subdir and point a
+# stable `current` symlink at it so the PATH used by build_native is
+# version-agnostic.
+- name: zig | check whether resolved version is already installed
+  ansible.builtin.stat:
+    path: "{{ bench_root }}/zig/{{ zig_version }}/zig"
+  register: zig_installed
+
+- name: zig | download + verify prebuilt tarball
+  ansible.builtin.get_url:
+    url: "{{ zig_url }}"
+    dest: "{{ bench_root }}/zig/zig-{{ zig_dl_arch }}-{{ zig_version }}.tar.xz"
+    checksum: "sha256:{{ zig_sha256 }}"
+    mode: '0644'
+  when: not zig_installed.stat.exists
+
+- name: zig | unpack tarball into versioned dir
+  ansible.builtin.unarchive:
+    src: "{{ bench_root }}/zig/zig-{{ zig_dl_arch }}-{{ zig_version }}.tar.xz"
+    dest: "{{ bench_root }}/zig/"
+    remote_src: true
+    # The tarball's top-level dir is `zig-<arch>-linux-<version>` (or
+    # `zig-linux-<arch>-<version>` on older releases). extra_opts strips
+    # that one leading path component so files land directly under the
+    # versioned dir we control, regardless of the upstream naming drift.
+    extra_opts:
+      - "--strip-components=1"
+      - "--one-top-level={{ bench_root }}/zig/{{ zig_version }}"
+  when: not zig_installed.stat.exists
+
+- name: zig | point stable `current` symlink at the resolved version
+  ansible.builtin.file:
+    src: "{{ bench_root }}/zig/{{ zig_version }}"
+    dest: "{{ bench_root }}/zig/current"
+    state: link
+    force: true
+
+- name: zig | drop the downloaded tarball (unpacked tree is what we keep)
+  ansible.builtin.file:
+    path: "{{ bench_root }}/zig/zig-{{ zig_dl_arch }}-{{ zig_version }}.tar.xz"
+    state: absent
+
+- name: zig | resolve installed zig version (sanity check)
+  ansible.builtin.command: "{{ bench_root }}/zig/current/zig version"
+  register: zig_ver_out
+  changed_when: false
+
+- name: zig | append toolchain entry to manifest
+  ansible.builtin.set_fact:
+    installed_toolchains: >-
+      {{ installed_toolchains
+         + [{ 'lang': 'zig',
+              'path': bench_root + '/zig',
+              'apt_pkgs': zig_missing_pkgs.stdout_lines }] }}
+    fetched_versions: >-
+      {{ fetched_versions
+         | combine({ 'zig': zig_ver_out.stdout | trim }) }}
