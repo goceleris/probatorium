@@ -184,7 +184,12 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	var readyOnce sync.Once
 	go superviseStderr(proc.Stderr(), tally.liveness,
 		func() { readyOnce.Do(func() { close(readyCh) }) },
-		func(err error) { select { case readyErrCh <- err: default: } },
+		func(err error) {
+			select {
+			case readyErrCh <- err:
+			default:
+			}
+		},
 		cancelRun)
 	go watchProcessExit(ctx, proc, tally.liveness, cancelRun)
 
