@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/bradfitz/gomemcache v0.0.0-20260422231931-4d751bb6e37c
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/kataras/iris/v12 v12.2.11
 	github.com/redis/go-redis/v9 v9.20.0
 )
