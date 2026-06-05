@@ -125,6 +125,12 @@ func newestBenchmarkedVersion() (string, error) {
 //	BENCH_BACK_TO_BACK=1       N published run-K cells (release: 3)
 //	BENCH_RUNS=3               per-cell median basis inside each publish
 //	BENCH_TARGET=both          msa2-server | msr1 | both (both = 2 arches)
+//	BENCH_SKIP_RATED=          "1" runs saturation passes only. The rated
+//	                           pass currently publishes to the same run-K
+//	                           tree as its saturation pass, so it would
+//	                           overwrite the full throughput grid with the
+//	                           SLO subset; skip it for a throughput-only
+//	                           baseline until rated gets its own sub-resource.
 func BenchTier() error {
 	p := budget.ForProfile(os.Getenv("BENCH_PROFILE"))
 	n := atoiOr(os.Getenv("BENCH_BACK_TO_BACK"), 1)
@@ -167,8 +173,11 @@ func BenchTier() error {
 		}
 
 		// Rated pass: curated subset, rated ON, same run-K cell. Skipped
-		// when the profile carries no rated subset.
-		if p.RatedCells > 0 && len(p.RatedGlobs) > 0 {
+		// when the profile carries no rated subset, or when BENCH_SKIP_RATED
+		// is set (it would otherwise overwrite the saturation grid at the
+		// shared run-K path — see the BENCH_SKIP_RATED knob doc above).
+		skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true"
+		if p.RatedCells > 0 && len(p.RatedGlobs) > 0 && !skipRated {
 			fmt.Printf("\n=== BenchTier: %s (rated pass) ===\n", runID)
 			setBenchEnvFromProfile(p, true)
 			if err := Bench(); err != nil {

@@ -37,6 +37,9 @@ const benchmarkPublishedEvent = "benchmark-published"
 // docsRepo is the GitHub owner/repo the tree is published to.
 const docsRepo = "goceleris/docs"
 
+// docsBranch is the docs default branch every publish pushes to.
+const docsBranch = "main"
+
 // defaultRunID is the canonical run for a date. Phase 5's back-to-back
 // loop (BenchTier, #167) overrides this per pass via PUBLISH_RUN_ID
 // (run-1..run-N); absent that env, every publish is run-1.
@@ -187,9 +190,11 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, error) {
 }
 
 // cellRelPath is the repo-root-relative path of a published cell, the
-// value the pointer dispatch and the contents API both key on.
+// value the pointer dispatch and the contents API both key on. It mirrors
+// WriteTree's on-disk layout via the shared report.CellRelDir helper so a
+// back-to-back run-K never overwrites run-1's flat tree.
 func cellRelPath(meta report.SplitMeta) string {
-	return filepath.ToSlash(filepath.Join("results", meta.Version, meta.Date, meta.Arch))
+	return filepath.ToSlash(filepath.Join("results", report.CellRelDir(meta)))
 }
 
 // publishViaGit writes the tree into a goceleris/docs checkout and
@@ -233,7 +238,7 @@ func publishViaGit(meta report.SplitMeta, doc *report.Document, tsGz []byte) (st
 		"commit", "-m", msg); err != nil {
 		return "", err
 	}
-	if err := runGit(repoDir, "push", authRemote(token), "HEAD"); err != nil {
+	if err := pushDocsHEAD(repoDir, token); err != nil {
 		return "", err
 	}
 
@@ -368,6 +373,38 @@ func dispatchPointer(meta report.SplitMeta, commit string) error {
 func cloneDocs(dir, token string) error {
 	fmt.Printf("Cloning %s (shallow)...\n", docsRepo)
 	return runGit("", "clone", "--depth", "1", authRemote(token), dir)
+}
+
+// pushDocsHEAD pushes HEAD to the docs branch, recovering from the
+// non-fast-forward rejection that happens when the docs-sync workflow
+// commits an index.json update between two back-to-back publishes that
+// reuse one DOCS_REPO_DIR checkout (every BenchTier run: run-K saturation
+// then run-K rated, then the next run). publishViaGit's commit only touches
+// the run-K results tree — never index.json, which the workflow owns — so
+// rebasing our publish commit onto the freshly fetched remote head replays
+// cleanly with no file conflict; we then retry the push. Bounded retries
+// guard against a livelock if the remote keeps moving.
+func pushDocsHEAD(repoDir, token string) error {
+	const maxAttempts = 6
+	remote := authRemote(token)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := runGit(repoDir, "push", remote, "HEAD:"+docsBranch); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		// Rejected (the workflow moved the branch): re-base our publish commit
+		// onto the new remote head and retry the push.
+		if err := runGit(repoDir, "fetch", remote, docsBranch); err != nil {
+			return fmt.Errorf("docs push: fetch before rebase (attempt %d/%d): %w", attempt, maxAttempts, err)
+		}
+		if err := runGit(repoDir, "rebase", "FETCH_HEAD"); err != nil {
+			_ = runGit(repoDir, "rebase", "--abort")
+			return fmt.Errorf("docs push: rebase onto remote head (attempt %d/%d): %w", attempt, maxAttempts, err)
+		}
+	}
+	return fmt.Errorf("docs push: still rejected after %d rebase attempts (remote kept moving): %w", maxAttempts, lastErr)
 }
 
 // authRemote builds an https remote URL with the token embedded so git

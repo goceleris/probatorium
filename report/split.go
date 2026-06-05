@@ -51,6 +51,26 @@ const (
 	EnvFile        = "env.json"
 )
 
+// DefaultRunID is the canonical first run. Its split files live at the flat
+// <version>/<date>/<arch> path; back-to-back runs (run-2, run-3, …) get a
+// /<run-id> subdirectory. This mirrors the docs ingest layout
+// (scripts/lib/results.mjs: runDir / runFilePath / listRuns), so the weekly
+// single-run case stays flat while a multi-run baseline never collides.
+const DefaultRunID = "run-1"
+
+// CellRelDir is the results-root-relative directory a run's split files live
+// in: <version>/<date>/<arch> for the default run, suffixed with the run id
+// for additional back-to-back runs. WriteTree (file write), cellRelPath (git
+// add + dispatch pointer) and the docs ingest all key on this same layout, so
+// they must never diverge — hence the single shared helper.
+func CellRelDir(meta SplitMeta) string {
+	p := filepath.Join(meta.Version, meta.Date, meta.Arch)
+	if meta.RunID != "" && meta.RunID != DefaultRunID {
+		p = filepath.Join(p, meta.RunID)
+	}
+	return p
+}
+
 // HistogramDoc is the heavy sidecar: the per-(server, scenario) merged
 // HDR histograms lifted out of every [ServerResult.HdrHistogramB64].
 // Histograms maps server name → scenario name → V2-compressed base64
@@ -179,7 +199,7 @@ func MergeSplit(summary *Document, hist *HistogramDoc) *Document {
 func WriteTree(root string, doc *Document, tsGz []byte, meta SplitMeta) (string, error) {
 	summary, hist, env := SplitDocument(doc, meta)
 
-	cellDir := filepath.Join(root, meta.Version, meta.Date, meta.Arch)
+	cellDir := filepath.Join(root, CellRelDir(meta))
 	if err := os.MkdirAll(cellDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir tree cell: %w", err)
 	}
