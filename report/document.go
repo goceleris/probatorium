@@ -118,6 +118,19 @@ func BuildDocument(in BuildInput) *Document {
 
 		sr.SaturationModeRPS[c.ScenarioName] = c.RPSMedian
 
+		// Validity telemetry. Always surface when a run reported them
+		// (LoadgenCPUP95 > 0 / SentVsHandledDeltaPct > 0) so a release
+		// reader sees the loadgen-bottleneck and drop-rate signals
+		// alongside the saturation number. Zero values are deliberately
+		// omitted so a loadgen build that did not sample self-CPU does
+		// not surface a misleading "0% loadgen CPU" headline.
+		if c.LoadgenCPUP95 > 0 {
+			sr.LoadgenCPUP95[c.ScenarioName] = c.LoadgenCPUP95
+		}
+		if c.SentVsHandledDeltaPct > 0 {
+			sr.SentVsHandledDeltaPct[c.ScenarioName] = c.SentVsHandledDeltaPct
+		}
+
 		// LatencyAtSLO + RatedModeP99AtTargetRPS come from the real rated
 		// (closed-loop, coordinated-omission-corrected) sweep when it ran
 		// (probatorium#156). LatencyAtSLO[ms] is the max sustained target RPS

@@ -436,3 +436,73 @@ func TestBuildDocument(t *testing.T) {
 		t.Errorf("output carries retired top-level \"version\":\"5.0\"")
 	}
 }
+
+// TestBuildDocumentValidityTelemetry confirms the per-cell validity
+// fields (loadgen_cpu_p95, sent_vs_handled_delta_pct) are projected from
+// the aggregate onto ServerResult, in the on-wire format the schema
+// requires (a fraction of one core for CPU, a percentage for the
+// sent-vs-handled gap). A cell that didn't sample self-CPU (zero
+// LoadgenCPUP95) must NOT surface a misleading 0.0 leaf in the JSON —
+// the omission is itself the signal. A clean cell (zero delta) likewise
+// omits the leaf, since 0% is the default and carries no information
+// beyond "no errors". Both fields round-trip through schema validation.
+func TestBuildDocumentValidityTelemetry(t *testing.T) {
+	t.Parallel()
+	sch := loadSchema(t)
+
+	agg := map[string]CellAggregate{
+		CellID("get-json", "celeris-std-h1"): {
+			ScenarioName: "get-json", ServerName: "celeris-std-h1",
+			N:             3,
+			RPSMedian:     300000,
+			LoadgenCPUP95: 0.85, // 85% of one core
+			SentVsHandledDeltaPct: 1.4,
+		},
+		CellID("get-text", "celeris-std-h1"): {
+			ScenarioName: "get-text", ServerName: "celeris-std-h1",
+			N:         3,
+			RPSMedian: 250000,
+			// No CPU sample + no errors → both fields stay zero →
+			// BuildDocument omits both leaves.
+		},
+	}
+
+	doc := BuildDocument(BuildInput{
+		HostArchPair: "linux/amd64",
+		Environment:  Environment{KernelSysctlsApplied: []string{}, LoadgenHost: "h", Fabric: "loopback"},
+		BenchmarkConfig: BenchmarkConfig{
+			StartedAt: time.Unix(0, 0).UTC(), FinishedAt: time.Unix(0, 0).UTC(),
+			Runs: 1, Duration: time.Second, Warmup: 0,
+			GitRef: "v1", LoadgenVer: "v1", CelerisVer: "v1",
+		},
+		Servers: map[string]ServerMeta{
+			"celeris-std-h1": {Category: "celeris", Language: "go", Framework: "celeris", Engine: "std-h1", CompileOptions: CompileOptionsFor("go", "amd64")},
+		},
+		Agg: agg,
+	})
+
+	cel := doc.Benchmarks[0]
+
+	// get-json: both fields present at the expected values.
+	if got, ok := cel.LoadgenCPUP95["get-json"]; !ok || got != 0.85 {
+		t.Errorf("LoadgenCPUP95[get-json]: want 0.85, got %v (present=%v)", got, ok)
+	}
+	if got, ok := cel.SentVsHandledDeltaPct["get-json"]; !ok || got != 1.4 {
+		t.Errorf("SentVsHandledDeltaPct[get-json]: want 1.4, got %v (present=%v)", got, ok)
+	}
+
+	// get-text: neither field present (untested build + no errors).
+	if _, ok := cel.LoadgenCPUP95["get-text"]; ok {
+		t.Errorf("LoadgenCPUP95[get-text]: want absent for an untested build, got present")
+	}
+	if _, ok := cel.SentVsHandledDeltaPct["get-text"]; ok {
+		t.Errorf("SentVsHandledDeltaPct[get-text]: want absent for a clean cell, got present")
+	}
+
+	// Schema round-trip: the on-wire JSON validates against schema_v5.
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	validateAny(t, sch, raw)
+}

@@ -110,6 +110,27 @@ type CellAggregate struct {
 	RPSP95    float64 // 95th percentile bound of the per-run RPS distribution
 	RPSStdDev float64
 
+	// LoadgenCPUP95 is the median (across runs) of the loadgen's
+	// self-CPU P95 reading for this cell, expressed as a fraction of
+	// one core (0.0–1.0+; >1.0 means the loadgen process was using
+	// more than one core's worth of CPU). Anchors the read: a number
+	// close to or above 1.0 here means the loadgen — not the server —
+	// was the bottleneck and the saturation RPS is a loadgen ceiling,
+	// not a server ceiling. Zero when no run reported a sample (the
+	// loadgen build did not include a self-CPU sampler).
+	LoadgenCPUP95 float64
+
+	// SentVsHandledDeltaPct is the loadgen-side error rate as a proxy
+	// for the (sent − handled) gap: total loadgen Errors ÷ total
+	// Requests × 100. A value >2% is a release-gate signal that the
+	// server is dropping connections or returning non-2xx replies; 0
+	// means the loadgen saw no errors. Computed from the loadgen
+	// counter pair (Requests, Errors) without needing a server-side
+	// /metrics endpoint. Conservative upper bound — server-side
+	// handled could be higher if some "errors" are 4xx the server
+	// still processed. Zero when no Requests were recorded.
+	SentVsHandledDeltaPct float64
+
 	// LatencyMedian is the legacy median-of-percentiles snapshot kept
 	// for backward compatibility with v4-era consumers. Prefer
 	// LatencyMerged for new code — it is computed from a merged
@@ -188,11 +209,14 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 
 		rpsVals := make([]float64, 0, len(cell.Samples))
 		bytesVals := make([]float64, 0, len(cell.Samples))
-		var totalErrors int64
+		cpuVals := make([]float64, 0, len(cell.Samples))
+		var totalErrors, totalSent int64
 		for _, s := range cell.Samples {
 			rpsVals = append(rpsVals, s.RequestsPerSec)
 			bytesVals = append(bytesVals, s.ThroughputBPS)
+			cpuVals = append(cpuVals, s.CPUPctP95)
 			totalErrors += s.Errors
+			totalSent += s.Requests
 		}
 
 		agg.RPSMedian = percentile(rpsVals, 50)
@@ -201,6 +225,17 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 		agg.RPSStdDev = stddev(rpsVals)
 		agg.BytesMedian = percentile(bytesVals, 50)
 		agg.Errors = totalErrors
+		// Validity telemetry. The loadgen's CPUPctP95 is a percent
+		// (0–100+, normalised by available cores) — divide by 100 so
+		// the on-wire unit is a fraction of one core, matching the
+		// v5_minimal fixture convention. 0.0 means the loadgen
+		// build did not sample self-CPU, which is itself a signal
+		// (the consumer should treat the cell as
+		// loadgen-bottleneck-untested).
+		agg.LoadgenCPUP95 = percentile(cpuVals, 50) / 100.0
+		if totalSent > 0 {
+			agg.SentVsHandledDeltaPct = 100.0 * float64(totalErrors) / float64(totalSent)
+		}
 		agg.LatencyMedian = medianLatency(cell.Samples)
 
 		// HdrHistogram merge — only emits LatencyMerged when at least one
