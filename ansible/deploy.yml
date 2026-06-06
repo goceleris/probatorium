@@ -186,6 +186,62 @@
         - (arch == 'amd64' and validator_replay_binary_amd64 is defined) or
           (arch == 'arm64' and validator_replay_binary_arm64 is defined)
 
+    # ---------- bench kernel tuning ----------
+    # Apply the bench-tuning sysctls to the loadgen host (msa2-client) and
+    # every bench target (msa2-server etc.) BEFORE we start landing
+    # competitors. The default ephemeral-port range (28k ports) and
+    # TIME_WAIT timeout (60s) saturate the port pool within a few cells
+    # at 500-800k RPS × 256 concurrent conns, after which sshd can't
+    # allocate a port for new sessions and the host TCP wedges for tens
+    # of minutes. The sysctl block (tasks/bench_tuning.yml) snapshots
+    # prior values into deploy_manifest.prior_sysctl, so cleanup.yml
+    # restores the host's pristine state on teardown. See probatorium
+    # bug #184 for the root-cause postmortem.
+    - name: Snapshot pre-tuning sysctl values (so cleanup can restore)
+      become: true
+      ansible.builtin.shell: |
+        cat <<EOF
+        ip_local_port_range:        $(sysctl -n net.ipv4.ip_local_port_range)
+        tcp_tw_reuse:               $(sysctl -n net.ipv4.tcp_tw_reuse)
+        tcp_fin_timeout:            $(sysctl -n net.ipv4.tcp_fin_timeout)
+        tcp_max_tw_buckets:         $(sysctl -n net.ipv4.tcp_max_tw_buckets)
+        somaxconn:                  $(sysctl -n net.core.somaxconn)
+        tcp_max_syn_backlog:        $(sysctl -n net.ipv4.tcp_max_syn_backlog)
+        tcp_slow_start_after_idle:  $(sysctl -n net.ipv4.tcp_slow_start_after_idle)
+        tcp_no_metrics_save:        $(sysctl -n net.ipv4.tcp_no_metrics_save)
+        file_max:                   $(sysctl -n fs.file-max)
+        nf_conntrack_max:           $(sysctl -n net.netfilter.nf_conntrack_max)
+        EOF
+      register: bench_sysctl_snapshot_raw
+      changed_when: false
+      when:
+        - inventory_hostname in groups['bench_targets'] or
+          inventory_hostname == "msa2-client"
+
+    - name: Parse sysctl snapshot into a key:value map
+      ansible.builtin.set_fact:
+        bench_sysctl_snapshot: >-
+          {{ dict(bench_sysctl_snapshot_raw.stdout_lines
+                  | map('split', ': ', 1)
+                  | reject('equalto', [''])
+                  | list) }}
+      when:
+        - bench_sysctl_snapshot_raw is defined
+        - bench_sysctl_snapshot_raw.rc is defined
+        - bench_sysctl_snapshot_raw.rc == 0
+
+    - name: Merge sysctl snapshot into prior_sysctl (cleanup reads this)
+      ansible.builtin.set_fact:
+        prior_sysctl: "{{ prior_sysctl | combine(bench_sysctl_snapshot) }}"
+      when:
+        - bench_sysctl_snapshot is defined
+
+    - name: Apply bench kernel tuning
+      ansible.builtin.include_tasks: tasks/bench_tuning.yml
+      when:
+        - inventory_hostname in groups['bench_targets'] or
+          inventory_hostname == "msa2-client"
+
     # ---------- validation refapps ----------
     # The refapp binaries (validation/refapp/<slug>) are what the
     # validator orchestrator drives via remote.Driver as the
