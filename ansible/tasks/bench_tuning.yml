@@ -1,0 +1,71 @@
+# Stage 1: Apply bench-tuning kernel sysctls to the loadgen host and
+# all bench targets. The bench sustains 500-800k RPS × 256 concurrent
+# connections × 40s per cell — at that rate, the kernel's default
+# ephemeral-port range (28k ports) and TIME_WAIT timeout (60s) saturate
+# the port pool within a few cells, sshd can't allocate a port for new
+# sessions, and the host TCP wedges for tens of minutes (probatorium
+# bug #184: 7h+ SSH/ICMP wedge on msa2-server during a 31-cell
+# back-to-back run, while port 8080 and Tailscale UDP stayed up).
+#
+# Idempotent. Applies on every run; the prior values get snapshotted
+# into deploy_manifest.prior_sysctl so cleanup.yml can restore the
+# host's pristine state on teardown.
+#
+# Specifically NOT setting (deprecated / dangerous on modern kernels):
+#   net.ipv4.tcp_tw_recycle  - removed in kernel 4.12, breaks NAT
+#
+# Setting (all are safe on Linux 4.x+, default-on on most distros but
+# the defaults are too small for a 28k-conns/s sustained load):
+#   net.ipv4.ip_local_port_range    1024 65535   (was 32768 60999 = 28k)
+#   net.ipv4.tcp_tw_reuse           1            (was 0; safe for outbound)
+#   net.ipv4.tcp_fin_timeout        15           (was 60; Linux 4.12+)
+#   net.ipv4.tcp_max_tw_buckets     2000000      (was 262144)
+#   net.core.somaxconn              65535        (was 4096)
+#   net.ipv4.tcp_max_syn_backlog    65535        (was 128-512)
+#   net.ipv4.tcp_slow_start_after_idle 0         (bench's burst pattern)
+#   net.ipv4.tcp_no_metrics_save    1            (less cache pressure)
+#   fs.file-max                     2000000      (was ~1M)
+#   net.netfilter.nf_conntrack_max  1000000      (only if NAT active;
+#                                                 default 65536 too small)
+
+- name: Apply bench-tuning kernel sysctls (loadgen host + bench targets)
+  become: true
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    state: present
+    reload: false
+  loop:
+    - { name: "net.ipv4.ip_local_port_range",         value: "1024 65535" }
+    - { name: "net.ipv4.tcp_tw_reuse",                value: "1" }
+    - { name: "net.ipv4.tcp_fin_timeout",             value: "15" }
+    - { name: "net.ipv4.tcp_max_tw_buckets",          value: "2000000" }
+    - { name: "net.core.somaxconn",                   value: "65535" }
+    - { name: "net.ipv4.tcp_max_syn_backlog",         value: "65535" }
+    - { name: "net.ipv4.tcp_slow_start_after_idle",   value: "0" }
+    - { name: "net.ipv4.tcp_no_metrics_save",         value: "1" }
+    - { name: "fs.file-max",                          value: "2000000" }
+    - { name: "net.netfilter.nf_conntrack_max",       value: "1000000" }
+  when:
+    - inventory_hostname in groups['bench_targets'] or
+      inventory_hostname == "msa2-client"
+
+- name: Verify bench-tuning sysctls landed
+  become: true
+  ansible.builtin.command: "sysctl -n {{ item }}"
+  register: bench_sysctl_verify
+  changed_when: false
+  failed_when: bench_sysctl_verify.rc != 0
+  loop:
+    - "net.ipv4.ip_local_port_range"
+    - "net.ipv4.tcp_tw_reuse"
+    - "net.ipv4.tcp_fin_timeout"
+    - "net.ipv4.tcp_max_tw_buckets"
+    - "net.core.somaxconn"
+    - "net.ipv4.tcp_max_syn_backlog"
+    - "fs.file-max"
+    - "net.netfilter.nf_conntrack_max"
+  when:
+    - inventory_hostname in groups['bench_targets'] or
+      inventory_hostname == "msa2-client"
