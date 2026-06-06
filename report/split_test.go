@@ -210,6 +210,46 @@ func TestWriteTree(t *testing.T) {
 	}
 }
 
+// TestCellRelDir locks the layout the docs ingest (scripts/lib/results.mjs)
+// expects: run-1 stays flat, additional back-to-back runs go in a /<run-id>
+// subdirectory so they never overwrite each other. A regression here silently
+// collapses a multi-run baseline onto one clobbered tree.
+func TestCellRelDir(t *testing.T) {
+	base := SplitMeta{Version: "v1.4.15", Date: "20260605", Arch: "x86_64"}
+	cases := []struct {
+		runID string
+		want  string
+	}{
+		{"", filepath.Join("v1.4.15", "20260605", "x86_64")},               // unset → flat
+		{DefaultRunID, filepath.Join("v1.4.15", "20260605", "x86_64")},     // run-1 → flat
+		{"run-2", filepath.Join("v1.4.15", "20260605", "x86_64", "run-2")}, // run-K → subdir
+		{"run-3", filepath.Join("v1.4.15", "20260605", "x86_64", "run-3")},
+	}
+	for _, c := range cases {
+		m := base
+		m.RunID = c.runID
+		if got := CellRelDir(m); got != c.want {
+			t.Errorf("CellRelDir(run=%q) = %q, want %q", c.runID, got, c.want)
+		}
+	}
+
+	// WriteTree must land files under the run-K subdirectory for run-2+.
+	doc := splitSampleDocument()
+	meta := splitTestMeta()
+	meta.RunID = "run-2"
+	root := t.TempDir()
+	cellDir, err := WriteTree(root, doc, nil, meta)
+	if err != nil {
+		t.Fatalf("WriteTree: %v", err)
+	}
+	if want := filepath.Join(root, CellRelDir(meta)); cellDir != want {
+		t.Errorf("run-2 cell dir = %q, want %q", cellDir, want)
+	}
+	if _, err := os.Stat(filepath.Join(cellDir, SummaryFile)); err != nil {
+		t.Errorf("run-2 summary not written under subdir: %v", err)
+	}
+}
+
 func mustJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	raw, err := json.Marshal(v)
