@@ -224,14 +224,14 @@ func TestCellRelDir(t *testing.T) {
 		runID string
 		want  string
 	}{
-		{"", filepath.Join("v1.4.15", "20260605", "x86_64")},                                  // unset → flat
-		{DefaultRunID, filepath.Join("v1.4.15", "20260605", "x86_64")},                        // run-1 → flat
-		{"run-2", filepath.Join("v1.4.15", "20260605", "x86_64", "run-2")},                    // run-K → subdir
-		{"run-3", filepath.Join("v1.4.15", "20260605", "x86_64", "run-3")},                    // run-K → subdir
-		{"run-1-rated", filepath.Join("v1.4.15", "20260605", "x86_64", "run-1-rated")},       // rated subdir
-		{"run-2-rated", filepath.Join("v1.4.15", "20260605", "x86_64", "run-2-rated")},       // rated subdir
-		{"run-3-rated", filepath.Join("v1.4.15", "20260605", "x86_64", "run-3-rated")},       // rated subdir
-		{"run-2.soak", filepath.Join("v1.4.15", "20260605", "x86_64", "run-2.soak")},          // future variant — append verbatim
+		{"", filepath.Join("v1.4.15", "20260605", "x86_64")},                           // unset → flat
+		{DefaultRunID, filepath.Join("v1.4.15", "20260605", "x86_64")},                 // run-1 → flat
+		{"run-2", filepath.Join("v1.4.15", "20260605", "x86_64", "run-2")},             // run-K → subdir
+		{"run-3", filepath.Join("v1.4.15", "20260605", "x86_64", "run-3")},             // run-K → subdir
+		{"run-1-rated", filepath.Join("v1.4.15", "20260605", "x86_64", "run-1-rated")}, // rated subdir
+		{"run-2-rated", filepath.Join("v1.4.15", "20260605", "x86_64", "run-2-rated")}, // rated subdir
+		{"run-3-rated", filepath.Join("v1.4.15", "20260605", "x86_64", "run-3-rated")}, // rated subdir
+		{"run-2.soak", filepath.Join("v1.4.15", "20260605", "x86_64", "run-2.soak")},   // future variant — append verbatim
 	}
 	for _, c := range cases {
 		m := base
@@ -289,10 +289,10 @@ func TestWriteTreeRatedPassIsSeparateSubdir(t *testing.T) {
 					100000: 1 * time.Millisecond,
 					300000: 8 * time.Millisecond,
 				},
-				LatencyAtSLO:            map[int]int{10: 350000, 50: 350000, 100: 350000},
-				MergedHistogramB64:      "AAAA",
-				LoadgenCPUP95:           0.62,
-				SentVsHandledDeltaPct:   0.3,
+				LatencyAtSLO:          map[int]int{10: 350000, 50: 350000, 100: 350000},
+				MergedHistogramB64:    "AAAA",
+				LoadgenCPUP95:         0.62,
+				SentVsHandledDeltaPct: 0.3,
 			},
 		},
 	})

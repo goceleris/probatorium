@@ -453,9 +453,9 @@ func TestBuildDocumentValidityTelemetry(t *testing.T) {
 	agg := map[string]CellAggregate{
 		CellID("get-json", "celeris-std-h1"): {
 			ScenarioName: "get-json", ServerName: "celeris-std-h1",
-			N:             3,
-			RPSMedian:     300000,
-			LoadgenCPUP95: 0.85, // 85% of one core
+			N:                     3,
+			RPSMedian:             300000,
+			LoadgenCPUP95:         0.85, // 85% of one core
 			SentVsHandledDeltaPct: 1.4,
 		},
 		CellID("get-text", "celeris-std-h1"): {
