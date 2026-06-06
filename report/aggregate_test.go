@@ -86,6 +86,78 @@ func TestAggregateErrorsSummed(t *testing.T) {
 	}
 }
 
+// TestAggregateLoadgenCPUP95NormalisedToFraction verifies the loadgen's
+// percent (0–100+) self-CPU reading is normalised to a fraction of one
+// core (0.0–1.0+) on the aggregate, matching the v5_minimal fixture
+// convention. Also confirms the median-across-runs is taken (not the
+// max — a single hot run should not dominate the headline).
+func TestAggregateLoadgenCPUP95NormalisedToFraction(t *testing.T) {
+	samples := []loadgen.Result{
+		{RequestsPerSec: 100, CPUPctP95: 60},  // 0.60 of one core
+		{RequestsPerSec: 100, CPUPctP95: 80},  // 0.80 of one core
+		{RequestsPerSec: 100, CPUPctP95: 100}, // 1.00 of one core
+	}
+	agg := Aggregate([]CellResult{{ScenarioName: "s", ServerName: "v", Samples: samples}})
+	c := agg[CellID("s", "v")]
+	if math.Abs(c.LoadgenCPUP95-0.80) > 0.01 {
+		t.Errorf("LoadgenCPUP95: want 0.80 (median of 0.60/0.80/1.00), got %.3f", c.LoadgenCPUP95)
+	}
+}
+
+// TestAggregateLoadgenCPUP95UntestedBuildIsZero confirms that a loadgen
+// build that did not sample self-CPU (CPUPctP95==0 in every run) yields
+// a zero aggregate — NOT a 0.0/100 = 0 that would be confused with a
+// real "0% CPU" reading, but the same zero that a per-run absence
+// produces. The consumer (BuildDocument) interprets a zero as
+// "loadgen-bottleneck-untested" and omits the leaf from the JSON.
+func TestAggregateLoadgenCPUP95UntestedBuildIsZero(t *testing.T) {
+	samples := []loadgen.Result{
+		{RequestsPerSec: 100, CPUPctP95: 0},
+		{RequestsPerSec: 100, CPUPctP95: 0},
+	}
+	agg := Aggregate([]CellResult{{ScenarioName: "s", ServerName: "v", Samples: samples}})
+	c := agg[CellID("s", "v")]
+	if c.LoadgenCPUP95 != 0 {
+		t.Errorf("LoadgenCPUP95: want 0 (untested build), got %.3f", c.LoadgenCPUP95)
+	}
+}
+
+// TestAggregateSentVsHandledDeltaPctComputesRate verifies the per-cell
+// (sent − handled) gap proxy: total Errors ÷ total Requests × 100. A
+// clean cell (no errors) yields 0; a cell with 5 errors in 1000
+// requests yields 0.5; a cell with 50 errors in 1000 yields 5.0 (the
+// release-gate threshold is >2%).
+func TestAggregateSentVsHandledDeltaPctComputesRate(t *testing.T) {
+	cases := []struct {
+		name      string
+		samples   []loadgen.Result
+		wantDelta float64
+	}{
+		{"clean", []loadgen.Result{
+			{Requests: 1000, Errors: 0},
+			{Requests: 1000, Errors: 0},
+		}, 0},
+		{"five-in-thousand", []loadgen.Result{
+			{Requests: 1000, Errors: 5},
+		}, 0.5},
+		{"release-gate-breach", []loadgen.Result{
+			{Requests: 1000, Errors: 50},
+		}, 5.0},
+		{"zero-sent", []loadgen.Result{
+			{Requests: 0, Errors: 0},
+		}, 0}, // no signal — never divide by zero
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agg := Aggregate([]CellResult{{ScenarioName: "s", ServerName: "v", Samples: tc.samples}})
+			c := agg[CellID("s", "v")]
+			if math.Abs(c.SentVsHandledDeltaPct-tc.wantDelta) > 1e-9 {
+				t.Errorf("SentVsHandledDeltaPct: want %.3f, got %.3f", tc.wantDelta, c.SentVsHandledDeltaPct)
+			}
+		})
+	}
+}
+
 // TestAggregateEmpty ensures an empty samples slice produces a zero
 // aggregate rather than a NaN one.
 func TestAggregateEmpty(t *testing.T) {

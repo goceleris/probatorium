@@ -14,6 +14,16 @@ import (
 	"github.com/goceleris/probatorium/report"
 )
 
+// RatedRunIDSuffix is appended to a back-to-back run-K id to form the
+// sibling cell id for the rated (closed-loop, SLO-targeted) pass. The
+// suffix is appended verbatim to a name already matched by
+// /^run-\d+$/, so the docs ingest's run- dir regex (and the index's
+// run-sort comparator) must accept the suffix explicitly. The dash
+// separator keeps the rated cell human-distinguishable in the tree
+// (`run-2/`, `run-2-rated/`) and keeps the rated id shorter than a
+// full canonical id like `run-2.rated` so filesystem-safe everywhere.
+const RatedRunIDSuffix = "-rated"
+
 // Benchmark-tier orchestration (probatorium#172/#166/#167). BenchTier
 // resolves a curated profile into a budget-asserted matrix and runs it
 // back-to-back N times, publishing each pass as run-1..run-N. DetectRelease
@@ -102,7 +112,8 @@ func newestBenchmarkedVersion() (string, error) {
 // BenchTier runs the budget-asserted curated benchmark matrix N times
 // back-to-back, publishing each pass as a distinct run-K cell under the
 // same version/date/arch (#167). A second rated-scoped pass (#156) runs
-// once per N for the SLO panel.
+// once per N for the SLO panel, published to a sibling run-K-rated/ cell
+// so the saturation grid at run-K is never overwritten.
 //
 // Flow:
 //
@@ -126,11 +137,12 @@ func newestBenchmarkedVersion() (string, error) {
 //	BENCH_RUNS=3               per-cell median basis inside each publish
 //	BENCH_TARGET=both          msa2-server | msr1 | both (both = 2 arches)
 //	BENCH_SKIP_RATED=          "1" runs saturation passes only. The rated
-//	                           pass currently publishes to the same run-K
-//	                           tree as its saturation pass, so it would
-//	                           overwrite the full throughput grid with the
-//	                           SLO subset; skip it for a throughput-only
-//	                           baseline until rated gets its own sub-resource.
+//	                           pass publishes to its own run-K-rated/
+//	                           subdirectory alongside the saturation grid
+//	                           (so both panels survive a back-to-back run
+//	                           — the overwrite was fixed in this fix). Set
+//	                           this to "1" only for a throughput-only run
+//	                           that doesn't need the latency-at-SLO view.
 func BenchTier() error {
 	p := budget.ForProfile(os.Getenv("BENCH_PROFILE"))
 	n := atoiOr(os.Getenv("BENCH_BACK_TO_BACK"), 1)
@@ -172,19 +184,25 @@ func BenchTier() error {
 			return fmt.Errorf("%s saturation publish: %w", runID, err)
 		}
 
-		// Rated pass: curated subset, rated ON, same run-K cell. Skipped
-		// when the profile carries no rated subset, or when BENCH_SKIP_RATED
-		// is set (it would otherwise overwrite the saturation grid at the
-		// shared run-K path — see the BENCH_SKIP_RATED knob doc above).
+		// Rated pass: curated subset, rated ON. Published to a sibling
+		// run-K-rated/ subdirectory (CellRelDir appends the RunID verbatim,
+		// so a hyphenated suffix is just another sub-resource) so the
+		// saturation grid at the run-K path stays intact for the headline
+		// RPS table. Skipped when the profile carries no rated subset, or
+		// when BENCH_SKIP_RATED is set.
 		skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true"
 		if p.RatedCells > 0 && len(p.RatedGlobs) > 0 && !skipRated {
-			fmt.Printf("\n=== BenchTier: %s (rated pass) ===\n", runID)
+			ratedRunID := runID + RatedRunIDSuffix
+			if err := os.Setenv("PUBLISH_RUN_ID", ratedRunID); err != nil {
+				return err
+			}
+			fmt.Printf("\n=== BenchTier: %s (rated pass) ===\n", ratedRunID)
 			setBenchEnvFromProfile(p, true)
 			if err := Bench(); err != nil {
-				return fmt.Errorf("%s rated bench: %w", runID, err)
+				return fmt.Errorf("%s rated bench: %w", ratedRunID, err)
 			}
 			if err := Publish(); err != nil {
-				return fmt.Errorf("%s rated publish: %w", runID, err)
+				return fmt.Errorf("%s rated publish: %w", ratedRunID, err)
 			}
 			_ = os.Unsetenv("BENCH_RATED")
 		}
