@@ -175,11 +175,11 @@ func TestMergeBenchResults(t *testing.T) {
 // benchmark row.
 //
 // The test pins three things at once:
-//   1. readRunnerCellResults must read cf.RatedPasses into rec.RatedPasses
-//   2. mergeBenchResults must read cell.RatedPasses and convert each
-//      entry to a report.RatedSample via the wire mirror
-//   3. report.Aggregate must reduce the RatedSamples into
-//      LatencyAtSLO + RatedModeP99AtTargetRPS on the matching scenario
+//  1. readRunnerCellResults must read cf.RatedPasses into rec.RatedPasses
+//  2. mergeBenchResults must read cell.RatedPasses and convert each
+//     entry to a report.RatedSample via the wire mirror
+//  3. report.Aggregate must reduce the RatedSamples into
+//     LatencyAtSLO + RatedModeP99AtTargetRPS on the matching scenario
 func TestMergeRatedPassesThroughToDocument(t *testing.T) {
 	resultsDir := t.TempDir()
 	rawDir := filepath.Join(resultsDir, "raw")
@@ -199,12 +199,12 @@ func TestMergeRatedPassesThroughToDocument(t *testing.T) {
 	}
 	satRPS := 600000.0 // saturation anchor (60% of which = 180k = ~rated mid)
 	cell := cellRecord{
-		RunIndex:         0,
-		Competitor:       "celeris-epoll-h1-sync",
-		Scenario:         "get-json",
-		Status:           "ok",
+		RunIndex:          0,
+		Competitor:        "celeris-epoll-h1-sync",
+		Scenario:          "get-json",
+		Status:            "ok",
 		SaturationModeRPS: satRPS,
-		RatedPasses:      ratedPasses,
+		RatedPasses:       ratedPasses,
 		Loadgen: mustMarshalLoadgen(t, loadgen.Result{
 			Requests: 1_000_000, Errors: 0, Duration: 2 * time.Minute,
 			RequestsPerSec: satRPS, ThroughputBPS: satRPS * 120,
