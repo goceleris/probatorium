@@ -162,6 +162,263 @@ func TestMergeBenchResults(t *testing.T) {
 	}
 }
 
+// TestMergeRatedPassesThroughToDocument is the regression test for the
+// v3.2 review: the rated sweep ran on the runner and was persisted to
+// the per-cell JSON's `rated_passes` field, but readRunnerCellResults
+// never propagated them to the cluster cellRecord, so mergeBenchResults
+// never saw them, and the published summary.json's
+// RatedModeP99AtTargetRPS / LatencyAtSLO maps stayed empty for every
+// rated cell — which made the v1.4.15 "rated" cells effectively a
+// duplicate saturation-grid cell. This test writes a synthetic raw cell
+// with 3 rated passes and asserts the merged Document carries the
+// typed RatedModeP99AtTargetRPS + LatencyAtSLO leaves on the correct
+// benchmark row.
+//
+// The test pins three things at once:
+//   1. readRunnerCellResults must read cf.RatedPasses into rec.RatedPasses
+//   2. mergeBenchResults must read cell.RatedPasses and convert each
+//      entry to a report.RatedSample via the wire mirror
+//   3. report.Aggregate must reduce the RatedSamples into
+//      LatencyAtSLO + RatedModeP99AtTargetRPS on the matching scenario
+func TestMergeRatedPassesThroughToDocument(t *testing.T) {
+	resultsDir := t.TempDir()
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatalf("mkdir raw: %v", err)
+	}
+
+	// A synthetic rated sweep at targets 100k, 200k, 300k RPS with the
+	// p99 at each target (in nanoseconds, the loadgen wire format).
+	// LatencyAtSLO at 50ms is 200k (300k would exceed), at 100ms is 300k,
+	// at 500ms is 300k. The headline P99 (rated_mode_p99_at_target_rps)
+	// is the p99 at the HIGHEST target — 12ms here (300k).
+	ratedPasses := []ratedPassWire{
+		{TargetRPS: 100000, P99: 8 * time.Millisecond},
+		{TargetRPS: 200000, P99: 30 * time.Millisecond},
+		{TargetRPS: 300000, P99: 12 * time.Millisecond},
+	}
+	satRPS := 600000.0 // saturation anchor (60% of which = 180k = ~rated mid)
+	cell := cellRecord{
+		RunIndex:         0,
+		Competitor:       "celeris-epoll-h1-sync",
+		Scenario:         "get-json",
+		Status:           "ok",
+		SaturationModeRPS: satRPS,
+		RatedPasses:      ratedPasses,
+		Loadgen: mustMarshalLoadgen(t, loadgen.Result{
+			Requests: 1_000_000, Errors: 0, Duration: 2 * time.Minute,
+			RequestsPerSec: satRPS, ThroughputBPS: satRPS * 120,
+			Latency: loadgen.Percentiles{
+				P50: 200 * time.Microsecond, P99: 9 * time.Millisecond,
+				P999: 20 * time.Millisecond, P9999: 50 * time.Millisecond, Max: 80 * time.Millisecond,
+			},
+		}),
+	}
+	writeRawHost(t, rawDir, "msa2-server", []cellRecord{cell})
+
+	merged, err := mergeBenchResults(resultsDir, "msa2-server", benchParams{
+		CelerisVer: "v1.4.15", Duration: "40s", Warmup: "10s", Conns: "256", Runs: "1",
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	data, err := os.ReadFile(merged)
+	if err != nil {
+		t.Fatalf("read results.json: %v", err)
+	}
+	var doc report.Document
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(doc.Benchmarks) != 1 {
+		t.Fatalf("Benchmarks: want 1, got %d", len(doc.Benchmarks))
+	}
+	row := doc.Benchmarks[0]
+
+	// 1. SaturationModeRPS reached the Document (this was the easy one).
+	if got := row.SaturationModeRPS[cell.Scenario]; got != satRPS {
+		t.Errorf("SaturationModeRPS[%q]: want %v, got %v", cell.Scenario, satRPS, got)
+	}
+
+	// 2. The rated pass made it through the cluster path: at least one
+	//    target RPS reached the Document.
+	if got := row.RatedModeP99AtTargetRPS[cell.Scenario]; got == 0 {
+		t.Errorf("RatedModeP99AtTargetRPS[%q]: want non-zero (rated sweep was lost)", cell.Scenario)
+	}
+	// The headline P99 is the p99 at the highest target (300k → 12ms).
+	if got := row.RatedModeP99AtTargetRPS[cell.Scenario]; got != 12*time.Millisecond {
+		t.Errorf("RatedModeP99AtTargetRPS[%q]: want 12ms (P99 at 300k), got %v", cell.Scenario, got)
+	}
+
+	// 3. The LatencyAtSLO reduction fired. With 3 rated passes
+	//    (8ms@100k, 30ms@200k, 12ms@300k), the per-bucket winners are:
+	//      10ms  → 100k   (only 100k cleared 10ms; 30ms/12ms exceed 10ms? no,
+	//                    12ms at 300k exceeds 10ms, 30ms at 200k exceeds 10ms,
+	//                    only 8ms@100k ≤ 10ms)
+	//      50ms  → 300k   (all three clear 50ms; 300k is the highest)
+	//      100ms → 300k   (only 300k is the highest, all clear)
+	slo := row.LatencyAtSLO[cell.Scenario]
+	if slo == nil {
+		t.Fatalf("LatencyAtSLO[%q]: want populated, got nil", cell.Scenario)
+	}
+	if got := slo[10]; got != 100000 {
+		t.Errorf("LatencyAtSLO[%q][10ms]: want 100000 (only 8ms@100k clears), got %d", cell.Scenario, got)
+	}
+	if got := slo[50]; got != 300000 {
+		t.Errorf("LatencyAtSLO[%q][50ms]: want 300000 (all three clear 50ms; 300k wins), got %d", cell.Scenario, got)
+	}
+	if got := slo[100]; got != 300000 {
+		t.Errorf("LatencyAtSLO[%q][100ms]: want 300000, got %d", cell.Scenario, got)
+	}
+}
+
+// TestMergeMultipleScenariosPerCompetitor is the regression for the
+// secondary v3.2 bug: mergeBenchResults keyed its `collected` map by
+// competitor alone, collapsing all scenarios for a server into one
+// CellResult (ScenarioName="bench", the legacy default). The published
+// Document ended up with one SaturationModeRPS["bench"] entry per
+// benchmark instead of a per-scenario grid. This test writes a
+// competitor with TWO scenarios (different RPS + different rated sweeps)
+// and asserts each scenario's data is preserved on the final Document
+// under the right scenario key.
+func TestMergeMultipleScenariosPerCompetitor(t *testing.T) {
+	resultsDir := t.TempDir()
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatalf("mkdir raw: %v", err)
+	}
+
+	mkRes := func(rps float64) json.RawMessage {
+		b, _ := json.Marshal(loadgen.Result{
+			Requests: 1_000_000, Errors: 0, Duration: 2 * time.Minute,
+			RequestsPerSec: rps, ThroughputBPS: rps * 120,
+		})
+		return b
+	}
+
+	cells := []cellRecord{
+		// celeris-epoll-h1-sync on get-json: 600k RPS, rated {100k=8ms, 200k=30ms, 300k=12ms}
+		{
+			RunIndex: 0, Competitor: "celeris-epoll-h1-sync", Scenario: "get-json",
+			Status: "ok", SaturationModeRPS: 600000,
+			Loadgen: mkRes(600000),
+			RatedPasses: []ratedPassWire{
+				{TargetRPS: 100000, P99: 8 * time.Millisecond},
+				{TargetRPS: 200000, P99: 30 * time.Millisecond},
+				{TargetRPS: 300000, P99: 12 * time.Millisecond},
+			},
+		},
+		// celeris-epoll-h1-sync on get-simple: 700k RPS, rated {100k=500us, 300k=2ms}
+		{
+			RunIndex: 0, Competitor: "celeris-epoll-h1-sync", Scenario: "get-simple",
+			Status: "ok", SaturationModeRPS: 700000,
+			Loadgen: mkRes(700000),
+			RatedPasses: []ratedPassWire{
+				{TargetRPS: 100000, P99: 500 * time.Microsecond},
+				{TargetRPS: 300000, P99: 2 * time.Millisecond},
+			},
+		},
+		// gin-h1 on get-json only (1 scenario) — saturation only, no rated
+		{
+			RunIndex: 0, Competitor: "gin-h1", Scenario: "get-json",
+			Status: "ok", SaturationModeRPS: 400000,
+			Loadgen: mkRes(400000),
+		},
+	}
+	writeRawHost(t, rawDir, "msa2-server", cells)
+
+	merged, err := mergeBenchResults(resultsDir, "msa2-server", benchParams{
+		CelerisVer: "v1.4.15", Duration: "40s", Warmup: "10s", Conns: "256", Runs: "1",
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	data, _ := os.ReadFile(merged)
+	var doc report.Document
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if len(doc.Benchmarks) != 2 {
+		t.Fatalf("Benchmarks: want 2 (celeris-epoll-h1-sync + gin-h1), got %d", len(doc.Benchmarks))
+	}
+
+	// Locate celeris-epoll-h1-sync.
+	var cel *report.ServerResult
+	for i := range doc.Benchmarks {
+		if doc.Benchmarks[i].Name == "celeris-epoll-h1-sync" {
+			cel = &doc.Benchmarks[i]
+			break
+		}
+	}
+	if cel == nil {
+		t.Fatalf("celeris-epoll-h1-sync not in Document.Benchmarks")
+	}
+
+	// 1. The two scenarios must each carry their own SaturationModeRPS.
+	//    Before the fix, both would have collapsed into a single "bench" key.
+	if got := cel.SaturationModeRPS["get-json"]; got != 600000 {
+		t.Errorf("SaturationModeRPS[get-json]: want 600000, got %v", got)
+	}
+	if got := cel.SaturationModeRPS["get-simple"]; got != 700000 {
+		t.Errorf("SaturationModeRPS[get-simple]: want 700000, got %v", got)
+	}
+	if _, present := cel.SaturationModeRPS["bench"]; present {
+		t.Errorf("SaturationModeRPS[bench]: want ABSENT (no default fallback), got present")
+	}
+
+	// 2. Each scenario carries its own rated headline P99.
+	if got := cel.RatedModeP99AtTargetRPS["get-json"]; got != 12*time.Millisecond {
+		t.Errorf("RatedModeP99AtTargetRPS[get-json]: want 12ms (P99 at 300k), got %v", got)
+	}
+	if got := cel.RatedModeP99AtTargetRPS["get-simple"]; got != 2*time.Millisecond {
+		t.Errorf("RatedModeP99AtTargetRPS[get-simple]: want 2ms (P99 at 300k), got %v", got)
+	}
+
+	// 3. Each scenario's LatencyAtSLO is independently reduced.
+	//    get-json: 10ms → 100k (8ms clears; 12ms at 300k doesn't)
+	//    get-simple: 10ms → 300k (2ms clears)
+	//    get-simple: 50ms → 300k
+	if slo := cel.LatencyAtSLO["get-json"]; slo == nil {
+		t.Errorf("LatencyAtSLO[get-json]: want populated")
+	} else {
+		if got := slo[10]; got != 100000 {
+			t.Errorf("LatencyAtSLO[get-json][10ms]: want 100000, got %d", got)
+		}
+	}
+	if slo := cel.LatencyAtSLO["get-simple"]; slo == nil {
+		t.Errorf("LatencyAtSLO[get-simple]: want populated")
+	} else {
+		if got := slo[10]; got != 300000 {
+			t.Errorf("LatencyAtSLO[get-simple][10ms]: want 300000 (only 2ms@300k ≤ 10ms), got %d", got)
+		}
+		if got := slo[50]; got != 300000 {
+			t.Errorf("LatencyAtSLO[get-simple][50ms]: want 300000, got %d", got)
+		}
+	}
+
+	// 4. gin-h1 had no rated pass — its rated maps should be empty.
+	var gin *report.ServerResult
+	for i := range doc.Benchmarks {
+		if doc.Benchmarks[i].Name == "gin-h1" {
+			gin = &doc.Benchmarks[i]
+			break
+		}
+	}
+	if gin == nil {
+		t.Fatalf("gin-h1 not in Document.Benchmarks")
+	}
+	if _, present := gin.RatedModeP99AtTargetRPS["get-json"]; present {
+		t.Errorf("gin-h1 RatedModeP99AtTargetRPS[get-json]: want ABSENT (no rated pass), got present")
+	}
+	if _, present := gin.LatencyAtSLO["get-json"]; present {
+		t.Errorf("gin-h1 LatencyAtSLO[get-json]: want ABSENT (no rated pass), got present")
+	}
+}
+
 // TestDiffBenchResultsTypedShape proves the regression gate reads the
 // typed Benchmarks[].LatencyAtSLO (not the retired loose "hosts" walk):
 // it writes a baseline and a current canonical Document where one cell

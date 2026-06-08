@@ -680,6 +680,18 @@ func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cel
 				if status == report.CellOK && len(cf.Result) > 0 && string(cf.Result) != "null" {
 					rec.Loadgen = cf.Result
 				}
+				// Thread the rated sweep + saturation anchor from the
+				// per-cell JSON into the cellRecord. mergeBenchResults
+				// reads them off the wire and folds them into
+				// CellResult.RatedSamples so report.Aggregate can
+				// reduce them into LatencyAtSLO + RatedModeP99AtTargetRPS.
+				// Without this, the rated pass ran on the runner but its
+				// numbers never made it to the published summary (gap
+				// surfaced by v3.2 review).
+				rec.SaturationModeRPS = cf.SaturationModeRPS
+				if len(cf.RatedPasses) > 0 {
+					rec.RatedPasses = append(rec.RatedPasses, cf.RatedPasses...)
+				}
 				out = append(out, rec)
 			}
 		}
@@ -744,6 +756,11 @@ type cellRecord struct {
 	// merged Document's latency_at_slo by mergeBenchResults so the gate has
 	// a live signal.
 	RatedPasses []ratedPassWire `json:"rated_passes,omitempty"`
+
+	// SaturationModeRPS echoes the runner's measured open-loop saturation
+	// RPS so the rated pass's per-fraction targets stay interpretable as
+	// adapter-relative multipliers even after the JSON round-trip.
+	SaturationModeRPS float64 `json:"saturation_mode_rps,omitempty"`
 }
 
 // readCellResources parses the per-cell observer.sqlite + cpu.log into a
@@ -1100,13 +1117,25 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 			if status == "" {
 				status = report.ClassifyCellError(cell.Error)
 			}
-			cr := collected[cell.Competitor]
+			// Bucket by (competitor, scenario) — the runner expands the
+			// scenario catalogue per cell (issue #152) so a single server
+			// can produce cells for many scenarios. Collapsing on competitor
+			// alone (the legacy default) makes every per-scenario map on
+			// the published Document land in a single "bench" key, hiding
+			// the per-scenario grid. The empty-scenario fallback is for
+			// pre-#152 raw payloads that didn't record a scenario.
+			scenario := cell.Scenario
+			if scenario == "" {
+				scenario = clusterScenarioName
+			}
+			crKey := cell.Competitor + "|" + scenario
+			cr := collected[crKey]
 			if cr == nil {
 				cr = &report.CellResult{
-					ScenarioName: clusterScenarioName,
+					ScenarioName: scenario,
 					ServerName:   cell.Competitor,
 				}
-				collected[cell.Competitor] = cr
+				collected[crKey] = cr
 			}
 			if status != report.CellOK {
 				// A cell that did not run (or produced no real number): record
@@ -1210,7 +1239,18 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 // zero-valued meta so the Document carries them.
 func clusterServerMeta(cells map[string]*report.CellResult) map[string]report.ServerMeta {
 	out := make(map[string]report.ServerMeta, len(cells))
-	for name := range cells {
+	// The bucket key is "<competitor>|<scenario>" after the rated/scenario
+	// fix in mergeBenchResults. The servers.Registry is keyed by the
+	// competitor column only, so split on "|" and look the COMPETITOR up
+	// — the ServerResult the BuildDocument emits is still per (server,
+	// scenario), so the meta's `Name` should also be just the competitor.
+	seen := map[string]bool{}
+	for key := range cells {
+		name, _, _ := strings.Cut(key, "|")
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
 		a, ok := servers.Registry[name]
 		m := report.ServerMeta{}
 		if ok {
