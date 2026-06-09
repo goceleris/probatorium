@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -16,8 +17,16 @@ import (
 // writeRawHost writes a raw/<host>.json payload in the shape
 // aggregatePerCellResults produces (host / celeris_version / summary /
 // cells[] where each cell's loadgen is a marshalled loadgen.Result).
-func writeRawHost(t *testing.T, rawDir, host string, cells []cellRecord) {
+// suffix is appended to the filename (use "" for the default
+// <host>.json or a unique tag like "iter1" to write multiple raw
+// files in the same raw/ — the production bench does this for every
+// back-to-back iteration so the merge can fold them all together).
+func writeRawHost(t *testing.T, rawDir, host string, cells []cellRecord, suffix ...string) {
 	t.Helper()
+	name := host
+	if len(suffix) > 0 {
+		name = host + "." + suffix[0]
+	}
 	payload := map[string]any{
 		"host":            host,
 		"celeris_version": "v1.4.12",
@@ -28,7 +37,7 @@ func writeRawHost(t *testing.T, rawDir, host string, cells []cellRecord) {
 	if err != nil {
 		t.Fatalf("marshal raw host: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(rawDir, host+".json"), buf, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(rawDir, name+".json"), buf, 0o644); err != nil {
 		t.Fatalf("write raw host: %v", err)
 	}
 }
@@ -612,5 +621,114 @@ func TestMergeUnifiedPanelOnOneRow(t *testing.T) {
 		if got := slo[10]; got != 100000 {
 			t.Errorf("LatencyAtSLO[post-4k][10ms]: want 100000, got %d", got)
 		}
+	}
+}
+
+// TestMergeBackToBackRatedPersistsAcrossIterations is the regression
+// for the v3.4-rated-loss bug: the BenchTier tier loop runs N
+// back-to-back iterations, each of which should publish a summary
+// that carries the rated data on every row. The earlier bug was that
+// setBenchEnvFromProfile's else branch called os.Unsetenv(BENCH_RATED),
+// so iterations 2..N produced summaries with empty
+// latency_at_slo + rated_mode_p99_at_target_rps maps while iteration
+// 1 looked fine.
+//
+// This test writes THREE raw/<host>.json files — one per iteration
+// — each carrying a single (competitor, scenario) cell. The rated
+// sweep reuses the same TargetRPS across all 3 iterations with
+// distinct P99s, so the reduction collapses 3 P99 samples into one
+// target bucket and the median reduction is deterministic. The
+// assertion is that the Document has non-empty rated data on the
+// row, and the non-rated scenario (chain-fullstack-get-json) stays
+// empty, pinning the "rated set only" invariant.
+func TestMergeBackToBackRatedPersistsAcrossIterations(t *testing.T) {
+	resultsDir := t.TempDir()
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatalf("mkdir raw: %v", err)
+	}
+
+	mkRes := func(rps float64) json.RawMessage {
+		b, _ := json.Marshal(loadgen.Result{
+			Requests: 1_000_000, Errors: 0, Duration: 2 * time.Minute,
+			RequestsPerSec: rps, ThroughputBPS: rps * 120,
+			Latency: loadgen.Percentiles{
+				P50: 200 * time.Microsecond, P99: 1 * time.Millisecond,
+				P999: 2 * time.Millisecond, P9999: 3 * time.Millisecond,
+				Max:  4 * time.Millisecond,
+			},
+		})
+		return b
+	}
+
+	// Three iterations, each with its own raw/ payload. The bench
+	// code in production writes raw/<host>.json after each
+	// back-to-back iteration, then mergeBenchResults folds them all
+	// into one Document. Reusing the same 200k TargetRPS across all
+	// 3 iterations means the 3 P99s collapse into one bucket.
+	iterP99s := []time.Duration{2 * time.Millisecond, 4 * time.Millisecond, 6 * time.Millisecond}
+	for iter, p99 := range iterP99s {
+		cell := cellRecord{
+			RunIndex: iter, Competitor: "celeris-epoll-h1-sync", Scenario: "get-json",
+			Status: "ok", SaturationModeRPS: 250000,
+			Loadgen: mkRes(250000),
+			RatedPasses: []ratedPassWire{
+				{TargetRPS: 200000, P99: p99},
+			},
+		}
+		writeRawHost(t, rawDir, "msa2-server", []cellRecord{cell}, fmt.Sprintf("iter%d", iter))
+	}
+
+	merged, err := mergeBenchResults(resultsDir, "msa2-server", benchParams{
+		CelerisVer: "v1.4.15", Duration: "40s", Warmup: "10s", Conns: "256", Runs: "1",
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	data, _ := os.ReadFile(merged)
+	var doc report.Document
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(doc.Benchmarks) != 1 {
+		t.Fatalf("Benchmarks: want 1, got %d", len(doc.Benchmarks))
+	}
+	row := doc.Benchmarks[0]
+
+	// Saturation landed (median of 250k/250k/250k → 250k).
+	if got := row.SaturationModeRPS["get-json"]; got != 250000 {
+		t.Errorf("SaturationModeRPS[get-json]: want 250000 (median), got %v", got)
+	}
+
+	// THE key assertion: rated data is populated, not silently empty.
+	// If setBenchEnvFromProfile is ever broken again, the rated
+	// sweep never runs on iter 2/3 and these two maps come back nil.
+	if got := row.RatedModeP99AtTargetRPS["get-json"]; got != 4*time.Millisecond {
+		t.Errorf("RatedModeP99AtTargetRPS[get-json]: want 4ms (median of {2,4,6}ms at 200k target), got %v", got)
+	}
+	if slo := row.LatencyAtSLO["get-json"]; slo == nil {
+		t.Fatalf("LatencyAtSLO[get-json]: want populated, got nil (rated data lost)")
+	} else {
+		// Median 4ms @ 200k clears every SLO threshold in
+		// {10, 50, 100, 500, 1000}ms, so all 5 buckets collapse
+		// to the only target with a P99 below the threshold: 200k.
+		for _, ms := range []int{10, 50, 100, 500, 1000} {
+			if got := slo[ms]; got != 200000 {
+				t.Errorf("LatencyAtSLO[get-json][%dms]: want 200000, got %d", ms, got)
+			}
+		}
+	}
+
+	// Non-rated scenario (chain-fullstack-get-json) must stay empty
+	// even after the back-to-back loop. We only wrote get-json
+	// cells, so chain-fullstack-get-json has no raw payload, but
+	// the invariant matters: a future code change that mistakenly
+	// promotes chain into the rated set would silently leak here.
+	if _, present := row.RatedModeP99AtTargetRPS["chain-fullstack-get-json"]; present {
+		t.Errorf("RatedModeP99AtTargetRPS[chain-fullstack-get-json]: want ABSENT, got present")
+	}
+	if _, present := row.LatencyAtSLO["chain-fullstack-get-json"]; present {
+		t.Errorf("LatencyAtSLO[chain-fullstack-get-json]: want ABSENT, got present")
 	}
 }
