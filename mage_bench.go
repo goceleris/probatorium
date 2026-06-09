@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/goceleris/loadgen"
 	"github.com/goceleris/probatorium/report"
+	"github.com/goceleris/probatorium/scenarios"
 	"github.com/goceleris/probatorium/servers"
 )
 
@@ -109,6 +111,24 @@ func Bench() error {
 		return err
 	}
 
+	// Derive the unique server slugs the cells glob would match against the
+	// full registry. This is the source of truth for which competitors the
+	// bench will produce non-empty data for — the playbook's outer loop must
+	// iterate exactly this set, otherwise the bench wastes time on columns
+	// whose (server, scenario) cell glob is empty (regression: profile=headline
+	// glob is 15 servers, but `competitors` defaults to "all" = 31 → 16 no-op
+	// columns of wasted ansible outer-loop overhead per back-to-back
+	// iteration). Returns nil (→ use full registry) for cells == "*" / "".
+	//
+	// Computed BEFORE the auto-deploy block so the deploy gets the same
+	// trimmed scope the bench will use — installing rust + bun + python
+	// toolchains for 16 servers we will never run is wasted time on a fresh
+	// cluster.
+	cellsSlugs, err := cellsGlobServers(cells)
+	if err != nil {
+		return fmt.Errorf("resolve cells glob %q: %w", cells, err)
+	}
+
 	// Auto-deploy when neither bench target has a manifest yet. Cheap
 	// pre-flight: SSH to both bench_targets; if neither has the
 	// manifest file, kick off Deploy. A partial deploy (one target
@@ -132,6 +152,18 @@ func Bench() error {
 		// network IO (deadsnakes PPA gpg fetch can fail on flaky
 		// hosts) and breaks BENCH_COMPETITORS=axum because it tries
 		// to install python too.
+		//
+		// We deliberately keep DEPLOY_COMPETITORS at the user's
+		// `competitors` (default "all") rather than the cells-glob-derived
+		// slug list: Deploy's union check expects *module* slugs
+		// (e.g. "celeris", "axum", "gin"), not *column* slugs
+		// (e.g. "celeris-epoll-h1-sync", "gin-h1"), and the cells
+		// glob only carries the latter. Mixing the two would have
+		// Deploy reject the obvious-looking inputs. Wasted cost:
+		// installing 16 unused native toolchains on a fresh cluster
+		// (~5m). Acceptable: deploys are one-time per cluster, and
+		// the cost is bounded; the bench itself never iterates the
+		// unused columns (that's the whole point of this fix).
 		if os.Getenv("DEPLOY_COMPETITORS") == "" {
 			_ = os.Setenv("DEPLOY_COMPETITORS", competitors)
 			defer func() { _ = os.Unsetenv("DEPLOY_COMPETITORS") }()
@@ -174,6 +206,50 @@ func Bench() error {
 	fmt.Printf("  celeris ver:  %s\n", version)
 	fmt.Printf("  results:      %s\n\n", resultsDir)
 
+	// Derive the unique server slugs the cells glob would match against the
+	// `competitors` narrows further when the user passed an explicit CSV
+	// (the legacy "BENCH_COMPETITORS=celeris-epoll-h1-sync" form). "all"/""
+	// is a no-op narrowing (cellsSlugs already covers everything). Mismatch
+	// (user asked for a server that the cells glob cannot match) errors
+	// loudly so the user knows the two knobs disagree instead of the bench
+	// silently dropping the explicit ask.
+	columnsArg := competitors
+	switch {
+	case strings.TrimSpace(competitors) == "" || competitors == "all":
+		// Default path: derive the column set from the cells glob. This
+		// fixes the headline-profile regression (15-server cells glob
+		// paired with 31-column "all" competitor_set).
+		if cellsSlugs != nil {
+			columnsArg = strings.Join(cellsSlugs, ",")
+		}
+	default:
+		// Explicit user list. Every name must be a server the cells glob
+		// could schedule — otherwise the column would have been a no-op
+		// (silent waste) and the user's intent is unclear.
+		want := splitTrimNonEmpty(competitors)
+		allowed := map[string]bool{}
+		if cellsSlugs != nil {
+			for _, s := range cellsSlugs {
+				allowed[s] = true
+			}
+		} else {
+			for _, n := range servers.Names() {
+				allowed[n] = true
+			}
+		}
+		missing := []string{}
+		for _, w := range want {
+			if !allowed[w] {
+				missing = append(missing, w)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("BENCH_COMPETITORS=%q references servers not in BENCH_CELLS=%q: %s. "+
+				"Either drop BENCH_COMPETITORS (let it default to 'all' and derive from cells) or widen BENCH_CELLS to include them",
+				competitors, cells, strings.Join(missing, ", "))
+		}
+	}
+
 	// Expand the competitor arg into the matrix COLUMNS (one per registry
 	// adapter), each carrying the staged binary dir it runs from and the
 	// -engine flag the binary needs. A single binary (e.g. servers/gin)
@@ -182,7 +258,7 @@ func Bench() error {
 	// each binary with the right mode. competitor_columns is the slug→
 	// {bin,engine} map run_bench_cell.yml resolves; competitor_set is the
 	// comma-joined column slugs the playbook splits into its schedule.
-	columns, err := resolveBenchColumns(competitors)
+	columns, err := resolveBenchColumns(columnsArg)
 	if err != nil {
 		return err
 	}
@@ -359,6 +435,99 @@ func resolveBenchColumns(arg string) ([]benchColumn, error) {
 		cols = append(cols, col)
 	}
 	return cols, nil
+}
+
+// cellsGlobServers mirrors the runner's filterCells glob semantics against
+// the full (scenarios × servers) registry and returns the sorted, unique
+// server slugs the glob would schedule AT LEAST ONE cell for. Returns nil
+// (a sentinel for "use the full registry") when cells is "" or "*" — the
+// legacy behaviour where the playbook iterates every adapter column.
+//
+// This is the single source of truth for "which columns can possibly yield
+// data" — the bench must pass the resulting set to the playbook's
+// competitor_set, otherwise the outer ansible loop iterates columns whose
+// runner invocation finds zero matching cells and exits in ~1m as a no-op
+// (regression: profile=headline glob is 15 servers, but the default
+// competitors="all" feeds 31 columns → 16 wasted no-ops per back-to-back
+// iteration). Keep this in sync with cmd/runner/main.go's filterCells —
+// the parser and the include/exclude semantics are deliberately identical
+// so a glob like "*/celeris-*" produces the same set here and in the
+// runner.
+func cellsGlobServers(cells string) ([]string, error) {
+	cells = strings.TrimSpace(cells)
+	if cells == "" || cells == "*" {
+		return nil, nil
+	}
+	var include, exclude []string
+	for _, part := range strings.Split(cells, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, "!") {
+			exclude = append(exclude, p[1:])
+		} else {
+			include = append(include, p)
+		}
+	}
+	if len(include) == 0 {
+		include = []string{"*"}
+	}
+	for _, g := range append(append([]string{}, include...), exclude...) {
+		if _, err := path.Match(g, "probe/probe"); err != nil {
+			return nil, fmt.Errorf("invalid glob %q: %w", g, err)
+		}
+	}
+	matchAny := func(patterns []string, id string) bool {
+		for _, g := range patterns {
+			if g == "*" {
+				return true
+			}
+			if ok, _ := path.Match(g, id); ok {
+				return true
+			}
+		}
+		return false
+	}
+	scs := scenarios.Registry()
+	advs := servers.AdaptersSorted()
+	keep := map[string]bool{}
+	for _, s := range scs {
+		for _, a := range advs {
+			id := s.Name() + "/" + a.Name
+			if !matchAny(include, id) {
+				continue
+			}
+			if matchAny(exclude, id) {
+				continue
+			}
+			keep[a.Name] = true
+		}
+	}
+	out := make([]string, 0, len(keep))
+	for n := range keep {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// splitTrimNonEmpty splits a comma-separated list and drops empty
+// fragments after trimming. Used to normalise the BENCH_COMPETITORS CSV
+// before membership checks. Mirrors what the playbook's `split(',') | map
+// ('trim') | list` filter does in bench.yml, so a leading/trailing comma
+// or a doubled comma cannot silently introduce a phantom "" column.
+func splitTrimNonEmpty(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // aggregatePerCellResults walks the per-cell output the bench playbook's
