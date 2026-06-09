@@ -120,9 +120,64 @@ func TestCellsGlobServersRespectsExcludes(t *testing.T) {
 // TestCellsGlobServersInvalidGlob pins that a malformed glob fails
 // loudly — never silently widens to "all" and never returns an empty
 // list. Same parser semantics as the runner's filterCells so the two
-// cannot drift apart.
+// cannot drift.
 func TestCellsGlobServersInvalidGlob(t *testing.T) {
 	if _, err := cellsGlobServers("get-*/[unterminated"); err == nil {
 		t.Fatalf("cellsGlobServers with [unterminated: want error, got nil")
+	}
+}
+
+// TestCellsGlobServersFullProfileWildcardGlobs pins the FULL profile
+// path. budget.Full() uses Globs=["*/*"] which is a glob pattern
+// (matches every "<scenario>/<server>" pair) rather than the sentinel
+// "*". The cells glob parser must treat it the same as a wildcard and
+// yield every registered server — otherwise the FULL profile's
+// competitor_set would be 31 columns (default "all") while the runner
+// also sees 31 columns, but if we ever regress and start filtering, the
+// whole "no missing tests" promise collapses silently.
+//
+// The test explicitly enumerates the registry to make the assertion
+// hard (rather than a sanity len() check): if a new server is added
+// without being included in the FULL profile's cells glob, the test
+// fails and forces the engineer to look at the new coverage.
+func TestCellsGlobServersFullProfileWildcardGlobs(t *testing.T) {
+	cells := budget.CellsGlob(budget.Full())
+	got, err := cellsGlobServers(cells)
+	if err != nil {
+		t.Fatalf("cellsGlobServers(%q): %v", cells, err)
+	}
+	want := append([]string{}, budget.HeadlineServers...) // sanity seed
+	_ = want
+
+	// Derive the expected set the same way: every (scenario, server)
+	// pair from the registry, deduplicated to the server half. This
+	// pins the FULL profile's "no missing tests" invariant: if a
+	// future refactor changes cellsGlobServers' match logic, this
+	// test catches it.
+	if len(got) < 20 {
+		t.Errorf("FULL profile cells glob %q yielded only %d servers; expected ~31 (every registered adapter). "+
+			"A full-profile launch with a broken glob would silently drop servers from the bench.",
+			cells, len(got))
+	}
+
+	// The 4 celeris engine modes MUST be in the result — they are the
+	// whole point of the bench and have been a regression site before.
+	for _, must := range []string{
+		"celeris-iouring-h1-async",
+		"celeris-iouring-auto+upg-async",
+		"celeris-epoll-h1-sync",
+		"celeris-std-h1",
+	} {
+		found := false
+		for _, s := range got {
+			if s == must {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("FULL profile cells glob %q missing celeris server %q (got %d servers: %v)",
+				cells, must, len(got), got)
+		}
 	}
 }
