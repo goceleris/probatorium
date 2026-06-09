@@ -237,10 +237,14 @@ func BenchTier() error {
 }
 
 // setBenchEnvFromProfile pushes the resolved profile's per-cell tuning +
-// cell glob into the BENCH_* env Bench() reads. rated=true scopes the cell
-// glob to the curated rated subset and flips BENCH_RATED on with the
-// rated-pass durations; rated=false runs the full saturation glob with
-// rated off.
+// cell glob into the BENCH_* env Bench() reads. The new design does
+// NOT have a separate rated pass — every cell does BOTH the saturation
+// pass and the rated sweep inside one execution, so BENCH_RATED is
+// managed by the caller (BenchTier) and this function only sets the
+// per-pass tuning + cell glob. The `rated` argument is preserved for
+// the legacy "two-pass" callers (Bench, Publish when BENCH_RATED is
+// not set) — when true, the cell glob scopes to the rated subset
+// AND BENCH_RATED is toggled.
 func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 	if rated {
 		_ = os.Setenv("BENCH_RATED", "1")
@@ -249,7 +253,13 @@ func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 		_ = os.Setenv("BENCH_WARMUP", durString(p.RatedWarmup))
 		_ = os.Setenv("BENCH_RATED_DURATION", durString(p.RatedDuration))
 	} else {
-		_ = os.Unsetenv("BENCH_RATED")
+		// Saturation-pass tuning: full cell glob, saturation
+		// duration. Do NOT touch BENCH_RATED — the caller in the
+		// unified path has already set it to "1" so the runner does
+		// the rated sweep inside every cell. The legacy Bench() +
+		// Publish() callers (without BENCH_RATED set) end up with
+		// BENCH_RATED unset, which is the correct behaviour for a
+		// pure-saturation call.
 		_ = os.Setenv("BENCH_CELLS", budget.CellsGlob(p))
 		_ = os.Setenv("BENCH_DURATION", durString(p.Duration))
 		_ = os.Setenv("BENCH_WARMUP", durString(p.Warmup))
