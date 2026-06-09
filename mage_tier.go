@@ -158,7 +158,13 @@ func newestBenchmarkedVersion() (string, error) {
 //
 // Env knobs (in addition to every BENCH_*/PUBLISH_*/DOCS_TOKEN knob):
 //
-//	BENCH_PROFILE=headline     headline | full curated matrix
+//	BENCH_PROFILE=full         full | headline (default: full — every
+//	                           server × every scenario, capability-gated.
+//	                           headline is the explicit opt-in for the
+//	                           ~3h smoke-test path; never the silent
+//	                           default, because users asked repeatedly
+//	                           for "no missing tests" and got the
+//	                           curated subset instead.)
 //	BENCH_BACK_TO_BACK=1       N published run-K cells (release: 3)
 //	BENCH_RUNS=3               per-cell median basis inside each publish
 //	BENCH_TARGET=both          msa2-server | msr1 | both (both = 2 arches)

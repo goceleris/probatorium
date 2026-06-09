@@ -89,8 +89,12 @@ func TestArchParallelHalvesWallClock(t *testing.T) {
 	}
 }
 
-// TestForProfileResolves checks the BENCH_PROFILE resolution: known names
-// map to their config, unknown/empty fall back to the weekly headline.
+// TestForProfileResolves checks the BENCH_PROFILE resolution: known
+// names map to their config, unknown/empty fall back to the FULL
+// matrix (every server × every scenario, capability-gated). Headline
+// is the explicit opt-in for the ~3h smoke-test path, not the silent
+// default — see ForProfile's docstring for why this flipped from the
+// prior behaviour.
 func TestForProfileResolves(t *testing.T) {
 	if ForProfile("headline").Name != "headline" {
 		t.Errorf("ForProfile(headline) should resolve headline")
@@ -98,11 +102,30 @@ func TestForProfileResolves(t *testing.T) {
 	if ForProfile("full").Name != "full" {
 		t.Errorf("ForProfile(full) should resolve full")
 	}
-	if ForProfile("").Name != "headline" {
-		t.Errorf("ForProfile(empty) should fall back to headline")
+	if ForProfile("").Name != "full" {
+		t.Errorf("ForProfile(empty) should fall back to full, got %q (a weekly run with no env was being silently scoped down to the headline subset, dropping driver-*, chain-*, tls-*, ws-hub-*, h2/h2c variants, and ~16 long-tail servers)",
+			ForProfile("").Name)
 	}
-	if ForProfile("bogus").Name != "headline" {
-		t.Errorf("ForProfile(unknown) should fall back to headline")
+	if ForProfile("bogus").Name != "full" {
+		t.Errorf("ForProfile(unknown) should fall back to full, got %q (an unknown name must not silently downgrade to headline)", ForProfile("bogus").Name)
+	}
+}
+
+// TestForProfileDefaultHasFullCoverage pins the "no missing tests"
+// invariant: the default (no env / empty string) must yield a profile
+// whose Globs cover every registered server. Otherwise a weekly run
+// would silently drop servers from the publish, and we'd publish a
+// headline-scoped report without telling the user.
+func TestForProfileDefaultHasFullCoverage(t *testing.T) {
+	def := ForProfile("")
+	if def.Name != "full" {
+		t.Fatalf("ForProfile(\"\").Name: want %q, got %q (the default must be the full matrix)",
+			"full", def.Name)
+	}
+	if def.Cells < 400 {
+		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~520 capability-gated), got %d. "+
+			"A value this low means the default was silently scoped down to the headline subset (~150 cells).",
+			def.Cells)
 	}
 }
 

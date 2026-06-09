@@ -30,10 +30,10 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: headline | full curated matrix
+        description: full | headline (default: full — every server × every scenario, capability-gated. headline is the ~3h smoke-test opt-in, never the silent default, because users asked repeatedly for "no missing tests" and got the curated subset instead.)
         required: false
         type: string
-        default: headline
+        default: full
       force_new_release:
         description: force the N back-to-back release runs ("true"/"false")
         required: false
@@ -114,7 +114,7 @@ jobs:
     runs-on: [self-hosted, celeris-cluster]
     timeout-minutes: 1440
     env:
-      BENCH_PROFILE: ${{ github.event.inputs.profile || 'headline' }}
+      BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
       IS_NEW_RELEASE: ${{ needs.detect.outputs.is_new_release }}
     steps:
       - uses: actions/checkout@v6

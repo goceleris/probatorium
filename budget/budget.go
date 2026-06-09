@@ -194,17 +194,33 @@ func plural(n int) string {
 }
 
 // ForProfile resolves a BENCH_PROFILE env value into a configured
-// Profile. Unknown / empty names fall back to the headline weekly config
-// — the safe default for the scheduled tier. The caller may still mutate
-// Runs / Arches / ArchParallel before asserting FitWithin.
+// Profile. The default (empty / "headline" / unknown) is the FULL
+// matrix — every registered server × every scenario, capability-gated —
+// so a weekly run is never silently scoped down to a curated subset
+// that drops servers or scenarios. "headline" stays available as an
+// explicit opt-in for the ~3h smoke-test path (15 servers × 12
+// scenarios, faster turnaround, narrower signal), and is the value
+// the docs test / smoke workflows continue to use. The caller may
+// still mutate Runs / Arches / ArchParallel before asserting
+// FitWithin.
+//
+// History: prior versions defaulted to the headline weekly config
+// because it was the only profile that fit the 24h budget with both
+// arches serial. That default silently dropped ~85% of the registry
+// from the weekly publish (e.g. driver-*, chain-*, tls-*, ws-hub-*
+// scenarios, and 16 long-tail servers like chi / drogon / elysia /
+// fastapi / hono / iris / ntex / zig_zap). Users repeatedly asked
+// for a full benchmark and got the headline subset instead because
+// no env was set. The default flip here is the fix; the headline
+// profile is now an explicit opt-in, not a silent default.
 func ForProfile(name string) Profile {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "full":
+	case "full", "":
 		return Full()
-	case "headline", "":
+	case "headline":
 		return HeadlineWeekly()
 	default:
-		return HeadlineWeekly()
+		return Full()
 	}
 }
 
