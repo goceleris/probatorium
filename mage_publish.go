@@ -175,10 +175,19 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, error) {
 	}
 
 	now := time.Now().UTC()
+	// BENCH_START_DATE (if set) pins every Publish in a back-to-back
+	// iteration to the bench's start date, so a run that crosses
+	// midnight UTC lands all cells under the same date. Falls back
+	// to the per-Publish timestamp otherwise (the legacy behaviour
+	// for a one-shot `mage Publish` invocation).
+	dateStr := os.Getenv("BENCH_START_DATE")
+	if dateStr == "" {
+		dateStr = now.Format("20060102")
+	}
 	meta := report.SplitMeta{
 		Version:        version,
 		Arch:           archTag(benchTargetGOARCH()),
-		Date:           now.Format("20060102"),
+		Date:           dateStr,
 		RunID:          envOrDefault("PUBLISH_RUN_ID", defaultRunID),
 		GitSHA:         gitRefOr(),
 		GitRef:         os.Getenv("GITHUB_REF"),

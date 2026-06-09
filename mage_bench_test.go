@@ -480,3 +480,137 @@ func TestDiffBenchResultsTypedShape(t *testing.T) {
 		t.Errorf("did not expect regression for a 1%% drop")
 	}
 }
+
+// TestMergeUnifiedPanelOnOneRow is the regression for the user-visible
+// "I have to look in two folders" complaint: a saturation grid and a
+// rated grid for the same (server, scenario) pair must land on the
+// SAME benchmarks[] row in a single Document, with both maps keyed
+// by scenario. The split-tree design (run-K/ + run-K-rated/) is gone
+// — every back-to-back iteration produces exactly one summary.json
+// per arch, with the per-scenario SaturationModeRPS and the
+// per-scenario LatencyAtSLO+RatedModeP99AtTargetRPS living side by
+// side on the same ServerResult.
+//
+// This test pins that contract: a synthetic cell with both
+// saturation AND rated data, plus a second cell with saturation
+// only, plus a third cell with rated only (so the per-scenario
+// presence pattern is mixed), and the Document must carry:
+//
+//   celeris-X on get-json:
+//     saturation_mode_rps["get-json"]      = 700000
+//     latency_at_slo["get-json"]           = { "1000": 600000, "500": 600000 }
+//     rated_mode_p99["get-json"]           = 12ms
+//   celeris-X on chain-fullstack-get-json:
+//     saturation_mode_rps[...]             = 580000
+//     latency_at_slo[...]                  = {}   (chain is not in rated set)
+//     rated_mode_p99[...]                  = {}   (chain is not in rated set)
+//
+// The two-panel-on-one-row invariant is the headline the dashboard
+// reads — breaking it forces consumers to re-merge two folders.
+func TestMergeUnifiedPanelOnOneRow(t *testing.T) {
+	resultsDir := t.TempDir()
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatalf("mkdir raw: %v", err)
+	}
+
+	mkRes := func(rps float64) json.RawMessage {
+		b, _ := json.Marshal(loadgen.Result{
+			Requests: 1_000_000, Errors: 0, Duration: 2 * time.Minute,
+			RequestsPerSec: rps, ThroughputBPS: rps * 120,
+		})
+		return b
+	}
+
+	cells := []cellRecord{
+		// get-json: BOTH panels populated on the same row.
+		{
+			RunIndex: 0, Competitor: "celeris-X", Scenario: "get-json",
+			Status: "ok", SaturationModeRPS: 700000,
+			Loadgen: mkRes(700000),
+			RatedPasses: []ratedPassWire{
+				{TargetRPS: 100000, P99: 8 * time.Millisecond},
+				{TargetRPS: 300000, P99: 12 * time.Millisecond},
+			},
+		},
+		// chain-fullstack-get-json: only saturation (chain is not in
+		// the rated set; the per-cell rated sweep leaves the maps empty
+		// for this scenario).
+		{
+			RunIndex: 0, Competitor: "celeris-X", Scenario: "chain-fullstack-get-json",
+			Status: "ok", SaturationModeRPS: 580000,
+			Loadgen: mkRes(580000),
+		},
+		// post-4k: BOTH panels populated on the same row (post-4k IS in
+		// the rated set).
+		{
+			RunIndex: 0, Competitor: "celeris-X", Scenario: "post-4k",
+			Status: "ok", SaturationModeRPS: 430000,
+			Loadgen: mkRes(430000),
+			RatedPasses: []ratedPassWire{
+				{TargetRPS: 100000, P99: 200 * time.Microsecond},
+			},
+		},
+	}
+	writeRawHost(t, rawDir, "msa2-server", cells)
+
+	merged, err := mergeBenchResults(resultsDir, "msa2-server", benchParams{
+		CelerisVer: "v1.4.15", Duration: "40s", Warmup: "10s", Conns: "256", Runs: "1",
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	data, _ := os.ReadFile(merged)
+	var doc report.Document
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(doc.Benchmarks) != 1 {
+		t.Fatalf("Benchmarks: want 1 (celeris-X), got %d", len(doc.Benchmarks))
+	}
+	row := doc.Benchmarks[0]
+
+	// get-json: both panels on the same row.
+	if got := row.SaturationModeRPS["get-json"]; got != 700000 {
+		t.Errorf("SaturationModeRPS[get-json]: want 700000, got %v", got)
+	}
+	if got := row.RatedModeP99AtTargetRPS["get-json"]; got != 12*time.Millisecond {
+		t.Errorf("RatedModeP99AtTargetRPS[get-json]: want 12ms (P99 at 300k), got %v", got)
+	}
+	if slo := row.LatencyAtSLO["get-json"]; slo == nil {
+		t.Errorf("LatencyAtSLO[get-json]: want populated")
+	} else {
+		if got := slo[1000]; got != 300000 {
+			t.Errorf("LatencyAtSLO[get-json][1000ms]: want 300000, got %d", got)
+		}
+	}
+
+	// chain-fullstack-get-json: only saturation, rated maps empty.
+	if got := row.SaturationModeRPS["chain-fullstack-get-json"]; got != 580000 {
+		t.Errorf("SaturationModeRPS[chain-fullstack-get-json]: want 580000, got %v", got)
+	}
+	if _, present := row.LatencyAtSLO["chain-fullstack-get-json"]; present {
+		t.Errorf("LatencyAtSLO[chain-fullstack-get-json]: want ABSENT (chain not in rated set), got present")
+	}
+	if _, present := row.RatedModeP99AtTargetRPS["chain-fullstack-get-json"]; present {
+		t.Errorf("RatedModeP99AtTargetRPS[chain-fullstack-get-json]: want ABSENT, got present")
+	}
+
+	// post-4k: both panels on the same row.
+	if got := row.SaturationModeRPS["post-4k"]; got != 430000 {
+		t.Errorf("SaturationModeRPS[post-4k]: want 430000, got %v", got)
+	}
+	if got := row.RatedModeP99AtTargetRPS["post-4k"]; got != 200*time.Microsecond {
+		t.Errorf("RatedModeP99AtTargetRPS[post-4k]: want 200us (P99 at 100k), got %v", got)
+	}
+	if slo := row.LatencyAtSLO["post-4k"]; slo == nil {
+		t.Errorf("LatencyAtSLO[post-4k]: want populated")
+	} else {
+		// 200us @ 100k → clears 10ms (well under) → bucket {10: 100000}
+		// also clears 50/100/500/1000ms → all buckets = 100000
+		if got := slo[10]; got != 100000 {
+			t.Errorf("LatencyAtSLO[post-4k][10ms]: want 100000, got %d", got)
+		}
+	}
+}

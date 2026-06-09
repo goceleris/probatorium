@@ -112,8 +112,29 @@ func newestBenchmarkedVersion() (string, error) {
 // BenchTier runs the budget-asserted curated benchmark matrix N times
 // back-to-back, publishing each pass as a distinct run-K cell under the
 // same version/date/arch (#167). A second rated-scoped pass (#156) runs
-// once per N for the SLO panel, published to a sibling run-K-rated/ cell
-// so the saturation grid at run-K is never overwritten.
+// once per N. The runner executes BOTH the saturation pass (open-loop
+// blast) AND the rated sweep (closed-loop coordinated-omission-corrected
+// at fractions of measured saturation) inside a single cell, so the
+// published per-cell JSON carries both panels on the same scenario.
+//
+// The two-pass design (separate run-K/ + run-K-rated/ subdirs, with the
+// rated pass using a smaller 8-server × 3-scenario glob) is intentionally
+// gone: it doubled the published-tree cell count, fragmented the data
+// into two folders per iteration (run-K/ for the throughput grid,
+// run-K-rated/ for the latency-at-SLO grid), split the bench across
+// two UTC days when the run crossed midnight, and forced the consumer
+// to merge two folders to answer "what's celeris-iouring's RPS and
+// p99-at-1s-slo on the get-json scenario?". The new design answers
+// that question in one folder.
+//
+// Per-cell execution: a cell visits ONE (server, scenario) pair and
+// runs the saturation pass unconditionally. If the scenario is in
+// the rated subset (currently get-json / post-4k / auto-mix-111) and
+// the runner is launched with BENCH_RATED=1, the same cell ALSO runs
+// the rated sweep after the saturation pass. The cell's JSON carries
+// both maps on the same row; the bench's published Document has a
+// per-scenario SaturationModeRPS (every scenario) + a per-scenario
+// LatencyAtSLO (only the rated 3).
 //
 // Flow:
 //
@@ -123,8 +144,13 @@ func newestBenchmarkedVersion() (string, error) {
 //     then assert the whole run fits the 24h budget via FitWithin —
 //     logging exactly what was trimmed. NEVER silently truncates: if even
 //     minRuns overflows, fail loudly.
-//  3. For k in 1..N (BENCH_BACK_TO_BACK): publish the saturation pass as
-//     run-k, then the rated subset pass as run-k.
+//  3. Set BENCH_START_DATE to the bench start timestamp (UTC yyyymmdd)
+//     and reuse it for every iteration's Publish so the whole back-to-back
+//     run lands under a single date even when it crosses midnight.
+//  4. For k in 1..N (BENCH_BACK_TO_BACK): one Bench + one Publish, both
+//     onto run-K. BENCH_RATED=1 is set so every cell does its rated
+//     sweep; BENCH_SKIP_RATED=1 disables the rated subpass for throughput-
+//     only runs.
 //
 // N (back-to-back published cells) is orthogonal to BENCH_RUNS (per-cell
 // median interleave inside one publish). N=3 outer x BENCH_RUNS=3 inner is
@@ -136,13 +162,9 @@ func newestBenchmarkedVersion() (string, error) {
 //	BENCH_BACK_TO_BACK=1       N published run-K cells (release: 3)
 //	BENCH_RUNS=3               per-cell median basis inside each publish
 //	BENCH_TARGET=both          msa2-server | msr1 | both (both = 2 arches)
-//	BENCH_SKIP_RATED=          "1" runs saturation passes only. The rated
-//	                           pass publishes to its own run-K-rated/
-//	                           subdirectory alongside the saturation grid
-//	                           (so both panels survive a back-to-back run
-//	                           — the overwrite was fixed in this fix). Set
-//	                           this to "1" only for a throughput-only run
-//	                           that doesn't need the latency-at-SLO view.
+//	BENCH_SKIP_RATED=          "1" runs saturation passes only. Every
+//	                           cell still runs the saturation pass; the
+//	                           rated sweep is skipped per-cell.
 func BenchTier() error {
 	p := budget.ForProfile(os.Getenv("BENCH_PROFILE"))
 	n := atoiOr(os.Getenv("BENCH_BACK_TO_BACK"), 1)
@@ -169,45 +191,47 @@ func BenchTier() error {
 	fmt.Printf("\n=== BenchTier: profile=%s back-to-back=%d runs/cell=%d cells=%d rated-cells=%d ===\n",
 		p.Name, n, p.Runs, p.Cells, p.RatedCells)
 
+	// Bench start date is set ONCE before the back-to-back loop and
+	// inherited by every Publish in the iteration so a 10h bench that
+	// crosses midnight lands all cells under the same date. (Prior
+	// implementation used now() per Publish, which split the 3
+	// iterations across 2 dates when a run straddled UTC midnight.)
+	benchStartDate := time.Now().UTC().Format("20060102")
+	_ = os.Setenv("BENCH_START_DATE", benchStartDate)
+
 	for k := 1; k <= n; k++ {
 		runID := fmt.Sprintf("run-%d", k)
-		fmt.Printf("\n=== BenchTier: %s (saturation pass) ===\n", runID)
+		fmt.Printf("\n=== BenchTier: %s ===\n", runID)
 		if err := os.Setenv("PUBLISH_RUN_ID", runID); err != nil {
 			return err
 		}
-		// Saturation pass: curated cell glob, rated OFF, per-cell tuning.
+		// One bench per iteration: the runner does BOTH the saturation
+		// pass and the rated sweep (per rated-scenario) inside each
+		// cell. The published per-cell JSON carries both maps on the
+		// same row. The rated sweep is opt-in via BENCH_SKIP_RATED=1
+		// (set when the caller wants throughput-only — e.g. for the
+		// weekly smoke test). Per-scenario rated data lands in
+		// benchmarks[].latency_at_slo alongside the per-scenario
+		// saturation data, so the dashboard's headline reads "for
+		// this server × this scenario: RPS, p99-at-1s, SLO" all
+		// from one Document.
+		skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true"
+		if skipRated {
+			_ = os.Unsetenv("BENCH_RATED")
+		} else {
+			_ = os.Setenv("BENCH_RATED", "1")
+		}
 		setBenchEnvFromProfile(p, false)
 		if err := Bench(); err != nil {
-			return fmt.Errorf("%s saturation bench: %w", runID, err)
+			return fmt.Errorf("%s bench: %w", runID, err)
 		}
 		if err := Publish(); err != nil {
-			return fmt.Errorf("%s saturation publish: %w", runID, err)
-		}
-
-		// Rated pass: curated subset, rated ON. Published to a sibling
-		// run-K-rated/ subdirectory (CellRelDir appends the RunID verbatim,
-		// so a hyphenated suffix is just another sub-resource) so the
-		// saturation grid at the run-K path stays intact for the headline
-		// RPS table. Skipped when the profile carries no rated subset, or
-		// when BENCH_SKIP_RATED is set.
-		skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true"
-		if p.RatedCells > 0 && len(p.RatedGlobs) > 0 && !skipRated {
-			ratedRunID := runID + RatedRunIDSuffix
-			if err := os.Setenv("PUBLISH_RUN_ID", ratedRunID); err != nil {
-				return err
-			}
-			fmt.Printf("\n=== BenchTier: %s (rated pass) ===\n", ratedRunID)
-			setBenchEnvFromProfile(p, true)
-			if err := Bench(); err != nil {
-				return fmt.Errorf("%s rated bench: %w", ratedRunID, err)
-			}
-			if err := Publish(); err != nil {
-				return fmt.Errorf("%s rated publish: %w", ratedRunID, err)
-			}
-			_ = os.Unsetenv("BENCH_RATED")
+			return fmt.Errorf("%s publish: %w", runID, err)
 		}
 	}
 	_ = os.Unsetenv("PUBLISH_RUN_ID")
+	_ = os.Unsetenv("BENCH_RATED")
+	_ = os.Unsetenv("BENCH_START_DATE")
 	fmt.Printf("\n=== BenchTier complete (%d back-to-back run%s) ===\n", n, pluralN(n))
 	return nil
 }
