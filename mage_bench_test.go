@@ -496,14 +496,14 @@ func TestDiffBenchResultsTypedShape(t *testing.T) {
 // only, plus a third cell with rated only (so the per-scenario
 // presence pattern is mixed), and the Document must carry:
 //
-//   celeris-X on get-json:
-//     saturation_mode_rps["get-json"]      = 700000
-//     latency_at_slo["get-json"]           = { "1000": 600000, "500": 600000 }
-//     rated_mode_p99["get-json"]           = 12ms
-//   celeris-X on chain-fullstack-get-json:
-//     saturation_mode_rps[...]             = 580000
-//     latency_at_slo[...]                  = {}   (chain is not in rated set)
-//     rated_mode_p99[...]                  = {}   (chain is not in rated set)
+//	celeris-X on get-json:
+//	  saturation_mode_rps["get-json"]      = 700000
+//	  latency_at_slo["get-json"]           = { "1000": 600000, "500": 600000 }
+//	  rated_mode_p99["get-json"]           = 12ms
+//	celeris-X on chain-fullstack-get-json:
+//	  saturation_mode_rps[...]             = 580000
+//	  latency_at_slo[...]                  = {}   (chain is not in rated set)
+//	  rated_mode_p99[...]                  = {}   (chain is not in rated set)
 //
 // The two-panel-on-one-row invariant is the headline the dashboard
 // reads — breaking it forces consumers to re-merge two folders.
