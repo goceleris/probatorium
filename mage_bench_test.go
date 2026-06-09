@@ -655,7 +655,7 @@ func TestMergeBackToBackRatedPersistsAcrossIterations(t *testing.T) {
 			Latency: loadgen.Percentiles{
 				P50: 200 * time.Microsecond, P99: 1 * time.Millisecond,
 				P999: 2 * time.Millisecond, P9999: 3 * time.Millisecond,
-				Max:  4 * time.Millisecond,
+				Max: 4 * time.Millisecond,
 			},
 		})
 		return b

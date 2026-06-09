@@ -30,7 +30,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: full | headline (default: full — every server × every scenario, capability-gated. headline is the ~3h smoke-test opt-in, never the silent default, because users asked repeatedly for "no missing tests" and got the curated subset instead.)
+        description: "full | headline (default: full — every server × every scenario, capability-gated. headline is the ~3h smoke-test opt-in, never the silent default, because users asked repeatedly for \"no missing tests\" and got the curated subset instead.)"
         required: false
         type: string
         default: full
