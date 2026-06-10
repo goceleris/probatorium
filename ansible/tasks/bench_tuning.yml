@@ -143,7 +143,17 @@
     - inventory_hostname in groups['bench_targets'] or
       inventory_hostname == "msa2-client"
 
-- name: Verify memlock is raised on the bench target
+- name: Verify memlock=unlimited landed in /etc/security/limits.conf
+  become: true
+  ansible.builtin.shell: grep -E '^\*\s+(soft|hard)\s+memlock\s+unlimited' /etc/security/limits.conf
+  register: limits_conf_verify
+  changed_when: false
+  failed_when: limits_conf_verify.stdout_lines | length < 2
+  when:
+    - inventory_hostname in groups['bench_targets'] or
+      inventory_hostname == "msa2-client"
+
+- name: Verify prlimit raise worked in this shell (memlock should NOT be 8192)
   become: true
   ansible.builtin.shell: ulimit -l
   register: memlock_verify
@@ -155,7 +165,10 @@
 
 - name: Report memlock raise
   ansible.builtin.debug:
-    msg: "memlock: {{ memlock_verify.stdout | trim }} (was 8192 / 8MB before fix; needs >= 200MB for 16 iouring workers)"
+    msg: >-
+      memlock: limits.conf has {{ limits_conf_verify.stdout_lines | length }} memlock=unlimited entries;
+      current shell ulimit -l = {{ memlock_verify.stdout | trim }}
+      (was 8192 / 8MB before fix; needs >= 200MB for 16 iouring workers)
   when:
     - inventory_hostname in groups['bench_targets'] or
       inventory_hostname == "msa2-client"
