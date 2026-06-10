@@ -55,11 +55,14 @@ async fn main() -> std::io::Result<()> {
             // the same default as actix-web. The contract's POST
             // /upload drains the body — including the 1 MiB post-1m
             // scenario — so the server must accept up to ~2 MiB.
-            // web::PayloadConfig::new raises the per-payload limit;
-            // without this, post-1m returns 400 Payload Overflow and
-            // the cell is classified not_applicable (zero-request
-            // cell: all bodies rejected, all responses non-2xx).
-            .state(web::PayloadConfig::new(2 * 1024 * 1024))
+            // web::types::PayloadConfig::new raises the per-payload
+            // limit; without this, post-1m returns 400 Payload
+            // Overflow and the cell is classified not_applicable
+            // (zero-request cell: all bodies rejected, all responses
+            // non-2xx). PayloadConfig lives in
+            // ntex::web::types (not ntex::web::PayloadConfig — the
+            // actix-web-style re-export doesn't exist on ntex).
+            .state(web::types::PayloadConfig::new(2 * 1024 * 1024))
             .route("/", web::get().to(root))
             .route("/json", web::get().to(json_static))
             .route("/json-1k", web::get().to(json_1k))
