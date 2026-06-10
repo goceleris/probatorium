@@ -171,6 +171,15 @@ func newestBenchmarkedVersion() (string, error) {
 //	BENCH_SKIP_RATED=          "1" runs saturation passes only. Every
 //	                           cell still runs the saturation pass; the
 //	                           rated sweep is skipped per-cell.
+//	BENCH_PUBLISH=0            "0" / "false" skips the docs push so a
+//	                           short-window smoke test (e.g.
+//	                           BENCH_DURATION=5s BENCH_WARMUP=2s
+//	                           BENCH_SKIP_RATED=1 BENCH_PUBLISH=0) can
+//	                           verify every (server, scenario) pair
+//	                           produces data WITHOUT shipping partial
+//	                           results to the public docs site. Real
+//	                           publishes leave BENCH_PUBLISH unset
+//	                           (default = push).
 func BenchTier() error {
 	p := budget.ForProfile(os.Getenv("BENCH_PROFILE"))
 	n := atoiOr(os.Getenv("BENCH_BACK_TO_BACK"), 1)
@@ -231,8 +240,24 @@ func BenchTier() error {
 		if err := Bench(); err != nil {
 			return fmt.Errorf("%s bench: %w", runID, err)
 		}
-		if err := Publish(); err != nil {
-			return fmt.Errorf("%s publish: %w", runID, err)
+		// BENCH_PUBLISH=0 / false skips the docs push so a smoke test
+		// (`mage BenchTier BENCH_DURATION=5s BENCH_WARMUP=2s BENCH_SKIP_RATED=1
+		// BENCH_PUBLISH=0`) can verify every (server, scenario) pair
+		// produces a non-zero RPS result WITHOUT shipping partial /
+		// short-window data to the public docs site. Smoke tests are
+		// 5s cells × full grid ≈ 3h; the real weekly v3.8 is 90s cells
+		// × 1 back-to-back ≈ 19h, and only the latter is worth
+		// publishing. v3.8's 5s smoke test accidentally published
+		// 110 OK + 2 DNF + 21 not_applicable cells because there was
+		// no env knob to suppress the auto-publish — root cause of the
+		// docs pollution that needed a manual revert.
+		skipPublish := os.Getenv("BENCH_PUBLISH") == "0" || os.Getenv("BENCH_PUBLISH") == "false"
+		if skipPublish {
+			fmt.Printf("\n=== %s: BENCH_PUBLISH=0 — skipping docs push (smoke test mode) ===\n", runID)
+		} else {
+			if err := Publish(); err != nil {
+				return fmt.Errorf("%s publish: %w", runID, err)
+			}
 		}
 	}
 	_ = os.Unsetenv("PUBLISH_RUN_ID")
