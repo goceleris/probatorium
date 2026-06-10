@@ -53,6 +53,7 @@
       ansible.builtin.set_fact:
         to_remove: "{{ (cleanup_manifest.content | b64decode | from_json).installed_packages | default([]) }}"
         sysctl_to_restore: "{{ (cleanup_manifest.content | b64decode | from_json).prior_sysctl | default({}) }}"
+        prior_limits_conf: "{{ (cleanup_manifest.content | b64decode | from_json).prior_limits_conf | default('') }}"
         toolchains_to_remove: "{{ (cleanup_manifest.content | b64decode | from_json).installed_toolchains | default([]) }}"
       when: cleanup_manifest is defined and cleanup_manifest.content is defined
 
@@ -131,6 +132,22 @@
         - sysctl_to_restore is defined
         - sysctl_to_restore | length > 0
         - item.value != ''
+
+    # ---------- /etc/security/limits.conf restore ----------
+    # The deploy step adds memlock=unlimited lines for the io_uring
+    # engine (probatorium#1). A new login session is required for the
+    # changes to take effect, so we restore the snapshot from the
+    # manifest rather than re-applying the original lines. If the
+    # manifest is empty (first deploy), we leave the file as-is.
+    - name: Restore prior /etc/security/limits.conf (drop the memlock=unlimited lines)
+      become: true
+      ansible.builtin.copy:
+        content: "{{ prior_limits_conf | b64decode }}"
+        dest: /etc/security/limits.conf
+        mode: '0644'
+      when:
+        - prior_limits_conf is defined
+        - prior_limits_conf | length > 0
 
     # ---------- apt teardown ----------
     - name: Stop docker daemon before purge

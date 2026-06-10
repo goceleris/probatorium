@@ -107,6 +107,7 @@
       ansible.builtin.set_fact:
         installed_packages: "{{ (deploy_manifest_slurp.content | b64decode | from_json).installed_packages | default([]) }}"
         prior_sysctl: "{{ (deploy_manifest_slurp.content | b64decode | from_json).prior_sysctl | default({}) }}"
+        prior_limits_conf: "{{ (deploy_manifest_slurp.content | b64decode | from_json).prior_limits_conf | default('') }}"
         installed_toolchains: "{{ (deploy_manifest_slurp.content | b64decode | from_json).installed_toolchains | default([]) }}"
         fetched_versions: "{{ (deploy_manifest_slurp.content | b64decode | from_json).fetched_versions | default({}) }}"
       when: deploy_manifest_slurp is defined and deploy_manifest_slurp.content is defined
@@ -438,6 +439,7 @@
           {{ {
             'installed_packages': installed_packages,
             'prior_sysctl': prior_sysctl,
+            'prior_limits_conf': prior_limits_conf | default(''),
             'installed_toolchains': installed_toolchains,
             'fetched_versions': fetched_versions,
           } | to_nice_json }}
