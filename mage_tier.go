@@ -251,12 +251,23 @@ func BenchTier() error {
 // the legacy "two-pass" callers (Bench, Publish when BENCH_RATED is
 // not set) — when true, the cell glob scopes to the rated subset
 // AND BENCH_RATED is toggled.
+//
+// Honour a pre-set BENCH_DURATION / BENCH_WARMUP. The bench (and the
+// BenchTier entrypoint) read BENCH_DURATION before setBenchEnvFromProfile
+// runs, so a caller can pin a short window for a smoke test without
+// having to add a new profile. The function only sets the env if the
+// caller hasn't set it — a `mage Smoke` style command uses this to
+// override the profile's 90s/20s with 5s/2s for a 30-minute sweep.
 func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 	if rated {
 		_ = os.Setenv("BENCH_RATED", "1")
 		_ = os.Setenv("BENCH_CELLS", budget.RatedGlob(p))
-		_ = os.Setenv("BENCH_DURATION", durString(p.RatedDuration))
-		_ = os.Setenv("BENCH_WARMUP", durString(p.RatedWarmup))
+		if os.Getenv("BENCH_DURATION") == "" {
+			_ = os.Setenv("BENCH_DURATION", durString(p.RatedDuration))
+		}
+		if os.Getenv("BENCH_WARMUP") == "" {
+			_ = os.Setenv("BENCH_WARMUP", durString(p.RatedWarmup))
+		}
 		_ = os.Setenv("BENCH_RATED_DURATION", durString(p.RatedDuration))
 	} else {
 		// Saturation-pass tuning: full cell glob, saturation
@@ -267,8 +278,12 @@ func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 		// BENCH_RATED unset, which is the correct behaviour for a
 		// pure-saturation call.
 		_ = os.Setenv("BENCH_CELLS", budget.CellsGlob(p))
-		_ = os.Setenv("BENCH_DURATION", durString(p.Duration))
-		_ = os.Setenv("BENCH_WARMUP", durString(p.Warmup))
+		if os.Getenv("BENCH_DURATION") == "" {
+			_ = os.Setenv("BENCH_DURATION", durString(p.Duration))
+		}
+		if os.Getenv("BENCH_WARMUP") == "" {
+			_ = os.Setenv("BENCH_WARMUP", durString(p.Warmup))
+		}
 	}
 	_ = os.Setenv("BENCH_RUNS", fmt.Sprintf("%d", p.Runs))
 }
