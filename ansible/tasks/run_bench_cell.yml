@@ -125,21 +125,14 @@
     # host). Both inert for every non-.NET binary.
     DOTNET_ROOT: "{{ bench_root }}/dotnet"
     DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
-  ansible.builtin.shell: |
-    cd {{ bench_root }}
-    # Belt-and-suspenders: the deploy step writes memlock=unlimited to
-    # /etc/security/limits.conf AND raises the limit via prlimit on the
-    # ansible task that owns the deploy. But: (a) the limits.conf entry
-    # only takes effect on the NEXT login session, and (b) the prlimit
-    # raise lives in the deploy ansible shell, not the bench one. The
-    # bench SUT shell (this one) needs to raise memlock too — prlimit
-    # is the only mechanism that works in a one-shot ansible task, and
-    # it propagates to the nohup'd SUT process via fork/exec.
-    prlimit --memlock=unlimited --pid="$$" 2>&1 || true
-    ulimit -l unlimited 2>&1 || true
-    nohup ./competitors/{{ cell_bin }} -bind 0.0.0.0:{{ bench_port | default(8080) }} {{ ('-engine ' + cell_engine) if cell_engine else '' }} > {{ cell_dir }}/server.log 2>&1 &
-    echo $! > {{ cell_dir }}/server.pid
-    disown
+  ansible.builtin.shell:
+    cmd: |
+      cd {{ bench_root }}
+      ulimit -l unlimited 2>/dev/null || true
+      nohup ./competitors/{{ cell_bin }} -bind 0.0.0.0:{{ bench_port | default(8080) }} {{ ('-engine ' + cell_engine) if cell_engine else '' }} > {{ cell_dir }}/server.log 2>&1 &
+      echo $! > {{ cell_dir }}/server.pid
+      disown
+    executable: /bin/bash
   args:
     executable: /bin/bash
   when: inventory_hostname == bench_target
