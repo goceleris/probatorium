@@ -178,7 +178,7 @@ var Registry = map[string]Adapter{
 		Category:     "go-net-http",
 		Language:     "go",
 		Framework:    "stdhttp",
-		Engine:       "h2c",
+		Engine:       "h2c-noupg",
 		Bin:          GoBinary{ModuleDir: "servers/stdhttp"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},

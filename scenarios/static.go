@@ -75,6 +75,20 @@ func (s *StaticScenario) Workload(target string) loadgen.Config {
 		Connections:      conns,
 		DisableKeepAlive: s.DisableKeepAlive,
 	}
+	if s.DisableKeepAlive {
+		// Connection-close (churn) scenarios open `Workers × PoolSize`
+		// TCP connections in loadgen.New (h1client.go: connsPerWorker =
+		// PoolSize when !keepAlive). The default PoolSize=16 × Workers=64
+		// = 1024 simultaneous dials, which overwhelms single-listener
+		// SUTs (Zig std.http / Rust axum 0.7 with one accept loop, etc.)
+		// and manifests as the 145th-or-so dial hitting the 10s default
+		// dial timeout. Cap PoolSize=1 for churn so loadgen opens one
+		// conn per worker (64 dials), which every adapter on the bench
+		// handles cleanly. (v3.8 smoke test caught this on zig_zap /
+		// churn-close — single-listener SUT, accept queue filled before
+		// the bench started its measurement window.)
+		cfg.PoolSize = 1
+	}
 	if s.HTTP2 {
 		cfg.HTTP2 = true
 		// loadgen's HTTP/2 side has its own connection count knob —

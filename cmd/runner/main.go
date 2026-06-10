@@ -947,10 +947,17 @@ func featureSetFor(a servers.Adapter, tlsReady bool) servers.FeatureSet {
 		fs.Auto = true
 		fs.H2CUpgrade = true
 	case strings.Contains(a.Engine, "hybrid"):
-		// Celeris "stdhttp-hybrid" — auto-picks h1 or h2c per
-		// connection and supports the upgrade dance.
+		// Go net/http "hybrid" — SetHTTP1(true) + SetUnencryptedHTTP2(true)
+		// accepts plain HTTP/1.1 OR prior-knowledge h2c. It does NOT
+		// speak the h1→h2c upgrade handshake (101 Switching Protocols)
+		// because the Go stdlib's http2.Transport requires a custom
+		// handler that the stdlib doesn't wire up. Leave H2CUpgrade=false
+		// so loadgen's -h2c-upgrade mode is not scheduled against
+		// stdhttp-hybrid (it would DNF with "h2c upgrade: server
+		// returned status 200 (expected 101)" — same root cause as the
+		// v3.7 chi-h2 regression; stdhttp-hybrid is just a different
+		// adapter making the same false H2CUpgrade claim).
 		fs.HTTP2C = true
-		fs.H2CUpgrade = true
 	}
 	if strings.Contains(a.Engine, "async") {
 		fs.AsyncHandlers = true

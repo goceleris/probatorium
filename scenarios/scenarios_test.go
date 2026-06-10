@@ -153,6 +153,15 @@ func TestChurnCloseUsesConnectionClose(t *testing.T) {
 	if cfg.Connections != 32 {
 		t.Errorf("churn-close: Connections = %d, want 32", cfg.Connections)
 	}
+	// churn-close (DisableKeepAlive=true) must cap loadgen's PoolSize=1
+	// so the bench only opens Workers (64) concurrent dials, not
+	// Workers × PoolSize (1024). The 1024-dial burst overwhelms
+	// single-listener SUTs (Zig std.http, axum's default accept loop,
+	// etc.) and manifests as "i/o timeout" on the Nth dial. v3.8
+	// smoke test caught this on zig_zap / churn-close.
+	if cfg.PoolSize != 1 {
+		t.Errorf("churn-close: PoolSize = %d, want 1 (cap to keep dial burst under the kernel accept-backlog limit)", cfg.PoolSize)
+	}
 }
 
 func TestAutoMixApplicableGating(t *testing.T) {
