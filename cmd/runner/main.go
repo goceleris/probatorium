@@ -921,19 +921,34 @@ func featureSetFor(a servers.Adapter, tlsReady bool) servers.FeatureSet {
 	fs := servers.FeatureSet{HTTP1: true}
 	switch {
 	case strings.Contains(a.Engine, "h2c"):
+		// "h2c" without any upgrade suffix is the Go-net/http h2c
+		// mode (chi-h2, gin-h2, echo-h2, hertz-h2, iris-h2,
+		// stdhttp-h2). All use http.Protocols.SetUnencryptedHTTP2()
+		// or h2c.NewHandler, which only accept PRIOR-KNOWLEDGE h2c
+		// — they do NOT speak the h1→h2c upgrade handshake (the
+		// 101 Switching Protocols response the loadgen's
+		// -h2c-upgrade mode looks for). Flagging H2CUpgrade=true
+		// for these engines produces a DNF cell on every
+		// auto-mix-111 / mixed-protocol run, not a real signal.
+		// Only the celeris "h2c+upg" mode (today: "iouring-auto+upg-async"
+		// — caught by the "auto" branch below) actually implements
+		// the upgrade path, so H2CUpgrade is intentionally left false
+		// for plain "h2c" engines. (Regression seen in v3.7:
+		// chi-h2 / auto-mix-111 DNF'd with "h2c upgrade: server
+		// returned status 200 (expected 101)" — fixed here.)
 		fs.HTTP2C = true
-		// h2c-noupg is the only mode that refuses H1; everything else
-		// (h2c+upg, hybrid) accepts both.
-		if !strings.Contains(a.Engine, "noupg") {
-			fs.H2CUpgrade = true
-		} else {
+		if strings.Contains(a.Engine, "noupg") {
 			fs.HTTP1 = false
 		}
 	case strings.Contains(a.Engine, "auto"):
+		// Celeris "iouring-auto+upg-async" — the only engine that
+		// implements the full h1+h2c+upgrade protocol triple.
 		fs.HTTP2C = true
 		fs.Auto = true
 		fs.H2CUpgrade = true
 	case strings.Contains(a.Engine, "hybrid"):
+		// Celeris "stdhttp-hybrid" — auto-picks h1 or h2c per
+		// connection and supports the upgrade dance.
 		fs.HTTP2C = true
 		fs.H2CUpgrade = true
 	}
