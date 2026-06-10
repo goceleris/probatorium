@@ -78,16 +78,31 @@ func (s *StaticScenario) Workload(target string) loadgen.Config {
 	if s.DisableKeepAlive {
 		// Connection-close (churn) scenarios open `Workers × PoolSize`
 		// TCP connections in loadgen.New (h1client.go: connsPerWorker =
-		// PoolSize when !keepAlive). The default PoolSize=16 × Workers=64
-		// = 1024 simultaneous dials, which overwhelms single-listener
-		// SUTs (Zig std.http / Rust axum 0.7 with one accept loop, etc.)
-		// and manifests as the 145th-or-so dial hitting the 10s default
-		// dial timeout. Cap PoolSize=1 for churn so loadgen opens one
-		// conn per worker (64 dials), which every adapter on the bench
-		// handles cleanly. (v3.8 smoke test caught this on zig_zap /
-		// churn-close — single-listener SUT, accept queue filled before
-		// the bench started its measurement window.)
+		// PoolSize when !keepAlive). Two caps apply:
+		//
+		//   1. PoolSize=1 — loadgen dials 1 conn per worker instead of
+		//      the default 16. The default 16 × Workers=64 = 1024
+		//      simultaneous dials overwhelms single-listener SUTs (Zig
+		//      std.http / Rust axum 0.7 with one accept loop, etc.) and
+		//      manifests as the 145th-or-so dial hitting the 10s default
+		//      dial timeout.
+		//   2. Workers=8 — even 1×64 simultaneous dials (PoolSize=1,
+		//      Workers=64) overwhelms the slowest single-listener SUT
+		//      (zig_zap's std.http.Server, which has no SO_REUSEPORT in
+		//      Zig 0.16 — the kernel accept queue fills before the
+		//      bench's measurement window starts). 8 simultaneous
+		//      dials × 1 conn/worker = 8 in-flight, which every
+		//      adapter on the bench (multi-listener or
+		//      single-listener + fast accept) drains in well under
+		//      10s. 8 workers is still enough to characterise
+		//      Connection: close overhead — the per-conn cost is the
+		//      signal, not the parallelism.
+		//
+		// v3.8 smoke test caught this: 1024 dials hung the runner on
+		// zig_zap's first cell (PoolSize=1 + Workers=64 reduced it to
+		// 64 dials, still too many for zig_zap).
 		cfg.PoolSize = 1
+		cfg.Workers = 8
 	}
 	if s.HTTP2 {
 		cfg.HTTP2 = true
