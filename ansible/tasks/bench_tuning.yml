@@ -76,17 +76,29 @@
 # default is 8MB which caps the engine to 1 worker ("io_uring workers
 # capped by RLIMIT_MEMLOCK requested=16 capped_to=1"); that single
 # worker then crashes with stack pool corruption under the bench's
-# 200-conns × 8-deep load. Three layers of fix, all idempotent:
+# 200-conns × 8-deep load.
 #
-#   1. /etc/security/limits.conf: persistent entry so future login
-#      sessions inherit the new limit. Survives across deploys.
-#   2. prlimit --memlock=unlimited on the CURRENT shell: raises the
-#      limit immediately (no re-login required) for any process
-#      spawned from this ansible task onwards. This is the load-bearing
-#      fix — limits.conf changes only take effect on next login.
-#   3. Snapshot the prior limits.conf state into prior_limits_conf so
-#      cleanup.yml can restore the host's pristine state on teardown
-#      (the same pattern as prior_sysctl).
+# The fix is layered: (a) defaults in systemd for FUTURE logins, (b)
+# an sshd drop-in so NEW sshd-spawned sessions inherit unlimited,
+# and (c) explicit user entries in limits.conf as a belt-and-suspenders.
+# All three are needed because the limit is enforced at process
+# creation — any of the three alone is insufficient. The (a)+(b)
+# combo takes full effect on the NEXT system boot (systemd reads
+# DefaultLimitMEMLOCK at pid 1 startup; sshd reads LimitMEMLOCK when
+# it itself starts, which only happens at boot). The bench is
+# intended to run on hosts that have been booted at least once with
+# this deploy's systemd.conf in place.
+#
+# Three things make this layer-defence complete:
+#   1. /etc/systemd/system.conf: DefaultLimitMEMLOCK=infinity
+#      → sets the system-wide default for new processes
+#   2. /etc/systemd/system/ssh.service.d/memlock.conf: LimitMEMLOCK=infinity
+#      → forces sshd to inherit unlimited even if (1) is missing
+#   3. /etc/security/limits.conf: explicit memlock=unlimited for *,
+#      root, and mini (the wildcard does NOT apply to root per
+#      limits.conf(5) — both must be listed)
+# → future SSH logins read (3) and inherit unlimited memlock
+# → sshd children (the SUT shell) inherit the raised limit
 - name: Snapshot prior /etc/security/limits.conf (so cleanup can restore)
   become: true
   ansible.builtin.slurp:
@@ -103,41 +115,82 @@
     prior_limits_conf: "{{ limits_conf_slurp.content | default('') }}"
   when: limits_conf_slurp is defined
 
-- name: Add memlock=unlimited to /etc/security/limits.conf
+- name: Add memlock=unlimited lines to /etc/security/limits.conf
+  # Per limits.conf(5): "group and wildcard limits are not applied to
+  # the root user. To set a limit for the root user, this field must
+  # contain the literal username root." We list BOTH the wildcard and
+  # explicit root/mini so the limit applies regardless of which user
+  # the bench runs as (ansible become: true = root; ssh login = mini).
   become: true
   ansible.builtin.lineinfile:
     path: /etc/security/limits.conf
-    line: "*    soft    memlock    unlimited"
+    line: "{{ item }}"
     insertbefore: "# End of file"
+    state: present
+    create: false
+  loop:
+    - "*    soft    memlock    unlimited"
+    - "*    hard    memlock    unlimited"
+    - "root  soft    memlock    unlimited"
+    - "root  hard    memlock    unlimited"
+    - "mini  soft    memlock    unlimited"
+    - "mini  hard    memlock    unlimited"
+  when:
+    - inventory_hostname in groups['bench_targets'] or
+      inventory_hostname == "msa2-client"
+
+- name: Set DefaultLimitMEMLOCK=infinity in /etc/systemd/system.conf
+  # Takes effect on the NEXT system boot. The bench is intended to
+  # run on hosts that have been rebooted at least once with this
+  # deploy's systemd.conf in place, so sshd inherits the unlimited
+  # limit at boot.
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/systemd/system.conf
+    line: "DefaultLimitMEMLOCK=infinity"
+    regexp: "^#?DefaultLimitMEMLOCK="
     state: present
     create: false
   when:
     - inventory_hostname in groups['bench_targets'] or
       inventory_hostname == "msa2-client"
 
-- name: Add memlock=unlimited hard limit to /etc/security/limits.conf
+- name: Drop-in LimitMEMLOCK=infinity for the sshd service
+  # Belt-and-suspenders: the sshd service drop-in overrides the
+  # system default for the sshd process itself, so even if
+  # /etc/systemd/system.conf is missing the line, sshd is started
+  # with unlimited memlock. Requires `systemctl daemon-reload` and
+  # a subsequent sshd restart to take effect.
   become: true
-  ansible.builtin.lineinfile:
-    path: /etc/security/limits.conf
-    line: "*    hard    memlock    unlimited"
-    insertbefore: "# End of file"
-    state: present
-    create: false
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/ssh.service.d/memlock.conf
+    content: |
+      [Service]
+      LimitMEMLOCK=infinity
+    mode: '0644'
   when:
     - inventory_hostname in groups['bench_targets'] or
       inventory_hostname == "msa2-client"
 
-- name: Raise RLIMIT_MEMLOCK on the current shell (prlimit) for immediate effect
+- name: systemctl daemon-reload (picks up the sshd drop-in)
+  become: true
+  ansible.builtin.command: systemctl daemon-reload
+  changed_when: false
+  when:
+    - inventory_hostname in groups['bench_targets'] or
+      inventory_hostname == "msa2-client"
+
+- name: Schedule a delayed sshd restart (so the issuing session survives)
+  # Restarting sshd directly would kill the ansible connection that
+  # issued the command. Instead, kick off a 5-second nohup background
+  # job that does the restart, then return. By the time the next SSH
+  # session lands, sshd has been restarted and reads the new limit.
   become: true
   ansible.builtin.shell: |
-    # prlimit can raise the hard limit only if the kernel allows it
-    # (CONFIG_SECURITY_CAPABILITIES or root-in-init_user); on a stock
-    # Ubuntu 26.04 host, root-in-user_ns CAN raise its own memlock.
-    # The change applies to this shell + children. The SUT is spawned
-    # from this ansible task, so it inherits the raised limit.
-    prlimit --memlock=unlimited --pid=$$ --output=RESOURCE,SOFT,HARD 2>&1 || true
-    echo "current memlock limit: $(ulimit -l)"
-  register: prlimit_raise
+    nohup bash -c 'sleep 5 && systemctl restart ssh' > /var/log/probatorium-sshd-restart.log 2>&1 &
+    disown
+  args:
+    executable: /bin/bash
   changed_when: false
   when:
     - inventory_hostname in groups['bench_targets'] or
@@ -145,30 +198,34 @@
 
 - name: Verify memlock=unlimited landed in /etc/security/limits.conf
   become: true
-  ansible.builtin.shell: grep -E '^\*\s+(soft|hard)\s+memlock\s+unlimited' /etc/security/limits.conf
+  ansible.builtin.shell: grep -E '^((\*|root|mini)\s+(soft|hard)\s+memlock\s+unlimited)' /etc/security/limits.conf
   register: limits_conf_verify
   changed_when: false
-  failed_when: limits_conf_verify.stdout_lines | length < 2
+  failed_when: limits_conf_verify.stdout_lines | length < 6
   when:
     - inventory_hostname in groups['bench_targets'] or
       inventory_hostname == "msa2-client"
 
-- name: Verify prlimit raise worked in this shell (memlock should NOT be 8192)
+- name: Verify DefaultLimitMEMLOCK=infinity landed in /etc/systemd/system.conf
   become: true
-  ansible.builtin.shell: ulimit -l
-  register: memlock_verify
+  ansible.builtin.shell: grep -E '^DefaultLimitMEMLOCK=infinity' /etc/systemd/system.conf
+  register: systemd_verify
   changed_when: false
-  failed_when: memlock_verify.stdout | trim == "8192"
+  failed_when: systemd_verify.stdout_lines | length != 1
   when:
     - inventory_hostname in groups['bench_targets'] or
       inventory_hostname == "msa2-client"
 
-- name: Report memlock raise
+- name: Report memlock fix status
   ansible.builtin.debug:
     msg: >-
-      memlock: limits.conf has {{ limits_conf_verify.stdout_lines | length }} memlock=unlimited entries;
-      current shell ulimit -l = {{ memlock_verify.stdout | trim }}
-      (was 8192 / 8MB before fix; needs >= 200MB for 16 iouring workers)
+      memlock fix applied to {{ inventory_hostname }}:
+      limits.conf has {{ limits_conf_verify.stdout_lines | length }} memlock=unlimited entries;
+      systemd DefaultLimitMEMLOCK=infinity set;
+      sshd drop-in installed at /etc/systemd/system/ssh.service.d/memlock.conf;
+      sshd restart scheduled. A subsequent boot is needed for the
+      full effect; until then, the bench may still cap iouring to 1
+      worker (logs will show 'capped_to=1').
   when:
     - inventory_hostname in groups['bench_targets'] or
       inventory_hostname == "msa2-client"
