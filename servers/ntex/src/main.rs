@@ -50,6 +50,16 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(async || {
         App::new()
+            // ntex's web::Bytes extractor caps the buffered body at
+            // 256 KiB by default (ntex::web::Bytes::LIMIT = 262144),
+            // the same default as actix-web. The contract's POST
+            // /upload drains the body — including the 1 MiB post-1m
+            // scenario — so the server must accept up to ~2 MiB.
+            // web::PayloadConfig::new raises the per-payload limit;
+            // without this, post-1m returns 400 Payload Overflow and
+            // the cell is classified not_applicable (zero-request
+            // cell: all bodies rejected, all responses non-2xx).
+            .state(web::PayloadConfig::new(2 * 1024 * 1024))
             .route("/", web::get().to(root))
             .route("/json", web::get().to(json_static))
             .route("/json-1k", web::get().to(json_1k))

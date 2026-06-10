@@ -45,6 +45,19 @@ async fn main() -> std::io::Result<()> {
     let server = HttpServer::new(|| {
         App::new()
             .wrap(middleware::DefaultHeaders::new())
+            // actix-web's web::Bytes extractor caps the buffered body at
+            // 256 KiB by default (actix_web::web::Bytes::MAX = 262144).
+            // The contract's POST /upload drains the body — including the
+            // 1 MiB post-1m scenario — so the server must accept up to
+            // ~2 MiB. PayloadConfig::new sets the limit for the streaming
+            // Payload type; the Bytes extractor's own cap is raised via
+            // the same JSON-config path that JsonConfig uses, which
+            // also raises JsonConfig's default 32 KiB. Without this,
+            // post-1m returns 413 Payload Too Large and the cell is
+            // classified not_applicable (zero-request cell: all bodies
+            // rejected, all responses non-2xx). 2 MiB covers the bench
+            // while still capping pathological clients.
+            .app_data(web::PayloadConfig::new(2 * 1024 * 1024))
             .route("/", web::get().to(root))
             .route("/json", web::get().to(json_static))
             .route("/json-1k", web::get().to(json_1k))
