@@ -447,6 +447,24 @@ func resolveBenchColumns(arg string) ([]benchColumn, error) {
 			// fiber), so passing the registry Engine value is always safe there.
 			if col.Bin != "gorilla_ws" {
 				col.Engine = a.Engine
+				// Strip a "-noupg" suffix from the SUT-facing engine flag.
+				// The registry's Engine field is the FEATURE-SET tag
+				// (cmd/runner/featureSetFor reads it to decide HTTP1 /
+				// HTTP2C), while col.Engine is the flag value passed to
+				// the SUT binary. The stdhttp adapter's -engine parser
+				// accepts h1|h2c|hybrid — it doesn't know "h2c-noupg".
+				// chi-h2 / gin-h2 / echo-h2 / hertz-h2 / iris-h2 use
+				// "h2c" (no noupg suffix) because their SUT actually
+				// does h1+h2c via http.Protocols.SetHTTP1 + SetUnencryptedHTTP2;
+				// only stdhttp-h2's SUT does h2c-only, and that's the
+				// one we tag as h2c-noupg. Strip here so the SUT sees
+				// the h2c it understands and the runner sees the
+				// h2c-noupg it needs for the capability filter. v3.8
+				// smoke test caught this: stdhttp-h2's runner was
+				// never invoked because the SUT exited immediately on
+				// "unknown -engine h2c-noupg", so the bind gate timed
+				// out and the whole column was skipped.
+				col.Engine = strings.TrimSuffix(col.Engine, "-noupg")
 			}
 		} else {
 			// NativeBinary (rust/cpp/dotnet/zig/bun/python) — staged under
