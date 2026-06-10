@@ -135,7 +135,7 @@
     # bench SUT shell (this one) needs to raise memlock too — prlimit
     # is the only mechanism that works in a one-shot ansible task, and
     # it propagates to the nohup'd SUT process via fork/exec.
-    prlimit --memlock=unlimited --pid=$$ 2>&1 || true
+    prlimit --memlock=unlimited --pid="$$" 2>&1 || true
     ulimit -l unlimited 2>&1 || true
     nohup ./competitors/{{ cell_bin }} -bind 0.0.0.0:{{ bench_port | default(8080) }} {{ ('-engine ' + cell_engine) if cell_engine else '' }} > {{ cell_dir }}/server.log 2>&1 &
     echo $! > {{ cell_dir }}/server.pid
