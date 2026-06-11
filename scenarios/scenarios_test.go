@@ -153,23 +153,14 @@ func TestChurnCloseUsesConnectionClose(t *testing.T) {
 	if cfg.Connections != 32 {
 		t.Errorf("churn-close: Connections = %d, want 32", cfg.Connections)
 	}
-	// churn-close (DisableKeepAlive=true) must cap loadgen's
-	// PoolSize=1 + Workers=8 so the bench only opens 8 concurrent
-	// dials, not 1024 (default PoolSize=16 × Workers=64). The
-	// 1024-dial burst overwhelms single-listener SUTs (Zig
-	// std.http, axum's default accept loop, etc.) and manifests as
-	// "i/o timeout" on the Nth dial. Even 64 simultaneous dials
-	// (PoolSize=1 + Workers=64) hung zig_zap's runner on v3.8's
-	// smoke test — Zig 0.16's std.http.Server has no SO_REUSEPORT,
-	// so the kernel accept queue fills before the bench's
-	// measurement window starts. 8 simultaneous dials is small
-	// enough to drain on every adapter on the bench and large
-	// enough to characterise Connection: close overhead.
+	// churn-close (DisableKeepAlive=true) must cap loadgen's PoolSize=1
+	// so the bench only opens Workers (64) concurrent dials, not
+	// Workers × PoolSize (1024). The 1024-dial burst overwhelms
+	// single-listener SUTs (Zig std.http, axum's default accept loop,
+	// etc.) and manifests as "i/o timeout" on the Nth dial. v3.8
+	// smoke test caught this on zig_zap / churn-close.
 	if cfg.PoolSize != 1 {
 		t.Errorf("churn-close: PoolSize = %d, want 1 (cap to keep dial burst under the kernel accept-backlog limit)", cfg.PoolSize)
-	}
-	if cfg.Workers != 8 {
-		t.Errorf("churn-close: Workers = %d, want 8 (cap to keep in-flight dials under the single-listener accept-backlog limit)", cfg.Workers)
 	}
 }
 

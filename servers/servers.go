@@ -421,32 +421,29 @@ var Registry = map[string]Adapter{
 		Capabilities: Capabilities{Static: true},
 	},
 
-	// zig_zap — the Zig event-loop competitor column, a direct architectural
-	// peer to celeris's iouring / epoll engines: a fixed pool of OS threads,
-	// each running a blocking accept + HTTP/1.1 serve loop over the same
-	// SO_REUSEPORT listener so the kernel load-balances connections across
-	// cores with no userspace contention. Built natively on the bench host
-	// like the Rust/dotnet adapters: `zig build -Doptimize=ReleaseFast` emits
-	// zig-out/bin/zig_zap, which the build symlinks into
-	// {bench}/competitors/zig_zap; the runner invokes it with `-bind <addr>`
-	// and waits for `ready addr=<addr>` on stdout.
-	//
-	// The HTTP codec is the Zig standard library's std.http.Server (the
-	// from-scratch HTTP/1.1 server that ships with Zig 0.16), NOT zigzap/zap:
-	// zap 0.10.7 declares minimum_zig_version 0.15.0 and bundles facil.io (C),
-	// whose sources fail to build under the installed Zig 0.16 C toolchain.
-	// Static-only contract — no Drivers / Middleware / WS / SSE / TLS. H1-only.
-	"zig_zap": {
-		Name: "zig_zap", Category: "zig-stdhttp", Language: "zig", Framework: "zig_zap", Engine: "h1",
-		Bin: NativeBinary{
-			Lang: "zig",
-			BuildSteps: []string{
-				"cd $SRC && zig build -Doptimize=ReleaseFast",
-			},
-			RunCmd: "{bin} -bind {bind}",
-		},
-		Capabilities: Capabilities{Static: true},
-	},
+	// zig_zap — REMOVED from the registry on 2026-06-11. The Zig 0.16
+	// std.http.Server's accept loop is single-listener / single-thread
+	// (Zig 0.16's IpAddress.listen has no SO_REUSEPORT primitive — the
+	// old `reuse_address: true` workaround doesn't apply to
+	// ephemeral-port sharing in the v3.8 build of std). At the bench's
+	// default Workers=64, the second cell (get-json, keep-alive with
+	// 64 simultaneous dials) deadlocked loadgen.New's h1client dial
+	// burst and the runner was killed by the bench's SIGKILL timeout
+	// (8m56s). The cell came back as a misclassified not_applicable
+	// ("zero-request cell: errors=0 duration=318µs"). Manual test:
+	// zig_zap handles 8 / 16 / 32 concurrent conns cleanly, but 64
+	// simultaneous dials overflow the kernel accept queue
+	// (LISTEN 48 active, 128 in backlog; the 65th-and-up dials block
+	// on accept). With the v3.7-era stdlib going multi-listener is
+	// non-trivial and we don't want to pin a stale Zig nightly. The
+	// right call at this point in the v3.8 cycle is to retire the
+	// column; the Zig adapter was a single-listener entrant in a
+	// bench where every other adapter is either multi-thread + SO_REUSEPORT
+	// (Rust / Go / .NET) or has a fast accept loop (celeris epoll /
+	// iouring). The `servers/zig_zap/` source is left in tree for
+	// reference and to be re-introduced when Zig 0.16+ lands a proper
+	// reuse-port primitive; the registry entry is intentionally
+	// absent so the bench never schedules a column against it.
 
 	// celeris — 4 engine modes selected at runtime via -engine. The
 	// binary is the same; entries differ only in Engine + Name.
