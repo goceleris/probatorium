@@ -939,10 +939,12 @@ func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cel
 					Status:     string(status),
 					Error:      cf.Error,
 				}
-				// Only an OK cell carries a loadgen payload to rank. A
-				// cell with no `result` (the SUT failed to answer) is emitted
-				// as a classified N/A / DNF record rather than dropped.
-				if status == report.CellOK && len(cf.Result) > 0 && string(cf.Result) != "null" {
+				// Only a cell with a real measurement carries a loadgen
+				// payload: OK always, and suspect too — its numbers exist,
+				// integrity flagged (schema v5.4). A cell with no `result`
+				// (the SUT failed to answer) is emitted as a classified
+				// N/A / DNF record rather than dropped.
+				if status.HasData() && len(cf.Result) > 0 && string(cf.Result) != "null" {
 					rec.Loadgen = cf.Result
 				}
 				// Thread the rated sweep + saturation anchor from the
@@ -1071,14 +1073,15 @@ func summarizeCells(cells []cellRecord) (map[string]competitorStats, error) {
 	res := map[string][]*report.ResourceStats{}
 	rated := map[string][][]ratedPassWire{}
 	for _, c := range cells {
-		// Non-OK cells (not_applicable / dnf) carry no loadgen payload — they
-		// were recorded for classification and live on in the raw `cells`
-		// array for the document merge, but there is nothing to summarise.
-		// Gate on the classified status (the SAME predicate the document-merge
-		// path uses) so both cluster-path aggregations share one inclusion
+		// No-data cells (not_applicable / dnf) carry no loadgen payload —
+		// they were recorded for classification and live on in the raw
+		// `cells` array for the document merge, but there is nothing to
+		// summarise. Suspect cells keep their numbers (schema v5.4). Gate
+		// on HasData (the SAME predicate Aggregate and the document-merge
+		// path use) so every cluster-path aggregation shares one inclusion
 		// rule; the Loadgen-emptiness check stays as a defensive backstop so
 		// the unmarshal below never hits empty input.
-		if st := report.CellStatus(c.Status); st != "" && st != report.CellOK {
+		if !report.CellStatus(c.Status).HasData() {
 			continue
 		}
 		if len(c.Loadgen) == 0 || string(c.Loadgen) == "null" {
@@ -1358,6 +1361,17 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 	// competitor that ran on both bench targets contributes its runs
 	// from both files into the same CellResult.
 	collected := map[string]*report.CellResult{}
+	// Per-cell run evidence, mirroring cmd/runner's resultsSink: EVERY
+	// run's status is preserved and the cell-level status is reduced
+	// after the walk, so outcome order can never promote — an OK record
+	// arriving after a crash used to reset Status=ok / ErrorMsg="" here
+	// (the merge-side half of the v3.8 OK-promotion bug).
+	type runEvidence struct {
+		runIdx int
+		status report.CellStatus
+		errMsg string
+	}
+	evidence := map[string][]runEvidence{}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -1402,15 +1416,13 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 				}
 				collected[crKey] = cr
 			}
-			if status != report.CellOK {
-				// A cell that did not run (or produced no real number): record
-				// the classified status + error and SKIP the Sample append
-				// rather than unmarshaling a zero Result into a ranked sample.
-				// An OK record on any run still promotes the cell below.
-				if len(cr.Samples) == 0 && cr.Status != report.CellOK {
-					cr.Status = status
-					cr.ErrorMsg = cell.Error
-				}
+			evidence[crKey] = append(evidence[crKey],
+				runEvidence{runIdx: cell.RunIndex, status: status, errMsg: cell.Error})
+			// Only runs that carry a real measurement contribute samples:
+			// OK always, suspect keeps its data (schema v5.4). DNF / N/A
+			// runs never append a bogus 0-RPS sample. Status + ErrorMsg are
+			// reduced AFTER the walk from the full evidence.
+			if !status.HasData() || len(cell.Loadgen) == 0 || string(cell.Loadgen) == "null" {
 				continue
 			}
 			var res loadgen.Result
@@ -1419,8 +1431,6 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 					cell.Competitor, cell.RunIndex, e.Name(), err)
 			}
 			cr.Samples = append(cr.Samples, res)
-			cr.Status = report.CellOK
-			cr.ErrorMsg = ""
 			// loadgen.Result.Histogram is the V2-compressed HdrHistogram
 			// payload as raw bytes; CellResult wants base64 strings so
 			// report.Aggregate can decode + merge them across runs.
@@ -1440,6 +1450,38 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 				}
 				cr.RatedSamples = append(cr.RatedSamples, rs)
 			}
+		}
+	}
+
+	// Reduce each cell's evidence into the cell-level status, mirroring
+	// cmd/runner's resultsSink.recordRun: runs are ordered by the ansible
+	// run index (the real execution order), a run that failed for
+	// SUT-behaviour reasons (anything but a harness-side "interrupted:")
+	// demotes the cell to suspect even when a rerun passed, and the
+	// surviving ErrorMsg is the FIRST failure, not the latest.
+	for key, cr := range collected {
+		evs := evidence[key]
+		sort.SliceStable(evs, func(i, j int) bool { return evs[i].runIdx < evs[j].runIdx })
+		runs := make([]report.CellStatus, len(evs))
+		demoted := false
+		firstErr, seenErr := "", false
+		for i, ev := range evs {
+			runs[i] = ev.status
+			if ev.status != report.CellOK {
+				if !seenErr {
+					firstErr, seenErr = ev.errMsg, true
+				}
+				if !strings.HasPrefix(ev.errMsg, "interrupted:") {
+					demoted = true
+				}
+			}
+		}
+		cr.RunStatuses = runs
+		cr.Status = report.ReduceCellStatus(runs, len(cr.Samples) > 0, demoted)
+		if cr.Status == report.CellOK {
+			cr.ErrorMsg = ""
+		} else {
+			cr.ErrorMsg = firstErr
 		}
 	}
 
