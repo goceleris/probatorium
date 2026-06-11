@@ -164,6 +164,36 @@ func TestBuildCellConfig(t *testing.T) {
 			t.Errorf("HTTP2Options.Connections = %d, want 32", lg.HTTP2Options.Connections)
 		}
 	})
+
+	// loadgen (≤ v1.4.7) Mode drivers run ONE stream per worker and
+	// ignore Config.Connections, so streaming cells must map the
+	// scenario's Connections onto Workers — otherwise sse-fanout-1024 /
+	// ws-hub-broadcast-1024 only ever open 64 streams (v3.8: the -128
+	// and -1024 variants recorded identical RPS in every archived run).
+	t.Run("sse-fanout-1024 maps connections to workers", func(t *testing.T) {
+		cell := interleave.Cell{Scenario: scenarioByName(t, "sse-fanout-1024")}
+		lg := buildCellConfig(cell, base, cfg)
+		if lg.Mode != "sse-fanout" {
+			t.Fatalf("Mode = %q, want sse-fanout", lg.Mode)
+		}
+		if lg.Workers != 1024 {
+			t.Errorf("Workers = %d, want 1024 (one stream per worker)", lg.Workers)
+		}
+	})
+	t.Run("ws-hub-broadcast-1024 maps connections to workers", func(t *testing.T) {
+		cell := interleave.Cell{Scenario: scenarioByName(t, "ws-hub-broadcast-1024")}
+		lg := buildCellConfig(cell, base, cfg)
+		if lg.Workers != 1024 {
+			t.Errorf("Workers = %d, want 1024 (one stream per worker)", lg.Workers)
+		}
+	})
+	t.Run("ws-echo maps connections to workers", func(t *testing.T) {
+		cell := interleave.Cell{Scenario: scenarioByName(t, "ws-echo")}
+		lg := buildCellConfig(cell, base, cfg)
+		if lg.Workers != 128 {
+			t.Errorf("Workers = %d, want 128", lg.Workers)
+		}
+	})
 }
 
 func TestRun_RemoteDryRun(t *testing.T) {
