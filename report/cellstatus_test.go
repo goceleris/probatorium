@@ -60,6 +60,64 @@ func TestClassifyCellError(t *testing.T) {
 	}
 }
 
+// TestReduceCellStatus pins the shared multi-run reduction (the
+// cluster-merge mirror of cmd/runner's private reduceCellStatus table —
+// the two MUST stay in sync): an OK run keeps the cell's data but can
+// never erase prior SUT-behaviour evidence (the v3.8 OK-promotion bug),
+// while harness-side interruptions never poison otherwise-clean data.
+func TestReduceCellStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		runs    []CellStatus
+		hasData bool
+		demoted bool
+		want    CellStatus
+	}{
+		{"all ok", []CellStatus{CellOK, CellOK}, true, false, CellOK},
+		{"crash then ok is suspect, not ok", []CellStatus{CellDNF, CellOK}, true, true, CellSuspect},
+		{"ok then crash is suspect", []CellStatus{CellOK, CellDNF}, true, true, CellSuspect},
+		{"ok then interrupted keeps ok", []CellStatus{CellOK, CellDNF}, true, false, CellOK},
+		{"suspect run is suspect", []CellStatus{CellSuspect}, true, true, CellSuspect},
+		{"dnf only", []CellStatus{CellDNF}, false, true, CellDNF},
+		{"n/a only", []CellStatus{CellNotApplicable}, false, true, CellNotApplicable},
+		{"n/a + dnf is dnf (loud)", []CellStatus{CellNotApplicable, CellDNF}, false, true, CellDNF},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReduceCellStatus(tc.runs, tc.hasData, tc.demoted); got != tc.want {
+				t.Errorf("ReduceCellStatus(%v, data=%v, demoted=%v) = %q, want %q",
+					tc.runs, tc.hasData, tc.demoted, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormatRunOutcome pins the markdown run-evidence rendering: the
+// reduced verdict leads, the ok-run fraction follows, and non-OK runs
+// are tallied in a fixed order so the note is byte-stable.
+func TestFormatRunOutcome(t *testing.T) {
+	cases := []struct {
+		name string
+		st   CellStatus
+		seq  []string
+		want string
+	}{
+		{"recovered interruption", CellOK, []string{"dnf", "ok", "ok"}, "ok (2/3 runs; 1 dnf)"},
+		{"crash demotes", CellSuspect, []string{"dnf", "ok"}, "suspect (1/2 runs; 1 dnf)"},
+		{"suspect run", CellSuspect, []string{"suspect"}, "suspect (0/1 runs; 1 suspect)"},
+		{"mixed non-ok order is fixed", CellSuspect, []string{"suspect", "dnf", "not_applicable", "ok"},
+			"suspect (1/4 runs; 1 dnf, 1 n/a, 1 suspect)"},
+		{"all ok (defensive)", CellOK, []string{"ok", "ok"}, "ok (2/2 runs)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatRunOutcome(tc.st, tc.seq); got != tc.want {
+				t.Errorf("formatRunOutcome(%q, %v) = %q, want %q", tc.st, tc.seq, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestAggregateNonOKExcludedFromHeadline asserts a not-applicable cell
 // (no samples) produces a CellAggregate that surfaces its Status but
 // contributes NO headline numbers, while an OK cell's numbers are
@@ -410,6 +468,15 @@ func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
 	// bolded as a leader (colMax excludes non-OK cells).
 	if strings.Contains(md, "**250.0k") {
 		t.Errorf("suspect cell's rated numbers were bolded as a leader:\n%s", md)
+	}
+	// Per-run outcome evidence renders under each scenario carrying it:
+	// the recovered cell shows the crash ("1 dnf"), the suspect churn
+	// cell its suspect run — an OK rerun stays visible as 1/2, never 2/2.
+	if !strings.Contains(md, "_runs: actix-web suspect (1/2 runs; 1 dnf)_") {
+		t.Errorf("markdown missing run evidence for the [dnf ok] cell:\n%s", md)
+	}
+	if !strings.Contains(md, "_runs: actix-web suspect (0/1 runs; 1 suspect)_") {
+		t.Errorf("markdown missing run evidence for the suspect churn cell:\n%s", md)
 	}
 }
 

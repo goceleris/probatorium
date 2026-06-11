@@ -122,6 +122,46 @@ func ClassifyCellError(errMsg string) CellStatus {
 	}
 }
 
+// ReduceCellStatus folds a cell's per-run statuses into the cell-level
+// status. All-OK stays OK. A cell with data whose only blemishes are
+// harness-side interruptions (demoted=false) also stays OK — RunStatuses
+// still carries the evidence. A cell with data plus any SUT-behaviour
+// failure (demoted=true) is suspect: the data exists, but a sibling run
+// crashed / lied / stormed, so an OK rerun can never erase the record
+// into a clean "ok" (the v3.8 OK-promotion bug). With no data at all,
+// any DNF run wins (loud) over not-applicable.
+//
+// Shared reduction for both result-merge paths. cmd/runner currently
+// carries a private copy with the identical table (reduceCellStatus,
+// pinned by cmd/runner/cellclassify_test.go); keep the two in sync
+// until the runner delegates here.
+func ReduceCellStatus(runs []CellStatus, hasData, demoted bool) CellStatus {
+	allOK := true
+	anyDNF := false
+	for _, st := range runs {
+		switch st {
+		case CellOK:
+		case CellDNF:
+			allOK = false
+			anyDNF = true
+		default:
+			allOK = false
+		}
+	}
+	switch {
+	case allOK:
+		return CellOK
+	case hasData && demoted:
+		return CellSuspect
+	case hasData:
+		return CellOK
+	case anyDNF:
+		return CellDNF
+	default:
+		return CellNotApplicable
+	}
+}
+
 // Document is the top-level v5.0 results JSON shape. One file per
 // probatorium run; emit by JSON-encoding from the orchestrator.
 type Document struct {

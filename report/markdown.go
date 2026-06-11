@@ -185,6 +185,24 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 			return err
 		}
 
+		// Per-run outcome evidence (schema v5.4): one entry per adapter
+		// whose run sequence carried a non-OK run, e.g.
+		// "gin-h1 ok (2/3 runs; 1 dnf)" for a cell that recovered from a
+		// harness interruption. Emitted only when evidence exists so
+		// pre-v5.4 reports stay byte-identical.
+		var evidence []string
+		for _, a := range adapters {
+			if seq := a.CellRunStatuses[sc]; len(seq) > 0 {
+				evidence = append(evidence,
+					a.Name+" "+formatRunOutcome(cellStatusFor(a, sc), seq))
+			}
+		}
+		if len(evidence) > 0 {
+			if _, err := io.WriteString(w, "_runs: "+strings.Join(evidence, " · ")+"_\n\n"); err != nil {
+				return err
+			}
+		}
+
 		// Header row: adapter | 10ms | 50ms | 100ms | 500ms | 1000ms
 		header := []string{"adapter"}
 		for _, ms := range SLOThresholds {
@@ -305,6 +323,58 @@ func cellStatusToken(st CellStatus) string {
 	default:
 		return "—"
 	}
+}
+
+// formatRunOutcome renders a cell's reduced status plus its per-run
+// outcome tally, e.g. "ok (2/3 runs; 1 dnf)" for a cell that recovered
+// from a harness interruption, or "suspect (1/2 runs; 1 dnf)" for one
+// demoted by a mid-column crash. The reduced status leads so a reader
+// sees the verdict first and the evidence second. Non-OK runs are
+// tallied in a fixed order (dnf, n/a, suspect, then unknown sorted) so
+// the note is byte-stable across reruns.
+func formatRunOutcome(st CellStatus, seq []string) string {
+	okCount := 0
+	nonOK := map[string]int{}
+	for _, s := range seq {
+		if s == string(CellOK) || s == "" {
+			okCount++
+			continue
+		}
+		nonOK[s]++
+	}
+	token := string(st)
+	if token == "" {
+		token = string(CellOK)
+	}
+	if len(nonOK) == 0 {
+		return fmt.Sprintf("%s (%d/%d runs)", token, okCount, len(seq))
+	}
+	display := map[string]string{string(CellNotApplicable): "n/a"}
+	order := []string{string(CellDNF), string(CellNotApplicable), string(CellSuspect)}
+	for k := range nonOK {
+		known := false
+		for _, o := range order {
+			if k == o {
+				known = true
+				break
+			}
+		}
+		if !known {
+			order = append(order, k)
+		}
+	}
+	sort.Strings(order[3:])
+	var parts []string
+	for _, k := range order {
+		if n := nonOK[k]; n > 0 {
+			name := k
+			if d, ok := display[k]; ok {
+				name = d
+			}
+			parts = append(parts, fmt.Sprintf("%d %s", n, name))
+		}
+	}
+	return fmt.Sprintf("%s (%d/%d runs; %s)", token, okCount, len(seq), strings.Join(parts, ", "))
 }
 
 // writeDetailSection emits the per-scenario detail block: median RPS
