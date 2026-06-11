@@ -39,6 +39,11 @@ type StaticScenario struct {
 	// directly (no HTTP/1.1 Upgrade handshake). Used to exercise H2C-capable
 	// server cells, including h2c-noupg which refuses plain H1 by design.
 	HTTP2 bool
+
+	// ErrBudget, when > 0, overrides [DefaultErrorBudget] as this
+	// scenario's loadgen error-ratio ceiling (see [ErrorBudgeter]). Only
+	// churn-close sets it today.
+	ErrBudget float64
 }
 
 // NewStaticScenario constructs a [StaticScenario] with the given
@@ -54,6 +59,15 @@ func (s *StaticScenario) Name() string { return s.name }
 
 // Category implements [Scenario].
 func (s *StaticScenario) Category() string { return CategoryStatic }
+
+// ErrorBudget implements [ErrorBudgeter]: the explicit ErrBudget when
+// set, else [DefaultErrorBudget].
+func (s *StaticScenario) ErrorBudget() float64 {
+	if s.ErrBudget > 0 {
+		return s.ErrBudget
+	}
+	return DefaultErrorBudget
+}
 
 // Workload returns the loadgen.Config for this scenario. The
 // orchestrator overwrites Duration and Warmup after calling Workload so
@@ -239,6 +253,20 @@ func init() {
 		Path:             "/",
 		Connections:      32,
 		DisableKeepAlive: true,
+		// Churn legitimately produces refused dials — the accept-backlog
+		// overflowing under connection churn is part of what the scenario
+		// measures — so the default 5% budget would flag every healthy
+		// run. But the v3.8 evidence (and every archived run before it)
+		// shows errors at 28x–97x REQUESTS on every server: under loadgen
+		// <= v1.4.7 a refused dial is retried in a hot loop with no
+		// backoff, so the counter records loadgen's retry-spin rate
+		// (~10^5/s), not the SUT's failure rate, and the published RPS
+		// describes a SUT in permanent accept-overload. Budget 0.5 means
+		// "failed dial attempts may not outnumber completed requests":
+		// generous headroom for the benign churn fraction, while every
+		// historical 0.96+-ratio cell — previously status=ok — is now
+		// flagged suspect until the loadgen dial-backoff fix lands.
+		ErrBudget: 0.5,
 	})
 
 	// HTTP/2 prior-knowledge variants. Paired with the H1 versions on the
