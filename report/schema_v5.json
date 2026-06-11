@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/goceleris/probatorium/main/report/schema_v5.json",
   "title": "Probatorium results document",
-  "description": "v5.3 schema for probatorium per-run results files. Additive over v4: every v4 field is still present, plus environment, benchmark_config, compile_options, latency_at_slo, hdr_histogram_b64, validation_results, soak_summary, (v5.2) per-(adapter, scenario) server resources and (v5.3) per-server cell_statuses recording cells that did not produce a real number (not_applicable / dnf) so they are not ranked as 0-RPS also-rans. A v4 reader sees a strict superset of the fields it knows. Both the in-process runner and the cluster mage Bench path emit this single canonical shape.",
+  "description": "v5.4 schema for probatorium per-run results files. Additive over v4: every v4 field is still present, plus environment, benchmark_config, compile_options, latency_at_slo, hdr_histogram_b64, validation_results, soak_summary, (v5.2) per-(adapter, scenario) server resources, (v5.3) per-server cell_statuses recording cells that did not produce a real number (not_applicable / dnf) so they are not ranked as 0-RPS also-rans, and (v5.4) the 'suspect' status (cell ran but its loadgen error ratio blew the scenario's error budget — data kept, integrity flagged) plus per-server cell_run_statuses preserving the per-run outcome sequence so an OK rerun can never erase prior non-OK evidence. A v4 reader sees a strict superset of the fields it knows. Both the in-process runner and the cluster mage Bench path emit this single canonical shape.",
   "type": "object",
   "required": [
     "schema_version",
@@ -133,10 +133,21 @@
         },
         "cell_statuses": {
           "type": "object",
-          "description": "Per-scenario outcome for cells this adapter did NOT produce a real number for, keyed by scenario name (v5.3+). Value is 'not_applicable' (route/protocol unimplemented) or 'dnf' (dial/port/crash/timeout). A scenario listed here is deliberately absent from saturation_mode_rps / latency_at_slo / hdr_histogram_b64 — it did not run, so it is never ranked as a 0-RPS row. 'ok' is documented as a value for completeness but never emitted (OK cells carry real numbers in the headline maps instead). Optional; omitted when every cell for this adapter ran. Older readers ignore the field.",
+          "description": "Per-scenario outcome for cells this adapter did NOT produce a clean number for, keyed by scenario name (v5.3+). Value is 'not_applicable' (route/protocol unimplemented), 'dnf' (dial/port/crash/timeout) or 'suspect' (v5.4+: the cell completed but its loadgen error ratio blew the scenario's error budget). A not_applicable/dnf scenario is deliberately absent from saturation_mode_rps / latency_at_slo / hdr_histogram_b64 — it did not run, so it is never ranked as a 0-RPS row; a suspect scenario keeps its headline numbers next to the flag. 'ok' is documented as a value for completeness but never emitted (OK cells carry real numbers in the headline maps instead). Optional; omitted when every cell for this adapter ran. Older readers ignore the field.",
           "additionalProperties": {
             "type": "string",
-            "enum": ["ok", "not_applicable", "dnf"]
+            "enum": ["ok", "not_applicable", "dnf", "suspect"]
+          }
+        },
+        "cell_run_statuses": {
+          "type": "object",
+          "description": "Per-scenario per-run outcome sequence in execution order (v5.4+), keyed by scenario name, emitted only when at least one run of the cell came back non-OK. Preserves the evidence of every run so an OK rerun can never erase a prior crash from the record. Optional; older readers ignore the field.",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["ok", "not_applicable", "dnf", "suspect"]
+            }
           }
         }
       }

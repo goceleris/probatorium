@@ -10,12 +10,15 @@ import (
 
 // TestClassifyCellError pins the error→status mapping that BOTH merge
 // paths (the in-process runner and the cluster mage Bench path) call so
-// they agree on field width. The split is load-bearing: "zero-request" /
-// "capability-lie" are the adapter not implementing the route (N/A);
-// "read server settings" is N/A only when it timed out (server never spoke
-// H2), but DNF on reset/EOF (an H2 server that crashed mid-handshake);
-// everything else is an infra failure (DNF); ambiguous defaults to DNF,
-// never N/A.
+// they agree on field width. The split is load-bearing: "capability-lie"
+// is the adapter not implementing the route (N/A); "suspect:" is the
+// runner's error-ratio gate (data kept, integrity flagged); "read server
+// settings" is N/A only when it timed out (server never spoke H2), but
+// DNF on reset/EOF (an H2 server that crashed mid-handshake); everything
+// else — including "zero-request cell", which v3.8 proved is what every
+// dead-SUT / interrupted cell wears (genuine capability gaps never reach
+// loadgen; the scheduler skips them) — is an infra failure (DNF);
+// ambiguous defaults to DNF, never N/A.
 func TestClassifyCellError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -23,7 +26,17 @@ func TestClassifyCellError(t *testing.T) {
 		want CellStatus
 	}{
 		{"empty is ok", "", CellOK},
-		{"zero-request is n/a", "zero-request cell: errors=10 duration=20s", CellNotApplicable},
+		// v3.9: zero-request was N/A before v5.4. The v3.8 dead-port
+		// streaming cells (0 req / 34.7M err) and the SIGTERM-truncated
+		// 354µs cells (0 req / 0 err) all carried this string and were
+		// silently excused as N/A — it is now loud by design.
+		{"zero-request is dnf", "zero-request cell: errors=10 duration=20s", CellDNF},
+		{"zero-request dead-port storm is dnf", "zero-request cell: errors=34730615 duration=1m30.000225614s", CellDNF},
+		{"zero-request interrupted stub is dnf", "zero-request cell: errors=0 duration=354.329µs", CellDNF},
+		{"server-down probe is dnf", "server-down: pre-cell probe: dial tcp 192.168.50.65:8080: connect: connection refused", CellDNF},
+		{"server-died-mid-cell is dnf", "server-died-mid-cell: post-cell probe: dial tcp 192.168.50.65:8080: connect: connection refused (requests=4029 errors=33140345)", CellDNF},
+		{"interrupted is dnf", "interrupted: cell cancelled mid-run (requests=0 errors=0 duration=354.329µs)", CellDNF},
+		{"suspect is suspect", "suspect: error ratio 0.960 exceeds budget 0.50 (errors=290204598 requests=12081484)", CellSuspect},
 		{"capability-lie is n/a", `capability-lie: scheduled chain scenario "chain-mw5" got high error ratio from gin-h1 (errors=999000/requests=1000000) — adapter declared the capability but did not serve the route`, CellNotApplicable},
 		{"read server settings timeout is n/a", "loadgen.Run: loadgen: dial: h2client: connect: read server settings: i/o timeout", CellNotApplicable},
 		{"read server settings reset is dnf (crash mid-handshake)", "loadgen.New: loadgen: dial: h2client: dial conn[0]: read server settings: read tcp 10.0.0.2:5->10.0.0.1:8080: read: connection reset by peer", CellDNF},
@@ -242,6 +255,186 @@ func TestDocumentV52DecodesWithoutCellStatuses(t *testing.T) {
 	}
 	if doc.Benchmarks[0].CellStatuses != nil {
 		t.Errorf("CellStatuses should be nil for a v5.2 doc, got %v", doc.Benchmarks[0].CellStatuses)
+	}
+}
+
+// TestAggregateSuspectKeepsData asserts a suspect cell — real samples,
+// error ratio over budget (the churn-close shape: v3.8 actix-web ran
+// 12,081,484 requests against 290,204,598 errors and was published
+// status=ok) — keeps its headline numbers while carrying the suspect
+// status, unlike N/A / DNF cells which stay zero.
+func TestAggregateSuspectKeepsData(t *testing.T) {
+	samples := makeSamples([]float64{134231.93}, 50*time.Microsecond)
+	samples[0].Requests = 12081484
+	samples[0].Errors = 290204598
+	cell := CellResult{
+		ScenarioName: "churn-close", ServerName: "actix-web",
+		ServerKind: "actix", Category: "static",
+		Samples:     samples,
+		Status:      CellSuspect,
+		ErrorMsg:    "suspect: error ratio 0.960 exceeds budget 0.50 (errors=290204598 requests=12081484)",
+		RunStatuses: []CellStatus{CellSuspect},
+	}
+
+	agg := Aggregate([]CellResult{cell})
+	c := agg[CellID("churn-close", "actix-web")]
+	if c.Status != CellSuspect {
+		t.Errorf("Status = %q, want suspect", c.Status)
+	}
+	if c.RPSMedian != 134231.93 {
+		t.Errorf("suspect cell lost its data: RPSMedian = %.2f, want 134231.93", c.RPSMedian)
+	}
+	if c.Errors != 290204598 {
+		t.Errorf("Errors = %d, want 290204598", c.Errors)
+	}
+	if c.ErrorMsg == "" {
+		t.Errorf("suspect cell dropped ErrorMsg")
+	}
+	if len(c.RunStatuses) != 1 || c.RunStatuses[0] != CellSuspect {
+		t.Errorf("RunStatuses = %v, want [suspect]", c.RunStatuses)
+	}
+}
+
+// TestBuildDocumentSuspectAndRunStatuses asserts (a) a suspect cell gets
+// BOTH a cell_statuses entry and its headline saturation number — data
+// exists, integrity flagged — and (b) a cell whose run sequence was
+// [dnf, ok] surfaces the sequence in cell_run_statuses so the OK rerun
+// does not erase the crash evidence. The emitted document must still
+// validate against schema_v5.json.
+func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
+	suspectSamples := makeSamples([]float64{134231.93}, 50*time.Microsecond)
+	suspectSamples[0].Requests = 12081484
+	suspectSamples[0].Errors = 290204598
+	suspect := CellResult{
+		ScenarioName: "churn-close", ServerName: "actix-web",
+		ServerKind: "actix", Category: "static",
+		Samples:     suspectSamples,
+		Status:      CellSuspect,
+		ErrorMsg:    "suspect: error ratio 0.960 exceeds budget 0.50 (errors=290204598 requests=12081484)",
+		RunStatuses: []CellStatus{CellSuspect},
+	}
+	// A second adapter ran churn-close clean WITH rated data so the
+	// scenario gets a Latency-at-SLO section for the suspect row to
+	// render its token in.
+	churnOK := CellResult{
+		ScenarioName: "churn-close", ServerName: "celeris-std-h1",
+		ServerKind: "celeris", Category: "static",
+		Samples:      makeSamples([]float64{160000}, 45*time.Microsecond),
+		RatedSamples: [][]RatedSample{{{TargetRPS: 120000, P99: 2 * time.Millisecond}}},
+		RunStatuses:  []CellStatus{CellOK},
+	}
+	recovered := CellResult{
+		ScenarioName: "get-json", ServerName: "actix-web",
+		ServerKind: "actix", Category: "static",
+		Samples:      makeSamples([]float64{500000}, 40*time.Microsecond),
+		RatedSamples: [][]RatedSample{{{TargetRPS: 250000, P99: 2 * time.Millisecond}}},
+		Status:       CellSuspect,
+		ErrorMsg:     "server-down: pre-cell probe: dial tcp 10.0.0.2:8080: connect: connection refused",
+		RunStatuses:  []CellStatus{CellDNF, CellOK},
+	}
+	clean := CellResult{
+		ScenarioName: "get-simple", ServerName: "actix-web",
+		ServerKind: "actix", Category: "static",
+		Samples:     makeSamples([]float64{700000}, 30*time.Microsecond),
+		RunStatuses: []CellStatus{CellOK, CellOK},
+	}
+	agg := Aggregate([]CellResult{suspect, churnOK, recovered, clean})
+
+	doc := BuildDocument(BuildInput{
+		HostArchPair: "linux/amd64",
+		Environment:  Environment{KernelSysctlsApplied: []string{}, LoadgenHost: "h", Fabric: "loopback"},
+		BenchmarkConfig: BenchmarkConfig{
+			StartedAt:  time.Unix(1700000000, 0).UTC(),
+			FinishedAt: time.Unix(1700001000, 0).UTC(),
+			Runs:       2, Duration: time.Second, GitRef: "x",
+			LoadgenVer: "v1", CelerisVer: "v1",
+		},
+		Servers: map[string]ServerMeta{
+			"actix-web":      {Category: "static", Language: "rust", Framework: "actix-web", FrameworkVersion: "v4", CompileOptions: []string{}},
+			"celeris-std-h1": {Category: "static", Language: "go", LanguageVersion: "go1.26", Framework: "celeris", FrameworkVersion: "v1", CompileOptions: []string{}},
+		},
+		Agg: agg,
+	})
+	if len(doc.Benchmarks) != 2 {
+		t.Fatalf("Benchmarks = %d, want 2", len(doc.Benchmarks))
+	}
+	// Sorted by Name: actix-web first.
+	sr := doc.Benchmarks[0]
+
+	// Suspect cell: flagged AND ranked-with-data.
+	if sr.CellStatuses["churn-close"] != string(CellSuspect) {
+		t.Errorf("cell_statuses[churn-close] = %q, want suspect", sr.CellStatuses["churn-close"])
+	}
+	if got := sr.SaturationModeRPS["churn-close"]; got != 134231.93 {
+		t.Errorf("suspect cell lost its headline number: saturation = %v, want 134231.93", got)
+	}
+	if got := sr.CellRunStatuses["churn-close"]; len(got) != 1 || got[0] != "suspect" {
+		t.Errorf("cell_run_statuses[churn-close] = %v, want [suspect]", got)
+	}
+
+	// Recovered cell: the [dnf, ok] sequence survives.
+	if got := sr.CellRunStatuses["get-json"]; len(got) != 2 || got[0] != "dnf" || got[1] != "ok" {
+		t.Errorf("cell_run_statuses[get-json] = %v, want [dnf ok]", got)
+	}
+
+	// Clean cell: all-OK runs add no run-status bytes.
+	if _, present := sr.CellRunStatuses["get-simple"]; present {
+		t.Errorf("all-OK cell must not appear in cell_run_statuses, got %v", sr.CellRunStatuses)
+	}
+	if _, present := sr.CellStatuses["get-simple"]; present {
+		t.Errorf("all-OK cell must not appear in cell_statuses, got %v", sr.CellStatuses)
+	}
+
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal doc: %v", err)
+	}
+	validateAny(t, loadSchema(t), raw)
+
+	// Markdown: the suspect count appears in the field note and the
+	// suspect cell never renders as a 0-RPS or bolded row.
+	var buf bytes.Buffer
+	if err := WriteMarkdown(&buf, doc, agg, Meta{GitRef: "t"}); err != nil {
+		t.Fatalf("WriteMarkdown: %v", err)
+	}
+	md := buf.String()
+	if !strings.Contains(md, "ran=1 n/a=0 dnf=0 suspect=1") {
+		t.Errorf("markdown missing suspect count in field note:\n%s", md)
+	}
+	// churn-close: suspect with NO rated row → token spanning the SLO
+	// columns, never "0 rps".
+	if !strings.Contains(md, "| actix-web | SUSPECT | SUSPECT | SUSPECT | SUSPECT | SUSPECT |") {
+		t.Errorf("markdown missing SUSPECT token row for rated-data-less suspect cell:\n%s", md)
+	}
+	// get-json: suspect WITH a rated row → numbers render but are never
+	// bolded as a leader (colMax excludes non-OK cells).
+	if strings.Contains(md, "**250.0k") {
+		t.Errorf("suspect cell's rated numbers were bolded as a leader:\n%s", md)
+	}
+}
+
+// TestDocumentV53DecodesWithoutRunStatuses asserts a v5.3 document (no
+// cell_run_statuses field) still decodes — the v5.4 fields are additive
+// and omitempty, so older artefacts round-trip with nil maps.
+func TestDocumentV53DecodesWithoutRunStatuses(t *testing.T) {
+	const v53 = `{
+		"schema_version": "5.3",
+		"host_arch_pair": "linux/amd64",
+		"environment": {"kernel_sysctls_applied": [], "loadgen_host": "h", "fabric": "loopback"},
+		"benchmark_config": {"started_at":"2024-01-01T00:00:00Z","finished_at":"2024-01-01T00:01:00Z","runs":1,"duration":1,"warmup":0,"git_ref":"x","loadgen_version":"v1","celeris_version":"v1"},
+		"benchmarks": [
+			{"name":"celeris-std-h1","category":"static","language":"go","language_version":"go1.26","framework":"celeris","framework_version":"v1","compile_options":[],"saturation_mode_rps":{"get-json":100},"rated_mode_p99_at_target_rps":{},"latency_at_slo":{},"hdr_histogram_b64":{},"loadgen_cpu_p95":{},"sent_vs_handled_delta_pct":{},"cell_statuses":{"chain-mw5":"dnf"}}
+		]
+	}`
+	var doc Document
+	if err := json.Unmarshal([]byte(v53), &doc); err != nil {
+		t.Fatalf("v5.3 document failed to decode under v5.4 schema: %v", err)
+	}
+	if doc.Benchmarks[0].CellRunStatuses != nil {
+		t.Errorf("CellRunStatuses should be nil for a v5.3 doc, got %v", doc.Benchmarks[0].CellRunStatuses)
+	}
+	if doc.Benchmarks[0].CellStatuses["chain-mw5"] != "dnf" {
+		t.Errorf("v5.3 cell_statuses lost in decode: %v", doc.Benchmarks[0].CellStatuses)
 	}
 }
 

@@ -102,18 +102,27 @@ func BuildDocument(in BuildInput) *Document {
 			byAdapter[c.ServerName] = sr
 		}
 
-		// A non-OK cell did not produce a real number: it is route/protocol
-		// not-implemented (not_applicable) or an infra failure (dnf). Record
-		// it in CellStatuses and skip every headline map so it is never
-		// ranked as a 0-RPS also-ran (schema v5.3). An empty-string Status
-		// is treated as OK for back-compat with callers that pre-date the
-		// classification (they only ever hand OK cells anyway).
+		// Per-run outcome evidence (schema v5.4): emitted whenever at least
+		// one run came back non-OK so a clean rerun can never erase a prior
+		// crash; all-OK cells add no bytes.
+		recordRunStatuses(sr, c)
+
+		// A non-OK cell is route/protocol not-implemented (not_applicable),
+		// an infra failure (dnf), or integrity-questionable data (suspect).
+		// Record it in CellStatuses (schema v5.3). Cells with no data skip
+		// every headline map so they are never ranked as a 0-RPS also-ran;
+		// suspect cells fall through and keep their numbers next to the
+		// flag (schema v5.4). An empty-string Status is treated as OK for
+		// back-compat with callers that pre-date the classification (they
+		// only ever hand OK cells anyway).
 		if c.Status != "" && c.Status != CellOK {
 			if sr.CellStatuses == nil {
 				sr.CellStatuses = map[string]string{}
 			}
 			sr.CellStatuses[c.ScenarioName] = string(c.Status)
-			continue
+			if !c.Status.HasData() {
+				continue
+			}
 		}
 
 		sr.SaturationModeRPS[c.ScenarioName] = c.RPSMedian
@@ -172,6 +181,31 @@ func BuildDocument(in BuildInput) *Document {
 		out.Benchmarks = append(out.Benchmarks, *byAdapter[n])
 	}
 	return out
+}
+
+// recordRunStatuses copies a cell's per-run outcome sequence into
+// ServerResult.CellRunStatuses (schema v5.4) when at least one run was
+// non-OK. All-OK cells are skipped so the field stays absent for the
+// common case and v5.3-era output is byte-identical.
+func recordRunStatuses(sr *ServerResult, c CellAggregate) {
+	anyNonOK := false
+	for _, st := range c.RunStatuses {
+		if st != CellOK {
+			anyNonOK = true
+			break
+		}
+	}
+	if !anyNonOK {
+		return
+	}
+	if sr.CellRunStatuses == nil {
+		sr.CellRunStatuses = map[string][]string{}
+	}
+	runs := make([]string, len(c.RunStatuses))
+	for i, st := range c.RunStatuses {
+		runs[i] = string(st)
+	}
+	sr.CellRunStatuses[c.ScenarioName] = runs
 }
 
 // ratedHeadlineP99 picks the canonical rated-pass P99 to surface in

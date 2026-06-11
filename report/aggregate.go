@@ -69,6 +69,13 @@ type CellResult struct {
 	// is unset, so either path (in-process runner or cluster merge) can
 	// hand a cell either pre-classified or as a raw error string.
 	ErrorMsg string
+
+	// RunStatuses is the per-run outcome sequence in execution order,
+	// one entry per scheduled run of this cell (schema v5.4). Unlike
+	// Status (the reduced cell-level outcome) it preserves the evidence
+	// of every run, so an OK rerun cannot erase a prior crash. Nil when
+	// the producer pre-dates v5.4.
+	RunStatuses []CellStatus
 }
 
 // RatedSample is one rated pass: a target offered load and the
@@ -104,6 +111,10 @@ type CellAggregate struct {
 	// ErrorMsg is the per-cell error string that produced a non-OK
 	// Status, surfaced for JSON detail / debugging. Empty for CellOK.
 	ErrorMsg string
+
+	// RunStatuses is the per-run outcome sequence carried through from
+	// [CellResult] (schema v5.4). Nil for pre-v5.4 producers.
+	RunStatuses []CellStatus
 
 	RPSMedian float64
 	RPSP5     float64 // 5th percentile bound of the per-run RPS distribution
@@ -194,11 +205,16 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 			N:            len(cell.Samples),
 			Status:       status,
 			ErrorMsg:     cell.ErrorMsg,
+			RunStatuses:  cell.RunStatuses,
 		}
 		// A cell that did not run (or ran but produced no real number) is
 		// never emitted as a ranked datapoint: leave every headline field
 		// zero so BuildDocument records it in CellStatuses instead.
-		if status != CellOK {
+		// Suspect cells DO carry data — integrity questionable, but the
+		// number exists — so they fall through to the math below exactly
+		// like OK cells; their non-OK Status still travels on the
+		// aggregate so BuildDocument flags them (schema v5.4).
+		if !status.HasData() {
 			out[CellID(cell.ScenarioName, cell.ServerName)] = agg
 			continue
 		}
@@ -311,11 +327,11 @@ func BuildTimeseries(cells []CellResult) *TimeseriesDoc {
 		SchemaVersion: TimeseriesSchemaVersion,
 	}
 	for _, c := range cells {
-		// Skip non-OK cells (not_applicable / dnf): they carry no samples, so
+		// Skip no-data cells (not_applicable / dnf): they carry no samples, so
 		// they would only append empty ScenarioSeries entries and bloat the
-		// sidecar — matching Aggregate / the markdown reducers, which all
-		// exclude non-OK cells (schema v5.3).
-		if c.Status != "" && c.Status != CellOK {
+		// sidecar — matching Aggregate / the markdown reducers (schema v5.3).
+		// Suspect cells carry real samples and stay in (schema v5.4).
+		if !c.Status.HasData() {
 			continue
 		}
 		out.Scenarios = append(out.Scenarios,
