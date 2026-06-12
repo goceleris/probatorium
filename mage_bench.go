@@ -702,7 +702,11 @@ type skipEntry struct {
 // dropped with a loud warning instead of excluding the cell: those are
 // transient-or-infra outcomes, and auto-skipping them would permanently
 // hide a healthy pair behind one bad run (regenerate the file with
-// `smoketest scan`, which no longer emits them). The runner's
+// `smoketest scan`, which no longer emits them). capability-lie error
+// strings are re-classified with report.ClassifyCellError: a stale
+// pre-v3.9 file can carry status=not_applicable with the legacy
+// ratio-fired form ("got high error ratio", requests > 0 — in v3.8
+// those were dead-SUT cells), which is ineligible too. The runner's
 // filterCells honours the !exclusions and simply does not schedule the
 // skipped cells. An empty path is a no-op; a malformed file is an error
 // (the operator should fix the JSON, not silently bypass the safety
@@ -735,9 +739,16 @@ func applySkipFile(cells string) string {
 			fmt.Fprintf(os.Stderr, "Bench: skip entry has empty server/scenario: %+v\n", s)
 			os.Exit(1)
 		}
-		if report.CellStatus(s.Status) != report.CellNotApplicable {
+		status := report.CellStatus(s.Status)
+		// Re-classify capability-lie errors: the legacy ratio-fired
+		// form maps to dnf under today's rules even when a stale file
+		// recorded it as not_applicable.
+		if strings.Contains(s.Error, "capability-lie") {
+			status = report.ClassifyCellError(s.Error)
+		}
+		if status != report.CellNotApplicable {
 			fmt.Fprintf(os.Stderr, "Bench: skip entry %s/%s has status %q — only not_applicable (capability gap) may auto-skip; ignoring it\n",
-				s.Scenario, s.Server, s.Status)
+				s.Scenario, s.Server, status)
 			dropped++
 			continue
 		}

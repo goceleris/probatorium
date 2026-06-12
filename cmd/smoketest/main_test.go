@@ -34,10 +34,11 @@ func writeCell(t *testing.T, root, server, scenario, status, errMsg string) {
 // with the real v3.8 failure strings: only a genuine capability gap
 // (not_applicable) may feed the auto-skip machinery. dnf (dead SUT),
 // suspect (over error budget) and interrupted cells never enter the
-// skip list, and a pre-v5.4 "zero-request cell" record that was
-// misclassified not_applicable (in v3.8 every such cell was a dead SUT)
-// is re-classified to dnf by the same report.ClassifyCellError the
-// runner uses — and therefore excluded too.
+// skip list, and the two pre-v3.9 record shapes that were misclassified
+// not_applicable — "zero-request cell" and the ratio-fired
+// "capability-lie: ... got high error ratio ..." (in v3.8 every such
+// cell was a dead SUT) — are re-classified to dnf by the same
+// report.ClassifyCellError the runner uses, and therefore excluded too.
 func TestScanOnlyCapabilityGapsEnterSkipList(t *testing.T) {
 	root := t.TempDir()
 
@@ -58,10 +59,16 @@ func TestScanOnlyCapabilityGapsEnterSkipList(t *testing.T) {
 	// re-classifies to dnf under today's rules.
 	writeCell(t, root, "celeris-std-h1", "sse-fanout-1024", "not_applicable",
 		"zero-request cell: 0 requests after 90s (errors=34700000)")
+	// Pre-v3.9 ratio-fired capability-lie, verbatim from the v3.8 run:
+	// the io_uring crash cell got 4029 successes before the SUT died, so
+	// by the zero-successes rule it can never be a genuine gap — the
+	// error string re-classifies to dnf and stays out of the skip list.
+	writeCell(t, root, "celeris-iouring-h1-async", "chain-api-post-4k", "not_applicable",
+		`capability-lie: scheduled chain scenario "chain-api-post-4k" got high error ratio from celeris-iouring-h1-async (errors=33140345/requests=4029) — adapter declared the capability but did not serve the route`)
 
 	skip, scanned, byStatus := scanResultsDir(root)
-	if scanned != 6 {
-		t.Fatalf("scanned: want 6 got %d", scanned)
+	if scanned != 7 {
+		t.Fatalf("scanned: want 7 got %d", scanned)
 	}
 	if len(skip) != 1 {
 		t.Fatalf("skip list: want exactly the capability gap, got %d entries: %+v", len(skip), skip)
@@ -71,7 +78,7 @@ func TestScanOnlyCapabilityGapsEnterSkipList(t *testing.T) {
 	}
 	// The histogram still reports every status so the operator sees what
 	// the scan saw, even though only not_applicable feeds the skip list.
-	if byStatus["dnf"] != 2 || byStatus["suspect"] != 1 || byStatus["ok"] != 1 || byStatus["not_applicable"] != 2 {
+	if byStatus["dnf"] != 2 || byStatus["suspect"] != 1 || byStatus["ok"] != 1 || byStatus["not_applicable"] != 3 {
 		t.Errorf("byStatus histogram: got %v", byStatus)
 	}
 }

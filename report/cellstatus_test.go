@@ -11,7 +11,8 @@ import (
 // TestClassifyCellError pins the error→status mapping that BOTH merge
 // paths (the in-process runner and the cluster mage Bench path) call so
 // they agree on field width. The split is load-bearing: "capability-lie"
-// is the adapter not implementing the route (N/A); "suspect:" is the
+// is the adapter not implementing the route (N/A) — but its legacy
+// ratio-fired form (pre-v3.9, requests > 0) is DNF; "suspect:" is the
 // runner's error-ratio gate (data kept, integrity flagged); "read server
 // settings" is N/A only when it timed out (server never spoke H2), but
 // DNF on reset/EOF (an H2 server that crashed mid-handshake); everything
@@ -37,7 +38,13 @@ func TestClassifyCellError(t *testing.T) {
 		{"server-died-mid-cell is dnf", "server-died-mid-cell: post-cell probe: dial tcp 192.168.50.65:8080: connect: connection refused (requests=4029 errors=33140345)", CellDNF},
 		{"interrupted is dnf", "interrupted: cell cancelled mid-run (requests=0 errors=0 duration=354.329µs)", CellDNF},
 		{"suspect is suspect", "suspect: error ratio 0.960 exceeds budget 0.50 (errors=290204598 requests=12081484)", CellSuspect},
-		{"capability-lie is n/a", `capability-lie: scheduled chain scenario "chain-mw5" got high error ratio from gin-h1 (errors=999000/requests=1000000) — adapter declared the capability but did not serve the route`, CellNotApplicable},
+		{"capability-lie (zero successes, live server) is n/a", `capability-lie: scheduled ws scenario "ws-echo" got zero successes from live server gnet-h1 (errors=120000) — adapter declared the capability but did not serve the route`, CellNotApplicable},
+		// v3.9: the verbatim v3.8 io_uring crash cell. The pre-v3.9 guard
+		// fired on a RATIO (requests > 0), which the zero-successes rule
+		// says can never be a genuine gap — re-classified DNF so a
+		// `smoketest scan` over stale results can't feed it to the skip
+		// list as N/A.
+		{"legacy ratio-fired capability-lie is dnf", `capability-lie: scheduled chain scenario "chain-api-post-4k" got high error ratio from celeris-iouring-h1-async (errors=33140345/requests=4029) — adapter declared the capability but did not serve the route`, CellDNF},
 		{"read server settings timeout is n/a", "loadgen.Run: loadgen: dial: h2client: connect: read server settings: i/o timeout", CellNotApplicable},
 		{"read server settings reset is dnf (crash mid-handshake)", "loadgen.New: loadgen: dial: h2client: dial conn[0]: read server settings: read tcp 10.0.0.2:5->10.0.0.1:8080: read: connection reset by peer", CellDNF},
 		{"read server settings EOF is dnf (crash mid-handshake)", "loadgen.New: loadgen: dial: h2client: dial conn[0]: read server settings: unexpected EOF", CellDNF},

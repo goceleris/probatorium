@@ -197,8 +197,10 @@ func scanResultsDir(resultsDir string) (skip []skipEntry, scanned int, byStatus 
 			// error string is re-classified with the same
 			// report.ClassifyCellError the runner uses, so per-cell
 			// JSON written before the v5.4 reclassification
-			// ("zero-request cell" used to be not_applicable; in v3.8
-			// those were dead-SUT cells) buckets by today's rules.
+			// ("zero-request cell" used to be not_applicable, and the
+			// pre-v3.9 capability-lie guard fired on a RATIO with
+			// requests > 0 — in v3.8 both shapes were dead-SUT cells)
+			// buckets by today's rules.
 			status := report.CellStatus(cr.Status)
 			if cr.Error != "" {
 				status = report.ClassifyCellError(cr.Error)

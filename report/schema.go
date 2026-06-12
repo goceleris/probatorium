@@ -87,7 +87,13 @@ func (s CellStatus) HasData() bool {
 // An empty error means the cell ran (CellOK).
 //
 // The split: "capability-lie" means the adapter does not implement the
-// route (zero successes against a live server) → CellNotApplicable.
+// route (zero successes against a live server) → CellNotApplicable —
+// EXCEPT the legacy ratio-fired form: pre-v3.9 runners emitted
+// "capability-lie: ... got high error ratio ... (errors=N/requests=M)"
+// and only with requests > 0, which under the zero-successes rule can
+// never be a genuine gap (v3.8's io_uring crash cell, 4029 req / 33.1M
+// err, wore exactly that string) → CellDNF, so stale artefacts cannot
+// re-enter the skip list as N/A.
 // "suspect:" is the runner's error-ratio gate — the cell completed with
 // real data but its errors exceeded the scenario's budget → CellSuspect.
 // "read server settings" (the H2 prior-knowledge preface going unanswered)
@@ -116,6 +122,11 @@ func ClassifyCellError(errMsg string) CellStatus {
 		}
 		return CellDNF
 	case strings.Contains(errMsg, "capability-lie"):
+		// Legacy ratio-fired guard (pre-v3.9) — requests were > 0, so
+		// this cannot be a genuine capability gap under today's rule.
+		if strings.Contains(errMsg, "got high error ratio") {
+			return CellDNF
+		}
 		return CellNotApplicable
 	default:
 		return CellDNF
