@@ -229,8 +229,20 @@
         (inventory_hostname != bench_target) and
         (inventory_hostname != "msa2-client")
 
-    - name: Stop any leftover server processes (bench target only)
+    - name: Stop any leftover bench processes (both hosts)
       become: true
+      # Leak guard, not the primary teardown: it runs on BOTH selected
+      # hosts (server/observer on the bench target; runner/loadgen on
+      # msa2-client) strictly AFTER the run play, when every per-cell
+      # `timeout --foreground` has already TERM-then-KILLed its runner —
+      # so the name-pkills below only ever reach processes that escaped
+      # their cell (an aborted play, an orphaned sampler). They send one
+      # TERM per process; a leaked runner handles it by flushing its
+      # results best-effort. Do NOT add a second kill pass for the
+      # runner here: a TERM landing on a runner that already absorbed
+      # its hang-guard TERM trips its second-signal force-exit and can
+      # truncate the final results write (the v3.8 double-signal bug).
+      #
       # CRITICAL: every literal occurrence of the staging dir name in
       # this script must be BRACKET-PROTECTED. `pkill -f` matches each
       # process's full argv, and the bash session running this pkill

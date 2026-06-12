@@ -359,13 +359,25 @@
   # blocked read syscall isn't ctx-cancellable). An unguarded runner then
   # wedges the WHOLE 31-column grid on one bad adapter. `timeout` caps the
   # whole runner invocation at cell_guard_seconds — the rated-aware
-  # per-column budget (budget.ColumnWallClock) + 25% slack + 300s headroom —
-  # then SIGKILLs 30s later if it ignores SIGTERM. A timed-out cell (exit
-  # 124) is recorded + skipped via failed_when:false below; the grid
+  # per-column budget (budget.ColumnWallClock) + 25% slack + 300s headroom.
+  # SIGNAL HYGIENE: --foreground is load-bearing. Backgrounded (default)
+  # coreutils timeout signals the monitored pid DIRECTLY and then the
+  # process group it shares with it — the runner receives TWO SIGTERMs per
+  # expiry. The runner's handler treats a second signal as "force exit
+  # now"; usually the kernel coalesces the back-to-back TERMs, but when
+  # both land (v3.8, celeris-epoll-h1-sync) the runner force-exited before
+  # its final results.json write and the whole column was lost.
+  # --foreground sends exactly ONE signal, to the runner alone (it spawns
+  # no children, so group delivery buys nothing). --kill-after=60 then
+  # SIGKILLs if the graceful path wedges; 60s comfortably covers the
+  # runner's interrupt path (cancel + mark remaining cells interrupted +
+  # atomic results.json/manifest writes — seconds, not tens) while the old
+  # 30s left no margin over a slow in-flight cell unwind. A timed-out cell
+  # (exit 124) is recorded + skipped via failed_when:false below; the grid
   # continues.
   ansible.builtin.shell: |
     cd {{ bench_root }}
-    timeout -k 30 {{ cell_guard_seconds }} ./runner \
+    timeout --foreground --kill-after=60 {{ cell_guard_seconds }} ./runner \
       -target http://{{ target_ip }}:{{ bench_port | default(8080) }} \
       -server-name {{ cell.1 }} \
       -runs 1 \
