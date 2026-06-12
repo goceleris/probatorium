@@ -407,6 +407,15 @@ func Bench() error {
 	if err != nil {
 		return err
 	}
+	// A glob that schedules nothing is an operator error (the halves are
+	// <scenario>/<server>; a server slug in the scenario half matches zero
+	// cells on every column). Without this guard the bench "succeeds" in
+	// minutes: 31 columns of 0-cell runners merged into a hollow document
+	// with benchmarks=null.
+	if scenarioCount == 0 {
+		return fmt.Errorf("BENCH_CELLS %q schedules zero cells on every column "+
+			"(glob halves are <scenario>/<server> — e.g. '*/celeris-*', not 'celeris-*/*')", cells)
+	}
 	ratedPasses := 0
 	if ratedOn {
 		ratedPasses = budget.DefaultRatedPasses
