@@ -266,8 +266,11 @@
         - bench_needs_dbservices | default(false) | bool
 
     - name: Wait for mpstat samplers to finish writing
+      # Glob covers both sampler pid files: mpstat.pid (server side) and
+      # mpstat.loadgen.pid (loadgen side — renamed so the two hosts'
+      # tarballs can't clobber each other's cpu.log in results_local_dir).
       ansible.builtin.shell: |
-        for pidfile in {{ bench_run_dir }}/*/mpstat.pid; do
+        for pidfile in {{ bench_run_dir }}/*/mpstat*.pid; do
           [ -f "$pidfile" ] || continue
           pid=$(cat "$pidfile")
           for i in $(seq 1 10); do

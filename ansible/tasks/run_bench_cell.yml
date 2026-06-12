@@ -287,11 +287,19 @@
 
 # ---------- loadgen side: mpstat + runner ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (loadgen side)"
+  # Distinct filenames from the server-side sampler ON PURPOSE. bench.yml
+  # tars bench_run_dir on BOTH hosts and extracts both into the same
+  # results_local_dir, so a loadgen-side cpu.log/mpstat.pid would clobber
+  # the server-side files of the same cell dir — readCellResources then
+  # parses LOADGEN-box CPU as the SUT's Resources.MeanCPUPct (observed in
+  # v3.8). The server-side names are a reader contract (report.ParseMPStat
+  # + readCellResources look for cpu.log) and must NOT change; nothing
+  # parses the loadgen-side log today, it is operator forensics only.
   ansible.builtin.shell: |
     nohup mpstat -P ALL 1 {{ mpstat_seconds }} \
-      > {{ cell_dir }}/cpu.log 2>&1 &
+      > {{ cell_dir }}/cpu.loadgen.log 2>&1 &
     disown
-    echo $! > {{ cell_dir }}/mpstat.pid
+    echo $! > {{ cell_dir }}/mpstat.loadgen.pid
   args:
     executable: /bin/bash
   changed_when: false
