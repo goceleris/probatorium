@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -91,9 +92,20 @@ func archTag(goarch string) string {
 //	                   made in a temp dir.
 //	DOCS_TOKEN=        GitHub token with repo scope on goceleris/docs.
 //	                   Falls back to `gh auth token`.
+//	BENCH_PUBLISH_FORCE=1  publish despite integrity violations (missing
+//	                   column rollups, >20% non-ok cells, dead-SUT
+//	                   cells). The integrity summary always prints.
 func Publish() error {
-	meta, doc, tsGz, err := loadPublishInputs()
+	meta, doc, tsGz, resultsDir, err := loadPublishInputs()
 	if err != nil {
+		return err
+	}
+
+	// Integrity gate (v3.9): refuse to ship a run that v3.8 proved can
+	// look complete while being broken — a force-exited runner column,
+	// a mostly-dead grid, or cells measured against a crashed SUT. The
+	// summary prints either way; BENCH_PUBLISH_FORCE=1 overrides.
+	if err := checkPublishIntegrity(resultsDir, doc); err != nil {
 		return err
 	}
 
@@ -136,12 +148,14 @@ func PublishValidate() error {
 
 // loadPublishInputs resolves the run metadata and reads the newest bench
 // results.json + its timeseries sidecar. Shared by every publish path.
-func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, error) {
+// The fourth return is the run dir the results came from, so the
+// integrity gate can audit its column rollups + raw payloads.
+func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, string, error) {
 	version := os.Getenv("PUBLISH_VERSION")
 	if version == "" {
 		v, err := celerisVersion()
 		if err != nil {
-			return report.SplitMeta{}, nil, nil, err
+			return report.SplitMeta{}, nil, nil, "", err
 		}
 		version = v
 	}
@@ -153,17 +167,17 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, error) {
 		// what I have."
 		resultsPath, err = latestBenchResults("")
 		if err != nil {
-			return report.SplitMeta{}, nil, nil, fmt.Errorf("no bench results to publish: %w", err)
+			return report.SplitMeta{}, nil, nil, "", fmt.Errorf("no bench results to publish: %w", err)
 		}
 	}
 
 	data, err := os.ReadFile(resultsPath)
 	if err != nil {
-		return report.SplitMeta{}, nil, nil, fmt.Errorf("read %s: %w", resultsPath, err)
+		return report.SplitMeta{}, nil, nil, "", fmt.Errorf("read %s: %w", resultsPath, err)
 	}
 	var doc report.Document
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return report.SplitMeta{}, nil, nil, fmt.Errorf("parse %s: %w", resultsPath, err)
+		return report.SplitMeta{}, nil, nil, "", fmt.Errorf("parse %s: %w", resultsPath, err)
 	}
 
 	// timeseries.json.gz lives next to results.json (both emit paths
@@ -195,7 +209,7 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, error) {
 		LoadgenVersion: goModRequireVersion("github.com/goceleris/loadgen"),
 		GeneratedAt:    now,
 	}
-	return meta, &doc, tsGz, nil
+	return meta, &doc, tsGz, filepath.Dir(resultsPath), nil
 }
 
 // cellRelPath is the repo-root-relative path of a published cell, the
@@ -204,6 +218,209 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, error) {
 // back-to-back run-K never overwrites run-1's flat tree.
 func cellRelPath(meta report.SplitMeta) string {
 	return filepath.ToSlash(filepath.Join("results", report.CellRelDir(meta)))
+}
+
+// publishNonOKThreshold is the max tolerated fraction of non-OK cells in
+// a published Document. Past it the run is more hole than data (v3.8:
+// one crashed column alone produced 23 dnf cells) and publishing it
+// would put rows with no numbers on the docs site.
+const publishNonOKThreshold = 0.20
+
+// publishIntegrity is the pre-publish audit collected from the bench run
+// dir + merged Document. Pure data — the rule evaluation lives in
+// violations() so tests can pin both halves separately.
+type publishIntegrity struct {
+	ResultsDir string
+
+	// MissingRollups lists column dirs (relative to ResultsDir) without
+	// the runner's results.json rollup — the runner force-exited
+	// mid-column and ingest reconstructed the cells from per-cell JSONs
+	// (provenanceReconstructed in mage_bench.go).
+	MissingRollups []string
+
+	// Reconstructed counts raw cells carrying the reconstruction
+	// provenance mark — the cell-level mirror of MissingRollups.
+	Reconstructed int
+
+	// StatusCounts buckets every (server, scenario) cell of the merged
+	// Document by reduced status; TotalCells is the sum.
+	StatusCounts map[report.CellStatus]int
+	TotalCells   int
+
+	// ServerDied lists "server/scenario — error" for per-run records
+	// whose reason is a dead SUT (the runner-synthesised "server-down:"
+	// pre-probe and "server-died-mid-cell:" post-probe markers). A cell
+	// that recovered on a rerun still appears here — its suspect status
+	// keeps the evidence, and publishing it needs an explicit force.
+	ServerDied []string
+}
+
+// collectPublishIntegrity audits resultsDir + the merged Document.
+// Structural inputs (column dirs, raw payloads) are best-effort: an old
+// or hand-assembled run dir without them simply contributes nothing,
+// and the Document-level cell census still applies.
+func collectPublishIntegrity(resultsDir string, doc *report.Document) publishIntegrity {
+	pi := publishIntegrity{
+		ResultsDir:   resultsDir,
+		StatusCounts: map[report.CellStatus]int{},
+	}
+
+	// Column rollups: every <TS>-bench-<host>/<RR>-<comp>/ dir the
+	// playbook produced must carry the runner's own results.json. The
+	// dir matching mirrors aggregatePerCellResults.
+	if entries, err := os.ReadDir(resultsDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() || !strings.Contains(e.Name(), "-bench-") {
+				continue
+			}
+			cols, err := os.ReadDir(filepath.Join(resultsDir, e.Name()))
+			if err != nil {
+				continue
+			}
+			for _, c := range cols {
+				if !c.IsDir() {
+					continue
+				}
+				parts := strings.SplitN(c.Name(), "-", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				if _, err := parseRunIndex(parts[0]); err != nil {
+					continue
+				}
+				if _, err := os.Stat(filepath.Join(resultsDir, e.Name(), c.Name(), "results.json")); err != nil {
+					pi.MissingRollups = append(pi.MissingRollups, filepath.Join(e.Name(), c.Name()))
+				}
+			}
+		}
+	}
+	sort.Strings(pi.MissingRollups)
+
+	// Cell census from the Document: a scenario is one cell per server;
+	// CellStatuses carries every non-OK outcome, headline maps the OK
+	// (and suspect) ones. Union the two key sets so a suspect cell —
+	// present in both — counts once, under its flag.
+	for _, b := range doc.Benchmarks {
+		cells := map[string]report.CellStatus{}
+		for sc := range b.SaturationModeRPS {
+			cells[sc] = report.CellOK
+		}
+		for sc, st := range b.CellStatuses {
+			cells[sc] = report.CellStatus(st)
+		}
+		for _, st := range cells {
+			pi.StatusCounts[st]++
+			pi.TotalCells++
+		}
+	}
+
+	// Dead-SUT evidence + reconstruction marks live on the per-run raw
+	// records (the Document carries statuses, not error strings).
+	if entries, err := os.ReadDir(filepath.Join(resultsDir, "raw")); err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(resultsDir, "raw", e.Name()))
+			if err != nil {
+				continue
+			}
+			var payload struct {
+				Cells []cellRecord `json:"cells"`
+			}
+			if json.Unmarshal(data, &payload) != nil {
+				continue
+			}
+			for _, c := range payload.Cells {
+				if c.Provenance != "" {
+					pi.Reconstructed++
+				}
+				st := report.CellStatus(c.Status)
+				if st == "" {
+					st = report.ClassifyCellError(c.Error)
+				}
+				if st != report.CellDNF && st != report.CellSuspect {
+					continue
+				}
+				if strings.HasPrefix(c.Error, "server-died") || strings.HasPrefix(c.Error, "server-down:") {
+					pi.ServerDied = append(pi.ServerDied,
+						fmt.Sprintf("%s/%s — %s", c.Competitor, c.Scenario, c.Error))
+				}
+			}
+		}
+	}
+	sort.Strings(pi.ServerDied)
+	return pi
+}
+
+// violations evaluates the publish-refusal rules against the audit.
+// Empty means the run may ship.
+func (pi publishIntegrity) violations() []string {
+	var v []string
+	if n := len(pi.MissingRollups); n > 0 {
+		v = append(v, fmt.Sprintf("%d column(s) missing their results.json rollup (runner died mid-column; cells reconstructed from per-cell JSONs)", n))
+	}
+	if pi.TotalCells > 0 {
+		nonOK := pi.TotalCells - pi.StatusCounts[report.CellOK]
+		if frac := float64(nonOK) / float64(pi.TotalCells); frac > publishNonOKThreshold {
+			v = append(v, fmt.Sprintf("%.0f%% of cells are non-ok (%d/%d, threshold %.0f%%)",
+				frac*100, nonOK, pi.TotalCells, publishNonOKThreshold*100))
+		}
+	}
+	if n := len(pi.ServerDied); n > 0 {
+		v = append(v, fmt.Sprintf("%d cell(s) measured against a dead SUT (server-down / server-died-mid-cell)", n))
+	}
+	return v
+}
+
+// renderPublishIntegrity formats the audit as fixed-width text (not
+// markdown) so it reads cleanly in a CI log. Printed on every publish,
+// violations or not.
+func renderPublishIntegrity(pi publishIntegrity) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\n=== Publish integrity: %s ===\n", pi.ResultsDir)
+	fmt.Fprintf(&sb, "  cells: %d total", pi.TotalCells)
+	for _, st := range []report.CellStatus{report.CellOK, report.CellSuspect, report.CellDNF, report.CellNotApplicable} {
+		if n := pi.StatusCounts[st]; n > 0 {
+			fmt.Fprintf(&sb, "  %s=%d", st, n)
+		}
+	}
+	sb.WriteString("\n")
+	if pi.Reconstructed > 0 {
+		fmt.Fprintf(&sb, "  reconstructed cells: %d (from columns that lost their rollup)\n", pi.Reconstructed)
+	}
+	for _, m := range pi.MissingRollups {
+		fmt.Fprintf(&sb, "  MISSING ROLLUP  %s\n", m)
+	}
+	for _, s := range pi.ServerDied {
+		fmt.Fprintf(&sb, "  SERVER DIED     %s\n", s)
+	}
+	if v := pi.violations(); len(v) > 0 {
+		for _, msg := range v {
+			fmt.Fprintf(&sb, "  VIOLATION       %s\n", msg)
+		}
+	} else {
+		sb.WriteString("  integrity: ok\n")
+	}
+	return sb.String()
+}
+
+// checkPublishIntegrity prints the integrity summary and refuses the
+// publish when any violation is present, unless BENCH_PUBLISH_FORCE=1
+// (which still prints everything, then proceeds loudly).
+func checkPublishIntegrity(resultsDir string, doc *report.Document) error {
+	pi := collectPublishIntegrity(resultsDir, doc)
+	fmt.Print(renderPublishIntegrity(pi))
+	v := pi.violations()
+	if len(v) == 0 {
+		return nil
+	}
+	if os.Getenv("BENCH_PUBLISH_FORCE") == "1" {
+		fmt.Printf("  BENCH_PUBLISH_FORCE=1 — publishing despite %d violation(s)\n", len(v))
+		return nil
+	}
+	return fmt.Errorf("publish integrity: refusing to publish %s: %s (set BENCH_PUBLISH_FORCE=1 to override)",
+		resultsDir, strings.Join(v, "; "))
 }
 
 // publishViaGit writes the tree into a goceleris/docs checkout and
