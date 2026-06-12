@@ -18,9 +18,31 @@
 # rather than re-running the same playbook on a smaller `hosts:` set,
 # because that would lose the fact context (target_ip, bench_run_dir).
 
+# HOST-DROP GUARD. When ansible marks a host UNREACHABLE it removes it
+# from ansible_play_hosts and keeps running the play on the survivors:
+# every bench_target-conditioned task below then silently skips while
+# the loadgen side keeps benching whatever still listens on the port,
+# gated by STALE hostvars from the last column that ran (2026-06-12:
+# a become-prompt timeout dropped msa2-server after the axum column and
+# its orphaned SUT got benched under five other columns' labels). The
+# play sets any_errors_fatal, but unreachable handling varies across
+# ansible versions — assert explicitly, from a host that is still in
+# the play, that the bench target is too.
+- name: "{{ cell.1 }} run={{ cell.0 }} | assert bench target still in play"
+  ansible.builtin.assert:
+    that:
+      - bench_target in ansible_play_hosts
+    fail_msg: >-
+      {{ bench_target }} dropped out of the play (unreachable?) — aborting
+      the bench instead of measuring an orphaned server under wrong labels.
+  any_errors_fatal: true
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | per-cell output dir"
   ansible.builtin.set_fact:
     cell_dir: "{{ bench_run_dir }}/{{ '%02d' | format(cell.0 | int) }}-{{ cell.1 }}"
+    # Reset per-column so a column whose server-side tasks never ran can
+    # never inherit the previous column's bind verdict.
+    cell_bound: false
 
 # Resolve the matrix column slug (cell.1, e.g. "gin-h2" /
 # "celeris-epoll-h1-sync") to the staged binary dir it runs from and the
@@ -94,6 +116,11 @@
   # Best-effort (always exits 0): if the port still can't be freed, the
   # process-identity readiness gate records the cell as a clean skip and the
   # grid continues, so per-column failure isolation is preserved.
+  # become: the SUTs are launched under root (ulimit -l/-n in their start
+  # shell), so an unprivileged sweep can neither signal them nor even SEE
+  # their pids (`ss -ltnp` omits users:() for other users' sockets — the
+  # sweep would read an empty pid list and conclude the port is free).
+  become: true
   ansible.builtin.shell: |
     bp={{ bench_port | default(8080) }}
     pkill -TERM -f "[c]ompetitors/" 2>/dev/null

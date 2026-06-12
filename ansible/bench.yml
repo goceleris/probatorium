@@ -197,6 +197,15 @@
   hosts: cluster
   gather_facts: false
   tags: run
+  # A bench without its bench target is meaningless — and worse than a
+  # failure: when ansible drops an UNREACHABLE host it keeps running the
+  # play on the survivors, every bench_target-conditioned task silently
+  # skips, and the loadgen-side runner gates on STALE hostvars (2026-06-12:
+  # a become-prompt timeout dropped msa2-server after the axum column; its
+  # orphaned SUT was then benched under five other columns' labels). Abort
+  # the whole play the moment any host drops.
+  any_errors_fatal: true
+  max_fail_percentage: 0
   tasks:
     - name: Filter to selected hosts
       ansible.builtin.meta: end_host
