@@ -13,9 +13,11 @@
 // write the pre-baked bytes via Context.Blob/String, /users/:id echoes
 // the path param, /upload drains the body and replies "OK".
 //
-// Always-latest version policy: this module pulls the celeris release
-// at build time via `go mod tidy` (see go.mod). No version is pinned in
-// the source — bumps are landed by re-running tidy.
+// Version policy: go.mod pins the celeris milestone/v1.5.0 branch by
+// pseudo-version (the v1.4.15 release carries an io_uring heap-corruption
+// bug class fixed only on that branch). Return to the always-latest
+// release policy — re-running `go mod tidy` against the latest tag —
+// once v1.5.0 ships.
 package main
 
 import (
