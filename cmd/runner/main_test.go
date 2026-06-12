@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/probatorium/budget"
 	"github.com/goceleris/probatorium/interleave"
 	"github.com/goceleris/probatorium/scenarios"
 	"github.com/goceleris/probatorium/servers"
@@ -303,5 +304,19 @@ func TestFeatureSetTLSGating(t *testing.T) {
 	}
 	if got := featureSetFor(noTLS, true).TLS; got {
 		t.Fatalf("non-TLS adapter must never advertise fs.TLS even with a terminator; got true")
+	}
+}
+
+// TestDefaultRatedFractionsMatchBudgetModel pins the runner's default
+// rated-sweep step count to budget.DefaultRatedPasses. The ansible
+// per-column hang guard is sized from budget.ColumnWallClock using that
+// constant (the bench playbook never passes -rated-fractions), so a
+// drift here would silently under-budget every rated column — the exact
+// v3.8 failure mode (guard SIGTERM at cell 28/33).
+func TestDefaultRatedFractionsMatchBudgetModel(t *testing.T) {
+	if got := len(defaultRatedFractions); got != budget.DefaultRatedPasses {
+		t.Fatalf("len(defaultRatedFractions) = %d, want budget.DefaultRatedPasses = %d; "+
+			"update both together (and re-check the ansible guard sizing)",
+			got, budget.DefaultRatedPasses)
 	}
 }

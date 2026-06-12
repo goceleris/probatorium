@@ -905,3 +905,63 @@ func TestMergeBackToBackRatedPersistsAcrossIterations(t *testing.T) {
 		t.Errorf("LatencyAtSLO[chain-fullstack-get-json]: want ABSENT, got present")
 	}
 }
+
+// TestMaxDryRunCellsPerServer pins the parse of the runner's -dry-run
+// schedule print ("run0 <scenario>/<server>"), which sizes the ansible
+// per-column hang guard. Server slugs with '+' (celeris-iouring-
+// auto+upg-async) must count correctly, columns outside the slug scope
+// must not contribute, and garbage lines must be ignored.
+func TestMaxDryRunCellsPerServer(t *testing.T) {
+	out := `run0 get-json/celeris-epoll-h1-sync
+run0 get-json/celeris-iouring-auto+upg-async
+run0 auto-mix-111/celeris-iouring-auto+upg-async
+run0 chain-api-get-json/celeris-iouring-auto+upg-async
+run0 get-json/gin-h1
+
+not-a-schedule-line
+`
+	cases := []struct {
+		name  string
+		slugs []string
+		want  int
+	}{
+		{"max across in-scope columns", []string{"celeris-epoll-h1-sync", "celeris-iouring-auto+upg-async"}, 3},
+		{"scope excludes the busiest column", []string{"celeris-epoll-h1-sync", "gin-h1"}, 1},
+		{"no matching column", []string{"axum"}, 0},
+		{"empty schedule", nil, 0},
+	}
+	for _, tc := range cases {
+		if got := maxDryRunCellsPerServer(out, tc.slugs); got != tc.want {
+			t.Errorf("%s: maxDryRunCellsPerServer = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestDurationSeconds pins the Go-side duration→seconds conversion that
+// replaced the playbook's unit-stripping regex (which read "1m30s" as
+// 130 seconds).
+func TestDurationSeconds(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int
+		wantErr bool
+	}{
+		{"90s", 90, false},
+		{"1m30s", 90, false}, // the regex hack returned 130 for this
+		{"2h", 7200, false},
+		{"500ms", 1, false}, // sub-second rounds UP, never to 0
+		{"0s", 0, true},     // zero would disable `timeout`
+		{"-5s", 0, true},
+		{"five", 0, true},
+	}
+	for _, tc := range cases {
+		got, err := durationSeconds(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("durationSeconds(%q): err = %v, wantErr = %v", tc.in, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr && got != tc.want {
+			t.Errorf("durationSeconds(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}

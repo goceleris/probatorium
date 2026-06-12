@@ -41,21 +41,43 @@
     state: directory
     mode: '0755'
 
-- name: "{{ cell.1 }} run={{ cell.0 }} | size mpstat for the whole runner pass"
-  # The runner now runs N scenarios back-to-back inside one cell, so the
-  # mpstat samplers must cover the WHOLE pass, not a single
-  # (warmup+duration) window. Size = n_scenarios x (warmup + duration) +
-  # pad. bench_scenario_count defaults to a safe upper bound (the static
-  # + concurrency catalogue is ~16 cells; 28 covers the full catalogue
-  # with chain/driver), and BENCH_CELLS filtering only ever shrinks the
-  # real count, so over-sizing is harmless — mpstat is killed in
-  # teardown once the runner returns.
+- name: "{{ cell.1 }} run={{ cell.0 }} | derive per-cell wall-clock budget"
+  # The runner runs N scenarios back-to-back inside one cell; each costs
+  # warmup + duration on the saturation pass PLUS — in rated mode — 4
+  # closed-loop passes of warmup + rated-duration each (every rated pass
+  # re-runs the FULL warmup), plus the runner's 5s inter-cell cooldown
+  # and ~12s fixed overhead. mage Bench computes that projection from
+  # the ACTUAL config via budget.ColumnWallClock and passes it as
+  # bench_cell_budget_seconds — the single source of truth — along with
+  # the realized bench_scenario_count from the runner's own dry-run
+  # schedule. The Jinja fallback below mirrors the same formula for a
+  # direct ansible-playbook invocation without mage (17 = runner
+  # cooldown 5s + budget.PerCellOverhead 12s; 4 = the runner's default
+  # rated fraction count; 40 covers the full catalogue's busiest column,
+  # 38 cells today). All duration vars are INTEGER SECONDS — the old
+  # regex_replace unit-stripping read "1m30s" as 130. The v3.8 sizing
+  # also ignored the rated sweep entirely: every healthy rated column
+  # blew its 2h22m guard at cell 28/33 and was SIGTERMed mid-run.
   ansible.builtin.set_fact:
-    mpstat_seconds: >-
-      {{ ((bench_scenario_count | default(28) | int)
-          * (((bench_warmup | default('5s')) | regex_replace('[^0-9]','') | int)
-             + ((bench_duration | default('30s')) | regex_replace('[^0-9]','') | int)))
-         + 10 }}
+    cell_budget_seconds: >-
+      {{ bench_cell_budget_seconds | default(
+           (bench_scenario_count | default(40) | int)
+           * ((bench_warmup_seconds | default(5) | int)
+              + (bench_duration_seconds | default(30) | int)
+              + 17
+              + ((bench_rated | default(false) | bool) | ternary(
+                   4 * ((bench_warmup_seconds | default(5) | int)
+                        + (bench_rated_duration_seconds | default(30) | int)),
+                   0)))) | int }}
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | size hang guard + samplers from the budget"
+  # Guard = budget + 25% slack + 300s fixed headroom. ONE number drives
+  # both the runner `timeout` and the mpstat sample counts, so the
+  # samplers always outlive the runner — and teardown kills them as soon
+  # as the runner returns, so the over-sized window can never leak the
+  # next cell's load into this cell's cpu.log mean.
+  ansible.builtin.set_fact:
+    cell_guard_seconds: "{{ ((cell_budget_seconds | int) * 5) // 4 + 300 }}"
 
 # ---------- bench target side: start server + mpstat ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop any prior server + wait for bench port free"
@@ -243,7 +265,7 @@
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (server side)"
   ansible.builtin.shell: |
-    nohup mpstat -P ALL 1 {{ mpstat_seconds }} \
+    nohup mpstat -P ALL 1 {{ cell_guard_seconds }} \
       > {{ cell_dir }}/cpu.log 2>&1 &
     disown
     echo $! > {{ cell_dir }}/mpstat.pid
@@ -296,7 +318,7 @@
   # + readCellResources look for cpu.log) and must NOT change; nothing
   # parses the loadgen-side log today, it is operator forensics only.
   ansible.builtin.shell: |
-    nohup mpstat -P ALL 1 {{ mpstat_seconds }} \
+    nohup mpstat -P ALL 1 {{ cell_guard_seconds }} \
       > {{ cell_dir }}/cpu.loadgen.log 2>&1 &
     disown
     echo $! > {{ cell_dir }}/mpstat.loadgen.pid
@@ -336,20 +358,21 @@
   # the runner's own per-cell context timeout can't always interrupt (a
   # blocked read syscall isn't ctx-cancellable). An unguarded runner then
   # wedges the WHOLE 31-column grid on one bad adapter. `timeout` caps the
-  # whole runner invocation at a generous per-cell wall-clock (the mpstat
-  # window — n_scenarios × (warmup+duration) — doubled, + 120s slack), then
-  # SIGKILLs 30s later if it ignores SIGTERM. A timed-out cell (exit 124) is
-  # recorded + skipped via failed_when:false below; the grid continues.
+  # whole runner invocation at cell_guard_seconds — the rated-aware
+  # per-column budget (budget.ColumnWallClock) + 25% slack + 300s headroom —
+  # then SIGKILLs 30s later if it ignores SIGTERM. A timed-out cell (exit
+  # 124) is recorded + skipped via failed_when:false below; the grid
+  # continues.
   ansible.builtin.shell: |
     cd {{ bench_root }}
-    timeout -k 30 {{ (mpstat_seconds | int) * 2 + 120 }} ./runner \
+    timeout -k 30 {{ cell_guard_seconds }} ./runner \
       -target http://{{ target_ip }}:{{ bench_port | default(8080) }} \
       -server-name {{ cell.1 }} \
       -runs 1 \
-      -duration {{ bench_duration | default('30s') }} \
-      -warmup {{ bench_warmup | default('5s') }} \
+      -duration {{ bench_duration_seconds | default(30) }}s \
+      -warmup {{ bench_warmup_seconds | default(5) }}s \
       -cells '{{ bench_cells | default('*') }}' \
-      {% if bench_rated | default(false) | bool %}-rated -rated-duration {{ bench_rated_duration | default('30s') }} {% endif %}\
+      {% if bench_rated | default(false) | bool %}-rated -rated-duration {{ bench_rated_duration_seconds | default(30) }}s {% endif %}\
       -services none \
       -out {{ cell_dir }} \
       2> {{ cell_dir }}/runner.stderr
@@ -373,6 +396,22 @@
     - (runner_run.rc | default(0)) != 0
 
 # ---------- teardown for this cell ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (loadgen side)"
+  # The sampler window is sized to the hang guard so it always outlives
+  # the runner; without this kill a healthy (much shorter) cell would
+  # leave it sampling well into the NEXT cells. mpstat flushes each 1Hz
+  # sample as it goes, so a TERM mid-run loses nothing but the trailing
+  # Average block (which report.ParseMPStat skips anyway).
+  ansible.builtin.shell: |
+    if [ -f {{ cell_dir }}/mpstat.loadgen.pid ]; then
+      kill -TERM "$(cat {{ cell_dir }}/mpstat.loadgen.pid)" 2>/dev/null
+    fi
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == "msa2-client"
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop observer (server side)"
   # Drain the observer's SQLite write buffer before killing it. The
   # pid file was written when nohup forked the sampler under root
@@ -393,6 +432,21 @@
   args:
     executable: /bin/bash
   changed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (server side)"
+  # Same rationale as the loadgen-side kill: the guard-sized sampler must
+  # not keep writing this cell's cpu.log while the NEXT cell's server is
+  # under load — readCellResources means that log as THIS cell's CPU.
+  ansible.builtin.shell: |
+    if [ -f {{ cell_dir }}/mpstat.pid ]; then
+      kill -TERM "$(cat {{ cell_dir }}/mpstat.pid)" 2>/dev/null
+    fi
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
   when: inventory_hostname == bench_target
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop server"

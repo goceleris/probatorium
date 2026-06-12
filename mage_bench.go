@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/goceleris/loadgen"
+	"github.com/goceleris/probatorium/budget"
 	"github.com/goceleris/probatorium/report"
 	"github.com/goceleris/probatorium/scenarios"
 	"github.com/goceleris/probatorium/servers"
@@ -82,6 +83,73 @@ func benchNeedsDBServices(cells, competitors string) (bool, error) {
 		return false, fmt.Errorf("resolve required services: %w", err)
 	}
 	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// benchMaxScenariosPerColumn asks the runner itself how many scenarios the
+// resolved -cells glob schedules onto the busiest in-scope column, via its
+// -dry-run schedule print. The dry run walks the SAME filterCells +
+// featureSetFor capability gating the remote cells execute (the registry
+// adapters' declared FeatureSets are identical in local and remote mode),
+// so the count can never drift from what a column will actually run — the
+// playbook's old bench_scenario_count default (28) had already drifted
+// from the real catalogue (33 on the celeris columns, 38 on auto+upg) when
+// v3.8 ran. The MAX across columns is the right sizing input because every
+// ansible cell shares one hang-guard formula; over-sizing the short
+// columns' guard is harmless (the guard only fires on a wedged runner).
+func benchMaxScenariosPerColumn(cells string, colSlugs []string) (int, error) {
+	out, err := exec.Command("go", "run", "./cmd/runner",
+		"-dry-run", "-runs", "1", "-cells", cells).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return 0, fmt.Errorf("resolve scenario count: %w (stderr: %s)", err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return 0, fmt.Errorf("resolve scenario count: %w", err)
+	}
+	return maxDryRunCellsPerServer(string(out), colSlugs), nil
+}
+
+// maxDryRunCellsPerServer parses `runner -dry-run` schedule lines
+// ("run0 <scenario>/<server>") and returns the maximum cell count any of
+// the given column slugs receives. Pure so the parse is unit-testable
+// without exec'ing the runner.
+func maxDryRunCellsPerServer(dryRunOut string, colSlugs []string) int {
+	counts := make(map[string]int)
+	for _, line := range strings.Split(dryRunOut, "\n") {
+		_, pair, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		// First "/" splits scenario from server: scenario names never
+		// contain one, server slugs may contain anything else ("+upg").
+		_, server, ok := strings.Cut(pair, "/")
+		if !ok {
+			continue
+		}
+		counts[server]++
+	}
+	maxCells := 0
+	for _, slug := range colSlugs {
+		if counts[slug] > maxCells {
+			maxCells = counts[slug]
+		}
+	}
+	return maxCells
+}
+
+// durationSeconds renders a BENCH_* Go duration string as the whole
+// integer seconds the playbooks consume. The old path forwarded the raw
+// string and had run_bench_cell.yml strip units with a regex — which
+// parsed "1m30s" as 130 seconds. Sub-second durations round up so a
+// non-zero duration can never become 0 (= `timeout` disabled).
+func durationSeconds(s string) (int, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("duration %q must be positive", s)
+	}
+	return int((d + time.Second - 1) / time.Second), nil
 }
 
 func Bench() error {
@@ -314,6 +382,43 @@ func Bench() error {
 	}
 	fmt.Printf("  dbservices:   %v\n", needsDB)
 
+	// Per-column wall-clock budget, computed HERE from the actual config —
+	// not in the playbook from a regex over duration strings. The playbook
+	// derives both the mpstat sampler window and the runner hang-guard
+	// timeout from bench_cell_budget_seconds (+ slack); the scenario count
+	// comes from the runner's own dry-run schedule so it can never drift
+	// from what a column actually executes. budget.ColumnWallClock is the
+	// single source of truth for the projection (incl. the rated sweep the
+	// v3.8 guard ignored — the #1 data-loss bug: every healthy rated column
+	// was SIGTERMed at the 2h22m cap, 28 cells into 33).
+	durationSec, err := durationSeconds(duration)
+	if err != nil {
+		return fmt.Errorf("BENCH_DURATION %q: %w", duration, err)
+	}
+	warmupSec, err := durationSeconds(warmup)
+	if err != nil {
+		return fmt.Errorf("BENCH_WARMUP %q: %w", warmup, err)
+	}
+	ratedDurationSec, err := durationSeconds(ratedDuration)
+	if err != nil {
+		return fmt.Errorf("BENCH_RATED_DURATION %q: %w", ratedDuration, err)
+	}
+	scenarioCount, err := benchMaxScenariosPerColumn(cells, colSlugs)
+	if err != nil {
+		return err
+	}
+	ratedPasses := 0
+	if ratedOn {
+		ratedPasses = budget.DefaultRatedPasses
+	}
+	cellBudget := budget.ColumnWallClock(scenarioCount, ratedPasses,
+		time.Duration(warmupSec)*time.Second,
+		time.Duration(durationSec)*time.Second,
+		time.Duration(ratedDurationSec)*time.Second)
+	cellBudgetSec := int(cellBudget / time.Second)
+	fmt.Printf("  cell budget:  %s (%d scenarios/column max, rated passes %d)\n",
+		cellBudget, scenarioCount, ratedPasses)
+
 	// Expand "both" into the two concrete arch hosts and invoke the playbook
 	// once per arch. bench.yml resolves hostvars[bench_target].lan_ip, so it
 	// needs a REAL host — "both" is not an inventory host (passing it yields
@@ -336,11 +441,17 @@ func Bench() error {
 			"--extra-vars", "bench_target=" + pt,
 			"--extra-vars", "competitor_set=" + competitorSetCSV,
 			"--extra-vars", "@" + benchVarsFile,
-			"--extra-vars", "bench_duration=" + duration,
-			"--extra-vars", "bench_warmup=" + warmup,
+			// Durations cross into ansible as INTEGER SECONDS — the playbook
+			// renders "{{ ... }}s" for the runner flags and does arithmetic
+			// for the sampler/guard windows without any unit-stripping regex
+			// (the old one read "1m30s" as 130 seconds).
+			"--extra-vars", "bench_duration_seconds=" + strconv.Itoa(durationSec),
+			"--extra-vars", "bench_warmup_seconds=" + strconv.Itoa(warmupSec),
 			"--extra-vars", "bench_connections=" + conns,
 			"--extra-vars", "bench_cells=" + cells,
 			"--extra-vars", "bench_runs=" + runs,
+			"--extra-vars", "bench_scenario_count=" + strconv.Itoa(scenarioCount),
+			"--extra-vars", "bench_cell_budget_seconds=" + strconv.Itoa(cellBudgetSec),
 			"--extra-vars", "celeris_version=" + version,
 			"--extra-vars", "results_local_dir=" + resultsDir,
 			"--extra-vars", fmt.Sprintf("bench_needs_dbservices=%t", needsDB),
@@ -351,7 +462,7 @@ func Bench() error {
 		if ratedOn {
 			args = append(args,
 				"--extra-vars", "bench_rated=1",
-				"--extra-vars", "bench_rated_duration="+ratedDuration)
+				"--extra-vars", "bench_rated_duration_seconds="+strconv.Itoa(ratedDurationSec))
 		}
 		if os.Getenv("CLUSTER_USE_LAN") == "1" {
 			args = append(args, "--extra-vars", "use_lan=true")

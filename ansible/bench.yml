@@ -23,8 +23,13 @@
 #                         staged under {{ bench_root }}/competitors/<slug>
 #                         by `ansible-playbook deploy.yml`.
 #   bench_port            port the server binds (default: 8080)
-#   bench_duration        runner -duration, per scenario (default: 30s)
-#   bench_warmup          runner -warmup, per scenario (default: 5s)
+#   bench_duration_seconds  runner -duration per scenario, INTEGER seconds
+#                         (default: 30). All durations cross the mage→
+#                         ansible boundary as integer seconds — the old
+#                         Go-duration strings needed a unit-stripping
+#                         regex that read "1m30s" as 130.
+#   bench_warmup_seconds  runner -warmup per scenario, integer seconds
+#                         (default: 5)
 #   bench_cells           cell glob forwarded to runner -cells over
 #                         "<scenario>/<competitor>" (default: *). The
 #                         server half is the competitor slug.
@@ -32,9 +37,20 @@
 #                         rated (closed-loop, CO-corrected) sweep per cell and
 #                         emits latency_at_slo for the regression gate. Default
 #                         false; opt-in via BENCH_RATED=1 (budget issue #166).
-#   bench_rated_duration  measurement window per rated pass (default: 30s).
-#   bench_scenario_count  upper bound on scenarios per cell, used only to
-#                         size the mpstat samplers (default: 28).
+#   bench_rated_duration_seconds  measurement window per rated pass,
+#                         integer seconds (default: 30).
+#   bench_scenario_count  realized scenario count of the busiest column
+#                         (mage derives it from the runner's dry-run
+#                         schedule); sizes the per-cell budget fallback
+#                         (default: 40, covering the full catalogue).
+#   bench_cell_budget_seconds  projected wall-clock of one full column
+#                         pass (budget.ColumnWallClock: saturation +
+#                         rated sweep + cooldown/overhead, x scenario
+#                         count). run_bench_cell.yml derives the mpstat
+#                         window and the runner hang-guard timeout from
+#                         it. When absent (direct playbook invocation)
+#                         the cell task recomputes the same formula from
+#                         the *_seconds vars above.
 #   bench_runs            number of repetitions per competitor (default: 3)
 #   results_local_dir     where to fetch outputs back to on the Mac
 #
