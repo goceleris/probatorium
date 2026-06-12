@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -108,6 +109,15 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		return err
 	}
 
+	// Integer seconds for the playbook (async window + validator
+	// -duration flag) — same contract as the bench path, replacing the
+	// unit-suffix Jinja conversion that mis-parsed compound durations
+	// ("1h30m" read as 90 hours).
+	durationSec, err := durationSeconds(duration)
+	if err != nil {
+		return fmt.Errorf("%s duration %q: %w", kind, duration, err)
+	}
+
 	var targets []string
 	switch target {
 	case "both":
@@ -139,7 +149,7 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 			"-i", "inventory.yml",
 			playbook,
 			"--extra-vars", "bench_target=" + t,
-			"--extra-vars", "validate_duration=" + duration,
+			"--extra-vars", "validate_duration_seconds=" + strconv.Itoa(durationSec),
 			"--extra-vars", "celeris_version=" + version,
 			"--extra-vars", "results_local_dir=" + resultsDir,
 		}
@@ -256,6 +266,10 @@ func Fuzz() error {
 		return err
 	}
 	duration := envOrDefault("FUZZ_DURATION", "30m")
+	durationSec, err := durationSeconds(duration)
+	if err != nil {
+		return fmt.Errorf("FUZZ_DURATION %q: %w", duration, err)
+	}
 	corpus := envOrDefault("FUZZ_CORPUS", "default")
 	if corpus != "default" && corpus != "aggressive" {
 		return fmt.Errorf("FUZZ_CORPUS must be default or aggressive (got %q)", corpus)
@@ -284,7 +298,7 @@ func Fuzz() error {
 	args := []string{
 		"-i", "inventory.yml",
 		fuzzPlaybook,
-		"--extra-vars", "fuzz_duration=" + duration,
+		"--extra-vars", "fuzz_duration_seconds=" + strconv.Itoa(durationSec),
 		"--extra-vars", "fuzz_corpus=" + corpus,
 		"--extra-vars", "celeris_version=" + version,
 		"--extra-vars", "results_local_dir=" + resultsDir,

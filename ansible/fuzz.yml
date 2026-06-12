@@ -7,7 +7,7 @@
 # Required extra-vars (typically `mage Fuzz`):
 #   bench_target          single host name from [bench_targets]
 #   competitor            slug of the server-under-test (default: celeris)
-#   fuzz_duration         total fuzz length, e.g. "30m" / "2h"
+#   fuzz_duration_seconds total fuzz length, integer seconds
 #                         (default: "30m")
 #   fuzz_seed             RNG seed for reproducibility (default: 1)
 #   fuzz_concurrency      validator -concurrency (default: 64)
@@ -77,16 +77,12 @@
         target_ip: "{{ hostvars[bench_target].lan_ip }}"
       when: inventory_hostname == "msa2-client"
 
+    # async window = fuzz seconds + 120s slack. mage passes INTEGER
+    # SECONDS (fuzz_duration_seconds) — the old unit-suffix conversion
+    # mis-parsed compound Go durations ("1h30m" as 90 hours).
     - name: Compute fuzz timeout in seconds
       ansible.builtin.set_fact:
-        fuzz_seconds: >-
-          {{ ((fuzz_duration | default('30m') | regex_replace('[^0-9]', '') | int)
-              * (
-                86400 if 'd' in (fuzz_duration | default('30m')) else
-                3600  if 'h' in (fuzz_duration | default('30m')) else
-                60    if 'm' in (fuzz_duration | default('30m')) else
-                1
-              )) + 120 }}
+        fuzz_seconds: "{{ (fuzz_duration_seconds | default(1800) | int) + 120 }}"
 
     - block:
         - name: Stop any prior server-under-test
@@ -132,7 +128,7 @@
             ./validator \
               -mode fuzz \
               -url http://{{ target_ip }}:{{ bench_port | default(8080) }} \
-              -duration {{ fuzz_duration | default('30m') }} \
+              -duration {{ fuzz_duration_seconds | default(1800) }}s \
               -concurrency {{ fuzz_concurrency | default(64) }} \
               -seed {{ fuzz_seed | default(1) }} \
               {% if fuzz_corpus is defined and fuzz_corpus | length > 0 %}-corpus {{ bench_root }}/corpus{% endif %} \

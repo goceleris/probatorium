@@ -15,8 +15,8 @@
 #   bench_target              msa2-server | msr1
 #   refapp                    slug of the refapp to run (default
 #                             "auth_session_ratelimit")
-#   validate_duration         soak window, e.g. "10m" / "6h"
-#                             (default "10m")
+#   validate_duration_seconds soak window, INTEGER seconds
+#                             (default 600)
 #   validate_property_tier    -property-tier filter (default
 #                             "core,middleware")
 #   validate_seed             reserved for future per-run seed knob
@@ -57,19 +57,14 @@
         state: directory
         mode: '0755'
 
-    # Convert "10m" / "6h" / "1d" → seconds + 300s slack. ansible's
-    # async timeout MUST be greater than the validator's natural exit
-    # window or we lose the final results fetch.
+    # ansible's async timeout MUST be greater than the validator's
+    # natural exit window or we lose the final results fetch. mage passes
+    # the soak window as INTEGER SECONDS (validate_duration_seconds) —
+    # the old unit-suffix conversion mis-parsed compound Go durations
+    # ("1h30m" read as 90 hours).
     - name: Compute timeout-seconds for the validate run
       ansible.builtin.set_fact:
-        validate_seconds: >-
-          {{ ((validate_duration | default('10m') | regex_replace('[^0-9]', '') | int)
-              * (
-                86400 if 'd' in (validate_duration | default('10m')) else
-                3600  if 'h' in (validate_duration | default('10m')) else
-                60    if 'm' in (validate_duration | default('10m')) else
-                1
-              )) + 300 }}
+        validate_seconds: "{{ (validate_duration_seconds | default(600) | int) + 300 }}"
 
     - block:
         - name: Confirm refapp binary is staged
@@ -169,7 +164,7 @@
             ulimit -l unlimited
             ./validator \
               -target=localhost \
-              -duration={{ validate_duration | default('10m') }} \
+              -duration={{ validate_duration_seconds | default(600) }}s \
               {% if validate_matrix | default('') == '1' %}-matrix -matrix-refapp-root={{ bench_root }}/validation/refapp -matrix-bin-dir={{ bench_root }}/refapps -markov={{ bench_root }}/markov/auth_session_ratelimit.yaml {% if validate_matrix_refapps | default('') %}-matrix-refapps={{ validate_matrix_refapps }}{% endif %} {% if validate_matrix_engines | default('') %}-matrix-engines={{ validate_matrix_engines }}{% endif %} \
               {% else %}-celeris-bin={{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }} -celeris-addr=127.0.0.1:{{ bench_port | default(8080) }} -markov={{ bench_root }}/markov/{{ refapp | default('auth_session_ratelimit') }}.yaml {% if validate_refapp_engine | default('') %}-refapp-engine={{ validate_refapp_engine }}{% endif %} {% if validate_refapp_async | default('') %}-refapp-async-handlers={{ validate_refapp_async }}{% endif %} \
               {% endif %}
