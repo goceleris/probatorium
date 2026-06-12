@@ -136,8 +136,35 @@ func TestBuildCellConfig(t *testing.T) {
 		if lg.Warmup != time.Second {
 			t.Errorf("Warmup = %v, want 1s", lg.Warmup)
 		}
-		if lg.Workers != 64 {
-			t.Errorf("Workers = %d, want 64 (default)", lg.Workers)
+		if lg.Workers != 128 {
+			t.Errorf("Workers = %d, want 128 (mapped from declared Connections)", lg.Workers)
+		}
+	})
+
+	// loadgen sizes every driver's concurrency from Workers (the
+	// keep-alive H1 pool dials Workers conns; Mode drivers run one
+	// stream per worker) and never reads Config.Connections, so the
+	// runner maps each scenario's declared Connections onto Workers.
+	// Before this mapping every H1 cell ran 64 conns regardless of its
+	// label: get-json (128), get-json-1c (1) and get-simple-1024c (1024)
+	// were all the same 64-conn workload.
+	t.Run("declared connections map to workers", func(t *testing.T) {
+		for _, tc := range []struct {
+			scenario string
+			want     int
+		}{
+			{"get-json-1c", 1},
+			{"get-simple-1024c", 1024},
+			{"get-simple-128c", 128},
+			{"churn-close", 32},
+			{"get-json-h2", 32},
+		} {
+			cell := interleave.Cell{Scenario: scenarioByName(t, tc.scenario)}
+			lg := buildCellConfig(cell, base, cfg)
+			if lg.Workers != tc.want {
+				t.Errorf("%s: Workers = %d, want %d (declared Connections)",
+					tc.scenario, lg.Workers, tc.want)
+			}
 		}
 	})
 

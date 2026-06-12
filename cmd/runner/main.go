@@ -900,15 +900,20 @@ func buildCellConfig(cell interleave.Cell, baseURL string, cfg Config) loadgen.C
 	}
 	lgCfg.Duration = cfg.Duration
 	lgCfg.Warmup = cfg.Warmup
-	if lgCfg.Mode != "" && lgCfg.Connections > 0 {
-		// loadgen (≤ v1.4.7) Mode drivers (ws-* / sse-fanout) hold ONE
-		// stream per WORKER and ignore Config.Connections entirely, so a
-		// fanout-1024 cell under the 64-worker default only ever opened
-		// 64 streams — which is why the -128 and -1024 streaming variants
-		// recorded historically identical RPS. Map the scenario's
-		// declared Connections onto Workers so the stream count is what
-		// the cell row claims. (Connections stays set too: ignored on
-		// v1.4.7, correct if a later loadgen honours it.)
+	if lgCfg.Connections > 0 {
+		// loadgen sizes EVERY driver's concurrency from Workers, never
+		// from Config.Connections: Mode drivers (ws-*/sse-fanout) hold one
+		// stream per worker, and the keep-alive H1 pool dials
+		// Workers×connsPerWorker conns (h1client numConns). Under the old
+		// 64-worker default that made the concurrency axis fictional —
+		// fanout-128 vs -1024 opened 64 streams each, and get-json (128),
+		// get-json-1c (1) and get-simple-1024c (1024) all ran 64 conns.
+		// Map the scenario's declared Connections onto Workers so each
+		// cell runs the concurrency its row label claims. (Connections
+		// stays set too: documentation, and correct if a later loadgen
+		// honours it directly.) No scenario sets Workers explicitly, so
+		// this mapping is total; the 64 default below only covers
+		// workloads that declare no Connections at all.
 		lgCfg.Workers = lgCfg.Connections
 	}
 	if lgCfg.Workers == 0 {
