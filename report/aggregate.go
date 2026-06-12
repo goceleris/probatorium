@@ -159,7 +159,15 @@ type CellAggregate struct {
 	// archs without re-running the bench.
 	MergedHistogramB64 string
 
-	Errors      int64
+	Errors int64
+
+	// ConnectErrors is the summed-across-runs dial/handshake-failure
+	// subset of Errors (loadgen Result.ConnectErrors, additive within
+	// schema v5.4). Errors ≈ ConnectErrors reads "server unreachable",
+	// not "server misbehaving". Zero for pre-ConnectErrors loadgen
+	// builds.
+	ConnectErrors uint64
+
 	BytesMedian float64
 
 	// RatedP99ByTarget maps an integer target-RPS bucket to the median
@@ -227,12 +235,14 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 		bytesVals := make([]float64, 0, len(cell.Samples))
 		cpuVals := make([]float64, 0, len(cell.Samples))
 		var totalErrors, totalSent int64
+		var totalConnectErrors uint64
 		for _, s := range cell.Samples {
 			rpsVals = append(rpsVals, s.RequestsPerSec)
 			bytesVals = append(bytesVals, s.ThroughputBPS)
 			cpuVals = append(cpuVals, s.CPUPctP95)
 			totalErrors += s.Errors
 			totalSent += s.Requests
+			totalConnectErrors += s.ConnectErrors
 		}
 
 		agg.RPSMedian = percentile(rpsVals, 50)
@@ -241,6 +251,7 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 		agg.RPSStdDev = stddev(rpsVals)
 		agg.BytesMedian = percentile(bytesVals, 50)
 		agg.Errors = totalErrors
+		agg.ConnectErrors = totalConnectErrors
 		// Validity telemetry. The loadgen's CPUPctP95 is a percent
 		// (0–100+, normalised by available cores) — divide by 100 so
 		// the on-wire unit is a fraction of one core, matching the

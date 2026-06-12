@@ -139,6 +139,16 @@ func BuildDocument(in BuildInput) *Document {
 		if c.SentVsHandledDeltaPct > 0 {
 			sr.SentVsHandledDeltaPct[c.ScenarioName] = c.SentVsHandledDeltaPct
 		}
+		// Connect-class error split (additive within v5.4). Zero values
+		// are omitted: a pre-ConnectErrors loadgen build must not surface
+		// a misleading "0 connect errors" claim next to a real error
+		// count.
+		if c.ConnectErrors > 0 {
+			if sr.ConnectErrors == nil {
+				sr.ConnectErrors = map[string]uint64{}
+			}
+			sr.ConnectErrors[c.ScenarioName] = c.ConnectErrors
+		}
 
 		// LatencyAtSLO + RatedModeP99AtTargetRPS come from the real rated
 		// (closed-loop, coordinated-omission-corrected) sweep when it ran

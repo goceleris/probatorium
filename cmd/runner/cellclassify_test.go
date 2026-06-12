@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -25,11 +27,12 @@ import (
 func TestClassifyCompletedCell(t *testing.T) {
 	const refused = "dial tcp 192.168.50.65:8080: connect: connection refused"
 	cases := []struct {
-		name       string
-		in         completedCell
-		wantPrefix string // "" = clean
-		wantHard   bool
-		wantStatus report.CellStatus
+		name         string
+		in           completedCell
+		wantPrefix   string // "" = clean
+		wantContains string // "" = no substring assertion
+		wantHard     bool
+		wantStatus   report.CellStatus
 	}{
 		{
 			// v3.8 chain-api-post-4k/celeris-iouring-h1-async: the io_uring
@@ -123,6 +126,84 @@ func TestClassifyCompletedCell(t *testing.T) {
 			},
 			wantPrefix: "suspect:", wantHard: false, wantStatus: report.CellSuspect,
 		},
+		// ── ConnectErrors variants (loadgen >= c902b92 pin). The rows
+		// above all carry ConnectErrors=0 — pre-counter artefacts — and
+		// pin that legacy classification is untouched.
+		{
+			// The v3.8 dead-port streaming cell as the NEW loadgen would
+			// report it, against a SUT that systemd flapped back up just in
+			// time to pass the post-probe: every error is connect-class, so
+			// the probe's verdict is outranked — server-down, not
+			// capability-lie/zero-request.
+			name: "connect-class error storm with zero requests is server-down despite passing probe",
+			in: completedCell{
+				ScenarioName: "sse-fanout-128", ServerName: "celeris-iouring-h1-async",
+				Category: "sse", Requests: 0, Errors: 34730615,
+				ConnectErrors: 34730615,
+				Duration:      90000225614, ServerAlive: true,
+				ErrorBudget: 0.05,
+			},
+			wantPrefix: "server-down:", wantContains: "connect_errors=34730615",
+			wantHard: true, wantStatus: report.CellDNF,
+		},
+		{
+			// Same counters but the post-probe also failed: the stronger
+			// "server-died-mid-cell" evidence wins and now carries the
+			// connect-class count.
+			name: "connect-class error storm with dead probe stays server-died-mid-cell",
+			in: completedCell{
+				ScenarioName: "sse-fanout-128", ServerName: "celeris-iouring-h1-async",
+				Category: "sse", Requests: 0, Errors: 34730615,
+				ConnectErrors: 34730615,
+				Duration:      90000225614, ServerAlive: false, ProbeErr: refused,
+				ErrorBudget: 0.05,
+			},
+			wantPrefix: "server-died-mid-cell:", wantContains: "connect_errors=34730615",
+			wantHard: true, wantStatus: report.CellDNF,
+		},
+		{
+			// A genuine route gap on an HTTP-class category: the 404s are
+			// request errors, NOT connect-class (h1client only counts failed
+			// reconnect dials), so capability-lie still fires with the new
+			// counters present-but-zero-ish (a handful of churn reconnects).
+			name: "chain capability-lie with marginal connect errors stays not_applicable",
+			in: completedCell{
+				ScenarioName: "chain-api-get-json-1c", ServerName: "gnet-h1",
+				Category: "chain", Requests: 0, Errors: 120000,
+				ConnectErrors: 37,
+				Duration:      90 * time.Second, ServerAlive: true,
+				ErrorBudget: 0.05,
+			},
+			wantPrefix: "capability-lie:", wantHard: true, wantStatus: report.CellNotApplicable,
+		},
+		{
+			// v3.8 churn-close storm as the new loadgen would report it when
+			// the failed dials ARE the overage: the suspect reason must
+			// attribute the blow-up to reachability, not server behaviour.
+			name: "churn-close over budget with connect-class overage says so",
+			in: completedCell{
+				ScenarioName: "churn-close", ServerName: "actix-web",
+				Category: "static", Requests: 12081484, Errors: 290204598,
+				ConnectErrors: 290204598,
+				Duration:      90004545724, ServerAlive: true,
+				ErrorBudget: 0.5,
+			},
+			wantPrefix: "suspect:", wantContains: "overage is connect-class (connect_errors=290204598)",
+			wantHard: false, wantStatus: report.CellSuspect,
+		},
+		{
+			// Over budget where the errors are NOT connect-class (server
+			// answering 5xx): no reachability claim may appear.
+			name: "over budget with non-connect errors carries no connect-class claim",
+			in: completedCell{
+				ScenarioName: "churn-close", ServerName: "actix-web",
+				Category: "static", Requests: 12081484, Errors: 290204598,
+				ConnectErrors: 1024,
+				Duration:      90004545724, ServerAlive: true,
+				ErrorBudget: 0.5,
+			},
+			wantPrefix: "suspect:", wantHard: false, wantStatus: report.CellSuspect,
+		},
 		{
 			// Churn with failed dials under half of completed requests
 			// stays clean under the 0.5 budget.
@@ -157,6 +238,15 @@ func TestClassifyCompletedCell(t *testing.T) {
 				}
 			} else if !strings.HasPrefix(v.ErrMsg, tc.wantPrefix) {
 				t.Fatalf("ErrMsg = %q, want prefix %q", v.ErrMsg, tc.wantPrefix)
+			}
+			if tc.wantContains != "" && !strings.Contains(v.ErrMsg, tc.wantContains) {
+				t.Errorf("ErrMsg = %q, want substring %q", v.ErrMsg, tc.wantContains)
+			}
+			// A connect-class claim must never appear unless the table row
+			// asked for one — reachability blame on a server that answered
+			// (with errors) would be a lie in the other direction.
+			if tc.wantContains == "" && strings.Contains(v.ErrMsg, "connect-class") {
+				t.Errorf("ErrMsg = %q makes an unrequested connect-class claim", v.ErrMsg)
 			}
 			if v.Hard != tc.wantHard {
 				t.Errorf("Hard = %v, want %v", v.Hard, tc.wantHard)
@@ -363,6 +453,76 @@ func TestHostPortFromURL(t *testing.T) {
 		if got != tc.want || ok != tc.wantOK {
 			t.Errorf("hostPortFromURL(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOK)
 		}
+	}
+}
+
+// TestLoadgenRunCellError pins the loadgen.Run error-path classification,
+// in particular the fail-fast abort introduced by the c902b92 loadgen pin:
+// Run returns a NIL Result and an ErrNeverConnected-wrapped "loadgen:
+// dial: …" error instead of burning the window against a dead target. The
+// cell must land DNF with the "server-down:" mark (cooldown skip + publish
+// dead-SUT tally) whether or not the post-probe passes — a flapping
+// listener answering three spaced probe dials is not a healthy server.
+func TestLoadgenRunCellError(t *testing.T) {
+	// Shaped exactly like loadgen's failFastTracker.failure synthesis.
+	failFast := fmt.Errorf("loadgen: dial: %w (fail-fast: %w within %v)",
+		errors.New("dial tcp 192.168.50.65:8080: connect: connection refused"),
+		loadgen.ErrNeverConnected, 5*time.Second)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	liveAddr := l.Addr().String()
+
+	deadPort, err := freePort()
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	deadAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(deadPort))
+
+	cases := []struct {
+		name         string
+		err          error
+		probeAddr    string
+		wantPrefix   string
+		wantContains string
+	}{
+		{
+			name: "fail-fast abort with dead probe is server-down",
+			err:  failFast, probeAddr: deadAddr,
+			wantPrefix: "server-down:", wantContains: "post-probe:",
+		},
+		{
+			name: "fail-fast abort with passing probe is STILL server-down",
+			err:  failFast, probeAddr: liveAddr,
+			wantPrefix: "server-down:", wantContains: "post-probe passed",
+		},
+		{
+			name: "fail-fast abort without probe addr is server-down",
+			err:  failFast, probeAddr: "",
+			wantPrefix: "server-down:", wantContains: "no post-probe addr",
+		},
+		{
+			name:       "non-fail-fast Run error keeps the legacy prefix",
+			err:        errors.New("h2: read server settings: connection reset"),
+			wantPrefix: "loadgen.Run:",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := loadgenRunCellError(context.Background(), tc.err, tc.probeAddr)
+			if !strings.HasPrefix(msg, tc.wantPrefix) {
+				t.Fatalf("msg = %q, want prefix %q", msg, tc.wantPrefix)
+			}
+			if tc.wantContains != "" && !strings.Contains(msg, tc.wantContains) {
+				t.Errorf("msg = %q, want substring %q", msg, tc.wantContains)
+			}
+			if got := report.ClassifyCellError(msg); got != report.CellDNF {
+				t.Errorf("ClassifyCellError(%q) = %q, want dnf", msg, got)
+			}
+		})
 	}
 }
 

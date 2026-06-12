@@ -1039,8 +1039,8 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	}
 	res, err := bm.Run(cellCtx)
 	if err != nil {
-		cellRes.Error = "loadgen.Run: " + err.Error()
-		return cellOutcome{}, err
+		cellRes.Error = loadgenRunCellError(parent, err, probeAddr)
+		return cellOutcome{}, errors.New(cellRes.Error)
 	}
 	cellRes.Result = res
 	oc := cellOutcome{Result: res}
@@ -1050,15 +1050,16 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	}
 
 	in := completedCell{
-		ScenarioName: cell.Scenario.Name(),
-		ServerName:   cell.Server.Name(),
-		Category:     cell.Scenario.Category(),
-		Requests:     res.Requests,
-		Errors:       res.Errors,
-		Duration:     res.Duration,
-		Interrupted:  parent.Err() != nil,
-		ServerAlive:  true,
-		ErrorBudget:  scenarios.ErrorBudgetFor(cell.Scenario),
+		ScenarioName:  cell.Scenario.Name(),
+		ServerName:    cell.Server.Name(),
+		Category:      cell.Scenario.Category(),
+		Requests:      res.Requests,
+		Errors:        res.Errors,
+		ConnectErrors: res.ConnectErrors,
+		Duration:      res.Duration,
+		Interrupted:   parent.Err() != nil,
+		ServerAlive:   true,
+		ErrorBudget:   scenarios.ErrorBudgetFor(cell.Scenario),
 	}
 	// Post-cell liveness probe, lazily: only an anomalous cell (zero
 	// requests, or error ratio past 50%) needs the dead-or-alive fact to
@@ -1111,7 +1112,15 @@ type completedCell struct {
 	Category     string
 	Requests     int64
 	Errors       int64
-	Duration     time.Duration
+
+	// ConnectErrors is loadgen's dial/handshake-failure subset of Errors
+	// (Result.ConnectErrors, loadgen >= the c902b92 pin; zero from older
+	// builds). Errors ≈ ConnectErrors means the server was unreachable,
+	// not misbehaving — additive evidence the rules below use to sharpen
+	// dead-SUT detection beyond the post-probe.
+	ConnectErrors uint64
+
+	Duration time.Duration
 
 	// Interrupted is true when the run context was cancelled while the
 	// cell was in flight: the measurement window was truncated, so
@@ -1161,16 +1170,29 @@ func errorRatio(requests, errors int64) float64 {
 //     post-crash dial errors then tripped the old ratio-based
 //     capability-lie guard (N/A), and the following dead-port streaming
 //     cells (0 req / 34.7M err) published as zero-request N/A.
-//  3. Zero successes + errors > 0 + server alive + capability-gated
+//  3. Zero requests + errors overwhelmingly connect-class →
+//     "server-down:" (DNF) EVEN when the post-probe passed: a SUT
+//     flapping under systemd restart can answer the probe's three
+//     spaced dials while refusing every loadgen connect for the whole
+//     window. Connect-class evidence outranks the probe — ConnectErrors
+//     counts dial/handshake failures only, which a live server serving
+//     wrong answers can never produce in bulk. (Caveat: loadgen counts
+//     WS/SSE upgrade rejections as connect-class too, so a streaming
+//     capability lie with the new counters lands here as DNF instead
+//     of rule 4's N/A — ambiguity resolves loud, never skip-eligible,
+//     matching report.ClassifyCellError's default.)
+//  4. Zero successes + errors > 0 + server alive + capability-gated
 //     class → "capability-lie:" (N/A). The ONLY runtime path to N/A
 //     left: the adapter declared the capability, is demonstrably up,
 //     yet served nothing. A cell with even one success can never be a
 //     lie.
-//  4. Zero requests otherwise → "zero-request cell:" (DNF — loud; see
+//  5. Zero requests otherwise → "zero-request cell:" (DNF — loud; see
 //     report.ClassifyCellError for why this stopped being N/A).
-//  5. Error ratio over the scenario budget → "suspect:" (soft; data
+//  6. Error ratio over the scenario budget → "suspect:" (soft; data
 //     kept). churn-close's 0.96+ ratios published as status=ok in every
-//     v3.8/history run.
+//     v3.8/history run. When connect-class failures cover the whole
+//     overage past the budget, the reason says so: the server was
+//     unreachable for part of the cell, not misbehaving.
 func classifyCompletedCell(in completedCell) cellVerdict {
 	ratio := errorRatio(in.Requests, in.Errors)
 	switch {
@@ -1181,9 +1203,17 @@ func classifyCompletedCell(in completedCell) cellVerdict {
 			Hard: true,
 		}
 	case (in.Requests == 0 || ratio > 0.5) && !in.ServerAlive:
+		msg := fmt.Sprintf("server-died-mid-cell: post-cell probe: %s (requests=%d errors=%d",
+			in.ProbeErr, in.Requests, in.Errors)
+		if in.ConnectErrors > 0 {
+			msg += fmt.Sprintf(" connect_errors=%d", in.ConnectErrors)
+		}
+		return cellVerdict{ErrMsg: msg + ")", Hard: true}
+	case in.Requests == 0 && connectClassDominated(in.Errors, in.ConnectErrors):
 		return cellVerdict{
-			ErrMsg: fmt.Sprintf("server-died-mid-cell: post-cell probe: %s (requests=%d errors=%d)",
-				in.ProbeErr, in.Requests, in.Errors),
+			ErrMsg: fmt.Sprintf(
+				"server-down: zero requests and the errors are connect-class (connect_errors=%d errors=%d) — no stream ever served; a passing post-probe means a flapping listener, not a healthy server",
+				in.ConnectErrors, in.Errors),
 			Hard: true,
 		}
 	case in.Requests == 0 && in.Errors > 0 && capabilityGatedClass(in.Category):
@@ -1199,13 +1229,59 @@ func classifyCompletedCell(in completedCell) cellVerdict {
 			Hard:   true,
 		}
 	case ratio > in.ErrorBudget:
-		return cellVerdict{
-			ErrMsg: fmt.Sprintf("suspect: error ratio %.3f exceeds budget %.2f (errors=%d requests=%d)",
-				ratio, in.ErrorBudget, in.Errors, in.Requests),
-			Hard: false,
+		msg := fmt.Sprintf("suspect: error ratio %.3f exceeds budget %.2f (errors=%d requests=%d)",
+			ratio, in.ErrorBudget, in.Errors, in.Requests)
+		// Overage attribution: the budget allows ErrorBudget×total failed
+		// operations; when the connect-class subset covers everything past
+		// that allowance, the blow-up is reachability, not server
+		// misbehaviour — say so next to the flag.
+		allowed := in.ErrorBudget * float64(in.Requests+in.Errors)
+		if in.ConnectErrors > 0 && float64(in.ConnectErrors) >= float64(in.Errors)-allowed {
+			msg += fmt.Sprintf("; the overage is connect-class (connect_errors=%d) — server unreachable for part of the cell", in.ConnectErrors)
 		}
+		return cellVerdict{ErrMsg: msg, Hard: false}
 	}
 	return cellVerdict{}
+}
+
+// connectClassDominated reports whether a cell's error total is
+// overwhelmingly dial/handshake failures. The two counters are kept by
+// different layers (Errors per failed request, ConnectErrors at the
+// driver) and can differ by a few attempts cut off at phase boundaries,
+// so "all of them" is a 99% band rather than equality. Always false for
+// pre-ConnectErrors loadgen builds (counter zero), keeping legacy
+// artefacts on the old rules.
+func connectClassDominated(errs int64, connectErrs uint64) bool {
+	if errs <= 0 || connectErrs == 0 {
+		return false
+	}
+	return float64(connectErrs) >= 0.99*float64(errs)
+}
+
+// loadgenRunCellError synthesises the per-cell error string for a failed
+// loadgen.Run. A fail-fast abort — loadgen returns a nil Result and an
+// ErrNeverConnected-wrapped "loadgen: dial: …" error when not a single
+// stream was established within its fail-fast window — means the SUT was
+// dead or flapping from the cell's first dial, so it wears the same
+// "server-down:" prefix as the pre-cell probe mark: DNF, the run loop
+// skips the cooldown, and the publish integrity gate counts it as a
+// dead-SUT measurement. The post-probe is attached as evidence only; a
+// flapping listener can pass it, which must not soften the verdict.
+// Every other Run error keeps the legacy "loadgen.Run:" prefix (DNF via
+// report.ClassifyCellError's default).
+func loadgenRunCellError(parent context.Context, err error, probeAddr string) string {
+	if !errors.Is(err, loadgen.ErrNeverConnected) {
+		return "loadgen.Run: " + err.Error()
+	}
+	probe := "no post-probe addr"
+	if probeAddr != "" {
+		if perr := probeSUT(parent, probeAddr); perr != nil {
+			probe = "post-probe: " + perr.Error()
+		} else {
+			probe = "post-probe passed — flapping listener, not a healthy server"
+		}
+	}
+	return fmt.Sprintf("server-down: loadgen fail-fast: %s (%s)", err.Error(), probe)
 }
 
 // probeSUT answers "is the SUT accepting TCP connections right now?"

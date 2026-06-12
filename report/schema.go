@@ -40,6 +40,9 @@ import (
 //     scenario's error budget: the data exists (and stays in the
 //     headline maps) but its integrity is questionable. Additive —
 //     older readers ignore both and a v5.3 document still decodes.
+//     Also additive within 5.4: ServerResult.ConnectErrors, the
+//     per-scenario dial/handshake-failure subset of the loadgen error
+//     total (loadgen Result.ConnectErrors), emitted only when nonzero.
 const SchemaVersion = "5.4"
 
 // CellStatus classifies the OUTCOME of a single (scenario, server)
@@ -290,6 +293,14 @@ type ServerResult struct {
 	// percentage of sent. Per scenario. >2% indicates the server is
 	// dropping connections / replies — release-gate signal.
 	SentVsHandledDeltaPct map[string]float64 `json:"sent_vs_handled_delta_pct"`
+
+	// ConnectErrors is the summed-across-runs dial/handshake-failure
+	// subset of loadgen's error total, per scenario (additive within
+	// schema v5.4; loadgen Result.ConnectErrors). Splits "server
+	// unreachable" from "server answering with errors" next to the
+	// headline number. Omitted when zero (including every pre-
+	// ConnectErrors loadgen build). Older readers ignore it.
+	ConnectErrors map[string]uint64 `json:"connect_errors,omitempty"`
 
 	// Resources carries the server-side resource aggregate (RSS, CPU,
 	// GC pause, goroutine / FD high-water) sampled at 1 Hz alongside the
