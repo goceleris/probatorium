@@ -724,6 +724,22 @@ func aggregatePerCellResults(resultsDir string) error {
 			if err != nil {
 				return fmt.Errorf("read runner output %s: %w", cellDir, err)
 			}
+			// Ingest fallback (v3.9): a column whose runner died before
+			// the final rollup write has per-cell JSONs under run<N>/ but
+			// no results.json sibling. The per-cell files ARE the ingest
+			// source either way, so the finished cells are recovered
+			// normally — but mark their provenance and warn so a lost
+			// rollup is loud at merge time and the Publish integrity
+			// gate can refuse the run.
+			if len(recs) > 0 {
+				if _, statErr := os.Stat(filepath.Join(cellDir, "results.json")); statErr != nil {
+					for i := range recs {
+						recs[i].Provenance = provenanceReconstructed
+					}
+					fmt.Printf("  WARN: %s has no results.json (runner died mid-column?) — reconstructed %d cells from per-cell JSONs\n",
+						cellDir, len(recs))
+				}
+			}
 			// Server-side resource sampling (#154) lands directly in the
 			// cell dir (observer.sqlite + cpu.log) next to the runner's
 			// nested run<N>/ output. Best-effort: a cell that ran without
@@ -833,6 +849,11 @@ func writeClusterTimeseries(resultsDir string, hostCells map[string][]cellRecord
 	}
 	return os.WriteFile(filepath.Join(resultsDir, "timeseries.json.gz"), data, 0o644)
 }
+
+// provenanceReconstructed is the cellRecord.Provenance value for cells
+// recovered from a column dir that lost its results.json rollup (the
+// runner force-exited before the final write).
+const provenanceReconstructed = "reconstructed-from-per-cell-files"
 
 // runnerCellFile mirrors cmd/runner's cellResultFile JSON shape — the
 // per-cell artefact the runner writes under run<N>/<scenario>/<server>.json.
@@ -1011,6 +1032,15 @@ type cellRecord struct {
 	// on a record with a Loadgen payload means OK.
 	Status string `json:"status,omitempty"`
 	Error  string `json:"error,omitempty"`
+
+	// Provenance marks a cell recovered from a column whose runner died
+	// before writing its results.json rollup (v3.8: a second hang-guard
+	// signal force-exited the celeris-epoll-h1-sync runner and stranded
+	// 27 finished cells). The per-cell JSONs under run<N>/ are the
+	// source of truth either way, so the data is identical — the mark
+	// exists so the merge log and the Publish integrity gate can tell a
+	// clean column from a reconstructed one. Empty for normal columns.
+	Provenance string `json:"provenance,omitempty"`
 
 	// Resources is the server-side resource aggregate (#154) parsed from
 	// the cell's observer.sqlite + cpu.log. Nil when the cell ran without
@@ -1372,6 +1402,7 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 		errMsg string
 	}
 	evidence := map[string][]runEvidence{}
+	reconstructed := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
@@ -1418,6 +1449,9 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 			}
 			evidence[crKey] = append(evidence[crKey],
 				runEvidence{runIdx: cell.RunIndex, status: status, errMsg: cell.Error})
+			if cell.Provenance != "" {
+				reconstructed++
+			}
 			// Only runs that carry a real measurement contribute samples:
 			// OK always, suspect keeps its data (schema v5.4). DNF / N/A
 			// runs never append a bogus 0-RPS sample. Status + ErrorMsg are
@@ -1451,6 +1485,10 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 				cr.RatedSamples = append(cr.RatedSamples, rs)
 			}
 		}
+	}
+	if reconstructed > 0 {
+		fmt.Printf("  NOTE: %d cells came from columns that lost their results.json rollup (provenance=%s)\n",
+			reconstructed, provenanceReconstructed)
 	}
 
 	// Reduce each cell's evidence into the cell-level status, mirroring
