@@ -382,9 +382,13 @@
   # 30s left no margin over a slow in-flight cell unwind. A timed-out cell
   # (exit 124) is recorded + skipped via failed_when:false below; the grid
   # continues.
+  # QUOTING: ansible's free-form arg splitter counts every single/double
+  # quote across the WHOLE block below — shell comments included — and
+  # refuses to load the task on odd parity ("unbalanced jinja2 block or
+  # quotes"). No contractions or possessives inside the scalar.
   ansible.builtin.shell: |
     cd {{ bench_root }}
-    # nofile: msa2-client's soft limit is 1024 (hard 524288) and the
+    # nofile: the msa2-client soft limit is 1024 (hard 524288) and the
     # runner is NOT launched under become — raise the soft limit within
     # the hard ceiling or the 1024-stream cells (sse-fanout-1024 /
     # ws-hub-broadcast-1024, now that the fanout fix maps Connections
@@ -396,7 +400,7 @@
       -runs 1 \
       -duration {{ bench_duration_seconds | default(30) }}s \
       -warmup {{ bench_warmup_seconds | default(5) }}s \
-      -cells '{{ bench_cells | default('*') }}' \
+      -cells '{{ bench_cells | default("*") }}' \
       {% if bench_rated | default(false) | bool %}-rated -rated-duration {{ bench_rated_duration_seconds | default(30) }}s {% endif %}\
       -services none \
       -out {{ cell_dir }} \
