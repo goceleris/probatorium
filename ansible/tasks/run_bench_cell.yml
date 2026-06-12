@@ -151,6 +151,13 @@
     cmd: |
       cd {{ bench_root }}
       ulimit -l unlimited 2>/dev/null || true
+      # nofile: the default 1024 soft limit is below a single
+      # 1024-connection cell (sse-fanout-1024 / ws-hub-broadcast-1024 /
+      # get-simple-1024c) before counting the listener, logs and backend
+      # client sockets — and churn-close's dial storms park hundreds more
+      # in TIME_WAIT/accept queues. Launched under root (become), so both
+      # soft+hard rise; best-effort like -l above.
+      ulimit -n 65535 2>/dev/null || true
       nohup ./competitors/{{ cell_bin }} -bind 0.0.0.0:{{ bench_port | default(8080) }} {{ ('-engine ' + cell_engine) if cell_engine else '' }} > {{ cell_dir }}/server.log 2>&1 &
       echo $! > {{ cell_dir }}/server.pid
       disown
@@ -377,6 +384,12 @@
   # continues.
   ansible.builtin.shell: |
     cd {{ bench_root }}
+    # nofile: msa2-client's soft limit is 1024 (hard 524288) and the
+    # runner is NOT launched under become — raise the soft limit within
+    # the hard ceiling or the 1024-stream cells (sse-fanout-1024 /
+    # ws-hub-broadcast-1024, now that the fanout fix maps Connections
+    # onto Workers) exhaust FDs before opening their last streams.
+    ulimit -n 65535 2>/dev/null || true
     timeout --foreground --kill-after=60 {{ cell_guard_seconds }} ./runner \
       -target http://{{ target_ip }}:{{ bench_port | default(8080) }} \
       -server-name {{ cell.1 }} \
@@ -424,6 +437,7 @@
   changed_when: false
   failed_when: false
   when: inventory_hostname == "msa2-client"
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop observer (server side)"
   # Drain the observer's SQLite write buffer before killing it. The
   # pid file was written when nohup forked the sampler under root
@@ -449,7 +463,7 @@
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (server side)"
   # Same rationale as the loadgen-side kill: the guard-sized sampler must
   # not keep writing this cell's cpu.log while the NEXT cell's server is
-  # under load — readCellResources means that log as THIS cell's CPU.
+  # under load — readCellResources reads that log as THIS cell's CPU.
   ansible.builtin.shell: |
     if [ -f {{ cell_dir }}/mpstat.pid ]; then
       kill -TERM "$(cat {{ cell_dir }}/mpstat.pid)" 2>/dev/null
