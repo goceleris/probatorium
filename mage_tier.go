@@ -195,11 +195,27 @@ func BenchTier() error {
 		p.Arches = 1
 	}
 
-	runs, log, ok := p.FitWithin(budget.Budget, 1)
+	// The fit budget defaults to the 24h weekly cluster invariant
+	// (budget.Budget) but can be raised per-invocation via BENCH_BUDGET for
+	// a manual full-matrix dispatch that intentionally runs longer than the
+	// weekly headline — the full profile is ~58h on one arch and cannot fit
+	// 24h. The CI job's timeout-minutes must exceed this budget (+ Deploy /
+	// Cleanup overhead). The weekly auto-run leaves BENCH_BUDGET unset and
+	// stays gated at 24h, so this never silently lengthens the weekly window.
+	fitBudget := budget.Budget
+	if v := os.Getenv("BENCH_BUDGET"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("BENCH_BUDGET %q: %w", v, err)
+		}
+		fitBudget = d
+	}
+
+	runs, log, ok := p.FitWithin(fitBudget, 1)
 	fmt.Println(log)
 	if !ok {
 		return fmt.Errorf("no benchmark config fits the %s budget for profile %q; aborting rather than truncating the matrix:\n%s",
-			budget.Budget, p.Name, log)
+			fitBudget, p.Name, log)
 	}
 	p.Runs = runs
 
