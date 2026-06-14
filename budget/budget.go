@@ -47,6 +47,14 @@ const PerCellOverhead = 12 * time.Second
 // is explicit, but every curated profile uses this value today.
 const defaultCooldown = 5 * time.Second
 
+// DefaultRatedPasses is the number of offered-load steps the runner's
+// rated sweep takes when no -rated-fractions override is given
+// (cmd/runner defaultRatedFractions = 0.25,0.5,0.75,0.9). The bench
+// playbook never overrides the fractions, so this is the multiplier
+// ColumnWallClock budgets per rated cell. A cmd/runner test pins
+// len(defaultRatedFractions) to this constant so the two cannot drift.
+const DefaultRatedPasses = 4
+
 // Profile is the cost model for one benchmark-tier run. Every field is a
 // knob the workflow sets; WallClock projects them into a single duration
 // the CI budget test and the mage orchestrator both assert against.
@@ -122,6 +130,37 @@ func (p Profile) WallClock() time.Duration {
 		total /= 2
 	}
 	return total
+}
+
+// ColumnWallClock projects the healthy wall-clock of ONE distributed-bench
+// column pass: a single runner invocation expanding `scenarios`
+// capability-gated scenarios back-to-back against one competitor. Per
+// scenario the runner spends warmup+duration on the saturation pass,
+// then — in rated mode — ratedPasses extra closed-loop passes of
+// warmup+ratedDuration each (every rated pass re-runs the FULL cfg.Warmup:
+// runRatedSweep clones the saturation loadgen.Config, there is no separate
+// rated warmup on the wire), plus the inter-cell cooldown and the fixed
+// per-cell overhead. ratedPasses == 0 models rated mode off.
+//
+// mage Bench forwards this projection to ansible as
+// bench_cell_budget_seconds; run_bench_cell.yml derives both the mpstat
+// sampler window and the runner hang-guard timeout from it (budget +
+// slack). This function is the single source of truth for that sizing —
+// the v3.8 guard was sized from scenarios x (warmup+duration) alone, so
+// rated mode (which roughly triples the per-scenario cost: ~5.3min real
+// vs ~110s budgeted at 90s/20s/4x30s) blew the 2h22m cap 28 cells into
+// every healthy 33-cell celeris column.
+func ColumnWallClock(scenarios, ratedPasses int, warmup, duration, ratedDuration time.Duration) time.Duration {
+	if scenarios < 1 {
+		// Floor: an empty schedule still gets a sane (non-zero) guard —
+		// `timeout 0` would DISABLE the hang guard entirely.
+		scenarios = 1
+	}
+	per := warmup + duration + defaultCooldown + PerCellOverhead
+	if ratedPasses > 0 {
+		per += time.Duration(ratedPasses) * (warmup + ratedDuration)
+	}
+	return time.Duration(scenarios) * per
 }
 
 // arches clamps Arches to at least 1 so a zero-valued Profile never

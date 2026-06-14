@@ -158,13 +158,15 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 		// the table so a wide field of N/A cells (chain/driver scenarios
 		// only ~3 servers implement) is honest about the real competitor
 		// count rather than implying a ~19-wide ranking.
-		var ran, na, dnf int
+		var ran, na, dnf, suspect int
 		for _, a := range adapters {
 			switch cellStatusFor(a, sc) {
 			case CellNotApplicable:
 				na++
 			case CellDNF:
 				dnf++
+			case CellSuspect:
+				suspect++
 			default:
 				if _, ok := a.LatencyAtSLO[sc]; ok {
 					ran++
@@ -173,8 +175,32 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 				}
 			}
 		}
-		if _, err := fmt.Fprintf(w, "_field: ran=%d n/a=%d dnf=%d_\n\n", ran, na, dnf); err != nil {
+		note := fmt.Sprintf("_field: ran=%d n/a=%d dnf=%d", ran, na, dnf)
+		if suspect > 0 {
+			// Appended only when present so pre-v5.4 reports stay
+			// byte-identical.
+			note += fmt.Sprintf(" suspect=%d", suspect)
+		}
+		if _, err := io.WriteString(w, note+"_\n\n"); err != nil {
 			return err
+		}
+
+		// Per-run outcome evidence (schema v5.4): one entry per adapter
+		// whose run sequence carried a non-OK run, e.g.
+		// "gin-h1 ok (2/3 runs; 1 dnf)" for a cell that recovered from a
+		// harness interruption. Emitted only when evidence exists so
+		// pre-v5.4 reports stay byte-identical.
+		var evidence []string
+		for _, a := range adapters {
+			if seq := a.CellRunStatuses[sc]; len(seq) > 0 {
+				evidence = append(evidence,
+					a.Name+" "+formatRunOutcome(cellStatusFor(a, sc), seq))
+			}
+		}
+		if len(evidence) > 0 {
+			if _, err := io.WriteString(w, "_runs: "+strings.Join(evidence, " · ")+"_\n\n"); err != nil {
+				return err
+			}
 		}
 
 		// Header row: adapter | 10ms | 50ms | 100ms | 500ms | 1000ms
@@ -216,15 +242,22 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 			row := []string{a.Name}
 			// Non-OK cells render a single status token spanning every SLO
 			// column — never "0 rps" / "—" — and are excluded from bolding.
+			// Exception: a suspect cell that DOES carry a rated row keeps
+			// its numbers (data exists, flagged via the field note +
+			// cell_statuses) but the colMax pass above skipped it, so it
+			// can never be bolded as a leader.
 			if st := cellStatusFor(a, sc); st != CellOK {
-				token := cellStatusToken(st)
-				for range SLOThresholds {
-					row = append(row, token)
+				_, hasSLO := a.LatencyAtSLO[sc]
+				if st != CellSuspect || !hasSLO {
+					token := cellStatusToken(st)
+					for range SLOThresholds {
+						row = append(row, token)
+					}
+					if _, err := io.WriteString(w, "| "+strings.Join(row, " | ")+" |\n"); err != nil {
+						return err
+					}
+					continue
 				}
-				if _, err := io.WriteString(w, "| "+strings.Join(row, " | ")+" |\n"); err != nil {
-					return err
-				}
-				continue
 			}
 			slo, ok := a.LatencyAtSLO[sc]
 			for _, ms := range SLOThresholds {
@@ -267,23 +300,81 @@ func cellStatusFor(a ServerResult, scenario string) CellStatus {
 		return CellNotApplicable
 	case string(CellDNF):
 		return CellDNF
+	case string(CellSuspect):
+		return CellSuspect
 	default:
 		return CellOK
 	}
 }
 
 // cellStatusToken is the markdown token rendered for a non-OK cell:
-// "N/A" for not-applicable, "DNF" for did-not-finish. Never "0 rps" or
-// "—", which would mislead either as a real number or an absent cell.
+// "N/A" for not-applicable, "DNF" for did-not-finish, "SUSPECT" for a
+// cell whose error ratio blew the scenario's budget and carries no
+// rated row. Never "0 rps" or "—", which would mislead either as a
+// real number or an absent cell.
 func cellStatusToken(st CellStatus) string {
 	switch st {
 	case CellNotApplicable:
 		return "N/A"
 	case CellDNF:
 		return "DNF"
+	case CellSuspect:
+		return "SUSPECT"
 	default:
 		return "—"
 	}
+}
+
+// formatRunOutcome renders a cell's reduced status plus its per-run
+// outcome tally, e.g. "ok (2/3 runs; 1 dnf)" for a cell that recovered
+// from a harness interruption, or "suspect (1/2 runs; 1 dnf)" for one
+// demoted by a mid-column crash. The reduced status leads so a reader
+// sees the verdict first and the evidence second. Non-OK runs are
+// tallied in a fixed order (dnf, n/a, suspect, then unknown sorted) so
+// the note is byte-stable across reruns.
+func formatRunOutcome(st CellStatus, seq []string) string {
+	okCount := 0
+	nonOK := map[string]int{}
+	for _, s := range seq {
+		if s == string(CellOK) || s == "" {
+			okCount++
+			continue
+		}
+		nonOK[s]++
+	}
+	token := string(st)
+	if token == "" {
+		token = string(CellOK)
+	}
+	if len(nonOK) == 0 {
+		return fmt.Sprintf("%s (%d/%d runs)", token, okCount, len(seq))
+	}
+	display := map[string]string{string(CellNotApplicable): "n/a"}
+	order := []string{string(CellDNF), string(CellNotApplicable), string(CellSuspect)}
+	for k := range nonOK {
+		known := false
+		for _, o := range order {
+			if k == o {
+				known = true
+				break
+			}
+		}
+		if !known {
+			order = append(order, k)
+		}
+	}
+	sort.Strings(order[3:])
+	var parts []string
+	for _, k := range order {
+		if n := nonOK[k]; n > 0 {
+			name := k
+			if d, ok := display[k]; ok {
+				name = d
+			}
+			parts = append(parts, fmt.Sprintf("%d %s", n, name))
+		}
+	}
+	return fmt.Sprintf("%s (%d/%d runs; %s)", token, okCount, len(seq), strings.Join(parts, ", "))
 }
 
 // writeDetailSection emits the per-scenario detail block: median RPS
@@ -374,8 +465,10 @@ func writeTailLatencySection(w io.Writer, agg map[string]CellAggregate) error {
 
 	flat := make([]CellAggregate, 0, len(agg))
 	for _, v := range agg {
-		// Non-OK cells (N/A / DNF) carry no real latency — skip them so
-		// the tail-latency table ranks only cells that actually ran.
+		// Non-OK cells carry no trustworthy latency — N/A / DNF have no
+		// data at all and a suspect cell's tail is dominated by its error
+		// storm — so the tail-latency RANKING stays OK-only (suspect data
+		// remains visible in the detail section).
 		if v.Status != "" && v.Status != CellOK {
 			continue
 		}
@@ -638,7 +731,10 @@ func scenariosFromDoc(doc *Document) []string {
 func groupByCategory(agg map[string]CellAggregate) map[string][]CellAggregate {
 	out := make(map[string][]CellAggregate)
 	for _, c := range agg {
-		if c.Status != "" && c.Status != CellOK {
+		// No-data cells (N/A / DNF) have nothing to detail; suspect cells
+		// carry real numbers and stay visible (their error column is the
+		// tell).
+		if !c.Status.HasData() {
 			continue
 		}
 		cat := c.Category

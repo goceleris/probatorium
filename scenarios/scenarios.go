@@ -24,6 +24,35 @@ const (
 	CategoryTLS         = "tls"
 )
 
+// DefaultErrorBudget is the loadgen error-ratio ceiling — errors /
+// (errors + requests) — a completed cell may reach before the runner
+// flags it "suspect" (data kept, integrity questionable; schema v5.4).
+// 5% tolerates warmup blips and the odd dropped keep-alive without
+// letting an error storm publish as a clean number.
+const DefaultErrorBudget = 0.05
+
+// ErrorBudgeter is an optional [Scenario] facet: a scenario whose
+// workload legitimately produces loadgen-side errors above
+// [DefaultErrorBudget] (e.g. connection churn, where refused dials are
+// part of what is being measured) implements it to declare its own
+// ceiling. Resolved via [ErrorBudgetFor].
+type ErrorBudgeter interface {
+	// ErrorBudget returns the error-ratio ceiling in (0,1].
+	ErrorBudget() float64
+}
+
+// ErrorBudgetFor returns s's declared error budget, falling back to
+// [DefaultErrorBudget] for scenarios that do not implement
+// [ErrorBudgeter] (or declare a non-positive budget).
+func ErrorBudgetFor(s Scenario) float64 {
+	if eb, ok := s.(ErrorBudgeter); ok {
+		if b := eb.ErrorBudget(); b > 0 {
+			return b
+		}
+	}
+	return DefaultErrorBudget
+}
+
 // Scenario is one benchable workload — it knows how to configure loadgen
 // and how to interpret the result.
 type Scenario interface {

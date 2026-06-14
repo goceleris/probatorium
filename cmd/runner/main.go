@@ -23,9 +23,16 @@
 //  5. For each cell:
 //     a. Pick a free loopback port.
 //     b. servers.StartAdapter(ctx, name, "127.0.0.1:<port>").
-//     c. TCP-probe the bind addr until ready (5 s cap).
-//     d. Run loadgen.New(...).Run(ctx) and persist the result.
+//     c. TCP-probe the bind addr until ready (5 s cap). (Remote-target
+//     mode replaces a–c with a pre-cell SUT liveness probe: a dead
+//     target marks the cell DNF "server-down" in seconds instead of
+//     burning the measurement window — see executeCell.)
+//     d. Run loadgen.New(...).Run(ctx); classify the outcome
+//     (classifyCompletedCell: interrupted / server-died / capability-
+//     lie / zero-request / suspect-over-error-budget) and persist it.
 //     e. SIGTERM / SIGKILL the adapter; record the FD delta.
+//     f. Re-write results.json (atomic temp+rename) so a killed runner
+//     still leaves a parseable column current to the last cell.
 //  6. Aggregate per-cell samples; write v5.0 JSON + Markdown.
 //
 // Acceptance for wave 3: this binary is a complete code path. Running it
@@ -55,6 +62,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -64,6 +72,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -526,7 +535,8 @@ func run(cfg Config) error {
 
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
-	installSignalHandler(rootCancel)
+	sink := newResultsSink(cfg, time.Now().UTC())
+	installSignalHandler(rootCancel, sink)
 
 	var handles *services.Handles
 	if !cfg.DryRun && len(svcKinds) > 0 {
@@ -564,63 +574,35 @@ func run(cfg Config) error {
 		return writeManifest(cfg, effSc, srvs, schedule)
 	}
 
-	manifestStart := time.Now().UTC()
+	manifestStart := sink.started
 	fmt.Fprintf(os.Stderr, "probatorium-runner: %d cells across %d scenarios × %d adapters × %d runs\n",
 		len(schedule), len(effSc), len(effAdv), cfg.Runs)
 
-	collected := map[string]*report.CellResult{}
 	preRunFDs := countProcessFDs()
 
 	var firstErr error
 	for i, cell := range schedule {
 		if rootCtx.Err() != nil {
-			fmt.Fprintln(os.Stderr, "probatorium-runner: cancelled")
+			// First signal landed between cells: mark everything that
+			// never started as interrupted (per-cell JSON + final write)
+			// instead of silently truncating the matrix.
+			fmt.Fprintln(os.Stderr, "probatorium-runner: cancelled; marking remaining cells interrupted")
+			markCellsInterrupted(cfg, sink, schedule[i:])
 			break
 		}
 		fmt.Fprintf(os.Stderr, "[%d/%d] run=%d scenario=%s server=%s\n",
 			i+1, len(schedule), cell.RunIdx, cell.Scenario.Name(), cell.Server.Name())
 
 		res, cerr := executeCell(rootCtx, cfg, cell)
-		status := res.Status
-		if status == "" {
-			status = report.ClassifyCellError(res.ErrorMsg)
-		}
-		// Look up (or create) the collected cell for EVERY outcome so a
-		// not-applicable / did-not-finish cell survives into the report
-		// instead of vanishing (the old `if res.Result != nil` gate
-		// silently dropped DNF cells and ranked N/A cells as 0-RPS rows).
-		key := report.CellID(cell.Scenario.Name(), cell.Server.Name())
-		cr := collected[key]
-		if cr == nil {
-			cr = &report.CellResult{
-				ScenarioName: cell.Scenario.Name(),
-				ServerName:   cell.Server.Name(),
-				Category:     cell.Scenario.Category(),
-			}
-			collected[key] = cr
-		}
-		if status == report.CellOK && res.Result != nil {
-			// A real measurement: append the sample exactly as before. An
-			// OK run promotes the cell to OK even if an earlier run of the
-			// same cell did not finish — a cell that produced a real number
-			// on any run is a real datapoint, so clear any prior non-OK mark
-			// and let Aggregate see Samples + an empty (OK) status.
-			cr.Samples = append(cr.Samples, *res.Result)
-			cr.HistogramsB64 = append(cr.HistogramsB64, res.HistogramB64)
-			if cfg.RatedMode {
-				cr.RatedSamples = append(cr.RatedSamples, res.RatedSamples)
-			}
-			cr.Status = report.CellOK
-			cr.ErrorMsg = ""
-		} else if len(cr.Samples) == 0 && cr.Status != report.CellOK {
-			// A cell that did not run (or produced no real number) AND has no
-			// OK sample yet: record the classified status + error string but
-			// DO NOT append a bogus 0-RPS Sample. Aggregate gates headline
-			// inclusion on Status==CellOK, so this becomes an N/A / DNF row,
-			// not a ranked also-ran. A later OK run still upgrades it via the
-			// branch above.
-			cr.Status = status
-			cr.ErrorMsg = res.ErrorMsg
+		// recordRun keeps per-run statuses (schema v5.4) so a later OK
+		// run can never erase this run's evidence; suspect outcomes keep
+		// their samples. See resultsSink.recordRun / reduceCellStatus.
+		sink.recordRun(cell, res, cfg.RatedMode)
+		// Incremental persistence: results.json is complete and parseable
+		// after every cell, so even a SIGKILL loses at most the in-flight
+		// cell — never the column.
+		if ferr := sink.flush(); ferr != nil {
+			fmt.Fprintf(os.Stderr, "  flush results.json: %v\n", ferr)
 		}
 		if cerr != nil {
 			fmt.Fprintf(os.Stderr, "  cell error: %v\n", cerr)
@@ -631,6 +613,12 @@ func run(cfg Config) error {
 			}
 		}
 
+		// No cooldown after a server-down mark: the cell never drove any
+		// load, and the column should finish its probe-and-mark sweep
+		// fast (seconds per dead cell, not cooldown × remaining cells).
+		if strings.HasPrefix(res.ErrorMsg, "server-down:") {
+			continue
+		}
 		if i+1 < len(schedule) && cfg.Cooldown > 0 {
 			select {
 			case <-rootCtx.Done():
@@ -645,17 +633,7 @@ func run(cfg Config) error {
 			preRunFDs, postRunFDs, postRunFDs-preRunFDs)
 	}
 
-	// Convert collected map to slice for Aggregate. Sorting keeps the
-	// resulting markdown / JSON byte-stable across runs.
-	cells := make([]report.CellResult, 0, len(collected))
-	keys := make([]string, 0, len(collected))
-	for k := range collected {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		cells = append(cells, *collected[k])
-	}
+	cells := sink.cellsSnapshot()
 	agg := report.Aggregate(cells)
 	ts := report.BuildTimeseries(cells)
 
@@ -695,6 +673,221 @@ type cellOutcome struct {
 	ErrorMsg string
 }
 
+// resultsSink owns the cross-cell collection map and writes results.json
+// incrementally — atomic temp+rename after every recorded run — so a
+// SIGKILLed runner (the ansible hang-guard escalates) still leaves a
+// parseable, current-to-the-last-cell column file. v3.8 lost the entire
+// celeris-epoll-h1-sync column this way: the second signal force-exited
+// before the single end-of-run write, stranding 27 good cells in
+// per-cell JSONs the ingest never reads. Methods are safe for concurrent
+// use; the second-signal handler calls flushBestEffort from its own
+// goroutine.
+type resultsSink struct {
+	mu        sync.Mutex
+	cfg       Config
+	started   time.Time
+	collected map[string]*report.CellResult
+
+	// demoted marks cells where at least one run produced a
+	// SUT-behaviour failure (anything but a harness-side "interrupted:"
+	// mark). Such a cell may keep its data but can never publish as
+	// plain OK again — an OK rerun must not erase the evidence (the
+	// v3.8 OK-promotion bug, main.go pre-v3.9 collection loop).
+	demoted map[string]bool
+
+	// firstErr remembers the first non-OK error string per cell so the
+	// surviving ErrorMsg points at the ORIGINAL failure, not the latest.
+	firstErr map[string]string
+
+	// dirty is set once anything was recorded, so the best-effort signal
+	// flush never creates an empty results.json for dry-run / no-cell
+	// invocations.
+	dirty bool
+}
+
+func newResultsSink(cfg Config, started time.Time) *resultsSink {
+	return &resultsSink{
+		cfg:       cfg,
+		started:   started,
+		collected: map[string]*report.CellResult{},
+		demoted:   map[string]bool{},
+		firstErr:  map[string]string{},
+	}
+}
+
+// recordRun folds one run outcome into the per-cell result. The per-run
+// status is ALWAYS appended (schema v5.4 RunStatuses) and the cell-level
+// status re-reduced via reduceCellStatus, so the final results.json
+// carries every run's evidence regardless of outcome order.
+func (s *resultsSink) recordRun(cell interleave.Cell, out cellOutcome, rated bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status := out.Status
+	if status == "" {
+		status = report.ClassifyCellError(out.ErrorMsg)
+	}
+	key := report.CellID(cell.Scenario.Name(), cell.Server.Name())
+	cr := s.collected[key]
+	if cr == nil {
+		cr = &report.CellResult{
+			ScenarioName: cell.Scenario.Name(),
+			ServerName:   cell.Server.Name(),
+			Category:     cell.Scenario.Category(),
+		}
+		s.collected[key] = cr
+	}
+	cr.RunStatuses = append(cr.RunStatuses, status)
+	if status != report.CellOK {
+		if _, ok := s.firstErr[key]; !ok {
+			s.firstErr[key] = out.ErrorMsg
+		}
+		// A harness-side interruption says nothing about the SUT — it
+		// must not turn a cell with otherwise-clean data suspect.
+		if !strings.HasPrefix(out.ErrorMsg, "interrupted:") {
+			s.demoted[key] = true
+		}
+	}
+	// Suspect runs carry a real measurement (that is the point of the
+	// status); OK runs always do. DNF / N/A runs never append a bogus
+	// 0-RPS sample.
+	if status.HasData() && out.Result != nil {
+		cr.Samples = append(cr.Samples, *out.Result)
+		cr.HistogramsB64 = append(cr.HistogramsB64, out.HistogramB64)
+		if rated {
+			cr.RatedSamples = append(cr.RatedSamples, out.RatedSamples)
+		}
+	}
+	cr.Status = reduceCellStatus(cr.RunStatuses, len(cr.Samples) > 0, s.demoted[key])
+	if cr.Status == report.CellOK {
+		cr.ErrorMsg = ""
+	} else {
+		cr.ErrorMsg = s.firstErr[key]
+	}
+	s.dirty = true
+}
+
+// cellsSnapshot returns the collected cells as a sorted value slice —
+// the shape Aggregate / BuildTimeseries consume. Sorting keeps the
+// rendered output byte-stable across runs.
+func (s *resultsSink) cellsSnapshot() []report.CellResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.collected))
+	for k := range s.collected {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	cells := make([]report.CellResult, 0, len(keys))
+	for _, k := range keys {
+		cells = append(cells, *s.collected[k])
+	}
+	return cells
+}
+
+// flush writes the current aggregate to <out>/results.json (atomic
+// temp+rename via writeJSON). Called after every cell and on shutdown.
+func (s *resultsSink) flush() error {
+	cells := s.cellsSnapshot()
+	agg := report.Aggregate(cells)
+	doc := buildDocument(s.cfg, agg, s.started)
+	return writeJSON(filepath.Join(s.cfg.Out, "results.json"), doc)
+}
+
+// flushBestEffort is the second-signal path: it never panics and never
+// blocks the exit on an error — the per-cell incremental flush already
+// left a parseable results.json current to the last finished cell, so
+// losing this final write costs at most the interrupted-cell marks.
+func (s *resultsSink) flushBestEffort() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "probatorium-runner: final flush panic: %v\n", r)
+		}
+	}()
+	s.mu.Lock()
+	dirty := s.dirty
+	s.mu.Unlock()
+	if !dirty {
+		return
+	}
+	if err := s.flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "probatorium-runner: final flush: %v\n", err)
+	}
+}
+
+// reduceCellStatus folds per-run statuses into the cell-level status.
+// All-OK stays OK. A cell with data whose only blemishes are harness
+// interruptions (demoted=false) also stays OK — RunStatuses still
+// carries the evidence. A cell with data plus any SUT-behaviour failure
+// is suspect: the data exists, but a sibling run crashed / lied /
+// stormed, so an OK rerun no longer erases the record into a clean
+// "ok". With no data at all, any DNF run wins (loud) over
+// not-applicable.
+func reduceCellStatus(runs []report.CellStatus, hasData, demoted bool) report.CellStatus {
+	allOK := true
+	anyDNF := false
+	for _, st := range runs {
+		switch st {
+		case report.CellOK:
+		case report.CellDNF:
+			allOK = false
+			anyDNF = true
+		default:
+			allOK = false
+		}
+	}
+	switch {
+	case allOK:
+		return report.CellOK
+	case hasData && demoted:
+		return report.CellSuspect
+	case hasData:
+		return report.CellOK
+	case anyDNF:
+		return report.CellDNF
+	default:
+		return report.CellNotApplicable
+	}
+}
+
+// markCellsInterrupted records every not-yet-started cell as DNF
+// "interrupted" after the first signal, writing the per-cell JSON for
+// each so the cluster ingest sees an explicit outcome instead of a
+// missing file, then flushes once. v3.8's hang-guard SIGTERM simply
+// stopped the loop here, and the in-flight truncation surfaced later as
+// bogus 354µs "zero-request cells" classified not_applicable.
+func markCellsInterrupted(cfg Config, sink *resultsSink, cells []interleave.Cell) {
+	const reason = "interrupted: run cancelled before cell start"
+	for _, cell := range cells {
+		writeSkippedCellFile(cfg, cell, reason)
+		sink.recordRun(cell, cellOutcome{Status: report.CellDNF, ErrorMsg: reason}, cfg.RatedMode)
+	}
+	if err := sink.flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "probatorium-runner: flush after interrupt: %v\n", err)
+	}
+}
+
+// writeSkippedCellFile persists a per-cell JSON for a cell that never
+// drove load (interrupted before start). Same shape executeCell writes,
+// so the cluster merge path needs no special case.
+func writeSkippedCellFile(cfg Config, cell interleave.Cell, errMsg string) {
+	now := time.Now().UTC()
+	cellRes := cellResultFile{
+		RunIdx:       cell.RunIdx,
+		ScenarioName: cell.Scenario.Name(),
+		ServerName:   cell.Server.Name(),
+		Category:     cell.Scenario.Category(),
+		StartedAt:    now,
+		CompletedAt:  now,
+		Error:        errMsg,
+		Status:       string(report.ClassifyCellError(errMsg)),
+	}
+	outFile := filepath.Join(cfg.Out, fmt.Sprintf("run%d", cell.RunIdx),
+		cell.Scenario.Name(), cell.Server.Name()+".json")
+	if err := writeJSON(outFile, &cellRes); err != nil {
+		fmt.Fprintf(os.Stderr, "  write %s: %v\n", outFile, err)
+	}
+}
+
 // buildCellConfig maps a scenario's Workload onto baseURL and overlays
 // the run-wide duration / warmup / worker defaults. Pure (no I/O, no
 // live server), so the scenario→loadgen.Config mapping is unit-testable
@@ -707,6 +900,22 @@ func buildCellConfig(cell interleave.Cell, baseURL string, cfg Config) loadgen.C
 	}
 	lgCfg.Duration = cfg.Duration
 	lgCfg.Warmup = cfg.Warmup
+	if lgCfg.Connections > 0 {
+		// loadgen sizes EVERY driver's concurrency from Workers, never
+		// from Config.Connections: Mode drivers (ws-*/sse-fanout) hold one
+		// stream per worker, and the keep-alive H1 pool dials
+		// Workers×connsPerWorker conns (h1client numConns). Under the old
+		// 64-worker default that made the concurrency axis fictional —
+		// fanout-128 vs -1024 opened 64 streams each, and get-json (128),
+		// get-json-1c (1) and get-simple-1024c (1024) all ran 64 conns.
+		// Map the scenario's declared Connections onto Workers so each
+		// cell runs the concurrency its row label claims. (Connections
+		// stays set too: documentation, and correct if a later loadgen
+		// honours it directly.) No scenario sets Workers explicitly, so
+		// this mapping is total; the 64 default below only covers
+		// workloads that declare no Connections at all.
+		lgCfg.Workers = lgCfg.Connections
+	}
 	if lgCfg.Workers == 0 {
 		lgCfg.Workers = 64
 	}
@@ -723,7 +932,11 @@ func buildCellConfig(cell interleave.Cell, baseURL string, cfg Config) loadgen.C
 func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out cellOutcome, _ error) {
 	outDir := filepath.Join(cfg.Out, fmt.Sprintf("run%d", cell.RunIdx), cell.Scenario.Name())
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return cellOutcome{}, fmt.Errorf("mkdir %s: %w", outDir, err)
+		err = fmt.Errorf("mkdir %s: %w", outDir, err)
+		// Classified explicitly because the persisting defer below is not
+		// registered yet — without this the cell would surface as a
+		// status-less (treated-OK) zero row in the collection.
+		return cellOutcome{Status: report.CellDNF, ErrorMsg: err.Error()}, err
 	}
 	outFile := filepath.Join(outDir, cell.Server.Name()+".json")
 
@@ -751,6 +964,7 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	}()
 
 	var lgURL string
+	var probeAddr string // dialable SUT addr for the pre/post liveness probes
 	if cfg.Target != "" {
 		// Remote-target mode: the SUT is already running on another host.
 		// Skip freePort / StartAdapter / waitForTCP and the FD-leak scope —
@@ -758,6 +972,22 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 		// FD/RSS is covered by the cluster-side CPU/observer sidecar.
 		cellRes.TargetAddr = cfg.Target
 		lgURL = cfg.Target
+		// SUT liveness gate (v3.9): when the SUT has already crashed
+		// (celeris v1.4.15's io_uring heap corruption took it down
+		// mid-column in v3.8) every remaining cell used to burn its full
+		// measurement window against a dead port and come back as a
+		// 34.7M-error "zero-request" N/A. Probe first: a dead target
+		// marks the cell DNF in seconds, and the column finishes its
+		// probe-and-mark sweep fast (the run loop skips the cooldown
+		// after a server-down cell). The probe re-runs per cell, so a SUT
+		// brought back by systemd resumes real measurements automatically.
+		if addr, ok := hostPortFromURL(cfg.Target); ok {
+			probeAddr = addr
+			if perr := probeSUT(parent, addr); perr != nil {
+				cellRes.Error = "server-down: pre-cell probe: " + perr.Error()
+				return cellOutcome{}, errors.New(cellRes.Error)
+			}
+		}
 	} else {
 		cellRes.FDsBefore = countProcessFDs()
 
@@ -794,6 +1024,11 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 			cellRes.Error = "ready-check: " + err.Error()
 			return cellOutcome{}, err
 		}
+		// Local mode needs no pre-cell probe — waitForTCP above IS the
+		// gate — but the post-cell probe below still wants the addr (the
+		// adapter is alive until the deferred stop(), so a dead probe
+		// after an anomalous result means it crashed mid-cell).
+		probeAddr = bindAddr
 	}
 
 	lgCfg := buildCellConfig(cell, lgURL, cfg)
@@ -809,33 +1044,52 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	}
 	res, err := bm.Run(cellCtx)
 	if err != nil {
-		cellRes.Error = "loadgen.Run: " + err.Error()
-		return cellOutcome{}, err
+		cellRes.Error = loadgenRunCellError(parent, err, probeAddr)
+		return cellOutcome{}, errors.New(cellRes.Error)
 	}
 	cellRes.Result = res
 	oc := cellOutcome{Result: res}
-
-	if res != nil && res.Requests == 0 {
-		cellRes.Error = fmt.Sprintf("zero-request cell: errors=%d duration=%s", res.Errors, res.Duration)
+	if res == nil {
+		cellRes.Error = "loadgen.Run: returned nil result"
 		return oc, errors.New(cellRes.Error)
 	}
 
-	// Capability-lie guard: a scheduled scenario whose class is gated on a
-	// declared capability (driver / chain / ws / sse / tls) MUST return mostly
-	// 2xx/3xx. A high error ratio here means the adapter claimed the capability
-	// (so the scheduler ran the cell) but did not actually serve the route —
-	// loadgen counts the resulting 404/501 storm as errors. Surface it as a
-	// HARD error rather than letting a near-zero-RPS cell masquerade as a real
-	// datapoint. With -fail-fast this aborts the matrix; otherwise the cell
-	// records a non-nil error and the run exits non-zero (firstErr is set).
-	if res != nil && res.Requests > 0 && capabilityGatedClass(cell.Scenario.Category()) {
-		const maxErrRatio = 0.01
-		if float64(res.Errors)/float64(res.Requests) > maxErrRatio {
-			cellRes.Error = fmt.Sprintf(
-				"capability-lie: scheduled %s scenario %q got high error ratio from %s (errors=%d/requests=%d) — adapter declared the capability but did not serve the route",
-				cell.Scenario.Category(), cell.Scenario.Name(), cell.Server.Name(), res.Errors, res.Requests)
-			return oc, errors.New(cellRes.Error)
+	in := completedCell{
+		ScenarioName:  cell.Scenario.Name(),
+		ServerName:    cell.Server.Name(),
+		Category:      cell.Scenario.Category(),
+		Requests:      res.Requests,
+		Errors:        res.Errors,
+		ConnectErrors: res.ConnectErrors,
+		Duration:      res.Duration,
+		Interrupted:   parent.Err() != nil,
+		ServerAlive:   true,
+		ErrorBudget:   scenarios.ErrorBudgetFor(cell.Scenario),
+	}
+	// Post-cell liveness probe, lazily: only an anomalous cell (zero
+	// requests, or error ratio past 50%) needs the dead-or-alive fact to
+	// classify; an interrupted cell is classified as such before the
+	// probe result would matter.
+	if !in.Interrupted && probeAddr != "" &&
+		(in.Requests == 0 || errorRatio(in.Requests, in.Errors) > 0.5) {
+		if perr := probeSUT(parent, probeAddr); perr != nil {
+			in.ServerAlive = false
+			in.ProbeErr = perr.Error()
 		}
+	}
+	if v := classifyCompletedCell(in); v.ErrMsg != "" {
+		cellRes.Error = v.ErrMsg
+		if v.Hard {
+			// With -fail-fast this aborts the matrix; otherwise the cell
+			// records a non-nil error and the run exits non-zero.
+			return oc, errors.New(v.ErrMsg)
+		}
+		// Suspect: keep the measurement — surfacing the number next to
+		// the flag is the point of the status — but skip the rated sweep
+		// below, whose targets would anchor on a saturation figure we
+		// just flagged.
+		fmt.Fprintf(os.Stderr, "  cell flagged: %s\n", v.ErrMsg)
+		return oc, nil
 	}
 
 	// Rated sweep: after the open-loop saturation pass, drive loadgen at
@@ -851,6 +1105,235 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 		cellRes.RatedPasses = passes
 	}
 	return oc, nil
+}
+
+// completedCell carries the facts classifyCompletedCell folds into a
+// verdict for a cell whose loadgen pass RETURNED. (The pre-loadgen
+// failure paths — adapter start, ready-check, server-down pre-probe —
+// keep their own error strings.)
+type completedCell struct {
+	ScenarioName string
+	ServerName   string
+	Category     string
+	Requests     int64
+	Errors       int64
+
+	// ConnectErrors is loadgen's dial/handshake-failure subset of Errors
+	// (Result.ConnectErrors, loadgen >= the c902b92 pin; zero from older
+	// builds). Errors ≈ ConnectErrors means the server was unreachable,
+	// not misbehaving — additive evidence the rules below use to sharpen
+	// dead-SUT detection beyond the post-probe.
+	ConnectErrors uint64
+
+	Duration time.Duration
+
+	// Interrupted is true when the run context was cancelled while the
+	// cell was in flight: the measurement window was truncated, so
+	// whatever came back is not a sample.
+	Interrupted bool
+
+	// ServerAlive is the post-cell probe verdict; ProbeErr is the dial
+	// error when dead. Only consulted for anomalous cells — the caller
+	// probes lazily.
+	ServerAlive bool
+	ProbeErr    string
+
+	// ErrorBudget is the scenario's error-ratio ceiling
+	// (scenarios.ErrorBudgetFor).
+	ErrorBudget float64
+}
+
+// cellVerdict is classifyCompletedCell's outcome: the synthesised
+// machine-readable cell error ("" = clean) and whether it is a hard
+// failure (DNF / N/A — counts toward -fail-fast and a non-zero exit) or
+// a soft flag (suspect — the measurement is kept).
+type cellVerdict struct {
+	ErrMsg string
+	Hard   bool
+}
+
+// errorRatio is errors/(errors+requests) — the fraction of attempted
+// operations that failed. 0 when nothing happened at all.
+func errorRatio(requests, errors int64) float64 {
+	total := requests + errors
+	if total <= 0 {
+		return 0
+	}
+	return float64(errors) / float64(total)
+}
+
+// classifyCompletedCell decides what a returned loadgen pass actually
+// was. Decision order (first match wins), each rule pinned to the v3.8
+// cell that motivated it:
+//
+//  1. Run context cancelled → "interrupted:" (DNF). The ansible
+//     hang-guard SIGTERM left 354µs/549µs zero-request stubs that v3.8
+//     published as not_applicable.
+//  2. Anomalous (zero requests, or error ratio > 50%) + post-probe dead
+//     → "server-died-mid-cell:" (DNF). The io_uring heap corruption
+//     crashed the SUT 4029 requests into chain-api-post-4k; the 33.1M
+//     post-crash dial errors then tripped the old ratio-based
+//     capability-lie guard (N/A), and the following dead-port streaming
+//     cells (0 req / 34.7M err) published as zero-request N/A.
+//  3. Zero requests + errors overwhelmingly connect-class →
+//     "server-down:" (DNF) EVEN when the post-probe passed: a SUT
+//     flapping under systemd restart can answer the probe's three
+//     spaced dials while refusing every loadgen connect for the whole
+//     window. Connect-class evidence outranks the probe — ConnectErrors
+//     counts dial/handshake failures only, which a live server serving
+//     wrong answers can never produce in bulk. (Caveat: loadgen counts
+//     WS/SSE upgrade rejections as connect-class too, so a streaming
+//     capability lie with the new counters lands here as DNF instead
+//     of rule 4's N/A — ambiguity resolves loud, never skip-eligible,
+//     matching report.ClassifyCellError's default.)
+//  4. Zero successes + errors > 0 + server alive + capability-gated
+//     class → "capability-lie:" (N/A). The ONLY runtime path to N/A
+//     left: the adapter declared the capability, is demonstrably up,
+//     yet served nothing. A cell with even one success can never be a
+//     lie.
+//  5. Zero requests otherwise → "zero-request cell:" (DNF — loud; see
+//     report.ClassifyCellError for why this stopped being N/A).
+//  6. Error ratio over the scenario budget → "suspect:" (soft; data
+//     kept). churn-close's 0.96+ ratios published as status=ok in every
+//     v3.8/history run. When connect-class failures cover the whole
+//     overage past the budget, the reason says so: the server was
+//     unreachable for part of the cell, not misbehaving.
+func classifyCompletedCell(in completedCell) cellVerdict {
+	ratio := errorRatio(in.Requests, in.Errors)
+	switch {
+	case in.Interrupted:
+		return cellVerdict{
+			ErrMsg: fmt.Sprintf("interrupted: cell cancelled mid-run (requests=%d errors=%d duration=%s)",
+				in.Requests, in.Errors, in.Duration),
+			Hard: true,
+		}
+	case (in.Requests == 0 || ratio > 0.5) && !in.ServerAlive:
+		msg := fmt.Sprintf("server-died-mid-cell: post-cell probe: %s (requests=%d errors=%d",
+			in.ProbeErr, in.Requests, in.Errors)
+		if in.ConnectErrors > 0 {
+			msg += fmt.Sprintf(" connect_errors=%d", in.ConnectErrors)
+		}
+		return cellVerdict{ErrMsg: msg + ")", Hard: true}
+	case in.Requests == 0 && connectClassDominated(in.Errors, in.ConnectErrors):
+		return cellVerdict{
+			ErrMsg: fmt.Sprintf(
+				"server-down: zero requests and the errors are connect-class (connect_errors=%d errors=%d) — no stream ever served; a passing post-probe means a flapping listener, not a healthy server",
+				in.ConnectErrors, in.Errors),
+			Hard: true,
+		}
+	case in.Requests == 0 && in.Errors > 0 && capabilityGatedClass(in.Category):
+		return cellVerdict{
+			ErrMsg: fmt.Sprintf(
+				"capability-lie: scheduled %s scenario %q got zero successes from live server %s (errors=%d) — adapter declared the capability but did not serve the route",
+				in.Category, in.ScenarioName, in.ServerName, in.Errors),
+			Hard: true,
+		}
+	case in.Requests == 0:
+		return cellVerdict{
+			ErrMsg: fmt.Sprintf("zero-request cell: errors=%d duration=%s", in.Errors, in.Duration),
+			Hard:   true,
+		}
+	case ratio > in.ErrorBudget:
+		msg := fmt.Sprintf("suspect: error ratio %.3f exceeds budget %.2f (errors=%d requests=%d)",
+			ratio, in.ErrorBudget, in.Errors, in.Requests)
+		// Overage attribution: the budget allows ErrorBudget×total failed
+		// operations; when the connect-class subset covers everything past
+		// that allowance, the blow-up is reachability, not server
+		// misbehaviour — say so next to the flag.
+		allowed := in.ErrorBudget * float64(in.Requests+in.Errors)
+		if in.ConnectErrors > 0 && float64(in.ConnectErrors) >= float64(in.Errors)-allowed {
+			msg += fmt.Sprintf("; the overage is connect-class (connect_errors=%d) — server unreachable for part of the cell", in.ConnectErrors)
+		}
+		return cellVerdict{ErrMsg: msg, Hard: false}
+	}
+	return cellVerdict{}
+}
+
+// connectClassDominated reports whether a cell's error total is
+// overwhelmingly dial/handshake failures. The two counters are kept by
+// different layers (Errors per failed request, ConnectErrors at the
+// driver) and can differ by a few attempts cut off at phase boundaries,
+// so "all of them" is a 99% band rather than equality. Always false for
+// pre-ConnectErrors loadgen builds (counter zero), keeping legacy
+// artefacts on the old rules.
+func connectClassDominated(errs int64, connectErrs uint64) bool {
+	if errs <= 0 || connectErrs == 0 {
+		return false
+	}
+	return float64(connectErrs) >= 0.99*float64(errs)
+}
+
+// loadgenRunCellError synthesises the per-cell error string for a failed
+// loadgen.Run. A fail-fast abort — loadgen returns a nil Result and an
+// ErrNeverConnected-wrapped "loadgen: dial: …" error when not a single
+// stream was established within its fail-fast window — means the SUT was
+// dead or flapping from the cell's first dial, so it wears the same
+// "server-down:" prefix as the pre-cell probe mark: DNF, the run loop
+// skips the cooldown, and the publish integrity gate counts it as a
+// dead-SUT measurement. The post-probe is attached as evidence only; a
+// flapping listener can pass it, which must not soften the verdict.
+// Every other Run error keeps the legacy "loadgen.Run:" prefix (DNF via
+// report.ClassifyCellError's default).
+func loadgenRunCellError(parent context.Context, err error, probeAddr string) string {
+	if !errors.Is(err, loadgen.ErrNeverConnected) {
+		return "loadgen.Run: " + err.Error()
+	}
+	probe := "no post-probe addr"
+	if probeAddr != "" {
+		if perr := probeSUT(parent, probeAddr); perr != nil {
+			probe = "post-probe: " + perr.Error()
+		} else {
+			probe = "post-probe passed — flapping listener, not a healthy server"
+		}
+	}
+	return fmt.Sprintf("server-down: loadgen fail-fast: %s (%s)", err.Error(), probe)
+}
+
+// probeSUT answers "is the SUT accepting TCP connections right now?"
+// with a plain dial — the right primitive for a remote target (the
+// readiness gate from commit 81a5661 verifies the argv of the LOCAL
+// listening process; from the loadgen host all that is observable is the
+// socket). Up to three quick attempts so one accept-queue blip does not
+// read as a dead server. The dials run on a context detached from the
+// run's cancellation so an interrupt mid-probe can never masquerade as a
+// server death.
+func probeSUT(parent context.Context, addr string) error {
+	ctx := context.WithoutCancel(parent)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(250 * time.Millisecond)
+		}
+		d := net.Dialer{Timeout: time.Second}
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// hostPortFromURL extracts the dialable host:port from a -target base
+// URL, defaulting the port from the scheme. ok=false for unparseable
+// input — the caller skips probing rather than failing the cell on a
+// probe bug.
+func hostPortFromURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "https":
+			port = "443"
+		default:
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port), true
 }
 
 // runRatedSweep drives one rated (closed-loop, CO-corrected) pass per
@@ -1167,10 +1650,13 @@ func countProcessFDs() int {
 	return len(entries)
 }
 
-// installSignalHandler routes SIGINT/SIGTERM to cancel the root context.
-// A second signal forces immediate exit so a hung adapter cannot wedge
-// shutdown.
-func installSignalHandler(cancel context.CancelFunc) {
+// installSignalHandler routes SIGINT/SIGTERM to cancel the root context;
+// the run loop then marks the in-flight cell + everything unstarted as
+// "interrupted" and writes final results. A second signal forces
+// immediate exit so a hung adapter cannot wedge shutdown — but flushes
+// results.json best-effort first, because v3.8's second SIGTERM landed
+// before the (then end-of-run-only) write and lost a whole column.
+func installSignalHandler(cancel context.CancelFunc, sink *resultsSink) {
 	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -1178,13 +1664,17 @@ func installSignalHandler(cancel context.CancelFunc) {
 		fmt.Fprintln(os.Stderr, "probatorium-runner: interrupted, shutting down")
 		cancel()
 		<-ch
-		fmt.Fprintln(os.Stderr, "probatorium-runner: second signal, forcing exit")
+		fmt.Fprintln(os.Stderr, "probatorium-runner: second signal, flushing results and forcing exit")
+		sink.flushBestEffort()
 		os.Exit(130)
 	}()
 }
 
-// writeJSON marshals v to path with 2-space indent. Creates the parent
-// directory if missing.
+// writeJSON marshals v to path with 2-space indent, atomically: the
+// bytes land in a same-directory temp file that is renamed over path, so
+// a runner killed mid-write (second SIGTERM, OOM, SIGKILL) never leaves
+// a torn half-file — the previous complete version survives until the
+// rename lands. Creates the parent directory if missing.
 func writeJSON(p string, v any) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
@@ -1193,7 +1683,32 @@ func writeJSON(p string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, buf, 0o644)
+	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(buf); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	// Match os.WriteFile's historical 0644 (CreateTemp gives 0600).
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpName, p); err != nil {
+		cleanup()
+		return err
+	}
+	return nil
 }
 
 // writeManifest writes the top-level manifest summarising the run.

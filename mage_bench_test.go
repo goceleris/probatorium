@@ -428,6 +428,179 @@ func TestMergeMultipleScenariosPerCompetitor(t *testing.T) {
 	}
 }
 
+// TestMergeCrashThenOKDemotesToSuspect is the merge-side mirror of the
+// v3.8 OK-promotion bug (the runner-side half is pinned by
+// cmd/runner/cellclassify_test.go): run 0 of a cell died with the real
+// v3.8 crash signature, run 1 passed clean. The merged Document must
+// keep the OK run's number but flag the cell suspect and carry the
+// [dnf, ok] evidence in cell_run_statuses — never publish a clean "ok"
+// that erases the crash. The raw cells are written OK-run-first to
+// prove the reduction orders by RunIndex, not encounter order.
+func TestMergeCrashThenOKDemotesToSuspect(t *testing.T) {
+	resultsDir := t.TempDir()
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatalf("mkdir raw: %v", err)
+	}
+
+	crash := "server-died-mid-cell: post-cell probe: dial tcp 192.168.50.65:8080: connect: connection refused (requests=4029 errors=33140345)"
+	cells := []cellRecord{
+		// OK run written FIRST with the higher RunIndex.
+		{
+			RunIndex: 1, Competitor: "celeris-iouring-h1-async", Scenario: "get-json",
+			Status: "ok", SaturationModeRPS: 500000,
+			Loadgen: mustMarshalLoadgen(t, loadgen.Result{
+				Requests: 1_000_000, Duration: 2 * time.Minute, RequestsPerSec: 500000,
+			}),
+		},
+		{
+			RunIndex: 0, Competitor: "celeris-iouring-h1-async", Scenario: "get-json",
+			Status: "dnf", Error: crash,
+		},
+	}
+	writeRawHost(t, rawDir, "msa2-server", cells)
+
+	merged, err := mergeBenchResults(resultsDir, "msa2-server", benchParams{
+		CelerisVer: "v1.4.15", Duration: "90s", Warmup: "20s", Conns: "256", Runs: "2",
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	data, _ := os.ReadFile(merged)
+	var doc report.Document
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(doc.Benchmarks) != 1 {
+		t.Fatalf("Benchmarks: want 1, got %d", len(doc.Benchmarks))
+	}
+	row := doc.Benchmarks[0]
+
+	// Demoted, not promoted: the OK rerun no longer erases the crash.
+	if got := row.CellStatuses["get-json"]; got != string(report.CellSuspect) {
+		t.Errorf("cell_statuses[get-json] = %q, want suspect (OK rerun must not erase the crash)", got)
+	}
+	// The OK run's data is kept — suspect means flagged, not dropped.
+	if got := row.SaturationModeRPS["get-json"]; got != 500000 {
+		t.Errorf("SaturationModeRPS[get-json] = %v, want 500000 (suspect keeps data)", got)
+	}
+	// Evidence in execution (RunIndex) order, despite reversed file order.
+	if got := row.CellRunStatuses["get-json"]; len(got) != 2 || got[0] != "dnf" || got[1] != "ok" {
+		t.Errorf("cell_run_statuses[get-json] = %v, want [dnf ok]", got)
+	}
+}
+
+// TestMergeInterruptedThenOKStaysOK asserts a harness-side interruption
+// (the ansible hang-guard SIGTERM, error prefix "interrupted:") does NOT
+// demote a cell whose rerun produced clean data — it says nothing about
+// the SUT — while the [dnf, ok] evidence still lands in
+// cell_run_statuses so the interruption stays on the record.
+func TestMergeInterruptedThenOKStaysOK(t *testing.T) {
+	resultsDir := t.TempDir()
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatalf("mkdir raw: %v", err)
+	}
+
+	cells := []cellRecord{
+		{
+			RunIndex: 0, Competitor: "gin-h1", Scenario: "get-json",
+			Status: "dnf", Error: "interrupted: run cancelled before cell start",
+		},
+		{
+			RunIndex: 1, Competitor: "gin-h1", Scenario: "get-json",
+			Status: "ok", SaturationModeRPS: 120000,
+			Loadgen: mustMarshalLoadgen(t, loadgen.Result{
+				Requests: 1_000_000, Duration: 2 * time.Minute, RequestsPerSec: 120000,
+			}),
+		},
+	}
+	writeRawHost(t, rawDir, "msa2-server", cells)
+
+	merged, err := mergeBenchResults(resultsDir, "msa2-server", benchParams{
+		CelerisVer: "v1.4.15", Duration: "90s", Warmup: "20s", Conns: "256", Runs: "2",
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	data, _ := os.ReadFile(merged)
+	var doc report.Document
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	row := doc.Benchmarks[0]
+
+	// Interruptions never demote a cell with clean data...
+	if _, present := row.CellStatuses["get-json"]; present {
+		t.Errorf("cell_statuses[get-json] = %v, want absent (interruption must not demote)", row.CellStatuses)
+	}
+	if got := row.SaturationModeRPS["get-json"]; got != 120000 {
+		t.Errorf("SaturationModeRPS[get-json] = %v, want 120000", got)
+	}
+	// ...but the evidence is preserved.
+	if got := row.CellRunStatuses["get-json"]; len(got) != 2 || got[0] != "dnf" || got[1] != "ok" {
+		t.Errorf("cell_run_statuses[get-json] = %v, want [dnf ok]", got)
+	}
+}
+
+// TestMergeSuspectCellKeepsData asserts a suspect record (the v3.8
+// churn-close shape: errors 24x requests, published status=ok back then)
+// travels the cluster path with its loadgen payload intact: the Document
+// flags it suspect AND keeps the headline number, and the raw summary
+// (summarizeCells) includes its totals.
+func TestMergeSuspectCellKeepsData(t *testing.T) {
+	resultsDir := t.TempDir()
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatalf("mkdir raw: %v", err)
+	}
+
+	res := loadgen.Result{
+		Requests: 12081484, Errors: 290204598,
+		Duration: 90 * time.Second, RequestsPerSec: 134231.93,
+	}
+	cells := []cellRecord{{
+		RunIndex: 0, Competitor: "actix-web", Scenario: "churn-close",
+		Status:  "suspect",
+		Error:   "suspect: error ratio 0.960 exceeds budget 0.50 (errors=290204598 requests=12081484)",
+		Loadgen: mustMarshalLoadgen(t, res),
+	}}
+	writeRawHost(t, rawDir, "msa2-server", cells)
+
+	merged, err := mergeBenchResults(resultsDir, "msa2-server", benchParams{
+		CelerisVer: "v1.4.15", Duration: "90s", Warmup: "20s", Conns: "256", Runs: "1",
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	data, _ := os.ReadFile(merged)
+	var doc report.Document
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	row := doc.Benchmarks[0]
+	if got := row.CellStatuses["churn-close"]; got != string(report.CellSuspect) {
+		t.Errorf("cell_statuses[churn-close] = %q, want suspect", got)
+	}
+	if got := row.SaturationModeRPS["churn-close"]; got != 134231.93 {
+		t.Errorf("SaturationModeRPS[churn-close] = %v, want 134231.93 (suspect keeps data)", got)
+	}
+
+	// summarizeCells shares the HasData inclusion rule: the suspect
+	// cell's totals appear in the raw summary instead of vanishing.
+	sum, err := summarizeCells(cells)
+	if err != nil {
+		t.Fatalf("summarizeCells: %v", err)
+	}
+	st, ok := sum[summaryKey("actix-web", "churn-close")]
+	if !ok {
+		t.Fatalf("summary missing suspect cell bucket: %v", sum)
+	}
+	if st.TotalErrors != 290204598 || st.TotalRequests != 12081484 {
+		t.Errorf("summary totals = req %d err %d, want req 12081484 err 290204598", st.TotalRequests, st.TotalErrors)
+	}
+}
+
 // TestDiffBenchResultsTypedShape proves the regression gate reads the
 // typed Benchmarks[].LatencyAtSLO (not the retired loose "hosts" walk):
 // it writes a baseline and a current canonical Document where one cell
@@ -730,5 +903,65 @@ func TestMergeBackToBackRatedPersistsAcrossIterations(t *testing.T) {
 	}
 	if _, present := row.LatencyAtSLO["chain-fullstack-get-json"]; present {
 		t.Errorf("LatencyAtSLO[chain-fullstack-get-json]: want ABSENT, got present")
+	}
+}
+
+// TestMaxDryRunCellsPerServer pins the parse of the runner's -dry-run
+// schedule print ("run0 <scenario>/<server>"), which sizes the ansible
+// per-column hang guard. Server slugs with '+' (celeris-iouring-
+// auto+upg-async) must count correctly, columns outside the slug scope
+// must not contribute, and garbage lines must be ignored.
+func TestMaxDryRunCellsPerServer(t *testing.T) {
+	out := `run0 get-json/celeris-epoll-h1-sync
+run0 get-json/celeris-iouring-auto+upg-async
+run0 auto-mix-111/celeris-iouring-auto+upg-async
+run0 chain-api-get-json/celeris-iouring-auto+upg-async
+run0 get-json/gin-h1
+
+not-a-schedule-line
+`
+	cases := []struct {
+		name  string
+		slugs []string
+		want  int
+	}{
+		{"max across in-scope columns", []string{"celeris-epoll-h1-sync", "celeris-iouring-auto+upg-async"}, 3},
+		{"scope excludes the busiest column", []string{"celeris-epoll-h1-sync", "gin-h1"}, 1},
+		{"no matching column", []string{"axum"}, 0},
+		{"empty schedule", nil, 0},
+	}
+	for _, tc := range cases {
+		if got := maxDryRunCellsPerServer(out, tc.slugs); got != tc.want {
+			t.Errorf("%s: maxDryRunCellsPerServer = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestDurationSeconds pins the Go-side duration→seconds conversion that
+// replaced the playbook's unit-stripping regex (which read "1m30s" as
+// 130 seconds).
+func TestDurationSeconds(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int
+		wantErr bool
+	}{
+		{"90s", 90, false},
+		{"1m30s", 90, false}, // the regex hack returned 130 for this
+		{"2h", 7200, false},
+		{"500ms", 1, false}, // sub-second rounds UP, never to 0
+		{"0s", 0, true},     // zero would disable `timeout`
+		{"-5s", 0, true},
+		{"five", 0, true},
+	}
+	for _, tc := range cases {
+		got, err := durationSeconds(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("durationSeconds(%q): err = %v, wantErr = %v", tc.in, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr && got != tc.want {
+			t.Errorf("durationSeconds(%q) = %d, want %d", tc.in, got, tc.want)
+		}
 	}
 }

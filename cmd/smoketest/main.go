@@ -9,9 +9,14 @@
 // Scan walks the per-cell JSONs the bench produced (run0/<scenario>/<server>.json
 // inside <results-dir>/00-<server>/) and classifies each cell as ok, dnf
 // (runner couldn't talk to the SUT — typically the SUT segfaulted on first
-// request), or not_applicable (capability gate false positive, server claims
-// to support the scenario but emits 0 requests). The output is a JSON list
-// of (server, scenario) pairs to skip.
+// request), suspect (data exists but over the error budget), or
+// not_applicable (genuine capability gap: the adapter cannot serve the
+// scenario). The output is a JSON list of (server, scenario) pairs to
+// skip — ONLY not_applicable cells are eligible. dnf / suspect /
+// interrupted cells never enter the skip list: those are transient or
+// infra outcomes, and auto-excluding them would permanently hide a
+// healthy pair behind one bad run (v3.8: a dead SUT marked 23 healthy
+// cells dnf; the SUT liveness gate now makes re-trying them cheap).
 //
 // Render turns a skip list into a comma-separated glob compatible with the
 // runner's -cells flag: the full grid plus !exclusion for every skip. The
@@ -42,6 +47,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/goceleris/probatorium/report"
 )
 
 // cellResult mirrors the per-cell JSON the runner writes.
@@ -96,8 +103,9 @@ Usage:
   smoketest show   -skip-file <path>                      # print skip list as a table
 
 The 'scan' output is a JSON list of (server, scenario) pairs that the bench
-must not run, classified by the reason (dnf = SUT segfault or connection
-refused; not_applicable = capability gate false positive, 0 requests).
+must not run. Only not_applicable cells (genuine capability gaps) are
+eligible; dnf / suspect / interrupted cells are transient-or-infra outcomes
+and never enter the skip list.
 
 The 'render' output is a comma-separated glob suitable for the runner's
 -cells flag: every (server, scenario) pair is in the include set, the skip
@@ -181,14 +189,30 @@ func scanResultsDir(resultsDir string) (skip []skipEntry, scanned int, byStatus 
 			}
 			scanned++
 			byStatus[cr.Status]++
-			if cr.Status == "dnf" || cr.Status == "not_applicable" {
+			// Skip-eligibility: ONLY a genuine capability gap
+			// (not_applicable) may feed the auto-skip machinery.
+			// dnf / suspect / interrupted are transient-or-infra
+			// outcomes — auto-excluding them would permanently hide a
+			// healthy (server, scenario) pair behind one bad run. The
+			// error string is re-classified with the same
+			// report.ClassifyCellError the runner uses, so per-cell
+			// JSON written before the v5.4 reclassification
+			// ("zero-request cell" used to be not_applicable, and the
+			// pre-v3.9 capability-lie guard fired on a RATIO with
+			// requests > 0 — in v3.8 both shapes were dead-SUT cells)
+			// buckets by today's rules.
+			status := report.CellStatus(cr.Status)
+			if cr.Error != "" {
+				status = report.ClassifyCellError(cr.Error)
+			}
+			if status == report.CellNotApplicable {
 				key := cr.Server + "|" + cr.Scenario
 				if !seen[key] {
 					seen[key] = true
 					skip = append(skip, skipEntry{
 						Server:    cr.Server,
 						Scenario:  cr.Scenario,
-						Status:    cr.Status,
+						Status:    string(status),
 						Error:     cr.Error,
 						FirstSeen: filepath.Base(resultsDir),
 					})

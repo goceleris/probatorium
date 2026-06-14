@@ -164,6 +164,34 @@ func TestChurnCloseUsesConnectionClose(t *testing.T) {
 	}
 }
 
+// TestErrorBudgets pins the per-scenario error-ratio ceilings the runner's
+// suspect gate keys on (schema v5.4). churn-close carries an explicit 0.5
+// budget — refused dials are inherent to churn, but the v3.8 evidence
+// (errors 28x–97x requests on EVERY server, published status=ok) must flag
+// as suspect. Every other scenario uses the 5% default.
+func TestErrorBudgets(t *testing.T) {
+	t.Parallel()
+	if got := ErrorBudgetFor(findScenario(t, "churn-close")); got != 0.5 {
+		t.Errorf("churn-close ErrorBudget = %v, want 0.5", got)
+	}
+	for _, name := range []string{"get-json", "post-4k", "sse-fanout-1024", "chain-api-post-4k"} {
+		if got := ErrorBudgetFor(findScenario(t, name)); got != DefaultErrorBudget {
+			t.Errorf("%s ErrorBudget = %v, want DefaultErrorBudget (%v)", name, got, DefaultErrorBudget)
+		}
+	}
+	// A zero/negative declared budget falls back to the default rather
+	// than disabling the gate.
+	if got := ErrorBudgetFor(&StaticScenario{name: "x"}); got != DefaultErrorBudget {
+		t.Errorf("zero-ErrBudget scenario = %v, want DefaultErrorBudget fallback", got)
+	}
+	// The v3.8 churn-close numbers themselves: actix-web ran 12,081,484
+	// requests against 290,204,598 errors (ratio 0.960) — over budget.
+	ratio := 290204598.0 / (290204598.0 + 12081484.0)
+	if budget := ErrorBudgetFor(findScenario(t, "churn-close")); ratio <= budget {
+		t.Errorf("v3.8 churn-close ratio %.3f must exceed the 0.5 budget", ratio)
+	}
+}
+
 func TestAutoMixApplicableGating(t *testing.T) {
 	t.Parallel()
 	s := findScenario(t, "auto-mix-111")

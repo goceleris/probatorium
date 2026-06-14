@@ -17,7 +17,7 @@
 # Required extra-vars (mage Validate with PROBATORIUM_VALIDATE_DRIVER=ssh):
 #   bench_target              msa2-server | msr1
 #   refapp                    slug (default "auth_session_ratelimit")
-#   validate_duration         soak window (default "10m")
+#   validate_duration_seconds soak window, integer seconds (default 600)
 #   validate_property_tier    -property-tier filter (default "core,middleware")
 #   bench_port                refapp bind port (default 8080)
 #   celeris_version           recorded in incident dossiers
@@ -60,17 +60,12 @@
         mode: '0755'
       when: inventory_hostname == "msa2-client"
 
-    # Convert "10m" / "6h" / "1d" → seconds + 300s slack.
+    # async window = soak seconds + 300s slack. mage passes INTEGER
+    # SECONDS (validate_duration_seconds) — the old unit-suffix
+    # conversion mis-parsed compound Go durations ("1h30m" as 90 hours).
     - name: Compute timeout-seconds for the validate run
       ansible.builtin.set_fact:
-        validate_seconds: >-
-          {{ ((validate_duration | default('10m') | regex_replace('[^0-9]', '') | int)
-              * (
-                86400 if 'd' in (validate_duration | default('10m')) else
-                3600  if 'h' in (validate_duration | default('10m')) else
-                60    if 'm' in (validate_duration | default('10m')) else
-                1
-              )) + 300 }}
+        validate_seconds: "{{ (validate_duration_seconds | default(600) | int) + 300 }}"
       when: inventory_hostname == "msa2-client"
 
     - block:
@@ -104,7 +99,7 @@
               -driver=ssh \
               -ssh-user={{ ssh_user | default('mini') }} \
               -ssh-host={{ hostvars[bench_target].lan_ip if (use_lan | default(false) | bool) else bench_target }} \
-              -duration={{ validate_duration | default('10m') }} \
+              -duration={{ validate_duration_seconds | default(600) }}s \
               -celeris-bin={{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }} \
               -celeris-addr=127.0.0.1:{{ bench_port | default(8080) }} \
               -markov={{ bench_root }}/markov/{{ refapp | default('auth_session_ratelimit') }}.yaml \

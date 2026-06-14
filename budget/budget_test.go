@@ -146,3 +146,53 @@ func TestGlobsAreNonEmpty(t *testing.T) {
 		t.Errorf("CellsGlob must carry <scenario>/<server> pairs, got %q", CellsGlob(h))
 	}
 }
+
+// TestColumnWallClock pins the per-column projection the ansible hang
+// guard is sized from. The "v3.8 rated column" case uses the REAL run
+// config (33 capability-gated scenarios on celeris-epoll-h1-sync,
+// 90s/20s saturation, 4 x 30s rated passes each re-running the full
+// warmup): the projection must exceed the old 8540s guard
+// (28 x (20+90) + 10, doubled, +120s) that SIGTERMed every healthy
+// rated column 28 cells into 33.
+func TestColumnWallClock(t *testing.T) {
+	const v38OldGuard = 8540 * time.Second // (28*(90+20)+10)*2 + 120
+
+	cases := []struct {
+		name                      string
+		scenarios, ratedPasses    int
+		warmup, duration, ratedDu time.Duration
+		want                      time.Duration
+	}{
+		{
+			// 33 x (20+90+5+12 + 4*(20+30)) = 33 x 327s
+			name: "v3.8 rated column", scenarios: 33, ratedPasses: 4,
+			warmup: 20 * time.Second, duration: 90 * time.Second, ratedDu: 30 * time.Second,
+			want: 33 * 327 * time.Second,
+		},
+		{
+			// rated off: 33 x (20+90+5+12)
+			name: "saturation only", scenarios: 33, ratedPasses: 0,
+			warmup: 20 * time.Second, duration: 90 * time.Second, ratedDu: 30 * time.Second,
+			want: 33 * 127 * time.Second,
+		},
+		{
+			// empty schedule floors at one scenario so `timeout 0` (=
+			// guard disabled) can never be derived from it.
+			name: "zero scenarios floors to one", scenarios: 0, ratedPasses: 0,
+			warmup: 5 * time.Second, duration: 30 * time.Second, ratedDu: 30 * time.Second,
+			want: 52 * time.Second,
+		},
+	}
+	for _, tc := range cases {
+		got := ColumnWallClock(tc.scenarios, tc.ratedPasses, tc.warmup, tc.duration, tc.ratedDu)
+		if got != tc.want {
+			t.Errorf("%s: ColumnWallClock = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	rated := ColumnWallClock(33, 4, 20*time.Second, 90*time.Second, 30*time.Second)
+	if rated <= v38OldGuard {
+		t.Errorf("rated column projection %v must exceed the v3.8 guard %v that killed the run; "+
+			"a smaller projection means the data-loss bug is back", rated, v38OldGuard)
+	}
+}

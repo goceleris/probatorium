@@ -175,11 +175,18 @@ jobs:
           CLUSTER_USE_LAN: "1"
           BENCH_TARGET: both
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
-          # N = 3 back-to-back run-K cells when a new release is detected
-          # (or forced via dispatch), else 1. Orthogonal to BENCH_RUNS (the
-          # per-cell median basis inside each publish).
+          # N back-to-back run-K cells, each published. The AUTOMATIC
+          # weekend trigger (workflow_run) does the full 3-pass release
+          # protocol when a new release is detected. A MANUAL dispatch
+          # defaults to a SINGLE published pass — so an operator can
+          # de-risk the durable cluster path and review one pass before
+          # committing to the multi-day run — and only goes 3-pass when
+          # force_new_release=true explicitly asks for it. (Publishing is
+          # NOT gated on pass count; every pass publishes either way.)
+          # Orthogonal to BENCH_RUNS (the per-cell median basis).
           BENCH_BACK_TO_BACK: >-
-            ${{ (needs.detect.outputs.is_new_release == 'true' ||
+            ${{ ((github.event_name == 'workflow_run' &&
+                  needs.detect.outputs.is_new_release == 'true') ||
                  github.event.inputs.force_new_release == 'true') && '3' || '1' }}
         run: mage BenchTier
 

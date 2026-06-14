@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goceleris/probatorium/budget"
 	"github.com/goceleris/probatorium/interleave"
 	"github.com/goceleris/probatorium/scenarios"
 	"github.com/goceleris/probatorium/servers"
@@ -135,8 +136,35 @@ func TestBuildCellConfig(t *testing.T) {
 		if lg.Warmup != time.Second {
 			t.Errorf("Warmup = %v, want 1s", lg.Warmup)
 		}
-		if lg.Workers != 64 {
-			t.Errorf("Workers = %d, want 64 (default)", lg.Workers)
+		if lg.Workers != 128 {
+			t.Errorf("Workers = %d, want 128 (mapped from declared Connections)", lg.Workers)
+		}
+	})
+
+	// loadgen sizes every driver's concurrency from Workers (the
+	// keep-alive H1 pool dials Workers conns; Mode drivers run one
+	// stream per worker) and never reads Config.Connections, so the
+	// runner maps each scenario's declared Connections onto Workers.
+	// Before this mapping every H1 cell ran 64 conns regardless of its
+	// label: get-json (128), get-json-1c (1) and get-simple-1024c (1024)
+	// were all the same 64-conn workload.
+	t.Run("declared connections map to workers", func(t *testing.T) {
+		for _, tc := range []struct {
+			scenario string
+			want     int
+		}{
+			{"get-json-1c", 1},
+			{"get-simple-1024c", 1024},
+			{"get-simple-128c", 128},
+			{"churn-close", 32},
+			{"get-json-h2", 32},
+		} {
+			cell := interleave.Cell{Scenario: scenarioByName(t, tc.scenario)}
+			lg := buildCellConfig(cell, base, cfg)
+			if lg.Workers != tc.want {
+				t.Errorf("%s: Workers = %d, want %d (declared Connections)",
+					tc.scenario, lg.Workers, tc.want)
+			}
 		}
 	})
 
@@ -162,6 +190,36 @@ func TestBuildCellConfig(t *testing.T) {
 		}
 		if lg.HTTP2Options.Connections != 32 {
 			t.Errorf("HTTP2Options.Connections = %d, want 32", lg.HTTP2Options.Connections)
+		}
+	})
+
+	// loadgen (≤ v1.4.7) Mode drivers run ONE stream per worker and
+	// ignore Config.Connections, so streaming cells must map the
+	// scenario's Connections onto Workers — otherwise sse-fanout-1024 /
+	// ws-hub-broadcast-1024 only ever open 64 streams (v3.8: the -128
+	// and -1024 variants recorded identical RPS in every archived run).
+	t.Run("sse-fanout-1024 maps connections to workers", func(t *testing.T) {
+		cell := interleave.Cell{Scenario: scenarioByName(t, "sse-fanout-1024")}
+		lg := buildCellConfig(cell, base, cfg)
+		if lg.Mode != "sse-fanout" {
+			t.Fatalf("Mode = %q, want sse-fanout", lg.Mode)
+		}
+		if lg.Workers != 1024 {
+			t.Errorf("Workers = %d, want 1024 (one stream per worker)", lg.Workers)
+		}
+	})
+	t.Run("ws-hub-broadcast-1024 maps connections to workers", func(t *testing.T) {
+		cell := interleave.Cell{Scenario: scenarioByName(t, "ws-hub-broadcast-1024")}
+		lg := buildCellConfig(cell, base, cfg)
+		if lg.Workers != 1024 {
+			t.Errorf("Workers = %d, want 1024 (one stream per worker)", lg.Workers)
+		}
+	})
+	t.Run("ws-echo maps connections to workers", func(t *testing.T) {
+		cell := interleave.Cell{Scenario: scenarioByName(t, "ws-echo")}
+		lg := buildCellConfig(cell, base, cfg)
+		if lg.Workers != 128 {
+			t.Errorf("Workers = %d, want 128", lg.Workers)
 		}
 	})
 }
@@ -273,5 +331,19 @@ func TestFeatureSetTLSGating(t *testing.T) {
 	}
 	if got := featureSetFor(noTLS, true).TLS; got {
 		t.Fatalf("non-TLS adapter must never advertise fs.TLS even with a terminator; got true")
+	}
+}
+
+// TestDefaultRatedFractionsMatchBudgetModel pins the runner's default
+// rated-sweep step count to budget.DefaultRatedPasses. The ansible
+// per-column hang guard is sized from budget.ColumnWallClock using that
+// constant (the bench playbook never passes -rated-fractions), so a
+// drift here would silently under-budget every rated column — the exact
+// v3.8 failure mode (guard SIGTERM at cell 28/33).
+func TestDefaultRatedFractionsMatchBudgetModel(t *testing.T) {
+	if got := len(defaultRatedFractions); got != budget.DefaultRatedPasses {
+		t.Fatalf("len(defaultRatedFractions) = %d, want budget.DefaultRatedPasses = %d; "+
+			"update both together (and re-check the ansible guard sizing)",
+			got, budget.DefaultRatedPasses)
 	}
 }

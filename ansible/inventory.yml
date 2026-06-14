@@ -39,6 +39,12 @@ all:
       -o TCPKeepAlive=yes
       -o StrictHostKeyChecking=accept-new
     ansible_command_timeout: 120
+    # Privilege escalation must tolerate a saturated host: ansible's
+    # default 12s become-prompt timeout dropped msa2-server as
+    # UNREACHABLE mid-bench (2026-06-12: sudo lagged in the axum
+    # column's load tail), which silently orphaned the SUT and benched
+    # it under the next five columns' labels.
+    ansible_become_timeout: 90
     # All transient bench state lives under /tmp so a reboot wipes it.
     bench_root: /tmp/celeris-bench
     results_root: /tmp/celeris-results

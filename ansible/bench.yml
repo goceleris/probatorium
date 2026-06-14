@@ -23,8 +23,13 @@
 #                         staged under {{ bench_root }}/competitors/<slug>
 #                         by `ansible-playbook deploy.yml`.
 #   bench_port            port the server binds (default: 8080)
-#   bench_duration        runner -duration, per scenario (default: 30s)
-#   bench_warmup          runner -warmup, per scenario (default: 5s)
+#   bench_duration_seconds  runner -duration per scenario, INTEGER seconds
+#                         (default: 30). All durations cross the mage→
+#                         ansible boundary as integer seconds — the old
+#                         Go-duration strings needed a unit-stripping
+#                         regex that read "1m30s" as 130.
+#   bench_warmup_seconds  runner -warmup per scenario, integer seconds
+#                         (default: 5)
 #   bench_cells           cell glob forwarded to runner -cells over
 #                         "<scenario>/<competitor>" (default: *). The
 #                         server half is the competitor slug.
@@ -32,9 +37,20 @@
 #                         rated (closed-loop, CO-corrected) sweep per cell and
 #                         emits latency_at_slo for the regression gate. Default
 #                         false; opt-in via BENCH_RATED=1 (budget issue #166).
-#   bench_rated_duration  measurement window per rated pass (default: 30s).
-#   bench_scenario_count  upper bound on scenarios per cell, used only to
-#                         size the mpstat samplers (default: 28).
+#   bench_rated_duration_seconds  measurement window per rated pass,
+#                         integer seconds (default: 30).
+#   bench_scenario_count  realized scenario count of the busiest column
+#                         (mage derives it from the runner's dry-run
+#                         schedule); sizes the per-cell budget fallback
+#                         (default: 40, covering the full catalogue).
+#   bench_cell_budget_seconds  projected wall-clock of one full column
+#                         pass (budget.ColumnWallClock: saturation +
+#                         rated sweep + cooldown/overhead, x scenario
+#                         count). run_bench_cell.yml derives the mpstat
+#                         window and the runner hang-guard timeout from
+#                         it. When absent (direct playbook invocation)
+#                         the cell task recomputes the same formula from
+#                         the *_seconds vars above.
 #   bench_runs            number of repetitions per competitor (default: 3)
 #   results_local_dir     where to fetch outputs back to on the Mac
 #
@@ -181,6 +197,15 @@
   hosts: cluster
   gather_facts: false
   tags: run
+  # A bench without its bench target is meaningless — and worse than a
+  # failure: when ansible drops an UNREACHABLE host it keeps running the
+  # play on the survivors, every bench_target-conditioned task silently
+  # skips, and the loadgen-side runner gates on STALE hostvars (2026-06-12:
+  # a become-prompt timeout dropped msa2-server after the axum column; its
+  # orphaned SUT was then benched under five other columns' labels). Abort
+  # the whole play the moment any host drops.
+  any_errors_fatal: true
+  max_fail_percentage: 0
   tasks:
     - name: Filter to selected hosts
       ansible.builtin.meta: end_host
@@ -213,8 +238,20 @@
         (inventory_hostname != bench_target) and
         (inventory_hostname != "msa2-client")
 
-    - name: Stop any leftover server processes (bench target only)
+    - name: Stop any leftover bench processes (both hosts)
       become: true
+      # Leak guard, not the primary teardown: it runs on BOTH selected
+      # hosts (server/observer on the bench target; runner/loadgen on
+      # msa2-client) strictly AFTER the run play, when every per-cell
+      # `timeout --foreground` has already TERM-then-KILLed its runner —
+      # so the name-pkills below only ever reach processes that escaped
+      # their cell (an aborted play, an orphaned sampler). They send one
+      # TERM per process; a leaked runner handles it by flushing its
+      # results best-effort. Do NOT add a second kill pass for the
+      # runner here: a TERM landing on a runner that already absorbed
+      # its hang-guard TERM trips its second-signal force-exit and can
+      # truncate the final results write (the v3.8 double-signal bug).
+      #
       # CRITICAL: every literal occurrence of the staging dir name in
       # this script must be BRACKET-PROTECTED. `pkill -f` matches each
       # process's full argv, and the bash session running this pkill
@@ -266,8 +303,11 @@
         - bench_needs_dbservices | default(false) | bool
 
     - name: Wait for mpstat samplers to finish writing
+      # Glob covers both sampler pid files: mpstat.pid (server side) and
+      # mpstat.loadgen.pid (loadgen side — renamed so the two hosts'
+      # tarballs can't clobber each other's cpu.log in results_local_dir).
       ansible.builtin.shell: |
-        for pidfile in {{ bench_run_dir }}/*/mpstat.pid; do
+        for pidfile in {{ bench_run_dir }}/*/mpstat*.pid; do
           [ -f "$pidfile" ] || continue
           pid=$(cat "$pidfile")
           for i in $(seq 1 10); do

@@ -107,6 +107,9 @@ func TestSchemaRoundTrip(t *testing.T) {
 				SentVsHandledDeltaPct: map[string]float64{
 					"get-json": 0.001,
 				},
+				ConnectErrors: map[string]uint64{
+					"get-json": 312,
+				},
 				Resources: map[string]*ResourceStats{
 					"get-json": {
 						Summary: ResourceSummary{
@@ -166,6 +169,9 @@ func TestSchemaRoundTrip(t *testing.T) {
 	}
 	if got := rt.Benchmarks[0].RatedModeP99AtTargetRPS["get-json"]; got != 420*time.Microsecond {
 		t.Errorf("RatedModeP99: want 420µs got %v", got)
+	}
+	if got := rt.Benchmarks[0].ConnectErrors["get-json"]; got != 312 {
+		t.Errorf("ConnectErrors: want 312 got %d", got)
 	}
 	if rt.Validation == nil || rt.Validation.PropertiesPassed != 47 {
 		t.Errorf("Validation: drift, got %+v", rt.Validation)
@@ -389,8 +395,8 @@ func TestBuildDocument(t *testing.T) {
 	if doc.SchemaVersion != SchemaVersion {
 		t.Errorf("SchemaVersion: want %q got %q", SchemaVersion, doc.SchemaVersion)
 	}
-	if doc.SchemaVersion != "5.3" {
-		t.Errorf("SchemaVersion drift: want 5.3 got %q", doc.SchemaVersion)
+	if doc.SchemaVersion != "5.4" {
+		t.Errorf("SchemaVersion drift: want 5.4 got %q", doc.SchemaVersion)
 	}
 	if len(doc.Benchmarks) != 2 {
 		t.Fatalf("Benchmarks: want 2 got %d", len(doc.Benchmarks))

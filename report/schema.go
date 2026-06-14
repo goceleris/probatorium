@@ -31,7 +31,19 @@ import (
 //     0-RPS also-ran; it is recorded here instead. Additive — older
 //     readers ignore the field and a v5.2 document (no cell_statuses)
 //     still decodes.
-const SchemaVersion = "5.3"
+//   - 5.4 — per-run outcome evidence + "suspect" status (v3.9 harness
+//     hardening). Adds ServerResult.CellRunStatuses: scenario → one
+//     status per scheduled run (execution order), emitted only when at
+//     least one run was non-OK, so a clean rerun can never erase a
+//     prior crash from the record. Adds the "suspect" CellStatus for
+//     completed cells whose loadgen error ratio exceeded the
+//     scenario's error budget: the data exists (and stays in the
+//     headline maps) but its integrity is questionable. Additive —
+//     older readers ignore both and a v5.3 document still decodes.
+//     Also additive within 5.4: ServerResult.ConnectErrors, the
+//     per-scenario dial/handshake-failure subset of the loadgen error
+//     total (loadgen Result.ConnectErrors), emitted only when nonzero.
+const SchemaVersion = "5.4"
 
 // CellStatus classifies the OUTCOME of a single (scenario, server)
 // cell. It is the single source of truth for whether a cell ran and
@@ -57,35 +69,110 @@ const (
 	// (dial / port / crash / timeout). Loud by design: a real server
 	// crash must surface, never be silently bucketed as not-applicable.
 	CellDNF CellStatus = "dnf"
+	// CellSuspect is a cell that ran and produced a real measurement
+	// whose integrity is questionable: the loadgen error ratio exceeded
+	// the scenario's error budget, or a sibling run of the same cell
+	// failed against the server. The data is kept (it still appears in
+	// the headline maps) but flagged — never silently promoted back to
+	// OK, and never ranked as a leader. Schema v5.4+.
+	CellSuspect CellStatus = "suspect"
 )
+
+// HasData reports whether cells with this status carry real measurement
+// samples. The empty string is legacy-OK (producers that pre-date the
+// v5.3 classification only ever hand over OK cells); suspect cells keep
+// their data — surfacing the number next to the flag is the point.
+func (s CellStatus) HasData() bool {
+	return s == "" || s == CellOK || s == CellSuspect
+}
 
 // ClassifyCellError maps a per-cell error string to a [CellStatus].
 // An empty error means the cell ran (CellOK).
 //
-// The split: "zero-request" / "capability-lie" mean the adapter does not
-// implement the route → CellNotApplicable. "read server settings" (the H2
-// prior-knowledge preface going unanswered) is N/A ONLY when it TIMED OUT —
-// the server simply never spoke H2; a reset / EOF / broken pipe on that
-// handshake means the connection was actively torn down (an H2 server that
-// crashed mid-handshake) and is a DNF, not N/A. Everything else (adapter
-// start, ready-check, address-already-in-use, loadgen.New / loadgen.Run,
-// dial / reset / EOF / timeout) is an infra failure → CellDNF. Ambiguous
-// errors default to CellDNF, never to CellNotApplicable: a real crash must
-// not be silently excused as N/A.
+// The split: "capability-lie" means the adapter does not implement the
+// route (zero successes against a live server) → CellNotApplicable —
+// EXCEPT the legacy ratio-fired form: pre-v3.9 runners emitted
+// "capability-lie: ... got high error ratio ... (errors=N/requests=M)"
+// and only with requests > 0, which under the zero-successes rule can
+// never be a genuine gap (v3.8's io_uring crash cell, 4029 req / 33.1M
+// err, wore exactly that string) → CellDNF, so stale artefacts cannot
+// re-enter the skip list as N/A.
+// "suspect:" is the runner's error-ratio gate — the cell completed with
+// real data but its errors exceeded the scenario's budget → CellSuspect.
+// "read server settings" (the H2 prior-knowledge preface going unanswered)
+// is N/A ONLY when it TIMED OUT — the server simply never spoke H2; a
+// reset / EOF / broken pipe on that handshake means the connection was
+// actively torn down (an H2 server that crashed mid-handshake) and is a
+// DNF, not N/A. Everything else — adapter start, ready-check,
+// address-already-in-use, loadgen.New / loadgen.Run, dial / reset / EOF /
+// timeout, plus the runner's synthesised "server-down:" /
+// "server-died-mid-cell:" / "interrupted:" / "zero-request cell" reasons —
+// is an infra failure → CellDNF. ("zero-request cell" was N/A before
+// v5.4; the v3.8 run proved every dead-SUT and interrupted cell wears
+// that string, and genuine capability gaps never reach loadgen — the
+// scheduler skips them via featureSetFor — so zero requests is now loud.)
+// Ambiguous errors default to CellDNF, never to CellNotApplicable: a real
+// crash must not be silently excused as N/A.
 func ClassifyCellError(errMsg string) CellStatus {
 	switch {
 	case errMsg == "":
 		return CellOK
+	case strings.HasPrefix(errMsg, "suspect:"):
+		return CellSuspect
 	case strings.Contains(errMsg, "read server settings"):
 		if strings.Contains(errMsg, "i/o timeout") || strings.Contains(errMsg, "deadline exceeded") {
 			return CellNotApplicable
 		}
 		return CellDNF
-	case strings.Contains(errMsg, "zero-request cell"),
-		strings.Contains(errMsg, "capability-lie"):
+	case strings.Contains(errMsg, "capability-lie"):
+		// Legacy ratio-fired guard (pre-v3.9) — requests were > 0, so
+		// this cannot be a genuine capability gap under today's rule.
+		if strings.Contains(errMsg, "got high error ratio") {
+			return CellDNF
+		}
 		return CellNotApplicable
 	default:
 		return CellDNF
+	}
+}
+
+// ReduceCellStatus folds a cell's per-run statuses into the cell-level
+// status. All-OK stays OK. A cell with data whose only blemishes are
+// harness-side interruptions (demoted=false) also stays OK — RunStatuses
+// still carries the evidence. A cell with data plus any SUT-behaviour
+// failure (demoted=true) is suspect: the data exists, but a sibling run
+// crashed / lied / stormed, so an OK rerun can never erase the record
+// into a clean "ok" (the v3.8 OK-promotion bug). With no data at all,
+// any DNF run wins (loud) over not-applicable.
+//
+// Shared reduction for both result-merge paths. cmd/runner currently
+// carries a private copy with the identical table (reduceCellStatus,
+// pinned by cmd/runner/cellclassify_test.go); keep the two in sync
+// until the runner delegates here.
+func ReduceCellStatus(runs []CellStatus, hasData, demoted bool) CellStatus {
+	allOK := true
+	anyDNF := false
+	for _, st := range runs {
+		switch st {
+		case CellOK:
+		case CellDNF:
+			allOK = false
+			anyDNF = true
+		default:
+			allOK = false
+		}
+	}
+	switch {
+	case allOK:
+		return CellOK
+	case hasData && demoted:
+		return CellSuspect
+	case hasData:
+		return CellOK
+	case anyDNF:
+		return CellDNF
+	default:
+		return CellNotApplicable
 	}
 }
 
@@ -207,6 +294,14 @@ type ServerResult struct {
 	// dropping connections / replies — release-gate signal.
 	SentVsHandledDeltaPct map[string]float64 `json:"sent_vs_handled_delta_pct"`
 
+	// ConnectErrors is the summed-across-runs dial/handshake-failure
+	// subset of loadgen's error total, per scenario (additive within
+	// schema v5.4; loadgen Result.ConnectErrors). Splits "server
+	// unreachable" from "server answering with errors" next to the
+	// headline number. Omitted when zero (including every pre-
+	// ConnectErrors loadgen build). Older readers ignore it.
+	ConnectErrors map[string]uint64 `json:"connect_errors,omitempty"`
+
 	// Resources carries the server-side resource aggregate (RSS, CPU,
 	// GC pause, goroutine / FD high-water) sampled at 1 Hz alongside the
 	// run by cmd/observer + mpstat, keyed by Scenario.Name(). Schema
@@ -217,14 +312,26 @@ type ServerResult struct {
 	Resources map[string]*ResourceStats `json:"resources,omitempty"`
 
 	// CellStatuses records the non-OK outcome of every scenario this
-	// adapter did NOT produce a real number for, keyed by
+	// adapter did NOT produce a clean number for, keyed by
 	// Scenario.Name(); the value is "not_applicable" (route/protocol
-	// unimplemented) or "dnf" (dial/port/crash/timeout). Schema v5.3+.
-	// A scenario present here is deliberately absent from
-	// SaturationModeRPS / LatencyAtSLO / HdrHistogramB64 — it did not
-	// run, so it is never ranked as a 0-RPS row. Omitted when every
-	// cell for this adapter ran (CellOK). Older readers ignore it.
+	// unimplemented), "dnf" (dial/port/crash/timeout) or "suspect"
+	// (v5.4+: data exists but its error ratio blew the scenario's
+	// budget). Schema v5.3+. A not_applicable / dnf scenario is
+	// deliberately absent from SaturationModeRPS / LatencyAtSLO /
+	// HdrHistogramB64 — it did not run, so it is never ranked as a
+	// 0-RPS row. A suspect scenario keeps its headline numbers next to
+	// the flag. Omitted when every cell for this adapter ran (CellOK).
+	// Older readers ignore it.
 	CellStatuses map[string]string `json:"cell_statuses,omitempty"`
+
+	// CellRunStatuses records, for any scenario where at least one run
+	// came back non-OK, the per-run outcome sequence in execution order
+	// (e.g. ["dnf","ok","ok"]). Schema v5.4+. Complements CellStatuses:
+	// a cell that recovered on a later run still carries the earlier
+	// failure here, so an OK rerun can never erase non-OK evidence (the
+	// v3.8 celeris column crash vanished exactly this way). Omitted
+	// when every run was OK. Older readers ignore it.
+	CellRunStatuses map[string][]string `json:"cell_run_statuses,omitempty"`
 }
 
 // ValidationResults captures the fixture-graph property tests and the
