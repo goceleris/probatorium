@@ -109,10 +109,14 @@ jobs:
           wait-timeout-seconds:      "3600"
 
   matrix:
-    name: benchmark tier (curated, both arches)
+    name: benchmark tier (amd64)
     needs: [detect, setup]
     runs-on: [self-hosted, celeris-cluster]
-    timeout-minutes: 1440
+    # 72h ceiling: the full profile on one arch is ~58h, plus Deploy +
+    # Cleanup. Well under GitHub's 5-day self-hosted job hard limit. This is
+    # only a ceiling — the weekly headline run finishes in hours and exits
+    # early. BENCH_BUDGET (below) is the real fail-loud projection gate.
+    timeout-minutes: 4320
     env:
       BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
       IS_NEW_RELEASE: ${{ needs.detect.outputs.is_new_release }}
@@ -173,7 +177,16 @@ jobs:
       - name: mage BenchTier (curated matrix, both arches, xN, publish each run)
         env:
           CLUSTER_USE_LAN: "1"
-          BENCH_TARGET: both
+          # amd64 only: msr1 (arm64) has a firmware bug that makes it
+          # unusable as a BENCH target right now (validation still uses it).
+          # Restore "both" once the arm64 host is fixed (and #168 ArchParallel
+          # lands, or the budget/timeout below is re-checked for two arches).
+          BENCH_TARGET: msa2-server
+          # Manual full-matrix dispatch runs ~58h on one arch — raise the fit
+          # budget above the 24h weekly default so BenchTier doesn't refuse it
+          # (must stay under the job timeout-minutes above). The weekly
+          # auto-run (workflow_run) leaves this unset and stays gated at 24h.
+          BENCH_BUDGET: ${{ github.event_name == 'workflow_dispatch' && '70h' || '' }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
           # N back-to-back run-K cells, each published. The AUTOMATIC
           # weekend trigger (workflow_run) does the full 3-pass release
