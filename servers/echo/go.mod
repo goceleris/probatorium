@@ -7,7 +7,7 @@ require (
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/labstack/echo/v4 v4.15.2
+	github.com/labstack/echo/v4 v4.15.3
 	github.com/redis/go-redis/v9 v9.20.1
 )
 
