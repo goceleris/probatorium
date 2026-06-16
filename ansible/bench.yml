@@ -51,19 +51,17 @@
 #                         it. When absent (direct playbook invocation)
 #                         the cell task recomputes the same formula from
 #                         the *_seconds vars above.
-#   bench_runs            number of repetitions per competitor (default: 3)
 #   results_local_dir     where to fetch outputs back to on the Mac
 #
-# Interleaving rationale: rather than run all N runs of competitor A
-# back-to-back then all of B, we cycle [A,B,C,...,A,B,C,...] so each
-# competitor sees the same coarse-grained slice of cluster state
-# (kernel cache warmth, port-pool depletion, neighbour interference).
-# Failure to interleave was responsible for the v1.4.1 ranking flip
-# between fasthttp and gnet on msr1. The runner is deliberately invoked
-# with -runs 1 per cell so run repetition stays in THIS outer loop —
-# folding runs into one runner pass (-runs N) would run all of
-# competitor A's runs back-to-back and regress that guarantee. The
-# runner adds only the scenario inner loop within each cell.
+# Single-pass: the bench runs exactly ONE pass over the competitor set
+# (run_index 0 only). The multi-run outer loop (range(0, bench_runs) x
+# competitors with the 00-/01-/... cell-dir prefixes) was removed — if
+# more passes are wanted, more benchmarks are scheduled. Within the one
+# pass the competitors are still cycled [A,B,C,...,Z] so each sees the
+# same coarse-grained slice of cluster state (kernel cache warmth,
+# port-pool depletion, neighbour interference). The runner is invoked
+# with -runs 1 per cell; it adds only the scenario inner loop within
+# each cell.
 
 - name: Stage bench-run state
   hosts: cluster
@@ -213,12 +211,16 @@
         (inventory_hostname != bench_target) and
         (inventory_hostname != "msa2-client")
 
-    - name: Build interleaved schedule (run_index x competitor)
+    - name: Build single-pass schedule (run_index 0 x competitor)
       ansible.builtin.set_fact:
-        # [(0,A),(0,B),...,(0,Z),(1,A),(1,B),...]
+        # The bench ALWAYS runs exactly one pass. The multi-run outer loop
+        # (range(0, bench_runs) x competitors, producing the 00-/01-/...
+        # cell-dir prefixes) was removed — if more passes are wanted, more
+        # benchmarks are scheduled. run_index is hard-pinned to 0 so the
+        # cell-dir prefix stays "00-" for every cell.
+        # [(0,A),(0,B),...,(0,Z)]
         bench_schedule: >-
-          {{ range(0, bench_runs | default(3) | int) | list
-             | product(bench_competitors) | list }}
+          {{ [0] | product(bench_competitors) | list }}
 
     - name: Iterate bench cells
       ansible.builtin.include_tasks: tasks/run_bench_cell.yml

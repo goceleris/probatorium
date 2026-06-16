@@ -11,7 +11,7 @@ import "time"
 // helper's output must match, so a registry change that blows the budget
 // surfaces as a failing test rather than a silently-overflowing run.
 
-// HeadlineServers is the curated weekly column set (~15): the four celeris
+// HeadlineServers is the curated weekly column set (~14): the four celeris
 // engine modes worth comparing, the headline Go competitors, and one
 // representative per non-Go language. Drops the -h2 duplicate columns,
 // the chi/iris mid-pack routers, and the long-tail competitors
@@ -30,7 +30,6 @@ var HeadlineServers = []string{
 	"gnet-h1",
 	"hertz-h1",
 	"axum",
-	"actix-web",
 	"aspnet",
 	"hyper",
 }
@@ -82,11 +81,11 @@ var RatedServers = []string{
 // the mage-tagged realized-count helper validates against the live
 // registries.
 //
-// Derivation (headline): 15 servers x 12 scenarios = 180 nominal cells.
+// Derivation (headline): 14 servers x 12 scenarios = 168 nominal cells.
 // Capability gating drops the streaming cells (ws-echo, sse-fanout-128)
 // and the chain cell on servers that don't advertise WebSocket / SSE /
 // chain support, plus a handful of payload-size cells inapplicable to a
-// given adapter — landing the realized grid near ~150. The constant is
+// given adapter — landing the realized grid near ~140. The constant is
 // the conservative pinned figure the workflow runs against; the helper
 // fails the build if the live count exceeds it (which would invalidate
 // the budget assertion).
@@ -104,10 +103,9 @@ const (
 
 // HeadlineWeekly is the exact config the benchmark-tier workflow runs on
 // the weekly (non-release) schedule: the curated ~15x12 grid at
-// 60s/15s/3, plus the curated rated subset. N=1 weekly; the workflow
-// bumps Runs to the back-to-back release count via FitWithin when a new
-// release is detected (#167), and the NewReleaseConfig test pins that
-// N=3 still fits.
+// 40s/10s, plus the curated rated subset. The bench ALWAYS runs exactly
+// one pass (Runs=1) — multi-pass / back-to-back release runs were removed;
+// if more passes are wanted, more benchmarks are scheduled.
 //
 // ArchParallel is false: arm64 loadgen federation (#168) is blocked on
 // the loadgen repo shipping linux/arm64, so both arches run serially
@@ -119,14 +117,14 @@ func HeadlineWeekly() Profile {
 		Cells: HeadlineRealizedCells,
 		// Per-cell window is 40s/10s (not the nominal 60s/15s) because the
 		// two arches run SERIALLY today — arm64 loadgen federation (#168,
-		// ArchParallel) is blocked on the loadgen repo. At runs=3 x 150
-		// cells x 2 serial arches, a 60s window plus the rated pass
-		// overflows 24h; 40s lands the whole run at ~21h with headroom.
-		// When #168 lands and ArchParallel flips on, this can grow back.
+		// ArchParallel) is blocked on the loadgen repo. At 150 cells x 2
+		// serial arches, a 60s window plus the rated pass overflows 24h;
+		// 40s lands the whole run well under budget. When #168 lands and
+		// ArchParallel flips on, this can grow back.
 		Duration:      40 * time.Second,
 		Warmup:        10 * time.Second,
 		Cooldown:      defaultCooldown,
-		Runs:          3,
+		Runs:          1,
 		Arches:        2,
 		ArchParallel:  false,
 		RatedCells:    HeadlineRatedRealizedCells,
@@ -139,10 +137,10 @@ func HeadlineWeekly() Profile {
 }
 
 // Full is the exhaustive sweep: every server x every scenario at a
-// slightly longer 90s/20s window, same back-to-back Runs and rated
-// subset. Far over the 24h budget with the long window — Full is intended
-// for ArchParallel + a trimmed Runs, and FitWithin will report it does
-// not fit at Runs=3 so the caller fails loudly rather than overruns.
+// slightly longer 90s/20s window, single pass and the rated subset. Far
+// over the 24h weekly budget with the long window — Full is a manual
+// dispatch that raises BENCH_BUDGET above 24h; FitWithin asserts the
+// single-pass config fits the (raised) budget and fails loudly otherwise.
 func Full() Profile {
 	return Profile{
 		Name:          "full",
@@ -150,7 +148,7 @@ func Full() Profile {
 		Duration:      90 * time.Second,
 		Warmup:        20 * time.Second,
 		Cooldown:      defaultCooldown,
-		Runs:          3,
+		Runs:          1,
 		Arches:        2,
 		ArchParallel:  false,
 		RatedCells:    FullRatedRealizedCells,

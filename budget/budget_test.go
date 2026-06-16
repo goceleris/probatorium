@@ -18,58 +18,47 @@ func TestWeeklyConfigFitsBudget(t *testing.T) {
 	}
 }
 
-// TestNewReleaseConfigFitsBudget pins the back-to-back release config
-// (#167): N=3 published run-K cells, BENCH_RUNS=3 per cell. The release
-// path is the most expensive one — if it overflows, the workflow must
-// trim Runs via FitWithin and log it, never silently truncate the matrix.
-func TestNewReleaseConfigFitsBudget(t *testing.T) {
-	p := HeadlineWeekly()
-	p.Runs = 3 // back-to-back release N, #167
-	if got := p.WallClock(); got >= Budget {
-		t.Fatalf("release headline (runs=3) wall-clock %v >= %v budget", got, Budget)
-	}
-}
-
-// TestFitWithinChoosesLargestFittingRuns proves FitWithin returns the
-// largest Runs that fits and never silently exceeds the budget.
-func TestFitWithinChoosesLargestFittingRuns(t *testing.T) {
-	p := HeadlineWeekly()
-	p.Runs = 9 // ask for far more than fits
-	runs, log, ok := p.FitWithin(Budget, 1)
-	if !ok {
-		t.Fatalf("expected some Runs to fit; log:\n%s", log)
-	}
-	if runs < 1 {
-		t.Fatalf("chosen runs must be >= 1, got %d", runs)
-	}
-	trial := p
-	trial.Runs = runs
-	if trial.WallClock() >= Budget {
-		t.Fatalf("FitWithin chose runs=%d whose wall-clock %v exceeds budget %v",
-			runs, trial.WallClock(), Budget)
-	}
-	// One more run must not fit (it returned the largest fitting Runs).
-	if runs < p.Runs {
-		bigger := p
-		bigger.Runs = runs + 1
-		if bigger.WallClock() < Budget {
-			t.Fatalf("FitWithin chose runs=%d but runs=%d also fits (%v < %v)",
-				runs, runs+1, bigger.WallClock(), Budget)
+// TestProfilesAreSinglePass pins the single-pass invariant: the bench
+// ALWAYS runs exactly one pass. The back-to-back / multi-run machinery was
+// removed (if more passes are wanted, more benchmarks are scheduled), so
+// every curated profile MUST carry Runs=1. A profile that ships Runs>1
+// would silently re-introduce a multi-pass run.
+func TestProfilesAreSinglePass(t *testing.T) {
+	for _, p := range []Profile{HeadlineWeekly(), Full()} {
+		if p.Runs != 1 {
+			t.Errorf("profile %q must be single-pass (Runs=1), got Runs=%d", p.Name, p.Runs)
 		}
 	}
 }
 
-// TestFitWithinFailsLoudlyWhenNothingFits proves the no-silent-truncation
-// rule: when even minRuns overflows, ok is false and the log explains it.
-func TestFitWithinFailsLoudlyWhenNothingFits(t *testing.T) {
+// TestFitWithinAcceptsSinglePassThatFits proves FitWithin returns ok for
+// the single-pass config when it fits, and reports the headroom.
+func TestFitWithinAcceptsSinglePassThatFits(t *testing.T) {
 	p := HeadlineWeekly()
-	p.Duration = 10 * time.Hour // absurd window: nothing fits, even runs=1
-	runs, log, ok := p.FitWithin(Budget, 1)
-	if ok {
-		t.Fatalf("expected no fit for a 10h-per-cell window, got runs=%d", runs)
+	log, ok := p.FitWithin(Budget)
+	if !ok {
+		t.Fatalf("single-pass headline must fit the %v budget; log:\n%s", Budget, log)
 	}
-	if runs != 0 {
-		t.Fatalf("no-fit must return runs=0, got %d", runs)
+	if p.WallClock() >= Budget {
+		t.Fatalf("FitWithin returned ok but wall-clock %v exceeds budget %v",
+			p.WallClock(), Budget)
+	}
+	if !strings.Contains(log, "fits") {
+		t.Fatalf("fit log must call out that the config fits; got:\n%s", log)
+	}
+}
+
+// TestFitWithinFailsLoudlyWhenSinglePassOverflows proves the
+// no-silent-truncation rule: there is no Runs dimension left to trim, so
+// when the single-pass config overflows the budget, ok is false and the
+// log explains it. The caller MUST fail loudly rather than shrink the
+// matrix.
+func TestFitWithinFailsLoudlyWhenSinglePassOverflows(t *testing.T) {
+	p := HeadlineWeekly()
+	p.Duration = 10 * time.Hour // absurd window: a single pass cannot fit
+	log, ok := p.FitWithin(Budget)
+	if ok {
+		t.Fatalf("expected no fit for a 10h-per-cell window; log:\n%s", log)
 	}
 	if !strings.Contains(log, "NO FIT") {
 		t.Fatalf("no-fit log must call out the failure; got:\n%s", log)

@@ -114,12 +114,12 @@ func TestClassifyCompletedCell(t *testing.T) {
 			wantPrefix: "zero-request cell:", wantHard: true, wantStatus: report.CellDNF,
 		},
 		{
-			// v3.8 churn-close/actix-web: 12,081,484 requests vs
+			// v3.8 churn-close/ntex: 12,081,484 requests vs
 			// 290,204,598 errors (ratio 0.960) published as status=ok.
 			// Over the explicit 0.5 churn budget → suspect, data kept.
 			name: "v3.8 churn-close error storm is suspect",
 			in: completedCell{
-				ScenarioName: "churn-close", ServerName: "actix-web",
+				ScenarioName: "churn-close", ServerName: "ntex",
 				Category: "static", Requests: 12081484, Errors: 290204598,
 				Duration: 90004545724, ServerAlive: true,
 				ErrorBudget: 0.5,
@@ -182,7 +182,7 @@ func TestClassifyCompletedCell(t *testing.T) {
 			// attribute the blow-up to reachability, not server behaviour.
 			name: "churn-close over budget with connect-class overage says so",
 			in: completedCell{
-				ScenarioName: "churn-close", ServerName: "actix-web",
+				ScenarioName: "churn-close", ServerName: "ntex",
 				Category: "static", Requests: 12081484, Errors: 290204598,
 				ConnectErrors: 290204598,
 				Duration:      90004545724, ServerAlive: true,
@@ -196,7 +196,7 @@ func TestClassifyCompletedCell(t *testing.T) {
 			// answering 5xx): no reachability claim may appear.
 			name: "over budget with non-connect errors carries no connect-class claim",
 			in: completedCell{
-				ScenarioName: "churn-close", ServerName: "actix-web",
+				ScenarioName: "churn-close", ServerName: "ntex",
 				Category: "static", Requests: 12081484, Errors: 290204598,
 				ConnectErrors: 1024,
 				Duration:      90004545724, ServerAlive: true,

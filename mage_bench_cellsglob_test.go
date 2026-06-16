@@ -12,10 +12,10 @@ import (
 
 // TestCellsGlobServersDerivesFromHeadlineCells pins the regression: when
 // the bench is launched via BenchTier with profile=headline, the cells
-// glob is the headline 180-cell set (15 servers x 12 scenarios), but
-// BENCH_COMPETITORS defaults to "all" (= 31 servers). The default
+// glob is the headline 168-cell set (14 servers x 12 scenarios), but
+// BENCH_COMPETITORS defaults to "all" (= full registry). The default
 // (no explicit user narrowing) must derive competitor_set from the cells
-// glob, yielding EXACTLY the 15 HeadlineServers — never the 31-column
+// glob, yielding EXACTLY the 14 HeadlineServers — never the full-column
 // registry, never an empty set, never a partial subset.
 //
 // If this test fails, the v3.5 bug is back: 16 of the 31 columns are
@@ -38,9 +38,9 @@ func TestCellsGlobServersDerivesFromHeadlineCells(t *testing.T) {
 			"the cells glob, not from the 31-column full registry)",
 			got, want)
 	}
-	if len(got) != 15 {
-		t.Errorf("len: want 15 HeadlineServers, got %d (the cells glob is 12 scenarios "+
-			"x 15 servers = 180 cells; the unique-server derivation must yield 15)", len(got))
+	if len(got) != 14 {
+		t.Errorf("len: want 14 HeadlineServers, got %d (the cells glob is 12 scenarios "+
+			"x 14 servers = 168 cells; the unique-server derivation must yield 14)", len(got))
 	}
 }
 

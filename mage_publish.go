@@ -41,9 +41,10 @@ const docsRepo = "goceleris/docs"
 // docsBranch is the docs default branch every publish pushes to.
 const docsBranch = "main"
 
-// defaultRunID is the canonical run for a date. Phase 5's back-to-back
-// loop (BenchTier, #167) overrides this per pass via PUBLISH_RUN_ID
-// (run-1..run-N); absent that env, every publish is run-1.
+// defaultRunID is the canonical run for a date. The bench runs a single
+// pass, so PUBLISH_RUN_ID is left unset and every publish is run-1. The
+// env override is retained (a manual relabel can still set it) but the
+// removed back-to-back loop no longer iterates run-1..run-N.
 const defaultRunID = "run-1"
 
 // archTag maps a Go GOARCH to the canonical on-disk / dispatch arch
@@ -189,11 +190,10 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, string, er
 	}
 
 	now := time.Now().UTC()
-	// BENCH_START_DATE (if set) pins every Publish in a back-to-back
-	// iteration to the bench's start date, so a run that crosses
-	// midnight UTC lands all cells under the same date. Falls back
-	// to the per-Publish timestamp otherwise (the legacy behaviour
-	// for a one-shot `mage Publish` invocation).
+	// BENCH_START_DATE (if set) pins the Publish to the bench's start
+	// date, so a single pass that crosses midnight UTC lands all cells
+	// under the same date. Falls back to the per-Publish timestamp
+	// otherwise (the behaviour for a one-shot `mage Publish` invocation).
 	dateStr := os.Getenv("BENCH_START_DATE")
 	if dateStr == "" {
 		dateStr = now.Format("20060102")
@@ -214,8 +214,9 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, string, er
 
 // cellRelPath is the repo-root-relative path of a published cell, the
 // value the pointer dispatch and the contents API both key on. It mirrors
-// WriteTree's on-disk layout via the shared report.CellRelDir helper so a
-// back-to-back run-K never overwrites run-1's flat tree.
+// WriteTree's on-disk layout via the shared report.CellRelDir helper. The
+// run-id segment keeps an alternate run-K (a manual relabel) from
+// overwriting run-1's tree; the single-pass bench only ever writes run-1.
 func cellRelPath(meta report.SplitMeta) string {
 	return filepath.ToSlash(filepath.Join("results", report.CellRelDir(meta)))
 }
@@ -603,13 +604,12 @@ func cloneDocs(dir, token string) error {
 
 // pushDocsHEAD pushes HEAD to the docs branch, recovering from the
 // non-fast-forward rejection that happens when the docs-sync workflow
-// commits an index.json update between two back-to-back publishes that
-// reuse one DOCS_REPO_DIR checkout (every BenchTier run: run-K saturation
-// then run-K rated, then the next run). publishViaGit's commit only touches
-// the run-K results tree — never index.json, which the workflow owns — so
-// rebasing our publish commit onto the freshly fetched remote head replays
-// cleanly with no file conflict; we then retry the push. Bounded retries
-// guard against a livelock if the remote keeps moving.
+// commits an index.json update concurrently with our publish.
+// publishViaGit's commit only touches the results tree — never
+// index.json, which the workflow owns — so rebasing our publish commit
+// onto the freshly fetched remote head replays cleanly with no file
+// conflict; we then retry the push. Bounded retries guard against a
+// livelock if the remote keeps moving.
 func pushDocsHEAD(repoDir, token string) error {
 	const maxAttempts = 6
 	remote := authRemote(token)

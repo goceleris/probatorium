@@ -1,7 +1,7 @@
 // probatorium hyper adapter — wave 4a.
 //
 // The raw Rust baseline: hyper driven directly, with no router crate and
-// no tower stack. axum, actix-web and ntex all sit above hyper (axum and
+// no tower stack. axum and ntex both sit above hyper (axum and
 // the tower ecosystem literally re-export it); this column is the floor
 // their numbers are interpreted against — the cost of hyper's H1 codec
 // plus a hand-rolled match on (method, path), nothing more.

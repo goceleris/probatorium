@@ -33,11 +33,11 @@ mage Status
 # DEPLOY_COMPETITORS=go-only skips native toolchains (sub-minute deploy).
 CLUSTER_USE_LAN=1 DEPLOY_COMPETITORS=go-only mage Deploy
 
-# Smoke bench: 2 servers × 1 run × 15s on amd64.
+# Smoke bench: 2 servers × 15s on amd64 (the bench always runs one pass).
 CLUSTER_USE_LAN=1 \
   BENCH_TARGET=msa2-server \
   BENCH_COMPETITORS=stdhttp,gin \
-  BENCH_DURATION=15s BENCH_WARMUP=3s BENCH_RUNS=1 \
+  BENCH_DURATION=15s BENCH_WARMUP=3s \
   mage Bench
 
 # Single-cell validation smoke (one refapp, one engine): 10-min on amd64.
@@ -126,7 +126,7 @@ Each refapp follows the same shape: own `go.mod`, `engine.go` (`resolveEngine("a
 | `Status` | — |
 | `Deploy` | `CLUSTER_USE_LAN`, `DEPLOY_COMPETITORS=all\|go-only\|<list>` |
 | `Cleanup` | `CLEANUP_HOSTS=all\|<list>` |
-| `Bench` | `BENCH_TARGET`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RUNS`, `BENCH_CELLS`, `CELERIS_VERSION` |
+| `Bench` | `BENCH_TARGET`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_CELLS`, `CELERIS_VERSION` |
 | `BenchSince` | `BASELINE_VERSION=v1.4.3`, `REGRESSION_THRESHOLD=0.05` |
 | `Validate` | `VALIDATE_TARGET`, `VALIDATE_DURATION`, `VALIDATE_PARALLEL=1`, `VALIDATE_MATRIX=1`, `VALIDATE_MATRIX_REFAPPS=<csv>`, `VALIDATE_MATRIX_ENGINES=<csv>`, `VALIDATE_REFAPP_ENGINE`, `CELERIS_VERSION`, `PROBATORIUM_VALIDATE_DRIVER=ssh` |
 | `Soak` | `SOAK_DURATION=24h`, `VALIDATE_TARGET`, `VALIDATE_PARALLEL=1`, `VALIDATE_MATRIX=1` |

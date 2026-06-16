@@ -310,18 +310,6 @@ var Registry = map[string]Adapter{
 		},
 		Capabilities: Capabilities{Static: true},
 	},
-	"actix-web": {
-		Name: "actix-web", Category: "rust-actix", Language: "rust", Framework: "actix-web", Engine: "h1",
-		Bin: NativeBinary{
-			Lang: "rust",
-			BuildSteps: []string{
-				"source $RUSTUP_HOME/env",
-				"cd $SRC && cargo build --profile release-fat",
-			},
-			RunCmd: "{bin} -bind {bind}",
-		},
-		Capabilities: Capabilities{Static: true},
-	},
 	"ntex": {
 		Name: "ntex", Category: "rust-ntex", Language: "rust", Framework: "ntex", Engine: "h1",
 		Bin: NativeBinary{
@@ -335,7 +323,7 @@ var Registry = map[string]Adapter{
 		Capabilities: Capabilities{Static: true},
 	},
 
-	// hyper — the raw Rust baseline axum / actix-web / ntex are all built
+	// hyper — the raw Rust baseline axum / ntex are all built
 	// on or measured against. No router crate, no tower stack: the adapter
 	// drives hyper's H1 server directly with a hand-rolled (method, path)
 	// match, so this column is the floor the framework columns add their

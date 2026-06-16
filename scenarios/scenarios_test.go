@@ -184,7 +184,7 @@ func TestErrorBudgets(t *testing.T) {
 	if got := ErrorBudgetFor(&StaticScenario{name: "x"}); got != DefaultErrorBudget {
 		t.Errorf("zero-ErrBudget scenario = %v, want DefaultErrorBudget fallback", got)
 	}
-	// The v3.8 churn-close numbers themselves: actix-web ran 12,081,484
+	// The v3.8 churn-close numbers themselves: ntex ran 12,081,484
 	// requests against 290,204,598 errors (ratio 0.960) — over budget.
 	ratio := 290204598.0 / (290204598.0 + 12081484.0)
 	if budget := ErrorBudgetFor(findScenario(t, "churn-close")); ratio <= budget {

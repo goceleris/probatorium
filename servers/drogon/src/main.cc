@@ -1,6 +1,6 @@
 // probatorium drogon adapter — wave 4 (C++).
 //
-// Same contract as servers/axum, servers/actix-web, servers/ntex, served
+// Same contract as servers/axum, servers/ntex, served
 // by drogon's HTTP stack. Lifecycle and CLI match the Rust competitors so
 // servers.StartAdapter can launch every native adapter with one
 // invocation pattern (`{bin} -bind {addr}`, wait for `ready addr=<addr>`).

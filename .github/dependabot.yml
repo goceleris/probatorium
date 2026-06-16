@@ -51,10 +51,9 @@ updates:
 
   # ----- Cargo (Rust adapters) -----
   # One entry per Cargo.toml; the `groups` block still collapses all
-  # rust dep updates across the three crates into ONE PR per run.
+  # rust dep updates across the crates into ONE PR per run.
   - package-ecosystem: cargo
     directories:
-      - /servers/actix-web
       - /servers/axum
       - /servers/ntex
     schedule:
