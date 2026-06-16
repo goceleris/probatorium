@@ -11,7 +11,7 @@ import "time"
 // helper's output must match, so a registry change that blows the budget
 // surfaces as a failing test rather than a silently-overflowing run.
 
-// HeadlineServers is the curated weekly column set (~15): the four celeris
+// HeadlineServers is the curated weekly column set (~14): the four celeris
 // engine modes worth comparing, the headline Go competitors, and one
 // representative per non-Go language. Drops the -h2 duplicate columns,
 // the chi/iris mid-pack routers, and the long-tail competitors
@@ -30,7 +30,6 @@ var HeadlineServers = []string{
 	"gnet-h1",
 	"hertz-h1",
 	"axum",
-	"actix-web",
 	"aspnet",
 	"hyper",
 }
@@ -82,11 +81,11 @@ var RatedServers = []string{
 // the mage-tagged realized-count helper validates against the live
 // registries.
 //
-// Derivation (headline): 15 servers x 12 scenarios = 180 nominal cells.
+// Derivation (headline): 14 servers x 12 scenarios = 168 nominal cells.
 // Capability gating drops the streaming cells (ws-echo, sse-fanout-128)
 // and the chain cell on servers that don't advertise WebSocket / SSE /
 // chain support, plus a handful of payload-size cells inapplicable to a
-// given adapter — landing the realized grid near ~150. The constant is
+// given adapter — landing the realized grid near ~140. The constant is
 // the conservative pinned figure the workflow runs against; the helper
 // fails the build if the live count exceeds it (which would invalidate
 // the budget assertion).

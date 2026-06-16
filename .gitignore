@@ -60,8 +60,6 @@ servers/_docker/**/*.tar
 # deploy resolves dependencies freshly via `cargo update`.
 /servers/axum/target/
 /servers/axum/Cargo.lock
-/servers/actix-web/target/
-/servers/actix-web/Cargo.lock
 /servers/ntex/target/
 /servers/ntex/Cargo.lock
 

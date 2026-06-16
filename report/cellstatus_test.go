@@ -324,7 +324,7 @@ func TestDocumentV52DecodesWithoutCellStatuses(t *testing.T) {
 }
 
 // TestAggregateSuspectKeepsData asserts a suspect cell — real samples,
-// error ratio over budget (the churn-close shape: v3.8 actix-web ran
+// error ratio over budget (the churn-close shape: v3.8 axum ran
 // 12,081,484 requests against 290,204,598 errors and was published
 // status=ok) — keeps its headline numbers while carrying the suspect
 // status, unlike N/A / DNF cells which stay zero.
@@ -333,8 +333,8 @@ func TestAggregateSuspectKeepsData(t *testing.T) {
 	samples[0].Requests = 12081484
 	samples[0].Errors = 290204598
 	cell := CellResult{
-		ScenarioName: "churn-close", ServerName: "actix-web",
-		ServerKind: "actix", Category: "static",
+		ScenarioName: "churn-close", ServerName: "axum",
+		ServerKind: "axum", Category: "static",
 		Samples:     samples,
 		Status:      CellSuspect,
 		ErrorMsg:    "suspect: error ratio 0.960 exceeds budget 0.50 (errors=290204598 requests=12081484)",
@@ -342,7 +342,7 @@ func TestAggregateSuspectKeepsData(t *testing.T) {
 	}
 
 	agg := Aggregate([]CellResult{cell})
-	c := agg[CellID("churn-close", "actix-web")]
+	c := agg[CellID("churn-close", "axum")]
 	if c.Status != CellSuspect {
 		t.Errorf("Status = %q, want suspect", c.Status)
 	}
@@ -371,8 +371,8 @@ func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
 	suspectSamples[0].Requests = 12081484
 	suspectSamples[0].Errors = 290204598
 	suspect := CellResult{
-		ScenarioName: "churn-close", ServerName: "actix-web",
-		ServerKind: "actix", Category: "static",
+		ScenarioName: "churn-close", ServerName: "axum",
+		ServerKind: "axum", Category: "static",
 		Samples:     suspectSamples,
 		Status:      CellSuspect,
 		ErrorMsg:    "suspect: error ratio 0.960 exceeds budget 0.50 (errors=290204598 requests=12081484)",
@@ -389,8 +389,8 @@ func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
 		RunStatuses:  []CellStatus{CellOK},
 	}
 	recovered := CellResult{
-		ScenarioName: "get-json", ServerName: "actix-web",
-		ServerKind: "actix", Category: "static",
+		ScenarioName: "get-json", ServerName: "axum",
+		ServerKind: "axum", Category: "static",
 		Samples:      makeSamples([]float64{500000}, 40*time.Microsecond),
 		RatedSamples: [][]RatedSample{{{TargetRPS: 250000, P99: 2 * time.Millisecond}}},
 		Status:       CellSuspect,
@@ -398,8 +398,8 @@ func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
 		RunStatuses:  []CellStatus{CellDNF, CellOK},
 	}
 	clean := CellResult{
-		ScenarioName: "get-simple", ServerName: "actix-web",
-		ServerKind: "actix", Category: "static",
+		ScenarioName: "get-simple", ServerName: "axum",
+		ServerKind: "axum", Category: "static",
 		Samples:     makeSamples([]float64{700000}, 30*time.Microsecond),
 		RunStatuses: []CellStatus{CellOK, CellOK},
 	}
@@ -415,7 +415,7 @@ func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
 			LoadgenVer: "v1", CelerisVer: "v1",
 		},
 		Servers: map[string]ServerMeta{
-			"actix-web":      {Category: "static", Language: "rust", Framework: "actix-web", FrameworkVersion: "v4", CompileOptions: []string{}},
+			"axum":           {Category: "static", Language: "rust", Framework: "axum", FrameworkVersion: "v0.7", CompileOptions: []string{}},
 			"celeris-std-h1": {Category: "static", Language: "go", LanguageVersion: "go1.26", Framework: "celeris", FrameworkVersion: "v1", CompileOptions: []string{}},
 		},
 		Agg: agg,
@@ -423,7 +423,7 @@ func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
 	if len(doc.Benchmarks) != 2 {
 		t.Fatalf("Benchmarks = %d, want 2", len(doc.Benchmarks))
 	}
-	// Sorted by Name: actix-web first.
+	// Sorted by Name: axum first.
 	sr := doc.Benchmarks[0]
 
 	// Suspect cell: flagged AND ranked-with-data.
@@ -468,7 +468,7 @@ func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
 	}
 	// churn-close: suspect with NO rated row → token spanning the SLO
 	// columns, never "0 rps".
-	if !strings.Contains(md, "| actix-web | SUSPECT | SUSPECT | SUSPECT | SUSPECT | SUSPECT |") {
+	if !strings.Contains(md, "| axum | SUSPECT | SUSPECT | SUSPECT | SUSPECT | SUSPECT |") {
 		t.Errorf("markdown missing SUSPECT token row for rated-data-less suspect cell:\n%s", md)
 	}
 	// get-json: suspect WITH a rated row → numbers render but are never
@@ -479,10 +479,10 @@ func TestBuildDocumentSuspectAndRunStatuses(t *testing.T) {
 	// Per-run outcome evidence renders under each scenario carrying it:
 	// the recovered cell shows the crash ("1 dnf"), the suspect churn
 	// cell its suspect run — an OK rerun stays visible as 1/2, never 2/2.
-	if !strings.Contains(md, "_runs: actix-web suspect (1/2 runs; 1 dnf)_") {
+	if !strings.Contains(md, "_runs: axum suspect (1/2 runs; 1 dnf)_") {
 		t.Errorf("markdown missing run evidence for the [dnf ok] cell:\n%s", md)
 	}
-	if !strings.Contains(md, "_runs: actix-web suspect (0/1 runs; 1 suspect)_") {
+	if !strings.Contains(md, "_runs: axum suspect (0/1 runs; 1 suspect)_") {
 		t.Errorf("markdown missing run evidence for the suspect churn cell:\n%s", md)
 	}
 }

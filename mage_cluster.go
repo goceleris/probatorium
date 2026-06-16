@@ -588,11 +588,6 @@ var nativeBuildSpecs = map[string]nativeBuildSpec{
 		buildCmd:  "cargo build --profile release-fat",
 		binaryRel: "target/release-fat/probatorium-axum-server",
 	},
-	"actix-web": {
-		lang:      "rust",
-		buildCmd:  "cargo build --profile release-fat",
-		binaryRel: "target/release-fat/probatorium-actix-server",
-	},
 	"ntex": {
 		lang:      "rust",
 		buildCmd:  "cargo build --profile release-fat",

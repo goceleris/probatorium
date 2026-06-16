@@ -41,7 +41,7 @@ func TestApplySkipFileMissingFile(t *testing.T) {
 func TestApplySkipFileValid(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "skip.json")
 	body := `[
-		{"server": "actix-web", "scenario": "post-1m", "status": "not_applicable", "error": "capability-lie: 413 body limit"},
+		{"server": "ntex", "scenario": "post-1m", "status": "not_applicable", "error": "capability-lie: 413 body limit"},
 		{"server": "chi-h2", "scenario": "auto-mix-111", "status": "not_applicable", "error": "h2c upgrade 200"}
 	]`
 	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
@@ -59,8 +59,8 @@ func TestApplySkipFileValid(t *testing.T) {
 	if parts[0] != "*/*" {
 		t.Errorf("include should be first: %q", parts[0])
 	}
-	// Sort the !exclusions: "auto-mix-111/chi-h2" < "post-1m/actix-web"
-	want := []string{"*/*", "!auto-mix-111/chi-h2", "!post-1m/actix-web"}
+	// Sort the !exclusions: "auto-mix-111/chi-h2" < "post-1m/ntex"
+	want := []string{"*/*", "!auto-mix-111/chi-h2", "!post-1m/ntex"}
 	if strings.Join(parts, ",") != strings.Join(want, ",") {
 		t.Errorf("got %q, want %q", got, want)
 	}

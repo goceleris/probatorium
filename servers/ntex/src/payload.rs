@@ -1,7 +1,7 @@
 // Deterministic 1 KiB / 64 KiB JSON payload generator.
 //
-// Verbatim duplicate of servers/axum/src/payload.rs and
-// servers/actix-web/src/payload.rs. Each Rust adapter ships its own
+// Verbatim duplicate of servers/axum/src/payload.rs. Each Rust
+// adapter ships its own
 // copy so the source tarball ansible/tasks/build_native_competitor.yml
 // pushes is self-contained — no path-dep crate to coordinate.
 // The duplication is bounded (~80 LOC) and the sizes are asserted by

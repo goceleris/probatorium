@@ -560,7 +560,7 @@ func TestMergeSuspectCellKeepsData(t *testing.T) {
 		Duration: 90 * time.Second, RequestsPerSec: 134231.93,
 	}
 	cells := []cellRecord{{
-		RunIndex: 0, Competitor: "actix-web", Scenario: "churn-close",
+		RunIndex: 0, Competitor: "ntex", Scenario: "churn-close",
 		Status:  "suspect",
 		Error:   "suspect: error ratio 0.960 exceeds budget 0.50 (errors=290204598 requests=12081484)",
 		Loadgen: mustMarshalLoadgen(t, res),
@@ -592,7 +592,7 @@ func TestMergeSuspectCellKeepsData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("summarizeCells: %v", err)
 	}
-	st, ok := sum[summaryKey("actix-web", "churn-close")]
+	st, ok := sum[summaryKey("ntex", "churn-close")]
 	if !ok {
 		t.Fatalf("summary missing suspect cell bucket: %v", sum)
 	}

@@ -4,8 +4,8 @@
 # Idempotent stage-and-leave. Cross-compiled Go artefacts (runner,
 # loadgen, observer, validator, conformance, validator-checker,
 # validator-replay, plus any Go competitor adapters) are pushed under
-# {{ bench_root }}. Non-Go competitor frameworks (rust/axum, rust/actix-
-# web, rust/ntex, bun/hono, bun/elysia, python/fastapi, etc.) are built
+# {{ bench_root }}. Non-Go competitor frameworks (rust/axum, rust/ntex,
+# bun/hono, bun/elysia, python/fastapi, etc.) are built
 # natively on the cluster node via per-language toolchain roles.
 #
 # Hard rule: ONLY the dbservices role may install docker. Frameworks

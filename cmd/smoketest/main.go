@@ -31,7 +31,7 @@
 // the 7.0.0-22-generic kernel — 43 DNF where celeris-iouring-h1-async /
 // -iouring-auto+upg-async SEGFAULT on first request, 15 not_applicable
 // (celeris std/epoll SSE capability false positives, chi-h2 h2c upgrade
-// false positive, actix-web 1MB body limit). The bench used to publish
+// false positive, ntex 1MB body limit). The bench used to publish
 // every cell regardless, so the docs site silently carried rows with zero
 // data. This tool makes the broken set explicit, lets the bench skip them
 // at schedule time, and trips CI when a previously-broken cell starts

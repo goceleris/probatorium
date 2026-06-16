@@ -1,6 +1,6 @@
 // probatorium ntex adapter — wave 4a.
 //
-// Same contract as servers/axum and servers/actix-web, served by the
+// Same contract as servers/axum, served by the
 // ntex framework on its default tokio runtime. Lifecycle and CLI are
 // identical so servers.StartAdapter can launch every Rust competitor
 // with one invocation pattern.
@@ -37,8 +37,8 @@ async fn main() -> std::io::Result<()> {
 
     // Bind a std listener ourselves so we can resolve the actual addr
     // (handles port=0 cleanly) before handing it to ntex via .listen().
-    // ntex's HttpServer doesn't expose an addrs() accessor like
-    // actix-web's, so this is the canonical pattern.
+    // ntex's HttpServer doesn't expose an addrs() accessor, so this
+    // is the canonical pattern.
     let listener = TcpListener::bind(&bind)
         .unwrap_or_else(|e| panic!("ntex: bind {bind:?}: {e}"));
     let bound = listener
@@ -51,17 +51,16 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(async || {
         App::new()
             // ntex's web::Bytes extractor caps the buffered body at
-            // 256 KiB by default (ntex::web::Bytes::LIMIT = 262144),
-            // the same default as actix-web. The contract's POST
-            // /upload drains the body — including the 1 MiB post-1m
-            // scenario — so the server must accept up to ~2 MiB.
-            // web::types::PayloadConfig::new raises the per-payload
-            // limit; without this, post-1m returns 400 Payload
-            // Overflow and the cell is classified not_applicable
+            // 256 KiB by default (ntex::web::Bytes::LIMIT = 262144).
+            // The contract's POST /upload drains the body — including
+            // the 1 MiB post-1m scenario — so the server must accept
+            // up to ~2 MiB. web::types::PayloadConfig::new raises the
+            // per-payload limit; without this, post-1m returns 400
+            // Payload Overflow and the cell is classified not_applicable
             // (zero-request cell: all bodies rejected, all responses
-            // non-2xx). PayloadConfig lives in
-            // ntex::web::types (not ntex::web::PayloadConfig — the
-            // actix-web-style re-export doesn't exist on ntex).
+            // non-2xx). PayloadConfig lives in ntex::web::types (not
+            // ntex::web::PayloadConfig — that re-export doesn't exist
+            // on ntex).
             .state(web::types::PayloadConfig::new(2 * 1024 * 1024))
             .route("/", web::get().to(root))
             .route("/json", web::get().to(json_static))

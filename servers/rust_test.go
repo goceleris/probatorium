@@ -1,6 +1,6 @@
 package servers_test
 
-// Smoke test for the wave 4a Rust adapters (axum, actix-web, ntex). The
+// Smoke test for the wave 4a Rust adapters (axum, ntex). The
 // test SKIPs gracefully when no Rust binary has been pre-built — most
 // dev machines don't have a rust toolchain installed, and the cluster
 // build is ansible-driven, not part of `go test`. When a binary IS
@@ -37,7 +37,7 @@ import (
 )
 
 func TestRustAdapters_ContractConformance(t *testing.T) {
-	for _, name := range []string{"axum", "actix-web", "ntex"} {
+	for _, name := range []string{"axum", "ntex"} {
 		name := name
 		t.Run(name, func(t *testing.T) {
 			runRustAdapterConformance(t, name)

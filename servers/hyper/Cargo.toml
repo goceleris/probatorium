@@ -1,9 +1,9 @@
 # probatorium hyper adapter — wave 4a (rust-hyper).
 #
 # hyper is the raw Rust baseline every higher-level Rust framework
-# (axum, actix-web, ntex) is built on or measured against. This adapter
+# (axum, ntex) is built on or measured against. This adapter
 # drives hyper directly — no router crate, no tower stack — so its cell
-# is the floor the tower/actix/ntex columns are interpreted against.
+# is the floor the tower/ntex columns are interpreted against.
 #
 # Build / run / lifecycle reference (no markdown docs; everything the
 # operator needs lives here or in the source).
