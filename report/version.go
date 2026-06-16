@@ -7,11 +7,13 @@ import (
 	"strings"
 )
 
-// Version comparison + docs-index parsing for new-release detection
-// (probatorium#167). Lives in report/ (no build tag) so plain
-// `go test ./report/` reaches it, exactly like the SLO gate — the
-// mage-tagged DetectRelease target is a thin shell over these pure
-// helpers.
+// Version comparison + docs-index parsing (probatorium#167). Lives in
+// report/ (no build tag) so plain `go test ./report/` reaches it, exactly
+// like the SLO gate. These are pure helpers: CompareSemver orders release
+// tags and NewestBenchmarkedVersion reads the docs index.json. (The
+// mage-tagged new-release auto-detection that once consumed them was
+// removed when the bench moved to a single manual-dispatch pass; the
+// helpers stay because they are still independently useful + tested.)
 
 // CompareSemver returns -1, 0, or +1 for a < b, a == b, a > b over
 // vMAJOR.MINOR.PATCH tags. A leading "v" is optional and ignored. A
@@ -21,7 +23,7 @@ import (
 // the docs index, which only ever carries release tags.
 //
 // Non-semver inputs (e.g. "dev", "") sort LOWEST: a "dev" pin compared
-// against any real published tag yields -1, so DetectRelease never treats
+// against any real published tag yields -1, so a caller never treats
 // an un-pinned dev build as newer than a shipped release.
 func CompareSemver(a, b string) int {
 	na, oka := parseSemver(a)
@@ -99,8 +101,9 @@ func parseSemver(s string) (semver, bool) {
 // NewestBenchmarkedVersion returns the highest version key present in the
 // docs results/index.json body. The docs sync-benchmarks workflow is the
 // single writer of that manifest, so it is the canonical record of what
-// has already been benchmarked — DetectRelease compares the go.mod celeris
-// pin against this to decide is_new_release.
+// has already been benchmarked — a caller can compare a go.mod celeris
+// pin against this to decide whether a version is newer than anything
+// already published.
 //
 // The index shape is tolerated loosely so a docs-side schema tweak
 // doesn't break detection: the parser accepts any of

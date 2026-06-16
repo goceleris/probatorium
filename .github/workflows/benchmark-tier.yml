@@ -1,32 +1,26 @@
 name: Benchmark Tier
 
-# Curated benchmark sweep on the cluster within a 24h budget
-# (probatorium#172/#166/#167). Runs AFTER the Weekend Soak completes so it
-# never contends for the cluster, plus a manual workflow_dispatch.
+# Curated benchmark sweep on the cluster within a budget
+# (probatorium#172/#166). MANUAL dispatch only — the owner dispatches one
+# bench per release. The bench ALWAYS runs exactly ONE pass; the
+# multi-pass / back-to-back machinery and the new-release auto-trigger
+# (workflow_run on "Weekend Soak") were removed. If more passes are
+# wanted, more benchmarks are dispatched.
 #
-# Job graph: gate -> detect -> setup -> matrix -> teardown.
-#   - gate:     only proceed after a SUCCESSFUL soak (workflow_run fires on
-#               success AND failure); manual dispatch always passes.
-#   - detect:   is the go.mod celeris pin newer than the newest benchmarked
-#               version in the docs index.json? Cheap, ubuntu, no cluster.
+# Job graph: setup -> matrix -> teardown.
 #   - setup:    provision FRESH ephemeral cluster runners.
-#   - matrix:   deploy -> mage BenchTier (curated matrix, both arches, xN
-#               back-to-back when new release, publish run-1..run-N).
+#   - matrix:   deploy -> mage BenchTier (curated matrix, amd64, single
+#               pass, publish run-1).
 #   - teardown: retire the runners.
 #
 # Concurrency: shares the matrix-tier-cluster group with the PR / nightly /
-# weekend tiers and cancel-in-progress:false, so it QUEUES behind the soak
-# and never overlaps the cluster. (workflow_run also fires only after the
-# soak fully completes, so the shared group is the real serialization
-# guarantee; the trigger ordering is belt-and-braces.)
+# weekend tiers and cancel-in-progress:false, so it QUEUES behind any
+# in-flight cluster job and never overlaps the cluster.
 #
-# Schedule / maintainer-owned: no cluster-ok label gate (the PR tier needs
-# one; this never runs from an untrusted PR surface).
+# Maintainer-owned: no cluster-ok label gate (the PR tier needs one; this
+# never runs from an untrusted PR surface).
 
 on:
-  workflow_run:
-    workflows: ["Weekend Soak"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       profile:
@@ -34,11 +28,6 @@ on:
         required: false
         type: string
         default: full
-      force_new_release:
-        description: force the N back-to-back release runs ("true"/"false")
-        required: false
-        type: string
-        default: "false"
 
 permissions:
   contents: read
@@ -51,50 +40,8 @@ env:
   CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
 
 jobs:
-  gate:
-    name: gate (soak success or manual)
-    runs-on: ubuntu-latest
-    timeout-minutes: 1
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
-    steps:
-      - name: Log trigger
-        run: |
-          echo "trigger=${{ github.event_name }}"
-          echo "soak_conclusion=${{ github.event.workflow_run.conclusion }}"
-
-  detect:
-    name: detect new release
-    needs: gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      is_new_release: ${{ steps.d.outputs.is_new_release }}
-      version: ${{ steps.d.outputs.version }}
-      newest_benchmarked: ${{ steps.d.outputs.newest_benchmarked }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26.4"
-          cache: true
-
-      - name: Install mage
-        run: |
-          go install github.com/magefile/mage@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Detect release (go.mod pin vs docs index.json)
-        id: d
-        env:
-          DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
-        run: mage DetectRelease >> "$GITHUB_OUTPUT"
-
   setup:
     name: bootstrap cluster runners
-    needs: [gate, detect]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -105,21 +52,21 @@ jobs:
           tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
           gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
           wait-for-manifest-clear:   "true"
-          # The soak just finished; give the cluster generous drain time.
+          # Give any in-flight cluster job generous drain time.
           wait-timeout-seconds:      "3600"
 
   matrix:
     name: benchmark tier (amd64)
-    needs: [detect, setup]
+    needs: [setup]
     runs-on: [self-hosted, celeris-cluster]
-    # 72h ceiling: the full profile on one arch is ~58h, plus Deploy +
-    # Cleanup. Well under GitHub's 5-day self-hosted job hard limit. This is
-    # only a ceiling — the weekly headline run finishes in hours and exits
-    # early. BENCH_BUDGET (below) is the real fail-loud projection gate.
+    # 72h ceiling: the full profile on one arch is ~19h single-pass, plus
+    # Deploy + Cleanup. Well under GitHub's 5-day self-hosted job hard
+    # limit. This is only a ceiling — the headline profile finishes in
+    # hours and exits early. BENCH_BUDGET (below) is the real fail-loud
+    # projection gate.
     timeout-minutes: 4320
     env:
       BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
-      IS_NEW_RELEASE: ${{ needs.detect.outputs.is_new_release }}
     steps:
       - uses: actions/checkout@v6
 
@@ -174,7 +121,7 @@ jobs:
           DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
 
-      - name: mage BenchTier (curated matrix, both arches, xN, publish each run)
+      - name: mage BenchTier (curated matrix, amd64, single pass, publish run-1)
         env:
           CLUSTER_USE_LAN: "1"
           # amd64 only: msr1 (arm64) has a firmware bug that makes it
@@ -182,25 +129,12 @@ jobs:
           # Restore "both" once the arm64 host is fixed (and #168 ArchParallel
           # lands, or the budget/timeout below is re-checked for two arches).
           BENCH_TARGET: msa2-server
-          # Manual full-matrix dispatch runs ~58h on one arch — raise the fit
-          # budget above the 24h weekly default so BenchTier doesn't refuse it
-          # (must stay under the job timeout-minutes above). The weekly
-          # auto-run (workflow_run) leaves this unset and stays gated at 24h.
-          BENCH_BUDGET: ${{ github.event_name == 'workflow_dispatch' && '70h' || '' }}
+          # The full single-pass matrix runs ~19h on one arch — raise the
+          # fit budget above the 24h weekly default so BenchTier doesn't
+          # refuse a future larger registry (must stay under the job
+          # timeout-minutes above).
+          BENCH_BUDGET: "70h"
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
-          # N back-to-back run-K cells, each published. The AUTOMATIC
-          # weekend trigger (workflow_run) does the full 3-pass release
-          # protocol when a new release is detected. A MANUAL dispatch
-          # defaults to a SINGLE published pass — so an operator can
-          # de-risk the durable cluster path and review one pass before
-          # committing to the multi-day run — and only goes 3-pass when
-          # force_new_release=true explicitly asks for it. (Publishing is
-          # NOT gated on pass count; every pass publishes either way.)
-          # Orthogonal to BENCH_RUNS (the per-cell median basis).
-          BENCH_BACK_TO_BACK: >-
-            ${{ ((github.event_name == 'workflow_run' &&
-                  needs.detect.outputs.is_new_release == 'true') ||
-                 github.event.inputs.force_new_release == 'true') && '3' || '1' }}
         run: mage BenchTier
 
       - name: Upload results

@@ -1239,9 +1239,10 @@ func readCellResources(cellDir string) *report.ResourceStats {
 //
 // Median is chosen over mean because a single GC pause / scheduler
 // blip on the cluster can shift the mean by 5% while the median
-// shrugs off any one outlier — and our smallest bench profile is
-// 3 runs (BENCH_RUNS default), where the median is well-defined and
-// robust.
+// shrugs off any one outlier. The bench runs a single pass today, so
+// most buckets carry one record (median == that value); the reduction
+// stays median-based so it remains correct if a bucket ever gathers
+// more than one record (e.g. a re-run cell) without special-casing.
 func summarizeCells(cells []cellRecord) (map[string]competitorStats, error) {
 	type loadgenLite struct {
 		Requests       int64   `json:"requests"`
