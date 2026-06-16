@@ -104,10 +104,9 @@ const (
 
 // HeadlineWeekly is the exact config the benchmark-tier workflow runs on
 // the weekly (non-release) schedule: the curated ~15x12 grid at
-// 60s/15s/3, plus the curated rated subset. N=1 weekly; the workflow
-// bumps Runs to the back-to-back release count via FitWithin when a new
-// release is detected (#167), and the NewReleaseConfig test pins that
-// N=3 still fits.
+// 40s/10s, plus the curated rated subset. The bench ALWAYS runs exactly
+// one pass (Runs=1) — multi-pass / back-to-back release runs were removed;
+// if more passes are wanted, more benchmarks are scheduled.
 //
 // ArchParallel is false: arm64 loadgen federation (#168) is blocked on
 // the loadgen repo shipping linux/arm64, so both arches run serially
@@ -119,14 +118,14 @@ func HeadlineWeekly() Profile {
 		Cells: HeadlineRealizedCells,
 		// Per-cell window is 40s/10s (not the nominal 60s/15s) because the
 		// two arches run SERIALLY today — arm64 loadgen federation (#168,
-		// ArchParallel) is blocked on the loadgen repo. At runs=3 x 150
-		// cells x 2 serial arches, a 60s window plus the rated pass
-		// overflows 24h; 40s lands the whole run at ~21h with headroom.
-		// When #168 lands and ArchParallel flips on, this can grow back.
+		// ArchParallel) is blocked on the loadgen repo. At 150 cells x 2
+		// serial arches, a 60s window plus the rated pass overflows 24h;
+		// 40s lands the whole run well under budget. When #168 lands and
+		// ArchParallel flips on, this can grow back.
 		Duration:      40 * time.Second,
 		Warmup:        10 * time.Second,
 		Cooldown:      defaultCooldown,
-		Runs:          3,
+		Runs:          1,
 		Arches:        2,
 		ArchParallel:  false,
 		RatedCells:    HeadlineRatedRealizedCells,
@@ -139,10 +138,10 @@ func HeadlineWeekly() Profile {
 }
 
 // Full is the exhaustive sweep: every server x every scenario at a
-// slightly longer 90s/20s window, same back-to-back Runs and rated
-// subset. Far over the 24h budget with the long window — Full is intended
-// for ArchParallel + a trimmed Runs, and FitWithin will report it does
-// not fit at Runs=3 so the caller fails loudly rather than overruns.
+// slightly longer 90s/20s window, single pass and the rated subset. Far
+// over the 24h weekly budget with the long window — Full is a manual
+// dispatch that raises BENCH_BUDGET above 24h; FitWithin asserts the
+// single-pass config fits the (raised) budget and fails loudly otherwise.
 func Full() Profile {
 	return Profile{
 		Name:          "full",
@@ -150,7 +149,7 @@ func Full() Profile {
 		Duration:      90 * time.Second,
 		Warmup:        20 * time.Second,
 		Cooldown:      defaultCooldown,
-		Runs:          3,
+		Runs:          1,
 		Arches:        2,
 		ArchParallel:  false,
 		RatedCells:    FullRatedRealizedCells,

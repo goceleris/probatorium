@@ -57,7 +57,6 @@ import (
 //	                               the server half is the competitor slug
 //	BENCH_SEED=                    deterministic loadgen seed (empty
 //	                               → random)
-//	BENCH_RUNS=5                   median over N runs
 //	CELERIS_VERSION=               override go.mod auto-detect
 //	CLUSTER_USE_LAN=1              LAN fabric instead of Tailscale
 //
@@ -191,7 +190,12 @@ func Bench() error {
 	// JSON, not silently skip the safety check.
 	cells = applySkipFile(cells)
 	seed := os.Getenv("BENCH_SEED")
-	runs := envOrDefault("BENCH_RUNS", "5")
+	// The bench ALWAYS runs exactly one pass. The BENCH_RUNS multi-run knob
+	// (median over N runs) was removed — if more passes are wanted, more
+	// benchmarks are scheduled. runs is hard-pinned to 1 (no env override):
+	// it drives the ansible outer loop (run_index=0 only) and the recorded
+	// BenchmarkConfig.Runs.
+	runs := "1"
 	// Rated mode (probatorium#156) is opt-in and default-OFF: it multiplies
 	// per-cell wall-clock by the rated sweep, so the budget issue (#166)
 	// curates when it runs. "1"/"true" turns it on; forwarded to the runner

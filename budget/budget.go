@@ -64,7 +64,7 @@ type Profile struct {
 	Duration time.Duration // per-cell measurement window (BENCH_DURATION)
 	Warmup   time.Duration // per-cell warmup (BENCH_WARMUP)
 	Cooldown time.Duration // inter-cell TIME_WAIT drain (runner default 5s)
-	Runs     int           // BENCH_RUNS (back-to-back repetitions per cell)
+	Runs     int           // per-cell repetitions; ALWAYS 1 (single-pass bench)
 	Arches   int           // 1 (single target) or 2 (both, serial today)
 
 	// ArchParallel, when true, means the two arches' bench passes overlap
@@ -172,50 +172,36 @@ func (p Profile) arches() int {
 	return p.Arches
 }
 
-// FitWithin returns the largest Runs (down to minRuns) for which
-// WallClock() <= budget, plus a human-readable log of how the decision
-// was reached. ok is false iff even minRuns overflows — in which case the
-// caller MUST fail loudly rather than silently shrink the matrix (the
-// no-silent-truncation rule, #166).
-//
-// FitWithin only trims the back-to-back Runs dimension; it never drops
-// servers or scenarios silently. The returned log records the projected
-// wall-clock at each Runs value it tried so a CI reader sees exactly why
-// a given Runs was chosen (or why nothing fit).
-func (p Profile) FitWithin(budget time.Duration, minRuns int) (chosenRuns int, log string, ok bool) {
-	if minRuns < 1 {
-		minRuns = 1
-	}
+// FitWithin asserts the single-pass config fits the budget. The bench
+// ALWAYS runs exactly one pass (Runs=1) — the back-to-back / multi-run
+// machinery was removed — so there is no Runs dimension left to trim.
+// FitWithin therefore projects the one config's wall-clock and returns
+// ok=false iff it overflows, in which case the caller MUST fail loudly
+// rather than silently shrink the matrix (the no-silent-truncation rule,
+// #166). The log records the projected wall-clock so a CI reader sees
+// exactly why the config fit (or why it did not).
+func (p Profile) FitWithin(budget time.Duration) (log string, ok bool) {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "budget fit for profile %q (%d cells, %d rated cells, %d arch%s, parallel=%v):\n",
 		p.Name, p.Cells, p.RatedCells, p.arches(), plural(p.arches()), p.ArchParallel)
 	fmt.Fprintf(&sb, "  per-cell=%s rated-per-cell=%s budget=%s\n",
 		p.PerCell().Round(time.Second), p.perRatedCell().Round(time.Second), budget)
 
-	start := p.Runs
-	if start < minRuns {
-		start = minRuns
+	wc := p.WallClock()
+	fit := wc <= budget
+	fmt.Fprintf(&sb, "  saturation=%s rated=%s total=%s (%s)\n",
+		p.Saturation().Round(time.Minute),
+		p.Rated().Round(time.Minute),
+		wc.Round(time.Minute),
+		fitLabel(fit))
+	if fit {
+		fmt.Fprintf(&sb, "  fits: total=%s headroom=%s\n",
+			wc.Round(time.Minute), (budget - wc).Round(time.Minute))
+		return sb.String(), true
 	}
-	for runs := start; runs >= minRuns; runs-- {
-		trial := p
-		trial.Runs = runs
-		wc := trial.WallClock()
-		fit := wc <= budget
-		fmt.Fprintf(&sb, "  runs=%d -> saturation=%s rated=%s total=%s (%s)\n",
-			runs,
-			trial.Saturation().Round(time.Minute),
-			trial.Rated().Round(time.Minute),
-			wc.Round(time.Minute),
-			fitLabel(fit))
-		if fit {
-			fmt.Fprintf(&sb, "  chosen: runs=%d, total=%s headroom=%s\n",
-				runs, wc.Round(time.Minute), (budget - wc).Round(time.Minute))
-			return runs, sb.String(), true
-		}
-	}
-	fmt.Fprintf(&sb, "  NO FIT: even runs=%d overflows the %s budget; caller must fail loudly\n",
-		minRuns, budget)
-	return 0, sb.String(), false
+	fmt.Fprintf(&sb, "  NO FIT: the single-pass config overflows the %s budget; caller must fail loudly\n",
+		budget)
+	return sb.String(), false
 }
 
 func fitLabel(fit bool) string {
