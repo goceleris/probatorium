@@ -462,7 +462,6 @@ func Bench() error {
 			"--extra-vars", "bench_warmup_seconds=" + strconv.Itoa(warmupSec),
 			"--extra-vars", "bench_connections=" + conns,
 			"--extra-vars", "bench_cells=" + cells,
-			"--extra-vars", "bench_runs=" + runs,
 			"--extra-vars", "bench_scenario_count=" + strconv.Itoa(scenarioCount),
 			"--extra-vars", "bench_cell_budget_seconds=" + strconv.Itoa(cellBudgetSec),
 			"--extra-vars", "celeris_version=" + version,
