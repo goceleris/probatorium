@@ -135,6 +135,14 @@ func (s *Server) dispatch(ctx *fasthttp.RequestCtx) {
 		ctx.SetContentType("application/json")
 		ctx.SetBody(common.JSON1KPayload())
 		return
+	case method == "GET" && path == "/json-8k":
+		ctx.SetContentType("application/json")
+		ctx.SetBody(common.JSON8KPayload())
+		return
+	case method == "GET" && path == "/json-16k":
+		ctx.SetContentType("application/json")
+		ctx.SetBody(common.JSON16KPayload())
+		return
 	case method == "GET" && path == "/json-64k":
 		ctx.SetContentType("application/json")
 		ctx.SetBody(common.JSON64KPayload())

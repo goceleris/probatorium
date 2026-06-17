@@ -42,6 +42,8 @@ var (
 	respRoot    = buildResponse("text/plain", common.Endpoints[0].ResponseBody)
 	respJSON    = buildResponse("application/json", common.Endpoints[1].ResponseBody)
 	respJSON1K  = buildResponse("application/json", common.JSON1KPayload())
+	respJSON8K  = buildResponse("application/json", common.JSON8KPayload())
+	respJSON16K = buildResponse("application/json", common.JSON16KPayload())
 	respJSON64K = buildResponse("application/json", common.JSON64KPayload())
 	respUpload  = buildResponse("text/plain", []byte("OK"))
 	respNotFnd  = buildStatusResponse(404, "Not Found", "text/plain", []byte("Not Found"))
@@ -148,6 +150,10 @@ func route(method, target []byte) []byte {
 			return respJSON
 		case equal(path, "/json-1k"):
 			return respJSON1K
+		case equal(path, "/json-8k"):
+			return respJSON8K
+		case equal(path, "/json-16k"):
+			return respJSON16K
 		case equal(path, "/json-64k"):
 			return respJSON64K
 		case hasPrefix(path, "/users/"):

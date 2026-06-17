@@ -12,14 +12,18 @@ import (
 // files and are deliberately excluded here — this test guards the slice
 // we own, not the ones we don't.
 var expectedRegistry = []string{
-	// static H1 (8)
+	// static H1 (12)
 	"churn-close",
 	"get-json",
 	"get-json-1k",
+	"get-json-8k",
+	"get-json-16k",
 	"get-json-64k",
 	"get-simple",
 	"post-1m",
 	"post-4k",
+	"post-8k",
+	"post-16k",
 	"post-64k",
 
 	// static H2-prior-knowledge (4) — exercise h2c-noupg and other

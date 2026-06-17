@@ -66,11 +66,16 @@ func TestFitWithinFailsLoudlyWhenSinglePassOverflows(t *testing.T) {
 }
 
 // TestArchParallelHalvesWallClock proves the #168 win is modeled: with
-// both arches and ArchParallel, wall-clock is half the serial cost.
+// both arches and ArchParallel, wall-clock is half the serial cost. The
+// halving only applies at Arches==2, so the test forces both arches
+// explicitly — the weekly/full profiles ship Arches:1 today (amd64-only),
+// which would otherwise make the toggle a no-op.
 func TestArchParallelHalvesWallClock(t *testing.T) {
 	serial := HeadlineWeekly()
+	serial.Arches = 2
 	serial.ArchParallel = false
 	parallel := HeadlineWeekly()
+	parallel.Arches = 2
 	parallel.ArchParallel = true
 	if parallel.WallClock() != serial.WallClock()/2 {
 		t.Fatalf("ArchParallel wall-clock %v != serial/2 %v",
@@ -79,11 +84,11 @@ func TestArchParallelHalvesWallClock(t *testing.T) {
 }
 
 // TestForProfileResolves checks the BENCH_PROFILE resolution: known
-// names map to their config, unknown/empty fall back to the FULL
-// matrix (every server × every scenario, capability-gated). Headline
-// is the explicit opt-in for the ~3h smoke-test path, not the silent
-// default — see ForProfile's docstring for why this flipped from the
-// prior behaviour.
+// names map to their config, unknown/empty fall back to "full". Both
+// "headline" and "full" cover the same full grid (every server × every
+// scenario, capability-gated); they differ only by the per-cell window
+// (headline's shorter window fits 24h, full's longer window is the
+// exhaustive sweep) — see ForProfile's docstring.
 func TestForProfileResolves(t *testing.T) {
 	if ForProfile("headline").Name != "headline" {
 		t.Errorf("ForProfile(headline) should resolve headline")
@@ -112,8 +117,8 @@ func TestForProfileDefaultHasFullCoverage(t *testing.T) {
 			"full", def.Name)
 	}
 	if def.Cells < 400 {
-		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~520 capability-gated), got %d. "+
-			"A value this low means the default was silently scoped down to the headline subset (~150 cells).",
+		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~800 capability-gated), got %d. "+
+			"A value this low means the default was silently scoped down to a curated subset.",
 			def.Cells)
 	}
 }

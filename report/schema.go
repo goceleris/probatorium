@@ -43,7 +43,17 @@ import (
 //     Also additive within 5.4: ServerResult.ConnectErrors, the
 //     per-scenario dial/handshake-failure subset of the loadgen error
 //     total (loadgen Result.ConnectErrors), emitted only when nonzero.
-const SchemaVersion = "5.4"
+//   - 5.5 — network-bound annotation for large-payload cells. Adds
+//     Environment.FabricLineRateBitsPerSec (the fabric's theoretical
+//     egress ceiling) and ServerResult.NetworkBound: scenario → true for
+//     cells whose achieved bandwidth sat at/near the fabric line rate
+//     while the loadgen still had CPU headroom — i.e. the NIC, not the
+//     server, was the bottleneck, so raw RPS converges across fast
+//     adapters and must NOT be read as a ranking. The CPU/RSS efficiency
+//     in ServerResult.Resources (now populated, finally) is the
+//     differentiator for those cells. Both additive and omitted when
+//     absent: a Tailscale-overlay run (no known line rate) emits neither.
+const SchemaVersion = "5.5"
 
 // CellStatus classifies the OUTCOME of a single (scenario, server)
 // cell. It is the single source of truth for whether a cell ran and
@@ -212,6 +222,14 @@ type Environment struct {
 	// Fabric describes the wire fabric (e.g. "3-host LACP 20G", or
 	// "loopback" for a single-host smoke run).
 	Fabric string `json:"fabric"`
+
+	// FabricLineRateBitsPerSec is the fabric's theoretical egress ceiling
+	// in bits/sec (e.g. 20e9 for the 2x10G LACP LAN). Used by BuildDocument
+	// to flag large-payload cells whose achieved bandwidth sat at the NIC
+	// ceiling (network-bound) rather than the server's CPU limit. Zero/
+	// omitted when the line rate is unknown (the Tailscale overlay), in
+	// which case no cell is flagged. Schema v5.5+.
+	FabricLineRateBitsPerSec int64 `json:"fabric_line_rate_bits_per_sec,omitempty"`
 }
 
 // BenchmarkConfig records the orchestrator flags + tunables that
@@ -310,6 +328,17 @@ type ServerResult struct {
 	// every metric is a nullable pointer: non-Go competitors expose
 	// RSS/CPU/FD only, leaving goroutine/GC/heap null.
 	Resources map[string]*ResourceStats `json:"resources,omitempty"`
+
+	// NetworkBound flags, per scenario, the cells whose achieved egress
+	// bandwidth sat at/near the fabric line rate while the loadgen still
+	// had CPU headroom — the NIC, not the server, capped throughput. For
+	// these cells the saturation RPS converges across every fast adapter
+	// and is NOT a ranking signal; compare ServerResult.Resources (CPU/RSS
+	// at the shared ceiling) instead. Schema v5.5+. Omitted when no cell
+	// for this adapter was network-bound (every small-payload run, and
+	// every run on a fabric with no known line rate). Older readers ignore
+	// it.
+	NetworkBound map[string]bool `json:"network_bound,omitempty"`
 
 	// CellStatuses records the non-OK outcome of every scenario this
 	// adapter did NOT produce a clean number for, keyed by

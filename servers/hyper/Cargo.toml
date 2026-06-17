@@ -39,16 +39,19 @@ name = "probatorium-hyper-server"
 path = "src/main.rs"
 
 [dependencies]
-# hyper — the raw HTTP/1 server. We drive http1::Builder::serve_connection
-# directly on accepted sockets, so the only hyper features we need are the
-# H1 server stack. No router, no tower, no axum layer — this is the
-# baseline competitors above it are measured against.
-hyper = { version = ">=1", features = ["http1", "server"] }
+# hyper — the raw HTTP server. We drive http1::Builder::serve_connection
+# (engine h1) or http2::Builder::serve_connection (engine h2c) directly on
+# accepted sockets. The "http2" feature pulls hyper's H2 server stack used
+# for prior-knowledge h2c cleartext. No router, no tower, no axum layer —
+# this is the baseline competitors above it are measured against.
+hyper = { version = ">=1", features = ["http1", "http2", "server"] }
 # hyper-util — the small glue layer hyper 1.x split out: TokioIo (adapts a
-# tokio TcpStream to hyper's I/O traits) and the graceful-shutdown watcher.
-# The `http1` feature is what makes hyper's H1 Connection implement
-# GracefulConnection, which GracefulShutdown::watch requires.
-hyper-util = { version = ">=0.1", features = ["tokio", "server", "server-graceful", "http1"] }
+# tokio TcpStream to hyper's I/O traits), TokioExecutor (the
+# Http2ServerConnExec the http2 builder requires), and the
+# graceful-shutdown watcher. The `http1`/`http2` features make hyper's
+# H1/H2 Connection implement GracefulConnection, which
+# GracefulShutdown::watch requires.
+hyper-util = { version = ">=0.1", features = ["tokio", "server", "server-graceful", "http1", "http2"] }
 # http-body-util — Full<Bytes> body type for fixed-size response bodies and
 # BodyExt::collect for draining the /upload request body.
 http-body-util = ">=0.1"

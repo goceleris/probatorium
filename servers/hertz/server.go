@@ -78,6 +78,14 @@ func registerRoutes(h *server.Hertz) {
 		ctx.SetContentType("application/json")
 		ctx.Response.SetBody(common.JSON1KPayload())
 	})
+	h.GET("/json-8k", func(_ context.Context, ctx *app.RequestContext) {
+		ctx.SetContentType("application/json")
+		ctx.Response.SetBody(common.JSON8KPayload())
+	})
+	h.GET("/json-16k", func(_ context.Context, ctx *app.RequestContext) {
+		ctx.SetContentType("application/json")
+		ctx.Response.SetBody(common.JSON16KPayload())
+	})
 	h.GET("/json-64k", func(_ context.Context, ctx *app.RequestContext) {
 		ctx.SetContentType("application/json")
 		ctx.Response.SetBody(common.JSON64KPayload())

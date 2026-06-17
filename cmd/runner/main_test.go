@@ -334,6 +334,40 @@ func TestFeatureSetTLSGating(t *testing.T) {
 	}
 }
 
+// TestNativeH2cColumnsAreH2cOnly locks the native h2c expansion: every
+// "<framework>-h2" native column carries Engine "h2c-noupg", which
+// featureSetFor must project to HTTP2C=true + HTTP1=false so ONLY the H2
+// scenarios schedule against it (the H1 grid stays on the h1 column). It
+// also pins which natives gained an h2c column (the ones whose runtimes can
+// actually serve cleartext h2c prior-knowledge) and which did NOT (drogon,
+// whose drogon build has no server-side HTTP/2 at all).
+func TestNativeH2cColumnsAreH2cOnly(t *testing.T) {
+	wantH2 := []string{
+		"axum-h2", "ntex-h2", "hyper-h2", "aspnet-h2",
+		"fastapi-h2", "hono-h2", "elysia-h2",
+	}
+	for _, name := range wantH2 {
+		a, ok := servers.Registry[name]
+		if !ok {
+			t.Errorf("expected native h2c column %q in registry", name)
+			continue
+		}
+		fs := featureSetFor(a, false)
+		if !fs.HTTP2C {
+			t.Errorf("%s: featureSetFor.HTTP2C = false, want true", name)
+		}
+		if fs.HTTP1 {
+			t.Errorf("%s: featureSetFor.HTTP1 = true, want false (h2c-noupg: H1 rows must skip it)", name)
+		}
+	}
+	// drogon genuinely cannot serve cleartext h2c (no server-side HTTP/2 in
+	// the drogon build), so there must be NO drogon-h2 column — a registered
+	// one would only ever DNF.
+	if _, ok := servers.Registry["drogon-h2"]; ok {
+		t.Error("drogon-h2 must NOT be registered: drogon has no server-side HTTP/2")
+	}
+}
+
 // TestDefaultRatedFractionsMatchBudgetModel pins the runner's default
 // rated-sweep step count to budget.DefaultRatedPasses. The ansible
 // per-column hang guard is sized from budget.ColumnWallClock using that

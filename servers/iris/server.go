@@ -81,6 +81,14 @@ func registerRoutes(app *iris.Application) {
 		ctx.ContentType("application/json")
 		_, _ = ctx.Write(common.JSON1KPayload())
 	})
+	app.Get("/json-8k", func(ctx iris.Context) {
+		ctx.ContentType("application/json")
+		_, _ = ctx.Write(common.JSON8KPayload())
+	})
+	app.Get("/json-16k", func(ctx iris.Context) {
+		ctx.ContentType("application/json")
+		_, _ = ctx.Write(common.JSON16KPayload())
+	})
 	app.Get("/json-64k", func(ctx iris.Context) {
 		ctx.ContentType("application/json")
 		_, _ = ctx.Write(common.JSON64KPayload())

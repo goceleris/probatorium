@@ -69,6 +69,12 @@ func registerRoutes(r chi.Router) {
 	r.Get("/json-1k", func(w http.ResponseWriter, _ *http.Request) {
 		common.WriteJSON1K(w)
 	})
+	r.Get("/json-8k", func(w http.ResponseWriter, _ *http.Request) {
+		common.WriteJSON8K(w)
+	})
+	r.Get("/json-16k", func(w http.ResponseWriter, _ *http.Request) {
+		common.WriteJSON16K(w)
+	})
 	r.Get("/json-64k", func(w http.ResponseWriter, _ *http.Request) {
 		common.WriteJSON64K(w)
 	})

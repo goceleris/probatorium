@@ -76,6 +76,12 @@ func registerRoutes(r *gin.Engine) {
 	r.GET("/json-1k", func(c *gin.Context) {
 		c.Data(http.StatusOK, "application/json", common.JSON1KPayload())
 	})
+	r.GET("/json-8k", func(c *gin.Context) {
+		c.Data(http.StatusOK, "application/json", common.JSON8KPayload())
+	})
+	r.GET("/json-16k", func(c *gin.Context) {
+		c.Data(http.StatusOK, "application/json", common.JSON16KPayload())
+	})
 	r.GET("/json-64k", func(c *gin.Context) {
 		c.Data(http.StatusOK, "application/json", common.JSON64KPayload())
 	})

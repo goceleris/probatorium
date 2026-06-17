@@ -307,3 +307,78 @@ func percentileI64(xs []int64, p float64) int64 {
 
 func ptrI64(v int64) *int64     { return &v }
 func ptrF64(v float64) *float64 { return &v }
+
+// ReduceResources folds a cell's per-run [ResourceStats] into one
+// representative (#154): each summary scalar is the median across the runs
+// that reported it (so a single GC spike or RSS blip does not skew the
+// headline), and the last reporting run's series is kept verbatim as the
+// illustrative trajectory. A metric stays null in the result iff it was
+// null in EVERY run, so a non-Go competitor keeps goroutine/GC null while
+// RSS/CPU/FD survive. nil run entries are skipped; the result is nil when
+// no run carried resources.
+//
+// This is the single source of truth for the per-run reduction shared by
+// the report-side [Aggregate] (the typed Document path) and the cluster
+// per-host summary (mage_bench.go summarizeCells).
+func ReduceResources(runs []*ResourceStats) *ResourceStats {
+	present := make([]*ResourceStats, 0, len(runs))
+	for _, r := range runs {
+		if r != nil {
+			present = append(present, r)
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	out := &ResourceStats{Series: present[len(present)-1].Series}
+	out.Summary.PeakRSSBytes = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.PeakRSSBytes }))
+	out.Summary.SteadyRSSBytes = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.SteadyRSSBytes }))
+	out.Summary.GCPauseP99Ns = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.GCPauseP99Ns }))
+	out.Summary.GoroutineHWM = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.GoroutineHWM }))
+	out.Summary.FDHWM = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.FDHWM }))
+	out.Summary.MeanCPUPct = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.MeanCPUPct }))
+	return out
+}
+
+// collectResI64 gathers the non-nil int64 values a selector pulls from
+// each run's summary.
+func collectResI64(runs []*ResourceStats, sel func(ResourceSummary) *int64) []int64 {
+	var out []int64
+	for _, r := range runs {
+		if v := sel(r.Summary); v != nil {
+			out = append(out, *v)
+		}
+	}
+	return out
+}
+
+// collectResF64 is collectResI64 for float metrics.
+func collectResF64(runs []*ResourceStats, sel func(ResourceSummary) *float64) []float64 {
+	var out []float64
+	for _, r := range runs {
+		if v := sel(r.Summary); v != nil {
+			out = append(out, *v)
+		}
+	}
+	return out
+}
+
+// medianI64Ptr returns the median of xs as a fresh pointer, or nil when xs
+// is empty (every run had the metric null).
+func medianI64Ptr(xs []int64) *int64 {
+	if len(xs) == 0 {
+		return nil
+	}
+	v := medianInt64(xs)
+	return &v
+}
+
+// medianF64Ptr is medianI64Ptr for floats (uses the p50 of the percentile
+// helper so the tie-break matches the RPS/CPU aggregation in this package).
+func medianF64Ptr(xs []float64) *float64 {
+	if len(xs) == 0 {
+		return nil
+	}
+	v := percentile(xs, 50)
+	return &v
+}

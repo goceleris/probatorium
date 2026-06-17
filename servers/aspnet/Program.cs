@@ -6,10 +6,10 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 // ASP.NET Core (Kestrel, minimal APIs) competitor adapter for the
 // probatorium benchmark matrix.
 //
-// Implements the same 6-endpoint contract as every other adapter
-// (servers/common/contract.go): GET / /json /json-1k /json-64k
-// /users/:id and POST /upload. The JSON payloads are produced by the
-// deterministic generator in Payload.cs, byte-identical to the Go and
+// Implements the same canonical contract as every other adapter
+// (servers/common/contract.go): GET / /json /json-1k /json-8k /json-16k
+// /json-64k /users/:id and POST /upload. The JSON payloads are produced by
+// the deterministic generator in Payload.cs, byte-identical to the Go and
 // Rust adapters so loadgen fixtures compare equal across languages.
 //
 // The server prints "ready addr=<addr>" on stdout once it is listening so
@@ -19,8 +19,16 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 // Configured for raw throughput: no logging providers, no dev middleware,
 // no HTTPS redirection, no response buffering — endpoints write bytes
 // straight to the response body.
+//
+// Wire protocol is selected by -engine (default "h1"):
+//   - h1  → HTTP/1.1 cleartext only on the listener.
+//   - h2c → HTTP/2 cleartext prior-knowledge only (no TLS, no HTTP/1.1
+//           upgrade dance), mirroring stdhttp-h2's h2c-noupg mode.
+// The two modes are strictly separated: an h1 listener never speaks h2 and
+// an h2c listener never speaks h1.
 
 var bind = "127.0.0.1:8080";
+var engine = "h1";
 for (var i = 0; i < args.Length; i++)
 {
     if (args[i] == "-bind" && i + 1 < args.Length)
@@ -28,7 +36,24 @@ for (var i = 0; i < args.Length; i++)
         bind = args[i + 1];
         i++;
     }
+    else if (args[i] == "-engine" && i + 1 < args.Length)
+    {
+        engine = args[i + 1];
+        i++;
+    }
 }
+
+if (engine != "h1" && engine != "h2c")
+{
+    Console.Error.Write($"aspnet: unknown -engine \"{engine}\" (want \"h1\" or \"h2c\")\n");
+    Environment.Exit(2);
+}
+
+// Prior-knowledge protocol selection. h2c serves HTTP/2 cleartext ONLY;
+// h1 serves HTTP/1.1 ONLY. Neither falls back to the other (no Http1AndHttp2
+// negotiation), so the listener's wire behaviour is unambiguous for the
+// conformance probe and the loadgen client.
+var protocols = engine == "h2c" ? HttpProtocols.Http2 : HttpProtocols.Http1;
 
 var (host, port) = SplitBind(bind);
 
@@ -44,11 +69,11 @@ builder.WebHost.ConfigureKestrel(options =>
     options.AllowSynchronousIO = false;
     if (host is null)
     {
-        options.ListenAnyIP(port);
+        options.ListenAnyIP(port, listenOptions => listenOptions.Protocols = protocols);
     }
     else
     {
-        options.Listen(System.Net.IPAddress.Parse(host), port);
+        options.Listen(System.Net.IPAddress.Parse(host), port, listenOptions => listenOptions.Protocols = protocols);
     }
 });
 
@@ -61,12 +86,16 @@ ReadOnlySpan<byte> jsonHello = "{\"message\":\"Hello, World!\"}"u8;
 var helloBytes = hello.ToArray();
 var jsonHelloBytes = jsonHello.ToArray();
 var json1k = Payload.Json1k;
+var json8k = Payload.Json8k;
+var json16k = Payload.Json16k;
 var json64k = Payload.Json64k;
 var okBytes = "OK"u8.ToArray();
 
 app.MapGet("/", (HttpContext ctx) => WriteBytes(ctx, "text/plain", helloBytes));
 app.MapGet("/json", (HttpContext ctx) => WriteBytes(ctx, "application/json", jsonHelloBytes));
 app.MapGet("/json-1k", (HttpContext ctx) => WriteBytes(ctx, "application/json", json1k));
+app.MapGet("/json-8k", (HttpContext ctx) => WriteBytes(ctx, "application/json", json8k));
+app.MapGet("/json-16k", (HttpContext ctx) => WriteBytes(ctx, "application/json", json16k));
 app.MapGet("/json-64k", (HttpContext ctx) => WriteBytes(ctx, "application/json", json64k));
 
 app.MapGet("/users/{id}", (HttpContext ctx, string id) =>

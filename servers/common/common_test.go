@@ -109,7 +109,7 @@ func TestEndpoints_ContractStable(t *testing.T) {
 	// Adapters iterate Endpoints in stable order at registration time.
 	// Any reorder breaks adapter authors' assumptions; any new path
 	// without a corresponding adapter helper breaks the contract.
-	wantPaths := []string{"/", "/json", "/json-1k", "/json-64k", "/users/:id", "/upload"}
+	wantPaths := []string{"/", "/json", "/json-1k", "/json-8k", "/json-16k", "/json-64k", "/users/:id", "/upload"}
 	if len(Endpoints) != len(wantPaths) {
 		t.Fatalf("Endpoints count: got %d, want %d", len(Endpoints), len(wantPaths))
 	}

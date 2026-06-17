@@ -2,10 +2,17 @@
 # Launcher for the {{ competitor_name }} python adapter.
 #
 # The orchestrator (servers.StartAdapter) execs this path with:
-#     server -bind <host:port>
-# We translate that into a uvicorn invocation under the project venv.
+#     server -bind <host:port> [-engine h1|h2c]
+# We translate that into a server invocation under the project venv.
 #
-# Performance knobs (always on):
+# -engine selects the wire protocol:
+#   h1 (or absent) → uvicorn fast path (knobs below).
+#   h2c            → HTTP/2 cleartext, prior-knowledge, no TLS. uvicorn
+#                    cannot speak HTTP/2, so we exec `python -m app.server
+#                    -engine h2c`, which serves the same ASGI app under
+#                    hypercorn. See app/server.py / pyproject.toml.
+#
+# Performance knobs (always on, h1 path):
 #   --loop uvloop        — uvloop event loop (uvicorn[standard] dep)
 #   --http httptools     — httptools parser (uvicorn[standard] dep)
 #   --no-access-log      — log per-request line cost killed
@@ -34,6 +41,7 @@ SRC_DIR="{{ competitor_src_path }}"
 APP_TARGET="{{ competitor_module_target }}"
 
 bind=""
+engine="h1"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -bind|--bind)
@@ -44,6 +52,14 @@ while [[ $# -gt 0 ]]; do
             bind="${1#*=}"
             shift
             ;;
+        -engine|--engine)
+            engine="$2"
+            shift 2
+            ;;
+        -engine=*|--engine=*)
+            engine="${1#*=}"
+            shift
+            ;;
         *)
             shift
             ;;
@@ -52,6 +68,10 @@ done
 
 if [[ -z "$bind" ]]; then
     bind="127.0.0.1:8080"
+fi
+
+if [[ -z "$engine" ]]; then
+    engine="h1"
 fi
 
 # IPv6 literal handling: [::1]:8080 → host=::1 port=8080.
@@ -74,6 +94,12 @@ export WATCHFILES_FORCE_POLLING=false
 # packages doesn't need an editable install.
 export PYTHONPATH="${SRC_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
+# The launcher's external TCP probe (below) is the single source of the
+# `ready addr=...` banner for BOTH engines. The h2c path runs
+# `app.server`, which would otherwise print its own banner — suppress it
+# so multi-banner parsing in the orchestrator stays correct.
+export PROBATORIUM_SUPPRESS_READY=1
+
 workers="$(nproc 2>/dev/null || echo 1)"
 
 # Emit `ready addr=...` ONCE after uvicorn binds. Polls the TCP port
@@ -95,11 +121,29 @@ ready_probe=$!
 # parent's exit.
 disown "$ready_probe" 2>/dev/null || true
 
-exec "${VENV_DIR}/bin/python" -m uvicorn "${APP_TARGET}" \
-    --host "${host}" \
-    --port "${port}" \
-    --workers "${workers}" \
-    --loop uvloop \
-    --http httptools \
-    --no-access-log \
-    --log-level warning
+case "${engine}" in
+    h2c)
+        # HTTP/2 cleartext (prior-knowledge, no TLS) under hypercorn.
+        # uvicorn cannot speak HTTP/2, so route through the app entry
+        # point, which selects hypercorn for -engine h2c. Single process
+        # (hypercorn's asyncio.serve runs one worker); the GET-heavy bench
+        # contract is the same app regardless of server.
+        exec "${VENV_DIR}/bin/python" -m app.server \
+            -bind "${host}:${port}" \
+            -engine h2c
+        ;;
+    h1|"")
+        exec "${VENV_DIR}/bin/python" -m uvicorn "${APP_TARGET}" \
+            --host "${host}" \
+            --port "${port}" \
+            --workers "${workers}" \
+            --loop uvloop \
+            --http httptools \
+            --no-access-log \
+            --log-level warning
+        ;;
+    *)
+        echo "fastapi launcher: unknown -engine '${engine}' (want h1|h2c)" >&2
+        exit 2
+        ;;
+esac

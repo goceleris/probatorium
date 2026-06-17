@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "full | headline (default: full — every server × every scenario, capability-gated. headline is the ~3h smoke-test opt-in, never the silent default, because users asked repeatedly for \"no missing tests\" and got the curated subset instead.)"
+        description: "full | headline. Both cover the SAME full grid (every server × every scenario, capability-gated); they differ only by per-cell window. headline (the weekly cadence) uses a shorter 60s/15s window so the whole grid fits 24h single-arch (~21.6h); full uses 90s/20s for the exhaustive sweep (~30h, needs a raised BENCH_BUDGET). Default: full."
         required: false
         type: string
         default: full
@@ -59,11 +59,12 @@ jobs:
     name: benchmark tier (amd64)
     needs: [setup]
     runs-on: [self-hosted, celeris-cluster]
-    # 72h ceiling: the full profile on one arch is ~19h single-pass, plus
+    # 72h ceiling: the full profile on one arch is ~30h single-pass (the
+    # grid grew with the mid-size payload rows + native h2c columns), plus
     # Deploy + Cleanup. Well under GitHub's 5-day self-hosted job hard
-    # limit. This is only a ceiling — the headline profile finishes in
-    # hours and exits early. BENCH_BUDGET (below) is the real fail-loud
-    # projection gate.
+    # limit. This is only a ceiling — the headline profile (same grid,
+    # shorter window) projects ~21.6h. BENCH_BUDGET (below) is the real
+    # fail-loud projection gate.
     timeout-minutes: 4320
     env:
       BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
@@ -129,10 +130,11 @@ jobs:
           # Restore "both" once the arm64 host is fixed (and #168 ArchParallel
           # lands, or the budget/timeout below is re-checked for two arches).
           BENCH_TARGET: msa2-server
-          # The full single-pass matrix runs ~19h on one arch — raise the
-          # fit budget above the 24h weekly default so BenchTier doesn't
-          # refuse a future larger registry (must stay under the job
-          # timeout-minutes above).
+          # The full single-pass matrix runs ~30h on one arch (headline is
+          # ~21.6h on the same grid) — raise the fit budget above the 24h
+          # weekly default so BenchTier doesn't refuse the full profile or a
+          # future larger registry (must stay under the job timeout-minutes
+          # above).
           BENCH_BUDGET: "70h"
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier

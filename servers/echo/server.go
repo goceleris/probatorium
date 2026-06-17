@@ -76,6 +76,12 @@ func registerRoutes(e *echo.Echo) {
 	e.GET("/json-1k", func(c echo.Context) error {
 		return c.Blob(http.StatusOK, "application/json", common.JSON1KPayload())
 	})
+	e.GET("/json-8k", func(c echo.Context) error {
+		return c.Blob(http.StatusOK, "application/json", common.JSON8KPayload())
+	})
+	e.GET("/json-16k", func(c echo.Context) error {
+		return c.Blob(http.StatusOK, "application/json", common.JSON16KPayload())
+	})
 	e.GET("/json-64k", func(c echo.Context) error {
 		return c.Blob(http.StatusOK, "application/json", common.JSON64KPayload())
 	})

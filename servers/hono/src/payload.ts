@@ -1,4 +1,4 @@
-// Deterministic 1 KiB / 64 KiB JSON payload generator.
+// Deterministic 1/8/16/64 KiB JSON payload generator.
 //
 // Byte-identical port of probatorium/servers/common/payload.go. The Go
 // reference uses encoding/json on (paginatedResponse, paginatedItem),
@@ -21,17 +21,31 @@
 // Termination rule from the Go reference: append items until the
 // marshalled length is at least targetSize. Resulting sizes:
 //   1 KiB target  -> 1026 bytes ending at item 9
+//   8 KiB target  -> 8286 bytes ending at item 75
+//   16 KiB target -> 16463 bytes ending at item 147
 //   64 KiB target -> 65618 bytes ending at item 583
 
 const HEADER = '{"page":1,"per_page":50,"total":1000,"total_pages":20,"data":[';
 const FOOTER = "]}";
 
 let json1k: Uint8Array | undefined;
+let json8k: Uint8Array | undefined;
+let json16k: Uint8Array | undefined;
 let json64k: Uint8Array | undefined;
 
 export function json1KPayload(): Uint8Array {
   if (!json1k) json1k = generate(1024);
   return json1k;
+}
+
+export function json8KPayload(): Uint8Array {
+  if (!json8k) json8k = generate(8192);
+  return json8k;
+}
+
+export function json16KPayload(): Uint8Array {
+  if (!json16k) json16k = generate(16384);
+  return json16k;
 }
 
 export function json64KPayload(): Uint8Array {

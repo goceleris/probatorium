@@ -56,6 +56,15 @@ type CellResult struct {
 	// sees no signal for this cell.
 	RatedSamples [][]RatedSample
 
+	// Resources is the per-run server-side resource aggregate (#154):
+	// one [ResourceStats] per run that captured an observer.sqlite + cpu.log
+	// sidecar (cluster path), reduced across runs by [Aggregate] into
+	// CellAggregate.Resources. Unlike Samples this is NOT strictly parallel:
+	// nil-resource runs are simply absent, so a run with loadgen samples but
+	// no observer data contributes a sample without a resource entry. Nil
+	// for the in-process loopback runner (no observer sidecar).
+	Resources []*ResourceStats
+
 	// Status is the per-cell outcome classification (schema v5.3+). The
 	// zero value ("") is treated as [CellOK] when Samples are present —
 	// [Aggregate] derives the effective status from ErrorMsg via
@@ -180,6 +189,16 @@ type CellAggregate struct {
 	// is better — this is the leaf the regression gate keys on. Nil when
 	// rated mode was off, so a non-rated run emits no fake gate signal.
 	LatencyAtSLO map[int]int
+
+	// Resources is the across-runs reduction of the cell's server-side
+	// resource sampling (#154): median of each scalar across the runs that
+	// reported it, plus the last run's downsampled series. Nil when no run
+	// carried observer data (e.g. the in-process loopback path, or a cell
+	// whose observer sidecar produced nothing). BuildDocument surfaces it on
+	// ServerResult.Resources so the report can rank by CPU/RSS efficiency —
+	// the key lever for the network-bound large-payload cells, where raw RPS
+	// converges at the NIC ceiling but CPU cost per byte still differs.
+	Resources *ResourceStats
 }
 
 // ErrNotImplemented is returned by scaffold stubs that have not yet been
@@ -275,6 +294,10 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 		}
 
 		reduceRated(cell.RatedSamples, &agg)
+
+		// Server-side resource reduction (#154): median each scalar across
+		// the runs that captured an observer sidecar. Nil when none did.
+		agg.Resources = ReduceResources(cell.Resources)
 
 		out[CellID(cell.ScenarioName, cell.ServerName)] = agg
 	}

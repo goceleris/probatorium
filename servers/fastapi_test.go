@@ -75,6 +75,8 @@ func TestFastAPIPayload(t *testing.T) {
 		expected []byte
 	}{
 		{"json-1k", "import sys; from app.payload import JSON_1K_PAYLOAD as p; sys.stdout.buffer.write(p)", common.JSON1KPayload()},
+		{"json-8k", "import sys; from app.payload import JSON_8K_PAYLOAD as p; sys.stdout.buffer.write(p)", common.JSON8KPayload()},
+		{"json-16k", "import sys; from app.payload import JSON_16K_PAYLOAD as p; sys.stdout.buffer.write(p)", common.JSON16KPayload()},
 		{"json-64k", "import sys; from app.payload import JSON_64K_PAYLOAD as p; sys.stdout.buffer.write(p)", common.JSON64KPayload()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

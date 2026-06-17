@@ -133,6 +133,12 @@ func registerRoutes(srv *celeris.Server) {
 	srv.GET("/json-1k", func(c *celeris.Context) error {
 		return c.Blob(200, "application/json", common.JSON1KPayload())
 	})
+	srv.GET("/json-8k", func(c *celeris.Context) error {
+		return c.Blob(200, "application/json", common.JSON8KPayload())
+	})
+	srv.GET("/json-16k", func(c *celeris.Context) error {
+		return c.Blob(200, "application/json", common.JSON16KPayload())
+	})
 	srv.GET("/json-64k", func(c *celeris.Context) error {
 		return c.Blob(200, "application/json", common.JSON64KPayload())
 	})

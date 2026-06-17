@@ -11,11 +11,11 @@
 //
 // Two named profiles are curated (#166):
 //
-//   - headline: the weekly default — ~15 servers x ~12 scenarios,
-//     trimmed so the realized (capability-gated) grid stays under 24h
-//     even with both arches serial (ArchParallel is blocked on #168).
-//   - full: every server x every scenario (capability-gated), the
-//     occasional exhaustive sweep.
+//   - headline: the weekly cadence — the FULL grid (every server x every
+//     scenario, capability-gated) at a shorter per-cell window so it fits
+//     24h single-arch (amd64-only today; ArchParallel is blocked on #168).
+//   - full: the same full grid at a longer window, the occasional
+//     exhaustive sweep run as a manual dispatch with a raised budget.
 //
 // Rated/SLO sweeps (#156) are an ADDITIVE second pass scoped to a curated
 // subset, so the expensive rated cost is bounded rather than multiplying
@@ -219,25 +219,21 @@ func plural(n int) string {
 }
 
 // ForProfile resolves a BENCH_PROFILE env value into a configured
-// Profile. The default (empty / "headline" / unknown) is the FULL
-// matrix — every registered server × every scenario, capability-gated —
-// so a weekly run is never silently scoped down to a curated subset
-// that drops servers or scenarios. "headline" stays available as an
-// explicit opt-in for the ~3h smoke-test path (15 servers × 12
-// scenarios, faster turnaround, narrower signal), and is the value
-// the docs test / smoke workflows continue to use. The caller may
-// still mutate Runs / Arches / ArchParallel before asserting
-// FitWithin.
+// Profile. Both "headline" and "full" now cover the SAME grid — every
+// registered server × every scenario, capability-gated (Globs "*/*") —
+// so NEITHER silently drops servers or scenarios. They differ only by the
+// per-cell window: "headline" (the weekly cadence) uses a shorter 60s/15s
+// window so the whole grid fits the 24h budget single-arch; "full" uses a
+// longer 90s/20s window for the occasional exhaustive sweep (over 24h,
+// run as a manual dispatch with a raised BENCH_BUDGET). The default (empty
+// / unknown) is "full". The caller may still mutate Runs / Arches /
+// ArchParallel before asserting FitWithin.
 //
-// History: prior versions defaulted to the headline weekly config
-// because it was the only profile that fit the 24h budget with both
-// arches serial. That default silently dropped ~85% of the registry
-// from the weekly publish (e.g. driver-*, chain-*, tls-*, ws-hub-*
-// scenarios, and 16 long-tail servers like chi / drogon / elysia /
-// fastapi / hono / iris / ntex / zig_zap). Users repeatedly asked
-// for a full benchmark and got the headline subset instead because
-// no env was set. The default flip here is the fix; the headline
-// profile is now an explicit opt-in, not a silent default.
+// History: "headline" used to be a curated ~14-server × 12-scenario
+// subset that silently dropped ~85% of the registry (driver-*, chain-*,
+// tls-*, ws-hub-*, h2/h2c variants, and the long-tail servers) from the
+// weekly publish. That curation is gone — the weekly grid is now the full
+// grid, fit under 24h by the window rather than by dropping coverage.
 func ForProfile(name string) Profile {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "full", "":

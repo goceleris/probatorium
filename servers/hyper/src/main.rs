@@ -11,6 +11,8 @@
 //   GET  /            -> "Hello, World!"  text/plain
 //   GET  /json        -> {"message":"Hello, World!"}  application/json
 //   GET  /json-1k     -> deterministic 1026-byte JSON page
+//   GET  /json-8k     -> deterministic 8286-byte JSON page
+//   GET  /json-16k    -> deterministic 16463-byte JSON page
 //   GET  /json-64k    -> deterministic 65618-byte JSON page
 //   GET  /users/{id}  -> "User ID: <id>"  text/plain
 //   POST /upload      -> read-and-discard body, reply "OK"  text/plain
@@ -26,6 +28,15 @@
 //                      bound address is reported on stdout via the
 //                      `ready addr=<addr>` line that the runner waits for
 //                      before opening loadgen.
+//   -engine <value>    default "h1". One of:
+//                        h1  — plain HTTP/1.1 (http1::Builder, as before).
+//                        h2c — HTTP/2 cleartext, PRIOR-KNOWLEDGE only:
+//                              each accepted TCP conn is served through
+//                              http2::Builder, so the client must open
+//                              with the h2 preface (curl
+//                              --http2-prior-knowledge). No TLS, no h1->h2
+//                              upgrade. Mirrors stdhttp-h2's h2c-noupg
+//                              mode. Unknown values exit non-zero.
 //
 // Lifecycle: SIGTERM (or SIGINT) stops accepting new connections and the
 // hyper-util GracefulShutdown watcher drains in-flight connections, well
@@ -36,6 +47,7 @@ mod payload;
 use std::convert::Infallible;
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::process::ExitCode;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -43,20 +55,52 @@ use hyper::body::Incoming;
 use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> std::io::Result<()> {
-    let bind = parse_bind_arg().unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let addr: SocketAddr = bind
-        .parse()
-        .unwrap_or_else(|e| panic!("hyper: bad -bind {bind:?}: {e}"));
+// Engine names the wire protocol the listener speaks. h2c is
+// prior-knowledge-only (no h1 fallback on that listener), mirroring the
+// stdhttp adapter's h2c-noupg mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    H1,
+    H2c,
+}
 
-    let listener = TcpListener::bind(addr).await?;
-    let local = listener.local_addr()?;
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> ExitCode {
+    let engine = match parse_engine_arg() {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bind = parse_bind_arg().unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let addr: SocketAddr = match bind.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("hyper: bad -bind {bind:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("hyper: bind {addr}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let local = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("hyper: local_addr: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // The runner's TCP probe waits for this exact line on stdout. Print
     // and flush before the accept loop so the probe never races the
@@ -65,10 +109,12 @@ async fn main() -> std::io::Result<()> {
     let _ = std::io::stdout().flush();
 
     // hyper 1.x has no top-level serve() like axum: we own the accept
-    // loop. http1::Builder serves one connection per accepted socket;
+    // loop. Each accepted socket is served as one connection — http1 for
+    // engine h1, http2 (prior-knowledge cleartext) for engine h2c.
     // GracefulShutdown tracks them so SIGTERM drains in-flight requests
     // instead of cutting them mid-response.
-    let http = hyper::server::conn::http1::Builder::new();
+    let http1 = hyper::server::conn::http1::Builder::new();
+    let http2 = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
     // Pin the shutdown future so it can be polled by reference across loop
     // iterations inside select! without being moved.
@@ -86,13 +132,27 @@ async fn main() -> std::io::Result<()> {
                     Err(_) => continue,
                 };
                 let io = TokioIo::new(stream);
-                let conn = http.serve_connection(io, service_fn(handle));
-                let fut = graceful.watch(conn);
-                tokio::spawn(async move {
-                    // Per-connection errors (client resets, partial sends)
-                    // are expected churn under load; drop them.
-                    let _ = fut.await;
-                });
+                // serve_connection returns different Connection types for
+                // h1 vs h2; watch() each in its own arm so the graceful
+                // watcher tracks both without a boxed trait object.
+                match engine {
+                    Engine::H1 => {
+                        let conn = http1.serve_connection(io, service_fn(handle));
+                        let fut = graceful.watch(conn);
+                        tokio::spawn(async move {
+                            // Per-connection errors (client resets, partial
+                            // sends) are expected churn under load; drop them.
+                            let _ = fut.await;
+                        });
+                    }
+                    Engine::H2c => {
+                        let conn = http2.serve_connection(io, service_fn(handle));
+                        let fut = graceful.watch(conn);
+                        tokio::spawn(async move {
+                            let _ = fut.await;
+                        });
+                    }
+                }
             }
             _ = &mut shutdown => {
                 // Stop accepting; fall through to draining below.
@@ -109,7 +169,7 @@ async fn main() -> std::io::Result<()> {
         _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
     }
 
-    Ok(())
+    ExitCode::SUCCESS
 }
 
 // parse_bind_arg walks argv looking for `-bind <value>` (Go-flag style,
@@ -130,6 +190,28 @@ fn parse_bind_arg() -> Option<String> {
         }
     }
     None
+}
+
+// parse_engine_arg reads `-engine <value>` (default "h1"). Accepts "h1"
+// and "h2c"; any other value is a hard error so a typo in the runner's
+// invocation fails fast and visibly rather than silently serving h1.
+fn parse_engine_arg() -> Result<Engine, String> {
+    let mut value: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "-engine" || a == "--engine" {
+            value = args.next();
+        } else if let Some(rest) = a.strip_prefix("-engine=") {
+            value = Some(rest.to_string());
+        } else if let Some(rest) = a.strip_prefix("--engine=") {
+            value = Some(rest.to_string());
+        }
+    }
+    match value.as_deref() {
+        None | Some("h1") => Ok(Engine::H1),
+        Some("h2c") => Ok(Engine::H2c),
+        Some(other) => Err(format!("hyper: unknown -engine {other:?} (want h1|h2c)")),
+    }
 }
 
 // shutdown_signal resolves on the first SIGTERM or SIGINT. Returning ends
@@ -157,6 +239,8 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infalli
             json_response(Bytes::from_static(br#"{"message":"Hello, World!"}"#))
         }
         (&Method::GET, "/json-1k") => json_response(Bytes::from_static(payload::json_1k())),
+        (&Method::GET, "/json-8k") => json_response(Bytes::from_static(payload::json_8k())),
+        (&Method::GET, "/json-16k") => json_response(Bytes::from_static(payload::json_16k())),
         (&Method::GET, "/json-64k") => json_response(Bytes::from_static(payload::json_64k())),
         (&Method::POST, "/upload") => {
             // Read-and-discard the request body so /upload exercises the

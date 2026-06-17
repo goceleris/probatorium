@@ -5,7 +5,8 @@ namespace AspnetAdapter;
 // Deterministic JSON payload generator — must match servers/common/payload.go
 // byte for byte so the loadgen fixtures compare equal across every adapter
 // (verified with cmp against the live common.Endpoints bytes: /json-1k =
-// 1026 bytes, /json-64k = 65618 bytes).
+// 1026 bytes, /json-8k = 8286 bytes, /json-16k = 16463 bytes,
+// /json-64k = 65618 bytes).
 //
 // The Go reference builds a paginated envelope
 //   {"page":1,"per_page":50,"total":1000,"total_pages":20,"data":[ ...items... ]}
@@ -18,6 +19,15 @@ namespace AspnetAdapter;
 internal static class Payload
 {
     internal static readonly byte[] Json1k = Generate(1024);
+
+    // Mid-size payloads bridge the 1k→64k gap: on the 20G LACP fabric the
+    // 64k cells are NIC-bound (fast adapters converge at line rate), so the
+    // 8k/16k cells stay under the ceiling and keep differentiating adapters
+    // by CPU throughput. Same parametric generator as the Go reference
+    // (generateJSONPayload with targets 8192 / 16384).
+    internal static readonly byte[] Json8k = Generate(8192);
+    internal static readonly byte[] Json16k = Generate(16384);
+
     internal static readonly byte[] Json64k = Generate(65536);
 
     private static byte[] Generate(int target)

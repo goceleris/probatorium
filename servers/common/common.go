@@ -49,6 +49,23 @@ func WriteJSON1K(w http.ResponseWriter) {
 	_, _ = w.Write(json1KPayload)
 }
 
+// WriteJSON8K writes the pre-computed ~8 KiB JSON payload (mid-size, below
+// the 20G fabric ceiling — see [JSON8KPayload]).
+func WriteJSON8K(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(json8KPayload)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(json8KPayload)
+}
+
+// WriteJSON16K writes the pre-computed ~16 KiB JSON payload (mid-size).
+func WriteJSON16K(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(json16KPayload)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(json16KPayload)
+}
+
 // WriteJSON64K writes the pre-computed ~64 KiB JSON payload.
 func WriteJSON64K(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
