@@ -1,0 +1,216 @@
+---
+# Native C toolchain + libreactor, for the libreactor adapter. Mirrors the
+# cpp/drogon role: a C framework links against system libraries, so the
+# cluster's own gcc + apt build-deps are the toolchain, and libreactor is
+# compiled from source into a pristine prefix under
+# {{ bench_root }}/libreactor.
+#
+# Pristine accounting (what cleanup.yml reverses):
+#   - apt build-deps WE installed → installed_packages (apt-purge). We probe
+#     each with dpkg -s and only request the missing ones, so a node that
+#     already ships e.g. autoconf/libssl-dev keeps them on cleanup.
+#   - the libreactor build tree + install prefix → installed_toolchains entry
+#     { lang: 'c-libreactor', path: {{ bench_root }}/libreactor } (rm -rf).
+#     The adapter's own build output lives under competitors-src/libreactor
+#     and is wiped by the bench_root sweep.
+#
+# Why build libreactor from source: libreactor is not packaged in Ubuntu's
+# repos, and adding a PPA would mutate /etc (the pristine rule forbids it).
+# A from-source autotools build into a bench_root prefix is the minimally-
+# invasive path: only the (already-tracked) generic C apt deps touch the
+# system; everything libreactor-specific stays under bench_root. Always-latest
+# stable is the newest libreactor git tag at deploy time (mirrors the
+# always-latest policy of the other roles).
+#
+# LIBREACTOR_PREFIX (exported by build_native_competitor.yml for c adapters)
+# points the adapter Makefile's -I/-L at this prefix via `make PREFIX=...`.
+
+- name: c | ensure libreactor prefix root exists
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ bench_root }}/libreactor"
+    - "{{ bench_root }}/libreactor/src"
+    - "{{ bench_root }}/libreactor/prefix"
+
+# libreactor's build deps: a C compiler (build-essential → gcc), the
+# autotools chain (autoconf/automake/libtool — libreactor ships autogen.sh,
+# not a tarball with a pre-generated configure), git (to fetch the source),
+# pkg-config, and OpenSSL dev headers (the server module embeds an SSL_CTX
+# and #includes <openssl/ssl.h>, so the static archive references libssl/
+# libcrypto symbols and the adapter links -lssl -lcrypto). Probe each so we
+# only apt-install — and therefore only later apt-purge — the missing ones.
+# libh2o (the second c adapter, h2o) adds: cmake (its build system),
+# zlib + brotli + wslay (the libh2o-evloop static archive references their
+# symbols, so the adapter links -lz -lbrotlienc -lbrotlidec -lwslay). These
+# are harmless extras on a libreactor-only deploy.
+- name: c | detect missing system packages (compiler + autotools + openssl + libh2o deps)
+  ansible.builtin.shell: |
+    for pkg in build-essential autoconf automake libtool pkg-config \
+               git ca-certificates libssl-dev \
+               cmake zlib1g-dev libbrotli-dev libwslay-dev; do
+      dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
+    done
+  register: c_missing_pkgs
+  changed_when: false
+
+- name: c | install missing apt packages
+  become: true
+  ansible.builtin.apt:
+    name: "{{ c_missing_pkgs.stdout_lines }}"
+    state: present
+    update_cache: true
+  when: c_missing_pkgs.stdout_lines | length > 0
+
+- name: c | append apt packages to manifest fact
+  ansible.builtin.set_fact:
+    installed_packages: "{{ installed_packages + c_missing_pkgs.stdout_lines }}"
+  when: c_missing_pkgs.stdout_lines | length > 0
+
+# Build libreactor from the default branch (master), NOT the newest semver
+# tag. The latest tag (v1.0.1) predates the merge of the dynamic primitives
+# into the tree: its example/*.c still `#include <dynamic.h>` (an external
+# libdynamic header) and `make all` builds those examples, so a from-source
+# build fails on the missing header. master bundles the dynamic primitives
+# (reactor_vector/reactor_pool/…) into libreactor.la and keeps examples in
+# DIST_SUBDIRS only (not built by `make all`), so it compiles clean with no
+# external deps. We pin to the resolved HEAD commit for reproducibility and
+# to mark the build prefix. ls-remote so we never clone history to resolve.
+- name: c | resolve libreactor master HEAD commit
+  ansible.builtin.shell: |
+    set -euo pipefail
+    git ls-remote https://github.com/fredrikwidlund/libreactor.git HEAD \
+      | cut -f1 | cut -c1-12
+  register: libreactor_tag
+  changed_when: false
+
+- name: c | record resolved libreactor commit
+  ansible.builtin.set_fact:
+    libreactor_version: "{{ libreactor_tag.stdout | trim }}"
+
+# Idempotency: skip the whole clone+build when the resolved version's static
+# archive already exists in the prefix. lib/libreactor.a is the canonical
+# "already built" marker the adapter Makefile links against.
+- name: c | check whether resolved libreactor is already built
+  ansible.builtin.stat:
+    path: "{{ bench_root }}/libreactor/prefix/lib/libreactor.a"
+  register: libreactor_built
+
+# Shallow-clone the default branch (master). --depth 1 with no --branch
+# fetches the current master tip, which is what we resolved above.
+- name: c | shallow-clone libreactor master
+  ansible.builtin.command:
+    cmd: >-
+      git clone --depth 1
+      https://github.com/fredrikwidlund/libreactor.git
+      {{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}
+    creates: "{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}/configure.ac"
+  when: not libreactor_built.stat.exists
+
+# autogen + configure + make + make install into the bench_root prefix.
+# libreactor is autotools: autogen.sh regenerates configure, then a normal
+# --prefix build. The default optimized build is fine; the ADAPTER picks up
+# -O3 -flto -march=native from its own Makefile. We do NOT run `make check`
+# (it needs libcmocka and is irrelevant to producing the archive).
+- name: c | autogen + configure + build + install libreactor into bench_root prefix
+  environment:
+    CFLAGS: "-O3 -march=native"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    cd "{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}"
+    ./autogen.sh
+    ./configure --prefix="{{ bench_root }}/libreactor/prefix"
+    make -j"$(nproc)"
+    make install
+  args:
+    executable: /bin/bash
+    creates: "{{ bench_root }}/libreactor/prefix/lib/libreactor.a"
+  when: not libreactor_built.stat.exists
+
+# ---------------------------------------------------------------------
+# libh2o (the h2o adapter). Built ONLY when h2o is in the competitor set,
+# so a libreactor-only deploy skips this entirely. libh2o-evloop is the
+# event-loop variant (no libuv); the adapter links it via pkg-config or
+# -I/-L against {{ bench_root }}/h2o/prefix (H2O_PREFIX in
+# build_native_competitor.yml).
+# ---------------------------------------------------------------------
+- name: c | h2o | ensure libh2o roots exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ bench_root }}/h2o"
+    - "{{ bench_root }}/h2o/src"
+    - "{{ bench_root }}/h2o/prefix"
+  when: "'h2o' in (competitor_list | default([]))"
+
+- name: c | h2o | check whether libh2o is already built
+  ansible.builtin.stat:
+    path: "{{ bench_root }}/h2o/prefix/lib/libh2o-evloop.a"
+  register: libh2o_built
+  when: "'h2o' in (competitor_list | default([]))"
+
+# h2o vendors picotls/quicly/picohttpparser as git submodules — the build
+# needs their sources, so the shallow clone MUST recurse submodules.
+- name: c | h2o | shallow-clone h2o master (with submodules)
+  ansible.builtin.command:
+    cmd: >-
+      git clone --depth 1 --recurse-submodules --shallow-submodules
+      https://github.com/h2o/h2o.git
+      {{ bench_root }}/h2o/src/h2o
+    creates: "{{ bench_root }}/h2o/src/h2o/CMakeLists.txt"
+  when:
+    - "'h2o' in (competitor_list | default([]))"
+    - not (libh2o_built.stat.exists | default(false))
+
+# Build ONLY the libh2o-evloop target (the standalone h2o server needs
+# libuv + a full link we don't want). h2o's INSTALL(TARGETS h2o) is
+# UNCONDITIONAL, so `cmake --install` would fail on the unbuilt server
+# binary — instead we stage exactly what its lib-install rules do:
+# the archive, the generated .pc (prefix-correct because CMAKE_INSTALL_PREFIX
+# is set), and the public headers from include/ + deps/{picotls,quicly}/include.
+- name: c | h2o | cmake build libh2o-evloop + stage into prefix
+  environment:
+    CFLAGS: "-O3 -march=native"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    PREFIX="{{ bench_root }}/h2o/prefix"
+    cd "{{ bench_root }}/h2o/src/h2o"
+    cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DWITH_MRUBY=off \
+      -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+      -DCMAKE_INSTALL_LIBDIR=lib
+    cmake --build build --target libh2o-evloop -j"$(nproc)"
+    mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
+    cp build/libh2o-evloop.a "$PREFIX/lib/"
+    cp build/libh2o-evloop.pc "$PREFIX/lib/pkgconfig/"
+    cp -a include/. "$PREFIX/include/"
+    cp -a deps/picotls/include/. "$PREFIX/include/"
+    cp -a deps/quicly/include/. "$PREFIX/include/"
+  args:
+    executable: /bin/bash
+    creates: "{{ bench_root }}/h2o/prefix/lib/libh2o-evloop.a"
+  when:
+    - "'h2o' in (competitor_list | default([]))"
+    - not (libh2o_built.stat.exists | default(false))
+
+- name: c | resolve installed gcc version
+  ansible.builtin.shell: |
+    gcc --version 2>/dev/null | head -1 || true
+  register: c_versions
+  changed_when: false
+
+- name: c | append toolchain entry to manifest
+  ansible.builtin.set_fact:
+    installed_toolchains: >-
+      {{ installed_toolchains
+         + [{ 'lang': 'c-libreactor',
+              'path': bench_root + '/libreactor',
+              'apt_pkgs': c_missing_pkgs.stdout_lines }] }}
+    fetched_versions: >-
+      {{ fetched_versions
+         | combine({ 'c': (c_versions.stdout | trim) + ' / libreactor ' + libreactor_version }) }}

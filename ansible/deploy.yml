@@ -342,6 +342,11 @@
               | selectattr('key', 'in', competitor_list)
               | selectattr('value.lang', 'equalto', 'cpp')
               | list | length) > 0 }}
+        need_c: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'c')
+              | list | length) > 0 }}
         need_dotnet: >-
           {{ (competitor_sources | default({}) | dict2items
               | selectattr('key', 'in', competitor_list)
@@ -362,6 +367,16 @@
               | selectattr('key', 'in', competitor_list)
               | selectattr('value.lang', 'equalto', 'python')
               | list | length) > 0 }}
+        need_node: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'node')
+              | list | length) > 0 }}
+        need_java: >-
+          {{ (competitor_sources | default({}) | dict2items
+              | selectattr('key', 'in', competitor_list)
+              | selectattr('value.lang', 'equalto', 'java')
+              | list | length) > 0 }}
 
     - name: Install rust toolchain (only when a rust competitor is in scope — incl. hyper)
       ansible.builtin.include_role:
@@ -376,6 +391,13 @@
       when:
         - inventory_hostname in groups['bench_targets']
         - need_cpp | bool
+
+    - name: Install c toolchain + libreactor (only when a c competitor is in scope)
+      ansible.builtin.include_role:
+        name: c
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_c | bool
 
     - name: Install .NET SDK (only when a dotnet competitor is in scope)
       ansible.builtin.include_role:
@@ -404,6 +426,20 @@
       when:
         - inventory_hostname in groups['bench_targets']
         - need_python | bool
+
+    - name: Install node toolchain (only when a node competitor is in scope)
+      ansible.builtin.include_role:
+        name: node
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_node | bool
+
+    - name: Install java toolchain (only when a java competitor is in scope)
+      ansible.builtin.include_role:
+        name: java
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - need_java | bool
 
     # ---------- native competitor builds ----------
     # For each non-Go competitor, push the source tarball, extract under

@@ -49,8 +49,8 @@ import (
 //
 //	BENCH_TARGET=both              msa2-server | msr1 | both
 //	BENCH_COMPETITORS=all          all | <csv>; matches Deploy filter
-//	BENCH_DURATION=120s            per-cell active duration
-//	BENCH_WARMUP=30s               per-cell warmup
+//	BENCH_DURATION=45s             per-cell active duration
+//	BENCH_WARMUP=10s               per-cell warmup
 //	BENCH_CONNECTIONS=256          loadgen concurrent conns
 //	BENCH_CELLS=*                  cell glob forwarded to the runner's
 //	                               -cells over "<scenario>/<competitor>";
@@ -161,8 +161,8 @@ func Bench() error {
 		return fmt.Errorf("BENCH_TARGET must be msa2-server, msr1, or both (got %q)", target)
 	}
 	competitors := envOrDefault("BENCH_COMPETITORS", "all")
-	duration := envOrDefault("BENCH_DURATION", "120s")
-	warmup := envOrDefault("BENCH_WARMUP", "30s")
+	duration := envOrDefault("BENCH_DURATION", "45s")
+	warmup := envOrDefault("BENCH_WARMUP", "10s")
 	conns := envOrDefault("BENCH_CONNECTIONS", "256")
 	cells := envOrDefault("BENCH_CELLS", "*")
 	// BENCH_SKIP_FILE is a JSON list of (server, scenario) pairs to

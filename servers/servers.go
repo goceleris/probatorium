@@ -286,6 +286,13 @@ var Registry = map[string]Adapter{
 		Bin:          GoBinary{ModuleDir: "servers/gnet"},
 		Capabilities: Capabilities{Static: true},
 	},
+	// nbio — lesegit/nbio epoll event-loop (the other Go async-IO lib next to
+	// gnet). Separate module (servers/nbio/go.mod). H1-only, Static.
+	"nbio-h1": {
+		Name: "nbio-h1", Category: "go-nbio", Language: "go", Framework: "nbio", Engine: "h1",
+		Bin:          GoBinary{ModuleDir: "servers/nbio"},
+		Capabilities: Capabilities{Static: true},
+	},
 
 	// fasthttp + fiber — H1-only. fiber wraps fasthttp.
 	"fasthttp-h1": {
@@ -354,21 +361,17 @@ var Registry = map[string]Adapter{
 		},
 		Capabilities: Capabilities{Static: true},
 	},
-	// ntex-h2 — prior-knowledge h2c via ntex's native HTTP/2 codec. Shares
-	// the competitors/ntex build (see axum-h2).
-	"ntex-h2": {
-		Name: "ntex-h2", Category: "rust-ntex", Language: "rust", Framework: "ntex", Engine: "h2c-noupg",
-		Bin: NativeBinary{
-			Lang: "rust",
-			BuildSteps: []string{
-				"source $RUSTUP_HOME/env",
-				"cd $SRC && cargo build --profile release-fat",
-			},
-			RunCmd:  "{bin} -bind {bind}",
-			BinName: "ntex",
-		},
-		Capabilities: Capabilities{Static: true},
-	},
+	// ntex has NO h2c column. ntex's low-level server::build()+HttpService::h2
+	// path serves h2c prior-knowledge for a single connection (curl
+	// --http2-prior-knowledge → 200) but FAILS the HTTP/2 handshake under the
+	// loadgen's concurrent connection pool: it stops emitting the server
+	// SETTINGS frame around the ~15th simultaneous dial, so the loadgen aborts
+	// with "h2client: dial conn[15]: read server settings: i/o timeout" before
+	// the bench can start — a guaranteed-DNF cell. Unlike hyper/axum (whose
+	// hyper-backed h2 server handshakes immediately), ntex's h2c cannot sustain
+	// the bench's concurrent dial, so we register no ntex-h2 column rather than
+	// ship a cell that always DNFs (same policy as drogon-h2 / libreactor-h2).
+	// ntex-h1 is unaffected and stays. Revisit if ntex's h2c handshake improves.
 
 	// hyper — the raw Rust baseline axum / ntex are all built
 	// on or measured against. No router crate, no tower stack: the adapter
@@ -532,8 +535,11 @@ var Registry = map[string]Adapter{
 	// reuse-port primitive; the registry entry is intentionally
 	// absent so the bench never schedules a column against it.
 
-	// celeris — 4 engine modes selected at runtime via -engine. The
-	// binary is the same; entries differ only in Engine + Name.
+	// celeris — 9 engine modes selected at runtime via -engine. The
+	// binary is the same; entries differ only in Engine + Name. The first
+	// 4 are the original headline columns; the next 5 (adaptive ×2,
+	// epoll-async ×2, iouring-h1-sync) isolate the engine × sync/async ×
+	// adaptive axes the v1.5.x work added.
 	"celeris-iouring-h1-async": {
 		Name: "celeris-iouring-h1-async", Category: "celeris", Language: "go", Framework: "celeris",
 		Engine:       "iouring-h1-async",
@@ -555,6 +561,41 @@ var Registry = map[string]Adapter{
 	"celeris-std-h1": {
 		Name: "celeris-std-h1", Category: "celeris", Language: "go", Framework: "celeris",
 		Engine:       "std-h1",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
+	},
+	// adaptive meta-engine (the v1.5.x headline): starts epoll, promotes
+	// new conns to io_uring under sustained load. h1 + auto(h2c) variants.
+	"celeris-adaptive-h1-async": {
+		Name: "celeris-adaptive-h1-async", Category: "celeris", Language: "go", Framework: "celeris",
+		Engine:       "adaptive-h1-async",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
+	},
+	"celeris-adaptive-auto+upg-async": {
+		Name: "celeris-adaptive-auto+upg-async", Category: "celeris", Language: "go", Framework: "celeris",
+		Engine:       "adaptive-auto+upg-async",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
+	},
+	// engine × sync/async grid completers — epoll-async (h1 + h2c) and
+	// iouring-h1-sync — so the matrix can isolate the sync-vs-async axis on
+	// a fixed engine, and h2c on epoll (which the original 4 could not express).
+	"celeris-epoll-h1-async": {
+		Name: "celeris-epoll-h1-async", Category: "celeris", Language: "go", Framework: "celeris",
+		Engine:       "epoll-h1-async",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
+	},
+	"celeris-epoll-auto+upg-async": {
+		Name: "celeris-epoll-auto+upg-async", Category: "celeris", Language: "go", Framework: "celeris",
+		Engine:       "epoll-auto+upg-async",
+		Bin:          GoBinary{ModuleDir: "servers/celeris"},
+		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
+	},
+	"celeris-iouring-h1-sync": {
+		Name: "celeris-iouring-h1-sync", Category: "celeris", Language: "go", Framework: "celeris",
+		Engine:       "iouring-h1-sync",
 		Bin:          GoBinary{ModuleDir: "servers/celeris"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true, WS: true, SSE: true, TLS: true},
 	},
@@ -610,6 +651,118 @@ var Registry = map[string]Adapter{
 			RunCmd:  "{name} -bind {bind}",
 			BinName: "elysia",
 		},
+	},
+
+	// ---- wave-6 native competitors (h1 columns; -h2 siblings follow once
+	// the h1 grid is cluster-verified). Each rides an existing or new
+	// toolchain role; see ansible/roles/<lang> + mage_cluster.go specs. ----
+
+	// actix — actix-web 4.x (rust role, unchanged). Worker-per-core, no TLS.
+	"actix": {
+		Name: "actix", Category: "rust-actix", Language: "rust", Framework: "actix-web", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:       "rust",
+			BuildSteps: []string{"source $RUSTUP_HOME/env", "cd $SRC && cargo build --profile release-fat"},
+			RunCmd:     "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// starlette — pure ASGI Starlette on uvicorn (python role, like fastapi).
+	"starlette": {
+		Name: "starlette", Category: "python-starlette", Language: "python", Framework: "starlette", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:   "python",
+			RunCmd: "{bench}/competitors/{name}/server -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// bunraw — raw Bun.serve baseline, no framework (the bun analogue of hyper).
+	"bunraw": {
+		Name: "bunraw", Category: "bun-ts", Language: "bun", Framework: "bunraw", Engine: "",
+		Bin: NativeBinary{
+			Lang:   "bun",
+			RunCmd: "{name} -bind {bind}",
+		},
+	},
+	// httpzig — karlseguin/http.zig (zig role). HTTP/1.1-only.
+	"httpzig": {
+		Name: "httpzig", Category: "zig-httpz", Language: "zig", Framework: "httpzig", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:       "zig",
+			BuildSteps: []string{"cd $SRC && zig build -Doptimize=ReleaseFast"},
+			RunCmd:     "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// lithium — matt-42/lithium (cpp role + Boost.Context). HTTP/1.x-only.
+	"lithium": {
+		Name: "lithium", Category: "cpp-lithium", Language: "cpp", Framework: "lithium", Engine: "h1",
+		Bin: NativeBinary{
+			Lang: "cpp",
+			BuildSteps: []string{
+				"cd $SRC && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release",
+				"cd $SRC && cmake --build build -j",
+			},
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// h2o — libh2o evloop server (c role EXTENDED to build libh2o into
+	// {bench}/h2o/prefix; H2O_PREFIX env points the adapter Makefile there).
+	"h2o": {
+		Name: "h2o", Category: "c-h2o", Language: "c", Framework: "h2o", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:       "c",
+			BuildSteps: []string{"cd $SRC && make H2O_PREFIX=\"$H2O_PREFIX\" CFLAGS_EXTRA=-march=native"},
+			RunCmd:     "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// uws — uWebSockets.js (NEW node role; launcher tier like bun). HTTP/1.1.
+	"uws": {
+		Name: "uws", Category: "node-uws", Language: "node", Framework: "uWebSockets.js", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:   "node",
+			RunCmd: "{name} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// fastify — Fastify (node role). Launcher symlinked at competitors/fastify
+	// (bun-style), so RunCmd is the {name} form, NOT {bench}/.../{name}/server.
+	"fastify": {
+		Name: "fastify", Category: "node-fastify", Language: "node", Framework: "fastify", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:   "node",
+			RunCmd: "{name} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// express — Express 5 (node role), the JS baseline floor. HTTP/1.1-only.
+	"express": {
+		Name: "express", Category: "node-express", Language: "node", Framework: "express", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:   "node",
+			RunCmd: "{name} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// vertx — Eclipse Vert.x (NEW java role; maven fat jar + launcher).
+	"vertx": {
+		Name: "vertx", Category: "java-vertx", Language: "java", Framework: "vertx", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:   "java",
+			RunCmd: "{bin} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
+	},
+	// netty — raw Netty HTTP/1.1 (java role), the JVM floor analogue of hyper.
+	"netty": {
+		Name: "netty", Category: "java-netty", Language: "java", Framework: "netty", Engine: "h1",
+		Bin: NativeBinary{
+			Lang:   "java",
+			RunCmd: "{name} -bind {bind}",
+		},
+		Capabilities: Capabilities{Static: true},
 	},
 }
 

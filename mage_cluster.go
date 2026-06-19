@@ -626,6 +626,40 @@ var nativeBuildSpecs = map[string]nativeBuildSpec{
 	"hono":    {lang: "bun"},
 	"elysia":  {lang: "bun"},
 	"fastapi": {lang: "python", moduleTarget: "app.server:app"},
+
+	// ---- wave-6 native competitors ----
+	"actix": {
+		lang:      "rust",
+		buildCmd:  "cargo build --profile release-fat",
+		binaryRel: "target/release-fat/probatorium-actix-server",
+	},
+	"starlette": {lang: "python", moduleTarget: "app.server:app"},
+	"bunraw":    {lang: "bun"},
+	"httpzig": {
+		lang:      "zig",
+		buildCmd:  "zig build -Doptimize=ReleaseFast",
+		binaryRel: "zig-out/bin/httpzig",
+	},
+	"lithium": {
+		lang:      "cpp",
+		buildCmd:  "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j",
+		binaryRel: "build/lithium-adapter",
+	},
+	// h2o — c role builds libh2o into {bench}/h2o/prefix; the adapter Makefile
+	// reads $H2O_PREFIX (env in build_native_competitor.yml) for -I/-L.
+	"h2o": {
+		lang:      "c",
+		buildCmd:  "make H2O_PREFIX=\"$H2O_PREFIX\" CFLAGS_EXTRA=-march=native",
+		binaryRel: "h2o-adapter",
+	},
+	// node + java are launcher langs (like bun): the role's build_competitor.yml
+	// owns npm install / mvn package + launcher rendering, so the spec carries
+	// only lang (buildCmd/binaryRel empty).
+	"uws":     {lang: "node"},
+	"fastify": {lang: "node"},
+	"express": {lang: "node"},
+	"vertx":   {lang: "java"},
+	"netty":   {lang: "java"},
 }
 
 // selectNativeCompetitors returns the list of non-Go competitor slugs

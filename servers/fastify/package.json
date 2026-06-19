@@ -1,0 +1,16 @@
+{
+  "name": "probatorium-fastify-server",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Fastify (Node.js) adapter for the probatorium contract.",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "//versions": "Always-latest policy: fastify is pinned to `latest` so `npm install` resolves the newest cut at deploy time. Do NOT pin an upper bound — the bench is meant to track upstream as-is. There is NO bundle step: Node runs src/server.js directly against node_modules.",
+  "//run": "`node src/server.js -bind <host:port> [-engine h1|h2c]` is the canonical entry. The ansible node role writes a POSIX-sh launcher at competitors/fastify that execs the bench-installed node on this file, forwarding argv.",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "fastify": "latest"
+  }
+}

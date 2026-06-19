@@ -37,6 +37,13 @@
 /servers/elysia/bun.lock
 /servers/elysia/bun.lockb
 
+# Express (Node.js) competitor adapter. node runs src/ directly (no
+# bundle), so only the resolved-deps cache and npm's lockfile stay out
+# of git — every cluster deploy does a fresh `npm install` against the
+# upstream registry, enforcing the always-latest policy.
+/servers/express/node_modules/
+/servers/express/package-lock.json
+
 # Python adapter local-dev artefacts. The cluster builds the venv under
 # {{ bench_root }}/competitors/<name>/.venv via the python ansible role
 # — both the in-repo .venv and the bytecode caches are dev-only debris.
@@ -83,3 +90,18 @@ servers/_docker/**/*.tar
 /validation/refapp/driver_memcached/driver_memcached
 /validation/refapp/observability/observability
 /validation/refapp/static_swagger_proxy/static_swagger_proxy
+
+# wave-6 native competitor adapters (actix/lithium/starlette/bunraw/httpzig/
+# h2o/uws/fastify/express/vertx/netty + nbio). The cluster builds every
+# artefact under bench_root; nothing here should be committed. Generic globs
+# so a local validation build never dirties the tree.
+/servers/*/target/
+/servers/*/build/
+/servers/*/node_modules/
+/servers/*/dist/
+/servers/*/zig-out/
+/servers/*/.zig-cache/
+/servers/**/__pycache__/
+/servers/*/server
+/servers/actix/target/
+/servers/actix/Cargo.lock

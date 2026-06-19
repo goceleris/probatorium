@@ -1,0 +1,17 @@
+{
+  "name": "probatorium-bunraw-server",
+  "private": true,
+  "type": "module",
+  "//purpose": "Raw Bun.serve baseline — NO web framework. A single hand-rolled fetch(req) router over Bun.serve, the Bun analogue of the rust 'hyper' baseline. Hence zero runtime dependencies; only the Bun/TypeScript dev tooling.",
+  "//build": "Bundles src/server.ts into a single dist/server file via Bun's native bundler. --target=bun keeps Bun built-ins (Bun.serve, node:http2, ...) external; --minify shaves bytes; --sourcemap=none keeps deploys lean. The wrapper script written by the ansible build step then execs `bun run dist/server` so the runtime is Bun, not node.",
+  "//run": "`bun run dist/server` is the canonical entry — invoked by the launcher symlink the ansible build_native_competitor task creates. CLI args after `--` are forwarded to the script (process.argv).",
+  "//versions": "Always-latest policy: deps use unbounded `latest` so `bun install` resolves the newest cut at deploy time. Do NOT pin — the bench is meant to track upstream as-is.",
+  "scripts": {
+    "build": "bun build --target=bun --minify --sourcemap=none ./src/server.ts --outfile=./dist/server",
+    "start": "bun run dist/server"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
