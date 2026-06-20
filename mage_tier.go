@@ -126,7 +126,11 @@ func BenchTier() error {
 	// benchmarks[].latency_at_slo alongside the per-scenario saturation
 	// data, so the dashboard's headline reads "for this server × this
 	// scenario: RPS, p99-at-1s, SLO" all from one Document.
-	skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true"
+	// Rated OFF when the caller asks (BENCH_SKIP_RATED) OR the profile ships
+	// no rated sweep (RatedPasses==0, e.g. the "fast" routine/weekly profile).
+	// Rated is the dominant per-cell cost (4 closed-loop passes), so the
+	// default fast profile leaves it off and runs the full grid saturation-only.
+	skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true" || p.RatedPasses == 0
 	if skipRated {
 		_ = os.Unsetenv("BENCH_RATED")
 	} else {

@@ -236,12 +236,14 @@ func plural(n int) string {
 // grid, fit under 24h by the window rather than by dropping coverage.
 func ForProfile(name string) Profile {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "full", "":
+	case "fast", "":
+		return Fast()
+	case "full":
 		return Full()
 	case "headline":
 		return HeadlineWeekly()
 	default:
-		return Full()
+		return Fast()
 	}
 }
 

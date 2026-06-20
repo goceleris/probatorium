@@ -111,6 +111,41 @@ func HeadlineWeekly() Profile {
 	}
 }
 
+// FastRealizedCells is the live capability-gated saturation cell count of
+// the full "*/*" grid (every server × every scenario the scheduler keeps).
+// Recompute with `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when
+// the registry grows; FitWithin uses it to assert the fast profile still
+// fits 24h, so an over-large grid fails loudly instead of overrunning.
+const FastRealizedCells = 1257
+
+// Fast is the DEFAULT routine + weekly profile: the FULL grid (every server
+// × every scenario, capability-gated, "*/*") in SATURATION ONLY — no rated
+// sweep — at a 35s/10s window so the whole grid fits comfortably under 24h
+// on one arch. Saturation gives the headline ceiling (max RPS + tail latency
+// at saturation) for every cell; the rated/SLO sweep (4 closed-loop passes
+// per cell, the dominant cost) is intentionally OFF here and belongs in a
+// separate, scoped dispatch when latency-under-controlled-load is the story.
+//
+// Budget: 1257 cells × (10+35+5+12)s × 1 arch = ~21.6h saturation, rated=0
+// → ~21.6h < 24h. RatedPasses=0 makes BenchTier skip the rated flag entirely
+// (rated OFF for every cell), so this is the cheap, full-breadth mode.
+func Fast() Profile {
+	return Profile{
+		Name:         "fast",
+		Cells:        FastRealizedCells,
+		Duration:     35 * time.Second,
+		Warmup:       10 * time.Second,
+		Cooldown:     defaultCooldown,
+		Runs:         1,
+		Arches:       1,
+		ArchParallel: false,
+		RatedCells:   0, // rated OFF — saturation-only
+		RatedPasses:  0,
+		Globs:        []string{"*/*"},
+		RatedGlobs:   nil,
+	}
+}
+
 // Full is the exhaustive sweep: every server x every scenario at a
 // slightly longer 90s/20s window, single pass and the rated subset. Far
 // over the 24h weekly budget with the long window — Full is a manual
