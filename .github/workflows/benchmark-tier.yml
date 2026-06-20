@@ -64,7 +64,13 @@ jobs:
   matrix:
     name: benchmark tier (amd64)
     needs: [setup]
-    runs-on: [self-hosted, celeris-cluster]
+    # Orchestrate from msr1 specifically: the ansible control loop + result
+    # aggregation must NOT share a host with the SUT (bench_target=msa2-server)
+    # or the loadgen (msa2-client), or its CPU/IO steals from the measurement.
+    # msr1 (arm64) is unusable as a BENCH target under NIC load (firmware bug
+    # celeris#312) but is perfectly safe and otherwise-idle as the conductor —
+    # it just runs ansible over SSH. This keeps the amd64 SUT's numbers clean.
+    runs-on: [self-hosted, celeris-cluster, msr1]
     # 72h ceiling: the full profile on one arch is ~30h single-pass (the
     # grid grew with the mid-size payload rows + native h2c columns), plus
     # Deploy + Cleanup. Well under GitHub's 5-day self-hosted job hard
