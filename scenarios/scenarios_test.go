@@ -12,26 +12,20 @@ import (
 // files and are deliberately excluded here — this test guards the slice
 // we own, not the ones we don't.
 var expectedRegistry = []string{
-	// static H1 (12)
+	// static H1 (6) — v1.5.4 cut the NIC-bound 8k/16k/64k GET + 8k/16k/64k
+	// POST rows; post-1m kept as the single documented wire-bound datapoint.
 	"churn-close",
 	"get-json",
 	"get-json-1k",
-	"get-json-8k",
-	"get-json-16k",
-	"get-json-64k",
 	"get-simple",
 	"post-1m",
 	"post-4k",
-	"post-8k",
-	"post-16k",
-	"post-64k",
 
-	// static H2-prior-knowledge (4) — exercise h2c-noupg and other
-	// HTTP2C-capable cells that the H1 variants skip.
-	"get-json-64k-h2",
+	// static H2-prior-knowledge (2) — exercise h2c-noupg and other
+	// HTTP2C-capable cells that the H1 variants skip. v1.5.4 cut the
+	// saturated 64k h2 rows.
 	"get-json-h2",
 	"post-4k-h2",
-	"post-64k-h2",
 
 	// concurrency (5)
 	"get-json-1c",
@@ -107,7 +101,6 @@ func TestStaticPOSTBodiesExactSize(t *testing.T) {
 		want int
 	}{
 		{"post-4k", 4 * 1024},
-		{"post-64k", 64 * 1024},
 		{"post-1m", 1024 * 1024},
 	}
 	for _, tc := range cases {
@@ -135,8 +128,8 @@ func TestStaticScenariosRequireHTTP1(t *testing.T) {
 	h1Only := servers.FeatureSet{HTTP1: true}
 	h2cOnly := servers.FeatureSet{HTTP2C: true}
 	for _, name := range []string{
-		"churn-close", "get-json", "get-json-1k", "get-json-64k",
-		"get-simple", "post-1m", "post-4k", "post-64k",
+		"churn-close", "get-json", "get-json-1k",
+		"get-simple", "post-1m", "post-4k",
 	} {
 		s := findScenario(t, name)
 		if !s.Applicable(h1Only) {
@@ -216,7 +209,7 @@ func TestStaticH2ScenariosRequireHTTP2C(t *testing.T) {
 	t.Parallel()
 	h1Only := servers.FeatureSet{HTTP1: true}
 	h2cOnly := servers.FeatureSet{HTTP2C: true}
-	for _, name := range []string{"get-json-h2", "get-json-64k-h2", "post-4k-h2", "post-64k-h2"} {
+	for _, name := range []string{"get-json-h2", "post-4k-h2"} {
 		s := findScenario(t, name)
 		if s.Applicable(h1Only) {
 			t.Errorf("%q: applicable to HTTP1-only server (H2 scenario needs HTTP2C)", name)
@@ -230,9 +223,9 @@ func TestStaticH2ScenariosRequireHTTP2C(t *testing.T) {
 func TestCategories(t *testing.T) {
 	t.Parallel()
 	for _, name := range []string{
-		"churn-close", "get-json", "get-json-1k", "get-json-64k",
-		"get-simple", "post-1m", "post-4k", "post-64k",
-		"get-json-h2", "get-json-64k-h2", "post-4k-h2", "post-64k-h2",
+		"churn-close", "get-json", "get-json-1k",
+		"get-simple", "post-1m", "post-4k",
+		"get-json-h2", "post-4k-h2",
 	} {
 		s := findScenario(t, name)
 		if got := s.Category(); got != CategoryStatic {
