@@ -636,8 +636,12 @@ var nativeBuildSpecs = map[string]nativeBuildSpec{
 	"starlette": {lang: "python", moduleTarget: "app.server:app"},
 	"bunraw":    {lang: "bun"},
 	"httpzig": {
-		lang:      "zig",
-		buildCmd:  "zig build -Doptimize=ReleaseFast",
+		lang: "zig",
+		// ReleaseSafe (not ReleaseFast): http.zig's NonBlocking worker hits an
+		// `unreachable` under connection churn (churn-close) that becomes a
+		// silent process-killing UB in ReleaseFast; ReleaseSafe makes it a
+		// recoverable panic instead. This is the actual build the cluster uses.
+		buildCmd:  "zig build -Doptimize=ReleaseSafe",
 		binaryRel: "zig-out/bin/httpzig",
 	},
 	"lithium": {

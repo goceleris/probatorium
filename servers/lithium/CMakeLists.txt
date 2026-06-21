@@ -29,7 +29,10 @@ endif()
 # response.set_header/write, request.url_parameters(s::id=...),
 # request.http_ctx.read_whole_body(), li::http_serve(api, port,
 # s::nthreads=...)).
-set(LITHIUM_COMMIT "master" CACHE STRING "Upstream matt-42/lithium revision to vendor")
+# Pinned (not "master") so the input-buffer patch below targets an exact,
+# reproducible source literal. This tip still has `buffer_(50 * 1024)` verbatim
+# and an unchanged adapter API (li::http_api, read_whole_body, s::nthreads).
+set(LITHIUM_COMMIT "879620e6df4540eefa4c6ae408934307d305e9d9" CACHE STRING "Upstream matt-42/lithium revision to vendor")
 
 set(_lithium_header "")
 if(DEFINED LITHIUM_HEADER_DIR AND EXISTS "${LITHIUM_HEADER_DIR}/lithium_http_server.hh")
@@ -59,6 +62,32 @@ else()
 endif()
 message(STATUS "lithium: using header from ${_lithium_header}")
 
+# --- patch the input buffer cap (post-64k / post-1m DNF fix) ---------------
+#
+# lithium's single header hard-codes the per-connection input buffer at
+# `buffer_(50 * 1024)` (50 KiB) and NEVER grows it, so a request body larger
+# than ~50 KiB (post-64k = 64 KiB, post-1m = 1 MiB) yields zero successful
+# requests (the server reads-and-discards via read_whole_body, but the body
+# never fully buffers). Copy the resolved header into a build-owned dir and
+# bump the cap to 2 MiB, then HARD-FAIL if the literal wasn't found (so a
+# silent upstream drift can't ship the 50 KiB cap with a green build).
+set(_lithium_patched "${CMAKE_CURRENT_BINARY_DIR}/lithium_patched")
+configure_file("${_lithium_header}/lithium_http_server.hh"
+               "${_lithium_patched}/lithium_http_server.hh" COPYONLY)
+execute_process(
+    COMMAND sed -i.bak "s/buffer_(50 \\* 1024)/buffer_(2 * 1024 * 1024)/"
+            "${_lithium_patched}/lithium_http_server.hh"
+    RESULT_VARIABLE _sed_rc)
+file(READ "${_lithium_patched}/lithium_http_server.hh" _patched_src)
+string(FIND "${_patched_src}" "buffer_(2 * 1024 * 1024)" _has_patch)
+if(_has_patch EQUAL -1)
+    message(FATAL_ERROR "lithium: input-buffer patch did not apply — upstream literal "
+                        "'buffer_(50 * 1024)' not found at commit ${LITHIUM_COMMIT}; refusing to "
+                        "build the 50KB-capped header (would dnf post-64k/post-1m). Re-pin "
+                        "LITHIUM_COMMIT and update the sed pattern.")
+endif()
+message(STATUS "lithium: input buffer patched to 2 MiB")
+
 # --- link dependencies ----------------------------------------------------
 #
 # lithium links against pthread (Threads), OpenSSL (ssl + crypto, used by
@@ -70,7 +99,7 @@ find_package(OpenSSL REQUIRED)
 find_package(Boost REQUIRED COMPONENTS context)
 
 add_executable(lithium-adapter src/main.cc)
-target_include_directories(lithium-adapter PRIVATE "${_lithium_header}")
+target_include_directories(lithium-adapter PRIVATE "${_lithium_patched}")
 target_link_libraries(lithium-adapter PRIVATE
     Threads::Threads
     OpenSSL::SSL

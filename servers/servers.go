@@ -689,7 +689,7 @@ var Registry = map[string]Adapter{
 		Name: "httpzig", Category: "zig-httpz", Language: "zig", Framework: "httpzig", Engine: "h1",
 		Bin: NativeBinary{
 			Lang:       "zig",
-			BuildSteps: []string{"cd $SRC && zig build -Doptimize=ReleaseFast"},
+			BuildSteps: []string{"cd $SRC && zig build -Doptimize=ReleaseSafe"}, // ReleaseSafe turns http.zig's churn-race UB into a recoverable panic (the bench respawns it)
 			RunCmd:     "{bin} -bind {bind}",
 		},
 		Capabilities: Capabilities{Static: true},
