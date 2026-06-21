@@ -139,7 +139,7 @@ func TestForProfileDefaultHasFullCoverage(t *testing.T) {
 		t.Fatalf("default profile must cover the full grid (Globs '*/*'), got %v", def.Globs)
 	}
 	if def.Cells < 400 {
-		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~800 capability-gated), got %d. "+
+		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~1111 capability-gated), got %d. "+
 			"A value this low means the default was silently scoped down to a curated subset.",
 			def.Cells)
 	}

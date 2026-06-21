@@ -56,17 +56,17 @@ const (
 	HeadlineRealizedCells      = FullRealizedCells
 	HeadlineRatedRealizedCells = 24 // 8 rated servers x 3 rated scenarios, capability-gated
 
-	// Full profile: every server x every scenario, capability-gated. After
-	// the mid-size payload rows (get/post-json-8k/16k) and the native h2c
-	// columns (axum/ntex/hyper/aspnet/fastapi/hono/elysia -h2) landed, the
-	// nominal grid is ~36 columns x 45 rows ~ 1620; capability gating (the
-	// streaming / driver / chain / TLS cells, plus the h2c-noupg columns
-	// skipping every H1 row) lands the realized count near ~800. Pinned
-	// conservatively high so FitWithin over-projects slightly and a registry
-	// change that blows the budget fails loudly rather than overflowing the
-	// run. Recompute with the scheduler's Applicable gate when the registry
-	// grows again.
-	FullRealizedCells      = 820
+	// Full profile: every server x every scenario, capability-gated. This is
+	// the SAME realized "*/*" grid Fast runs (FullRealizedCells ==
+	// FastRealizedCells); the profiles differ only by per-cell window. The
+	// v1.5.4 redesign reshaped the grid — saturated static rows pruned (W1),
+	// the driver set deepened 4->10 (W3), and WS/SSE coverage added to three
+	// more columns (W4) — so the realized count moved off the older ~800/1257
+	// pins. Recompute with `cmd/runner -dry-run -cells '*/*' | grep -c
+	// '^run0'` when the registry changes; the nominal grid is 52 columns x 44
+	// rows and capability gating (the streaming / driver / chain / TLS cells,
+	// plus the h2c-noupg columns skipping every H1 row) lands it here.
+	FullRealizedCells      = 1111
 	FullRatedRealizedCells = 24
 )
 
@@ -88,16 +88,19 @@ const (
 // the correct loud failure, since the full grid x 2 serial arches cannot fit
 // 24h until ArchParallel (#168, blocked on loadgen linux/arm64) lands.
 //
-// Budget: ~820 cells x (15+60+5+12)s x 1 arch = ~20.9h saturation + ~0.7h
-// curated rated = ~21.6h < 24h. The rated sweep stays curated (RatedGlobs)
-// because it is the expensive additive dimension; expanding it to the full
-// grid would blow the budget many times over.
+// Budget: ~1111 cells x (12+40+5+12)s x 1 arch = ~21.3h saturation + ~0.7h
+// curated rated = ~22.0h < 24h. The per-cell window was shortened from
+// 60s/15s to 40s/12s in the v1.5.4 redesign so the grown full grid (1111
+// realized cells, up from ~820) still fits 24h — the longer window no
+// longer does. The rated sweep stays curated (RatedGlobs) because it is the
+// expensive additive dimension; expanding it to the full grid would blow
+// the budget many times over.
 func HeadlineWeekly() Profile {
 	return Profile{
 		Name:          "headline",
 		Cells:         HeadlineRealizedCells,
-		Duration:      60 * time.Second,
-		Warmup:        15 * time.Second,
+		Duration:      40 * time.Second,
+		Warmup:        12 * time.Second,
 		Cooldown:      defaultCooldown,
 		Runs:          1,
 		Arches:        1,
@@ -116,7 +119,9 @@ func HeadlineWeekly() Profile {
 // Recompute with `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when
 // the registry grows; FitWithin uses it to assert the fast profile still
 // fits 24h, so an over-large grid fails loudly instead of overrunning.
-const FastRealizedCells = 1257
+// v1.5.4 redesign: 1257 -> 1111 (W1 pruned saturated static rows; W3
+// deepened drivers 4->10; W4 added WS/SSE to three columns).
+const FastRealizedCells = 1111
 
 // Fast is the DEFAULT routine + weekly profile: the FULL grid (every server
 // × every scenario, capability-gated, "*/*") in SATURATION ONLY — no rated
@@ -126,8 +131,8 @@ const FastRealizedCells = 1257
 // per cell, the dominant cost) is intentionally OFF here and belongs in a
 // separate, scoped dispatch when latency-under-controlled-load is the story.
 //
-// Budget: 1257 cells × (10+35+5+12)s × 1 arch = ~21.6h saturation, rated=0
-// → ~21.6h < 24h. RatedPasses=0 makes BenchTier skip the rated flag entirely
+// Budget: 1111 cells × (10+35+5+12)s × 1 arch = ~19.1h saturation, rated=0
+// → ~19.1h < 24h. RatedPasses=0 makes BenchTier skip the rated flag entirely
 // (rated OFF for every cell), so this is the cheap, full-breadth mode.
 func Fast() Profile {
 	return Profile{
