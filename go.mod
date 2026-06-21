@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf
-	github.com/goceleris/loadgen v1.4.8
+	github.com/goceleris/loadgen v1.4.9
 	github.com/google/gofuzz v1.2.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pierrec/lz4/v4 v4.1.27
@@ -25,7 +25,7 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	modernc.org/libc v1.72.3 // indirect
