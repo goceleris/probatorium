@@ -123,9 +123,13 @@
   become: true
   ansible.builtin.shell: |
     bp={{ bench_port | default(8080) }}
-    # Kill the prior column's respawn supervisor FIRST (pid at a fixed path) so
-    # it cannot relaunch the SUT we are about to reap. Without this the bounded
+    # Kill the prior respawn supervisor FIRST (pid at a fixed path) so it
+    # cannot relaunch the SUT we are about to reap. Without this the bounded
     # loop would re-bind the port after every sweep pass.
+    # NB: keep this free-form shell block free of apostrophes and unpaired
+    # quote chars. ansible split_args tokenizes the entire string (it does
+    # not honor the leading hash as a comment), so a stray quote anywhere
+    # fails task loading with an unbalanced-quotes error.
     sup_pidfile={{ bench_root }}/.sut-supervisor.pid
     if [ -f "$sup_pidfile" ]; then
       sup=$(cat "$sup_pidfile" 2>/dev/null)
