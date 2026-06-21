@@ -17,6 +17,9 @@
 #     threadpool which would distort the cell.
 #   * `uvicorn[standard]` — pulls in uvloop, httptools, watchfiles,
 #     websockets in one extra so we never hand-list the C accelerators.
+#     The WS streaming surface (app/streaming.py, /ws + /events) rides this
+#     `websockets` dep on the H1 path — verified `uvicorn[standard]` alone
+#     resolves it, so NO standalone `websockets` floor is listed here.
 #   * `orjson` — used only by app/payload.py to generate the deterministic
 #     1k/8k/16k/64k bodies byte-identically to the Go reference (and to the
 #     fastapi adapter). Not on the request hot path.

@@ -327,7 +327,10 @@ var Registry = map[string]Adapter{
 			},
 			RunCmd: "{bin} -bind {bind}",
 		},
-		Capabilities: Capabilities{Static: true},
+		// v1.5.4: native WS+SSE streaming (axum::extract::ws + sse) — the
+		// /ws (?mode=) + /events routes ride the h1 listener; the h2c
+		// column never drives them (streaming gates on fs.HTTP1).
+		Capabilities: Capabilities{Static: true, WS: true, SSE: true},
 	},
 	// axum-h2 — the same servers/axum binary in prior-knowledge h2c mode
 	// (-engine h2c serves HTTP/2 cleartext only, refusing H1 like
@@ -622,6 +625,10 @@ var Registry = map[string]Adapter{
 			Lang:   "bun",
 			RunCmd: "{name} -bind {bind}",
 		},
+		// v1.5.4: native WS+SSE streaming (Bun.serve websocket + SSE
+		// ReadableStream) on the h1 path; the hono-h2 column (node:http2
+		// bridge) keeps no streaming — scenarios gate on fs.HTTP1.
+		Capabilities: Capabilities{Static: true, WS: true, SSE: true},
 	},
 	// hono-h2 — prior-knowledge h2c via node:http2.createServer bridged to
 	// Hono's app.fetch; -engine h2c selects it. Shares the competitors/hono
@@ -674,7 +681,10 @@ var Registry = map[string]Adapter{
 			Lang:   "python",
 			RunCmd: "{bench}/competitors/{name}/server -bind {bind}",
 		},
-		Capabilities: Capabilities{Static: true},
+		// v1.5.4: native WS+SSE streaming (Starlette WebSocketRoute +
+		// StreamingResponse) on the uvicorn h1 path; the starlette-h2
+		// (hypercorn) column drives no streaming — gates on fs.HTTP1.
+		Capabilities: Capabilities{Static: true, WS: true, SSE: true},
 	},
 	// bunraw — raw Bun.serve baseline, no framework (the bun analogue of hyper).
 	"bunraw": {
