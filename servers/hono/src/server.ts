@@ -17,14 +17,29 @@
 // the canonical CLI form `bun run dist/server -- -bind 127.0.0.1:0`
 // puts our flags after `--`; we walk the array looking for `-bind` to
 // stay robust to either invocation shape.
+//
+// -engine flag: the bench passes `-engine <value>` only when the registry
+// gives the adapter an Engine. Today hono has none, so no -engine arrives
+// — but we parse it defensively so an added Engine works without a code
+// change. "h1" (or absent) stays on the Bun.serve fast path. "h2c" serves
+// HTTP/2 cleartext prior-knowledge via the node:http2 bridge in h2c.ts.
+// Any other value exits non-zero with a clear message.
 
 import { Hono } from "hono";
-import { json1KPayload, json64KPayload } from "./payload";
+import {
+  json1KPayload,
+  json8KPayload,
+  json16KPayload,
+  json64KPayload,
+} from "./payload";
+import { serveH2C } from "./h2c";
 
 const HELLO = new TextEncoder().encode("Hello, World!");
 const JSON_HELLO = new TextEncoder().encode('{"message":"Hello, World!"}');
 const OK = new TextEncoder().encode("OK");
 const JSON_1K = json1KPayload();
+const JSON_8K = json8KPayload();
+const JSON_16K = json16KPayload();
 const JSON_64K = json64KPayload();
 
 const TEXT = "text/plain";
@@ -57,6 +72,20 @@ app.get("/json-1k", (c) =>
   }),
 );
 
+app.get("/json-8k", (c) =>
+  c.body(JSON_8K, 200, {
+    "Content-Type": JSON_CT,
+    "Content-Length": String(JSON_8K.length),
+  }),
+);
+
+app.get("/json-16k", (c) =>
+  c.body(JSON_16K, 200, {
+    "Content-Type": JSON_CT,
+    "Content-Length": String(JSON_16K.length),
+  }),
+);
+
 app.get("/json-64k", (c) =>
   c.body(JSON_64K, 200, {
     "Content-Type": JSON_CT,
@@ -84,34 +113,51 @@ app.post("/upload", async (c) => {
 });
 
 const { host, port } = parseBind(process.argv);
+const engine = parseEngine(process.argv);
 
-const server = Bun.serve({
-  hostname: host,
-  port,
-  // reusePort lets the kernel SO_REUSEPORT load-balance across
-  // multiple Bun.serve workers if a future operator launches more
-  // than one process — harmless on a single-process bench.
-  reusePort: true,
-  fetch: app.fetch,
-});
+if (engine === "h2c") {
+  // HTTP/2 cleartext prior-knowledge via node:http2 (see h2c.ts). Bun.serve
+  // has no cleartext-h2 server option as of Bun 1.3.14, so we bridge the h2
+  // streams to the same app.fetch handler the h1 path uses.
+  const h2c = await serveH2C(host, port, app.fetch);
+  console.log(`ready addr=${h2c.hostname}:${h2c.port}`);
 
-// Bun.serve.port is the resolved port (kernel-assigned when the
-// caller passed 0). Print the ready line in the exact shape every
-// other adapter uses so the runner's TCP-probe loop can attach.
-console.log(`ready addr=${server.hostname}:${server.port}`);
+  const shutdownH2C = (signal: string): void => {
+    console.log(`hono: received ${signal}, shutting down`);
+    h2c.stop();
+    setTimeout(() => process.exit(0), 50);
+  };
+  process.on("SIGTERM", () => shutdownH2C("SIGTERM"));
+  process.on("SIGINT", () => shutdownH2C("SIGINT"));
+} else {
+  const server = Bun.serve({
+    hostname: host,
+    port,
+    // reusePort lets the kernel SO_REUSEPORT load-balance across
+    // multiple Bun.serve workers if a future operator launches more
+    // than one process — harmless on a single-process bench.
+    reusePort: true,
+    fetch: app.fetch,
+  });
 
-const shutdown = (signal: string): void => {
-  console.log(`hono: received ${signal}, shutting down`);
-  // stop(true) closes idle keep-alives immediately; in-flight
-  // requests still get to drain. Bun resolves the returned promise
-  // when the listener is fully torn down, but we don't await it —
-  // the runner's 5s SIGKILL backstop is the upper bound.
-  server.stop(true);
-  // Give Bun's loop a tick to finish flushing logs, then exit.
-  setTimeout(() => process.exit(0), 50);
-};
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+  // Bun.serve.port is the resolved port (kernel-assigned when the
+  // caller passed 0). Print the ready line in the exact shape every
+  // other adapter uses so the runner's TCP-probe loop can attach.
+  console.log(`ready addr=${server.hostname}:${server.port}`);
+
+  const shutdown = (signal: string): void => {
+    console.log(`hono: received ${signal}, shutting down`);
+    // stop(true) closes idle keep-alives immediately; in-flight
+    // requests still get to drain. Bun resolves the returned promise
+    // when the listener is fully torn down, but we don't await it —
+    // the runner's 5s SIGKILL backstop is the upper bound.
+    server.stop(true);
+    // Give Bun's loop a tick to finish flushing logs, then exit.
+    setTimeout(() => process.exit(0), 50);
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}
 
 // parseBind walks argv looking for -bind (the canonical probatorium
 // flag). Falls back to BIND env var, then 0.0.0.0:8080. Accepts both
@@ -143,4 +189,35 @@ function parseBind(argv: readonly string[]): { host: string; port: number } {
     throw new Error(`hono: invalid port in -bind ${JSON.stringify(raw)}`);
   }
   return { host, port };
+}
+
+// parseEngine walks argv for -engine (accepts `-engine h1` and
+// `-engine=h1`). Recognised values:
+//   "" / absent / "h1" → Bun.serve HTTP/1.1 fast path.
+//   "h2c"              → HTTP/2 cleartext prior-knowledge (node:http2).
+// Any other value is a hard error: better to fail loudly than silently
+// serve the wrong protocol and skew the bench. The registry currently
+// gives hono no Engine, so this returns "h1" in practice — but an added
+// Engine flows through here without further changes.
+function parseEngine(argv: readonly string[]): "h1" | "h2c" {
+  let raw = "";
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === undefined) continue;
+    if (a === "-engine" || a === "--engine") {
+      raw = argv[i + 1] ?? "";
+      break;
+    }
+    if (a.startsWith("-engine=") || a.startsWith("--engine=")) {
+      raw = a.slice(a.indexOf("=") + 1);
+      break;
+    }
+  }
+  if (raw === "" || raw === "h1") return "h1";
+  if (raw === "h2c") return "h2c";
+  console.error(
+    `hono: unsupported -engine ${JSON.stringify(raw)} ` +
+      `(supported: h1, h2c)`,
+  );
+  process.exit(2);
 }

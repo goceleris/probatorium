@@ -70,6 +70,20 @@ var Endpoints = []Endpoint{
 	},
 	{
 		Method:              "GET",
+		Path:                "/json-8k",
+		ResponseContentType: "application/json",
+		// ResponseBody filled in init(). Mid-size payload: bridges the
+		// 1k→64k gap so the bench keeps differentiating adapters below the
+		// 20G fabric ceiling that makes the 64k cells NIC-bound.
+	},
+	{
+		Method:              "GET",
+		Path:                "/json-16k",
+		ResponseContentType: "application/json",
+		// ResponseBody filled in init(). Mid-size payload (see /json-8k).
+	},
+	{
+		Method:              "GET",
 		Path:                "/json-64k",
 		ResponseContentType: "application/json",
 		// ResponseBody filled in init().
@@ -106,6 +120,10 @@ func init() {
 		switch Endpoints[i].Path {
 		case "/json-1k":
 			Endpoints[i].ResponseBody = generateJSONPayload(1024)
+		case "/json-8k":
+			Endpoints[i].ResponseBody = generateJSONPayload(8192)
+		case "/json-16k":
+			Endpoints[i].ResponseBody = generateJSONPayload(16384)
 		case "/json-64k":
 			Endpoints[i].ResponseBody = generateJSONPayload(65536)
 		}

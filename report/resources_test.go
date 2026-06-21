@@ -309,3 +309,116 @@ func TestResourceJSONRoundTrip(t *testing.T) {
 		t.Errorf("Series drift: %+v", got.Series)
 	}
 }
+
+// rstat is a tiny constructor for a ResourceStats with a CPU + RSS scalar
+// summary and one series point, for the aggregation/document flow tests.
+func rstat(cpuPct float64, rssBytes, fdHWM int64) *ResourceStats {
+	return &ResourceStats{
+		Summary: ResourceSummary{
+			MeanCPUPct:   ptrF64(cpuPct),
+			PeakRSSBytes: ptrI64(rssBytes),
+			FDHWM:        ptrI64(fdHWM),
+		},
+		Series: []ResourcePoint{{TSUnix: 1, CPUPct: ptrF64(cpuPct), RSSBytes: ptrI64(rssBytes)}},
+	}
+}
+
+// TestReduceResourcesMediansAndSkipsNil pins the per-run reducer: medians
+// each scalar across the runs that reported it, drops nil run entries, and
+// keeps the last reporting run's series.
+func TestReduceResourcesMediansAndSkipsNil(t *testing.T) {
+	t.Parallel()
+	runs := []*ResourceStats{
+		rstat(40, 100, 10),
+		nil, // a run with no observer sidecar — must be skipped, not panic
+		rstat(60, 300, 30),
+		rstat(50, 200, 20),
+	}
+	got := ReduceResources(runs)
+	if got == nil {
+		t.Fatal("ReduceResources returned nil for non-empty input")
+	}
+	if got.Summary.MeanCPUPct == nil || *got.Summary.MeanCPUPct != 50 {
+		t.Errorf("MeanCPUPct=%v want 50 (median of 40,60,50)", got.Summary.MeanCPUPct)
+	}
+	if got.Summary.PeakRSSBytes == nil || *got.Summary.PeakRSSBytes != 200 {
+		t.Errorf("PeakRSSBytes=%v want 200", got.Summary.PeakRSSBytes)
+	}
+	// Series is the LAST reporting run's (the 200/50 entry).
+	if len(got.Series) != 1 || got.Series[0].CPUPct == nil || *got.Series[0].CPUPct != 50 {
+		t.Errorf("Series drift: %+v", got.Series)
+	}
+	if ReduceResources(nil) != nil {
+		t.Error("ReduceResources(nil) should be nil")
+	}
+	if ReduceResources([]*ResourceStats{nil, nil}) != nil {
+		t.Error("ReduceResources of all-nil should be nil")
+	}
+}
+
+// TestResourcesFlowAggregateToDocument is the regression guard for the bug
+// the next bench round must not reship: server-side resources were captured
+// per cell (observer.sqlite + cpu.log) but the merge → Aggregate →
+// BuildDocument path dropped them, so every published Document carried an
+// empty resources map. This drives a CellResult carrying per-run Resources
+// all the way to ServerResult.Resources.
+func TestResourcesFlowAggregateToDocument(t *testing.T) {
+	t.Parallel()
+	cell := CellResult{
+		ScenarioName: "get-json-64k",
+		ServerName:   "celeris-iouring-h1-async",
+		// Two OK runs with real RPS so the cell is data-bearing.
+		Samples: makeSamples([]float64{35000, 35200}, 0),
+		Resources: []*ResourceStats{
+			rstat(45, 100, 12),
+			rstat(55, 120, 14),
+		},
+	}
+
+	agg := Aggregate([]CellResult{cell})
+	a, ok := agg[CellID(cell.ScenarioName, cell.ServerName)]
+	if !ok {
+		t.Fatal("aggregate missing cell")
+	}
+	if a.Resources == nil {
+		t.Fatal("CellAggregate.Resources is nil — reduction dropped it")
+	}
+	if a.Resources.Summary.MeanCPUPct == nil || *a.Resources.Summary.MeanCPUPct != 50 {
+		t.Errorf("aggregate MeanCPUPct=%v want 50", a.Resources.Summary.MeanCPUPct)
+	}
+
+	doc := BuildDocument(BuildInput{
+		HostArchPair: "linux/amd64",
+		Servers: map[string]ServerMeta{
+			cell.ServerName: {Category: "celeris", Language: "go", Framework: "celeris"},
+		},
+		Agg: agg,
+	})
+	if len(doc.Benchmarks) != 1 {
+		t.Fatalf("benchmarks=%d want 1", len(doc.Benchmarks))
+	}
+	sr := doc.Benchmarks[0]
+	if sr.Resources == nil {
+		t.Fatal("ServerResult.Resources is nil — BuildDocument dropped resources")
+	}
+	r, ok := sr.Resources[cell.ScenarioName]
+	if !ok || r == nil {
+		t.Fatalf("no resources for scenario %q", cell.ScenarioName)
+	}
+	if r.Summary.MeanCPUPct == nil || *r.Summary.MeanCPUPct != 50 {
+		t.Errorf("document MeanCPUPct=%v want 50", r.Summary.MeanCPUPct)
+	}
+
+	// And it must survive a JSON round-trip under the documented tag.
+	b, err := json.Marshal(sr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back ServerResult
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Resources[cell.ScenarioName] == nil {
+		t.Error("resources lost across JSON round-trip")
+	}
+}

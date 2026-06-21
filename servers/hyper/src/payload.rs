@@ -13,10 +13,20 @@
 use std::sync::OnceLock;
 
 static JSON_1K: OnceLock<Vec<u8>> = OnceLock::new();
+static JSON_8K: OnceLock<Vec<u8>> = OnceLock::new();
+static JSON_16K: OnceLock<Vec<u8>> = OnceLock::new();
 static JSON_64K: OnceLock<Vec<u8>> = OnceLock::new();
 
 pub fn json_1k() -> &'static [u8] {
     JSON_1K.get_or_init(|| generate(1024)).as_slice()
+}
+
+pub fn json_8k() -> &'static [u8] {
+    JSON_8K.get_or_init(|| generate(8192)).as_slice()
+}
+
+pub fn json_16k() -> &'static [u8] {
+    JSON_16K.get_or_init(|| generate(16384)).as_slice()
 }
 
 pub fn json_64k() -> &'static [u8] {
@@ -77,6 +87,16 @@ mod tests {
     #[test]
     fn json_1k_matches_go_size() {
         assert_eq!(json_1k().len(), 1026);
+    }
+
+    #[test]
+    fn json_8k_matches_go_size() {
+        assert_eq!(json_8k().len(), 8286);
+    }
+
+    #[test]
+    fn json_16k_matches_go_size() {
+        assert_eq!(json_16k().len(), 16463);
     }
 
     #[test]

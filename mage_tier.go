@@ -53,13 +53,14 @@ import (
 //
 // Env knobs (in addition to every BENCH_*/PUBLISH_*/DOCS_TOKEN knob):
 //
-//	BENCH_PROFILE=full         full | headline (default: full — every
-//	                           server × every scenario, capability-gated.
-//	                           headline is the explicit opt-in for the
-//	                           ~3h smoke-test path; never the silent
-//	                           default, because users asked repeatedly
-//	                           for "no missing tests" and got the
-//	                           curated subset instead.)
+//	BENCH_PROFILE=full         full | headline. Both cover the SAME full
+//	                           grid (every server × every scenario,
+//	                           capability-gated); they differ ONLY by the
+//	                           per-cell window. headline (the weekly
+//	                           cadence) uses 60s/15s so the whole grid fits
+//	                           24h single-arch (~21.6h); full uses 90s/20s
+//	                           for the exhaustive sweep (~30h on one arch,
+//	                           needs a raised BENCH_BUDGET). Default: full.
 //	BENCH_TARGET=both          msa2-server | msr1 | both (both = 2 arches)
 //	BENCH_SKIP_RATED=          "1" runs saturation passes only. Every
 //	                           cell still runs the saturation pass; the
@@ -88,8 +89,9 @@ func BenchTier() error {
 	// The fit budget defaults to the 24h weekly cluster invariant
 	// (budget.Budget) but can be raised per-invocation via BENCH_BUDGET for
 	// a manual full-matrix dispatch that intentionally runs longer than the
-	// weekly headline — the full profile is ~58h on one arch and cannot fit
-	// 24h. The CI job's timeout-minutes must exceed this budget (+ Deploy /
+	// weekly headline — the full profile is ~30h on one arch (the same full
+	// grid as headline, at the longer 90s/20s window) and cannot fit 24h.
+	// The CI job's timeout-minutes must exceed this budget (+ Deploy /
 	// Cleanup overhead).
 	fitBudget := budget.Budget
 	if v := os.Getenv("BENCH_BUDGET"); v != "" {
@@ -124,7 +126,11 @@ func BenchTier() error {
 	// benchmarks[].latency_at_slo alongside the per-scenario saturation
 	// data, so the dashboard's headline reads "for this server × this
 	// scenario: RPS, p99-at-1s, SLO" all from one Document.
-	skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true"
+	// Rated OFF when the caller asks (BENCH_SKIP_RATED) OR the profile ships
+	// no rated sweep (RatedPasses==0, e.g. the "fast" routine/weekly profile).
+	// Rated is the dominant per-cell cost (4 closed-loop passes), so the
+	// default fast profile leaves it off and runs the full grid saturation-only.
+	skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true" || p.RatedPasses == 0
 	if skipRated {
 		_ = os.Unsetenv("BENCH_RATED")
 	} else {

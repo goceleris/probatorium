@@ -24,10 +24,26 @@ func TestWeeklyConfigFitsBudget(t *testing.T) {
 // every curated profile MUST carry Runs=1. A profile that ships Runs>1
 // would silently re-introduce a multi-pass run.
 func TestProfilesAreSinglePass(t *testing.T) {
-	for _, p := range []Profile{HeadlineWeekly(), Full()} {
+	for _, p := range []Profile{Fast(), HeadlineWeekly(), Full()} {
 		if p.Runs != 1 {
 			t.Errorf("profile %q must be single-pass (Runs=1), got Runs=%d", p.Name, p.Runs)
 		}
+	}
+}
+
+// TestFastFitsWithin24h pins the routine/weekly invariant: the default
+// "fast" profile (full grid, saturation-only, 35s/10s) MUST fit the 24h
+// budget. If the registry grows the grid past ~1390 cells this fails loudly
+// so we shorten the window (or trim coverage) deliberately rather than
+// silently overrunning the weekly cluster slot.
+func TestFastFitsWithin24h(t *testing.T) {
+	p := Fast()
+	log, ok := p.FitWithin(Budget)
+	if !ok {
+		t.Fatalf("fast profile must fit the %v budget; log:\n%s", Budget, log)
+	}
+	if p.Rated() != 0 {
+		t.Errorf("fast profile must be saturation-only (Rated()=0), got %v", p.Rated())
 	}
 }
 
@@ -66,11 +82,16 @@ func TestFitWithinFailsLoudlyWhenSinglePassOverflows(t *testing.T) {
 }
 
 // TestArchParallelHalvesWallClock proves the #168 win is modeled: with
-// both arches and ArchParallel, wall-clock is half the serial cost.
+// both arches and ArchParallel, wall-clock is half the serial cost. The
+// halving only applies at Arches==2, so the test forces both arches
+// explicitly — the weekly/full profiles ship Arches:1 today (amd64-only),
+// which would otherwise make the toggle a no-op.
 func TestArchParallelHalvesWallClock(t *testing.T) {
 	serial := HeadlineWeekly()
+	serial.Arches = 2
 	serial.ArchParallel = false
 	parallel := HeadlineWeekly()
+	parallel.Arches = 2
 	parallel.ArchParallel = true
 	if parallel.WallClock() != serial.WallClock()/2 {
 		t.Fatalf("ArchParallel wall-clock %v != serial/2 %v",
@@ -79,11 +100,11 @@ func TestArchParallelHalvesWallClock(t *testing.T) {
 }
 
 // TestForProfileResolves checks the BENCH_PROFILE resolution: known
-// names map to their config, unknown/empty fall back to the FULL
-// matrix (every server × every scenario, capability-gated). Headline
-// is the explicit opt-in for the ~3h smoke-test path, not the silent
-// default — see ForProfile's docstring for why this flipped from the
-// prior behaviour.
+// names map to their config, unknown/empty fall back to "full". Both
+// "headline" and "full" cover the same full grid (every server × every
+// scenario, capability-gated); they differ only by the per-cell window
+// (headline's shorter window fits 24h, full's longer window is the
+// exhaustive sweep) — see ForProfile's docstring.
 func TestForProfileResolves(t *testing.T) {
 	if ForProfile("headline").Name != "headline" {
 		t.Errorf("ForProfile(headline) should resolve headline")
@@ -91,12 +112,15 @@ func TestForProfileResolves(t *testing.T) {
 	if ForProfile("full").Name != "full" {
 		t.Errorf("ForProfile(full) should resolve full")
 	}
-	if ForProfile("").Name != "full" {
-		t.Errorf("ForProfile(empty) should fall back to full, got %q (a weekly run with no env was being silently scoped down to the headline subset, dropping driver-*, chain-*, tls-*, ws-hub-*, h2/h2c variants, and ~16 long-tail servers)",
+	if ForProfile("fast").Name != "fast" {
+		t.Errorf("ForProfile(fast) should resolve fast")
+	}
+	if ForProfile("").Name != "fast" {
+		t.Errorf("ForProfile(empty) should fall back to fast (the full-grid, <24h saturation default), got %q (the fallback must still be a full-coverage */* grid, never a curated subset)",
 			ForProfile("").Name)
 	}
-	if ForProfile("bogus").Name != "full" {
-		t.Errorf("ForProfile(unknown) should fall back to full, got %q (an unknown name must not silently downgrade to headline)", ForProfile("bogus").Name)
+	if ForProfile("bogus").Name != "fast" {
+		t.Errorf("ForProfile(unknown) should fall back to fast, got %q (an unknown name must not silently downgrade coverage)", ForProfile("bogus").Name)
 	}
 }
 
@@ -107,13 +131,16 @@ func TestForProfileResolves(t *testing.T) {
 // headline-scoped report without telling the user.
 func TestForProfileDefaultHasFullCoverage(t *testing.T) {
 	def := ForProfile("")
-	if def.Name != "full" {
-		t.Fatalf("ForProfile(\"\").Name: want %q, got %q (the default must be the full matrix)",
-			"full", def.Name)
+	if def.Name != "fast" {
+		t.Fatalf("ForProfile(\"\").Name: want %q, got %q (the default must be the full-coverage saturation matrix)",
+			"fast", def.Name)
+	}
+	if len(def.Globs) == 0 || def.Globs[0] != "*/*" {
+		t.Fatalf("default profile must cover the full grid (Globs '*/*'), got %v", def.Globs)
 	}
 	if def.Cells < 400 {
-		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~520 capability-gated), got %d. "+
-			"A value this low means the default was silently scoped down to the headline subset (~150 cells).",
+		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~800 capability-gated), got %d. "+
+			"A value this low means the default was silently scoped down to a curated subset.",
 			def.Cells)
 	}
 }

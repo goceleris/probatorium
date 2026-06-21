@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Eclipse Vert.x competitor adapter for probatorium.
+
+  Stack: io.vertx:vertx-core HttpServer + io.vertx:vertx-web Router on the
+  JVM event-loop reactor. The canonical top-JVM TechEmpower entrant.
+
+  Always-latest policy (mirrors the rust / python / dotnet adapters): the
+  vertx.version property below is a floor that the ansible java role bumps
+  to the freshest stable at deploy time via `mvn versions:use-latest-releases`
+  (or by overriding -Dvertx.version=). NEVER treat it as a hard pin — the
+  bench is intentionally a moving target. The value committed here only has
+  to be new enough to compile.
+
+  Build: `mvn -q -B package` produces an executable uber-jar (maven-shade)
+  at target/probatorium-vertx-server.jar runnable via
+  `java -jar target/probatorium-vertx-server.jar -bind <host:port>`.
+
+  No docker. The java ansible role installs a JDK + Maven pristinely under
+  {{ bench_root }} and runs `mvn package` on the bench node so the JIT and
+  the bundled Netty native epoll transport match the node's libc/CPU.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.probatorium</groupId>
+  <artifactId>probatorium-vertx-adapter</artifactId>
+  <version>0.0.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Always-latest floor; the java role resolves the freshest stable at
+         deploy time. Vert.x 5.x is the current line (Java 11+ baseline,
+         tested on 21). -->
+    <vertx.version>5.0.0</vertx.version>
+    <!-- Single-class entry point; the shade plugin stamps it as Main-Class. -->
+    <main.class>probatorium.vertx.Server</main.class>
+    <!-- Stable uber-jar name so the launcher / RunCmd reference it without
+         knowing the project version. -->
+    <finalName>probatorium-vertx-server</finalName>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.vertx</groupId>
+      <artifactId>vertx-core</artifactId>
+      <version>${vertx.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.vertx</groupId>
+      <artifactId>vertx-web</artifactId>
+      <version>${vertx.version}</version>
+    </dependency>
+    <!-- Netty's native Linux epoll transport: lets Vert.x use epoll +
+         SO_REUSEPORT on the bench host instead of NIO, so each event-loop
+         verticle binds the shared port with its own acceptor. Classifier is
+         set per-arch by the java role (linux-x86_64 / linux-aarch_64) via
+         -Dnetty.epoll.classifier=. Falls back to NIO automatically if the
+         native lib is absent, so an unset classifier still runs. -->
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-transport-native-epoll</artifactId>
+      <version>${netty.epoll.version}</version>
+      <classifier>${netty.epoll.classifier}</classifier>
+    </dependency>
+    <!-- The arch-independent epoll Java classes (EpollIoHandler, EpollTransport,
+         …). vertx-core 5.x calls EpollTransport.ioHandlerFactory()->EpollIoHandler,
+         which only exists in netty 4.2.x's IoHandler API. The native-epoll jar above
+         carries only the .so + transitively pulls THIS at its own version, so
+         netty.epoll.version MUST match vertx-core's netty (4.2.x) or EpollIoHandler
+         is absent (NoClassDefFoundError at Vertx.vertx()). Declared explicitly so the
+         shade always bundles it. -->
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-transport-classes-epoll</artifactId>
+      <version>${netty.epoll.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>${finalName}</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+
+      <!-- Shade into a single executable uber-jar. The
+           ServicesResourceTransformer merges META-INF/services entries from
+           vertx-core, vertx-web and netty (Vert.x discovers its transport /
+           codec SPIs through them — without the merge the jar boots but
+           silently loses native epoll + some web handlers). The Manifest
+           transformer stamps Main-Class so `java -jar` works. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <transformers>
+                <transformer
+                    implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                <transformer
+                    implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>${main.class}</mainClass>
+                </transformer>
+              </transformers>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <!-- Drop signature files from signed deps so the shaded
+                         jar's own (unsigned) manifest is honoured rather than
+                         triggering a SecurityException at launch. -->
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <!-- netty.epoll.version / netty.epoll.classifier carry defaults here so a
+       bare `mvn package` on the dev Mac compiles (NIO fallback; the macOS
+       classifier osx-x86_64 / osx-aarch_64 is wrong for epoll but the jar
+       still builds and runs on NIO). The java role overrides
+       netty.epoll.classifier per the node arch and bumps the version with
+       the resolved vertx-core's transitive netty. -->
+  <profiles>
+    <profile>
+      <id>default-netty</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
+      <properties>
+        <!-- MUST track vertx-core's netty (vert.x 5.0.0 → netty 4.2.0.Final).
+             EpollIoHandler exists only in 4.2.x; an older pin → NoClassDefFoundError
+             at startup. Bump in lockstep when vertx.version is bumped. -->
+        <netty.epoll.version>4.2.0.Final</netty.epoll.version>
+        <netty.epoll.classifier>linux-x86_64</netty.epoll.classifier>
+      </properties>
+    </profile>
+  </profiles>
+</project>

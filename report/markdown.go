@@ -84,6 +84,12 @@ func WriteMarkdown(w io.Writer, doc *Document, agg map[string]CellAggregate, met
 		}
 	}
 
+	if doc != nil && len(agg) > 0 {
+		if err := writeNetworkBoundSection(w, doc, agg); err != nil {
+			return err
+		}
+	}
+
 	if meta.BaselinePath != "" && doc != nil {
 		if err := writeRegressionSection(w, doc, meta.BaselinePath); err != nil {
 			return err
@@ -578,6 +584,98 @@ func writeResourceSection(w io.Writer, doc *Document) error {
 			fmtNsUs(s.GCPauseP99Ns),
 			fmtI64p(s.GoroutineHWM),
 			fmtI64p(s.FDHWM),
+		}
+		if _, err := io.WriteString(w, "| "+strings.Join(cells, " | ")+" |\n"); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(w, "\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeNetworkBoundSection renders the large-payload cells flagged
+// network-bound (schema v5.5): cells whose achieved egress bandwidth sat at
+// the fabric line rate, so their saturation RPS converged across every fast
+// adapter and is NOT a ranking. The honest comparison for these cells is CPU
+// efficiency at the shared ceiling — bandwidth delivered per unit of
+// server CPU — so the table ranks by Gbps-per-CPU% (higher is better: the
+// adapter pushing the same wire with less CPU has the most headroom). Emits
+// nothing when no cell was network-bound (every run below the ceiling, or a
+// fabric with no known line rate).
+func writeNetworkBoundSection(w io.Writer, doc *Document, agg map[string]CellAggregate) error {
+	type row struct {
+		scenario, adapter string
+		rps               float64
+		gbps              float64
+		cpuPct            *float64
+		eff               float64 // gbps per CPU%; <0 sentinel when CPU unknown
+	}
+	var rows []row
+	for _, a := range doc.Benchmarks {
+		for sc, bound := range a.NetworkBound {
+			if !bound {
+				continue
+			}
+			c, ok := agg[CellID(sc, a.Name)]
+			if !ok {
+				continue
+			}
+			gbps := c.BytesMedian * 8 / 1e9
+			r := row{scenario: sc, adapter: a.Name, rps: c.RPSMedian, gbps: gbps, eff: -1}
+			if res := a.Resources[sc]; res != nil && res.Summary.MeanCPUPct != nil && *res.Summary.MeanCPUPct > 0 {
+				r.cpuPct = res.Summary.MeanCPUPct
+				r.eff = gbps / *res.Summary.MeanCPUPct
+			}
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].scenario != rows[j].scenario {
+			return rows[i].scenario < rows[j].scenario
+		}
+		if rows[i].eff != rows[j].eff {
+			return rows[i].eff > rows[j].eff // most efficient first
+		}
+		return rows[i].adapter < rows[j].adapter
+	})
+
+	if _, err := io.WriteString(w, "\n## Network-bound cells — ranked by CPU efficiency, not RPS\n\n"); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w,
+		"These cells hit the fabric line rate: their saturation RPS converges across "+
+			"fast adapters and is **not** a ranking. The adapter delivering the same "+
+			"bandwidth with less server CPU has the most headroom — higher Gbps/CPU%% wins.\n\n"); err != nil {
+		return err
+	}
+	header := []string{"scenario", "adapter", "RPS", "Gbps", "Server CPU%", "Gbps / CPU% (↑ better)"}
+	if _, err := io.WriteString(w, "| "+strings.Join(header, " | ")+" |\n"); err != nil {
+		return err
+	}
+	sep := make([]string, len(header))
+	for i := range sep {
+		sep[i] = "---"
+	}
+	if _, err := io.WriteString(w, "| "+strings.Join(sep, " | ")+" |\n"); err != nil {
+		return err
+	}
+	for _, r := range rows {
+		effStr := "—"
+		if r.eff >= 0 {
+			effStr = fmt.Sprintf("%.3f", r.eff)
+		}
+		cells := []string{
+			r.scenario,
+			r.adapter,
+			fmt.Sprintf("%.0f", r.rps),
+			fmt.Sprintf("%.2f", r.gbps),
+			fmtF64p(r.cpuPct, "%.1f"),
+			effStr,
 		}
 		if _, err := io.WriteString(w, "| "+strings.Join(cells, " | ")+" |\n"); err != nil {
 			return err

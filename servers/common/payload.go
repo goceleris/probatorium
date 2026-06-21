@@ -12,11 +12,15 @@ import (
 // throughput axis of the report.
 var (
 	json1KPayload  []byte
+	json8KPayload  []byte
+	json16KPayload []byte
 	json64KPayload []byte
 )
 
 func init() {
 	json1KPayload = generateJSONPayload(1024)
+	json8KPayload = generateJSONPayload(8192)
+	json16KPayload = generateJSONPayload(16384)
 	json64KPayload = generateJSONPayload(65536)
 }
 
@@ -68,6 +72,18 @@ func generateJSONPayload(targetSize int) []byte {
 // JSON1KPayload returns the pre-computed ~1 KiB JSON payload. The slice
 // is shared — callers must not mutate it.
 func JSON1KPayload() []byte { return json1KPayload }
+
+// JSON8KPayload returns the pre-computed ~8 KiB JSON payload. The mid-size
+// payloads (8K/16K) bridge the 1K→64K gap: on the 20G LACP fabric the 64K
+// cells are NIC-bound (all fast adapters converge at the line rate), so the
+// mid sizes stay under the ceiling and keep differentiating adapters by CPU
+// throughput. The slice is shared — callers must not mutate it.
+func JSON8KPayload() []byte { return json8KPayload }
+
+// JSON16KPayload returns the pre-computed ~16 KiB JSON payload. See
+// [JSON8KPayload] for the mid-size rationale. The slice is shared — callers
+// must not mutate it.
+func JSON16KPayload() []byte { return json16KPayload }
 
 // JSON64KPayload returns the pre-computed ~64 KiB JSON payload. The
 // slice is shared — callers must not mutate it.

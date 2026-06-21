@@ -4,43 +4,50 @@ package main
 
 import (
 	"reflect"
-	"sort"
 	"testing"
 
 	"github.com/goceleris/probatorium/budget"
+	"github.com/goceleris/probatorium/servers"
 )
 
-// TestCellsGlobServersDerivesFromHeadlineCells pins the regression: when
-// the bench is launched via BenchTier with profile=headline, the cells
-// glob is the headline 168-cell set (14 servers x 12 scenarios), but
-// BENCH_COMPETITORS defaults to "all" (= full registry). The default
-// (no explicit user narrowing) must derive competitor_set from the cells
-// glob, yielding EXACTLY the 14 HeadlineServers — never the full-column
-// registry, never an empty set, never a partial subset.
-//
-// If this test fails, the v3.5 bug is back: 16 of the 31 columns are
-// no-op (the runner's filterCells finds zero matching (server, scenario)
-// cells for those servers and exits in ~1m), wasting ~16m of ansible
-// outer-loop overhead per back-to-back iteration.
+// TestCellsGlobServersDerivesFromHeadlineCells pins that the WEEKLY
+// (headline) profile covers the FULL column set. The weekly profile no
+// longer curates a subset — it runs every registered server x scenario via
+// the "*/*" cells glob — so deriving competitor_set from that glob must
+// yield EVERY registered adapter, never a narrowed subset and never an
+// empty set. Guards two ways the weekly run could silently lose coverage:
+// the v3.5 no-op-column regression (a glob that drops servers), and any
+// future re-curation that quietly shrinks the weekly grid back to a
+// "headline" subset — which the user explicitly does not want.
 func TestCellsGlobServersDerivesFromHeadlineCells(t *testing.T) {
+	// The weekly profile now runs the FULL grid (Globs "*/*"), so its cells
+	// glob must derive the COMPLETE server set — every registered adapter,
+	// the same coverage as the full profile. The old behaviour (a curated
+	// ~14-server headline subset) is gone: "weekly should include all of
+	// them, not a headline." This test guards that the weekly never silently
+	// narrows the column set back to a subset.
 	cells := budget.CellsGlob(budget.HeadlineWeekly())
 	got, err := cellsGlobServers(cells)
 	if err != nil {
 		t.Fatalf("cellsGlobServers(%q): %v", cells, err)
 	}
 
-	want := append([]string{}, budget.HeadlineServers...)
-	sort.Strings(want)
-
+	want := servers.Names() // every registered adapter, sorted
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("cellsGlobServers(HeadlineWeekly) = %v, want %v "+
-			"(the default BENCH_COMPETITORS=path must derive competitor_set from "+
-			"the cells glob, not from the 31-column full registry)",
+		t.Errorf("cellsGlobServers(HeadlineWeekly) = %v, want the FULL registry %v "+
+			"(the weekly grid must cover every server, never a curated subset)",
 			got, want)
 	}
-	if len(got) != 14 {
-		t.Errorf("len: want 14 HeadlineServers, got %d (the cells glob is 12 scenarios "+
-			"x 14 servers = 168 cells; the unique-server derivation must yield 14)", len(got))
+
+	// The weekly and full profiles now derive the same column set — they
+	// differ only by per-cell window. Pin that equivalence.
+	fullCells := budget.CellsGlob(budget.Full())
+	fullGot, err := cellsGlobServers(fullCells)
+	if err != nil {
+		t.Fatalf("cellsGlobServers(full %q): %v", fullCells, err)
+	}
+	if !reflect.DeepEqual(got, fullGot) {
+		t.Errorf("weekly server set %v != full server set %v; they must match now", got, fullGot)
 	}
 }
 
@@ -146,9 +153,6 @@ func TestCellsGlobServersFullProfileWildcardGlobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cellsGlobServers(%q): %v", cells, err)
 	}
-	want := append([]string{}, budget.HeadlineServers...) // sanity seed
-	_ = want
-
 	// Derive the expected set the same way: every (scenario, server)
 	// pair from the registry, deduplicated to the server half. This
 	// pins the FULL profile's "no missing tests" invariant: if a
@@ -178,6 +182,49 @@ func TestCellsGlobServersFullProfileWildcardGlobs(t *testing.T) {
 		if !found {
 			t.Errorf("FULL profile cells glob %q missing celeris server %q (got %d servers: %v)",
 				cells, must, len(got), got)
+		}
+	}
+}
+
+// TestResolveBenchColumnsNativeH2cSharesBuild pins the native h2c column
+// plumbing: an "<framework>-h2" native column reuses its h1 sibling's staged
+// binary (Bin.BinName → competitors/<framework>) and passes the SUT-facing
+// -engine value with the feature-set "-noupg" suffix stripped. It also pins
+// that the existing h1 native columns now carry an explicit -engine h1 (so
+// the run_bench_cell port-ownership guard can tell two columns sharing one
+// binary apart).
+func TestResolveBenchColumnsNativeH2cSharesBuild(t *testing.T) {
+	cols, err := resolveBenchColumns("axum,axum-h2,aspnet,aspnet-h2,fastapi,fastapi-h2,hono,hono-h2")
+	if err != nil {
+		t.Fatalf("resolveBenchColumns: %v", err)
+	}
+	by := map[string]benchColumn{}
+	for _, c := range cols {
+		by[c.Slug] = c
+	}
+	cases := []struct {
+		slug, wantBin, wantEngine string
+	}{
+		{"axum", "axum", "h1"},
+		{"axum-h2", "axum", "h2c"}, // shares competitors/axum, -engine h2c
+		{"aspnet", "aspnet", "h1"},
+		{"aspnet-h2", "aspnet", "h2c"},
+		{"fastapi", "fastapi", "h1"},
+		{"fastapi-h2", "fastapi", "h2c"}, // shares the python launcher
+		{"hono", "hono", ""},             // bun h1 column has no Engine → no flag
+		{"hono-h2", "hono", "h2c"},       // shares the bun launcher
+	}
+	for _, c := range cases {
+		got, ok := by[c.slug]
+		if !ok {
+			t.Errorf("column %q missing from resolveBenchColumns output", c.slug)
+			continue
+		}
+		if got.Bin != c.wantBin {
+			t.Errorf("%s: Bin = %q, want %q", c.slug, got.Bin, c.wantBin)
+		}
+		if got.Engine != c.wantEngine {
+			t.Errorf("%s: Engine = %q, want %q", c.slug, got.Engine, c.wantEngine)
 		}
 	}
 }

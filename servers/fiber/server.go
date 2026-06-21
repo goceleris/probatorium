@@ -75,6 +75,14 @@ func registerRoutes(app *fiber.App) {
 		c.Set("Content-Type", "application/json")
 		return c.Send(common.JSON1KPayload())
 	})
+	app.Get("/json-8k", func(c *fiber.Ctx) error {
+		c.Set("Content-Type", "application/json")
+		return c.Send(common.JSON8KPayload())
+	})
+	app.Get("/json-16k", func(c *fiber.Ctx) error {
+		c.Set("Content-Type", "application/json")
+		return c.Send(common.JSON16KPayload())
+	})
 	app.Get("/json-64k", func(c *fiber.Ctx) error {
 		c.Set("Content-Type", "application/json")
 		return c.Send(common.JSON64KPayload())

@@ -11,48 +11,14 @@ import "time"
 // helper's output must match, so a registry change that blows the budget
 // surfaces as a failing test rather than a silently-overflowing run.
 
-// HeadlineServers is the curated weekly column set (~14): the four celeris
-// engine modes worth comparing, the headline Go competitors, and one
-// representative per non-Go language. Drops the -h2 duplicate columns,
-// the chi/iris mid-pack routers, and the long-tail competitors
-// (drogon / zig_zap / ntex / fastapi / hono / elysia / gorilla_ws) the
-// full profile keeps.
-var HeadlineServers = []string{
-	"celeris-iouring-h1-async",
-	"celeris-iouring-auto+upg-async",
-	"celeris-epoll-h1-sync",
-	"celeris-std-h1",
-	"stdhttp-h1",
-	"gin-h1",
-	"echo-h1",
-	"fiber-h1",
-	"fasthttp-h1",
-	"gnet-h1",
-	"hertz-h1",
-	"axum",
-	"aspnet",
-	"hyper",
-}
-
-// HeadlineScenarios is the curated weekly row set (~12): the static /
-// payload-size / concurrency / mix / chain / streaming scenarios that
-// carry the most signal. Capability gating means the streaming + chain
-// cells only land on servers that declare those capabilities, so the
-// realized count is lower than len(servers) x len(scenarios).
-var HeadlineScenarios = []string{
-	"get-simple",
-	"get-json",
-	"get-json-1k",
-	"get-json-64k",
-	"post-4k",
-	"post-64k",
-	"get-simple-128c",
-	"get-simple-1024c",
-	"auto-mix-111",
-	"chain-fullstack-get-json",
-	"ws-echo",
-	"sse-fanout-128",
-}
+// The weekly (headline) profile no longer curates a SUBSET of servers or
+// scenarios: it runs the FULL grid (every registered server x every
+// registered scenario, capability-gated) via the "*/*" cells glob, the same
+// coverage as the Full profile — only the per-cell window differs (a shorter
+// weekly window that still fits the 24h budget). There is therefore no
+// HeadlineServers / HeadlineScenarios list anymore; the SATURATION grid is
+// "everything". The RATED sweep stays curated (RatedServers x RatedScenarios)
+// because it is the expensive additive dimension — see RatedServers below.
 
 // RatedScenarios is the curated rated/SLO subset (#156): the SLO-knee
 // scenarios where throughput-at-SLO carries the most signal.
@@ -81,58 +47,102 @@ var RatedServers = []string{
 // the mage-tagged realized-count helper validates against the live
 // registries.
 //
-// Derivation (headline): 14 servers x 12 scenarios = 168 nominal cells.
-// Capability gating drops the streaming cells (ws-echo, sse-fanout-128)
-// and the chain cell on servers that don't advertise WebSocket / SSE /
-// chain support, plus a handful of payload-size cells inapplicable to a
-// given adapter — landing the realized grid near ~140. The constant is
-// the conservative pinned figure the workflow runs against; the helper
-// fails the build if the live count exceeds it (which would invalidate
-// the budget assertion).
+// Derivation (headline): the weekly SATURATION grid is now the FULL grid
+// (every server x every scenario, capability-gated), so its realized count
+// is FullRealizedCells — the only thing that keeps weekly under 24h is the
+// shorter per-cell window (see HeadlineWeekly), not a curated subset. The
+// rated sweep stays curated, so HeadlineRatedRealizedCells is unchanged.
 const (
-	HeadlineRealizedCells      = 150
+	HeadlineRealizedCells      = FullRealizedCells
 	HeadlineRatedRealizedCells = 24 // 8 rated servers x 3 rated scenarios, capability-gated
 
-	// Full profile: every server x every scenario, capability-gated. The
-	// nominal grid is ~25 columns x 33 rows ~ 825; gating lands it near
-	// ~520. Pinned conservatively high so the budget test catches an
-	// overflow even after registry growth.
-	FullRealizedCells      = 520
+	// Full profile: every server x every scenario, capability-gated. After
+	// the mid-size payload rows (get/post-json-8k/16k) and the native h2c
+	// columns (axum/ntex/hyper/aspnet/fastapi/hono/elysia -h2) landed, the
+	// nominal grid is ~36 columns x 45 rows ~ 1620; capability gating (the
+	// streaming / driver / chain / TLS cells, plus the h2c-noupg columns
+	// skipping every H1 row) lands the realized count near ~800. Pinned
+	// conservatively high so FitWithin over-projects slightly and a registry
+	// change that blows the budget fails loudly rather than overflowing the
+	// run. Recompute with the scheduler's Applicable gate when the registry
+	// grows again.
+	FullRealizedCells      = 820
 	FullRatedRealizedCells = 24
 )
 
-// HeadlineWeekly is the exact config the benchmark-tier workflow runs on
-// the weekly (non-release) schedule: the curated ~15x12 grid at
-// 40s/10s, plus the curated rated subset. The bench ALWAYS runs exactly
-// one pass (Runs=1) — multi-pass / back-to-back release runs were removed;
-// if more passes are wanted, more benchmarks are scheduled.
+// HeadlineWeekly is the config the benchmark-tier workflow runs on the
+// weekly (non-release) cadence. It now covers the FULL grid — every
+// registered server x every registered scenario, capability-gated (Globs
+// "*/*") — so no framework or scenario is silently left out of the weekly
+// numbers. The ONLY thing distinguishing it from Full() is a shorter
+// per-cell window (60s/15s vs 90s/20s) chosen so the whole grid still fits
+// the 24h budget. The bench ALWAYS runs exactly one pass (Runs=1).
 //
-// ArchParallel is false: arm64 loadgen federation (#168) is blocked on
-// the loadgen repo shipping linux/arm64, so both arches run serially
-// today. The aggressive curation is precisely what keeps the serial
-// run under 24h until that win lands.
+// Arches is 1: the bench runs amd64-only today (BENCH_TARGET=msa2-server;
+// msr1/arm64 is out on a firmware bug, celeris#312), and BenchTier already
+// overrides Arches to 1 at runtime for any non-"both" target — pinning 1
+// here makes the static FitWithin projection match what actually runs
+// instead of over-projecting a non-existent arm64 pass. If arm64 returns
+// (BENCH_TARGET=both), BenchTier sets Arches=2 and FitWithin then aborts the
+// full grid against the default 24h budget unless BENCH_BUDGET is raised —
+// the correct loud failure, since the full grid x 2 serial arches cannot fit
+// 24h until ArchParallel (#168, blocked on loadgen linux/arm64) lands.
+//
+// Budget: ~820 cells x (15+60+5+12)s x 1 arch = ~20.9h saturation + ~0.7h
+// curated rated = ~21.6h < 24h. The rated sweep stays curated (RatedGlobs)
+// because it is the expensive additive dimension; expanding it to the full
+// grid would blow the budget many times over.
 func HeadlineWeekly() Profile {
 	return Profile{
-		Name:  "headline",
-		Cells: HeadlineRealizedCells,
-		// Per-cell window is 40s/10s (not the nominal 60s/15s) because the
-		// two arches run SERIALLY today — arm64 loadgen federation (#168,
-		// ArchParallel) is blocked on the loadgen repo. At 150 cells x 2
-		// serial arches, a 60s window plus the rated pass overflows 24h;
-		// 40s lands the whole run well under budget. When #168 lands and
-		// ArchParallel flips on, this can grow back.
-		Duration:      40 * time.Second,
-		Warmup:        10 * time.Second,
+		Name:          "headline",
+		Cells:         HeadlineRealizedCells,
+		Duration:      60 * time.Second,
+		Warmup:        15 * time.Second,
 		Cooldown:      defaultCooldown,
 		Runs:          1,
-		Arches:        2,
+		Arches:        1,
 		ArchParallel:  false,
 		RatedCells:    HeadlineRatedRealizedCells,
 		RatedPasses:   4,
 		RatedDuration: 20 * time.Second,
 		RatedWarmup:   10 * time.Second,
-		Globs:         headlineGlobs(),
+		Globs:         []string{"*/*"},
 		RatedGlobs:    ratedGlobs(),
+	}
+}
+
+// FastRealizedCells is the live capability-gated saturation cell count of
+// the full "*/*" grid (every server × every scenario the scheduler keeps).
+// Recompute with `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when
+// the registry grows; FitWithin uses it to assert the fast profile still
+// fits 24h, so an over-large grid fails loudly instead of overrunning.
+const FastRealizedCells = 1257
+
+// Fast is the DEFAULT routine + weekly profile: the FULL grid (every server
+// × every scenario, capability-gated, "*/*") in SATURATION ONLY — no rated
+// sweep — at a 35s/10s window so the whole grid fits comfortably under 24h
+// on one arch. Saturation gives the headline ceiling (max RPS + tail latency
+// at saturation) for every cell; the rated/SLO sweep (4 closed-loop passes
+// per cell, the dominant cost) is intentionally OFF here and belongs in a
+// separate, scoped dispatch when latency-under-controlled-load is the story.
+//
+// Budget: 1257 cells × (10+35+5+12)s × 1 arch = ~21.6h saturation, rated=0
+// → ~21.6h < 24h. RatedPasses=0 makes BenchTier skip the rated flag entirely
+// (rated OFF for every cell), so this is the cheap, full-breadth mode.
+func Fast() Profile {
+	return Profile{
+		Name:         "fast",
+		Cells:        FastRealizedCells,
+		Duration:     35 * time.Second,
+		Warmup:       10 * time.Second,
+		Cooldown:     defaultCooldown,
+		Runs:         1,
+		Arches:       1,
+		ArchParallel: false,
+		RatedCells:   0, // rated OFF — saturation-only
+		RatedPasses:  0,
+		Globs:        []string{"*/*"},
+		RatedGlobs:   nil,
 	}
 }
 
@@ -149,7 +159,7 @@ func Full() Profile {
 		Warmup:        20 * time.Second,
 		Cooldown:      defaultCooldown,
 		Runs:          1,
-		Arches:        2,
+		Arches:        1,
 		ArchParallel:  false,
 		RatedCells:    FullRatedRealizedCells,
 		RatedPasses:   4,
@@ -158,15 +168,6 @@ func Full() Profile {
 		Globs:         []string{"*/*"},
 		RatedGlobs:    ratedGlobs(),
 	}
-}
-
-// headlineGlobs expands the curated headline scenario x server lists into
-// the "<scenario>/<server>" glob set the runner's -cells filter consumes.
-// The runner skips capability-inapplicable pairs, so emitting the full
-// cartesian product here is correct — the realized count is the gated
-// subset, not len(Globs).
-func headlineGlobs() []string {
-	return crossGlobs(HeadlineScenarios, HeadlineServers)
 }
 
 // ratedGlobs expands the curated rated scenario x server subset into its

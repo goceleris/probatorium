@@ -185,8 +185,8 @@ var defaultRatedFractions = []float64{0.25, 0.5, 0.75, 0.9}
 func DefaultConfig() Config {
 	return Config{
 		Runs:           5,
-		Duration:       120 * time.Second,
-		Warmup:         30 * time.Second,
+		Duration:       45 * time.Second,
+		Warmup:         10 * time.Second,
 		Cooldown:       5 * time.Second,
 		Services:       "local",
 		Seed:           0,

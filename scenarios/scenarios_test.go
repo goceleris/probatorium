@@ -12,14 +12,18 @@ import (
 // files and are deliberately excluded here — this test guards the slice
 // we own, not the ones we don't.
 var expectedRegistry = []string{
-	// static H1 (8)
+	// static H1 (12)
 	"churn-close",
 	"get-json",
 	"get-json-1k",
+	"get-json-8k",
+	"get-json-16k",
 	"get-json-64k",
 	"get-simple",
 	"post-1m",
 	"post-4k",
+	"post-8k",
+	"post-16k",
 	"post-64k",
 
 	// static H2-prior-knowledge (4) — exercise h2c-noupg and other
@@ -29,11 +33,12 @@ var expectedRegistry = []string{
 	"post-4k-h2",
 	"post-64k-h2",
 
-	// concurrency (4)
-	"auto-mix-111",
+	// concurrency (5)
 	"get-json-1c",
-	"get-simple-1024c",
 	"get-simple-128c",
+	"get-simple-256c",
+	"get-simple-512c",
+	"get-simple-1024c",
 }
 
 func TestRegistryContainsExpectedScenarios(t *testing.T) {
@@ -192,49 +197,11 @@ func TestErrorBudgets(t *testing.T) {
 	}
 }
 
-func TestAutoMixApplicableGating(t *testing.T) {
-	t.Parallel()
-	s := findScenario(t, "auto-mix-111")
-	checks := []struct {
-		name string
-		fs   servers.FeatureSet
-		want bool
-	}{
-		{"empty", servers.FeatureSet{}, false},
-		{"only-h1", servers.FeatureSet{HTTP1: true}, false},
-		{"h1+h2c", servers.FeatureSet{HTTP1: true, HTTP2C: true}, false},
-		{"h1+h2c+upgrade", servers.FeatureSet{HTTP1: true, HTTP2C: true, H2CUpgrade: true}, true},
-		{"everything", servers.FeatureSet{
-			HTTP1: true, HTTP2C: true, Auto: true, H2CUpgrade: true,
-			Drivers: true, Middleware: true, AsyncHandlers: true,
-		}, true},
-	}
-	for _, c := range checks {
-		if got := s.Applicable(c.fs); got != c.want {
-			t.Errorf("auto-mix-111 Applicable(%s) = %v, want %v", c.name, got, c.want)
-		}
-	}
-
-	cfg := s.Workload("http://x")
-	if cfg.Mix == nil {
-		t.Fatalf("auto-mix-111: Workload.Mix == nil, want *loadgen.MixRatio{1,1,1}")
-	}
-	if cfg.Mix.H1 != 1 || cfg.Mix.H2 != 1 || cfg.Mix.Upgrade != 1 {
-		t.Errorf("auto-mix-111: Mix = %+v, want {1,1,1}", *cfg.Mix)
-	}
-	if cfg.HTTP2 {
-		t.Errorf("auto-mix-111: HTTP2 = true, must be false when Mix is set")
-	}
-	if cfg.H2CUpgrade {
-		t.Errorf("auto-mix-111: H2CUpgrade = true, must be false when Mix is set")
-	}
-}
-
-func TestConcurrencyNonAutoMixRequireHTTP1(t *testing.T) {
+func TestConcurrencyRequireHTTP1(t *testing.T) {
 	t.Parallel()
 	h1Only := servers.FeatureSet{HTTP1: true}
 	h2cOnly := servers.FeatureSet{HTTP2C: true}
-	for _, name := range []string{"get-json-1c", "get-simple-128c", "get-simple-1024c"} {
+	for _, name := range []string{"get-json-1c", "get-simple-128c", "get-simple-256c", "get-simple-512c", "get-simple-1024c"} {
 		s := findScenario(t, name)
 		if !s.Applicable(h1Only) {
 			t.Errorf("%q: unexpectedly skipped for HTTP1-only server", name)
@@ -273,7 +240,7 @@ func TestCategories(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"auto-mix-111", "get-json-1c", "get-simple-128c", "get-simple-1024c",
+		"get-json-1c", "get-simple-128c", "get-simple-256c", "get-simple-512c", "get-simple-1024c",
 	} {
 		s := findScenario(t, name)
 		if got := s.Category(); got != CategoryConcurrency {

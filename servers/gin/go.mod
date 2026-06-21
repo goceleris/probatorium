@@ -3,7 +3,7 @@ module github.com/goceleris/probatorium/servers/gin
 go 1.26.4
 
 require (
-	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf
+	github.com/bradfitz/gomemcache v0.0.0-20260422231931-4d751bb6e37c
 	github.com/gin-gonic/gin v1.12.0
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 	github.com/google/uuid v1.6.0
@@ -43,7 +43,7 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/arch v0.22.0 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect

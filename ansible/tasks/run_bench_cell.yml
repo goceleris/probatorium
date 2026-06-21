@@ -123,6 +123,23 @@
   become: true
   ansible.builtin.shell: |
     bp={{ bench_port | default(8080) }}
+    # Kill the prior respawn supervisor FIRST (pid at a fixed path) so it
+    # cannot relaunch the SUT we are about to reap. Without this the bounded
+    # loop would re-bind the port after every sweep pass.
+    # NB: keep this free-form shell block free of apostrophes and unpaired
+    # quote chars. ansible split_args tokenizes the entire string (it does
+    # not honor the leading hash as a comment), so a stray quote anywhere
+    # fails task loading with an unbalanced-quotes error.
+    sup_pidfile={{ bench_root }}/.sut-supervisor.pid
+    if [ -f "$sup_pidfile" ]; then
+      sup=$(cat "$sup_pidfile" 2>/dev/null)
+      if [ -n "$sup" ]; then
+        pkill -TERM -P "$sup" 2>/dev/null; kill -TERM "$sup" 2>/dev/null
+        sleep 0.3
+        pkill -KILL -P "$sup" 2>/dev/null; kill -KILL "$sup" 2>/dev/null
+      fi
+      rm -f "$sup_pidfile"
+    fi
     pkill -TERM -f "[c]ompetitors/" 2>/dev/null
     pkill -x server 2>/dev/null
     for i in $(seq 1 40); do
@@ -185,8 +202,27 @@
       # in TIME_WAIT/accept queues. Launched under root (become), so both
       # soft+hard rise; best-effort like -l above.
       ulimit -n 65535 2>/dev/null || true
-      nohup ./competitors/{{ cell_bin }} -bind 0.0.0.0:{{ bench_port | default(8080) }} {{ ('-engine ' + cell_engine) if cell_engine else '' }} > {{ cell_dir }}/server.log 2>&1 &
-      echo $! > {{ cell_dir }}/server.pid
+      # Bounded respawn supervisor (max 5). A SUT that crashes mid-column
+      # (e.g. http.zig hitting an unreachable under churn-close) self-heals
+      # within ~0.5s, so only the crashing scenario is lost — NOT the rest of
+      # the column (httpzig previously cascaded one crash into 16 server-down
+      # cells). The cap means a true crash-loop still lands as server-down for
+      # the runner to record rather than spinning forever. The supervisor pid
+      # (the subshell) is what teardown kills FIRST — see the stop task — so
+      # the loop can never re-bind after the column ends.
+      ENGINE_ARG="{{ ('-engine ' + cell_engine) if cell_engine else '' }}"
+      (
+        n=0
+        while [ "$n" -lt 5 ]; do
+          ./competitors/{{ cell_bin }} -bind 0.0.0.0:{{ bench_port | default(8080) }} $ENGINE_ARG
+          echo "[respawn] SUT exited rc=$? (attempt $n) at $(date -u +%H:%M:%S)"
+          n=$((n + 1))
+          sleep 0.5
+        done
+      ) > {{ cell_dir }}/server.log 2>&1 &
+      # Fixed location (not cell_dir) so the NEXT column's generic stop task can
+      # find + kill this supervisor without knowing this column's cell_dir.
+      echo $! > {{ bench_root }}/.sut-supervisor.pid
       disown
     executable: /bin/bash
   args:

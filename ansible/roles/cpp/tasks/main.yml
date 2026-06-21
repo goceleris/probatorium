@@ -43,11 +43,15 @@
 #   hashing), c-ares (async DNS), brotli (optional compression). pkg-config
 #   lets drogon's CMake locate them. Probe each so we only apt-install —
 #   and therefore only later apt-purge — the genuinely-missing ones.
-- name: cpp | detect missing system packages (compiler + cmake + drogon libs)
+#   lithium (the second cpp adapter) is header-only but its http_backend
+#   links Boost.Context (fiber stacks); libboost-context-dev + libboost-dev
+#   satisfy find_package(Boost COMPONENTS context).
+- name: cpp | detect missing system packages (compiler + cmake + drogon/lithium libs)
   ansible.builtin.shell: |
     for pkg in build-essential cmake git pkg-config ca-certificates \
                libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev \
-               libc-ares-dev libbrotli-dev; do
+               libc-ares-dev libbrotli-dev \
+               libboost-context-dev libboost-dev; do
       dpkg -s "$pkg" >/dev/null 2>&1 || echo "$pkg"
     done
   register: cpp_missing_pkgs

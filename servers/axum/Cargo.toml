@@ -36,8 +36,21 @@ path = "src/main.rs"
 [dependencies]
 # axum — tower-stack HTTP framework. Pulls hyper transitively.
 axum = ">=0.7"
+# hyper — declared explicitly so the h2c engine can drive each accepted
+# TCP connection with hyper's HTTP/2 prior-knowledge server builder
+# (hyper::server::conn::http2::Builder). The "http2" feature is what
+# pulls that builder in; "server" + "http1" keep the H1 serve path for
+# the default -engine h1 mode. axum already pulls hyper transitively, but
+# we name it here to control the feature set.
+hyper = { version = ">=1", features = ["server", "http1", "http2"] }
+# hyper-util — TokioExecutor (the Http2ServerConnExec the http2 builder
+# needs), TokioIo (adapts a tokio TcpStream to hyper's I/O traits),
+# TowerToHyperService (wraps axum's tower Router into a hyper Service for
+# serve_connection), and the graceful-shutdown watcher used to drain
+# in-flight h2c connections on SIGTERM.
+hyper-util = { version = ">=0.1", features = ["tokio", "server", "server-graceful", "service", "http1", "http2"] }
 # tokio — async runtime. multi-thread + signal + macros (#[tokio::main]).
-tokio = { version = ">=1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync"] }
+tokio = { version = ">=1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "sync", "time"] }
 # serde_json — only needed for one tiny ad-hoc map encoding; the
 # deterministic 1k/64k payloads are emitted by hand to guarantee
 # byte-identical output to the Go reference (see src/payload.rs).

@@ -140,8 +140,12 @@ var StaticScenarioNames = []string{
 	"get-simple",
 	"get-json",
 	"get-json-1k",
+	"get-json-8k",
+	"get-json-16k",
 	"get-json-64k",
 	"post-4k",
+	"post-8k",
+	"post-16k",
 	"post-64k",
 	"post-1m",
 	"churn-close",
@@ -162,6 +166,8 @@ var StaticScenarioNames = []string{
 // size leaves the others byte-identical.
 var (
 	post4KBody  = makeRandomBody(4*1024, 0xA11CE_4000)
+	post8KBody  = makeRandomBody(8*1024, 0xA11CE_8000)
+	post16KBody = makeRandomBody(16*1024, 0xB0B_16000)
 	post64KBody = makeRandomBody(64*1024, 0xB0B_64000)
 	post1MBody  = makeRandomBody(1024*1024, 0xC0DE_10000)
 )
@@ -220,6 +226,24 @@ func init() {
 		Path:        "/json-1k",
 		Connections: 128,
 	})
+	// Mid-size GET payloads (8k/16k). The 64k cells are NIC-bound on the 20G
+	// LACP fabric — every fast adapter converges at the line rate, so raw RPS
+	// stops differentiating them. 8k/16k responses stay well under the
+	// ceiling (a server doing 100k RPS of 16k is ~13 Gbps, still CPU-bound),
+	// so these rows recover the response-serialisation throughput signal the
+	// 64k row loses to the wire.
+	Register(&StaticScenario{
+		name:        "get-json-8k",
+		Method:      "GET",
+		Path:        "/json-8k",
+		Connections: 128,
+	})
+	Register(&StaticScenario{
+		name:        "get-json-16k",
+		Method:      "GET",
+		Path:        "/json-16k",
+		Connections: 128,
+	})
 	Register(&StaticScenario{
 		name:        "get-json-64k",
 		Method:      "GET",
@@ -231,6 +255,24 @@ func init() {
 		Method:      "POST",
 		Path:        "/upload",
 		Body:        post4KBody,
+		Connections: 128,
+	})
+	// Mid-size POST bodies (8k/16k). Same NIC-ceiling rationale as the
+	// mid-size GET rows, on the upload (request-body parse) axis — and free
+	// of any per-adapter route work, since every adapter already serves
+	// /upload.
+	Register(&StaticScenario{
+		name:        "post-8k",
+		Method:      "POST",
+		Path:        "/upload",
+		Body:        post8KBody,
+		Connections: 128,
+	})
+	Register(&StaticScenario{
+		name:        "post-16k",
+		Method:      "POST",
+		Path:        "/upload",
+		Body:        post16KBody,
 		Connections: 128,
 	})
 	Register(&StaticScenario{

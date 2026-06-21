@@ -49,8 +49,8 @@ import (
 //
 //	BENCH_TARGET=both              msa2-server | msr1 | both
 //	BENCH_COMPETITORS=all          all | <csv>; matches Deploy filter
-//	BENCH_DURATION=120s            per-cell active duration
-//	BENCH_WARMUP=30s               per-cell warmup
+//	BENCH_DURATION=45s             per-cell active duration
+//	BENCH_WARMUP=10s               per-cell warmup
 //	BENCH_CONNECTIONS=256          loadgen concurrent conns
 //	BENCH_CELLS=*                  cell glob forwarded to the runner's
 //	                               -cells over "<scenario>/<competitor>";
@@ -161,8 +161,8 @@ func Bench() error {
 		return fmt.Errorf("BENCH_TARGET must be msa2-server, msr1, or both (got %q)", target)
 	}
 	competitors := envOrDefault("BENCH_COMPETITORS", "all")
-	duration := envOrDefault("BENCH_DURATION", "120s")
-	warmup := envOrDefault("BENCH_WARMUP", "30s")
+	duration := envOrDefault("BENCH_DURATION", "45s")
+	warmup := envOrDefault("BENCH_WARMUP", "10s")
 	conns := envOrDefault("BENCH_CONNECTIONS", "256")
 	cells := envOrDefault("BENCH_CELLS", "*")
 	// BENCH_SKIP_FILE is a JSON list of (server, scenario) pairs to
@@ -211,10 +211,12 @@ func Bench() error {
 	// full registry. This is the source of truth for which competitors the
 	// bench will produce non-empty data for — the playbook's outer loop must
 	// iterate exactly this set, otherwise the bench wastes time on columns
-	// whose (server, scenario) cell glob is empty (regression: profile=headline
-	// glob is 15 servers, but `competitors` defaults to "all" = 31 → 16 no-op
-	// columns of wasted ansible outer-loop overhead per back-to-back
-	// iteration). Returns nil (→ use full registry) for cells == "*" / "".
+	// whose (server, scenario) cell glob is empty (regression: a narrow
+	// BENCH_CELLS like "get-*/celeris-*" matches only the celeris columns,
+	// but `competitors` defaults to "all" = the full registry → every other
+	// column is a no-op of wasted ansible outer-loop overhead per pass). The
+	// weekly/full profiles both use "*/*" so they correctly derive the whole
+	// registry here. Returns nil (→ use full registry) for cells == "*" / "".
 	//
 	// Computed BEFORE the auto-deploy block so the deploy gets the same
 	// trimmed scope the bench will use — installing rust + bun + python
@@ -535,6 +537,16 @@ type benchColumn struct {
 // truth. Engine == the registry Adapter.Engine field for Go adapters (the
 // two are identical by construction); gorilla_ws is the lone Go binary with
 // no -engine flag, and natives are launched with -bind only.
+// engineFlagValue maps a registry Adapter.Engine (the FEATURE-SET tag the
+// runner's featureSetFor reads) to the value passed to the SUT's -engine
+// flag. The only translation is stripping the "-noupg" suffix: the runner
+// needs "h2c-noupg" to gate HTTP1=false, but every adapter's -engine parser
+// only knows "h2c" (prior-knowledge h2c). An empty Engine yields "" so the
+// playbook omits the flag entirely.
+func engineFlagValue(engine string) string {
+	return strings.TrimSuffix(engine, "-noupg")
+}
+
 func resolveBenchColumns(arg string) ([]benchColumn, error) {
 	all := servers.Names() // sorted, stable
 	names := all
@@ -572,7 +584,6 @@ func resolveBenchColumns(arg string) ([]benchColumn, error) {
 			// iris/hertz/celeris) or accepts-and-ignores it (gnet/fasthttp/
 			// fiber), so passing the registry Engine value is always safe there.
 			if col.Bin != "gorilla_ws" {
-				col.Engine = a.Engine
 				// Strip a "-noupg" suffix from the SUT-facing engine flag.
 				// The registry's Engine field is the FEATURE-SET tag
 				// (cmd/runner/featureSetFor reads it to decide HTTP1 /
@@ -590,11 +601,24 @@ func resolveBenchColumns(arg string) ([]benchColumn, error) {
 				// never invoked because the SUT exited immediately on
 				// "unknown -engine h2c-noupg", so the bind gate timed
 				// out and the whole column was skipped.
-				col.Engine = strings.TrimSuffix(col.Engine, "-noupg")
+				col.Engine = engineFlagValue(a.Engine)
 			}
+		} else if nb, ok := a.Bin.(servers.NativeBinary); ok {
+			// NativeBinary (rust/cpp/dotnet/bun/python). Staged under
+			// competitors/<slug>; an h2c column reuses its h1 sibling's build
+			// via Bin.BinName (axum-h2 → competitors/axum). The -engine flag
+			// is passed for every native carrying a registry Engine so the
+			// adapter selects the right wire protocol AND the run_bench_cell
+			// port-ownership guard can tell two columns sharing one binary
+			// apart (it greps "-engine <value> " in the live cmdline). A
+			// native with no Engine (bun: hono/elysia) passes no flag — the
+			// guard accepts the language-runtime argv loosely either way.
+			col.Bin = n
+			if nb.BinName != "" {
+				col.Bin = nb.BinName
+			}
+			col.Engine = engineFlagValue(a.Engine)
 		} else {
-			// NativeBinary (rust/cpp/dotnet/zig/bun/python) — staged under
-			// competitors/<slug>, launched with -bind only.
 			col.Bin = n
 		}
 		cols = append(cols, col)
@@ -612,9 +636,9 @@ func resolveBenchColumns(arg string) ([]benchColumn, error) {
 // data" — the bench must pass the resulting set to the playbook's
 // competitor_set, otherwise the outer ansible loop iterates columns whose
 // runner invocation finds zero matching cells and exits in ~1m as a no-op
-// (regression: profile=headline glob is 15 servers, but the default
-// competitors="all" feeds 31 columns → 16 wasted no-ops per back-to-back
-// iteration). Keep this in sync with cmd/runner/main.go's filterCells —
+// (regression: a narrow BENCH_CELLS would match only a few servers, but the
+// default competitors="all" feeds the whole registry → wasted no-op columns
+// per pass). Keep this in sync with cmd/runner/main.go's filterCells —
 // the parser and the include/exclude semantics are deliberately identical
 // so a glob like "*/celeris-*" produces the same set here and in the
 // runner.
@@ -1302,7 +1326,7 @@ func summarizeCells(cells []cellRecord) (map[string]competitorStats, error) {
 			MedianP99Ns:   medianInt(p99[key]),
 			TotalRequests: reqs[key],
 			TotalErrors:   errs[key],
-			Resources:     reduceResources(res[key]),
+			Resources:     report.ReduceResources(res[key]),
 			LatencyAtSLO:  reduceLatencyAtSLO(rated[key]),
 		}
 	}
@@ -1345,68 +1369,6 @@ func reduceLatencyAtSLO(runs [][]ratedPassWire) map[int]int {
 		return nil
 	}
 	return slo
-}
-
-// reduceResources folds a bucket's per-run ResourceStats into one
-// representative (#154): each summary scalar is the median across runs
-// (so a single GC spike or RSS blip does not skew the headline), and the
-// last run's series is kept verbatim as the illustrative trajectory. A
-// metric stays null in the result iff it was null in EVERY run, so a
-// non-Go competitor keeps goroutine/GC null while RSS/CPU/FD survive.
-func reduceResources(runs []*report.ResourceStats) *report.ResourceStats {
-	if len(runs) == 0 {
-		return nil
-	}
-	out := &report.ResourceStats{Series: runs[len(runs)-1].Series}
-	out.Summary.PeakRSSBytes = medianIntPtr(collectI64(runs, func(s report.ResourceSummary) *int64 { return s.PeakRSSBytes }))
-	out.Summary.SteadyRSSBytes = medianIntPtr(collectI64(runs, func(s report.ResourceSummary) *int64 { return s.SteadyRSSBytes }))
-	out.Summary.GCPauseP99Ns = medianIntPtr(collectI64(runs, func(s report.ResourceSummary) *int64 { return s.GCPauseP99Ns }))
-	out.Summary.GoroutineHWM = medianIntPtr(collectI64(runs, func(s report.ResourceSummary) *int64 { return s.GoroutineHWM }))
-	out.Summary.FDHWM = medianIntPtr(collectI64(runs, func(s report.ResourceSummary) *int64 { return s.FDHWM }))
-	out.Summary.MeanCPUPct = medianFloatPtr(collectF64(runs, func(s report.ResourceSummary) *float64 { return s.MeanCPUPct }))
-	return out
-}
-
-// collectI64 gathers the non-nil values a selector pulls from each run's
-// summary.
-func collectI64(runs []*report.ResourceStats, sel func(report.ResourceSummary) *int64) []int64 {
-	var out []int64
-	for _, r := range runs {
-		if v := sel(r.Summary); v != nil {
-			out = append(out, *v)
-		}
-	}
-	return out
-}
-
-// collectF64 is collectI64 for float metrics.
-func collectF64(runs []*report.ResourceStats, sel func(report.ResourceSummary) *float64) []float64 {
-	var out []float64
-	for _, r := range runs {
-		if v := sel(r.Summary); v != nil {
-			out = append(out, *v)
-		}
-	}
-	return out
-}
-
-// medianIntPtr returns the median of xs as a fresh pointer, or nil when
-// xs is empty (every run had the metric null).
-func medianIntPtr(xs []int64) *int64 {
-	if len(xs) == 0 {
-		return nil
-	}
-	v := medianInt(xs)
-	return &v
-}
-
-// medianFloatPtr is medianIntPtr for floats.
-func medianFloatPtr(xs []float64) *float64 {
-	if len(xs) == 0 {
-		return nil
-	}
-	v := medianFloat(xs)
-	return &v
 }
 
 // summaryKey joins a competitor and scenario into the per-bucket key for
@@ -1623,6 +1585,18 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 					cell.Competitor, cell.RunIndex, e.Name(), err)
 			}
 			cr.Samples = append(cr.Samples, res)
+			// Server-side resource sidecar (#154): the per-cell observer.sqlite
+			// + cpu.log were reduced into cell.Resources by
+			// aggregatePerCellResults. Thread it onto the CellResult so
+			// report.Aggregate reduces it across runs into the typed Document's
+			// benchmarks[].resources — the merge step used to drop it on the
+			// floor (CellResult had no Resources field), so every published
+			// document carried an empty resources map despite the raw payloads
+			// holding the data. Skip nil so a run without an observer never
+			// nil-panics ReduceResources.
+			if cell.Resources != nil {
+				cr.Resources = append(cr.Resources, cell.Resources)
+			}
 			// loadgen.Result.Histogram is the V2-compressed HdrHistogram
 			// payload as raw bytes; CellResult wants base64 strings so
 			// report.Aggregate can decode + merge them across runs.
@@ -1710,9 +1684,10 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 		// so v1 of #155 synthesises Environment from the known fabric
 		// constants and leaves the sysctl list empty. Capturing the live
 		// sysctls is a cluster-side ansible follow-up.
-		KernelSysctlsApplied: []string{},
-		LoadgenHost:          "msa2-client",
-		Fabric:               benchFabric(),
+		KernelSysctlsApplied:     []string{},
+		LoadgenHost:              "msa2-client",
+		Fabric:                   benchFabric(),
+		FabricLineRateBitsPerSec: benchFabricLineRate(),
 	}
 
 	doc := report.BuildDocument(report.BuildInput{
@@ -1804,6 +1779,18 @@ func benchFabric() string {
 		return "3-host LACP 20G"
 	}
 	return "3-host Tailscale overlay"
+}
+
+// benchFabricLineRate returns the fabric's theoretical egress ceiling in
+// bits/sec for the network-bound annotation (#schema-5.5): 20 Gbps on the
+// 2x10G LACP LAN, 0 (unknown) on the Tailscale overlay — where the report
+// flags no cell, since the WireGuard overlay's throughput is not a fixed
+// line rate worth ranking CPU efficiency against.
+func benchFabricLineRate() int64 {
+	if os.Getenv("CLUSTER_USE_LAN") == "1" {
+		return 20_000_000_000
+	}
+	return 0
 }
 
 // benchTargetArch maps a bench_target host to its CPU arch for the

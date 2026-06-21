@@ -67,6 +67,36 @@ var engineSpecs = map[string]engineSpec{
 		protocol:   celeris.HTTP1,
 		async:      false,
 	},
+	// Adaptive meta-engine (the v1.5.x focus): starts epoll, promotes new
+	// conns to io_uring under sustained load. h1 + auto(h2c) variants.
+	"adaptive-h1-async": {
+		engineType: celeris.Adaptive,
+		protocol:   celeris.HTTP1,
+		async:      true,
+	},
+	"adaptive-auto+upg-async": {
+		engineType: celeris.Adaptive,
+		protocol:   celeris.Auto,
+		async:      true,
+	},
+	// Engine × sync/async grid completers so the matrix can isolate the
+	// sync-vs-async axis on a fixed engine (and h2c on epoll, which the
+	// original 4 columns could not express).
+	"epoll-h1-async": {
+		engineType: celeris.Epoll,
+		protocol:   celeris.HTTP1,
+		async:      true,
+	},
+	"epoll-auto+upg-async": {
+		engineType: celeris.Epoll,
+		protocol:   celeris.Auto,
+		async:      true,
+	},
+	"iouring-h1-sync": {
+		engineType: celeris.IOUring,
+		protocol:   celeris.HTTP1,
+		async:      false,
+	},
 }
 
 func main() {
@@ -132,6 +162,12 @@ func registerRoutes(srv *celeris.Server) {
 	})
 	srv.GET("/json-1k", func(c *celeris.Context) error {
 		return c.Blob(200, "application/json", common.JSON1KPayload())
+	})
+	srv.GET("/json-8k", func(c *celeris.Context) error {
+		return c.Blob(200, "application/json", common.JSON8KPayload())
+	})
+	srv.GET("/json-16k", func(c *celeris.Context) error {
+		return c.Blob(200, "application/json", common.JSON16KPayload())
 	})
 	srv.GET("/json-64k", func(c *celeris.Context) error {
 		return c.Blob(200, "application/json", common.JSON64KPayload())

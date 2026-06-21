@@ -1,5 +1,5 @@
-github.com/goceleris/celeris v1.5.2 h1:oQLMkpoRDKB40kyk5m10QnrwMEVYxc1SVOGvUu9Cw8Q=
-github.com/goceleris/celeris v1.5.2/go.mod h1:usrqjcfMxiNA4lFoE/YbEzX10+UFhoJ4JQVkAS7noSc=
+github.com/goceleris/celeris v1.5.3 h1:n3/2xAqwqyMG0c9g1bP+F2KdjZngCOgGFHup1f3fRY4=
+github.com/goceleris/celeris v1.5.3/go.mod h1:usrqjcfMxiNA4lFoE/YbEzX10+UFhoJ4JQVkAS7noSc=
 golang.org/x/net v0.56.0 h1:Rw8j/hFzGvJUZwNBXnAtf5sVDVt+65SK2C7IxCxZt5o=
 golang.org/x/net v0.56.0/go.mod h1:D3Ku6r+V6JROoZK144D2XfMHFcMq/0zSfLelVTCFKec=
 golang.org/x/sys v0.46.0 h1:noSf2Fq6F8DBgS+LysIkx7rIExoNHJsxOAtPp4rthXw=

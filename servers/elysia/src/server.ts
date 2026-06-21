@@ -18,14 +18,29 @@
 //                  "ready addr=...".
 //   stdout         "ready addr=<final-bind-addr>" once listening.
 //   SIGTERM        graceful shutdown within 5s.
+//
+// -engine flag: the bench passes `-engine <value>` only when the registry
+// gives the adapter an Engine. Today elysia has none, so no -engine arrives
+// — but we parse it defensively so an added Engine works without a code
+// change. "h1" (or absent) stays on the Bun.serve fast path. "h2c" serves
+// HTTP/2 cleartext prior-knowledge via the node:http2 bridge in h2c.ts.
+// Any other value exits non-zero with a clear message.
 
 import { Elysia } from "elysia";
-import { json1KPayload, json64KPayload } from "./payload";
+import {
+  json1KPayload,
+  json8KPayload,
+  json16KPayload,
+  json64KPayload,
+} from "./payload";
+import { serveH2C } from "./h2c";
 
 const HELLO = new TextEncoder().encode("Hello, World!");
 const JSON_HELLO = new TextEncoder().encode('{"message":"Hello, World!"}');
 const OK = new TextEncoder().encode("OK");
 const JSON_1K = json1KPayload();
+const JSON_8K = json8KPayload();
+const JSON_16K = json16KPayload();
 const JSON_64K = json64KPayload();
 
 const TEXT = "text/plain";
@@ -65,6 +80,22 @@ const app = new Elysia()
       }),
   )
   .get(
+    "/json-8k",
+    () =>
+      new Response(JSON_8K, {
+        status: 200,
+        headers: { ...headersJSON, "Content-Length": String(JSON_8K.length) },
+      }),
+  )
+  .get(
+    "/json-16k",
+    () =>
+      new Response(JSON_16K, {
+        status: 200,
+        headers: { ...headersJSON, "Content-Length": String(JSON_16K.length) },
+      }),
+  )
+  .get(
     "/json-64k",
     () =>
       new Response(JSON_64K, {
@@ -92,23 +123,40 @@ const app = new Elysia()
   });
 
 const { host, port } = parseBind(process.argv);
+const engine = parseEngine(process.argv);
 
-const server = Bun.serve({
-  hostname: host,
-  port,
-  reusePort: true,
-  fetch: app.fetch,
-});
+if (engine === "h2c") {
+  // HTTP/2 cleartext prior-knowledge via node:http2 (see h2c.ts). Bun.serve
+  // has no cleartext-h2 server option as of Bun 1.3.14, so we bridge the h2
+  // streams to the same app.fetch handler the h1 path uses.
+  const h2c = await serveH2C(host, port, app.fetch);
+  console.log(`ready addr=${h2c.hostname}:${h2c.port}`);
 
-console.log(`ready addr=${server.hostname}:${server.port}`);
+  const shutdownH2C = (signal: string): void => {
+    console.log(`elysia: received ${signal}, shutting down`);
+    h2c.stop();
+    setTimeout(() => process.exit(0), 50);
+  };
+  process.on("SIGTERM", () => shutdownH2C("SIGTERM"));
+  process.on("SIGINT", () => shutdownH2C("SIGINT"));
+} else {
+  const server = Bun.serve({
+    hostname: host,
+    port,
+    reusePort: true,
+    fetch: app.fetch,
+  });
 
-const shutdown = (signal: string): void => {
-  console.log(`elysia: received ${signal}, shutting down`);
-  server.stop(true);
-  setTimeout(() => process.exit(0), 50);
-};
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+  console.log(`ready addr=${server.hostname}:${server.port}`);
+
+  const shutdown = (signal: string): void => {
+    console.log(`elysia: received ${signal}, shutting down`);
+    server.stop(true);
+    setTimeout(() => process.exit(0), 50);
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}
 
 function parseBind(argv: readonly string[]): { host: string; port: number } {
   let raw = process.env["BIND"] ?? "0.0.0.0:8080";
@@ -135,4 +183,35 @@ function parseBind(argv: readonly string[]): { host: string; port: number } {
     throw new Error(`elysia: invalid port in -bind ${JSON.stringify(raw)}`);
   }
   return { host, port };
+}
+
+// parseEngine walks argv for -engine (accepts `-engine h1` and
+// `-engine=h1`). Recognised values:
+//   "" / absent / "h1" → Bun.serve HTTP/1.1 fast path.
+//   "h2c"              → HTTP/2 cleartext prior-knowledge (node:http2).
+// Any other value is a hard error: better to fail loudly than silently
+// serve the wrong protocol and skew the bench. The registry currently
+// gives elysia no Engine, so this returns "h1" in practice — but an added
+// Engine flows through here without further changes.
+function parseEngine(argv: readonly string[]): "h1" | "h2c" {
+  let raw = "";
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === undefined) continue;
+    if (a === "-engine" || a === "--engine") {
+      raw = argv[i + 1] ?? "";
+      break;
+    }
+    if (a.startsWith("-engine=") || a.startsWith("--engine=")) {
+      raw = a.slice(a.indexOf("=") + 1);
+      break;
+    }
+  }
+  if (raw === "" || raw === "h1") return "h1";
+  if (raw === "h2c") return "h2c";
+  console.error(
+    `elysia: unsupported -engine ${JSON.stringify(raw)} ` +
+      `(supported: h1, h2c)`,
+  );
+  process.exit(2);
 }

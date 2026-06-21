@@ -7,14 +7,16 @@ import (
 )
 
 // ConcurrencyProfile enumerates the per-target concurrency profiles the
-// matrix sweeps: 1 connection, 128 connections, 1024 connections, and an
-// auto-mix blend (H1 + H2 + H2C-upgrade, 1:1:1) produced via loadgen's
-// -mix mode.
+// matrix sweeps: 1, 128, 256, 512, and 1024 connections. The 256/512
+// mid-high points make the engine crossover visible — celeris's io_uring
+// engine ties through ~256c and pulls ahead by 512c, peaking at 1024c;
+// without them the sweep jumps 128c→1024c and hides the inflection.
 const (
-	ProfileSingle  = "single-conn"
-	ProfileMid     = "128-conn"
-	ProfileHigh    = "1024-conn"
-	ProfileAutoMix = "auto-mix-h1:h2:upgrade=1:1:1"
+	ProfileSingle = "single-conn"
+	ProfileMid    = "128-conn"
+	ProfileMidHi  = "256-conn"
+	ProfileHi512  = "512-conn"
+	ProfileHigh   = "1024-conn"
 )
 
 // ConcurrencyScenario parameterises a static workload with one of the
@@ -29,15 +31,8 @@ type ConcurrencyScenario struct {
 	// Path is the request path ("/" or "/json").
 	Path string
 
-	// Connections is the TCP connection count passed to loadgen. For the
-	// auto-mix profile, loadgen spreads these connections across the three
-	// protocol buckets according to Mix.
+	// Connections is the TCP connection count passed to loadgen.
 	Connections int
-
-	// Mix, when non-nil, enables loadgen's weighted-draw protocol mixer
-	// and MUST NOT be combined with HTTP2 / H2CUpgrade per loadgen's
-	// Config godoc. Only the auto-mix scenario sets it.
-	Mix *loadgen.MixRatio
 }
 
 // NewConcurrencyScenario constructs a [ConcurrencyScenario]. Kept for
@@ -53,7 +48,7 @@ func (s *ConcurrencyScenario) Name() string { return s.name }
 func (s *ConcurrencyScenario) Category() string { return CategoryConcurrency }
 
 // Profile returns the concurrency profile identifier (one of [ProfileSingle],
-// [ProfileMid], [ProfileHigh], [ProfileAutoMix]).
+// [ProfileMid], [ProfileMidHi], [ProfileHi512], [ProfileHigh]).
 func (s *ConcurrencyScenario) Profile() string { return s.profile }
 
 // Workload returns the loadgen.Config for this scenario. The orchestrator
@@ -73,24 +68,13 @@ func (s *ConcurrencyScenario) Workload(target string) loadgen.Config {
 		Method:      method,
 		Connections: conns,
 	}
-	// Mix is mutually exclusive with HTTP2 / H2CUpgrade per loadgen's
-	// Config godoc — we deliberately do not set those flags here.
-	if s.Mix != nil {
-		mix := *s.Mix
-		cfg.Mix = &mix
-	}
 	return cfg
 }
 
-// Applicable gates the auto-mix profile to servers that expose every
-// wire-format the mixer draws from (H1, H2C prior-knowledge, and H2C
-// upgrade). Every other profile drives plain H1 on the wire and is
-// inapplicable to H2C-prior-knowledge-only servers (h2c-noupg) — those
-// would silently record 0 RPS.
+// Applicable: every concurrency profile drives plain H1 on the wire, so a
+// column is in scope iff it speaks HTTP/1.1. H2C-prior-knowledge-only
+// servers (h2c-noupg) are excluded — they would silently record 0 RPS.
 func (s *ConcurrencyScenario) Applicable(fs servers.FeatureSet) bool {
-	if s.profile == ProfileAutoMix {
-		return fs.HTTP1 && fs.HTTP2C && fs.H2CUpgrade
-	}
 	return fs.HTTP1
 }
 
@@ -101,8 +85,9 @@ var _ Scenario = (*ConcurrencyScenario)(nil)
 var ConcurrencyProfiles = []string{
 	ProfileSingle,
 	ProfileMid,
+	ProfileMidHi,
+	ProfileHi512,
 	ProfileHigh,
-	ProfileAutoMix,
 }
 
 func init() {
@@ -121,18 +106,24 @@ func init() {
 		Connections: 128,
 	})
 	Register(&ConcurrencyScenario{
+		name:        "get-simple-256c",
+		profile:     ProfileMidHi,
+		Method:      "GET",
+		Path:        "/",
+		Connections: 256,
+	})
+	Register(&ConcurrencyScenario{
+		name:        "get-simple-512c",
+		profile:     ProfileHi512,
+		Method:      "GET",
+		Path:        "/",
+		Connections: 512,
+	})
+	Register(&ConcurrencyScenario{
 		name:        "get-simple-1024c",
 		profile:     ProfileHigh,
 		Method:      "GET",
 		Path:        "/",
 		Connections: 1024,
-	})
-	Register(&ConcurrencyScenario{
-		name:        "auto-mix-111",
-		profile:     ProfileAutoMix,
-		Method:      "GET",
-		Path:        "/",
-		Connections: 64,
-		Mix:         &loadgen.MixRatio{H1: 1, H2: 1, Upgrade: 1},
 	})
 }

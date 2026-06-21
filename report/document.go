@@ -172,6 +172,34 @@ func BuildDocument(in BuildInput) *Document {
 		if c.MergedHistogramB64 != "" {
 			sr.HdrHistogramB64[c.ScenarioName] = c.MergedHistogramB64
 		}
+
+		// Server-side resource aggregate (#154). Surfaced for every
+		// data-bearing cell that captured an observer sidecar so the report
+		// can rank adapters by CPU/RSS efficiency — the differentiator for
+		// the NIC-bound large-payload cells where raw RPS converges at the
+		// fabric ceiling. Nil for runs with no observer (in-process loopback)
+		// so the field stays omitted there. The map is lazily allocated so a
+		// resource-free run emits no empty "resources":{} object.
+		if c.Resources != nil {
+			if sr.Resources == nil {
+				sr.Resources = map[string]*ResourceStats{}
+			}
+			sr.Resources[c.ScenarioName] = c.Resources
+		}
+
+		// Network-bound annotation (schema v5.5): a large-payload cell whose
+		// achieved egress bandwidth sat at the fabric ceiling while the
+		// loadgen still had CPU headroom is NIC-limited, not server-limited.
+		// Its saturation RPS converges across every fast adapter and must not
+		// be read as a ranking — the CPU efficiency in Resources is the real
+		// signal. Only flagged when the fabric's line rate is known (the LAN;
+		// the Tailscale overlay reports 0 and flags nothing).
+		if isNetworkBound(c.BytesMedian, c.LoadgenCPUP95, in.Environment.FabricLineRateBitsPerSec) {
+			if sr.NetworkBound == nil {
+				sr.NetworkBound = map[string]bool{}
+			}
+			sr.NetworkBound[c.ScenarioName] = true
+		}
 	}
 
 	out := &Document{
@@ -191,6 +219,41 @@ func BuildDocument(in BuildInput) *Document {
 		out.Benchmarks = append(out.Benchmarks, *byAdapter[n])
 	}
 	return out
+}
+
+const (
+	// networkBoundBandwidthFraction is the share of the fabric line rate a
+	// cell's achieved egress bandwidth must reach to be called network-bound.
+	// 0.80 leaves headroom below the theoretical ceiling: the 2x10G LACP
+	// fabric tops out near 18.8/20 Gbps in practice (per-flow hashing keeps a
+	// single TCP flow on one 10G member), and only the large-payload cells
+	// (64k/1m, ~18.8 Gbps) ever approach it — every small-response cell stays
+	// orders of magnitude below, so there are no false positives.
+	networkBoundBandwidthFraction = 0.80
+
+	// networkBoundLoadgenCPUCeiling guards against mislabelling a
+	// loadgen-bottlenecked cell as NIC-bound. LoadgenCPUP95 is a fraction of
+	// one core; a value at/above this means the load generator itself was the
+	// limit, so the cell's ceiling is a client artefact, not the fabric.
+	// (Realistically a NIC-bound cell shows LOW loadgen CPU — the client is
+	// blocked on the wire, not burning cycles.)
+	networkBoundLoadgenCPUCeiling = 8.0
+)
+
+// isNetworkBound reports whether a cell's achieved egress bandwidth sat at
+// the fabric line rate (NIC-limited) rather than the server's CPU limit.
+// bytesPerSec is the median across-runs throughput; loadgenCPUP95 is the
+// loadgen self-CPU fraction; lineRateBits is the fabric ceiling in bits/sec
+// (0 when unknown → never flagged).
+func isNetworkBound(bytesPerSec, loadgenCPUP95 float64, lineRateBits int64) bool {
+	if lineRateBits <= 0 || bytesPerSec <= 0 {
+		return false
+	}
+	if loadgenCPUP95 >= networkBoundLoadgenCPUCeiling {
+		return false
+	}
+	achievedBits := bytesPerSec * 8
+	return achievedBits >= networkBoundBandwidthFraction*float64(lineRateBits)
 }
 
 // recordRunStatuses copies a cell's per-run outcome sequence into

@@ -1,0 +1,16 @@
+{
+  "name": "probatorium-uws-server",
+  "private": true,
+  "type": "module",
+  "//purpose": "uWebSockets.js adapter — the JavaScript HTTP speed leader. A thin Node N-API binding over the µWS C++ server. NO web framework, NO bundler: uWebSockets.js ships a prebuilt native .node addon that uws.js require()s at runtime, so the source must run from node_modules (it cannot be esbuild/bun-bundled into a single file). Hence: node server.js, not a bundle.",
+  "//dep": "uWebSockets.js is NOT on the npm registry under a usable name — the canonical install is the GitHub tarball dependency 'uNetworking/uWebSockets.js#<tag>'. npm fetches the repo at that tag; the prebuilt uws_<platform>_<arch>_<node-abi>.node binaries are committed in the repo, so `npm install` performs NO native compile (no node-gyp). Supports Node 22/24/26 on glibc Linux, macOS, Windows.",
+  "//versions": "Pinned to a release tag for reproducible ABI matching (the prebuilt addon must match the bench host's Node ABI; a moving HEAD could ship an addon that lags a brand-new Node). Bump the tag to track upstream — the bench host's Node major (22/24/26) must be one uWS publishes a prebuilt for.",
+  "//run": "node server.js -bind {bind}. The launcher script the ansible build step writes execs `node <dir>/src/server.js \"$@\"` so the runner's -bind/-engine flags reach process.argv.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "uWebSockets.js": "uNetworking/uWebSockets.js#v20.68.0"
+  }
+}

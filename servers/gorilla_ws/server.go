@@ -119,6 +119,12 @@ func registerStatic(mux *http.ServeMux) {
 	mux.HandleFunc("GET /json-1k", func(w http.ResponseWriter, r *http.Request) {
 		writeBlob(w, "application/json", common.JSON1KPayload())
 	})
+	mux.HandleFunc("GET /json-8k", func(w http.ResponseWriter, r *http.Request) {
+		writeBlob(w, "application/json", common.JSON8KPayload())
+	})
+	mux.HandleFunc("GET /json-16k", func(w http.ResponseWriter, r *http.Request) {
+		writeBlob(w, "application/json", common.JSON16KPayload())
+	})
 	mux.HandleFunc("GET /json-64k", func(w http.ResponseWriter, r *http.Request) {
 		writeBlob(w, "application/json", common.JSON64KPayload())
 	})

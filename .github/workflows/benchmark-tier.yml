@@ -21,13 +21,34 @@ name: Benchmark Tier
 # never runs from an untrusted PR surface).
 
 on:
+  schedule:
+    # Weekly full-grid SATURATION bench (the "fast" profile: rated OFF, 35s/10s,
+    # ~21.6h — fits the 24h cluster slot). This re-activates the weekly cadence
+    # that was previously manual-only. Wednesday 04:00 UTC keeps it clear of the
+    # weekend soak; the matrix-tier-cluster concurrency group serializes anyway.
+    - cron: "0 4 * * 3"
   workflow_dispatch:
     inputs:
       profile:
-        description: "full | headline (default: full — every server × every scenario, capability-gated. headline is the ~3h smoke-test opt-in, never the silent default, because users asked repeatedly for \"no missing tests\" and got the curated subset instead.)"
+        description: "fast (DEFAULT, recommended): full grid, saturation-only (rated OFF), 35s/10s → ~21.6h, fits 24h. | full / headline: ALSO run the rated/SLO sweep — much longer; full needs a raised BENCH_BUDGET (set automatically below) and won't fit 24h."
         required: false
         type: string
-        default: full
+        default: fast
+      competitors:
+        description: "Adapter columns to BENCH (BENCH_COMPETITORS). 'all' (DEFAULT) runs the full grid; a CSV of registry slugs (e.g. 'httpzig,drogon,aspnet-h2') runs ONLY those columns — used to re-run the subset that DNF'd in a prior run without paying for the whole grid. Names must match servers.Registry."
+        required: false
+        type: string
+        default: all
+      deploy_competitors:
+        description: "Binary set to BUILD+DEPLOY (DEPLOY_COMPETITORS). 'all' (DEFAULT). For a subset re-run set this to the underlying BINARY names — h2 columns share their h1 sibling's binary, so 'aspnet-h2' needs binary 'aspnet' (e.g. 'httpzig,drogon,aspnet,axum'). Must be the deploy-side names (nativeBuildSpecs/servers dirs), not column slugs."
+        required: false
+        type: string
+        default: all
+      publish:
+        description: "Push results to the docs repo (BENCH_PUBLISH). 'true' (DEFAULT) publishes; 'false' produces data only (no docs push, no integrity gate) — use for a subset re-run that you compose + publish manually."
+        required: false
+        type: string
+        default: "true"
 
 permissions:
   contents: read
@@ -45,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/cluster-runner-up
         with:
           tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -58,17 +79,38 @@ jobs:
   matrix:
     name: benchmark tier (amd64)
     needs: [setup]
-    runs-on: [self-hosted, celeris-cluster]
-    # 72h ceiling: the full profile on one arch is ~19h single-pass, plus
+    # Orchestrate from msr1 specifically: the ansible control loop + result
+    # aggregation must NOT share a host with the SUT (bench_target=msa2-server)
+    # or the loadgen (msa2-client), or its CPU/IO steals from the measurement.
+    # msr1 (arm64) is unusable as a BENCH target under NIC load (firmware bug
+    # celeris#312) but is perfectly safe and otherwise-idle as the conductor —
+    # it just runs ansible over SSH. This keeps the amd64 SUT's numbers clean.
+    runs-on: [self-hosted, celeris-cluster, msr1]
+    # 72h ceiling: the full profile on one arch is ~30h single-pass (the
+    # grid grew with the mid-size payload rows + native h2c columns), plus
     # Deploy + Cleanup. Well under GitHub's 5-day self-hosted job hard
-    # limit. This is only a ceiling — the headline profile finishes in
-    # hours and exits early. BENCH_BUDGET (below) is the real fail-loud
-    # projection gate.
+    # limit. This is only a ceiling — the headline profile (same grid,
+    # shorter window) projects ~21.6h. BENCH_BUDGET (below) is the real
+    # fail-loud projection gate.
     timeout-minutes: 4320
     env:
-      BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
+      BENCH_PROFILE: ${{ github.event.inputs.profile || 'fast' }}
+      # Column subset to BENCH for a targeted re-run; 'all' on schedule/default.
+      BENCH_COMPETITORS: ${{ github.event.inputs.competitors || 'all' }}
+      # Binary/module set to BUILD+DEPLOY. MUST be job-level (not just the
+      # Deploy step): BenchTier runs an internal auto-deploy when no manifest
+      # is present (always true right after the prior run's Cleanup), and that
+      # auto-deploy falls back to BENCH_COMPETITORS — which is column slugs
+      # (e.g. 'aspnet-h2') that Deploy rejects. Pinning the module names here
+      # (e.g. 'aspnet') makes both the explicit Deploy step AND the auto-deploy
+      # use them. h2 columns reuse their h1 sibling's binary, so this set
+      # differs from BENCH_COMPETITORS.
+      DEPLOY_COMPETITORS: ${{ github.event.inputs.deploy_competitors || 'all' }}
+      # 'false' => data-only (no docs push, no integrity gate). Maps to the
+      # BENCH_PUBLISH=0 the mage targets read; any other value publishes.
+      BENCH_PUBLISH: ${{ github.event.inputs.publish == 'false' && '0' || '1' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
@@ -115,8 +157,8 @@ jobs:
 
       - name: mage Deploy (competitors + db services for the profile)
         env:
-          # Bench needs the competitor binaries staged.
-          DEPLOY_COMPETITORS: all
+          # DEPLOY_COMPETITORS is set at the job level (above) so the BenchTier
+          # auto-deploy inherits it too.
           # driver-* cells in the profile need postgres/redis/memcached.
           DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
@@ -129,11 +171,12 @@ jobs:
           # Restore "both" once the arm64 host is fixed (and #168 ArchParallel
           # lands, or the budget/timeout below is re-checked for two arches).
           BENCH_TARGET: msa2-server
-          # The full single-pass matrix runs ~19h on one arch — raise the
-          # fit budget above the 24h weekly default so BenchTier doesn't
-          # refuse a future larger registry (must stay under the job
-          # timeout-minutes above).
-          BENCH_BUDGET: "70h"
+          # fast/headline fit the 24h cluster slot, so the budget asserts <24h
+          # (FitWithin fails loudly if the grid ever grows past it). Only the
+          # rated "full" deep-dive needs the raised ceiling (it runs the rated
+          # sweep on the whole grid — many hours); both stay under the job
+          # timeout-minutes above.
+          BENCH_BUDGET: ${{ github.event.inputs.profile == 'full' && '70h' || '24h' }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 
@@ -156,7 +199,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/cluster-runner-down
         with:
           tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}

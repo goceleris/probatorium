@@ -1,0 +1,62 @@
+# Starlette competitor adapter for probatorium.
+#
+# Starlette is the raw ASGI toolkit FastAPI sits on. Running it directly
+# (no FastAPI dependency-injection / pydantic layer) is the faster Python
+# baseline — this column isolates the routing + ASGI cost FastAPI adds its
+# DI/validation overhead on top of.
+#
+# Always-latest version policy: every dep uses a `>=` floor only — `uv lock`
+# resolves at deploy time so each cluster run picks up the freshest stable
+# wheel from PyPI. NEVER pin upper bounds here; the bench is intentionally
+# a moving target.
+#
+# The blessed Starlette fast-path:
+#   * Plain `Starlette(routes=[...])` with `async def` handlers returning
+#     pre-baked `Response(bytes, media_type=...)` — no JSONResponse
+#     re-encoding, no FastAPI DI. Sync handlers would be punted to a
+#     threadpool which would distort the cell.
+#   * `uvicorn[standard]` — pulls in uvloop, httptools, watchfiles,
+#     websockets in one extra so we never hand-list the C accelerators.
+#   * `orjson` — used only by app/payload.py to generate the deterministic
+#     1k/8k/16k/64k bodies byte-identically to the Go reference (and to the
+#     fastapi adapter). Not on the request hot path.
+#
+# NO docker. The ansible role builds a venv natively under
+# {{ bench_root }}/python-venvs/starlette via `uv venv` + `uv pip install`.
+#
+# Run command (the launcher script in this directory wraps it):
+#   -engine h1 (or absent):  HTTP/1.1 fast path
+#     uvicorn app.server:app --host 127.0.0.1 --port <p> \
+#         --workers $(nproc) --loop uvloop --http httptools \
+#         --no-access-log --log-level warning
+#   -engine h2c:  HTTP/2 cleartext, prior-knowledge, no TLS
+#     python -m app.server -bind 127.0.0.1:<p> -engine h2c
+#     (launches the same ASGI app under hypercorn; uvicorn has no HTTP/2.)
+#
+# `--workers` only takes effect outside reload mode (which we never enable),
+# so the launcher hard-codes a non-reload uvicorn invocation for h1.
+
+[project]
+name = "probatorium-starlette-adapter"
+version = "0.0.0"
+description = "Starlette/uvicorn/uvloop/httptools adapter for the probatorium contract."
+requires-python = ">=3.13"
+dependencies = [
+    "starlette>=0.40",
+    "uvicorn[standard]>=0.32",
+    "orjson>=3.10",
+    # `-engine h2c` only. uvicorn cannot speak HTTP/2, so the h2c column
+    # runs the same ASGI app under hypercorn, which serves HTTP/2 cleartext
+    # prior-knowledge on a plain (no-TLS) bind. `-engine h1` never imports
+    # it. hypercorn's HTTP/2 stack (h2, hpack, priority) is a core dep, not
+    # an extra — plain `hypercorn` already pulls it. uvloop comes from
+    # uvicorn[standard] above, so no `[uvloop]` extra is needed here.
+    "hypercorn>=0.17",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
