@@ -34,6 +34,21 @@ on:
         required: false
         type: string
         default: fast
+      competitors:
+        description: "Adapter columns to BENCH (BENCH_COMPETITORS). 'all' (DEFAULT) runs the full grid; a CSV of registry slugs (e.g. 'httpzig,drogon,aspnet-h2') runs ONLY those columns — used to re-run the subset that DNF'd in a prior run without paying for the whole grid. Names must match servers.Registry."
+        required: false
+        type: string
+        default: all
+      deploy_competitors:
+        description: "Binary set to BUILD+DEPLOY (DEPLOY_COMPETITORS). 'all' (DEFAULT). For a subset re-run set this to the underlying BINARY names — h2 columns share their h1 sibling's binary, so 'aspnet-h2' needs binary 'aspnet' (e.g. 'httpzig,drogon,aspnet,axum'). Must be the deploy-side names (nativeBuildSpecs/servers dirs), not column slugs."
+        required: false
+        type: string
+        default: all
+      publish:
+        description: "Push results to the docs repo (BENCH_PUBLISH). 'true' (DEFAULT) publishes; 'false' produces data only (no docs push, no integrity gate) — use for a subset re-run that you compose + publish manually."
+        required: false
+        type: string
+        default: "true"
 
 permissions:
   contents: read
@@ -80,6 +95,13 @@ jobs:
     timeout-minutes: 4320
     env:
       BENCH_PROFILE: ${{ github.event.inputs.profile || 'fast' }}
+      # Column subset to BENCH for a targeted re-run; 'all' on schedule/default.
+      # (DEPLOY_COMPETITORS is set on the Deploy step — h2 columns reuse their
+      # h1 sibling's binary, so the deploy set differs from the bench set.)
+      BENCH_COMPETITORS: ${{ github.event.inputs.competitors || 'all' }}
+      # 'false' => data-only (no docs push, no integrity gate). Maps to the
+      # BENCH_PUBLISH=0 the mage targets read; any other value publishes.
+      BENCH_PUBLISH: ${{ github.event.inputs.publish == 'false' && '0' || '1' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -128,8 +150,9 @@ jobs:
 
       - name: mage Deploy (competitors + db services for the profile)
         env:
-          # Bench needs the competitor binaries staged.
-          DEPLOY_COMPETITORS: all
+          # Bench needs the competitor binaries staged. 'all' on schedule/
+          # default; a subset re-run passes the underlying BINARY names.
+          DEPLOY_COMPETITORS: ${{ github.event.inputs.deploy_competitors || 'all' }}
           # driver-* cells in the profile need postgres/redis/memcached.
           DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
