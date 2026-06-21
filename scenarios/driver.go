@@ -7,16 +7,32 @@ import (
 	"github.com/goceleris/probatorium/services"
 )
 
-// DriverKind names the 4 driver-backed scenarios.
+// DriverKind names the driver-backed scenarios. v1.5.4 deepened the set
+// from 4 single-op reads to 10 — adding writes, an explicit transaction, a
+// multi-row range, a pipelined batch, and a multi-key fetch — so the
+// native-driver-vs-ecosystem comparison becomes multi-dimensional instead
+// of a single GET number.
 const (
-	DriverPG        = "driver-pg-read"
-	DriverRedis     = "driver-redis-get"
-	DriverMemcached = "driver-mc-get"
-	DriverSession   = "driver-session-rw"
+	DriverPG        = "driver-pg-read"  // GET /db/user/42 — 1 SELECT (hot row)
+	DriverRedis     = "driver-redis-get" // GET /cache/<key> — 1 GET
+	DriverMemcached = "driver-mc-get"    // GET /mc/<key> — 1 GET
+	DriverSession   = "driver-session-rw" // POST /session — GET + SET round-trip
+
+	// v1.5.4 depth additions:
+	DriverPGWrite       = "driver-pg-write"        // POST /db/insert — 1 INSERT (write path)
+	DriverPGUpdateTx    = "driver-pg-update-tx"    // POST /db/tx/user/42 — BEGIN;UPDATE;COMMIT
+	DriverPGReadRange   = "driver-pg-read-range"   // GET /db/users?limit=50 — N-row result set
+	DriverRedisSet      = "driver-redis-set"       // POST /cache — 1 SET (write path)
+	DriverRedisPipeline = "driver-redis-pipeline"  // GET /cache/pipeline?n=10 — pipelined GETs
+	DriverMCMultiGet    = "driver-mc-multiget"     // GET /mc/multi?keys=10 — multi-key fetch
 )
 
 // DriverKinds is the canonical ordered list of driver scenarios.
-var DriverKinds = []string{DriverPG, DriverRedis, DriverMemcached, DriverSession}
+var DriverKinds = []string{
+	DriverPG, DriverRedis, DriverMemcached, DriverSession,
+	DriverPGWrite, DriverPGUpdateTx, DriverPGReadRange,
+	DriverRedisSet, DriverRedisPipeline, DriverMCMultiGet,
+}
 
 // sessionBody is the 256-byte payload POSTed by driver-session-rw. It is
 // deterministic so repeat runs send byte-identical requests — any
@@ -91,6 +107,27 @@ func (s *DriverScenario) Workload(target string) loadgen.Config {
 		cfg.Method = "POST"
 		cfg.URL = target + "/session"
 		cfg.Body = sessionBody
+	case DriverPGWrite:
+		cfg.Method = "POST"
+		cfg.URL = target + "/db/insert"
+		cfg.Body = sessionBody // 256B payload inserted into bench_writes
+	case DriverPGUpdateTx:
+		cfg.Method = "POST"
+		cfg.URL = target + "/db/tx/user/42" // BEGIN;UPDATE score+1;COMMIT on the hot row
+		cfg.Body = sessionBody              // body ignored by the handler
+	case DriverPGReadRange:
+		cfg.Method = "GET"
+		cfg.URL = target + "/db/users?limit=50" // 50-row SELECT -> JSON array
+	case DriverRedisSet:
+		cfg.Method = "POST"
+		cfg.URL = target + "/cache"
+		cfg.Body = sessionBody // SET services.FixtureRedisWriteKey = body
+	case DriverRedisPipeline:
+		cfg.Method = "GET"
+		cfg.URL = target + "/cache/pipeline?n=10" // 10x GET FixtureDemoKey, pipelined
+	case DriverMCMultiGet:
+		cfg.Method = "GET"
+		cfg.URL = target + "/mc/multi?keys=10" // GetMulti of 10 seeded session keys
 	}
 	return cfg
 }
@@ -112,4 +149,10 @@ func init() {
 	Register(NewDriverScenario(DriverRedis, DriverRedis))
 	Register(NewDriverScenario(DriverMemcached, DriverMemcached))
 	Register(NewDriverScenario(DriverSession, DriverSession))
+	Register(NewDriverScenario(DriverPGWrite, DriverPGWrite))
+	Register(NewDriverScenario(DriverPGUpdateTx, DriverPGUpdateTx))
+	Register(NewDriverScenario(DriverPGReadRange, DriverPGReadRange))
+	Register(NewDriverScenario(DriverRedisSet, DriverRedisSet))
+	Register(NewDriverScenario(DriverRedisPipeline, DriverRedisPipeline))
+	Register(NewDriverScenario(DriverMCMultiGet, DriverMCMultiGet))
 }

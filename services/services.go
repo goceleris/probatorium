@@ -35,6 +35,10 @@ const (
 	FixtureDemoKey      = "demo-key"
 	FixtureSessionIDMin = 1
 	FixtureSessionIDMax = 1000
+
+	// v1.5.4 driver-depth fixtures.
+	FixtureWritesTable   = "bench_writes" // unlogged PG table for driver-pg-write
+	FixtureRedisWriteKey = "demo-write"   // key driver-redis-set writes (no seed; the bench writes it)
 )
 
 // Kind enumerates the services probatorium can provision. String values
@@ -483,6 +487,19 @@ func seedPostgres(ctx context.Context, dsn string) error {
 		name  TEXT NOT NULL,
 		email TEXT NOT NULL,
 		score INT  NOT NULL
+	)`); err != nil {
+		return err
+	}
+
+	// bench_writes: scratch target for driver-pg-write. UNLOGGED so the
+	// write-path bench measures driver + server overhead, not WAL fsync
+	// noise. Truncated on each seed for determinism.
+	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS `+FixtureWritesTable); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(ctx, `CREATE UNLOGGED TABLE `+FixtureWritesTable+` (
+		id      BIGSERIAL PRIMARY KEY,
+		payload TEXT NOT NULL
 	)`); err != nil {
 		return err
 	}
