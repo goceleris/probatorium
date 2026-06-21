@@ -1,6 +1,9 @@
 self-hosted-runner:
   # `celeris-cluster` is the label our ephemeral cluster runners
   # register themselves with (see .github/actions/cluster-runner-up).
-  # Declaring it here silences actionlint's runner-label warning.
+  # `msr1` pins matrix orchestration to that specific node (it is the
+  # benchmark conductor; see benchmark-tier.yml runs-on). Declaring both
+  # here silences actionlint's runner-label warning.
   labels:
     - celeris-cluster
+    - msr1

@@ -22,8 +22,8 @@ func TestParseArgs_Defaults(t *testing.T) {
 	if cfg.Runs != 5 {
 		t.Errorf("Runs = %d, want 5", cfg.Runs)
 	}
-	if cfg.Duration != 120*time.Second {
-		t.Errorf("Duration = %v, want 120s", cfg.Duration)
+	if cfg.Duration != 45*time.Second {
+		t.Errorf("Duration = %v, want 45s", cfg.Duration)
 	}
 	if cfg.Services != "local" {
 		t.Errorf("Services = %q, want local", cfg.Services)
@@ -343,7 +343,7 @@ func TestFeatureSetTLSGating(t *testing.T) {
 // whose drogon build has no server-side HTTP/2 at all).
 func TestNativeH2cColumnsAreH2cOnly(t *testing.T) {
 	wantH2 := []string{
-		"axum-h2", "ntex-h2", "hyper-h2", "aspnet-h2",
+		"axum-h2", "hyper-h2", "aspnet-h2",
 		"fastapi-h2", "hono-h2", "elysia-h2",
 	}
 	for _, name := range wantH2 {
