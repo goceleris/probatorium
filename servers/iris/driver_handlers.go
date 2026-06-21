@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -40,7 +41,7 @@ type driverClients struct {
 const (
 	envPGDSN     = "PROBATORIUM_PG_DSN"
 	envRedisAddr = "PROBATORIUM_REDIS_ADDR"
-	envMCAddr    = "PROBATORIUM_MC_ADDR"
+	envMCAddr    = "PROBATORIUM_MEMCACHED_ADDR"
 )
 
 // userRow mirrors the seeded users table row (id, name, email, score).
@@ -154,6 +155,172 @@ func mountDriverHandlers(app *irisv12.Application, dc *driverClients) {
 		}
 		c.ContentType("application/octet-stream")
 		_, _ = c.Write(it.Value)
+	})
+
+	// v1.5.4 driver-depth routes (writes / transaction / range / pipeline /
+	// multiget) using the same idiomatic pgx/go-redis/gomemcache ops as the
+	// other adapters. The /cache-pipeline and /mc-multiget paths are flat
+	// (not /cache/pipeline) so they don't collide with the /cache/{key} and
+	// /mc/{key} param routes above.
+
+	// Postgres write: POST /db/insert — INSERT the request body into bench_writes.
+	app.Post("/db/insert", func(c irisv12.Context) {
+		if dc.pg == nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		body, _ := io.ReadAll(c.Request().Body)
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+		defer cancel()
+		if _, err := dc.pg.Exec(ctx,
+			"INSERT INTO bench_writes(payload) VALUES($1)", string(body),
+		); err != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		c.ContentType("application/json")
+		_ = c.JSON(sessionResponse{OK: true})
+	})
+
+	// Postgres transaction: POST /db/tx/user/{id} — BEGIN; UPDATE score+1; COMMIT.
+	app.Post("/db/tx/user/{id:int}", func(c irisv12.Context) {
+		if dc.pg == nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		id, err := c.Params().GetInt("id")
+		if err != nil {
+			c.StopWithStatus(http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+		defer cancel()
+		tx, err := dc.pg.Begin(ctx)
+		if err != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		if _, err := tx.Exec(ctx, "UPDATE users SET score=score+1 WHERE id=$1", id); err != nil {
+			_ = tx.Rollback(ctx)
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		c.ContentType("application/json")
+		_ = c.JSON(sessionResponse{OK: true, Seq: id})
+	})
+
+	// Postgres range read: GET /db/users?limit=N — SELECT N rows -> JSON array.
+	app.Get("/db/users", func(c irisv12.Context) {
+		if dc.pg == nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		limit := c.URLParamIntDefault("limit", 50)
+		if limit <= 0 || limit > 1000 {
+			limit = 50
+		}
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+		defer cancel()
+		rows, err := dc.pg.Query(ctx,
+			"SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND $1 ORDER BY id", limit)
+		if err != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		defer rows.Close()
+		out := make([]userRow, 0, limit)
+		for rows.Next() {
+			var r userRow
+			if err := rows.Scan(&r.ID, &r.Name, &r.Email, &r.Score); err != nil {
+				c.StopWithStatus(http.StatusServiceUnavailable)
+				return
+			}
+			out = append(out, r)
+		}
+		if rows.Err() != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		c.ContentType("application/json")
+		_ = c.JSON(out)
+	})
+
+	// Redis write: POST /cache — SET demo-write = request body, no expiry.
+	app.Post("/cache", func(c irisv12.Context) {
+		if dc.redis == nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		body, _ := io.ReadAll(c.Request().Body)
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+		defer cancel()
+		if err := dc.redis.Set(ctx, "demo-write", body, 0).Err(); err != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		c.ContentType("application/json")
+		_ = c.JSON(sessionResponse{OK: true})
+	})
+
+	// Redis pipeline: GET /cache-pipeline?n=N — pipeline N GETs of demo-key.
+	app.Get("/cache-pipeline", func(c irisv12.Context) {
+		if dc.redis == nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		n := c.URLParamIntDefault("n", 10)
+		if n <= 0 || n > 100 {
+			n = 10
+		}
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+		defer cancel()
+		pipe := dc.redis.Pipeline()
+		cmds := make([]*redis.StringCmd, n)
+		for i := 0; i < n; i++ {
+			cmds[i] = pipe.Get(ctx, "demo-key")
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		total := 0
+		for _, cmd := range cmds {
+			v, err := cmd.Bytes()
+			if err != nil {
+				c.StopWithStatus(http.StatusServiceUnavailable)
+				return
+			}
+			total += len(v)
+		}
+		c.ContentType("application/json")
+		_ = c.JSON(sessionResponse{OK: true, Seq: total})
+	})
+
+	// Memcached multiget: GET /mc-multiget?keys=N — GetMulti of N session keys.
+	app.Get("/mc-multiget", func(c irisv12.Context) {
+		if dc.mc == nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		n := c.URLParamIntDefault("keys", 10)
+		if n <= 0 || n > 100 {
+			n = 10
+		}
+		keys := make([]string, n)
+		for i := 0; i < n; i++ {
+			keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
+		}
+		items, err := dc.mc.GetMulti(keys)
+		if err != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		c.ContentType("application/json")
+		_ = c.JSON(sessionResponse{OK: true, Seq: len(items)})
 	})
 
 	// Session: POST /session — iris's own session middleware, started

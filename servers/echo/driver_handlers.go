@@ -60,7 +60,7 @@ type driverClients struct {
 
 // envOr returns the env var value for key, or def when unset/empty. The
 // service endpoints are injected by the orchestrator as PROBATORIUM_PG_DSN
-// / PROBATORIUM_REDIS_ADDR / PROBATORIUM_MC_ADDR (see ansible/validate.yml);
+// / PROBATORIUM_REDIS_ADDR / PROBATORIUM_MEMCACHED_ADDR (see ansible/validate.yml);
 // the -postgres-dsn / -redis-addr / -mc-addr flags override them.
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -228,5 +228,146 @@ func registerDriverHandlers(e *echov4.Echo, dc *driverClients) {
 		_ = dc.redis.Expire(ctx, key, 10*time.Minute).Err()
 
 		return c.JSON(http.StatusOK, sessionResponse{OK: true, Seq: int(seq)})
+	})
+
+	// v1.5.4 driver-depth routes (idiomatic pgx/go-redis/gomemcache). The
+	// paths are /cache-pipeline and /mc-multiget rather than nested under the
+	// /cache and /mc :key routes so they do not collide with those param
+	// segments.
+
+	// POST /db/insert — INSERT the request body into bench_writes.
+	e.POST("/db/insert", func(c echov4.Context) error {
+		if dc.pg == nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		body, _ := io.ReadAll(c.Request().Body)
+		ctx, cancel := context.WithTimeout(c.Request().Context(), driverOpTimeout)
+		defer cancel()
+		if _, err := dc.pg.Exec(ctx,
+			"INSERT INTO bench_writes(payload) VALUES($1)", string(body),
+		); err != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		return c.JSON(http.StatusOK, sessionResponse{OK: true})
+	})
+
+	// POST /db/tx/user/:id — BEGIN; UPDATE score+1; COMMIT (Rollback on err).
+	e.POST("/db/tx/user/:id", func(c echov4.Context) error {
+		if dc.pg == nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		id, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			return c.NoContent(http.StatusBadRequest)
+		}
+		ctx, cancel := context.WithTimeout(c.Request().Context(), driverOpTimeout)
+		defer cancel()
+		tx, err := dc.pg.Begin(ctx)
+		if err != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		if _, err := tx.Exec(ctx, "UPDATE users SET score=score+1 WHERE id=$1", id); err != nil {
+			_ = tx.Rollback(ctx)
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		return c.JSON(http.StatusOK, sessionResponse{OK: true, Seq: id})
+	})
+
+	// GET /db/users?limit=N — SELECT N seeded rows -> JSON array.
+	e.GET("/db/users", func(c echov4.Context) error {
+		if dc.pg == nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		limit, err := strconv.Atoi(c.QueryParam("limit"))
+		if err != nil || limit <= 0 || limit > 1000 {
+			limit = 50
+		}
+		ctx, cancel := context.WithTimeout(c.Request().Context(), driverOpTimeout)
+		defer cancel()
+		rows, err := dc.pg.Query(ctx,
+			"SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND $1 ORDER BY id", limit)
+		if err != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		defer rows.Close()
+		out := make([]userRow, 0, limit)
+		for rows.Next() {
+			var r userRow
+			if err := rows.Scan(&r.ID, &r.Name, &r.Email, &r.Score); err != nil {
+				return c.NoContent(http.StatusServiceUnavailable)
+			}
+			out = append(out, r)
+		}
+		if rows.Err() != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		return c.JSON(http.StatusOK, out)
+	})
+
+	// POST /cache — Redis SET demo-write = request body, no expiry.
+	e.POST("/cache", func(c echov4.Context) error {
+		if dc.redis == nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		body, _ := io.ReadAll(c.Request().Body)
+		ctx, cancel := context.WithTimeout(c.Request().Context(), driverOpTimeout)
+		defer cancel()
+		if err := dc.redis.Set(ctx, "demo-write", body, 0).Err(); err != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		return c.JSON(http.StatusOK, sessionResponse{OK: true})
+	})
+
+	// GET /cache-pipeline?n=N — pipeline N GETs of demo-key, sum byte lengths.
+	e.GET("/cache-pipeline", func(c echov4.Context) error {
+		if dc.redis == nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		n, err := strconv.Atoi(c.QueryParam("n"))
+		if err != nil || n <= 0 || n > 100 {
+			n = 10
+		}
+		ctx, cancel := context.WithTimeout(c.Request().Context(), driverOpTimeout)
+		defer cancel()
+		pipe := dc.redis.Pipeline()
+		cmds := make([]*redis.StringCmd, n)
+		for i := 0; i < n; i++ {
+			cmds[i] = pipe.Get(ctx, "demo-key")
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		total := 0
+		for _, cmd := range cmds {
+			v, err := cmd.Bytes()
+			if err != nil {
+				return c.NoContent(http.StatusServiceUnavailable)
+			}
+			total += len(v)
+		}
+		return c.JSON(http.StatusOK, sessionResponse{OK: true, Seq: total})
+	})
+
+	// GET /mc-multiget?keys=N — GetMulti of N seeded session keys.
+	e.GET("/mc-multiget", func(c echov4.Context) error {
+		if dc.mc == nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		n, err := strconv.Atoi(c.QueryParam("keys"))
+		if err != nil || n <= 0 || n > 100 {
+			n = 10
+		}
+		keys := make([]string, n)
+		for i := 0; i < n; i++ {
+			keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
+		}
+		items, err := dc.mc.GetMulti(keys)
+		if err != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		return c.JSON(http.StatusOK, sessionResponse{OK: true, Seq: len(items)})
 	})
 }

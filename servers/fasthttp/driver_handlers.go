@@ -2,7 +2,7 @@
 // driver routes (postgres / redis / memcached / session). Clients are
 // opened from the backend addresses the runner exports in the child
 // environment (PROBATORIUM_PG_DSN / PROBATORIUM_REDIS_ADDR /
-// PROBATORIUM_MC_ADDR — the same vars the validation refapps read). An
+// PROBATORIUM_MEMCACHED_ADDR — the same vars the validation refapps read). An
 // absent or unreachable backend leaves the matching route returning 503
 // so the runner's per-cell guard records a clean error rather than a
 // panic or a silent 0-RPS cell.
@@ -38,7 +38,7 @@ import (
 const (
 	envPGDSN     = "PROBATORIUM_PG_DSN"
 	envRedisAddr = "PROBATORIUM_REDIS_ADDR"
-	envMCAddr    = "PROBATORIUM_MC_ADDR"
+	envMCAddr    = "PROBATORIUM_MEMCACHED_ADDR"
 )
 
 // driverPoolSize bounds each driver's connection pool so the bench is
@@ -127,6 +127,209 @@ func mountDriverHandlers(s *Server) {
 	s.MountNative(http.MethodGet, cachePrefix, cacheHandler(cachePrefix))
 	s.MountNative(http.MethodGet, mcPrefix, mcHandler(mcPrefix))
 	s.MountNative(http.MethodPost, sessionPath, sessionHandler())
+
+	// v1.5.4 driver-depth routes (idiomatic pgx/go-redis/gomemcache). The
+	// literal paths /cache-pipeline and /mc-multiget are deliberately not
+	// /cache/... or /mc/... so they don't collide with the cache/mc prefix
+	// routes above. /db/tx/user/:id is a prefix route (the id is sliced off
+	// the path); the rest are exact matches and the limit/n/keys parameters
+	// arrive as query args.
+	const dbTxPrefix = "/db/tx/user/"
+	s.MountNative(http.MethodPost, "/db/insert", dbInsertHandler())
+	s.MountNative(http.MethodPost, dbTxPrefix, dbTxHandler(dbTxPrefix))
+	s.MountNative(http.MethodGet, "/db/users", dbUsersRangeHandler())
+	s.MountNative(http.MethodPost, "/cache", cacheSetHandler())
+	s.MountNative(http.MethodGet, "/cache-pipeline", cachePipelineHandler())
+	s.MountNative(http.MethodGet, "/mc-multiget", mcMultiGetHandler())
+}
+
+// dbInsertHandler serves POST /db/insert — INSERT the request body into
+// bench_writes.
+func dbInsertHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		pg := mountedDrivers.pg
+		if pg == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pg.Exec(ctx,
+			"INSERT INTO bench_writes(payload) VALUES($1)", string(rc.PostBody()),
+		); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true}))
+	}
+}
+
+// dbTxHandler serves POST /db/tx/user/:id — BEGIN; UPDATE score+1; COMMIT.
+func dbTxHandler(prefix string) fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		pg := mountedDrivers.pg
+		if pg == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		idStr := strings.TrimPrefix(string(rc.Path()), prefix)
+		if idStr == "" || strings.Contains(idStr, "/") {
+			rc.SetStatusCode(fasthttp.StatusBadRequest)
+			return
+		}
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			rc.SetStatusCode(fasthttp.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tx, err := pg.Begin(ctx)
+		if err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		if _, err := tx.Exec(ctx, "UPDATE users SET score=score+1 WHERE id=$1", id); err != nil {
+			_ = tx.Rollback(ctx)
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true, Seq: id}))
+	}
+}
+
+// dbUsersRangeHandler serves GET /db/users?limit=N — SELECT N rows -> JSON array.
+func dbUsersRangeHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		pg := mountedDrivers.pg
+		if pg == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		limit, err := strconv.Atoi(string(rc.QueryArgs().Peek("limit")))
+		if err != nil || limit <= 0 || limit > 1000 {
+			limit = 50
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		rows, err := pg.Query(ctx,
+			"SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND $1 ORDER BY id", limit)
+		if err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		defer rows.Close()
+		out := make([]userRow, 0, limit)
+		for rows.Next() {
+			var r userRow
+			if err := rows.Scan(&r.ID, &r.Name, &r.Email, &r.Score); err != nil {
+				rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+				return
+			}
+			out = append(out, r)
+		}
+		if rows.Err() != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(out))
+	}
+}
+
+// cacheSetHandler serves POST /cache — redis SET demo-write = request body.
+func cacheSetHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		rdb := mountedDrivers.rdb
+		if rdb == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := rdb.Set(ctx, "demo-write", rc.PostBody(), 0).Err(); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true}))
+	}
+}
+
+// cachePipelineHandler serves GET /cache-pipeline?n=N — pipeline N GETs of
+// demo-key, returning the summed value length as seq.
+func cachePipelineHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		rdb := mountedDrivers.rdb
+		if rdb == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		n, err := strconv.Atoi(string(rc.QueryArgs().Peek("n")))
+		if err != nil || n <= 0 || n > 100 {
+			n = 10
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		pipe := rdb.Pipeline()
+		cmds := make([]*goredis.StringCmd, n)
+		for i := 0; i < n; i++ {
+			cmds[i] = pipe.Get(ctx, "demo-key")
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		total := 0
+		for _, cmd := range cmds {
+			v, err := cmd.Bytes()
+			if err != nil {
+				rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+				return
+			}
+			total += len(v)
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true, Seq: total}))
+	}
+}
+
+// mcMultiGetHandler serves GET /mc-multiget?keys=N — GetMulti of N session keys.
+func mcMultiGetHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		mc := mountedDrivers.mc
+		if mc == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		n, err := strconv.Atoi(string(rc.QueryArgs().Peek("keys")))
+		if err != nil || n <= 0 || n > 100 {
+			n = 10
+		}
+		keys := make([]string, n)
+		for i := 0; i < n; i++ {
+			keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
+		}
+		items, err := mc.GetMulti(keys)
+		if err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true, Seq: len(items)}))
+	}
 }
 
 // dbUserHandler serves GET /db/user/:id — a single-row primary-key lookup

@@ -13,18 +13,18 @@ import (
 // native-driver-vs-ecosystem comparison becomes multi-dimensional instead
 // of a single GET number.
 const (
-	DriverPG        = "driver-pg-read"  // GET /db/user/42 — 1 SELECT (hot row)
-	DriverRedis     = "driver-redis-get" // GET /cache/<key> — 1 GET
-	DriverMemcached = "driver-mc-get"    // GET /mc/<key> — 1 GET
+	DriverPG        = "driver-pg-read"    // GET /db/user/42 — 1 SELECT (hot row)
+	DriverRedis     = "driver-redis-get"  // GET /cache/<key> — 1 GET
+	DriverMemcached = "driver-mc-get"     // GET /mc/<key> — 1 GET
 	DriverSession   = "driver-session-rw" // POST /session — GET + SET round-trip
 
 	// v1.5.4 depth additions:
-	DriverPGWrite       = "driver-pg-write"        // POST /db/insert — 1 INSERT (write path)
-	DriverPGUpdateTx    = "driver-pg-update-tx"    // POST /db/tx/user/42 — BEGIN;UPDATE;COMMIT
-	DriverPGReadRange   = "driver-pg-read-range"   // GET /db/users?limit=50 — N-row result set
-	DriverRedisSet      = "driver-redis-set"       // POST /cache — 1 SET (write path)
-	DriverRedisPipeline = "driver-redis-pipeline"  // GET /cache/pipeline?n=10 — pipelined GETs
-	DriverMCMultiGet    = "driver-mc-multiget"     // GET /mc/multi?keys=10 — multi-key fetch
+	DriverPGWrite       = "driver-pg-write"       // POST /db/insert — 1 INSERT (write path)
+	DriverPGUpdateTx    = "driver-pg-update-tx"   // POST /db/tx/user/42 — BEGIN;UPDATE;COMMIT
+	DriverPGReadRange   = "driver-pg-read-range"  // GET /db/users?limit=50 — N-row result set
+	DriverRedisSet      = "driver-redis-set"      // POST /cache — 1 SET (write path)
+	DriverRedisPipeline = "driver-redis-pipeline" // GET /cache-pipeline?n=10 — pipelined GETs
+	DriverMCMultiGet    = "driver-mc-multiget"    // GET /mc-multiget?keys=10 — multi-key fetch
 )
 
 // DriverKinds is the canonical ordered list of driver scenarios.
@@ -124,10 +124,12 @@ func (s *DriverScenario) Workload(target string) loadgen.Config {
 		cfg.Body = sessionBody // SET services.FixtureRedisWriteKey = body
 	case DriverRedisPipeline:
 		cfg.Method = "GET"
-		cfg.URL = target + "/cache/pipeline?n=10" // 10x GET FixtureDemoKey, pipelined
+		// Distinct path (not /cache/pipeline) so it can't collide with the
+		// /cache/:key param route in any of the framework routers.
+		cfg.URL = target + "/cache-pipeline?n=10" // 10x GET FixtureDemoKey, pipelined
 	case DriverMCMultiGet:
 		cfg.Method = "GET"
-		cfg.URL = target + "/mc/multi?keys=10" // GetMulti of 10 seeded session keys
+		cfg.URL = target + "/mc-multiget?keys=10" // GetMulti of 10 seeded session keys
 	}
 	return cfg
 }

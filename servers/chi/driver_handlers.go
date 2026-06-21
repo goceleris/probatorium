@@ -28,6 +28,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -130,6 +131,174 @@ func mountDriverHandlers(r chi.Router) {
 	r.Get("/cache/{key}", c.cacheHandler)
 	r.Get("/mc/{key}", c.mcHandler)
 	r.Post("/session", c.sessionHandler)
+
+	// v1.5.4 driver-depth routes (idiomatic pgx/go-redis/gomemcache).
+	r.Post("/db/insert", c.dbInsertHandler)
+	r.Post("/db/tx/user/{id}", c.dbTxHandler)
+	r.Get("/db/users", c.dbUsersRangeHandler)
+	r.Post("/cache", c.cacheSetHandler)
+	r.Get("/cache-pipeline", c.cachePipelineHandler)
+	r.Get("/mc-multiget", c.mcMultiGetHandler)
+}
+
+// dbInsertHandler serves POST /db/insert: INSERT the body into bench_writes.
+func (c *driverClients) dbInsertHandler(w http.ResponseWriter, r *http.Request) {
+	if c.pg == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := c.pg.Exec(ctx, "INSERT INTO bench_writes(payload) VALUES($1)", string(body)); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, sessionResponse{OK: true})
+}
+
+// dbTxHandler serves POST /db/tx/user/{id}: BEGIN; UPDATE score+1; COMMIT.
+func (c *driverClients) dbTxHandler(w http.ResponseWriter, r *http.Request) {
+	if c.pg == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := c.pg.Begin(ctx)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if _, err := tx.Exec(ctx, "UPDATE users SET score=score+1 WHERE id=$1", id); err != nil {
+		_ = tx.Rollback(ctx)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, sessionResponse{OK: true, Seq: id})
+}
+
+// dbUsersRangeHandler serves GET /db/users?limit=N: SELECT N rows -> JSON array.
+func (c *driverClients) dbUsersRangeHandler(w http.ResponseWriter, r *http.Request) {
+	if c.pg == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit <= 0 || limit > 1000 {
+		limit = 50
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, err := c.pg.Query(ctx,
+		"SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND $1 ORDER BY id", limit)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	defer rows.Close()
+	out := make([]userRow, 0, limit)
+	for rows.Next() {
+		var row userRow
+		if err := rows.Scan(&row.ID, &row.Name, &row.Email, &row.Score); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		out = append(out, row)
+	}
+	if rows.Err() != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, out)
+}
+
+// cacheSetHandler serves POST /cache: SET demo-write = body.
+func (c *driverClients) cacheSetHandler(w http.ResponseWriter, r *http.Request) {
+	if c.redis == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.redis.Set(ctx, "demo-write", body, 0).Err(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, sessionResponse{OK: true})
+}
+
+// cachePipelineHandler serves GET /cache-pipeline?n=N: pipeline N GETs of demo-key.
+func (c *driverClients) cachePipelineHandler(w http.ResponseWriter, r *http.Request) {
+	if c.redis == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	n, err := strconv.Atoi(r.URL.Query().Get("n"))
+	if err != nil || n <= 0 || n > 100 {
+		n = 10
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	pipe := c.redis.Pipeline()
+	cmds := make([]*redis.StringCmd, n)
+	for i := 0; i < n; i++ {
+		cmds[i] = pipe.Get(ctx, "demo-key")
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	total := 0
+	for _, cmd := range cmds {
+		v, err := cmd.Bytes()
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		total += len(v)
+	}
+	writeJSON(w, sessionResponse{OK: true, Seq: total})
+}
+
+// mcMultiGetHandler serves GET /mc-multiget?keys=N: GetMulti of N session keys.
+func (c *driverClients) mcMultiGetHandler(w http.ResponseWriter, r *http.Request) {
+	if c.mc == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	n, err := strconv.Atoi(r.URL.Query().Get("keys"))
+	if err != nil || n <= 0 || n > 100 {
+		n = 10
+	}
+	keys := make([]string, n)
+	for i := 0; i < n; i++ {
+		keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
+	}
+	items, err := c.mc.GetMulti(keys)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, sessionResponse{OK: true, Seq: len(items)})
+}
+
+// writeJSON encodes v as the 200 JSON response body, matching the existing
+// handlers' Content-Type/WriteHeader/Encode sequence.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // dbUserHandler serves GET /db/user/{id}: SELECT id,name,email,score and

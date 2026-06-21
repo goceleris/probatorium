@@ -168,9 +168,10 @@
     # dbservices role only installs docker + pulls images; it never runs a
     # container). Every driver-capable competitor reads its backend address
     # from these PROBATORIUM_* vars; an unset var leaves that client nil and
-    # the driver cell 404s (→ capability-lie hard error). gin/celeris read
-    # PROBATORIUM_MEMCACHED_ADDR, echo reads PROBATORIUM_MC_ADDR, so we set
-    # both spellings. Harmless for static-only competitors (they ignore them).
+    # the driver cell 404s (→ capability-lie hard error). Every adapter reads
+    # PROBATORIUM_MEMCACHED_ADDR (standardized in v1.5.4 — fasthttp/echo/iris
+    # used to read PROBATORIUM_MC_ADDR). Harmless for static-only competitors
+    # (they ignore them).
     # Ports MUST match bench.yml's container -p mappings AND validate.yml:
     #   postgres 54321  redis 63791  memcached 21211  (remapped off the
     # defaults so a stray system postgres/redis on the bench host can't shadow
@@ -179,7 +180,6 @@
     PROBATORIUM_PG_DSN: "postgres://bench:bench@127.0.0.1:54321/bench?sslmode=disable"
     PROBATORIUM_REDIS_ADDR: "127.0.0.1:63791"
     PROBATORIUM_MEMCACHED_ADDR: "127.0.0.1:21211"
-    PROBATORIUM_MC_ADDR: "127.0.0.1:21211"
     # aspnet (.NET) is a FRAMEWORK-DEPENDENT publish: the native apphost
     # (competitors/aspnet) must locate the shared .NET runtime at launch. We
     # installed the SDK (which carries the runtime) pristinely under
