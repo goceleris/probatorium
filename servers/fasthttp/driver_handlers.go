@@ -15,8 +15,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -31,6 +29,11 @@ import (
 
 	"github.com/goceleris/probatorium/servers/common"
 )
+
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
 
 // Backend address environment variables the runner sets before launching
 // the adapter. An empty value means the backend is absent and the route
@@ -65,8 +68,7 @@ type userRow struct {
 }
 
 // sessionResponse is the JSON body returned by POST /session; seq is the
-// session's hit counter, incremented on every request bound to the same
-// cookie.
+// hit counter loaded from the fixed-key blob and bumped on every request.
 type sessionResponse struct {
 	OK  bool `json:"ok"`
 	Seq int  `json:"seq"`
@@ -418,11 +420,11 @@ func mcHandler(prefix string) fasthttp.RequestHandler {
 	}
 }
 
-// sessionHandler serves POST /session — a redis-backed session round-trip
-// that merges the request body into the stored blob and bumps a hit
-// counter. Matches the celeris perfmatrix reference's wire behaviour
-// (common.SessionCookieName cookie, "pmsess:" key prefix, 10-minute TTL)
-// so the session scenario is comparable across frameworks.
+// sessionHandler serves POST /session — a fixed-key redis round-trip over
+// go-redis: GET the seeded blob on pmsess:bench (redis.Nil on the unseeded
+// key is ignored), merge the JSON request body, bump the seq hit counter,
+// then SET the blob back with a 10-minute TTL. Exactly two round-trips (GET
+// then SET) — the same workload every adapter runs. No Redis -> 503.
 func sessionHandler() fasthttp.RequestHandler {
 	return func(rc *fasthttp.RequestCtx) {
 		rdb := mountedDrivers.rdb
@@ -433,22 +435,9 @@ func sessionHandler() fasthttp.RequestHandler {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		sid := string(rc.Request.Header.Cookie(common.SessionCookieName))
 		data := make(map[string]any, 4)
-		if sid != "" {
-			raw, err := rdb.Get(ctx, "pmsess:"+sid).Bytes()
-			switch {
-			case err == nil:
-				_ = json.Unmarshal(raw, &data)
-			case err == goredis.Nil:
-				// New session under an unknown cookie: start fresh.
-			default:
-				rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
-				return
-			}
-		}
-		if sid == "" {
-			sid = newSessionID()
+		if raw, err := rdb.Get(ctx, sessionKey).Bytes(); err == nil {
+			_ = json.Unmarshal(raw, &data)
 		}
 		if body := rc.PostBody(); len(body) > 0 {
 			var incoming map[string]any
@@ -463,18 +452,10 @@ func sessionHandler() fasthttp.RequestHandler {
 		data["seq"] = newSeq
 
 		buf, _ := json.Marshal(data)
-		if err := rdb.Set(ctx, "pmsess:"+sid, buf, 10*time.Minute).Err(); err != nil {
+		if err := rdb.Set(ctx, sessionKey, buf, 10*time.Minute).Err(); err != nil {
 			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
 			return
 		}
-
-		ck := fasthttp.AcquireCookie()
-		ck.SetKey(common.SessionCookieName)
-		ck.SetValue(sid)
-		ck.SetPath("/")
-		ck.SetHTTPOnly(true)
-		rc.Response.Header.SetCookie(ck)
-		fasthttp.ReleaseCookie(ck)
 
 		rc.SetContentType("application/json")
 		rc.SetStatusCode(fasthttp.StatusOK)
@@ -494,13 +475,6 @@ func closeDrivers() {
 		mountedDrivers.rdb = nil
 	}
 	mountedDrivers.mc = nil
-}
-
-// newSessionID returns a random 128-bit hex session id.
-func newSessionID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
 }
 
 // mustJSON marshals v or panics; the driver response types are fixed

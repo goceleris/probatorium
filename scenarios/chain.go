@@ -135,10 +135,9 @@ func chainScenarioName(chain, workload string) string {
 	return "chain-" + chain + "-" + workload
 }
 
-func init() {
-	for _, chain := range ChainProfiles {
-		for _, wl := range []string{ChainWorkloadGetJSON, ChainWorkloadPost4K, ChainWorkloadGetJSON1C} {
-			Register(NewChainScenario(chainScenarioName(chain, wl), chain, wl))
-		}
-	}
-}
+// Chain scenarios are intentionally NOT registered: they compare unequal
+// work across adapters (each framework's middleware stack differs), so the
+// numbers aren't comparable and aren't worth the compute. The types above
+// are retained as harmless dead code so the framework-side chain_handlers.go
+// and the ChainProfiles contract stay buildable.
+func init() {}

@@ -60,13 +60,13 @@ const (
 	// the SAME realized "*/*" grid Fast runs (FullRealizedCells ==
 	// FastRealizedCells); the profiles differ only by per-cell window. The
 	// v1.5.4 redesign reshaped the grid — saturated static rows pruned (W1),
-	// the driver set deepened 4->10 (W3), and WS/SSE coverage added to three
-	// more columns (W4) — so the realized count moved off the older ~800/1257
-	// pins. Recompute with `cmd/runner -dry-run -cells '*/*' | grep -c
-	// '^run0'` when the registry changes; the nominal grid is 52 columns x 44
-	// rows and capability gating (the streaming / driver / chain / TLS cells,
-	// plus the h2c-noupg columns skipping every H1 row) lands it here.
-	FullRealizedCells      = 1111
+	// the driver set deepened 4->10 (W3), WS/SSE coverage added to three more
+	// columns (W4), and the 12 middleware/chain scenarios REMOVED (pre-run
+	// audit: they compared unequal work across adapters) — so the realized
+	// count moved off the older ~800/1257/1111 pins to 835. Recompute with
+	// `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when the registry
+	// changes; the grid is now 52 columns x 29 rows, capability-gated.
+	FullRealizedCells      = 835
 	FullRatedRealizedCells = 24
 )
 
@@ -88,13 +88,12 @@ const (
 // the correct loud failure, since the full grid x 2 serial arches cannot fit
 // 24h until ArchParallel (#168, blocked on loadgen linux/arm64) lands.
 //
-// Budget: ~1111 cells x (12+40+5+12)s x 1 arch = ~21.3h saturation + ~0.7h
-// curated rated = ~22.0h < 24h. The per-cell window was shortened from
-// 60s/15s to 40s/12s in the v1.5.4 redesign so the grown full grid (1111
-// realized cells, up from ~820) still fits 24h — the longer window no
-// longer does. The rated sweep stays curated (RatedGlobs) because it is the
-// expensive additive dimension; expanding it to the full grid would blow
-// the budget many times over.
+// Budget: ~835 cells x (12+40+5+12)s x 1 arch = ~16.0h saturation + ~0.7h
+// curated rated = ~16.7h < 24h. The per-cell window stays at the v1.5.4
+// 40s/12s (the chain-scenario removal dropped the grid 1111->835, so there
+// is now ample headroom). The rated sweep stays curated (RatedGlobs) because
+// it is the expensive additive dimension; expanding it to the full grid
+// would blow the budget many times over.
 func HeadlineWeekly() Profile {
 	return Profile{
 		Name:          "headline",
@@ -119,9 +118,10 @@ func HeadlineWeekly() Profile {
 // Recompute with `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when
 // the registry grows; FitWithin uses it to assert the fast profile still
 // fits 24h, so an over-large grid fails loudly instead of overrunning.
-// v1.5.4 redesign: 1257 -> 1111 (W1 pruned saturated static rows; W3
-// deepened drivers 4->10; W4 added WS/SSE to three columns).
-const FastRealizedCells = 1111
+// v1.5.4 redesign: 1257 -> 1111 -> 835 (W1 pruned saturated static rows; W3
+// deepened drivers 4->10; W4 added WS/SSE to three columns; pre-run audit
+// REMOVED the 12 middleware/chain scenarios as unfair).
+const FastRealizedCells = 835
 
 // Fast is the DEFAULT routine + weekly profile: the FULL grid (every server
 // × every scenario, capability-gated, "*/*") in SATURATION ONLY — no rated
@@ -131,8 +131,8 @@ const FastRealizedCells = 1111
 // per cell, the dominant cost) is intentionally OFF here and belongs in a
 // separate, scoped dispatch when latency-under-controlled-load is the story.
 //
-// Budget: 1111 cells × (10+35+5+12)s × 1 arch = ~19.1h saturation, rated=0
-// → ~19.1h < 24h. RatedPasses=0 makes BenchTier skip the rated flag entirely
+// Budget: 835 cells × (10+35+5+12)s × 1 arch = ~14.4h saturation, rated=0
+// → ~14.4h < 24h. RatedPasses=0 makes BenchTier skip the rated flag entirely
 // (rated OFF for every cell), so this is the cheap, full-breadth mode.
 func Fast() Profile {
 	return Profile{

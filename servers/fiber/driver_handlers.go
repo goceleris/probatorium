@@ -9,10 +9,14 @@ import (
 
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
 )
+
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
 
 // driverState holds the lazily-opened backend clients. Each field is nil
 // when the matching PROBATORIUM_* env var is unset; the handler then
@@ -68,7 +72,7 @@ func buildDriverState() *driverState {
 // mountDriverHandlers registers the 4 driver routes on app as native
 // fiber v2 handlers. The workloads mirror the celeris reference: a PG
 // row read, Redis/memcached GETs returning the raw blob, and a session
-// read-merge-write round-trip keyed on the pmsid cookie.
+// load+merge+save round-trip on the fixed key pmsess:bench.
 func mountDriverHandlers(app *fiber.App, ds *driverState) {
 	app.Get("/db/user/:id", func(c *fiber.Ctx) error {
 		if ds.pg == nil {
@@ -255,27 +259,20 @@ func mountDriverHandlers(app *fiber.App, ds *driverState) {
 	})
 
 	app.Post("/session", func(c *fiber.Ctx) error {
-		// The session round-trip is Redis-backed (parity with celeris's
-		// redisstore). Without Redis there is nowhere to persist the blob,
-		// so the route is 503 — matching the driver-unavailable contract.
+		// Fixed-key round-trip over go-redis: GET the seeded blob (redis.Nil
+		// on the unseeded key is ignored), merge the JSON request body, bump
+		// the seq hit counter, then SET the blob back with a 10-minute TTL.
+		// Exactly two round-trips (GET then SET) — the same workload every
+		// adapter runs. No Redis -> 503.
 		if ds.rdb == nil {
 			return c.SendStatus(fiber.StatusServiceUnavailable)
 		}
 		ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
 		defer cancel()
 
-		sid := c.Cookies("pmsid")
 		data := make(map[string]any, 4)
-		if sid != "" {
-			raw, err := ds.rdb.Get(ctx, "pmsess:"+sid).Bytes()
-			if err == nil {
-				_ = json.Unmarshal(raw, &data)
-			} else if err != goredis.Nil {
-				return c.SendStatus(fiber.StatusServiceUnavailable)
-			}
-		}
-		if sid == "" {
-			sid = uuid.NewString()
+		if raw, err := ds.rdb.Get(ctx, sessionKey).Bytes(); err == nil {
+			_ = json.Unmarshal(raw, &data)
 		}
 
 		// Merge the request body if it is JSON. Parse failures are
@@ -298,11 +295,10 @@ func mountDriverHandlers(app *fiber.App, ds *driverState) {
 		if err != nil {
 			return c.SendStatus(fiber.StatusServiceUnavailable)
 		}
-		if err := ds.rdb.Set(ctx, "pmsess:"+sid, buf, 10*time.Minute).Err(); err != nil {
+		if err := ds.rdb.Set(ctx, sessionKey, buf, 10*time.Minute).Err(); err != nil {
 			return c.SendStatus(fiber.StatusServiceUnavailable)
 		}
 
-		c.Cookie(&fiber.Cookie{Name: "pmsid", Value: sid, Path: "/", HTTPOnly: true})
 		c.Set("Content-Type", "application/json")
 		return c.Send(mustJSON(sessionResponse{OK: true, Seq: newSeq}))
 	})

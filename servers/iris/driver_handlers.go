@@ -12,11 +12,13 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/jackc/pgx/v5/pgxpool"
 	irisv12 "github.com/kataras/iris/v12"
-	"github.com/kataras/iris/v12/sessions"
 	"github.com/redis/go-redis/v9"
-
-	"github.com/goceleris/probatorium/servers/common"
 )
+
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
 
 // driverClients holds the lazily-constructed driver handles the four
 // driver scenarios round-trip against. A nil field means the service is
@@ -25,14 +27,13 @@ import (
 // deterministically rather than measuring a phantom 0-byte success.
 //
 // The iris adapter deliberately uses community-standard clients — pgx
-// for Postgres, go-redis for Redis, gomemcache for memcached, and iris's
-// own sessions package — so a chain cell reflects iris + idiomatic driver
-// cost, never celeris in-tree drivers leaking into a competitor column.
+// for Postgres, go-redis for Redis, gomemcache for memcached — so a chain
+// cell reflects iris + idiomatic driver cost, never celeris in-tree
+// drivers leaking into a competitor column.
 type driverClients struct {
-	pg       *pgxpool.Pool
-	redis    *redis.Client
-	mc       *memcache.Client
-	sessions *sessions.Sessions
+	pg    *pgxpool.Pool
+	redis *redis.Client
+	mc    *memcache.Client
 }
 
 // Service-endpoint env vars. Mirrors the perfmatrix services.FromEnv
@@ -53,7 +54,7 @@ type userRow struct {
 }
 
 // sessionResponse is the JSON body returned by POST /session; Seq is the
-// per-cookie hit counter the session middleware increments each request.
+// hit counter loaded from the fixed-key blob and bumped on every request.
 type sessionResponse struct {
 	OK  bool `json:"ok"`
 	Seq int  `json:"seq"`
@@ -86,15 +87,6 @@ func newDriverClients() *driverClients {
 		mc := memcache.New(addr)
 		mc.MaxIdleConns = 16
 		dc.mc = mc
-	}
-
-	// The session store rides on Redis when it is configured; otherwise
-	// POST /session degrades to 503 like the other unconfigured routes.
-	if dc.redis != nil {
-		dc.sessions = sessions.New(sessions.Config{
-			Cookie:  common.SessionCookieName,
-			Expires: 10 * time.Minute,
-		})
 	}
 
 	return dc
@@ -323,24 +315,46 @@ func mountDriverHandlers(app *irisv12.Application, dc *driverClients) {
 		_ = c.JSON(sessionResponse{OK: true, Seq: len(items)})
 	})
 
-	// Session: POST /session — iris's own session middleware, started
-	// inline so the hit counter only fires on this route.
+	// Session: POST /session — fixed-key round-trip over go-redis directly
+	// (no iris sessions library), so the workload matches every adapter:
+	// GET the fixed-key blob (redis.Nil on the unseeded key is ignored),
+	// merge the JSON request body, bump the seq hit counter, then SET the
+	// blob back with a 10-minute TTL. Exactly two round-trips (GET then SET).
 	app.Post("/session", func(c irisv12.Context) {
-		if dc.sessions == nil {
+		if dc.redis == nil {
 			c.StopWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		sess := dc.sessions.Start(c)
-		body, _ := io.ReadAll(c.Request().Body)
-		if len(body) > 0 {
+		ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
+		defer cancel()
+
+		blob := map[string]any{}
+		if raw, err := dc.redis.Get(ctx, sessionKey).Bytes(); err == nil {
+			_ = json.Unmarshal(raw, &blob)
+		}
+
+		if body, _ := io.ReadAll(c.Request().Body); len(body) > 0 {
 			var payload map[string]any
 			if err := json.Unmarshal(body, &payload); err == nil {
 				for k, v := range payload {
-					sess.Set(k, v)
+					blob[k] = v
 				}
 			}
 		}
-		seq := sess.Increment("seq", 1)
+
+		seq := 0
+		if n, ok := blob["seq"].(float64); ok { // JSON numbers decode to float64
+			seq = int(n)
+		}
+		seq++
+		blob["seq"] = seq
+
+		if raw, err := json.Marshal(blob); err == nil {
+			if err := dc.redis.Set(ctx, sessionKey, raw, 10*time.Minute).Err(); err != nil {
+				c.StopWithStatus(http.StatusServiceUnavailable)
+				return
+			}
+		}
 		c.ContentType("application/json")
 		_ = c.JSON(sessionResponse{OK: true, Seq: seq})
 	})
@@ -362,5 +376,4 @@ func closeDriverClients(dc *driverClients) {
 		dc.redis = nil
 	}
 	dc.mc = nil
-	dc.sessions = nil
 }

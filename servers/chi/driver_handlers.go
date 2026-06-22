@@ -6,8 +6,8 @@
 //   - GET  /db/user/{id}  — jackc/pgx/v5 pool, SELECT by id, JSON row.
 //   - GET  /cache/{key}   — redis/go-redis/v9, GET raw bytes.
 //   - GET  /mc/{key}      — bradfitz/gomemcache, GET raw bytes.
-//   - POST /session       — go-redis-backed session: load/merge/save a hit
-//     counter keyed by the pmsid cookie, JSON {ok,seq} reply.
+//   - POST /session       — go-redis GET+SET round-trip on the fixed key
+//     pmsess:bench: load/merge/save a hit counter, JSON {ok,seq} reply.
 //
 // Backends are addressed via environment variables (see driverConfig).
 // The probatorium binary takes only -bind/-engine flags, so the
@@ -24,8 +24,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -40,6 +38,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
+
 // userRow mirrors the seeded users table row (id, name, email, score),
 // matching the celeris reference's userRow so the JSON body is identical
 // across adapters.
@@ -51,8 +54,8 @@ type userRow struct {
 }
 
 // sessionResponse is the JSON body returned by POST /session. seq is the
-// session's hit counter, incremented on every request carrying the same
-// pmsid cookie. Shape matches the celeris reference.
+// hit counter loaded from the fixed-key blob and bumped on every request.
+// Shape matches the celeris reference.
 type sessionResponse struct {
 	OK  bool `json:"ok"`
 	Seq int  `json:"seq"`
@@ -362,15 +365,11 @@ func (c *driverClients) mcHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(item.Value)
 }
 
-// sessionHandler serves POST /session with a Redis-backed session store,
-// mirroring the celeris reference's redisstore session: load the blob by
-// the pmsid cookie, merge any JSON request body, bump the seq hit
-// counter, persist, and reply {ok,seq}. No Redis -> 503.
-//
-// The store is a plain Redis hash-free JSON blob under "sess:<sid>" with
-// a 10-minute TTL (the reference's IdleTimeout). A loadgen client that
-// reuses the cookie observes a monotonically increasing seq, proving the
-// store round-trip; a fresh client starts at 1.
+// sessionHandler serves POST /session over a Redis-backed JSON blob on the
+// fixed key pmsess:bench: GET the blob (redis.Nil on the unseeded key is
+// ignored), merge any JSON request body, bump the seq hit counter, then SET
+// the blob back with a 10-minute TTL. Exactly two round-trips (GET then SET)
+// — the same workload every adapter runs, over go-redis here. No Redis -> 503.
 func (c *driverClients) sessionHandler(w http.ResponseWriter, r *http.Request) {
 	if c.redis == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -379,14 +378,9 @@ func (c *driverClients) sessionHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	sid, fresh := sessionID(r)
-	key := "sess:" + sid
-
 	blob := map[string]any{}
-	if !fresh {
-		if raw, err := c.redis.Get(ctx, key).Bytes(); err == nil {
-			_ = json.Unmarshal(raw, &blob)
-		}
+	if raw, err := c.redis.Get(ctx, sessionKey).Bytes(); err == nil {
+		_ = json.Unmarshal(raw, &blob)
 	}
 
 	// Merge a JSON request body if present (the scenario POSTs a ~256B
@@ -408,33 +402,15 @@ func (c *driverClients) sessionHandler(w http.ResponseWriter, r *http.Request) {
 	blob["seq"] = seq
 
 	if raw, err := json.Marshal(blob); err == nil {
-		_ = c.redis.Set(ctx, key, raw, 10*time.Minute).Err()
+		if err := c.redis.Set(ctx, sessionKey, raw, 10*time.Minute).Err(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 	}
 
-	if fresh {
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookieName,
-			Value:    sid,
-			Path:     "/",
-			HttpOnly: true,
-		})
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(sessionResponse{OK: true, Seq: seq})
-}
-
-// sessionID returns the session id from the pmsid cookie, or a freshly
-// generated one (with fresh=true so the caller emits a Set-Cookie).
-func sessionID(r *http.Request) (id string, fresh bool) {
-	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
-		return ck.Value, false
-	}
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 16), true
-	}
-	return hex.EncodeToString(b[:]), true
 }
 
 // Compile-time guard so the errors import stays tied to real behavior even

@@ -2,8 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,6 +14,11 @@ import (
 
 	"github.com/bradfitz/gomemcache/memcache"
 )
+
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
 
 // driverState holds the lazily-opened driver clients shared across the
 // four driver routes. Each client is opened once at registration from
@@ -271,30 +275,47 @@ func (st *driverState) handleMC(c *gin.Context) {
 	c.Data(http.StatusOK, "application/octet-stream", it.Value)
 }
 
+// handleSession serves POST /session: GET the fixed-key blob (redis.Nil on
+// the unseeded key is ignored), merge the JSON request body, bump the seq
+// hit counter, then SET the blob back with a 10-minute TTL. Exactly two
+// round-trips (GET then SET), the same workload every adapter runs — here
+// over go-redis. No Redis -> 503.
 func (st *driverState) handleSession(c *gin.Context) {
 	if st.redis == nil {
 		c.AbortWithStatus(http.StatusServiceUnavailable)
 		return
 	}
-	var sid string
-	if ck, err := c.Request.Cookie(sessionCookieName); err == nil {
-		sid = ck.Value
-	}
-	if sid == "" {
-		sid = newSessionID()
-		http.SetCookie(c.Writer, &http.Cookie{
-			Name:     sessionCookieName,
-			Value:    sid,
-			Path:     "/",
-			HttpOnly: true,
-		})
-	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	key := "sess:" + sid
-	seq, _ := st.redis.Incr(ctx, key).Result()
-	st.redis.Expire(ctx, key, 10*time.Minute)
-	c.JSON(http.StatusOK, sessionResponse{OK: true, Seq: int(seq)})
+
+	blob := map[string]any{}
+	if raw, err := st.redis.Get(ctx, sessionKey).Bytes(); err == nil {
+		_ = json.Unmarshal(raw, &blob)
+	}
+
+	if body, _ := c.GetRawData(); len(body) > 0 {
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err == nil {
+			for k, v := range payload {
+				blob[k] = v
+			}
+		}
+	}
+
+	seq := 0
+	if n, ok := blob["seq"].(float64); ok { // JSON numbers decode to float64
+		seq = int(n)
+	}
+	seq++
+	blob["seq"] = seq
+
+	if raw, err := json.Marshal(blob); err == nil {
+		if err := st.redis.Set(ctx, sessionKey, raw, 10*time.Minute).Err(); err != nil {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+	}
+	c.JSON(http.StatusOK, sessionResponse{OK: true, Seq: seq})
 }
 
 // userRow mirrors the users table row returned by GET /db/user/:id.
@@ -309,11 +330,4 @@ type userRow struct {
 type sessionResponse struct {
 	OK  bool `json:"ok"`
 	Seq int  `json:"seq"`
-}
-
-// newSessionID returns a random 16-byte hex session id.
-func newSessionID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
 }

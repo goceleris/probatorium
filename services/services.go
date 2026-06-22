@@ -39,6 +39,10 @@ const (
 	// v1.5.4 driver-depth fixtures.
 	FixtureWritesTable   = "bench_writes" // unlogged PG table for driver-pg-write
 	FixtureRedisWriteKey = "demo-write"   // key driver-redis-set writes (no seed; the bench writes it)
+
+	// FixtureSessionKey is the fixed key driver-session-rw GETs+SETs. Seeded
+	// with a small JSON blob so the handler's read hits a populated key.
+	FixtureSessionKey = "pmsess:bench"
 )
 
 // Kind enumerates the services probatorium can provision. String values
@@ -55,6 +59,18 @@ const (
 	imageRedis     = "redis:8.2-alpine"
 	imageMemcached = "memcached:1.6.41-alpine"
 )
+
+// sessionSeed is the initial value written to FixtureSessionKey: a ~256B
+// JSON-ish blob padded with filler so driver-session-rw's GET hits a
+// populated key sized like a real session record.
+var sessionSeed = func() []byte {
+	const size = 256
+	b := []byte(`{"seq":0,"uid":42,"pad":"`)
+	for len(b) < size-2 {
+		b = append(b, 'x')
+	}
+	return append(b, '"', '}')
+}()
 
 // Handles is the set of running services returned by Start. Fields are nil
 // when the corresponding service was not requested. Driver scenarios read
@@ -235,6 +251,9 @@ func startPostgres(ctx context.Context) (*PGService, error) {
 		"-e", "POSTGRES_DB=bench",
 		"-p", "127.0.0.1:0:5432/tcp",
 		imagePostgres,
+		// Disable WAL fsync-on-commit so driver-pg-update-tx measures
+		// driver/framework overhead, not the host's disk fsync rate.
+		"-c", "synchronous_commit=off",
 	)
 	if err != nil {
 		return nil, err
@@ -527,6 +546,10 @@ func seedRedis(ctx context.Context, addr string) error {
 
 	payload := bytes.Repeat([]byte("a"), 4*1024)
 	if err := rdb.Set(ctx, FixtureDemoKey, payload, 0).Err(); err != nil {
+		return err
+	}
+
+	if err := rdb.Set(ctx, FixtureSessionKey, sessionSeed, 0).Err(); err != nil {
 		return err
 	}
 

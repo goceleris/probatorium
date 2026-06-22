@@ -90,7 +90,7 @@
             docker run -d --rm --name probatorium-pg \
               -p 127.0.0.1:54321:5432 \
               -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
-              postgres:17-alpine
+              postgres:17-alpine -c synchronous_commit=off
           register: dbsvc_pg
           changed_when: dbsvc_pg.rc == 0
           failed_when: false

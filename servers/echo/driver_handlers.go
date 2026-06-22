@@ -11,14 +11,16 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	echov4 "github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
-
-	"github.com/goceleris/probatorium/servers/common"
 )
+
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
 
 // driverPoolSize bounds every backing client so the bench is gated by the
 // server under test rather than by an unbounded client-side connection
@@ -40,8 +42,7 @@ type userRow struct {
 }
 
 // sessionResponse is the JSON body returned by POST /session; Seq is the
-// session's hit counter, incremented on every request bound to the same
-// cookie.
+// hit counter loaded from the fixed-key blob and bumped on every request.
 type sessionResponse struct {
 	OK  bool `json:"ok"`
 	Seq int  `json:"seq"`
@@ -173,61 +174,51 @@ func registerDriverHandlers(e *echov4.Echo, dc *driverClients) {
 		return c.Blob(http.StatusOK, "application/octet-stream", item.Value)
 	})
 
-	// POST /session — cookie-keyed session round-trip backed by Redis.
+	// POST /session — fixed-key session round-trip backed by Redis.
 	//
-	// Echo ships no session middleware in the core module and there is no
-	// celeris session store to reuse, so the round-trip is expressed
-	// directly: read (or mint) the pmsid cookie, merge the request body
-	// into the session blob, increment a per-session hit counter, and
-	// reply with the current seq. This is the semantic equal of the
-	// celeris adapter's session.New(...) + sessionHandler — a load + merge
-	// + save + counter round-trip per request on the same cookie — using
-	// the same Redis backend.
+	// Echo ships no session middleware in the core module, so the
+	// round-trip is expressed directly: GET the fixed-key blob (redis.Nil
+	// on the unseeded key is ignored), merge the JSON request body, bump
+	// the seq hit counter, then SET the blob back with a 10-minute TTL.
+	// Exactly two round-trips (GET then SET) — the same workload every
+	// adapter runs, over go-redis here.
 	e.POST("/session", func(c echov4.Context) error {
 		if dc.redis == nil {
 			return c.NoContent(http.StatusServiceUnavailable)
 		}
 
-		sid := ""
-		if ck, err := c.Cookie(common.SessionCookieName); err == nil && ck.Value != "" {
-			sid = ck.Value
-		}
-		if sid == "" {
-			sid = uuid.NewString()
-			c.SetCookie(&http.Cookie{
-				Name:     common.SessionCookieName,
-				Value:    sid,
-				Path:     "/",
-				HttpOnly: true,
-			})
-		}
-
 		ctx, cancel := context.WithTimeout(c.Request().Context(), driverOpTimeout)
 		defer cancel()
 
-		key := "pmsess:" + sid
+		blob := map[string]any{}
+		if raw, err := dc.redis.Get(ctx, sessionKey).Bytes(); err == nil {
+			_ = json.Unmarshal(raw, &blob)
+		}
 
-		// Merge the request body into the session blob when it parses as
-		// JSON. Parse failures are non-fatal: the counter round-trip below
-		// still runs so the session path is observable on every request.
+		// Merge the request body when it parses as JSON. Parse failures are
+		// non-fatal: the SET below still runs so the path is observable.
 		if body, err := io.ReadAll(c.Request().Body); err == nil && len(body) > 0 {
 			var payload map[string]any
-			if json.Unmarshal(body, &payload) == nil && len(payload) > 0 {
-				fields := make(map[string]any, len(payload))
+			if json.Unmarshal(body, &payload) == nil {
 				for k, v := range payload {
-					fields["d:"+k] = v
+					blob[k] = v
 				}
-				_ = dc.redis.HSet(ctx, key, fields).Err()
 			}
 		}
 
-		seq, err := dc.redis.HIncrBy(ctx, key, "seq", 1).Result()
-		if err != nil {
-			return c.NoContent(http.StatusServiceUnavailable)
+		seq := 0
+		if n, ok := blob["seq"].(float64); ok { // JSON numbers decode to float64
+			seq = int(n)
 		}
-		_ = dc.redis.Expire(ctx, key, 10*time.Minute).Err()
+		seq++
+		blob["seq"] = seq
 
-		return c.JSON(http.StatusOK, sessionResponse{OK: true, Seq: int(seq)})
+		if raw, err := json.Marshal(blob); err == nil {
+			if err := dc.redis.Set(ctx, sessionKey, raw, 10*time.Minute).Err(); err != nil {
+				return c.NoContent(http.StatusServiceUnavailable)
+			}
+		}
+		return c.JSON(http.StatusOK, sessionResponse{OK: true, Seq: seq})
 	})
 
 	// v1.5.4 driver-depth routes (idiomatic pgx/go-redis/gomemcache). The

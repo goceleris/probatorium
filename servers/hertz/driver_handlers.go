@@ -10,14 +10,15 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
-	"github.com/cloudwego/hertz/pkg/protocol"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
-
-	"github.com/goceleris/probatorium/servers/common"
 )
+
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
 
 // driverState holds the lazily-opened backend clients. Each field is nil
 // when the matching PROBATORIUM_* env var is unset; the handler then
@@ -73,7 +74,7 @@ func buildDriverState() *driverState {
 // mountDriverHandlers registers the 4 driver routes on h as native hertz
 // handlers. The workloads mirror the fiber/celeris reference: a PG row
 // read, Redis/memcached GETs returning the raw blob, and a session
-// read-merge-write round-trip keyed on the pmsid cookie.
+// load+merge+save round-trip on the fixed key pmsess:bench.
 func mountDriverHandlers(h *server.Hertz, ds *driverState) {
 	h.GET("/db/user/:id", func(c context.Context, ctx *app.RequestContext) {
 		if ds.pg == nil {
@@ -126,9 +127,11 @@ func mountDriverHandlers(h *server.Hertz, ds *driverState) {
 	})
 
 	h.POST("/session", func(c context.Context, ctx *app.RequestContext) {
-		// The session round-trip is Redis-backed (parity with celeris's
-		// redisstore). Without Redis there is nowhere to persist the blob,
-		// so the route is 503 — matching the driver-unavailable contract.
+		// Fixed-key round-trip over go-redis: GET the seeded blob (redis.Nil
+		// on the unseeded key is ignored), merge the JSON request body, bump
+		// the seq hit counter, then SET the blob back with a 10-minute TTL.
+		// Exactly two round-trips (GET then SET) — the same workload every
+		// adapter runs. No Redis -> 503.
 		if ds.rdb == nil {
 			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
 			return
@@ -136,19 +139,9 @@ func mountDriverHandlers(h *server.Hertz, ds *driverState) {
 		qctx, cancel := context.WithTimeout(c, 5*time.Second)
 		defer cancel()
 
-		sid := string(ctx.Cookie(common.SessionCookieName))
 		data := make(map[string]any, 4)
-		if sid != "" {
-			raw, err := ds.rdb.Get(qctx, "pmsess:"+sid).Bytes()
-			if err == nil {
-				_ = json.Unmarshal(raw, &data)
-			} else if err != goredis.Nil {
-				ctx.AbortWithStatus(consts.StatusServiceUnavailable)
-				return
-			}
-		}
-		if sid == "" {
-			sid = uuid.NewString()
+		if raw, err := ds.rdb.Get(qctx, sessionKey).Bytes(); err == nil {
+			_ = json.Unmarshal(raw, &data)
 		}
 
 		// Merge the request body if it is JSON. Parse failures are
@@ -172,12 +165,11 @@ func mountDriverHandlers(h *server.Hertz, ds *driverState) {
 			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
 			return
 		}
-		if err := ds.rdb.Set(qctx, "pmsess:"+sid, buf, 10*time.Minute).Err(); err != nil {
+		if err := ds.rdb.Set(qctx, sessionKey, buf, 10*time.Minute).Err(); err != nil {
 			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
 			return
 		}
 
-		ctx.SetCookie(common.SessionCookieName, sid, 0, "/", "", protocol.CookieSameSiteDisabled, false, true)
 		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true, Seq: newSeq}))
 	})
 

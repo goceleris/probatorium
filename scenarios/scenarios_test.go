@@ -172,7 +172,7 @@ func TestErrorBudgets(t *testing.T) {
 	if got := ErrorBudgetFor(findScenario(t, "churn-close")); got != 0.5 {
 		t.Errorf("churn-close ErrorBudget = %v, want 0.5", got)
 	}
-	for _, name := range []string{"get-json", "post-4k", "sse-fanout-1024", "chain-api-post-4k"} {
+	for _, name := range []string{"get-json", "post-4k", "sse-fanout-1024"} {
 		if got := ErrorBudgetFor(findScenario(t, name)); got != DefaultErrorBudget {
 			t.Errorf("%s ErrorBudget = %v, want DefaultErrorBudget (%v)", name, got, DefaultErrorBudget)
 		}

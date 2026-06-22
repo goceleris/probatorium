@@ -16,7 +16,7 @@ const (
 	DriverPG        = "driver-pg-read"    // GET /db/user/42 — 1 SELECT (hot row)
 	DriverRedis     = "driver-redis-get"  // GET /cache/<key> — 1 GET
 	DriverMemcached = "driver-mc-get"     // GET /mc/<key> — 1 GET
-	DriverSession   = "driver-session-rw" // POST /session — GET + SET round-trip
+	DriverSession   = "driver-session-rw" // POST /session — fixed-key GET+SET round-trip (no cookie)
 
 	// v1.5.4 depth additions:
 	DriverPGWrite       = "driver-pg-write"       // POST /db/insert — 1 INSERT (write path)
@@ -85,7 +85,9 @@ func (s *DriverScenario) Kind() string { return s.kind }
 // Workload returns the loadgen.Config for this driver scenario.
 // driver-pg-read pins id=42 (seeded by services.Seed); driver-redis-get
 // and driver-mc-get both request services.FixtureDemoKey; driver-session-rw
-// POSTs a 256-byte payload to /session.
+// POSTs a 256-byte payload to /session, which the handler turns into a
+// GET+SET round-trip on the fixed server-side key services.FixtureSessionKey
+// (no cookie — the key is constant).
 func (s *DriverScenario) Workload(target string) loadgen.Config {
 	cfg := loadgen.Config{
 		Connections: 128,
