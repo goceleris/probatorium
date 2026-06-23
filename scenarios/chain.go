@@ -129,12 +129,6 @@ func (s *ChainScenario) Applicable(fs servers.FeatureSet) bool {
 // Compile-time assertion that ChainScenario satisfies Scenario.
 var _ Scenario = (*ChainScenario)(nil)
 
-// chainScenarioName returns the canonical name for a (chain, workload)
-// pair, e.g. ("api", "get-json-1c") → "chain-api-get-json-1c".
-func chainScenarioName(chain, workload string) string {
-	return "chain-" + chain + "-" + workload
-}
-
 // Chain scenarios are intentionally NOT registered: they compare unequal
 // work across adapters (each framework's middleware stack differs), so the
 // numbers aren't comparable and aren't worth the compute. The types above
