@@ -21,12 +21,12 @@ import "time"
 // because it is the expensive additive dimension — see RatedServers below.
 
 // RatedScenarios is the curated rated/SLO subset (#156): the SLO-knee
-// scenarios where throughput-at-SLO carries the most signal. Kept to the
-// two registered static rows that every rated server runs — a GET read and
-// a 4 KiB POST. (A third entry, "auto-mix-111", was listed here but never
-// registered, so the -cells filter silently matched nothing and the rated
-// grid was 16 cells while the pin claimed 24; removed in the v1.5.4 pre-run
-// audit. Re-add an auto-mix scenario here only once it is registered.)
+// scenarios where throughput-at-SLO carries the most signal. The two
+// registered static rows every rated server runs — a GET read and a 4 KiB
+// POST. (A third entry, "auto-mix-111", used to be listed here but the
+// scenario was deleted and never registered, so the -cells filter silently
+// matched nothing and the rated grid was 16 cells while the pin claimed 24;
+// removed from the rated pass in the v1.5.4 pre-run audit.)
 var RatedScenarios = []string{
 	"get-json",
 	"post-4k",
