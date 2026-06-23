@@ -35,6 +35,14 @@ const (
 	FixtureDemoKey      = "demo-key"
 	FixtureSessionIDMin = 1
 	FixtureSessionIDMax = 1000
+
+	// v1.5.4 driver-depth fixtures.
+	FixtureWritesTable   = "bench_writes" // unlogged PG table for driver-pg-write
+	FixtureRedisWriteKey = "demo-write"   // key driver-redis-set writes (no seed; the bench writes it)
+
+	// FixtureSessionKey is the fixed key driver-session-rw GETs+SETs. Seeded
+	// with a small JSON blob so the handler's read hits a populated key.
+	FixtureSessionKey = "pmsess:bench"
 )
 
 // Kind enumerates the services probatorium can provision. String values
@@ -51,6 +59,18 @@ const (
 	imageRedis     = "redis:8.2-alpine"
 	imageMemcached = "memcached:1.6.41-alpine"
 )
+
+// sessionSeed is the initial value written to FixtureSessionKey: a ~256B
+// JSON-ish blob padded with filler so driver-session-rw's GET hits a
+// populated key sized like a real session record.
+var sessionSeed = func() []byte {
+	const size = 256
+	b := []byte(`{"seq":0,"uid":42,"pad":"`)
+	for len(b) < size-2 {
+		b = append(b, 'x')
+	}
+	return append(b, '"', '}')
+}()
 
 // Handles is the set of running services returned by Start. Fields are nil
 // when the corresponding service was not requested. Driver scenarios read
@@ -188,6 +208,51 @@ func SeedExternal(ctx context.Context, pgDSN, redisAddr, mcAddr string) error {
 			return fmt.Errorf("seed memcached %s: %w", mcAddr, err)
 		}
 	}
+	return VerifySeed(ctx, pgDSN, redisAddr, mcAddr)
+}
+
+// VerifySeed reads back a representative fixture from each configured
+// backend and errors if any canonical key/row is missing. It is the
+// post-seed guard that turns a silent partial or mis-targeted seed — the
+// dominant cause of a driver cell that publishes a fast 200 while doing no
+// real work, since a cache miss / empty range is a cheap, healthy-looking
+// response that the per-cell classifier cannot tell from genuine throughput
+// — into a loud failure on the seed step, before any bench cell runs. An
+// empty address skips that backend, mirroring SeedExternal.
+func VerifySeed(ctx context.Context, pgDSN, redisAddr, mcAddr string) error {
+	if pgDSN != "" {
+		conn, err := pgx.Connect(ctx, pgDSN)
+		if err != nil {
+			return fmt.Errorf("verify seed: connect postgres %s: %w", pgDSN, err)
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		var n int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM users`).Scan(&n); err != nil {
+			return fmt.Errorf("verify seed: count users: %w", err)
+		}
+		if n < FixtureUserMaxID {
+			return fmt.Errorf("verify seed: users has %d rows, want >= %d (seed did not populate the bench backend)", n, FixtureUserMaxID)
+		}
+	}
+	if redisAddr != "" {
+		rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+		defer func() { _ = rdb.Close() }()
+		for _, k := range []string{FixtureDemoKey, FixtureSessionKey, "user:1:session"} {
+			v, err := rdb.Get(ctx, k).Result()
+			if err != nil || len(v) == 0 {
+				return fmt.Errorf("verify seed: redis key %q missing/empty (err=%v); seed did not reach %s", k, err, redisAddr)
+			}
+		}
+	}
+	if mcAddr != "" {
+		mc := memcache.New(mcAddr)
+		for _, k := range []string{FixtureDemoKey, "user:1:session"} {
+			it, err := mc.Get(k)
+			if err != nil || it == nil || len(it.Value) == 0 {
+				return fmt.Errorf("verify seed: memcached key %q missing/empty (err=%v); seed did not reach %s", k, err, mcAddr)
+			}
+		}
+	}
 	return nil
 }
 
@@ -219,7 +284,17 @@ func (h *Handles) Seed(ctx context.Context) error {
 			return fmt.Errorf("seed memcached: %w", err)
 		}
 	}
-	return nil
+	var pgDSN, redisAddr, mcAddr string
+	if h.Postgres != nil {
+		pgDSN = h.Postgres.DSN
+	}
+	if h.Redis != nil {
+		redisAddr = h.Redis.Addr
+	}
+	if h.Memcached != nil {
+		mcAddr = h.Memcached.Addr
+	}
+	return VerifySeed(ctx, pgDSN, redisAddr, mcAddr)
 }
 
 // startPostgres runs a Postgres container on a random loopback port and
@@ -231,6 +306,9 @@ func startPostgres(ctx context.Context) (*PGService, error) {
 		"-e", "POSTGRES_DB=bench",
 		"-p", "127.0.0.1:0:5432/tcp",
 		imagePostgres,
+		// Disable WAL fsync-on-commit so driver-pg-update-tx measures
+		// driver/framework overhead, not the host's disk fsync rate.
+		"-c", "synchronous_commit=off",
 	)
 	if err != nil {
 		return nil, err
@@ -487,6 +565,19 @@ func seedPostgres(ctx context.Context, dsn string) error {
 		return err
 	}
 
+	// bench_writes: scratch target for driver-pg-write. UNLOGGED so the
+	// write-path bench measures driver + server overhead, not WAL fsync
+	// noise. Truncated on each seed for determinism.
+	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS `+FixtureWritesTable); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(ctx, `CREATE UNLOGGED TABLE `+FixtureWritesTable+` (
+		id      BIGSERIAL PRIMARY KEY,
+		payload TEXT NOT NULL
+	)`); err != nil {
+		return err
+	}
+
 	rows := make([][]any, 0, FixtureUserMaxID-FixtureUserMinID+1)
 	for i := FixtureUserMinID; i <= FixtureUserMaxID; i++ {
 		rows = append(rows, []any{
@@ -510,6 +601,10 @@ func seedRedis(ctx context.Context, addr string) error {
 
 	payload := bytes.Repeat([]byte("a"), 4*1024)
 	if err := rdb.Set(ctx, FixtureDemoKey, payload, 0).Err(); err != nil {
+		return err
+	}
+
+	if err := rdb.Set(ctx, FixtureSessionKey, sessionSeed, 0).Err(); err != nil {
 		return err
 	}
 

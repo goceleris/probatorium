@@ -67,6 +67,12 @@ builder.WebHost.ConfigureKestrel(options =>
 {
     options.AddServerHeader = false;
     options.AllowSynchronousIO = false;
+    // Match celeris's advertised h2 flow-control profile so the matrix is a
+    // fair fight: 1 MiB initial windows (Kestrel defaults below 1 MiB),
+    // connection window >= stream window, 100 concurrent streams.
+    options.Limits.Http2.InitialStreamWindowSize = 1024 * 1024;
+    options.Limits.Http2.InitialConnectionWindowSize = 1024 * 1024;
+    options.Limits.Http2.MaxStreamsPerConnection = 100;
     if (host is null)
     {
         options.ListenAnyIP(port, listenOptions => listenOptions.Protocols = protocols);

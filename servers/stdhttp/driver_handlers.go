@@ -6,8 +6,8 @@
 //   - GET  /db/user/{id}  — jackc/pgx/v5 pool, SELECT by id, JSON row.
 //   - GET  /cache/{key}   — redis/go-redis/v9, GET raw bytes.
 //   - GET  /mc/{key}      — bradfitz/gomemcache, GET raw bytes.
-//   - POST /session       — go-redis-backed session: load/merge/save a hit
-//     counter keyed by the pmsid cookie, JSON {ok,seq} reply.
+//   - POST /session       — go-redis GET+SET round-trip on the fixed key
+//     pmsess:bench: load/merge/save a hit counter, JSON {ok,seq} reply.
 //
 // This is the chi adapter's driver layer with chi.URLParam swapped for
 // ServeMux's r.PathValue and chi.Router swapped for *http.ServeMux — the
@@ -25,10 +25,9 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -38,6 +37,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
+
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
 
 // userRow mirrors the seeded users table row (id, name, email, score),
 // matching the celeris reference's userRow so the JSON body is identical
@@ -50,8 +54,8 @@ type userRow struct {
 }
 
 // sessionResponse is the JSON body returned by POST /session. seq is the
-// session's hit counter, incremented on every request carrying the same
-// pmsid cookie. Shape matches the celeris reference.
+// hit counter loaded from the fixed-key blob and bumped on every request.
+// Shape matches the celeris reference.
 type sessionResponse struct {
 	OK  bool `json:"ok"`
 	Seq int  `json:"seq"`
@@ -130,6 +134,18 @@ func mountDriverHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("GET /cache/{key}", c.cacheHandler)
 	mux.HandleFunc("GET /mc/{key}", c.mcHandler)
 	mux.HandleFunc("POST /session", c.sessionHandler)
+
+	// v1.5.4 driver-depth routes (writes / transaction / range / pipeline /
+	// multiget), expressed with the same idiomatic pgx/go-redis/gomemcache
+	// APIs as the reads above. The /cache-pipeline and /mc-multiget paths are
+	// deliberately distinct from the /cache/{key} and /mc/{key} param routes
+	// so they do not collide on ServeMux's pattern matching.
+	mux.HandleFunc("POST /db/insert", c.dbInsertHandler)
+	mux.HandleFunc("POST /db/tx/user/{id}", c.dbTxHandler)
+	mux.HandleFunc("GET /db/users", c.dbUsersRangeHandler)
+	mux.HandleFunc("POST /cache", c.cacheSetHandler)
+	mux.HandleFunc("GET /cache-pipeline", c.cachePipelineHandler)
+	mux.HandleFunc("GET /mc-multiget", c.mcMultiGetHandler)
 }
 
 // dbUserHandler serves GET /db/user/{id}: SELECT id,name,email,score and
@@ -193,15 +209,11 @@ func (c *driverClients) mcHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(item.Value)
 }
 
-// sessionHandler serves POST /session with a Redis-backed session store,
-// mirroring the celeris reference's redisstore session: load the blob by
-// the pmsid cookie, merge any JSON request body, bump the seq hit
-// counter, persist, and reply {ok,seq}. No Redis -> 503.
-//
-// The store is a plain Redis JSON blob under "sess:<sid>" with a 10-minute
-// TTL (the reference's IdleTimeout). A loadgen client that reuses the
-// cookie observes a monotonically increasing seq, proving the store
-// round-trip; a fresh client starts at 1.
+// sessionHandler serves POST /session over a Redis-backed JSON blob on the
+// fixed key pmsess:bench: GET the blob (redis.Nil on the unseeded key is
+// ignored), merge any JSON request body, bump the seq hit counter, then SET
+// the blob back with a 10-minute TTL. Exactly two round-trips (GET then SET)
+// — the same workload every adapter runs, over go-redis here. No Redis -> 503.
 func (c *driverClients) sessionHandler(w http.ResponseWriter, r *http.Request) {
 	if c.redis == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -210,14 +222,9 @@ func (c *driverClients) sessionHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	sid, fresh := sessionID(r)
-	key := "sess:" + sid
-
 	blob := map[string]any{}
-	if !fresh {
-		if raw, err := c.redis.Get(ctx, key).Bytes(); err == nil {
-			_ = json.Unmarshal(raw, &blob)
-		}
+	if raw, err := c.redis.Get(ctx, sessionKey).Bytes(); err == nil {
+		_ = json.Unmarshal(raw, &blob)
 	}
 
 	// Merge a JSON request body if present (the scenario POSTs a ~256B
@@ -239,33 +246,189 @@ func (c *driverClients) sessionHandler(w http.ResponseWriter, r *http.Request) {
 	blob["seq"] = seq
 
 	if raw, err := json.Marshal(blob); err == nil {
-		_ = c.redis.Set(ctx, key, raw, 10*time.Minute).Err()
+		if err := c.redis.Set(ctx, sessionKey, raw, 10*time.Minute).Err(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 	}
 
-	if fresh {
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookieName,
-			Value:    sid,
-			Path:     "/",
-			HttpOnly: true,
-		})
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(sessionResponse{OK: true, Seq: seq})
 }
 
-// sessionID returns the session id from the pmsid cookie, or a freshly
-// generated one (with fresh=true so the caller emits a Set-Cookie).
-func sessionID(r *http.Request) (id string, fresh bool) {
-	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
-		return ck.Value, false
+// dbInsertHandler serves POST /db/insert: INSERT the request body into the
+// bench_writes table. nil pool / exec error -> 503.
+func (c *driverClients) dbInsertHandler(w http.ResponseWriter, r *http.Request) {
+	if c.pg == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
 	}
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 16), true
+	body, _ := io.ReadAll(r.Body)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := c.pg.Exec(ctx,
+		"INSERT INTO bench_writes(payload) VALUES($1)", string(body),
+	); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
 	}
-	return hex.EncodeToString(b[:]), true
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(sessionResponse{OK: true})
+}
+
+// dbTxHandler serves POST /db/tx/user/{id}: BEGIN; UPDATE score+1; COMMIT.
+// nil pool / error -> 503; bad id -> 400.
+func (c *driverClients) dbTxHandler(w http.ResponseWriter, r *http.Request) {
+	if c.pg == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := c.pg.Begin(ctx)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if _, err := tx.Exec(ctx, "UPDATE users SET score=score+1 WHERE id=$1", id); err != nil {
+		_ = tx.Rollback(ctx)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(sessionResponse{OK: true, Seq: id})
+}
+
+// dbUsersRangeHandler serves GET /db/users?limit=N: SELECT the first N rows
+// and JSON-encode the array. limit defaults to 50, clamped to 1..1000.
+func (c *driverClients) dbUsersRangeHandler(w http.ResponseWriter, r *http.Request) {
+	if c.pg == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit <= 0 || limit > 1000 {
+		limit = 50
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, err := c.pg.Query(ctx,
+		"SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND $1 ORDER BY id", limit,
+	)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	defer rows.Close()
+	out := make([]userRow, 0, limit)
+	for rows.Next() {
+		var row userRow
+		if err := rows.Scan(&row.ID, &row.Name, &row.Email, &row.Score); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		out = append(out, row)
+	}
+	if rows.Err() != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// cacheSetHandler serves POST /cache: Redis SET demo-write = request body,
+// no expiry. nil client / error -> 503.
+func (c *driverClients) cacheSetHandler(w http.ResponseWriter, r *http.Request) {
+	if c.redis == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.redis.Set(ctx, "demo-write", body, 0).Err(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(sessionResponse{OK: true})
+}
+
+// cachePipelineHandler serves GET /cache-pipeline?n=N: pipeline N GETs of
+// demo-key in one round-trip and sum their byte lengths into seq. n defaults
+// to 10, clamped to 1..100.
+func (c *driverClients) cachePipelineHandler(w http.ResponseWriter, r *http.Request) {
+	if c.redis == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	n, err := strconv.Atoi(r.URL.Query().Get("n"))
+	if err != nil || n <= 0 || n > 100 {
+		n = 10
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	pipe := c.redis.Pipeline()
+	cmds := make([]*redis.StringCmd, n)
+	for i := 0; i < n; i++ {
+		cmds[i] = pipe.Get(ctx, "demo-key")
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	total := 0
+	for _, cmd := range cmds {
+		v, err := cmd.Bytes()
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		total += len(v)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(sessionResponse{OK: true, Seq: total})
+}
+
+// mcMultiGetHandler serves GET /mc-multiget?keys=N: GetMulti of N seeded
+// user:<id>:session keys in one batch. keys defaults to 10, clamped to 1..100.
+func (c *driverClients) mcMultiGetHandler(w http.ResponseWriter, r *http.Request) {
+	if c.mc == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	n, err := strconv.Atoi(r.URL.Query().Get("keys"))
+	if err != nil || n <= 0 || n > 100 {
+		n = 10
+	}
+	keys := make([]string, n)
+	for i := 0; i < n; i++ {
+		keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
+	}
+	items, err := c.mc.GetMulti(keys)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(sessionResponse{OK: true, Seq: len(items)})
 }
 
 // Compile-time guard so the errors import stays tied to real behavior even

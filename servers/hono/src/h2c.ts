@@ -51,7 +51,26 @@ export function serveH2C(
   port: number,
   handler: FetchHandler,
 ): Promise<H2CListenResult> {
-  const server: Http2Server = http2.createServer();
+  // Advertise the celeris H2 flow-control profile so the h2c fair-fight
+  // compares like for like: node:http2 otherwise defaults the per-stream
+  // initialWindowSize to 64 KiB, throttling large-body streams below every
+  // Go column and axum (all 1 MiB). maxConcurrentStreams matches celeris's
+  // cap of 100; maxFrameSize stays at the 16 KiB RFC minimum celeris uses.
+  const server: Http2Server = http2.createServer({
+    settings: {
+      initialWindowSize: 1 << 20,
+      maxConcurrentStreams: 100,
+      maxFrameSize: 1 << 14,
+    },
+  });
+
+  server.on("session", (session) => {
+    // The per-stream initialWindowSize above does NOT raise the connection
+    // (session) receive window — that stays at the ~64 KiB default and would
+    // cap aggregate in-flight body bytes. Lift it to 1 MiB so the session
+    // window never becomes the bottleneck the per-stream one no longer is.
+    session.setLocalWindowSize(1 << 20);
+  });
 
   server.on("stream", (stream, headers) => {
     // node's "stream" event types the first arg as the base Http2Stream,

@@ -40,6 +40,7 @@
 // well below the spawn() SIGKILL fallback in servers/start.go.
 
 mod payload;
+mod streaming;
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -79,6 +80,15 @@ async fn main() -> ExitCode {
     };
     let bind = parse_bind_arg().unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
+    // Shared streaming state (the broadcast tick) + its 1ms publisher,
+    // spawned before serving so the first subscriber catches the next pulse.
+    // The static handlers are state-free; with_state returns a plain Router,
+    // so serve_h1/serve_h2c signatures are unchanged. The WS/SSE routes ride
+    // h1 only — they exist on both listeners, but the h2c column never hits
+    // them (see scenario applicability in servers/servers.go).
+    let state = streaming::AppState::new();
+    state.spawn_publisher();
+
     let app = Router::new()
         .route("/", get(root))
         .route("/json", get(json_static))
@@ -89,7 +99,10 @@ async fn main() -> ExitCode {
         // axum 0.8+ uses `{id}` capture groups; older `:id` is rejected
         // at router-build time. See axum CHANGELOG 0.8 for the rationale.
         .route("/users/{id}", get(users_id))
-        .route("/upload", post(upload));
+        .route("/upload", post(upload))
+        .route("/ws", get(streaming::ws_handler))
+        .route("/events", get(streaming::sse_handler))
+        .with_state(state);
 
     let addr: SocketAddr = match bind.parse() {
         Ok(a) => a,
@@ -140,8 +153,22 @@ async fn main() -> ExitCode {
 async fn serve_h1(listener: TcpListener, app: Router) -> std::io::Result<()> {
     let svc = TowerToHyperService::new(app);
     serve_loop(listener, move |io, graceful| {
-        let conn = http1::Builder::new().serve_connection(io, svc.clone());
-        graceful.watch(conn)
+        // with_upgrades() is mandatory for the /ws route: it hands the
+        // post-101 socket back to axum's on_upgrade future. Without it hyper
+        // writes the 101 and then drops the connection, so the WebSocket
+        // closes the instant it opens. The h2c path needs no equivalent —
+        // WS/SSE are h1-only and the h2c column never drives them.
+        //
+        // hyper-util's GracefulConnection is NOT implemented for the h1
+        // UpgradeableConnection, so we cannot route it through
+        // graceful.watch like the plain connections. We bypass the watcher
+        // and own the conn future directly; the accept loop's 3s drain cap
+        // (serve_loop) still bounds shutdown, and these connections are the
+        // long-lived WS/SSE streams that are force-dropped on SIGTERM anyway.
+        let _ = graceful;
+        http1::Builder::new()
+            .serve_connection(io, svc.clone())
+            .with_upgrades()
     })
     .await
 }

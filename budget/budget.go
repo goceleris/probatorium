@@ -222,7 +222,7 @@ func plural(n int) string {
 // Profile. Both "headline" and "full" now cover the SAME grid — every
 // registered server × every scenario, capability-gated (Globs "*/*") —
 // so NEITHER silently drops servers or scenarios. They differ only by the
-// per-cell window: "headline" (the weekly cadence) uses a shorter 60s/15s
+// per-cell window: "headline" (the weekly cadence) uses a shorter 40s/12s
 // window so the whole grid fits the 24h budget single-arch; "full" uses a
 // longer 90s/20s window for the occasional exhaustive sweep (over 24h,
 // run as a manual dispatch with a raised BENCH_BUDGET). The default (empty

@@ -33,6 +33,12 @@ import {
   json64KPayload,
 } from "./payload";
 import { serveH2C } from "./h2c";
+import {
+  websocket,
+  handleStreaming,
+  startBroadcast,
+  stopBroadcast,
+} from "./streaming";
 
 const HELLO = new TextEncoder().encode("Hello, World!");
 const JSON_HELLO = new TextEncoder().encode('{"message":"Hello, World!"}');
@@ -137,8 +143,22 @@ if (engine === "h2c") {
     // multiple Bun.serve workers if a future operator launches more
     // than one process — harmless on a single-process bench.
     reusePort: true,
-    fetch: app.fetch,
+    // WS frame size is capped to the large-echo ceiling (1 MiB) by
+    // maxPayloadLength inside the websocket handler; static routes unaffected.
+    websocket,
+    fetch: (req, srv) => {
+      // WS/SSE ride this same H1 listener: intercept /ws (upgrade) and
+      // /events (SSE) first, else delegate to the Hono route table. A
+      // successful upgrade returns undefined (Bun owns the socket).
+      const streamed = handleStreaming(req, srv);
+      if (streamed !== null) return streamed ?? undefined;
+      return app.fetch(req, srv);
+    },
   });
+
+  // Start the single 1ms ticker driving the WS hub broadcast + SSE publish
+  // fan-out once the listener is up.
+  startBroadcast();
 
   // Bun.serve.port is the resolved port (kernel-assigned when the
   // caller passed 0). Print the ready line in the exact shape every
@@ -147,6 +167,8 @@ if (engine === "h2c") {
 
   const shutdown = (signal: string): void => {
     console.log(`hono: received ${signal}, shutting down`);
+    // Halt the 1ms broadcast/publish ticker before tearing the listener down.
+    stopBroadcast();
     // stop(true) closes idle keep-alives immediately; in-flight
     // requests still get to drain. Bun resolves the returned promise
     // when the listener is fully torn down, but we don't await it —

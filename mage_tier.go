@@ -30,12 +30,12 @@ import (
 //
 // Per-cell execution: a cell visits ONE (server, scenario) pair and
 // runs the saturation pass unconditionally. If the scenario is in
-// the rated subset (currently get-json / post-4k / auto-mix-111) and
-// the runner is launched with BENCH_RATED=1, the same cell ALSO runs
-// the rated sweep after the saturation pass. The cell's JSON carries
-// both maps on the same row; the bench's published Document has a
-// per-scenario SaturationModeRPS (every scenario) + a per-scenario
-// LatencyAtSLO (only the rated 3).
+// the rated subset (currently get-json / post-4k) and the runner is
+// launched with BENCH_RATED=1, the same cell ALSO runs the rated
+// sweep after the saturation pass. The cell's JSON carries both maps
+// on the same row; the bench's published Document has a per-scenario
+// SaturationModeRPS (every scenario) + a per-scenario LatencyAtSLO
+// (only the rated 2).
 //
 // Flow:
 //
@@ -57,8 +57,8 @@ import (
 //	                           grid (every server × every scenario,
 //	                           capability-gated); they differ ONLY by the
 //	                           per-cell window. headline (the weekly
-//	                           cadence) uses 60s/15s so the whole grid fits
-//	                           24h single-arch (~21.6h); full uses 90s/20s
+//	                           cadence) uses 40s/12s so the whole grid fits
+//	                           24h single-arch (~16.7h); full uses 90s/20s
 //	                           for the exhaustive sweep (~30h on one arch,
 //	                           needs a raised BENCH_BUDGET). Default: full.
 //	BENCH_TARGET=both          msa2-server | msr1 | both (both = 2 arches)

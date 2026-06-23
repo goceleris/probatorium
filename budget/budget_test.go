@@ -139,7 +139,7 @@ func TestForProfileDefaultHasFullCoverage(t *testing.T) {
 		t.Fatalf("default profile must cover the full grid (Globs '*/*'), got %v", def.Globs)
 	}
 	if def.Cells < 400 {
-		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~800 capability-gated), got %d. "+
+		t.Errorf("default profile Cells: want >= 400 (the full matrix is ~1111 capability-gated), got %d. "+
 			"A value this low means the default was silently scoped down to a curated subset.",
 			def.Cells)
 	}
@@ -160,6 +160,31 @@ func TestGlobsAreNonEmpty(t *testing.T) {
 	}
 	if !strings.Contains(CellsGlob(h), "/") {
 		t.Errorf("CellsGlob must carry <scenario>/<server> pairs, got %q", CellsGlob(h))
+	}
+}
+
+// TestRatedRealizedCellsMatchSubset guards the rated-pin against the
+// auto-mix-111 class of drift: the rated sweep runs RatedScenarios x
+// RatedServers, and every curated rated scenario is a plain-H1 static row
+// that applies to every curated rated server, so the realized count is the
+// full cross product with no capability-gating loss. If a stale entry
+// (an unregistered scenario whose glob matches nothing) sneaks back into
+// RatedScenarios, the cross-product pin and this assertion diverge from
+// reality — fail here rather than silently shrinking the published rated
+// grid while the budget over-projects.
+func TestRatedRealizedCellsMatchSubset(t *testing.T) {
+	want := len(RatedScenarios) * len(RatedServers)
+	if HeadlineRatedRealizedCells != want {
+		t.Errorf("HeadlineRatedRealizedCells = %d, want %d (len(RatedScenarios)=%d * len(RatedServers)=%d); "+
+			"a mismatch means a rated scenario is unregistered or the pin is stale",
+			HeadlineRatedRealizedCells, want, len(RatedScenarios), len(RatedServers))
+	}
+	if FullRatedRealizedCells != want {
+		t.Errorf("FullRatedRealizedCells = %d, want %d", FullRatedRealizedCells, want)
+	}
+	if len(ratedGlobs()) != want {
+		t.Errorf("len(ratedGlobs()) = %d, want %d (the expanded glob set must match the pin)",
+			len(ratedGlobs()), want)
 	}
 }
 

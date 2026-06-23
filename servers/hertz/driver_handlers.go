@@ -10,14 +10,15 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
-	"github.com/cloudwego/hertz/pkg/protocol"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
-
-	"github.com/goceleris/probatorium/servers/common"
 )
+
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
 
 // driverState holds the lazily-opened backend clients. Each field is nil
 // when the matching PROBATORIUM_* env var is unset; the handler then
@@ -73,7 +74,7 @@ func buildDriverState() *driverState {
 // mountDriverHandlers registers the 4 driver routes on h as native hertz
 // handlers. The workloads mirror the fiber/celeris reference: a PG row
 // read, Redis/memcached GETs returning the raw blob, and a session
-// read-merge-write round-trip keyed on the pmsid cookie.
+// load+merge+save round-trip on the fixed key pmsess:bench.
 func mountDriverHandlers(h *server.Hertz, ds *driverState) {
 	h.GET("/db/user/:id", func(c context.Context, ctx *app.RequestContext) {
 		if ds.pg == nil {
@@ -126,9 +127,11 @@ func mountDriverHandlers(h *server.Hertz, ds *driverState) {
 	})
 
 	h.POST("/session", func(c context.Context, ctx *app.RequestContext) {
-		// The session round-trip is Redis-backed (parity with celeris's
-		// redisstore). Without Redis there is nowhere to persist the blob,
-		// so the route is 503 — matching the driver-unavailable contract.
+		// Fixed-key round-trip over go-redis: GET the seeded blob (redis.Nil
+		// on the unseeded key is ignored), merge the JSON request body, bump
+		// the seq hit counter, then SET the blob back with a 10-minute TTL.
+		// Exactly two round-trips (GET then SET) — the same workload every
+		// adapter runs. No Redis -> 503.
 		if ds.rdb == nil {
 			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
 			return
@@ -136,19 +139,9 @@ func mountDriverHandlers(h *server.Hertz, ds *driverState) {
 		qctx, cancel := context.WithTimeout(c, 5*time.Second)
 		defer cancel()
 
-		sid := string(ctx.Cookie(common.SessionCookieName))
 		data := make(map[string]any, 4)
-		if sid != "" {
-			raw, err := ds.rdb.Get(qctx, "pmsess:"+sid).Bytes()
-			if err == nil {
-				_ = json.Unmarshal(raw, &data)
-			} else if err != goredis.Nil {
-				ctx.AbortWithStatus(consts.StatusServiceUnavailable)
-				return
-			}
-		}
-		if sid == "" {
-			sid = uuid.NewString()
+		if raw, err := ds.rdb.Get(qctx, sessionKey).Bytes(); err == nil {
+			_ = json.Unmarshal(raw, &data)
 		}
 
 		// Merge the request body if it is JSON. Parse failures are
@@ -172,13 +165,172 @@ func mountDriverHandlers(h *server.Hertz, ds *driverState) {
 			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
 			return
 		}
-		if err := ds.rdb.Set(qctx, "pmsess:"+sid, buf, 10*time.Minute).Err(); err != nil {
+		if err := ds.rdb.Set(qctx, sessionKey, buf, 10*time.Minute).Err(); err != nil {
 			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
 			return
 		}
 
-		ctx.SetCookie(common.SessionCookieName, sid, 0, "/", "", protocol.CookieSameSiteDisabled, false, true)
 		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true, Seq: newSeq}))
+	})
+
+	mountDriverDepthHandlers(h, ds)
+}
+
+// mountDriverDepthHandlers registers the v1.5.4 driver-depth routes
+// (idiomatic pgx/go-redis/gomemcache). The paths are /cache-pipeline and
+// /mc-multiget rather than /cache/pipeline and /mc/multi so they do not
+// shadow the existing /cache/:key and /mc/:key param routes.
+func mountDriverDepthHandlers(h *server.Hertz, ds *driverState) {
+	// POST /db/insert: INSERT the body into bench_writes.
+	h.POST("/db/insert", func(c context.Context, ctx *app.RequestContext) {
+		if ds.pg == nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		body := ctx.Request.Body()
+		qctx, cancel := context.WithTimeout(c, 5*time.Second)
+		defer cancel()
+		if _, err := ds.pg.Exec(qctx, "INSERT INTO bench_writes(payload) VALUES($1)", string(body)); err != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true}))
+	})
+
+	// POST /db/tx/user/:id: BEGIN; UPDATE score+1; COMMIT.
+	h.POST("/db/tx/user/:id", func(c context.Context, ctx *app.RequestContext) {
+		if ds.pg == nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		id, perr := strconv.Atoi(ctx.Param("id"))
+		if perr != nil {
+			ctx.AbortWithStatus(consts.StatusBadRequest)
+			return
+		}
+		qctx, cancel := context.WithTimeout(c, 5*time.Second)
+		defer cancel()
+		tx, err := ds.pg.Begin(qctx)
+		if err != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		if _, err := tx.Exec(qctx, "UPDATE users SET score=score+1 WHERE id=$1", id); err != nil {
+			_ = tx.Rollback(qctx)
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		if err := tx.Commit(qctx); err != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true, Seq: id}))
+	})
+
+	// GET /db/users?limit=N: SELECT N rows -> JSON array.
+	h.GET("/db/users", func(c context.Context, ctx *app.RequestContext) {
+		if ds.pg == nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		limit, err := strconv.Atoi(string(ctx.QueryArgs().Peek("limit")))
+		if err != nil || limit <= 0 || limit > 1000 {
+			limit = 50
+		}
+		qctx, cancel := context.WithTimeout(c, 5*time.Second)
+		defer cancel()
+		rows, err := ds.pg.Query(qctx,
+			"SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND $1 ORDER BY id", limit)
+		if err != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		defer rows.Close()
+		out := make([]userRow, 0, limit)
+		for rows.Next() {
+			var r userRow
+			if err := rows.Scan(&r.ID, &r.Name, &r.Email, &r.Score); err != nil {
+				ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+				return
+			}
+			out = append(out, r)
+		}
+		if rows.Err() != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		ctx.Data(consts.StatusOK, "application/json", mustJSON(out))
+	})
+
+	// POST /cache: SET demo-write = body.
+	h.POST("/cache", func(c context.Context, ctx *app.RequestContext) {
+		if ds.rdb == nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		body := ctx.Request.Body()
+		qctx, cancel := context.WithTimeout(c, 5*time.Second)
+		defer cancel()
+		if err := ds.rdb.Set(qctx, "demo-write", body, 0).Err(); err != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true}))
+	})
+
+	// GET /cache-pipeline?n=N: pipeline N GETs of demo-key.
+	h.GET("/cache-pipeline", func(c context.Context, ctx *app.RequestContext) {
+		if ds.rdb == nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		n, err := strconv.Atoi(string(ctx.QueryArgs().Peek("n")))
+		if err != nil || n <= 0 || n > 100 {
+			n = 10
+		}
+		qctx, cancel := context.WithTimeout(c, 5*time.Second)
+		defer cancel()
+		pipe := ds.rdb.Pipeline()
+		cmds := make([]*goredis.StringCmd, n)
+		for i := 0; i < n; i++ {
+			cmds[i] = pipe.Get(qctx, "demo-key")
+		}
+		if _, err := pipe.Exec(qctx); err != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		total := 0
+		for _, cmd := range cmds {
+			v, err := cmd.Bytes()
+			if err != nil {
+				ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+				return
+			}
+			total += len(v)
+		}
+		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true, Seq: total}))
+	})
+
+	// GET /mc-multiget?keys=N: GetMulti of N session keys.
+	h.GET("/mc-multiget", func(_ context.Context, ctx *app.RequestContext) {
+		if ds.mc == nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		n, err := strconv.Atoi(string(ctx.QueryArgs().Peek("keys")))
+		if err != nil || n <= 0 || n > 100 {
+			n = 10
+		}
+		keys := make([]string, n)
+		for i := 0; i < n; i++ {
+			keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
+		}
+		items, err := ds.mc.GetMulti(keys)
+		if err != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true, Seq: len(items)}))
 	})
 }
 

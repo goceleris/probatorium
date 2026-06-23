@@ -2,6 +2,7 @@ package report
 
 import (
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -192,9 +193,13 @@ func BuildDocument(in BuildInput) *Document {
 		// loadgen still had CPU headroom is NIC-limited, not server-limited.
 		// Its saturation RPS converges across every fast adapter and must not
 		// be read as a ranking — the CPU efficiency in Resources is the real
-		// signal. Only flagged when the fabric's line rate is known (the LAN;
-		// the Tailscale overlay reports 0 and flags nothing).
-		if isNetworkBound(c.BytesMedian, c.LoadgenCPUP95, in.Environment.FabricLineRateBitsPerSec) {
+		// signal. Runtime detection only fires when the fabric's line rate is
+		// known (the LAN; the Tailscale overlay reports 0 and flags nothing),
+		// so the wire-bound-by-design scenarios are OR'd in unconditionally:
+		// post-1m is a documented wire-bound datapoint, never a ranking row,
+		// regardless of whether the line rate was measurable.
+		if isWireBoundByDesign(c.ScenarioName) ||
+			isNetworkBound(c.BytesMedian, c.LoadgenCPUP95, in.Environment.FabricLineRateBitsPerSec) {
 			if sr.NetworkBound == nil {
 				sr.NetworkBound = map[string]bool{}
 			}
@@ -239,6 +244,44 @@ const (
 	// blocked on the wire, not burning cycles.)
 	networkBoundLoadgenCPUCeiling = 8.0
 )
+
+// isWireBoundByDesign reports whether a scenario is wire-bound by design
+// rather than by runtime measurement. post-1m is a documented 1 MiB-payload
+// datapoint whose saturation RPS is dictated by the fabric, not the server,
+// so it must always land in the wire-bound section and never head a raw-RPS
+// ranking — even on overlays where the line rate is unknown and isNetworkBound
+// cannot fire.
+func isWireBoundByDesign(scenarioName string) bool {
+	return scenarioName == "post-1m"
+}
+
+// isFanoutBound reports whether a scenario's throughput is paced by the
+// server's fixed publish tick rather than by CPU. The hub-broadcast and
+// SSE-fanout cells push to N subscribers on a 1 ms cadence, so their RPS
+// ceiling is ~1000*N regardless of server headroom — a fan-out rate, not a
+// throughput the field can be ranked by. Their real signal is delivery
+// latency (the tail-latency section), so they are kept out of the headline
+// ranking just like the wire-bound cells. The echo modes (ws-echo /
+// ws-large-echo) are client-driven round-trips and stay ranked.
+func isFanoutBound(scenarioName string) bool {
+	switch scenarioName {
+	case "ws-hub-broadcast-128", "ws-hub-broadcast-1024",
+		"sse-fanout-128", "sse-fanout-1024":
+		return true
+	}
+	return false
+}
+
+// isLatencyProbeByDesign reports whether a scenario is a single-connection
+// latency probe whose saturation "RPS" is a latency reciprocal (1/RTT)
+// rather than a throughput. At one connection requests serialize, so the
+// number rewards low per-request latency, not throughput, and must never
+// head a raw-RPS ranking — its real signal is the tail-latency section. The
+// "-1c" suffix is the single-conn marker (scenarios.ProfileSingle);
+// get-json-1c is the only such scenario today.
+func isLatencyProbeByDesign(scenarioName string) bool {
+	return strings.HasSuffix(scenarioName, "-1c")
+}
 
 // isNetworkBound reports whether a cell's achieved egress bandwidth sat at
 // the fabric line rate (NIC-limited) rather than the server's CPU limit.

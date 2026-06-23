@@ -34,8 +34,13 @@ name = "probatorium-axum-server"
 path = "src/main.rs"
 
 [dependencies]
-# axum — tower-stack HTTP framework. Pulls hyper transitively.
-axum = ">=0.7"
+# axum — tower-stack HTTP framework. Pulls hyper transitively. The "ws"
+# feature pulls the WebSocketUpgrade extractor + tungstenite codec for the
+# /ws route; SSE (Sse/Event/KeepAlive) is in axum's default surface.
+axum = { version = ">=0.7", features = ["ws"] }
+# futures-util — Stream/StreamExt + stream::unfold for the SSE response
+# stream, and the Sink/Stream traits the axum WebSocket is built on.
+futures-util = ">=0.3"
 # hyper — declared explicitly so the h2c engine can drive each accepted
 # TCP connection with hyper's HTTP/2 prior-knowledge server builder
 # (hyper::server::conn::http2::Builder). The "http2" feature is what

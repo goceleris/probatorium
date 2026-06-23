@@ -63,7 +63,7 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 
 from .payload import (
     JSON_1K_PAYLOAD,
@@ -71,6 +71,7 @@ from .payload import (
     JSON_16K_PAYLOAD,
     JSON_64K_PAYLOAD,
 )
+from .streaming import lifespan, sse_endpoint, ws_endpoint
 
 # Static byte payloads. Hoisted to module scope so each request reuses the
 # same immutable bytes object — no per-request allocation, mirrors the Go
@@ -140,7 +141,10 @@ async def upload(request: Request) -> Response:
 
 # Explicit route table — the plain-Starlette analogue of FastAPI's
 # decorators. Order is irrelevant (Starlette matches by exact path then
-# parametrised path), but kept in contract order for readability.
+# parametrised path), but kept in contract order for readability. The /ws and
+# /events routes ride the same H1 listener (streaming is H1-only); `lifespan`
+# launches the 1ms WS-broadcast + SSE-publish tickers per worker on the live
+# event loop.
 app = Starlette(
     routes=[
         Route("/", root, methods=["GET"]),
@@ -151,7 +155,10 @@ app = Starlette(
         Route("/json-64k", json_64k, methods=["GET"]),
         Route("/users/{user_id}", users, methods=["GET"]),
         Route("/upload", upload, methods=["POST"]),
-    ]
+        WebSocketRoute("/ws", ws_endpoint),
+        Route("/events", sse_endpoint, methods=["GET"]),
+    ],
+    lifespan=lifespan,
 )
 
 

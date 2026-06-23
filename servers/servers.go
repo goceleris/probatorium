@@ -219,6 +219,31 @@ var Registry = map[string]Adapter{
 		Capabilities: Capabilities{Static: true, WS: true, SSE: true, TLS: true},
 	},
 
+	// --- HTTP/2 flow-control methodology (h2c fair-fight) ---
+	//
+	// Every -h2 column below speaks h2c prior-knowledge. loadgen adopts the
+	// server's advertised SETTINGS_INITIAL_WINDOW_SIZE as its per-stream
+	// UPLOAD window, so a server that advertises a small window throttles
+	// the client's POST throughput independent of how fast it actually
+	// processes — a flow-control artifact, not merit. To keep the matrix a
+	// fair fight we equalize the advertised per-stream window to celeris's
+	// profile (1 MiB initial window + 100 max concurrent streams; see
+	// celeris resource/config.go, which also notes 1 MiB matches
+	// golang.org/x/net/http2 and fasthttp2):
+	//   - Go columns (gin/echo/chi/iris/hertz/stdhttp) and the Rust
+	//     hyper-based columns (axum/hyper) already advertise a 1 MiB window
+	//     by library default — left untouched.
+	//   - aspnet (Kestrel) and the Bun node:http2 columns (hono/elysia)
+	//     default below 1 MiB; their adapters now explicitly advertise the
+	//     1 MiB profile (servers/aspnet/Program.cs, servers/{hono,elysia}/
+	//     src/h2c.ts).
+	//   - DISCLOSED CAVEAT: fastapi-h2/starlette-h2 serve h2c via hypercorn,
+	//     which exposes no per-stream initial-window knob (it inherits the
+	//     h2-library default); they advertise a smaller window than the rest
+	//     and cannot be equalized without a fragile internal monkeypatch.
+	//     They are the slowest columns regardless, so the window is not
+	//     their binding constraint.
+	//
 	// gin / echo / chi / iris — net/http-based routers. Each carries an
 	// h1 and an h2c (h2c.NewHandler-wrapped) variant.
 	"gin-h1": {
@@ -327,7 +352,10 @@ var Registry = map[string]Adapter{
 			},
 			RunCmd: "{bin} -bind {bind}",
 		},
-		Capabilities: Capabilities{Static: true},
+		// v1.5.4: native WS+SSE streaming (axum::extract::ws + sse) — the
+		// /ws (?mode=) + /events routes ride the h1 listener; the h2c
+		// column never drives them (streaming gates on fs.HTTP1).
+		Capabilities: Capabilities{Static: true, WS: true, SSE: true},
 	},
 	// axum-h2 — the same servers/axum binary in prior-knowledge h2c mode
 	// (-engine h2c serves HTTP/2 cleartext only, refusing H1 like
@@ -622,6 +650,10 @@ var Registry = map[string]Adapter{
 			Lang:   "bun",
 			RunCmd: "{name} -bind {bind}",
 		},
+		// v1.5.4: native WS+SSE streaming (Bun.serve websocket + SSE
+		// ReadableStream) on the h1 path; the hono-h2 column (node:http2
+		// bridge) keeps no streaming — scenarios gate on fs.HTTP1.
+		Capabilities: Capabilities{Static: true, WS: true, SSE: true},
 	},
 	// hono-h2 — prior-knowledge h2c via node:http2.createServer bridged to
 	// Hono's app.fetch; -engine h2c selects it. Shares the competitors/hono
@@ -674,7 +706,10 @@ var Registry = map[string]Adapter{
 			Lang:   "python",
 			RunCmd: "{bench}/competitors/{name}/server -bind {bind}",
 		},
-		Capabilities: Capabilities{Static: true},
+		// v1.5.4: native WS+SSE streaming (Starlette WebSocketRoute +
+		// StreamingResponse) on the uvicorn h1 path; the starlette-h2
+		// (hypercorn) column drives no streaming — gates on fs.HTTP1.
+		Capabilities: Capabilities{Static: true, WS: true, SSE: true},
 	},
 	// bunraw — raw Bun.serve baseline, no framework (the bun analogue of hyper).
 	"bunraw": {

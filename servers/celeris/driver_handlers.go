@@ -7,9 +7,9 @@
 //   - GET  /db/user/:id  — driver/postgres pool, SELECT by id, JSON row.
 //   - GET  /cache/:key   — driver/redis, GET raw bytes.
 //   - GET  /mc/:key      — driver/memcached, GET raw bytes.
-//   - POST /session      — middleware/session over a redisstore backend:
-//     load/merge/save a hit counter keyed by the pmsid cookie, JSON
-//     {ok,seq} reply.
+//   - POST /session      — driver/redis GET+SET round-trip on the fixed key
+//     pmsess:bench: load the seeded blob, merge the JSON body, save with a
+//     10-minute TTL, JSON {ok,seq} reply. Exactly two round-trips.
 //
 // Each celeris driver is opened WithEngine(srv) so that — when the server
 // runs with AsyncHandlers — the driver auto-selects its direct net.Conn
@@ -42,11 +42,12 @@ import (
 	"github.com/goceleris/celeris/driver/memcached"
 	"github.com/goceleris/celeris/driver/postgres"
 	"github.com/goceleris/celeris/driver/redis"
-	"github.com/goceleris/celeris/middleware/session"
-	"github.com/goceleris/celeris/middleware/session/redisstore"
-
-	"github.com/goceleris/probatorium/servers/common"
 )
+
+// sessionKey is the fixed key every adapter's POST /session round-trips
+// against, so the workload is a load+merge+save of one seeded blob — no
+// per-cookie key fan-out — and identical across frameworks.
+const sessionKey = "pmsess:bench"
 
 // userRow mirrors the seeded users table row (id, name, email, score),
 // matching the reference's userRow so the JSON body is identical across
@@ -59,8 +60,8 @@ type userRow struct {
 }
 
 // sessionResponse is the JSON body returned by POST /session. seq is the
-// session's hit counter, incremented on every request carrying the same
-// pmsid cookie. Shape matches the reference.
+// hit counter loaded from the fixed-key blob and bumped on every request.
+// Shape matches the reference.
 type sessionResponse struct {
 	OK  bool `json:"ok"`
 	Seq int  `json:"seq"`
@@ -93,13 +94,11 @@ func envOr(key, def string) string {
 	return def
 }
 
-// driverClients are the lazily-opened, process-lifetime backend handles
-// plus the per-route session middleware.
+// driverClients are the lazily-opened, process-lifetime backend handles.
 type driverClients struct {
-	pg        *postgres.Pool
-	redis     *redis.Client
-	mc        *memcached.Client
-	sessionMW celeris.HandlerFunc
+	pg    *postgres.Pool
+	redis *redis.Client
+	mc    *memcached.Client
 }
 
 // mountDriverHandlers opens the celeris drivers and attaches the four
@@ -141,31 +140,20 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 		}
 	}
 
-	// Session middleware over a redisstore backend, available only when
-	// Redis opened. The cookie name and idle timeout match the reference.
-	if c.redis != nil {
-		store := redisstore.New(c.redis)
-		c.sessionMW = session.New(session.Config{
-			Store:       store,
-			CookieName:  common.SessionCookieName,
-			IdleTimeout: 10 * time.Minute,
-		})
-	}
-
 	srv.GET("/db/user/:id", c.dbUserHandler).Async()
 	srv.GET("/cache/:key", c.cacheHandler).Async()
 	srv.GET("/mc/:key", c.mcHandler).Async()
 
-	// The session middleware is mounted as a per-route layer (not globally)
-	// so its load/save round-trip only fires on /session requests. When
-	// Redis is unavailable the route degrades to a deterministic 503.
-	if c.sessionMW != nil {
-		srv.POST("/session", sessionTerminal).Use(c.sessionMW).Async()
-	} else {
-		srv.POST("/session", func(ctx *celeris.Context) error {
-			return ctx.AbortWithStatus(503)
-		}).Async()
-	}
+	// v1.5.4 driver-depth routes (writes / transaction / range / pipeline /
+	// multiget). Same WithEngine().Async() discipline as the reads above.
+	srv.POST("/db/insert", c.dbInsertHandler).Async()
+	srv.POST("/db/tx/user/:id", c.dbTxHandler).Async()
+	srv.GET("/db/users", c.dbUsersRangeHandler).Async()
+	srv.POST("/cache", c.cacheSetHandler).Async()
+	srv.GET("/cache-pipeline", c.cachePipelineHandler).Async()
+	srv.GET("/mc-multiget", c.mcMultiGetHandler).Async()
+
+	srv.POST("/session", c.sessionHandler).Async()
 
 	return c
 }
@@ -220,27 +208,194 @@ func (c *driverClients) mcHandler(ctx *celeris.Context) error {
 	return ctx.Blob(200, "application/octet-stream", val)
 }
 
-// sessionTerminal is the inner handler the session middleware wraps (via
-// Route.Use): the middleware loads the session, calls c.Next() into this
-// terminal, then saves on the way out. A loadgen client that reuses the
-// pmsid cookie observes a monotonically increasing seq, proving the store
-// round-trip. This terminal merges the request body if it is JSON, bumps
-// seq, and replies {ok,seq}.
-func sessionTerminal(ctx *celeris.Context) error {
-	sess := session.FromContext(ctx)
-	if sess == nil {
+// dbInsertHandler serves POST /db/insert: INSERT the request body into the
+// unlogged bench_writes table (driver-pg-write; "bench_writes" matches
+// services.FixtureWritesTable). nil pool / exec error -> 503.
+func (c *driverClients) dbInsertHandler(ctx *celeris.Context) error {
+	if c.pg == nil {
 		return ctx.AbortWithStatus(503)
 	}
+	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := c.pg.ExecContext(qctx,
+		"INSERT INTO bench_writes(payload) VALUES($1)", string(ctx.Body()),
+	); err != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	return ctx.JSON(200, sessionResponse{OK: true})
+}
+
+// dbTxHandler serves POST /db/tx/user/:id: BEGIN; UPDATE score+1; COMMIT
+// (driver-pg-update-tx) — an explicit transaction round-trip on the hot row.
+func (c *driverClients) dbTxHandler(ctx *celeris.Context) error {
+	if c.pg == nil {
+		return ctx.AbortWithStatus(503)
+	}
+	id, err := strconv.Atoi(ctx.Param("id"))
+	if err != nil {
+		return ctx.AbortWithStatus(400)
+	}
+	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := c.pg.BeginTx(qctx, nil)
+	if err != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	if _, err := tx.ExecContext(qctx, "UPDATE users SET score=score+1 WHERE id=$1", id); err != nil {
+		_ = tx.Rollback()
+		return ctx.AbortWithStatus(503)
+	}
+	if err := tx.Commit(); err != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	return ctx.JSON(200, sessionResponse{OK: true, Seq: id})
+}
+
+// dbUsersRangeHandler serves GET /db/users?limit=N: SELECT the first N rows
+// and JSON-encode the array (driver-pg-read-range) — result-set marshalling
+// rather than a single-row read.
+func (c *driverClients) dbUsersRangeHandler(ctx *celeris.Context) error {
+	if c.pg == nil {
+		return ctx.AbortWithStatus(503)
+	}
+	limit, err := strconv.Atoi(ctx.Query("limit"))
+	if err != nil || limit <= 0 || limit > 1000 {
+		limit = 50
+	}
+	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
+	defer cancel()
+	rows, err := c.pg.QueryContext(qctx,
+		"SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND $1 ORDER BY id", limit,
+	)
+	if err != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]userRow, 0, limit)
+	for rows.Next() {
+		var r userRow
+		if err := rows.Scan(&r.ID, &r.Name, &r.Email, &r.Score); err != nil {
+			return ctx.AbortWithStatus(503)
+		}
+		out = append(out, r)
+	}
+	if rows.Err() != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	return ctx.JSON(200, out)
+}
+
+// cacheSetHandler serves POST /cache: SET demo-write = request body
+// (driver-redis-set; "demo-write" matches services.FixtureRedisWriteKey).
+func (c *driverClients) cacheSetHandler(ctx *celeris.Context) error {
+	if c.redis == nil {
+		return ctx.AbortWithStatus(503)
+	}
+	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.redis.SetBytes(qctx, "demo-write", ctx.Body(), 0); err != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	return ctx.JSON(200, sessionResponse{OK: true})
+}
+
+// cachePipelineHandler serves GET /cache-pipeline?n=N: pipeline N GETs of
+// demo-key in one round-trip (driver-redis-pipeline) — the native-driver
+// batching differentiator. "demo-key" matches services.FixtureDemoKey.
+func (c *driverClients) cachePipelineHandler(ctx *celeris.Context) error {
+	if c.redis == nil {
+		return ctx.AbortWithStatus(503)
+	}
+	n, err := strconv.Atoi(ctx.Query("n"))
+	if err != nil || n <= 0 || n > 100 {
+		n = 10
+	}
+	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
+	defer cancel()
+	p := c.redis.Pipeline()
+	defer p.Release()
+	cmds := make([]*redis.StringCmd, n)
+	for i := 0; i < n; i++ {
+		cmds[i] = p.Get("demo-key")
+	}
+	if err := p.Exec(qctx); err != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	total := 0
+	for _, cmd := range cmds {
+		v, err := cmd.Result()
+		if err != nil {
+			return ctx.AbortWithStatus(503)
+		}
+		total += len(v)
+	}
+	return ctx.JSON(200, sessionResponse{OK: true, Seq: total})
+}
+
+// mcMultiGetHandler serves GET /mc-multiget?keys=N: GetMulti of N seeded
+// user:<id>:session keys in one batch (driver-mc-multiget).
+func (c *driverClients) mcMultiGetHandler(ctx *celeris.Context) error {
+	if c.mc == nil {
+		return ctx.AbortWithStatus(503)
+	}
+	n, err := strconv.Atoi(ctx.Query("keys"))
+	if err != nil || n <= 0 || n > 100 {
+		n = 10
+	}
+	keys := make([]string, n)
+	for i := 0; i < n; i++ {
+		keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
+	}
+	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
+	defer cancel()
+	vals, err := c.mc.GetMulti(qctx, keys...)
+	if err != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	return ctx.JSON(200, sessionResponse{OK: true, Seq: len(vals)})
+}
+
+// sessionHandler serves POST /session via the native redis driver: GET the
+// fixed-key blob (ErrNil when unseeded is ignored), merge the JSON request
+// body, bump the seq hit counter, then SET the blob back with a 10-minute
+// TTL. Exactly two round-trips (GET then SET) — identical work to every
+// other adapter, differing only in this being celeris's in-tree driver. No
+// Redis -> 503.
+func (c *driverClients) sessionHandler(ctx *celeris.Context) error {
+	if c.redis == nil {
+		return ctx.AbortWithStatus(503)
+	}
+	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
+	defer cancel()
+
+	blob := map[string]any{}
+	if raw, err := c.redis.GetBytes(qctx, sessionKey); err == nil {
+		_ = json.Unmarshal(raw, &blob)
+	}
+
+	// Merge the JSON request body if present (the scenario POSTs a ~256B
+	// payload). Parse failures are non-fatal.
 	if body := ctx.Body(); len(body) > 0 {
 		var payload map[string]any
 		if err := json.Unmarshal(body, &payload); err == nil {
 			for k, v := range payload {
-				sess.Set(k, v)
+				blob[k] = v
 			}
 		}
 	}
-	seq := sess.GetInt("seq") + 1
-	sess.Set("seq", seq)
+
+	seq := 0
+	if n, ok := blob["seq"].(float64); ok { // JSON numbers decode to float64
+		seq = int(n)
+	}
+	seq++
+	blob["seq"] = seq
+
+	if raw, err := json.Marshal(blob); err == nil {
+		if err := c.redis.SetBytes(qctx, sessionKey, raw, 10*time.Minute); err != nil {
+			return ctx.AbortWithStatus(503)
+		}
+	}
 	return ctx.JSON(200, sessionResponse{OK: true, Seq: seq})
 }
 

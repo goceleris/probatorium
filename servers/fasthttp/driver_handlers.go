@@ -2,7 +2,7 @@
 // driver routes (postgres / redis / memcached / session). Clients are
 // opened from the backend addresses the runner exports in the child
 // environment (PROBATORIUM_PG_DSN / PROBATORIUM_REDIS_ADDR /
-// PROBATORIUM_MC_ADDR — the same vars the validation refapps read). An
+// PROBATORIUM_MEMCACHED_ADDR — the same vars the validation refapps read). An
 // absent or unreachable backend leaves the matching route returning 503
 // so the runner's per-cell guard records a clean error rather than a
 // panic or a silent 0-RPS cell.
@@ -15,8 +15,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -32,13 +30,18 @@ import (
 	"github.com/goceleris/probatorium/servers/common"
 )
 
+// sessionKey is the fixed key POST /session round-trips against, so the
+// workload is a load+merge+save of one seeded blob — identical to the
+// other adapters.
+const sessionKey = "pmsess:bench"
+
 // Backend address environment variables the runner sets before launching
 // the adapter. An empty value means the backend is absent and the route
 // responds 503. Names match the validation refapps and ansible/validate.yml.
 const (
 	envPGDSN     = "PROBATORIUM_PG_DSN"
 	envRedisAddr = "PROBATORIUM_REDIS_ADDR"
-	envMCAddr    = "PROBATORIUM_MC_ADDR"
+	envMCAddr    = "PROBATORIUM_MEMCACHED_ADDR"
 )
 
 // driverPoolSize bounds each driver's connection pool so the bench is
@@ -65,8 +68,7 @@ type userRow struct {
 }
 
 // sessionResponse is the JSON body returned by POST /session; seq is the
-// session's hit counter, incremented on every request bound to the same
-// cookie.
+// hit counter loaded from the fixed-key blob and bumped on every request.
 type sessionResponse struct {
 	OK  bool `json:"ok"`
 	Seq int  `json:"seq"`
@@ -127,6 +129,209 @@ func mountDriverHandlers(s *Server) {
 	s.MountNative(http.MethodGet, cachePrefix, cacheHandler(cachePrefix))
 	s.MountNative(http.MethodGet, mcPrefix, mcHandler(mcPrefix))
 	s.MountNative(http.MethodPost, sessionPath, sessionHandler())
+
+	// v1.5.4 driver-depth routes (idiomatic pgx/go-redis/gomemcache). The
+	// literal paths /cache-pipeline and /mc-multiget are deliberately not
+	// /cache/... or /mc/... so they don't collide with the cache/mc prefix
+	// routes above. /db/tx/user/:id is a prefix route (the id is sliced off
+	// the path); the rest are exact matches and the limit/n/keys parameters
+	// arrive as query args.
+	const dbTxPrefix = "/db/tx/user/"
+	s.MountNative(http.MethodPost, "/db/insert", dbInsertHandler())
+	s.MountNative(http.MethodPost, dbTxPrefix, dbTxHandler(dbTxPrefix))
+	s.MountNative(http.MethodGet, "/db/users", dbUsersRangeHandler())
+	s.MountNative(http.MethodPost, "/cache", cacheSetHandler())
+	s.MountNative(http.MethodGet, "/cache-pipeline", cachePipelineHandler())
+	s.MountNative(http.MethodGet, "/mc-multiget", mcMultiGetHandler())
+}
+
+// dbInsertHandler serves POST /db/insert — INSERT the request body into
+// bench_writes.
+func dbInsertHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		pg := mountedDrivers.pg
+		if pg == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pg.Exec(ctx,
+			"INSERT INTO bench_writes(payload) VALUES($1)", string(rc.PostBody()),
+		); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true}))
+	}
+}
+
+// dbTxHandler serves POST /db/tx/user/:id — BEGIN; UPDATE score+1; COMMIT.
+func dbTxHandler(prefix string) fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		pg := mountedDrivers.pg
+		if pg == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		idStr := strings.TrimPrefix(string(rc.Path()), prefix)
+		if idStr == "" || strings.Contains(idStr, "/") {
+			rc.SetStatusCode(fasthttp.StatusBadRequest)
+			return
+		}
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			rc.SetStatusCode(fasthttp.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tx, err := pg.Begin(ctx)
+		if err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		if _, err := tx.Exec(ctx, "UPDATE users SET score=score+1 WHERE id=$1", id); err != nil {
+			_ = tx.Rollback(ctx)
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true, Seq: id}))
+	}
+}
+
+// dbUsersRangeHandler serves GET /db/users?limit=N — SELECT N rows -> JSON array.
+func dbUsersRangeHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		pg := mountedDrivers.pg
+		if pg == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		limit, err := strconv.Atoi(string(rc.QueryArgs().Peek("limit")))
+		if err != nil || limit <= 0 || limit > 1000 {
+			limit = 50
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		rows, err := pg.Query(ctx,
+			"SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND $1 ORDER BY id", limit)
+		if err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		defer rows.Close()
+		out := make([]userRow, 0, limit)
+		for rows.Next() {
+			var r userRow
+			if err := rows.Scan(&r.ID, &r.Name, &r.Email, &r.Score); err != nil {
+				rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+				return
+			}
+			out = append(out, r)
+		}
+		if rows.Err() != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(out))
+	}
+}
+
+// cacheSetHandler serves POST /cache — redis SET demo-write = request body.
+func cacheSetHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		rdb := mountedDrivers.rdb
+		if rdb == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := rdb.Set(ctx, "demo-write", rc.PostBody(), 0).Err(); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true}))
+	}
+}
+
+// cachePipelineHandler serves GET /cache-pipeline?n=N — pipeline N GETs of
+// demo-key, returning the summed value length as seq.
+func cachePipelineHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		rdb := mountedDrivers.rdb
+		if rdb == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		n, err := strconv.Atoi(string(rc.QueryArgs().Peek("n")))
+		if err != nil || n <= 0 || n > 100 {
+			n = 10
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		pipe := rdb.Pipeline()
+		cmds := make([]*goredis.StringCmd, n)
+		for i := 0; i < n; i++ {
+			cmds[i] = pipe.Get(ctx, "demo-key")
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		total := 0
+		for _, cmd := range cmds {
+			v, err := cmd.Bytes()
+			if err != nil {
+				rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+				return
+			}
+			total += len(v)
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true, Seq: total}))
+	}
+}
+
+// mcMultiGetHandler serves GET /mc-multiget?keys=N — GetMulti of N session keys.
+func mcMultiGetHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		mc := mountedDrivers.mc
+		if mc == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		n, err := strconv.Atoi(string(rc.QueryArgs().Peek("keys")))
+		if err != nil || n <= 0 || n > 100 {
+			n = 10
+		}
+		keys := make([]string, n)
+		for i := 0; i < n; i++ {
+			keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
+		}
+		items, err := mc.GetMulti(keys)
+		if err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true, Seq: len(items)}))
+	}
 }
 
 // dbUserHandler serves GET /db/user/:id — a single-row primary-key lookup
@@ -215,11 +420,11 @@ func mcHandler(prefix string) fasthttp.RequestHandler {
 	}
 }
 
-// sessionHandler serves POST /session — a redis-backed session round-trip
-// that merges the request body into the stored blob and bumps a hit
-// counter. Matches the celeris perfmatrix reference's wire behaviour
-// (common.SessionCookieName cookie, "pmsess:" key prefix, 10-minute TTL)
-// so the session scenario is comparable across frameworks.
+// sessionHandler serves POST /session — a fixed-key redis round-trip over
+// go-redis: GET the seeded blob on pmsess:bench (redis.Nil on the unseeded
+// key is ignored), merge the JSON request body, bump the seq hit counter,
+// then SET the blob back with a 10-minute TTL. Exactly two round-trips (GET
+// then SET) — the same workload every adapter runs. No Redis -> 503.
 func sessionHandler() fasthttp.RequestHandler {
 	return func(rc *fasthttp.RequestCtx) {
 		rdb := mountedDrivers.rdb
@@ -230,22 +435,9 @@ func sessionHandler() fasthttp.RequestHandler {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		sid := string(rc.Request.Header.Cookie(common.SessionCookieName))
 		data := make(map[string]any, 4)
-		if sid != "" {
-			raw, err := rdb.Get(ctx, "pmsess:"+sid).Bytes()
-			switch {
-			case err == nil:
-				_ = json.Unmarshal(raw, &data)
-			case err == goredis.Nil:
-				// New session under an unknown cookie: start fresh.
-			default:
-				rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
-				return
-			}
-		}
-		if sid == "" {
-			sid = newSessionID()
+		if raw, err := rdb.Get(ctx, sessionKey).Bytes(); err == nil {
+			_ = json.Unmarshal(raw, &data)
 		}
 		if body := rc.PostBody(); len(body) > 0 {
 			var incoming map[string]any
@@ -260,18 +452,10 @@ func sessionHandler() fasthttp.RequestHandler {
 		data["seq"] = newSeq
 
 		buf, _ := json.Marshal(data)
-		if err := rdb.Set(ctx, "pmsess:"+sid, buf, 10*time.Minute).Err(); err != nil {
+		if err := rdb.Set(ctx, sessionKey, buf, 10*time.Minute).Err(); err != nil {
 			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
 			return
 		}
-
-		ck := fasthttp.AcquireCookie()
-		ck.SetKey(common.SessionCookieName)
-		ck.SetValue(sid)
-		ck.SetPath("/")
-		ck.SetHTTPOnly(true)
-		rc.Response.Header.SetCookie(ck)
-		fasthttp.ReleaseCookie(ck)
 
 		rc.SetContentType("application/json")
 		rc.SetStatusCode(fasthttp.StatusOK)
@@ -291,13 +475,6 @@ func closeDrivers() {
 		mountedDrivers.rdb = nil
 	}
 	mountedDrivers.mc = nil
-}
-
-// newSessionID returns a random 128-bit hex session id.
-func newSessionID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
 }
 
 // mustJSON marshals v or panics; the driver response types are fixed

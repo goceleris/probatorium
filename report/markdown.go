@@ -146,8 +146,32 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 		return err
 	}
 
-	scenarios := scenariosFromDoc(doc)
+	// Only scenarios whose max-sustained-RPS is a server-CPU-bound
+	// throughput belong in the headline ranking (it crowns a per-column
+	// leader). Wire-bound (post-1m), fan-out (ws-hub/sse-fanout) and
+	// single-conn latency-probe (get-json-1c) cells are dropped here — they
+	// remain in the detail, tail-latency and network-bound sections — and
+	// disclosed in a note so the table is honest about what it excludes.
+	all := scenariosFromDoc(doc)
+	scenarios := make([]string, 0, len(all))
+	var excluded []string
+	for _, sc := range all {
+		if headlineRanked(doc, sc) {
+			scenarios = append(scenarios, sc)
+		} else {
+			excluded = append(excluded, sc)
+		}
+	}
 	sort.Strings(scenarios)
+	sort.Strings(excluded)
+	if len(excluded) > 0 {
+		if _, err := fmt.Fprintf(w,
+			"_Not ranked here — saturation RPS for these is not server-CPU-bound "+
+				"(wire-bound, fan-out, or single-conn latency probe); see the tail-latency "+
+				"and network-bound sections: %s._\n\n", strings.Join(excluded, ", ")); err != nil {
+			return err
+		}
+	}
 
 	// Sort adapters by Name for stable rendering.
 	adapters := make([]ServerResult, len(doc.Benchmarks))
@@ -819,6 +843,44 @@ func scenariosFromDoc(doc *Document) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// headlineRanked reports whether a scenario belongs in the headline
+// Latency-at-SLO ranking. The headline bolds a per-column leader, so it
+// must contain only scenarios whose max-sustained-RPS is a server-CPU-
+// bound throughput the field can be fairly ranked by. A scenario is
+// excluded when its number is bound by something other than the server:
+//
+//   - wire-bound by design (post-1m) OR runtime network-bound for every
+//     data-bearing adapter: the RPS sat at the fabric line rate and
+//     converged across fast adapters, so the honest comparison is the
+//     CPU-efficiency table (writeNetworkBoundSection), not a bolded leader
+//     here. Without this check the NetworkBound flag set in BuildDocument
+//     was never consulted by the headline ranking.
+//   - fan-out cells (ws-hub-broadcast-*, sse-fanout-*): paced by the
+//     server's fixed 1 ms publish tick, not CPU.
+//   - single-connection latency probes (get-json-1c): RPS == 1/latency.
+//
+// Excluded scenarios still appear in the detail, tail-latency and
+// network-bound sections; they are dropped only from the bolded headline.
+func headlineRanked(doc *Document, sc string) bool {
+	if isFanoutBound(sc) || isLatencyProbeByDesign(sc) {
+		return false
+	}
+	// Network-bound (by design OR runtime measurement): excluded only when
+	// it held for EVERY adapter that produced rated data for this scenario
+	// — a split result (bound for some, CPU-limited for others) still ranks.
+	dataBearing, bound := 0, 0
+	for _, a := range doc.Benchmarks {
+		if _, ok := a.LatencyAtSLO[sc]; !ok {
+			continue
+		}
+		dataBearing++
+		if isWireBoundByDesign(sc) || a.NetworkBound[sc] {
+			bound++
+		}
+	}
+	return dataBearing == 0 || bound < dataBearing
 }
 
 // groupByCategory buckets aggregates by Scenario category. Aggregates
