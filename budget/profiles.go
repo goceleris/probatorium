@@ -21,11 +21,15 @@ import "time"
 // because it is the expensive additive dimension — see RatedServers below.
 
 // RatedScenarios is the curated rated/SLO subset (#156): the SLO-knee
-// scenarios where throughput-at-SLO carries the most signal.
+// scenarios where throughput-at-SLO carries the most signal. Kept to the
+// two registered static rows that every rated server runs — a GET read and
+// a 4 KiB POST. (A third entry, "auto-mix-111", was listed here but never
+// registered, so the -cells filter silently matched nothing and the rated
+// grid was 16 cells while the pin claimed 24; removed in the v1.5.4 pre-run
+// audit. Re-add an auto-mix scenario here only once it is registered.)
 var RatedScenarios = []string{
 	"get-json",
 	"post-4k",
-	"auto-mix-111",
 }
 
 // RatedServers is the curated rated column subset: the four celeris modes
@@ -54,7 +58,7 @@ var RatedServers = []string{
 // rated sweep stays curated, so HeadlineRatedRealizedCells is unchanged.
 const (
 	HeadlineRealizedCells      = FullRealizedCells
-	HeadlineRatedRealizedCells = 24 // 8 rated servers x 3 rated scenarios, capability-gated
+	HeadlineRatedRealizedCells = 16 // 8 rated servers x 2 rated scenarios, capability-gated
 
 	// Full profile: every server x every scenario, capability-gated. This is
 	// the SAME realized "*/*" grid Fast runs (FullRealizedCells ==
@@ -67,7 +71,7 @@ const (
 	// `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when the registry
 	// changes; the grid is now 52 columns x 29 rows, capability-gated.
 	FullRealizedCells      = 835
-	FullRatedRealizedCells = 24
+	FullRatedRealizedCells = 16
 )
 
 // HeadlineWeekly is the config the benchmark-tier workflow runs on the

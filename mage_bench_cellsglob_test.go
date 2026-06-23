@@ -83,23 +83,30 @@ func TestCellsGlobServersWildcardUsesFullRegistry(t *testing.T) {
 //     the exclude).
 //   - the full negative "get-*/celeris-std-h1" then
 //     "!get-*/celeris-std-h1" leaves an empty include glob → fallback
-//     to "*", which keeps the 4 celeris servers via the implicit
+//     to "*", which keeps the celeris servers via the implicit
 //     include from the empty include. Documented behaviour: empty
 //     include with all excludes = "use the registry, but respect the
 //     excludes against it" — same as the runner.
 func TestCellsGlobServersRespectsExcludes(t *testing.T) {
 	// Case 1: include "get-*/celeris-*" + exclude "get-simple/celeris-std-h1".
-	// The 4 celeris servers all match at least one (get-json etc.), so
+	// Every celeris engine column matches at least one (get-json etc.), so
 	// celeris-std-h1 stays (its get-json/celeris-std-h1 pair still
-	// matches the include, and no exclude covers the whole server).
+	// matches the include, and no exclude covers the whole server). The
+	// want set is the FULL celeris-* column family (the v1.5.4 redesign
+	// expanded it from 4 to the 9 engine modes below).
 	got, err := cellsGlobServers("get-*/celeris-*,!get-simple/celeris-std-h1")
 	if err != nil {
 		t.Fatalf("cellsGlobServers: %v", err)
 	}
 	want := []string{
+		"celeris-adaptive-auto+upg-async",
+		"celeris-adaptive-h1-async",
+		"celeris-epoll-auto+upg-async",
+		"celeris-epoll-h1-async",
 		"celeris-epoll-h1-sync",
 		"celeris-iouring-auto+upg-async",
 		"celeris-iouring-h1-async",
+		"celeris-iouring-h1-sync",
 		"celeris-std-h1",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -114,9 +121,14 @@ func TestCellsGlobServersRespectsExcludes(t *testing.T) {
 		t.Fatalf("cellsGlobServers: %v", err)
 	}
 	want = []string{
+		"celeris-adaptive-auto+upg-async",
+		"celeris-adaptive-h1-async",
+		"celeris-epoll-auto+upg-async",
+		"celeris-epoll-h1-async",
 		"celeris-epoll-h1-sync",
 		"celeris-iouring-auto+upg-async",
 		"celeris-iouring-h1-async",
+		"celeris-iouring-h1-sync",
 		"celeris-std-h1",
 	}
 	if !reflect.DeepEqual(got, want) {

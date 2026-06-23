@@ -163,6 +163,31 @@ func TestGlobsAreNonEmpty(t *testing.T) {
 	}
 }
 
+// TestRatedRealizedCellsMatchSubset guards the rated-pin against the
+// auto-mix-111 class of drift: the rated sweep runs RatedScenarios x
+// RatedServers, and every curated rated scenario is a plain-H1 static row
+// that applies to every curated rated server, so the realized count is the
+// full cross product with no capability-gating loss. If a stale entry
+// (an unregistered scenario whose glob matches nothing) sneaks back into
+// RatedScenarios, the cross-product pin and this assertion diverge from
+// reality — fail here rather than silently shrinking the published rated
+// grid while the budget over-projects.
+func TestRatedRealizedCellsMatchSubset(t *testing.T) {
+	want := len(RatedScenarios) * len(RatedServers)
+	if HeadlineRatedRealizedCells != want {
+		t.Errorf("HeadlineRatedRealizedCells = %d, want %d (len(RatedScenarios)=%d * len(RatedServers)=%d); "+
+			"a mismatch means a rated scenario is unregistered or the pin is stale",
+			HeadlineRatedRealizedCells, want, len(RatedScenarios), len(RatedServers))
+	}
+	if FullRatedRealizedCells != want {
+		t.Errorf("FullRatedRealizedCells = %d, want %d", FullRatedRealizedCells, want)
+	}
+	if len(ratedGlobs()) != want {
+		t.Errorf("len(ratedGlobs()) = %d, want %d (the expanded glob set must match the pin)",
+			len(ratedGlobs()), want)
+	}
+}
+
 // TestColumnWallClock pins the per-column projection the ansible hang
 // guard is sized from. The "v3.8 rated column" case uses the REAL run
 // config (33 capability-gated scenarios on celeris-epoll-h1-sync,

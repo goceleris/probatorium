@@ -12,7 +12,8 @@
 //   - Set + Get happy path on the seeded demo-key.
 //   - CAS update + read-after-write consistency (I-DRV-1).
 //
-// Address is taken from -mc-addr or PROBATORIUM_MC_ADDR.
+// Address is taken from -mc-addr or PROBATORIUM_MEMCACHED_ADDR (the
+// canonical var the bench adapters and ansible/validate.yml export).
 //
 // On startup the refapp prints the canonical ready line:
 //
@@ -54,8 +55,8 @@ func envOr(key, def string) string {
 func main() {
 	bind := flag.String("bind", "127.0.0.1:8080", "address:port to listen on")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto")
-	addr := flag.String("mc-addr", envOr("PROBATORIUM_MC_ADDR", "127.0.0.1:21211"),
-		"memcached host:port; env: PROBATORIUM_MC_ADDR")
+	addr := flag.String("mc-addr", envOr("PROBATORIUM_MEMCACHED_ADDR", "127.0.0.1:21211"),
+		"memcached host:port; env: PROBATORIUM_MEMCACHED_ADDR")
 	rps := flag.Float64("rps", 5000, "ratelimit RPS per key (permissive for walker traffic)")
 	burst := flag.Int("burst", 1000, "ratelimit burst per key")
 	flag.Parse()

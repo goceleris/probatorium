@@ -208,6 +208,51 @@ func SeedExternal(ctx context.Context, pgDSN, redisAddr, mcAddr string) error {
 			return fmt.Errorf("seed memcached %s: %w", mcAddr, err)
 		}
 	}
+	return VerifySeed(ctx, pgDSN, redisAddr, mcAddr)
+}
+
+// VerifySeed reads back a representative fixture from each configured
+// backend and errors if any canonical key/row is missing. It is the
+// post-seed guard that turns a silent partial or mis-targeted seed — the
+// dominant cause of a driver cell that publishes a fast 200 while doing no
+// real work, since a cache miss / empty range is a cheap, healthy-looking
+// response that the per-cell classifier cannot tell from genuine throughput
+// — into a loud failure on the seed step, before any bench cell runs. An
+// empty address skips that backend, mirroring SeedExternal.
+func VerifySeed(ctx context.Context, pgDSN, redisAddr, mcAddr string) error {
+	if pgDSN != "" {
+		conn, err := pgx.Connect(ctx, pgDSN)
+		if err != nil {
+			return fmt.Errorf("verify seed: connect postgres %s: %w", pgDSN, err)
+		}
+		defer func() { _ = conn.Close(ctx) }()
+		var n int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM users`).Scan(&n); err != nil {
+			return fmt.Errorf("verify seed: count users: %w", err)
+		}
+		if n < FixtureUserMaxID {
+			return fmt.Errorf("verify seed: users has %d rows, want >= %d (seed did not populate the bench backend)", n, FixtureUserMaxID)
+		}
+	}
+	if redisAddr != "" {
+		rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+		defer func() { _ = rdb.Close() }()
+		for _, k := range []string{FixtureDemoKey, FixtureSessionKey, "user:1:session"} {
+			v, err := rdb.Get(ctx, k).Result()
+			if err != nil || len(v) == 0 {
+				return fmt.Errorf("verify seed: redis key %q missing/empty (err=%v); seed did not reach %s", k, err, redisAddr)
+			}
+		}
+	}
+	if mcAddr != "" {
+		mc := memcache.New(mcAddr)
+		for _, k := range []string{FixtureDemoKey, "user:1:session"} {
+			it, err := mc.Get(k)
+			if err != nil || it == nil || len(it.Value) == 0 {
+				return fmt.Errorf("verify seed: memcached key %q missing/empty (err=%v); seed did not reach %s", k, err, mcAddr)
+			}
+		}
+	}
 	return nil
 }
 
@@ -239,7 +284,17 @@ func (h *Handles) Seed(ctx context.Context) error {
 			return fmt.Errorf("seed memcached: %w", err)
 		}
 	}
-	return nil
+	var pgDSN, redisAddr, mcAddr string
+	if h.Postgres != nil {
+		pgDSN = h.Postgres.DSN
+	}
+	if h.Redis != nil {
+		redisAddr = h.Redis.Addr
+	}
+	if h.Memcached != nil {
+		mcAddr = h.Memcached.Addr
+	}
+	return VerifySeed(ctx, pgDSN, redisAddr, mcAddr)
 }
 
 // startPostgres runs a Postgres container on a random loopback port and
