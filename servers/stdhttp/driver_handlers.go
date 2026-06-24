@@ -144,6 +144,7 @@ func mountDriverHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("POST /db/tx/user/{id}", c.dbTxHandler)
 	mux.HandleFunc("GET /db/users", c.dbUsersRangeHandler)
 	mux.HandleFunc("POST /cache", c.cacheSetHandler)
+	mux.HandleFunc("POST /mc", c.mcSetHandler)
 	mux.HandleFunc("GET /cache-pipeline", c.cachePipelineHandler)
 	mux.HandleFunc("GET /mc-multiget", c.mcMultiGetHandler)
 }
@@ -361,6 +362,23 @@ func (c *driverClients) cacheSetHandler(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if err := c.redis.Set(ctx, "demo-write", body, 0).Err(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(sessionResponse{OK: true})
+}
+
+// mcSetHandler serves POST /mc: memcached SET demo-write = request body.
+// nil client / error -> 503.
+func (c *driverClients) mcSetHandler(w http.ResponseWriter, r *http.Request) {
+	if c.mc == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	if err := c.mc.Set(&memcache.Item{Key: "demo-write", Value: body}); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}

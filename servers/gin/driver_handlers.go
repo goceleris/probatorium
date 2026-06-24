@@ -68,6 +68,7 @@ func mountDriverHandlers(r *gin.Engine) {
 	r.POST("/db/tx/user/:id", st.handleDBTx)
 	r.GET("/db/users", st.handleDBUsersRange)
 	r.POST("/cache", st.handleCacheSet)
+	r.POST("/mc", st.handleMCSet)
 	r.GET("/cache-pipeline", st.handleCachePipeline)
 	r.GET("/mc-multiget", st.handleMCMultiGet)
 }
@@ -163,6 +164,20 @@ func (st *driverState) handleCacheSet(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 	if err := st.redis.Set(ctx, "demo-write", body, 0).Err(); err != nil {
+		c.AbortWithStatus(http.StatusServiceUnavailable)
+		return
+	}
+	c.JSON(http.StatusOK, sessionResponse{OK: true})
+}
+
+// handleMCSet serves POST /mc: memcached SET demo-write = body.
+func (st *driverState) handleMCSet(c *gin.Context) {
+	if st.mc == nil {
+		c.AbortWithStatus(http.StatusServiceUnavailable)
+		return
+	}
+	body, _ := c.GetRawData()
+	if err := st.mc.Set(&memcache.Item{Key: "demo-write", Value: body}); err != nil {
 		c.AbortWithStatus(http.StatusServiceUnavailable)
 		return
 	}

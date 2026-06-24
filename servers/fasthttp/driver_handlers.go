@@ -141,6 +141,7 @@ func mountDriverHandlers(s *Server) {
 	s.MountNative(http.MethodPost, dbTxPrefix, dbTxHandler(dbTxPrefix))
 	s.MountNative(http.MethodGet, "/db/users", dbUsersRangeHandler())
 	s.MountNative(http.MethodPost, "/cache", cacheSetHandler())
+	s.MountNative(http.MethodPost, "/mc", mcSetHandler())
 	s.MountNative(http.MethodGet, "/cache-pipeline", cachePipelineHandler())
 	s.MountNative(http.MethodGet, "/mc-multiget", mcMultiGetHandler())
 }
@@ -259,6 +260,24 @@ func cacheSetHandler() fasthttp.RequestHandler {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := rdb.Set(ctx, "demo-write", rc.PostBody(), 0).Err(); err != nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		rc.SetContentType("application/json")
+		rc.SetStatusCode(fasthttp.StatusOK)
+		_, _ = rc.Write(mustJSON(sessionResponse{OK: true}))
+	}
+}
+
+// mcSetHandler serves POST /mc — memcached SET demo-write = request body.
+func mcSetHandler() fasthttp.RequestHandler {
+	return func(rc *fasthttp.RequestCtx) {
+		mc := mountedDrivers.mc
+		if mc == nil {
+			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		if err := mc.Set(&memcache.Item{Key: "demo-write", Value: rc.PostBody()}); err != nil {
 			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
 			return
 		}

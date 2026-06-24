@@ -278,6 +278,20 @@ func mountDriverDepthHandlers(h *server.Hertz, ds *driverState) {
 		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true}))
 	})
 
+	// POST /mc: SET demo-write = body.
+	h.POST("/mc", func(_ context.Context, ctx *app.RequestContext) {
+		if ds.mc == nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		body := ctx.Request.Body()
+		if err := ds.mc.Set(&memcache.Item{Key: "demo-write", Value: body}); err != nil {
+			ctx.AbortWithStatus(consts.StatusServiceUnavailable)
+			return
+		}
+		ctx.Data(consts.StatusOK, "application/json", mustJSON(sessionResponse{OK: true}))
+	})
+
 	// GET /cache-pipeline?n=N: pipeline N GETs of demo-key.
 	h.GET("/cache-pipeline", func(c context.Context, ctx *app.RequestContext) {
 		if ds.rdb == nil {

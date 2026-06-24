@@ -152,6 +152,7 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 	srv.POST("/cache", c.cacheSetHandler).Async()
 	srv.GET("/cache-pipeline", c.cachePipelineHandler).Async()
 	srv.GET("/mc-multiget", c.mcMultiGetHandler).Async()
+	srv.POST("/mc", c.mcSetHandler).Async()
 
 	srv.POST("/session", c.sessionHandler).Async()
 
@@ -294,6 +295,22 @@ func (c *driverClients) cacheSetHandler(ctx *celeris.Context) error {
 	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
 	defer cancel()
 	if err := c.redis.SetBytes(qctx, "demo-write", ctx.Body(), 0); err != nil {
+		return ctx.AbortWithStatus(503)
+	}
+	return ctx.JSON(200, sessionResponse{OK: true})
+}
+
+// mcSetHandler serves POST /mc: memcached SET demo-write = request body
+// (driver-mc-set; the memcached write counterpart of cacheSetHandler, using
+// celeris's native memcached driver). "demo-write" matches the redis write
+// key — no seed needed, the SET creates it.
+func (c *driverClients) mcSetHandler(ctx *celeris.Context) error {
+	if c.mc == nil {
+		return ctx.AbortWithStatus(503)
+	}
+	qctx, cancel := context.WithTimeout(ctx.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.mc.SetBytes(qctx, "demo-write", ctx.Body(), 0); err != nil {
 		return ctx.AbortWithStatus(503)
 	}
 	return ctx.JSON(200, sessionResponse{OK: true})

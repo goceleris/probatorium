@@ -907,7 +907,7 @@ func buildCellConfig(cell interleave.Cell, baseURL string, cfg Config) loadgen.C
 		// Workers×connsPerWorker conns (h1client numConns). Under the old
 		// 64-worker default that made the concurrency axis fictional —
 		// fanout-128 vs -1024 opened 64 streams each, and get-json (128),
-		// get-json-1c (1) and get-simple-1024c (1024) all ran 64 conns.
+		// get-simple-1c (1) and get-simple-1024c (1024) all ran 64 conns.
 		// Map the scenario's declared Connections onto Workers so each
 		// cell runs the concurrency its row label claims. (Connections
 		// stays set too: documentation, and correct if a later loadgen

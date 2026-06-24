@@ -312,6 +312,18 @@ func registerDriverHandlers(e *echov4.Echo, dc *driverClients) {
 		return c.JSON(http.StatusOK, sessionResponse{OK: true})
 	})
 
+	// POST /mc — memcached SET demo-write = request body.
+	e.POST("/mc", func(c echov4.Context) error {
+		if dc.mc == nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		body, _ := io.ReadAll(c.Request().Body)
+		if err := dc.mc.Set(&memcache.Item{Key: "demo-write", Value: body}); err != nil {
+			return c.NoContent(http.StatusServiceUnavailable)
+		}
+		return c.JSON(http.StatusOK, sessionResponse{OK: true})
+	})
+
 	// GET /cache-pipeline?n=N — pipeline N GETs of demo-key, sum byte lengths.
 	e.GET("/cache-pipeline", func(c echov4.Context) error {
 		if dc.redis == nil {

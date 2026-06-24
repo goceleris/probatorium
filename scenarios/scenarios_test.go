@@ -27,7 +27,7 @@ var expectedRegistry = []string{
 	"post-4k-h2",
 
 	// concurrency (5)
-	"get-json-1c",
+	"get-simple-1c",
 	"get-simple-128c",
 	"get-simple-256c",
 	"get-simple-512c",
@@ -192,7 +192,7 @@ func TestConcurrencyRequireHTTP1(t *testing.T) {
 	t.Parallel()
 	h1Only := servers.FeatureSet{HTTP1: true}
 	h2cOnly := servers.FeatureSet{HTTP2C: true}
-	for _, name := range []string{"get-json-1c", "get-simple-128c", "get-simple-256c", "get-simple-512c", "get-simple-1024c"} {
+	for _, name := range []string{"get-simple-1c", "get-simple-128c", "get-simple-256c", "get-simple-512c", "get-simple-1024c"} {
 		s := findScenario(t, name)
 		if !s.Applicable(h1Only) {
 			t.Errorf("%q: unexpectedly skipped for HTTP1-only server", name)
@@ -231,7 +231,7 @@ func TestCategories(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"get-json-1c", "get-simple-128c", "get-simple-256c", "get-simple-512c", "get-simple-1024c",
+		"get-simple-1c", "get-simple-128c", "get-simple-256c", "get-simple-512c", "get-simple-1024c",
 	} {
 		s := findScenario(t, name)
 		if got := s.Category(); got != CategoryConcurrency {

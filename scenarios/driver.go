@@ -25,13 +25,14 @@ const (
 	DriverRedisSet      = "driver-redis-set"      // POST /cache — 1 SET (write path)
 	DriverRedisPipeline = "driver-redis-pipeline" // GET /cache-pipeline?n=10 — pipelined GETs
 	DriverMCMultiGet    = "driver-mc-multiget"    // GET /mc-multiget?keys=10 — multi-key fetch
+	DriverMCSet         = "driver-mc-set"         // POST /mc — 1 SET (memcached write path)
 )
 
 // DriverKinds is the canonical ordered list of driver scenarios.
 var DriverKinds = []string{
 	DriverPG, DriverRedis, DriverMemcached, DriverSession,
 	DriverPGWrite, DriverPGUpdateTx, DriverPGReadRange,
-	DriverRedisSet, DriverRedisPipeline, DriverMCMultiGet,
+	DriverRedisSet, DriverRedisPipeline, DriverMCMultiGet, DriverMCSet,
 }
 
 // sessionBody is the 256-byte payload POSTed by driver-session-rw. It is
@@ -132,6 +133,10 @@ func (s *DriverScenario) Workload(target string) loadgen.Config {
 	case DriverMCMultiGet:
 		cfg.Method = "GET"
 		cfg.URL = target + "/mc-multiget?keys=10" // GetMulti of 10 seeded session keys
+	case DriverMCSet:
+		cfg.Method = "POST"
+		cfg.URL = target + "/mc" // SET the fixed memcached write key = body
+		cfg.Body = sessionBody
 	}
 	return cfg
 }
@@ -159,4 +164,5 @@ func init() {
 	Register(NewDriverScenario(DriverRedisSet, DriverRedisSet))
 	Register(NewDriverScenario(DriverRedisPipeline, DriverRedisPipeline))
 	Register(NewDriverScenario(DriverMCMultiGet, DriverMCMultiGet))
+	Register(NewDriverScenario(DriverMCSet, DriverMCSet))
 }

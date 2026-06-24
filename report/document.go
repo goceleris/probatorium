@@ -266,7 +266,7 @@ func isFanoutBound(scenarioName string) bool {
 // number rewards low per-request latency, not throughput, and must never
 // head a raw-RPS ranking — its real signal is the tail-latency section. The
 // "-1c" suffix is the single-conn marker (scenarios.ProfileSingle);
-// get-json-1c is the only such scenario today.
+// get-simple-1c is the only such scenario today.
 func isLatencyProbeByDesign(scenarioName string) bool {
 	return strings.HasSuffix(scenarioName, "-1c")
 }

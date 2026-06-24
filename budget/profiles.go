@@ -68,10 +68,11 @@ const (
 	// columns (W4), the 12 middleware/chain scenarios REMOVED (pre-run audit:
 	// unequal work across adapters), and the 1 MiB post-1m row REMOVED
 	// (wire-bound, never a ranking signal) — so the realized count moved off
-	// the older ~800/1257/1111/835 pins to 790. Recompute with
+	// the older ~800/1257/1111/835/790 pins to 813 (v1.5.5 added driver-mc-set,
+	// +23 — one per H1 driver column). Recompute with
 	// `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when the registry
-	// changes; the grid is now 52 columns x 28 rows, capability-gated.
-	FullRealizedCells      = 790
+	// changes; the grid is now 52 columns x 29 rows, capability-gated.
+	FullRealizedCells      = 813
 	FullRatedRealizedCells = 16
 )
 
@@ -93,9 +94,9 @@ const (
 // the correct loud failure, since the full grid x 2 serial arches cannot fit
 // 24h until ArchParallel (#168, blocked on loadgen linux/arm64) lands.
 //
-// Budget: ~790 cells x (12+40+5+12)s x 1 arch = ~15.1h saturation + ~0.7h
-// curated rated = ~15.8h < 24h. The per-cell window stays at the v1.5.4
-// 40s/12s (the chain + post-1m removals dropped the grid 1111->790, so there
+// Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~0.7h
+// curated rated = ~16.3h < 24h. The per-cell window stays at the v1.5.4
+// 40s/12s (chain + post-1m removals then the v1.5.5 driver-mc-set add left the grid at 813, so there
 // is now ample headroom). The rated sweep stays curated (RatedGlobs) because
 // it is the expensive additive dimension; expanding it to the full grid
 // would blow the budget many times over.
@@ -123,11 +124,11 @@ func HeadlineWeekly() Profile {
 // Recompute with `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when
 // the registry grows; FitWithin uses it to assert the fast profile still
 // fits 24h, so an over-large grid fails loudly instead of overrunning.
-// v1.5.4 redesign: 1257 -> 1111 -> 835 -> 790 (W1 pruned saturated static
-// rows; W3 deepened drivers 4->10; W4 added WS/SSE to three columns; pre-run
-// audit REMOVED the 12 middleware/chain scenarios; post-1m removed as
-// wire-bound).
-const FastRealizedCells = 790
+// v1.5.4 redesign: 1257 -> 1111 -> 835 -> 790; v1.5.5: -> 813 (W1 pruned
+// saturated static rows; W3 deepened drivers 4->10; W4 added WS/SSE to three
+// columns; pre-run audit REMOVED the 12 middleware/chain scenarios; post-1m
+// removed as wire-bound; v1.5.5 added driver-mc-set, +23).
+const FastRealizedCells = 813
 
 // Fast is the DEFAULT routine + weekly profile: the FULL grid (every server
 // × every scenario, capability-gated, "*/*") in SATURATION ONLY — no rated
@@ -137,8 +138,8 @@ const FastRealizedCells = 790
 // per cell, the dominant cost) is intentionally OFF here and belongs in a
 // separate, scoped dispatch when latency-under-controlled-load is the story.
 //
-// Budget: 790 cells × (10+35+5+12)s × 1 arch = ~13.6h saturation, rated=0
-// → ~13.6h < 24h. RatedPasses=0 makes BenchTier skip the rated flag entirely
+// Budget: 813 cells × (10+35+5+12)s × 1 arch = ~14.0h saturation, rated=0
+// → ~14.0h < 24h. RatedPasses=0 makes BenchTier skip the rated flag entirely
 // (rated OFF for every cell), so this is the cheap, full-breadth mode.
 func Fast() Profile {
 	return Profile{

@@ -92,10 +92,16 @@ var ConcurrencyProfiles = []string{
 
 func init() {
 	Register(&ConcurrencyScenario{
-		name:        "get-json-1c",
+		// Single-connection latency floor. Lives on "/" (plain "Hello,
+		// World!") so the whole concurrency sweep — get-simple-{1,128,256,
+		// 512,1024}c — varies ONLY the connection count on ONE endpoint; the
+		// 1c point used to sit on /json (JSON serialization) which made the
+		// 1c→128c segment move two variables at once. JSON-marshalling cost
+		// is already visible as get-simple vs get-json at 128c.
+		name:        "get-simple-1c",
 		profile:     ProfileSingle,
 		Method:      "GET",
-		Path:        "/json",
+		Path:        "/",
 		Connections: 1,
 	})
 	Register(&ConcurrencyScenario{
