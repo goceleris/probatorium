@@ -70,6 +70,19 @@
         - "{{ results_root }}"
         - "{{ bench_root }}/competitors"
 
+    # CPU sampler. run_bench_cell.yml samples per-cell CPU via a fire-and-forget
+    # `mpstat -P ALL ...`; if sysstat is absent that writes a 0-byte cpu.log and
+    # the report silently drops mean_cpu_pct — the v1.5.4 publish shipped CPU%
+    # on 0/822 cells for exactly this reason. Runs on bench_targets AND the
+    # loadgen host (both sample CPU). Intentionally NOT manifest-tracked: a base
+    # sampler we leave installed so a re-imaged host keeps CPU collection working.
+    - name: Ensure sysstat (mpstat) is installed — per-cell CPU sampler
+      become: true
+      ansible.builtin.apt:
+        name: sysstat
+        state: present
+        update_cache: true
+
     # Drop a marker so the cleanup playbook can mtime-diff ~ for leaks.
     - name: Drop deploy-start marker for mtime diff
       ansible.builtin.file:
