@@ -193,13 +193,11 @@ func BuildDocument(in BuildInput) *Document {
 		// loadgen still had CPU headroom is NIC-limited, not server-limited.
 		// Its saturation RPS converges across every fast adapter and must not
 		// be read as a ranking — the CPU efficiency in Resources is the real
-		// signal. Runtime detection only fires when the fabric's line rate is
-		// known (the LAN; the Tailscale overlay reports 0 and flags nothing),
-		// so the wire-bound-by-design scenarios are OR'd in unconditionally:
-		// post-1m is a documented wire-bound datapoint, never a ranking row,
-		// regardless of whether the line rate was measurable.
-		if isWireBoundByDesign(c.ScenarioName) ||
-			isNetworkBound(c.BytesMedian, c.LoadgenCPUP95, in.Environment.FabricLineRateBitsPerSec) {
+		// signal. Detection fires only when the fabric's line rate is known
+		// (the LAN; the Tailscale overlay reports 0 and flags nothing). The
+		// v1.5.4 grid carries no by-design wire-bound row anymore (post-1m and
+		// the 8k/16k/64k payload rows were removed), so this is purely runtime.
+		if isNetworkBound(c.BytesMedian, c.LoadgenCPUP95, in.Environment.FabricLineRateBitsPerSec) {
 			if sr.NetworkBound == nil {
 				sr.NetworkBound = map[string]bool{}
 			}
@@ -244,16 +242,6 @@ const (
 	// blocked on the wire, not burning cycles.)
 	networkBoundLoadgenCPUCeiling = 8.0
 )
-
-// isWireBoundByDesign reports whether a scenario is wire-bound by design
-// rather than by runtime measurement. post-1m is a documented 1 MiB-payload
-// datapoint whose saturation RPS is dictated by the fabric, not the server,
-// so it must always land in the wire-bound section and never head a raw-RPS
-// ranking — even on overlays where the line rate is unknown and isNetworkBound
-// cannot fire.
-func isWireBoundByDesign(scenarioName string) bool {
-	return scenarioName == "post-1m"
-}
 
 // isFanoutBound reports whether a scenario's throughput is paced by the
 // server's fixed publish tick rather than by CPU. The hub-broadcast and

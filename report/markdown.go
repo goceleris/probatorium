@@ -148,7 +148,7 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 
 	// Only scenarios whose max-sustained-RPS is a server-CPU-bound
 	// throughput belong in the headline ranking (it crowns a per-column
-	// leader). Wire-bound (post-1m), fan-out (ws-hub/sse-fanout) and
+	// leader). Runtime network-bound, fan-out (ws-hub/sse-fanout) and
 	// single-conn latency-probe (get-json-1c) cells are dropped here — they
 	// remain in the detail, tail-latency and network-bound sections — and
 	// disclosed in a note so the table is honest about what it excludes.
@@ -851,12 +851,11 @@ func scenariosFromDoc(doc *Document) []string {
 // bound throughput the field can be fairly ranked by. A scenario is
 // excluded when its number is bound by something other than the server:
 //
-//   - wire-bound by design (post-1m) OR runtime network-bound for every
-//     data-bearing adapter: the RPS sat at the fabric line rate and
-//     converged across fast adapters, so the honest comparison is the
-//     CPU-efficiency table (writeNetworkBoundSection), not a bolded leader
-//     here. Without this check the NetworkBound flag set in BuildDocument
-//     was never consulted by the headline ranking.
+//   - runtime network-bound for every data-bearing adapter: the RPS sat at
+//     the fabric line rate and converged across fast adapters, so the honest
+//     comparison is the CPU-efficiency table (writeNetworkBoundSection), not
+//     a bolded leader here. Without this check the NetworkBound flag set in
+//     BuildDocument was never consulted by the headline ranking.
 //   - fan-out cells (ws-hub-broadcast-*, sse-fanout-*): paced by the
 //     server's fixed 1 ms publish tick, not CPU.
 //   - single-connection latency probes (get-json-1c): RPS == 1/latency.
@@ -867,16 +866,16 @@ func headlineRanked(doc *Document, sc string) bool {
 	if isFanoutBound(sc) || isLatencyProbeByDesign(sc) {
 		return false
 	}
-	// Network-bound (by design OR runtime measurement): excluded only when
-	// it held for EVERY adapter that produced rated data for this scenario
-	// — a split result (bound for some, CPU-limited for others) still ranks.
+	// Network-bound: excluded only when it held for EVERY adapter that
+	// produced rated data for this scenario — a split result (bound for some,
+	// CPU-limited for others) still ranks.
 	dataBearing, bound := 0, 0
 	for _, a := range doc.Benchmarks {
 		if _, ok := a.LatencyAtSLO[sc]; !ok {
 			continue
 		}
 		dataBearing++
-		if isWireBoundByDesign(sc) || a.NetworkBound[sc] {
+		if a.NetworkBound[sc] {
 			bound++
 		}
 	}

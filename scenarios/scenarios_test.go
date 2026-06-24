@@ -12,13 +12,12 @@ import (
 // files and are deliberately excluded here — this test guards the slice
 // we own, not the ones we don't.
 var expectedRegistry = []string{
-	// static H1 (6) — v1.5.4 cut the NIC-bound 8k/16k/64k GET + 8k/16k/64k
-	// POST rows; post-1m kept as the single documented wire-bound datapoint.
+	// static H1 (5) — v1.5.4 cut the NIC-bound 8k/16k/64k GET + 8k/16k/64k
+	// POST rows and the 1 MiB post-1m row (all wire-bound, not ranking signal).
 	"churn-close",
 	"get-json",
 	"get-json-1k",
 	"get-simple",
-	"post-1m",
 	"post-4k",
 
 	// static H2-prior-knowledge (2) — exercise h2c-noupg and other
@@ -101,7 +100,6 @@ func TestStaticPOSTBodiesExactSize(t *testing.T) {
 		want int
 	}{
 		{"post-4k", 4 * 1024},
-		{"post-1m", 1024 * 1024},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -129,7 +127,7 @@ func TestStaticScenariosRequireHTTP1(t *testing.T) {
 	h2cOnly := servers.FeatureSet{HTTP2C: true}
 	for _, name := range []string{
 		"churn-close", "get-json", "get-json-1k",
-		"get-simple", "post-1m", "post-4k",
+		"get-simple", "post-4k",
 	} {
 		s := findScenario(t, name)
 		if !s.Applicable(h1Only) {
@@ -224,7 +222,7 @@ func TestCategories(t *testing.T) {
 	t.Parallel()
 	for _, name := range []string{
 		"churn-close", "get-json", "get-json-1k",
-		"get-simple", "post-1m", "post-4k",
+		"get-simple", "post-4k",
 		"get-json-h2", "post-4k-h2",
 	} {
 		s := findScenario(t, name)

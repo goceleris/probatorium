@@ -129,11 +129,12 @@ func TestNetworkBoundMarkdownSection(t *testing.T) {
 }
 
 // TestHeadlineExcludesNonCPUBoundScenarios pins the headline ranking gate:
-// a scenario whose saturation RPS is not server-CPU-bound — wire-bound by
-// design (post-1m), fan-out (ws-hub/sse-fanout), or a single-conn latency
-// probe (get-json-1c) — must NOT head a bolded Latency-at-SLO table, while a
-// genuine CPU-bound row (get-json) still does. This is the consult of the
-// NetworkBound flag that the headline ranking previously ignored.
+// a scenario whose saturation RPS is not server-CPU-bound — runtime
+// network-bound (flagged via the NetworkBound map), fan-out
+// (ws-hub/sse-fanout), or a single-conn latency probe (get-json-1c) — must
+// NOT head a bolded Latency-at-SLO table, while a genuine CPU-bound row
+// (get-json) still does. This is the consult of the NetworkBound flag that
+// the headline ranking previously ignored.
 func TestHeadlineExcludesNonCPUBoundScenarios(t *testing.T) {
 	t.Parallel()
 	slo := map[int]int{10: 1000, 50: 2000, 100: 3000, 500: 4000, 1000: 5000}
@@ -143,11 +144,11 @@ func TestHeadlineExcludesNonCPUBoundScenarios(t *testing.T) {
 			Name: "celeris-iouring-h1-async",
 			LatencyAtSLO: map[string]map[int]int{
 				"get-json":             slo, // CPU-bound → ranked
-				"post-1m":              slo, // wire-bound by design → excluded
+				"netbound-cell":        slo, // runtime network-bound (flagged) → excluded
 				"get-json-1c":          slo, // single-conn latency probe → excluded
 				"ws-hub-broadcast-128": slo, // fan-out → excluded
 			},
-			NetworkBound: map[string]bool{"post-1m": true},
+			NetworkBound: map[string]bool{"netbound-cell": true},
 		}},
 	}
 	var buf bytes.Buffer
@@ -158,7 +159,7 @@ func TestHeadlineExcludesNonCPUBoundScenarios(t *testing.T) {
 	if !strings.Contains(out, "### get-json\n") {
 		t.Error("get-json (CPU-bound) must head a headline ranking table")
 	}
-	for _, sc := range []string{"### post-1m", "### get-json-1c", "### ws-hub-broadcast-128"} {
+	for _, sc := range []string{"### netbound-cell", "### get-json-1c", "### ws-hub-broadcast-128"} {
 		if strings.Contains(out, sc) {
 			t.Errorf("%q must NOT head a headline ranking table", sc)
 		}
