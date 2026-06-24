@@ -20,30 +20,28 @@ import "time"
 // "everything". The RATED sweep stays curated (RatedServers x RatedScenarios)
 // because it is the expensive additive dimension — see RatedServers below.
 
-// RatedScenarios is the curated rated/SLO subset (#156): the SLO-knee
-// scenarios where throughput-at-SLO carries the most signal. The two
-// registered static rows every rated server runs — a GET read and a 4 KiB
-// POST. (A third entry, "auto-mix-111", used to be listed here but the
-// scenario was deleted and never registered, so the -cells filter silently
-// matched nothing and the rated grid was 16 cells while the pin claimed 24;
-// removed from the rated pass in the v1.5.4 pre-run audit.)
+// RatedScenarios is the rated/SLO subset (#156): the scenarios where
+// throughput-at-SLO (max sustained RPS while P99 <= N ms) carries signal that
+// saturation RPS alone misses. The v1.5.5 audit rebalanced this toward the
+// DRIVER rows — adapters pile up at identical store-bound saturation ceilings
+// there, so latency-at-load is the only thing that ranks them — plus the two
+// static headline rows and churn-close (latency under connection churn, the
+// v1.5.5 timer-cancel signal). The concurrency sweep is already a
+// latency-vs-load curve, and WS/SSE rate-vs-stream is ill-defined, so neither
+// is rated (saturation ranks them).
+//
+// Every rated scenario runs on EVERY participating, capability-gated server
+// (see ratedGlobs) — not a curated column subset — so the rated table ranks
+// each row against its real field leader. That makes the rated sweep large: it
+// no longer fits the 24h budget, so the rated profiles (headline/full) are
+// manual BENCH_BUDGET dispatches. The weekly cron runs Fast (rated OFF), which
+// still fits 24h.
 var RatedScenarios = []string{
-	"get-json",
-	"post-4k",
-}
-
-// RatedServers is the curated rated column subset: the four celeris modes
-// plus the four strongest competitors. Rated runs ONLY on this subset so
-// the expensive sweep is additive, not a whole-grid multiplier.
-var RatedServers = []string{
-	"celeris-iouring-h1-async",
-	"celeris-iouring-auto+upg-async",
-	"celeris-epoll-h1-sync",
-	"celeris-std-h1",
-	"gin-h1",
-	"fasthttp-h1",
-	"axum",
-	"aspnet",
+	"get-json", "post-4k", "churn-close",
+	"driver-pg-read", "driver-pg-write", "driver-pg-update-tx", "driver-pg-read-range",
+	"driver-redis-get", "driver-redis-set", "driver-redis-pipeline",
+	"driver-mc-get", "driver-mc-set", "driver-mc-multiget",
+	"driver-session-rw",
 }
 
 // Realized (capability-gated) cell counts for the headline weekly
@@ -57,8 +55,13 @@ var RatedServers = []string{
 // shorter per-cell window (see HeadlineWeekly), not a curated subset. The
 // rated sweep stays curated, so HeadlineRatedRealizedCells is unchanged.
 const (
-	HeadlineRealizedCells      = FullRealizedCells
-	HeadlineRatedRealizedCells = 16 // 8 rated servers x 2 rated scenarios, capability-gated
+	HeadlineRealizedCells = FullRealizedCells
+	// Rated now runs the meaningful scenarios on ALL participating servers
+	// (capability-gated), not a curated column subset. Realized via
+	// `cmd/runner -dry-run -cells '<ratedGlobs()>' | grep -c '^run0'`:
+	// 3 static rows × 45 H1 cols + 11 driver rows × 23 driver-capable cols = 388.
+	// Re-pin when RatedScenarios or the registry changes.
+	HeadlineRatedRealizedCells = 388
 
 	// Full profile: every server x every scenario, capability-gated. This is
 	// the SAME realized "*/*" grid Fast runs (FullRealizedCells ==
@@ -73,7 +76,7 @@ const (
 	// `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when the registry
 	// changes; the grid is now 52 columns x 29 rows, capability-gated.
 	FullRealizedCells      = 813
-	FullRatedRealizedCells = 16
+	FullRatedRealizedCells = 388 // same rated set as Headline (all participating servers)
 )
 
 // HeadlineWeekly is the config the benchmark-tier workflow runs on the
@@ -94,12 +97,14 @@ const (
 // the correct loud failure, since the full grid x 2 serial arches cannot fit
 // 24h until ArchParallel (#168, blocked on loadgen linux/arm64) lands.
 //
-// Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~0.7h
-// curated rated = ~16.3h < 24h. The per-cell window stays at the v1.5.4
-// 40s/12s (chain + post-1m removals then the v1.5.5 driver-mc-set add left the grid at 813, so there
-// is now ample headroom). The rated sweep stays curated (RatedGlobs) because
-// it is the expensive additive dimension; expanding it to the full grid
-// would blow the budget many times over.
+// Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~11.0h
+// rated (388 rated cells x (10+4*20+12)s) = ~26.6h bench (~29.4h wall-clock
+// incl deploy) — this NO LONGER fits 24h. The v1.5.5 audit expanded rated to
+// run the meaningful scenarios (drivers + static headline + churn-close) on
+// EVERY participating server (RatedGlobs) so each rated row ranks against its
+// real field leader, which is the whole point of the rated table. Headline and
+// Full are therefore MANUAL BENCH_BUDGET dispatches now; the weekly cron runs
+// Fast (rated OFF), which still fits 24h. Per-cell window stays 40s/12s.
 func HeadlineWeekly() Profile {
 	return Profile{
 		Name:          "headline",
@@ -182,19 +187,14 @@ func Full() Profile {
 	}
 }
 
-// ratedGlobs expands the curated rated scenario x server subset into its
-// "<scenario>/<server>" glob set.
+// ratedGlobs expands the rated scenario set into "<scenario>/*" globs — every
+// rated scenario on every participating server, capability-gated by the runner
+// — so the rated/SLO table ranks each row against its true field leader rather
+// than a curated column subset.
 func ratedGlobs() []string {
-	return crossGlobs(RatedScenarios, RatedServers)
-}
-
-// crossGlobs builds the "<scenario>/<server>" glob for every pair.
-func crossGlobs(scenarios, servers []string) []string {
-	out := make([]string, 0, len(scenarios)*len(servers))
-	for _, s := range scenarios {
-		for _, srv := range servers {
-			out = append(out, s+"/"+srv)
-		}
+	out := make([]string, 0, len(RatedScenarios))
+	for _, s := range RatedScenarios {
+		out = append(out, s+"/*")
 	}
 	return out
 }
