@@ -208,6 +208,17 @@ func mountDriverHandlers(app *fiber.App, ds *driverState) {
 		return c.Send(mustJSON(sessionResponse{OK: true}))
 	})
 
+	app.Post("/mc", func(c *fiber.Ctx) error {
+		if ds.mc == nil {
+			return c.SendStatus(fiber.StatusServiceUnavailable)
+		}
+		if err := ds.mc.Set(&memcache.Item{Key: "demo-write", Value: c.Body()}); err != nil {
+			return c.SendStatus(fiber.StatusServiceUnavailable)
+		}
+		c.Set("Content-Type", "application/json")
+		return c.Send(mustJSON(sessionResponse{OK: true}))
+	})
+
 	app.Get("/cache-pipeline", func(c *fiber.Ctx) error {
 		if ds.rdb == nil {
 			return c.SendStatus(fiber.StatusServiceUnavailable)

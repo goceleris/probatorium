@@ -6,15 +6,26 @@ import (
 	"time"
 )
 
-// TestWeeklyConfigFitsBudget is the CI invariant (#166): the exact config
-// the benchmark-tier workflow runs weekly must fit the 24h cluster
-// window. Runs on the cluster-free test.yml job so the budget is enforced
-// on every PR, before any 24h window is ever spent.
+// TestWeeklyConfigFitsBudget is the CI invariant (#166): the exact config the
+// benchmark-tier workflow runs WEEKLY must fit the 24h cluster window. The
+// schedule cron passes no profile input, so the weekly is Fast (saturation-
+// only) — that is the config the 24h budget protects. The rated profiles
+// (headline/full) now run the rated sweep on every participating server and
+// intentionally do NOT fit 24h: they are manual BENCH_BUDGET dispatches, so
+// they are asserted to REQUIRE the override (fail under 24h, fit under the 72h
+// manual ceiling). Runs on the cluster-free test.yml job so the budget is
+// enforced on every PR.
 func TestWeeklyConfigFitsBudget(t *testing.T) {
-	p := HeadlineWeekly()
-	if got := p.WallClock(); got >= Budget {
-		t.Fatalf("weekly headline wall-clock %v >= %v budget (saturation=%v rated=%v)",
-			got, Budget, p.Saturation(), p.Rated())
+	if got := Fast().WallClock(); got >= Budget {
+		t.Fatalf("weekly (fast) wall-clock %v >= %v budget", got, Budget)
+	}
+	for _, p := range []Profile{HeadlineWeekly(), Full()} {
+		if _, ok := p.FitWithin(Budget); ok {
+			t.Errorf("rated profile %q runs all-server rated (rated=%v) and must NOT fit the default 24h budget — it is a manual BENCH_BUDGET dispatch", p.Name, p.Rated())
+		}
+		if _, ok := p.FitWithin(72 * time.Hour); !ok {
+			t.Errorf("rated profile %q must fit the 72h manual-dispatch job ceiling", p.Name)
+		}
 	}
 }
 
@@ -50,10 +61,10 @@ func TestFastFitsWithin24h(t *testing.T) {
 // TestFitWithinAcceptsSinglePassThatFits proves FitWithin returns ok for
 // the single-pass config when it fits, and reports the headroom.
 func TestFitWithinAcceptsSinglePassThatFits(t *testing.T) {
-	p := HeadlineWeekly()
+	p := Fast() // the within-24h profile (headline/full now carry all-server rated)
 	log, ok := p.FitWithin(Budget)
 	if !ok {
-		t.Fatalf("single-pass headline must fit the %v budget; log:\n%s", Budget, log)
+		t.Fatalf("single-pass fast must fit the %v budget; log:\n%s", Budget, log)
 	}
 	if p.WallClock() >= Budget {
 		t.Fatalf("FitWithin returned ok but wall-clock %v exceeds budget %v",
@@ -163,28 +174,31 @@ func TestGlobsAreNonEmpty(t *testing.T) {
 	}
 }
 
-// TestRatedRealizedCellsMatchSubset guards the rated-pin against the
-// auto-mix-111 class of drift: the rated sweep runs RatedScenarios x
-// RatedServers, and every curated rated scenario is a plain-H1 static row
-// that applies to every curated rated server, so the realized count is the
-// full cross product with no capability-gating loss. If a stale entry
-// (an unregistered scenario whose glob matches nothing) sneaks back into
-// RatedScenarios, the cross-product pin and this assertion diverge from
-// reality — fail here rather than silently shrinking the published rated
-// grid while the budget over-projects.
-func TestRatedRealizedCellsMatchSubset(t *testing.T) {
-	want := len(RatedScenarios) * len(RatedServers)
-	if HeadlineRatedRealizedCells != want {
-		t.Errorf("HeadlineRatedRealizedCells = %d, want %d (len(RatedScenarios)=%d * len(RatedServers)=%d); "+
-			"a mismatch means a rated scenario is unregistered or the pin is stale",
-			HeadlineRatedRealizedCells, want, len(RatedScenarios), len(RatedServers))
+// TestRatedGlobsConsistent guards the rated wiring. Rated now runs each
+// RatedScenario on every participating server ("<scenario>/*"), so the realized
+// count is capability-gated — NOT a clean product — and is pinned from a live
+// `cmd/runner -dry-run -cells '<ratedGlobs()>' | grep -c '^run0'` (388),
+// re-verified when RatedScenarios or the registry change. This test guards the
+// cheap invariants the pin can't: exactly one glob per rated scenario, both
+// rated pins agree, and the pin covers at least one cell per scenario (a stale
+// scenario whose glob matched nothing would drag the realized count below this
+// — the auto-mix-111 trap).
+func TestRatedGlobsConsistent(t *testing.T) {
+	globs := ratedGlobs()
+	if len(globs) != len(RatedScenarios) {
+		t.Errorf("ratedGlobs() = %d globs, want one per RatedScenario (%d)", len(globs), len(RatedScenarios))
 	}
-	if FullRatedRealizedCells != want {
-		t.Errorf("FullRatedRealizedCells = %d, want %d", FullRatedRealizedCells, want)
+	for _, g := range globs {
+		if !strings.HasSuffix(g, "/*") {
+			t.Errorf("rated glob %q must be <scenario>/* (all participating servers)", g)
+		}
 	}
-	if len(ratedGlobs()) != want {
-		t.Errorf("len(ratedGlobs()) = %d, want %d (the expanded glob set must match the pin)",
-			len(ratedGlobs()), want)
+	if HeadlineRatedRealizedCells != FullRatedRealizedCells {
+		t.Errorf("Headline/Full rated pins must agree: %d vs %d", HeadlineRatedRealizedCells, FullRatedRealizedCells)
+	}
+	if HeadlineRatedRealizedCells < len(RatedScenarios) {
+		t.Errorf("rated pin %d < %d scenarios — expected >=1 cell/scenario; re-pin from `cmd/runner -dry-run`",
+			HeadlineRatedRealizedCells, len(RatedScenarios))
 	}
 }
 

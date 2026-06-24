@@ -258,6 +258,21 @@ func mountDriverHandlers(app *irisv12.Application, dc *driverClients) {
 		_ = c.JSON(sessionResponse{OK: true})
 	})
 
+	// Memcached write: POST /mc — SET demo-write = request body, no expiry.
+	app.Post("/mc", func(c irisv12.Context) {
+		if dc.mc == nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		body, _ := io.ReadAll(c.Request().Body)
+		if err := dc.mc.Set(&memcache.Item{Key: "demo-write", Value: body}); err != nil {
+			c.StopWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		c.ContentType("application/json")
+		_ = c.JSON(sessionResponse{OK: true})
+	})
+
 	// Redis pipeline: GET /cache-pipeline?n=N — pipeline N GETs of demo-key.
 	app.Get("/cache-pipeline", func(c irisv12.Context) {
 		if dc.redis == nil {

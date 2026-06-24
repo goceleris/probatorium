@@ -131,7 +131,7 @@ func TestNetworkBoundMarkdownSection(t *testing.T) {
 // TestHeadlineExcludesNonCPUBoundScenarios pins the headline ranking gate:
 // a scenario whose saturation RPS is not server-CPU-bound — runtime
 // network-bound (flagged via the NetworkBound map), fan-out
-// (ws-hub/sse-fanout), or a single-conn latency probe (get-json-1c) — must
+// (ws-hub/sse-fanout), or a single-conn latency probe (get-simple-1c) — must
 // NOT head a bolded Latency-at-SLO table, while a genuine CPU-bound row
 // (get-json) still does. This is the consult of the NetworkBound flag that
 // the headline ranking previously ignored.
@@ -145,7 +145,7 @@ func TestHeadlineExcludesNonCPUBoundScenarios(t *testing.T) {
 			LatencyAtSLO: map[string]map[int]int{
 				"get-json":             slo, // CPU-bound → ranked
 				"netbound-cell":        slo, // runtime network-bound (flagged) → excluded
-				"get-json-1c":          slo, // single-conn latency probe → excluded
+				"get-simple-1c":        slo, // single-conn latency probe → excluded
 				"ws-hub-broadcast-128": slo, // fan-out → excluded
 			},
 			NetworkBound: map[string]bool{"netbound-cell": true},
@@ -159,7 +159,7 @@ func TestHeadlineExcludesNonCPUBoundScenarios(t *testing.T) {
 	if !strings.Contains(out, "### get-json\n") {
 		t.Error("get-json (CPU-bound) must head a headline ranking table")
 	}
-	for _, sc := range []string{"### netbound-cell", "### get-json-1c", "### ws-hub-broadcast-128"} {
+	for _, sc := range []string{"### netbound-cell", "### get-simple-1c", "### ws-hub-broadcast-128"} {
 		if strings.Contains(out, sc) {
 			t.Errorf("%q must NOT head a headline ranking table", sc)
 		}

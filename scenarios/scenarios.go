@@ -57,7 +57,7 @@ func ErrorBudgetFor(s Scenario) float64 {
 // and how to interpret the result.
 type Scenario interface {
 	// Name is the canonical cell-row identifier. Examples: "get-json",
-	// "post-4k", "get-json-1c", "driver-pg-read", "ws-hub-broadcast-128".
+	// "post-4k", "get-simple-1c", "driver-pg-read", "ws-hub-broadcast-128".
 	Name() string
 
 	// Category groups scenarios for report sections: "static",

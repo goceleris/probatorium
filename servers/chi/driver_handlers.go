@@ -140,6 +140,7 @@ func mountDriverHandlers(r chi.Router) {
 	r.Post("/db/tx/user/{id}", c.dbTxHandler)
 	r.Get("/db/users", c.dbUsersRangeHandler)
 	r.Post("/cache", c.cacheSetHandler)
+	r.Post("/mc", c.mcSetHandler)
 	r.Get("/cache-pipeline", c.cachePipelineHandler)
 	r.Get("/mc-multiget", c.mcMultiGetHandler)
 }
@@ -235,6 +236,20 @@ func (c *driverClients) cacheSetHandler(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	if err := c.redis.Set(ctx, "demo-write", body, 0).Err(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, sessionResponse{OK: true})
+}
+
+// mcSetHandler serves POST /mc: memcached SET demo-write = body.
+func (c *driverClients) mcSetHandler(w http.ResponseWriter, r *http.Request) {
+	if c.mc == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	if err := c.mc.Set(&memcache.Item{Key: "demo-write", Value: body}); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}

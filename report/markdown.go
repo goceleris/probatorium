@@ -149,7 +149,7 @@ func writeLatencyAtSLOSection(w io.Writer, doc *Document) error {
 	// Only scenarios whose max-sustained-RPS is a server-CPU-bound
 	// throughput belong in the headline ranking (it crowns a per-column
 	// leader). Runtime network-bound, fan-out (ws-hub/sse-fanout) and
-	// single-conn latency-probe (get-json-1c) cells are dropped here — they
+	// single-conn latency-probe (get-simple-1c) cells are dropped here — they
 	// remain in the detail, tail-latency and network-bound sections — and
 	// disclosed in a note so the table is honest about what it excludes.
 	all := scenariosFromDoc(doc)
@@ -858,7 +858,7 @@ func scenariosFromDoc(doc *Document) []string {
 //     BuildDocument was never consulted by the headline ranking.
 //   - fan-out cells (ws-hub-broadcast-*, sse-fanout-*): paced by the
 //     server's fixed 1 ms publish tick, not CPU.
-//   - single-connection latency probes (get-json-1c): RPS == 1/latency.
+//   - single-connection latency probes (get-simple-1c): RPS == 1/latency.
 //
 // Excluded scenarios still appear in the detail, tail-latency and
 // network-bound sections; they are dropped only from the bolded headline.

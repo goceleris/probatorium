@@ -146,14 +146,14 @@ func TestBuildCellConfig(t *testing.T) {
 	// stream per worker) and never reads Config.Connections, so the
 	// runner maps each scenario's declared Connections onto Workers.
 	// Before this mapping every H1 cell ran 64 conns regardless of its
-	// label: get-json (128), get-json-1c (1) and get-simple-1024c (1024)
+	// label: get-json (128), get-simple-1c (1) and get-simple-1024c (1024)
 	// were all the same 64-conn workload.
 	t.Run("declared connections map to workers", func(t *testing.T) {
 		for _, tc := range []struct {
 			scenario string
 			want     int
 		}{
-			{"get-json-1c", 1},
+			{"get-simple-1c", 1},
 			{"get-simple-1024c", 1024},
 			{"get-simple-128c", 128},
 			{"churn-close", 32},
