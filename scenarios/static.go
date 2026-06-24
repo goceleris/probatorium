@@ -141,12 +141,10 @@ var StaticScenarioNames = []string{
 	"get-json",
 	"get-json-1k",
 	"post-4k",
-	// post-1m is the single deliberate wire-bound row kept for the
-	// saturation/methodology discussion — NOT a ranking signal (RPS converges
-	// at line rate). The 8k/16k/64k GET + 8k/16k/64k POST rows were cut in
-	// v1.5.4: every fast adapter converges at the 20G fabric ceiling, so they
-	// burned compute without differentiating. See report network_bound flags.
-	"post-1m",
+	// The large-payload rows (8k/16k/64k GET+POST and the 1 MiB post-1m) were
+	// cut as wire-bound: on the 20G LACP fabric every fast adapter converges at
+	// the line rate, so raw RPS stopped differentiating them. Server CPU/RSS at
+	// the shared ceiling — not these rows — is the large-payload signal now.
 	"churn-close",
 	// HTTP/2 prior-knowledge variants — exercise every HTTP2C-capable
 	// server, including h2c-noupg (which refuses H1 entirely). The 64k h2
@@ -162,10 +160,7 @@ var StaticScenarioNames = []string{
 //
 // Each payload uses its own deterministic seed so a future change to one
 // size leaves the others byte-identical.
-var (
-	post4KBody = makeRandomBody(4*1024, 0xA11CE_4000)
-	post1MBody = makeRandomBody(1024*1024, 0xC0DE_10000)
-)
+var post4KBody = makeRandomBody(4*1024, 0xA11CE_4000)
 
 // makeRandomBody returns a byte slice of exactly n bytes filled with a
 // deterministic PRNG keyed by seed. math/rand/v2's ChaCha8 is allocation-
@@ -226,19 +221,6 @@ func init() {
 		Method:      "POST",
 		Path:        "/upload",
 		Body:        post4KBody,
-		Connections: 128,
-	})
-	// post-1m is kept deliberately as the ONE wire-bound datapoint for the
-	// saturation/methodology discussion. The 8k/16k/64k GET and 8k/16k/64k
-	// POST rows were removed in v1.5.4: on the 20G LACP fabric every fast
-	// adapter converges at the line rate, so raw RPS stopped differentiating
-	// them (report flags them network_bound). Document post-1m as NIC-bound,
-	// not a ranking row.
-	Register(&StaticScenario{
-		name:        "post-1m",
-		Method:      "POST",
-		Path:        "/upload",
-		Body:        post1MBody,
 		Connections: 128,
 	})
 	Register(&StaticScenario{
