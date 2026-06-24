@@ -208,7 +208,61 @@ func SeedExternal(ctx context.Context, pgDSN, redisAddr, mcAddr string) error {
 			return fmt.Errorf("seed memcached %s: %w", mcAddr, err)
 		}
 	}
-	return VerifySeed(ctx, pgDSN, redisAddr, mcAddr)
+	if err := VerifySeed(ctx, pgDSN, redisAddr, mcAddr); err != nil {
+		return err
+	}
+	WarmServices(ctx, pgDSN, redisAddr, mcAddr)
+	return nil
+}
+
+// WarmServices drives a brief, best-effort read burst against each seeded
+// backend AFTER the correctness gate, so the FIRST benched column does not pay
+// cold PostgreSQL buffer-cache / connection-establishment / post-deploy
+// host-settling latency. The v1.5.5 readiness audit found the first columns'
+// driver cells run 30-80% slow (recovering to parity by later columns); since
+// rated targets scale off each column's saturation anchor, a cold first column
+// understates its LatencyAtSLO and biases against whichever adapter happens to
+// be benched first. This warms the SHARED backend + docker-proxy path (each
+// SUT's own driver pool is warmed by that cell's warmup window). Errors are
+// ignored — this is warmup, not correctness; VerifySeed already gated that.
+// Time-boxed to a few seconds, negligible against a multi-hour grid. NOTE: a
+// cluster smoke should confirm it removes the first-column dip; if the residual
+// is host- rather than backend-bound, escalate to a sacrificial first column.
+func WarmServices(ctx context.Context, pgDSN, redisAddr, mcAddr string) {
+	var (
+		pg  *pgx.Conn
+		rdb *redis.Client
+		mc  *memcache.Client
+	)
+	if pgDSN != "" {
+		if c, err := pgx.Connect(ctx, pgDSN); err == nil {
+			pg = c
+			defer func() { _ = pg.Close(ctx) }()
+		}
+	}
+	if redisAddr != "" {
+		rdb = redis.NewClient(&redis.Options{Addr: redisAddr})
+		defer func() { _ = rdb.Close() }()
+	}
+	if mcAddr != "" {
+		mc = memcache.New(mcAddr)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if pg != nil {
+			if rows, err := pg.Query(ctx, `SELECT id, name, email, score FROM users WHERE id BETWEEN 1 AND 50`); err == nil {
+				for rows.Next() { //nolint:revive // draining to warm the buffer cache; values unused
+				}
+				rows.Close()
+			}
+		}
+		if rdb != nil {
+			_ = rdb.Get(ctx, FixtureDemoKey).Err()
+		}
+		if mc != nil {
+			_, _ = mc.Get(FixtureDemoKey)
+		}
+	}
 }
 
 // VerifySeed reads back a representative fixture from each configured
