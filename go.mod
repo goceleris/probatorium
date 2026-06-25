@@ -9,7 +9,7 @@ require (
 	github.com/google/gofuzz v1.2.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pierrec/lz4/v4 v4.1.27
-	github.com/redis/go-redis/v9 v9.20.1
+	github.com/redis/go-redis/v9 v9.21.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	golang.org/x/crypto v0.53.0
 	modernc.org/sqlite v1.53.0
