@@ -155,6 +155,25 @@ jobs:
             echo "CLUSTER_USE_LAN=1"
           } >> "$GITHUB_ENV"
 
+      - name: Publish preflight (fail fast on missing docs token)
+        # When this run will publish (BENCH_PUBLISH != 0), refuse to start the
+        # multi-hour bench unless the docs token is present. The DOCS_DISPATCH_TOKEN
+        # secret MUST be set (a PAT with repo scope on goceleris/docs) — without it
+        # the final `mage Publish` falls back to `gh auth token`, which fails on the
+        # self-hosted runner (no gh in PATH). The v1.5.5 run completed all 813 cells
+        # and then lost the publish here after ~69h; this guard turns that into a
+        # minute-0 failure. (mage BenchTier also runs an in-process publishPreflight
+        # after Deploy as a second line of defence.)
+        if: env.BENCH_PUBLISH != '0'
+        env:
+          DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$DOCS_TOKEN" ]; then
+            echo "::error::BENCH_PUBLISH is on but the DOCS_DISPATCH_TOKEN secret is empty/unset. Set it (a PAT with repo scope on goceleris/docs) or dispatch with publish=false for a data-only run. Aborting before the multi-hour bench."
+            exit 1
+          fi
+          echo "docs publish token present — preflight OK"
+
       - name: mage Deploy (competitors + db services for the profile)
         env:
           # DEPLOY_COMPETITORS is set at the job level (above) so the BenchTier

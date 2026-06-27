@@ -737,6 +737,33 @@ func BenchAndValidate() error {
 	return nil
 }
 
+// publishPreflight checks, BEFORE a multi-hour bench runs, that a real docs
+// publish CAN succeed: the version must resolve to a real tag/pseudo-version
+// (not "dev") and the docs token must resolve (DOCS_TOKEN env or `gh auth
+// token`). BenchTier calls this when BENCH_PUBLISH is on so a missing
+// DOCS_DISPATCH_TOKEN secret / absent gh on the runner fails at minute 0
+// instead of after the whole grid — the v1.5.5 run completed all 813 cells
+// and then lost the publish because the token was unresolvable on the runner.
+// A dry-run (PUBLISH_DRYRUN=1) neither clones nor pushes, so the token check
+// is skipped there.
+func publishPreflight() error {
+	version := os.Getenv("PUBLISH_VERSION")
+	if version == "" {
+		v, _ := celerisVersion()
+		version = v
+	}
+	if version == "" || version == "dev" {
+		return fmt.Errorf("publish version resolves to %q: set PUBLISH_VERSION, or pin celeris in servers/celeris/go.mod, so the docs land under the real version instead of \"dev\"", version)
+	}
+	if os.Getenv("PUBLISH_DRYRUN") == "1" {
+		return nil
+	}
+	if _, err := resolveDocsToken(); err != nil {
+		return fmt.Errorf("docs token unresolved: set the DOCS_DISPATCH_TOKEN secret (a PAT with repo scope on %s) / DOCS_TOKEN env, or install gh on the runner: %w", docsRepo, err)
+	}
+	return nil
+}
+
 // resolveDocsToken returns the token used for the docs push + dispatch.
 // DOCS_TOKEN env wins; falls back to `gh auth token`. We never log the
 // token so a stray CI log dump doesn't leak credentials.
