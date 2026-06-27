@@ -724,7 +724,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// is the catch-all that the per-protocol counters above can't see — a
 		// dead server just looks like connection-refused to every walker.
 		fire(properties.ILiveness.ID,
-			fmt.Sprintf("refapp process died mid-run: %s", snap.Liveness.Reason()),
+			livenessDeathMessage(snap.Liveness),
 			snap.Liveness.Crashed)
 		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
 		// connection errors). Complements I-LIVENESS for the hang class.
@@ -912,6 +912,21 @@ func summariseTier3Stderr(res tier3Result) string {
 	default:
 		return fmt.Sprintf("exit=%d (no output)", res.ExitCode)
 	}
+}
+
+// livenessDeathMessage renders the I-LIVENESS incident message. Reason()
+// already names a death that left a recognised crash signature; for a clean
+// exit with NO signature (e.g. the refapp's own log.Fatalf -> os.Exit(1)) it
+// appends the captured stdout+stderr tail so the persisted incident records WHY
+// (the refapp's final output) instead of only "process exited unexpectedly
+// (code=1)". The message is always written to incident.json, so this guarantees
+// the cause reaches the run evidence.
+func livenessDeathMessage(s livenessSnapshot) string {
+	msg := "refapp process died mid-run: " + s.Reason()
+	if s.Signature == "" && s.Trace != "" {
+		msg += "\n" + s.Trace
+	}
+	return msg
 }
 
 // handleIncident captures forensics on a violation and writes the
