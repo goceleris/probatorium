@@ -19,7 +19,7 @@ func TestSuperviseStderr_TailCapturedOnCleanExit(t *testing.T) {
 	var readyCalled, crashCalled bool
 
 	superviseStderr(in, l,
-		func() { readyCalled = true },
+		func(string) { readyCalled = true },
 		func(error) {},
 		func() { crashCalled = true },
 	)
@@ -46,7 +46,7 @@ func TestSuperviseStderr_SignatureTracePreserved(t *testing.T) {
 		"fatal error: concurrent map writes\n" +
 		"goroutine 1 [running]:\n")
 	l := &livenessTally{}
-	superviseStderr(in, l, func() {}, func(error) {}, func() {})
+	superviseStderr(in, l, func(string) {}, func(error) {}, func() {})
 
 	snap := l.snapshot()
 	if snap.Signature == "" {

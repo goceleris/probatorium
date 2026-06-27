@@ -1,13 +1,16 @@
 package validation
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,8 +35,11 @@ type shrinkCfg struct {
 	// per seed. Each shrink attempt brings up a fresh refapp so
 	// state from the failing replay doesn't bleed in.
 	RefappBin string
-	// RefappListenAddr is what the refapp binds. Same value
-	// orchestrator passed in (typically 127.0.0.1:8080).
+	// RefappListenAddr is the -bind value for the fresh refapp. Same
+	// value the orchestrator passed in — typically "127.0.0.1:0" in
+	// matrix mode, where the OS picks the port and the refapp announces
+	// the real one on its "ready addr=" banner (attemptShrink reads it
+	// back rather than assuming the port from this field).
 	RefappListenAddr string
 	// CelerisCommit is recorded in the per-attempt log.
 	CelerisCommit string
@@ -167,6 +173,10 @@ func attemptShrink(ctx context.Context, seed uint64, dur time.Duration, cfg shri
 	// (Cross-host shrink lives on top of the SSH driver in a
 	// follow-up.)
 	refappCmd := exec.CommandContext(ctx, cfg.RefappBin, "-bind", cfg.RefappListenAddr)
+	stdout, err := refappCmd.StdoutPipe()
+	if err != nil {
+		return false, 0, fmt.Errorf("refapp stdout pipe: %w", err)
+	}
 	if err := refappCmd.Start(); err != nil {
 		return false, 0, fmt.Errorf("start refapp: %w", err)
 	}
@@ -177,15 +187,20 @@ func attemptShrink(ctx context.Context, seed uint64, dur time.Duration, cfg shri
 		_ = refappCmd.Wait()
 	}()
 
-	// Give the refapp 5s to bind. Crude but enough — the shrinker
-	// is best-effort and a stuck refapp is rare on a clean fresh
-	// process.
-	time.Sleep(2 * time.Second)
+	// Read the refapp's "ready addr=" banner to learn its REAL bound
+	// address. With "-bind :0" the OS picks the port, so we can't assume
+	// it from RefappListenAddr — that's exactly how matrix mode dodges the
+	// ephemeral-port allocation race. Bounded so a refapp that never binds
+	// doesn't hang the (best-effort) shrink.
+	readyAddr := waitReadyLine(stdout, 10*time.Second)
+	if readyAddr == "" {
+		return false, 0, fmt.Errorf("refapp did not announce ready addr")
+	}
 
 	args := []string{
 		"-seed", fmt.Sprintf("0x%x", seed),
 		"-celeris-pid", strconv.Itoa(refappCmd.Process.Pid),
-		"-celeris-port", portFromAddr(cfg.RefappListenAddr),
+		"-celeris-port", portFromAddr(readyAddr),
 		"-duration", dur.String(),
 	}
 	if cfg.CelerisCommit != "" {
@@ -200,6 +215,35 @@ func attemptShrink(ctx context.Context, seed uint64, dur time.Duration, cfg shri
 		return true, exitErr.ExitCode(), nil
 	} else {
 		return false, 0, fmt.Errorf("replay fork: %w", err)
+	}
+}
+
+// waitReadyLine scans r for the refapp's "ready addr=<addr>" banner and
+// returns the announced addr (host:port), or "" if it doesn't arrive
+// within timeout (or the stream ends first). After matching it keeps
+// draining r so the refapp never blocks writing stdout for the rest of
+// the attempt; the goroutine exits when the pipe closes (refapp killed).
+func waitReadyLine(r io.Reader, timeout time.Duration) string {
+	ch := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		sent := false
+		for sc.Scan() {
+			if !sent && strings.HasPrefix(sc.Text(), "ready addr=") {
+				ch <- strings.TrimSpace(strings.TrimPrefix(sc.Text(), "ready addr="))
+				sent = true
+			}
+		}
+		if !sent {
+			ch <- ""
+		}
+	}()
+	select {
+	case addr := <-ch:
+		return addr
+	case <-time.After(timeout):
+		return ""
 	}
 }
 

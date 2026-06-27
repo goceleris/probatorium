@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -301,9 +300,10 @@ func buildRefappBin(ctx context.Context, root, slug string) (string, error) {
 // time budget = total_duration / len(cells), and writes a single
 // v5.1 validate-results.json with Cells[] populated.
 //
-// Per-cell port allocation uses ephemeral TCP listeners (port 0) so
-// cells never collide even when run in parallel by a future
-// extension.
+// Per-cell port allocation passes "-bind 127.0.0.1:0" to the refapp,
+// which binds an OS-assigned port and announces the real one on its
+// "ready addr=" banner — so cells never collide, with no pre-allocation
+// race, even when run in parallel by a future extension.
 //
 // Returns the aggregate exit error: non-nil if any cell failed
 // hard. Per-cell snapshots are still recorded in Cells[] regardless
@@ -406,13 +406,16 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		defer func() { _ = os.Remove(tempBin) }()
 	}
 
-	// Allocate a unique loopback port for the cell so concurrent
-	// re-runs / sibling matrix runs never collide.
-	port, err := pickEphemeralPort()
-	if err != nil {
-		return cell, fmt.Errorf("port: %w", err)
-	}
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	// Bind the refapp to an OS-assigned loopback port: pass ":0" and let
+	// the kernel choose. The refapp creates the listener itself, announces
+	// the real port on its "ready addr=" banner, and the orchestrator
+	// parses that for all traffic + forensics. This replaces the old
+	// pickEphemeralPort scheme (bind :0 → close → hand the freed port to
+	// the refapp, which rebound it seconds later): that close-then-rebind
+	// window collided with the cell's own load test churning the ephemeral
+	// range to exhaustion, so the refapp failed to bind ("address already
+	// in use") and died — surfacing as a spurious std-engine I-LIVENESS.
+	addr := "127.0.0.1:0"
 
 	cellOut := filepath.Join(cfg.OutDir, fmt.Sprintf("cell-%02d-%s-%s", idx, mc.Refapp, mc.Engine))
 	if err := os.MkdirAll(cellOut, 0o755); err != nil {
@@ -475,22 +478,6 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		return cell, fmt.Errorf("cell run: %w", runErr)
 	}
 	return cell, nil
-}
-
-// pickEphemeralPort asks the kernel for a free port, returns the
-// chosen port number, and immediately releases the listener. Race-
-// prone in theory (another process could grab the same port between
-// release and the refapp's bind) but the window is microseconds and
-// the refapps all bind to 127.0.0.1, so it's acceptable for matrix
-// runs on the cluster (no other listener competes for loopback).
-func pickEphemeralPort() (int, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return port, nil
 }
 
 // writeJSON marshals v to path with indent=2 + trailing newline. A

@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/probatorium/report"
@@ -199,6 +200,15 @@ type Orchestrator struct {
 	tier3Snapshot tier3TallySnapshot
 	tier1Ran      bool
 	tier3Ran      bool
+
+	// resolvedAddr is the refapp's REAL bound address (host:port),
+	// learned from the "ready addr=" banner once Tier 1 brings the
+	// refapp up. With a "-bind :0" launch the OS chooses the port, so
+	// this — not cfg.CelerisListenAddr (which is "127.0.0.1:0" in matrix
+	// mode) — is the address live forensics (pprof) must target.
+	// atomic.Pointer because the Tier 1 goroutine publishes it while the
+	// incident handler reads it.
+	resolvedAddr atomic.Pointer[string]
 }
 
 // Plan is the deterministic schedule [Orchestrator.Run] would execute.
@@ -679,6 +689,16 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	var pid int
 	go func() { pid = <-pidCh }() // best-effort: stays 0 until startup
 
+	// addrCh receives the refapp's real bound addr once it's up (the
+	// "-bind :0" port the OS chose). Published to the orchestrator so
+	// handleIncident can point live pprof forensics at the right port.
+	addrCh := make(chan string, 1)
+	go func() {
+		if a := <-addrCh; a != "" {
+			o.resolvedAddr.Store(&a)
+		}
+	}()
+
 	// alertedCounters tracks which sub-tally counters we've already
 	// emitted an Incident for, so the periodic callback fires AT MOST
 	// ONCE per counter per run. Without this, a steady-rate adversarial
@@ -746,6 +766,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// the value so handleIncident can drive /proc + pprof
 		// forensics against the same process Tier 1 is exercising.
 		PIDChan:               pidCh,
+		AddrChan:              addrCh,
 		TallyCallback:         tallyCB,
 		TallyCallbackInterval: 2 * time.Second,
 		// Periodic snapshot to disk so long-running soaks (24h, 72h,
@@ -999,7 +1020,14 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 // forensics_status.txt stub; the dossier still includes incident.json
 // and shrink_plan.json so the orchestrator can act on what it has.
 func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Incident) error {
-	return captureForensicsLive(ctx, dir, inc.RefappPID, o.cfg.CelerisListenAddr)
+	// Prefer the refapp's REAL bound addr (the "-bind :0" port the OS
+	// chose, learned from the ready banner); fall back to the configured
+	// addr for fixed-port / single-cell runs where they're the same.
+	addr := o.cfg.CelerisListenAddr
+	if r := o.resolvedAddr.Load(); r != nil && *r != "" {
+		addr = *r
+	}
+	return captureForensicsLive(ctx, dir, inc.RefappPID, addr)
 }
 
 // Tier1Summary projects a tier1TallySnapshot into the public

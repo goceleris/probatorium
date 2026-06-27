@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -203,8 +204,12 @@ func main() {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	fmt.Printf("ready addr=%s\n", *bind)
-	if err := srv.Start(); err != nil {
+	ln, err := net.Listen("tcp", *bind)
+	if err != nil {
+		log.Fatalf("observability: listen: %v", err)
+	}
+	fmt.Printf("ready addr=%s\n", ln.Addr().String())
+	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("observability: start: %v", err)
 	}
 }

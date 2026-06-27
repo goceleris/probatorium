@@ -32,6 +32,7 @@ import (
 	"io/fs"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -181,8 +182,12 @@ func main() {
 	// path checks the static middleware does for traversal.
 	_ = strings.TrimPrefix
 
-	fmt.Printf("ready addr=%s\n", *bind)
-	if err := srv.Start(); err != nil {
+	ln, err := net.Listen("tcp", *bind)
+	if err != nil {
+		log.Fatalf("static_swagger_proxy: listen: %v", err)
+	}
+	fmt.Printf("ready addr=%s\n", ln.Addr().String())
+	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("static_swagger_proxy: start: %v", err)
 	}
 }

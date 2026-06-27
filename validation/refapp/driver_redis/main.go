@@ -29,6 +29,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -235,8 +236,12 @@ func main() {
 		_ = srv.Shutdown(shCtx)
 	}()
 
-	fmt.Printf("ready addr=%s\n", *bind)
-	if err := srv.Start(); err != nil {
+	ln, err := net.Listen("tcp", *bind)
+	if err != nil {
+		log.Fatalf("driver_redis: listen: %v", err)
+	}
+	fmt.Printf("ready addr=%s\n", ln.Addr().String())
+	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("driver_redis: start: %v", err)
 	}
 }

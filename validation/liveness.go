@@ -271,16 +271,19 @@ func looksLikeCrash(line string) bool {
 // waitForReady — that spawned its own short-lived reader).
 //
 // It does three jobs from one scan loop:
-//  1. ready detection — signals onReady when it sees the "ready addr=" banner;
-//     if EOF arrives first, the refapp died before binding → onReadyFail with
-//     the captured pre-ready output (so the dossier records WHY).
+//  1. ready detection — signals onReady (with the addr parsed off the banner)
+//     when it sees the "ready addr=" line; if EOF arrives first, the refapp
+//     died before binding → onReadyFail with the captured pre-ready output (so
+//     the dossier records WHY). The parsed addr is the refapp's REAL bound
+//     address — with a "-bind :0" launch the OS picks the port and the refapp
+//     announces it here, which is the only place the caller learns it.
 //  2. crash-signature scan — after ready, the first line matching a runtime
 //     crash marker is recorded on the liveness tally and triggers onCrash.
 //  3. unconditional drain — every post-ready line is consumed even when no
 //     reader cares, so the refapp can never block writing a multi-megabyte
 //     goroutine dump on its way down. A stalled write there would stop the
 //     process from exiting and HIDE the crash from the exit watcher.
-func superviseStderr(r io.Reader, l *livenessTally, onReady func(), onReadyFail func(error), onCrash func()) {
+func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), onReadyFail func(error), onCrash func()) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	ready := false
@@ -297,7 +300,7 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(), onReadyFail 
 		if !ready {
 			if strings.HasPrefix(line, "ready addr=") {
 				ready = true
-				onReady()
+				onReady(strings.TrimSpace(strings.TrimPrefix(line, "ready addr=")))
 				continue
 			}
 			if preReady.Len() < refappOutputCapMax {

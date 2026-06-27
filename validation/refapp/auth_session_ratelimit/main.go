@@ -22,6 +22,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -235,8 +236,12 @@ func main() {
 
 	// Print the canonical ready line BEFORE Start (which blocks). The
 	// orchestrator parses this line to know when to start probing.
-	fmt.Printf("ready addr=%s\n", *bind)
-	if err := srv.Start(); err != nil {
+	ln, err := net.Listen("tcp", *bind)
+	if err != nil {
+		log.Fatalf("auth_session_ratelimit: listen: %v", err)
+	}
+	fmt.Printf("ready addr=%s\n", ln.Addr().String())
+	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("auth_session_ratelimit: start: %v", err)
 	}
 }
