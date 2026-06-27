@@ -209,20 +209,39 @@ func celerisVersion() (string, error) {
 	if v := os.Getenv("CELERIS_VERSION"); v != "" {
 		return v, nil
 	}
-	data, err := os.ReadFile("go.mod")
-	if err != nil {
-		return "dev", nil
+	// Root go.mod first (probatorium standalone could pin celeris directly).
+	if v := requireVersionFromFile("go.mod", "github.com/goceleris/celeris"); v != "" {
+		return v, nil
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "github.com/goceleris/celeris ") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				return fields[1], nil
-			}
-		}
+	// Fall back to the celeris ADAPTER's go.mod: probatorium's root module does
+	// NOT require celeris (only the servers/celeris SUT does), so without this
+	// the version degrades to "dev" even on a tagged release — which is exactly
+	// what mislabeled the v1.5.5 publish (run dir "...-bench-dev"). The adapter
+	// pin is the version actually benched, so use it for the run-dir name and
+	// the publish version. PUBLISH_VERSION / CELERIS_VERSION still override.
+	if v := requireVersionFromFile("servers/celeris/go.mod", "github.com/goceleris/celeris"); v != "" {
+		return v, nil
 	}
 	return "dev", nil
+}
+
+// requireVersionFromFile returns the version pinned for modPath in the named
+// go.mod, or "" when the file or require is absent. It matches the module path
+// exactly (so "…/celeris" never matches "…/celeris/middleware/metrics") and
+// only accepts a require line (version starts with "v"), so a `replace …=>…`
+// directive for the same module is ignored.
+func requireVersionFromFile(file, modPath string) string {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) >= 2 && fields[0] == modPath && strings.HasPrefix(fields[1], "v") {
+			return fields[1]
+		}
+	}
+	return ""
 }
 
 // goModRequireVersion returns the version pinned for modPath in the

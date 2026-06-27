@@ -137,6 +137,19 @@ func BenchTier() error {
 		_ = os.Setenv("BENCH_RATED", "1")
 	}
 	setBenchEnvFromProfile(p, false)
+
+	// Publish preflight: if this run WILL publish at the end, prove NOW (before
+	// the multi-hour bench) that the docs token + version resolve. A missing
+	// DOCS_DISPATCH_TOKEN secret otherwise wastes the entire run — the v1.5.5
+	// bench finished all 813 cells and then failed the final push because the
+	// token was unresolvable on the runner. Skipped for data-only runs.
+	skipPublish := os.Getenv("BENCH_PUBLISH") == "0" || os.Getenv("BENCH_PUBLISH") == "false"
+	if !skipPublish {
+		if err := publishPreflight(); err != nil {
+			return fmt.Errorf("publish preflight failed — aborting before the bench to avoid wasting cluster time (set BENCH_PUBLISH=0 for a data-only run): %w", err)
+		}
+	}
+
 	if err := Bench(); err != nil {
 		return fmt.Errorf("bench: %w", err)
 	}
@@ -147,8 +160,8 @@ func BenchTier() error {
 	// the public docs site. v3.8's 5s smoke test accidentally published
 	// 110 OK + 2 DNF + 21 not_applicable cells because there was no env
 	// knob to suppress the auto-publish — root cause of the docs pollution
-	// that needed a manual revert.
-	skipPublish := os.Getenv("BENCH_PUBLISH") == "0" || os.Getenv("BENCH_PUBLISH") == "false"
+	// that needed a manual revert. (skipPublish is computed above, before the
+	// bench, so the publish preflight can gate the run.)
 	if skipPublish {
 		fmt.Printf("\n=== BENCH_PUBLISH=0 — skipping docs push (smoke test mode) ===\n")
 	} else {
