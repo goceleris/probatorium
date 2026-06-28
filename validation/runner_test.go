@@ -394,7 +394,7 @@ func TestOrchestratorBuildDriver_SSHWithHostAndUser(t *testing.T) {
 }
 
 func TestBuildRefappArgs_NoEngine(t *testing.T) {
-	got := buildRefappArgs("127.0.0.1:8080", "", "")
+	got := buildRefappArgs("127.0.0.1:8080", "", "", 0)
 	want := []string{"-bind", "127.0.0.1:8080"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -407,7 +407,8 @@ func TestBuildRefappArgs_NoEngine(t *testing.T) {
 }
 
 func TestBuildRefappArgs_WithEngine(t *testing.T) {
-	got := buildRefappArgs("127.0.0.1:8080", "iouring", "")
+	// workers=0 must NOT add -workers even for iouring.
+	got := buildRefappArgs("127.0.0.1:8080", "iouring", "", 0)
 	want := []string{"-bind", "127.0.0.1:8080", "-engine", "iouring"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -415,6 +416,39 @@ func TestBuildRefappArgs_WithEngine(t *testing.T) {
 	for i := range got {
 		if got[i] != want[i] {
 			t.Errorf("[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestBuildRefappArgs_Workers locks the io_uring-scoping of the -workers cap:
+// it is emitted only for the ring-allocating engines (iouring/adaptive) and
+// only when > 0, so std/epoll cells keep their GOMAXPROCS worker count (no
+// needless coverage loss) and a 0 value is a no-op everywhere.
+func TestBuildRefappArgs_Workers(t *testing.T) {
+	hasWorkers := func(args []string) string {
+		for i, a := range args {
+			if a == "-workers" && i+1 < len(args) {
+				return args[i+1]
+			}
+		}
+		return ""
+	}
+	cases := []struct {
+		engine  string
+		workers int
+		want    string // expected -workers value, "" = flag absent
+	}{
+		{"iouring", 4, "4"},
+		{"adaptive", 4, "4"},
+		{"epoll", 4, ""},   // honours Workers but no locked mem to save → leave full
+		{"std", 4, ""},     // net/http ignores Workers
+		{"iouring", 0, ""}, // 0 = leave GOMAXPROCS default
+		{"", 4, ""},        // no engine pin → no cap
+	}
+	for _, c := range cases {
+		got := hasWorkers(buildRefappArgs("127.0.0.1:8080", c.engine, "", c.workers))
+		if got != c.want {
+			t.Errorf("engine=%q workers=%d: -workers=%q, want %q", c.engine, c.workers, got, c.want)
 		}
 	}
 }

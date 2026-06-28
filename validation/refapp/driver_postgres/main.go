@@ -30,6 +30,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -63,6 +64,7 @@ func envOr(key, def string) string {
 func main() {
 	bind := flag.String("bind", "127.0.0.1:8080", "address:port to listen on")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto")
+	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	dsn := flag.String("postgres-dsn", envOr("PROBATORIUM_PG_DSN",
 		"postgres://bench:bench@127.0.0.1:54321/bench?sslmode=disable"),
 		"libpq DSN; env: PROBATORIUM_PG_DSN")
@@ -106,6 +108,7 @@ func main() {
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
+		Workers:         *workersFlag,
 		Protocol:        celeris.HTTP1,
 		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,
@@ -292,8 +295,12 @@ func main() {
 		_ = srv.Shutdown(shCtx)
 	}()
 
-	fmt.Printf("ready addr=%s\n", *bind)
-	if err := srv.Start(); err != nil {
+	ln, err := net.Listen("tcp", *bind)
+	if err != nil {
+		log.Fatalf("driver_postgres: listen: %v", err)
+	}
+	fmt.Printf("ready addr=%s\n", ln.Addr().String())
+	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("driver_postgres: start: %v", err)
 	}
 }

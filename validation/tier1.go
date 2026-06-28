@@ -44,9 +44,13 @@ type tier1Config struct {
 	// the refapp's "ready addr=" stdout line before sending traffic.
 	RefappArgs []string
 
-	// BaseURL is the http://host:port prefix the Markov walker
-	// targets. Caller picks this in lockstep with RefappArgs so both
-	// agree on which port the refapp binds.
+	// BaseURL is a FALLBACK http://host:port prefix for the walkers,
+	// used only until the refapp announces its real bound address. With a
+	// "-bind :0" launch the OS picks the port, so the authoritative
+	// target is the addr parsed off the "ready addr=" banner (see
+	// driveTier1, which rebuilds the effective base URL from it once the
+	// refapp is up). A fixed-port launch makes BaseURL and the announced
+	// addr agree, so this stays correct in single-cell mode too.
 	BaseURL string
 
 	// Matrix drives the realistic 60% slice of the workload mix.
@@ -77,6 +81,14 @@ type tier1Config struct {
 	// uses this to fan the PID into forensics capture on hard fail
 	// without having to introspect Driver internals.
 	PIDChan chan<- int
+
+	// AddrChan, when non-nil, receives the refapp's REAL bound address
+	// (host:port, no scheme) exactly once — the addr parsed off the
+	// "ready addr=" banner after the refapp binds. Capacity 1;
+	// driveTier1 non-blocking sends. The orchestrator uses it to target
+	// live forensics (pprof) at the actual port when the refapp launched
+	// with "-bind :0" and the OS chose the port.
+	AddrChan chan<- string
 
 	// TallyCallback, when non-nil, is invoked at a fixed cadence with
 	// the current tally snapshot. The orchestrator uses this to watch
@@ -182,8 +194,9 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	readyCh := make(chan struct{})
 	readyErrCh := make(chan error, 1)
 	var readyOnce sync.Once
+	var readyAddr string // refapp's REAL bound addr; set before close(readyCh)
 	go superviseStderr(proc.Stderr(), tally.liveness,
-		func() { readyOnce.Do(func() { close(readyCh) }) },
+		func(addr string) { readyOnce.Do(func() { readyAddr = addr; close(readyCh) }) },
 		func(err error) {
 			select {
 			case readyErrCh <- err:
@@ -204,6 +217,32 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		return tally.snapshot(), ctx.Err()
 	}
 
+	// The refapp announced its REAL bound address on the ready banner.
+	// With a "-bind :0" launch the OS chose the port, so this — not the
+	// pre-launch cfg.BaseURL guess — is the authoritative target for the
+	// walkers, the warm-up, and the responsiveness probe. A fixed-port
+	// launch makes the two agree, so single-cell mode is unaffected.
+	//
+	// The banner carries host:port (net.Listener.Addr().String()); strip a
+	// stray scheme defensively so a "http://host:port" banner still yields
+	// a single, clean base URL rather than "http://http://...".
+	if readyAddr != "" {
+		readyAddr = strings.TrimPrefix(strings.TrimPrefix(readyAddr, "http://"), "https://")
+	}
+	baseURL := cfg.BaseURL
+	if readyAddr != "" {
+		baseURL = "http://" + readyAddr
+	}
+	// Surface the resolved addr so the orchestrator can target live
+	// forensics (pprof) at the actual port. Non-blocking — cap-1 channel,
+	// read at most once.
+	if cfg.AddrChan != nil && readyAddr != "" {
+		select {
+		case cfg.AddrChan <- readyAddr:
+		default:
+		}
+	}
+
 	// Refapp is bound; surface its PID for the orchestrator's
 	// forensics path. Non-blocking — if the channel is full (the
 	// orchestrator only ever reads once) we drop silently.
@@ -219,7 +258,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	// deadlock / wedge (celeris#311) the per-request walkers read as mere
 	// connection errors. Health-probe timeouts trip it; cancelRun winds the
 	// run down so driveTier1 returns promptly with Hung set.
-	go watchResponsiveness(runCtx, cfg.BaseURL, tally.liveness, cancelRun)
+	go watchResponsiveness(runCtx, baseURL, tally.liveness, cancelRun)
 
 	// Tier 1 fan-out. Five slices today (matches the full workload
 	// mix called out in issue #55):
@@ -234,7 +273,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	// h2c churn, WS torture, and SSE kill all speak raw TCP so they
 	// can send bytes net/http would otherwise rewrite (or, for h2c,
 	// complete handshakes we explicitly want to RST mid-flight).
-	hostPort := strings.TrimPrefix(strings.TrimPrefix(cfg.BaseURL, "http://"), "https://")
+	hostPort := strings.TrimPrefix(strings.TrimPrefix(baseURL, "http://"), "https://")
 	httpc := &http.Client{Timeout: cfg.RequestTimeout}
 
 	// Warm-up phase: hit /healthz repeatedly for 30s before launching
@@ -252,7 +291,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	if dl, ok := runCtx.Deadline(); !ok || time.Until(dl) >= time.Minute {
 		const warmupBudget = 30 * time.Second
 		warmupCtx, cancelWarmup := context.WithTimeout(runCtx, warmupBudget)
-		req, werr := http.NewRequestWithContext(warmupCtx, "GET", cfg.BaseURL+"/healthz", nil)
+		req, werr := http.NewRequestWithContext(warmupCtx, "GET", baseURL+"/healthz", nil)
 		if werr == nil {
 			for warmupCtx.Err() == nil {
 				resp, derr := httpc.Do(req.Clone(warmupCtx))
@@ -331,7 +370,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		go func(walkerID int) {
 			defer wg.Done()
 			seed := cfg.Seed ^ uint64(walkerID)*0x9e3779b97f4a7c15
-			runMarkovWalker(runCtx, httpc, cfg.BaseURL, cfg.Matrix, seed, tally)
+			runMarkovWalker(runCtx, httpc, baseURL, cfg.Matrix, seed, tally)
 		}(i)
 	}
 	for i := 0; i < advCount; i++ {
@@ -431,8 +470,11 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 
 // waitForReady tails the refapp's combined stderr+stdout until it
 // emits the canonical `ready addr=<addr>` line (see
-// validation/refapp/auth_session_ratelimit/main.go:10). Returns
-// non-nil error on timeout or process death before ready.
+// validation/refapp/auth_session_ratelimit/main.go:10). On success it
+// returns the announced addr — the refapp's REAL bound address, which
+// with a "-bind :0" launch is the OS-chosen port the caller cannot know
+// otherwise. Returns a non-nil error (and "") on timeout or process
+// death before ready.
 //
 // The scanner goroutine selects on readyCtx for EVERY channel send,
 // not just the loop boundary. This closes the leak the 3-day soak
@@ -459,7 +501,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 // or fill incident dossiers indefinitely.
 const refappOutputCapMax = 64 * 1024
 
-func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duration) error {
+func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duration) (string, error) {
 	readyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if timeout > 0 {
@@ -522,17 +564,17 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 	for {
 		select {
 		case <-readyCtx.Done():
-			return appendCaptured(fmt.Errorf("ready timeout: %w", readyCtx.Err()))
+			return "", appendCaptured(fmt.Errorf("ready timeout: %w", readyCtx.Err()))
 		case line, ok := <-lineCh:
 			if !ok {
-				return appendCaptured(fmt.Errorf("refapp exited before ready: %w", io.EOF))
+				return "", appendCaptured(fmt.Errorf("refapp exited before ready: %w", io.EOF))
 			}
 			if strings.HasPrefix(line, "ready addr=") {
-				return nil
+				return strings.TrimSpace(strings.TrimPrefix(line, "ready addr=")), nil
 			}
 			captureLine(line)
 		case err := <-errCh:
-			return appendCaptured(fmt.Errorf("refapp exited before ready: %w", err))
+			return "", appendCaptured(fmt.Errorf("refapp exited before ready: %w", err))
 		}
 	}
 }

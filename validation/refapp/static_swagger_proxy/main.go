@@ -32,6 +32,7 @@ import (
 	"io/fs"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -72,11 +73,13 @@ const openAPISpec = `{
 func main() {
 	bind := flag.String("bind", "127.0.0.1:8080", "address:port to listen on")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto")
+	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	flag.Parse()
 
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
+		Workers:         *workersFlag,
 		Protocol:        celeris.HTTP1,
 		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,
@@ -181,8 +184,12 @@ func main() {
 	// path checks the static middleware does for traversal.
 	_ = strings.TrimPrefix
 
-	fmt.Printf("ready addr=%s\n", *bind)
-	if err := srv.Start(); err != nil {
+	ln, err := net.Listen("tcp", *bind)
+	if err != nil {
+		log.Fatalf("static_swagger_proxy: listen: %v", err)
+	}
+	fmt.Printf("ready addr=%s\n", ln.Addr().String())
+	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("static_swagger_proxy: start: %v", err)
 	}
 }

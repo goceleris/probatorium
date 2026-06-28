@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goceleris/probatorium/report"
@@ -151,6 +152,15 @@ type Config struct {
 	// crashed in celeris#309 and that the AsyncHandlers=true refapps never
 	// exercised (validation gap C).
 	RefappAsyncHandlers string
+
+	// RefappWorkers, when > 0, caps the refapp's io_uring worker count
+	// (passed as `-workers <n>`, plumbed to celeris.Config.Workers) for the
+	// ring-allocating engines only — see buildRefappArgs. 0 leaves the
+	// celeris GOMAXPROCS default. Lets a memory-constrained validation host
+	// run the heaviest io_uring refapp without io_uring_setup ENOMEM, while
+	// keeping every io_uring code path covered. Must be 0 or >= 2 (celeris
+	// rejects Workers in [1,2)).
+	RefappWorkers int
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -199,6 +209,15 @@ type Orchestrator struct {
 	tier3Snapshot tier3TallySnapshot
 	tier1Ran      bool
 	tier3Ran      bool
+
+	// resolvedAddr is the refapp's REAL bound address (host:port),
+	// learned from the "ready addr=" banner once Tier 1 brings the
+	// refapp up. With a "-bind :0" launch the OS chooses the port, so
+	// this — not cfg.CelerisListenAddr (which is "127.0.0.1:0" in matrix
+	// mode) — is the address live forensics (pprof) must target.
+	// atomic.Pointer because the Tier 1 goroutine publishes it while the
+	// incident handler reads it.
+	resolvedAddr atomic.Pointer[string]
 }
 
 // Plan is the deterministic schedule [Orchestrator.Run] would execute.
@@ -679,6 +698,16 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	var pid int
 	go func() { pid = <-pidCh }() // best-effort: stays 0 until startup
 
+	// addrCh receives the refapp's real bound addr once it's up (the
+	// "-bind :0" port the OS chose). Published to the orchestrator so
+	// handleIncident can point live pprof forensics at the right port.
+	addrCh := make(chan string, 1)
+	go func() {
+		if a := <-addrCh; a != "" {
+			o.resolvedAddr.Store(&a)
+		}
+	}()
+
 	// alertedCounters tracks which sub-tally counters we've already
 	// emitted an Incident for, so the periodic callback fires AT MOST
 	// ONCE per counter per run. Without this, a steady-rate adversarial
@@ -724,7 +753,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// is the catch-all that the per-protocol counters above can't see — a
 		// dead server just looks like connection-refused to every walker.
 		fire(properties.ILiveness.ID,
-			fmt.Sprintf("refapp process died mid-run: %s", snap.Liveness.Reason()),
+			livenessDeathMessage(snap.Liveness),
 			snap.Liveness.Crashed)
 		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
 		// connection errors). Complements I-LIVENESS for the hang class.
@@ -735,7 +764,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 
 	cfg := tier1Config{
 		Driver:      driver,
-		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers),
+		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers, o.cfg.RefappWorkers),
 		BaseURL:     "http://" + o.cfg.CelerisListenAddr,
 		Matrix:      o.matrix,
 		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
@@ -746,6 +775,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// the value so handleIncident can drive /proc + pprof
 		// forensics against the same process Tier 1 is exercising.
 		PIDChan:               pidCh,
+		AddrChan:              addrCh,
 		TallyCallback:         tallyCB,
 		TallyCallbackInterval: 2 * time.Second,
 		// Periodic snapshot to disk so long-running soaks (24h, 72h,
@@ -861,7 +891,7 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 
 	cfg := tier3Config{
 		Driver:        driver,
-		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers),
+		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers, o.cfg.RefappWorkers),
 		ReplayBin:     replayBin,
 		Seeds:         o.seeds,
 		CelerisCommit: o.cfg.CelerisCommit,
@@ -912,6 +942,21 @@ func summariseTier3Stderr(res tier3Result) string {
 	default:
 		return fmt.Sprintf("exit=%d (no output)", res.ExitCode)
 	}
+}
+
+// livenessDeathMessage renders the I-LIVENESS incident message. Reason()
+// already names a death that left a recognised crash signature; for a clean
+// exit with NO signature (e.g. the refapp's own log.Fatalf -> os.Exit(1)) it
+// appends the captured stdout+stderr tail so the persisted incident records WHY
+// (the refapp's final output) instead of only "process exited unexpectedly
+// (code=1)". The message is always written to incident.json, so this guarantees
+// the cause reaches the run evidence.
+func livenessDeathMessage(s livenessSnapshot) string {
+	msg := "refapp process died mid-run: " + s.Reason()
+	if s.Signature == "" && s.Trace != "" {
+		msg += "\n" + s.Trace
+	}
+	return msg
 }
 
 // handleIncident captures forensics on a violation and writes the
@@ -984,7 +1029,14 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 // forensics_status.txt stub; the dossier still includes incident.json
 // and shrink_plan.json so the orchestrator can act on what it has.
 func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Incident) error {
-	return captureForensicsLive(ctx, dir, inc.RefappPID, o.cfg.CelerisListenAddr)
+	// Prefer the refapp's REAL bound addr (the "-bind :0" port the OS
+	// chose, learned from the ready banner); fall back to the configured
+	// addr for fixed-port / single-cell runs where they're the same.
+	addr := o.cfg.CelerisListenAddr
+	if r := o.resolvedAddr.Load(); r != nil && *r != "" {
+		addr = *r
+	}
+	return captureForensicsLive(ctx, dir, inc.RefappPID, addr)
 }
 
 // Tier1Summary projects a tier1TallySnapshot into the public
@@ -1238,13 +1290,28 @@ func PrintReplayPlan(w io.Writer, rs ReplayedSeed) {
 // the engine choice through Config.RefappEngine so a single mage
 // Validate run can pin to a specific celeris engine without rebuilding
 // the refapp.
-func buildRefappArgs(addr, engine, asyncHandlers string) []string {
+//
+// workers caps the refapp's io_uring worker count (celeris.Config.Workers)
+// and is emitted ONLY for the ring-allocating engines (iouring / adaptive),
+// and only when > 0. Memory-constrained validation hosts can't pin 16
+// io_uring rings (one per worker at GOMAXPROCS) alongside the heaviest
+// refapp's heap — kitchen_sink-iouring hit io_uring_setup ENOMEM on a 28GB
+// host. Capping workers shrinks the locked-page footprint (4 workers ≈ 4×
+// less, below the 12-worker host that already survives) while preserving
+// every io_uring code path. std ignores Workers; epoll honours it but has
+// no locked memory to save, so it's deliberately left at GOMAXPROCS to keep
+// its cross-loop SO_REUSEPORT coverage intact. celeris requires Workers>=2
+// when set; 0 = leave the GOMAXPROCS default.
+func buildRefappArgs(addr, engine, asyncHandlers string, workers int) []string {
 	args := []string{"-bind", addr}
 	if engine != "" {
 		args = append(args, "-engine", engine)
 	}
 	if asyncHandlers != "" {
 		args = append(args, "-async-handlers="+asyncHandlers)
+	}
+	if workers > 0 && (engine == "iouring" || engine == "adaptive") {
+		args = append(args, "-workers", strconv.Itoa(workers))
 	}
 	return args
 }

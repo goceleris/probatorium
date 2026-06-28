@@ -30,6 +30,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -56,6 +57,7 @@ var apiKeys = []string{"walker-api-key-1", "walker-api-key-2"}
 func main() {
 	bind := flag.String("bind", "127.0.0.1:8080", "address:port to listen on")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto")
+	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	flag.Parse()
 
 	engineType := resolveEngine(*engineFlag)
@@ -63,6 +65,7 @@ func main() {
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          engineType,
+		Workers:         *workersFlag,
 		Protocol:        celeris.HTTP1,
 		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,
@@ -144,8 +147,12 @@ func main() {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	fmt.Printf("ready addr=%s\n", *bind)
-	if err := srv.Start(); err != nil {
+	ln, err := net.Listen("tcp", *bind)
+	if err != nil {
+		log.Fatalf("auth_jwt_csrf: listen: %v", err)
+	}
+	fmt.Printf("ready addr=%s\n", ln.Addr().String())
+	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("auth_jwt_csrf: start: %v", err)
 	}
 }

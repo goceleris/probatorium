@@ -259,8 +259,12 @@ func TestWaitForReady_NoGoroutineLeak(t *testing.T) {
 		if err != nil {
 			t.Fatalf("start: %v", err)
 		}
-		if err := waitForReady(context.Background(), proc, time.Second); err != nil {
+		addr, err := waitForReady(context.Background(), proc, time.Second)
+		if err != nil {
 			t.Fatalf("waitForReady iter %d: %v", i, err)
+		}
+		if addr != "127.0.0.1:0" {
+			t.Fatalf("waitForReady iter %d: addr=%q, want 127.0.0.1:0", i, addr)
 		}
 		// SIGTERM the refapp to free its pipe goroutines.
 		_ = proc.Signal(0xf)

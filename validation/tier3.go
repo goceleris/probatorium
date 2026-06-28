@@ -270,7 +270,8 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3
 	}
 	defer func() { _ = proc.Signal(0xf) /* SIGTERM */ }()
 
-	if err := waitForReady(seedCtx, proc, cfg.ReadyTimeout); err != nil {
+	readyAddr, err := waitForReady(seedCtx, proc, cfg.ReadyTimeout)
+	if err != nil {
 		res.ExitCode = -1
 		// waitForReady already embeds any captured refapp stderr lines
 		// in the returned error string (see tier1.go), so the dossier
@@ -305,6 +306,16 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3
 	// WaitDelay (Go 1.20+) tightens the grace: stdout/stderr pipes are
 	// forcibly closed after the delay even if the process is stuck.
 	pidStr := strconv.Itoa(res.RefappPID)
+	// The refapp announced its real bound port on the ready banner; with a
+	// "-bind :0" launch that's the OS-chosen port the replay's fault
+	// injection must target. Fall back to the configured port only if the
+	// banner carried no parseable port (shouldn't happen) — which also
+	// fixes the prior default-8080 mismatch in matrix mode, where the
+	// refapp bound an ephemeral port but the replay was told 8080.
+	celerisPort := portFromAddr(readyAddr)
+	if celerisPort == "" || celerisPort == readyAddr {
+		celerisPort = strconv.Itoa(cfg.CelerisListenPort)
+	}
 	const replayGrace = 2 * time.Second
 	replayInternalDuration := cfg.PerSeedDuration
 	if replayInternalDuration > replayGrace {
@@ -316,7 +327,7 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3
 	args := []string{
 		"-seed", fmt.Sprintf("0x%x", seed.Value),
 		"-celeris-pid", pidStr,
-		"-celeris-port", strconv.Itoa(cfg.CelerisListenPort),
+		"-celeris-port", celerisPort,
 		"-duration", replayInternalDuration.String(),
 	}
 	if cfg.CelerisCommit != "" {

@@ -124,7 +124,10 @@ type livenessSnapshot struct {
 	// "fatal error: sync: unlock of unlocked mutex"), empty if the process
 	// died without printing a recognised marker (e.g. SIGKILL/OOM).
 	Signature string `json:"signature,omitempty"`
-	// Trace is a bounded tail of the stderr output following the signature.
+	// Trace is a bounded tail of the stderr output following the signature —
+	// or, when the process died WITHOUT a recognised signature (e.g. a clean
+	// os.Exit(1)), the tail of its final merged stdout+stderr, so the cause is
+	// still recorded.
 	Trace string `json:"trace,omitempty"`
 	// Hung is the deadlock oracle: the process stayed alive but stopped
 	// answering a periodic health probe. A true value is a hard failure.
@@ -228,6 +231,13 @@ func isProbeTimeout(err error) bool {
 const (
 	crashTraceMaxLines = 60
 	crashTraceMaxBytes = 16 * 1024
+	// refappTailMaxLines is how many trailing lines of the refapp's merged
+	// stdout+stderr to retain when it dies WITHOUT a recognised crash
+	// signature (e.g. a clean os.Exit(1) from its own log.Fatalf). The
+	// signature scan only keeps a trace once a runtime crash marker matches, so
+	// a clean exit previously recorded no output at all — this tail names the
+	// cause (e.g. the refapp's "<app>: start: <err>" line).
+	refappTailMaxLines = 80
 )
 
 // crashLineMarkers are line-start tokens the Go runtime ONLY emits on an
@@ -261,16 +271,19 @@ func looksLikeCrash(line string) bool {
 // waitForReady — that spawned its own short-lived reader).
 //
 // It does three jobs from one scan loop:
-//  1. ready detection — signals onReady when it sees the "ready addr=" banner;
-//     if EOF arrives first, the refapp died before binding → onReadyFail with
-//     the captured pre-ready output (so the dossier records WHY).
+//  1. ready detection — signals onReady (with the addr parsed off the banner)
+//     when it sees the "ready addr=" line; if EOF arrives first, the refapp
+//     died before binding → onReadyFail with the captured pre-ready output (so
+//     the dossier records WHY). The parsed addr is the refapp's REAL bound
+//     address — with a "-bind :0" launch the OS picks the port and the refapp
+//     announces it here, which is the only place the caller learns it.
 //  2. crash-signature scan — after ready, the first line matching a runtime
 //     crash marker is recorded on the liveness tally and triggers onCrash.
 //  3. unconditional drain — every post-ready line is consumed even when no
 //     reader cares, so the refapp can never block writing a multi-megabyte
 //     goroutine dump on its way down. A stalled write there would stop the
 //     process from exiting and HIDE the crash from the exit watcher.
-func superviseStderr(r io.Reader, l *livenessTally, onReady func(), onReadyFail func(error), onCrash func()) {
+func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), onReadyFail func(error), onCrash func()) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	ready := false
@@ -278,12 +291,16 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(), onReadyFail 
 	capturing := false
 	var trace strings.Builder
 	traceLines := 0
+	// Rolling ring of the last refappTailMaxLines post-ready lines, so a death
+	// with NO recognised crash signature still records its final output.
+	ring := make([]string, refappTailMaxLines)
+	ringLen, ringPos := 0, 0
 	for sc.Scan() {
 		line := sc.Text()
 		if !ready {
 			if strings.HasPrefix(line, "ready addr=") {
 				ready = true
-				onReady()
+				onReady(strings.TrimSpace(strings.TrimPrefix(line, "ready addr=")))
 				continue
 			}
 			if preReady.Len() < refappOutputCapMax {
@@ -291,6 +308,11 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(), onReadyFail 
 				preReady.WriteByte('\n')
 			}
 			continue
+		}
+		ring[ringPos] = line
+		ringPos = (ringPos + 1) % refappTailMaxLines
+		if ringLen < refappTailMaxLines {
+			ringLen++
 		}
 		if capturing {
 			if traceLines < crashTraceMaxLines && trace.Len() < crashTraceMaxBytes {
@@ -320,8 +342,24 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(), onReadyFail 
 		}
 		onReadyFail(err)
 	}
-	if capturing {
+	switch {
+	case capturing:
 		l.attachTrace(trace.String())
+	case ready && ringLen > 0:
+		// Died after ready with no recognised crash signature (e.g. a clean
+		// os.Exit(1) from the refapp's own log.Fatalf). Attach the tail of the
+		// merged stream so the incident records WHY instead of just "exit=1".
+		start := 0
+		if ringLen == refappTailMaxLines {
+			start = ringPos
+		}
+		var tail strings.Builder
+		tail.WriteString("--- refapp stdout+stderr tail (no crash signature) ---\n")
+		for i := 0; i < ringLen; i++ {
+			tail.WriteString(ring[(start+i)%refappTailMaxLines])
+			tail.WriteByte('\n')
+		}
+		l.attachTrace(tail.String())
 	}
 }
 
