@@ -1048,3 +1048,68 @@ func TestDurationSeconds(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckDataCompleteness is the regression guard for the publish-time
+// completeness gate — the protection that was ABSENT while hdr_histogram_b64,
+// loadgen_cpu_p95, and framework_version silently shipped empty across four
+// releases. A complete doc passes; each individual silent-drop must fail the
+// gate; BENCH_PUBLISH_FORCE=1 bypasses.
+func TestCheckDataCompleteness(t *testing.T) {
+	mk := func() *report.Document {
+		return &report.Document{
+			BenchmarkConfig: report.BenchmarkConfig{
+				StartedAt:  time.Now().Add(-time.Hour),
+				FinishedAt: time.Now(),
+			},
+			Benchmarks: []report.ServerResult{{
+				Name: "celeris-std-h1", Framework: "celeris", Language: "go", Category: "celeris",
+				FrameworkVersion:  "v1.5.6",
+				SaturationModeRPS: map[string]float64{"get-json": 100000},
+				HdrHistogramB64:   map[string]string{"get-json": "HISTFAAA"},
+				LoadgenCPUP95:     map[string]float64{"get-json": 0.6},
+			}},
+		}
+	}
+	if err := checkDataCompleteness(mk()); err != nil {
+		t.Fatalf("a complete document must pass the gate: %v", err)
+	}
+	defects := map[string]func(*report.Document){
+		"empty histogram":   func(d *report.Document) { d.Benchmarks[0].HdrHistogramB64 = map[string]string{"get-json": ""} },
+		"empty cpu":         func(d *report.Document) { d.Benchmarks[0].LoadgenCPUP95 = map[string]float64{} },
+		"empty fwk version": func(d *report.Document) { d.Benchmarks[0].FrameworkVersion = "" },
+		"zero started_at":   func(d *report.Document) { d.BenchmarkConfig.StartedAt = time.Time{} },
+		"empty saturation":  func(d *report.Document) { d.Benchmarks[0].SaturationModeRPS = nil },
+		"no celeris column": func(d *report.Document) { d.Benchmarks[0].Framework = "gin" },
+	}
+	for name, mut := range defects {
+		d := mk()
+		mut(d)
+		if err := checkDataCompleteness(d); err == nil {
+			t.Errorf("%s: gate should FAIL but passed", name)
+		}
+	}
+	// FORCE override ships a known-incomplete run anyway.
+	t.Setenv("BENCH_PUBLISH_FORCE", "1")
+	d := mk()
+	d.Benchmarks[0].FrameworkVersion = ""
+	if err := checkDataCompleteness(d); err != nil {
+		t.Errorf("BENCH_PUBLISH_FORCE=1 must bypass the gate: %v", err)
+	}
+}
+
+// TestClusterServerMetaFrameworkVersion pins the cluster-path framework_version
+// fix: celeris columns carry the threaded benched version, competitors carry
+// their registry-pinned version (the field was 0/52 before — never assigned).
+func TestClusterServerMetaFrameworkVersion(t *testing.T) {
+	cells := map[string]*report.CellResult{
+		"celeris-std-h1|get-json": {},
+		"gin-h1|get-json":         {},
+	}
+	meta := clusterServerMeta(cells, "v1.5.9")
+	if got := meta["celeris-std-h1"].FrameworkVersion; got != "v1.5.9" {
+		t.Errorf("celeris FrameworkVersion = %q, want v1.5.9 (threaded benched version)", got)
+	}
+	if got := meta["gin-h1"].FrameworkVersion; got == "" {
+		t.Error("gin-h1 FrameworkVersion is empty; want the registry-pinned version")
+	}
+}

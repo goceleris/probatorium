@@ -349,10 +349,16 @@
 - name: "{{ cell.1 }} run={{ cell.0 }} | start observer sampler (server side)"
   # The observer sidecars the server during the cell and emits a 1Hz
   # SQLite time series of FD count, RSS, goroutine count, GC pause,
-  # and accept/close totals. Server adapters under test don't expose
-  # /debug/vars themselves (only celeris does), so the metrics-URL
-  # flag is intentionally empty here — /proc-derived fields (RSS,
-  # FDs) carry the leak-detection signal.
+  # and accept/close totals. /proc-derived fields (RSS, FDs) carry the
+  # leak-detection signal for EVERY adapter; the Go-runtime fields
+  # (goroutine count, heap, GC pause) come from -metrics-url scraping
+  # the SUT's expvar /debug/vars, which only celeris exposes among the
+  # benched adapters. The bench-cell playbook only knows the competitor
+  # slug (cell.1), not the adapter language, so we gate the metrics URL
+  # on the celeris-* name prefix: celeris cells scrape the local expvar
+  # endpoint (the SUT binds 0.0.0.0:{{ bench_port }} on this host), and
+  # every non-celeris cell keeps an empty -metrics-url so no non-Go
+  # competitor is asked for Go expvar it doesn't serve.
   #
   # Runs as root (`become: true`) because the bench server above is
   # started under root (it needs `ulimit -l unlimited` to lift
@@ -364,7 +370,7 @@
     cd {{ bench_root }}
     nohup ./observer \
       -pid $(cat {{ cell_dir }}/server.pid) \
-      -metrics-url '' \
+      -metrics-url '{{ ("http://127.0.0.1:" ~ (bench_port | default(8080)) ~ "/debug/vars") if (cell.1 | regex_search("^celeris")) else "" }}' \
       -out {{ cell_dir }}/observer.sqlite \
       -interval 1s \
       > {{ cell_dir }}/observer.log 2>&1 &

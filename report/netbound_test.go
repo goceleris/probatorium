@@ -78,8 +78,11 @@ func TestNetworkBoundFlaggedAtLineRate(t *testing.T) {
 func TestNetworkBoundLoadgenSaturatedNotFlagged(t *testing.T) {
 	t.Parallel()
 	cpu := 42.0
-	// 19.2 Gbps but loadgen self-CPU p95 = 900% (9 cores) → above the ceiling.
-	hot := bwCell("post-64k", "axum", 2.4e9, 900, 35000, &cpu)
+	// 19.2 Gbps but loadgen self-CPU p95 = 95% of all cores (→ agg 0.95,
+	// above the 0.90 fraction-of-all-cores ceiling). A realistic pegged-client
+	// value — the old fixture used 900, which the real sampler (normalised to
+	// 0–100% of all cores) can never emit, so it masked the dead 8.0 guard.
+	hot := bwCell("post-64k", "axum", 2.4e9, 95, 35000, &cpu)
 	agg := Aggregate([]CellResult{hot})
 	doc := BuildDocument(BuildInput{
 		Environment: Environment{FabricLineRateBitsPerSec: 20_000_000_000},

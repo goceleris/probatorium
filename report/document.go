@@ -236,11 +236,15 @@ const (
 
 	// networkBoundLoadgenCPUCeiling guards against mislabelling a
 	// loadgen-bottlenecked cell as NIC-bound. LoadgenCPUP95 is a fraction of
-	// one core; a value at/above this means the load generator itself was the
-	// limit, so the cell's ceiling is a client artefact, not the fabric.
-	// (Realistically a NIC-bound cell shows LOW loadgen CPU — the client is
-	// blocked on the wire, not burning cycles.)
-	networkBoundLoadgenCPUCeiling = 8.0
+	// ALL cores in [0,~1.0] (loadgen samples self-CPU normalised by core
+	// count, then Aggregate divides by 100) — so a value at/above this means
+	// the load generator was burning most of the machine and the cell's
+	// ceiling is a client artefact, not the fabric. (A genuinely NIC-bound
+	// cell shows LOW loadgen CPU — the client is blocked on the wire, not
+	// spinning.) MUST be in fraction-of-all-cores units: the historical 8.0
+	// here was a cores-count value the 0-1 metric could never reach, so the
+	// guard was dead code and never excluded a loadgen-pegged false positive.
+	networkBoundLoadgenCPUCeiling = 0.90
 )
 
 // isFanoutBound reports whether a scenario's throughput is paced by the

@@ -282,7 +282,8 @@ func Bench() error {
 		}
 	}
 
-	ts := time.Now().UTC().Format("20060102-150405")
+	benchStart := time.Now().UTC()
+	ts := benchStart.Format("20060102-150405")
 	resultsDir, err := filepath.Abs(filepath.Join("results",
 		fmt.Sprintf("%s-bench-%s", ts, version)))
 	if err != nil {
@@ -506,6 +507,7 @@ func Bench() error {
 		Conns:      conns,
 		Runs:       runs,
 		Seed:       seed,
+		StartedAt:  benchStart,
 	})
 	if err != nil {
 		return fmt.Errorf("merge results: %w", err)
@@ -1016,11 +1018,16 @@ func writeClusterTimeseries(resultsDir string, hostCells map[string][]cellRecord
 			}
 			results = append(results, res)
 		}
-		// Server keys on competitor; the host dimension is folded into the
-		// Category slot so a competitor benched on both targets stays
-		// attributable without bloating the sidecar shape.
+		// Category is the benchmark category for this competitor (looked up
+		// from the registry), matching summary.json and the in-process path
+		// (report/aggregate.go passes c.Category here). Empty when the
+		// competitor isn't in the registry.
+		cat := ""
+		if a, ok := servers.Registry[k.Competitor]; ok {
+			cat = a.Category
+		}
 		doc.Scenarios = append(doc.Scenarios,
-			report.BuildScenarioSeries(k.Scenario, k.Competitor, k.Host, results))
+			report.BuildScenarioSeries(k.Scenario, k.Competitor, cat, results))
 	}
 
 	data, err := doc.MarshalGzip()
@@ -1476,6 +1483,9 @@ type benchParams struct {
 	Conns      string
 	Runs       string
 	Seed       string
+	// StartedAt is the bench wall-clock start, captured once in Bench() so
+	// the merged BenchmarkConfig.started_at is real (not the zero time).
+	StartedAt time.Time
 }
 
 // clusterScenarioName is the legacy single-scenario fallback. Since
@@ -1669,14 +1679,19 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 
 	now := time.Now().UTC()
 	bench := report.BenchmarkConfig{
-		FinishedAt:      now,
-		Runs:            atoiOr(p.Runs, 0),
-		Duration:        parseDurationOr(p.Duration),
-		Warmup:          parseDurationOr(p.Warmup),
-		GitRef:          gitRefOr(),
-		LoadgenVer:      goModRequireVersion("github.com/goceleris/loadgen"),
-		CelerisVer:      p.CelerisVer,
-		ScenariosFilter: "target=" + target,
+		StartedAt:  p.StartedAt,
+		FinishedAt: now,
+		Runs:       atoiOr(p.Runs, 0),
+		Duration:   parseDurationOr(p.Duration),
+		Warmup:     parseDurationOr(p.Warmup),
+		GitRef:     gitRefOr(),
+		LoadgenVer: goModRequireVersion("github.com/goceleris/loadgen"),
+		CelerisVer: p.CelerisVer,
+		// ScenariosFilter is the -scenarios CLI arg, empty = "all" (see
+		// schema). The cluster bench runs the full scenario set, so it's
+		// left empty rather than stuffed with the bench TARGET host (which
+		// is already captured in HostArchPair) — the old "target=<host>"
+		// value misused this field and misled consumers parsing it.
 	}
 
 	env := report.Environment{
@@ -1695,7 +1710,7 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 		HostArchPair:    "linux/" + benchTargetArch(target),
 		Environment:     env,
 		BenchmarkConfig: bench,
-		Servers:         clusterServerMeta(collected),
+		Servers:         clusterServerMeta(collected, p.CelerisVer),
 		Agg:             agg,
 	})
 
@@ -1716,7 +1731,7 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 // language, framework, engine) facets and synthesise CompileOptions
 // from the language. Competitors absent from the registry still get a
 // zero-valued meta so the Document carries them.
-func clusterServerMeta(cells map[string]*report.CellResult) map[string]report.ServerMeta {
+func clusterServerMeta(cells map[string]*report.CellResult, celerisVer string) map[string]report.ServerMeta {
 	out := make(map[string]report.ServerMeta, len(cells))
 	// The bucket key is "<competitor>|<scenario>" after the rated/scenario
 	// fix in mergeBenchResults. The servers.Registry is keyed by the
@@ -1737,6 +1752,13 @@ func clusterServerMeta(cells map[string]*report.CellResult) map[string]report.Se
 			m.Language = a.Language
 			m.Framework = a.Framework
 			m.Engine = a.Engine
+			// celeris' version is the benched build, set dynamically; every
+			// other framework's pinned version comes from the registry.
+			if a.Framework == "celeris" {
+				m.FrameworkVersion = celerisVer
+			} else {
+				m.FrameworkVersion = a.FrameworkVersion
+			}
 			m.CompileOptions = report.CompileOptionsFor(a.Language, benchTargetGOARCH())
 			if a.Language == "go" {
 				m.LanguageVersion = runtime.Version()

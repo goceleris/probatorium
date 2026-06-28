@@ -1807,12 +1807,19 @@ func buildDocument(cfg Config, agg map[string]report.CellAggregate, started time
 func serverMetaFromRegistry() map[string]report.ServerMeta {
 	out := make(map[string]report.ServerMeta, len(servers.Registry))
 	for name, a := range servers.Registry {
+		fwVer := a.FrameworkVersion
+		if a.Framework == "celeris" {
+			// celeris' version is the runner's pinned build, not a registry
+			// constant; modRequireVersion returns "" if absent (acceptable).
+			fwVer = modRequireVersion("github.com/goceleris/celeris")
+		}
 		m := report.ServerMeta{
-			Category:       a.Category,
-			Language:       a.Language,
-			Framework:      a.Framework,
-			Engine:         a.Engine,
-			CompileOptions: report.CompileOptionsFor(a.Language, runtime.GOARCH),
+			Category:         a.Category,
+			Language:         a.Language,
+			Framework:        a.Framework,
+			FrameworkVersion: fwVer,
+			Engine:           a.Engine,
+			CompileOptions:   report.CompileOptionsFor(a.Language, runtime.GOARCH),
 		}
 		if a.Language == "go" {
 			m.LanguageVersion = runtime.Version()

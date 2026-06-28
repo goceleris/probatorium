@@ -102,11 +102,31 @@ func Publish() error {
 		return err
 	}
 
+	// Provenance single-source: the publish version (meta.Version) is
+	// authoritative — it names the results tree. The embedded
+	// BenchmarkConfig.CelerisVer can be stale ("dev") when the bench ran
+	// before a tag resolved, which is exactly how published v1.5.5 shipped
+	// celeris_version="dev" while the tree said v1.5.5. Overwrite so the
+	// embedded value and the tree can never disagree.
+	if meta.Version != "" {
+		doc.BenchmarkConfig.CelerisVer = meta.Version
+	}
+
 	// Integrity gate (v3.9): refuse to ship a run that v3.8 proved can
 	// look complete while being broken — a force-exited runner column,
 	// a mostly-dead grid, or cells measured against a crashed SUT. The
 	// summary prints either way; BENCH_PUBLISH_FORCE=1 overrides.
 	if err := checkPublishIntegrity(resultsDir, doc); err != nil {
+		return err
+	}
+
+	// Data-completeness gate: refuse to ship a document missing data that
+	// must never be empty. This is the guard that was absent while
+	// hdr_histogram_b64 / loadgen_cpu_p95 / framework_version silently
+	// shipped empty for four releases (v1.5.2–v1.5.5). BENCH_PUBLISH_FORCE=1
+	// overrides (e.g. backfilling an old run whose raw data predates a
+	// metric). See checkDataCompleteness.
+	if err := checkDataCompleteness(doc); err != nil {
 		return err
 	}
 
@@ -145,6 +165,98 @@ func Publish() error {
 // event type. It simply delegates to Publish.
 func PublishValidate() error {
 	return Publish()
+}
+
+// checkDataCompleteness fails the publish when the merged Document is missing
+// data that must never ship empty. It is the structural guard that was absent
+// while hdr_histogram_b64, loadgen_cpu_p95, and framework_version silently
+// shipped 0/52 — and started_at shipped as the zero time — across FOUR
+// releases (v1.5.2–v1.5.5). A "looks complete but is empty" document now fails
+// here at release time instead of being discovered four releases later.
+//
+// BENCH_PUBLISH_FORCE=1 overrides (same escape hatch as the integrity gate),
+// e.g. to backfill an old run whose RAW data predates a metric (the v1.5.5
+// histograms can be backfilled, but that run never captured loadgen_cpu_p95).
+func checkDataCompleteness(doc *report.Document) error {
+	var problems []string
+
+	bc := doc.BenchmarkConfig
+	if bc.StartedAt.IsZero() {
+		problems = append(problems, "benchmark_config.started_at is the zero time (cluster-merge never set it)")
+	}
+	if bc.FinishedAt.IsZero() {
+		problems = append(problems, "benchmark_config.finished_at is the zero time")
+	}
+	if !bc.StartedAt.IsZero() && !bc.FinishedAt.IsZero() && bc.FinishedAt.Before(bc.StartedAt) {
+		problems = append(problems, "benchmark_config.finished_at precedes started_at")
+	}
+
+	celerisSeen := false
+	for _, b := range doc.Benchmarks {
+		// Every cell, every framework: identity + the headline metric must
+		// be present (these are projected verbatim from the registry / the
+		// always-emitted aggregate, so empty here means a real drop).
+		if b.Name == "" {
+			problems = append(problems, "a benchmark row has an empty name")
+		}
+		for field, v := range map[string]string{"framework": b.Framework, "language": b.Language, "category": b.Category} {
+			if v == "" {
+				problems = append(problems, fmt.Sprintf("%s: %s is empty", b.Name, field))
+			}
+		}
+		if len(b.SaturationModeRPS) == 0 {
+			problems = append(problems, fmt.Sprintf("%s: saturation_mode_rps is empty (no scenario produced a number)", b.Name))
+		}
+
+		// The framework UNDER TEST must carry its full per-cell data — this
+		// is the exact set that silently shipped empty. Competitor rows are
+		// exempt (their version/CPU/histogram coverage is best-effort).
+		if b.Framework == "celeris" {
+			celerisSeen = true
+			if b.FrameworkVersion == "" {
+				problems = append(problems, fmt.Sprintf("%s: framework_version is empty (celeris is the framework under test)", b.Name))
+			}
+			if countNonEmptyStr(b.HdrHistogramB64) == 0 {
+				problems = append(problems, fmt.Sprintf("%s: hdr_histogram_b64 has no non-empty entries (histogram dropped)", b.Name))
+			}
+			if countNonZeroF(b.LoadgenCPUP95) == 0 {
+				problems = append(problems, fmt.Sprintf("%s: loadgen_cpu_p95 has no non-zero entries (self-CPU sampler off?)", b.Name))
+			}
+		}
+	}
+	if !celerisSeen {
+		problems = append(problems, "no celeris column in the document — the framework under test is missing entirely")
+	}
+
+	if len(problems) == 0 {
+		return nil
+	}
+	msg := fmt.Sprintf("publish data-completeness gate FAILED (%d issue(s)):\n  - %s", len(problems), strings.Join(problems, "\n  - "))
+	if os.Getenv("BENCH_PUBLISH_FORCE") == "1" {
+		fmt.Fprintf(os.Stderr, "WARNING: %s\n(shipping anyway: BENCH_PUBLISH_FORCE=1)\n", msg)
+		return nil
+	}
+	return fmt.Errorf("%s\n(set BENCH_PUBLISH_FORCE=1 to deliberately ship a known-incomplete run)", msg)
+}
+
+func countNonEmptyStr(m map[string]string) int {
+	n := 0
+	for _, v := range m {
+		if v != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func countNonZeroF(m map[string]float64) int {
+	n := 0
+	for _, v := range m {
+		if v != 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // loadPublishInputs resolves the run metadata and reads the newest bench

@@ -388,3 +388,22 @@ func TestDefaultRatedFractionsMatchBudgetModel(t *testing.T) {
 			got, budget.DefaultRatedPasses)
 	}
 }
+
+// TestServerMetaFromRegistryFrameworkVersion pins the in-process-path
+// framework_version fix: competitor rows carry their registry-pinned version
+// (the field was never assigned before, shipping 0/52). celeris rows resolve
+// from the runner's pinned celeris module via modRequireVersion.
+func TestServerMetaFromRegistryFrameworkVersion(t *testing.T) {
+	m := serverMetaFromRegistry()
+	if got := m["gin-h1"].FrameworkVersion; got == "" {
+		t.Error("gin-h1 FrameworkVersion is empty; want the registry-pinned version")
+	}
+	// celeris columns must be present (the framework under test); the exact
+	// version depends on the runner's go.mod, so only assert non-empty when
+	// the pin is resolvable in this build context.
+	if v := modRequireVersion("github.com/goceleris/celeris"); v != "" {
+		if got := m["celeris-std-h1"].FrameworkVersion; got != v {
+			t.Errorf("celeris-std-h1 FrameworkVersion = %q, want %q (runner's pinned celeris)", got, v)
+		}
+	}
+}

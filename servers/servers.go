@@ -127,8 +127,13 @@ type Adapter struct {
 	Category  string
 	Language  string
 	Framework string
-	Engine    string
-	Bin       BuildSpec
+	// FrameworkVersion is the framework's pinned version, surfaced as
+	// benchmarks[].framework_version. Empty when there is no stable
+	// version source (celeris' version is set dynamically by the report
+	// builders, not here).
+	FrameworkVersion string
+	Engine           string
+	Bin              BuildSpec
 
 	// Capabilities is the declared Phase-2 capability manifest for this
 	// adapter — the single source of truth the scheduler trusts instead of
@@ -176,31 +181,34 @@ var Registry = map[string]Adapter{
 	// stdhttp baseline — 3 modes (H1, H2C-only, hybrid). Treated as
 	// three distinct cell-columns because performance differs by mode.
 	"stdhttp-h1": {
-		Name:         "stdhttp-h1",
-		Category:     "go-net-http",
-		Language:     "go",
-		Framework:    "stdhttp",
-		Engine:       "h1",
-		Bin:          GoBinary{ModuleDir: "servers/stdhttp"},
-		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
+		Name:             "stdhttp-h1",
+		Category:         "go-net-http",
+		Language:         "go",
+		Framework:        "stdhttp",
+		FrameworkVersion: "net/http (Go stdlib)",
+		Engine:           "h1",
+		Bin:              GoBinary{ModuleDir: "servers/stdhttp"},
+		Capabilities:     Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"stdhttp-h2": {
-		Name:         "stdhttp-h2",
-		Category:     "go-net-http",
-		Language:     "go",
-		Framework:    "stdhttp",
-		Engine:       "h2c-noupg",
-		Bin:          GoBinary{ModuleDir: "servers/stdhttp"},
-		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
+		Name:             "stdhttp-h2",
+		Category:         "go-net-http",
+		Language:         "go",
+		Framework:        "stdhttp",
+		FrameworkVersion: "net/http (Go stdlib)",
+		Engine:           "h2c-noupg",
+		Bin:              GoBinary{ModuleDir: "servers/stdhttp"},
+		Capabilities:     Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"stdhttp-hybrid": {
-		Name:         "stdhttp-hybrid",
-		Category:     "go-net-http",
-		Language:     "go",
-		Framework:    "stdhttp",
-		Engine:       "hybrid",
-		Bin:          GoBinary{ModuleDir: "servers/stdhttp"},
-		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
+		Name:             "stdhttp-hybrid",
+		Category:         "go-net-http",
+		Language:         "go",
+		Framework:        "stdhttp",
+		FrameworkVersion: "net/http (Go stdlib)",
+		Engine:           "hybrid",
+		Bin:              GoBinary{ModuleDir: "servers/stdhttp"},
+		Capabilities:     Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 
 	// gorilla_ws — the WS/SSE reference adapter. A net/http server whose
@@ -214,7 +222,7 @@ var Registry = map[string]Adapter{
 	// middleware-chain support. TLS is reachable via the shared terminator
 	// like every other adapter.
 	"gorilla_ws": {
-		Name: "gorilla_ws", Category: "go-net-http", Language: "go", Framework: "gorilla", Engine: "h1",
+		Name: "gorilla_ws", Category: "go-net-http", Language: "go", Framework: "gorilla", FrameworkVersion: "v1.5.3", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/gorilla_ws"},
 		Capabilities: Capabilities{Static: true, WS: true, SSE: true, TLS: true},
 	},
@@ -247,54 +255,54 @@ var Registry = map[string]Adapter{
 	// gin / echo / chi / iris — net/http-based routers. Each carries an
 	// h1 and an h2c (h2c.NewHandler-wrapped) variant.
 	"gin-h1": {
-		Name: "gin-h1", Category: "go-net-http", Language: "go", Framework: "gin", Engine: "h1",
+		Name: "gin-h1", Category: "go-net-http", Language: "go", Framework: "gin", FrameworkVersion: "v1.12.0", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/gin"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"gin-h2": {
-		Name: "gin-h2", Category: "go-net-http", Language: "go", Framework: "gin", Engine: "h2c",
+		Name: "gin-h2", Category: "go-net-http", Language: "go", Framework: "gin", FrameworkVersion: "v1.12.0", Engine: "h2c",
 		Bin:          GoBinary{ModuleDir: "servers/gin"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"echo-h1": {
-		Name: "echo-h1", Category: "go-net-http", Language: "go", Framework: "echo", Engine: "h1",
+		Name: "echo-h1", Category: "go-net-http", Language: "go", Framework: "echo", FrameworkVersion: "v4.15.4", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/echo"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"echo-h2": {
-		Name: "echo-h2", Category: "go-net-http", Language: "go", Framework: "echo", Engine: "h2c",
+		Name: "echo-h2", Category: "go-net-http", Language: "go", Framework: "echo", FrameworkVersion: "v4.15.4", Engine: "h2c",
 		Bin:          GoBinary{ModuleDir: "servers/echo"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"chi-h1": {
-		Name: "chi-h1", Category: "go-net-http", Language: "go", Framework: "chi", Engine: "h1",
+		Name: "chi-h1", Category: "go-net-http", Language: "go", Framework: "chi", FrameworkVersion: "v5.3.0", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/chi"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"chi-h2": {
-		Name: "chi-h2", Category: "go-net-http", Language: "go", Framework: "chi", Engine: "h2c",
+		Name: "chi-h2", Category: "go-net-http", Language: "go", Framework: "chi", FrameworkVersion: "v5.3.0", Engine: "h2c",
 		Bin:          GoBinary{ModuleDir: "servers/chi"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"iris-h1": {
-		Name: "iris-h1", Category: "go-net-http", Language: "go", Framework: "iris", Engine: "h1",
+		Name: "iris-h1", Category: "go-net-http", Language: "go", Framework: "iris", FrameworkVersion: "v12.2.11", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/iris"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"iris-h2": {
-		Name: "iris-h2", Category: "go-net-http", Language: "go", Framework: "iris", Engine: "h2c",
+		Name: "iris-h2", Category: "go-net-http", Language: "go", Framework: "iris", FrameworkVersion: "v12.2.11", Engine: "h2c",
 		Bin:          GoBinary{ModuleDir: "servers/iris"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 
 	// hertz — netpoll-backed. H1 + native H2 via hertz-contrib.
 	"hertz-h1": {
-		Name: "hertz-h1", Category: "go-netpoll", Language: "go", Framework: "hertz", Engine: "h1",
+		Name: "hertz-h1", Category: "go-netpoll", Language: "go", Framework: "hertz", FrameworkVersion: "v0.10.5", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/hertz"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"hertz-h2": {
-		Name: "hertz-h2", Category: "go-netpoll", Language: "go", Framework: "hertz", Engine: "h2c",
+		Name: "hertz-h2", Category: "go-netpoll", Language: "go", Framework: "hertz", FrameworkVersion: "v0.10.5", Engine: "h2c",
 		Bin:          GoBinary{ModuleDir: "servers/hertz"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
@@ -307,26 +315,26 @@ var Registry = map[string]Adapter{
 	// Static-only capability manifest (no Drivers / Middleware / WS / SSE /
 	// TLS). H1-only.
 	"gnet-h1": {
-		Name: "gnet-h1", Category: "go-gnet", Language: "go", Framework: "gnet", Engine: "h1",
+		Name: "gnet-h1", Category: "go-gnet", Language: "go", Framework: "gnet", FrameworkVersion: "v2.9.8", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/gnet"},
 		Capabilities: Capabilities{Static: true},
 	},
 	// nbio — lesegit/nbio epoll event-loop (the other Go async-IO lib next to
 	// gnet). Separate module (servers/nbio/go.mod). H1-only, Static.
 	"nbio-h1": {
-		Name: "nbio-h1", Category: "go-nbio", Language: "go", Framework: "nbio", Engine: "h1",
+		Name: "nbio-h1", Category: "go-nbio", Language: "go", Framework: "nbio", FrameworkVersion: "v1.6.9", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/nbio"},
 		Capabilities: Capabilities{Static: true},
 	},
 
 	// fasthttp + fiber — H1-only. fiber wraps fasthttp.
 	"fasthttp-h1": {
-		Name: "fasthttp-h1", Category: "go-fasthttp", Language: "go", Framework: "fasthttp", Engine: "h1",
+		Name: "fasthttp-h1", Category: "go-fasthttp", Language: "go", Framework: "fasthttp", FrameworkVersion: "v1.71.0", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/fasthttp"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
 	"fiber-h1": {
-		Name: "fiber-h1", Category: "go-fasthttp", Language: "go", Framework: "fiber", Engine: "h1",
+		Name: "fiber-h1", Category: "go-fasthttp", Language: "go", Framework: "fiber", FrameworkVersion: "v2.52.13", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/fiber"},
 		Capabilities: Capabilities{Static: true, Drivers: true, Middleware: true},
 	},
@@ -343,7 +351,7 @@ var Registry = map[string]Adapter{
 	// h1 column (below) and a prior-knowledge h2c column (-h2): hyper, ntex,
 	// and axum-on-hyper all serve cleartext h2c, selected via -engine h2c.
 	"axum": {
-		Name: "axum", Category: "rust-tower", Language: "rust", Framework: "axum", Engine: "h1",
+		Name: "axum", Category: "rust-tower", Language: "rust", Framework: "axum", FrameworkVersion: ">=0.7", Engine: "h1",
 		Bin: NativeBinary{
 			Lang: "rust",
 			BuildSteps: []string{
@@ -365,7 +373,7 @@ var Registry = map[string]Adapter{
 	// gives HTTP2C=true / HTTP1=false, so only the H2 scenarios schedule
 	// here (the H1 grid stays on the axum column).
 	"axum-h2": {
-		Name: "axum-h2", Category: "rust-tower", Language: "rust", Framework: "axum", Engine: "h2c-noupg",
+		Name: "axum-h2", Category: "rust-tower", Language: "rust", Framework: "axum", FrameworkVersion: ">=0.7", Engine: "h2c-noupg",
 		Bin: NativeBinary{
 			Lang: "rust",
 			BuildSteps: []string{
@@ -378,7 +386,7 @@ var Registry = map[string]Adapter{
 		Capabilities: Capabilities{Static: true},
 	},
 	"ntex": {
-		Name: "ntex", Category: "rust-ntex", Language: "rust", Framework: "ntex", Engine: "h1",
+		Name: "ntex", Category: "rust-ntex", Language: "rust", Framework: "ntex", FrameworkVersion: ">=3", Engine: "h1",
 		Bin: NativeBinary{
 			Lang: "rust",
 			BuildSteps: []string{
@@ -409,7 +417,7 @@ var Registry = map[string]Adapter{
 	// as the other three Rust adapters (release-fat + target-cpu=native,
 	// `-bind`, `ready addr=` on stdout, SIGTERM graceful drain). H1-only.
 	"hyper": {
-		Name: "hyper", Category: "rust-hyper", Language: "rust", Framework: "hyper", Engine: "h1",
+		Name: "hyper", Category: "rust-hyper", Language: "rust", Framework: "hyper", FrameworkVersion: ">=1", Engine: "h1",
 		Bin: NativeBinary{
 			Lang: "rust",
 			BuildSteps: []string{
@@ -423,7 +431,7 @@ var Registry = map[string]Adapter{
 	// hyper-h2 — raw hyper's http2 server builder serves prior-knowledge
 	// h2c directly. Shares the competitors/hyper build (see axum-h2).
 	"hyper-h2": {
-		Name: "hyper-h2", Category: "rust-hyper", Language: "rust", Framework: "hyper", Engine: "h2c-noupg",
+		Name: "hyper-h2", Category: "rust-hyper", Language: "rust", Framework: "hyper", FrameworkVersion: ">=1", Engine: "h2c-noupg",
 		Bin: NativeBinary{
 			Lang: "rust",
 			BuildSteps: []string{
@@ -475,7 +483,7 @@ var Registry = map[string]Adapter{
 	// ORJSONResponse default class. See servers/fastapi/pyproject.toml
 	// for the always-latest dep set (no upper pins).
 	"fastapi": {
-		Name: "fastapi", Category: "python-fastapi", Language: "python", Framework: "fastapi", Engine: "h1",
+		Name: "fastapi", Category: "python-fastapi", Language: "python", Framework: "fastapi", FrameworkVersion: ">=0.115", Engine: "h1",
 		Bin: NativeBinary{
 			Lang:   "python",
 			RunCmd: "{bench}/competitors/{name}/server -bind {bind}",
@@ -489,7 +497,7 @@ var Registry = map[string]Adapter{
 	// dispatches -engine h2c → hypercorn. Shares the competitors/fastapi
 	// launcher via Bin.BinName (see axum-h2).
 	"fastapi-h2": {
-		Name: "fastapi-h2", Category: "python-fastapi", Language: "python", Framework: "fastapi", Engine: "h2c-noupg",
+		Name: "fastapi-h2", Category: "python-fastapi", Language: "python", Framework: "fastapi", FrameworkVersion: ">=0.115", Engine: "h2c-noupg",
 		Bin: NativeBinary{
 			Lang:    "python",
 			RunCmd:  "{bench}/competitors/{name}/server -bind {bind}",
@@ -513,7 +521,7 @@ var Registry = map[string]Adapter{
 	// both an h1 column and an aspnet-h2 prior-knowledge h2c column (Kestrel
 	// HttpProtocols.Http2, selected via -engine h2c).
 	"aspnet": {
-		Name: "aspnet", Category: "dotnet-aspnetcore", Language: "csharp", Framework: "aspnet", Engine: "h1",
+		Name: "aspnet", Category: "dotnet-aspnetcore", Language: "csharp", Framework: "aspnet", FrameworkVersion: "net10.0", Engine: "h1",
 		Bin: NativeBinary{
 			Lang: "dotnet",
 			BuildSteps: []string{
@@ -527,7 +535,7 @@ var Registry = map[string]Adapter{
 	// HttpProtocols is Http2; the -engine h2c mode selects it. Shares the
 	// competitors/aspnet build (see axum-h2).
 	"aspnet-h2": {
-		Name: "aspnet-h2", Category: "dotnet-aspnetcore", Language: "csharp", Framework: "aspnet", Engine: "h2c-noupg",
+		Name: "aspnet-h2", Category: "dotnet-aspnetcore", Language: "csharp", Framework: "aspnet", FrameworkVersion: "net10.0", Engine: "h2c-noupg",
 		Bin: NativeBinary{
 			Lang: "dotnet",
 			BuildSteps: []string{
@@ -691,7 +699,7 @@ var Registry = map[string]Adapter{
 
 	// actix — actix-web 4.x (rust role, unchanged). Worker-per-core, no TLS.
 	"actix": {
-		Name: "actix", Category: "rust-actix", Language: "rust", Framework: "actix-web", Engine: "h1",
+		Name: "actix", Category: "rust-actix", Language: "rust", Framework: "actix-web", FrameworkVersion: ">=4", Engine: "h1",
 		Bin: NativeBinary{
 			Lang:       "rust",
 			BuildSteps: []string{"source $RUSTUP_HOME/env", "cd $SRC && cargo build --profile release-fat"},
@@ -701,7 +709,7 @@ var Registry = map[string]Adapter{
 	},
 	// starlette — pure ASGI Starlette on uvicorn (python role, like fastapi).
 	"starlette": {
-		Name: "starlette", Category: "python-starlette", Language: "python", Framework: "starlette", Engine: "h1",
+		Name: "starlette", Category: "python-starlette", Language: "python", Framework: "starlette", FrameworkVersion: ">=0.40", Engine: "h1",
 		Bin: NativeBinary{
 			Lang:   "python",
 			RunCmd: "{bench}/competitors/{name}/server -bind {bind}",
@@ -755,7 +763,7 @@ var Registry = map[string]Adapter{
 	},
 	// uws — uWebSockets.js (NEW node role; launcher tier like bun). HTTP/1.1.
 	"uws": {
-		Name: "uws", Category: "node-uws", Language: "node", Framework: "uWebSockets.js", Engine: "h1",
+		Name: "uws", Category: "node-uws", Language: "node", Framework: "uWebSockets.js", FrameworkVersion: "v20.68.0", Engine: "h1",
 		Bin: NativeBinary{
 			Lang:   "node",
 			RunCmd: "{name} -bind {bind}",
@@ -783,7 +791,7 @@ var Registry = map[string]Adapter{
 	},
 	// vertx — Eclipse Vert.x (NEW java role; maven fat jar + launcher).
 	"vertx": {
-		Name: "vertx", Category: "java-vertx", Language: "java", Framework: "vertx", Engine: "h1",
+		Name: "vertx", Category: "java-vertx", Language: "java", Framework: "vertx", FrameworkVersion: ">=5.0.0", Engine: "h1",
 		Bin: NativeBinary{
 			Lang:   "java",
 			RunCmd: "{bin} -bind {bind}",
@@ -792,7 +800,7 @@ var Registry = map[string]Adapter{
 	},
 	// netty — raw Netty HTTP/1.1 (java role), the JVM floor analogue of hyper.
 	"netty": {
-		Name: "netty", Category: "java-netty", Language: "java", Framework: "netty", Engine: "h1",
+		Name: "netty", Category: "java-netty", Language: "java", Framework: "netty", FrameworkVersion: "4.2.9.Final", Engine: "h1",
 		Bin: NativeBinary{
 			Lang:   "java",
 			RunCmd: "{name} -bind {bind}",
