@@ -152,6 +152,15 @@ type Config struct {
 	// crashed in celeris#309 and that the AsyncHandlers=true refapps never
 	// exercised (validation gap C).
 	RefappAsyncHandlers string
+
+	// RefappWorkers, when > 0, caps the refapp's io_uring worker count
+	// (passed as `-workers <n>`, plumbed to celeris.Config.Workers) for the
+	// ring-allocating engines only — see buildRefappArgs. 0 leaves the
+	// celeris GOMAXPROCS default. Lets a memory-constrained validation host
+	// run the heaviest io_uring refapp without io_uring_setup ENOMEM, while
+	// keeping every io_uring code path covered. Must be 0 or >= 2 (celeris
+	// rejects Workers in [1,2)).
+	RefappWorkers int
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -755,7 +764,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 
 	cfg := tier1Config{
 		Driver:      driver,
-		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers),
+		RefappArgs:  buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers, o.cfg.RefappWorkers),
 		BaseURL:     "http://" + o.cfg.CelerisListenAddr,
 		Matrix:      o.matrix,
 		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
@@ -882,7 +891,7 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 
 	cfg := tier3Config{
 		Driver:        driver,
-		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers),
+		RefappArgs:    buildRefappArgs(o.cfg.CelerisListenAddr, o.cfg.RefappEngine, o.cfg.RefappAsyncHandlers, o.cfg.RefappWorkers),
 		ReplayBin:     replayBin,
 		Seeds:         o.seeds,
 		CelerisCommit: o.cfg.CelerisCommit,
@@ -1281,13 +1290,28 @@ func PrintReplayPlan(w io.Writer, rs ReplayedSeed) {
 // the engine choice through Config.RefappEngine so a single mage
 // Validate run can pin to a specific celeris engine without rebuilding
 // the refapp.
-func buildRefappArgs(addr, engine, asyncHandlers string) []string {
+//
+// workers caps the refapp's io_uring worker count (celeris.Config.Workers)
+// and is emitted ONLY for the ring-allocating engines (iouring / adaptive),
+// and only when > 0. Memory-constrained validation hosts can't pin 16
+// io_uring rings (one per worker at GOMAXPROCS) alongside the heaviest
+// refapp's heap — kitchen_sink-iouring hit io_uring_setup ENOMEM on a 28GB
+// host. Capping workers shrinks the locked-page footprint (4 workers ≈ 4×
+// less, below the 12-worker host that already survives) while preserving
+// every io_uring code path. std ignores Workers; epoll honours it but has
+// no locked memory to save, so it's deliberately left at GOMAXPROCS to keep
+// its cross-loop SO_REUSEPORT coverage intact. celeris requires Workers>=2
+// when set; 0 = leave the GOMAXPROCS default.
+func buildRefappArgs(addr, engine, asyncHandlers string, workers int) []string {
 	args := []string{"-bind", addr}
 	if engine != "" {
 		args = append(args, "-engine", engine)
 	}
 	if asyncHandlers != "" {
 		args = append(args, "-async-handlers="+asyncHandlers)
+	}
+	if workers > 0 && (engine == "iouring" || engine == "adaptive") {
+		args = append(args, "-workers", strconv.Itoa(workers))
 	}
 	return args
 }

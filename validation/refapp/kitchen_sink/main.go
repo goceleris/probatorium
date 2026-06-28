@@ -71,6 +71,7 @@ func main() {
 	rps := flag.Float64("rps", 5000, "ratelimit RPS per key (permissive for walker traffic)")
 	burst := flag.Int("burst", 1000, "ratelimit burst per key")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto")
+	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	flag.Parse()
 
 	engineType := resolveEngine(*engineFlag)
@@ -78,6 +79,7 @@ func main() {
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          engineType,
+		Workers:         *workersFlag,
 		Protocol:        celeris.HTTP1,
 		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,

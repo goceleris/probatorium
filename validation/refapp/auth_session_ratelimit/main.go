@@ -154,6 +154,7 @@ func main() {
 	rps := flag.Float64("rps", 1000, "ratelimit RPS per key")
 	burst := flag.Int("burst", 200, "ratelimit burst per key")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto (picks iouring on Linux, std elsewhere)")
+	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	asyncHandlers := flag.Bool("async-handlers", true,
 		"celeris.Config.AsyncHandlers. Set false to exercise the hasAsyncRoutes() derivation: "+
 			"AsyncHandlers off, but the .Async() route below still forces async dispatch — the bench "+
@@ -177,6 +178,7 @@ func main() {
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          engineType,
+		Workers:         *workersFlag,
 		Protocol:        celeris.HTTP1,
 		AsyncHandlers:   *asyncHandlers,
 		ReadTimeout:     30 * time.Second,

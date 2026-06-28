@@ -126,6 +126,14 @@ jobs:
           # 30 so all five slices fire on every cell:
           #   adv=6, h2c=3, ws=1, sse=1, markov=19.
           VALIDATE_CONCURRENCY: "30"
+          # Cap io_uring refapp workers (celeris Workers) for the matrix.
+          # At GOMAXPROCS the heaviest refapp (kitchen_sink) couldn't pin
+          # 16 io_uring rings alongside its heap on the 28GB amd64 host →
+          # io_uring_setup ENOMEM at startup (the 60GB arm64 host at 12
+          # workers survived). 4 keeps a real SO_REUSEPORT group + every
+          # io_uring code path while cutting locked memory ~4×; applies to
+          # the ring-allocating engines only (std/epoll keep GOMAXPROCS).
+          VALIDATE_REFAPP_WORKERS: "4"
           # Start postgres / redis / memcached containers on fixed
           # ports so the driver_* refapps in matrix mode can connect
           # to real backends. Without this, driver_postgres /

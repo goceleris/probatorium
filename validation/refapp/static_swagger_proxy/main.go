@@ -73,11 +73,13 @@ const openAPISpec = `{
 func main() {
 	bind := flag.String("bind", "127.0.0.1:8080", "address:port to listen on")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto")
+	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	flag.Parse()
 
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
+		Workers:         *workersFlag,
 		Protocol:        celeris.HTTP1,
 		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,

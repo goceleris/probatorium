@@ -182,6 +182,14 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_REFAPP_ASYNC"); v != "" {
 			args = append(args, "--extra-vars", "validate_refapp_async="+v)
 		}
+		// VALIDATE_REFAPP_WORKERS caps the io_uring refapp worker count
+		// (celeris Workers) for the ring-allocating engines, so a
+		// memory-constrained validation host can run the heaviest io_uring
+		// refapp without io_uring_setup ENOMEM. Empty / 0 leaves the
+		// GOMAXPROCS default; must be >= 2 if set.
+		if v := os.Getenv("VALIDATE_REFAPP_WORKERS"); v != "" {
+			args = append(args, "--extra-vars", "validate_refapp_workers="+v)
+		}
 		// VALIDATE_MATRIX=1 flips the validator into matrix mode:
 		// iterate (refapp × engine) cells, emit v5.1 Cells[].
 		// Per #113 / #114. Optional VALIDATE_MATRIX_REFAPPS and

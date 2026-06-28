@@ -56,6 +56,7 @@ func envOr(key, def string) string {
 func main() {
 	bind := flag.String("bind", "127.0.0.1:8080", "address:port to listen on")
 	engineFlag := flag.String("engine", "auto", "engine: iouring | epoll | std | adaptive | auto")
+	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	addr := flag.String("mc-addr", envOr("PROBATORIUM_MEMCACHED_ADDR", "127.0.0.1:21211"),
 		"memcached host:port; env: PROBATORIUM_MEMCACHED_ADDR")
 	rps := flag.Float64("rps", 5000, "ratelimit RPS per key (permissive for walker traffic)")
@@ -87,6 +88,7 @@ func main() {
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
+		Workers:         *workersFlag,
 		Protocol:        celeris.HTTP1,
 		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,
