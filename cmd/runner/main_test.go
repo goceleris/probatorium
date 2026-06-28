@@ -139,6 +139,13 @@ func TestBuildCellConfig(t *testing.T) {
 		if lg.Workers != 128 {
 			t.Errorf("Workers = %d, want 128 (mapped from declared Connections)", lg.Workers)
 		}
+		// The loadgen self-CPU sampler (1Hz, P95 -> Result.CPUPctP95) must be
+		// enabled: buildCellConfig starts from Scenario.Workload(), not
+		// loadgen.DefaultConfig (which sets it), so without an explicit enable
+		// every published loadgen_cpu_p95 came out empty.
+		if !lg.CPUMonitor {
+			t.Error("CPUMonitor = false, want true (loadgen self-CPU P95 sampler must be on)")
+		}
 	})
 
 	// loadgen sizes every driver's concurrency from Workers (the

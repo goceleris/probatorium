@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	hdr "github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/goceleris/loadgen"
 	"github.com/goceleris/probatorium/report"
 )
@@ -49,6 +50,88 @@ func mustMarshalLoadgen(t *testing.T, r loadgen.Result) json.RawMessage {
 		t.Fatalf("marshal loadgen.Result: %v", err)
 	}
 	return b
+}
+
+// TestMergeBenchResultsHistogramSurvives is the regression guard for the
+// double-base64 bug that left every published hdr_histogram_b64 empty
+// (v1.5.2–v1.5.5). loadgen.Result.Histogram is ALREADY the hdr base64 wire
+// form (hdrhistogram-go Encode base64-encodes); the merge must pass it
+// through verbatim. The old code base64-re-encoded it, so report's hdr.Decode
+// saw the ASCII "HIST" magic as the cookie ("only V2 is supported") and
+// silently dropped it. This drives a REAL histogram through mergeBenchResults
+// and asserts the merged blob is non-empty AND decodes back with the recorded
+// sample count — it fails loudly if anyone re-introduces an extra encode.
+func TestMergeBenchResultsHistogramSurvives(t *testing.T) {
+	resultsDir := t.TempDir()
+	rawDir := filepath.Join(resultsDir, "raw")
+	if err := os.MkdirAll(rawDir, 0o755); err != nil {
+		t.Fatalf("mkdir raw: %v", err)
+	}
+
+	// A REAL V2 histogram, encoded exactly as loadgen emits it: Encode()
+	// returns base64 bytes, and that string is what lands in Result.Histogram.
+	const perRun = 1000
+	mkWire := func(base int64) []byte {
+		h := hdr.New(1, 60_000_000, 3)
+		for i := 0; i < perRun; i++ {
+			_ = h.RecordValue(base + int64(i))
+		}
+		wire, err := h.Encode(hdr.V2CompressedEncodingCookieBase)
+		if err != nil {
+			t.Fatalf("encode histogram: %v", err)
+		}
+		return wire
+	}
+	mkResult := func(base int64) loadgen.Result {
+		return loadgen.Result{
+			Requests:       perRun,
+			Duration:       time.Minute,
+			RequestsPerSec: 300000,
+			ThroughputBPS:  300000 * 120,
+			Latency:        loadgen.Percentiles{P50: 200 * time.Microsecond, P99: 4 * time.Millisecond},
+			Histogram:      mkWire(base),
+			CPUPctP95:      60, // self-CPU sampler value → loadgen_cpu_p95 (0.60 of a core)
+		}
+	}
+
+	writeRawHost(t, rawDir, "msa2-server", []cellRecord{
+		{RunIndex: 0, Competitor: "celeris-std-h1", Loadgen: mustMarshalLoadgen(t, mkResult(100))},
+		{RunIndex: 1, Competitor: "celeris-std-h1", Loadgen: mustMarshalLoadgen(t, mkResult(200))},
+	})
+
+	out, err := mergeBenchResults(resultsDir, "msa2-server", benchParams{
+		CelerisVer: "v1.4.12", Duration: "60s", Warmup: "30s", Conns: "256", Runs: "2", Seed: "42",
+	})
+	if err != nil {
+		t.Fatalf("mergeBenchResults: %v", err)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read results.json: %v", err)
+	}
+	var doc report.Document
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal results.json: %v", err)
+	}
+	if len(doc.Benchmarks) == 0 {
+		t.Fatal("no benchmarks in merged document")
+	}
+	b := doc.Benchmarks[0]
+	blob := b.HdrHistogramB64[clusterScenarioName]
+	if blob == "" {
+		t.Fatalf("hdr_histogram_b64[%q] is EMPTY — histogram dropped in merge (double-encode regression?)", clusterScenarioName)
+	}
+	h, derr := hdr.Decode([]byte(blob))
+	if derr != nil || h == nil {
+		t.Fatalf("published hdr_histogram_b64 does not decode: %v", derr)
+	}
+	if got := h.TotalCount(); got != int64(2*perRun) {
+		t.Errorf("merged histogram TotalCount = %d, want %d (both runs merged)", got, 2*perRun)
+	}
+	// CPUPctP95=60 across runs → loadgen_cpu_p95 = 0.60 (fraction of one core).
+	if got := b.LoadgenCPUP95[clusterScenarioName]; got < 0.59 || got > 0.61 {
+		t.Errorf("loadgen_cpu_p95[%q] = %v, want ~0.60 (CPUPctP95 must flow through)", clusterScenarioName, got)
+	}
 }
 
 // TestMergeBenchResults drives the cluster merge path end to end: it

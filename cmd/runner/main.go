@@ -919,6 +919,13 @@ func buildCellConfig(cell interleave.Cell, baseURL string, cfg Config) loadgen.C
 	if lgCfg.Workers == 0 {
 		lgCfg.Workers = 64
 	}
+	// Enable the loadgen self-CPU sampler (1Hz, P95 on Result.CPUPctP95).
+	// buildCellConfig starts from Scenario.Workload(), NOT loadgen.DefaultConfig
+	// (which sets CPUMonitor=true), so without this the sampler stays off and
+	// every published loadgen_cpu_p95 is empty — which also disables the
+	// network-bound classifier that reads it. The whole-system ClientCPUPercent
+	// monitor is always on; this is the per-process P95 the report consumes.
+	lgCfg.CPUMonitor = true
 	return lgCfg
 }
 
@@ -1052,6 +1059,19 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	if res == nil {
 		cellRes.Error = "loadgen.Run: returned nil result"
 		return oc, errors.New(cellRes.Error)
+	}
+	// res.Histogram is ALREADY the hdr-encoded base64 wire form (loadgen's
+	// EncodeHistogram -> hdrhistogram-go Encode base64-encodes its output), which
+	// is exactly what report.mergeHistograms' hdr.Decode expects. Carry it
+	// VERBATIM onto the in-process outcome (resultsSink.recordRun appends
+	// oc.HistogramB64 to CellResult.HistogramsB64) and the on-disk per-cell file.
+	// Without this the in-process / single-node aggregation dropped the HDR
+	// distribution entirely; re-base64'ing it instead would double-encode and
+	// make Decode fail silently (the bug the cluster path had). The headline
+	// blob is the saturation pass's, which is exactly the res captured here.
+	if len(res.Histogram) > 0 {
+		oc.HistogramB64 = string(res.Histogram)
+		cellRes.HistogramB64 = string(res.Histogram)
 	}
 
 	in := completedCell{

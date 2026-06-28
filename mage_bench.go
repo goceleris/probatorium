@@ -3,7 +3,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -1597,14 +1596,16 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 			if cell.Resources != nil {
 				cr.Resources = append(cr.Resources, cell.Resources)
 			}
-			// loadgen.Result.Histogram is the V2-compressed HdrHistogram
-			// payload as raw bytes; CellResult wants base64 strings so
-			// report.Aggregate can decode + merge them across runs.
-			b64 := ""
-			if len(res.Histogram) > 0 {
-				b64 = base64.StdEncoding.EncodeToString(res.Histogram)
-			}
-			cr.HistogramsB64 = append(cr.HistogramsB64, b64)
+			// loadgen.Result.Histogram is ALREADY the hdr-encoded wire form:
+			// github.com/HdrHistogram/hdrhistogram-go Encode() base64-encodes
+			// its output (see loadgen latency.go EncodeHistogram), and that is
+			// exactly the base64 string report.Aggregate's mergeHistograms feeds
+			// to hdr.Decode (which base64-decodes first). Re-encoding it here was
+			// a DOUBLE base64 — hdr.Decode then peeled one layer, found base64
+			// text instead of the compressed payload, and failed silently, so
+			// every published hdr_histogram_b64 came out empty. Pass it through
+			// verbatim. (An empty Histogram yields "" → skipped by Aggregate.)
+			cr.HistogramsB64 = append(cr.HistogramsB64, string(res.Histogram))
 			// Thread the rated sweep so Aggregate reduces it into the typed
 			// Document's benchmarks[].latency_at_slo — this is what makes the
 			// BenchSince gate live on the cluster path (probatorium#156). One
