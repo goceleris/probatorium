@@ -139,6 +139,13 @@ func TestBuildCellConfig(t *testing.T) {
 		if lg.Workers != 128 {
 			t.Errorf("Workers = %d, want 128 (mapped from declared Connections)", lg.Workers)
 		}
+		// The loadgen self-CPU sampler (1Hz, P95 -> Result.CPUPctP95) must be
+		// enabled: buildCellConfig starts from Scenario.Workload(), not
+		// loadgen.DefaultConfig (which sets it), so without an explicit enable
+		// every published loadgen_cpu_p95 came out empty.
+		if !lg.CPUMonitor {
+			t.Error("CPUMonitor = false, want true (loadgen self-CPU P95 sampler must be on)")
+		}
 	})
 
 	// loadgen sizes every driver's concurrency from Workers (the
@@ -379,5 +386,24 @@ func TestDefaultRatedFractionsMatchBudgetModel(t *testing.T) {
 		t.Fatalf("len(defaultRatedFractions) = %d, want budget.DefaultRatedPasses = %d; "+
 			"update both together (and re-check the ansible guard sizing)",
 			got, budget.DefaultRatedPasses)
+	}
+}
+
+// TestServerMetaFromRegistryFrameworkVersion pins the in-process-path
+// framework_version fix: competitor rows carry their registry-pinned version
+// (the field was never assigned before, shipping 0/52). celeris rows resolve
+// from the runner's pinned celeris module via modRequireVersion.
+func TestServerMetaFromRegistryFrameworkVersion(t *testing.T) {
+	m := serverMetaFromRegistry()
+	if got := m["gin-h1"].FrameworkVersion; got == "" {
+		t.Error("gin-h1 FrameworkVersion is empty; want the registry-pinned version")
+	}
+	// celeris columns must be present (the framework under test); the exact
+	// version depends on the runner's go.mod, so only assert non-empty when
+	// the pin is resolvable in this build context.
+	if v := modRequireVersion("github.com/goceleris/celeris"); v != "" {
+		if got := m["celeris-std-h1"].FrameworkVersion; got != v {
+			t.Errorf("celeris-std-h1 FrameworkVersion = %q, want %q (runner's pinned celeris)", got, v)
+		}
 	}
 }

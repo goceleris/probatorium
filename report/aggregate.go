@@ -132,12 +132,13 @@ type CellAggregate struct {
 
 	// LoadgenCPUP95 is the median (across runs) of the loadgen's
 	// self-CPU P95 reading for this cell, expressed as a fraction of
-	// one core (0.0–1.0+; >1.0 means the loadgen process was using
-	// more than one core's worth of CPU). Anchors the read: a number
-	// close to or above 1.0 here means the loadgen — not the server —
-	// was the bottleneck and the saturation RPS is a loadgen ceiling,
-	// not a server ceiling. Zero when no run reported a sample (the
-	// loadgen build did not include a self-CPU sampler).
+	// ALL cores (0.0–~1.0; the loadgen samples self-CPU normalised by
+	// core count and Aggregate divides the percent by 100). Anchors the
+	// read: a number close to 1.0 here means the loadgen — not the
+	// server — was saturating the machine, so the saturation RPS is a
+	// loadgen ceiling, not a server ceiling (see networkBoundLoadgenCPUCeiling).
+	// Zero when no run reported a sample (CPUMonitor disabled — which it
+	// silently was until buildCellConfig was fixed to enable it).
 	LoadgenCPUP95 float64
 
 	// SentVsHandledDeltaPct is the loadgen-side error rate as a proxy
