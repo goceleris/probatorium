@@ -86,13 +86,14 @@ jobs:
     # celeris#312) but is perfectly safe and otherwise-idle as the conductor —
     # it just runs ansible over SSH. This keeps the amd64 SUT's numbers clean.
     runs-on: [self-hosted, celeris-cluster, msr1]
-    # 72h ceiling: the full profile on one arch is ~30h single-pass (the
-    # grid grew with the mid-size payload rows + native h2c columns), plus
-    # Deploy + Cleanup. Well under GitHub's 5-day self-hosted job hard
-    # limit. This is only a ceiling — the headline profile (same grid,
+    # 80h ceiling: the full rated profile on one arch runs ~69h single-pass
+    # (the v1.5.5 full run measured 813 cells in ~69h), plus Deploy + Cleanup.
+    # Raised from 72h to 80h so the run has comfortable headroom and reaching
+    # the ceiling is not a concern. Well under GitHub's 5-day self-hosted job
+    # hard limit. This is only a ceiling — the headline profile (same grid,
     # shorter window) projects ~21.6h. BENCH_BUDGET (below) is the real
     # fail-loud projection gate.
-    timeout-minutes: 4320
+    timeout-minutes: 4800
     env:
       BENCH_PROFILE: ${{ github.event.inputs.profile || 'fast' }}
       # Column subset to BENCH for a targeted re-run; 'all' on schedule/default.
@@ -195,7 +196,7 @@ jobs:
           # rated "full" deep-dive needs the raised ceiling (it runs the rated
           # sweep on the whole grid — many hours); both stay under the job
           # timeout-minutes above.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'full' && '70h' || '24h' }}
+          BENCH_BUDGET: ${{ github.event.inputs.profile == 'full' && '80h' || '24h' }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 
