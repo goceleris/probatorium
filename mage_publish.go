@@ -62,6 +62,28 @@ func archTag(goarch string) string {
 	}
 }
 
+// archTagFromHostArchPair derives the publish-path arch tag from the
+// document's own HostArchPair ("<GOOS>/<GOARCH>", e.g. "linux/amd64") — the
+// same value BuildDocument computes from BENCH_TARGET via benchTargetArch,
+// i.e. the arch of the benched SUT, not of the host running `mage Publish`.
+//
+// Using the document's self-reported arch (rather than re-deriving from
+// runtime.GOARCH / BENCH_GOARCH at publish time) ties the on-disk path to
+// the data's actual source of truth. Before this, meta.Arch fell back to
+// runtime.GOARCH of the PUBLISHING host, which is msr1 (arm64, the cluster
+// conductor pinned in benchmark-tier.yml) — not msa2-server (amd64, the
+// actual SUT) — silently mis-filing every amd64 SUT run under "arm64" once
+// the conductor was pinned to msr1 (see celeris v1.5.6 20260629 misfile).
+func archTagFromHostArchPair(hostArchPair string) string {
+	if _, goarch, ok := strings.Cut(hostArchPair, "/"); ok && goarch != "" {
+		return archTag(goarch)
+	}
+	// Malformed/empty HostArchPair (e.g. very old result trees predating the
+	// field) — fall back to the prior best-effort behaviour instead of
+	// publishing under an empty/garbage arch segment.
+	return archTag(benchTargetGOARCH())
+}
+
 // Publish writes the latest bench results into the docs tree and fires
 // the pointer dispatch.
 //
@@ -312,7 +334,7 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, string, er
 	}
 	meta := report.SplitMeta{
 		Version:        version,
-		Arch:           archTag(benchTargetGOARCH()),
+		Arch:           archTagFromHostArchPair(doc.HostArchPair),
 		Date:           dateStr,
 		RunID:          envOrDefault("PUBLISH_RUN_ID", defaultRunID),
 		GitSHA:         gitRefOr(),
