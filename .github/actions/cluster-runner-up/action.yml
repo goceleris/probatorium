@@ -42,9 +42,19 @@ inputs:
     required: false
     default: celeris-cluster
   runner-version:
-    description: actions-runner release tag (without leading "v").
+    description: >-
+      actions-runner release tag (without leading "v"). GitHub's Actions
+      backend forces a mandatory self-update on connect once a pinned
+      version is old enough (the runner prints "Runner update in
+      progress" and downloads the newer version before ever reaching
+      "Listening for Jobs") — that download adds unpredictable startup
+      latency that can exceed runner-setup.yml's fixed 60s/30-iteration
+      wait-for-listening poll, failing bootstrap with an empty
+      runner.stdout/stderr even though the runner itself is healthy.
+      Keep this within a release or two of current to avoid
+      re-triggering the forced-update hang.
     required: false
-    default: "2.327.1"
+    default: "2.335.1"
   inventory-path:
     description: Path to the ansible inventory.
     required: false
