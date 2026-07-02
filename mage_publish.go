@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -814,23 +816,53 @@ func redactArgs(args []string) string {
 	return strings.Join(cp, " ")
 }
 
-// ghAPI invokes `gh api` with an explicit method + Authorization header
-// and returns stdout. A nil body sends no input. stderr streams through
-// so failures are visible.
+// ghAPIBaseURL is the GitHub REST API root. A var (not const) so tests can
+// point ghAPI at an httptest.Server instead of the real api.github.com.
+var ghAPIBaseURL = "https://api.github.com"
+
+// ghAPI calls the GitHub REST API directly over net/http and returns the
+// response body. A nil body sends no request body. Non-2xx responses are
+// errors carrying the status + response body so callers see the same
+// detail `gh api` would have printed to stderr.
+//
+// This talks to the API directly rather than shelling out to the `gh`
+// CLI: the self-hosted matrix-tier runner (msr1, the cluster conductor —
+// see benchmark-tier.yml) does not have `gh` installed, so every publish's
+// dispatchPointer call failed with "exec: gh: executable file not found in
+// $PATH" AFTER the results had already been pushed to docs — the run
+// still reported failure despite shipping real data (celeris v1.5.6
+// 20260629). The Authorization header already carries the full token, so
+// gh's own auth handling added nothing `net/http` can't do directly.
 func ghAPI(token, method, path string, body []byte) ([]byte, error) {
-	args := []string{"api", "-X", method, path,
-		"-H", "Accept: application/vnd.github+json",
-		"-H", "Authorization: token " + token,
-	}
+	var reqBody io.Reader
 	if body != nil {
-		args = append(args, "--input", "-")
+		reqBody = bytes.NewReader(body)
 	}
-	cmd := exec.Command("gh", args...)
+	req, err := http.NewRequest(method, ghAPIBaseURL+path, reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("gh api %s %s: build request: %w", method, path, err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "token "+token)
 	if body != nil {
-		cmd.Stdin = bytes.NewReader(body)
+		req.Header.Set("Content-Type", "application/json")
 	}
-	cmd.Stderr = os.Stderr
-	return cmd.Output()
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gh api %s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("gh api %s %s: read response: %w", method, path, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, fmt.Errorf("gh api %s %s: HTTP %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(out)))
+	}
+	return out, nil
 }
 
 // BenchAndValidate is the release-gate composition: Validate first
