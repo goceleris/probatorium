@@ -3,6 +3,9 @@
 package main
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -222,5 +225,72 @@ func TestArchTagFromHostArchPair(t *testing.T) {
 				t.Errorf("archTagFromHostArchPair(%q) = %q, want %q", tc.hostArchPair, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGhAPIDoesNotShellOutToGhCLI guards against the exact failure the
+// v1.5.6 20260629 run hit: dispatchPointer's POST succeeded in pushing
+// results to docs but then failed with "exec: gh: executable file not
+// found in $PATH" because msr1 (the matrix-tier conductor) has no `gh`
+// CLI installed. ghAPI must talk to the API directly over net/http.
+func TestGhAPIDoesNotShellOutToGhCLI(t *testing.T) {
+	var gotMethod, gotPath, gotAuth, gotAccept string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotAccept = r.Header.Get("Accept")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	old := ghAPIBaseURL
+	ghAPIBaseURL = srv.URL
+	defer func() { ghAPIBaseURL = old }()
+
+	in := []byte(`{"event_type":"benchmark-published"}`)
+	if _, err := ghAPI("test-token", "POST", "/repos/goceleris/docs/dispatches", in); err != nil {
+		t.Fatalf("ghAPI: %v", err)
+	}
+	if gotMethod != "POST" {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/repos/goceleris/docs/dispatches" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if gotAuth != "token test-token" {
+		t.Errorf("Authorization = %q", gotAuth)
+	}
+	if gotAccept != "application/vnd.github+json" {
+		t.Errorf("Accept = %q", gotAccept)
+	}
+	if string(gotBody) != string(in) {
+		t.Errorf("body = %q, want %q", gotBody, in)
+	}
+}
+
+// TestGhAPINonOKStatusIsError confirms a non-2xx response surfaces as an
+// error carrying the status + body (dispatchPointer/putContents rely on
+// this — putContents's GET-for-existing-SHA specifically ignores this
+// error to mean "doesn't exist yet, create it").
+func TestGhAPINonOKStatusIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	}))
+	defer srv.Close()
+
+	old := ghAPIBaseURL
+	ghAPIBaseURL = srv.URL
+	defer func() { ghAPIBaseURL = old }()
+
+	_, err := ghAPI("test-token", "GET", "/repos/goceleris/docs/contents/x", nil)
+	if err == nil {
+		t.Fatal("expected an error for HTTP 404, got nil")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("error %q does not mention the status code", err.Error())
 	}
 }
