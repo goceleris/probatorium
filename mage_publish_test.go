@@ -197,3 +197,30 @@ func mustMkRaw(t *testing.T, resultsDir string) string {
 	}
 	return rawDir
 }
+
+// TestArchTagFromHostArchPair guards the publish-path arch tag against
+// regressing to the conductor host's own runtime.GOARCH (celeris v1.5.6
+// 20260629 shipped under results/v1.5.6/20260629/arm64/ because
+// benchmark-tier.yml pins the orchestrating job to msr1 (arm64) while the
+// benched SUT is msa2-server (amd64) — meta.Arch must always follow the
+// document's own HostArchPair, not the publishing host's arch.
+func TestArchTagFromHostArchPair(t *testing.T) {
+	cases := []struct {
+		name         string
+		hostArchPair string
+		want         string
+	}{
+		{"amd64 SUT published from an arm64 conductor", "linux/amd64", "x86_64"},
+		{"arm64 SUT", "linux/arm64", "arm64"},
+		{"already-canonical x86_64 tag survives", "linux/x86_64", "x86_64"},
+		{"empty falls back, does not crash or emit blank arch", "", archTag(benchTargetGOARCH())},
+		{"no slash falls back", "linux", archTag(benchTargetGOARCH())},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := archTagFromHostArchPair(tc.hostArchPair); got != tc.want {
+				t.Errorf("archTagFromHostArchPair(%q) = %q, want %q", tc.hostArchPair, got, tc.want)
+			}
+		})
+	}
+}
