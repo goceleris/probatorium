@@ -16,7 +16,11 @@
 #   gh_runner_token       repo-scoped registration token, obtained
 #                         from GH API just before the run via
 #                         POST /repos/<owner>/<repo>/actions/runners/registration-token
-#   runner_version        actions-runner release tag, e.g. "2.327.1"
+#   runner_version        actions-runner release tag, e.g. "2.335.1" —
+#                         keep current; a stale pin triggers a mandatory
+#                         self-update on connect that can outrun the
+#                         wait-for-listening poll below (see
+#                         cluster-runner-up/action.yml's runner-version input)
 #   runner_labels         comma-separated labels added to self-hosted,
 #                         e.g. "celeris-cluster,msa2-client"
 #
