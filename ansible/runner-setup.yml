@@ -86,6 +86,11 @@
         dest: "{{ runner_root }}/{{ runner_tarball }}"
         mode: '0644'
         force: false
+        timeout: 60
+      register: runner_tarball_dl
+      retries: 5
+      delay: 10
+      until: runner_tarball_dl is succeeded
 
     - name: Extract tarball
       ansible.builtin.unarchive:
