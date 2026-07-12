@@ -54,11 +54,17 @@ runs:
         tags:            ${{ inputs.tailscale-tags }}
         version:         latest
 
-    - name: Install ansible-core
+    - name: Install ansible-core + ansible.posix collection
       shell: bash
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends ansible-core
+        # cleanup.yml (driven below) uses ansible.posix.sysctl, which ansible-core
+        # does NOT bundle. Provision it explicitly so the off-cluster reclamation
+        # is deterministic regardless of what the runner image happens to ship —
+        # mirrors runner-setup.yml's provisioning on the self-hosted runners.
+        # Installs to ~/.ansible/collections, already on ansible's default path.
+        ansible-galaxy collection install ansible.posix
 
     - name: Configure SSH
       shell: bash
