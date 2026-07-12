@@ -241,12 +241,11 @@
             path: "/tmp/validate-{{ inventory_hostname }}.tgz"
             state: absent
 
-        # The per-run dir is already tar+fetched above; drop the remote copy so
-        # results_root does not grow one run-tree per soak between cleanups.
-        - name: Remove remote validate run dir after fetch
-          ansible.builtin.file:
-            path: "{{ validate_run_dir }}"
-            state: absent
+        # NOTE: the remote per-run dir (validate_run_dir, under results_root) is
+        # reclaimed by the teardown job's cleanup.yml (purge_results). It holds
+        # ROOT-owned cell subdirs — the validator launches refapps under become
+        # for io_uring memlock — so it can only be removed as root; do NOT add a
+        # non-root removal task here (it fails with EPERM and aborts the run).
 
         - name: Extract fetched tarball locally
           delegate_to: localhost

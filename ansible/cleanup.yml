@@ -187,12 +187,22 @@
       changed_when: true
 
     - name: Remove manifest file
+      become: true
       ansible.builtin.file:
         path: "{{ manifest_path }}"
         state: absent
 
+    # results_root holds ROOT-owned per-cell run dirs (the validator launches
+    # refapps under become for io_uring memlock), so a non-root `file: absent`
+    # fails with EPERM. Use the same become + chmod -R u+w + rm -rf pattern as
+    # the bench_root drop above so purge_results actually reclaims it.
     - name: Optionally remove results dir (set --extra-vars purge_results=true)
-      ansible.builtin.file:
-        path: "{{ results_root }}"
-        state: absent
+      become: true
+      ansible.builtin.shell: |
+        chmod -R u+w {{ results_root }} 2>/dev/null || true
+        rm -rf {{ results_root }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: purge_results | default(false) | bool
       when: purge_results | default(false) | bool
