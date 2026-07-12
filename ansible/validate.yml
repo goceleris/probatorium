@@ -86,7 +86,7 @@
         # cleanup.yml stops any docker containers we leave running.
         - name: dbservices | start postgres
           ansible.builtin.shell: |
-            docker rm -f probatorium-pg 2>/dev/null
+            docker rm -f -v probatorium-pg 2>/dev/null
             docker run -d --rm --name probatorium-pg \
               -p 127.0.0.1:54321:5432 \
               -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
@@ -98,7 +98,7 @@
 
         - name: dbservices | start redis
           ansible.builtin.shell: |
-            docker rm -f probatorium-redis 2>/dev/null
+            docker rm -f -v probatorium-redis 2>/dev/null
             docker run -d --rm --name probatorium-redis -p 127.0.0.1:63791:6379 redis:8.2-alpine
           register: dbsvc_redis
           changed_when: dbsvc_redis.rc == 0
@@ -107,7 +107,7 @@
 
         - name: dbservices | start memcached
           ansible.builtin.shell: |
-            docker rm -f probatorium-mc 2>/dev/null
+            docker rm -f -v probatorium-mc 2>/dev/null
             docker run -d --rm --name probatorium-mc -p 127.0.0.1:21211:11211 memcached:1.6.41-alpine
           register: dbsvc_mc
           changed_when: dbsvc_mc.rc == 0
@@ -162,6 +162,10 @@
           ansible.builtin.shell: |
             cd {{ bench_root }}
             ulimit -l unlimited
+            # No core dumps: the validator drives refapps that intentionally
+            # crash under soak load; unbounded cores fill /var (same disk-fill
+            # class as the volume leak). Inherited by all refapp children.
+            ulimit -c 0 2>/dev/null || true
             ./validator \
               -target=localhost \
               -duration={{ validate_duration_seconds | default(600) }}s \
@@ -183,6 +187,20 @@
           register: validator_result
 
       always:
+        # Reap the fixture DB containers + their ANONYMOUS data volumes on the
+        # failure path too. Previously nothing stopped them here, so every soak
+        # left pg/redis/mc running and leaked their anon volumes (the 925GB
+        # pile). Inside `always:`, so a SIGBUS / validator crash still reaps them.
+        - name: dbservices | stop fixture containers (with anonymous volumes)
+          become: true
+          ansible.builtin.shell: |
+            docker rm -f -v probatorium-pg probatorium-redis probatorium-mc 2>/dev/null || true
+            true
+          args:
+            executable: /bin/bash
+          changed_when: false
+          when: validate_dbservices | default('') == '1'
+
         - name: Stop any leftover validator / refapp processes
           become: true
           ansible.builtin.shell: |
@@ -221,6 +239,13 @@
         - name: Remove remote tarball after fetch
           ansible.builtin.file:
             path: "/tmp/validate-{{ inventory_hostname }}.tgz"
+            state: absent
+
+        # The per-run dir is already tar+fetched above; drop the remote copy so
+        # results_root does not grow one run-tree per soak between cleanups.
+        - name: Remove remote validate run dir after fetch
+          ansible.builtin.file:
+            path: "{{ validate_run_dir }}"
             state: absent
 
         - name: Extract fetched tarball locally

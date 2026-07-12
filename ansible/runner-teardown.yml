@@ -16,6 +16,11 @@
 - name: Tear down actions-runner per cluster host
   hosts: cluster
   gather_facts: false
+  # A wedged/unreachable SUT host must NOT abort teardown of the others.
+  # Without this, one dead host (the 2026-07-11 incident) fails the play and
+  # skips the GitHub-side orphan-runner sweep + manifest drop on the healthy
+  # hosts, re-wedging the cluster. Reachable hosts clean fully; rc stays 0.
+  ignore_unreachable: true
   vars:
     runner_root: "/tmp/actions-runner-{{ inventory_hostname }}"
   tasks:
@@ -79,6 +84,19 @@
             state: absent
 
       when: runner_dir.stat.exists
+
+    # Unconditionally drop the bench manifest — the cluster ownership lock that
+    # `wait-for-manifest-clear` serialises every tier on. It is normally removed
+    # by `mage Cleanup`, an in-band step that DIES WITH THE RUNNER on a host
+    # wedge / SIGBUS / hard-cancel, stranding the lock and blocking every future
+    # cluster job until a human rm's it (2026-07-11 incident). This off-cluster,
+    # always-run teardown job is the only reliable place to drop it. Runs on
+    # every reachable host regardless of runner-dir state.
+    - name: Drop stale bench manifest (cluster ownership lock)
+      become: true
+      ansible.builtin.file:
+        path: "{{ manifest_path | default('/tmp/celeris-bench-manifest.json') }}"
+        state: absent
 
     - name: Confirm pristine state
       ansible.builtin.stat:

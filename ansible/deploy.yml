@@ -60,6 +60,24 @@
         (inventory_hostname in groups['bench_targets']) and
         (inventory_hostname not in bench_targets_filter.split(','))
 
+    # Preflight disk guard (2026-07-11 incident): a leaked-volume / stale-results
+    # pile that fills the SUT root disk mid-run drives ext4 into emergency
+    # read-only, which SIGBUS-kills the soak and wedges the host. Fail FAST here —
+    # before committing to a run that can be 24h long — rather than discover it at
+    # hour 24. Deploy runs first in every tier with gather_facts, so ansible_mounts
+    # is populated. Threshold 50GB leaves ample headroom over a soak's ~20GB churn.
+    - name: Preflight | require >=50GB free on the root filesystem
+      ansible.builtin.assert:
+        that:
+          - (ansible_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | int) > (50 * 1024 * 1024 * 1024)
+        fail_msg: >-
+          Root fs has <50GB free on {{ inventory_hostname }} — refusing to start.
+          Likely leaked docker volumes or stale results; run the teardown job's
+          cleanup.yml (docker volume prune) or `mage Cleanup`, then retry.
+        success_msg: "preflight: root fs free space OK on {{ inventory_hostname }}"
+        quiet: true
+      when: ansible_mounts is defined
+
     - name: Ensure transient dirs exist
       ansible.builtin.file:
         path: "{{ item }}"

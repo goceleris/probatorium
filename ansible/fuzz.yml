@@ -99,6 +99,9 @@
           ansible.builtin.shell: |
             cd {{ bench_root }}
             ulimit -l unlimited
+            # No core dumps — fuzzing deliberately crashes the server; unbounded
+            # cores would fill /var (same disk-fill class as the volume leak).
+            ulimit -c 0 2>/dev/null || true
             nohup ./competitors/{{ competitor | default('celeris') }} \
               -bind 0.0.0.0:{{ bench_port | default(8080) }} \
               > {{ fuzz_run_dir }}/server.log 2>&1 &

@@ -1,13 +1,20 @@
 name: Cluster runner down
 description: >-
   Mints a removal-token from the GitHub API, joins the tailnet as an
-  ephemeral Tailscale node, then SSH-driven ansible kills every
-  Runner.Listener, de-registers from GitHub, and rm -rf's
-  /tmp/actions-runner-<host>/ on all three cluster hosts. Pristine.
+  ephemeral Tailscale node, then SSH-driven ansible: (1) drives
+  cleanup.yml to reclaim ALL cluster host state — docker containers +
+  their anonymous volumes, bench/results dirs, and the manifest
+  ownership lock; (2) kills every Runner.Listener, de-registers from
+  GitHub, and rm -rf's /tmp/actions-runner-<host>/; (3) sweeps orphan
+  offline runner registrations. Pristine.
 
   Pair with cluster-runner-up/. Designed to run as a teardown job
   with `if: always()` so cluster state is cleaned up even when the
-  middle (matrix) job failed or was cancelled.
+  middle (matrix) job failed, was cancelled, or the SUT runner DIED
+  with the host (the in-band `mage Cleanup` cannot run in that case —
+  this off-cluster job is the host-failure-survivable reclamation
+  path). Every reclamation step is `if: always()` so one failing step
+  does not skip the others.
 
 inputs:
   tailscale-oauth-client-id:
@@ -82,7 +89,27 @@ runs:
         echo "::add-mask::${TOKEN}"
         echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
 
+    # KEYSTONE (2026-07-11 incident): reclaim ALL cluster host state — docker
+    # volumes, bench_root, results, and the manifest ownership lock — from this
+    # OFF-CLUSTER, always-run teardown job. The in-band `mage Cleanup` step runs
+    # on the SUT runner and DIES WITH IT on a host wedge / SIGBUS / hard-cancel,
+    # so it cannot be the only place reclamation happens. cleanup.yml is
+    # idempotent ("safe to run any number of times"); purge_results is safe
+    # because per-run results are already tar+fetched as CI artefacts.
+    - name: Reclaim cluster host state (docker volumes / bench dirs / manifest)
+      if: always()
+      shell: bash
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: "False"
+      run: |
+        ansible-playbook \
+          -i ${{ inputs.inventory-path }} \
+          ansible/cleanup.yml \
+          --extra-vars "purge_results=true" \
+          || echo "::warning::off-cluster cleanup.yml returned non-zero (a host may be unreachable); continuing teardown"
+
     - name: Run ansible runner-teardown
+      if: always()
       shell: bash
       env:
         ANSIBLE_HOST_KEY_CHECKING: "False"
@@ -94,6 +121,7 @@ runs:
           --extra-vars "gh_runner_remove_token=${{ steps.remtoken.outputs.token }}"
 
     - name: Sweep any orphan runner registrations
+      if: always()
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.gh-runner-pat }}
