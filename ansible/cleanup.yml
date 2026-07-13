@@ -60,6 +60,11 @@
         prior_limits_conf: "{{ (cleanup_manifest.content | b64decode | from_json).prior_limits_conf | default('') }}"
         toolchains_to_remove: "{{ (cleanup_manifest.content | b64decode | from_json).installed_toolchains | default([]) }}"
       when: cleanup_manifest is defined and cleanup_manifest.content is defined
+      # A truncated/corrupt manifest (b64decode|from_json throws) must not abort
+      # the play before the docker reap + filesystem sweep + manifest drop below.
+      # On failure the facts stay unset and downstream `... is defined` gates skip
+      # the apt/sysctl restores — the reclamation tasks still run.
+      ignore_errors: true
 
     # ---------- docker state teardown (ungated: dedicated bench cluster) ----------
     # Reclaim ALL probatorium docker state whenever docker is present. This was
@@ -175,6 +180,10 @@
         purge: true
         autoremove: true
       when: to_remove is defined and to_remove | length > 0
+      # A transient dpkg/apt lock (e.g. unattended-upgrades) must not abort the
+      # play before the filesystem sweep + manifest drop below — the packages
+      # will be re-purged on the next cleanup. Disk reclamation is the priority.
+      ignore_errors: true
 
     # ---------- final filesystem sweep ----------
     - name: Drop bench staging dir (rm -rf {{ bench_root }})
@@ -204,5 +213,4 @@
       args:
         executable: /bin/bash
       changed_when: true
-      when: purge_results | default(false) | bool
       when: purge_results | default(false) | bool
