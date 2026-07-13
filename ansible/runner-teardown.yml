@@ -83,7 +83,12 @@
             path: "{{ runner_root }}"
             state: absent
 
-      when: runner_dir.stat.exists
+      # `| default(false)`: with play-level ignore_unreachable, an unreachable
+      # host's stat probe registers an unreachable dict with NO `.stat`, so a
+      # bare `runner_dir.stat.exists` raises "'dict' has no attribute 'stat'"
+      # and fails the whole play for every host. Default-guarding skips the
+      # block on hosts we couldn't probe instead of crashing.
+      when: runner_dir.stat.exists | default(false)
 
     # Unconditionally drop the bench manifest — the cluster ownership lock that
     # `wait-for-manifest-clear` serialises every tier on. It is normally removed
@@ -102,7 +107,9 @@
       ansible.builtin.stat:
         path: "{{ runner_root }}"
       register: post_teardown
-      failed_when: post_teardown.stat.exists
+      # default(false): an unreachable host's register lacks `.stat`; without the
+      # guard the failed_when raises instead of degrading (same as the block when).
+      failed_when: post_teardown.stat.exists | default(false)
 
     - name: Summarise teardown
       ansible.builtin.debug:
