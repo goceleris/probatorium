@@ -115,9 +115,15 @@
     # `zig-linux-<arch>-<version>` on older releases). extra_opts strips
     # that one leading path component so files land directly under the
     # versioned dir we control, regardless of the upstream naming drift.
+    #
+    # --one-top-level MUST be RELATIVE (just the version), created under the
+    # `dest` (-C) dir. An ABSOLUTE --one-top-level combined with -C makes GNU
+    # tar 1.35 fail every entry with "Cannot mkdir: Invalid cross-device link".
+    # This was latent until probatorium#221 (reliable bench_root wipe) started
+    # running the extract every deploy instead of reusing a cached zig.
     extra_opts:
       - "--strip-components=1"
-      - "--one-top-level={{ bench_root }}/zig/{{ zig_version }}"
+      - "--one-top-level={{ zig_version }}"
   when: not zig_installed.stat.exists
 
 - name: zig | point stable `current` symlink at the resolved version
