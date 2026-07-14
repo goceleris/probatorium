@@ -195,6 +195,11 @@
     cmd: |
       cd {{ bench_root }}
       ulimit -l unlimited 2>/dev/null || true
+      # No core dumps: a SUT that crashes mid-column (the respawn supervisor
+      # below exists precisely because they do) would otherwise write a
+      # multi-hundred-MB core to /var each time — same disk-fill class as the
+      # leaked volumes. Best-effort like the limits above.
+      ulimit -c 0 2>/dev/null || true
       # nofile: the default 1024 soft limit is below a single
       # 1024-connection cell (sse-fanout-1024 / ws-hub-broadcast-1024 /
       # get-simple-1024c) before counting the listener, logs and backend

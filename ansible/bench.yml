@@ -131,7 +131,7 @@
 
     - name: dbservices | start postgres + redis + memcached (fixed ports)
       ansible.builtin.shell: |
-        docker rm -f probatorium-pg probatorium-redis probatorium-mc 2>/dev/null
+        docker rm -f -v probatorium-pg probatorium-redis probatorium-mc 2>/dev/null
         docker run -d --rm --name probatorium-pg -p 127.0.0.1:54321:5432 \
           -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
           postgres:17-alpine -c synchronous_commit=off
@@ -290,12 +290,15 @@
       delay: 5
 
     - name: dbservices | stop fixture containers (bench target only)
-      # Symmetric teardown for the start step in the Stage play. --rm means a
-      # stop is enough to remove them; -f covers a still-running container. Never
-      # fail the cleanup play on this — a missing container (Go-only bench, or an
-      # earlier crash) is fine.
+      # Symmetric teardown for the start step in the Stage play. `-v` reaps each
+      # container's ANONYMOUS data volume — `--rm` does NOT remove it on a
+      # force-rm, which is how the 925GB volume pile accumulated. Never fail the
+      # cleanup play on this — a missing container (Go-only bench, or an earlier
+      # crash) is fine. NOTE: this play is skipped when `any_errors_fatal` aborts
+      # the run play on a host drop; the off-cluster teardown job's cleanup.yml
+      # (volume prune) is the resilient safety net for that abort path.
       ansible.builtin.shell: |
-        docker rm -f probatorium-pg probatorium-redis probatorium-mc 2>/dev/null
+        docker rm -f -v probatorium-pg probatorium-redis probatorium-mc 2>/dev/null
         true
       args:
         executable: /bin/bash

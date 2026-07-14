@@ -16,6 +16,10 @@
 - name: Force cleanup of probatorium state on cluster nodes
   hosts: cluster
   gather_facts: false
+  # Reclaim reachable hosts even when one is wedged/unreachable — this
+  # playbook is now also driven from the off-cluster teardown job as the
+  # host-failure-survivable reclamation path (2026-07-11 incident).
+  ignore_unreachable: true
   tasks:
     # ---------- kill processes first ----------
     # Match by exact process name to avoid pkill self-killing
@@ -56,24 +60,34 @@
         prior_limits_conf: "{{ (cleanup_manifest.content | b64decode | from_json).prior_limits_conf | default('') }}"
         toolchains_to_remove: "{{ (cleanup_manifest.content | b64decode | from_json).installed_toolchains | default([]) }}"
       when: cleanup_manifest is defined and cleanup_manifest.content is defined
+      # A truncated/corrupt manifest (b64decode|from_json throws) must not abort
+      # the play before the docker reap + filesystem sweep + manifest drop below.
+      # On failure the facts stay unset and downstream `... is defined` gates skip
+      # the apt/sysctl restores — the reclamation tasks still run.
+      ignore_errors: true
 
-    # ---------- docker container teardown (only if WE installed docker) ----------
-    - name: Stop any docker containers we spawned (only if we installed docker)
+    # ---------- docker state teardown (ungated: dedicated bench cluster) ----------
+    # Reclaim ALL probatorium docker state whenever docker is present. This was
+    # previously gated on `'docker.io' in to_remove`, which self-disabled on any
+    # host where docker was pre-installed OR whose manifest was lost — so the
+    # fixture DB containers' ANONYMOUS data volumes accumulated unbounded (275
+    # volumes = 925GB filled the SUT root disk and wedged the whole cluster,
+    # 2026-07-11). Two defects fixed: (a) ungate — guard only on docker being
+    # present, not on our having installed it; (b) `-v` on the force-rm reaps
+    # each container's anon volume, and `docker volume prune -af` reclaims any
+    # that already leaked (`container prune` alone never touches volumes).
+    - name: Reap probatorium docker state (containers + their anonymous volumes)
       become: true
       ansible.builtin.shell: |
-        ids=$(docker ps -q 2>/dev/null)
-        if [ -n "$ids" ]; then
-          docker kill $ids 2>/dev/null || true
-        fi
-        # Also remove any stopped containers that were not auto-removed
-        # (e.g. memcached:1.6-alpine launched without --rm).
+        command -v docker >/dev/null 2>&1 || exit 0
+        docker rm -f -v probatorium-pg probatorium-redis probatorium-mc 2>/dev/null || true
+        ids=$(docker ps -q 2>/dev/null); [ -n "$ids" ] && docker kill $ids 2>/dev/null || true
         docker container prune -f 2>/dev/null || true
+        docker volume prune -af 2>/dev/null || true
+        docker image prune -f 2>/dev/null || true
         true
       args:
         executable: /bin/bash
-      when:
-        - to_remove is defined
-        - "'docker.io' in to_remove"
       changed_when: false
 
     # ---------- toolchain teardown ----------
@@ -166,6 +180,10 @@
         purge: true
         autoremove: true
       when: to_remove is defined and to_remove | length > 0
+      # A transient dpkg/apt lock (e.g. unattended-upgrades) must not abort the
+      # play before the filesystem sweep + manifest drop below — the packages
+      # will be re-purged on the next cleanup. Disk reclamation is the priority.
+      ignore_errors: true
 
     # ---------- final filesystem sweep ----------
     - name: Drop bench staging dir (rm -rf {{ bench_root }})
@@ -178,12 +196,21 @@
       changed_when: true
 
     - name: Remove manifest file
+      become: true
       ansible.builtin.file:
         path: "{{ manifest_path }}"
         state: absent
 
+    # results_root holds ROOT-owned per-cell run dirs (the validator launches
+    # refapps under become for io_uring memlock), so a non-root `file: absent`
+    # fails with EPERM. Use the same become + chmod -R u+w + rm -rf pattern as
+    # the bench_root drop above so purge_results actually reclaims it.
     - name: Optionally remove results dir (set --extra-vars purge_results=true)
-      ansible.builtin.file:
-        path: "{{ results_root }}"
-        state: absent
+      become: true
+      ansible.builtin.shell: |
+        chmod -R u+w {{ results_root }} 2>/dev/null || true
+        rm -rf {{ results_root }}
+      args:
+        executable: /bin/bash
+      changed_when: true
       when: purge_results | default(false) | bool
