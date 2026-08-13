@@ -69,45 +69,52 @@
     installed_packages: "{{ installed_packages + c_missing_pkgs.stdout_lines }}"
   when: c_missing_pkgs.stdout_lines | length > 0
 
-# Build libreactor from the default branch (master), NOT the newest semver
-# tag. The latest tag (v1.0.1) predates the merge of the dynamic primitives
-# into the tree: its example/*.c still `#include <dynamic.h>` (an external
-# libdynamic header) and `make all` builds those examples, so a from-source
-# build fails on the missing header. master bundles the dynamic primitives
-# (reactor_vector/reactor_pool/…) into libreactor.la and keeps examples in
-# DIST_SUBDIRS only (not built by `make all`), so it compiles clean with no
-# external deps. We pin to the resolved HEAD commit for reproducibility and
-# to mark the build prefix. ls-remote so we never clone history to resolve.
-- name: c | resolve libreactor master HEAD commit
+# libreactor is built from a commit on the default branch, NOT the newest
+# semver tag. The latest tag (v1.0.1) predates the merge of the dynamic
+# primitives into the tree: its example/*.c still `#include <dynamic.h>` (an
+# external libdynamic header) and `make all` builds those examples, so a
+# from-source build fails on the missing header. The pinned commit bundles the
+# dynamic primitives (reactor_vector/reactor_pool/…) into libreactor.la and
+# keeps examples in DIST_SUBDIRS only, so it compiles clean with no external
+# deps.
+#
+# Two changes on 2026-08-13:
+#   1. PINNED (libreactor_commit in defaults/main.yml). This used to
+#      `git ls-remote ... HEAD` on every deploy and build whatever the default
+#      branch tip was — unpinned upstream code compiled on the bench hosts.
+#   2. GATED on libreactor actually being in scope. The tasks below had NO
+#      `when:` guard, so they ran on every deploy even though libreactor is not
+#      in servers.Registry or mage_cluster.go's nativeBuildSpecs and appears in
+#      no published result — a dead adapter costing an unpinned fetch plus an
+#      autotools build every time. The source under servers/libreactor/ is kept
+#      so the adapter can be re-registered; it just no longer builds unasked.
+- name: c | check whether the PINNED libreactor is already built
+  ansible.builtin.stat:
+    path: "{{ bench_root }}/libreactor/prefix/.pin-{{ libreactor_commit }}"
+  register: libreactor_built
+  when: "'libreactor' in (competitor_list | default([]))"
+
+- name: c | fetch libreactor at the pinned commit
   ansible.builtin.shell: |
     set -euo pipefail
-    git ls-remote https://github.com/fredrikwidlund/libreactor.git HEAD \
-      | cut -f1 | cut -c1-12
-  register: libreactor_tag
-  changed_when: false
-
-- name: c | record resolved libreactor commit
-  ansible.builtin.set_fact:
-    libreactor_version: "{{ libreactor_tag.stdout | trim }}"
-
-# Idempotency: skip the whole clone+build when the resolved version's static
-# archive already exists in the prefix. lib/libreactor.a is the canonical
-# "already built" marker the adapter Makefile links against.
-- name: c | check whether resolved libreactor is already built
-  ansible.builtin.stat:
-    path: "{{ bench_root }}/libreactor/prefix/lib/libreactor.a"
-  register: libreactor_built
-
-# Shallow-clone the default branch (master). --depth 1 with no --branch
-# fetches the current master tip, which is what we resolved above.
-- name: c | shallow-clone libreactor master
-  ansible.builtin.command:
-    cmd: >-
-      git clone --depth 1
-      https://github.com/fredrikwidlund/libreactor.git
-      {{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}
-    creates: "{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}/configure.ac"
-  when: not libreactor_built.stat.exists
+    dest="{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_commit[:12] }}"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    cd "$dest"
+    git init -q
+    git remote add origin https://github.com/fredrikwidlund/libreactor.git
+    git fetch -q --depth 1 origin "{{ libreactor_commit }}"
+    git checkout -q FETCH_HEAD
+    got="$(git rev-parse HEAD)"
+    if [ "$got" != "{{ libreactor_commit }}" ]; then
+      echo "libreactor: expected {{ libreactor_commit }}, got $got" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  when:
+    - "'libreactor' in (competitor_list | default([]))"
+    - not (libreactor_built.stat.exists | default(false))
 
 # autogen + configure + make + make install into the bench_root prefix.
 # libreactor is autotools: autogen.sh regenerates configure, then a normal
@@ -119,15 +126,20 @@
     CFLAGS: "-O3 -march=native"
   ansible.builtin.shell: |
     set -euo pipefail
-    cd "{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}"
+    cd "{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_commit[:12] }}"
     ./autogen.sh
     ./configure --prefix="{{ bench_root }}/libreactor/prefix"
     make -j"$(nproc)"
     make install
+    # Commit-stamp the prefix (see the drogon/h2o rationale): lib/libreactor.a
+    # alone is revision-agnostic, so a warm bench_root would mask a pin change.
+    touch "{{ bench_root }}/libreactor/prefix/.pin-{{ libreactor_commit }}"
   args:
     executable: /bin/bash
-    creates: "{{ bench_root }}/libreactor/prefix/lib/libreactor.a"
-  when: not libreactor_built.stat.exists
+    creates: "{{ bench_root }}/libreactor/prefix/.pin-{{ libreactor_commit }}"
+  when:
+    - "'libreactor' in (competitor_list | default([]))"
+    - not (libreactor_built.stat.exists | default(false))
 
 # ---------------------------------------------------------------------
 # libh2o (the h2o adapter). Built ONLY when h2o is in the competitor set,
