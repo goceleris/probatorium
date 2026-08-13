@@ -41,7 +41,7 @@
     <!-- Always-latest floor; the java role resolves the freshest stable at
          deploy time. Vert.x 5.x is the current line (Java 11+ baseline,
          tested on 21). -->
-    <vertx.version>5.0.0</vertx.version>
+    <vertx.version>5.0.5</vertx.version>
     <!-- Single-class entry point; the shade plugin stamps it as Main-Class. -->
     <main.class>probatorium.vertx.Server</main.class>
     <!-- Stable uber-jar name so the launcher / RunCmd reference it without
