@@ -32,7 +32,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>17</maven.compiler.release>
     <!-- Always-latest 4.2.x. Bump this single line to track upstream. -->
-    <netty.version>4.2.9.Final</netty.version>
+    <netty.version>4.2.17.Final</netty.version>
   </properties>
 
   <dependencyManagement>
@@ -114,7 +114,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>
-        <version>3.6.0</version>
+        <version>3.6.2</version>
         <executions>
           <execution>
             <phase>package</phase>
