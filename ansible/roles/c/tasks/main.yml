@@ -238,6 +238,12 @@
   register: c_versions
   changed_when: false
 
+# Records the PINNED revisions rather than a deploy-time-resolved fact.
+# `libreactor_version` used to be set by a `git ls-remote` task that ran
+# unconditionally; now that libreactor is gated on being in scope, that fact no
+# longer exists on a deploy without it — so this reads the pin from
+# defaults/main.yml, which is always defined. h2o is recorded here too: it is
+# the C dependency that actually ships in every bench.
 - name: c | append toolchain entry to manifest
   ansible.builtin.set_fact:
     installed_toolchains: >-
@@ -247,4 +253,6 @@
               'apt_pkgs': c_missing_pkgs.stdout_lines }] }}
     fetched_versions: >-
       {{ fetched_versions
-         | combine({ 'c': (c_versions.stdout | trim) + ' / libreactor ' + libreactor_version }) }}
+         | combine({ 'c': (c_versions.stdout | trim)
+                          + ' / h2o ' + h2o_commit[:12]
+                          + ' / libreactor ' + libreactor_commit[:12] }) }}
