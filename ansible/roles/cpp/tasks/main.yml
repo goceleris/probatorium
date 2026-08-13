@@ -72,39 +72,43 @@
 
 # Resolve always-latest stable libdrogon: the newest semver tag in the
 # upstream repo (tags are vN.M.P; we sort by the numeric tuple and take
-# the max, skipping any pre-release suffix). Done via ls-remote so we
-# never clone history we don't need.
-- name: cpp | resolve latest stable libdrogon tag
-  ansible.builtin.shell: |
-    set -euo pipefail
-    git ls-remote --tags --refs https://github.com/drogonframework/drogon.git \
-      | sed 's#.*refs/tags/##' \
-      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-      | sort -V \
-      | tail -1
-  register: drogon_tag
-  changed_when: false
+# (Until 2026-08-13 the newest stable tag was resolved here at deploy time via
+# ls-remote. It is now pinned in defaults/main.yml — see the fetch task below.)
+# libdrogon is PINNED (drogon_version / drogon_commit in defaults/main.yml),
+# not resolved from upstream at deploy time. See that file for the rationale
+# and the bump procedure.
 
-- name: cpp | record resolved libdrogon tag
-  ansible.builtin.set_fact:
-    drogon_version: "{{ drogon_tag.stdout | trim }}"
-
-# Idempotency: skip the whole clone+build when the resolved version's
-# CMake package file already exists in the prefix. find_package(Drogon)
-# keys off lib/cmake/Drogon/DrogonConfig.cmake, so its presence is the
-# canonical "already built" marker.
-- name: cpp | check whether resolved libdrogon is already built
+# Idempotency marker. MUST be commit-stamped: DrogonConfig.cmake alone is
+# version-agnostic, so a warm bench_root carrying a prefix built from the old
+# always-latest policy would satisfy it and skip the clone+build entirely —
+# a green deploy running an UNPINNED library. The stamp file records which
+# commit produced the prefix, so changing the pin invalidates it.
+- name: cpp | check whether the PINNED libdrogon is already built
   ansible.builtin.stat:
-    path: "{{ bench_root }}/drogon/prefix/lib/cmake/Drogon/DrogonConfig.cmake"
+    path: "{{ bench_root }}/drogon/prefix/.pin-{{ drogon_commit }}"
   register: drogon_built
 
-- name: cpp | shallow-clone libdrogon at the resolved tag (with submodules)
-  ansible.builtin.command:
-    cmd: >-
-      git clone --depth 1 --branch {{ drogon_version }} --recurse-submodules
-      https://github.com/drogonframework/drogon.git
-      {{ bench_root }}/drogon/src/drogon-{{ drogon_version }}
-    creates: "{{ bench_root }}/drogon/src/drogon-{{ drogon_version }}/CMakeLists.txt"
+- name: cpp | fetch libdrogon at the pinned commit (with submodules)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    dest="{{ bench_root }}/drogon/src/drogon-{{ drogon_version }}"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    cd "$dest"
+    git init -q
+    git remote add origin https://github.com/drogonframework/drogon.git
+    git fetch -q --depth 1 origin "{{ drogon_commit }}"
+    git checkout -q FETCH_HEAD
+    git submodule update -q --init --recursive --depth 1
+    # Assert we got the commit we asked for. Never use `creates:` on this task:
+    # it would skip the assertion, which is the entire enforcement.
+    got="$(git rev-parse HEAD)"
+    if [ "$got" != "{{ drogon_commit }}" ]; then
+      echo "drogon: expected {{ drogon_commit }}, got $got" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
   when: not drogon_built.stat.exists
 
 # Configure + build + install libdrogon into the bench_root prefix.
@@ -131,9 +135,12 @@
       -DBUILD_REDIS=OFF
     cmake --build build -j
     cmake --install build
+    # Commit-stamp the prefix so the next deploy can tell WHICH revision built
+    # it. Written last so a partial build never looks complete.
+    touch "{{ bench_root }}/drogon/prefix/.pin-{{ drogon_commit }}"
   args:
     executable: /bin/bash
-    creates: "{{ bench_root }}/drogon/prefix/lib/cmake/Drogon/DrogonConfig.cmake"
+    creates: "{{ bench_root }}/drogon/prefix/.pin-{{ drogon_commit }}"
   when: not drogon_built.stat.exists
 
 - name: cpp | resolve installed g++ + cmake versions

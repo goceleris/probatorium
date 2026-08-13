@@ -147,21 +147,40 @@
     - "{{ bench_root }}/h2o/prefix"
   when: "'h2o' in (competitor_list | default([]))"
 
-- name: c | h2o | check whether libh2o is already built
+# Idempotency marker. MUST be commit-stamped: libh2o-evloop.a alone is
+# revision-agnostic, so a warm bench_root carrying an archive built from the
+# old always-latest `master` clone would satisfy it and skip the fetch+build —
+# a green deploy running an UNPINNED library.
+- name: c | h2o | check whether the PINNED libh2o is already built
   ansible.builtin.stat:
-    path: "{{ bench_root }}/h2o/prefix/lib/libh2o-evloop.a"
+    path: "{{ bench_root }}/h2o/prefix/.pin-{{ h2o_commit }}"
   register: libh2o_built
   when: "'h2o' in (competitor_list | default([]))"
 
-# h2o vendors picotls/quicly/picohttpparser as git submodules — the build
-# needs their sources, so the shallow clone MUST recurse submodules.
-- name: c | h2o | shallow-clone h2o master (with submodules)
-  ansible.builtin.command:
-    cmd: >-
-      git clone --depth 1 --recurse-submodules --shallow-submodules
-      https://github.com/h2o/h2o.git
-      {{ bench_root }}/h2o/src/h2o
-    creates: "{{ bench_root }}/h2o/src/h2o/CMakeLists.txt"
+# h2o needs its picotls/quicly/picohttpparser sources, so the fetch recurses
+# submodules. Pinned to h2o_commit (see defaults/main.yml) — this used to clone
+# whatever `master` happened to be that morning.
+- name: c | h2o | fetch h2o at the pinned commit (with submodules)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    dest="{{ bench_root }}/h2o/src/h2o"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    cd "$dest"
+    git init -q
+    git remote add origin https://github.com/h2o/h2o.git
+    git fetch -q --depth 1 origin "{{ h2o_commit }}"
+    git checkout -q FETCH_HEAD
+    git submodule update -q --init --recursive --depth 1
+    # Assert we got the commit we asked for. Never use `creates:` on this task:
+    # it would skip the assertion, which is the entire enforcement.
+    got="$(git rev-parse HEAD)"
+    if [ "$got" != "{{ h2o_commit }}" ]; then
+      echo "h2o: expected {{ h2o_commit }}, got $got" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
   when:
     - "'h2o' in (competitor_list | default([]))"
     - not (libh2o_built.stat.exists | default(false))
@@ -191,9 +210,12 @@
     cp -a include/. "$PREFIX/include/"
     cp -a deps/picotls/include/. "$PREFIX/include/"
     cp -a deps/quicly/include/. "$PREFIX/include/"
+    # Commit-stamp the prefix so the next deploy can tell WHICH revision built
+    # it. Written last so a partial build never looks complete.
+    touch "$PREFIX/.pin-{{ h2o_commit }}"
   args:
     executable: /bin/bash
-    creates: "{{ bench_root }}/h2o/prefix/lib/libh2o-evloop.a"
+    creates: "{{ bench_root }}/h2o/prefix/.pin-{{ h2o_commit }}"
   when:
     - "'h2o' in (competitor_list | default([]))"
     - not (libh2o_built.stat.exists | default(false))

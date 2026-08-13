@@ -1,0 +1,22 @@
+---
+# Pinned upstream revision for the C competitor toolchain (libh2o).
+#
+# Until 2026-08-13 this role cloned h2o's `master` HEAD with no branch, tag or
+# revision pin at all — the most unpinned surface in the repo. Whatever upstream
+# had merged that morning was compiled and benchmarked. That is the same class
+# of exposure that put a broken ntex-server on the bench hosts on 2026-08-12.
+#
+# Why a commit SHA and not a tag: h2o's newest tag is v2.3.0-beta2 (2019) and
+# newest stable v2.2.6 (2019), both of which predate the deps/quicly/include
+# layout this role stages — pinning to a tag would roll the library back ~7
+# years and break the build. The commit SHA is the only workable identity, and
+# git's object naming is what guarantees it.
+#
+# Dependabot has no ecosystem for a git clone inside an ansible task, so this is
+# bumped MANUALLY. To bump:
+#
+#   git ls-remote https://github.com/h2o/h2o.git refs/heads/master
+#
+# then update the value below. A bump changes the benchmarked library, so treat
+# it as a perf-relevant change, not routine maintenance.
+h2o_commit: "706842c0f8c0d9422efb97a4d8ef7d6ec9df87b7"
