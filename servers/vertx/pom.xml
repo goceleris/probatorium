@@ -42,7 +42,7 @@
          nothing resolves this at deploy time. Vert.x 5.x is the current line
          (Java 11+ baseline, tested on 21). NOTE: netty.epoll.version below
          must track vertx-core's netty — see the profile at the bottom. -->
-<vertx.version>5.0.12</vertx.version>
+<vertx.version>5.1.6</vertx.version>
     <!-- Single-class entry point; the shade plugin stamps it as Main-Class. -->
     <main.class>probatorium.vertx.Server</main.class>
     <!-- Stable uber-jar name so the launcher / RunCmd reference it without
@@ -93,7 +93,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.13.0</version>
+        <version>3.15.0</version>
       </plugin>
 
       <!-- Shade into a single executable uber-jar. The
@@ -105,7 +105,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>
-        <version>3.6.0</version>
+        <version>3.6.2</version>
         <executions>
           <execution>
             <phase>package</phase>
@@ -159,7 +159,7 @@
         <!-- MUST track vertx-core's netty (vert.x 5.0.0 → netty 4.2.0.Final).
              EpollIoHandler exists only in 4.2.x; an older pin → NoClassDefFoundError
              at startup. Bump in lockstep when vertx.version is bumped. -->
-        <netty.epoll.version>4.2.0.Final</netty.epoll.version>
+        <netty.epoll.version>4.2.17.Final</netty.epoll.version>
         <netty.epoll.classifier>linux-x86_64</netty.epoll.classifier>
       </properties>
     </profile>
