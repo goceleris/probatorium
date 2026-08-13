@@ -1,0 +1,37 @@
+---
+# Pinned upstream revision for the C competitor toolchain (libh2o).
+#
+# Until 2026-08-13 this role cloned h2o's `master` HEAD with no branch, tag or
+# revision pin at all — the most unpinned surface in the repo. Whatever upstream
+# had merged that morning was compiled and benchmarked. That is the same class
+# of exposure that put a broken ntex-server on the bench hosts on 2026-08-12.
+#
+# Why a commit SHA and not a tag: h2o's newest tag is v2.3.0-beta2 (2019) and
+# newest stable v2.2.6 (2019), both of which predate the deps/quicly/include
+# layout this role stages — pinning to a tag would roll the library back ~7
+# years and break the build. The commit SHA is the only workable identity, and
+# git's object naming is what guarantees it.
+#
+# Dependabot has no ecosystem for a git clone inside an ansible task, so this is
+# bumped MANUALLY. To bump:
+#
+#   git ls-remote https://github.com/h2o/h2o.git refs/heads/master
+#
+# then update the value below. A bump changes the benchmarked library, so treat
+# it as a perf-relevant change, not routine maintenance.
+h2o_commit: "706842c0f8c0d9422efb97a4d8ef7d6ec9df87b7"
+
+# libreactor: pinned upstream revision.
+#
+# Until 2026-08-13 this was `git ls-remote ... HEAD` on every deploy — the
+# default-branch tip, compiled and linked into the adapter, unreviewed. The
+# tasks were also UNGATED, so they ran even though libreactor is not in
+# servers.Registry / nativeBuildSpecs and appears in no published result. They
+# are now gated on libreactor being in scope, so this pin only matters if the
+# adapter is re-registered.
+#
+# A tag pin is not viable: the newest tag (v1.0.1) predates the merge of the
+# dynamic primitives, and its examples fail to build against it.
+#
+# To bump: git ls-remote https://github.com/fredrikwidlund/libreactor.git HEAD
+libreactor_commit: "64afa5364c445736317e44e820a85f09aa88dfc0"

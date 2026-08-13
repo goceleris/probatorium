@@ -67,13 +67,18 @@
     dotnet_arch: "{{ 'x64' if arch == 'amd64' else 'arm64' }}"
 
 # dotnet-install.sh is idempotent: --install-dir pins the SDK tree under
-# bench_root, and re-running with the same channel is a no-op when the
-# resolved SDK is already present (it skips the download). --channel LTS
-# resolves always-latest LTS at fetch time (mirrors the always-latest
-# policy of the rust/bun/python roles). --no-path stops it editing any
+# bench_root, and re-running with the same version is a no-op when that SDK
+# is already present (it skips the download). --no-path stops it editing any
 # profile/rc file — a critical pristine-violation guard, equivalent to
 # rustup's --no-modify-path / uv's UV_NO_MODIFY_PATH.
-- name: dotnet | install .NET SDK (always-latest LTS) via dotnet-install.sh
+#
+# --version {{ dotnet_sdk_version }} (was --channel LTS, i.e. always-latest
+# resolved at fetch time). For this adapter the SDK IS the dependency pin:
+# servers/aspnet declares no PackageReference, so the ASP.NET/runtime/host/
+# crossgen2 packs come from the installed SDK's BundledVersions.props. It must
+# match servers/aspnet/global.json, which sets rollForward:disable so a
+# mismatch fails loudly instead of silently benchmarking a different Kestrel.
+- name: dotnet | install the PINNED .NET SDK via dotnet-install.sh
   environment:
     DOTNET_CLI_TELEMETRY_OPTOUT: "1"
     DOTNET_NOLOGO: "1"
@@ -82,13 +87,17 @@
     curl -fsSL https://dot.net/v1/dotnet-install.sh -o "{{ bench_root }}/dotnet/dotnet-install.sh"
     chmod +x "{{ bench_root }}/dotnet/dotnet-install.sh"
     "{{ bench_root }}/dotnet/dotnet-install.sh" \
-      --channel LTS \
+      --version {{ dotnet_sdk_version }} \
       --architecture {{ dotnet_arch }} \
       --install-dir "{{ bench_root }}/dotnet" \
       --no-path
   args:
     executable: /bin/bash
-    creates: "{{ bench_root }}/dotnet/dotnet"
+    # Version-stamped guard. `{{ bench_root }}/dotnet/dotnet` is version-
+    # agnostic, so on a warm bench_root it would skip the install and leave an
+    # older SDK in place — the same trap the drogon/h2o markers had. The SDK
+    # unpacks to sdk/<version>/, which is naturally stamped.
+    creates: "{{ bench_root }}/dotnet/sdk/{{ dotnet_sdk_version }}"
 
 - name: dotnet | resolve installed SDK version
   environment:

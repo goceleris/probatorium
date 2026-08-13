@@ -11,6 +11,6 @@
     "start": "node src/server.js"
   },
   "dependencies": {
-    "uWebSockets.js": "uNetworking/uWebSockets.js#v20.68.0"
+    "uWebSockets.js": "uNetworking/uWebSockets.js#v20.69.0"
   }
 }

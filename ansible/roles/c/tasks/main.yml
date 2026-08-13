@@ -69,45 +69,52 @@
     installed_packages: "{{ installed_packages + c_missing_pkgs.stdout_lines }}"
   when: c_missing_pkgs.stdout_lines | length > 0
 
-# Build libreactor from the default branch (master), NOT the newest semver
-# tag. The latest tag (v1.0.1) predates the merge of the dynamic primitives
-# into the tree: its example/*.c still `#include <dynamic.h>` (an external
-# libdynamic header) and `make all` builds those examples, so a from-source
-# build fails on the missing header. master bundles the dynamic primitives
-# (reactor_vector/reactor_pool/…) into libreactor.la and keeps examples in
-# DIST_SUBDIRS only (not built by `make all`), so it compiles clean with no
-# external deps. We pin to the resolved HEAD commit for reproducibility and
-# to mark the build prefix. ls-remote so we never clone history to resolve.
-- name: c | resolve libreactor master HEAD commit
+# libreactor is built from a commit on the default branch, NOT the newest
+# semver tag. The latest tag (v1.0.1) predates the merge of the dynamic
+# primitives into the tree: its example/*.c still `#include <dynamic.h>` (an
+# external libdynamic header) and `make all` builds those examples, so a
+# from-source build fails on the missing header. The pinned commit bundles the
+# dynamic primitives (reactor_vector/reactor_pool/…) into libreactor.la and
+# keeps examples in DIST_SUBDIRS only, so it compiles clean with no external
+# deps.
+#
+# Two changes on 2026-08-13:
+#   1. PINNED (libreactor_commit in defaults/main.yml). This used to
+#      `git ls-remote ... HEAD` on every deploy and build whatever the default
+#      branch tip was — unpinned upstream code compiled on the bench hosts.
+#   2. GATED on libreactor actually being in scope. The tasks below had NO
+#      `when:` guard, so they ran on every deploy even though libreactor is not
+#      in servers.Registry or mage_cluster.go's nativeBuildSpecs and appears in
+#      no published result — a dead adapter costing an unpinned fetch plus an
+#      autotools build every time. The source under servers/libreactor/ is kept
+#      so the adapter can be re-registered; it just no longer builds unasked.
+- name: c | check whether the PINNED libreactor is already built
+  ansible.builtin.stat:
+    path: "{{ bench_root }}/libreactor/prefix/.pin-{{ libreactor_commit }}"
+  register: libreactor_built
+  when: "'libreactor' in (competitor_list | default([]))"
+
+- name: c | fetch libreactor at the pinned commit
   ansible.builtin.shell: |
     set -euo pipefail
-    git ls-remote https://github.com/fredrikwidlund/libreactor.git HEAD \
-      | cut -f1 | cut -c1-12
-  register: libreactor_tag
-  changed_when: false
-
-- name: c | record resolved libreactor commit
-  ansible.builtin.set_fact:
-    libreactor_version: "{{ libreactor_tag.stdout | trim }}"
-
-# Idempotency: skip the whole clone+build when the resolved version's static
-# archive already exists in the prefix. lib/libreactor.a is the canonical
-# "already built" marker the adapter Makefile links against.
-- name: c | check whether resolved libreactor is already built
-  ansible.builtin.stat:
-    path: "{{ bench_root }}/libreactor/prefix/lib/libreactor.a"
-  register: libreactor_built
-
-# Shallow-clone the default branch (master). --depth 1 with no --branch
-# fetches the current master tip, which is what we resolved above.
-- name: c | shallow-clone libreactor master
-  ansible.builtin.command:
-    cmd: >-
-      git clone --depth 1
-      https://github.com/fredrikwidlund/libreactor.git
-      {{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}
-    creates: "{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}/configure.ac"
-  when: not libreactor_built.stat.exists
+    dest="{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_commit[:12] }}"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    cd "$dest"
+    git init -q
+    git remote add origin https://github.com/fredrikwidlund/libreactor.git
+    git fetch -q --depth 1 origin "{{ libreactor_commit }}"
+    git checkout -q FETCH_HEAD
+    got="$(git rev-parse HEAD)"
+    if [ "$got" != "{{ libreactor_commit }}" ]; then
+      echo "libreactor: expected {{ libreactor_commit }}, got $got" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  when:
+    - "'libreactor' in (competitor_list | default([]))"
+    - not (libreactor_built.stat.exists | default(false))
 
 # autogen + configure + make + make install into the bench_root prefix.
 # libreactor is autotools: autogen.sh regenerates configure, then a normal
@@ -119,15 +126,20 @@
     CFLAGS: "-O3 -march=native"
   ansible.builtin.shell: |
     set -euo pipefail
-    cd "{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_version }}"
+    cd "{{ bench_root }}/libreactor/src/libreactor-{{ libreactor_commit[:12] }}"
     ./autogen.sh
     ./configure --prefix="{{ bench_root }}/libreactor/prefix"
     make -j"$(nproc)"
     make install
+    # Commit-stamp the prefix (see the drogon/h2o rationale): lib/libreactor.a
+    # alone is revision-agnostic, so a warm bench_root would mask a pin change.
+    touch "{{ bench_root }}/libreactor/prefix/.pin-{{ libreactor_commit }}"
   args:
     executable: /bin/bash
-    creates: "{{ bench_root }}/libreactor/prefix/lib/libreactor.a"
-  when: not libreactor_built.stat.exists
+    creates: "{{ bench_root }}/libreactor/prefix/.pin-{{ libreactor_commit }}"
+  when:
+    - "'libreactor' in (competitor_list | default([]))"
+    - not (libreactor_built.stat.exists | default(false))
 
 # ---------------------------------------------------------------------
 # libh2o (the h2o adapter). Built ONLY when h2o is in the competitor set,
@@ -147,21 +159,40 @@
     - "{{ bench_root }}/h2o/prefix"
   when: "'h2o' in (competitor_list | default([]))"
 
-- name: c | h2o | check whether libh2o is already built
+# Idempotency marker. MUST be commit-stamped: libh2o-evloop.a alone is
+# revision-agnostic, so a warm bench_root carrying an archive built from the
+# old always-latest `master` clone would satisfy it and skip the fetch+build —
+# a green deploy running an UNPINNED library.
+- name: c | h2o | check whether the PINNED libh2o is already built
   ansible.builtin.stat:
-    path: "{{ bench_root }}/h2o/prefix/lib/libh2o-evloop.a"
+    path: "{{ bench_root }}/h2o/prefix/.pin-{{ h2o_commit }}"
   register: libh2o_built
   when: "'h2o' in (competitor_list | default([]))"
 
-# h2o vendors picotls/quicly/picohttpparser as git submodules — the build
-# needs their sources, so the shallow clone MUST recurse submodules.
-- name: c | h2o | shallow-clone h2o master (with submodules)
-  ansible.builtin.command:
-    cmd: >-
-      git clone --depth 1 --recurse-submodules --shallow-submodules
-      https://github.com/h2o/h2o.git
-      {{ bench_root }}/h2o/src/h2o
-    creates: "{{ bench_root }}/h2o/src/h2o/CMakeLists.txt"
+# h2o needs its picotls/quicly/picohttpparser sources, so the fetch recurses
+# submodules. Pinned to h2o_commit (see defaults/main.yml) — this used to clone
+# whatever `master` happened to be that morning.
+- name: c | h2o | fetch h2o at the pinned commit (with submodules)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    dest="{{ bench_root }}/h2o/src/h2o"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    cd "$dest"
+    git init -q
+    git remote add origin https://github.com/h2o/h2o.git
+    git fetch -q --depth 1 origin "{{ h2o_commit }}"
+    git checkout -q FETCH_HEAD
+    git submodule update -q --init --recursive --depth 1
+    # Assert we got the commit we asked for. Never use `creates:` on this task:
+    # it would skip the assertion, which is the entire enforcement.
+    got="$(git rev-parse HEAD)"
+    if [ "$got" != "{{ h2o_commit }}" ]; then
+      echo "h2o: expected {{ h2o_commit }}, got $got" >&2
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
   when:
     - "'h2o' in (competitor_list | default([]))"
     - not (libh2o_built.stat.exists | default(false))
@@ -191,9 +222,12 @@
     cp -a include/. "$PREFIX/include/"
     cp -a deps/picotls/include/. "$PREFIX/include/"
     cp -a deps/quicly/include/. "$PREFIX/include/"
+    # Commit-stamp the prefix so the next deploy can tell WHICH revision built
+    # it. Written last so a partial build never looks complete.
+    touch "$PREFIX/.pin-{{ h2o_commit }}"
   args:
     executable: /bin/bash
-    creates: "{{ bench_root }}/h2o/prefix/lib/libh2o-evloop.a"
+    creates: "{{ bench_root }}/h2o/prefix/.pin-{{ h2o_commit }}"
   when:
     - "'h2o' in (competitor_list | default([]))"
     - not (libh2o_built.stat.exists | default(false))
@@ -204,6 +238,12 @@
   register: c_versions
   changed_when: false
 
+# Records the PINNED revisions rather than a deploy-time-resolved fact.
+# `libreactor_version` used to be set by a `git ls-remote` task that ran
+# unconditionally; now that libreactor is gated on being in scope, that fact no
+# longer exists on a deploy without it — so this reads the pin from
+# defaults/main.yml, which is always defined. h2o is recorded here too: it is
+# the C dependency that actually ships in every bench.
 - name: c | append toolchain entry to manifest
   ansible.builtin.set_fact:
     installed_toolchains: >-
@@ -213,4 +253,6 @@
               'apt_pkgs': c_missing_pkgs.stdout_lines }] }}
     fetched_versions: >-
       {{ fetched_versions
-         | combine({ 'c': (c_versions.stdout | trim) + ' / libreactor ' + libreactor_version }) }}
+         | combine({ 'c': (c_versions.stdout | trim)
+                          + ' / h2o ' + h2o_commit[:12]
+                          + ' / libreactor ' + libreactor_commit[:12] }) }}

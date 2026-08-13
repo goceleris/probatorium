@@ -7,7 +7,7 @@ require (
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/kataras/iris/v12 v12.2.11
-	github.com/redis/go-redis/v9 v9.21.0
+	github.com/redis/go-redis/v9 v9.22.0
 )
 
 require (
@@ -42,7 +42,7 @@ require (
 	github.com/rogpeppe/go-internal v1.15.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/schollz/closestmatch v2.1.0+incompatible // indirect
-	github.com/sirupsen/logrus v1.8.1 // indirect
+	github.com/sirupsen/logrus v1.8.3 // indirect
 	github.com/tdewolff/minify/v2 v2.20.19 // indirect
 	github.com/tdewolff/parse/v2 v2.7.12 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect

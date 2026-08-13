@@ -114,6 +114,39 @@ updates:
     commit-message:
       prefix: "deps(js)"
 
+  # ----- Maven (JVM adapters) -----
+  # Both poms already carry exact version pins and nothing bumps them at
+  # deploy time, but until 2026-08-13 they were entirely unwatched — so a
+  # pinned-and-forgotten version was the failure mode rather than an
+  # unreviewed bump. Dependabot follows the ${vertx.version} / ${netty.version}
+  # property indirection and also bumps BOM imports and plugin versions.
+  - package-ecosystem: maven
+    directories:
+      - /servers/netty
+      - /servers/vertx
+    schedule:
+      interval: daily
+    groups:
+      all-maven-deps:
+        patterns:
+          - "*"
+        update-types:
+          - major
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps(maven)"
+
+  # ----- Manually-pinned upstreams (no Dependabot ecosystem exists) -----
+  # These are pinned in-repo and bumped BY HAND — there is no manager for a
+  # git clone inside an ansible task, for CMake, or for the .NET SDK:
+  #   ansible/roles/cpp/defaults/main.yml   drogon_version + drogon_commit
+  #   ansible/roles/c/defaults/main.yml     h2o_commit
+  #   servers/lithium/CMakeLists.txt        LITHIUM_COMMIT + LITHIUM_SHA256
+  #   ansible/roles/dotnet/                 .NET SDK channel (still floating)
+  # servers/httpzig/build.zig.zon already pins by URL + content hash and
+  # `zig build` fails on mismatch, so zig needs no entry.
+
   # ----- pip (Python adapters) -----
   # Both adapters pin via a hash-verified requirements.lock generated from
   # pyproject.toml; dependabot bumps the pyproject floors and the lock.

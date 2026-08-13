@@ -5,12 +5,17 @@
   Stack: io.vertx:vertx-core HttpServer + io.vertx:vertx-web Router on the
   JVM event-loop reactor. The canonical top-JVM TechEmpower entrant.
 
-  Always-latest policy (mirrors the rust / python / dotnet adapters): the
-  vertx.version property below is a floor that the ansible java role bumps
-  to the freshest stable at deploy time via `mvn versions:use-latest-releases`
-  (or by overriding -Dvertx.version=). NEVER treat it as a hard pin — the
-  bench is intentionally a moving target. The value committed here only has
-  to be new enough to compile.
+  Dependency policy: every version here is an EXACT PIN and is treated as one.
+  Maven has no lockfile, but nothing resolves versions at deploy time either —
+  the only mvn invocation in the repo is `mvn -B -DskipTests ... package` in
+  ansible/roles/java/tasks/build_competitor.yml, with no `versions:` goal and
+  no -U. Bumps land through a reviewed Dependabot PR, same as the other
+  ecosystems.
+
+  (An earlier version of this comment claimed the java role bumped these to the
+  freshest stable at deploy time via `mvn versions:use-latest-releases`. It
+  never did — that string appeared nowhere in the repo except the comment
+  itself — so this adapter was already pinned while documenting otherwise.)
 
   Build: `mvn -q -B package` produces an executable uber-jar (maven-shade)
   at target/probatorium-vertx-server.jar runnable via
@@ -33,10 +38,11 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <!-- Always-latest floor; the java role resolves the freshest stable at
-         deploy time. Vert.x 5.x is the current line (Java 11+ baseline,
-         tested on 21). -->
-    <vertx.version>5.0.0</vertx.version>
+    <!-- EXACT PIN (not a floor). Bumped only via a reviewed Dependabot PR;
+         nothing resolves this at deploy time. Vert.x 5.x is the current line
+         (Java 11+ baseline, tested on 21). NOTE: netty.epoll.version below
+         must track vertx-core's netty — see the profile at the bottom. -->
+<vertx.version>5.0.12</vertx.version>
     <!-- Single-class entry point; the shade plugin stamps it as Main-Class. -->
     <main.class>probatorium.vertx.Server</main.class>
     <!-- Stable uber-jar name so the launcher / RunCmd reference it without

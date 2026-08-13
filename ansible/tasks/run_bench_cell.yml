@@ -76,9 +76,21 @@
 # (2026-08-13). Running celeris unprivileged too is the end state, but
 # that changes how the measured SUT starts, so it needs its own A/B —
 # tracked separately rather than folded into a security fix.
+# celeris_needs_root exists so the "should the SUT drop root too?" question
+# (probatorium#231) can be A/B'd by flipping one extra-var instead of editing
+# this file:
+#
+#   ansible-playbook ... --extra-vars celeris_needs_root=false
+#
+# Default stays `true` deliberately. The unprivileged path looks safe on the
+# evidence — the 2026-08-13 validation run showed unprivileged competitors
+# reaching `Max open files: 65535/65535`, memlock is unlimited for the bench
+# user, and celeris runs with sqpoll=false which needs no capability — but
+# this changes how the MEASURED server starts, and perf-neutrality must be
+# demonstrated by an A/B across the io_uring/epoll columns, not assumed.
 - name: "{{ cell.1 }} run={{ cell.0 }} | resolve privilege for this column"
   ansible.builtin.set_fact:
-    cell_needs_root: "{{ cell_bin == 'celeris' }}"
+    cell_needs_root: "{{ cell_bin == 'celeris' and (celeris_needs_root | default(true) | bool) }}"
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
   ansible.builtin.file:

@@ -1,0 +1,21 @@
+---
+# Pinned .NET SDK version for the aspnet competitor.
+#
+# Until 2026-08-13 the role installed `--channel LTS`, i.e. always-latest LTS
+# resolved at fetch time. For this adapter the SDK IS the dependency pin:
+# servers/aspnet declares ZERO PackageReference, so a NuGet lockfile would lock
+# an empty graph — the ASP.NET/runtime/host/crossgen2 packs are chosen by the
+# installed SDK's BundledVersions.props (MSBuild PackageDownload items, which a
+# lockfile provably does not record). Pinning the SDK is therefore the pin.
+#
+# 10.0.400 is what `--channel LTS` resolved to on the cluster (observed in the
+# running SDK path during the 2026-08-13 deploy), so this is a behavioural
+# no-op today — it just stops the version moving unreviewed.
+#
+# MUST match servers/aspnet/global.json, which sets rollForward:disable so a
+# mismatch fails loudly rather than silently benchmarking a different Kestrel.
+#
+# Dependabot has no manager for the .NET SDK, so this is bumped MANUALLY, and a
+# bump changes the benchmarked Kestrel implementation and the ReadyToRun
+# codegen — treat it as a PERF-RELEVANT change, not routine maintenance.
+dotnet_sdk_version: "10.0.400"

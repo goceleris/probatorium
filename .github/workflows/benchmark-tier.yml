@@ -1,11 +1,16 @@
 name: Benchmark Tier
 
 # Curated benchmark sweep on the cluster within a budget
-# (probatorium#172/#166). MANUAL dispatch only — the owner dispatches one
-# bench per release. The bench ALWAYS runs exactly ONE pass; the
-# multi-pass / back-to-back machinery and the new-release auto-trigger
-# (workflow_run on "Weekend Soak") were removed. If more passes are
-# wanted, more benchmarks are dispatched.
+# (probatorium#172/#166). Runs weekly on a schedule (Wednesday, the
+# "headline" RATED profile) and on manual dispatch — e.g. the owner
+# dispatching a release-grade `full` run. The bench ALWAYS runs exactly ONE
+# pass; the multi-pass / back-to-back machinery and the new-release
+# auto-trigger (workflow_run on "Weekend Soak") were removed. If more passes
+# are wanted, more benchmarks are dispatched.
+#
+# PUBLISH POLICY (probatorium#229): only RATED profiles publish. `fast` is
+# saturation-only and is pinned to BENCH_PUBLISH=0 — it exists for
+# development and PR approval, never for the public dataset.
 #
 # Job graph: setup -> matrix -> teardown.
 #   - setup:    provision FRESH ephemeral cluster runners.
@@ -22,18 +27,25 @@ name: Benchmark Tier
 
 on:
   schedule:
-    # Weekly full-grid SATURATION bench (the "fast" profile: rated OFF, 35s/10s,
-    # ~21.6h — fits the 24h cluster slot). This re-activates the weekly cadence
-    # that was previously manual-only. Wednesday 04:00 UTC keeps it clear of the
-    # weekend soak; the matrix-tier-cluster concurrency group serializes anyway.
+    # Weekly RATED bench (the "headline" profile: full grid WITH the rated/SLO
+    # sweep, 40s/12s → ~16.7h, fits the 24h cluster slot). Wednesday 04:00 UTC
+    # keeps it clear of the weekend soak; the matrix-tier-cluster concurrency
+    # group serializes anyway.
+    #
+    # Was the "fast" profile until 2026-08-13. fast is saturation-ONLY, so the
+    # weekly kept publishing datasets with zero rated_mode_p99 / latency_at_slo
+    # over the rated release data (v1.5.8: 20260716 rated vs 20260722/29/0805
+    # fast) — progressively shadowing the very metric the rated mode exists to
+    # produce. Published results must always carry rated data; see the publish
+    # policy on BENCH_PUBLISH below.
     - cron: "0 4 * * 3"
   workflow_dispatch:
     inputs:
       profile:
-        description: "fast (DEFAULT, recommended): full grid, saturation-only (rated OFF), 35s/10s → ~21.6h, fits 24h. | full / headline: ALSO run the rated/SLO sweep — much longer; full needs a raised BENCH_BUDGET (set automatically below) and won't fit 24h."
+        description: "headline (DEFAULT, the weekly cadence): full grid WITH the rated/SLO sweep, 40s/12s → ~16.7h, fits 24h — this is what PUBLISHES. | full: same grid at the exhaustive 90s/20s window (~30h+, needs a raised BENCH_BUDGET, will not fit 24h) — for release-grade runs. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
         required: false
         type: string
-        default: fast
+        default: headline
       competitors:
         description: "Adapter columns to BENCH (BENCH_COMPETITORS). 'all' (DEFAULT) runs the full grid; a CSV of registry slugs (e.g. 'httpzig,drogon,aspnet-h2') runs ONLY those columns — used to re-run the subset that DNF'd in a prior run without paying for the whole grid. Names must match servers.Registry."
         required: false
@@ -45,7 +57,7 @@ on:
         type: string
         default: all
       publish:
-        description: "Push results to the docs repo (BENCH_PUBLISH). 'true' (DEFAULT) publishes; 'false' produces data only (no docs push, no integrity gate) — use for a subset re-run that you compose + publish manually."
+        description: "Push results to the docs repo (BENCH_PUBLISH). 'true' (DEFAULT) publishes; 'false' produces data only (no docs push, no integrity gate) — use for a subset re-run that you compose + publish manually. IGNORED when profile=fast: saturation-only data is never published."
         required: false
         type: string
         default: "true"
@@ -91,11 +103,11 @@ jobs:
     # Raised from 72h to 80h so the run has comfortable headroom and reaching
     # the ceiling is not a concern. Well under GitHub's 5-day self-hosted job
     # hard limit. This is only a ceiling — the headline profile (same grid,
-    # shorter window) projects ~21.6h. BENCH_BUDGET (below) is the real
+    # shorter 40s/12s window) projects ~16.7h. BENCH_BUDGET (below) is the real
     # fail-loud projection gate.
     timeout-minutes: 4800
     env:
-      BENCH_PROFILE: ${{ github.event.inputs.profile || 'fast' }}
+      BENCH_PROFILE: ${{ github.event.inputs.profile || 'headline' }}
       # Column subset to BENCH for a targeted re-run; 'all' on schedule/default.
       BENCH_COMPETITORS: ${{ github.event.inputs.competitors || 'all' }}
       # Binary/module set to BUILD+DEPLOY. MUST be job-level (not just the
@@ -107,13 +119,26 @@ jobs:
       # use them. h2 columns reuse their h1 sibling's binary, so this set
       # differs from BENCH_COMPETITORS.
       DEPLOY_COMPETITORS: ${{ github.event.inputs.deploy_competitors || 'all' }}
-      # 'false' => data-only (no docs push, no integrity gate). Maps to the
-      # BENCH_PUBLISH=0 the mage targets read; any other value publishes.
-      BENCH_PUBLISH: ${{ github.event.inputs.publish == 'false' && '0' || '1' }}
+      # PUBLISH POLICY. Two rules, in order:
+      #
+      #   1. profile=fast NEVER publishes — full stop, regardless of the
+      #      `publish` input. fast is saturation-only (rated OFF), so its
+      #      datasets carry no rated_mode_p99 / latency_at_slo. Publishing
+      #      them shadowed the rated release data on the docs site with
+      #      strictly-less-informative numbers (v1.5.8: the rated 20260716
+      #      run was followed by three fast 2026-07-22/29 + 08-05 runs that
+      #      had ZERO rated entries). fast exists for development and PR
+      #      approval, and its output stays off the public site.
+      #   2. Otherwise honour the input: 'false' => data-only (no docs push,
+      #      no integrity gate); anything else publishes.
+      #
+      # Enforced here rather than by convention so a stray manual dispatch
+      # (or a future scheduled tier) cannot publish saturation-only data.
+      BENCH_PUBLISH: ${{ (github.event.inputs.profile || 'headline') == 'fast' && '0' || (github.event.inputs.publish == 'false' && '0' || '1') }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.4"
           cache: true
