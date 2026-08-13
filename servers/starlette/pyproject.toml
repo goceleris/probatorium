@@ -5,10 +5,11 @@
 # baseline — this column isolates the routing + ASGI cost FastAPI adds its
 # DI/validation overhead on top of.
 #
-# Always-latest version policy: every dep uses a `>=` floor only — `uv lock`
-# resolves at deploy time so each cluster run picks up the freshest stable
-# wheel from PyPI. NEVER pin upper bounds here; the bench is intentionally
-# a moving target.
+# Dependency policy: the `>=` floors below are deliberately loose; the
+# COMMITTED requirements.lock (uv pip compile --universal
+# --generate-hashes) is the source of truth and installs run with
+# --require-hashes. Versions move only through a reviewed
+# Dependabot PR, never resolved fresh at deploy time.
 #
 # The blessed Starlette fast-path:
 #   * Plain `Starlette(routes=[...])` with `async def` handlers returning

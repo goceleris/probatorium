@@ -14,11 +14,14 @@
 #
 # What we do, in order:
 #
-#   1. bun install --production. Resolves "latest" deps fresh against
-#      the upstream registry — no lockfile is shipped (always-latest
-#      policy), so this is the canonical resolution step. --production
-#      drops devDependencies (typescript, @types/bun) since the build
-#      output is plain JS.
+#   1. bun install --production --frozen-lockfile. Installs EXACTLY the
+#      versions in the committed bun.lock and fails if package.json and
+#      the lock disagree — no fresh resolution at deploy time. Upstream
+#      bumps arrive only via a reviewed Dependabot PR. (Until 2026-08-12
+#      this was an unpinned `bun install` against registry HEAD, i.e.
+#      unreviewed third-party code executing on the bench hosts.)
+#      --production drops devDependencies (typescript, @types/bun) since
+#      the build output is plain JS.
 #   2. bun build --target=bun --minify --sourcemap=none src/server.ts
 #      --outfile=dist/server. Produces a single-file bundle Bun can
 #      execute directly. --target=bun keeps Bun built-ins (Bun.serve,
@@ -40,14 +43,15 @@
 # operator's ~/.bun shipped. Other env vars (BUN_INSTALL, XDG_*) come
 # from the calling task in build_native_competitor.yml.
 
-- name: "bun | {{ competitor_name }} | install dependencies (always-latest)"
+- name: "bun | {{ competitor_name }} | install dependencies (frozen lockfile)"
   environment:
     PATH: "{{ bench_root }}/bun/bin:{{ ansible_env.PATH }}"
     BUN_INSTALL: "{{ bench_root }}/bun"
   ansible.builtin.shell: |
     set -euo pipefail
     cd "{{ competitor_src }}"
-    bun install --production
+    test -f bun.lock || { echo "bun.lock missing for {{ competitor_name }} — refusing to resolve deps unpinned"; exit 1; }
+    bun install --production --frozen-lockfile
   args:
     executable: /bin/bash
 

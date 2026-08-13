@@ -57,6 +57,29 @@
     cell_bin: "{{ competitor_columns[cell.1].bin if (competitor_columns is defined and cell.1 in competitor_columns) else cell.1 }}"
     cell_engine: "{{ competitor_columns[cell.1].engine if (competitor_columns is defined and cell.1 in competitor_columns) else '' }}"
 
+# PRIVILEGE GATE. Only the celeris SUT is launched as root; every
+# third-party competitor runs as the unprivileged bench user.
+#
+# Why: competitor binaries are built from upstream source we do not
+# review line-by-line. Until 2026-08-13 every one of them was started
+# with `become: true`, so any compromised or broken upstream release
+# executed as root on the bench hosts — which also carry the Tailnet
+# membership, the self-hosted runner and its secrets. The 2026-08-12
+# ntex-server 3.11.0 breakage showed how easily an unreviewed upstream
+# cut reaches these machines.
+#
+# Fairness: this does NOT advantage celeris. Both rlimits that matter
+# are already equalised for the unprivileged user on every cluster host
+# — memlock is `unlimited` via /etc/security/limits.conf, and nofile's
+# hard limit is 524288, so the `ulimit -n 65535` in the launch task
+# succeeds without root. Verified on msa2-server + msa2-client
+# (2026-08-13). Running celeris unprivileged too is the end state, but
+# that changes how the measured SUT starts, so it needs its own A/B —
+# tracked separately rather than folded into a security fix.
+- name: "{{ cell.1 }} run={{ cell.0 }} | resolve privilege for this column"
+  ansible.builtin.set_fact:
+    cell_needs_root: "{{ cell_bin == 'celeris' }}"
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
   ansible.builtin.file:
     path: "{{ cell_dir }}"
@@ -155,7 +178,8 @@
   when: inventory_hostname == bench_target
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start competitor server in background"
-  become: true
+  # Root ONLY for the celeris SUT — see the privilege-gate fact above.
+  become: "{{ cell_needs_root | bool }}"
   # The binary is {{ cell_bin }} (the dir under competitors/), launched with
   # the column's -engine when one applies. gorilla_ws + native adapters carry
   # an empty cell_engine, so the `-engine` arg is omitted entirely — passing
@@ -204,8 +228,9 @@
       # 1024-connection cell (sse-fanout-1024 / ws-hub-broadcast-1024 /
       # get-simple-1024c) before counting the listener, logs and backend
       # client sockets — and churn-close's dial storms park hundreds more
-      # in TIME_WAIT/accept queues. Launched under root (become), so both
-      # soft+hard rise; best-effort like -l above.
+      # in TIME_WAIT/accept queues. Root raises soft+hard; unprivileged
+      # competitors raise the soft limit within the host's 524288 hard
+      # ceiling, which clears 65535 either way. Best-effort like -l above.
       ulimit -n 65535 2>/dev/null || true
       # Bounded respawn supervisor (max 5). A SUT that crashes mid-column
       # (e.g. http.zig hitting an unreachable under churn-close) self-heals

@@ -22,11 +22,10 @@
 #       The binary prints `ready addr=<final-bind-addr>` on stdout once
 #       the listener is up; SIGTERM triggers graceful shutdown within 5s.
 #
-# Always-latest version policy: every dependency is expressed as a `>=`
-# floor with no upper bound so `cargo update` resolves the newest
-# compatible release at deploy time. Do NOT pin to exact versions — the
-# whole probatorium contract is to bench whatever stable cuts the
-# upstream world has at the moment the cluster runs.
+# Dependency policy: the `>=` floors below are deliberately loose; the
+# COMMITTED Cargo.lock is the source of truth and builds run with
+# `cargo build --locked`. Versions move only through a reviewed
+# Dependabot PR, never resolved fresh at deploy time.
 
 [package]
 name = "probatorium-hyper-server"

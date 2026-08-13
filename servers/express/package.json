@@ -5,7 +5,7 @@
   "//purpose": "Express 5 adapter — the Node.js baseline. Express on the stock Node.js http server (HTTP/1.1 only). Node-runtime counterpart to the bun adapters and the python fastapi adapter. Source is plain CommonJS run directly by node — NO bundler, NO transpile step.",
   "//build": "node has no build step for this adapter: `npm ci` (or `npm install`) populates node_modules from the resolved express, then the launcher execs `node src/server.js`. The ansible node role writes a POSIX-sh launcher next to src/ that runs the bench-installed node on src/server.js, forwarding argv.",
   "//run": "`node src/server.js -bind <host:port> [-engine h1]` is the canonical entry. The launcher symlinked into competitors/express forwards the runner's -bind flag.",
-  "//versions": "Always-latest policy: express uses unbounded `latest` so `npm install` resolves the newest stable cut at deploy time. Do NOT pin — the bench tracks upstream as-is.",
+  "//versions": "Versions are pinned by the committed lockfile and installed frozen (bun install --frozen-lockfile / npm ci). Bumps land only via a reviewed Dependabot PR — never resolved fresh at deploy time. See .gitignore (Rust block) for why.",
   "engines": {
     "node": ">=18"
   },
@@ -13,6 +13,6 @@
     "start": "node src/server.js"
   },
   "dependencies": {
-    "express": "latest"
+    "express": "^5.2.1"
   }
 }

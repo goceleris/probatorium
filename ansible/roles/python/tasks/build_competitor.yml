@@ -55,18 +55,42 @@
     cmd: "{{ bench_root }}/uv/bin/uv venv --python 3.13 {{ bench_root }}/python-venvs/{{ competitor_name }}"
     creates: "{{ bench_root }}/python-venvs/{{ competitor_name }}/bin/python"
 
-# `uv pip install --python <venv-py> .` resolves and installs every
-# dep listed in pyproject.toml's [project.dependencies] using the
-# always-latest semantics encoded in the `>=` floors. No lockfile is
-# committed — we WANT each deploy to pick up newer wheels.
-- name: "{{ competitor_name }} | install adapter deps into venv"
+# Deps come from the COMMITTED requirements.lock, installed with
+# --require-hashes so every wheel is verified against a sha256 recorded
+# in-repo. The lock is generated universally (all platforms/arches) via:
+#
+#   uv pip compile pyproject.toml --universal --generate-hashes \
+#       --python-version 3.13 -o requirements.lock
+#
+# Deploys no longer resolve fresh from PyPI: a new upstream release
+# reaches the cluster only through a reviewed Dependabot PR that
+# regenerates this lock and passes CI. Before 2026-08-12 the `>=` floors
+# were resolved at deploy time, so unreviewed third-party code ran here.
+- name: "{{ competitor_name }} | install adapter deps into venv (hash-verified lock)"
   environment:
     UV_CACHE_DIR: "{{ bench_root }}/uv-cache"
     UV_PYTHON_INSTALL_DIR: "{{ bench_root }}/uv-python"
     XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
     XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
   ansible.builtin.command:
-    cmd: "{{ bench_root }}/uv/bin/uv pip install --python {{ bench_root }}/python-venvs/{{ competitor_name }}/bin/python {{ competitor_src_dir }}"
+    cmd: >-
+      {{ bench_root }}/uv/bin/uv pip install
+      --python {{ bench_root }}/python-venvs/{{ competitor_name }}/bin/python
+      --require-hashes -r {{ competitor_src_dir }}/requirements.lock
+
+# The adapter package itself, with --no-deps: every dependency was
+# already installed hash-verified above, so this must not re-resolve.
+- name: "{{ competitor_name }} | install adapter package (no deps)"
+  environment:
+    UV_CACHE_DIR: "{{ bench_root }}/uv-cache"
+    UV_PYTHON_INSTALL_DIR: "{{ bench_root }}/uv-python"
+    XDG_CACHE_HOME: "{{ bench_root }}/xdg-cache"
+    XDG_CONFIG_HOME: "{{ bench_root }}/xdg-config"
+  ansible.builtin.command:
+    cmd: >-
+      {{ bench_root }}/uv/bin/uv pip install
+      --python {{ bench_root }}/python-venvs/{{ competitor_name }}/bin/python
+      --no-deps {{ competitor_src_dir }}
 
 # The launcher is a tiny shell shim: parse `-bind <addr>`, split into
 # host+port, exec uvicorn under the venv with the always-on perf flags.

@@ -491,6 +491,30 @@
         - inventory_hostname in groups['bench_targets']
         - competitor_sources is defined
 
+    # ---------- competitor build preflight (fail fast) ----------
+    # A competitor that fails to build is ABSENT from the grid, which means
+    # its column produces no results.json rollup — and the publish integrity
+    # gate then refuses the whole dataset. Before this gate that verdict
+    # arrived at the END of the run: on 2026-08-12 an upstream ntex-server
+    # 3.11.0 breakage burned 11.5h of cluster time before failing at publish.
+    #
+    # Failing here instead costs ~15 minutes and leaves the cluster free.
+    # Ad-hoc/dev runs that genuinely want a partial grid can opt out with
+    # `--extra-vars allow_missing_competitors=true`.
+    - name: Competitor build preflight — abort if any native competitor failed to build
+      ansible.builtin.fail:
+        msg: >-
+          NATIVE COMPETITOR BUILD FAILURE on {{ inventory_hostname }}:
+          {{ failed_natives | join(', ') }}.
+          These competitors would be ABSENT from the grid, so the run would
+          produce an incomplete dataset and be rejected by the publish
+          integrity gate after hours of cluster time. Fix the adapter (or
+          its pinned dependency), or re-run with
+          --extra-vars allow_missing_competitors=true to accept a partial grid.
+      when:
+        - failed_natives | default([]) | length > 0
+        - not (allow_missing_competitors | default(false) | bool)
+
     # ---------- dbservices (only role allowed to install docker) ----------
     - name: Install dbservices (postgres / redis / memcached containers)
       ansible.builtin.include_role:

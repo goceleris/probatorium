@@ -585,19 +585,19 @@ type nativeBuildSpec struct {
 var nativeBuildSpecs = map[string]nativeBuildSpec{
 	"axum": {
 		lang:      "rust",
-		buildCmd:  "cargo build --profile release-fat",
+		buildCmd:  "cargo build --locked --profile release-fat",
 		binaryRel: "target/release-fat/probatorium-axum-server",
 	},
 	"ntex": {
 		lang:      "rust",
-		buildCmd:  "cargo build --profile release-fat",
+		buildCmd:  "cargo build --locked --profile release-fat",
 		binaryRel: "target/release-fat/probatorium-ntex-server",
 	},
 	// hyper — same rust toolchain + release-fat profile as the framework
 	// crates above; binary name from servers/hyper/Cargo.toml's [[bin]].
 	"hyper": {
 		lang:      "rust",
-		buildCmd:  "cargo build --profile release-fat",
+		buildCmd:  "cargo build --locked --profile release-fat",
 		binaryRel: "target/release-fat/probatorium-hyper-server",
 	},
 	// drogon — C++ built on the bench host via the cpp role + libdrogon.
@@ -630,7 +630,7 @@ var nativeBuildSpecs = map[string]nativeBuildSpec{
 	// ---- wave-6 native competitors ----
 	"actix": {
 		lang:      "rust",
-		buildCmd:  "cargo build --profile release-fat",
+		buildCmd:  "cargo build --locked --profile release-fat",
 		binaryRel: "target/release-fat/probatorium-actix-server",
 	},
 	"starlette": {lang: "python", moduleTarget: "app.server:app"},
