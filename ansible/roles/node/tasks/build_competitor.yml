@@ -14,12 +14,19 @@
 #
 # Node adapters run src/server.js directly (no transpile/bundle) — pure
 # JS or prebuilt N-API addons (uWebSockets.js). So the only build step is
-# `npm install`; the launcher execs node on src/server.js, forwarding argv.
+# `npm ci`; the launcher execs node on src/server.js, forwarding argv.
+#
+# `npm ci` (not `npm install`) installs EXACTLY the committed
+# package-lock.json and fails if it disagrees with package.json — no
+# deploy-time resolution against registry HEAD. Upstream bumps arrive
+# only through a reviewed Dependabot PR. Until 2026-08-12 this was an
+# unpinned `npm install`, i.e. unreviewed third-party code executing on
+# the bench hosts.
 #
 # Caches stay under bench_root (npm_config_cache) so pristine cleanup
 # wipes everything — no $HOME writes.
 
-- name: "node | {{ competitor_name }} | npm install (always-latest)"
+- name: "node | {{ competitor_name }} | npm ci (locked)"
   environment:
     PATH: "{{ bench_root }}/node/bin:{{ ansible_env.PATH }}"
     npm_config_cache: "{{ bench_root }}/npm-cache"
@@ -29,7 +36,8 @@
   ansible.builtin.shell: |
     set -euo pipefail
     cd "{{ competitor_src }}"
-    "{{ bench_root }}/node/bin/npm" install --no-audit --no-fund
+    test -f package-lock.json || { echo "package-lock.json missing for {{ competitor_name }} — refusing to resolve deps unpinned"; exit 1; }
+    "{{ bench_root }}/node/bin/npm" ci --no-audit --no-fund
   args:
     executable: /bin/bash
 

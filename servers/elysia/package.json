@@ -4,16 +4,16 @@
   "type": "module",
   "//build": "Bundles src/server.ts into a single dist/server file via Bun's native bundler. --target=bun keeps Bun built-ins external; --minify shaves bytes. The launcher symlink the ansible build_native_competitor task creates execs `bun run dist/server` so the runtime is Bun, not node.",
   "//run": "`bun run dist/server` is the canonical entry — invoked by the launcher symlink. CLI args after `--` are forwarded to the script (process.argv).",
-  "//versions": "Always-latest policy: deps use unbounded `latest` so `bun install` resolves the newest cut at deploy time. Do NOT pin — the bench is meant to track upstream as-is.",
+  "//versions": "Versions are pinned by the committed lockfile and installed frozen (bun install --frozen-lockfile / npm ci). Bumps land only via a reviewed Dependabot PR — never resolved fresh at deploy time. See .gitignore (Rust block) for why.",
   "scripts": {
     "build": "bun build --target=bun --minify --sourcemap=none ./src/server.ts --outfile=./dist/server",
     "start": "bun run dist/server"
   },
   "dependencies": {
-    "elysia": "latest"
+    "elysia": "^1.4.29"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "typescript": "latest"
+    "@types/bun": "^1.3.14",
+    "typescript": "^7.0.2"
   }
 }

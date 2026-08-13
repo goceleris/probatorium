@@ -17,9 +17,20 @@ updates:
       - /servers/fasthttp
       - /servers/fiber
       - /servers/gin
+      - /servers/gnet
+      - /servers/gorilla_ws
       - /servers/hertz
       - /servers/iris
+      - /servers/nbio
       - /servers/stdhttp
+      - /validation/refapp/auth_jwt_csrf
+      - /validation/refapp/auth_session_ratelimit
+      - /validation/refapp/driver_memcached
+      - /validation/refapp/driver_postgres
+      - /validation/refapp/driver_redis
+      - /validation/refapp/kitchen_sink
+      - /validation/refapp/observability
+      - /validation/refapp/static_swagger_proxy
     schedule:
       interval: daily
     groups:
@@ -52,9 +63,17 @@ updates:
   # ----- Cargo (Rust adapters) -----
   # One entry per Cargo.toml; the `groups` block still collapses all
   # rust dep updates across the crates into ONE PR per run.
+  # Competitor lockfiles are COMMITTED and installs are frozen, so these
+  # PRs are the ONLY way an upstream competitor version reaches the bench
+  # hosts. `major` is included deliberately: the bench is meant to track
+  # upstream as-is, and with the lock in place a major bump arrives as a
+  # reviewable PR that CI builds — instead of landing unannounced at
+  # deploy time the way it did before 2026-08-13.
   - package-ecosystem: cargo
     directories:
+      - /servers/actix
       - /servers/axum
+      - /servers/hyper
       - /servers/ntex
     schedule:
       interval: daily
@@ -63,6 +82,7 @@ updates:
         patterns:
           - "*"
         update-types:
+          - major
           - minor
           - patch
     commit-message:
@@ -75,23 +95,32 @@ updates:
   # graph dependabot can already see.
   - package-ecosystem: npm
     directories:
+      - /servers/bunraw
       - /servers/elysia
+      - /servers/express
+      - /servers/fastify
       - /servers/hono
+      - /servers/uws
     schedule:
       interval: daily
     groups:
-      all-bun-deps:
+      all-js-deps:
         patterns:
           - "*"
         update-types:
+          - major
           - minor
           - patch
     commit-message:
-      prefix: "deps(bun)"
+      prefix: "deps(js)"
 
-  # ----- pip (FastAPI adapter) -----
+  # ----- pip (Python adapters) -----
+  # Both adapters pin via a hash-verified requirements.lock generated from
+  # pyproject.toml; dependabot bumps the pyproject floors and the lock.
   - package-ecosystem: pip
-    directory: /servers/fastapi
+    directories:
+      - /servers/fastapi
+      - /servers/starlette
     schedule:
       interval: daily
     groups:
@@ -99,6 +128,7 @@ updates:
         patterns:
           - "*"
         update-types:
+          - major
           - minor
           - patch
     commit-message:

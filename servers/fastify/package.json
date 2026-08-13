@@ -5,12 +5,12 @@
   "description": "Fastify (Node.js) adapter for the probatorium contract.",
   "type": "commonjs",
   "main": "src/server.js",
-  "//versions": "Always-latest policy: fastify is pinned to `latest` so `npm install` resolves the newest cut at deploy time. Do NOT pin an upper bound — the bench is meant to track upstream as-is. There is NO bundle step: Node runs src/server.js directly against node_modules.",
+  "//versions": "Versions are pinned by the committed lockfile and installed frozen (bun install --frozen-lockfile / npm ci). Bumps land only via a reviewed Dependabot PR — never resolved fresh at deploy time. See .gitignore (Rust block) for why.",
   "//run": "`node src/server.js -bind <host:port> [-engine h1|h2c]` is the canonical entry. The ansible node role writes a POSIX-sh launcher at competitors/fastify that execs the bench-installed node on this file, forwarding argv.",
   "scripts": {
     "start": "node src/server.js"
   },
   "dependencies": {
-    "fastify": "latest"
+    "fastify": "^5.11.3"
   }
 }

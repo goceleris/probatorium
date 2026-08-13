@@ -16,16 +16,17 @@
 #       The binary prints `ready addr=<final-bind-addr>` on stdout once
 #       the listener is up; SIGTERM triggers graceful shutdown within 5s.
 #
-# Always-latest version policy: every dependency is a `>=` floor with
-# no upper bound, resolved at deploy time.
+# Dependency policy: the `>=` floors below are deliberately loose; the
+# COMMITTED Cargo.lock is the source of truth and builds run with
+# `cargo build --locked`. Versions move only through a reviewed
+# Dependabot PR, never resolved fresh at deploy time.
 #
 # Runtime backend: we use the default tokio backend (the
 # `ntex/tokio` feature set) for wave 4a. ntex also offers `compio` and
 # `neon` runtimes — and, on linux, an io_uring-flavoured backend via
 # the `compio` runtime — but their feature names and API have shifted
-# across recent ntex releases and the always-latest policy means we
-# cannot pin to a specific feature-flag set without risking a build
-# break on the next upstream cut. Wave 4a lands the tokio backend
+# across recent ntex releases, so we stay on the feature set that works
+# on every stable ntex >= 3 rather than chasing per-release flags. Wave 4a lands the tokio backend
 # (works on every stable ntex >= 3) and the io_uring backend lands
 # as a follow-up behind a separate Cargo feature once the upstream
 # API stabilises. The benchmark headline for ntex on tokio is still
