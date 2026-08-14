@@ -1,7 +1,7 @@
-github.com/lesismal/llib v1.2.2 h1:ZoVgP9J58Ju3Yue5jtj8ybWl+BKqoVmdRaN1mNwG5Gc=
-github.com/lesismal/llib v1.2.2/go.mod h1:70tFXXe7P1FZ02AU9l8LgSOK7d7sRrpnkUr3rd3gKSg=
-github.com/lesismal/nbio v1.6.9 h1:wkeD5RAshrNJG5e/Ci0xezGlsvFccIZKLP+1htJEreY=
-github.com/lesismal/nbio v1.6.9/go.mod h1:mBn1rSIZ+cmOILhvP+/1Mb/JimgA+1LQudlHJUb/aNA=
+github.com/lesismal/llib v1.2.4 h1:O9ih7VDnOB6KOP3r64DAJpMyMJ/bCKbzYI80VoXEV28=
+github.com/lesismal/llib v1.2.4/go.mod h1:70tFXXe7P1FZ02AU9l8LgSOK7d7sRrpnkUr3rd3gKSg=
+github.com/lesismal/nbio v1.6.12 h1:nzCqb/vli06hoYdMHD+TYAGIdUnEv/BIHm3TddUD/h4=
+github.com/lesismal/nbio v1.6.12/go.mod h1:yJob6W9OvqMKsp1xB0JvUVyJz1B2hVsQY/whgvQHIM8=
 golang.org/x/crypto v0.0.0-20210513122933-cd7d49e622d5/go.mod h1:P+XmwS30IXTQdn5tA2iutPOUgjI07+tq3H3K9MVA1s8=
 golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=
 golang.org/x/crypto v0.54.0/go.mod h1:KWL8ny2AZdGR2cWmzeHrp2azQPGogOv+HeQaVEXC2dk=

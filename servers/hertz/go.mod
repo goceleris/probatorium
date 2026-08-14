@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/bradfitz/gomemcache v0.0.0-20260422231931-4d751bb6e37c
-	github.com/cloudwego/hertz v0.10.5
+	github.com/cloudwego/hertz v0.10.6
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 	github.com/google/uuid v1.6.0
 	github.com/hertz-contrib/http2 v0.1.8
@@ -20,7 +20,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/cloudwego/gopkg v0.2.0 // indirect
-	github.com/cloudwego/netpoll v0.7.3 // indirect
+	github.com/cloudwego/netpoll v0.7.5 // indirect
 	github.com/fsnotify/fsnotify v1.5.4 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect

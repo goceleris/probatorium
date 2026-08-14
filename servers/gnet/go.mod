@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
-	github.com/panjf2000/gnet/v2 v2.9.8
+	github.com/panjf2000/gnet/v2 v2.10.0
 )
 
 require (
