@@ -76,21 +76,27 @@
 # (2026-08-13). Running celeris unprivileged too is the end state, but
 # that changes how the measured SUT starts, so it needs its own A/B —
 # tracked separately rather than folded into a security fix.
-# celeris_needs_root exists so the "should the SUT drop root too?" question
-# (probatorium#231) can be A/B'd by flipping one extra-var instead of editing
-# this file:
+# NOTHING on the bench hosts runs as root any more, including the SUT.
 #
-#   ansible-playbook ... --extra-vars celeris_needs_root=false
+# The default flipped to `false` on 2026-08-14 once probatorium#231's A/B
+# showed dropping root costs nothing measurable. Six interleaved runs (3 per
+# arm) over celeris-epoll-h1-async + celeris-iouring-h1-async:
 #
-# Default stays `true` deliberately. The unprivileged path looks safe on the
-# evidence — the 2026-08-13 validation run showed unprivileged competitors
-# reaching `Max open files: 65535/65535`, memlock is unlimited for the bench
-# user, and celeris runs with sqpoll=false which needs no capability — but
-# this changes how the MEASURED server starts, and perf-neutrality must be
-# demonstrated by an A/B across the io_uring/epoll columns, not assumed.
+#   within-arm noise (same config, different rounds, n=324): |Δ| p90 = 1.97%
+#   between-arm effect (unprivileged vs root,        n=54 ): median = -0.23%
+#
+# The effect is ~8x smaller than the run-to-run noise, and the between-arm
+# spread (stdev 0.68%) is NARROWER than two runs of the same config differ
+# from each other — i.e. the arms are indistinguishable. io_uring, the case
+# where privilege could plausibly matter (memlock, ring setup), came out at
+# -0.09%. Both rlimits that motivated root are already available unprivileged:
+# memlock is unlimited via /etc/security/limits.conf and nofile's hard limit
+# is 524288, so `ulimit -n 65535` below succeeds either way.
+#
+# Set `--extra-vars celeris_needs_root=true` to put the SUT back on root.
 - name: "{{ cell.1 }} run={{ cell.0 }} | resolve privilege for this column"
   ansible.builtin.set_fact:
-    cell_needs_root: "{{ cell_bin == 'celeris' and (celeris_needs_root | default(true) | bool) }}"
+    cell_needs_root: "{{ cell_bin == 'celeris' and (celeris_needs_root | default(false) | bool) }}"
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
   ansible.builtin.file:
