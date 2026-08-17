@@ -49,6 +49,38 @@ all:
     bench_root: /tmp/celeris-bench
     results_root: /tmp/celeris-results
     manifest_path: /tmp/celeris-bench-manifest.json
+    # ---------- SSD longevity (2026-08-17 incident) ----------
+    # msa2-client's NVMe died mid-soak with unrecoverable read errors
+    # (`critical medium error`, sct 0x2 / sc 0x81), taking PID 1 down with
+    # SIGBUS on every boot. Post-mortem on its surviving twin found 56.3 TB
+    # written for 1.96 TB read — a 29:1 write:read ratio on a rig that
+    # should be read-dominated — and 21% of a ~268 TBW QLC drive consumed.
+    # Bench artefacts were never the cause (bench_root/results_root and the
+    # Actions runner root all live on the /tmp tmpfs). The writes came from
+    # the driver-* fixture containers: postgres running fully durable into
+    # a docker volume ON THE NVMe, and redis snapshotting RDB to disk under
+    # load. See ansible/bench.yml's dbservices block.
+    #
+    # bench_db_ephemeral: treat the fixture databases as what they are — a
+    # fixture, not the subject under test. Data directories move to tmpfs,
+    # postgres drops fsync/full_page_writes, redis stops snapshotting.
+    #
+    # NOTE: this CHANGES what the driver-* columns measure (engine + an
+    # in-memory backend, rather than engine + a durable one) and therefore
+    # shifts their absolute numbers. That is the intended methodology — disk
+    # durability is noise in an HTTP-engine benchmark — but it breaks
+    # comparability with previously published driver-* results, so re-baseline
+    # at a version boundary. Set false to restore the old on-disk behaviour
+    # byte-for-byte.
+    bench_db_ephemeral: true
+    # Refuse to start a multi-hour run on a dying disk. msa2-client burned an
+    # 8h soak hanging on a failing drive instead of failing in the first
+    # minute; this is the gate that turns that into a fast, legible failure.
+    bench_smart_gate: true
+    # Percentage Used is the drive's own wear estimate (100% = rated TBW
+    # consumed). Block well before the cliff — a bench host past this should
+    # be replaced, not measured on.
+    bench_smart_max_used_pct: 90
     # When `use_lan` is passed as an extra-var (mage Deploy / Bench /
     # Validate / Cleanup all set it under CLUSTER_USE_LAN=1) every host
     # routes its ansible SSH through the 20G LACP fabric instead of the

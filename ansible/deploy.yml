@@ -101,6 +101,77 @@
         state: present
         update_cache: true
 
+    # SMART tooling for the NVMe health gate below. Same "base tooling we
+    # leave installed" rationale as sysstat: intentionally NOT manifest-
+    # tracked, so a re-imaged host keeps its disk observable. Neither was
+    # present on any cluster host before 2026-08-17, which is why the
+    # msa2-client failure had to be reconstructed from sysfs after the fact.
+    - name: Ensure smartmontools + nvme-cli are installed — disk health gate
+      become: true
+      ansible.builtin.apt:
+        name:
+          - smartmontools
+          - nvme-cli
+        state: present
+        update_cache: true
+
+    # Preflight disk-health guard (2026-08-17 incident): msa2-client's NVMe
+    # developed unrecoverable read errors (`critical medium error`, sct 0x2 /
+    # sc 0x81). The dying drive did not fail the run cleanly — it HUNG the
+    # weekend soak for ~8h and then took PID 1 down with SIGBUS on every
+    # subsequent boot. A run started on a drive in that state cannot produce
+    # trustworthy numbers, so refuse in the first minute rather than at hour 8.
+    #
+    # Thresholds, in order of severity:
+    #   critical_warning != 0     drive is reporting a fault to the host
+    #   media_errors     > 0      unrecoverable read/write errors have occurred
+    #                             — this is the exact msa2-client signature
+    #   percentage_used  >= gate  rated endurance nearly consumed
+    #   available_spare  <= its own threshold — remap pool exhausted
+    # 70% used is a warning only: still measurable, but order the replacement.
+    - name: Preflight | NVMe health gate — refuse to run on a dying disk
+      become: true
+      # NOTE: deliberately no bash arrays here. `${#arr[@]}` contains the
+      # sequence `{#`, which Jinja parses as a comment opener and which breaks
+      # `ansible-playbook --syntax-check` on this file. Plain globs only.
+      ansible.builtin.shell: |
+        set -uo pipefail
+        if ! command -v smartctl >/dev/null 2>&1; then
+          echo "SKIP: smartctl unavailable on {{ inventory_hostname }}"
+          exit 0
+        fi
+        rc=0
+        found=0
+        for c in /dev/nvme0 /dev/nvme1 /dev/nvme2 /dev/nvme3; do
+          [ -e "$c" ] || continue
+          found=1
+          vals=$(smartctl -j -a "$c" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin).get('nvme_smart_health_information_log',{}); print(d.get('critical_warning',0), d.get('media_errors',0), d.get('percentage_used',0), d.get('available_spare',100), d.get('available_spare_threshold',0))" 2>/dev/null)
+          if [ -z "$vals" ]; then echo "SKIP $c: no SMART health log"; continue; fi
+          set -- $vals
+          cw=$1 me=$2 pu=$3 asp=$4 ast=$5
+          echo "$c: critical_warning=$cw media_errors=$me percentage_used=${pu}% available_spare=${asp}% (threshold ${ast}%)"
+          [ "$cw" -eq 0 ] || { echo "  FAIL: critical_warning is set — the drive is reporting a fault"; rc=1; }
+          [ "$me" -eq 0 ] || { echo "  FAIL: $me media/data-integrity errors — this drive has unreadable sectors, REPLACE IT"; rc=1; }
+          [ "$pu" -lt {{ bench_smart_max_used_pct | default(90) }} ] || { echo "  FAIL: percentage_used ${pu}% >= {{ bench_smart_max_used_pct | default(90) }}% of rated endurance"; rc=1; }
+          [ "$asp" -gt "$ast" ] || { echo "  FAIL: available_spare ${asp}% at/below its threshold ${ast}% — remap pool exhausted"; rc=1; }
+          [ "$pu" -lt 70 ] && continue
+          echo "  WARN: ${pu}% of rated endurance consumed — plan a replacement"
+        done
+        if [ "$found" -eq 0 ]; then
+          echo "SKIP: no NVMe controller found on {{ inventory_hostname }}"
+        fi
+        if [ $rc -ne 0 ]; then
+          echo "Refusing to start on {{ inventory_hostname }}. Replace the drive, or"
+          echo "re-run with --extra-vars bench_smart_gate=false to override deliberately."
+        fi
+        exit $rc
+      args:
+        executable: /bin/bash
+      register: smart_gate
+      changed_when: false
+      failed_when: smart_gate.rc != 0
+      when: bench_smart_gate | default(true) | bool
+
     # Drop a marker so the cleanup playbook can mtime-diff ~ for leaks.
     - name: Drop deploy-start marker for mtime diff
       ansible.builtin.file:
