@@ -84,13 +84,34 @@
         #   redis    127.0.0.1:63791
         #   memcached 127.0.0.1:21211
         # cleanup.yml stops any docker containers we leave running.
+        # Same fixture-container treatment as bench.yml's dbservices block —
+        # see the rationale there and in inventory.yml (bench_db_ephemeral).
+        # Validation runs far shorter than a bench, but it runs NIGHTLY, so
+        # its share of the NVMe write budget is not negligible.
+        - name: dbservices | resolve fixture-container storage + durability flags
+          ansible.builtin.set_fact:
+            db_log_caps: "--log-opt max-size=10m --log-opt max-file=1"
+            db_pg_store: >-
+              {{ '--tmpfs /var/lib/postgresql/data:rw,size=4g -e PGDATA=/var/lib/postgresql/data/pgdata'
+                 if (bench_db_ephemeral | default(true) | bool) else '' }}
+            db_pg_args: >-
+              {{ '-c synchronous_commit=off -c fsync=off -c full_page_writes=off'
+                 if (bench_db_ephemeral | default(true) | bool) else '-c synchronous_commit=off' }}
+            db_redis_store: >-
+              {{ '--tmpfs /data:rw,size=1g' if (bench_db_ephemeral | default(true) | bool) else '' }}
+            db_redis_args: >-
+              {{ 'redis-server --save "" --appendonly no'
+                 if (bench_db_ephemeral | default(true) | bool) else '' }}
+          when: validate_dbservices | default('') == '1'
+
         - name: dbservices | start postgres
           ansible.builtin.shell: |
             docker rm -f -v probatorium-pg 2>/dev/null
             docker run -d --rm --name probatorium-pg \
               -p 127.0.0.1:54321:5432 \
+              {{ db_log_caps }} {{ db_pg_store }} \
               -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
-              postgres:17-alpine -c synchronous_commit=off
+              postgres:17-alpine {{ db_pg_args }}
           register: dbsvc_pg
           changed_when: dbsvc_pg.rc == 0
           failed_when: false
@@ -99,7 +120,9 @@
         - name: dbservices | start redis
           ansible.builtin.shell: |
             docker rm -f -v probatorium-redis 2>/dev/null
-            docker run -d --rm --name probatorium-redis -p 127.0.0.1:63791:6379 redis:8.2-alpine
+            docker run -d --rm --name probatorium-redis -p 127.0.0.1:63791:6379 \
+              {{ db_log_caps }} {{ db_redis_store }} \
+              redis:8.2-alpine {{ db_redis_args }}
           register: dbsvc_redis
           changed_when: dbsvc_redis.rc == 0
           failed_when: false
@@ -108,7 +131,8 @@
         - name: dbservices | start memcached
           ansible.builtin.shell: |
             docker rm -f -v probatorium-mc 2>/dev/null
-            docker run -d --rm --name probatorium-mc -p 127.0.0.1:21211:11211 memcached:1.6.41-alpine
+            docker run -d --rm --name probatorium-mc -p 127.0.0.1:21211:11211 \
+              {{ db_log_caps }} memcached:1.6.41-alpine
           register: dbsvc_mc
           changed_when: dbsvc_mc.rc == 0
           failed_when: false

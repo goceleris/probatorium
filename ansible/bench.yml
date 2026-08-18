@@ -129,14 +129,66 @@
         - inventory_hostname == bench_target
         - bench_needs_dbservices | default(false) | bool
 
+    # Fixture-container flags. Two concerns, deliberately separated:
+    #
+    #   db_log_caps  — UNCONDITIONAL. Docker's default json-file driver has no
+    #     size limit and no rotation, so a chatty container writes to the NVMe
+    #     without bound. 10MB/1file keeps `docker logs` useful for debugging a
+    #     failed start while capping the write. Not a methodology change.
+    #
+    #   db_*_store / db_*_args — gated on bench_db_ephemeral (see inventory.yml).
+    #     Moves the fixture data directories into RAM and stops the two
+    #     durability mechanisms that dominated NVMe writes: postgres WAL +
+    #     full-page writes, and redis RDB snapshots (default `save 60 10000`
+    #     fires EVERY MINUTE under bench load).
+    #
+    # PGDATA is deliberately a SUBDIRECTORY of the tmpfs mount: docker mounts
+    # --tmpfs world-writable (1777) and postgres refuses to start on a data
+    # directory that isn't u=rwx,go= — initdb creates the subdir with correct
+    # permissions itself.
+    - name: dbservices | resolve fixture-container storage + durability flags
+      ansible.builtin.set_fact:
+        db_log_caps: "--log-opt max-size=10m --log-opt max-file=1"
+        db_pg_store: >-
+          {{ '--tmpfs /var/lib/postgresql/data:rw,size=4g -e PGDATA=/var/lib/postgresql/data/pgdata'
+             if (bench_db_ephemeral | default(true) | bool) else '' }}
+        db_pg_args: >-
+          {{ '-c synchronous_commit=off -c fsync=off -c full_page_writes=off'
+             if (bench_db_ephemeral | default(true) | bool) else '-c synchronous_commit=off' }}
+        db_redis_store: >-
+          {{ '--tmpfs /data:rw,size=1g' if (bench_db_ephemeral | default(true) | bool) else '' }}
+        db_redis_args: >-
+          {{ 'redis-server --save "" --appendonly no'
+             if (bench_db_ephemeral | default(true) | bool) else '' }}
+      when:
+        - inventory_hostname == bench_target
+        - bench_needs_dbservices | default(false) | bool
+
+    - name: dbservices | announce fixture mode (recorded in the bench log)
+      ansible.builtin.debug:
+        msg: >-
+          dbservices fixture mode:
+          {{ 'EPHEMERAL (tmpfs data dirs, pg fsync/full_page_writes off, redis
+          snapshots off) — driver-* numbers are NOT comparable with runs made
+          in durable mode' if (bench_db_ephemeral | default(true) | bool)
+          else 'DURABLE (on-disk data dirs, pg fsync on) — legacy behaviour,
+          writes land on the SUT NVMe' }}
+      when:
+        - inventory_hostname == bench_target
+        - bench_needs_dbservices | default(false) | bool
+
     - name: dbservices | start postgres + redis + memcached (fixed ports)
       ansible.builtin.shell: |
         docker rm -f -v probatorium-pg probatorium-redis probatorium-mc 2>/dev/null
         docker run -d --rm --name probatorium-pg -p 127.0.0.1:54321:5432 \
+          {{ db_log_caps }} {{ db_pg_store }} \
           -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
-          postgres:17-alpine -c synchronous_commit=off
-        docker run -d --rm --name probatorium-redis -p 127.0.0.1:63791:6379 redis:8.2-alpine
-        docker run -d --rm --name probatorium-mc -p 127.0.0.1:21211:11211 memcached:1.6.41-alpine
+          postgres:17-alpine {{ db_pg_args }}
+        docker run -d --rm --name probatorium-redis -p 127.0.0.1:63791:6379 \
+          {{ db_log_caps }} {{ db_redis_store }} \
+          redis:8.2-alpine {{ db_redis_args }}
+        docker run -d --rm --name probatorium-mc -p 127.0.0.1:21211:11211 \
+          {{ db_log_caps }} memcached:1.6.41-alpine
       args:
         executable: /bin/bash
       changed_when: true
