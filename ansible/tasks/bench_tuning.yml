@@ -155,6 +155,23 @@
     - inventory_hostname in groups['bench_targets'] or
       inventory_hostname == "msa2-client"
 
+- name: Ensure the sshd drop-in directory exists
+  # ansible.builtin.copy does NOT create parent directories. This dir happened
+  # to exist on the two hand-built cluster hosts, so the deploy had a silent
+  # dependency on state no freshly-installed node has — msa2-client's rebuild
+  # (2026-08-18) failed here with "Destination directory ... does not exist"
+  # while the other two passed.
+  become: true
+  ansible.builtin.file:
+    path: /etc/systemd/system/ssh.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when:
+    - inventory_hostname in groups['bench_targets'] or
+      inventory_hostname == "msa2-client"
+
 - name: Drop-in LimitMEMLOCK=infinity for the sshd service
   # Belt-and-suspenders: the sshd service drop-in overrides the
   # system default for the sshd process itself, so even if
