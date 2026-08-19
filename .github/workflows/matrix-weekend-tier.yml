@@ -98,7 +98,14 @@ jobs:
             echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519"
             echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)"
             echo "CLUSTER_USE_LAN=1"
+            echo "CLUSTER_KNOWN_HOSTS=${RUNNER_ROOT}/.ssh/known_hosts"
           } >> "$GITHUB_ENV"
+          # Rebuild the cluster host-key file for THIS run. Without it, a node
+          # that has been reinstalled presents a new key, accept-new refuses the
+          # change, and ansible reports UNREACHABLE — a healthy machine that
+          # looks dead. See the script header.
+          bash .github/scripts/refresh-cluster-known-hosts.sh \
+            ansible/inventory.yml "${RUNNER_ROOT}/.ssh/known_hosts"
 
       - name: mage Deploy (stage refapps + validator)
         env:
