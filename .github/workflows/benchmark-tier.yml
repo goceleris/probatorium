@@ -42,7 +42,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "headline (DEFAULT, the weekly cadence): full grid WITH the rated/SLO sweep, 40s/12s → ~16.7h, fits 24h — this is what PUBLISHES. | full: same grid at the exhaustive 90s/20s window (~30h+, needs a raised BENCH_BUDGET, will not fit 24h) — for release-grade runs. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
+        description: "headline (DEFAULT, the weekly cadence): full grid WITH the rated/SLO sweep, 40s/12s → projects ~26h35m, runs under a 30h budget — this is what PUBLISHES. | full: same grid at the exhaustive 90s/20s window (~30h+, needs a raised BENCH_BUDGET, will not fit 24h) — for release-grade runs. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
         required: false
         type: string
         default: headline
@@ -103,7 +103,7 @@ jobs:
     # Raised from 72h to 80h so the run has comfortable headroom and reaching
     # the ceiling is not a concern. Well under GitHub's 5-day self-hosted job
     # hard limit. This is only a ceiling — the headline profile (same grid,
-    # shorter 40s/12s window) projects ~16.7h. BENCH_BUDGET (below) is the real
+    # shorter 40s/12s window) projects ~26h35m. BENCH_BUDGET (below) is the real
     # fail-loud projection gate.
     timeout-minutes: 4800
     env:
@@ -228,7 +228,12 @@ jobs:
           # rated "full" deep-dive needs the raised ceiling (it runs the rated
           # sweep on the whole grid — many hours); both stay under the job
           # timeout-minutes above.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'full' && '80h' || '24h' }}
+          # headline PROJECTS 26h35m (813 cells x 1m9s saturation + 388 rated
+          # cells x 1m42s), so the old 24h ceiling aborted it before a single
+          # cell ran. 30h leaves ~3h25m headroom. NOTE: the run then spans into
+          # the next day and one Nightly Validation will queue behind it on the
+          # matrix-tier-cluster concurrency group — it runs late, it is not lost.
+          BENCH_BUDGET: ${{ github.event.inputs.profile == 'full' && '80h' || (github.event.inputs.profile == 'fast' && '24h' || '30h') }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 
