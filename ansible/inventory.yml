@@ -30,6 +30,12 @@ all:
     #   ServerAliveCountMax=18    — survive ~3 minutes of dropped heartbeats
     #   ControlPersist=600s       — long-lived ControlMaster across cells
     #   TCPKeepAlive=yes          — kernel-level keepalive too
+    #   UserKnownHostsFile        — CI points this at a per-run file rebuilt by
+    #     .github/scripts/refresh-cluster-known-hosts.sh, so a REBUILT node's new
+    #     host key never collides with a stale entry. accept-new refuses CHANGED
+    #     keys (correctly), which after msa2-client's 2026-08-18 rebuild made a
+    #     healthy machine look dead in every run. Unset outside CI → normal
+    #     ~/.ssh/known_hosts, so dev-machine behaviour is unchanged.
     ansible_ssh_common_args: >-
       -o ControlMaster=auto
       -o ControlPersist=600s
@@ -38,6 +44,7 @@ all:
       -o ServerAliveCountMax=18
       -o TCPKeepAlive=yes
       -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
     ansible_command_timeout: 120
     # Privilege escalation must tolerate a saturated host: ansible's
     # default 12s become-prompt timeout dropped msa2-server as
