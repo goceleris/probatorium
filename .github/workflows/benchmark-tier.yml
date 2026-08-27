@@ -42,7 +42,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "headline (DEFAULT, the weekly cadence): full grid WITH the rated/SLO sweep, 40s/12s → projects ~26h35m, runs under a 30h budget — this is what PUBLISHES. | full: same grid at the exhaustive 90s/20s window (~30h+, needs a raised BENCH_BUDGET, will not fit 24h) — for release-grade runs. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
+        description: "full (DEFAULT, the weekly cadence): the whole grid at the exhaustive 90s/20s window — MEASURED ~69h, runs under a 90h budget. This is what PUBLISHES. | headline: same grid at a shorter 40s/12s window, MEASURED ~53h — only ~16h cheaper than full, which is why full is the weekly default. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
         required: false
         type: string
         default: headline
@@ -105,9 +105,9 @@ jobs:
     # hard limit. This is only a ceiling — the headline profile (same grid,
     # shorter 40s/12s window) projects ~26h35m. BENCH_BUDGET (below) is the real
     # fail-loud projection gate.
-    timeout-minutes: 4800
+    timeout-minutes: 6600
     env:
-      BENCH_PROFILE: ${{ github.event.inputs.profile || 'headline' }}
+      BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
       # Column subset to BENCH for a targeted re-run; 'all' on schedule/default.
       BENCH_COMPETITORS: ${{ github.event.inputs.competitors || 'all' }}
       # Binary/module set to BUILD+DEPLOY. MUST be job-level (not just the
@@ -134,7 +134,7 @@ jobs:
       #
       # Enforced here rather than by convention so a stray manual dispatch
       # (or a future scheduled tier) cannot publish saturation-only data.
-      BENCH_PUBLISH: ${{ (github.event.inputs.profile || 'headline') == 'fast' && '0' || (github.event.inputs.publish == 'false' && '0' || '1') }}
+      BENCH_PUBLISH: ${{ (github.event.inputs.profile || 'full') == 'fast' && '0' || (github.event.inputs.publish == 'false' && '0' || '1') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -233,7 +233,14 @@ jobs:
           # cell ran. 30h leaves ~3h25m headroom. NOTE: the run then spans into
           # the next day and one Nightly Validation will queue behind it on the
           # matrix-tier-cluster concurrency group — it runs late, it is not lost.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'full' && '80h' || (github.event.inputs.profile == 'fast' && '24h' || '30h') }}
+          # MEASURED, not projected. The estimator counts only the measurement
+          # window and ignores per-cell fixed overhead (server start, warmup,
+          # teardown), so it under-counts — worse for shorter windows:
+          #   full     projected 44h31m -> ACTUAL 69h15m  (1.56x, 2026-07-16)
+          #   headline projected 26h35m -> ACTUAL ~53h    (2.01x, 2026-08-26)
+          # Budgets below are set from the ACTUALS with headroom, not the
+          # projection. Fixing the estimator itself is a separate follow-up.
+          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && '60h' || '90h') }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 
