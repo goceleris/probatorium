@@ -62,6 +62,33 @@ func lanIPForHost(host string) string {
 	return lanIPs[host]
 }
 
+// loadgenHost is the host that always drives load, regardless of which
+// bench_target is under test. ansible/bench.yml hardcodes the same name in its
+// end_host filter; keep the two in step.
+const loadgenHost = "msa2-client"
+
+// clusterLimitForTarget returns an ansible --limit expression naming only the
+// hosts a bench actually needs: the bench target(s) plus the loadgen. It returns
+// "" for "both"/"all", meaning no limit.
+//
+// Why this exists (2026-08-28): bench.yml already filters non-target hosts with
+// `meta: end_host`, but that is a TASK — ansible must CONNECT to a host before
+// it can run it. So an amd64-only bench still opened SSH to the arm64 box, and
+// when that box was rebooted for unrelated work the play hit UNREACHABLE and
+// any_errors_fatal killed a 34-hour run at 63% completion.
+//
+// --limit acts at host SELECTION, before any connection is attempted, so a host
+// outside the limit can be rebooted, reinstalled or powered off mid-bench
+// without the run noticing. That is the property we actually want: the bench
+// depends only on the hosts it is measuring.
+func clusterLimitForTarget(target string) string {
+	switch target {
+	case "", "both", "all":
+		return ""
+	}
+	return target + "," + loadgenHost
+}
+
 // envOrDefault returns os.Getenv(k) if non-empty, otherwise d. Used
 // for every bench/validate knob — keep the defaults next to the call
 // site so each target's docstring reads as self-contained.
