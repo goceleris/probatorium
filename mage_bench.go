@@ -481,6 +481,12 @@ func Bench() error {
 		if os.Getenv("CLUSTER_USE_LAN") == "1" {
 			args = append(args, "--extra-vars", "use_lan=true")
 		}
+		// Host SELECTION, not a task-level filter: hosts outside the limit are
+		// never connected to, so they can be rebooted or powered off mid-bench
+		// without tripping any_errors_fatal on this play.
+		if limit := clusterLimitForTarget(pt); limit != "" {
+			args = append(args, "--limit", limit)
+		}
 
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir

@@ -428,6 +428,13 @@ func Deploy() error {
 		deployPlaybook,
 		"--extra-vars", "@" + varsFile,
 	}
+	// Scope the deploy to the hosts this bench actually needs. Without this a
+	// single-arch bench still provisions (and therefore CONNECTS to) every
+	// cluster host, so unrelated maintenance on an idle host can abort the run.
+	if limit := clusterLimitForTarget(envOrDefault("BENCH_TARGET", "")); limit != "" {
+		args = append(args, "--limit", limit)
+		fmt.Printf("deploy: limiting to %s (BENCH_TARGET scoped)\n", limit)
+	}
 
 	cmd := exec.Command("ansible-playbook", args...)
 	cmd.Dir = ansibleDir
