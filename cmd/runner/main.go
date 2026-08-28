@@ -112,6 +112,15 @@ type Config struct {
 	// uses — the SUT runs on bench_target and the runner on the loadgen
 	// host, so there is no in-process adapter to start.
 	Target string
+	// TargetArch is the GOARCH of the HOST UNDER TEST, not of this
+	// process. The runner executes on the loadgen host (msa2-client,
+	// amd64) while the SUT may be msa2-server (amd64) or msr1 (arm64),
+	// so runtime.GOARCH tags every arm64 cell as amd64 — which silently
+	// mislabels an entire arch's published results. Ansible passes the
+	// inventory's `arch` for bench_target. Empty falls back to
+	// runtime.GOARCH (correct for the local-adapter path, where the SUT
+	// really is this host).
+	TargetArch string
 	// ServerName is the friendly competitor slug recorded as the cell's
 	// server in remote-target mode (e.g. "celeris-iouring-h1-async").
 	// Ignored when Target is empty.
@@ -214,6 +223,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.Int64Var(&c.Seed, "seed", c.Seed, "rng seed for reproducibility echo; 0 = time.Now().UnixNano()")
 	fs.StringVar(&c.Target, "target", c.Target,
 		"remote base URL (http://host:port) to bench against; empty = spawn local loopback adapters")
+	fs.StringVar(&c.TargetArch, "target-arch", c.TargetArch,
+		"GOARCH of the host under test (amd64|arm64); empty = this process's arch")
 	fs.StringVar(&c.ServerName, "server-name", c.ServerName,
 		"friendly server slug recorded in per-cell JSON / report when -target is set")
 	fs.BoolVar(&c.DryRun, "dry-run", c.DryRun, "print the resolved schedule and exit without starting adapters")
@@ -1790,8 +1801,12 @@ func buildDocument(cfg Config, agg map[string]report.CellAggregate, started time
 		AdaptersFilter:  cfg.Cells,
 	}
 
+	targetArch := cfg.TargetArch
+	if targetArch == "" {
+		targetArch = runtime.GOARCH
+	}
 	return report.BuildDocument(report.BuildInput{
-		HostArchPair:    runtime.GOOS + "/" + runtime.GOARCH,
+		HostArchPair:    runtime.GOOS + "/" + targetArch,
 		Environment:     env,
 		BenchmarkConfig: bench,
 		Servers:         serverMetaFromRegistry(),

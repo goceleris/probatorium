@@ -548,7 +548,7 @@ func Bench() error {
 		return fmt.Errorf("aggregate per-cell results: %w", err)
 	}
 
-	merged, err := mergeBenchResults(resultsDir, target, benchParams{
+	bp := benchParams{
 		CelerisVer: version,
 		Duration:   duration,
 		Warmup:     warmup,
@@ -556,7 +556,30 @@ func Bench() error {
 		Runs:       runs,
 		Seed:       seed,
 		StartedAt:  benchStart,
-	})
+	}
+
+	// BENCH_TARGET=both emits ONE Document PER ARCH, never a blended one.
+	// Merging across arches would average two machines that differ by ~7x
+	// into a single "linux/multi" row describing neither. Publish picks the
+	// per-arch file up via PUBLISH_RESULTS (see mage_tier.go).
+	if target == "both" {
+		var outs []string
+		for _, h := range playbookTargets {
+			out, err := mergeBenchResultsFor(resultsDir, target, bp, h,
+				"results-"+benchTargetArch(h)+".json")
+			if err != nil {
+				return fmt.Errorf("merge results (%s): %w", h, err)
+			}
+			outs = append(outs, out)
+		}
+		fmt.Printf("\n=== Bench complete (per-arch documents) ===\n")
+		for _, o := range outs {
+			fmt.Printf("  %s\n", o)
+		}
+		return nil
+	}
+
+	merged, err := mergeBenchResults(resultsDir, target, bp)
 	if err != nil {
 		return fmt.Errorf("merge results: %w", err)
 	}
@@ -1557,7 +1580,24 @@ const clusterScenarioName = "bench"
 // competitor — per-host fidelity that the retired loose "hosts" map
 // carried is intentionally dropped here in favour of one schema-typed
 // shape every downstream tool can read.
+// mergeBenchResults merges every host's raw payload into one Document.
+// Kept for the single-target path.
 func mergeBenchResults(resultsDir, target string, p benchParams) (string, error) {
+	return mergeBenchResultsFor(resultsDir, target, p, "", "results.json")
+}
+
+// mergeBenchResultsFor merges raw payloads into one Document, optionally
+// scoped to a single bench target.
+//
+// Scoping matters for BENCH_TARGET=both. The unscoped merge buckets samples
+// by competitor ACROSS hosts, so amd64 and arm64 runs of the same column land
+// in one CellResult and publish as their average under HostArchPair
+// "linux/multi" — a smoke test measured msa2-server at 377,371 rps and msr1 at
+// 54,850 rps (6.9x apart) and published 216,111. That is not a per-arch
+// comparison, it is a number describing no machine that exists. Bench therefore
+// calls this once per target so each arch publishes its own Document with its
+// own HostArchPair.
+func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, outName string) (string, error) {
 	rawDir := filepath.Join(resultsDir, "raw")
 	entries, err := os.ReadDir(rawDir)
 	if err != nil {
@@ -1582,6 +1622,9 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 	reconstructed := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		if onlyHost != "" && e.Name() != onlyHost+".json" {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(rawDir, e.Name()))
@@ -1754,15 +1797,19 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 		FabricLineRateBitsPerSec: benchFabricLineRate(),
 	}
 
+	archTarget := target
+	if onlyHost != "" {
+		archTarget = onlyHost
+	}
 	doc := report.BuildDocument(report.BuildInput{
-		HostArchPair:    "linux/" + benchTargetArch(target),
+		HostArchPair:    "linux/" + benchTargetArch(archTarget),
 		Environment:     env,
 		BenchmarkConfig: bench,
 		Servers:         clusterServerMeta(collected, p.CelerisVer),
 		Agg:             agg,
 	})
 
-	out := filepath.Join(resultsDir, "results.json")
+	out := filepath.Join(resultsDir, outName)
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return "", err
@@ -1900,6 +1947,23 @@ func benchTargetGOARCH() string {
 // nested path mode below (used for validate) doesn't apply here.
 func latestBenchResults(version string) (string, error) {
 	return latestResultsByPattern("-bench-", "results.json", version, false)
+}
+
+// clusterTarget is the resolved BENCH_TARGET (msa2-server | msr1 | both).
+func clusterTarget() string {
+	return envOrDefault("BENCH_TARGET", defaultClusterTarget)
+}
+
+// latestBenchDir returns the directory of the most recent bench run that
+// emitted PER-ARCH documents (BENCH_TARGET=both writes results-<arch>.json
+// instead of a single blended results.json, so latestBenchResults — which
+// looks for results.json — cannot find it).
+func latestBenchDir(version string) (string, error) {
+	p, err := latestResultsByPattern("-bench-", "results-amd64.json", version, false)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(p), nil
 }
 
 // latestValidateResults returns the path to the most recent

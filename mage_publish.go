@@ -297,6 +297,13 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, string, er
 		version = v
 	}
 
+	// PUBLISH_RESULTS pins Publish to one specific results file. BenchTier
+	// sets it per arch for a BENCH_TARGET=both run, which emits
+	// results-amd64.json and results-arm64.json side by side rather than one
+	// blended results.json — auto-discovery cannot choose between them.
+	if pinned := os.Getenv("PUBLISH_RESULTS"); pinned != "" {
+		return loadPublishInputsFrom(pinned, version)
+	}
 	resultsPath, err := latestBenchResults(version)
 	if err != nil {
 		// Fall back to the most recent run regardless of version: the
@@ -308,6 +315,14 @@ func loadPublishInputs() (report.SplitMeta, *report.Document, []byte, string, er
 		}
 	}
 
+	return loadPublishInputsFrom(resultsPath, version)
+}
+
+// loadPublishInputsFrom builds the publish inputs from ONE specific results
+// document, so a BENCH_TARGET=both run can publish its per-arch files in turn.
+// The Arch tag comes from the document's own HostArchPair, so amd64 and arm64
+// land on their own publish paths.
+func loadPublishInputsFrom(resultsPath, version string) (report.SplitMeta, *report.Document, []byte, string, error) {
 	data, err := os.ReadFile(resultsPath)
 	if err != nil {
 		return report.SplitMeta{}, nil, nil, "", fmt.Errorf("read %s: %w", resultsPath, err)

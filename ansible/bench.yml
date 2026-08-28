@@ -313,9 +313,30 @@
       # the substring (even in a comment) self-matches and SIGTERMs
       # the wrapper before `true` runs (rc=-15).
       ansible.builtin.shell: |
-        for name in server runner loadgen observer; do
+        # SUT-side names are host-scoped: each arch pass has a distinct
+        # bench_target, so a bare name-kill cannot cross passes.
+        for name in server observer; do
           pkill -x "$name" 2>/dev/null
         done
+        # The driver host is SHARED by both arch passes, which run
+        # CONCURRENTLY (#168). An unscoped name-kill here reaps the other
+        # arch mid-cell: amd64 finishes ~7x sooner, so its sweep hit the
+        # arm64 driver at 3.8s of a 5s cell (226091 requests, 0 errors)
+        # and cost the whole arm64 grid. The note above holds only for a
+        # SINGLE pass: for one pass this runs strictly AFTER the run play,
+        # but that is DURING the other. Scope by the target instead.
+        #
+        # TWO RULES for the patterns below, both learned the hard way:
+        #   1. bracket-protect them, and never spell either driver process
+        #      name literally in this comment -- the whole script sits in
+        #      the argv of the shell running it, so a bare mention here
+        #      plus the IP below gets bridged by the .* and the sweep
+        #      SIGTERMs itself (rc!=0, 3 retries, play aborts).
+        #   2. no apostrophes anywhere in this scalar, per the note above.
+        pkill -f "[r]unner .*{{ hostvars[bench_target].lan_ip }}" 2>/dev/null
+        pkill -f "[l]oadgen .*{{ hostvars[bench_target].lan_ip }}" 2>/dev/null
+        # Competitors only ever run on the SUT and each pass has a distinct
+        # bench_target, so this stays host-scoped without a filter.
         pkill -f "[c]ompetitors/" 2>/dev/null
         pkill -KILL -f "[u]vicorn" 2>/dev/null
         pkill -KILL -f "[g]unicorn" 2>/dev/null
