@@ -385,15 +385,15 @@
     - name: Tar bench artefacts on remote
       ansible.builtin.shell: |
         cd {{ bench_run_dir | dirname }}
-        tar czf /tmp/bench-{{ inventory_hostname }}.tgz {{ bench_run_dir | basename }}/
+        tar czf /tmp/bench-{{ inventory_hostname }}-{{ bench_target }}.tgz {{ bench_run_dir | basename }}/
       args:
         executable: /bin/bash
       changed_when: true
 
     - name: Fetch bench tarball back to dev machine
       ansible.builtin.fetch:
-        src: "/tmp/bench-{{ inventory_hostname }}.tgz"
-        dest: "{{ results_local_dir }}/{{ inventory_hostname }}.tgz"
+        src: "/tmp/bench-{{ inventory_hostname }}-{{ bench_target }}.tgz"
+        dest: "{{ results_local_dir }}/{{ inventory_hostname }}-{{ bench_target }}.tgz"
         flat: true
       register: fetch_result
       until: fetch_result is succeeded
@@ -402,7 +402,7 @@
 
     - name: Remove remote tarball after fetch
       ansible.builtin.file:
-        path: "/tmp/bench-{{ inventory_hostname }}.tgz"
+        path: "/tmp/bench-{{ inventory_hostname }}-{{ bench_target }}.tgz"
         state: absent
 
     # macOS ships BSD tar, which extracts tar.gz cleanly but
@@ -413,12 +413,12 @@
       delegate_to: localhost
       become: false
       ansible.builtin.command:
-        cmd: tar xzf {{ results_local_dir }}/{{ inventory_hostname }}.tgz -C {{ results_local_dir }}/
+        cmd: tar xzf {{ results_local_dir }}/{{ inventory_hostname }}-{{ bench_target }}.tgz -C {{ results_local_dir }}/
       changed_when: true
 
     - name: Drop the local tarball
       delegate_to: localhost
       become: false
       ansible.builtin.file:
-        path: "{{ results_local_dir }}/{{ inventory_hostname }}.tgz"
+        path: "{{ results_local_dir }}/{{ inventory_hostname }}-{{ bench_target }}.tgz"
         state: absent

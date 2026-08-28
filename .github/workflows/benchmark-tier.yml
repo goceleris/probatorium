@@ -46,6 +46,12 @@ on:
         required: false
         type: string
         default: headline
+      target:
+        description: "Bench SUT (BENCH_TARGET): 'both' (DEFAULT — msa2-server amd64 AND msr1 arm64, driven IN PARALLEL by the oversized msa2-client loadgen) | 'msa2-server' | 'msr1'."
+        required: false
+        type: string
+        default: both
+
       competitors:
         description: "Adapter columns to BENCH (BENCH_COMPETITORS). 'all' (DEFAULT) runs the full grid; a CSV of registry slugs (e.g. 'httpzig,drogon,aspnet-h2') runs ONLY those columns — used to re-run the subset that DNF'd in a prior run without paying for the whole grid. Names must match servers.Registry."
         required: false
@@ -94,9 +100,11 @@ jobs:
     # Orchestrate from msr1 specifically: the ansible control loop + result
     # aggregation must NOT share a host with the SUT (bench_target=msa2-server)
     # or the loadgen (msa2-client), or its CPU/IO steals from the measurement.
-    # msr1 (arm64) is unusable as a BENCH target under NIC load (firmware bug
-    # celeris#312) but is perfectly safe and otherwise-idle as the conductor —
-    # it just runs ansible over SSH. This keeps the amd64 SUT's numbers clean.
+    # msr1 (arm64) is BOTH the conductor and an arm64 SUT. The two arch passes
+    # run IN PARALLEL (#168): distinct SUT hosts, every artefact keyed by
+    # bench_target, sharing only the deliberately-oversized msa2-client loadgen
+    # (measured ~40%/core of 32 and ~1.2 of 14 Gbit/s driving a single arch, so
+    # far from the bottleneck that would contaminate either measurement).
     runs-on: [self-hosted, celeris-cluster, msr1]
     # 80h ceiling: the full rated profile on one arch runs ~69h single-pass
     # (the v1.5.5 full run measured 813 cells in ~69h), plus Deploy + Cleanup.
@@ -111,8 +119,8 @@ jobs:
       # Job-level so BOTH `mage Deploy` and `mage BenchTier` see it. Deploy uses
       # it to scope its ansible --limit; without that an amd64-only bench still
       # CONNECTED to the arm64 host, and unrelated maintenance there aborted a
-      # 34h run at 63% (2026-08-27). amd64 only: msr1 is gated by celeris#312.
-      BENCH_TARGET: msa2-server
+      # 34h run at 63% (2026-08-27). Both arches run in parallel (#168).
+      BENCH_TARGET: ${{ github.event.inputs.target || 'both' }}
       # Column subset to BENCH for a targeted re-run; 'all' on schedule/default.
       BENCH_COMPETITORS: ${{ github.event.inputs.competitors || 'all' }}
       # Binary/module set to BUILD+DEPLOY. MUST be job-level (not just the
@@ -243,7 +251,7 @@ jobs:
           #   headline projected 26h35m -> ACTUAL ~53h    (2.01x, 2026-08-26)
           # Budgets below are set from the ACTUALS with headroom, not the
           # projection. Fixing the estimator itself is a separate follow-up.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && '60h' || '90h') }}
+          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && '60h' || '80h') }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 

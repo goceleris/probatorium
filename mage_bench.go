@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goceleris/loadgen"
@@ -446,10 +448,7 @@ func Bench() error {
 	if target == "both" {
 		playbookTargets = []string{"msa2-server", "msr1"}
 	}
-	for _, pt := range playbookTargets {
-		if len(playbookTargets) > 1 {
-			fmt.Printf("\n=== Bench arch pass: %s ===\n", pt)
-		}
+	buildArgs := func(pt string) []string {
 		args := []string{
 			"-i", "inventory.yml",
 			benchPlaybook,
@@ -487,13 +486,56 @@ func Bench() error {
 		if limit := clusterLimitForTarget(pt); limit != "" {
 			args = append(args, "--limit", limit)
 		}
+		return args
+	}
 
-		cmd := exec.Command("ansible-playbook", args...)
+	runPass := func(pt string, stdout, stderr io.Writer) error {
+		cmd := exec.Command("ansible-playbook", buildArgs(pt)...)
 		cmd.Dir = ansibleDir
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("bench (%s): %w", pt, err)
+		}
+		return nil
+	}
+
+	if len(playbookTargets) == 1 {
+		if err := runPass(playbookTargets[0], os.Stdout, os.Stderr); err != nil {
+			return err
+		}
+	} else {
+		// PARALLEL arch passes (#168). The two SUTs are distinct hosts and the
+		// playbook keys every artefact by bench_target (bench_run_dir and the
+		// loadgen transport tarball), so the passes share only msa2-client —
+		// which is deliberately oversized and measured at ~40%/core and
+		// ~1.2 of 14 Gbit/s while driving one arch, i.e. far from the
+		// bottleneck that would contaminate either measurement.
+		//
+		// Output from both ansible processes is line-prefixed and serialised
+		// through one mutex so the interleaved logs stay readable.
+		fmt.Printf("\n=== Bench arch passes IN PARALLEL: %s ===\n", strings.Join(playbookTargets, ", "))
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		errs := make([]error, len(playbookTargets))
+		for i, pt := range playbookTargets {
+			wg.Add(1)
+			go func(i int, pt string) {
+				defer wg.Done()
+				out := &prefixWriter{mu: &mu, w: os.Stdout, prefix: "[" + pt + "] "}
+				errs[i] = runPass(pt, out, out)
+				out.flush()
+			}(i, pt)
+		}
+		wg.Wait()
+		var failed []string
+		for _, err := range errs {
+			if err != nil {
+				failed = append(failed, err.Error())
+			}
+		}
+		if len(failed) > 0 {
+			return fmt.Errorf("parallel arch passes failed:\n  %s", strings.Join(failed, "\n  "))
 		}
 	}
 
