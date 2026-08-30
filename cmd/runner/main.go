@@ -1809,7 +1809,7 @@ func buildDocument(cfg Config, agg map[string]report.CellAggregate, started time
 		HostArchPair:    runtime.GOOS + "/" + targetArch,
 		Environment:     env,
 		BenchmarkConfig: bench,
-		Servers:         serverMetaFromRegistry(),
+		Servers:         serverMetaFromRegistry(targetArch),
 		Agg:             agg,
 	})
 }
@@ -1818,8 +1818,9 @@ func buildDocument(cfg Config, agg map[string]report.CellAggregate, started time
 // ServerMeta map BuildDocument consumes. LanguageVersion is the runner's
 // own toolchain for Go adapters; CompileOptions mirror the canonical
 // build path (crossCompileGoBinary for Go, the native role flags for
-// rust/python/bun).
-func serverMetaFromRegistry() map[string]report.ServerMeta {
+// rust/python/bun). targetArch is the BENCHED host's arch (-target-arch),
+// not the runner's: the loadgen box is amd64 even when it drives msr1.
+func serverMetaFromRegistry(targetArch string) map[string]report.ServerMeta {
 	out := make(map[string]report.ServerMeta, len(servers.Registry))
 	for name, a := range servers.Registry {
 		fwVer := a.FrameworkVersion
@@ -1834,7 +1835,7 @@ func serverMetaFromRegistry() map[string]report.ServerMeta {
 			Framework:        a.Framework,
 			FrameworkVersion: fwVer,
 			Engine:           a.Engine,
-			CompileOptions:   report.CompileOptionsFor(a.Language, runtime.GOARCH),
+			CompileOptions:   report.CompileOptionsFor(a.Language, targetArch),
 		}
 		if a.Language == "go" {
 			m.LanguageVersion = runtime.Version()

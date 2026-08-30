@@ -1805,7 +1805,7 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 		HostArchPair:    "linux/" + benchTargetArch(archTarget),
 		Environment:     env,
 		BenchmarkConfig: bench,
-		Servers:         clusterServerMeta(collected, p.CelerisVer),
+		Servers:         clusterServerMeta(collected, p.CelerisVer, benchTargetArch(archTarget)),
 		Agg:             agg,
 	})
 
@@ -1826,7 +1826,7 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 // language, framework, engine) facets and synthesise CompileOptions
 // from the language. Competitors absent from the registry still get a
 // zero-valued meta so the Document carries them.
-func clusterServerMeta(cells map[string]*report.CellResult, celerisVer string) map[string]report.ServerMeta {
+func clusterServerMeta(cells map[string]*report.CellResult, celerisVer, targetArch string) map[string]report.ServerMeta {
 	out := make(map[string]report.ServerMeta, len(cells))
 	// The bucket key is "<competitor>|<scenario>" after the rated/scenario
 	// fix in mergeBenchResults. The servers.Registry is keyed by the
@@ -1854,7 +1854,7 @@ func clusterServerMeta(cells map[string]*report.CellResult, celerisVer string) m
 			} else {
 				m.FrameworkVersion = a.FrameworkVersion
 			}
-			m.CompileOptions = report.CompileOptionsFor(a.Language, benchTargetGOARCH())
+			m.CompileOptions = report.CompileOptionsFor(a.Language, targetArch)
 			if a.Language == "go" {
 				m.LanguageVersion = runtime.Version()
 			}
@@ -1923,17 +1923,6 @@ func benchTargetArch(target string) string {
 	default:
 		return "multi"
 	}
-}
-
-// benchTargetGOARCH returns the GOARCH used to synthesise Go
-// CompileOptions for cluster competitors. The cross-compile produces
-// one binary per arch; for the metadata we report the env override
-// when set, else the dev host's arch.
-func benchTargetGOARCH() string {
-	if a := os.Getenv("BENCH_GOARCH"); a != "" {
-		return a
-	}
-	return runtime.GOARCH
 }
 
 // latestBenchResults returns the path to the most recent
