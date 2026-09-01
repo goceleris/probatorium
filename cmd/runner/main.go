@@ -112,6 +112,15 @@ type Config struct {
 	// uses — the SUT runs on bench_target and the runner on the loadgen
 	// host, so there is no in-process adapter to start.
 	Target string
+	// TargetArch is the GOARCH of the HOST UNDER TEST, not of this
+	// process. The runner executes on the loadgen host (msa2-client,
+	// amd64) while the SUT may be msa2-server (amd64) or msr1 (arm64),
+	// so runtime.GOARCH tags every arm64 cell as amd64 — which silently
+	// mislabels an entire arch's published results. Ansible passes the
+	// inventory's `arch` for bench_target. Empty falls back to
+	// runtime.GOARCH (correct for the local-adapter path, where the SUT
+	// really is this host).
+	TargetArch string
 	// ServerName is the friendly competitor slug recorded as the cell's
 	// server in remote-target mode (e.g. "celeris-iouring-h1-async").
 	// Ignored when Target is empty.
@@ -214,6 +223,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.Int64Var(&c.Seed, "seed", c.Seed, "rng seed for reproducibility echo; 0 = time.Now().UnixNano()")
 	fs.StringVar(&c.Target, "target", c.Target,
 		"remote base URL (http://host:port) to bench against; empty = spawn local loopback adapters")
+	fs.StringVar(&c.TargetArch, "target-arch", c.TargetArch,
+		"GOARCH of the host under test (amd64|arm64); empty = this process's arch")
 	fs.StringVar(&c.ServerName, "server-name", c.ServerName,
 		"friendly server slug recorded in per-cell JSON / report when -target is set")
 	fs.BoolVar(&c.DryRun, "dry-run", c.DryRun, "print the resolved schedule and exit without starting adapters")
@@ -1790,11 +1801,15 @@ func buildDocument(cfg Config, agg map[string]report.CellAggregate, started time
 		AdaptersFilter:  cfg.Cells,
 	}
 
+	targetArch := cfg.TargetArch
+	if targetArch == "" {
+		targetArch = runtime.GOARCH
+	}
 	return report.BuildDocument(report.BuildInput{
-		HostArchPair:    runtime.GOOS + "/" + runtime.GOARCH,
+		HostArchPair:    runtime.GOOS + "/" + targetArch,
 		Environment:     env,
 		BenchmarkConfig: bench,
-		Servers:         serverMetaFromRegistry(),
+		Servers:         serverMetaFromRegistry(targetArch),
 		Agg:             agg,
 	})
 }
@@ -1803,8 +1818,9 @@ func buildDocument(cfg Config, agg map[string]report.CellAggregate, started time
 // ServerMeta map BuildDocument consumes. LanguageVersion is the runner's
 // own toolchain for Go adapters; CompileOptions mirror the canonical
 // build path (crossCompileGoBinary for Go, the native role flags for
-// rust/python/bun).
-func serverMetaFromRegistry() map[string]report.ServerMeta {
+// rust/python/bun). targetArch is the BENCHED host's arch (-target-arch),
+// not the runner's: the loadgen box is amd64 even when it drives msr1.
+func serverMetaFromRegistry(targetArch string) map[string]report.ServerMeta {
 	out := make(map[string]report.ServerMeta, len(servers.Registry))
 	for name, a := range servers.Registry {
 		fwVer := a.FrameworkVersion
@@ -1819,7 +1835,7 @@ func serverMetaFromRegistry() map[string]report.ServerMeta {
 			Framework:        a.Framework,
 			FrameworkVersion: fwVer,
 			Engine:           a.Engine,
-			CompileOptions:   report.CompileOptionsFor(a.Language, runtime.GOARCH),
+			CompileOptions:   report.CompileOptionsFor(a.Language, targetArch),
 		}
 		if a.Language == "go" {
 			m.LanguageVersion = runtime.Version()

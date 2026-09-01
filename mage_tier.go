@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/goceleris/probatorium/budget"
@@ -164,6 +165,29 @@ func BenchTier() error {
 	// bench, so the publish preflight can gate the run.)
 	if skipPublish {
 		fmt.Printf("\n=== BENCH_PUBLISH=0 — skipping docs push (smoke test mode) ===\n")
+	} else if clusterTarget() == "both" {
+		// A both-arch bench wrote results-amd64.json AND results-arm64.json
+		// instead of one blended results.json, so publish each in turn and
+		// pin Publish to the exact file — auto-discovery cannot choose.
+		// Each Document carries its own HostArchPair, so archTagFromHostArchPair
+		// lands them on separate publish paths.
+		dir, err := latestBenchDir("")
+		if err != nil {
+			return fmt.Errorf("locate per-arch bench results: %w", err)
+		}
+		for _, arch := range []string{"amd64", "arm64"} {
+			f := filepath.Join(dir, "results-"+arch+".json")
+			if _, statErr := os.Stat(f); statErr != nil {
+				return fmt.Errorf("expected per-arch results %s for a BENCH_TARGET=both run: %w", f, statErr)
+			}
+			fmt.Printf("\n=== Publish arch=%s (%s) ===\n", arch, f)
+			_ = os.Setenv("PUBLISH_RESULTS", f)
+			if err := Publish(); err != nil {
+				_ = os.Unsetenv("PUBLISH_RESULTS")
+				return fmt.Errorf("publish %s: %w", arch, err)
+			}
+		}
+		_ = os.Unsetenv("PUBLISH_RESULTS")
 	} else {
 		if err := Publish(); err != nil {
 			return fmt.Errorf("publish: %w", err)

@@ -394,7 +394,7 @@ func TestDefaultRatedFractionsMatchBudgetModel(t *testing.T) {
 // (the field was never assigned before, shipping 0/52). celeris rows resolve
 // from the runner's pinned celeris module via modRequireVersion.
 func TestServerMetaFromRegistryFrameworkVersion(t *testing.T) {
-	m := serverMetaFromRegistry()
+	m := serverMetaFromRegistry("amd64")
 	if got := m["gin-h1"].FrameworkVersion; got == "" {
 		t.Error("gin-h1 FrameworkVersion is empty; want the registry-pinned version")
 	}
@@ -404,6 +404,34 @@ func TestServerMetaFromRegistryFrameworkVersion(t *testing.T) {
 	if v := modRequireVersion("github.com/goceleris/celeris"); v != "" {
 		if got := m["celeris-std-h1"].FrameworkVersion; got != v {
 			t.Errorf("celeris-std-h1 FrameworkVersion = %q, want %q (runner's pinned celeris)", got, v)
+		}
+	}
+}
+
+// TestServerMetaFromRegistryCompileOptionsArch pins the per-column half of
+// the arch-blind compile_options bug: the runner executes on the amd64
+// loadgen box even when it drives the arm64 SUT, so CompileOptions must
+// follow -target-arch, never runtime.GOARCH.
+func TestServerMetaFromRegistryCompileOptionsArch(t *testing.T) {
+	for _, tc := range []struct{ arch, want, notWant string }{
+		{"arm64", "GOARM64=v8.0", "GOAMD64=v3"},
+		{"amd64", "GOAMD64=v3", "GOARM64=v8.0"},
+	} {
+		opts := serverMetaFromRegistry(tc.arch)["gin-h1"].CompileOptions
+		var hasWant, hasNot bool
+		for _, o := range opts {
+			if o == tc.want {
+				hasWant = true
+			}
+			if o == tc.notWant {
+				hasNot = true
+			}
+		}
+		if !hasWant {
+			t.Errorf("target-arch %s: CompileOptions %v missing %q", tc.arch, opts, tc.want)
+		}
+		if hasNot {
+			t.Errorf("target-arch %s: CompileOptions %v leaked %q from the runner host", tc.arch, opts, tc.notWant)
 		}
 	}
 }

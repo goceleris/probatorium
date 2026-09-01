@@ -3,12 +3,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // Internal helpers shared by mage_*.go targets. None of these are
@@ -37,14 +40,15 @@ const (
 // defaultClusterTarget is the default BENCH_TARGET / VALIDATE_TARGET when the
 // user doesn't set one.
 //
-// arm64 benchmarking is TEMPORARILY DISABLED (2026-06): the sole arm64 cluster
-// node (msr1 — a CIX Sky1 / CD8180 board) hard-hangs the entire host under
-// sustained NIC load due to an immature SoC/firmware defect (celeris#312), NOT a
-// celeris bug — both celeris and gnet trigger it and no OS-level workaround
-// exists. Until a stable arm64 host replaces it, the benchmark + validation of
-// record is amd64-only. Re-enable arm64 by setting BENCH_TARGET=both /
-// VALIDATE_TARGET=both (or =msr1) once a reliable arm64 node is in the fabric.
-const defaultClusterTarget = "msa2-server" // was "both"
+// arm64 benchmarking is ENABLED (re-enabled 2026-08-28). msr1 was gated out in
+// 2026-06 under celeris#312 (hard hang under sustained NIC load). After the
+// 2026-08-27 kernel 7.0.0-30 + linux-firmware update the hang no longer
+// reproduces: msr1 survived a 59min synthetic soak (iperf3 bidir 14.9 Gbit/s +
+// all-core stress, 2.4B packets) and a 3h real bench in its historical failing
+// role (Actions runner + ansible conductor + SUT), with zero heartbeat gaps and
+// zero kernel warnings. #312 is NOT formally closed — see the arm64 columns of
+// the next full run for confirmation.
+const defaultClusterTarget = "both"
 
 // lanIPs maps inventory hostname to the LAN-pinned DHCP reservation
 // used when CLUSTER_USE_LAN=1 forces traffic over the 20G LACP fabric
@@ -288,4 +292,42 @@ func goModRequireVersion(modPath string) string {
 		}
 	}
 	return ""
+}
+
+// prefixWriter prefixes every complete line with a tag and serialises writes
+// through a shared mutex, so the two parallel arch passes (#168) interleave
+// at line granularity instead of shredding each other mid-line. Partial lines
+// are buffered until their newline arrives; flush emits any trailing remainder.
+type prefixWriter struct {
+	mu     *sync.Mutex
+	w      io.Writer
+	prefix string
+	buf    []byte
+}
+
+func (p *prefixWriter) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(b)
+	p.buf = append(p.buf, b...)
+	for {
+		i := bytes.IndexByte(p.buf, '\n')
+		if i < 0 {
+			break
+		}
+		if _, err := p.w.Write(append([]byte(p.prefix), p.buf[:i+1]...)); err != nil {
+			return n, err
+		}
+		p.buf = p.buf[i+1:]
+	}
+	return n, nil
+}
+
+func (p *prefixWriter) flush() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.buf) > 0 {
+		_, _ = p.w.Write(append([]byte(p.prefix), append(p.buf, '\n')...))
+		p.buf = nil
+	}
 }

@@ -1105,11 +1105,40 @@ func TestClusterServerMetaFrameworkVersion(t *testing.T) {
 		"celeris-std-h1|get-json": {},
 		"gin-h1|get-json":         {},
 	}
-	meta := clusterServerMeta(cells, "v1.5.9")
+	meta := clusterServerMeta(cells, "v1.5.9", "amd64")
 	if got := meta["celeris-std-h1"].FrameworkVersion; got != "v1.5.9" {
 		t.Errorf("celeris FrameworkVersion = %q, want v1.5.9 (threaded benched version)", got)
 	}
 	if got := meta["gin-h1"].FrameworkVersion; got == "" {
 		t.Error("gin-h1 FrameworkVersion is empty; want the registry-pinned version")
+	}
+}
+
+// TestClusterServerMetaCompileOptionsArch pins the published half of the
+// arch-blind compile_options bug (v1.5.5-v1.5.8 shipped GOARM64=v8.0 on
+// every amd64 document): the merge runs on the arm64 Actions runner, so
+// CompileOptions must come from the bench TARGET, never runtime.GOARCH.
+func TestClusterServerMetaCompileOptionsArch(t *testing.T) {
+	cells := map[string]*report.CellResult{"gin-h1|get-json": {}}
+	for _, tc := range []struct{ arch, want, notWant string }{
+		{"amd64", "GOAMD64=v3", "GOARM64=v8.0"},
+		{"arm64", "GOARM64=v8.0", "GOAMD64=v3"},
+	} {
+		opts := clusterServerMeta(cells, "v1.5.9", tc.arch)["gin-h1"].CompileOptions
+		var hasWant, hasNot bool
+		for _, o := range opts {
+			if o == tc.want {
+				hasWant = true
+			}
+			if o == tc.notWant {
+				hasNot = true
+			}
+		}
+		if !hasWant {
+			t.Errorf("target arch %s: CompileOptions %v missing %q", tc.arch, opts, tc.want)
+		}
+		if hasNot {
+			t.Errorf("target arch %s: CompileOptions %v leaked %q from the merge host", tc.arch, opts, tc.notWant)
+		}
 	}
 }

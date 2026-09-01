@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/goceleris/loadgen"
@@ -446,10 +448,7 @@ func Bench() error {
 	if target == "both" {
 		playbookTargets = []string{"msa2-server", "msr1"}
 	}
-	for _, pt := range playbookTargets {
-		if len(playbookTargets) > 1 {
-			fmt.Printf("\n=== Bench arch pass: %s ===\n", pt)
-		}
+	buildArgs := func(pt string) []string {
 		args := []string{
 			"-i", "inventory.yml",
 			benchPlaybook,
@@ -487,13 +486,56 @@ func Bench() error {
 		if limit := clusterLimitForTarget(pt); limit != "" {
 			args = append(args, "--limit", limit)
 		}
+		return args
+	}
 
-		cmd := exec.Command("ansible-playbook", args...)
+	runPass := func(pt string, stdout, stderr io.Writer) error {
+		cmd := exec.Command("ansible-playbook", buildArgs(pt)...)
 		cmd.Dir = ansibleDir
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("bench (%s): %w", pt, err)
+		}
+		return nil
+	}
+
+	if len(playbookTargets) == 1 {
+		if err := runPass(playbookTargets[0], os.Stdout, os.Stderr); err != nil {
+			return err
+		}
+	} else {
+		// PARALLEL arch passes (#168). The two SUTs are distinct hosts and the
+		// playbook keys every artefact by bench_target (bench_run_dir and the
+		// loadgen transport tarball), so the passes share only msa2-client —
+		// which is deliberately oversized and measured at ~40%/core and
+		// ~1.2 of 14 Gbit/s while driving one arch, i.e. far from the
+		// bottleneck that would contaminate either measurement.
+		//
+		// Output from both ansible processes is line-prefixed and serialised
+		// through one mutex so the interleaved logs stay readable.
+		fmt.Printf("\n=== Bench arch passes IN PARALLEL: %s ===\n", strings.Join(playbookTargets, ", "))
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		errs := make([]error, len(playbookTargets))
+		for i, pt := range playbookTargets {
+			wg.Add(1)
+			go func(i int, pt string) {
+				defer wg.Done()
+				out := &prefixWriter{mu: &mu, w: os.Stdout, prefix: "[" + pt + "] "}
+				errs[i] = runPass(pt, out, out)
+				out.flush()
+			}(i, pt)
+		}
+		wg.Wait()
+		var failed []string
+		for _, err := range errs {
+			if err != nil {
+				failed = append(failed, err.Error())
+			}
+		}
+		if len(failed) > 0 {
+			return fmt.Errorf("parallel arch passes failed:\n  %s", strings.Join(failed, "\n  "))
 		}
 	}
 
@@ -506,7 +548,7 @@ func Bench() error {
 		return fmt.Errorf("aggregate per-cell results: %w", err)
 	}
 
-	merged, err := mergeBenchResults(resultsDir, target, benchParams{
+	bp := benchParams{
 		CelerisVer: version,
 		Duration:   duration,
 		Warmup:     warmup,
@@ -514,7 +556,30 @@ func Bench() error {
 		Runs:       runs,
 		Seed:       seed,
 		StartedAt:  benchStart,
-	})
+	}
+
+	// BENCH_TARGET=both emits ONE Document PER ARCH, never a blended one.
+	// Merging across arches would average two machines that differ by ~7x
+	// into a single "linux/multi" row describing neither. Publish picks the
+	// per-arch file up via PUBLISH_RESULTS (see mage_tier.go).
+	if target == "both" {
+		var outs []string
+		for _, h := range playbookTargets {
+			out, err := mergeBenchResultsFor(resultsDir, target, bp, h,
+				"results-"+benchTargetArch(h)+".json")
+			if err != nil {
+				return fmt.Errorf("merge results (%s): %w", h, err)
+			}
+			outs = append(outs, out)
+		}
+		fmt.Printf("\n=== Bench complete (per-arch documents) ===\n")
+		for _, o := range outs {
+			fmt.Printf("  %s\n", o)
+		}
+		return nil
+	}
+
+	merged, err := mergeBenchResults(resultsDir, target, bp)
 	if err != nil {
 		return fmt.Errorf("merge results: %w", err)
 	}
@@ -1515,7 +1580,24 @@ const clusterScenarioName = "bench"
 // competitor — per-host fidelity that the retired loose "hosts" map
 // carried is intentionally dropped here in favour of one schema-typed
 // shape every downstream tool can read.
+// mergeBenchResults merges every host's raw payload into one Document.
+// Kept for the single-target path.
 func mergeBenchResults(resultsDir, target string, p benchParams) (string, error) {
+	return mergeBenchResultsFor(resultsDir, target, p, "", "results.json")
+}
+
+// mergeBenchResultsFor merges raw payloads into one Document, optionally
+// scoped to a single bench target.
+//
+// Scoping matters for BENCH_TARGET=both. The unscoped merge buckets samples
+// by competitor ACROSS hosts, so amd64 and arm64 runs of the same column land
+// in one CellResult and publish as their average under HostArchPair
+// "linux/multi" — a smoke test measured msa2-server at 377,371 rps and msr1 at
+// 54,850 rps (6.9x apart) and published 216,111. That is not a per-arch
+// comparison, it is a number describing no machine that exists. Bench therefore
+// calls this once per target so each arch publishes its own Document with its
+// own HostArchPair.
+func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, outName string) (string, error) {
 	rawDir := filepath.Join(resultsDir, "raw")
 	entries, err := os.ReadDir(rawDir)
 	if err != nil {
@@ -1540,6 +1622,9 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 	reconstructed := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		if onlyHost != "" && e.Name() != onlyHost+".json" {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(rawDir, e.Name()))
@@ -1712,15 +1797,19 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 		FabricLineRateBitsPerSec: benchFabricLineRate(),
 	}
 
+	archTarget := target
+	if onlyHost != "" {
+		archTarget = onlyHost
+	}
 	doc := report.BuildDocument(report.BuildInput{
-		HostArchPair:    "linux/" + benchTargetArch(target),
+		HostArchPair:    "linux/" + benchTargetArch(archTarget),
 		Environment:     env,
 		BenchmarkConfig: bench,
-		Servers:         clusterServerMeta(collected, p.CelerisVer),
+		Servers:         clusterServerMeta(collected, p.CelerisVer, benchTargetArch(archTarget)),
 		Agg:             agg,
 	})
 
-	out := filepath.Join(resultsDir, "results.json")
+	out := filepath.Join(resultsDir, outName)
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return "", err
@@ -1737,7 +1826,7 @@ func mergeBenchResults(resultsDir, target string, p benchParams) (string, error)
 // language, framework, engine) facets and synthesise CompileOptions
 // from the language. Competitors absent from the registry still get a
 // zero-valued meta so the Document carries them.
-func clusterServerMeta(cells map[string]*report.CellResult, celerisVer string) map[string]report.ServerMeta {
+func clusterServerMeta(cells map[string]*report.CellResult, celerisVer, targetArch string) map[string]report.ServerMeta {
 	out := make(map[string]report.ServerMeta, len(cells))
 	// The bucket key is "<competitor>|<scenario>" after the rated/scenario
 	// fix in mergeBenchResults. The servers.Registry is keyed by the
@@ -1765,7 +1854,7 @@ func clusterServerMeta(cells map[string]*report.CellResult, celerisVer string) m
 			} else {
 				m.FrameworkVersion = a.FrameworkVersion
 			}
-			m.CompileOptions = report.CompileOptionsFor(a.Language, benchTargetGOARCH())
+			m.CompileOptions = report.CompileOptionsFor(a.Language, targetArch)
 			if a.Language == "go" {
 				m.LanguageVersion = runtime.Version()
 			}
@@ -1836,17 +1925,6 @@ func benchTargetArch(target string) string {
 	}
 }
 
-// benchTargetGOARCH returns the GOARCH used to synthesise Go
-// CompileOptions for cluster competitors. The cross-compile produces
-// one binary per arch; for the metadata we report the env override
-// when set, else the dev host's arch.
-func benchTargetGOARCH() string {
-	if a := os.Getenv("BENCH_GOARCH"); a != "" {
-		return a
-	}
-	return runtime.GOARCH
-}
-
 // latestBenchResults returns the path to the most recent
 // results/<ts>-bench-<version>/results.json. If version is empty,
 // returns the most recent bench run regardless of version. Returns
@@ -1858,6 +1936,23 @@ func benchTargetGOARCH() string {
 // nested path mode below (used for validate) doesn't apply here.
 func latestBenchResults(version string) (string, error) {
 	return latestResultsByPattern("-bench-", "results.json", version, false)
+}
+
+// clusterTarget is the resolved BENCH_TARGET (msa2-server | msr1 | both).
+func clusterTarget() string {
+	return envOrDefault("BENCH_TARGET", defaultClusterTarget)
+}
+
+// latestBenchDir returns the directory of the most recent bench run that
+// emitted PER-ARCH documents (BENCH_TARGET=both writes results-<arch>.json
+// instead of a single blended results.json, so latestBenchResults — which
+// looks for results.json — cannot find it).
+func latestBenchDir(version string) (string, error) {
+	p, err := latestResultsByPattern("-bench-", "results-amd64.json", version, false)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(p), nil
 }
 
 // latestValidateResults returns the path to the most recent

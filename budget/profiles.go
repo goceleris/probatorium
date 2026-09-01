@@ -87,15 +87,13 @@ const (
 // per-cell window (60s/15s vs 90s/20s) chosen so the whole grid still fits
 // the 24h budget. The bench ALWAYS runs exactly one pass (Runs=1).
 //
-// Arches is 1: the bench runs amd64-only today (BENCH_TARGET=msa2-server;
-// msr1/arm64 is out on a firmware bug, celeris#312), and BenchTier already
-// overrides Arches to 1 at runtime for any non-"both" target — pinning 1
-// here makes the static FitWithin projection match what actually runs
-// instead of over-projecting a non-existent arm64 pass. If arm64 returns
-// (BENCH_TARGET=both), BenchTier sets Arches=2 and FitWithin then aborts the
-// full grid against the default 24h budget unless BENCH_BUDGET is raised —
-// the correct loud failure, since the full grid x 2 serial arches cannot fit
-// 24h until ArchParallel (#168, blocked on loadgen linux/arm64) lands.
+// Arches is 1 as the static default; BenchTier sets Arches=2 at runtime for
+// BENCH_TARGET=both. ArchParallel is now true (#168 landed 2026-08-28): the
+// two arch passes run CONCURRENTLY against distinct SUT hosts, sharing only
+// the msa2-client loadgen, so two arches cost the same wall-clock as one and
+// FitWithin projects accordingly. The parallel path is safe because every
+// artefact is keyed by bench_target (bench_run_dir AND the loadgen transport
+// tarball) and msa2-client is far from saturation while driving one arch.
 //
 // Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~11.0h
 // rated (388 rated cells x (10+4*20+12)s) = ~26.6h bench (~29.4h wall-clock
@@ -114,7 +112,7 @@ func HeadlineWeekly() Profile {
 		Cooldown:      defaultCooldown,
 		Runs:          1,
 		Arches:        1,
-		ArchParallel:  false,
+		ArchParallel:  true,
 		RatedCells:    HeadlineRatedRealizedCells,
 		RatedPasses:   4,
 		RatedDuration: 20 * time.Second,
@@ -155,7 +153,7 @@ func Fast() Profile {
 		Cooldown:     defaultCooldown,
 		Runs:         1,
 		Arches:       1,
-		ArchParallel: false,
+		ArchParallel: true,
 		RatedCells:   0, // rated OFF — saturation-only
 		RatedPasses:  0,
 		Globs:        []string{"*/*"},
@@ -177,7 +175,7 @@ func Full() Profile {
 		Cooldown:      defaultCooldown,
 		Runs:          1,
 		Arches:        1,
-		ArchParallel:  false,
+		ArchParallel:  true,
 		RatedCells:    FullRatedRealizedCells,
 		RatedPasses:   4,
 		RatedDuration: 30 * time.Second,

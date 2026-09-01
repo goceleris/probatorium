@@ -513,6 +513,7 @@
     ulimit -n 65535 2>/dev/null || true
     timeout --foreground --kill-after=60 {{ cell_guard_seconds }} ./runner \
       -target http://{{ target_ip }}:{{ bench_port | default(8080) }} \
+      -target-arch {{ hostvars[bench_target].arch }} \
       -server-name {{ cell.1 }} \
       -runs 1 \
       -duration {{ bench_duration_seconds | default(30) }}s \
