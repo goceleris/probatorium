@@ -224,6 +224,13 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("CELERIS_IOURING_WEDGE_DEBUG"); v != "" {
 			args = append(args, "--extra-vars", "celeris_wedge_debug="+v)
 		}
+		// VALIDATE_REFAPP_LOG_DIR makes the Local driver tee refapp
+		// stdout/stderr to a file per process. Needed alongside the wedge
+		// debug flag because superviseStderr otherwise discards a healthy
+		// refapp's output (celeris#470).
+		if v := os.Getenv("VALIDATE_REFAPP_LOG_DIR"); v != "" {
+			args = append(args, "--extra-vars", "validate_refapp_log_dir="+v)
+		}
 		// VALIDATE_DBSERVICES=1 starts the postgres/redis/memcached
 		// containers (assumed pre-pulled by deploy.yml's dbservices
 		// role) so the driver_* refapps in matrix-mode validate can

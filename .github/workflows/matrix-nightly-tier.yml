@@ -152,6 +152,10 @@ jobs:
           # 5s catches the wedge while the conn is still live. Off in celeris
           # unless this is set; clear it once #470 is diagnosed.
           CELERIS_IOURING_WEDGE_DEBUG: "5s"
+          # superviseStderr keeps a healthy refapp's output only in a ring it
+          # discards unless the refapp dies, so the diagnostic above would be
+          # thrown away. Tee it to files instead. Remove with the flag.
+          VALIDATE_REFAPP_LOG_DIR: "/tmp/celeris-wedge-logs"
           # Start postgres / redis / memcached containers on fixed
           # ports so the driver_* refapps in matrix mode can connect
           # to real backends. Without this, driver_postgres /
