@@ -33,7 +33,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12
+          version: v2.13
           args: --timeout=5m
       # gofmt -l prints offending files and emits no output on success.
       # Fail the job if anything appears on stdout — preserves the
