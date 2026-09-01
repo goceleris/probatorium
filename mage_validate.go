@@ -215,6 +215,15 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_CONCURRENCY"); v != "" {
 			args = append(args, "--extra-vars", "validate_concurrency="+v)
 		}
+		// CELERIS_IOURING_WEDGE_DEBUG=<duration> turns on celeris'
+		// accepted-but-silent connection diagnostic (celeris#470). Same
+		// SSH-boundary problem as VALIDATE_CONCURRENCY, so it takes the
+		// same passthrough. The validator's Driver spawns refapps with an
+		// inherited environment, so setting it on the validator is enough
+		// to reach every refapp process.
+		if v := os.Getenv("CELERIS_IOURING_WEDGE_DEBUG"); v != "" {
+			args = append(args, "--extra-vars", "celeris_wedge_debug="+v)
+		}
 		// VALIDATE_DBSERVICES=1 starts the postgres/redis/memcached
 		// containers (assumed pre-pulled by deploy.yml's dbservices
 		// role) so the driver_* refapps in matrix-mode validate can
