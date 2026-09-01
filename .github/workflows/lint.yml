@@ -46,6 +46,18 @@ jobs:
             echo "$out"
             exit 1
           fi
+      # Magefiles carry `//go:build mage`, so `go vet ./...`, `go build` and
+      # `go test` ALL skip them — only mage itself compiles them. A magefile
+      # that stopped compiling therefore reached main green and only surfaced
+      # when the nightly ran `mage Deploy` on the cluster (an undefined symbol
+      # left behind by a dead-code removal). Compile them here instead.
+      - name: Install mage
+        run: |
+          go install github.com/magefile/mage@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: mage compiles
+        run: mage -compile /tmp/mage-compile-check
+
       - name: actionlint
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@latest
