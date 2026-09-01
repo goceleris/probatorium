@@ -1911,6 +1911,19 @@ func benchFabricLineRate() int64 {
 	return 0
 }
 
+// benchTargetGOARCH returns the GOARCH used as a LAST-RESORT fallback when a
+// results document carries no usable HostArchPair (archTagFromHostArchPair).
+// It is NOT used to stamp compile_options -- that reads the bench target, see
+// clusterServerMeta -- and the BENCH_GOARCH override is the only way to correct
+// the arch for a malformed document, since runtime.GOARCH here is the
+// PUBLISHING host (msr1/arm64), not the SUT.
+func benchTargetGOARCH() string {
+	if a := os.Getenv("BENCH_GOARCH"); a != "" {
+		return a
+	}
+	return runtime.GOARCH
+}
+
 // benchTargetArch maps a bench_target host to its CPU arch for the
 // HostArchPair tag. msa2-server is amd64; msr1 is arm64. BENCH_TARGET=
 // both has no single arch, so it reports "multi".
