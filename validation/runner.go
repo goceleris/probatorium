@@ -1064,6 +1064,15 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"h2c_crashed":         s.H2CChurn.Crashed,
 			"h2c_hang":            s.H2CChurn.Hang,
 			"h2c_intentional_rst": s.H2CChurn.IntentionalRST,
+			// Cause split for h2c_hang (celeris#470). The bare total
+			// cannot separate a real >10s stall from an immediate
+			// close; without these the classification never reaches
+			// the report and the whole measurement is inert.
+			"h2c_hang_eof":            s.H2CChurn.HangEOF,
+			"h2c_hang_timeout":        s.H2CChurn.HangTimeout,
+			"h2c_hang_reset":          s.H2CChurn.HangReset,
+			"h2c_hang_other":          s.H2CChurn.HangOther,
+			"h2c_hang_max_elapsed_ms": s.H2CChurn.HangMaxElapsedMs,
 		},
 		WSTorture: map[string]int64{
 			"ws_sent":               s.WSTorture.Sent,
