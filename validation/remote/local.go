@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"syscall"
 )
@@ -56,28 +54,9 @@ func (l *Local) Start(ctx context.Context, args []string) (Process, error) {
 	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, stderr) }()
 	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, stdout) }()
 	go func() { copyWG.Wait(); _ = mergedW.Close() }()
-	var errReader io.Reader = mergedR
-	// Debug capture (celeris#470). superviseStderr keeps post-ready refapp
-	// output only in a rolling ring it discards unless the refapp dies, so a
-	// healthy refapp's diagnostics are lost. When VALIDATE_REFAPP_LOG_DIR is
-	// set, tee everything the supervisor reads into a per-process file so
-	// engine-level diagnostics survive a clean run.
-	//
-	// Tee on the READ side deliberately: the two io.Copy goroutines above
-	// already share mergedW, and adding a file to both would need its own
-	// synchronisation. A TeeReader has exactly one writer -- the supervisor's
-	// own read loop -- so it needs none.
-	if dir := os.Getenv("VALIDATE_REFAPP_LOG_DIR"); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err == nil {
-			name := fmt.Sprintf("refapp-%s-%d.log", filepath.Base(l.binary), cmd.Process.Pid)
-			if f, ferr := os.Create(filepath.Join(dir, name)); ferr == nil {
-				errReader = io.TeeReader(mergedR, f)
-			}
-		}
-	}
 	p := &localProcess{
 		cmd:       cmd,
-		errReader: errReader,
+		errReader: mergedR,
 		done:      make(chan struct{}),
 	}
 	return p, nil

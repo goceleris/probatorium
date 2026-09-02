@@ -146,19 +146,6 @@ jobs:
           # this constraint, re-add the override with its own host-specific
           # reasoning rather than reusing this comment.
           VALIDATE_REFAPP_WORKERS: "0"
-          # celeris#470: report any conn accepted >5s ago that has never
-          # received a byte, with the engine state that decides whether a
-          # recv is outstanding. The validator's h2c read budget is 10s, so
-          # 9s, just under that budget: at 5s this also caught legitimate
-          # backend latency in the driver_* refapps (75 hits in 5 bursts,
-          # all in driver_memcached/postgres/redis), which is slowness, not
-          # the wedge. A hit at 9s is a conn the walker will count. Off in celeris
-          # unless this is set; clear it once #470 is diagnosed.
-          CELERIS_IOURING_WEDGE_DEBUG: "9s"
-          # superviseStderr keeps a healthy refapp's output only in a ring it
-          # discards unless the refapp dies, so the diagnostic above would be
-          # thrown away. Tee it to files instead. Remove with the flag.
-          VALIDATE_REFAPP_LOG_DIR: "/tmp/celeris-wedge-logs"
           # Start postgres / redis / memcached containers on fixed
           # ports so the driver_* refapps in matrix mode can connect
           # to real backends. Without this, driver_postgres /
