@@ -2,11 +2,15 @@ package validation
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -82,6 +86,25 @@ type h2cTally struct {
 	// h2c_hang=317K on amd64 which was almost entirely this workload
 	// noise rather than real server hangs.
 	intentionalRST atomic.Int64
+	// hangEOF / hangTimeout / hangReset / hangOther classify WHY the
+	// read that incremented `hang` yielded no bytes. `hang` alone is
+	// ambiguous: its predicate is `err != nil || n == 0`, which scores
+	// "server never replied within 10s", "server closed cleanly without
+	// replying" and "server sent RST" identically. Those are three
+	// different bugs (or non-bugs), and collapsing them makes the
+	// counter undiagnosable -- see probatorium#259 and celeris#470,
+	// where a 1-per-cell h2c_hang could not be attributed for weeks
+	// because the cause was discarded at the point of measurement.
+	// `hang` stays the total so historical comparisons keep working.
+	hangEOF     atomic.Int64
+	hangTimeout atomic.Int64
+	hangReset   atomic.Int64
+	hangOther   atomic.Int64
+	// hangMaxElapsedMs is the longest no-byte read observed, in ms.
+	// A value near the 10s read budget means a genuine stall; a small
+	// value means the server closed early and the connection never had
+	// a chance to be slow.
+	hangMaxElapsedMs atomic.Int64
 }
 
 // h2cSnapshot is the value-typed projection emitted into the tally
@@ -93,6 +116,12 @@ type h2cSnapshot struct {
 	Crashed        int64 `json:"h2c_crashed"`
 	Hang           int64 `json:"h2c_hang"`
 	IntentionalRST int64 `json:"h2c_intentional_rst"`
+
+	HangEOF          int64 `json:"h2c_hang_eof"`
+	HangTimeout      int64 `json:"h2c_hang_timeout"`
+	HangReset        int64 `json:"h2c_hang_reset"`
+	HangOther        int64 `json:"h2c_hang_other"`
+	HangMaxElapsedMs int64 `json:"h2c_hang_max_elapsed_ms"`
 }
 
 func (t *h2cTally) snapshot() h2cSnapshot {
@@ -103,6 +132,12 @@ func (t *h2cTally) snapshot() h2cSnapshot {
 		Crashed:        t.crashed.Load(),
 		Hang:           t.hang.Load(),
 		IntentionalRST: t.intentionalRST.Load(),
+
+		HangEOF:          t.hangEOF.Load(),
+		HangTimeout:      t.hangTimeout.Load(),
+		HangReset:        t.hangReset.Load(),
+		HangOther:        t.hangOther.Load(),
+		HangMaxElapsedMs: t.hangMaxElapsedMs.Load(),
 	}
 }
 
@@ -153,6 +188,34 @@ const (
 	h2cChurnDialTimeout = 2 * time.Second
 	h2cChurnReadTimeout = 10 * time.Second
 )
+
+// recordHang increments the hang total plus the cause-specific counter,
+// and tracks the longest no-byte read seen. Classification is by errno /
+// sentinel rather than string matching so it stays correct across Go
+// versions.
+func (t *h2cTally) recordHang(err error, elapsed time.Duration) {
+	t.hang.Add(1)
+	switch {
+	case err == nil:
+		// n == 0 with no error: a zero-length read. Rare; not a stall.
+		t.hangOther.Add(1)
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		t.hangTimeout.Add(1)
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		t.hangEOF.Add(1)
+	case errors.Is(err, syscall.ECONNRESET):
+		t.hangReset.Add(1)
+	default:
+		t.hangOther.Add(1)
+	}
+	ms := elapsed.Milliseconds()
+	for {
+		cur := t.hangMaxElapsedMs.Load()
+		if ms <= cur || t.hangMaxElapsedMs.CompareAndSwap(cur, ms) {
+			return
+		}
+	}
+}
 
 // fireH2CChurn opens one raw TCP conn, writes a valid h2c upgrade
 // preamble, then either RSTs immediately, RSTs after the 101 line, or
@@ -210,12 +273,17 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 	// intentionally don't drain — the 101 path produces SETTINGS
 	// frames we ignore.
 	buf := make([]byte, 256)
+	readStart := time.Now()
 	n, err := conn.Read(buf)
 	if err != nil || n == 0 {
 		// Read EOF / timeout before any bytes. If we never saw bytes
 		// after a valid upgrade request, that's the server hanging on
 		// us — possible PauseAccept wedge.
-		tally.hang.Add(1)
+		//
+		// Record WHICH of those it was: the bare `hang` total cannot
+		// distinguish a real >10s stall from an immediate close, and
+		// that distinction is the whole diagnosis.
+		tally.recordHang(err, time.Since(readStart))
 		return
 	}
 	statusLine := string(buf[:n])
@@ -294,6 +362,8 @@ func h2cChurnModeFor(seed uint64, step int) h2cChurnMode {
 
 // summariseH2CChurn formats a snapshot for the run summary log line.
 func summariseH2CChurn(s h2cSnapshot) string {
-	return fmt.Sprintf("h2c_sent=%d h2c_upgraded=%d h2c_declined=%d h2c_crashed=%d h2c_hang=%d",
-		s.Sent, s.Upgraded, s.Declined, s.Crashed, s.Hang)
+	return fmt.Sprintf("h2c_sent=%d h2c_upgraded=%d h2c_declined=%d h2c_crashed=%d "+
+		"h2c_hang=%d (eof=%d timeout=%d reset=%d other=%d max_elapsed=%dms)",
+		s.Sent, s.Upgraded, s.Declined, s.Crashed, s.Hang,
+		s.HangEOF, s.HangTimeout, s.HangReset, s.HangOther, s.HangMaxElapsedMs)
 }
