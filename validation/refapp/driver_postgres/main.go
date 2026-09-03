@@ -83,14 +83,22 @@ func main() {
 
 	// Seed the user-id counter from the current MAX(id) in the
 	// fixture table so a refapp restart against an already-seeded
-	// DB doesn't collide with rows from a previous run. Falls back
-	// to FixtureUserMaxID (10000) on any error.
+	// DB doesn't collide with rows from a previous run. Requires the
+	// fixture seed (services.SeedExternal) to have run; refuses to start
+	// without it.
 	{
 		var maxID int
 		bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		row := pool.QueryRow(bootCtx, "SELECT COALESCE(MAX(id), 0) FROM users")
-		_ = row.Scan(&maxID)
+		err := row.Scan(&maxID)
 		bootCancel()
+		if err != nil {
+			// Fail LOUDLY. Falling back silently here let every write
+			// 500 with "relation users does not exist" for the whole
+			// history of the nightly (no fixture seed in validate) while
+			// the refapp reported itself healthy.
+			log.Fatalf("driver_postgres: users table not provisioned (run the fixture seed: validator -seed-services / runner -seed-services): %v", err)
+		}
 		if maxID < 10000 {
 			maxID = 10000
 		}

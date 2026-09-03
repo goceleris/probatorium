@@ -124,8 +124,17 @@ type tier1Tally struct {
 	requestsSent  atomic.Int64
 	requests2xx   atomic.Int64
 	requests4xx   atomic.Int64
-	requests5xx   atomic.Int64
+	requests5xx   atomic.Int64 // UNEXPECTED 5xx only (see requests5xxExpected)
 	requestsError atomic.Int64
+	// requests5xxExpected counts 5xx from states the corpus marks
+	// `expect: 5xx` (designed-to-fail routes such as observability's
+	// /api/error). Kept apart so requests5xx can be gated to zero.
+	requests5xxExpected atomic.Int64
+	// invariantHits counts unexpected 5xx whose body carries the refapp
+	// invariant marker ("x-invariant": e.g. I-DRV-1 read-after-write). A
+	// refapp reporting its own invariant violation must surface as an
+	// invariant hit, not vanish into a generic 5xx count.
+	invariantHits atomic.Int64
 	adv           *adversarialTally
 	h2c           *h2cTally
 	ws            *wsTally
@@ -672,7 +681,7 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 		// `request: METHOD path`; states without an entry are silent.
 		// See validation/markov/<refapp>.yaml.
 		if req, ok := m.Requests[state]; ok {
-			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, tally)
+			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, tally)
 			if status == 401 && hasLogin {
 				// Session likely expired — re-login and keep walking.
 				// The next request will pick up the fresh cookie.
@@ -730,7 +739,7 @@ func walkerLogin(ctx context.Context, hc *http.Client, base string, login markov
 // POST/PUT/PATCH requests fire with an empty body for now. Body
 // generation is the Tier 2 RESTler fuzzer's job; Tier 1's purpose
 // here is volume + endpoint coverage, not payload variation.
-func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, tally *tier1Tally) int {
+func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, expect5xx bool, tally *tier1Tally) int {
 	tally.requestsSent.Add(1)
 	if method == "" {
 		method = "GET"
@@ -746,16 +755,25 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, t
 		return 0
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// Drain body — keep-alive requires it.
-	_, _ = io.Copy(io.Discard, resp.Body)
 	switch {
+	case resp.StatusCode >= 500 && expect5xx:
+		tally.requests5xxExpected.Add(1)
 	case resp.StatusCode >= 500:
 		tally.requests5xx.Add(1)
+		// Peek the body for the refapp invariant marker. 5xx is rare on
+		// a healthy run, so the extra read costs nothing in steady state.
+		head := make([]byte, 512)
+		n, _ := io.ReadFull(resp.Body, head)
+		if bytes.Contains(head[:n], []byte(`"x-invariant"`)) {
+			tally.invariantHits.Add(1)
+		}
 	case resp.StatusCode >= 400:
 		tally.requests4xx.Add(1)
 	default:
 		tally.requests2xx.Add(1)
 	}
+	// Drain body — keep-alive requires it.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode
 }
 
@@ -768,6 +786,9 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 		Requests4xx:   t.requests4xx.Load(),
 		Requests5xx:   t.requests5xx.Load(),
 		RequestsError: t.requestsError.Load(),
+
+		Requests5xxExpected: t.requests5xxExpected.Load(),
+		InvariantHits:       t.invariantHits.Load(),
 	}
 	if t.adv != nil {
 		s.Adversarial = t.adv.snapshot()
@@ -790,16 +811,18 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 // tier1TallySnapshot is the value-typed projection of tier1Tally
 // (atomic counters loaded at one instant).
 type tier1TallySnapshot struct {
-	RequestsSent  int64               `json:"requests_sent"`
-	Requests2xx   int64               `json:"requests_2xx"`
-	Requests4xx   int64               `json:"requests_4xx"`
-	Requests5xx   int64               `json:"requests_5xx"`
-	RequestsError int64               `json:"requests_error"`
-	Adversarial   adversarialSnapshot `json:"adversarial,omitempty"`
-	H2CChurn      h2cSnapshot         `json:"h2c_churn,omitempty"`
-	WSTorture     wsSnapshot          `json:"ws_torture,omitempty"`
-	SSEKill       sseSnapshot         `json:"sse_kill,omitempty"`
-	Liveness      livenessSnapshot    `json:"liveness,omitempty"`
+	RequestsSent        int64               `json:"requests_sent"`
+	Requests2xx         int64               `json:"requests_2xx"`
+	Requests4xx         int64               `json:"requests_4xx"`
+	Requests5xx         int64               `json:"requests_5xx"`
+	RequestsError       int64               `json:"requests_error"`
+	Requests5xxExpected int64               `json:"requests_5xx_expected"`
+	InvariantHits       int64               `json:"invariant_hits"`
+	Adversarial         adversarialSnapshot `json:"adversarial,omitempty"`
+	H2CChurn            h2cSnapshot         `json:"h2c_churn,omitempty"`
+	WSTorture           wsSnapshot          `json:"ws_torture,omitempty"`
+	SSEKill             sseSnapshot         `json:"sse_kill,omitempty"`
+	Liveness            livenessSnapshot    `json:"liveness,omitempty"`
 }
 
 // String formats a tally for the run summary log line.

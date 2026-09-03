@@ -1051,6 +1051,9 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		Requests4xx:   s.Requests4xx,
 		Requests5xx:   s.Requests5xx,
 		RequestsError: s.RequestsError,
+
+		Requests5xxExpected: s.Requests5xxExpected,
+		InvariantHits:       s.InvariantHits,
 		Adversarial: map[string]int64{
 			"adv_sent":               s.Adversarial.Sent,
 			"adv_well_rejected":      s.Adversarial.WellRejected,

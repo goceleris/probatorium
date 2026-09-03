@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/goceleris/probatorium/services"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,15 @@ import (
 // "auto-discover under validation/refapp/", an unset Engines defaults
 // to the per-OS production set.
 type MatrixConfig struct {
+	// SeedServices, when non-empty, provisions the driver fixtures the
+	// driver_* refapps depend on (users table + 10k rows, demo keys)
+	// BEFORE the first cell runs, via services.SeedExternal -- the same
+	// fixture set the bench seeds. Comma list of kind=addr:
+	// postgres=<dsn>,redis=<host:port>,memcached=<host:port>. Without it
+	// a fresh fixture container has no schema and every driver write
+	// fails with "relation \"users\" does not exist" (the 18% 5xx that
+	// hid the postgres driver from tier-1 for its entire history).
+	SeedServices string
 	// Enabled flips the validator from single-cell to matrix mode.
 	Enabled bool
 
@@ -68,6 +78,8 @@ func (m *MatrixConfig) Bind(fs interface {
 		"comma-separated engine names; empty or 'auto' expands to the OS production set")
 	fs.StringVar(&m.RefappRoot, "matrix-refapp-root", m.RefappRoot,
 		"directory under which refapps live; default validation/refapp")
+	fs.StringVar(&m.SeedServices, "seed-services", m.SeedServices,
+		"provision driver fixtures before the matrix: comma list of kind=addr (postgres=<dsn>,redis=<host:port>,memcached=<host:port>)")
 	fs.StringVar(&m.BinDir, "matrix-bin-dir", m.BinDir,
 		"pre-built refapp binary dir; falls back to `go build` per cell when empty")
 }
@@ -309,6 +321,11 @@ func buildRefappBin(ctx context.Context, root, slug string) (string, error) {
 // hard. Per-cell snapshots are still recorded in Cells[] regardless
 // of cell-level failures so the report shows what ran.
 func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
+	if matrix.SeedServices != "" {
+		if err := seedServicesWithRetry(ctx, matrix.SeedServices); err != nil {
+			return fmt.Errorf("matrix: seed services: %w", err)
+		}
+	}
 	plan, err := resolveMatrixPlan(matrix)
 	if err != nil {
 		return err
@@ -491,4 +508,57 @@ func writeJSON(path string, v any) error {
 	}
 	buf = append(buf, '\n')
 	return os.WriteFile(path, buf, 0o644)
+}
+
+// seedServicesWithRetry provisions the driver fixtures for spec
+// ("kind=addr,..."). A freshly initialised postgres restarts once after its
+// init scripts, so the first connection can be reset; retry the seed itself
+// for up to a minute rather than trusting a readiness probe.
+func seedServicesWithRetry(ctx context.Context, spec string) error {
+	var pgDSN, redisAddr, mcAddr string
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kind, addr, ok := strings.Cut(part, "=")
+		if !ok {
+			return fmt.Errorf("bad -seed-services entry %q (want kind=addr)", part)
+		}
+		switch strings.TrimSpace(kind) {
+		case "postgres", "pg":
+			pgDSN = strings.TrimSpace(addr)
+		case "redis":
+			redisAddr = strings.TrimSpace(addr)
+		case "memcached", "mc":
+			mcAddr = strings.TrimSpace(addr)
+		default:
+			return fmt.Errorf("unknown -seed-services kind %q", kind)
+		}
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	var last error
+	for attempt := 1; ; attempt++ {
+		sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		err := services.SeedExternal(sctx, pgDSN, redisAddr, mcAddr)
+		if err == nil {
+			err = services.VerifySeed(sctx, pgDSN, redisAddr, mcAddr)
+		}
+		cancel()
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "matrix: seeded driver fixtures (pg=%t redis=%t mc=%t) on attempt %d\n",
+				pgDSN != "", redisAddr != "", mcAddr != "", attempt)
+			return nil
+		}
+		last = err
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return fmt.Errorf("after %d attempts: %w", attempt, last)
+		}
+		fmt.Fprintf(os.Stderr, "matrix: seed attempt %d failed (%v), retrying\n", attempt, err)
+		select {
+		case <-time.After(3 * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
