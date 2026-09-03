@@ -130,6 +130,9 @@ type tier1Tally struct {
 	// `expect: 5xx` (designed-to-fail routes such as observability's
 	// /api/error). Kept apart so requests5xx can be gated to zero.
 	requests5xxExpected atomic.Int64
+	// requestsCutAtDeadline counts requests that were in flight when the
+	// tier's run context expired. Not errors: the budget ended.
+	requestsCutAtDeadline atomic.Int64
 	// invariantHits counts unexpected 5xx whose body carries the refapp
 	// invariant marker ("x-invariant": e.g. I-DRV-1 read-after-write). A
 	// refapp reporting its own invariant violation must surface as an
@@ -751,6 +754,17 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, e
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		// A request in flight when the tier's run context expires fails
+		// with "context deadline exceeded" after only milliseconds -- the
+		// budget ran out, nothing went wrong. Count those apart so
+		// requests_error means transport/server failures only (per-route
+		// latency attribution showed max 9 ms on every route while every
+		// "error" was one of these; 13-19 per cell = walkers mid-flight at
+		// cutoff).
+		if ctx.Err() != nil {
+			tally.requestsCutAtDeadline.Add(1)
+			return 0
+		}
 		tally.requestsError.Add(1)
 		return 0
 	}
@@ -787,8 +801,9 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 		Requests5xx:   t.requests5xx.Load(),
 		RequestsError: t.requestsError.Load(),
 
-		Requests5xxExpected: t.requests5xxExpected.Load(),
-		InvariantHits:       t.invariantHits.Load(),
+		Requests5xxExpected:   t.requests5xxExpected.Load(),
+		InvariantHits:         t.invariantHits.Load(),
+		RequestsCutAtDeadline: t.requestsCutAtDeadline.Load(),
 	}
 	if t.adv != nil {
 		s.Adversarial = t.adv.snapshot()
@@ -811,18 +826,19 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 // tier1TallySnapshot is the value-typed projection of tier1Tally
 // (atomic counters loaded at one instant).
 type tier1TallySnapshot struct {
-	RequestsSent        int64               `json:"requests_sent"`
-	Requests2xx         int64               `json:"requests_2xx"`
-	Requests4xx         int64               `json:"requests_4xx"`
-	Requests5xx         int64               `json:"requests_5xx"`
-	RequestsError       int64               `json:"requests_error"`
-	Requests5xxExpected int64               `json:"requests_5xx_expected"`
-	InvariantHits       int64               `json:"invariant_hits"`
-	Adversarial         adversarialSnapshot `json:"adversarial,omitempty"`
-	H2CChurn            h2cSnapshot         `json:"h2c_churn,omitempty"`
-	WSTorture           wsSnapshot          `json:"ws_torture,omitempty"`
-	SSEKill             sseSnapshot         `json:"sse_kill,omitempty"`
-	Liveness            livenessSnapshot    `json:"liveness,omitempty"`
+	RequestsSent          int64               `json:"requests_sent"`
+	Requests2xx           int64               `json:"requests_2xx"`
+	Requests4xx           int64               `json:"requests_4xx"`
+	Requests5xx           int64               `json:"requests_5xx"`
+	RequestsError         int64               `json:"requests_error"`
+	Requests5xxExpected   int64               `json:"requests_5xx_expected"`
+	InvariantHits         int64               `json:"invariant_hits"`
+	RequestsCutAtDeadline int64               `json:"requests_cut_at_deadline"`
+	Adversarial           adversarialSnapshot `json:"adversarial,omitempty"`
+	H2CChurn              h2cSnapshot         `json:"h2c_churn,omitempty"`
+	WSTorture             wsSnapshot          `json:"ws_torture,omitempty"`
+	SSEKill               sseSnapshot         `json:"sse_kill,omitempty"`
+	Liveness              livenessSnapshot    `json:"liveness,omitempty"`
 }
 
 // String formats a tally for the run summary log line.
