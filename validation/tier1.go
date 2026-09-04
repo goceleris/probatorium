@@ -207,25 +207,51 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	readyErrCh := make(chan error, 1)
 	var readyOnce sync.Once
 	var readyAddr string // refapp's REAL bound addr; set before close(readyCh)
-	go superviseStderr(proc.Stderr(), tally.liveness,
-		func(addr string) { readyOnce.Do(func() { readyAddr = addr; close(readyCh) }) },
-		func(err error) {
-			select {
-			case readyErrCh <- err:
-			default:
-			}
-		},
-		cancelRun)
+	// stderrDone closes when superviseStderr has drained the pipe to EOF. The
+	// exit watcher below observes the death FIRST (proc.Wait returns as soon
+	// as the process is reaped) and cancels the run; a snapshot taken at that
+	// instant loses the crash line still buffered in the pipe -- Crashed and
+	// ExitCode=2 with an empty Signature/Trace. Every post-start snapshot
+	// therefore joins the supervisor (bounded) once the process is known dead.
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		superviseStderr(proc.Stderr(), tally.liveness,
+			func(addr string) { readyOnce.Do(func() { readyAddr = addr; close(readyCh) }) },
+			func(err error) {
+				select {
+				case readyErrCh <- err:
+				default:
+				}
+			},
+			cancelRun)
+	}()
 	go watchProcessExit(ctx, proc, tally.liveness, cancelRun)
+	// joinStderrIfDead waits for the stderr supervisor to finish scanning once
+	// the process has been observed to exit: the pipe is at EOF so this is
+	// near-instant, and the bound only guards a wedged reader. A live process
+	// (ready timeout, ctx cancel) is never waited on.
+	joinStderrIfDead := func() {
+		if !tally.liveness.snapshot().Exited {
+			return
+		}
+		select {
+		case <-stderrDone:
+		case <-time.After(3 * time.Second):
+		}
+	}
 
 	select {
 	case <-readyCh:
 		// refapp bound — proceed to fan out walkers.
 	case err := <-readyErrCh:
+		joinStderrIfDead()
 		return tally.snapshot(), fmt.Errorf("tier1: refapp not ready: %w", err)
 	case <-time.After(cfg.ReadyTimeout):
+		joinStderrIfDead()
 		return tally.snapshot(), fmt.Errorf("tier1: refapp not ready: timeout after %s", cfg.ReadyTimeout)
 	case <-ctx.Done():
+		joinStderrIfDead()
 		return tally.snapshot(), ctx.Err()
 	}
 
@@ -468,6 +494,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		}()
 	}
 	wg.Wait()
+	joinStderrIfDead()
 	snap := tally.snapshot()
 	// If the refapp crashed OR hung, the periodic ticker stopped at cancelRun
 	// and may not have ticked between the event and here. Fire the callback
