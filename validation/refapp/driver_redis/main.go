@@ -178,10 +178,16 @@ func main() {
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
 		}
+		// Read-after-write on a SHARED counter: concurrent walkers INCR
+		// the same key, so GET may legitimately return MORE than this
+		// request's INCR result. The sound invariant is monotonic: GET
+		// must never be LESS than the value INCR returned -- that would
+		// be a stale or misrouted read (a real I-DRV-1 hit). Demanding
+		// equality produced a 12% false-positive rate at concurrency 30.
 		gotN, perr := strconv.ParseInt(got, 10, 64)
-		if perr != nil || gotN != n {
+		if perr != nil || gotN < n {
 			return c.JSON(http.StatusInternalServerError, map[string]any{
-				"err":           "incr read-after-write mismatch",
+				"err":           "incr read-after-write regression (GET < INCR return)",
 				"incr_return":   n,
 				"get_return":    got,
 				"x-invariant":   "I-DRV-1",

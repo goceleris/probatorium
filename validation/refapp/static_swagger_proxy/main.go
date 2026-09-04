@@ -99,8 +99,19 @@ func main() {
 	// occasional panics in proxy/static/swagger middleware — diagnosed
 	// from nightly 26444562273 which still showed 17-25 slowloris
 	// hangs/cell on this refapp despite observability now at 0.
-	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
+	// Recovered panics are discarded by default (see above: a stderr write
+	// under cs.detachMu gates the worker). That silence is exactly how the
+	// static file-cache key-aliasing panic (celeris#485) hid inside a
+	// "0.4% native-only 5xx" for the whole history of the nightly. When
+	// VALIDATE_PANIC_LOG names a file, recovered panics go there instead so
+	// a 5xx on this refapp can always be attributed.
+	panicLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if pl := os.Getenv("VALIDATE_PANIC_LOG"); pl != "" {
+		if f, err := os.OpenFile(pl, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			panicLog = slog.New(slog.NewTextHandler(f, nil))
+		}
+	}
+	srv.Use(recovery.New(recovery.Config{Logger: panicLog}))
 	srv.Use(requestid.New())
 
 	// proxy middleware — trusts loopback only. Walker traffic from

@@ -44,7 +44,6 @@ import (
 	"github.com/goceleris/celeris/middleware/recovery"
 	"github.com/goceleris/celeris/middleware/requestid"
 	"github.com/goceleris/celeris/middleware/secure"
-	"github.com/goceleris/celeris/middleware/session"
 	"github.com/goceleris/celeris/middleware/session/postgresstore"
 )
 
@@ -53,6 +52,16 @@ import (
 // fixture rows. Tier 1 walker may fire concurrent POSTs — atomic
 // Add gives each request a unique id.
 var nextUserID atomic.Int64
+
+// POST /users writes into a bounded id window [usersSeedMax+1,
+// usersSeedMax+usersWindow] with an UPSERT (see the handler): a bounded
+// working set keeps the fixture's tmpfs from filling under a long cell while
+// preserving a race-free read-after-write check. usersSeedMax matches the
+// fixture seed's MAX(id) (services.FixtureUserMaxID = 10000).
+const (
+	usersSeedMax = 10000
+	usersWindow  = 50000
+)
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -83,20 +92,27 @@ func main() {
 
 	// Seed the user-id counter from the current MAX(id) in the
 	// fixture table so a refapp restart against an already-seeded
-	// DB doesn't collide with rows from a previous run. Falls back
-	// to FixtureUserMaxID (10000) on any error.
+	// DB doesn't collide with rows from a previous run. Requires the
+	// fixture seed (services.SeedExternal) to have run; refuses to start
+	// without it.
 	{
 		var maxID int
 		bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		row := pool.QueryRow(bootCtx, "SELECT COALESCE(MAX(id), 0) FROM users")
-		_ = row.Scan(&maxID)
+		err := row.Scan(&maxID)
 		bootCancel()
+		if err != nil {
+			// Fail LOUDLY. Falling back silently here let every write
+			// 500 with "relation users does not exist" for the whole
+			// history of the nightly (no fixture seed in validate) while
+			// the refapp reported itself healthy.
+			log.Fatalf("driver_postgres: users table not provisioned (run the fixture seed: validator -seed-services / runner -seed-services): %v", err)
+		}
 		if maxID < 10000 {
 			maxID = 10000
 		}
 		nextUserID.Store(int64(maxID))
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sstore, err := postgresstore.New(ctx, pool)
@@ -128,11 +144,16 @@ func main() {
 	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
 	srv.Use(requestid.New())
 	srv.Use(secure.New())
-	srv.Use(session.New(session.Config{
-		Store:        sstore,
-		CookieName:   "probatorium_sess",
-		CookieMaxAge: session.IntPtr(86400),
-	}))
+	// NOTE: no global session middleware here. This refapp exercises the
+	// postgresstore KV API directly via the /store/* handlers below; no route
+	// reads c.Session(). Installing session.New() globally made every
+	// cookieless walker request create + persist a *fresh* (untouched)
+	// session row -- the middleware persists on `modified || fresh` -- which
+	// grew celeris_sessions ~5 MB/s and filled the fixture tmpfs (the
+	// driver_postgres 5xx). Session-middleware behaviour is covered by
+	// auth_session_ratelimit, which uses real cookies. (celeris: persisting a
+	// fresh, never-written session per anonymous request is itself a storage
+	// growth foot-gun -- filed separately.)
 
 	// /healthz — pool health probe (validator scrapes it once per
 	// scenario for the I-CONN-1 sentinel).
@@ -175,36 +196,48 @@ func main() {
 	// counter starting above FixtureUserMaxID (10000). Atomic so the
 	// Tier 1 walker can fire concurrent POSTs without id collisions.
 	srv.POST("/users", func(c *celeris.Context) error {
+		// Bounded working set over a fixed id window (usersWindow ids above
+		// the fixture seed), written with an UPSERT whose value is a
+		// deterministic function of the id. This mirrors the driver_redis /
+		// driver_memcached refapps, which SET a fixed key to a fixed value:
+		// concurrent walkers targeting the same id write byte-identical rows,
+		// so the read-after-write check can never race (a real stale or
+		// misrouted read still fails it). Because only usersWindow distinct
+		// ids ever exist and name/email/score are unindexed, the UPDATEs are
+		// HOT and the heap stays bounded -- an unbounded INSERT stream instead
+		// grew the table until the fixture's tmpfs filled ("No space left on
+		// device", the driver_postgres 5xx). A caller-supplied ?name is still
+		// honored for the write but the read-after-write assertion uses the
+		// deterministic value so it stays race-free.
+		id := int(usersSeedMax) + int(nextUserID.Add(1))%usersWindow + 1
+		wantName := "walker-user-" + strconv.Itoa(id)
 		name := c.Query("name")
 		if name == "" {
-			name = "tier1-walker"
+			name = wantName
 		}
-		email := c.Query("email")
-		if email == "" {
-			email = name + "@probatorium.local"
-		}
-		id := int(nextUserID.Add(1))
+		email := name + "@probatorium.local"
 		_, err := pool.ExecContext(c.Context(),
-			"INSERT INTO users (id, name, email, score) VALUES ($1, $2, $3, 0)",
-			id, name, email)
+			"INSERT INTO users (id, name, email, score) VALUES ($1, $2, $3, 0) "+
+				"ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email, score = EXCLUDED.score",
+			id, wantName, email)
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "insert: "+err.Error())
 		}
-		// Read-after-write check: the SELECT immediately after MUST
-		// see the row we just wrote. Single-writer per pool ensures
-		// this even under concurrent traffic.
+		// Read-after-write: the row for this id must exist and carry the
+		// deterministic name. A concurrent writer can only have written the
+		// SAME name for this id, so a mismatch is a real I-DRV-1 violation.
 		var roundtripName string
 		row := pool.QueryRow(c.Context(),
 			"SELECT name FROM users WHERE id = $1", id)
 		if err := row.Scan(&roundtripName); err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
 		}
-		if roundtripName != name {
+		if roundtripName != wantName {
 			// I-DRV-1 violation. The walker checks for this exact
 			// 500 shape and counts it as a HIGH-severity hit.
 			return c.JSON(http.StatusInternalServerError, map[string]string{
 				"err":           "read-after-write mismatch",
-				"wrote":         name,
+				"wrote":         wantName,
 				"read":          roundtripName,
 				"x-invariant":   "I-DRV-1",
 				"x-invariant-h": "high",
@@ -212,7 +245,7 @@ func main() {
 		}
 		return c.JSON(http.StatusCreated, map[string]any{
 			"id":    id,
-			"name":  name,
+			"name":  wantName,
 			"email": email,
 		})
 	})

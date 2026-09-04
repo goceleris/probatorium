@@ -434,6 +434,16 @@ type Tier1Summary struct {
 	Requests4xx   int64 `json:"requests_4xx"`
 	Requests5xx   int64 `json:"requests_5xx"`
 	RequestsError int64 `json:"requests_error"`
+	// Requests5xxExpected: 5xx from corpus states marked `expect: 5xx`
+	// (designed-to-fail routes). Requests5xx above is UNEXPECTED only.
+	Requests5xxExpected int64 `json:"requests_5xx_expected"`
+	// InvariantHits: unexpected 5xx whose body carried a refapp
+	// invariant marker (x-invariant) -- a self-reported invariant
+	// violation surfaced as a first-class signal.
+	InvariantHits int64 `json:"invariant_hits"`
+	// RequestsCutAtDeadline: requests in flight when the tier budget
+	// expired. Excluded from RequestsError, which is failures only.
+	RequestsCutAtDeadline int64 `json:"requests_cut_at_deadline"`
 
 	// Per-slice sub-tallies (one per workload-mix slice from
 	// validator-prod issue #55). Each is a plain `map[string]int64`
