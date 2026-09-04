@@ -132,6 +132,18 @@ jobs:
           VALIDATE_DBSERVICES: "1"
         run: mage Soak
 
+      - name: mage ValidateGate (absolute zero-signal gate)
+        # Fails on ANY nonzero true-signal counter in ANY cell (unexpected 5xx,
+        # transport errors, invariant hits, h2c hangs/crashes, adversarial
+        # wrong-accepts, WS bad frames/hangs, SSE failures, tier-3 seed
+        # failures, soak leaks) and on any dead or missing cell. ValidateDiff
+        # below is RELATIVE (cross-engine/arch) and cannot see a defect that
+        # is present on every engine; this gate can. probatorium#274.
+        if: success()
+        env:
+          VALIDATE_GATE_EXPECT_CELLS: "48" # 8 refapps x 3 engines x 2 archs
+        run: mage ValidateGate
+
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
         if: success()
         run: mage ValidateDiff
