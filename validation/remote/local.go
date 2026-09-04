@@ -49,12 +49,13 @@ func (l *Local) Start(ctx context.Context, args []string) (Process, error) {
 		return nil, fmt.Errorf("start %s: %w", l.binary, err)
 	}
 	mergedR, mergedW := io.Pipe()
+	copied := make(chan struct{})
 	var copyWG sync.WaitGroup
 	copyWG.Add(2)
 	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, stderr) }()
 	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, stdout) }()
-	go func() { copyWG.Wait(); _ = mergedW.Close() }()
-	p := &localProcess{
+	go func() { copyWG.Wait(); _ = mergedW.Close(); close(copied) }()
+	p := &localProcess{copied: copied,
 		cmd:       cmd,
 		errReader: mergedR,
 		done:      make(chan struct{}),
@@ -68,6 +69,7 @@ func (l *Local) Close() error { return nil }
 
 // localProcess is the exec.Cmd-backed Process.
 type localProcess struct {
+	copied    chan struct{} // closed once both OS pipes are drained to EOF (see Wait)
 	cmd       *exec.Cmd
 	errReader io.Reader
 
@@ -122,7 +124,18 @@ func (p *localProcess) Wait(ctx context.Context) (WaitResult, error) {
 	p.mu.Unlock()
 
 	waitErr := make(chan error, 1)
-	go func() { waitErr <- p.cmd.Wait() }()
+	go func() {
+		// Drain both OS pipes to EOF BEFORE reaping. cmd.Wait closes the
+		// StdoutPipe/StderrPipe read ends as soon as the process is reaped,
+		// which discards any bytes still buffered in the kernel -- the crash
+		// banner a process prints just before exiting was lost exactly that
+		// way (probatorium#276). EOF arrives when every writer has closed,
+		// i.e. at exit, so this adds no latency to a clean death.
+		if p.copied != nil {
+			<-p.copied
+		}
+		waitErr <- p.cmd.Wait()
+	}()
 	var err error
 	select {
 	case err = <-waitErr:
