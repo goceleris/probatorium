@@ -27,9 +27,6 @@ concurrency:
   group: matrix-tier-cluster
   cancel-in-progress: false
 
-env:
-  CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
-
 jobs:
   setup:
     name: bootstrap cluster runners
@@ -38,6 +35,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/cluster-runner-up
+        # The composite reads env.CLUSTER_SSH_KEY to write the private
+        # key for ansible. Scoped to this step (not the workflow) so no
+        # other step's process tree ever sees the cluster key.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
         with:
           tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
@@ -170,6 +172,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/cluster-runner-down
+        # The composite reads env.CLUSTER_SSH_KEY to write the private
+        # key for ansible. Scoped to this step (not the workflow) so no
+        # other step's process tree ever sees the cluster key.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
         with:
           tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
