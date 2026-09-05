@@ -62,8 +62,15 @@ permissions:
 
 # All cluster-touching workflows share the same group so they run
 # strictly in series. Queued runs wait, they're never cancelled.
+#
+# The group is claimed CONDITIONALLY (probatorium#288): `pull_request:
+# labeled` fires for EVERY label on a PR touching the watched paths, and
+# a run whose guard job will skip (wrong label) must not sit in
+# matrix-tier-cluster — GitHub keeps only one pending run per group, so
+# such a no-op run displaced a queued nightly/soak/bench. Runs that
+# cannot reach the cluster get a private per-run group instead.
 concurrency:
-  group: matrix-tier-cluster
+  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.label.name == 'cluster-ok') && 'matrix-tier-cluster' || format('matrix-pr-tier-noop-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -72,10 +79,17 @@ jobs:
     # `cluster-ok` label (or kicked the workflow manually). All
     # downstream jobs need this — if the gate is skipped/fails, the
     # cluster-touching jobs do not run and no secrets are exposed.
+    #
+    # The pull_request path additionally requires the head branch to
+    # live in THIS repository: a fork PR must never reach the
+    # self-hosted cluster, even if the label is applied — the label
+    # gates who approves, this gates whose code runs.
     name: cluster-ok label gate
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'cluster-ok')
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'cluster-ok' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
