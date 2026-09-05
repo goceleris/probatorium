@@ -54,3 +54,27 @@ jobs:
       - name: go test
         working-directory: servers/${{ matrix.adapter }}
         run: go test -count=1 -race -timeout=5m ./...
+
+  # The validation refapps are separate modules too. The shared
+  # /debug/vars helper has real tests (it boots a celeris server); each
+  # refapp is built + vetted so a helper API change cannot ship broken.
+  refapps:
+    name: validation/refapp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.0"
+          cache: true
+          cache-dependency-path: validation/refapp/internal/debugvars/go.sum
+      - name: go test (internal/debugvars)
+        working-directory: validation/refapp/internal/debugvars
+        run: go test -count=1 -race -timeout=5m ./...
+      - name: go build + vet (every refapp)
+        run: |
+          for d in validation/refapp/*/; do
+            case "$d" in */internal/) continue ;; esac
+            echo "== $d"
+            (cd "$d" && go build ./... && go vet ./...)
+          done

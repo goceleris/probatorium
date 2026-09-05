@@ -38,11 +38,48 @@ func TestICONN1_failsOverBudget(t *testing.T) {
 	}
 }
 
-func TestICONN2_failsOnDrift(t *testing.T) {
-	snap := &Snapshot{AcceptedConnTotal: 100, ClosedConnTotal: 90, ActiveConns: 5}
-	ok, msg := ICONN2.Predicate(snap, ctxWith(0, nil, false))
+// driftHistory builds n consecutive 1 Hz samples whose balance is off by
+// drift (same sign throughout), ending at the returned snapshot.
+func driftHistory(n int, drift int64) ([]Snapshot, *Snapshot) {
+	base := int64(1_700_000_000)
+	h := make([]Snapshot, 0, n)
+	for i := 0; i < n; i++ {
+		h = append(h, Snapshot{TS: base + int64(i), AcceptedConnTotal: 100 + int64(i), ClosedConnTotal: 90 + int64(i), ActiveConns: 10 - drift})
+	}
+	last := h[len(h)-1]
+	return h, &last
+}
+
+func TestICONN2_failsOnPersistentDrift(t *testing.T) {
+	h, snap := driftHistory(connDriftPersistSamples, 5)
+	ok, msg := ICONN2.Predicate(snap, ctxWith(0, h, false))
 	if ok {
-		t.Fatalf("expected fail; msg=%q", msg)
+		t.Fatalf("expected fail after %d same-sign samples; msg=%q", connDriftPersistSamples, msg)
+	}
+	if !strings.Contains(msg, "I-CONN-2") {
+		t.Fatalf("missing tag: %q", msg)
+	}
+}
+
+// One off-by-one sample under load (counters read at different instants)
+// must not fire; neither must drift that keeps flipping sign.
+func TestICONN2_ignoresTransientDrift(t *testing.T) {
+	snap := &Snapshot{AcceptedConnTotal: 100, ClosedConnTotal: 90, ActiveConns: 5}
+	if ok, msg := ICONN2.Predicate(snap, ctxWith(0, nil, false)); !ok {
+		t.Fatalf("single-sample drift must not fire; msg=%q", msg)
+	}
+	h, last := driftHistory(connDriftPersistSamples*2, 1)
+	for i := range h {
+		if i%2 == 0 {
+			h[i].ActiveConns += 2 // flip the sign every other sample
+		}
+	}
+	if ok, msg := ICONN2.Predicate(last, ctxWith(0, h, false)); !ok {
+		t.Fatalf("sign-flipping drift must not fire; msg=%q", msg)
+	}
+	h, last = driftHistory(connDriftPersistSamples-1, 3)
+	if ok, msg := ICONN2.Predicate(last, ctxWith(0, h, false)); !ok {
+		t.Fatalf("drift one sample short of the persistence bar must not fire; msg=%q", msg)
 	}
 }
 
@@ -201,6 +238,26 @@ func TestMWStubs_failOnNegative(t *testing.T) {
 	}
 }
 
+// The flap window is one HOUR of history; the old code subtracted 3600
+// nanoseconds and could never see a delta.
+func TestIENGAdaptive_flapOverAnHourFires(t *testing.T) {
+	base := int64(1_700_000_000)
+	h := make([]Snapshot, 0, 3600)
+	for i := 0; i < 3600; i++ {
+		h = append(h, Snapshot{TS: base + int64(i), AdaptiveSwitches: int64(i)})
+	}
+	ctx := ctxWith(time.Hour, h, false)
+	ctx.Now = time.Unix(base+3599, 0)
+	snap := &Snapshot{TS: base + 3599, AdaptiveSwitches: 3599}
+	if ok, msg := IENGAdaptive.Predicate(snap, ctx); ok {
+		t.Fatalf("3599 switches in an hour must fire; msg=%q", msg)
+	}
+	snap.AdaptiveSwitches = 100
+	if ok, msg := IENGAdaptive.Predicate(snap, ctx); !ok {
+		t.Fatalf("100 switches in an hour is within budget; msg=%q", msg)
+	}
+}
+
 func TestIDRV_failsOnMiss(t *testing.T) {
 	snap := &Snapshot{DriverReadsIssued: 10, DriverReadHits: 9, DriverReadMisses: 1}
 	ok, _ := IDRV.Predicate(snap, ctxWith(0, nil, false))
@@ -286,16 +343,26 @@ func TestRegistry_ByID(t *testing.T) {
 }
 
 func TestHeapSlope_LinearFit(t *testing.T) {
-	// y = 100x + 0 at integer x; slope should round-trip to 100.
-	samples := []Snapshot{
-		{TS: 100, HeapInuseBytes: 0},
-		{TS: 101, HeapInuseBytes: 100},
-		{TS: 102, HeapInuseBytes: 200},
-		{TS: 103, HeapInuseBytes: 300},
+	// y = 100x over four 150s trough buckets; slope should round-trip to 100.
+	var samples []Snapshot
+	for x := int64(0); x < 600; x++ {
+		samples = append(samples, Snapshot{TS: 100 + x, HeapInuseBytes: 100 * x})
 	}
 	got := heapSlope(samples)
 	if got < 99 || got > 101 {
 		t.Fatalf("expected slope ≈100, got %v", got)
+	}
+}
+
+// A GC sawtooth (slow ramp, instant drop) has a positive least-squares
+// slope over raw samples; the trough regression must read it as flat.
+func TestHeapSlope_SawtoothIsFlat(t *testing.T) {
+	var samples []Snapshot
+	for x := int64(0); x < 600; x++ {
+		samples = append(samples, Snapshot{TS: x, HeapInuseBytes: 500<<20 + (x%5)*(100<<20)})
+	}
+	if got := heapSlope(samples); got > 1 {
+		t.Fatalf("sawtooth must regress flat over troughs, got %v B/s", got)
 	}
 }
 

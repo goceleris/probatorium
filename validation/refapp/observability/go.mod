@@ -3,13 +3,6 @@ module github.com/goceleris/probatorium/validation/refapp/observability
 go 1.27.0
 
 require (
-	github.com/goceleris/celeris v1.5.10
-	github.com/goceleris/celeris/middleware/metrics v1.5.8
-	github.com/goceleris/celeris/middleware/otel v1.5.8
-	github.com/prometheus/client_golang v1.24.1
-)
-
-require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
@@ -27,3 +20,13 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+require (
+	github.com/goceleris/celeris v1.5.10
+	github.com/goceleris/celeris/middleware/metrics v1.5.8
+	github.com/goceleris/celeris/middleware/otel v1.5.8
+	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
+	github.com/prometheus/client_golang v1.24.1
+)
+
+replace github.com/goceleris/probatorium/validation/refapp/internal/debugvars => ../internal/debugvars

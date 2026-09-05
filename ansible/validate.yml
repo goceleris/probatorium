@@ -6,8 +6,11 @@
 # internally; this playbook's job is binary placement + lifecycle
 # bracketing + result fetch.
 #
-# Single-host execution: validator + refapp + validator-checker all
-# run on bench_target. msa2-client doesn't host any validator state.
+# Single-host execution: validator + refapp run on bench_target (the
+# per-second property loop runs inside the validator process and polls
+# the refapp's /debug/vars; the standalone validator-checker binary is
+# staged for ad-hoc use only and is not launched by this playbook).
+# msa2-client doesn't host any validator state.
 # The cross-host SSH driver lands in a separate playbook
 # (validate-ssh.yml) once issue #54 cluster integration ships.
 #
@@ -174,6 +177,16 @@
             # default (concurrency=1 for cells under 5min) leaves the
             # h2c / WS / SSE walker slices dormant on every cell.
             VALIDATE_CONCURRENCY: "{{ validate_concurrency | default('') }}"
+            # VALIDATE_PROPERTY_HARD_FAIL=1 makes the FIRST snapshot-
+            # predicate violation (I-MEM-*, I-PANIC, ...) cancel the
+            # cell (cmd/validator -property-hard-fail). Unset = record
+            # only: the violation is counted into
+            # tier_1.property_violations (mage ValidateGate fails on it
+            # regardless), an incident dossier with live forensics is
+            # written, and the cell runs to its budget. Leave unset
+            # until the slope budgets have been calibrated on a real
+            # nightly + weekend run.
+            VALIDATE_PROPERTY_HARD_FAIL: "{{ validate_property_hard_fail | default('') }}"
             # Driver-refapp backend addresses. The driver_postgres /
             # driver_redis / driver_memcached refapps look up these env
             # vars (or their -postgres-dsn / -redis-addr / -mc-addr
