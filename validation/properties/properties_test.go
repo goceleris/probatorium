@@ -186,8 +186,11 @@ func TestIMEM2_failsWhenOverBudget(t *testing.T) {
 	}
 }
 
-func TestIPANIC_failsOnCount(t *testing.T) {
-	ok, _ := IPANIC.Predicate(&Snapshot{PanicCount: 1}, ctxWith(0, nil, false))
+func TestIPANIC_failsOnPersistentCount(t *testing.T) {
+	// A panic that persists across ipanicPersistence consecutive snapshots
+	// fires; the History carries the earlier samples.
+	hist := []Snapshot{{TS: 1, PanicCount: 1}, {TS: 2, PanicCount: 1}}
+	ok, _ := IPANIC.Predicate(&Snapshot{TS: 3, PanicCount: 1}, Context{History: hist})
 	if ok {
 		t.Fatal("expected violation")
 	}

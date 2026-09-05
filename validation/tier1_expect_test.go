@@ -26,9 +26,9 @@ func TestDoMarkovRequest_ExpectedFiveXXAndInvariantHits(t *testing.T) {
 	defer srv.Close()
 	hc := srv.Client()
 	var tally tier1Tally
-	doMarkovRequest(context.Background(), hc, "GET", srv.URL+"/designed", true, &tally)
-	doMarkovRequest(context.Background(), hc, "GET", srv.URL+"/invariant", false, &tally)
-	doMarkovRequest(context.Background(), hc, "GET", srv.URL+"/plain", false, &tally)
+	doMarkovRequest(context.Background(), hc, "GET", srv.URL+"/designed", true, false, &tally)
+	doMarkovRequest(context.Background(), hc, "GET", srv.URL+"/invariant", false, false, &tally)
+	doMarkovRequest(context.Background(), hc, "GET", srv.URL+"/plain", false, false, &tally)
 	s := tally.snapshot()
 	if s.Requests5xxExpected != 1 || s.Requests5xx != 2 || s.InvariantHits != 1 {
 		t.Fatalf("expected=%d unexpected=%d invariant=%d; want 1/2/1", s.Requests5xxExpected, s.Requests5xx, s.InvariantHits)
@@ -50,12 +50,34 @@ func TestDoMarkovRequest_DeadlineCutIsNotAnError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var tally tier1Tally
-	doMarkovRequest(ctx, srv.Client(), "GET", srv.URL, false, &tally)
+	doMarkovRequest(ctx, srv.Client(), "GET", srv.URL, false, false, &tally)
 	s := tally.snapshot()
 	if s.RequestsError != 0 || s.RequestsCutAtDeadline != 1 {
 		t.Fatalf("error=%d cut=%d; want 0/1", s.RequestsError, s.RequestsCutAtDeadline)
 	}
 	if s.Tier1Summary().RequestsCutAtDeadline != 1 {
 		t.Fatal("cut-at-deadline not projected into Tier1Summary")
+	}
+}
+
+// `expect: panic` states count their designed 5xx into BOTH
+// requests_5xx_expected and requests_panic_expected, so the property loop can
+// net designed panics out of I-PANIC.
+func TestDoMarkovRequest_ExpectPanicCounts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	var tally tier1Tally
+	doMarkovRequest(context.Background(), srv.Client(), "GET", srv.URL+"/panic", true, true, &tally)
+	doMarkovRequest(context.Background(), srv.Client(), "GET", srv.URL+"/designed", true, false, &tally)
+	if got := tally.requests5xxExpected.Load(); got != 2 {
+		t.Fatalf("requests_5xx_expected=%d want 2", got)
+	}
+	if got := tally.requestsPanicExpected.Load(); got != 1 {
+		t.Fatalf("requests_panic_expected=%d want 1", got)
+	}
+	if got := tally.requests5xx.Load(); got != 0 {
+		t.Fatalf("unexpected 5xx=%d want 0", got)
 	}
 }

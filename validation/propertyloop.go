@@ -25,6 +25,10 @@ type propertyLoopConfig struct {
 	// HardFail marks the emitted Incidents as cell-cancelling
 	// (Config.PropertyHardFail); false marks them RecordOnly.
 	HardFail bool
+	// ExpectedPanics, when non-nil, returns the workload's running count
+	// of designed panics; copied into every Snapshot so I-PANIC nets them
+	// out.
+	ExpectedPanics func() int64
 	// Violations receives one Incident per predicate ID on its FIRST
 	// violation (non-blocking send; the orchestrator's channel has
 	// capacity 1 and a dropped send is still counted in the tally).
@@ -85,6 +89,9 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		}
 		snap.PID = cfg.PID
 		snap.RSSBytes = checker.ReadRSS(cfg.PID)
+		if cfg.ExpectedPanics != nil {
+			snap.ExpectedPanics = cfg.ExpectedPanics()
+		}
 		for _, v := range ev.Observe(snap, t) {
 			if !v.First || cfg.Violations == nil {
 				continue

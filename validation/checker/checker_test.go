@@ -124,15 +124,24 @@ func TestEvaluator_BaselineViolationsAndTally(t *testing.T) {
 	if c := e.Context(); !c.RunStartedAt.Equal(start) || c.BaselineGoroutines != 30 {
 		t.Fatalf("context not initialised from the first sample: %+v", c)
 	}
-	// A panic shows up: I-PANIC fails on this and every following sample;
-	// only the first is flagged First.
-	for i := 1; i <= 3; i++ {
+	// A panic shows up. I-PANIC requires the unexpected excess to persist
+	// across three consecutive snapshots (a designed panic is counted by the
+	// server a moment before the walker tallies its 5xx), so samples 2 and 3
+	// stay clean and the violation fires from sample 4 on; only the first
+	// violation is flagged First.
+	for i := 1; i <= 5; i++ {
 		now := start.Add(time.Duration(i) * time.Second)
 		v = e.Observe(properties.Snapshot{TS: now.Unix(), GoroutineCount: 30, HeapInuseBytes: 1 << 20, PanicCount: 1}, now)
+		if i < 3 {
+			if len(v) != 0 {
+				t.Fatalf("sample %d: a transient panic excess must not fire yet, got %+v", i, v)
+			}
+			continue
+		}
 		if len(v) != 1 || v[0].ID != "I-PANIC" {
 			t.Fatalf("sample %d: want exactly one I-PANIC violation, got %+v", i, v)
 		}
-		if v[0].First != (i == 1) {
+		if v[0].First != (i == 3) {
 			t.Fatalf("sample %d: First=%v", i, v[0].First)
 		}
 		if v[0].Snapshot.PanicCount != 1 {
@@ -140,10 +149,10 @@ func TestEvaluator_BaselineViolationsAndTally(t *testing.T) {
 		}
 	}
 	tl := e.Tally()
-	if tl.Samples != 4 || tl.Violations != 3 || tl.Failed() != 1 || tl.ViolationIDs[0] != "I-PANIC" {
+	if tl.Samples != 6 || tl.Violations != 3 || tl.Failed() != 1 || tl.ViolationIDs[0] != "I-PANIC" {
 		t.Fatalf("tally: %+v", tl)
 	}
-	// Every core predicate ran four times; the slope predicates and
+	// Every core predicate ran six times; the slope predicates and
 	// I-MEM-2 skipped every time (no window / no idle mode), the rest
 	// reached a verdict.
 	skippers := 0
@@ -152,11 +161,11 @@ func TestEvaluator_BaselineViolationsAndTally(t *testing.T) {
 			skippers++
 		}
 	}
-	if want := 4 * int64(len(SelectPredicates("core"))-skippers); tl.Evaluations != want {
+	if want := 6 * int64(len(SelectPredicates("core"))-skippers); tl.Evaluations != want {
 		t.Fatalf("evaluations=%d want %d (skips=%d)", tl.Evaluations, want, tl.Skips)
 	}
-	if tl.Skips != 4*int64(skippers) {
-		t.Fatalf("skips=%d want %d", tl.Skips, 4*skippers)
+	if tl.Skips != 6*int64(skippers) {
+		t.Fatalf("skips=%d want %d", tl.Skips, 6*skippers)
 	}
 	for _, id := range []string{"I-MEM-1", "I-MEM-3"} {
 		if !slices.Contains(tl.NotJudged, id) {

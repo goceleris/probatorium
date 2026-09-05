@@ -106,6 +106,10 @@ type tier1Config struct {
 	// TallyCallbackInterval is how often TallyCallback fires. Zero
 	// defaults to 2 seconds; only used when TallyCallback is non-nil.
 	TallyCallbackInterval time.Duration
+	// OnLiveTally, when non-nil, receives an accessor for the live
+	// expected-panic count as soon as the tally exists, so the property
+	// loop can net designed panics out of I-PANIC while the tier runs.
+	OnLiveTally func(expectedPanics func() int64)
 
 	// SnapshotPath, when non-empty, names the path the tier writes the
 	// current tally snapshot to on every TallyCallback tick. Letting
@@ -131,6 +135,11 @@ type tier1Tally struct {
 	// `expect: 5xx` (designed-to-fail routes such as observability's
 	// /api/error). Kept apart so requests5xx can be gated to zero.
 	requests5xxExpected atomic.Int64
+	// requestsPanicExpected counts 5xx from states the corpus marks
+	// `expect: panic` (designed-to-panic routes such as observability's
+	// /api/error). The property loop subtracts it from the server's
+	// panic_count so I-PANIC judges only unexpected panics.
+	requestsPanicExpected atomic.Int64
 	// requestsCutAtDeadline counts requests that were in flight when the
 	// tier's run context expired. Not errors: the budget ended.
 	requestsCutAtDeadline atomic.Int64
@@ -159,6 +168,9 @@ type tier1Tally struct {
 // counters (govet copylocks).
 func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error) {
 	tally := &tier1Tally{}
+	if cfg.OnLiveTally != nil {
+		cfg.OnLiveTally(tally.requestsPanicExpected.Load)
+	}
 	if cfg.Driver == nil {
 		return tally.snapshot(), errors.New("tier1: nil Driver")
 	}
@@ -712,7 +724,7 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 		// `request: METHOD path`; states without an entry are silent.
 		// See validation/markov/<refapp>.yaml.
 		if req, ok := m.Requests[state]; ok {
-			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, tally)
+			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, req.ExpectPanic, tally)
 			if status == 401 && hasLogin {
 				// Session likely expired — re-login and keep walking.
 				// The next request will pick up the fresh cookie.
@@ -770,7 +782,7 @@ func walkerLogin(ctx context.Context, hc *http.Client, base string, login markov
 // POST/PUT/PATCH requests fire with an empty body for now. Body
 // generation is the Tier 2 RESTler fuzzer's job; Tier 1's purpose
 // here is volume + endpoint coverage, not payload variation.
-func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, expect5xx bool, tally *tier1Tally) int {
+func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, expect5xx, expectPanic bool, tally *tier1Tally) int {
 	tally.requestsSent.Add(1)
 	if method == "" {
 		method = "GET"
@@ -800,6 +812,9 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, e
 	switch {
 	case resp.StatusCode >= 500 && expect5xx:
 		tally.requests5xxExpected.Add(1)
+		if expectPanic {
+			tally.requestsPanicExpected.Add(1)
+		}
 	case resp.StatusCode >= 500:
 		tally.requests5xx.Add(1)
 		// Peek the body for the refapp invariant marker. 5xx is rare on
@@ -830,6 +845,7 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 		RequestsError: t.requestsError.Load(),
 
 		Requests5xxExpected:   t.requests5xxExpected.Load(),
+		RequestsPanicExpected: t.requestsPanicExpected.Load(),
 		InvariantHits:         t.invariantHits.Load(),
 		RequestsCutAtDeadline: t.requestsCutAtDeadline.Load(),
 	}
@@ -860,6 +876,7 @@ type tier1TallySnapshot struct {
 	Requests5xx           int64               `json:"requests_5xx"`
 	RequestsError         int64               `json:"requests_error"`
 	Requests5xxExpected   int64               `json:"requests_5xx_expected"`
+	RequestsPanicExpected int64               `json:"requests_panic_expected"`
 	InvariantHits         int64               `json:"invariant_hits"`
 	RequestsCutAtDeadline int64               `json:"requests_cut_at_deadline"`
 	Adversarial           adversarialSnapshot `json:"adversarial,omitempty"`
