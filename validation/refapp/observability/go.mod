@@ -3,7 +3,7 @@ module github.com/goceleris/probatorium/validation/refapp/observability
 go 1.27.0
 
 require (
-	github.com/goceleris/celeris v1.5.9
+	github.com/goceleris/celeris v1.5.10
 	github.com/goceleris/celeris/middleware/metrics v1.5.8
 	github.com/goceleris/celeris/middleware/otel v1.5.8
 	github.com/prometheus/client_golang v1.24.1
