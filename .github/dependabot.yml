@@ -45,10 +45,18 @@ updates:
       prefix: "deps"
 
   # ----- GitHub Actions -----
-  # Watches every workflow under .github/workflows. Group all action
+  # `/` covers every workflow under .github/workflows plus an action.yml
+  # at the repository ROOT only — Dependabot does not descend into
+  # .github/actions/ from there, so each composite action needs its own
+  # path here or its SHA pin never moves (both composites sat unwatched
+  # until 2026-09-06). Add a path whenever a new composite action lands
+  # (run `ls .github/actions` to verify coverage). Group all action
   # version bumps into ONE PR per scheduled run.
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/cluster-runner-up
+      - /.github/actions/cluster-runner-down
     schedule:
       interval: daily
     groups:

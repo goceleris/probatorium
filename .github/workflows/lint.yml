@@ -2,8 +2,11 @@ name: Lint
 
 # Always-latest policy: every third-party action is pinned to a full
 # commit SHA (with the resolved release tag in a trailing comment) so a
-# retagged or compromised upstream tag cannot change what runs here;
-# dependabot's github-actions ecosystem keeps the SHAs current.
+# retagged or compromised upstream tag cannot change what runs here.
+# Dependabot's github-actions entry keeps the SHAs and version comments
+# current for every directory it lists in .github/dependabot.yml — the
+# workflows via `/` and each composite action under .github/actions/ by
+# its own path (a root-only entry never sees the composites).
 #
 # Includes actionlint as a workflow-level lint so this repo's own GH
 # Actions YAML is sanity-checked on every PR (catches script-injection
