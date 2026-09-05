@@ -148,12 +148,18 @@ Real kernel, no mocking. A seed expands into a workload plus a fault schedule; a
 
 ### Invariants
 
-Beyond the Tier-1 HIGH-severity counters, the checker runs a registry of core invariants against every cell. Refapps run under celeris built with the **race detector** (`-race`) and **checkptr** (`-gcflags=all=-d=checkptr`) enabled; the validator-checker greps celeris's stderr and folds any finding into the corresponding invariant:
+Beyond the Tier-1 HIGH-severity counters, the orchestrator runs a **per-second property loop** inside every cell (`validation/propertyloop.go`, shared evaluator in `validation/checker`): once the refapp announces its real address, it polls the refapp's `/debug/vars` (served by every refapp via `validation/refapp/internal/debugvars`, alongside `/debug/pprof` for incident forensics), samples the refapp's RSS from `/proc`, and evaluates the registered `I-*` predicates against a rolling 1 h history. The first violation of a predicate hard-fails the cell (incident dossier + forensics); every violation is counted into `tier_1.property_violations` / `property_violation_ids`, and the cell reports `properties_passed` / `properties_failed` / `properties_not_instrumented`. `mage ValidateGate` fails on any `property_violations` and (by default) on a cell whose loop never evaluated anything (`property_evaluations == 0`, i.e. `/debug/vars` unreachable).
 
-- `I-LIVENESS` — the refapp process stayed up (a crash/exit is a hard violation).
-- `I-RACE` — the `-race` build reported no data races.
-- `I-CHECKPTR` — the `-d=checkptr` build fired no `unsafe.Pointer`/`uintptr` violation (SIMD / io_uring fast paths).
-- `I-CONN-1` / `I-CONN-2` — connection accounting: no stuck oldest-connection (FD leak / stuck reader), and `accepted − closed − active == 0` (engine conn-accounting drift).
+Instrumented today:
+
+- `I-LIVENESS` / `I-HANG` — the refapp process stayed up and responsive (walker-driven, not part of the snapshot loop).
+- `I-PANIC` — no panic was recovered by the refapp (counted from the recovery middleware's log stream).
+- `I-CONN-2` — `accepted − closed − active == 0` (refapp `OnConnect`/`OnDisconnect` counters vs. the engine's active gauge), judged only when the drift persists with the same sign for 30 samples.
+- `I-MEM-1` — `heap_inuse` trough slope ≤ 1 KB/s over the trailing min(1 h, elapsed) after a 5 min warm-up, judged from 10 min of samples.
+- `I-MEM-3` — goroutine-count trough slope ≤ 0.2/s over the trailing 10 min after warm-up (the celeris#494 leak class: 3 goroutines per killed SSE stream trips it at t=15 min).
+- `I-MEM-4` — RSS trough slope ≤ 64 KB/s over the trailing 10 min after warm-up (linux, local driver; reported as not instrumented otherwise).
+
+Registered but **not instrumented** (they pass vacuously and are listed under `properties_not_instrumented` rather than counted as passed): `I-CONN-1` (needs a per-connection last-byte table), `I-RFC-1`/`I-RFC-2` (need the response scraper), `I-RACE`/`I-CHECKPTR` (refapps are not built with `-race`/`-d=checkptr`; `-race` needs cgo, which the `CGO_ENABLED=0` cross-compile forbids), `I-MEM-2` (needs an orchestrator-driven idle window), `I-MW-*`/`I-ENG-IOURING` (counters exist only in `-tags=validation` builds of celeris).
 
 ### Cross-engine and cross-arch divergence as an invariant
 

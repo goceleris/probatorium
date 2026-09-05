@@ -6,8 +6,11 @@
 # internally; this playbook's job is binary placement + lifecycle
 # bracketing + result fetch.
 #
-# Single-host execution: validator + refapp + validator-checker all
-# run on bench_target. msa2-client doesn't host any validator state.
+# Single-host execution: validator + refapp run on bench_target (the
+# per-second property loop runs inside the validator process and polls
+# the refapp's /debug/vars; the standalone validator-checker binary is
+# staged for ad-hoc use only and is not launched by this playbook).
+# msa2-client doesn't host any validator state.
 # The cross-host SSH driver lands in a separate playbook
 # (validate-ssh.yml) once issue #54 cluster integration ships.
 #
