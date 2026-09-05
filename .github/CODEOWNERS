@@ -1,0 +1,12 @@
+# Code owners for goceleris/probatorium.
+#
+# GitHub requests a review from the matching owners on every pull request,
+# and branch protection can require that review before merge. Rules are
+# matched last-one-wins, so the catch-all stays first and any delegation
+# goes below it. Org hardening review 2026-09-06.
+#
+# To delegate an area, add a more specific rule under the catch-all, e.g.
+#   /ansible/     @FumingPower3925 @WdnLiu
+#   /validation/  @FumingPower3925 @WdnLiu
+
+* @FumingPower3925
