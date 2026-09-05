@@ -53,6 +53,13 @@ import (
 //     in ServerResult.Resources (now populated, finally) is the
 //     differentiator for those cells. Both additive and omitted when
 //     absent: a Tailscale-overlay run (no known line rate) emits neither.
+//     Also additive within 5.5: the in-process property loop's counters
+//     on Tier1Summary (property_evaluations, property_violations,
+//     property_violation_ids, property_poll_errors) and the per-cell
+//     properties_passed / properties_failed / properties_not_instrumented
+//     / failure_summaries on ValidationCellResult. Before these, the
+//     I-* snapshot predicates listed in plan.json were never evaluated
+//     by any run and properties_passed/failed were always 0/0.
 const SchemaVersion = "5.5"
 
 // CellStatus classifies the OUTCOME of a single (scenario, server)
@@ -424,6 +431,21 @@ type ValidationCellResult struct {
 	// it here lets the merged matrix document -- the only thing the gate
 	// reads -- keep it (probatorium#281).
 	Soak *SoakSummary `json:"soak_summary,omitempty"`
+
+	// PropertiesPassed / PropertiesFailed are the cell's snapshot-predicate
+	// verdicts from the in-process property loop: passed = instrumented
+	// predicates evaluated at least once with zero violations; failed =
+	// distinct predicates that violated at least once. Both 0 when the
+	// loop never observed a sample (see Tier1Summary.PropertyEvaluations).
+	PropertiesPassed int `json:"properties_passed"`
+	PropertiesFailed int `json:"properties_failed"`
+	// PropertiesNotInstrumented lists evaluated predicates whose inputs
+	// have no data source in this deployment (they pass vacuously and are
+	// excluded from PropertiesPassed).
+	PropertiesNotInstrumented []string `json:"properties_not_instrumented,omitempty"`
+	// FailureSummaries maps a failed predicate ID to its first violation
+	// message.
+	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`
 }
 
 // Tier1Summary mirrors the validator's tier1TallySnapshot in the
@@ -449,6 +471,28 @@ type Tier1Summary struct {
 	// RequestsCutAtDeadline: requests in flight when the tier budget
 	// expired. Excluded from RequestsError, which is failures only.
 	RequestsCutAtDeadline int64 `json:"requests_cut_at_deadline"`
+
+	// Property-loop counters. The orchestrator polls the refapp's
+	// /debug/vars once per second for the whole Tier 1 run and evaluates
+	// the selected I-* snapshot predicates (validation/checker) against
+	// each sample.
+	//
+	// PropertyEvaluations: total predicate evaluations (samples x
+	// predicates). 0 means the loop never got a sample -- the metrics
+	// endpoint was unreachable -- and the gate treats that as a failure
+	// when RequireProperties is set, because a run that evaluated
+	// nothing has verified nothing.
+	PropertyEvaluations int64 `json:"property_evaluations"`
+	// PropertyViolations: total failed evaluations (one per sample per
+	// predicate while the violation persists). Gated: any nonzero value
+	// fails the cell.
+	PropertyViolations int64 `json:"property_violations"`
+	// PropertyViolationIDs: distinct predicate IDs that failed at least
+	// once, sorted.
+	PropertyViolationIDs []string `json:"property_violation_ids,omitempty"`
+	// PropertyPollErrors: polls that yielded no sample (transport error,
+	// non-200, unparseable body). Informational.
+	PropertyPollErrors int64 `json:"property_poll_errors"`
 
 	// Per-slice sub-tallies (one per workload-mix slice from
 	// validator-prod issue #55). Each is a plain `map[string]int64`

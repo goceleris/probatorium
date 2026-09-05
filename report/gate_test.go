@@ -1,11 +1,15 @@
 package report
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func cleanCell(r, e, a string) ValidationCellResult {
 	return ValidationCellResult{Refapp: r, Engine: e, Arch: a,
 		Tier1: &Tier1Summary{RequestsSent: 1000, Requests2xx: 990, Requests4xx: 10,
 			Requests5xxExpected: 5, RequestsCutAtDeadline: 3,
+			PropertyEvaluations: 3600 * 14, PropertyPollErrors: 2,
 			Adversarial: map[string]int64{"adv_sent": 10, "adv_well_rejected": 10},
 			H2CChurn:    map[string]int64{"h2c_sent": 10, "h2c_declined": 7, "h2c_intentional_rst": 3, "h2c_hang_max_elapsed_ms": 40},
 			WSTorture:   map[string]int64{"ws_sent": 10, "ws_upgraded": 10, "ws_closed_correctly": 10},
@@ -31,6 +35,10 @@ func TestGate_EachSignalIsAViolation(t *testing.T) {
 		{"5xx", "tier_1.requests_5xx", func(c *ValidationCellResult) { c.Tier1.Requests5xx = 1 }},
 		{"error", "tier_1.requests_error", func(c *ValidationCellResult) { c.Tier1.RequestsError = 1 }},
 		{"invariant", "tier_1.invariant_hits", func(c *ValidationCellResult) { c.Tier1.InvariantHits = 1 }},
+		{"property_violations", "tier_1.property_violations", func(c *ValidationCellResult) {
+			c.Tier1.PropertyViolations = 7
+			c.Tier1.PropertyViolationIDs = []string{"I-MEM-3"}
+		}},
 		{"dead cell", "tier_1.requests_sent", func(c *ValidationCellResult) { c.Tier1.RequestsSent = 0 }},
 		{"tier1 missing", "tier_1", func(c *ValidationCellResult) { c.Tier1 = nil }},
 		{"h2c_hang", "tier_1.h2c_churn.h2c_hang", func(c *ValidationCellResult) { c.Tier1.H2CChurn["h2c_hang"] = 1 }},
@@ -81,6 +89,41 @@ func TestGate_InformationalCountersAreNotGated(t *testing.T) {
 	c.Tier1.Adversarial["adv_well_rejected"] = 1_000_000
 	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true}); len(v) != 0 {
 		t.Fatalf("informational counters must not be gated, got %v", v)
+	}
+}
+
+// A property violation names the predicate IDs so the gate output says
+// WHICH invariant failed, and a cell whose loop evaluated nothing is a
+// failure when the run requires properties (the silent-zero state of
+// every run before the in-process loop).
+func TestGate_PropertyLoop(t *testing.T) {
+	c := cleanCell("auth_session_ratelimit", "iouring", "arm64")
+	c.Tier1.PropertyViolations = 1200
+	c.Tier1.PropertyViolationIDs = []string{"I-MEM-1", "I-MEM-3"}
+	v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true, RequireProperties: true})
+	if len(v) != 1 || v[0].Field != "tier_1.property_violations" || v[0].Value != 1200 {
+		t.Fatalf("want one property_violations violation, got %v", v)
+	}
+	if !strings.Contains(v[0].Why, "I-MEM-1") || !strings.Contains(v[0].Why, "I-MEM-3") {
+		t.Fatalf("Why must name the predicate IDs, got %q", v[0].Why)
+	}
+
+	c = cleanCell("r", "std", "amd64")
+	c.Tier1.PropertyEvaluations = 0
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true}); len(v) != 0 {
+		t.Fatalf("zero evaluations must pass when properties are not required, got %v", v)
+	}
+	v = Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true, RequireProperties: true})
+	if len(v) != 1 || v[0].Field != "tier_1.property_evaluations" {
+		t.Fatalf("zero evaluations must fail under RequireProperties, got %v", v)
+	}
+
+	// Poll errors and the evaluation count itself are informational.
+	c = cleanCell("r", "std", "amd64")
+	c.Tier1.PropertyPollErrors = 1_000_000
+	c.Tier1.PropertyEvaluations = 1
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true, RequireProperties: true}); len(v) != 0 {
+		t.Fatalf("poll errors must not be gated, got %v", v)
 	}
 }
 

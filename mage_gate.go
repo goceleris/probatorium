@@ -25,9 +25,14 @@ import (
 // every engine agrees with itself and passes it. This gate exists because that
 // happened -- nightlies ran green for weeks over real bugs (probatorium#274).
 //
-//	VALIDATE_GATE_EXPECT_CELLS=48  fail if fewer cells reported (0 = no check)
-//	VALIDATE_GATE_REQUIRE_TIER3=1  fail a cell whose tier 3 never ran (default 1)
-//	VALIDATE_GATE_REQUIRE_SOAK=1   fail a cell that carries no soak summary (soak runs)
+//	VALIDATE_GATE_EXPECT_CELLS=48        fail if fewer cells reported (0 = no check)
+//	VALIDATE_GATE_REQUIRE_TIER3=1        fail a cell whose tier 3 never ran (default 1)
+//	VALIDATE_GATE_REQUIRE_SOAK=1         fail a cell that carries no soak summary (soak runs)
+//	VALIDATE_GATE_REQUIRE_PROPERTIES=1   fail a cell whose property loop never evaluated a
+//	                                     predicate, i.e. /debug/vars was unreachable (default 1)
+//
+// Property predicate violations (tier_1.property_violations, naming the
+// I-* IDs) are always gated.
 func ValidateGate() error {
 	paths, err := latestRunValidateResults()
 	if err != nil {
@@ -53,18 +58,24 @@ func ValidateGate() error {
 		}
 	}
 	opts := report.GateOptions{
-		ExpectedCells: gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
-		RequireTier3:  os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
-		RequireSoak:   os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
+		ExpectedCells:     gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
+		RequireTier3:      os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
+		RequireSoak:       os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
+		RequireProperties: os.Getenv("VALIDATE_GATE_REQUIRE_PROPERTIES") != "0",
 	}
 	cellSoaks := 0
+	var propEvals, propViol int64
 	for _, c := range cells {
 		if c.Soak != nil {
 			cellSoaks++
 		}
+		if c.Tier1 != nil {
+			propEvals += c.Tier1.PropertyEvaluations
+			propViol += c.Tier1.PropertyViolations
+		}
 	}
-	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v soak_summaries=%d (cells) + %d (hosts)\n",
-		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, cellSoaks, len(soaks))
+	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
+		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, cellSoaks, len(soaks), propEvals, propViol)
 	viol := report.Gate(cells, soaks, opts)
 	if len(viol) == 0 {
 		fmt.Println("ValidateGate: PASS -- every gated signal is zero in every cell.")
