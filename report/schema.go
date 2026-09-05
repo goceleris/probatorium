@@ -419,6 +419,11 @@ type ValidationCellResult struct {
 	Arch   string        `json:"arch"`
 	Tier1  *Tier1Summary `json:"tier_1,omitempty"`
 	Tier3  *Tier3Summary `json:"tier_3,omitempty"`
+	// Soak is the cell's soak block (soak mode only). The per-cell
+	// orchestrator already wrote it into the cell's own document; carrying
+	// it here lets the merged matrix document -- the only thing the gate
+	// reads -- keep it (probatorium#281).
+	Soak *SoakSummary `json:"soak_summary,omitempty"`
 }
 
 // Tier1Summary mirrors the validator's tier1TallySnapshot in the

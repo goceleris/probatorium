@@ -121,3 +121,31 @@ func TestGate_OutputIsSortedAndComplete(t *testing.T) {
 		t.Fatalf("violations must be sorted by cell then field and all reported, got %v", v)
 	}
 }
+
+func TestGate_SoakSummaryPerCell(t *testing.T) {
+	// Not required: a cell without a soak block passes.
+	c := cleanCell("r", "iouring", "arm64")
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true}); len(v) != 0 {
+		t.Fatalf("unrequired soak block produced violations: %+v", v)
+	}
+	// Required: the missing block is a violation naming the cell (probatorium#281).
+	v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true, RequireSoak: true})
+	if len(v) != 1 || v[0].Field != "soak_summary.missing" || v[0].Refapp != "r" || v[0].Engine != "iouring" {
+		t.Fatalf("missing soak block not gated: %+v", v)
+	}
+	// Present and clean: passes even when required.
+	c.Soak = &SoakSummary{Duration: 3600e9}
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true, RequireSoak: true}); len(v) != 0 {
+		t.Fatalf("clean soak block produced violations: %+v", v)
+	}
+	// Leak / restart indicators inside the cell's block are gated.
+	c.Soak = &SoakSummary{GoroutineLeakDetected: true, RestartedProcesses: 2}
+	v = Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true, RequireSoak: true})
+	fields := map[string]int64{}
+	for _, x := range v {
+		fields[x.Field] = x.Value
+	}
+	if fields["soak_summary.goroutine_leak_detected"] != 1 || fields["soak_summary.restarted_processes"] != 2 {
+		t.Fatalf("per-cell soak indicators not gated: %+v", v)
+	}
+}

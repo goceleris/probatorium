@@ -142,6 +142,7 @@ jobs:
         if: success()
         env:
           VALIDATE_GATE_EXPECT_CELLS: "48" # 8 refapps x 3 engines x 2 archs
+          VALIDATE_GATE_REQUIRE_SOAK: "1" # every cell must carry its soak block (probatorium#281)
         run: mage ValidateGate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)

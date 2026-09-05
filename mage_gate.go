@@ -27,6 +27,7 @@ import (
 //
 //	VALIDATE_GATE_EXPECT_CELLS=48  fail if fewer cells reported (0 = no check)
 //	VALIDATE_GATE_REQUIRE_TIER3=1  fail a cell whose tier 3 never ran (default 1)
+//	VALIDATE_GATE_REQUIRE_SOAK=1   fail a cell that carries no soak summary (soak runs)
 func ValidateGate() error {
 	paths, err := latestRunValidateResults()
 	if err != nil {
@@ -54,9 +55,16 @@ func ValidateGate() error {
 	opts := report.GateOptions{
 		ExpectedCells: gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
 		RequireTier3:  os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
+		RequireSoak:   os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
 	}
-	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v soak_summaries=%d\n",
-		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, len(soaks))
+	cellSoaks := 0
+	for _, c := range cells {
+		if c.Soak != nil {
+			cellSoaks++
+		}
+	}
+	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v soak_summaries=%d (cells) + %d (hosts)\n",
+		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, cellSoaks, len(soaks))
 	viol := report.Gate(cells, soaks, opts)
 	if len(viol) == 0 {
 		fmt.Println("ValidateGate: PASS -- every gated signal is zero in every cell.")
