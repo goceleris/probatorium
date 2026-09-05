@@ -1,6 +1,7 @@
 package report
 
 import (
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,14 +54,48 @@ import (
 //     in ServerResult.Resources (now populated, finally) is the
 //     differentiator for those cells. Both additive and omitted when
 //     absent: a Tailscale-overlay run (no known line rate) emits neither.
-//     Also additive within 5.5: the in-process property loop's counters
-//     on Tier1Summary (property_evaluations, property_violations,
-//     property_violation_ids, property_poll_errors) and the per-cell
+//   - 5.6 — the in-process property loop (probatorium, after the
+//     2026-09-04 soak reached an 18 GB heap with properties_passed=0).
+//     Adds the loop's counters on Tier1Summary (property_evaluations,
+//     property_skips, property_violations, property_violation_ids,
+//     property_poll_errors, property_loop_skipped) and the per-cell
 //     properties_passed / properties_failed / properties_not_instrumented
-//     / failure_summaries on ValidationCellResult. Before these, the
-//     I-* snapshot predicates listed in plan.json were never evaluated
-//     by any run and properties_passed/failed were always 0/0.
-const SchemaVersion = "5.5"
+//     / properties_not_judged / failure_summaries on
+//     ValidationCellResult. Before these, the I-* snapshot predicates
+//     listed in plan.json were never evaluated by any run and
+//     properties_passed/failed were always 0/0. Additive -- older readers
+//     ignore the fields -- but the version bump is load-bearing for
+//     mage ValidateGate: a 5.5 document has no property loop, so the
+//     "loop never evaluated anything" check defaults off for it.
+const SchemaVersion = "5.6"
+
+// SchemaAtLeast reports whether version (a "major.minor" string as
+// emitted in SchemaVersion) is at least want. Malformed input is
+// treated as older than anything.
+func SchemaAtLeast(version, want string) bool {
+	vm, vn, ok1 := parseSchema(version)
+	wm, wn, ok2 := parseSchema(want)
+	if !ok1 || !ok2 {
+		return false
+	}
+	return vm > wm || (vm == wm && vn >= wn)
+}
+
+func parseSchema(v string) (major, minor int, ok bool) {
+	parts := strings.SplitN(strings.TrimSpace(v), ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	minor, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
 
 // CellStatus classifies the OUTCOME of a single (scenario, server)
 // cell. It is the single source of truth for whether a cell ran and
@@ -434,15 +469,22 @@ type ValidationCellResult struct {
 
 	// PropertiesPassed / PropertiesFailed are the cell's snapshot-predicate
 	// verdicts from the in-process property loop: passed = instrumented
-	// predicates evaluated at least once with zero violations; failed =
-	// distinct predicates that violated at least once. Both 0 when the
-	// loop never observed a sample (see Tier1Summary.PropertyEvaluations).
+	// predicates that reached a verdict at least once with zero
+	// violations; failed = distinct predicates that violated at least
+	// once. Both 0 when the loop never observed a sample (see
+	// Tier1Summary.PropertyEvaluations).
 	PropertiesPassed int `json:"properties_passed"`
 	PropertiesFailed int `json:"properties_failed"`
 	// PropertiesNotInstrumented lists evaluated predicates whose inputs
 	// have no data source in this deployment (they pass vacuously and are
 	// excluded from PropertiesPassed).
 	PropertiesNotInstrumented []string `json:"properties_not_instrumented,omitempty"`
+	// PropertiesNotJudged lists instrumented predicates whose every
+	// evaluation was a skip: the slope oracles (I-MEM-1/3/4) need a
+	// 5 min warm-up plus a 10 min window, so a ~150 s nightly cell never
+	// judges them. They are excluded from PropertiesPassed -- a short
+	// cell's passed count must not read as "the leak oracles passed".
+	PropertiesNotJudged []string `json:"properties_not_judged,omitempty"`
 	// FailureSummaries maps a failed predicate ID to its first violation
 	// message.
 	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`
@@ -477,12 +519,21 @@ type Tier1Summary struct {
 	// the selected I-* snapshot predicates (validation/checker) against
 	// each sample.
 	//
-	// PropertyEvaluations: total predicate evaluations (samples x
-	// predicates). 0 means the loop never got a sample -- the metrics
-	// endpoint was unreachable -- and the gate treats that as a failure
-	// when RequireProperties is set, because a run that evaluated
-	// nothing has verified nothing.
+	// PropertyEvaluations: predicate evaluations that reached a verdict
+	// (pass or fail); skips are counted in PropertySkips. 0 means the
+	// loop never got a sample -- the metrics endpoint was unreachable --
+	// and the gate treats that as a failure when RequireProperties is
+	// set (unless PropertyLoopSkipped explains it), because a run that
+	// evaluated nothing has verified nothing.
 	PropertyEvaluations int64 `json:"property_evaluations"`
+	// PropertySkips: evaluations that reached no verdict (a slope
+	// window not judgeable yet, an input not sampled). Informational.
+	PropertySkips int64 `json:"property_skips"`
+	// PropertyLoopSkipped, when non-empty, says why the loop did not run
+	// at all for this cell (the ssh driver: the remote refapp serves
+	// /debug/vars to loopback peers only). The gate waives the
+	// zero-evaluations check for such a cell; the reason is on record.
+	PropertyLoopSkipped string `json:"property_loop_skipped,omitempty"`
 	// PropertyViolations: total failed evaluations (one per sample per
 	// predicate while the violation persists). Gated: any nonzero value
 	// fails the cell.

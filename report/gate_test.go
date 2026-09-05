@@ -120,7 +120,16 @@ func TestGate_PropertyLoop(t *testing.T) {
 
 	// Poll errors and the evaluation count itself are informational.
 	c = cleanCell("r", "std", "amd64")
+	// A cell whose loop was deliberately not run (ssh driver) says so and
+	// is waived from the zero-evaluations check.
+	c.Tier1.PropertyEvaluations = 0
+	c.Tier1.PropertyLoopSkipped = "ssh driver: remote /debug/vars is loopback-only"
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true, RequireProperties: true}); len(v) != 0 {
+		t.Fatalf("a skipped loop with a reason on record must not fail RequireProperties, got %v", v)
+	}
+	c.Tier1.PropertyLoopSkipped = ""
 	c.Tier1.PropertyPollErrors = 1_000_000
+	c.Tier1.PropertySkips = 1_000_000
 	c.Tier1.PropertyEvaluations = 1
 	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true, RequireProperties: true}); len(v) != 0 {
 		t.Fatalf("poll errors must not be gated, got %v", v)
@@ -190,5 +199,21 @@ func TestGate_SoakSummaryPerCell(t *testing.T) {
 	}
 	if fields["soak_summary.goroutine_leak_detected"] != 1 || fields["soak_summary.restarted_processes"] != 2 {
 		t.Fatalf("per-cell soak indicators not gated: %+v", v)
+	}
+}
+
+func TestSchemaAtLeast(t *testing.T) {
+	cases := []struct {
+		v, want string
+		ok      bool
+	}{
+		{"5.6", "5.6", true}, {"5.7", "5.6", true}, {"6.0", "5.6", true}, {"5.10", "5.6", true},
+		{"5.5", "5.6", false}, {"4.9", "5.6", false}, {"", "5.6", false}, {"junk", "5.6", false}, {"5", "5.6", false},
+		{SchemaVersion, "5.6", true},
+	}
+	for _, c := range cases {
+		if got := SchemaAtLeast(c.v, c.want); got != c.ok {
+			t.Errorf("SchemaAtLeast(%q, %q)=%v want %v", c.v, c.want, got, c.ok)
+		}
 	}
 }

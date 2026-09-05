@@ -37,7 +37,11 @@ type GateOptions struct {
 	// refapp's /debug/vars was unreachable for the whole cell, so every
 	// I-* predicate was vacuous. This is the silent-zero state every run
 	// before the in-process loop was in (properties_passed=0 on an 18 GB
-	// heap, celeris#494).
+	// heap, celeris#494). A cell whose tier_1.property_loop_skipped
+	// names a reason (ssh driver) is waived: the loop did not fail, it
+	// was not run, and the document says so. Documents older than
+	// schema 5.6 have no property loop at all; mage ValidateGate
+	// defaults this off for them.
 	RequireProperties bool
 }
 
@@ -51,9 +55,10 @@ type GateOptions struct {
 // The scalar Tier1Summary counters gated inline in Gate follow the same
 // rule: requests_5xx, requests_error, invariant_hits and
 // property_violations are defects; requests_5xx_expected,
-// requests_cut_at_deadline, property_evaluations and property_poll_errors
-// are informational (property_evaluations == 0 is gated only under
-// RequireProperties).
+// requests_cut_at_deadline, property_evaluations, property_skips and
+// property_poll_errors are informational (property_evaluations == 0 is
+// gated only under RequireProperties, and waived when
+// property_loop_skipped names a reason).
 var gatedTier1Keys = []struct{ slice, key, why string }{
 	{"adversarial", "adv_wrong_accepted", "a malformed request was accepted"},
 	{"adversarial", "adv_hang_until_timeout", "a malformed request hung the server"},
@@ -109,7 +114,7 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 				add(c, "tier_1.property_violations", t.PropertyViolations,
 					"property predicate(s) violated: "+strings.Join(t.PropertyViolationIDs, ", "))
 			}
-			if opts.RequireProperties && t.PropertyEvaluations == 0 {
+			if opts.RequireProperties && t.PropertyEvaluations == 0 && t.PropertyLoopSkipped == "" {
 				add(c, "tier_1.property_evaluations", 0, "the property loop never evaluated a predicate (refapp /debug/vars unreachable?)")
 			}
 			for _, g := range gatedTier1Keys {

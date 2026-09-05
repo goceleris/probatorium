@@ -29,10 +29,17 @@ import (
 //	VALIDATE_GATE_REQUIRE_TIER3=1        fail a cell whose tier 3 never ran (default 1)
 //	VALIDATE_GATE_REQUIRE_SOAK=1         fail a cell that carries no soak summary (soak runs)
 //	VALIDATE_GATE_REQUIRE_PROPERTIES=1   fail a cell whose property loop never evaluated a
-//	                                     predicate, i.e. /debug/vars was unreachable (default 1)
+//	                                     predicate, i.e. /debug/vars was unreachable. Unset
+//	                                     defaults to 1 when every document is schema >= 5.6
+//	                                     (emitted by a validator that has the in-process
+//	                                     loop) and to 0 for older results, which carry no
+//	                                     property fields at all and would fail every cell.
+//	                                     A cell whose tier_1.property_loop_skipped names a
+//	                                     reason (ssh driver) is waived either way.
 //
 // Property predicate violations (tier_1.property_violations, naming the
-// I-* IDs) are always gated.
+// I-* IDs) are always gated, whether the run recorded them (the default,
+// VALIDATE_PROPERTY_HARD_FAIL unset) or hard-failed the cell on them.
 func ValidateGate() error {
 	paths, err := latestRunValidateResults()
 	if err != nil {
@@ -40,10 +47,19 @@ func ValidateGate() error {
 	}
 	var cells []report.ValidationCellResult
 	soaks := map[string]*report.SoakSummary{}
+	// propertyAware: every document was emitted by a validator that runs
+	// the in-process property loop (schema >= 5.6). Older documents have
+	// no property fields, so their property_evaluations decode as 0 and
+	// RequireProperties would fail every cell of a run that never had a
+	// loop to begin with.
+	propertyAware := true
 	for _, p := range paths {
 		doc, err := loadValidateDoc(p)
 		if err != nil {
 			return fmt.Errorf("load %s: %w", p, err)
+		}
+		if !report.SchemaAtLeast(doc.SchemaVersion, "5.6") {
+			propertyAware = false
 		}
 		host := filepath.Base(filepath.Dir(p))
 		cs := doc.Validation.Cells
@@ -57,11 +73,18 @@ func ValidateGate() error {
 			soaks[host] = doc.Soak
 		}
 	}
+	requireProps := propertyAware
+	switch os.Getenv("VALIDATE_GATE_REQUIRE_PROPERTIES") {
+	case "1":
+		requireProps = true
+	case "0":
+		requireProps = false
+	}
 	opts := report.GateOptions{
 		ExpectedCells:     gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
 		RequireTier3:      os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
 		RequireSoak:       os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
-		RequireProperties: os.Getenv("VALIDATE_GATE_REQUIRE_PROPERTIES") != "0",
+		RequireProperties: requireProps,
 	}
 	cellSoaks := 0
 	var propEvals, propViol int64
@@ -74,8 +97,8 @@ func ValidateGate() error {
 			propViol += c.Tier1.PropertyViolations
 		}
 	}
-	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
-		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, cellSoaks, len(soaks), propEvals, propViol)
+	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v (schema>=5.6: %v) soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
+		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, propertyAware, cellSoaks, len(soaks), propEvals, propViol)
 	viol := report.Gate(cells, soaks, opts)
 	if len(viol) == 0 {
 		fmt.Println("ValidateGate: PASS -- every gated signal is zero in every cell.")
