@@ -22,6 +22,9 @@ type propertyLoopConfig struct {
 	Interval time.Duration
 	// Specs are the predicates to evaluate (checker.SelectPredicates).
 	Specs []properties.Spec
+	// HardFail marks the emitted Incidents as cell-cancelling
+	// (Config.PropertyHardFail); false marks them RecordOnly.
+	HardFail bool
 	// Violations receives one Incident per predicate ID on its FIRST
 	// violation (non-blocking send; the orchestrator's channel has
 	// capacity 1 and a dropped send is still counted in the tally).
@@ -35,6 +38,10 @@ type propertyLoopConfig struct {
 // propertyLoopSnapshotEvery is the tick cadence of the SnapshotPath
 // write (30 s at 1 Hz).
 const propertyLoopSnapshotEvery = 30
+
+// propertyLoopSkippedSSH is the Tally.SkippedReason recorded when the
+// orchestrator drives the refapp over ssh.
+const propertyLoopSkippedSSH = "ssh driver: the refapp serves /debug/vars to loopback peers on the remote host only; the property loop was not run"
 
 // propertyPollTimeout caps one /debug/vars GET. The document is a few
 // KB served from memory; anything slower than this is the refapp
@@ -51,12 +58,13 @@ const propertyPollTimeout = 500 * time.Millisecond
 //
 // The first violation of each predicate is surfaced as an Incident
 // (TierProperty, PredicateID = the I-* ID, Snapshot attached) exactly
-// like the tier-1-walker oracles in runTierProperty's TallyCallback;
-// the orchestrator's Run loop treats it as a hard fail, cancels the
-// cell, writes the dossier and captures forensics. Every violation,
-// first or not, is counted in the returned Tally so the cell document
-// (and the absolute gate) sees it even when the incident channel was
-// already occupied.
+// like the tier-1-walker oracles in runTierProperty's TallyCallback.
+// With cfg.HardFail the orchestrator's Run loop cancels the cell after
+// writing the dossier and capturing forensics; without it the Incident
+// is RecordOnly -- dossier + forensics, and the cell keeps running.
+// Every violation, first or not, is counted in the returned Tally so
+// the cell document (and the absolute gate) sees it even when the
+// incident channel was already occupied.
 //
 // Returns when ctx is done; never earlier.
 func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally {
@@ -89,6 +97,7 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 				Snapshot:    v.Snapshot,
 				ObservedAt:  t.UTC(),
 				RefappPID:   cfg.PID,
+				RecordOnly:  !cfg.HardFail,
 			}:
 			default:
 				// Channel full: the orchestrator is already handling a

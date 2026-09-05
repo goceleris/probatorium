@@ -121,12 +121,19 @@ func TestRunPropertyLoop_DeadEndpointIsVisible(t *testing.T) {
 // projection) -- the field-completeness test cannot see a nested struct.
 func TestTier1Summary_ProjectsPropertyTally(t *testing.T) {
 	s := tier1TallySnapshot{Properties: checker.Tally{
-		Samples: 100, PollErrors: 2, Evaluations: 1400, Violations: 30,
+		Samples: 100, PollErrors: 2, Evaluations: 1400, Skips: 300, Violations: 30,
 		ViolationIDs: []string{"I-MEM-1", "I-MEM-3"},
 	}}
 	sum := s.Tier1Summary()
-	if sum.PropertyEvaluations != 1400 || sum.PropertyViolations != 30 || sum.PropertyPollErrors != 2 {
+	if sum.PropertyEvaluations != 1400 || sum.PropertyViolations != 30 || sum.PropertyPollErrors != 2 || sum.PropertySkips != 300 {
 		t.Fatalf("scalars not projected: %+v", sum)
+	}
+	if sum.PropertyLoopSkipped != "" {
+		t.Fatalf("a loop that ran must not read as skipped: %q", sum.PropertyLoopSkipped)
+	}
+	skipped := tier1TallySnapshot{Properties: checker.Tally{SkippedReason: propertyLoopSkippedSSH}}.Tier1Summary()
+	if skipped.PropertyLoopSkipped != propertyLoopSkippedSSH || skipped.PropertyEvaluations != 0 {
+		t.Fatalf("skipped loop not projected: %+v", skipped)
 	}
 	if len(sum.PropertyViolationIDs) != 2 || sum.PropertyViolationIDs[1] != "I-MEM-3" {
 		t.Fatalf("ids not projected: %+v", sum.PropertyViolationIDs)

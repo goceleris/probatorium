@@ -43,6 +43,7 @@ type Config struct {
 	CelerisBin         string
 	CelerisListenAddr  string
 	MetricsURL         string
+	PropertyHardFail   bool
 	PropertyTier       string
 	CelerisCommit      string
 	ReplayBin          string
@@ -127,6 +128,7 @@ func DefaultConfig() Config {
 		Arch:               runtime.GOARCH,
 		Target:             "localhost",
 		PropertyTier:       "core,middleware",
+		PropertyHardFail:   os.Getenv("VALIDATE_PROPERTY_HARD_FAIL") == "1",
 		CelerisListenAddr:  "127.0.0.1:8080",
 		MarkovPath:         "validation/markov/auth_session_ratelimit.yaml",
 		OpenAPIPath:        "validation/spec/auth_session_ratelimit.openapi.yaml",
@@ -149,6 +151,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.CelerisListenAddr, "celeris-addr", c.CelerisListenAddr, "celeris bind addr")
 	fs.StringVar(&c.MetricsURL, "metrics-url", c.MetricsURL, "override the refapp /debug/vars URL the property loop polls; default derives it from the refapp's ready banner")
 	fs.StringVar(&c.PropertyTier, "property-tier", c.PropertyTier, "comma-separated tier filter (core,middleware,engine,driver); empty = all")
+	fs.BoolVar(&c.PropertyHardFail, "property-hard-fail", c.PropertyHardFail, "cancel the cell on the FIRST snapshot-predicate violation (I-MEM-*, I-PANIC, ...); default record-only: count it into tier_1.property_violations, write the incident dossier + live forensics, keep running (env VALIDATE_PROPERTY_HARD_FAIL=1 flips the default)")
 	fs.StringVar(&c.CelerisCommit, "celeris-commit", c.CelerisCommit, "celeris commit SHA; recorded in incidents")
 	fs.StringVar(&c.ReplayBin, "replay-bin", c.ReplayBin, "cmd/validator-replay binary; empty disables Tier 3")
 	fs.StringVar(&c.DriverMode, "driver", c.DriverMode, "process driver (local|ssh); default local")
@@ -233,6 +236,7 @@ func run(cfg Config) error {
 		CelerisListenAddr:   cfg.CelerisListenAddr,
 		MetricsURL:          cfg.MetricsURL,
 		PropertyTier:        cfg.PropertyTier,
+		PropertyHardFail:    cfg.PropertyHardFail,
 		ReplayBin:           cfg.ReplayBin,
 		RefappEngine:        cfg.RefappEngine,
 		RefappAsyncHandlers: cfg.RefappAsyncHandlers,

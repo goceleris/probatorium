@@ -489,13 +489,14 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		// MetricsURL deliberately empty: addr is ":0" here, so the only
 		// usable /debug/vars URL is the one the orchestrator derives
 		// from the refapp's ready banner.
-		PropertyTier:  cfg.PropertyTier,
-		ReplayBin:     cfg.ReplayBin,
-		RefappEngine:  mc.Engine,
-		RefappWorkers: cfg.RefappWorkers,
-		DriverMode:    cfg.DriverMode,
-		DriverSSHUser: cfg.DriverSSHUser,
-		DriverSSHHost: cfg.DriverSSHHost,
+		PropertyTier:     cfg.PropertyTier,
+		PropertyHardFail: cfg.PropertyHardFail,
+		ReplayBin:        cfg.ReplayBin,
+		RefappEngine:     mc.Engine,
+		RefappWorkers:    cfg.RefappWorkers,
+		DriverMode:       cfg.DriverMode,
+		DriverSSHUser:    cfg.DriverSSHUser,
+		DriverSSHHost:    cfg.DriverSSHHost,
 	}
 	o, err := validation.New(cellCfg)
 	if err != nil {
@@ -512,6 +513,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		cell.PropertiesPassed = res.Properties.Passed()
 		cell.PropertiesFailed = res.Properties.Failed()
 		cell.PropertiesNotInstrumented = res.Properties.NotInstrumented
+		cell.PropertiesNotJudged = res.Properties.NotJudged
 		cell.FailureSummaries = res.Properties.FailureSummaries
 	}
 	if res.Tier3Ran {

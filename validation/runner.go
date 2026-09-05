@@ -140,6 +140,21 @@ type Config struct {
 	// every registered predicate. Wave 6 default = "core" + "middleware"
 	// (the engine + driver tiers wait for wave 7's instrumentation).
 	PropertyTier string
+	// PropertyHardFail makes the FIRST violation of a snapshot predicate
+	// (I-MEM-*, I-PANIC, I-CONN-2, ...) cancel the cell: the incident
+	// dossier and forensics are captured while the refapp is still
+	// alive, then the tiers are torn down and Run returns the error.
+	//
+	// Off (the default) is RECORD-ONLY: the violation is still counted
+	// into tier_1.property_violations -- so mage ValidateGate fails the
+	// run regardless -- and the first violation of each predicate still
+	// writes an incident dossier with live forensics, but the cell keeps
+	// running so the leak's whole trajectory (and the walker counters
+	// behind it) is on record. It is the calibration default because
+	// the slope budgets have not yet been run against a real cell; a
+	// false positive costs a dossier, not a 24 h soak slot at t=17 min.
+	// cmd/validator: -property-hard-fail / VALIDATE_PROPERTY_HARD_FAIL=1.
+	PropertyHardFail bool
 
 	// RefappEngine, when non-empty, is appended to the refapp's
 	// process argv as `-engine <value>`. Used to exercise specific
@@ -555,15 +570,41 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 				})
 				continue
 			}
+			if inc.RecordOnly {
+				// Record-only property violation (Config.PropertyHardFail
+				// off): dossier + forensics against the live refapp, and
+				// the cell keeps running. The loop's tally already
+				// counts it; the gate fails on tier_1.property_violations.
+				if dir, err := o.writeIncidentDossier(inc); err == nil {
+					o.captureForensicsBounded(dir, inc)
+				} else {
+					fmt.Fprintf(os.Stderr, "validation: incident dossier: %v\n", err)
+				}
+				continue
+			}
+			// Hard fail. Forensics FIRST, while the refapp is still
+			// alive: cancel() SIGKILLs the Tier 1 refapp (it runs under
+			// exec.CommandContext on rootCtx) and driveTier1's deferred
+			// SIGTERM follows, so anything captured after the teardown
+			// is a directory of .missing markers -- including the
+			// goroutine profile that is the whole point of the dossier
+			// for the celeris#494 leak class. The capture runs on its
+			// own bounded context (forensicsBudget), not on rootCtx.
+			dir, derr := o.writeIncidentDossier(inc)
+			if derr == nil {
+				o.captureForensicsBounded(dir, inc)
+			} else {
+				fmt.Fprintf(os.Stderr, "validation: incident dossier: %v\n", derr)
+			}
 			cancel()
 			wg.Wait()
-			// Hard-fail path: emit the validate-results doc with
-			// whatever partial tallies the tiers managed to stash
-			// before the violation triggered abort. The incident
-			// dossier carries the bug specifics; the v5 doc gives
-			// dashboards the same shape as a clean exit.
+			// Emit the validate-results doc with whatever partial
+			// tallies the tiers managed to stash before the violation
+			// triggered abort. The incident dossier carries the bug
+			// specifics; the v5 doc gives dashboards the same shape as
+			// a clean exit.
 			_ = o.writeValidateResults(startedAt)
-			return o.handleIncident(rootCtx, inc)
+			return o.finishIncident(ctx, dir, inc)
 		case <-checkpoint.C:
 			_ = o.writeCheckpoint()
 		case <-rootCtx.Done():
@@ -618,6 +659,10 @@ type Incident struct {
 	// it per-seed. Zero suppresses /proc-dependent forensics (the
 	// dossier still records what we have).
 	RefappPID int
+	// RecordOnly marks a property-loop violation raised while
+	// Config.PropertyHardFail is off: the orchestrator writes the
+	// dossier and captures forensics but does NOT cancel the cell.
+	RecordOnly bool
 }
 
 // buildDriver constructs the remote.Driver per the orchestrator's
@@ -727,6 +772,17 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// exactly as long as the tier: loopCtx is cancelled once driveTier1
 	// returns and its tally is joined below so the cell document
 	// carries it.
+	//
+	// Under the ssh driver the loop is NOT run: the ready banner names
+	// the refapp's loopback on the REMOTE host and the refapp serves
+	// /debug/vars to loopback peers only, so polling from here would be
+	// zero samples and a poll error per second. The tally says so
+	// (SkippedReason -> tier_1.property_loop_skipped) and the gate
+	// waives its zero-evaluations check for the cell.
+	var loopSkipped string
+	if o.cfg.DriverMode == "ssh" {
+		loopSkipped = propertyLoopSkippedSSH
+	}
 	addrCh := make(chan string, 1)
 	loopCtx, cancelLoop := context.WithCancel(ctx)
 	defer cancelLoop()
@@ -736,7 +792,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		select {
 		case addr = <-addrCh:
 		case <-loopCtx.Done():
-			propDone <- checker.Tally{}
+			propDone <- checker.Tally{SkippedReason: loopSkipped}
 			return
 		}
 		if addr != "" {
@@ -750,6 +806,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		case <-loopCtx.Done():
 		}
 		refappPID.Store(int64(p))
+		if loopSkipped != "" {
+			propDone <- checker.Tally{SkippedReason: loopSkipped}
+			return
+		}
 		url := o.cfg.MetricsURL
 		if url == "" {
 			url = "http://" + addr + "/debug/vars"
@@ -758,6 +818,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 			MetricsURL:   url,
 			PID:          p,
 			Specs:        checker.SelectPredicates(o.cfg.PropertyTier),
+			HardFail:     o.cfg.PropertyHardFail,
 			Violations:   violations,
 			SnapshotPath: filepath.Join(o.cfg.OutDir, "properties_tally.json"),
 		})
@@ -1019,14 +1080,19 @@ func livenessDeathMessage(s livenessSnapshot) string {
 	return msg
 }
 
-// handleIncident captures forensics on a violation and writes the
-// incident dossier. Wave 6 emits the dossier; wave 7 wires the
-// shrinker into the same pipeline.
-func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
+// forensicsBudget bounds the live forensics capture on an incident.
+// The pprof legs are five 5 s HTTP fetches and the /proc reads are
+// instant; gcore on a multi-GB refapp is the only thing that can
+// approach this.
+const forensicsBudget = 30 * time.Second
+
+// writeIncidentDossier creates the per-incident directory and writes
+// incident.json into it. Returns the directory.
+func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
 	ts := time.Now().UTC().Format("20060102-150405")
 	dir := filepath.Join(o.cfg.OutDir, "incidents", ts+"-"+inc.PredicateID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	dossier := map[string]any{
 		"tier":        inc.Tier.String(),
@@ -1039,20 +1105,39 @@ func (o *Orchestrator) handleIncident(ctx context.Context, inc Incident) error {
 		"arch":        o.cfg.Arch,
 		"target":      o.cfg.Target,
 		"go_versions": []string{"runtime+target"},
+		"record_only": inc.RecordOnly,
 	}
 	if err := writeJSON(filepath.Join(dir, "incident.json"), dossier); err != nil {
-		return err
+		return "", err
 	}
-	if err := o.captureForensics(ctx, dir, inc); err != nil {
-		// Don't propagate — the incident is already recorded.
+	return dir, nil
+}
+
+// captureForensicsBounded runs captureForensics against the (still
+// running) refapp on a fresh context bounded by forensicsBudget. It
+// must be called BEFORE the run is cancelled: the refapp dies with the
+// run context, and a dead pid plus a cancelled context yields nothing
+// but .missing markers. Never propagates -- the dossier is already on
+// disk.
+func (o *Orchestrator) captureForensicsBounded(dir string, inc Incident) {
+	fctx, cancel := context.WithTimeout(context.Background(), forensicsBudget)
+	defer cancel()
+	if err := o.captureForensics(fctx, dir, inc); err != nil {
 		fmt.Fprintf(os.Stderr, "validation: forensics: %v\n", err)
 	}
+}
+
+// finishIncident is the tail of a hard fail after teardown: the seed
+// shrinker (Tier 3 only) and the error Run returns. ctx is the caller's
+// run context (NOT the cancelled rootCtx), so an interrupt still stops
+// the shrink but the teardown does not.
+func (o *Orchestrator) finishIncident(ctx context.Context, dir string, inc Incident) error {
 	// Seed shrinker: bisect the replay duration to find the smallest
 	// window that still reproduces. Only fires for Tier 3 seed
 	// failures (T3-SEED-FAIL); other incidents don't have a seed +
 	// duration tuple to shrink. Best-effort: any shrink failure is
 	// logged in shrink_log.json, never propagated.
-	if inc.PredicateID == "T3-SEED-FAIL" && inc.Seed != 0 && o.cfg.ReplayBin != "" {
+	if inc.PredicateID == "T3-SEED-FAIL" && inc.Seed != 0 && o.cfg.ReplayBin != "" && dir != "" {
 		shrinkDir := filepath.Join(dir, "shrink")
 		if err := os.MkdirAll(shrinkDir, 0o755); err == nil {
 			scfg := shrinkCfg{
@@ -1117,9 +1202,11 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		RequestsCutAtDeadline: s.RequestsCutAtDeadline,
 
 		PropertyEvaluations:  s.Properties.Evaluations,
+		PropertySkips:        s.Properties.Skips,
 		PropertyViolations:   s.Properties.Violations,
 		PropertyViolationIDs: append([]string(nil), s.Properties.ViolationIDs...),
 		PropertyPollErrors:   s.Properties.PollErrors,
+		PropertyLoopSkipped:  s.Properties.SkippedReason,
 		Adversarial: map[string]int64{
 			"adv_sent":               s.Adversarial.Sent,
 			"adv_well_rejected":      s.Adversarial.WellRejected,

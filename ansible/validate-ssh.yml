@@ -14,6 +14,13 @@
 # only the Driver implementation differs. cmd/validator's
 # -driver=ssh / -ssh-user / -ssh-host flags select it.
 #
+# The in-process property loop (I-MEM-*, I-PANIC, I-CONN-2) does NOT run
+# under the ssh driver: the refapp serves /debug/vars to loopback peers
+# on the REMOTE host only. The cell's document records the reason in
+# tier_1.property_loop_skipped and mage ValidateGate waives its
+# RequireProperties check for such cells (VALIDATE_GATE_REQUIRE_PROPERTIES=0
+# disables the check outright for a mixed results directory).
+#
 # Required extra-vars (mage Validate with PROBATORIUM_VALIDATE_DRIVER=ssh):
 #   bench_target              msa2-server | msr1
 #   refapp                    slug (default "auth_session_ratelimit")

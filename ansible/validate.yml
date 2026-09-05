@@ -177,6 +177,16 @@
             # default (concurrency=1 for cells under 5min) leaves the
             # h2c / WS / SSE walker slices dormant on every cell.
             VALIDATE_CONCURRENCY: "{{ validate_concurrency | default('') }}"
+            # VALIDATE_PROPERTY_HARD_FAIL=1 makes the FIRST snapshot-
+            # predicate violation (I-MEM-*, I-PANIC, ...) cancel the
+            # cell (cmd/validator -property-hard-fail). Unset = record
+            # only: the violation is counted into
+            # tier_1.property_violations (mage ValidateGate fails on it
+            # regardless), an incident dossier with live forensics is
+            # written, and the cell runs to its budget. Leave unset
+            # until the slope budgets have been calibrated on a real
+            # nightly + weekend run.
+            VALIDATE_PROPERTY_HARD_FAIL: "{{ validate_property_hard_fail | default('') }}"
             # Driver-refapp backend addresses. The driver_postgres /
             # driver_redis / driver_memcached refapps look up these env
             # vars (or their -postgres-dsn / -redis-addr / -mc-addr
