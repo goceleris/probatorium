@@ -24,15 +24,18 @@ var IPANIC = Spec{
 		if unexpectedPanics(snap) <= 0 {
 			return true, ""
 		}
-		seen := 1
+		// The Evaluator appends the current snapshot to ctx.History before
+		// evaluating, so count the trailing run of excess samples there; a
+		// direct call with a History that does not end in this snapshot
+		// counts the snapshot itself as one more sample.
+		seen := 0
 		for i := len(ctx.History) - 1; i >= 0 && seen < ipanicPersistence; i-- {
-			h := ctx.History[i]
-			if h.TS == snap.TS {
-				continue // the current snapshot may already be appended
-			}
-			if unexpectedPanics(&h) <= 0 {
+			if unexpectedPanics(&ctx.History[i]) <= 0 {
 				break
 			}
+			seen++
+		}
+		if n := len(ctx.History); n == 0 || !sameSample(&ctx.History[n-1], snap) {
 			seen++
 		}
 		if seen < ipanicPersistence {
@@ -41,6 +44,14 @@ var IPANIC = Spec{
 		return false, fmt.Sprintf("I-PANIC violated: %d unexpected panic(s) (panic_count=%d, expected=%d)",
 			unexpectedPanics(snap), snap.PanicCount, snap.ExpectedPanics)
 	},
+}
+
+// sameSample reports whether h is the very snapshot being evaluated (the
+// Evaluator appends it to History first). Snapshot timestamps have 1 s
+// resolution, so compare the counters too.
+func sameSample(h, s *Snapshot) bool {
+	return h.TS == s.TS && h.PanicCount == s.PanicCount && h.ExpectedPanics == s.ExpectedPanics &&
+		h.GoroutineCount == s.GoroutineCount && h.HeapInuseBytes == s.HeapInuseBytes
 }
 
 func unexpectedPanics(s *Snapshot) int64 { return s.PanicCount - s.ExpectedPanics }
