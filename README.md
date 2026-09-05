@@ -315,7 +315,7 @@ All CI runs on `[self-hosted, celeris-cluster]` runners that are provisioned on 
 
 Runners are provisioned on demand and torn down at end-of-run — nothing persists on the cluster between runs. The bootstrap lives in:
 
-- `.github/actions/cluster-runner-up/` — joins the tailnet via `tailscale/github-action@v3` (ephemeral `tag:ci` node), optionally waits for `/tmp/celeris-bench-manifest.json` to clear (off by default), mints a registration token, runs `ansible/runner-setup.yml`, and confirms ≥3 runners online.
+- `.github/actions/cluster-runner-up/` — joins the tailnet via a SHA-pinned `tailscale/github-action` (ephemeral `tag:ci` node), optionally waits for `/tmp/celeris-bench-manifest.json` to clear (off by default), mints a registration token, runs `ansible/runner-setup.yml`, and confirms ≥3 runners online.
 - `.github/actions/cluster-runner-down/` — the matching teardown: mints a removal token, runs `ansible/runner-teardown.yml`, and sweeps orphan offline registrations.
 - `ansible/runner-setup.yml` + `ansible/runner-teardown.yml` — per-host provisioning; everything lives under `/tmp/actions-runner-<host>/`, with no systemd unit and no package install.
 
