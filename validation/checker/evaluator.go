@@ -54,11 +54,19 @@ type Tally struct {
 	// PollErrors is the number of polls that returned no snapshot
 	// (transport error, non-200, unparseable body).
 	PollErrors int64 `json:"poll_errors"`
-	// Evaluations is the total predicate evaluations (Samples x specs).
+	// Evaluations is the number of predicate evaluations that reached a
+	// VERDICT (pass or fail). Skips -- a slope window not yet
+	// judgeable, an input never sampled -- are counted in Skips
+	// instead, so a 150 s cell that judged nothing but I-CONN-2 and
+	// I-PANIC does not report 700 evaluations of five predicates.
 	Evaluations int64 `json:"evaluations"`
+	// Skips is the number of evaluations that reached no verdict
+	// ([properties.Skip]).
+	Skips int64 `json:"skips"`
 	// Violations is the total number of failed evaluations across all
 	// predicates (one per sample per predicate while the violation
-	// persists), NOT the number of distinct predicates.
+	// persists, once its [properties.Spec.Persist] streak is reached),
+	// NOT the number of distinct predicates.
 	Violations int64 `json:"violations"`
 	// ViolationIDs are the distinct predicate IDs that failed at least
 	// once, sorted.
@@ -68,6 +76,17 @@ type Tally struct {
 	// NotInstrumented are the evaluated IDs listed in Uninstrumented:
 	// they passed vacuously and are excluded from Passed.
 	NotInstrumented []string `json:"not_instrumented,omitempty"`
+	// NotJudged are the instrumented IDs whose every evaluation was a
+	// skip -- typically the slope predicates in a cell shorter than
+	// warm-up + window (15 min). They verified nothing and are excluded
+	// from Passed; exported so a short cell's properties_passed cannot
+	// be read as "the leak oracles passed".
+	NotJudged []string `json:"not_judged,omitempty"`
+	// SkippedReason is set when the loop itself never ran (e.g. the ssh
+	// driver, whose remote refapp serves /debug/vars to loopback peers
+	// only); Samples and Evaluations are 0 and the gate's
+	// RequireProperties check is waived for the cell.
+	SkippedReason string `json:"skipped_reason,omitempty"`
 	// FailureSummaries maps a failed predicate ID to its FIRST violation
 	// message.
 	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`
@@ -83,23 +102,27 @@ type Tally struct {
 	LastRSS            int64 `json:"last_rss_bytes"`
 }
 
-// Passed is the number of instrumented predicates that were evaluated
-// at least once and never failed.
+// Passed is the number of instrumented predicates that reached a
+// verdict at least once and never failed. Predicates that only ever
+// skipped (NotJudged) or have no data source (NotInstrumented) are not
+// passes.
 func (t Tally) Passed() int {
 	if t.Samples == 0 {
 		return 0
 	}
-	failed := map[string]bool{}
+	excluded := map[string]bool{}
 	for _, id := range t.ViolationIDs {
-		failed[id] = true
+		excluded[id] = true
 	}
-	not := map[string]bool{}
 	for _, id := range t.NotInstrumented {
-		not[id] = true
+		excluded[id] = true
+	}
+	for _, id := range t.NotJudged {
+		excluded[id] = true
 	}
 	n := 0
 	for _, id := range t.Predicates {
-		if !failed[id] && !not[id] {
+		if !excluded[id] {
 			n++
 		}
 	}
@@ -112,20 +135,24 @@ func (t Tally) Failed() int { return len(t.ViolationIDs) }
 // Evaluator drives the selected predicates over a stream of snapshots.
 // Not safe for concurrent use; the property loop owns one per cell.
 type Evaluator struct {
-	specs []properties.Spec
-	ctx   properties.Context
-	tally Tally
-	per   map[string]int64
-	first map[string]string
+	specs  []properties.Spec
+	ctx    properties.Context
+	tally  Tally
+	per    map[string]int64  // declared violations per ID
+	judged map[string]int64  // verdict-reaching evaluations per ID
+	streak map[string]int    // consecutive failing evaluations per ID (Persist)
+	first  map[string]string // first violation message per ID
 }
 
 // NewEvaluator returns an Evaluator over specs (typically
 // SelectPredicates(tier)).
 func NewEvaluator(specs []properties.Spec) *Evaluator {
 	e := &Evaluator{
-		specs: specs,
-		per:   map[string]int64{},
-		first: map[string]string{},
+		specs:  specs,
+		per:    map[string]int64{},
+		judged: map[string]int64{},
+		streak: map[string]int{},
+		first:  map[string]string{},
 	}
 	for _, s := range specs {
 		e.per[s.ID] = 0
@@ -140,6 +167,12 @@ func (e *Evaluator) RecordPollError() { e.tally.PollErrors++ }
 // (RunStartedAt and BaselineGoroutines come from the FIRST observed
 // sample -- the first successful poll after the refapp announced ready)
 // and evaluates every spec. Returns the violations for this sample.
+//
+// A [properties.Skip] result is neither a pass nor a fail: it is
+// counted in Tally.Skips, does not mark the predicate judged, and
+// leaves its failing streak untouched. A failing result only becomes a
+// violation once the predicate has failed on Spec.Persist consecutive
+// verdicts (a pass resets the streak).
 func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation {
 	if e.tally.Samples == 0 {
 		e.ctx.RunStartedAt = now
@@ -165,9 +198,19 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 
 	var out []Violation
 	for _, s := range e.specs {
-		e.tally.Evaluations++
 		ok, msg := s.Predicate(&snap, e.ctx)
+		if properties.IsSkip(ok, msg) {
+			e.tally.Skips++
+			continue
+		}
+		e.tally.Evaluations++
+		e.judged[s.ID]++
 		if ok {
+			e.streak[s.ID] = 0
+			continue
+		}
+		e.streak[s.ID]++
+		if e.streak[s.ID] < s.Persist {
 			continue
 		}
 		e.tally.Violations++
@@ -199,6 +242,10 @@ func (e *Evaluator) Tally() Tally {
 			// RSS was never sampled (no pid, non-linux, remote refapp):
 			// I-MEM-4 skipped on every tick and verified nothing.
 			t.NotInstrumented = append(t.NotInstrumented, s.ID)
+		} else if e.tally.Samples > 0 && e.judged[s.ID] == 0 {
+			// Instrumented, but every evaluation was a skip: the cell
+			// ended before the predicate's window was judgeable.
+			t.NotJudged = append(t.NotJudged, s.ID)
 		}
 		if n := e.per[s.ID]; n > 0 {
 			t.ViolationIDs = append(t.ViolationIDs, s.ID)
@@ -210,6 +257,7 @@ func (e *Evaluator) Tally() Tally {
 	}
 	sort.Strings(t.Predicates)
 	sort.Strings(t.NotInstrumented)
+	sort.Strings(t.NotJudged)
 	sort.Strings(t.ViolationIDs)
 	return t
 }

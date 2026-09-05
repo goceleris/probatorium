@@ -143,8 +143,28 @@ func TestEvaluator_BaselineViolationsAndTally(t *testing.T) {
 	if tl.Samples != 4 || tl.Violations != 3 || tl.Failed() != 1 || tl.ViolationIDs[0] != "I-PANIC" {
 		t.Fatalf("tally: %+v", tl)
 	}
-	if tl.Evaluations != 4*int64(len(SelectPredicates("core"))) {
-		t.Fatalf("evaluations=%d", tl.Evaluations)
+	// Every core predicate ran four times; the slope predicates and
+	// I-MEM-2 skipped every time (no window / no idle mode), the rest
+	// reached a verdict.
+	skippers := 0
+	for _, id := range []string{"I-MEM-1", "I-MEM-2", "I-MEM-3", "I-MEM-4"} {
+		if slices.Contains(tl.Predicates, id) {
+			skippers++
+		}
+	}
+	if want := 4 * int64(len(SelectPredicates("core"))-skippers); tl.Evaluations != want {
+		t.Fatalf("evaluations=%d want %d (skips=%d)", tl.Evaluations, want, tl.Skips)
+	}
+	if tl.Skips != 4*int64(skippers) {
+		t.Fatalf("skips=%d want %d", tl.Skips, 4*skippers)
+	}
+	for _, id := range []string{"I-MEM-1", "I-MEM-3"} {
+		if !slices.Contains(tl.NotJudged, id) {
+			t.Fatalf("%s never reached a verdict and must be listed as not judged: %v", id, tl.NotJudged)
+		}
+	}
+	if slices.Contains(tl.NotJudged, "I-MEM-4") || slices.Contains(tl.NotJudged, "I-PANIC") || slices.Contains(tl.NotJudged, "I-CONN-2") {
+		t.Fatalf("not judged must list only instrumented, never-judged predicates: %v", tl.NotJudged)
 	}
 	if !strings.Contains(tl.FailureSummaries["I-PANIC"], "I-PANIC") {
 		t.Fatalf("failure summary missing: %+v", tl.FailureSummaries)
@@ -163,9 +183,13 @@ func TestEvaluator_BaselineViolationsAndTally(t *testing.T) {
 	if slices.Contains(tl.NotInstrumented, "I-MEM-3") || slices.Contains(tl.NotInstrumented, "I-PANIC") {
 		t.Fatalf("instrumented predicates listed as not instrumented: %v", tl.NotInstrumented)
 	}
-	instrumented := len(tl.Predicates) - len(tl.NotInstrumented)
-	if tl.Passed() != instrumented-1 {
-		t.Fatalf("passed=%d want %d (instrumented %d minus the failed one)", tl.Passed(), instrumented-1, instrumented)
+	judged := len(tl.Predicates) - len(tl.NotInstrumented) - len(tl.NotJudged)
+	if tl.Passed() != judged-1 {
+		t.Fatalf("passed=%d want %d (judged %d minus the failed one)", tl.Passed(), judged-1, judged)
+	}
+	if tl.Passed() != 1 {
+		// Exactly I-CONN-2 reached a verdict and passed; I-PANIC failed.
+		t.Fatalf("passed=%d want 1 (I-CONN-2): predicates=%v not_instrumented=%v not_judged=%v", tl.Passed(), tl.Predicates, tl.NotInstrumented, tl.NotJudged)
 	}
 	if tl.BaselineGoroutines != 30 || tl.LastGoroutines != 30 || tl.FirstHeapInuse != 1<<20 {
 		t.Fatalf("resource points: %+v", tl)
@@ -197,28 +221,109 @@ func TestEvaluator_HistoryIsCapped(t *testing.T) {
 }
 
 // End-to-end through the predicates: a 3 goroutine/s leak fed through
-// Observe at 1 Hz trips I-MEM-3 at t=15min and not before.
+// Observe at 1 Hz is judged from t=15min and, after the one-bucket
+// (150 s) persistence, declared at t=17.5min and not before.
 func TestEvaluator_GoroutineLeakTripsIMEM3(t *testing.T) {
 	e := NewEvaluator(SelectPredicates("core"))
 	start := time.Unix(1_700_000_000, 0)
 	firstAt := -1
-	for i := 0; i <= 16*60; i++ {
+	for i := 0; i <= 20*60; i++ {
 		now := start.Add(time.Duration(i) * time.Second)
 		v := e.Observe(properties.Snapshot{TS: now.Unix(), GoroutineCount: 100 + 3*int64(i), HeapInuseBytes: 50 << 20}, now)
 		for _, x := range v {
 			if x.ID == "I-MEM-3" && firstAt < 0 {
 				firstAt = i
+				if !x.First {
+					t.Fatal("the first declared violation must be flagged First")
+				}
 			}
 		}
 	}
 	if firstAt < 0 {
 		t.Fatal("I-MEM-3 never fired on a 3/s goroutine leak")
 	}
-	if firstAt < 15*60 || firstAt > 15*60+2 {
-		t.Fatalf("I-MEM-3 first fired at t=%ds, want ~900s", firstAt)
+	persist := properties.IMEM3.Persist
+	if firstAt < 15*60+persist-1 || firstAt > 15*60+persist+2 {
+		t.Fatalf("I-MEM-3 first fired at t=%ds, want ~%ds (15 min window + %d s persistence)", firstAt, 15*60+persist, persist)
 	}
-	if tl := e.Tally(); tl.Failed() != 1 || tl.ViolationIDs[0] != "I-MEM-3" {
+	tl := e.Tally()
+	if tl.Failed() != 1 || tl.ViolationIDs[0] != "I-MEM-3" {
 		t.Fatalf("tally: %+v", tl)
+	}
+	if slices.Contains(tl.NotJudged, "I-MEM-3") || slices.Contains(tl.NotJudged, "I-MEM-1") {
+		t.Fatalf("judged predicates listed as not judged: %v", tl.NotJudged)
+	}
+	if tl.Skips == 0 {
+		t.Fatal("the pre-window evaluations must be counted as skips")
+	}
+}
+
+// A nightly matrix cell is ~150 s: the slope predicates never reach a
+// judgeable window there and must NOT be reported as passed. Only the
+// predicates that actually reached a verdict (I-CONN-2, I-PANIC) may.
+func TestEvaluator_ShortCellDoesNotPassSlopePredicates(t *testing.T) {
+	e := NewEvaluator(SelectPredicates("core"))
+	start := time.Unix(1_700_000_000, 0)
+	for i := 0; i <= 150; i++ {
+		now := start.Add(time.Duration(i) * time.Second)
+		if v := e.Observe(properties.Snapshot{TS: now.Unix(), GoroutineCount: 100, HeapInuseBytes: 50 << 20, RSSBytes: 200 << 20}, now); len(v) != 0 {
+			t.Fatalf("clean short cell produced violations: %+v", v)
+		}
+	}
+	tl := e.Tally()
+	for _, id := range []string{"I-MEM-1", "I-MEM-3", "I-MEM-4"} {
+		if !slices.Contains(tl.NotJudged, id) {
+			t.Fatalf("%s must be not judged in a 150 s cell: not_judged=%v", id, tl.NotJudged)
+		}
+	}
+	if tl.Passed() != 2 {
+		t.Fatalf("passed=%d want 2 (I-CONN-2, I-PANIC): not_instrumented=%v not_judged=%v", tl.Passed(), tl.NotInstrumented, tl.NotJudged)
+	}
+	// Verdicts: every core predicate except the four I-MEM skippers
+	// (the uninstrumented ones still reach a vacuous verdict).
+	if want := int64(len(SelectPredicates("core"))-4) * 151; tl.Evaluations != want {
+		t.Fatalf("evaluations=%d want %d (only verdicts count; skips=%d)", tl.Evaluations, want, tl.Skips)
+	}
+	if tl.Skips != 4*151 {
+		t.Fatalf("skips=%d want %d", tl.Skips, 4*151)
+	}
+}
+
+// Spec.Persist: a predicate must fail on N consecutive verdicts before
+// a violation is declared; a pass in between resets the streak and a
+// skip leaves it untouched.
+func TestEvaluator_PersistRequiresConsecutiveFailures(t *testing.T) {
+	calls := 0
+	flaky := properties.Spec{ID: "T-FLAKY", Tier: "core", Persist: 3,
+		Predicate: func(*properties.Snapshot, properties.Context) (bool, string) {
+			calls++
+			switch calls {
+			case 1, 2:
+				return false, "fail" // streak 2
+			case 3:
+				return true, "" // reset
+			case 4, 5:
+				return false, "fail" // streak 2
+			case 6:
+				return properties.Skip("hold") // streak untouched
+			}
+			return false, "fail" // 7: streak 3 -> violation
+		}}
+	e := NewEvaluator([]properties.Spec{flaky})
+	start := time.Unix(1_700_000_000, 0)
+	var declaredAt int
+	for i := 1; i <= 7; i++ {
+		v := e.Observe(properties.Snapshot{TS: start.Unix() + int64(i)}, start.Add(time.Duration(i)*time.Second))
+		if len(v) > 0 && declaredAt == 0 {
+			declaredAt = i
+		}
+	}
+	if declaredAt != 7 {
+		t.Fatalf("violation declared at call %d, want 7", declaredAt)
+	}
+	tl := e.Tally()
+	if tl.Violations != 1 || tl.Evaluations != 6 || tl.Skips != 1 {
+		t.Fatalf("tally: violations=%d evaluations=%d skips=%d", tl.Violations, tl.Evaluations, tl.Skips)
 	}
 }
 
