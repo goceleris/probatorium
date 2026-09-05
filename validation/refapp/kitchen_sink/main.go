@@ -64,6 +64,7 @@ import (
 	"github.com/goceleris/celeris/middleware/secure"
 	"github.com/goceleris/celeris/middleware/singleflight"
 	"github.com/goceleris/celeris/middleware/timeout"
+	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
 func main() {
@@ -76,7 +77,8 @@ func main() {
 
 	engineType := resolveEngine(*engineFlag)
 
-	srv := celeris.New(celeris.Config{
+	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          engineType,
 		Workers:         *workersFlag,
@@ -102,7 +104,7 @@ func main() {
 	// cs.detachMu (around ProcessH1), gating the worker thread and
 	// letting concurrent slowloris header-deadlines slip past.
 	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
+	srv.Use(recovery.New(recovery.Config{Logger: dv.RecoveryLogger(discardLog)}))
 	// requestid: stamp X-Request-Id before anything else logs.
 	srv.Use(requestid.New())
 	// secure: emit security headers on EVERY response.

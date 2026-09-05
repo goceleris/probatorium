@@ -27,3 +27,7 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+require github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
+
+replace github.com/goceleris/probatorium/validation/refapp/internal/debugvars => ../internal/debugvars

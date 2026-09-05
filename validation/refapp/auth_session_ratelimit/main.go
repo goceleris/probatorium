@@ -37,6 +37,7 @@ import (
 	"github.com/goceleris/celeris/middleware/session"
 	"github.com/goceleris/celeris/middleware/sse"
 	"github.com/goceleris/celeris/middleware/websocket"
+	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
 // User is the in-memory record served at /api/users/{id}. The JSON
@@ -175,7 +176,8 @@ func main() {
 	// linux, std elsewhere, so this same binary runs both places.
 	engineType := resolveEngine(*engineFlag)
 
-	srv := celeris.New(celeris.Config{
+	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          engineType,
 		Workers:         *workersFlag,
@@ -194,7 +196,7 @@ func main() {
 	// cs.detachMu (around ProcessH1), gating the worker thread and
 	// letting concurrent slowloris header-deadlines slip past.
 	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
+	srv.Use(recovery.New(recovery.Config{Logger: dv.RecoveryLogger(discardLog)}))
 	// /ws and /events are transport-level endpoints (WS upgrade + SSE
 	// long-poll). Both are exercised by Tier 1 walkers that don't carry
 	// a session — and they shouldn't have to: WS handshakes are

@@ -9,3 +9,7 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 )
+
+require github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
+
+replace github.com/goceleris/probatorium/validation/refapp/internal/debugvars => ../internal/debugvars

@@ -46,6 +46,7 @@ import (
 	"github.com/goceleris/celeris/middleware/requestid"
 	"github.com/goceleris/celeris/middleware/static"
 	"github.com/goceleris/celeris/middleware/swagger"
+	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
 //go:embed static/*
@@ -76,7 +77,8 @@ func main() {
 	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	flag.Parse()
 
-	srv := celeris.New(celeris.Config{
+	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
 		Workers:         *workersFlag,
@@ -111,7 +113,7 @@ func main() {
 			panicLog = slog.New(slog.NewTextHandler(f, nil))
 		}
 	}
-	srv.Use(recovery.New(recovery.Config{Logger: panicLog}))
+	srv.Use(recovery.New(recovery.Config{Logger: dv.RecoveryLogger(panicLog)}))
 	srv.Use(requestid.New())
 
 	// proxy middleware — trusts loopback only. Walker traffic from

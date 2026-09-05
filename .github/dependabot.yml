@@ -28,6 +28,7 @@ updates:
       - /validation/refapp/driver_memcached
       - /validation/refapp/driver_postgres
       - /validation/refapp/driver_redis
+      - /validation/refapp/internal/debugvars
       - /validation/refapp/kitchen_sink
       - /validation/refapp/observability
       - /validation/refapp/static_swagger_proxy
