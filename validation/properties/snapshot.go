@@ -45,6 +45,11 @@ type Snapshot struct {
 	ClosedConnTotal   int64
 	ActiveConns       int64
 	PanicCount        int64
+	// ExpectedPanics is the number of panics the workload DESIGNED so far
+	// (corpus states marked `expect: panic`, counted by the Tier 1 walker
+	// when their 5xx arrives). Zero when no accounting is wired (e.g. the
+	// standalone checker CLI). I-PANIC judges PanicCount - ExpectedPanics.
+	ExpectedPanics int64
 
 	// Last-byte timestamps the validator-checker maintains per-conn
 	// (only stub-populated until wave 7 adds the validation build tag).

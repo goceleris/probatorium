@@ -787,6 +787,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	loopCtx, cancelLoop := context.WithCancel(ctx)
 	defer cancelLoop()
 	propDone := make(chan checker.Tally, 1)
+	// expectedPanicsFn is published by driveTier1 (OnLiveTally) once its tally
+	// exists; the property loop reads it on every snapshot so I-PANIC nets
+	// designed panics out.
+	var expectedPanicsFn atomic.Pointer[func() int64]
 	go func() {
 		var addr string
 		select {
@@ -815,7 +819,13 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 			url = "http://" + addr + "/debug/vars"
 		}
 		propDone <- runPropertyLoop(loopCtx, propertyLoopConfig{
-			MetricsURL:   url,
+			MetricsURL: url,
+			ExpectedPanics: func() int64 {
+				if f := expectedPanicsFn.Load(); f != nil {
+					return (*f)()
+				}
+				return 0
+			},
 			PID:          p,
 			Specs:        checker.SelectPredicates(o.cfg.PropertyTier),
 			HardFail:     o.cfg.PropertyHardFail,
@@ -893,6 +903,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		PIDChan:               pidCh,
 		AddrChan:              addrCh,
 		TallyCallback:         tallyCB,
+		OnLiveTally:           func(f func() int64) { expectedPanicsFn.Store(&f) },
 		TallyCallbackInterval: 2 * time.Second,
 		// Periodic snapshot to disk so long-running soaks (24h, 72h,
 		// 10d) surface mid-run progress without waiting for the
@@ -1198,6 +1209,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		RequestsError: s.RequestsError,
 
 		Requests5xxExpected:   s.Requests5xxExpected,
+		RequestsPanicExpected: s.RequestsPanicExpected,
 		InvariantHits:         s.InvariantHits,
 		RequestsCutAtDeadline: s.RequestsCutAtDeadline,
 

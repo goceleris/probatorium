@@ -45,3 +45,21 @@ func TestParse_ExpectRejectsBadValueAndSilentState(t *testing.T) {
 		t.Fatalf("expect on a silent state must be rejected, got %v", err)
 	}
 }
+
+// `expect: panic` marks a designed-to-panic state: it implies Expect5xx and
+// additionally sets ExpectPanic so the Tier 1 walker can count designed panics
+// for I-PANIC.
+func TestParse_ExpectPanicImpliesFiveXX(t *testing.T) {
+	src := "start: s\nstates:\n  s:\n    request: GET /api/error\n    expect: panic\n    s: 1.0\n"
+	m, err := LoadMatrix(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := m.Requests["s"]
+	if !req.Expect5xx || !req.ExpectPanic {
+		t.Fatalf("expect: panic must set Expect5xx and ExpectPanic, got %+v", req)
+	}
+	if _, err := LoadMatrix(strings.NewReader(strings.Replace(src, "expect: panic", "expect: boom", 1))); err == nil {
+		t.Fatal("an unknown expect value must be rejected")
+	}
+}

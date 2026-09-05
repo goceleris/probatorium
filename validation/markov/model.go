@@ -78,6 +78,12 @@ type Request struct {
 	// requests_5xx_expected instead of requests_5xx, so the unexpected
 	// 5xx count can be gated to zero without hiding intentional ones.
 	Expect5xx bool
+	// ExpectPanic marks a state whose request is DESIGNED to panic inside
+	// the handler (recovered by middleware/recovery into a 5xx). Parsed
+	// from `expect: panic`, which implies Expect5xx. The Tier 1 walker
+	// tallies such responses as requests_panic_expected so the property
+	// loop's I-PANIC can judge only UNEXPECTED panics (probatorium#289).
+	ExpectPanic bool
 }
 
 // Edge is one weighted outgoing transition.
@@ -225,6 +231,7 @@ func LoadMatrix(r io.Reader) (*Matrix, error) {
 	var (
 		m           = &Matrix{Transitions: map[string][]Edge{}, Requests: map[string]Request{}}
 		expect5xx   = map[string]bool{}
+		expectPanic = map[string]bool{}
 		currentFrom string
 		lineNo      int
 	)
@@ -287,10 +294,16 @@ func LoadMatrix(r io.Reader) (*Matrix, error) {
 			// Recorded aside and merged into Requests after parsing, since
 			// the directive may precede or follow the `request:` line.
 			if name == "expect" {
-				if strings.TrimSpace(val) != "5xx" {
-					return nil, fmt.Errorf("markov: line %d: expect %q must be \"5xx\"", lineNo, val)
+				switch strings.TrimSpace(val) {
+				case "5xx":
+					expect5xx[currentFrom] = true
+				case "panic":
+					// A designed panic is also a designed 5xx.
+					expect5xx[currentFrom] = true
+					expectPanic[currentFrom] = true
+				default:
+					return nil, fmt.Errorf("markov: line %d: expect %q must be \"5xx\" or \"panic\"", lineNo, val)
 				}
-				expect5xx[currentFrom] = true
 				break
 			}
 			if name == "request" {
@@ -343,6 +356,7 @@ func LoadMatrix(r io.Reader) (*Matrix, error) {
 			return nil, fmt.Errorf("markov: state %q has `expect: 5xx` but no `request:` line", st)
 		}
 		req.Expect5xx = true
+		req.ExpectPanic = expectPanic[st]
 		m.Requests[st] = req
 	}
 

@@ -38,7 +38,7 @@ states:
   # scrapes metrics + retries.
   api_error:
     request: GET /api/error
-    expect: 5xx   # induced panic route: a 500 here is the point, not a bug
+    expect: panic # induced panic route: the recovered panic and its 500 are the point, not a bug
     metrics:      4.0  # 40% scrape to confirm error counter
     api_ok:       3.0
     api_error:    1.0  # 10% retry the failing call

@@ -54,6 +54,7 @@ import (
 //     in ServerResult.Resources (now populated, finally) is the
 //     differentiator for those cells. Both additive and omitted when
 //     absent: a Tailscale-overlay run (no known line rate) emits neither.
+//   - 5.7 — requests_panic_expected (designed panics netted out of I-PANIC).
 //   - 5.6 — the in-process property loop (probatorium, after the
 //     2026-09-04 soak reached an 18 GB heap with properties_passed=0).
 //     Adds the loop's counters on Tier1Summary (property_evaluations,
@@ -67,7 +68,7 @@ import (
 //     ignore the fields -- but the version bump is load-bearing for
 //     mage ValidateGate: a 5.5 document has no property loop, so the
 //     "loop never evaluated anything" check defaults off for it.
-const SchemaVersion = "5.6"
+const SchemaVersion = "5.7"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -506,6 +507,11 @@ type Tier1Summary struct {
 	// Requests5xxExpected: 5xx from corpus states marked `expect: 5xx`
 	// (designed-to-fail routes). Requests5xx above is UNEXPECTED only.
 	Requests5xxExpected int64 `json:"requests_5xx_expected"`
+	// RequestsPanicExpected: 5xx from corpus states marked `expect: panic`
+	// (designed-to-panic routes). Informational; the property loop nets it
+	// out of the server's panic_count so I-PANIC judges only unexpected
+	// panics (schema 5.7).
+	RequestsPanicExpected int64 `json:"requests_panic_expected"`
 	// InvariantHits: unexpected 5xx whose body carried a refapp
 	// invariant marker (x-invariant) -- a self-reported invariant
 	// violation surfaced as a first-class signal.

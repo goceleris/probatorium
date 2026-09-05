@@ -78,6 +78,7 @@ func TestGate_EachSignalIsAViolation(t *testing.T) {
 func TestGate_InformationalCountersAreNotGated(t *testing.T) {
 	c := cleanCell("obs", "std", "arm64")
 	c.Tier1.Requests5xxExpected = 1_000_000
+	c.Tier1.RequestsPanicExpected = 1_000_000
 	c.Tier1.RequestsCutAtDeadline = 500
 	c.Tier1.Requests4xx = 3_000_000
 	c.Tier1.H2CChurn["h2c_declined"] = 1_000_000

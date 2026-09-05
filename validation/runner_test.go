@@ -66,7 +66,7 @@ func TestWriteValidateResults_Tier1OnlyEmitsDocument(t *testing.T) {
 		t.Fatalf("read result: %v", err)
 	}
 	for _, want := range []string{
-		`"schema_version": "5.6"`,
+		`"schema_version": "5.7"`,
 		`"host_arch_pair": "msa2-server-amd64"`,
 		`"adv_sent": 100`,
 		`"adv_wrong_accepted": 5`,
