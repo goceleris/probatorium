@@ -492,6 +492,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 	if res.Tier3Ran {
 		cell.Tier3 = res.Tier3.Tier3Summary()
 	}
+	cell.Soak = res.Soak
 	if runErr != nil && !errors.Is(runErr, context.DeadlineExceeded) {
 		return cell, fmt.Errorf("cell run: %w", runErr)
 	}

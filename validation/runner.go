@@ -207,8 +207,11 @@ type Orchestrator struct {
 	// Accessed only after wg.Wait() returns, so no mutex needed.
 	tier1Snapshot tier1TallySnapshot
 	tier3Snapshot tier3TallySnapshot
-	tier1Ran      bool
-	tier3Ran      bool
+	// soakSummary is the soak block written into the document (soak mode
+	// or ≥6h), exposed to the matrix runner through Result().
+	soakSummary *report.SoakSummary
+	tier1Ran    bool
+	tier3Ran    bool
 
 	// resolvedAddr is the refapp's REAL bound address (host:port),
 	// learned from the "ready addr=" banner once Tier 1 brings the
@@ -325,6 +328,9 @@ type CellResult struct {
 	Tier3Ran bool
 	Tier1    tier1TallySnapshot
 	Tier3    tier3TallySnapshot
+	// Soak is the soak block written into the cell's document, nil when
+	// the run was not a soak (probatorium#281).
+	Soak *report.SoakSummary
 }
 
 // Result returns a value-typed snapshot of the per-tier tallies
@@ -341,6 +347,7 @@ func (o *Orchestrator) Result() CellResult {
 		Tier3Ran: o.tier3Ran,
 		Tier1:    o.tier1Snapshot,
 		Tier3:    o.tier3Snapshot,
+		Soak:     o.soakSummary,
 	}
 }
 
@@ -1220,13 +1227,14 @@ func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
 			errRate = float64(o.tier1Snapshot.RequestsError) /
 				float64(o.tier1Snapshot.RequestsSent) * 100.0
 		}
-		doc.Soak = &report.SoakSummary{
+		o.soakSummary = &report.SoakSummary{
 			Duration:         elapsed,
 			PerHourErrorRate: errRate,
 			// RestartedProcesses, GoroutineLeakDetected, HeapGrowthMB:
 			// zero until per-tier driver-restart counter + per-snapshot
 			// heap/goroutine-history tracking are wired in.
 		}
+		doc.Soak = o.soakSummary
 	}
 	return writeJSON(filepath.Join(o.cfg.OutDir, "validate-results.json"), doc)
 }

@@ -27,6 +27,10 @@ type GateOptions struct {
 	ExpectedCells int
 	// RequireTier3 fails a cell whose tier 3 (seed replay) never ran.
 	RequireTier3 bool
+	// RequireSoak fails any cell that carries no soak summary: the soak
+	// workflow sets it so a dropped block fails the run instead of
+	// silently passing the soak rules (probatorium#281).
+	RequireSoak bool
 }
 
 // gatedTier1Keys are the sub-tally counters that are defects by definition.
@@ -114,6 +118,20 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			if t3.SeedsErrored > 0 {
 				add(c, "tier_3.seeds_errored", t3.SeedsErrored, "replayed seed(s) errored")
 			}
+		}
+	}
+	for _, c := range cells {
+		if c.Soak == nil {
+			if opts.RequireSoak {
+				add(c, "soak_summary.missing", 0, "soak mode, but the cell carries no soak summary")
+			}
+			continue
+		}
+		if c.Soak.GoroutineLeakDetected {
+			add(c, "soak_summary.goroutine_leak_detected", 1, "a goroutine leak was detected over the soak")
+		}
+		if c.Soak.RestartedProcesses > 0 {
+			add(c, "soak_summary.restarted_processes", int64(c.Soak.RestartedProcesses), "a server process died and was restarted during the soak")
 		}
 	}
 	hosts := make([]string, 0, len(soaks))
