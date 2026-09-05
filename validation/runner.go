@@ -16,9 +16,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	"github.com/goceleris/probatorium/report"
+	"github.com/goceleris/probatorium/validation/checker"
 	"github.com/goceleris/probatorium/validation/corpus"
 	"github.com/goceleris/probatorium/validation/fault"
 	"github.com/goceleris/probatorium/validation/markov"
@@ -127,9 +130,11 @@ type Config struct {
 	// CelerisListenAddr is the addr to bind celeris to inside the
 	// orchestrator's lifecycle. Default "127.0.0.1:8080".
 	CelerisListenAddr string
-	// MetricsURL is the celeris /debug/vars (wave 6) or
-	// /metrics (wave 7) endpoint validator-checker polls. Falls back
-	// to "http://" + CelerisListenAddr + "/debug/vars".
+	// MetricsURL, when non-empty, overrides the /debug/vars URL the
+	// in-process property loop polls (validation/propertyloop.go).
+	// Empty -- the matrix default -- derives it from the refapp's REAL
+	// bound address announced on its "ready addr=" banner, which is the
+	// only correct choice for a "-bind :0" launch.
 	MetricsURL string
 	// PropertyTier filters which property predicates fire. Empty =
 	// every registered predicate. Wave 6 default = "core" + "middleware"
@@ -331,6 +336,11 @@ type CellResult struct {
 	// Soak is the soak block written into the cell's document, nil when
 	// the run was not a soak (probatorium#281).
 	Soak *report.SoakSummary
+	// Properties is the Tier 1 property loop's tally (also carried on
+	// Tier1.Properties); exposed so the matrix runner can fill the
+	// per-cell properties_passed / properties_failed without reaching
+	// into the tally.
+	Properties checker.Tally
 }
 
 // Result returns a value-typed snapshot of the per-tier tallies
@@ -343,11 +353,12 @@ type CellResult struct {
 // reaching into orchestrator internals.
 func (o *Orchestrator) Result() CellResult {
 	return CellResult{
-		Tier1Ran: o.tier1Ran,
-		Tier3Ran: o.tier3Ran,
-		Tier1:    o.tier1Snapshot,
-		Tier3:    o.tier3Snapshot,
-		Soak:     o.soakSummary,
+		Tier1Ran:   o.tier1Ran,
+		Tier3Ran:   o.tier3Ran,
+		Tier1:      o.tier1Snapshot,
+		Tier3:      o.tier3Snapshot,
+		Soak:       o.soakSummary,
+		Properties: o.tier1Snapshot.Properties,
 	}
 }
 
@@ -484,10 +495,11 @@ func PrintPlan(w io.Writer, p *Plan) {
 // Run executes every tier in parallel for cfg.Duration. Returns the
 // first invariant violation (or context cancellation) to surface.
 //
-// Run is intentionally short: the heavy lifting lives in the
-// validator-checker (per-second predicate evaluation) and in the
-// per-tier goroutines. The orchestrator's job is to wire them
-// together and to drive the auto-bisect on HARD fail.
+// Run is intentionally short: the heavy lifting lives in the per-tier
+// goroutines -- Tier 1 drives the walkers AND the per-second property
+// loop that evaluates the I-* snapshot predicates against the refapp's
+// /debug/vars (validation/propertyloop.go). The orchestrator's job is
+// to wire them together and to drive the auto-bisect on HARD fail.
 func (o *Orchestrator) Run(ctx context.Context) error {
 	if err := os.MkdirAll(o.cfg.OutDir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", o.cfg.OutDir, err)
@@ -640,10 +652,12 @@ func (o *Orchestrator) buildDriver() (remote.Driver, error) {
 	}
 }
 
-// runTierProperty is the always-on Tier 1 driver. Stub for wave 6 —
-// the production driver lives in a separate subprocess (the loadgen +
-// the validator-checker), here we only set up the rendezvous so the
-// dry-run plan reflects reality.
+// runTierProperty is the always-on Tier 1 driver: it launches the
+// refapp and the Markov / adversarial / h2c / WS / SSE walkers
+// (driveTier1) and, once the refapp announces its real address, the
+// per-second property loop (runPropertyLoop) that evaluates the
+// selected I-* snapshot predicates against the refapp's /debug/vars.
+// Both kinds of violation reach the orchestrator on the same channel.
 func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- Incident) {
 	// CelerisBin empty = unit-test / dry-run-style mode: no refapp
 	// fork, no real traffic. Tier 1 still has to keep the goroutine
@@ -702,17 +716,51 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	}
 
 	pidCh := make(chan int, 1)
-	var pid int
-	go func() { pid = <-pidCh }() // best-effort: stays 0 until startup
+	var refappPID atomic.Int64 // 0 until the refapp is up; read by the incident emitters
+	pid := func() int { return int(refappPID.Load()) }
 
 	// addrCh receives the refapp's real bound addr once it's up (the
 	// "-bind :0" port the OS chose). Published to the orchestrator so
-	// handleIncident can point live pprof forensics at the right port.
+	// handleIncident can point live pprof forensics at the right port,
+	// and used to start the per-second property loop against the
+	// refapp's /debug/vars (validation/propertyloop.go). The loop lives
+	// exactly as long as the tier: loopCtx is cancelled once driveTier1
+	// returns and its tally is joined below so the cell document
+	// carries it.
 	addrCh := make(chan string, 1)
+	loopCtx, cancelLoop := context.WithCancel(ctx)
+	defer cancelLoop()
+	propDone := make(chan checker.Tally, 1)
 	go func() {
-		if a := <-addrCh; a != "" {
-			o.resolvedAddr.Store(&a)
+		var addr string
+		select {
+		case addr = <-addrCh:
+		case <-loopCtx.Done():
+			propDone <- checker.Tally{}
+			return
 		}
+		if addr != "" {
+			o.resolvedAddr.Store(&addr)
+		}
+		// The PID follows the addr on driveTier1's ready path; a cancel
+		// before it lands leaves 0 (RSS unsampled, I-MEM-4 skips).
+		var p int
+		select {
+		case p = <-pidCh:
+		case <-loopCtx.Done():
+		}
+		refappPID.Store(int64(p))
+		url := o.cfg.MetricsURL
+		if url == "" {
+			url = "http://" + addr + "/debug/vars"
+		}
+		propDone <- runPropertyLoop(loopCtx, propertyLoopConfig{
+			MetricsURL:   url,
+			PID:          p,
+			Specs:        checker.SelectPredicates(o.cfg.PropertyTier),
+			Violations:   violations,
+			SnapshotPath: filepath.Join(o.cfg.OutDir, "properties_tally.json"),
+		})
 	}()
 
 	// alertedCounters tracks which sub-tally counters we've already
@@ -737,7 +785,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 				PredicateID: counter,
 				Message:     msg,
 				ObservedAt:  time.Now().UTC(),
-				RefappPID:   pid,
+				RefappPID:   pid(),
 			}:
 			default:
 				// Channel full or closed — orchestrator already
@@ -793,6 +841,11 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		SnapshotPath: filepath.Join(o.cfg.OutDir, "tier1_tally.json"),
 	}
 	tally, err := driveTier1(ctx, cfg)
+	// The refapp is down (or going down) once driveTier1 returns: stop
+	// the property loop and collect its tally. Joined on every path so
+	// the goroutine never outlives the tier.
+	cancelLoop()
+	tally.Properties = <-propDone
 	if err != nil && ctx.Err() == nil {
 		// driveTier1 failure that isn't the parent-cancel — surface
 		// as a synthetic incident so the orchestrator captures
@@ -803,7 +856,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 			PredicateID: "T1-DRIVE",
 			Message:     err.Error(),
 			ObservedAt:  time.Now().UTC(),
-			RefappPID:   pid,
+			RefappPID:   pid(),
 		}
 		return
 	}
@@ -1062,6 +1115,11 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		Requests5xxExpected:   s.Requests5xxExpected,
 		InvariantHits:         s.InvariantHits,
 		RequestsCutAtDeadline: s.RequestsCutAtDeadline,
+
+		PropertyEvaluations:  s.Properties.Evaluations,
+		PropertyViolations:   s.Properties.Violations,
+		PropertyViolationIDs: append([]string(nil), s.Properties.ViolationIDs...),
+		PropertyPollErrors:   s.Properties.PollErrors,
 		Adversarial: map[string]int64{
 			"adv_sent":               s.Adversarial.Sent,
 			"adv_well_rejected":      s.Adversarial.WellRejected,
@@ -1140,46 +1198,16 @@ func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
 		},
 	}
 	if o.tier1Ran {
+		// Single projection for both the single-cell and the matrix
+		// document (the former inline copy had drifted: it lacked
+		// requests_5xx_expected, invariant_hits, the deadline cut and
+		// the h2c_hang cause split).
 		s := o.tier1Snapshot
-		doc.Validation.Tier1 = &report.Tier1Summary{
-			RequestsSent:  s.RequestsSent,
-			Requests2xx:   s.Requests2xx,
-			Requests4xx:   s.Requests4xx,
-			Requests5xx:   s.Requests5xx,
-			RequestsError: s.RequestsError,
-			Adversarial: map[string]int64{
-				"adv_sent":               s.Adversarial.Sent,
-				"adv_well_rejected":      s.Adversarial.WellRejected,
-				"adv_wrong_accepted":     s.Adversarial.WrongAccepted,
-				"adv_hang_until_timeout": s.Adversarial.HangUntilTimeout,
-			},
-			H2CChurn: map[string]int64{
-				"h2c_sent":            s.H2CChurn.Sent,
-				"h2c_upgraded":        s.H2CChurn.Upgraded,
-				"h2c_declined":        s.H2CChurn.Declined,
-				"h2c_crashed":         s.H2CChurn.Crashed,
-				"h2c_hang":            s.H2CChurn.Hang,
-				"h2c_intentional_rst": s.H2CChurn.IntentionalRST,
-			},
-			WSTorture: map[string]int64{
-				"ws_sent":               s.WSTorture.Sent,
-				"ws_upgraded":           s.WSTorture.Upgraded,
-				"ws_handshake_fail":     s.WSTorture.HandshakeFail,
-				"ws_closed_correctly":   s.WSTorture.ClosedCorrectly,
-				"ws_accepted_bad_frame": s.WSTorture.AcceptedBadFrame,
-				"ws_hang_no_close":      s.WSTorture.HangNoClose,
-				"ws_endpoint_absent":    s.WSTorture.EndpointAbsent,
-			},
-			SSEKill: map[string]int64{
-				"sse_sent":                s.SSEKill.Sent,
-				"sse_established":         s.SSEKill.Established,
-				"sse_events_read":         s.SSEKill.EventsRead,
-				"sse_killed_mid_stream":   s.SSEKill.KilledMidStream,
-				"sse_server_closed_early": s.SSEKill.ServerClosedEarly,
-				"sse_cut_at_deadline":     s.SSEKill.CutAtDeadline,
-				"sse_handshake_fail":      s.SSEKill.HandshakeFail,
-				"sse_endpoint_absent":     s.SSEKill.EndpointAbsent,
-			},
+		doc.Validation.Tier1 = s.Tier1Summary()
+		doc.Validation.PropertiesPassed = s.Properties.Passed()
+		doc.Validation.PropertiesFailed = s.Properties.Failed()
+		if len(s.Properties.FailureSummaries) > 0 {
+			doc.Validation.FailureSummaries = maps.Clone(s.Properties.FailureSummaries)
 		}
 	}
 	if o.tier3Ran {
@@ -1204,21 +1232,16 @@ func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
 	//     enough to "per-hour" for the docs intent
 	//     (long soaks dampen short-term spikes).
 	//
-	// Fields left zero pending follow-up infrastructure:
+	//   - GoroutineLeakDetected: the property loop's I-MEM-3 (goroutine
+	//     slope) or I-MEM-2 (idle baseline) violated during the run.
+	//   - HeapGrowthMB:          last minus first heap_inuse sample of
+	//     the property loop, in MB.
+	//
+	// Left zero:
 	//   - RestartedProcesses:    needs an orchestrator-level counter
 	//     incremented by the per-tier driver
 	//     restart path (none currently restarts
 	//     a refapp inside a single run).
-	//   - GoroutineLeakDetected: needs heap-slope-vs-baseline
-	//     comparison from the validator-checker
-	//     /debug/vars stream (Snapshot history
-	//     in properties.Context).
-	//   - HeapGrowthMB:          same Snapshot-history dependency.
-	//
-	// Per probatorium#103-followup: keeping the Soak block written
-	// (with the easy fields) lets downstream report-diff tooling
-	// distinguish soak from non-soak runs; the missing fields are
-	// flagged as known-pending in the schema-test fixture.
 	elapsed := time.Since(startedAt)
 	const soakThreshold = 6 * time.Hour
 	if o.cfg.SoakMode || elapsed >= soakThreshold {
@@ -1230,9 +1253,11 @@ func (o *Orchestrator) writeValidateResults(startedAt time.Time) error {
 		o.soakSummary = &report.SoakSummary{
 			Duration:         elapsed,
 			PerHourErrorRate: errRate,
-			// RestartedProcesses, GoroutineLeakDetected, HeapGrowthMB:
-			// zero until per-tier driver-restart counter + per-snapshot
-			// heap/goroutine-history tracking are wired in.
+		}
+		if p := o.tier1Snapshot.Properties; o.tier1Ran && p.Samples > 0 {
+			o.soakSummary.HeapGrowthMB = float64(p.LastHeapInuse-p.FirstHeapInuse) / 1e6
+			o.soakSummary.GoroutineLeakDetected = slices.Contains(p.ViolationIDs, properties.IMEM3.ID) ||
+				slices.Contains(p.ViolationIDs, properties.IMEM2.ID)
 		}
 		doc.Soak = o.soakSummary
 	}

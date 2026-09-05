@@ -147,7 +147,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.OpenAPIPath, "openapi", c.OpenAPIPath, "OpenAPI 3.1 spec path")
 	fs.StringVar(&c.CelerisBin, "celeris-bin", c.CelerisBin, "celeris executable; empty disables auto-launch")
 	fs.StringVar(&c.CelerisListenAddr, "celeris-addr", c.CelerisListenAddr, "celeris bind addr")
-	fs.StringVar(&c.MetricsURL, "metrics-url", c.MetricsURL, "celeris metrics endpoint; default http://<celeris-addr>/debug/vars")
+	fs.StringVar(&c.MetricsURL, "metrics-url", c.MetricsURL, "override the refapp /debug/vars URL the property loop polls; default derives it from the refapp's ready banner")
 	fs.StringVar(&c.PropertyTier, "property-tier", c.PropertyTier, "comma-separated tier filter (core,middleware,engine,driver); empty = all")
 	fs.StringVar(&c.CelerisCommit, "celeris-commit", c.CelerisCommit, "celeris commit SHA; recorded in incidents")
 	fs.StringVar(&c.ReplayBin, "replay-bin", c.ReplayBin, "cmd/validator-replay binary; empty disables Tier 3")
@@ -212,9 +212,10 @@ func run(cfg Config) error {
 		ts := time.Now().UTC().Format("20060102-150405")
 		cfg.OutDir = filepath.Join("results", ts+"-validate-"+cfg.Arch)
 	}
-	if cfg.MetricsURL == "" {
-		cfg.MetricsURL = "http://" + cfg.CelerisListenAddr + "/debug/vars"
-	}
+	// MetricsURL stays empty unless -metrics-url was given: the
+	// orchestrator derives the /debug/vars URL from the refapp's ready
+	// banner, which is also correct for a "-celeris-addr 127.0.0.1:0"
+	// launch.
 
 	o, err := validation.New(validation.Config{
 		Target:              cfg.Target,

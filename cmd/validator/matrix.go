@@ -370,13 +370,32 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 		}
 	}
 
+	// Run-wide property totals: the per-cell verdicts summed, with the
+	// first violation message of every failed predicate keyed
+	// "<refapp>/<engine>/<ID>" so the top-level document is readable
+	// without descending into cells.
+	var propsPassed, propsFailed int
+	var summaries map[string]string
+	for _, c := range cells {
+		propsPassed += c.PropertiesPassed
+		propsFailed += c.PropertiesFailed
+		for id, msg := range c.FailureSummaries {
+			if summaries == nil {
+				summaries = map[string]string{}
+			}
+			summaries[c.Refapp+"/"+c.Engine+"/"+id] = msg
+		}
+	}
 	doc := report.Document{
 		SchemaVersion: report.SchemaVersion,
 		HostArchPair:  cfg.Target + "-" + cfg.Arch,
 		Validation: &report.ValidationResults{
-			StartedAt:  startedAt,
-			FinishedAt: time.Now().UTC(),
-			Cells:      cells,
+			StartedAt:        startedAt,
+			FinishedAt:       time.Now().UTC(),
+			PropertiesPassed: propsPassed,
+			PropertiesFailed: propsFailed,
+			FailureSummaries: summaries,
+			Cells:            cells,
 		},
 	}
 	if err := writeJSON(filepath.Join(cfg.OutDir, "validate-results.json"), doc); err != nil {
@@ -467,14 +486,16 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		OpenAPIPath:        cfg.OpenAPIPath,
 		CelerisBin:         binPath,
 		CelerisListenAddr:  addr,
-		MetricsURL:         "http://" + addr + "/debug/vars",
-		PropertyTier:       cfg.PropertyTier,
-		ReplayBin:          cfg.ReplayBin,
-		RefappEngine:       mc.Engine,
-		RefappWorkers:      cfg.RefappWorkers,
-		DriverMode:         cfg.DriverMode,
-		DriverSSHUser:      cfg.DriverSSHUser,
-		DriverSSHHost:      cfg.DriverSSHHost,
+		// MetricsURL deliberately empty: addr is ":0" here, so the only
+		// usable /debug/vars URL is the one the orchestrator derives
+		// from the refapp's ready banner.
+		PropertyTier:  cfg.PropertyTier,
+		ReplayBin:     cfg.ReplayBin,
+		RefappEngine:  mc.Engine,
+		RefappWorkers: cfg.RefappWorkers,
+		DriverMode:    cfg.DriverMode,
+		DriverSSHUser: cfg.DriverSSHUser,
+		DriverSSHHost: cfg.DriverSSHHost,
 	}
 	o, err := validation.New(cellCfg)
 	if err != nil {
@@ -488,6 +509,10 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 	res := o.Result()
 	if res.Tier1Ran {
 		cell.Tier1 = res.Tier1.Tier1Summary()
+		cell.PropertiesPassed = res.Properties.Passed()
+		cell.PropertiesFailed = res.Properties.Failed()
+		cell.PropertiesNotInstrumented = res.Properties.NotInstrumented
+		cell.FailureSummaries = res.Properties.FailureSummaries
 	}
 	if res.Tier3Ran {
 		cell.Tier3 = res.Tier3.Tier3Summary()

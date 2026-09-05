@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goceleris/probatorium/validation/checker"
 	"github.com/goceleris/probatorium/validation/markov"
 	"github.com/goceleris/probatorium/validation/remote"
 )
@@ -866,6 +867,11 @@ type tier1TallySnapshot struct {
 	WSTorture             wsSnapshot          `json:"ws_torture,omitempty"`
 	SSEKill               sseSnapshot         `json:"sse_kill,omitempty"`
 	Liveness              livenessSnapshot    `json:"liveness,omitempty"`
+	// Properties is the in-process property loop's tally
+	// (validation/propertyloop.go), attached by the orchestrator once
+	// driveTier1 returns -- the loop runs beside the walkers, not inside
+	// them, so driveTier1's own snapshot() never carries it.
+	Properties checker.Tally `json:"properties"`
 }
 
 // String formats a tally for the run summary log line.

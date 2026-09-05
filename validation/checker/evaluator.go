@@ -19,7 +19,9 @@ const HistoryCap = 3600
 // zero has not verified anything.
 //
 // Instrumented today (refapp /debug/vars + orchestrator /proc):
-// I-CONN-2, I-MEM-1, I-MEM-3, I-MEM-4, I-PANIC, I-ENG-ADAPTIVE.
+// I-CONN-2, I-MEM-1, I-MEM-3, I-MEM-4 (linux local driver only -- the
+// Tally also lists it as not instrumented when RSS was never sampled),
+// I-PANIC, I-ENG-ADAPTIVE.
 var Uninstrumented = map[string]string{
 	"I-CONN-1":       "needs a per-connection last-byte table (OldestOpenConnLastByteAgeMs is never populated)",
 	"I-RFC-1":        "needs the response-scraping MITM (Responses* counters are never populated)",
@@ -192,6 +194,10 @@ func (e *Evaluator) Tally() Tally {
 		t.Predicates = append(t.Predicates, s.ID)
 		t.PerPredicate[s.ID] = e.per[s.ID]
 		if _, ok := Uninstrumented[s.ID]; ok {
+			t.NotInstrumented = append(t.NotInstrumented, s.ID)
+		} else if s.ID == properties.IMEM4.ID && e.tally.LastRSS == 0 {
+			// RSS was never sampled (no pid, non-linux, remote refapp):
+			// I-MEM-4 skipped on every tick and verified nothing.
 			t.NotInstrumented = append(t.NotInstrumented, s.ID)
 		}
 		if n := e.per[s.ID]; n > 0 {

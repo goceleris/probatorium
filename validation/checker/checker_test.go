@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -151,9 +152,16 @@ func TestEvaluator_BaselineViolationsAndTally(t *testing.T) {
 	if tl.PerPredicate["I-PANIC"] != 3 || tl.PerPredicate["I-MEM-3"] != 0 {
 		t.Fatalf("per-predicate counts: %+v", tl.PerPredicate)
 	}
-	// Uninstrumented core predicates are listed and not counted as passed.
+	// Uninstrumented core predicates are listed and not counted as passed;
+	// I-MEM-4 joins them because no sample carried an RSS reading.
 	if len(tl.NotInstrumented) == 0 {
 		t.Fatal("core tier has uninstrumented predicates; none listed")
+	}
+	if !slices.Contains(tl.NotInstrumented, "I-MEM-4") {
+		t.Fatalf("I-MEM-4 without RSS samples must be listed as not instrumented: %v", tl.NotInstrumented)
+	}
+	if slices.Contains(tl.NotInstrumented, "I-MEM-3") || slices.Contains(tl.NotInstrumented, "I-PANIC") {
+		t.Fatalf("instrumented predicates listed as not instrumented: %v", tl.NotInstrumented)
 	}
 	instrumented := len(tl.Predicates) - len(tl.NotInstrumented)
 	if tl.Passed() != instrumented-1 {
