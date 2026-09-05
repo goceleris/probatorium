@@ -26,7 +26,7 @@ func fakeDebugVars(t *testing.T, panics *atomic.Int64) *httptest.Server {
 			w.WriteHeader(404)
 			return
 		}
-		fmt.Fprintf(w, `{"goroutines": 40, "celeris.accepted_conn_total": 10, "celeris.closed_conn_total": 9,
+		_, _ = fmt.Fprintf(w, `{"goroutines": 40, "celeris.accepted_conn_total": 10, "celeris.closed_conn_total": 9,
 			"celeris.active_conns": 1, "celeris.panic_count": %d, "memstats": {"HeapInuse": 4194304, "HeapAlloc": 3000000}}`,
 			panics.Load())
 	}))
