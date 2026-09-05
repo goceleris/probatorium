@@ -47,7 +47,7 @@ runs:
   using: composite
   steps:
     - name: Join tailnet (ephemeral)
-      uses: tailscale/github-action@v3
+      uses: tailscale/github-action@6cae46e2d796f265265cfcf628b72a32b4d7cade # v3.3.0
       with:
         oauth-client-id: ${{ inputs.tailscale-oauth-client-id }}
         oauth-secret:    ${{ inputs.tailscale-oauth-secret }}
