@@ -1,6 +1,9 @@
 package properties
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // adaptiveSwitchBudgetPerHour caps adaptive engine switches per rolling
 // hour. The adaptive controller hysteresis is designed for ~minutes
@@ -26,11 +29,10 @@ var IENGAdaptive = Spec{
 			return false, fmt.Sprintf("I-ENG-ADAPTIVE violated: switches counter negative (%d)", snap.AdaptiveSwitches)
 		}
 		// Flap detection: compare snap.AdaptiveSwitches against the
-		// oldest in-history sample within the last hour.
-		if Forever(ctx) < 0 {
-			return true, ""
-		}
-		cutoff := ctx.Now.Add(-3600).Unix()
+		// oldest in-history sample within the last hour. (This used to
+		// subtract 3600 NANOSECONDS, so the "hour" was the current
+		// second and the delta was always 0.)
+		cutoff := ctx.Now.Add(-time.Hour).Unix()
 		var base int64 = -1
 		for _, h := range ctx.History {
 			if h.TS >= cutoff {
