@@ -84,3 +84,19 @@ jobs:
             echo "== $d"
             (cd "$d" && go build ./... && go vet ./...)
           done
+
+  # Fan-in over every job above so branch protection can require ONE
+  # stable check name ("ci-ok") instead of enumerating the adapter
+  # matrix — adding or removing an adapter then never silently drops a
+  # required check. `if: always()` makes this job run (and fail) when an
+  # upstream job failed or was cancelled instead of being skipped along
+  # with it. A skipped upstream job would pass this check, so every job
+  # listed in needs must stay unconditional on push + pull_request.
+  ci-ok:
+    name: ci-ok
+    needs: [root, adapters, refapps]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All Test jobs succeeded
+        run: test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = false
