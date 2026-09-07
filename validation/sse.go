@@ -41,7 +41,18 @@ import (
 //     separately so the matrix can run SSE walkers
 //     against every refapp without flagging refapps
 //     that simply don't expose /events as "broken."
+//     Since probatorium#300 the slice is skipped on a
+//     refapp whose route the pre-flight probe found
+//     absent, so a nonzero value now means the route
+//     vanished mid-run.
+//
+// routeProbed / routePresent carry the pre-flight verdict
+// (route_probe.go), so a cell of sse_* zeros says which of the three
+// states it is in: no /events on this refapp, slice dormant, or walked
+// clean.
 type sseTally struct {
+	routeProbed       atomic.Bool
+	routePresent      atomic.Bool
 	sent              atomic.Int64
 	established       atomic.Int64
 	eventsRead        atomic.Int64
@@ -53,6 +64,8 @@ type sseTally struct {
 }
 
 type sseSnapshot struct {
+	RouteProbed       bool  `json:"sse_route_probed"`
+	RoutePresent      bool  `json:"sse_route_present"`
 	Sent              int64 `json:"sse_sent"`
 	Established       int64 `json:"sse_established"`
 	EventsRead        int64 `json:"sse_events_read"`
@@ -63,8 +76,16 @@ type sseSnapshot struct {
 	EndpointAbsent    int64 `json:"sse_endpoint_absent"`
 }
 
+// recordRoute stores the pre-flight verdict for this cell.
+func (t *sseTally) recordRoute(p routeProbe) {
+	t.routeProbed.Store(p.Probed)
+	t.routePresent.Store(p.Present)
+}
+
 func (t *sseTally) snapshot() sseSnapshot {
 	return sseSnapshot{
+		RouteProbed:       t.routeProbed.Load(),
+		RoutePresent:      t.routePresent.Load(),
 		Sent:              t.sent.Load(),
 		Established:       t.established.Load(),
 		EventsRead:        t.eventsRead.Load(),

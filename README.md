@@ -128,6 +128,8 @@ Five slices fan out over `Concurrency` walker goroutines. The walker budget acti
 | WS frame torture | ~5% | 4 | Real RFC 6455 handshake then one of: fragmented-reserved opcode, oversize payload, unmasked client, ping flood, continuation-no-start, invalid UTF-8 |
 | SSE kill-mid-stream | ~5% | 4 | Establish an SSE long-poll, hold 50–1500ms, RST — the broker must clean up the client slot (I-CONN-2 catches a stuck broker) |
 
+The two streaming slices are **routed**: once per cell, above the activation threshold, the tier probes `/ws` and `/events` with the exact request its walker sends and skips the slice when the refapp answers 404 (only `auth_session_ratelimit` routes them today — the v1.5.11 soak spent 87.5% of its WS budget and 96.5% of its SSE budget collecting 404s, which made every `ws_*` / `sse_*` zero on the other seven refapps a statement about routing rather than robustness). The verdict is recorded per cell as `ws_route_probed` / `ws_route_present` (and the `sse_` pair), so a zero is attributable, and the matrix prints a per-refapp coverage table at the end of the run and leaves it in `streaming-coverage.txt` beside `validate-results.json`.
+
 Each slice keeps its own `tally`. **HIGH-severity counters** are must-be-zero invariants: the orchestrator trips the reactive incident path the FIRST time one goes non-zero, firing forensics and auto-bisect mid-run rather than at end-of-run.
 
 | Counter | Predicate ID | Interpretation |
@@ -140,7 +142,9 @@ Each slice keeps its own `tally`. **HIGH-severity counters** are must-be-zero in
 
 ### Tier 2 — RESTler-style stateful fuzzing
 
-Producer/consumer dependency inference from `validation/spec/<refapp>.openapi.yaml`. Catches API-level bugs Tier 1 misses — e.g. "DELETE twice → does the second 404 corrupt the session?".
+Producer/consumer dependency inference from `validation/spec/<refapp>.openapi.yaml`. Aimed at API-level bugs Tier 1 misses — e.g. "DELETE twice → does the second 404 corrupt the session?".
+
+**Not implemented — the tier is scaffolding.** `runTierRESTler` parks on the run context and sends nothing, so no matrix run has ever fuzzed a spec; every `plan.json` marks the tier `DISABLED` with that reason. Only `auth_session_ratelimit` currently ships a spec, and the validator resolves each cell's spec by refapp slug (`-spec-dir`, default `validation/spec/`) — a refapp with no spec of its own gets none rather than another refapp's, which is what must be a hard error before the tier is ever budgeted.
 
 ### Tier 3 — deterministic seed replay
 
@@ -275,10 +279,12 @@ The matrix-mode document carries a per-cell breakdown; single-cell runs leave `C
                            "adv_wrong_accepted": 0, "adv_hang_until_timeout": 2 },
           "h2c_churn":   { "h2c_sent": 25000, "h2c_upgraded": 0,
                            "h2c_declined": 25000, "h2c_crashed": 0, "h2c_hang": 0 },
-          "ws_torture":  { "ws_sent": 12000, "ws_upgraded": 12000,
+          "ws_torture":  { "ws_route_probed": 1, "ws_route_present": 1,
+                           "ws_sent": 12000, "ws_upgraded": 12000,
                            "ws_closed_correctly": 12000, "ws_accepted_bad_frame": 0,
                            "ws_hang_no_close": 0 },
-          "sse_kill":    { "sse_sent": 8000, "sse_established": 8000,
+          "sse_kill":    { "sse_route_probed": 1, "sse_route_present": 1,
+                           "sse_sent": 8000, "sse_established": 8000,
                            "sse_events_read": 240000, "sse_killed_mid_stream": 7950,
                            "sse_server_closed_early": 50, "sse_handshake_fail": 0 }
         },

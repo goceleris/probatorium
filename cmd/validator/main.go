@@ -39,17 +39,26 @@ type Config struct {
 	OutDir             string
 	CorpusPath         string
 	MarkovPath         string
-	OpenAPIPath        string
-	CelerisBin         string
-	CelerisListenAddr  string
-	MetricsURL         string
-	PropertyHardFail   bool
-	PropertyTier       string
-	CelerisCommit      string
-	ReplayBin          string
-	DriverMode         string
-	DriverSSHUser      string
-	DriverSSHHost      string
+	// OpenAPIPath names ONE refapp's spec explicitly. Empty is the
+	// normal case: matrix mode resolves each cell's spec from SpecDir by
+	// refapp slug. There is deliberately no global default — the old one
+	// pinned auth_session_ratelimit's spec onto all 48 cells
+	// (probatorium#300).
+	OpenAPIPath string
+	// SpecDir is where per-refapp OpenAPI documents live, one per slug:
+	// <SpecDir>/<refapp>.openapi.yaml. Mirrors how MarkovPath's
+	// directory is scanned for <refapp>.yaml.
+	SpecDir           string
+	CelerisBin        string
+	CelerisListenAddr string
+	MetricsURL        string
+	PropertyHardFail  bool
+	PropertyTier      string
+	CelerisCommit     string
+	ReplayBin         string
+	DriverMode        string
+	DriverSSHUser     string
+	DriverSSHHost     string
 
 	// PprofAddr, when non-empty, binds the standard /debug/pprof/*
 	// handlers on this address. Used for live leak / CPU diagnosis
@@ -131,7 +140,12 @@ func DefaultConfig() Config {
 		PropertyHardFail:   os.Getenv("VALIDATE_PROPERTY_HARD_FAIL") == "1",
 		CelerisListenAddr:  "127.0.0.1:8080",
 		MarkovPath:         "validation/markov/auth_session_ratelimit.yaml",
-		OpenAPIPath:        "validation/spec/auth_session_ratelimit.openapi.yaml",
+		// No OpenAPIPath default: a spec describes ONE refapp's API, and
+		// the previous default (auth_session_ratelimit's) rode into every
+		// matrix cell regardless of which refapp was under test — and
+		// named a path that is not even staged on the cluster. The spec
+		// is resolved per refapp from SpecDir instead (probatorium#300).
+		SpecDir: "validation/spec",
 	}
 }
 
@@ -146,7 +160,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.OutDir, "out", c.OutDir, "results directory; default results/<timestamp>-validate-<arch>/")
 	fs.StringVar(&c.CorpusPath, "corpus", c.CorpusPath, "seed corpus path; empty falls back to corpus.InitialSeeds")
 	fs.StringVar(&c.MarkovPath, "markov", c.MarkovPath, "Markov transition YAML path")
-	fs.StringVar(&c.OpenAPIPath, "openapi", c.OpenAPIPath, "OpenAPI 3.1 spec path")
+	fs.StringVar(&c.OpenAPIPath, "openapi", c.OpenAPIPath, "explicit OpenAPI 3.1 spec path for a SINGLE refapp; must exist; rejected in matrix mode with more than one refapp (use -spec-dir)")
+	fs.StringVar(&c.SpecDir, "spec-dir", c.SpecDir, "directory of per-refapp OpenAPI 3.1 specs (<dir>/<refapp>.openapi.yaml)")
 	fs.StringVar(&c.CelerisBin, "celeris-bin", c.CelerisBin, "celeris executable; empty disables auto-launch")
 	fs.StringVar(&c.CelerisListenAddr, "celeris-addr", c.CelerisListenAddr, "celeris bind addr")
 	fs.StringVar(&c.MetricsURL, "metrics-url", c.MetricsURL, "override the refapp /debug/vars URL the property loop polls; default derives it from the refapp's ready banner")
