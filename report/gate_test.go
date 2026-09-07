@@ -11,7 +11,7 @@ func cleanCell(r, e, a string) ValidationCellResult {
 			Requests5xxExpected: 5, RequestsCutAtDeadline: 3,
 			PropertyEvaluations: 3600 * 14, PropertyPollErrors: 2,
 			Adversarial: map[string]int64{"adv_sent": 10, "adv_well_rejected": 10},
-			H2CChurn:    map[string]int64{"h2c_sent": 10, "h2c_declined": 7, "h2c_intentional_rst": 3, "h2c_hang_max_elapsed_ms": 40},
+			H2CChurn:    map[string]int64{"h2c_sent": 10, "h2c_upgraded": 3, "h2c_declined": 7, "h2c_intentional_rst": 3, "h2c_hang_max_elapsed_ms": 40},
 			WSTorture:   map[string]int64{"ws_sent": 10, "ws_upgraded": 10, "ws_closed_correctly": 10},
 			SSEKill:     map[string]int64{"sse_sent": 10, "sse_established": 10, "sse_events_read": 50, "sse_killed_mid_stream": 10},
 		},
@@ -295,5 +295,77 @@ func TestGate_ReloginCountersAbsentIsSilent(t *testing.T) {
 	c := cleanCell("a", "std", "amd64") // both counters zero
 	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{}); len(v) != 0 {
 		t.Fatalf("absent relogin counters must not fail, got %+v", v)
+	}
+}
+
+// TestGate_VacuousH2CSliceIsAFailure pins probatorium#279: a cell whose
+// refapp is configured to answer the h1->h2c upgrade must record at least
+// one 101, or the whole h2c slice measured nothing.
+//
+// Zero upgrades means every churn mode degenerated into a plain declined
+// GET, so h2c_hang and h2c_crashed judged a code path the server never
+// entered -- and read as health. That is the same class as the dead-cell
+// (requests_sent == 0) rule, and it is the state the v1.5.11 nightly and
+// 24h soak shipped in: 172,656 preambles, zero upgrades, gate green.
+func TestGate_VacuousH2CSliceIsAFailure(t *testing.T) {
+	c := cleanCell("kitchen_sink", "iouring", "amd64")
+	c.Tier1.H2CChurn = map[string]int64{
+		"h2c_sent": 3597, "h2c_upgraded": 0, "h2c_declined": 2464, "h2c_intentional_rst": 1133,
+	}
+	v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true})
+	if len(v) != 1 || v[0].Field != "tier_1.h2c_churn.h2c_upgraded" {
+		t.Fatalf("want exactly one violation on tier_1.h2c_churn.h2c_upgraded, got %v", v)
+	}
+	if !strings.Contains(v[0].Why, "3597") {
+		t.Fatalf("Why must name the preamble count so the reading is attributable, got %q", v[0].Why)
+	}
+
+	// One upgrade is enough: the slice is exercising the path, and the
+	// magnitude is informational (the churn modes RST most of them).
+	c.Tier1.H2CChurn["h2c_upgraded"] = 1
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true}); len(v) != 0 {
+		t.Fatalf("a cell that completed an upgrade must pass, got %v", v)
+	}
+
+	// A refapp that serves HTTP/1.1 only is not judged on upgrades:
+	// declining is a valid answer per RFC 9113 3.4, and seven of the
+	// eight refapps stay on HTTP1 on purpose as the control group.
+	h1 := cleanCell("driver_postgres", "iouring", "amd64")
+	h1.Tier1.H2CChurn = map[string]int64{"h2c_sent": 3597, "h2c_upgraded": 0, "h2c_declined": 3597}
+	if v := Gate([]ValidationCellResult{h1}, nil, GateOptions{RequireTier3: true}); len(v) != 0 {
+		t.Fatalf("an HTTP1-only refapp must not be judged on upgrades, got %v", v)
+	}
+
+	// The slice not being scheduled (concurrency < 10) says nothing about
+	// the server -- only a cell that actually sent preambles is judged.
+	idle := cleanCell("kitchen_sink", "std", "arm64")
+	idle.Tier1.H2CChurn = map[string]int64{"h2c_sent": 0}
+	if v := Gate([]ValidationCellResult{idle}, nil, GateOptions{RequireTier3: true}); len(v) != 0 {
+		t.Fatalf("an unscheduled h2c slice must not be judged, got %v", v)
+	}
+}
+
+// The refapp set is nil-means-default so the nightly enforces the check
+// without opting in, and non-nil-empty-means-off so an archived run
+// recorded before any refapp served Auto can still be re-gated.
+func TestGate_H2CUpgradeRefappsOverride(t *testing.T) {
+	vacuous := func(refapp string) ValidationCellResult {
+		c := cleanCell(refapp, "epoll", "arm64")
+		c.Tier1.H2CChurn = map[string]int64{"h2c_sent": 100, "h2c_upgraded": 0, "h2c_declined": 100}
+		return c
+	}
+	if len(DefaultH2CUpgradeRefapps) == 0 {
+		t.Fatal("DefaultH2CUpgradeRefapps must name at least one refapp, or nothing exercises the upgrade")
+	}
+	dflt := vacuous(DefaultH2CUpgradeRefapps[0])
+	if v := Gate([]ValidationCellResult{dflt}, nil, GateOptions{}); len(v) != 1 {
+		t.Fatalf("a nil refapp set must fall back to DefaultH2CUpgradeRefapps, got %v", v)
+	}
+	if v := Gate([]ValidationCellResult{dflt}, nil, GateOptions{H2CUpgradeRefapps: []string{}}); len(v) != 0 {
+		t.Fatalf("an explicit empty refapp set must disable the check, got %v", v)
+	}
+	other := vacuous("observability")
+	if v := Gate([]ValidationCellResult{other}, nil, GateOptions{H2CUpgradeRefapps: []string{"observability"}}); len(v) != 1 {
+		t.Fatalf("an explicit refapp set must be honoured, got %v", v)
 	}
 }
