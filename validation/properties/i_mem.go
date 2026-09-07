@@ -59,6 +59,12 @@ const (
 // run for 2 minutes (runtime.forcegcperiod), so 150 s guarantees at
 // least one trough per bucket at any allocation rate. A 10 min window
 // yields 4 trough points, the 1 h window 24.
+// SlopeWarmup exposes the warm-up window the slope predicates exclude, so
+// the harness can capture its baseline heap profile at exactly the moment
+// the oracles start judging. A profile taken before this point would diff
+// against cold-start ramp rather than against steady state.
+func SlopeWarmup() time.Duration { return slopeWarmup }
+
 const slopeBucket = 150 * time.Second
 
 // slopePersistSamples is [Spec.Persist] for the slope predicates: at
