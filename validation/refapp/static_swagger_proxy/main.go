@@ -46,6 +46,7 @@ import (
 	"github.com/goceleris/celeris/middleware/requestid"
 	"github.com/goceleris/celeris/middleware/static"
 	"github.com/goceleris/celeris/middleware/swagger"
+	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
 //go:embed static/*
@@ -76,7 +77,8 @@ func main() {
 	workersFlag := flag.Int("workers", 0, "io worker count (0 = celeris default GOMAXPROCS); celeris requires >=2 if set")
 	flag.Parse()
 
-	srv := celeris.New(celeris.Config{
+	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
 		Workers:         *workersFlag,
@@ -99,8 +101,19 @@ func main() {
 	// occasional panics in proxy/static/swagger middleware — diagnosed
 	// from nightly 26444562273 which still showed 17-25 slowloris
 	// hangs/cell on this refapp despite observability now at 0.
-	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
+	// Recovered panics are discarded by default (see above: a stderr write
+	// under cs.detachMu gates the worker). That silence is exactly how the
+	// static file-cache key-aliasing panic (celeris#485) hid inside a
+	// "0.4% native-only 5xx" for the whole history of the nightly. When
+	// VALIDATE_PANIC_LOG names a file, recovered panics go there instead so
+	// a 5xx on this refapp can always be attributed.
+	panicLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if pl := os.Getenv("VALIDATE_PANIC_LOG"); pl != "" {
+		if f, err := os.OpenFile(pl, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			panicLog = slog.New(slog.NewTextHandler(f, nil))
+		}
+	}
+	srv.Use(recovery.New(recovery.Config{Logger: dv.RecoveryLogger(panicLog)}))
 	srv.Use(requestid.New())
 
 	// proxy middleware — trusts loopback only. Walker traffic from

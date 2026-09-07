@@ -44,6 +44,7 @@ import (
 	"github.com/goceleris/celeris/middleware/otel"
 	"github.com/goceleris/celeris/middleware/recovery"
 	"github.com/goceleris/celeris/middleware/requestid"
+	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -121,7 +122,8 @@ func main() {
 	// (The engine still stands up the async dispatch infrastructure
 	// because some routes are async, so slowloris/close behavior is
 	// unchanged from the prior all-async config.)
-	srv := celeris.New(celeris.Config{
+	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
 		Workers:         *workersFlag,
@@ -142,7 +144,7 @@ func main() {
 	// concurrent slowloris-conn header deadlines slip past. Diagnosed
 	// from nightly 26438393561 (~14× throughput regression vs std on
 	// this refapp + ~18 slowloris hangs/cell concentrated here).
-	srv.Use(recovery.New(recovery.Config{Logger: reqLog}))
+	srv.Use(recovery.New(recovery.Config{Logger: dv.RecoveryLogger(reqLog)}))
 	srv.Use(requestid.New())
 	srv.Use(logger.New(logger.Config{Output: reqLog}))
 	srv.Use(metrics.New(metrics.Config{Registry: reg}))

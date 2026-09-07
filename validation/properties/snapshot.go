@@ -11,7 +11,10 @@
 // runtime owns rolling window history in [Context.History].
 package properties
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Snapshot is one per-second projection of celeris metrics, /proc fields,
 // and synthesised counters from the validator-checker. It is intentionally
@@ -42,6 +45,11 @@ type Snapshot struct {
 	ClosedConnTotal   int64
 	ActiveConns       int64
 	PanicCount        int64
+	// ExpectedPanics is the number of panics the workload DESIGNED so far
+	// (corpus states marked `expect: panic`, counted by the Tier 1 walker
+	// when their 5xx arrives). Zero when no accounting is wired (e.g. the
+	// standalone checker CLI). I-PANIC judges PanicCount - ExpectedPanics.
+	ExpectedPanics int64
 
 	// Last-byte timestamps the validator-checker maintains per-conn
 	// (only stub-populated until wave 7 adds the validation build tag).
@@ -142,6 +150,21 @@ type Context struct {
 // `validator-replay` is deterministic against a recorded snapshot trace.
 type Predicate func(snap *Snapshot, ctx Context) (ok bool, msg string)
 
+// skipPrefix marks the msg of an evaluation that reached NO verdict.
+const skipPrefix = "skip: "
+
+// Skip is what a predicate returns when it cannot judge this sample:
+// the slope window is not full yet, the input was never sampled (RSS
+// without a pid), the idle window was never entered. It is ok=true --
+// nothing was violated -- but the evaluator counts it separately and a
+// predicate that only ever skipped is NOT reported as passed. Before
+// this distinction existed a 150 s nightly cell reported I-MEM-1/3/4 as
+// passed although none of them had judged a single sample.
+func Skip(reason string) (bool, string) { return true, skipPrefix + reason }
+
+// IsSkip reports whether a predicate result is a [Skip].
+func IsSkip(ok bool, msg string) bool { return ok && strings.HasPrefix(msg, skipPrefix) }
+
 // Spec describes one registered predicate.
 type Spec struct {
 	// ID is the canonical short name, e.g. "I-CONN-1". Used in incident
@@ -159,6 +182,14 @@ type Spec struct {
 
 	// Predicate is the evaluator itself. Required.
 	Predicate Predicate
+
+	// Persist is how many CONSECUTIVE failing evaluations (skips do not
+	// count either way) the evaluator requires before it declares a
+	// violation. 0 or 1 = the first failing sample is a violation. The
+	// slope predicates set it to one trough-bucket width so a verdict
+	// must survive a complete re-bucketing of the window before it
+	// hard-fails a cell.
+	Persist int
 }
 
 // Forever returns ctx.Now - ctx.RunStartedAt; convenience for predicates

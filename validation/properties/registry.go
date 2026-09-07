@@ -18,6 +18,8 @@ func All() []Spec {
 		IRFC2,
 		IMEM1,
 		IMEM2,
+		IMEM3,
+		IMEM4,
 		IPANIC,
 		IRACE,
 		ICHECKPTR,

@@ -1,44 +1,45 @@
-// Command validator-checker is the standalone invariant evaluator.
+// Command validator-checker is the standalone invariant evaluator: a
+// thin CLI over validation/checker, the same poll + predicate loop the
+// validator orchestrator runs in-process for every Tier 1 cell.
 //
 // Once per second it samples two sources, projects them into a
-// [properties.Snapshot], evaluates every registered predicate, and
+// [properties.Snapshot], evaluates every selected predicate, and
 // writes per-second rows to a SQLite store next to the observer's:
 //
-//  1. The legacy /debug/vars HTTP endpoint (wave 6) — carries
-//     expvar.Go counters: goroutine count, memstats, accepted /
-//     active / closed conn totals.
+//  1. The refapp's /debug/vars HTTP endpoint (see checker.DebugVarsKeys)
+//     — goroutine count, memstats, accepted / active / closed conn
+//     totals, panic count.
 //
 //  2. The validation-build Unix-domain socket at
-//     /tmp/celeris-validation.sock (wave 7+, celeris v1.4.3+) —
-//     carries the in-process assertion counters that only the
-//     validation build accumulates: panic count, ratelimit/session/
-//     JWT/iouring-SQE assertions. Missing socket is non-fatal (the
-//     binary under test may be a production build; we just leave
-//     those Snapshot slots at zero).
+//     /tmp/celeris-validation.sock (celeris v1.4.3+, -tags=validation
+//     only) — the in-process assertion counters. Missing socket is
+//     non-fatal (the binary under test may be a production build; the
+//     Snapshot slots stay at zero).
 //
 // On the first invariant violation the checker emits a JSON Incident
-// record on stdout and exits non-zero so the orchestrator can pick it
-// up, capture forensics, and trigger auto-bisect.
+// record on stdout and exits non-zero. The orchestrator no longer
+// launches this binary (it runs the loop in-process); it remains for
+// ad-hoc use against a running refapp:
+//
+//	validator-checker -metrics-url=http://127.0.0.1:8080/debug/vars -pid=$(pgrep refapp)
 package main
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
 
+	"github.com/goceleris/probatorium/validation/checker"
 	"github.com/goceleris/probatorium/validation/properties"
 )
 
@@ -48,9 +49,9 @@ type Config struct {
 	Out          string
 	Interval     time.Duration
 	PropertyTier string
-	// CelerisStderrPath is a log file path the checker tails to grep
-	// for "DATA RACE" / "checkptr" markers. Empty disables the tail.
-	CelerisStderrPath string
+	// PID, when > 0, is the refapp process whose /proc/<pid>/status
+	// VmRSS feeds Snapshot.RSSBytes (I-MEM-4). 0 leaves RSS unsampled.
+	PID int
 	// ValidationSocketPath is the unix-domain socket the validation
 	// build of celeris exposes its assertion counters on. Empty (or
 	// missing file at runtime) skips that poll and leaves the slots
@@ -74,7 +75,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.Out, "out", c.Out, "sqlite store for per-second predicate evaluations")
 	fs.DurationVar(&c.Interval, "interval", c.Interval, "sampling interval")
 	fs.StringVar(&c.PropertyTier, "property-tier", c.PropertyTier, "tier filter, comma-separated")
-	fs.StringVar(&c.CelerisStderrPath, "celeris-stderr", c.CelerisStderrPath, "celeris stderr log path; tailed for race/checkptr markers")
+	fs.IntVar(&c.PID, "pid", c.PID, "refapp pid; samples /proc/<pid>/status VmRSS for I-MEM-4 (0 = skip)")
 	fs.StringVar(&c.ValidationSocketPath, "validation-socket", c.ValidationSocketPath, "unix socket exposing celeris validation Counters (empty = skip)")
 }
 
@@ -121,7 +122,7 @@ func main() {
 }
 
 func run(cfg Config) error {
-	specs := selectPredicates(cfg.PropertyTier)
+	specs := checker.SelectPredicates(cfg.PropertyTier)
 	if len(specs) == 0 {
 		return fmt.Errorf("no predicates selected (tier=%q)", cfg.PropertyTier)
 	}
@@ -147,23 +148,8 @@ func run(cfg Config) error {
 	go func() { <-sigCh; cancel() }()
 
 	httpc := &http.Client{Timeout: 500 * time.Millisecond}
-	// Build a separate client for the unix socket — net/http's
-	// transport doesn't natively speak unix:// URLs, but a custom
-	// DialContext makes it transparent.
-	sockClient := &http.Client{
-		Timeout: 500 * time.Millisecond,
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				if cfg.ValidationSocketPath == "" {
-					return nil, errors.New("validation socket disabled")
-				}
-				return net.Dial("unix", cfg.ValidationSocketPath)
-			},
-		},
-	}
-	pctx := properties.Context{
-		RunStartedAt: time.Now(),
-	}
+	sockClient := checker.NewSocketClient(cfg.ValidationSocketPath, 500*time.Millisecond)
+	ev := checker.NewEvaluator(specs)
 
 	tick := time.NewTicker(cfg.Interval)
 	defer tick.Stop()
@@ -172,167 +158,39 @@ func run(cfg Config) error {
 		case <-ctx.Done():
 			return nil
 		case t := <-tick.C:
-			snap := poll(ctx, httpc, cfg.MetricsURL, t)
-			if cfg.ValidationSocketPath != "" {
-				pollValidationSocket(ctx, sockClient, &snap)
+			snap, perr := checker.Poll(ctx, httpc, cfg.MetricsURL, t)
+			if perr != nil {
+				ev.RecordPollError()
+				fmt.Fprintf(os.Stderr, "validator-checker: poll: %v\n", perr)
+				continue
 			}
-			pctx.Now = t
-			pctx.History = append(pctx.History, snap)
-			// Cap history at 3600 entries (1h at 1Hz).
-			if len(pctx.History) > 3600 {
-				pctx.History = pctx.History[len(pctx.History)-3600:]
+			if cfg.ValidationSocketPath != "" {
+				checker.PollValidationSocket(ctx, sockClient, &snap)
+			}
+			snap.PID = cfg.PID
+			snap.RSSBytes = checker.ReadRSS(cfg.PID)
+			violations := ev.Observe(snap, t)
+			failed := map[string]string{}
+			for _, v := range violations {
+				failed[v.ID] = v.Message
 			}
 			for _, s := range specs {
-				ok, msg := s.Predicate(&snap, pctx)
 				okInt := 1
-				if !ok {
+				msg, bad := failed[s.ID]
+				if bad {
 					okInt = 0
 				}
 				if _, err := stmt.Exec(snap.TS, s.ID, okInt, msg); err != nil {
 					fmt.Fprintf(os.Stderr, "validator-checker: insert: %v\n", err)
 				}
-				if !ok {
-					inc := Incident{
-						TS:          snap.TS,
-						PredicateID: s.ID,
-						Message:     msg,
-						Snapshot:    snap,
-					}
-					buf, _ := json.MarshalIndent(inc, "", "  ")
-					fmt.Println(string(buf))
-					return fmt.Errorf("hard fail: %s: %s", s.ID, msg)
-				}
+			}
+			if len(violations) > 0 {
+				v := violations[0]
+				inc := Incident{TS: snap.TS, PredicateID: v.ID, Message: v.Message, Snapshot: snap}
+				buf, _ := json.MarshalIndent(inc, "", "  ")
+				fmt.Println(string(buf))
+				return fmt.Errorf("hard fail: %s: %s", v.ID, v.Message)
 			}
 		}
 	}
-}
-
-// selectPredicates resolves a comma-separated tier filter, with empty
-// meaning "every registered predicate".
-func selectPredicates(tier string) []properties.Spec {
-	if tier == "" {
-		return properties.All()
-	}
-	var out []properties.Spec
-	seen := map[string]bool{}
-	for _, t := range strings.Split(tier, ",") {
-		t = strings.TrimSpace(t)
-		if t == "" {
-			continue
-		}
-		for _, p := range properties.ByTier(t) {
-			if !seen[p.ID] {
-				out = append(out, p)
-				seen[p.ID] = true
-			}
-		}
-	}
-	return out
-}
-
-// poll is the per-tick metrics fetch. Builds a [properties.Snapshot]
-// from the celeris /debug/vars JSON; missing fields default to zero.
-func poll(ctx context.Context, hc *http.Client, url string, t time.Time) properties.Snapshot {
-	snap := properties.Snapshot{TS: t.Unix()}
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return snap
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return snap
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return snap
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return snap
-	}
-	snap.GoroutineCount = readInt64(doc, "goroutines")
-	snap.AcceptedConnTotal = readInt64(doc, "celeris.accepted_conn_total")
-	snap.ClosedConnTotal = readInt64(doc, "celeris.closed_conn_total")
-	snap.ActiveConns = readInt64(doc, "celeris.active_conns")
-	snap.PanicCount = readInt64(doc, "celeris.panic_count")
-	if ms, ok := doc["memstats"].(map[string]any); ok {
-		snap.HeapInuseBytes = readInt64(ms, "HeapInuse")
-		snap.HeapAllocBytes = readInt64(ms, "HeapAlloc")
-	}
-	return snap
-}
-
-func readInt64(m map[string]any, key string) int64 {
-	switch v := m[key].(type) {
-	case float64:
-		return int64(v)
-	case int64:
-		return v
-	case int:
-		return int64(v)
-	default:
-		return 0
-	}
-}
-
-// pollValidationSocket fetches the in-process assertion counters from
-// celeris's validation-build unix-domain endpoint and copies them onto
-// snap. Schema matches `celeris/validation.Counters` (v1.4.3+):
-//
-//	{
-//	  "panic_count":                  uint64,
-//	  "ratelimit_token_violations":   uint64,
-//	  "session_owner_mismatches":     uint64,
-//	  "jwt_late_admits":              uint64,
-//	  "iouring_sqe_corruptions":      uint64
-//	}
-//
-// A connection failure (production build, socket missing, ECONNREFUSED)
-// is non-fatal — the slots stay at the previous tick's value (initially
-// zero), which is the correct behaviour for predicates that only react
-// to non-zero counts. PanicCount also feeds I-PANIC via the existing
-// /debug/vars `celeris.panic_count`, so a missing socket on a
-// production binary doesn't silence the panic invariant.
-func pollValidationSocket(ctx context.Context, hc *http.Client, snap *properties.Snapshot) {
-	// The URL host is ignored because DialContext routes to the unix
-	// socket regardless. We keep the path "/snapshot" to match the
-	// canonical route in celeris/validation/endpoint.go.
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://unix/snapshot", nil)
-	if err != nil {
-		return
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-	var c struct {
-		PanicCount               int64 `json:"panic_count"`
-		RatelimitTokenViolations int64 `json:"ratelimit_token_violations"`
-		SessionOwnerMismatches   int64 `json:"session_owner_mismatches"`
-		JWTLateAdmits            int64 `json:"jwt_late_admits"`
-		IouringSQECorruptions    int64 `json:"iouring_sqe_corruptions"`
-	}
-	if err := json.Unmarshal(body, &c); err != nil {
-		return
-	}
-	// PanicCount: validation socket wins over /debug/vars when both
-	// are present — the validation build's counter is the canonical
-	// source (assertions.IncrementPanic is called from the recover
-	// path BEFORE expvar would notice).
-	if c.PanicCount > snap.PanicCount {
-		snap.PanicCount = c.PanicCount
-	}
-	snap.RatelimitTokenViolations = c.RatelimitTokenViolations
-	snap.SessionOwnerMismatches = c.SessionOwnerMismatches
-	snap.JWTLateAdmits = c.JWTLateAdmits
-	snap.IouringSQECorruptions = c.IouringSQECorruptions
 }

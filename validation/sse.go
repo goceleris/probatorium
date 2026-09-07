@@ -47,6 +47,7 @@ type sseTally struct {
 	eventsRead        atomic.Int64
 	killedMidStream   atomic.Int64
 	serverClosedEarly atomic.Int64
+	cutAtDeadline     atomic.Int64
 	handshakeFail     atomic.Int64
 	endpointAbsent    atomic.Int64
 }
@@ -57,6 +58,7 @@ type sseSnapshot struct {
 	EventsRead        int64 `json:"sse_events_read"`
 	KilledMidStream   int64 `json:"sse_killed_mid_stream"`
 	ServerClosedEarly int64 `json:"sse_server_closed_early"`
+	CutAtDeadline     int64 `json:"sse_cut_at_deadline"`
 	HandshakeFail     int64 `json:"sse_handshake_fail"`
 	EndpointAbsent    int64 `json:"sse_endpoint_absent"`
 }
@@ -68,6 +70,7 @@ func (t *sseTally) snapshot() sseSnapshot {
 		EventsRead:        t.eventsRead.Load(),
 		KilledMidStream:   t.killedMidStream.Load(),
 		ServerClosedEarly: t.serverClosedEarly.Load(),
+		CutAtDeadline:     t.cutAtDeadline.Load(),
 		HandshakeFail:     t.handshakeFail.Load(),
 		EndpointAbsent:    t.endpointAbsent.Load(),
 	}
@@ -205,6 +208,15 @@ func fireSSEKill(ctx context.Context, hostPort, path string,
 			// We disambiguate by checking how close we are to the
 			// holdDeadline: within 50ms ≈ deadline tripped (ours);
 			// well before → server closed early.
+			if ctx.Err() != nil {
+				// The walker's context ended (tier budget exhausted, cell
+				// torn down) while this stream was held: the EOF is ours,
+				// not the server's. Exactly one in-flight stream per cell
+				// used to land here and be booked as a server defect
+				// (probatorium#274).
+				tally.cutAtDeadline.Add(1)
+				return
+			}
 			if time.Until(holdDeadline) > 50*time.Millisecond {
 				tally.serverClosedEarly.Add(1)
 				return
@@ -240,6 +252,6 @@ func sseGetRequest(hostPort, path string) []byte {
 
 // summariseSSEKill formats a snapshot for the run summary log line.
 func summariseSSEKill(s sseSnapshot) string {
-	return fmt.Sprintf("sse_sent=%d sse_established=%d sse_events=%d sse_killed=%d sse_early_close=%d sse_handshake_fail=%d",
-		s.Sent, s.Established, s.EventsRead, s.KilledMidStream, s.ServerClosedEarly, s.HandshakeFail)
+	return fmt.Sprintf("sse_sent=%d sse_established=%d sse_events=%d sse_killed=%d sse_early_close=%d sse_cut=%d sse_handshake_fail=%d",
+		s.Sent, s.Established, s.EventsRead, s.KilledMidStream, s.ServerClosedEarly, s.CutAtDeadline, s.HandshakeFail)
 }

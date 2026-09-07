@@ -46,6 +46,7 @@ import (
 	"github.com/goceleris/celeris/middleware/secure"
 	"github.com/goceleris/celeris/middleware/session"
 	sessredis "github.com/goceleris/celeris/middleware/session/redisstore"
+	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
 func envOr(key, def string) string {
@@ -86,7 +87,8 @@ func main() {
 		log.Fatalf("driver_redis: ratelimit store init: %v", err)
 	}
 
-	srv := celeris.New(celeris.Config{
+	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
 		Workers:         *workersFlag,
@@ -106,7 +108,7 @@ func main() {
 	// cs.detachMu (around ProcessH1), gating the worker thread and
 	// letting concurrent slowloris header-deadlines slip past.
 	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
+	srv.Use(recovery.New(recovery.Config{Logger: dv.RecoveryLogger(discardLog)}))
 	srv.Use(requestid.New())
 	srv.Use(secure.New())
 	srv.Use(ratelimit.New(ratelimit.Config{
@@ -178,10 +180,16 @@ func main() {
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
 		}
+		// Read-after-write on a SHARED counter: concurrent walkers INCR
+		// the same key, so GET may legitimately return MORE than this
+		// request's INCR result. The sound invariant is monotonic: GET
+		// must never be LESS than the value INCR returned -- that would
+		// be a stale or misrouted read (a real I-DRV-1 hit). Demanding
+		// equality produced a 12% false-positive rate at concurrency 30.
 		gotN, perr := strconv.ParseInt(got, 10, 64)
-		if perr != nil || gotN != n {
+		if perr != nil || gotN < n {
 			return c.JSON(http.StatusInternalServerError, map[string]any{
-				"err":           "incr read-after-write mismatch",
+				"err":           "incr read-after-write regression (GET < INCR return)",
 				"incr_return":   n,
 				"get_return":    got,
 				"x-invariant":   "I-DRV-1",

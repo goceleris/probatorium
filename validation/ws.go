@@ -6,11 +6,15 @@ import (
 	"crypto/sha1" //nolint:gosec // RFC 6455 mandates SHA-1 for the WS handshake; not used for crypto
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
+	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -45,6 +49,27 @@ const (
 	ModeInvalidUTF8
 	wsTortureModeCount
 )
+
+// recordHandshakeFail increments the total plus the cause-specific
+// counter. status is the received status line when the failure was a
+// non-101 response, empty otherwise.
+func (t *wsTally) recordHandshakeFail(err error, status string) {
+	t.handshakeFail.Add(1)
+	switch {
+	case status != "":
+		t.handshakeFailStatus.Add(1)
+	case err == nil:
+		t.handshakeFailOther.Add(1)
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		t.handshakeFailTimeout.Add(1)
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		t.handshakeFailEOF.Add(1)
+	case errors.Is(err, syscall.ECONNRESET):
+		t.handshakeFailReset.Add(1)
+	default:
+		t.handshakeFailOther.Add(1)
+	}
+}
 
 func (m wsTortureMode) String() string {
 	switch m {
@@ -82,36 +107,59 @@ func (m wsTortureMode) String() string {
 //     matrix can run WS walkers against every refapp without
 //     polluting handshake_fail. Mirrors sse_endpoint_absent.
 type wsTally struct {
-	sent             atomic.Int64
-	upgraded         atomic.Int64
-	handshakeFail    atomic.Int64
-	closedCorrectly  atomic.Int64
-	acceptedBadFrame atomic.Int64
-	hangNoClose      atomic.Int64
-	endpointAbsent   atomic.Int64
+	sent          atomic.Int64
+	upgraded      atomic.Int64
+	handshakeFail atomic.Int64
+	// handshakeFail{EOF,Timeout,Reset,Status,Other} classify WHY the
+	// handshake never completed, mirroring the h2c_hang cause split
+	// (celeris#470). Without this, three distinct defects — the peer
+	// vanishing before the status line, a real non-101 rejection, and a
+	// stall mid-header-drain — collapse into one counter, and a single
+	// failure in ~47,598 attempts (as the v1.5.11 soak recorded) is not
+	// diagnosable from the artifact at all.
+	handshakeFailEOF     atomic.Int64
+	handshakeFailTimeout atomic.Int64
+	handshakeFailReset   atomic.Int64
+	handshakeFailStatus  atomic.Int64
+	handshakeFailOther   atomic.Int64
+	closedCorrectly      atomic.Int64
+	acceptedBadFrame     atomic.Int64
+	hangNoClose          atomic.Int64
+	endpointAbsent       atomic.Int64
 }
 
 // wsSnapshot is the value-typed projection emitted into the tally
 // JSON. Prefix `ws_` keeps the keys unambiguous next to adv/h2c.
 type wsSnapshot struct {
-	Sent             int64 `json:"ws_sent"`
-	Upgraded         int64 `json:"ws_upgraded"`
-	HandshakeFail    int64 `json:"ws_handshake_fail"`
-	ClosedCorrectly  int64 `json:"ws_closed_correctly"`
-	AcceptedBadFrame int64 `json:"ws_accepted_bad_frame"`
-	HangNoClose      int64 `json:"ws_hang_no_close"`
-	EndpointAbsent   int64 `json:"ws_endpoint_absent"`
+	Sent          int64 `json:"ws_sent"`
+	Upgraded      int64 `json:"ws_upgraded"`
+	HandshakeFail int64 `json:"ws_handshake_fail"`
+	// Cause split for HandshakeFail; these sum to it.
+	HandshakeFailEOF     int64 `json:"ws_handshake_fail_eof"`
+	HandshakeFailTimeout int64 `json:"ws_handshake_fail_timeout"`
+	HandshakeFailReset   int64 `json:"ws_handshake_fail_reset"`
+	HandshakeFailStatus  int64 `json:"ws_handshake_fail_status"`
+	HandshakeFailOther   int64 `json:"ws_handshake_fail_other"`
+	ClosedCorrectly      int64 `json:"ws_closed_correctly"`
+	AcceptedBadFrame     int64 `json:"ws_accepted_bad_frame"`
+	HangNoClose          int64 `json:"ws_hang_no_close"`
+	EndpointAbsent       int64 `json:"ws_endpoint_absent"`
 }
 
 func (t *wsTally) snapshot() wsSnapshot {
 	return wsSnapshot{
-		Sent:             t.sent.Load(),
-		Upgraded:         t.upgraded.Load(),
-		HandshakeFail:    t.handshakeFail.Load(),
-		ClosedCorrectly:  t.closedCorrectly.Load(),
-		AcceptedBadFrame: t.acceptedBadFrame.Load(),
-		HangNoClose:      t.hangNoClose.Load(),
-		EndpointAbsent:   t.endpointAbsent.Load(),
+		Sent:                 t.sent.Load(),
+		Upgraded:             t.upgraded.Load(),
+		HandshakeFail:        t.handshakeFail.Load(),
+		HandshakeFailEOF:     t.handshakeFailEOF.Load(),
+		HandshakeFailTimeout: t.handshakeFailTimeout.Load(),
+		HandshakeFailReset:   t.handshakeFailReset.Load(),
+		HandshakeFailStatus:  t.handshakeFailStatus.Load(),
+		HandshakeFailOther:   t.handshakeFailOther.Load(),
+		ClosedCorrectly:      t.closedCorrectly.Load(),
+		AcceptedBadFrame:     t.acceptedBadFrame.Load(),
+		HangNoClose:          t.hangNoClose.Load(),
+		EndpointAbsent:       t.endpointAbsent.Load(),
 	}
 }
 
@@ -179,7 +227,7 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 	br := bufio.NewReader(conn)
 	statusLine, err := br.ReadString('\n')
 	if err != nil {
-		tally.handshakeFail.Add(1)
+		tally.recordHandshakeFail(err, "")
 		return
 	}
 	if !strings.HasPrefix(statusLine, "HTTP/1.1 101") {
@@ -193,14 +241,14 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 			tally.endpointAbsent.Add(1)
 			return
 		}
-		tally.handshakeFail.Add(1)
+		tally.recordHandshakeFail(nil, strings.TrimSpace(statusLine))
 		return
 	}
 	// Eat headers until we see the blank line that ends them.
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			tally.handshakeFail.Add(1)
+			tally.recordHandshakeFail(err, "")
 			return
 		}
 		if line == "\r\n" || line == "\n" {

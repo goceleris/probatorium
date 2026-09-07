@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goceleris/probatorium/validation/checker"
 	"github.com/goceleris/probatorium/validation/markov"
 	"github.com/goceleris/probatorium/validation/remote"
 )
@@ -105,6 +106,10 @@ type tier1Config struct {
 	// TallyCallbackInterval is how often TallyCallback fires. Zero
 	// defaults to 2 seconds; only used when TallyCallback is non-nil.
 	TallyCallbackInterval time.Duration
+	// OnLiveTally, when non-nil, receives an accessor for the live
+	// expected-panic count as soon as the tally exists, so the property
+	// loop can net designed panics out of I-PANIC while the tier runs.
+	OnLiveTally func(expectedPanics func() int64)
 
 	// SnapshotPath, when non-empty, names the path the tier writes the
 	// current tally snapshot to on every TallyCallback tick. Letting
@@ -124,8 +129,25 @@ type tier1Tally struct {
 	requestsSent  atomic.Int64
 	requests2xx   atomic.Int64
 	requests4xx   atomic.Int64
-	requests5xx   atomic.Int64
+	requests5xx   atomic.Int64 // UNEXPECTED 5xx only (see requests5xxExpected)
 	requestsError atomic.Int64
+	// requests5xxExpected counts 5xx from states the corpus marks
+	// `expect: 5xx` (designed-to-fail routes such as observability's
+	// /api/error). Kept apart so requests5xx can be gated to zero.
+	requests5xxExpected atomic.Int64
+	// requestsPanicExpected counts 5xx from states the corpus marks
+	// `expect: panic` (designed-to-panic routes such as observability's
+	// /api/error). The property loop subtracts it from the server's
+	// panic_count so I-PANIC judges only unexpected panics.
+	requestsPanicExpected atomic.Int64
+	// requestsCutAtDeadline counts requests that were in flight when the
+	// tier's run context expired. Not errors: the budget ended.
+	requestsCutAtDeadline atomic.Int64
+	// invariantHits counts unexpected 5xx whose body carries the refapp
+	// invariant marker ("x-invariant": e.g. I-DRV-1 read-after-write). A
+	// refapp reporting its own invariant violation must surface as an
+	// invariant hit, not vanish into a generic 5xx count.
+	invariantHits atomic.Int64
 	adv           *adversarialTally
 	h2c           *h2cTally
 	ws            *wsTally
@@ -146,6 +168,9 @@ type tier1Tally struct {
 // counters (govet copylocks).
 func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error) {
 	tally := &tier1Tally{}
+	if cfg.OnLiveTally != nil {
+		cfg.OnLiveTally(tally.requestsPanicExpected.Load)
+	}
 	if cfg.Driver == nil {
 		return tally.snapshot(), errors.New("tier1: nil Driver")
 	}
@@ -195,25 +220,51 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	readyErrCh := make(chan error, 1)
 	var readyOnce sync.Once
 	var readyAddr string // refapp's REAL bound addr; set before close(readyCh)
-	go superviseStderr(proc.Stderr(), tally.liveness,
-		func(addr string) { readyOnce.Do(func() { readyAddr = addr; close(readyCh) }) },
-		func(err error) {
-			select {
-			case readyErrCh <- err:
-			default:
-			}
-		},
-		cancelRun)
+	// stderrDone closes when superviseStderr has drained the pipe to EOF. The
+	// exit watcher below observes the death FIRST (proc.Wait returns as soon
+	// as the process is reaped) and cancels the run; a snapshot taken at that
+	// instant loses the crash line still buffered in the pipe -- Crashed and
+	// ExitCode=2 with an empty Signature/Trace. Every post-start snapshot
+	// therefore joins the supervisor (bounded) once the process is known dead.
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		superviseStderr(proc.Stderr(), tally.liveness,
+			func(addr string) { readyOnce.Do(func() { readyAddr = addr; close(readyCh) }) },
+			func(err error) {
+				select {
+				case readyErrCh <- err:
+				default:
+				}
+			},
+			cancelRun)
+	}()
 	go watchProcessExit(ctx, proc, tally.liveness, cancelRun)
+	// joinStderrIfDead waits for the stderr supervisor to finish scanning once
+	// the process has been observed to exit: the pipe is at EOF so this is
+	// near-instant, and the bound only guards a wedged reader. A live process
+	// (ready timeout, ctx cancel) is never waited on.
+	joinStderrIfDead := func() {
+		if !tally.liveness.snapshot().Exited {
+			return
+		}
+		select {
+		case <-stderrDone:
+		case <-time.After(3 * time.Second):
+		}
+	}
 
 	select {
 	case <-readyCh:
 		// refapp bound — proceed to fan out walkers.
 	case err := <-readyErrCh:
+		joinStderrIfDead()
 		return tally.snapshot(), fmt.Errorf("tier1: refapp not ready: %w", err)
 	case <-time.After(cfg.ReadyTimeout):
+		joinStderrIfDead()
 		return tally.snapshot(), fmt.Errorf("tier1: refapp not ready: timeout after %s", cfg.ReadyTimeout)
 	case <-ctx.Done():
+		joinStderrIfDead()
 		return tally.snapshot(), ctx.Err()
 	}
 
@@ -456,6 +507,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		}()
 	}
 	wg.Wait()
+	joinStderrIfDead()
 	snap := tally.snapshot()
 	// If the refapp crashed OR hung, the periodic ticker stopped at cancelRun
 	// and may not have ticked between the event and here. Fire the callback
@@ -672,7 +724,7 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 		// `request: METHOD path`; states without an entry are silent.
 		// See validation/markov/<refapp>.yaml.
 		if req, ok := m.Requests[state]; ok {
-			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, tally)
+			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, req.ExpectPanic, tally)
 			if status == 401 && hasLogin {
 				// Session likely expired — re-login and keep walking.
 				// The next request will pick up the fresh cookie.
@@ -730,7 +782,7 @@ func walkerLogin(ctx context.Context, hc *http.Client, base string, login markov
 // POST/PUT/PATCH requests fire with an empty body for now. Body
 // generation is the Tier 2 RESTler fuzzer's job; Tier 1's purpose
 // here is volume + endpoint coverage, not payload variation.
-func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, tally *tier1Tally) int {
+func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, expect5xx, expectPanic bool, tally *tier1Tally) int {
 	tally.requestsSent.Add(1)
 	if method == "" {
 		method = "GET"
@@ -742,20 +794,43 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, t
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		// A request in flight when the tier's run context expires fails
+		// with "context deadline exceeded" after only milliseconds -- the
+		// budget ran out, nothing went wrong. Count those apart so
+		// requests_error means transport/server failures only (per-route
+		// latency attribution showed max 9 ms on every route while every
+		// "error" was one of these; 13-19 per cell = walkers mid-flight at
+		// cutoff).
+		if ctx.Err() != nil {
+			tally.requestsCutAtDeadline.Add(1)
+			return 0
+		}
 		tally.requestsError.Add(1)
 		return 0
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// Drain body — keep-alive requires it.
-	_, _ = io.Copy(io.Discard, resp.Body)
 	switch {
+	case resp.StatusCode >= 500 && expect5xx:
+		tally.requests5xxExpected.Add(1)
+		if expectPanic {
+			tally.requestsPanicExpected.Add(1)
+		}
 	case resp.StatusCode >= 500:
 		tally.requests5xx.Add(1)
+		// Peek the body for the refapp invariant marker. 5xx is rare on
+		// a healthy run, so the extra read costs nothing in steady state.
+		head := make([]byte, 512)
+		n, _ := io.ReadFull(resp.Body, head)
+		if bytes.Contains(head[:n], []byte(`"x-invariant"`)) {
+			tally.invariantHits.Add(1)
+		}
 	case resp.StatusCode >= 400:
 		tally.requests4xx.Add(1)
 	default:
 		tally.requests2xx.Add(1)
 	}
+	// Drain body — keep-alive requires it.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return resp.StatusCode
 }
 
@@ -768,6 +843,11 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 		Requests4xx:   t.requests4xx.Load(),
 		Requests5xx:   t.requests5xx.Load(),
 		RequestsError: t.requestsError.Load(),
+
+		Requests5xxExpected:   t.requests5xxExpected.Load(),
+		RequestsPanicExpected: t.requestsPanicExpected.Load(),
+		InvariantHits:         t.invariantHits.Load(),
+		RequestsCutAtDeadline: t.requestsCutAtDeadline.Load(),
 	}
 	if t.adv != nil {
 		s.Adversarial = t.adv.snapshot()
@@ -790,16 +870,25 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 // tier1TallySnapshot is the value-typed projection of tier1Tally
 // (atomic counters loaded at one instant).
 type tier1TallySnapshot struct {
-	RequestsSent  int64               `json:"requests_sent"`
-	Requests2xx   int64               `json:"requests_2xx"`
-	Requests4xx   int64               `json:"requests_4xx"`
-	Requests5xx   int64               `json:"requests_5xx"`
-	RequestsError int64               `json:"requests_error"`
-	Adversarial   adversarialSnapshot `json:"adversarial,omitempty"`
-	H2CChurn      h2cSnapshot         `json:"h2c_churn,omitempty"`
-	WSTorture     wsSnapshot          `json:"ws_torture,omitempty"`
-	SSEKill       sseSnapshot         `json:"sse_kill,omitempty"`
-	Liveness      livenessSnapshot    `json:"liveness,omitempty"`
+	RequestsSent          int64               `json:"requests_sent"`
+	Requests2xx           int64               `json:"requests_2xx"`
+	Requests4xx           int64               `json:"requests_4xx"`
+	Requests5xx           int64               `json:"requests_5xx"`
+	RequestsError         int64               `json:"requests_error"`
+	Requests5xxExpected   int64               `json:"requests_5xx_expected"`
+	RequestsPanicExpected int64               `json:"requests_panic_expected"`
+	InvariantHits         int64               `json:"invariant_hits"`
+	RequestsCutAtDeadline int64               `json:"requests_cut_at_deadline"`
+	Adversarial           adversarialSnapshot `json:"adversarial,omitempty"`
+	H2CChurn              h2cSnapshot         `json:"h2c_churn,omitempty"`
+	WSTorture             wsSnapshot          `json:"ws_torture,omitempty"`
+	SSEKill               sseSnapshot         `json:"sse_kill,omitempty"`
+	Liveness              livenessSnapshot    `json:"liveness,omitempty"`
+	// Properties is the in-process property loop's tally
+	// (validation/propertyloop.go), attached by the orchestrator once
+	// driveTier1 returns -- the loop runs beside the walkers, not inside
+	// them, so driveTier1's own snapshot() never carries it.
+	Properties checker.Tally `json:"properties"`
 }
 
 // String formats a tally for the run summary log line.

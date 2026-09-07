@@ -62,12 +62,16 @@ permissions:
 
 # All cluster-touching workflows share the same group so they run
 # strictly in series. Queued runs wait, they're never cancelled.
+#
+# The group is claimed CONDITIONALLY (probatorium#288): `pull_request:
+# labeled` fires for EVERY label on a PR touching the watched paths, and
+# a run whose guard job will skip (wrong label) must not sit in
+# matrix-tier-cluster — GitHub keeps only one pending run per group, so
+# such a no-op run displaced a queued nightly/soak/bench. Runs that
+# cannot reach the cluster get a private per-run group instead.
 concurrency:
-  group: matrix-tier-cluster
+  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.label.name == 'cluster-ok') && 'matrix-tier-cluster' || format('matrix-pr-tier-noop-{0}', github.run_id) }}
   cancel-in-progress: false
-
-env:
-  CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
 
 jobs:
   guard:
@@ -75,10 +79,17 @@ jobs:
     # `cluster-ok` label (or kicked the workflow manually). All
     # downstream jobs need this — if the gate is skipped/fails, the
     # cluster-touching jobs do not run and no secrets are exposed.
+    #
+    # The pull_request path additionally requires the head branch to
+    # live in THIS repository: a fork PR must never reach the
+    # self-hosted cluster, even if the label is applied — the label
+    # gates who approves, this gates whose code runs.
     name: cluster-ok label gate
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'cluster-ok')
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'cluster-ok' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -95,8 +106,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/cluster-runner-up
+        # The composite reads env.CLUSTER_SSH_KEY to write the private
+        # key for ansible. Scoped to this step (not the workflow) so no
+        # other step's process tree ever sees the cluster key.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
         with:
           tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
@@ -110,9 +128,11 @@ jobs:
     runs-on: [self-hosted, celeris-cluster]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
           cache: true
@@ -191,7 +211,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: matrix-pr-results-${{ github.run_id }}
           path: results/
@@ -209,8 +229,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/cluster-runner-down
+        # The composite reads env.CLUSTER_SSH_KEY to write the private
+        # key for ansible. Scoped to this step (not the workflow) so no
+        # other step's process tree ever sees the cluster key.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
         with:
           tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}

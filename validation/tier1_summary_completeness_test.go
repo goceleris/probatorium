@@ -38,6 +38,31 @@ func TestTier1SummaryExportsEveryTallyField(t *testing.T) {
 		{"sse_kill", sseSnapshot{}, summary.SSEKill},
 	}
 
+	// Top-level int64 fields of the snapshot must exist on the summary
+	// struct itself (matched by json tag); nested walker snapshots are
+	// covered by the map cases below.
+	t.Run("top_level", func(t *testing.T) {
+		st := reflect.TypeOf(snap)
+		sum := reflect.TypeOf(*summary)
+		have := map[string]bool{}
+		for i := 0; i < sum.NumField(); i++ {
+			have[strings.Split(sum.Field(i).Tag.Get("json"), ",")[0]] = true
+		}
+		for i := 0; i < st.NumField(); i++ {
+			f := st.Field(i)
+			if f.Type.Kind() != reflect.Int64 {
+				continue
+			}
+			key := strings.Split(f.Tag.Get("json"), ",")[0]
+			if key == "" || key == "-" {
+				continue
+			}
+			if !have[key] {
+				t.Errorf("tier1TallySnapshot.%s (json %q) has no counterpart field on report.Tier1Summary -- it will be silently absent from validate-results.json", f.Name, key)
+			}
+		}
+	})
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := reflect.TypeOf(tc.snapshot)

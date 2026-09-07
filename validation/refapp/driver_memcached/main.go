@@ -44,6 +44,7 @@ import (
 	"github.com/goceleris/celeris/middleware/secure"
 	"github.com/goceleris/celeris/middleware/session"
 	sessmc "github.com/goceleris/celeris/middleware/session/memcachedstore"
+	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
 func envOr(key, def string) string {
@@ -85,7 +86,8 @@ func main() {
 		log.Fatalf("driver_memcached: ratelimit store init: %v", err)
 	}
 
-	srv := celeris.New(celeris.Config{
+	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
 		Workers:         *workersFlag,
@@ -105,7 +107,7 @@ func main() {
 	// cs.detachMu (around ProcessH1), gating the worker thread and
 	// letting concurrent slowloris header-deadlines slip past.
 	discardLog := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv.Use(recovery.New(recovery.Config{Logger: discardLog}))
+	srv.Use(recovery.New(recovery.Config{Logger: dv.RecoveryLogger(discardLog)}))
 	srv.Use(requestid.New())
 	srv.Use(secure.New())
 	srv.Use(ratelimit.New(ratelimit.Config{
