@@ -254,3 +254,46 @@ func TestGate_WSHandshakeCauseSplitIsNotDoubleCounted(t *testing.T) {
 		t.Errorf("the cause must survive in the message, got %q", v[0].Why)
 	}
 }
+
+// TestGate_ReloginStormFails pins probatorium#292: a walker re-logging in on
+// every request is the signature of a server that is not honouring sessions,
+// and it must fail the gate.
+//
+// celeris#507 did exactly this for months -- auth_session_ratelimit ran at
+// ~96% 4xx because the session cookie was never issued, so every /me was a 401
+// and the walker re-logged in each time. requests_4xx lumps 401/404/429
+// together, so nothing distinguished it from a healthy rate-limited run.
+func TestGate_ReloginStormFails(t *testing.T) {
+	c := cleanCell("auth_session_ratelimit", "iouring", "amd64")
+	c.Tier1.WalkerLogins = 24        // one pre-walk login per walker
+	c.Tier1.WalkerRelogins = 500_000 // a re-login on essentially every request
+
+	v := Gate([]ValidationCellResult{c}, nil, GateOptions{})
+	if len(v) != 1 || v[0].Field != "tier_1.walker_relogins" {
+		t.Fatalf("a relogin storm must fail the gate, got %+v", v)
+	}
+	if !strings.Contains(v[0].Why, "not honouring the session") {
+		t.Errorf("the message should name the cause, got %q", v[0].Why)
+	}
+}
+
+// TestGate_OrdinarySessionExpiryPasses guards the other side: a long soak cell
+// legitimately re-logs in when a session expires, and that must not fail.
+func TestGate_OrdinarySessionExpiryPasses(t *testing.T) {
+	c := cleanCell("auth_session_ratelimit", "iouring", "amd64")
+	c.Tier1.WalkerLogins = 24
+	c.Tier1.WalkerRelogins = 48 // a couple of expiries per walker over an hour
+
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{}); len(v) != 0 {
+		t.Fatalf("ordinary session expiry must not fail the gate, got %+v", v)
+	}
+}
+
+// TestGate_ReloginCountersAbsentIsSilent keeps older artifacts readable: runs
+// produced before these counters existed must gate exactly as they did.
+func TestGate_ReloginCountersAbsentIsSilent(t *testing.T) {
+	c := cleanCell("a", "std", "amd64") // both counters zero
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{}); len(v) != 0 {
+		t.Fatalf("absent relogin counters must not fail, got %+v", v)
+	}
+}

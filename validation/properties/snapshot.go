@@ -190,6 +190,22 @@ type Spec struct {
 	// must survive a complete re-bucketing of the window before it
 	// hard-fails a cell.
 	Persist int
+
+	// MinObservation is the shortest observation window in which this
+	// predicate can reach a verdict AT ALL: below it the predicate
+	// skips no matter how healthy or how broken the refapp is. Zero
+	// (the default) means it judges from a single snapshot.
+	//
+	// It exists to tell two silences apart. A predicate that reached no
+	// verdict in a cell SHORTER than this could not have: a 150 s
+	// nightly cell can never fit I-MEM-1's 5 min warm-up plus its
+	// 10 min window, and failing the nightly for that would be failing
+	// it for its own tier definition. A predicate that reached no
+	// verdict with the time to do so is a coverage failure -- the
+	// oracle was silent when it should have spoken, which on an
+	// absolute zero-signal gate is not the same as zero signal
+	// (probatorium#299).
+	MinObservation time.Duration
 }
 
 // Forever returns ctx.Now - ctx.RunStartedAt; convenience for predicates

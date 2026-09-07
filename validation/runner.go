@@ -1259,11 +1259,16 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 // validation package don't have to duplicate the map keys.
 func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 	return &report.Tier1Summary{
-		RequestsSent:  s.RequestsSent,
-		Requests2xx:   s.Requests2xx,
-		Requests4xx:   s.Requests4xx,
-		Requests5xx:   s.Requests5xx,
-		RequestsError: s.RequestsError,
+		RequestsSent:   s.RequestsSent,
+		Requests2xx:    s.Requests2xx,
+		Requests4xx:    s.Requests4xx,
+		Requests401:    s.Requests401,
+		Requests404:    s.Requests404,
+		Requests429:    s.Requests429,
+		WalkerLogins:   s.WalkerLogins,
+		WalkerRelogins: s.WalkerRelogins,
+		Requests5xx:    s.Requests5xx,
+		RequestsError:  s.RequestsError,
 
 		Requests5xxExpected:   s.Requests5xxExpected,
 		RequestsPanicExpected: s.RequestsPanicExpected,
