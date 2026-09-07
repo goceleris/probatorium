@@ -831,6 +831,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 			HardFail:     o.cfg.PropertyHardFail,
 			Violations:   violations,
 			SnapshotPath: filepath.Join(o.cfg.OutDir, "properties_tally.json"),
+			// Captured once, the instant the slope oracles start judging, so
+			// an I-MEM incident can be diffed rather than inferred:
+			//   go tool pprof -inuse_space -base heap-warm.pprof <incident>/heap.pprof
+			BaselineHeapPath: filepath.Join(o.cfg.OutDir, "heap-warm.pprof"),
 		})
 	}()
 
@@ -1202,11 +1206,16 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 // validation package don't have to duplicate the map keys.
 func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 	return &report.Tier1Summary{
-		RequestsSent:  s.RequestsSent,
-		Requests2xx:   s.Requests2xx,
-		Requests4xx:   s.Requests4xx,
-		Requests5xx:   s.Requests5xx,
-		RequestsError: s.RequestsError,
+		RequestsSent:   s.RequestsSent,
+		Requests2xx:    s.Requests2xx,
+		Requests4xx:    s.Requests4xx,
+		Requests401:    s.Requests401,
+		Requests404:    s.Requests404,
+		Requests429:    s.Requests429,
+		WalkerLogins:   s.WalkerLogins,
+		WalkerRelogins: s.WalkerRelogins,
+		Requests5xx:    s.Requests5xx,
+		RequestsError:  s.RequestsError,
 
 		Requests5xxExpected:   s.Requests5xxExpected,
 		RequestsPanicExpected: s.RequestsPanicExpected,
@@ -1243,13 +1252,20 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"h2c_hang_max_elapsed_ms": s.H2CChurn.HangMaxElapsedMs,
 		},
 		WSTorture: map[string]int64{
-			"ws_sent":               s.WSTorture.Sent,
-			"ws_upgraded":           s.WSTorture.Upgraded,
-			"ws_handshake_fail":     s.WSTorture.HandshakeFail,
-			"ws_closed_correctly":   s.WSTorture.ClosedCorrectly,
-			"ws_accepted_bad_frame": s.WSTorture.AcceptedBadFrame,
-			"ws_hang_no_close":      s.WSTorture.HangNoClose,
-			"ws_endpoint_absent":    s.WSTorture.EndpointAbsent,
+			"ws_sent":           s.WSTorture.Sent,
+			"ws_upgraded":       s.WSTorture.Upgraded,
+			"ws_handshake_fail": s.WSTorture.HandshakeFail,
+			// Cause split (sums to ws_handshake_fail): without it a lone
+			// failure in ~47,598 attempts is undiagnosable.
+			"ws_handshake_fail_eof":     s.WSTorture.HandshakeFailEOF,
+			"ws_handshake_fail_timeout": s.WSTorture.HandshakeFailTimeout,
+			"ws_handshake_fail_reset":   s.WSTorture.HandshakeFailReset,
+			"ws_handshake_fail_status":  s.WSTorture.HandshakeFailStatus,
+			"ws_handshake_fail_other":   s.WSTorture.HandshakeFailOther,
+			"ws_closed_correctly":       s.WSTorture.ClosedCorrectly,
+			"ws_accepted_bad_frame":     s.WSTorture.AcceptedBadFrame,
+			"ws_hang_no_close":          s.WSTorture.HangNoClose,
+			"ws_endpoint_absent":        s.WSTorture.EndpointAbsent,
 		},
 		SSEKill: map[string]int64{
 			"sse_sent":                s.SSEKill.Sent,

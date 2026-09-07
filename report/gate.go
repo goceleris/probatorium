@@ -52,6 +52,16 @@ type GateOptions struct {
 // sse_killed_mid_stream (the validator kills on purpose) and *_endpoint_absent
 // (the refapp has no such endpoint).
 //
+// The CAUSE splits are also excluded, and deliberately so: h2c_hang_{eof,
+// timeout,reset,other} sum to h2c_hang, and ws_handshake_fail_{eof,timeout,
+// reset,status,other} sum to ws_handshake_fail. Gating both a total and its
+// parts reports one defect as two violations — the v1.5.11 soak printed "5
+// violations" for what were only THREE distinct events, because a single h2c
+// hang was counted once as h2c_hang and again as h2c_hang_timeout. The cause
+// counters are diagnostic detail attached to a gated total, not independent
+// signals; gating the total alone keeps the violation count equal to the
+// event count.
+//
 // The scalar Tier1Summary counters gated inline in Gate follow the same
 // rule: requests_5xx, requests_error, invariant_hits and
 // property_violations are defects; requests_5xx_expected,
@@ -63,16 +73,40 @@ var gatedTier1Keys = []struct{ slice, key, why string }{
 	{"adversarial", "adv_wrong_accepted", "a malformed request was accepted"},
 	{"adversarial", "adv_hang_until_timeout", "a malformed request hung the server"},
 	{"h2c_churn", "h2c_hang", "an h2c request was neither answered nor declined"},
-	{"h2c_churn", "h2c_hang_eof", "h2c hang, cause: peer EOF"},
-	{"h2c_churn", "h2c_hang_timeout", "h2c hang, cause: timeout"},
-	{"h2c_churn", "h2c_hang_reset", "h2c hang, cause: reset"},
-	{"h2c_churn", "h2c_hang_other", "h2c hang, cause: other"},
 	{"h2c_churn", "h2c_crashed", "the server crashed under h2c churn"},
 	{"ws_torture", "ws_accepted_bad_frame", "an invalid WebSocket frame was accepted"},
 	{"ws_torture", "ws_hang_no_close", "a WebSocket conn never completed its close"},
 	{"ws_torture", "ws_handshake_fail", "a WebSocket upgrade handshake failed"},
 	{"sse_kill", "sse_handshake_fail", "an SSE handshake failed"},
 	{"sse_kill", "sse_server_closed_early", "the server closed an SSE stream before the client did"},
+}
+
+// causeCounters maps a gated total to the cause counters that sum to it.
+// The causes are reported as detail on the total's violation instead of as
+// violations of their own — see the gatedTier1Keys comment.
+var causeCounters = map[string][]string{
+	"h2c_hang":          {"h2c_hang_eof", "h2c_hang_timeout", "h2c_hang_reset", "h2c_hang_other"},
+	"ws_handshake_fail": {"ws_handshake_fail_eof", "ws_handshake_fail_timeout", "ws_handshake_fail_reset", "ws_handshake_fail_status", "ws_handshake_fail_other"},
+}
+
+// causeSuffix renders the non-zero cause breakdown for a gated total, e.g.
+// " (timeout=1)". Empty when the tally carries no cause detail, so a run
+// produced before the split was added reads exactly as it did before.
+func causeSuffix(m map[string]int64, key string) string {
+	causes, ok := causeCounters[key]
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, c := range causes {
+		if v := m[c]; v > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", strings.TrimPrefix(c, key+"_"), v))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 // Gate applies the ABSOLUTE zero-signal gate to every cell and, when present,
@@ -110,6 +144,26 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			if t.InvariantHits > 0 {
 				add(c, "tier_1.invariant_hits", t.InvariantHits, "the refapp reported an invariant violation")
 			}
+			// A walker re-logs in only when a request comes back 401. On a
+			// healthy run that happens after a deliberate logout, so
+			// relogins are bounded by logouts plus the one pre-walk login
+			// per walker. Unbounded relogins mean the server is not
+			// honouring the session at all -- which is exactly what
+			// celeris#507 did for months at ~96% 4xx, invisible to this
+			// gate because requests_4xx lumps 401/404/429 together
+			// (probatorium#292).
+			//
+			// Only judged when the tally carries the counters, so runs
+			// produced before they existed read exactly as they did.
+			if t.WalkerRelogins > 0 && t.WalkerLogins > 0 {
+				// One re-login per walker is ordinary session expiry over a
+				// long cell; an order of magnitude more is not.
+				if budget := t.WalkerLogins * 10; t.WalkerRelogins > budget {
+					add(c, "tier_1.walker_relogins", t.WalkerRelogins,
+						fmt.Sprintf("walkers re-logged in %d times against %d logins (budget %d): "+
+							"the server is not honouring the session", t.WalkerRelogins, t.WalkerLogins, budget))
+				}
+			}
 			if t.PropertyViolations > 0 {
 				add(c, "tier_1.property_violations", t.PropertyViolations,
 					"property predicate(s) violated: "+strings.Join(t.PropertyViolationIDs, ", "))
@@ -130,7 +184,7 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 					m = t.SSEKill
 				}
 				if v := m[g.key]; v > 0 {
-					add(c, "tier_1."+g.slice+"."+g.key, v, g.why)
+					add(c, "tier_1."+g.slice+"."+g.key, v, g.why+causeSuffix(m, g.key))
 				}
 			}
 		}

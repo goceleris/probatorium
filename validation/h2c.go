@@ -178,15 +178,23 @@ func runH2CChurnWalker(ctx context.Context, hostPort string,
 
 // h2cChurnDialTimeout and h2cChurnReadTimeout split what used to be a
 // single 2s budget. Dial stays at 2s — refapps should accept quickly.
-// Read budget is 10s — sized to celeris's default ReadTimeout (30s)
-// minus generous slack, so a slow-but-correct refapp (observability,
-// static_swagger_proxy under load) has time to respond before we
-// declare h2c_hang. Pre-fix the 2s read budget produced ~18K false-
-// positive hang events per soak on arm64 slow refapps, where the
-// server WAS responding correctly but took 2-5s.
+// Pre-fix the 2s read budget produced ~18K false-positive hang events per
+// soak on arm64 slow refapps, where the server WAS responding correctly but
+// took 2-5s.
+//
+// The read budget is 20s, NOT 10s. At 10s it exactly equalled celeris's own
+// default ReadHeaderTimeout, so when the server timed the request out the
+// walker's deadline expired in the same instant and which side fired first
+// was decided by scheduling noise. That makes the eof/timeout cause split
+// undiagnostic precisely when it matters: the v1.5.11 soak recorded a single
+// h2c_hang with cause=timeout whose elapsed time was the full budget, and it
+// is not recoverable from the artifact whether the server stalled or merely
+// hit its own header deadline. Keeping the walker's budget strictly longer
+// than the server's means a server-side timeout arrives as a response or a
+// close that we can classify, and only a genuine stall exhausts our budget.
 const (
 	h2cChurnDialTimeout = 2 * time.Second
-	h2cChurnReadTimeout = 10 * time.Second
+	h2cChurnReadTimeout = 20 * time.Second
 )
 
 // recordHang increments the hang total plus the cause-specific counter,
