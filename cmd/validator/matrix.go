@@ -593,6 +593,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		cell.PropertiesFailed = res.Properties.Failed()
 		cell.PropertiesNotInstrumented = res.Properties.NotInstrumented
 		cell.PropertiesNotJudged = res.Properties.NotJudged
+		cell.PropertiesNotJudgedByDesign = res.Properties.NotJudgedByDesign
 		cell.FailureSummaries = res.Properties.FailureSummaries
 	}
 	if res.Tier3Ran {

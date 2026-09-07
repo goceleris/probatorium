@@ -166,6 +166,25 @@ func pickCounter(t *Tier1Summary, slice, counter string) int64 {
 // isZeroAsymmetric returns true when exactly one of a, b is zero.
 // Both-zero (clean) and both-non-zero (predicate violation on both
 // arches — same bug, not a divergence) are NOT flagged here.
+// isZeroAsymmetric reports whether a counter is zero on exactly one side.
+//
+// Only ASYMMETRIC divergence is a cross-arch/cross-engine signal: it means the
+// two sides disagree. A counter non-zero on BOTH sides is not a divergence --
+// they agree -- but it is still a defect, and this function deliberately does
+// not report it. That gap used to be a real hole (probatorium#259: a bug
+// present on both arches looks like agreement, so io_uring h2c hangs went
+// unreported on the nights they happened to land symmetrically).
+//
+// It is no longer a hole: report.Gate is an ABSOLUTE zero-signal gate that
+// fails on ANY non-zero gated counter in ANY cell, symmetric or not, and its
+// gatedTier1Keys covers h2c_hang, adv_hang_until_timeout and
+// sse_handshake_fail -- the three counters #259 flagged as having no backing.
+// The v1.5.11 soak is the proof: it failed the absolute gate on h2c_hang=1 and
+// ws_handshake_fail=1, both of which this diff would have passed.
+//
+// So the division of labour is: Gate catches presence, Diff catches
+// disagreement. Do not widen this to symmetric cases -- that would duplicate
+// Gate and make every diff row fire twice.
 func isZeroAsymmetric(a, b int64) bool {
 	return (a == 0) != (b == 0)
 }

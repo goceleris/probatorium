@@ -203,7 +203,7 @@ func TestEvaluator_BaselineViolationsAndTally(t *testing.T) {
 	if tl.BaselineGoroutines != 30 || tl.LastGoroutines != 30 || tl.FirstHeapInuse != 1<<20 {
 		t.Fatalf("resource points: %+v", tl)
 	}
-	e.RecordPollError()
+	e.RecordPollError(start.Add(6 * time.Second))
 	if e.Tally().PollErrors != 1 {
 		t.Fatal("poll error not counted")
 	}
