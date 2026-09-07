@@ -42,7 +42,7 @@
          nothing resolves this at deploy time. Vert.x 5.x is the current line
          (Java 11+ baseline, tested on 21). NOTE: netty.epoll.version below
          must track vertx-core's netty — see the profile at the bottom. -->
-<vertx.version>5.1.6</vertx.version>
+<vertx.version>5.1.7</vertx.version>
     <!-- Single-class entry point; the shade plugin stamps it as Main-Class. -->
     <main.class>probatorium.vertx.Server</main.class>
     <!-- Stable uber-jar name so the launcher / RunCmd reference it without
@@ -93,7 +93,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.15.0</version>
+        <version>3.16.0</version>
       </plugin>
 
       <!-- Shade into a single executable uber-jar. The
