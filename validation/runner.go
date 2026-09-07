@@ -52,6 +52,12 @@ const (
 	TierReplay
 )
 
+// MarshalText makes plan.json carry the tier's NAME. It used to
+// serialize as the bare iota, so the tier described as "Tier 1" in
+// plan.json was in fact tier-2-restler — the numbering alone sent a
+// triage down the wrong tier (probatorium#300).
+func (t Tier) MarshalText() ([]byte, error) { return []byte(t.String()), nil }
+
 // String returns the tier's human-readable name.
 func (t Tier) String() string {
 	switch t {
@@ -262,10 +268,18 @@ type Plan struct {
 
 // TierPlan is the planned activity for one tier.
 type TierPlan struct {
-	Tier        Tier
-	Description string
-	BudgetUnits string
-	Cadence     string
+	Tier        Tier   `json:"tier"`
+	Description string `json:"description"`
+	BudgetUnits string `json:"budget_units"`
+	Cadence     string `json:"cadence"`
+	// Enabled is false for a tier that will not execute in this run.
+	// Every nightly plan.json advertised tier 2 as OpenAPI stateful
+	// fuzzing on a windowed cadence while runTierRESTler only parked on
+	// ctx, so the plan read as covered when nothing ran
+	// (probatorium#300). A disabled tier must say so.
+	Enabled bool `json:"enabled"`
+	// Status explains a disabled tier. Empty when Enabled.
+	Status string `json:"status,omitempty"`
 }
 
 // New constructs an orchestrator and pre-loads artifacts. Returns an
@@ -280,6 +294,18 @@ func New(cfg Config) (*Orchestrator, error) {
 			return nil, fmt.Errorf("validation: load markov %s: %w", cfg.MarkovPath, err)
 		}
 		o.matrix = m
+	}
+	// A NAMED spec must exist. This is the half of probatorium#300 that
+	// the doc comment above always claimed and the code never did: the
+	// path was recorded in plan.json unopened, so every cluster cell
+	// advertised validation/spec/auth_session_ratelimit.openapi.yaml —
+	// a file that is not staged under bench_root at all. An empty path
+	// is not an error: it means no spec was resolved for this refapp,
+	// and the plan says so rather than borrowing another refapp's.
+	if cfg.OpenAPIPath != "" {
+		if _, err := os.Stat(cfg.OpenAPIPath); err != nil {
+			return nil, fmt.Errorf("validation: openapi spec %s: %w", cfg.OpenAPIPath, err)
+		}
 	}
 	if cfg.CorpusPath != "" {
 		_, seeds, err := corpus.ReadFile(cfg.CorpusPath)
@@ -403,35 +429,46 @@ func (o *Orchestrator) Plan() *Plan {
 			Description: "always-on Markov-driven session traffic with adversarial HTTP/1.1, h2c upgrade, WS torture, SSE long-poll",
 			BudgetUnits: fmt.Sprintf("for %s", o.cfg.Duration),
 			Cadence:     "continuous",
+			Enabled:     true,
 		},
-		{
-			Tier:        TierRESTler,
-			Description: "RESTler-style stateful fuzzing over the OpenAPI 3.1 spec with dependency-inference value mutation",
-			BudgetUnits: "8h windows",
-			Cadence:     fmt.Sprintf("rolling, max %d windows", restlerWindowsFor(o.cfg.Duration)),
-		},
+		restlerTierPlan(o.cfg.OpenAPIPath),
 		{
 			Tier:        TierReplay,
 			Description: "deterministic seed replay (workload + fault schedule) on fresh celeris per seed",
 			BudgetUnits: fmt.Sprintf("%d seeds total", replaySeedsFor(o.cfg.Duration)),
 			Cadence:     "~200 seeds/h",
+			Enabled:     true,
 		},
 	}
 	o.plan = p
 	return p
 }
 
-// restlerWindowsFor returns how many full 8h windows fit in d.
-func restlerWindowsFor(d time.Duration) int {
-	if d <= 0 {
-		return 0
+// restlerTierPlan describes Tier 2 truthfully.
+//
+// Tier 2 has never run: runTierRESTler blocks on ctx and returns, so no
+// OpenAPI-derived request has ever reached a refapp. The plan used to
+// describe it as active on a "rolling, max N windows" cadence, which is
+// why every nightly plan.json read as if the stateful fuzzer were part
+// of the matrix's coverage (probatorium#300).
+//
+// The spec dependency is stated here too: when the fuzzer does land it
+// needs the refapp's OWN OpenAPI document, and a cell without one must
+// fail rather than fuzz against another refapp's API. Naming the
+// missing spec in the plan is what makes that a decision instead of a
+// silent fallback.
+func restlerTierPlan(specPath string) TierPlan {
+	t := TierPlan{
+		Tier:        TierRESTler,
+		Description: "RESTler-style stateful fuzzing over the OpenAPI 3.1 spec with dependency-inference value mutation",
+		BudgetUnits: "none",
+		Cadence:     "never",
+		Status:      "DISABLED: the stateful sequence generator is unimplemented scaffolding (runTierRESTler parks on ctx); no OpenAPI-derived traffic is sent",
 	}
-	n := int(d / (8 * time.Hour))
-	if n == 0 && d > time.Hour {
-		// Show one partial window so dry-run is informative.
-		return 1
+	if specPath == "" {
+		t.Status += "; and no OpenAPI spec is resolved for this refapp, which would be a hard error the moment the tier is budgeted"
 	}
-	return n
+	return t
 }
 
 // replaySeedsFor returns how many seeds Tier 3 would walk at 200/h.
@@ -493,7 +530,14 @@ func PrintPlan(w io.Writer, p *Plan) {
 	_, _ = fmt.Fprintf(w, "validator plan\n")
 	_, _ = fmt.Fprintf(w, "  target=%s arch=%s celeris=%s duration=%s soak=%t\n",
 		p.Target, p.Arch, p.CelerisCommit, p.Duration, p.SoakMode)
-	_, _ = fmt.Fprintf(w, "  bind=%s openapi=%s\n", p.CelerisListenAddr, p.OpenAPIPath)
+	// An empty spec path prints as "<none>": a bare "openapi=" reads
+	// like a formatting slip, and the whole point of probatorium#300 is
+	// that a missing per-refapp spec must be legible in the artifact.
+	openapi := p.OpenAPIPath
+	if openapi == "" {
+		openapi = "<none>"
+	}
+	_, _ = fmt.Fprintf(w, "  bind=%s openapi=%s\n", p.CelerisListenAddr, openapi)
 	_, _ = fmt.Fprintf(w, "  corpus=%d seed(s) | markov=%d state(s)\n", p.CorpusSize, len(p.MatrixStates))
 	_, _ = fmt.Fprintf(w, "  properties (%d):\n", len(p.Properties))
 	for _, s := range p.Properties {
@@ -504,6 +548,9 @@ func PrintPlan(w io.Writer, p *Plan) {
 		_, _ = fmt.Fprintf(w, "    %s\n", t.Tier)
 		_, _ = fmt.Fprintf(w, "      %s\n", t.Description)
 		_, _ = fmt.Fprintf(w, "      cadence=%s budget=%s\n", t.Cadence, t.BudgetUnits)
+		if !t.Enabled {
+			_, _ = fmt.Fprintf(w, "      %s\n", t.Status)
+		}
 	}
 }
 
@@ -948,6 +995,12 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 // runTierRESTler is Tier 2 — RESTler-style stateful fuzzer over the
 // OpenAPI spec. Wave 6 lands the scaffolding; the actual sequence
 // generator is exercised by the cmd/validator-checker process.
+//
+// It parks: no sequence is generated and no request is sent. That is a
+// deliberate (if long-standing) budget decision, and [restlerTierPlan]
+// is where the plan states it — keep the two in sync, and when the
+// generator does land, require o.cfg.OpenAPIPath to be the spec of the
+// refapp under test rather than whichever spec happened to be on disk.
 func (o *Orchestrator) runTierRESTler(ctx context.Context, violations chan<- Incident) {
 	<-ctx.Done()
 	_ = violations
@@ -1247,6 +1300,12 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"h2c_hang_max_elapsed_ms": s.H2CChurn.HangMaxElapsedMs,
 		},
 		WSTorture: map[string]int64{
+			// Route coverage FIRST: without it a cell of ws_* zeros can
+			// mean "no /ws on this refapp" (7 of 8), "slice dormant" or
+			// "walked clean", and the run-wide totals hide which
+			// (probatorium#300).
+			"ws_route_probed":   b2i(s.WSTorture.RouteProbed),
+			"ws_route_present":  b2i(s.WSTorture.RoutePresent),
 			"ws_sent":           s.WSTorture.Sent,
 			"ws_upgraded":       s.WSTorture.Upgraded,
 			"ws_handshake_fail": s.WSTorture.HandshakeFail,
@@ -1263,6 +1322,8 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"ws_endpoint_absent":        s.WSTorture.EndpointAbsent,
 		},
 		SSEKill: map[string]int64{
+			"sse_route_probed":        b2i(s.SSEKill.RouteProbed),
+			"sse_route_present":       b2i(s.SSEKill.RoutePresent),
 			"sse_sent":                s.SSEKill.Sent,
 			"sse_established":         s.SSEKill.Established,
 			"sse_events_read":         s.SSEKill.EventsRead,
@@ -1273,6 +1334,16 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"sse_endpoint_absent":     s.SSEKill.EndpointAbsent,
 		},
 	}
+}
+
+// b2i renders a boolean tally field as the 0/1 the sub-tally maps
+// carry — report.Tier1Summary keeps them as map[string]int64 so a new
+// counter never re-versions the schema.
+func b2i(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // Tier3Summary projects a tier3TallySnapshot into the public
