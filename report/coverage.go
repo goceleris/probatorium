@@ -98,8 +98,8 @@ func accumulateEndpoint(e *EndpointCoverage, m map[string]int64, prefix string) 
 func FormatStreamingCoverage(cov []StreamCoverage) string {
 	var b strings.Builder
 	b.WriteString("streaming endpoint coverage (per refapp)\n")
-	b.WriteString(fmt.Sprintf("  %-26s %-5s %-6s %-10s %-10s %s\n",
-		"refapp", "cells", "endpt", "routed", "sent", "reached"))
+	fmt.Fprintf(&b, "  %-26s %-5s %-6s %-10s %-10s %s\n",
+		"refapp", "cells", "endpt", "routed", "sent", "reached")
 	for _, c := range cov {
 		writeCoverageRow(&b, c.Refapp, c.Cells, "/ws", c.WS)
 		writeCoverageRow(&b, c.Refapp, c.Cells, "/events", c.SSE)
@@ -119,6 +119,6 @@ func writeCoverageRow(b *strings.Builder, refapp string, cells int, endpoint str
 	if e.Sent > 0 {
 		reached = fmt.Sprintf("%d (%.1f%%)", e.Reached, 100*float64(e.Reached)/float64(e.Sent))
 	}
-	b.WriteString(fmt.Sprintf("  %-26s %-5d %-6s %-10s %-10d %s\n",
-		refapp, cells, endpoint, routed, e.Sent, reached))
+	fmt.Fprintf(&b, "  %-26s %-5d %-6s %-10s %-10d %s\n",
+		refapp, cells, endpoint, routed, e.Sent, reached)
 }
