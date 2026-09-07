@@ -68,7 +68,20 @@ import (
 //     ignore the fields -- but the version bump is load-bearing for
 //     mage ValidateGate: a 5.5 document has no property loop, so the
 //     "loop never evaluated anything" check defaults off for it.
-const SchemaVersion = "5.7"
+//   - 5.8 — property verdict COVERAGE (probatorium#299). Adds
+//     ValidationCellResult.PropertiesNotJudgedByDesign: the subset of
+//     properties_not_judged whose predicate needs a longer observation
+//     window than this cell's property loop ran for. Without it the
+//     gate cannot tell a 150 s nightly cell, which structurally cannot
+//     judge a memory slope, from an hour-long soak cell whose slope
+//     oracle stayed silent anyway -- so it said nothing about either
+//     and a nightly PASS carried no opinion on memory growth at all.
+//     Additive -- older readers ignore the field -- but load-bearing
+//     for mage ValidateGate: a 5.6/5.7 document has the not-judged
+//     list without the by-design one, so its short-cell oracles would
+//     every one of them read as coverage failures, and the check
+//     defaults off for it.
+const SchemaVersion = "5.8"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -486,6 +499,14 @@ type ValidationCellResult struct {
 	// judges them. They are excluded from PropertiesPassed -- a short
 	// cell's passed count must not read as "the leak oracles passed".
 	PropertiesNotJudged []string `json:"properties_not_judged,omitempty"`
+	// PropertiesNotJudgedByDesign is the subset of PropertiesNotJudged
+	// this cell COULD NOT have judged: the predicate needs a longer
+	// observation window than the cell's property loop ran for (a 150 s
+	// nightly cell against I-MEM-1's 5 min warm-up plus 10 min span).
+	// It is what lets the absolute gate tell "cannot judge here, by
+	// design" from "should have judged and did not" -- see
+	// [Coverage] (schema 5.8, probatorium#299).
+	PropertiesNotJudgedByDesign []string `json:"properties_not_judged_by_design,omitempty"`
 	// FailureSummaries maps a failed predicate ID to its first violation
 	// message.
 	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`

@@ -43,6 +43,117 @@ type GateOptions struct {
 	// schema 5.6 have no property loop at all; mage ValidateGate
 	// defaults this off for them.
 	RequireProperties bool
+	// RequireCoverage fails the run for every predicate the property
+	// loop ran but never reached a verdict on in ANY cell, unless every
+	// cell that skipped it was structurally too short to judge it (see
+	// [Coverage]). Documents older than schema 5.8 carry no by-design
+	// list, so their short-cell oracles would all read as gaps; mage
+	// ValidateGate defaults this off for them.
+	RequireCoverage bool
+}
+
+// CoverageGap is one predicate the property loop RAN and never reached a
+// verdict on in ANY cell of the matrix: every evaluation, everywhere,
+// was a skip.
+//
+// It is a distinct finding from a [Violation]. Nothing was violated --
+// the run simply holds no opinion on what that predicate asserts, and
+// on an ABSOLUTE zero-signal gate silence is not zero signal. The
+// v1.5.11 nightlies passed for months with I-MEM-1, I-MEM-3 and
+// I-MEM-4 in this state in all 48 cells while the gate header printed
+// require_properties=true (probatorium#299).
+type CoverageGap struct {
+	// ID is the predicate, e.g. "I-MEM-1".
+	ID string
+	// Cells is the number of cells whose property loop ran and reported
+	// the predicate as not judged.
+	Cells int
+	// ByDesign is the subset of Cells that could not have judged it:
+	// the cell was shorter than the predicate's declared minimum
+	// observation (properties.Spec.MinObservation). A 150 s nightly
+	// cell can never fit I-MEM-1's 5 min warm-up plus its 10 min span.
+	ByDesign int
+}
+
+// Structural reports whether EVERY cell that failed to judge the
+// predicate was incapable of judging it. Such a gap describes the tier
+// (its cells are too short for this oracle), not the run: it is
+// reported so a nightly PASS cannot be misread as "the leak oracles
+// passed", but it does not fail the gate -- a 150 s cell legitimately
+// cannot judge a slope.
+//
+// A gap that is NOT structural means at least one cell had the time and
+// still reached no verdict: the oracle was silent when it should have
+// spoken, which is a coverage failure.
+func (g CoverageGap) Structural() bool { return g.Cells > 0 && g.ByDesign == g.Cells }
+
+// Coverage returns one [CoverageGap] per predicate that no cell in the
+// run ever judged, sorted by ID.
+//
+// Only cells whose property loop actually ran are evidence. A cell that
+// skipped the loop (ssh driver) reports empty lists, and reading those
+// as "this cell judged everything" would erase the gaps the other cells
+// reported. A cell that lists a predicate as not INSTRUMENTED is
+// likewise neither evidence of coverage nor a cell that failed to judge
+// it: vacuous instrumentation is its own finding (probatorium#297).
+func Coverage(cells []ValidationCellResult) []CoverageGap {
+	notJudged := map[string]int{}
+	byDesign := map[string]int{}
+	var ran []ValidationCellResult
+	for _, c := range cells {
+		if !propertyLoopRan(c) {
+			continue
+		}
+		ran = append(ran, c)
+		skipped := make(map[string]bool, len(c.PropertiesNotJudged))
+		for _, id := range c.PropertiesNotJudged {
+			skipped[id] = true
+			notJudged[id]++
+		}
+		for _, id := range c.PropertiesNotJudgedByDesign {
+			if skipped[id] {
+				byDesign[id]++
+			}
+		}
+	}
+	// Second pass, over the candidates the first one collected: every
+	// predicate this cell evaluated and did not report as skipped
+	// reached a verdict here, so the run has an opinion on it. The
+	// candidate set has to be complete first -- a cell that judged a
+	// predicate is evidence no matter whether it was walked before or
+	// after the cells that did not.
+	judged := make(map[string]bool, len(notJudged))
+	for _, c := range ran {
+		silent := make(map[string]bool, len(c.PropertiesNotJudged)+len(c.PropertiesNotInstrumented))
+		for _, id := range c.PropertiesNotJudged {
+			silent[id] = true
+		}
+		for _, id := range c.PropertiesNotInstrumented {
+			silent[id] = true
+		}
+		for id := range notJudged {
+			if !silent[id] {
+				judged[id] = true
+			}
+		}
+	}
+	out := make([]CoverageGap, 0, len(notJudged))
+	for id, n := range notJudged {
+		if judged[id] {
+			continue
+		}
+		out = append(out, CoverageGap{ID: id, Cells: n, ByDesign: byDesign[id]})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// propertyLoopRan reports whether the cell's in-process property loop
+// observed anything. A loop that was deliberately not run (ssh driver)
+// or never got a sample has nothing to say about coverage either way.
+func propertyLoopRan(c ValidationCellResult) bool {
+	t := c.Tier1
+	return t != nil && t.PropertyLoopSkipped == "" && t.PropertyEvaluations+t.PropertySkips > 0
 }
 
 // gatedTier1Keys are the sub-tally counters that are defects by definition.
@@ -119,6 +230,11 @@ func causeSuffix(m map[string]int64, key string) string {
 // sent), on any missing cell, on a tier that never ran, and on soak leak
 // indicators. Designed 5xx (requests_5xx_expected) and tier-deadline cutoffs
 // (requests_cut_at_deadline) are informational and are not gated.
+//
+// Under RequireCoverage it also fails on SILENCE: a predicate the property
+// loop ran but never reached a verdict on in any cell (see [Coverage]). A
+// counter that stayed zero and an oracle that never spoke look identical in
+// a tally, and only one of them is evidence.
 func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts GateOptions) []Violation {
 	var out []Violation
 	add := func(c ValidationCellResult, field string, v int64, why string) {
@@ -193,6 +309,20 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 		}
 		if c.Soak.RestartedProcesses > 0 {
 			add(c, "soak_summary.restarted_processes", int64(c.Soak.RestartedProcesses), "a server process died and was restarted during the soak")
+		}
+	}
+	if opts.RequireCoverage {
+		for _, g := range Coverage(cells) {
+			if g.Structural() {
+				// The tier cannot judge this oracle in cells this
+				// short. mage ValidateGate prints it either way; failing
+				// on it would fail the nightly for its own definition.
+				continue
+			}
+			out = append(out, Violation{Refapp: "*", Engine: "*", Arch: "*",
+				Field: "properties.coverage." + g.ID, Value: int64(g.Cells),
+				Why: fmt.Sprintf("%s reached no verdict in ANY cell (%d cell(s) never judged it, %d of them had the time): the predicate was requested by the tier and stayed silent, which on an absolute gate is not the same as zero signal",
+					g.ID, g.Cells, g.Cells-g.ByDesign)})
 		}
 	}
 	hosts := make([]string, 0, len(soaks))
