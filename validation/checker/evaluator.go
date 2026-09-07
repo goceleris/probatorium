@@ -2,6 +2,7 @@ package checker
 
 import (
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/goceleris/probatorium/validation/properties"
@@ -21,19 +22,34 @@ const HistoryCap = 3600
 // Instrumented today (refapp /debug/vars + orchestrator /proc):
 // I-CONN-2, I-MEM-1, I-MEM-3, I-MEM-4 (linux local driver only -- the
 // Tally also lists it as not instrumented when RSS was never sampled),
-// I-PANIC, I-ENG-ADAPTIVE.
+// I-PANIC, I-ENG-ADAPTIVE, plus the [DeclaredOnly] set below in the cells
+// whose refapp declares them.
 var Uninstrumented = map[string]string{
-	"I-CONN-1":       "needs a per-connection last-byte table (OldestOpenConnLastByteAgeMs is never populated)",
-	"I-RFC-1":        "needs the response-scraping MITM (Responses* counters are never populated)",
-	"I-RFC-2":        "needs the response-scraping MITM (Responses* counters are never populated)",
-	"I-RACE":         "refapps are not built with -race and no stderr marker counter exists",
-	"I-CHECKPTR":     "refapps are not built with -d=checkptr and no stderr marker counter exists",
-	"I-MEM-2":        "needs an orchestrator-driven idle window (Context.IdleMode is never set)",
-	"I-MW-RATELIMIT": "counters live only in -tags=validation builds served over the unix socket; refapps are plain builds",
-	"I-MW-SESSION":   "counters live only in -tags=validation builds served over the unix socket; refapps are plain builds",
-	"I-MW-JWT":       "counters live only in -tags=validation builds served over the unix socket; refapps are plain builds",
-	"I-ENG-IOURING":  "SQE/CQE counters and the sqe_corruptions assertion exist only in -tags=validation builds",
-	"I-DRV":          "needs the driver shadow map (Driver* counters are never populated)",
+	"I-CONN-1":      "needs a per-connection last-byte table (OldestOpenConnLastByteAgeMs is never populated)",
+	"I-RFC-1":       "needs the response-scraping MITM (Responses* counters are never populated)",
+	"I-RFC-2":       "needs the response-scraping MITM (Responses* counters are never populated)",
+	"I-RACE":        "refapps are not built with -race and no stderr marker counter exists",
+	"I-CHECKPTR":    "refapps are not built with -d=checkptr and no stderr marker counter exists",
+	"I-MEM-2":       "needs an orchestrator-driven idle window (Context.IdleMode is never set)",
+	"I-ENG-IOURING": "SQE/CQE counters and the sqe_corruptions assertion exist only in -tags=validation builds",
+	"I-DRV":         "needs the driver shadow map (Driver* counters are never populated)",
+}
+
+// DeclaredOnly lists the predicates whose data source exists only in the
+// refapps that install the matching middleware. Those refapps publish the
+// counters on /debug/vars AND name the predicate in
+// celeris.instrumented_properties; every other refapp leaves the counters at
+// zero, which is indistinguishable from clean. A cell whose refapp never
+// declared the ID therefore reports it as not-instrumented instead of
+// passing it vacuously.
+//
+// Without this the fix to probatorium#297 would have replaced one silent
+// vacuity with another: eight of the nine matrix refapps do not install
+// session middleware, and I-MW-SESSION would have "passed" in all of them.
+var DeclaredOnly = map[string]string{
+	"I-MW-SESSION":   "only the refapps that install middleware/session keep the id→owner ledger the predicate judges",
+	"I-MW-JWT":       "only the refapps that install middleware/jwt mint tokens and re-verify their expiry",
+	"I-MW-RATELIMIT": "only the refapps that install the in-process middleware/ratelimit run the shadow token bucket",
 }
 
 // Violation is one failed predicate evaluation.
@@ -142,17 +158,23 @@ type Evaluator struct {
 	judged map[string]int64  // verdict-reaching evaluations per ID
 	streak map[string]int    // consecutive failing evaluations per ID (Persist)
 	first  map[string]string // first violation message per ID
+	// declared is the union of the refapp's celeris.instrumented_properties
+	// over every sample. A union and not the last sample's value because a
+	// poll that failed mid-run must not retract a declaration the refapp
+	// already made.
+	declared map[string]bool
 }
 
 // NewEvaluator returns an Evaluator over specs (typically
 // SelectPredicates(tier)).
 func NewEvaluator(specs []properties.Spec) *Evaluator {
 	e := &Evaluator{
-		specs:  specs,
-		per:    map[string]int64{},
-		judged: map[string]int64{},
-		streak: map[string]int{},
-		first:  map[string]string{},
+		specs:    specs,
+		per:      map[string]int64{},
+		judged:   map[string]int64{},
+		streak:   map[string]int{},
+		first:    map[string]string{},
+		declared: map[string]bool{},
 	}
 	for _, s := range specs {
 		e.per[s.ID] = 0
@@ -189,6 +211,11 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 			e.tally.FirstRSS = snap.RSSBytes
 		}
 		e.tally.LastRSS = snap.RSSBytes
+	}
+	for _, id := range strings.Split(snap.InstrumentedProperties, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			e.declared[id] = true
+		}
 	}
 	e.ctx.Now = now
 	e.ctx.History = append(e.ctx.History, snap)
@@ -236,7 +263,13 @@ func (e *Evaluator) Tally() Tally {
 	for _, s := range e.specs {
 		t.Predicates = append(t.Predicates, s.ID)
 		t.PerPredicate[s.ID] = e.per[s.ID]
+		_, declaredOnly := DeclaredOnly[s.ID]
 		if _, ok := Uninstrumented[s.ID]; ok {
+			t.NotInstrumented = append(t.NotInstrumented, s.ID)
+		} else if declaredOnly && !e.declared[s.ID] {
+			// This refapp does not install the middleware, so its
+			// counters are structurally zero -- a pass here would mean
+			// nothing.
 			t.NotInstrumented = append(t.NotInstrumented, s.ID)
 		} else if s.ID == properties.IMEM4.ID && e.tally.LastRSS == 0 {
 			// RSS was never sampled (no pid, non-linux, remote refapp):

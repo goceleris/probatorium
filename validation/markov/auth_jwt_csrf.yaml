@@ -1,17 +1,25 @@
 # Transition matrix for the auth_jwt_csrf refapp.
 #
 # States model a JWT-protected API + CSRF-protected form workflow.
-# This refapp uses bearer-token / API-key auth (no cookie session) —
-# the Tier 1 walker therefore has NO `login:` directive; the JWT
-# rejection path is itself the validation goal.
+# This refapp has no cookie session, so the walker has NO `login:`
+# directive; it authenticates by fetching a short-lived JWT into its
+# cookie jar at /jwt-token.
 #
 # Routes verified against validation/refapp/auth_jwt_csrf/main.go:
 #   GET  /public         — anon
-#   GET  /api/me         — bearer required (apiGroup)
-#   GET  /api/users      — bearer required (apiGroup)
+#   GET  /jwt-token      — mints a 5 s JWT into the cookie jar
+#   GET  /api/me         — bearer/cookie JWT required (apiGroup)
+#   GET  /api/users      — bearer/cookie JWT required (apiGroup)
 #   GET  /key/whoami     — X-API-Key required (keyGroup)
 #   GET  /csrf-token     — mint
 #   POST /csrf-protected — CSRF-guarded mutation
+#
+# probatorium#297: before jwt_mint existed no walker ever presented a
+# VALID token, so /api/* was a pure 401 path and I-MW-JWT ("rejects
+# every token past its expiry") had nothing to judge — an admission
+# past expiry cannot be observed where there are no admissions. The
+# token's 5 s life is shorter than a walker's stay in the /api states,
+# so both sides of the boundary are exercised continuously.
 
 start: public
 
@@ -22,25 +30,38 @@ states:
   # endpoint directly.
   public:
     request: GET /public
-    api_me:       6.0  # 60% try authenticated probe (→ 401)
+    jwt_mint:     3.0  # 30% authenticate first, then probe /api/* as a valid caller
+    api_me:       3.0  # 30% probe unauthenticated (→ 401)
     key_whoami:   2.0  # 20% try API-key path (→ 401)
     csrf_token:   2.0  # 20% start CSRF workflow
 
-  # /api/me — JWT-protected. Without a bearer we get 401, which is
-  # the validation we want (verifying the rejection path runs cleanly).
+  # /jwt-token — mints a 5 s JWT into the cookie jar. Always followed by
+  # an /api/* call, so the middleware's ACCEPT path runs; the walker then
+  # loops in /api/* long past the 5 s life, so the reject-after-expiry
+  # path runs too. Both are needed for I-MW-JWT to mean anything.
+  jwt_mint:
+    request: GET /jwt-token
+    api_me:       6.0
+    api_users:    4.0
+
+  # /api/me — JWT-protected. 200 while the minted cookie is alive, 401
+  # once it expires or when the walker never minted one; both paths are
+  # validation targets.
   api_me:
     request: GET /api/me
     api_users:    5.0
-    csrf_token:   3.0
+    csrf_token:   2.0
+    jwt_mint:     1.0  # re-mint mid-walk: exercises re-admission after expiry
     api_me:       1.0
     public:       1.0  # back to anon — terminates cleanly via reset
 
-  # /api/users — JWT-protected listing. Same rejection path.
+  # /api/users — JWT-protected listing. Same accept/reject split.
   api_users:
     request: GET /api/users
     api_me:       3.0
     api_users:    2.0
-    csrf_token:   3.0
+    csrf_token:   2.0
+    jwt_mint:     1.0
     public:       2.0
 
   # /key/whoami — API-key auth. Returns 401 without X-API-Key header.

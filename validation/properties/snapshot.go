@@ -66,15 +66,23 @@ type Snapshot struct {
 	RaceReports     int64
 	CheckptrReports int64
 
-	// Middleware counters (wave 7 surfaces validation-only counters; for
-	// now the checker reads what Prometheus exposes on /metrics and
-	// reflects subset coverage here).
+	// Middleware counters. Published by the refapps that install the
+	// matching middleware (validation/refapp/internal/debugvars) and read
+	// off /debug/vars in every build; the validation socket below feeds
+	// the same fields when celeris is built with -tags=validation.
 	RateLimitAllowed     int64
 	RateLimitRejected    int64
 	SessionsCreatedTotal int64
 	SessionsExpiredTotal int64
 	JWTValidatedOK       int64
 	JWTValidatedFail     int64
+	// SessionCookieDrops is celeris middleware/session.DroppedCookies():
+	// requests whose id-CHANGING session cookie could not be emitted
+	// because the handler had already written the body. The client keeps
+	// (or never learns) an id that does not name the session it just
+	// authenticated into -- celeris#507. Counted in every build, so unlike
+	// SessionOwnerMismatches this one needs no validation tag.
+	SessionCookieDrops int64
 
 	// Driver shadow counters (validator-driven, not celeris-driven).
 	// Incremented by the validator's traffic generator after every
@@ -112,6 +120,20 @@ type Snapshot struct {
 	SessionOwnerMismatches   int64
 	JWTLateAdmits            int64
 	IouringSQECorruptions    int64
+
+	// InstrumentedProperties is the sorted, comma-joined list of predicate
+	// IDs the refapp declares it actually feeds (its
+	// celeris.instrumented_properties key). Only the refapps that install a
+	// given middleware can judge that middleware's invariant, so a
+	// predicate absent from this list is reported as not-instrumented for
+	// the cell rather than passing on a structurally-zero counter --
+	// probatorium#297, where nine predicates read as clean because nothing
+	// ever wrote to them.
+	//
+	// A string and not a []string on purpose: Snapshot must stay a
+	// comparable value type (the rolling History is copied around and the
+	// checker's tests compare whole snapshots).
+	InstrumentedProperties string
 }
 
 // Context carries rolling-window state needed by predicates that look

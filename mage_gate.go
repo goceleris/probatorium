@@ -36,6 +36,18 @@ import (
 //	                                     property fields at all and would fail every cell.
 //	                                     A cell whose tier_1.property_loop_skipped names a
 //	                                     reason (ssh driver) is waived either way.
+//	VALIDATE_GATE_REQUIRE_INSTRUMENTED=1 fail the RUN for any predicate that every
+//	                                     property-running cell reported as
+//	                                     not-instrumented and that is not on
+//	                                     report.WaivedUninstrumented. Defaults to the
+//	                                     same schema>=5.6 rule as REQUIRE_PROPERTIES.
+//	                                     probatorium#297: 9 of 14 requested predicates
+//	                                     were in that state in all 48 cells of both a
+//	                                     PASSING nightly and the failing v1.5.11 soak.
+//
+// The instrumentation coverage of every run is printed whether or not the
+// check is on: silent vacuity is what let a predicate with no data source sit
+// in the matrix for months.
 //
 // Property predicate violations (tier_1.property_violations, naming the
 // I-* IDs) are always gated, whether the run recorded them (the default,
@@ -80,11 +92,19 @@ func ValidateGate() error {
 	case "0":
 		requireProps = false
 	}
+	requireInstr := propertyAware
+	switch os.Getenv("VALIDATE_GATE_REQUIRE_INSTRUMENTED") {
+	case "1":
+		requireInstr = true
+	case "0":
+		requireInstr = false
+	}
 	opts := report.GateOptions{
-		ExpectedCells:     gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
-		RequireTier3:      os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
-		RequireSoak:       os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
-		RequireProperties: requireProps,
+		ExpectedCells:       gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
+		RequireTier3:        os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
+		RequireSoak:         os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
+		RequireProperties:   requireProps,
+		RequireInstrumented: requireInstr,
 	}
 	cellSoaks := 0
 	var propEvals, propViol int64
@@ -97,8 +117,9 @@ func ValidateGate() error {
 			propViol += c.Tier1.PropertyViolations
 		}
 	}
-	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v (schema>=5.6: %v) soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
-		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, propertyAware, cellSoaks, len(soaks), propEvals, propViol)
+	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v require_instrumented=%v (schema>=5.6: %v) soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
+		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, opts.RequireInstrumented, propertyAware, cellSoaks, len(soaks), propEvals, propViol)
+	printInstrumentationCoverage(cells)
 	viol := report.Gate(cells, soaks, opts)
 	if len(viol) == 0 {
 		fmt.Println("ValidateGate: PASS -- every gated signal is zero in every cell.")
@@ -110,6 +131,35 @@ func ValidateGate() error {
 		fmt.Printf("  %-24s %-8s %-12s %-44s %10d  %s\n", v.Refapp, v.Engine, v.Arch, v.Field, v.Value, v.Why)
 	}
 	return fmt.Errorf("ValidateGate: %d violation(s) -- a nonzero true-signal counter is a failure, not a note", len(viol))
+}
+
+// printInstrumentationCoverage prints, every run, which predicates verified
+// nothing anywhere -- separating the waived holes (a known gap, on the
+// record) from the unwaived ones (a gate failure) and from the predicates
+// that were instrumented but never reached a verdict.
+//
+// It prints even when the run passes and even when the check is off, because
+// the failure mode probatorium#297 describes is not a wrong number: it is a
+// true number nobody reads. properties_not_instrumented was in every cell of
+// every document the whole time.
+func printInstrumentationCoverage(cells []report.ValidationCellResult) {
+	uninstr := report.UninstrumentedEverywhere(cells)
+	notJudged := report.NotJudgedEverywhere(cells)
+	if len(uninstr) == 0 && len(notJudged) == 0 {
+		fmt.Println("ValidateGate: property coverage -- every requested predicate was instrumented and judged in at least one cell.")
+		return
+	}
+	fmt.Println("ValidateGate: property coverage --")
+	for _, id := range uninstr {
+		if why, ok := report.WaivedUninstrumented[id]; ok {
+			fmt.Printf("  %-16s NOT INSTRUMENTED in any cell (waived): %s\n", id, why)
+			continue
+		}
+		fmt.Printf("  %-16s NOT INSTRUMENTED in any cell -- verified nothing\n", id)
+	}
+	for _, id := range notJudged {
+		fmt.Printf("  %-16s instrumented but never judged in any cell (window never filled?)\n", id)
+	}
 }
 
 // latestRunValidateResults returns every host's validate-results.json from

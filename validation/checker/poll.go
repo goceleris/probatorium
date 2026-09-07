@@ -42,8 +42,30 @@ import (
 //	  "celeris.panic_count":         int,     // recovered panics
 //	  "celeris.adaptive_switches":   int,     // EngineMetrics.AdaptiveSwitches
 //	  "memstats": { "HeapInuse": int, "HeapAlloc": int, ... }  // runtime.MemStats
+//
+//	  // Middleware oracles -- present in every document, but only the
+//	  // refapps that install the matching middleware ever move them (and
+//	  // only those refapps name the predicate in instrumented_properties).
+//	  "celeris.session_owner_mismatches":   int, // id→owner ledger crossings
+//	  "celeris.sessions_created_total":     int,
+//	  "celeris.sessions_expired_total":     int,
+//	  "celeris.session_cookie_drops":       int, // session.DroppedCookies()
+//	  "celeris.ratelimit_allowed":          int,
+//	  "celeris.ratelimit_rejected":         int,
+//	  "celeris.ratelimit_token_violations": int, // shadow token-bucket bound
+//	  "celeris.jwt_validated_ok":           int,
+//	  "celeris.jwt_validated_fail":         int,
+//	  "celeris.jwt_late_admits":            int, // admitted past exp
+//	  "celeris.instrumented_properties":    string, // "I-MW-JWT,I-MW-SESSION"
 //	}
-const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, memstats.HeapInuse, memstats.HeapAlloc"
+//
+// A missing key parses as zero, which is indistinguishable from a clean
+// counter -- that is what made nine predicates read as healthy through two
+// soaks (probatorium#297). instrumented_properties is what tells the two
+// apart: it is the refapp's own statement of what it can judge, and the
+// evaluator reports anything absent from it as not-instrumented rather than
+// as passed.
+const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, memstats.HeapInuse, memstats.HeapAlloc, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties"
 
 // Poll fetches url and projects the /debug/vars document into a
 // [properties.Snapshot] stamped with t. Missing keys default to zero.
@@ -88,6 +110,22 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	snap.ActiveConns = readInt64(doc, "celeris.active_conns")
 	snap.PanicCount = readInt64(doc, "celeris.panic_count")
 	snap.AdaptiveSwitches = readInt64(doc, "celeris.adaptive_switches")
+	// Middleware oracles. See DebugVarsKeys: the refapps that install the
+	// middleware publish these, everything else leaves them at zero and
+	// omits the predicate from instrumented_properties.
+	snap.SessionOwnerMismatches = readInt64(doc, "celeris.session_owner_mismatches")
+	snap.SessionsCreatedTotal = readInt64(doc, "celeris.sessions_created_total")
+	snap.SessionsExpiredTotal = readInt64(doc, "celeris.sessions_expired_total")
+	snap.SessionCookieDrops = readInt64(doc, "celeris.session_cookie_drops")
+	snap.RateLimitAllowed = readInt64(doc, "celeris.ratelimit_allowed")
+	snap.RateLimitRejected = readInt64(doc, "celeris.ratelimit_rejected")
+	snap.RatelimitTokenViolations = readInt64(doc, "celeris.ratelimit_token_violations")
+	snap.JWTValidatedOK = readInt64(doc, "celeris.jwt_validated_ok")
+	snap.JWTValidatedFail = readInt64(doc, "celeris.jwt_validated_fail")
+	snap.JWTLateAdmits = readInt64(doc, "celeris.jwt_late_admits")
+	if s, ok := doc["celeris.instrumented_properties"].(string); ok {
+		snap.InstrumentedProperties = s
+	}
 	if ms, ok := doc["memstats"].(map[string]any); ok {
 		snap.HeapInuseBytes = readInt64(ms, "HeapInuse")
 		snap.HeapAllocBytes = readInt64(ms, "HeapAlloc")
@@ -142,8 +180,10 @@ func NewSocketClient(path string, timeout time.Duration) *http.Client {
 //	}
 //
 // A connection failure (production build, socket missing, ECONNREFUSED)
-// is non-fatal and leaves snap untouched. PanicCount takes the larger of
-// the socket value and whatever /debug/vars already put on snap.
+// is non-fatal and leaves snap untouched. Every counter takes the LARGER of
+// the socket value and whatever /debug/vars already put on snap: the refapps
+// now raise the same middleware counters from outside celeris, and a
+// validation build reporting its own zero must not be able to erase them.
 func PollValidationSocket(ctx context.Context, hc *http.Client, snap *properties.Snapshot) {
 	// The URL host is ignored because DialContext routes to the unix
 	// socket regardless. The path "/snapshot" matches the canonical
@@ -174,13 +214,11 @@ func PollValidationSocket(ctx context.Context, hc *http.Client, snap *properties
 	if err := json.Unmarshal(body, &c); err != nil {
 		return
 	}
-	if c.PanicCount > snap.PanicCount {
-		snap.PanicCount = c.PanicCount
-	}
-	snap.RatelimitTokenViolations = c.RatelimitTokenViolations
-	snap.SessionOwnerMismatches = c.SessionOwnerMismatches
-	snap.JWTLateAdmits = c.JWTLateAdmits
-	snap.IouringSQECorruptions = c.IouringSQECorruptions
+	snap.PanicCount = max(snap.PanicCount, c.PanicCount)
+	snap.RatelimitTokenViolations = max(snap.RatelimitTokenViolations, c.RatelimitTokenViolations)
+	snap.SessionOwnerMismatches = max(snap.SessionOwnerMismatches, c.SessionOwnerMismatches)
+	snap.JWTLateAdmits = max(snap.JWTLateAdmits, c.JWTLateAdmits)
+	snap.IouringSQECorruptions = max(snap.IouringSQECorruptions, c.IouringSQECorruptions)
 }
 
 // SelectPredicates resolves a comma-separated tier filter into the

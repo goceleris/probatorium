@@ -43,6 +43,93 @@ type GateOptions struct {
 	// schema 5.6 have no property loop at all; mage ValidateGate
 	// defaults this off for them.
 	RequireProperties bool
+	// RequireInstrumented fails the RUN (not a cell) for every predicate
+	// that every property-running cell listed in
+	// properties_not_instrumented and that is not on the
+	// [WaivedUninstrumented] record.
+	//
+	// Such a predicate judged nothing anywhere: the matrix says so in the
+	// document, the gate passes, and the hole stays invisible. Not a
+	// hypothetical -- probatorium#297 found 9 of 14 requested predicates in
+	// exactly that state across all 48 cells of both the passing nightly
+	// AND the failing v1.5.11 soak, I-MW-SESSION (the oracle for the
+	// session bug that failed two consecutive soaks) among them. Off by
+	// default so pre-5.6 documents, which carry no property fields at all,
+	// behave exactly as before.
+	RequireInstrumented bool
+}
+
+// WaivedUninstrumented lists the predicates allowed to be uninstrumented in
+// every cell, with the reason. This list IS the point of
+// [GateOptions.RequireInstrumented]: a coverage hole may exist, but it has to
+// be DECLARED here, in review, instead of being discovered a soak later.
+// Registering a predicate with no data source now fails the gate until
+// someone either wires it up or writes down why they did not.
+//
+// The reasons mirror validation/checker.Uninstrumented; report/ is a leaf
+// package and does not import it.
+var WaivedUninstrumented = map[string]string{
+	"I-RACE":        "needs a -race build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
+	"I-CHECKPTR":    "needs a -d=checkptr build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
+	"I-CONN-1":      "needs a per-connection last-byte table in the refapps (OldestOpenConnLastByteAgeMs)",
+	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
+	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",
+	"I-MEM-2":       "needs an orchestrator-driven idle window (properties.Context.IdleMode)",
+	"I-DRV":         "needs the validator's driver shadow map",
+	"I-ENG-IOURING": "SQE/CQE counters exist only in a -tags=validation build of celeris",
+}
+
+// ranPropertyLoop reports whether the cell's in-process property loop
+// actually observed samples. Only such a cell can say anything about which
+// predicates were instrumented; an ssh-driven cell (loop deliberately not
+// run) or a pre-5.6 document reports nothing and must not vote.
+func ranPropertyLoop(c ValidationCellResult) bool {
+	return c.Tier1 != nil && c.Tier1.PropertyLoopSkipped == "" &&
+		(c.Tier1.PropertyEvaluations > 0 || c.Tier1.PropertySkips > 0)
+}
+
+// everyCellLists returns the predicate IDs that appear in list(c) for EVERY
+// cell that ran a property loop, sorted. Empty when no cell ran one.
+func everyCellLists(cells []ValidationCellResult, list func(ValidationCellResult) []string) []string {
+	seen := map[string]int{}
+	total := 0
+	for _, c := range cells {
+		if !ranPropertyLoop(c) {
+			continue
+		}
+		total++
+		for _, id := range list(c) {
+			seen[id]++
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for id, n := range seen {
+		if n == total {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// UninstrumentedEverywhere returns the predicates that every property-running
+// cell reported as not-instrumented: they judged a structurally-zero input in
+// the whole run and verified nothing. Waivers are NOT applied here -- the
+// caller decides whether to gate or merely print.
+func UninstrumentedEverywhere(cells []ValidationCellResult) []string {
+	return everyCellLists(cells, func(c ValidationCellResult) []string { return c.PropertiesNotInstrumented })
+}
+
+// NotJudgedEverywhere returns the predicates that were instrumented but whose
+// every evaluation was a skip in every cell -- typically the slope oracles in
+// a run too short to fill their window. Reported, never gated: a 150 s
+// nightly legitimately never reaches them, and failing on it would fail every
+// nightly rather than teach anyone anything.
+func NotJudgedEverywhere(cells []ValidationCellResult) []string {
+	return everyCellLists(cells, func(c ValidationCellResult) []string { return c.PropertiesNotJudged })
 }
 
 // gatedTier1Keys are the sub-tally counters that are defects by definition.
@@ -193,6 +280,16 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 		}
 		if c.Soak.RestartedProcesses > 0 {
 			add(c, "soak_summary.restarted_processes", int64(c.Soak.RestartedProcesses), "a server process died and was restarted during the soak")
+		}
+	}
+	if opts.RequireInstrumented {
+		for _, id := range UninstrumentedEverywhere(cells) {
+			if _, waived := WaivedUninstrumented[id]; waived {
+				continue
+			}
+			out = append(out, Violation{Refapp: "*", Engine: "*", Arch: "*",
+				Field: "properties_not_instrumented." + id, Value: 0,
+				Why: "the predicate was requested by tier but not instrumented in every cell that ran a property loop: it verified nothing anywhere. Wire it up, or add it to report.WaivedUninstrumented with a reason"})
 		}
 	}
 	hosts := make([]string, 0, len(soaks))
