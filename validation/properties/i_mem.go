@@ -48,6 +48,15 @@ const (
 	slopeMinSamples = 60
 )
 
+// slopeMinObservation is [Spec.MinObservation] for the slope
+// predicates: warm-up plus one minimum span. At the loop's 1 Hz cadence
+// the earliest a window can be both post-warm-up and slopeMinSpan wide
+// (with the slopeMinSamples points that implies) is exactly here, so a
+// cell shorter than this cannot judge them and must not be reported as
+// though it had. A 150 s nightly cell is 6x too short; the 1h soak cell
+// starts judging at t=15min.
+const slopeMinObservation = slopeWarmup + slopeMinSpan
+
 // slopeBucket is the width of the trough buckets the regression runs
 // over. A GC cycle is a sawtooth (slow ramp, instant drop) and a plain
 // least-squares fit over one has a positive bias of roughly
@@ -59,6 +68,12 @@ const (
 // run for 2 minutes (runtime.forcegcperiod), so 150 s guarantees at
 // least one trough per bucket at any allocation rate. A 10 min window
 // yields 4 trough points, the 1 h window 24.
+// SlopeWarmup exposes the warm-up window the slope predicates exclude, so
+// the harness can capture its baseline heap profile at exactly the moment
+// the oracles start judging. A profile taken before this point would diff
+// against cold-start ramp rather than against steady state.
+func SlopeWarmup() time.Duration { return slopeWarmup }
+
 const slopeBucket = 150 * time.Second
 
 // slopePersistSamples is [Spec.Persist] for the slope predicates: at
@@ -444,9 +459,10 @@ var IMEM1 = Spec{
 	ID: "I-MEM-1",
 	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level, %gx sampling noise)",
 		fmtBytes(heapSlopeMaxBytesPerSec), slopeWarmup, fmtBytes(heapSlopeMaxBytesPerSec*slopeMinSpan.Seconds()), heapRiseRelFloor*100, slopeNoiseK),
-	Tier:      "core",
-	Persist:   slopePersistSamples,
-	Predicate: func(_ *Snapshot, ctx Context) (bool, string) { return heapSlopeSpec.judge(ctx) },
+	Tier:           "core",
+	Persist:        slopePersistSamples,
+	MinObservation: slopeMinObservation,
+	Predicate:      func(_ *Snapshot, ctx Context) (bool, string) { return heapSlopeSpec.judge(ctx) },
 }
 
 // IMEM3 asserts the goroutine count trough slope is bounded over the
@@ -461,9 +477,10 @@ var IMEM3 = Spec{
 	ID: "I-MEM-3",
 	Description: fmt.Sprintf("goroutine count trough slope ≤ %g/s over trailing %s after %s warm-up, rise ≥ max(%.0f, %.0f%% of level, %gx jitter)",
 		goroutineSlopeMaxPerSec, goroutineSlopeWindow, slopeWarmup, goroutineSlopeMaxPerSec*slopeMinSpan.Seconds(), goroutineRiseRelFloor*100, slopeNoiseK),
-	Tier:      "core",
-	Persist:   slopePersistSamples,
-	Predicate: func(_ *Snapshot, ctx Context) (bool, string) { return goroutineSlopeSpec.judge(ctx) },
+	Tier:           "core",
+	Persist:        slopePersistSamples,
+	MinObservation: slopeMinObservation,
+	Predicate:      func(_ *Snapshot, ctx Context) (bool, string) { return goroutineSlopeSpec.judge(ctx) },
 }
 
 // IMEM4 asserts the refapp's resident set (VmRSS) trough slope is
@@ -481,8 +498,9 @@ var IMEM4 = Spec{
 	ID: "I-MEM-4",
 	Description: fmt.Sprintf("RSS trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level) (skipped when RSS is not sampled)",
 		fmtBytes(rssSlopeMaxBytesPerSec), slopeWarmup, fmtBytes(rssSlopeMaxBytesPerSec*slopeMinSpan.Seconds()), rssRiseRelFloor*100),
-	Tier:    "core",
-	Persist: slopePersistSamples,
+	Tier:           "core",
+	Persist:        slopePersistSamples,
+	MinObservation: slopeMinObservation,
 	Predicate: func(snap *Snapshot, ctx Context) (bool, string) {
 		if snap.RSSBytes <= 0 {
 			return Skip("RSS not sampled (no pid, non-linux host, or remote refapp)")

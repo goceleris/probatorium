@@ -54,6 +54,7 @@ import (
 //     in ServerResult.Resources (now populated, finally) is the
 //     differentiator for those cells. Both additive and omitted when
 //     absent: a Tailscale-overlay run (no known line rate) emits neither.
+//   - 5.7 — requests_panic_expected (designed panics netted out of I-PANIC).
 //   - 5.6 — the in-process property loop (probatorium, after the
 //     2026-09-04 soak reached an 18 GB heap with properties_passed=0).
 //     Adds the loop's counters on Tier1Summary (property_evaluations,
@@ -67,7 +68,20 @@ import (
 //     ignore the fields -- but the version bump is load-bearing for
 //     mage ValidateGate: a 5.5 document has no property loop, so the
 //     "loop never evaluated anything" check defaults off for it.
-const SchemaVersion = "5.6"
+//   - 5.8 — property verdict COVERAGE (probatorium#299). Adds
+//     ValidationCellResult.PropertiesNotJudgedByDesign: the subset of
+//     properties_not_judged whose predicate needs a longer observation
+//     window than this cell's property loop ran for. Without it the
+//     gate cannot tell a 150 s nightly cell, which structurally cannot
+//     judge a memory slope, from an hour-long soak cell whose slope
+//     oracle stayed silent anyway -- so it said nothing about either
+//     and a nightly PASS carried no opinion on memory growth at all.
+//     Additive -- older readers ignore the field -- but load-bearing
+//     for mage ValidateGate: a 5.6/5.7 document has the not-judged
+//     list without the by-design one, so its short-cell oracles would
+//     every one of them read as coverage failures, and the check
+//     defaults off for it.
+const SchemaVersion = "5.8"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -485,6 +499,14 @@ type ValidationCellResult struct {
 	// judges them. They are excluded from PropertiesPassed -- a short
 	// cell's passed count must not read as "the leak oracles passed".
 	PropertiesNotJudged []string `json:"properties_not_judged,omitempty"`
+	// PropertiesNotJudgedByDesign is the subset of PropertiesNotJudged
+	// this cell COULD NOT have judged: the predicate needs a longer
+	// observation window than the cell's property loop ran for (a 150 s
+	// nightly cell against I-MEM-1's 5 min warm-up plus 10 min span).
+	// It is what lets the absolute gate tell "cannot judge here, by
+	// design" from "should have judged and did not" -- see
+	// [Coverage] (schema 5.8, probatorium#299).
+	PropertiesNotJudgedByDesign []string `json:"properties_not_judged_by_design,omitempty"`
 	// FailureSummaries maps a failed predicate ID to its first violation
 	// message.
 	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`
@@ -498,14 +520,34 @@ type ValidationCellResult struct {
 // New per-slice sub-tallies land as optional nested struct fields so
 // older readers can ignore unknown keys.
 type Tier1Summary struct {
-	RequestsSent  int64 `json:"requests_sent"`
-	Requests2xx   int64 `json:"requests_2xx"`
-	Requests4xx   int64 `json:"requests_4xx"`
-	Requests5xx   int64 `json:"requests_5xx"`
-	RequestsError int64 `json:"requests_error"`
+	RequestsSent int64 `json:"requests_sent"`
+	Requests2xx  int64 `json:"requests_2xx"`
+	Requests4xx  int64 `json:"requests_4xx"`
+	// Requests401 / Requests404 / Requests429 split Requests4xx by class.
+	// The lump sum hid a months-long failure: auth_session_ratelimit ran at
+	// ~96% 4xx because celeris never issued the session cookie, so every
+	// /me was a 401 and the walker re-logged in on each one. A 4xx rate
+	// alone cannot tell that apart from a healthy run that is mostly
+	// rate-limited or probing absent routes (probatorium#292).
+	Requests401 int64 `json:"requests_401,omitempty"`
+	Requests404 int64 `json:"requests_404,omitempty"`
+	Requests429 int64 `json:"requests_429,omitempty"`
+	// WalkerLogins counts pre-walk logins (one per walker); WalkerRelogins
+	// counts 401-triggered re-logins during the walk. A healthy run re-logs
+	// in only after a deliberate logout, so relogins scaling with request
+	// count is the signature of a server not honouring sessions at all.
+	WalkerLogins   int64 `json:"walker_logins,omitempty"`
+	WalkerRelogins int64 `json:"walker_relogins,omitempty"`
+	Requests5xx    int64 `json:"requests_5xx"`
+	RequestsError  int64 `json:"requests_error"`
 	// Requests5xxExpected: 5xx from corpus states marked `expect: 5xx`
 	// (designed-to-fail routes). Requests5xx above is UNEXPECTED only.
 	Requests5xxExpected int64 `json:"requests_5xx_expected"`
+	// RequestsPanicExpected: 5xx from corpus states marked `expect: panic`
+	// (designed-to-panic routes). Informational; the property loop nets it
+	// out of the server's panic_count so I-PANIC judges only unexpected
+	// panics (schema 5.7).
+	RequestsPanicExpected int64 `json:"requests_panic_expected"`
 	// InvariantHits: unexpected 5xx whose body carried a refapp
 	// invariant marker (x-invariant) -- a self-reported invariant
 	// violation surfaced as a first-class signal.

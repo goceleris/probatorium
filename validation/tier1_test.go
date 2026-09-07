@@ -113,7 +113,7 @@ func TestDoMarkovRequest_Counters(t *testing.T) {
 	var tally tier1Tally
 	hc := &http.Client{Timeout: time.Second}
 	for i := 0; i < 3; i++ {
-		doMarkovRequest(context.Background(), hc, "GET", srv.URL, false, &tally)
+		doMarkovRequest(context.Background(), hc, "GET", srv.URL, false, false, &tally)
 	}
 	s := tally.snapshot()
 	if s.RequestsSent != 3 {
@@ -133,7 +133,7 @@ func TestDoMarkovRequest_Counters(t *testing.T) {
 func TestDoMarkovRequest_NetworkErrorIncrementsError(t *testing.T) {
 	var tally tier1Tally
 	hc := &http.Client{Timeout: 100 * time.Millisecond}
-	doMarkovRequest(context.Background(), hc, "GET", "http://127.0.0.1:1/never-listens", false, &tally)
+	doMarkovRequest(context.Background(), hc, "GET", "http://127.0.0.1:1/never-listens", false, false, &tally)
 	s := tally.snapshot()
 	if s.RequestsError != 1 {
 		t.Errorf("RequestsError: got %d, want 1", s.RequestsError)

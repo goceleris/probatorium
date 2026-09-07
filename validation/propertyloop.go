@@ -2,7 +2,10 @@ package validation
 
 import (
 	"context"
+	"io"
 	"net/http"
+	neturl "net/url"
+	"os"
 	"time"
 
 	"github.com/goceleris/probatorium/validation/checker"
@@ -25,6 +28,10 @@ type propertyLoopConfig struct {
 	// HardFail marks the emitted Incidents as cell-cancelling
 	// (Config.PropertyHardFail); false marks them RecordOnly.
 	HardFail bool
+	// ExpectedPanics, when non-nil, returns the workload's running count
+	// of designed panics; copied into every Snapshot so I-PANIC nets them
+	// out.
+	ExpectedPanics func() int64
 	// Violations receives one Incident per predicate ID on its FIRST
 	// violation (non-blocking send; the orchestrator's channel has
 	// capacity 1 and a dropped send is still counted in the tally).
@@ -33,6 +40,19 @@ type propertyLoopConfig struct {
 	// propertyLoopSnapshotEvery ticks and once more on exit, so a long
 	// soak shows mid-run property progress.
 	SnapshotPath string
+	// BaselineHeapPath, when non-empty, receives ONE heap profile fetched
+	// the first time a sample lands at or after properties.SlopeWarmup()
+	// past run start -- i.e. the instant the slope oracles begin judging.
+	//
+	// Without it an I-MEM incident dossier holds a single heap profile and
+	// the growing allocation site can only be INFERRED from composition.
+	// With it, triage is a measurement:
+	//
+	//	go tool pprof -inuse_space -base heap-warm.pprof heap.pprof
+	//
+	// which names the site directly. The v1.5.11 soak's I-MEM-1 failure
+	// could not be attributed for exactly this reason.
+	BaselineHeapPath string
 }
 
 // propertyLoopSnapshotEvery is the tick cadence of the SnapshotPath
@@ -75,16 +95,63 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 	hc := &http.Client{Timeout: propertyPollTimeout}
 	ev := checker.NewEvaluator(cfg.Specs)
 
+	// firstSampleAt mirrors the evaluator's RunStartedAt: both are set from
+	// the first SUCCESSFUL poll, so the baseline lands on the same clock the
+	// slope predicates use.
+	var firstSampleAt time.Time
+	baselineDone := false
+	captureBaseline := func(elapsed time.Duration) {
+		if baselineDone || cfg.BaselineHeapPath == "" || cfg.MetricsURL == "" {
+			return
+		}
+		if elapsed < properties.SlopeWarmup() {
+			return
+		}
+		baselineDone = true // one attempt only; a retry loop would perturb the heap it measures
+		u, err := neturl.Parse(cfg.MetricsURL)
+		if err != nil {
+			return
+		}
+		u.Path = "/debug/pprof/heap"
+		u.RawQuery = ""
+		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+		f, err := os.Create(cfg.BaselineHeapPath)
+		if err != nil {
+			return
+		}
+		defer func() { _ = f.Close() }()
+		_, _ = io.Copy(f, resp.Body)
+	}
 	poll := func(t time.Time) {
 		snap, err := checker.Poll(ctx, hc, cfg.MetricsURL, t)
 		if err != nil {
 			if ctx.Err() == nil {
-				ev.RecordPollError()
+				ev.RecordPollError(t)
 			}
 			return
 		}
 		snap.PID = cfg.PID
 		snap.RSSBytes = checker.ReadRSS(cfg.PID)
+		if firstSampleAt.IsZero() {
+			firstSampleAt = t
+		}
+		captureBaseline(t.Sub(firstSampleAt))
+		if cfg.ExpectedPanics != nil {
+			snap.ExpectedPanics = cfg.ExpectedPanics()
+		}
 		for _, v := range ev.Observe(snap, t) {
 			if !v.First || cfg.Violations == nil {
 				continue

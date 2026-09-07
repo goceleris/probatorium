@@ -30,6 +30,15 @@ import (
 // in driveTier1 for why this used to be 20 and why that hid celeris#309.
 const streamingWalkerMinConcurrency = 4
 
+// Streaming endpoint paths the WS/SSE slices target. Named because the
+// pre-flight route probe (route_probe.go) and the walkers must ask
+// about the SAME path — a probe of a path the walker doesn't use would
+// report coverage the run never had.
+const (
+	wsTorturePath = "/ws"
+	sseKillPath   = "/events"
+)
+
 // tier1Config parameterises a single Tier 1 (always-on property
 // stress) run. Built from the orchestrator's [Config] but kept as a
 // struct so testing can stub each piece independently.
@@ -106,6 +115,10 @@ type tier1Config struct {
 	// TallyCallbackInterval is how often TallyCallback fires. Zero
 	// defaults to 2 seconds; only used when TallyCallback is non-nil.
 	TallyCallbackInterval time.Duration
+	// OnLiveTally, when non-nil, receives an accessor for the live
+	// expected-panic count as soon as the tally exists, so the property
+	// loop can net designed panics out of I-PANIC while the tier runs.
+	OnLiveTally func(expectedPanics func() int64)
 
 	// SnapshotPath, when non-empty, names the path the tier writes the
 	// current tally snapshot to on every TallyCallback tick. Letting
@@ -122,15 +135,35 @@ type tier1Config struct {
 // are pointers so the snapshot projection can read them without
 // copying atomic.Int64 (govet copylocks).
 type tier1Tally struct {
-	requestsSent  atomic.Int64
-	requests2xx   atomic.Int64
-	requests4xx   atomic.Int64
-	requests5xx   atomic.Int64 // UNEXPECTED 5xx only (see requests5xxExpected)
-	requestsError atomic.Int64
+	requestsSent atomic.Int64
+	requests2xx  atomic.Int64
+	requests4xx  atomic.Int64
+	// requests401 / requests404 / requests429 split requests4xx by class.
+	// The lump sum hid a months-long failure: auth_session_ratelimit ran at
+	// ~96% 4xx because celeris never issued the session cookie, so every
+	// /me was a 401 and the walker re-logged in on each one. A 4xx rate
+	// alone cannot distinguish that from a healthy run that is mostly
+	// rate-limited (429) or probing absent routes (404) (probatorium#292).
+	requests401 atomic.Int64
+	requests404 atomic.Int64
+	requests429 atomic.Int64
+	// walkerLogins counts pre-walk logins (one per walker); walkerRelogins
+	// counts 401-triggered re-logins during the walk. A healthy run
+	// re-logs in only after a deliberate logout, so relogins climbing with
+	// request count is the signature of broken auth.
+	walkerLogins   atomic.Int64
+	walkerRelogins atomic.Int64
+	requests5xx    atomic.Int64 // UNEXPECTED 5xx only (see requests5xxExpected)
+	requestsError  atomic.Int64
 	// requests5xxExpected counts 5xx from states the corpus marks
 	// `expect: 5xx` (designed-to-fail routes such as observability's
 	// /api/error). Kept apart so requests5xx can be gated to zero.
 	requests5xxExpected atomic.Int64
+	// requestsPanicExpected counts 5xx from states the corpus marks
+	// `expect: panic` (designed-to-panic routes such as observability's
+	// /api/error). The property loop subtracts it from the server's
+	// panic_count so I-PANIC judges only unexpected panics.
+	requestsPanicExpected atomic.Int64
 	// requestsCutAtDeadline counts requests that were in flight when the
 	// tier's run context expired. Not errors: the budget ended.
 	requestsCutAtDeadline atomic.Int64
@@ -159,6 +192,9 @@ type tier1Tally struct {
 // counters (govet copylocks).
 func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error) {
 	tally := &tier1Tally{}
+	if cfg.OnLiveTally != nil {
+		cfg.OnLiveTally(tally.requestsPanicExpected.Load)
+	}
 	if cfg.Driver == nil {
 		return tally.snapshot(), errors.New("tier1: nil Driver")
 	}
@@ -363,9 +399,13 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	//   adv     — at concurrency >= 1 (always at least 1 walker)
 	//   h2c     — at concurrency >= 10
 	//   ws      — at concurrency >= streamingWalkerMinConcurrency (full WS
-	//             handshake per fire)
+	//             handshake per fire) AND only where /ws is routed
 	//   sse     — at concurrency >= streamingWalkerMinConcurrency (each fire
-	//             holds a stream for up to ~1.5s before RST'ing)
+	//             holds a stream for up to ~1.5s before RST'ing) AND only
+	//             where /events is routed
+	//
+	// A slice skipped for an absent route gives its walker slots back to
+	// the Markov mix below, so no budget is spent collecting 404s.
 	//
 	// ws/sse fire from a LOW threshold (4) on purpose: the engine's inline
 	// streaming-Detach path (and any future WS/SSE corner) must be exercised
@@ -386,15 +426,30 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			h2cCount = 1
 		}
 	}
-	wsCount := 0
+	// Streaming routes are not universal: of the eight refapps, only
+	// auth_session_ratelimit routes /ws and /events. Firing the torture
+	// walkers at the other seven bought 404s — 87.5% of every WS upgrade
+	// and 96.5% of every SSE GET in the v1.5.11 soak — and left ws_* /
+	// sse_* zeros that said nothing about the engine. One pre-flight
+	// probe per cell decides whether the slice has anything to test;
+	// its verdict lands in the tally so the zeros are attributable
+	// (probatorium#300, route_probe.go). The probe only runs when the
+	// slice would: below the threshold the cell claims to know nothing.
+	var wsRoute, sseRoute routeProbe
 	if cfg.Concurrency >= streamingWalkerMinConcurrency {
+		wsRoute, sseRoute = probeStreamingRoutes(runCtx, hostPort, wsTorturePath, sseKillPath)
+		wsTallyPtr.recordRoute(wsRoute)
+		sseTallyPtr.recordRoute(sseRoute)
+	}
+	wsCount := 0
+	if cfg.Concurrency >= streamingWalkerMinConcurrency && !wsRoute.absent() {
 		wsCount = cfg.Concurrency / 20
 		if wsCount < 1 {
 			wsCount = 1
 		}
 	}
 	sseCount := 0
-	if cfg.Concurrency >= streamingWalkerMinConcurrency {
+	if cfg.Concurrency >= streamingWalkerMinConcurrency && !sseRoute.absent() {
 		sseCount = cfg.Concurrency / 20
 		if sseCount < 1 {
 			sseCount = 1
@@ -445,7 +500,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			// upgrade + read 101 + send torture frame + classify. At
 			// 150ms tick and 2s per-fire timeout the worst-case rate
 			// is ~6 fires/sec per walker.
-			runWSTortureWalker(runCtx, hostPort, "/ws", seed, 150*time.Millisecond, wsTallyPtr)
+			runWSTortureWalker(runCtx, hostPort, wsTorturePath, seed, 150*time.Millisecond, wsTallyPtr)
 		}(i)
 	}
 	for i := 0; i < sseCount; i++ {
@@ -458,7 +513,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			// stream-kill per few hundred ms. The point is to keep
 			// fresh disconnect events flowing to the I-CONN-2 oracle,
 			// not to maximise throughput.
-			runSSEKillWalker(runCtx, hostPort, "/events", seed, 200*time.Millisecond, sseTallyPtr)
+			runSSEKillWalker(runCtx, hostPort, sseKillPath, seed, 200*time.Millisecond, sseTallyPtr)
 		}(i)
 	}
 	// Optional periodic tally-callback + snapshot-to-disk for reactive
@@ -695,6 +750,7 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 	password := fmt.Sprintf("pw-%016x", ^seed)
 	hasLogin := m.Login.Method != "" && m.Login.Path != ""
 	if hasLogin {
+		tally.walkerLogins.Add(1)
 		_ = walkerLogin(ctx, hc, base, m.Login, username, password)
 	}
 
@@ -712,10 +768,16 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 		// `request: METHOD path`; states without an entry are silent.
 		// See validation/markov/<refapp>.yaml.
 		if req, ok := m.Requests[state]; ok {
-			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, tally)
+			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, req.ExpectPanic, tally)
 			if status == 401 && hasLogin {
 				// Session likely expired — re-login and keep walking.
 				// The next request will pick up the fresh cookie.
+				//
+				// Counted: a healthy run re-logs in only after a
+				// deliberate logout, so this climbing with request
+				// count means the server is not honouring the session
+				// at all (probatorium#292).
+				tally.walkerRelogins.Add(1)
 				_ = walkerLogin(ctx, hc, base, m.Login, username, password)
 			}
 		}
@@ -770,7 +832,7 @@ func walkerLogin(ctx context.Context, hc *http.Client, base string, login markov
 // POST/PUT/PATCH requests fire with an empty body for now. Body
 // generation is the Tier 2 RESTler fuzzer's job; Tier 1's purpose
 // here is volume + endpoint coverage, not payload variation.
-func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, expect5xx bool, tally *tier1Tally) int {
+func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, expect5xx, expectPanic bool, tally *tier1Tally) int {
 	tally.requestsSent.Add(1)
 	if method == "" {
 		method = "GET"
@@ -800,6 +862,9 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, e
 	switch {
 	case resp.StatusCode >= 500 && expect5xx:
 		tally.requests5xxExpected.Add(1)
+		if expectPanic {
+			tally.requestsPanicExpected.Add(1)
+		}
 	case resp.StatusCode >= 500:
 		tally.requests5xx.Add(1)
 		// Peek the body for the refapp invariant marker. 5xx is rare on
@@ -811,6 +876,14 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, e
 		}
 	case resp.StatusCode >= 400:
 		tally.requests4xx.Add(1)
+		switch resp.StatusCode {
+		case 401:
+			tally.requests401.Add(1)
+		case 404:
+			tally.requests404.Add(1)
+		case 429:
+			tally.requests429.Add(1)
+		}
 	default:
 		tally.requests2xx.Add(1)
 	}
@@ -823,13 +896,19 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, e
 // by the orchestrator's per-tick reporter.
 func (t *tier1Tally) snapshot() tier1TallySnapshot {
 	s := tier1TallySnapshot{
-		RequestsSent:  t.requestsSent.Load(),
-		Requests2xx:   t.requests2xx.Load(),
-		Requests4xx:   t.requests4xx.Load(),
-		Requests5xx:   t.requests5xx.Load(),
-		RequestsError: t.requestsError.Load(),
+		RequestsSent:   t.requestsSent.Load(),
+		Requests2xx:    t.requests2xx.Load(),
+		Requests4xx:    t.requests4xx.Load(),
+		Requests401:    t.requests401.Load(),
+		Requests404:    t.requests404.Load(),
+		Requests429:    t.requests429.Load(),
+		WalkerLogins:   t.walkerLogins.Load(),
+		WalkerRelogins: t.walkerRelogins.Load(),
+		Requests5xx:    t.requests5xx.Load(),
+		RequestsError:  t.requestsError.Load(),
 
 		Requests5xxExpected:   t.requests5xxExpected.Load(),
+		RequestsPanicExpected: t.requestsPanicExpected.Load(),
 		InvariantHits:         t.invariantHits.Load(),
 		RequestsCutAtDeadline: t.requestsCutAtDeadline.Load(),
 	}
@@ -857,9 +936,15 @@ type tier1TallySnapshot struct {
 	RequestsSent          int64               `json:"requests_sent"`
 	Requests2xx           int64               `json:"requests_2xx"`
 	Requests4xx           int64               `json:"requests_4xx"`
+	Requests401           int64               `json:"requests_401"`
+	Requests404           int64               `json:"requests_404"`
+	Requests429           int64               `json:"requests_429"`
+	WalkerLogins          int64               `json:"walker_logins"`
+	WalkerRelogins        int64               `json:"walker_relogins"`
 	Requests5xx           int64               `json:"requests_5xx"`
 	RequestsError         int64               `json:"requests_error"`
 	Requests5xxExpected   int64               `json:"requests_5xx_expected"`
+	RequestsPanicExpected int64               `json:"requests_panic_expected"`
 	InvariantHits         int64               `json:"invariant_hits"`
 	RequestsCutAtDeadline int64               `json:"requests_cut_at_deadline"`
 	Adversarial           adversarialSnapshot `json:"adversarial,omitempty"`

@@ -1,8 +1,12 @@
 name: Lint
 
-# Always-latest policy: setup-go uses `stable`, actions are pinned to a
-# major tag so dependabot can bump us to the latest minor/patch without
-# us having to touch the workflow.
+# Always-latest policy: every third-party action is pinned to a full
+# commit SHA (with the resolved release tag in a trailing comment) so a
+# retagged or compromised upstream tag cannot change what runs here.
+# Dependabot's github-actions entry keeps the SHAs and version comments
+# current for every directory it lists in .github/dependabot.yml — the
+# workflows via `/` and each composite action under .github/actions/ by
+# its own path (a root-only entry never sees the composites).
 #
 # Includes actionlint as a workflow-level lint so this repo's own GH
 # Actions YAML is sanity-checked on every PR (catches script-injection
@@ -23,15 +27,17 @@ jobs:
     name: go vet + golangci-lint + gofmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.27.0"
           cache: true
       - name: go vet
         run: go vet ./...
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.13
           args: --timeout=5m
