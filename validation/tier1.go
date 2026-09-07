@@ -126,11 +126,26 @@ type tier1Config struct {
 // are pointers so the snapshot projection can read them without
 // copying atomic.Int64 (govet copylocks).
 type tier1Tally struct {
-	requestsSent  atomic.Int64
-	requests2xx   atomic.Int64
-	requests4xx   atomic.Int64
-	requests5xx   atomic.Int64 // UNEXPECTED 5xx only (see requests5xxExpected)
-	requestsError atomic.Int64
+	requestsSent atomic.Int64
+	requests2xx  atomic.Int64
+	requests4xx  atomic.Int64
+	// requests401 / requests404 / requests429 split requests4xx by class.
+	// The lump sum hid a months-long failure: auth_session_ratelimit ran at
+	// ~96% 4xx because celeris never issued the session cookie, so every
+	// /me was a 401 and the walker re-logged in on each one. A 4xx rate
+	// alone cannot distinguish that from a healthy run that is mostly
+	// rate-limited (429) or probing absent routes (404) (probatorium#292).
+	requests401 atomic.Int64
+	requests404 atomic.Int64
+	requests429 atomic.Int64
+	// walkerLogins counts pre-walk logins (one per walker); walkerRelogins
+	// counts 401-triggered re-logins during the walk. A healthy run
+	// re-logs in only after a deliberate logout, so relogins climbing with
+	// request count is the signature of broken auth.
+	walkerLogins   atomic.Int64
+	walkerRelogins atomic.Int64
+	requests5xx    atomic.Int64 // UNEXPECTED 5xx only (see requests5xxExpected)
+	requestsError  atomic.Int64
 	// requests5xxExpected counts 5xx from states the corpus marks
 	// `expect: 5xx` (designed-to-fail routes such as observability's
 	// /api/error). Kept apart so requests5xx can be gated to zero.
@@ -707,6 +722,7 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 	password := fmt.Sprintf("pw-%016x", ^seed)
 	hasLogin := m.Login.Method != "" && m.Login.Path != ""
 	if hasLogin {
+		tally.walkerLogins.Add(1)
 		_ = walkerLogin(ctx, hc, base, m.Login, username, password)
 	}
 
@@ -728,6 +744,12 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 			if status == 401 && hasLogin {
 				// Session likely expired — re-login and keep walking.
 				// The next request will pick up the fresh cookie.
+				//
+				// Counted: a healthy run re-logs in only after a
+				// deliberate logout, so this climbing with request
+				// count means the server is not honouring the session
+				// at all (probatorium#292).
+				tally.walkerRelogins.Add(1)
 				_ = walkerLogin(ctx, hc, base, m.Login, username, password)
 			}
 		}
@@ -826,6 +848,14 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, e
 		}
 	case resp.StatusCode >= 400:
 		tally.requests4xx.Add(1)
+		switch resp.StatusCode {
+		case 401:
+			tally.requests401.Add(1)
+		case 404:
+			tally.requests404.Add(1)
+		case 429:
+			tally.requests429.Add(1)
+		}
 	default:
 		tally.requests2xx.Add(1)
 	}
@@ -838,11 +868,16 @@ func doMarkovRequest(ctx context.Context, hc *http.Client, method, url string, e
 // by the orchestrator's per-tick reporter.
 func (t *tier1Tally) snapshot() tier1TallySnapshot {
 	s := tier1TallySnapshot{
-		RequestsSent:  t.requestsSent.Load(),
-		Requests2xx:   t.requests2xx.Load(),
-		Requests4xx:   t.requests4xx.Load(),
-		Requests5xx:   t.requests5xx.Load(),
-		RequestsError: t.requestsError.Load(),
+		RequestsSent:   t.requestsSent.Load(),
+		Requests2xx:    t.requests2xx.Load(),
+		Requests4xx:    t.requests4xx.Load(),
+		Requests401:    t.requests401.Load(),
+		Requests404:    t.requests404.Load(),
+		Requests429:    t.requests429.Load(),
+		WalkerLogins:   t.walkerLogins.Load(),
+		WalkerRelogins: t.walkerRelogins.Load(),
+		Requests5xx:    t.requests5xx.Load(),
+		RequestsError:  t.requestsError.Load(),
 
 		Requests5xxExpected:   t.requests5xxExpected.Load(),
 		RequestsPanicExpected: t.requestsPanicExpected.Load(),
@@ -873,6 +908,11 @@ type tier1TallySnapshot struct {
 	RequestsSent          int64               `json:"requests_sent"`
 	Requests2xx           int64               `json:"requests_2xx"`
 	Requests4xx           int64               `json:"requests_4xx"`
+	Requests401           int64               `json:"requests_401"`
+	Requests404           int64               `json:"requests_404"`
+	Requests429           int64               `json:"requests_429"`
+	WalkerLogins          int64               `json:"walker_logins"`
+	WalkerRelogins        int64               `json:"walker_relogins"`
 	Requests5xx           int64               `json:"requests_5xx"`
 	RequestsError         int64               `json:"requests_error"`
 	Requests5xxExpected   int64               `json:"requests_5xx_expected"`
