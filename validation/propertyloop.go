@@ -139,7 +139,7 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		snap, err := checker.Poll(ctx, hc, cfg.MetricsURL, t)
 		if err != nil {
 			if ctx.Err() == nil {
-				ev.RecordPollError()
+				ev.RecordPollError(t)
 			}
 			return
 		}
