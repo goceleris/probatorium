@@ -42,10 +42,6 @@ func TestGate_EachSignalIsAViolation(t *testing.T) {
 		{"dead cell", "tier_1.requests_sent", func(c *ValidationCellResult) { c.Tier1.RequestsSent = 0 }},
 		{"tier1 missing", "tier_1", func(c *ValidationCellResult) { c.Tier1 = nil }},
 		{"h2c_hang", "tier_1.h2c_churn.h2c_hang", func(c *ValidationCellResult) { c.Tier1.H2CChurn["h2c_hang"] = 1 }},
-		{"h2c_hang_eof", "tier_1.h2c_churn.h2c_hang_eof", func(c *ValidationCellResult) { c.Tier1.H2CChurn["h2c_hang_eof"] = 1 }},
-		{"h2c_hang_timeout", "tier_1.h2c_churn.h2c_hang_timeout", func(c *ValidationCellResult) { c.Tier1.H2CChurn["h2c_hang_timeout"] = 1 }},
-		{"h2c_hang_reset", "tier_1.h2c_churn.h2c_hang_reset", func(c *ValidationCellResult) { c.Tier1.H2CChurn["h2c_hang_reset"] = 1 }},
-		{"h2c_hang_other", "tier_1.h2c_churn.h2c_hang_other", func(c *ValidationCellResult) { c.Tier1.H2CChurn["h2c_hang_other"] = 1 }},
 		{"h2c_crashed", "tier_1.h2c_churn.h2c_crashed", func(c *ValidationCellResult) { c.Tier1.H2CChurn["h2c_crashed"] = 1 }},
 		{"adv_wrong_accepted", "tier_1.adversarial.adv_wrong_accepted", func(c *ValidationCellResult) { c.Tier1.Adversarial["adv_wrong_accepted"] = 1 }},
 		{"adv_hang", "tier_1.adversarial.adv_hang_until_timeout", func(c *ValidationCellResult) { c.Tier1.Adversarial["adv_hang_until_timeout"] = 1 }},
@@ -216,5 +212,45 @@ func TestSchemaAtLeast(t *testing.T) {
 		if got := SchemaAtLeast(c.v, c.want); got != c.ok {
 			t.Errorf("SchemaAtLeast(%q, %q)=%v want %v", c.v, c.want, got, c.ok)
 		}
+	}
+}
+
+// TestGate_CauseSplitIsNotDoubleCounted pins the reporting contract: a cause
+// counter is detail on its gated total, not a violation of its own.
+//
+// The v1.5.11 soak printed "5 violations" for three distinct events because a
+// single h2c hang was counted once as h2c_hang and again as h2c_hang_timeout.
+// One defect must produce exactly one violation, with the cause carried in the
+// message so nothing diagnostic is lost.
+func TestGate_CauseSplitIsNotDoubleCounted(t *testing.T) {
+	c := cleanCell("a", "iouring", "amd64")
+	c.Tier1.H2CChurn["h2c_hang"] = 1
+	c.Tier1.H2CChurn["h2c_hang_timeout"] = 1
+
+	v := Gate([]ValidationCellResult{c}, nil, GateOptions{})
+	if len(v) != 1 {
+		t.Fatalf("one hang must yield exactly one violation, got %d: %+v", len(v), v)
+	}
+	if v[0].Field != "tier_1.h2c_churn.h2c_hang" {
+		t.Errorf("violation should be on the total, got %q", v[0].Field)
+	}
+	if !strings.Contains(v[0].Why, "timeout=1") {
+		t.Errorf("the cause must survive in the message, got %q", v[0].Why)
+	}
+}
+
+// TestGate_WSHandshakeCauseSplitIsNotDoubleCounted is the same contract for
+// the WebSocket handshake cause split.
+func TestGate_WSHandshakeCauseSplitIsNotDoubleCounted(t *testing.T) {
+	c := cleanCell("a", "iouring", "amd64")
+	c.Tier1.WSTorture["ws_handshake_fail"] = 1
+	c.Tier1.WSTorture["ws_handshake_fail_eof"] = 1
+
+	v := Gate([]ValidationCellResult{c}, nil, GateOptions{})
+	if len(v) != 1 {
+		t.Fatalf("one handshake failure must yield exactly one violation, got %d: %+v", len(v), v)
+	}
+	if !strings.Contains(v[0].Why, "eof=1") {
+		t.Errorf("the cause must survive in the message, got %q", v[0].Why)
 	}
 }
