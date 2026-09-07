@@ -119,6 +119,6 @@ func writeCoverageRow(b *strings.Builder, refapp string, cells int, endpoint str
 	if e.Sent > 0 {
 		reached = fmt.Sprintf("%d (%.1f%%)", e.Reached, 100*float64(e.Reached)/float64(e.Sent))
 	}
-	fmt.Fprintf(&b, "  %-26s %-5d %-6s %-10s %-10d %s\n",
+	fmt.Fprintf(b, "  %-26s %-5d %-6s %-10s %-10d %s\n",
 		refapp, cells, endpoint, routed, e.Sent, reached)
 }
