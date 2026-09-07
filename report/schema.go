@@ -520,11 +520,26 @@ type ValidationCellResult struct {
 // New per-slice sub-tallies land as optional nested struct fields so
 // older readers can ignore unknown keys.
 type Tier1Summary struct {
-	RequestsSent  int64 `json:"requests_sent"`
-	Requests2xx   int64 `json:"requests_2xx"`
-	Requests4xx   int64 `json:"requests_4xx"`
-	Requests5xx   int64 `json:"requests_5xx"`
-	RequestsError int64 `json:"requests_error"`
+	RequestsSent int64 `json:"requests_sent"`
+	Requests2xx  int64 `json:"requests_2xx"`
+	Requests4xx  int64 `json:"requests_4xx"`
+	// Requests401 / Requests404 / Requests429 split Requests4xx by class.
+	// The lump sum hid a months-long failure: auth_session_ratelimit ran at
+	// ~96% 4xx because celeris never issued the session cookie, so every
+	// /me was a 401 and the walker re-logged in on each one. A 4xx rate
+	// alone cannot tell that apart from a healthy run that is mostly
+	// rate-limited or probing absent routes (probatorium#292).
+	Requests401 int64 `json:"requests_401,omitempty"`
+	Requests404 int64 `json:"requests_404,omitempty"`
+	Requests429 int64 `json:"requests_429,omitempty"`
+	// WalkerLogins counts pre-walk logins (one per walker); WalkerRelogins
+	// counts 401-triggered re-logins during the walk. A healthy run re-logs
+	// in only after a deliberate logout, so relogins scaling with request
+	// count is the signature of a server not honouring sessions at all.
+	WalkerLogins   int64 `json:"walker_logins,omitempty"`
+	WalkerRelogins int64 `json:"walker_relogins,omitempty"`
+	Requests5xx    int64 `json:"requests_5xx"`
+	RequestsError  int64 `json:"requests_error"`
 	// Requests5xxExpected: 5xx from corpus states marked `expect: 5xx`
 	// (designed-to-fail routes). Requests5xx above is UNEXPECTED only.
 	Requests5xxExpected int64 `json:"requests_5xx_expected"`

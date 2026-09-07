@@ -260,6 +260,26 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			if t.InvariantHits > 0 {
 				add(c, "tier_1.invariant_hits", t.InvariantHits, "the refapp reported an invariant violation")
 			}
+			// A walker re-logs in only when a request comes back 401. On a
+			// healthy run that happens after a deliberate logout, so
+			// relogins are bounded by logouts plus the one pre-walk login
+			// per walker. Unbounded relogins mean the server is not
+			// honouring the session at all -- which is exactly what
+			// celeris#507 did for months at ~96% 4xx, invisible to this
+			// gate because requests_4xx lumps 401/404/429 together
+			// (probatorium#292).
+			//
+			// Only judged when the tally carries the counters, so runs
+			// produced before they existed read exactly as they did.
+			if t.WalkerRelogins > 0 && t.WalkerLogins > 0 {
+				// One re-login per walker is ordinary session expiry over a
+				// long cell; an order of magnitude more is not.
+				if budget := t.WalkerLogins * 10; t.WalkerRelogins > budget {
+					add(c, "tier_1.walker_relogins", t.WalkerRelogins,
+						fmt.Sprintf("walkers re-logged in %d times against %d logins (budget %d): "+
+							"the server is not honouring the session", t.WalkerRelogins, t.WalkerLogins, budget))
+				}
+			}
 			if t.PropertyViolations > 0 {
 				add(c, "tier_1.property_violations", t.PropertyViolations,
 					"property predicate(s) violated: "+strings.Join(t.PropertyViolationIDs, ", "))
