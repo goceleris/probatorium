@@ -160,7 +160,7 @@ func run(cfg Config) error {
 		case t := <-tick.C:
 			snap, perr := checker.Poll(ctx, httpc, cfg.MetricsURL, t)
 			if perr != nil {
-				ev.RecordPollError()
+				ev.RecordPollError(t)
 				fmt.Fprintf(os.Stderr, "validator-checker: poll: %v\n", perr)
 				continue
 			}
