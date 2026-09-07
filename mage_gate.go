@@ -36,6 +36,22 @@ import (
 //	                                     property fields at all and would fail every cell.
 //	                                     A cell whose tier_1.property_loop_skipped names a
 //	                                     reason (ssh driver) is waived either way.
+//	VALIDATE_GATE_REQUIRE_COVERAGE=1     fail the run for a predicate that reached no
+//	                                     verdict in ANY cell while at least one cell was
+//	                                     long enough to judge it. Unset defaults to 1 when
+//	                                     every document is schema >= 5.8 (the first that
+//	                                     records which silences were structural) and to 0
+//	                                     for older results, whose short-cell oracles would
+//	                                     all read as gaps.
+//
+// The not-judged set is PRINTED whatever the switches say, on PASS and on
+// FAIL. A 150 s nightly cell cannot judge I-MEM-1, I-MEM-3 or I-MEM-4 -- the
+// slope oracles need 5 min of warm-up plus a 10 min window -- so a nightly
+// PASS carries no opinion at all on memory growth, and the header's
+// require_properties=true reads as though the whole property suite had been
+// satisfied (probatorium#299). That is worth saying out loud; it is not
+// worth failing the nightly for, since the cells are short by design.
+//
 //	VALIDATE_GATE_REQUIRE_INSTRUMENTED=1 fail the RUN for any predicate that every
 //	                                     property-running cell reported as
 //	                                     not-instrumented and that is not on
@@ -64,7 +80,13 @@ func ValidateGate() error {
 	// no property fields, so their property_evaluations decode as 0 and
 	// RequireProperties would fail every cell of a run that never had a
 	// loop to begin with.
+	//
+	// coverageAware: every document also records WHICH not-judged
+	// predicates the cell was structurally too short to judge (schema
+	// >= 5.8). Without that list every short-cell oracle reads as a
+	// coverage gap, so the check defaults off for older documents.
 	propertyAware := true
+	coverageAware := true
 	for _, p := range paths {
 		doc, err := loadValidateDoc(p)
 		if err != nil {
@@ -72,6 +94,9 @@ func ValidateGate() error {
 		}
 		if !report.SchemaAtLeast(doc.SchemaVersion, "5.6") {
 			propertyAware = false
+		}
+		if !report.SchemaAtLeast(doc.SchemaVersion, "5.8") {
+			coverageAware = false
 		}
 		host := filepath.Base(filepath.Dir(p))
 		cs := doc.Validation.Cells
@@ -99,12 +124,20 @@ func ValidateGate() error {
 	case "0":
 		requireInstr = false
 	}
+	requireCoverage := coverageAware
+	switch os.Getenv("VALIDATE_GATE_REQUIRE_COVERAGE") {
+	case "1":
+		requireCoverage = true
+	case "0":
+		requireCoverage = false
+	}
 	opts := report.GateOptions{
 		ExpectedCells:       gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
 		RequireTier3:        os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
 		RequireSoak:         os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
 		RequireProperties:   requireProps,
 		RequireInstrumented: requireInstr,
+		RequireCoverage:     requireCoverage,
 	}
 	cellSoaks := 0
 	var propEvals, propViol int64
@@ -117,8 +150,9 @@ func ValidateGate() error {
 			propViol += c.Tier1.PropertyViolations
 		}
 	}
-	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v require_instrumented=%v (schema>=5.6: %v) soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
-		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, opts.RequireInstrumented, propertyAware, cellSoaks, len(soaks), propEvals, propViol)
+	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v (schema>=5.6: %v) require_coverage=%v (schema>=5.8: %v) soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
+		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, propertyAware, opts.RequireCoverage, coverageAware, cellSoaks, len(soaks), propEvals, propViol)
+	printCoverage(report.Coverage(cells), coverageAware)
 	printInstrumentationCoverage(cells)
 	viol := report.Gate(cells, soaks, opts)
 	if len(viol) == 0 {
@@ -159,6 +193,33 @@ func printInstrumentationCoverage(cells []report.ValidationCellResult) {
 	}
 	for _, id := range notJudged {
 		fmt.Printf("  %-16s instrumented but never judged in any cell (window never filled?)\n", id)
+	}
+}
+
+// printCoverage reports every predicate the property loop ran and never
+// reached a verdict on, in ANY cell. It prints on PASS as well as on
+// FAIL: "properties_passed=2" over 48 cells looks like a pass, and
+// nothing else in the summary says that the three memory oracles never
+// judged a single sample (probatorium#299).
+func printCoverage(gaps []report.CoverageGap, classified bool) {
+	if len(gaps) == 0 {
+		return
+	}
+	fmt.Printf("ValidateGate: property coverage -- %d predicate(s) reached NO verdict in any cell:\n", len(gaps))
+	for _, g := range gaps {
+		var why string
+		switch {
+		case !classified:
+			// Pre-5.8 documents carry the not-judged list without the
+			// by-design one, so "0 too short" means "not recorded", not
+			// "had the time". Saying SILENT ORACLE here would be a guess.
+			why = "cannot classify -- document predates the by-design list (schema < 5.8)"
+		case g.Structural():
+			why = "not judgeable in cells this short -- by design, no opinion recorded"
+		default:
+			why = fmt.Sprintf("SILENT ORACLE: %d cell(s) had the time and judged nothing", g.Cells-g.ByDesign)
+		}
+		fmt.Printf("  %-14s not judged in %d cell(s) (%d too short)  %s\n", g.ID, g.Cells, g.ByDesign, why)
 	}
 }
 

@@ -98,6 +98,19 @@ type Tally struct {
 	// from Passed; exported so a short cell's properties_passed cannot
 	// be read as "the leak oracles passed".
 	NotJudged []string `json:"not_judged,omitempty"`
+	// NotJudgedByDesign is the subset of NotJudged this cell COULD NOT
+	// have judged: the predicate declares a
+	// [properties.Spec.MinObservation] longer than Observed. A 150 s
+	// nightly cell never reaches I-MEM-1's 15 min, so that silence is
+	// the tier's own definition, not a defect. The complement -- not
+	// judged with the time to judge -- is what the absolute gate
+	// reports as a coverage failure (probatorium#299).
+	NotJudgedByDesign []string `json:"not_judged_by_design,omitempty"`
+	// Observed is the loop's observation window: first to last poll
+	// ATTEMPT. Failed polls count on purpose -- a refapp whose
+	// /debug/vars dies five minutes into an hour-long cell must not
+	// have its silent oracles excused as "the cell was too short".
+	Observed time.Duration `json:"observed"`
 	// SkippedReason is set when the loop itself never ran (e.g. the ssh
 	// driver, whose remote refapp serves /debug/vars to loopback peers
 	// only); Samples and Evaluations are 0 and the gate's
@@ -163,6 +176,10 @@ type Evaluator struct {
 	// poll that failed mid-run must not retract a declaration the refapp
 	// already made.
 	declared map[string]bool
+
+	// firstPoll / lastPoll bound the observation window
+	// (Tally.Observed) over poll ATTEMPTS, not successes.
+	firstPoll, lastPoll time.Time
 }
 
 // NewEvaluator returns an Evaluator over specs (typically
@@ -182,8 +199,28 @@ func NewEvaluator(specs []properties.Spec) *Evaluator {
 	return e
 }
 
-// RecordPollError counts a poll that produced no snapshot.
-func (e *Evaluator) RecordPollError() { e.tally.PollErrors++ }
+// RecordPollError counts a poll that produced no snapshot at time at.
+// A dead poll still widens the observation window: an endpoint that
+// goes away mid-cell must not make the cell look too short to have
+// judged anything.
+func (e *Evaluator) RecordPollError(at time.Time) {
+	e.tally.PollErrors++
+	e.attempt(at)
+}
+
+// attempt widens the observation window to cover a poll attempt at t.
+func (e *Evaluator) attempt(t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	if e.firstPoll.IsZero() || t.Before(e.firstPoll) {
+		e.firstPoll = t
+	}
+	if t.After(e.lastPoll) {
+		e.lastPoll = t
+	}
+	e.tally.Observed = e.lastPoll.Sub(e.firstPoll)
+}
 
 // Observe appends snap to the rolling History, updates the Context
 // (RunStartedAt and BaselineGoroutines come from the FIRST observed
@@ -204,6 +241,7 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 		e.tally.FirstRSS = snap.RSSBytes
 	}
 	e.tally.Samples++
+	e.attempt(now)
 	e.tally.LastGoroutines = snap.GoroutineCount
 	e.tally.LastHeapInuse = snap.HeapInuseBytes
 	if snap.RSSBytes > 0 {
@@ -279,6 +317,9 @@ func (e *Evaluator) Tally() Tally {
 			// Instrumented, but every evaluation was a skip: the cell
 			// ended before the predicate's window was judgeable.
 			t.NotJudged = append(t.NotJudged, s.ID)
+			if s.MinObservation > 0 && t.Observed < s.MinObservation {
+				t.NotJudgedByDesign = append(t.NotJudgedByDesign, s.ID)
+			}
 		}
 		if n := e.per[s.ID]; n > 0 {
 			t.ViolationIDs = append(t.ViolationIDs, s.ID)
@@ -291,6 +332,7 @@ func (e *Evaluator) Tally() Tally {
 	sort.Strings(t.Predicates)
 	sort.Strings(t.NotInstrumented)
 	sort.Strings(t.NotJudged)
+	sort.Strings(t.NotJudgedByDesign)
 	sort.Strings(t.ViolationIDs)
 	return t
 }
