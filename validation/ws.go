@@ -105,8 +105,20 @@ func (m wsTortureMode) String() string {
 //   - endpointAbsent   — server returned 404 to the upgrade GET; the
 //     refapp simply doesn't expose /ws. Counted separately so the
 //     matrix can run WS walkers against every refapp without
-//     polluting handshake_fail. Mirrors sse_endpoint_absent.
+//     polluting handshake_fail. Mirrors sse_endpoint_absent. Since
+//     probatorium#300 the slice is skipped entirely on a refapp whose
+//     route the pre-flight probe found absent, so a nonzero value here
+//     now means the route disappeared MID-RUN — a routing regression,
+//     not a config absence.
+//
+// routeProbed / routePresent carry the pre-flight verdict
+// (route_probe.go). They are what makes a cell of ws_* zeros readable:
+// probed+absent = this refapp has no /ws and the slice correctly did
+// not run; unprobed = the slice was dormant (smoke concurrency) and the
+// cell says nothing about WebSocket robustness either way.
 type wsTally struct {
+	routeProbed   atomic.Bool
+	routePresent  atomic.Bool
 	sent          atomic.Int64
 	upgraded      atomic.Int64
 	handshakeFail atomic.Int64
@@ -131,6 +143,8 @@ type wsTally struct {
 // wsSnapshot is the value-typed projection emitted into the tally
 // JSON. Prefix `ws_` keeps the keys unambiguous next to adv/h2c.
 type wsSnapshot struct {
+	RouteProbed   bool  `json:"ws_route_probed"`
+	RoutePresent  bool  `json:"ws_route_present"`
 	Sent          int64 `json:"ws_sent"`
 	Upgraded      int64 `json:"ws_upgraded"`
 	HandshakeFail int64 `json:"ws_handshake_fail"`
@@ -146,8 +160,16 @@ type wsSnapshot struct {
 	EndpointAbsent       int64 `json:"ws_endpoint_absent"`
 }
 
+// recordRoute stores the pre-flight verdict for this cell.
+func (t *wsTally) recordRoute(p routeProbe) {
+	t.routeProbed.Store(p.Probed)
+	t.routePresent.Store(p.Present)
+}
+
 func (t *wsTally) snapshot() wsSnapshot {
 	return wsSnapshot{
+		RouteProbed:          t.routeProbed.Load(),
+		RoutePresent:         t.routePresent.Load(),
 		Sent:                 t.sent.Load(),
 		Upgraded:             t.upgraded.Load(),
 		HandshakeFail:        t.handshakeFail.Load(),

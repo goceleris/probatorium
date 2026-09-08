@@ -30,6 +30,15 @@ import (
 // in driveTier1 for why this used to be 20 and why that hid celeris#309.
 const streamingWalkerMinConcurrency = 4
 
+// Streaming endpoint paths the WS/SSE slices target. Named because the
+// pre-flight route probe (route_probe.go) and the walkers must ask
+// about the SAME path — a probe of a path the walker doesn't use would
+// report coverage the run never had.
+const (
+	wsTorturePath = "/ws"
+	sseKillPath   = "/events"
+)
+
 // tier1Config parameterises a single Tier 1 (always-on property
 // stress) run. Built from the orchestrator's [Config] but kept as a
 // struct so testing can stub each piece independently.
@@ -390,9 +399,13 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	//   adv     — at concurrency >= 1 (always at least 1 walker)
 	//   h2c     — at concurrency >= 10
 	//   ws      — at concurrency >= streamingWalkerMinConcurrency (full WS
-	//             handshake per fire)
+	//             handshake per fire) AND only where /ws is routed
 	//   sse     — at concurrency >= streamingWalkerMinConcurrency (each fire
-	//             holds a stream for up to ~1.5s before RST'ing)
+	//             holds a stream for up to ~1.5s before RST'ing) AND only
+	//             where /events is routed
+	//
+	// A slice skipped for an absent route gives its walker slots back to
+	// the Markov mix below, so no budget is spent collecting 404s.
 	//
 	// ws/sse fire from a LOW threshold (4) on purpose: the engine's inline
 	// streaming-Detach path (and any future WS/SSE corner) must be exercised
@@ -413,15 +426,30 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			h2cCount = 1
 		}
 	}
-	wsCount := 0
+	// Streaming routes are not universal: of the eight refapps, only
+	// auth_session_ratelimit routes /ws and /events. Firing the torture
+	// walkers at the other seven bought 404s — 87.5% of every WS upgrade
+	// and 96.5% of every SSE GET in the v1.5.11 soak — and left ws_* /
+	// sse_* zeros that said nothing about the engine. One pre-flight
+	// probe per cell decides whether the slice has anything to test;
+	// its verdict lands in the tally so the zeros are attributable
+	// (probatorium#300, route_probe.go). The probe only runs when the
+	// slice would: below the threshold the cell claims to know nothing.
+	var wsRoute, sseRoute routeProbe
 	if cfg.Concurrency >= streamingWalkerMinConcurrency {
+		wsRoute, sseRoute = probeStreamingRoutes(runCtx, hostPort, wsTorturePath, sseKillPath)
+		wsTallyPtr.recordRoute(wsRoute)
+		sseTallyPtr.recordRoute(sseRoute)
+	}
+	wsCount := 0
+	if cfg.Concurrency >= streamingWalkerMinConcurrency && !wsRoute.absent() {
 		wsCount = cfg.Concurrency / 20
 		if wsCount < 1 {
 			wsCount = 1
 		}
 	}
 	sseCount := 0
-	if cfg.Concurrency >= streamingWalkerMinConcurrency {
+	if cfg.Concurrency >= streamingWalkerMinConcurrency && !sseRoute.absent() {
 		sseCount = cfg.Concurrency / 20
 		if sseCount < 1 {
 			sseCount = 1
@@ -472,7 +500,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			// upgrade + read 101 + send torture frame + classify. At
 			// 150ms tick and 2s per-fire timeout the worst-case rate
 			// is ~6 fires/sec per walker.
-			runWSTortureWalker(runCtx, hostPort, "/ws", seed, 150*time.Millisecond, wsTallyPtr)
+			runWSTortureWalker(runCtx, hostPort, wsTorturePath, seed, 150*time.Millisecond, wsTallyPtr)
 		}(i)
 	}
 	for i := 0; i < sseCount; i++ {
@@ -485,7 +513,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			// stream-kill per few hundred ms. The point is to keep
 			// fresh disconnect events flowing to the I-CONN-2 oracle,
 			// not to maximise throughput.
-			runSSEKillWalker(runCtx, hostPort, "/events", seed, 200*time.Millisecond, sseTallyPtr)
+			runSSEKillWalker(runCtx, hostPort, sseKillPath, seed, 200*time.Millisecond, sseTallyPtr)
 		}(i)
 	}
 	// Optional periodic tally-callback + snapshot-to-disk for reactive

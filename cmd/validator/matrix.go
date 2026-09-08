@@ -90,6 +90,54 @@ type matrixCell struct {
 	Engine string
 }
 
+// specFileSuffix is the per-refapp OpenAPI document's name suffix:
+// <spec-dir>/<refapp><specFileSuffix>.
+const specFileSuffix = ".openapi.yaml"
+
+// resolveRefappSpec picks the OpenAPI document that describes slug, the
+// same way the Markov yaml is picked: by refapp name. A refapp with no
+// spec gets NO spec plus a reason — never another refapp's.
+//
+// That fallback is the defect this replaces (probatorium#300): one
+// global default (auth_session_ratelimit's spec) was handed to all 48
+// cells, so the moment Tier 2 got a budget, seven of eight refapps
+// would have been fuzzed against an API description that does not
+// describe them, and nothing in the artifact would have said so.
+func resolveRefappSpec(specDir, slug string) (path, absentReason string) {
+	if specDir == "" {
+		specDir = "validation/spec"
+	}
+	candidate := filepath.Join(specDir, slug+specFileSuffix)
+	if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+		return candidate, ""
+	}
+	return "", fmt.Sprintf("no OpenAPI spec for refapp %s (looked for %s)", slug, candidate)
+}
+
+// checkMatrixSpecFlag rejects an explicit -openapi that would have to
+// describe more than one refapp. Fails before the first cell rather
+// than after hours of cluster time, and points at the fix.
+func checkMatrixSpecFlag(openapiPath string, plan []matrixCell) error {
+	if openapiPath == "" {
+		return nil
+	}
+	refapps := map[string]bool{}
+	for _, c := range plan {
+		refapps[c.Refapp] = true
+	}
+	if len(refapps) <= 1 {
+		return nil
+	}
+	names := make([]string, 0, len(refapps))
+	for r := range refapps {
+		names = append(names, r)
+	}
+	sort.Strings(names)
+	return fmt.Errorf("matrix: -openapi=%s names one spec but the plan covers %d refapps (%s): "+
+		"drop -openapi and place per-refapp specs at <-spec-dir>/<refapp>%s",
+		openapiPath, len(names), strings.Join(names, ", "), specFileSuffix)
+}
+
 // resolveMatrixPlan expands the matrix-mode flag set into a
 // concrete iteration plan. Returns the ordered cell list (refapp
 // outer loop, engine inner loop) so the validate-results.json
@@ -330,6 +378,9 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 	if err != nil {
 		return err
 	}
+	if err := checkMatrixSpecFlag(cfg.OpenAPIPath, plan); err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "matrix: %d cells (refapp × engine):\n", len(plan))
 	for _, c := range plan {
 		fmt.Fprintf(os.Stderr, "  - %s / %s\n", c.Refapp, c.Engine)
@@ -368,6 +419,18 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 			// Whole-run cancelled — emit what we have and bail.
 			break
 		}
+	}
+
+	// Streaming coverage rollup. The WS/SSE slices only run where the
+	// refapp routes the endpoint, so this table is the answer to "what
+	// did the ws_*/sse_* counters actually measure this run?" — printed
+	// to the run log and left beside the results for the same reason
+	// the soak's 87.5%-absent rate needed digging out of the totals
+	// (probatorium#300).
+	coverage := report.FormatStreamingCoverage(report.StreamingCoverage(cells))
+	fmt.Fprintf(os.Stderr, "\n%s", coverage)
+	if err := os.WriteFile(filepath.Join(cfg.OutDir, "streaming-coverage.txt"), []byte(coverage), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "matrix: write streaming coverage: %v\n", err)
 	}
 
 	// Run-wide property totals: the per-cell verdicts summed, with the
@@ -472,6 +535,22 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		}
 	}
 
+	// Per-refapp OpenAPI spec. An explicit -openapi is only reachable
+	// here for a single-refapp matrix (checkMatrixSpecFlag rejects the
+	// rest); otherwise the spec is resolved by slug and a refapp
+	// without one runs with NO spec. Announced per cell so the run log
+	// shows which refapps have a spec at all — the count is the honest
+	// upper bound on what a budgeted Tier 2 could ever cover.
+	specPath := cfg.OpenAPIPath
+	if specPath == "" {
+		var absent string
+		specPath, absent = resolveRefappSpec(cfg.SpecDir, mc.Refapp)
+		if absent != "" {
+			fmt.Fprintf(os.Stderr, "matrix: %s: %s — tier 2 (OpenAPI stateful fuzzing) has nothing to fuzz against\n",
+				mc.Refapp, absent)
+		}
+	}
+
 	cellCfg := validation.Config{
 		Target:             cfg.Target,
 		Arch:               cfg.Arch,
@@ -483,7 +562,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		OutDir:             cellOut,
 		CorpusPath:         cfg.CorpusPath,
 		MarkovPath:         markovPath,
-		OpenAPIPath:        cfg.OpenAPIPath,
+		OpenAPIPath:        specPath,
 		CelerisBin:         binPath,
 		CelerisListenAddr:  addr,
 		// MetricsURL deliberately empty: addr is ":0" here, so the only
