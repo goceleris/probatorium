@@ -27,6 +27,16 @@
 //	  "celeris.adaptive_switches":   EngineMetrics.AdaptiveSwitches,
 //	  "celeris.engine":              engine type name,
 //	  "memstats":                    runtime.MemStats (cached, see MemStatsTTL)
+//
+//	  // Middleware oracles + this refapp's declaration of what it can
+//	  // judge. Always present, moved only by the refapps that install the
+//	  // matching middleware. See middleware.go.
+//	  "celeris.session_owner_mismatches", "celeris.sessions_created_total",
+//	  "celeris.sessions_expired_total",   "celeris.session_cookie_drops",
+//	  "celeris.ratelimit_allowed",        "celeris.ratelimit_rejected",
+//	  "celeris.ratelimit_token_violations",
+//	  "celeris.jwt_validated_ok",         "celeris.jwt_validated_fail",
+//	  "celeris.jwt_late_admits",          "celeris.instrumented_properties"
 //	}
 //
 // Why the connection counters come from the refapp and not the engine:
@@ -81,6 +91,11 @@ type Vars struct {
 	panics   atomic.Int64
 
 	srv atomic.Pointer[celeris.Server]
+
+	// mw carries the middleware-oracle counters and the refapp's
+	// declaration of which property predicates it can judge. See
+	// middleware.go.
+	mw middleware
 
 	mu       sync.Mutex
 	cachedAt time.Time
@@ -201,6 +216,7 @@ func (v *Vars) Document() map[string]any {
 		"celeris.panic_count":         v.PanicCount(),
 		"memstats":                    v.MemStats(),
 	}
+	v.middlewareDocument(doc)
 	if srv := v.srv.Load(); srv != nil {
 		if info := srv.EngineInfo(); info != nil {
 			doc["celeris.active_conns"] = info.Metrics.ActiveConnections
