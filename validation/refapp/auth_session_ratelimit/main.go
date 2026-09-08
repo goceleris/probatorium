@@ -25,6 +25,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -215,18 +216,61 @@ func main() {
 		CookieName: "sid",
 		SkipPaths:  transportEndpoints,
 	}))
-	srv.Use(ratelimit.New(ratelimit.Config{
-		RPS:   *rps,
-		Burst: *burst,
-		// Skip paths that are part of the auth handshake so a
-		// rate-limited login does not lock out the entire suite. Also
-		// skip transport endpoints — they're walker targets that need
-		// to reach the engine without contention for the shared rate
-		// budget.
-		SkipPaths: append([]string{"/login"}, transportEndpoints...),
-	}))
+	// DroppedCookies is a process-wide gauge celeris keeps in EVERY build:
+	// requests whose id-changing Set-Cookie could not be emitted because the
+	// handler had already written the body. Nothing was watching it, so
+	// celeris#507 failed two soaks while I-MW-SESSION — the predicate
+	// written for exactly this — had no data at all (probatorium#297).
+	dv.TrackSessionCookieDrops(session.DroppedCookies)
 
-	registerRoutes(srv, users)
+	// The limiter's key function, spelled out rather than left to the
+	// default, so the shadow bucket below provably buckets requests the
+	// same way the limiter does. This IS celeris's default KeyFunc.
+	rlKey := func(c *celeris.Context) string {
+		if ip := c.ClientIP(); ip != "" {
+			return ip
+		}
+		return c.RemoteAddr()
+	}
+	// Skip paths that are part of the auth handshake so a rate-limited
+	// login does not lock out the entire suite. Also skip transport
+	// endpoints — they're walker targets that need to reach the engine
+	// without contention for the shared rate budget.
+	rlSkip := append([]string{"/login"}, transportEndpoints...)
+	rlShadow := debugvars.NewTokenShadow(*rps, *burst)
+	srv.Use(ratelimit.New(ratelimit.Config{
+		RPS:       *rps,
+		Burst:     *burst,
+		KeyFunc:   rlKey,
+		SkipPaths: rlSkip,
+		ErrorHandler: func(c *celeris.Context, err error) error {
+			dv.RateLimitRejected()
+			return err // unchanged 429; the handler only counts
+		},
+	}))
+	// Installed immediately after the limiter, so reaching it means the
+	// limiter admitted the request. The shadow re-derives the bound the
+	// token bucket promises (burst + RPS*elapsed, per key, with slack);
+	// an admission it cannot pay for is I-MW-RATELIMIT's token violation,
+	// observable without a -tags=validation build of celeris.
+	srv.Use(func(c *celeris.Context) error {
+		if !slices.Contains(rlSkip, c.Path()) {
+			dv.RateLimitAdmitted()
+			if !rlShadow.Admit(rlKey(c), time.Now()) {
+				dv.RecordRateLimitTokenViolation()
+			}
+		}
+		return c.Next()
+	})
+
+	registerRoutes(srv, dv, users)
+
+	// This refapp is the matrix's only in-process session + ratelimit cell,
+	// so it is the only one that can judge these two. Every other refapp
+	// leaves the counters at zero and stays silent, and the checker reports
+	// the predicates as not-instrumented there instead of passing them on a
+	// counter nothing ever writes to.
+	dv.Declare("I-MW-SESSION", "I-MW-RATELIMIT")
 
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -253,7 +297,11 @@ func main() {
 // registerRoutes wires every endpoint listed in the OpenAPI spec to
 // the in-memory store, with one twist: every handler short-circuits
 // to 401 if no session is established (except /login itself).
-func registerRoutes(srv *celeris.Server, users *store) {
+//
+// dv carries the session ledger: /login binds the id it just minted to the
+// user it authenticated, every authenticated handler re-checks that binding,
+// and /logout forgets it. That loop is the I-MW-SESSION oracle.
+func registerRoutes(srv *celeris.Server, dv *debugvars.Vars, users *store) {
 	// /async-data is a trivial .Async() route. Its mere presence flips the
 	// engine's hasAsyncRoutes() to true, so even with -async-handlers=false the
 	// listener runs async — the EXACT derivation the bench epoll-h1-sync config
@@ -280,6 +328,9 @@ func registerRoutes(srv *celeris.Server, users *store) {
 		}
 		sess.Set("user", req.Username)
 		_ = sess.Save()
+		// Bind id → owner BEFORE the response is written: from here on
+		// every request presenting this id must carry this user.
+		dv.SessionLogin(sess.ID(), req.Username)
 		u := users.create(req.Username, "")
 		return c.JSON(200, map[string]any{
 			"sid":        sess.ID(),
@@ -290,6 +341,7 @@ func registerRoutes(srv *celeris.Server, users *store) {
 
 	srv.POST("/logout", func(c *celeris.Context) error {
 		if sess := session.FromContext(c); sess != nil {
+			dv.SessionLogout(sess.ID())
 			_ = sess.Destroy()
 		}
 		return c.NoContent(204)
@@ -299,6 +351,19 @@ func registerRoutes(srv *celeris.Server, users *store) {
 		sess := session.FromContext(c)
 		if sess == nil || sess.GetString("user") == "" {
 			return c.JSON(401, map[string]string{"error": "unauthenticated"})
+		}
+		// I-MW-SESSION: this id was minted for exactly one user. Seeing
+		// it under a different one is session bleed — the middleware
+		// handed this request another walker's session. Reported twice
+		// on purpose: as a counter the property loop gates on, and as a
+		// 5xx carrying the x-invariant marker so the tier-1 tally's
+		// invariant_hits catches it even if the poll is down.
+		if !dv.SessionCheck(sess.ID(), sess.GetString("user")) {
+			return c.JSON(500, map[string]string{
+				"error":         "session owner mismatch",
+				"x-invariant":   "I-MW-SESSION",
+				"x-invariant-h": "high",
+			})
 		}
 		return h(c)
 	}

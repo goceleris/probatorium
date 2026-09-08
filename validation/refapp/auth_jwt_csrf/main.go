@@ -25,6 +25,10 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -33,6 +37,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,10 +52,30 @@ import (
 )
 
 // jwtSecret is the symmetric HMAC secret. Hardcoded — this is a
-// validation refapp, not production. Walker doesn't currently mint
-// JWTs so every JWT-gated request returns 401, exercising the reject
-// path.
+// validation refapp, not production.
 var jwtSecret = []byte("walker-validation-secret-not-for-production")
+
+// jwtTokenTTL is how long a token minted at /jwt-token stays valid.
+//
+// Short on purpose. The walker fires continuously and carries the cookie in
+// its jar, so a few seconds of validity means every walker crosses the expiry
+// boundary many times a minute: the middleware's ACCEPT path runs (it used to
+// be dead — nothing ever presented a valid token, so every /api request 401'd
+// and I-MW-JWT's whole reason for existing went unexercised) and so does the
+// reject-after-expiry path the predicate actually judges.
+const jwtTokenTTL = 5 * time.Second
+
+// jwtExpiryLeeway is how far past exp an admission is tolerated before it
+// counts as a late admit. Non-zero because RFC 7519 §4.1.4 allows a verifier
+// some clock leeway and because the refapp re-reads exp a moment after the
+// middleware did; one second is far below jwtTokenTTL, so a middleware that
+// ignores exp is still caught on essentially every request.
+const jwtExpiryLeeway = time.Second
+
+// jwtCookieName is where /jwt-token puts the minted token. A cookie and not
+// an Authorization header because the Tier 1 walker carries a cookie jar and
+// sends no custom headers — this is what makes the token reach /api/* at all.
+const jwtCookieName = "jwt"
 
 // apiKeys is the keyauth allowlist. Same intent as jwtSecret.
 var apiKeys = []string{"walker-api-key-1", "walker-api-key-2"}
@@ -94,10 +119,49 @@ func main() {
 		return c.JSON(200, map[string]any{"public": true})
 	})
 
-	// /api/* — gated by jwt. Walker is unauthed → 401.
+	// /jwt-token — mints a short-lived HS256 token into the walker's cookie
+	// jar. Without it nothing ever presents a VALID token and I-MW-JWT
+	// judges an accept path that never runs.
+	srv.GET("/jwt-token", func(c *celeris.Context) error {
+		exp := time.Now().Add(jwtTokenTTL)
+		tok, err := mintHS256(jwtSecret, exp)
+		if err != nil {
+			return c.JSON(500, map[string]string{"error": "mint: " + err.Error()})
+		}
+		c.SetCookie(&celeris.Cookie{
+			Name:     jwtCookieName,
+			Value:    tok,
+			Path:     "/",
+			MaxAge:   int(jwtTokenTTL.Seconds()),
+			HTTPOnly: true,
+		})
+		return c.JSON(200, map[string]any{"expires_at": exp.UTC().Format(time.RFC3339)})
+	})
+
+	// /api/* — gated by jwt. Unauthed walkers 401; walkers that passed
+	// through /jwt-token carry the cookie and are admitted until it expires.
 	apiGroup := srv.Group("/api",
 		jwt.New(jwt.Config{
 			SigningKey: jwtSecret,
+			// Header first (the conventional source), cookie second so
+			// the cookie-jar walker can reach the accept path.
+			TokenLookup: "header:Authorization:Bearer ,cookie:" + jwtCookieName,
+			// I-MW-JWT: the middleware just decided this token is good.
+			// Re-read its exp INDEPENDENTLY -- from the raw token, not
+			// from whatever the middleware parsed -- and count every
+			// admission that is already past it. That is the invariant
+			// the predicate states ("rejects every token past its
+			// expiry") and it needs no -tags=validation build.
+			SuccessHandler: func(c *celeris.Context) {
+				dv.JWTValidated(true)
+				if exp, ok := tokenExpiry(rawToken(c)); ok && time.Now().After(exp.Add(jwtExpiryLeeway)) {
+					dv.RecordJWTLateAdmit()
+				}
+			},
+			ErrorHandler: func(_ *celeris.Context, err error) error {
+				dv.JWTValidated(false)
+				return err // unchanged 401; the handler only counts
+			},
 		}),
 	)
 	apiGroup.GET("/me", func(c *celeris.Context) error {
@@ -139,6 +203,13 @@ func main() {
 		return c.JSON(200, map[string]any{"posted": true})
 	})
 
+	// The matrix's only JWT refapp, so the only cell that can judge
+	// I-MW-JWT. Every other refapp leaves the jwt_* counters at zero and
+	// stays silent, and the checker reports the predicate as
+	// not-instrumented there rather than passing it on an input nothing
+	// writes to (probatorium#297).
+	dv.Declare("I-MW-JWT")
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
@@ -157,4 +228,60 @@ func main() {
 	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("auth_jwt_csrf: start: %v", err)
 	}
+}
+
+// mintHS256 builds a compact HS256 JWS carrying a single `exp` claim.
+//
+// Hand-rolled rather than borrowed from celeris: the parser under test lives
+// in middleware/jwt/internal/jwtparse, and an oracle that mints with the same
+// code it is checking cannot catch a bug that is symmetric across both. Thirty
+// lines of stdlib keep the two sides independent.
+func mintHS256(secret []byte, exp time.Time) (string, error) {
+	header, err := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
+	if err != nil {
+		return "", err
+	}
+	claims, err := json.Marshal(map[string]int64{"exp": exp.Unix(), "iat": time.Now().Unix()})
+	if err != nil {
+		return "", err
+	}
+	enc := base64.RawURLEncoding
+	signing := enc.EncodeToString(header) + "." + enc.EncodeToString(claims)
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(signing))
+	return signing + "." + enc.EncodeToString(mac.Sum(nil)), nil
+}
+
+// rawToken returns the token the request presented, trying the same two
+// sources as the middleware's TokenLookup and in the same order.
+func rawToken(c *celeris.Context) string {
+	if h := c.Header("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimPrefix(h, "Bearer ")
+	}
+	if v, err := c.Cookie(jwtCookieName); err == nil {
+		return v
+	}
+	return ""
+}
+
+// tokenExpiry decodes the `exp` claim out of a compact JWS WITHOUT verifying
+// the signature: the middleware has already vouched for that, and what is
+// under test here is whether it honoured the expiry it just read. ok=false
+// when the token carries no usable exp, which is not a verdict either way.
+func tokenExpiry(token string) (time.Time, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Exp, 0), true
 }

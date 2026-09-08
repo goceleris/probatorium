@@ -490,8 +490,16 @@ type ValidationCellResult struct {
 	PropertiesPassed int `json:"properties_passed"`
 	PropertiesFailed int `json:"properties_failed"`
 	// PropertiesNotInstrumented lists evaluated predicates whose inputs
-	// have no data source in this deployment (they pass vacuously and are
-	// excluded from PropertiesPassed).
+	// have no data source in this cell (they pass vacuously and are
+	// excluded from PropertiesPassed) -- either globally, or because this
+	// refapp does not install the middleware the predicate judges and so
+	// does not declare it.
+	//
+	// A predicate that appears here in EVERY cell verified nothing in the
+	// whole run; [GateOptions.RequireInstrumented] fails on that unless the
+	// hole is on the [WaivedUninstrumented] record. Before that check this
+	// list carried 9 of 14 predicates through a PASSING nightly and nobody
+	// read it (probatorium#297).
 	PropertiesNotInstrumented []string `json:"properties_not_instrumented,omitempty"`
 	// PropertiesNotJudged lists instrumented predicates whose every
 	// evaluation was a skip: the slope oracles (I-MEM-1/3/4) need a
