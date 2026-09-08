@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/goceleris/probatorium/report"
 )
@@ -19,7 +20,8 @@ import (
 // transport errors, invariant hits, h2c hangs/crashes, adversarial
 // wrong-accepts or hangs, WebSocket bad frames / hangs / handshake failures,
 // SSE handshake failures / early server closes, tier-3 seed failures, dead
-// cells, missing cells, a tier that never ran, and soak leak indicators.
+// cells, missing cells, a tier that never ran, an h2c slice that never
+// completed an upgrade, and soak leak indicators.
 //
 // ValidateDiff is RELATIVE (cross-engine, cross-arch): a defect present on
 // every engine agrees with itself and passes it. This gate exists because that
@@ -64,6 +66,13 @@ import (
 // The instrumentation coverage of every run is printed whether or not the
 // check is on: silent vacuity is what let a predicate with no data source sit
 // in the matrix for months.
+//
+//	VALIDATE_GATE_H2C_UPGRADE_REFAPPS    comma-separated refapps whose cells must complete
+//	                                     at least one h1->h2c upgrade once the churn slice
+//	                                     has sent anything. Unset uses
+//	                                     report.DefaultH2CUpgradeRefapps; "none" disables
+//	                                     the check for replaying an archived run recorded
+//	                                     before any refapp served Protocol Auto.
 //
 // Property predicate violations (tier_1.property_violations, naming the
 // I-* IDs) are always gated, whether the run recorded them (the default,
@@ -138,6 +147,7 @@ func ValidateGate() error {
 		RequireProperties:   requireProps,
 		RequireInstrumented: requireInstr,
 		RequireCoverage:     requireCoverage,
+		H2CUpgradeRefapps:   gateEnvRefapps("VALIDATE_GATE_H2C_UPGRADE_REFAPPS"),
 	}
 	cellSoaks := 0
 	var propEvals, propViol int64
@@ -150,8 +160,12 @@ func ValidateGate() error {
 			propViol += c.Tier1.PropertyViolations
 		}
 	}
-	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v (schema>=5.6: %v) require_coverage=%v (schema>=5.8: %v) soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
-		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, propertyAware, opts.RequireCoverage, coverageAware, cellSoaks, len(soaks), propEvals, propViol)
+	upgradeRefapps := opts.H2CUpgradeRefapps
+	if upgradeRefapps == nil {
+		upgradeRefapps = report.DefaultH2CUpgradeRefapps
+	}
+	fmt.Printf("ValidateGate: %d cell(s) from %d host file(s); expect_cells=%d require_tier3=%v require_soak=%v require_properties=%v (schema>=5.6: %v) require_coverage=%v (schema>=5.8: %v) h2c_upgrade_refapps=%v soak_summaries=%d (cells) + %d (hosts) property_evaluations=%d property_violations=%d\n",
+		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, propertyAware, opts.RequireCoverage, coverageAware, upgradeRefapps, cellSoaks, len(soaks), propEvals, propViol)
 	printCoverage(report.Coverage(cells), coverageAware)
 	printInstrumentationCoverage(cells)
 	viol := report.Gate(cells, soaks, opts)
@@ -269,6 +283,33 @@ func latestRunValidateResults() ([]string, error) {
 	}
 	sort.Slice(runs, func(i, j int) bool { return runs[i].mtime > runs[j].mtime })
 	return runs[0].files, nil
+}
+
+// gateEnvRefapps reads the comma-separated refapp override for the
+// h2c-upgrade vacuity check. Unset returns nil, which the gate reads as
+// "use report.DefaultH2CUpgradeRefapps"; the literal "none" returns an
+// empty (non-nil) slice, which disables the check -- the escape hatch for
+// re-gating an archived run recorded before any refapp served Auto.
+func gateEnvRefapps(k string) []string {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return nil
+	}
+	if v == "none" {
+		return []string{}
+	}
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	// An override of only separators means the caller meant "nothing",
+	// not "fall back to the default".
+	if out == nil {
+		return []string{}
+	}
+	return out
 }
 
 func gateEnvInt(k string, def int) int {

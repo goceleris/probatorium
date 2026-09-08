@@ -65,6 +65,14 @@ type GateOptions struct {
 	// list, so their short-cell oracles would all read as gaps; mage
 	// ValidateGate defaults this off for them.
 	RequireCoverage bool
+
+	// H2CUpgradeRefapps names the refapps whose cells must record at least
+	// one completed h1->h2c upgrade (tier_1.h2c_churn.h2c_upgraded > 0)
+	// once the churn slice has sent anything at all. Nil selects
+	// DefaultH2CUpgradeRefapps; a non-nil empty slice disables the check --
+	// the escape hatch for re-gating a run recorded before any refapp
+	// served the upgrade.
+	H2CUpgradeRefapps []string
 }
 
 // WaivedUninstrumented lists the predicates allowed to be uninstrumented in
@@ -244,12 +252,27 @@ func propertyLoopRan(c ValidationCellResult) bool {
 	return t != nil && t.PropertyLoopSkipped == "" && t.PropertyEvaluations+t.PropertySkips > 0
 }
 
+// DefaultH2CUpgradeRefapps names the refapps configured to answer the
+// HTTP/1.1 -> h2c upgrade, and is what a nil GateOptions.H2CUpgradeRefapps
+// falls back to.
+//
+// It mirrors validation/refapp/<slug>/main.go: a refapp belongs here iff it
+// passes celeris.Auto as its Protocol, because celeris infers
+// EnableH2Upgrade from Protocol and the std engine reads Protocol alone.
+// Each refapp is a separate Go module, so the root module cannot link them
+// and read this off the config; TestRefappH2CUpgradeSetMatchesGateDefault in
+// package validation parses their sources and fails if the two ever drift.
+var DefaultH2CUpgradeRefapps = []string{"kitchen_sink"}
+
 // gatedTier1Keys are the sub-tally counters that are defects by definition.
 // Informational counters are deliberately NOT here: *_sent, *_upgraded,
 // h2c_declined, h2c_intentional_rst, h2c_hang_max_elapsed_ms (a duration),
 // adv_well_rejected, ws_closed_correctly, sse_established, sse_events_read,
 // sse_killed_mid_stream (the validator kills on purpose) and *_endpoint_absent
-// (the refapp has no such endpoint).
+// (the refapp has no such endpoint). h2c_upgraded is informational as a
+// MAGNITUDE only -- its being zero is gated separately in Gate, because a
+// refapp that should upgrade and never did means the whole slice measured
+// nothing (probatorium#279).
 //
 // The CAUSE splits are also excluded, and deliberately so: h2c_hang_{eof,
 // timeout,reset,other} sum to h2c_hang, and ws_handshake_fail_{eof,timeout,
@@ -323,10 +346,26 @@ func causeSuffix(m map[string]int64, key string) string {
 // loop ran but never reached a verdict on in any cell (see [Coverage]). A
 // counter that stayed zero and an oracle that never spoke look identical in
 // a tally, and only one of them is evidence.
+//
+// It also fails a cell whose oracles were VACUOUS -- one that reported zero
+// because it measured nothing, not because the server was clean. The dead
+// cell (requests_sent == 0), the property loop that never evaluated
+// (RequireProperties) and the h2c slice that never completed an upgrade
+// (H2CUpgradeRefapps) are all that same class.
 func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts GateOptions) []Violation {
 	var out []Violation
 	add := func(c ValidationCellResult, field string, v int64, why string) {
 		out = append(out, Violation{Refapp: c.Refapp, Engine: c.Engine, Arch: c.Arch, Field: field, Value: v, Why: why})
+	}
+	// Nil means "the built-in list"; a non-nil empty slice means "don't
+	// check", so an archived run can still be re-gated on its own terms.
+	upgradeRefapps := opts.H2CUpgradeRefapps
+	if upgradeRefapps == nil {
+		upgradeRefapps = DefaultH2CUpgradeRefapps
+	}
+	mustUpgrade := make(map[string]bool, len(upgradeRefapps))
+	for _, r := range upgradeRefapps {
+		mustUpgrade[r] = true
 	}
 	if opts.ExpectedCells > 0 && len(cells) < opts.ExpectedCells {
 		out = append(out, Violation{Refapp: "*", Engine: "*", Arch: "*", Field: "cells", Value: int64(len(cells)),
@@ -374,6 +413,16 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			}
 			if opts.RequireProperties && t.PropertyEvaluations == 0 && t.PropertyLoopSkipped == "" {
 				add(c, "tier_1.property_evaluations", 0, "the property loop never evaluated a predicate (refapp /debug/vars unreachable?)")
+			}
+			// Vacuous h2c slice. The three churn modes all peel away from a
+			// COMPLETED upgrade; against a server that declines, every one
+			// of them is a plain GET, and h2c_hang / h2c_crashed judge a
+			// path the engine never entered. Only cells that actually sent
+			// preambles are judged: below concurrency 10 the slice is not
+			// scheduled at all, which says nothing about the server.
+			if sent := t.H2CChurn["h2c_sent"]; mustUpgrade[c.Refapp] && sent > 0 && t.H2CChurn["h2c_upgraded"] == 0 {
+				add(c, "tier_1.h2c_churn.h2c_upgraded", 0, fmt.Sprintf(
+					"vacuous h2c slice: %d upgrade preambles, not one 101 -- h2c_hang/h2c_crashed judged nothing", sent))
 			}
 			for _, g := range gatedTier1Keys {
 				var m map[string]int64

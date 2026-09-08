@@ -124,7 +124,7 @@ Five slices fan out over `Concurrency` walker goroutines. The walker budget acti
 |---|---|---|---|
 | Markov | ~60% | 1 | Session-shaped traffic over the refapp's OpenAPI endpoints, transitions weighted by `validation/markov/<refapp>.yaml` |
 | Adversarial | ~20% | 1 | Raw-TCP malformed HTTP/1.1 — bad chunks, oversized headers, NUL in header, CRLF injection, slowloris, double Content-Length |
-| h2c upgrade churn | ~10% | 10 | Valid h2c upgrade preambles then RST at three different stages — exercises the engine's PauseAccept race (celeris commits `ed55fb6` + `bd675f9`) |
+| h2c upgrade churn | ~10% | 10 | Valid h2c upgrade preambles then RST at three different stages — exercises the engine's PauseAccept race (celeris commits `ed55fb6` + `bd675f9`). All three stages peel away from a *completed* upgrade, so the slice only bites against `kitchen_sink`, the one refapp on `Protocol: celeris.Auto`; the other seven serve HTTP/1.1 and decline by design |
 | WS frame torture | ~5% | 4 | Real RFC 6455 handshake then one of: fragmented-reserved opcode, oversize payload, unmasked client, ping flood, continuation-no-start, invalid UTF-8 |
 | SSE kill-mid-stream | ~5% | 4 | Establish an SSE long-poll, hold 50–1500ms, RST — the broker must clean up the client slot (I-CONN-2 catches a stuck broker) |
 
@@ -139,6 +139,8 @@ Each slice keeps its own `tally`. **HIGH-severity counters** are must-be-zero in
 | `ws.accepted_bad_frame > 0` | `I-WS-ACCEPTED` | Server accepted an RFC 6455 violation |
 | `ws.hang_no_close > 0` | `I-WS-HANG` | WebSocket goroutine wedged |
 | `drv.read_after_write_mismatch > 0` | `I-DRV-1` | Postgres / Redis / Memcached driver lost a write |
+
+A zero is only health when the oracle ran. `mage ValidateGate` therefore also fails a `kitchen_sink` cell whose `h2c_churn.h2c_upgraded == 0` after sending preambles: every churn mode then degenerated into a plain declined GET, so `h2c_hang` / `h2c_crashed` judged a path the engine never entered. That was the state of every cell until `kitchen_sink` moved to `Protocol: celeris.Auto` — 172,656 preambles across the v1.5.11 nightly's 48 cells, zero 101s, gate green (probatorium#279). Same class as the dead-cell (`requests_sent == 0`) and never-evaluated-property rules.
 
 ### Tier 2 — RESTler-style stateful fuzzing
 
@@ -191,7 +193,7 @@ Each refapp is a **separate Go module** under `validation/refapp/<slug>/`, so th
 |---|---|
 | `auth_session_ratelimit` | session cookie + ratelimit + WS / SSE detach paths |
 | `auth_jwt_csrf` | JWT (HS256), CSRF synchronizer-token, keyauth |
-| `kitchen_sink` | 16 stateless middlewares: recovery, requestid, secure, cors, bodylimit, methodoverride, rewrite, redirect, healthcheck, ratelimit, timeout, circuitbreaker, idempotency, singleflight, basicauth + per-route etag/cache |
+| `kitchen_sink` | 16 stateless middlewares: recovery, requestid, secure, cors, bodylimit, methodoverride, rewrite, redirect, healthcheck, ratelimit, timeout, circuitbreaker, idempotency, singleflight, basicauth + per-route etag/cache. The only refapp on `Protocol: celeris.Auto`, so it is also where the h1→h2c upgrade path is exercised |
 | `driver_postgres` | native postgres driver + session/postgresstore + I-DRV-1 round-trip |
 | `driver_redis` | native redis driver + session/redisstore + ratelimit/redisstore (atomic EVALSHA token-bucket) |
 | `driver_memcached` | native memcached driver + session/memcachedstore + ratelimit/memcachedstore (CAS-loop token-bucket) |

@@ -28,6 +28,10 @@
 // focused on a coherent middleware slice while covering ~25 of the
 // ~30 user-facing middlewares total.
 //
+// It is also the only refapp served over celeris Protocol Auto, which
+// is what gives the Tier 1 h2c-churn slice an upgrade to complete —
+// see the Config literal below and probatorium#279.
+//
 // On startup the refapp prints the canonical ready line:
 //
 //	ready addr=<bind-addr>
@@ -79,10 +83,27 @@ func main() {
 
 	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
 	srv := dv.NewServer(celeris.Config{
-		Addr:            *bind,
-		Engine:          engineType,
-		Workers:         *workersFlag,
-		Protocol:        celeris.HTTP1,
+		Addr:    *bind,
+		Engine:  engineType,
+		Workers: *workersFlag,
+		// Auto, not HTTP1 — kitchen_sink is the one refapp that answers
+		// the HTTP/1.1 → h2c upgrade, so the Tier 1 h2c-churn slice has
+		// a server to churn (probatorium#279). Under HTTP1 celeris
+		// infers EnableH2Upgrade=false and all three churn modes
+		// degenerate into a plain declined GET: the v1.5.11 nightly sent
+		// 172,656 preambles across 48 cells for zero 101s, so h2c_hang —
+		// the counter that caught celeris#470 — judged a path no engine
+		// ever entered. Auto rather than HTTP1 + EnableH2Upgrade=true
+		// because the std engine reads Protocol alone (it wraps the
+		// handler in x/net/http2/h2c only for Auto/H2C), so the flag
+		// would leave 1 of the 3 matrix engines still declining.
+		//
+		// Only this refapp switches: it mounts no WS/SSE routes
+		// (auth_session_ratelimit owns those) so the upgrade can't
+		// interact with the streaming detach paths, and the other seven
+		// staying on HTTP1 keeps a control group — a new failure
+		// confined to kitchen_sink cells is attributable on sight.
+		Protocol:        celeris.Auto,
 		AsyncHandlers:   true,
 		ReadTimeout:     30 * time.Second,
 		WriteTimeout:    30 * time.Second,
