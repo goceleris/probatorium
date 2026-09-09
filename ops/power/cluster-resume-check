@@ -22,10 +22,24 @@ log() { printf '%s resume-check: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"
 
 log "PENDING RESUME: $(cat "$PENDING" 2>/dev/null)"
 
-# Only meaningful on the host that holds the UPS cable, but harmless anywhere.
-CHARGE=$(apcaccess status 2>/dev/null | awk -F: '/^BCHARGE/{gsub(/ /,"",$2); print $2; exit}')
-STATUS=$(apcaccess status 2>/dev/null | awk -F: '/^STATUS/{gsub(/^ +| +$/,"",$2); print $2; exit}')
-log "ups status=${STATUS:-unknown} charge=${CHARGE:-unknown}%"
+# apcupsd needs a moment after boot: on a NIS slave it must reach the master
+# over the network first, and this unit runs seconds into the boot. Reading
+# once reported "COMMLOST (charge unknown%)" on a perfectly healthy UPS --
+# which is exactly the wrong thing to tell someone who has just come back
+# from a power cut and is deciding whether to resume. Poll briefly instead.
+STATUS=""; CHARGE=""
+i=0
+while [ "$i" -lt 15 ]; do
+    STATUS=$(apcaccess status 2>/dev/null | awk -F: '/^STATUS/{gsub(/^ +| +$/,"",$2); print $2; exit}')
+    case "${STATUS:-}" in
+        ""|COMMLOST|*NETWORK*) ;;
+        *) break ;;
+    esac
+    i=$((i+1))
+    sleep 2
+done
+CHARGE=$(apcaccess status 2>/dev/null | awk -F: '/^BCHARGE/{split($2,a," "); for(j=1;j<=2;j++) if(a[j]!=""){print a[j]; exit}}')
+log "ups status=${STATUS:-unknown} charge=${CHARGE:-unknown}% (after ${i} retries)"
 
 cat <<EOF
 ================= celeris power-loss resume pending =================
