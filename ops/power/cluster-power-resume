@@ -1,0 +1,115 @@
+#!/bin/sh
+# cluster-power-resume — decide whether it is safe to restart an interrupted
+# run, and if so dispatch it.
+#
+# Run from a timer, not from boot. During a storm mains cuts repeatedly, and
+# a boot-time dispatch turns that into a thrash loop: start a 24 h soak, lose
+# power twenty minutes in, boot, start again, each cycle leaving the battery
+# less able to cover the next one. Every interlock below exists because of
+# that failure mode.
+#
+#   --dry-run   evaluate the interlocks and print the decision, dispatch nothing
+#   --status    show the current state and exit
+#
+# Dispatching needs a GitHub token with actions:write at
+# /etc/celeris-power/github-token (0600 root). Without it this script still
+# runs every interlock and prints the exact command to run by hand -- the
+# design deliberately degrades to "tell a human" rather than failing shut.
+set -eu
+
+STATEDIR=/var/lib/celeris-power
+PENDING="$STATEDIR/resume-pending.json"
+ATTEMPTS="$STATEDIR/resume-attempts"
+ONLINE_SINCE="$STATEDIR/mains-online-since"
+TOKEN=/etc/celeris-power/github-token
+LOG=/var/log/cluster-power-event.log
+
+REPO="${CELERIS_RESUME_REPO:-goceleris/probatorium}"
+WORKFLOW="${CELERIS_RESUME_WORKFLOW:-matrix-weekend-tier.yml}"
+REF="${CELERIS_RESUME_REF:-main}"
+
+# Interlocks. Deliberately conservative: a late resume costs hours, a resume
+# into an unstable supply costs the run AND the battery headroom to retry.
+MIN_STABLE_SECONDS="${CELERIS_RESUME_MIN_STABLE:-900}"   # 15 min of mains
+MIN_CHARGE="${CELERIS_RESUME_MIN_CHARGE:-80}"            # percent
+MAX_ATTEMPTS="${CELERIS_RESUME_MAX_ATTEMPTS:-3}"
+
+MODE="${1:-}"
+log() { printf '%s resume: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
+say() { echo "$*"; }
+
+ups() { apcaccess status 2>/dev/null | sed -n "s/^$1 *: *//p" | head -1 | cut -d' ' -f1; }
+
+STATUS=$(apcaccess status 2>/dev/null | sed -n 's/^STATUS *: *//p' | head -1 | sed 's/ *$//')
+CHARGE=$(ups BCHARGE)
+ATT=$(cat "$ATTEMPTS" 2>/dev/null || echo 0)
+
+# Track how long mains has been back. Reset the clock on any non-ONLINE state
+# so a flapping supply can never accumulate credit toward "stable".
+case "$STATUS" in
+    ONLINE*) [ -f "$ONLINE_SINCE" ] || date +%s >"$ONLINE_SINCE" ;;
+    *) rm -f "$ONLINE_SINCE" ;;
+esac
+STABLE=0
+if [ -f "$ONLINE_SINCE" ]; then
+    STABLE=$(( $(date +%s) - $(cat "$ONLINE_SINCE") ))
+fi
+
+if [ "$MODE" = "--status" ]; then
+    say "pending   : $([ -f "$PENDING" ] && cat "$PENDING" || echo none)"
+    say "ups       : ${STATUS:-unknown} charge=${CHARGE:-?}%"
+    say "stable    : ${STABLE}s (need ${MIN_STABLE_SECONDS}s)"
+    say "attempts  : ${ATT}/${MAX_ATTEMPTS}"
+    say "token     : $([ -r "$TOKEN" ] && echo present || echo ABSENT)"
+    exit 0
+fi
+
+[ -f "$PENDING" ] || { log "no pending resume"; say "nothing pending"; exit 0; }
+
+refuse() { log "HOLD: $1"; say "holding off: $1"; exit 0; }
+
+case "$STATUS" in
+    ONLINE*) ;;
+    *) refuse "ups is ${STATUS:-unknown}, not back on mains" ;;
+esac
+[ "$STABLE" -ge "$MIN_STABLE_SECONDS" ] || refuse "mains only stable ${STABLE}s of ${MIN_STABLE_SECONDS}s"
+[ "${CHARGE:-0}" ] && [ "$(printf '%.0f' "${CHARGE:-0}")" -ge "$MIN_CHARGE" ] || \
+    refuse "battery at ${CHARGE:-?}%, need ${MIN_CHARGE}% to cover another outage"
+[ "$ATT" -lt "$MAX_ATTEMPTS" ] || \
+    refuse "already retried ${ATT} times; a run that cannot survive ${MAX_ATTEMPTS} attempts needs a human"
+
+CMD="gh workflow run $WORKFLOW -R $REPO --ref $REF -f resume_from=auto"
+
+if [ "$MODE" = "--dry-run" ]; then
+    say "WOULD DISPATCH: $CMD"
+    say "  (interlocks satisfied: mains ${STABLE}s, charge ${CHARGE}%, attempt $((ATT+1))/${MAX_ATTEMPTS})"
+    exit 0
+fi
+
+if [ ! -r "$TOKEN" ]; then
+    log "interlocks satisfied but no token at $TOKEN; not dispatching"
+    say "Interlocks satisfied, but there is no token at $TOKEN."
+    say "Run this to resume:"
+    say "  $CMD"
+    exit 0
+fi
+
+echo $((ATT+1)) >"$ATTEMPTS"
+log "dispatching resume (attempt $((ATT+1))/${MAX_ATTEMPTS}): $WORKFLOW on $REPO@$REF"
+
+if curl -sS -X POST \
+    -H "Authorization: Bearer $(cat "$TOKEN")" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW/dispatches" \
+    -d "{\"ref\":\"$REF\",\"inputs\":{\"resume_from\":\"auto\"}}" >/dev/null 2>&1; then
+    log "dispatch accepted"
+    say "resume dispatched (attempt $((ATT+1))/${MAX_ATTEMPTS})"
+    # The pending marker is cleared by the RUN, not here: cluster-power-restore
+    # removes it when it actually restores the snapshot. Clearing it now would
+    # lose the rescued state if the dispatch never produced a run.
+else
+    log "dispatch FAILED"
+    say "dispatch failed; see $LOG"
+    exit 1
+fi

@@ -1,0 +1,27 @@
+# The power guard writes two append-only files that nothing else prunes.
+# Unrotated they are a slow leak on the same NVMe the tmpfs policy exists to
+# protect, so bound them explicitly.
+/var/log/cluster-power-event.log {
+    monthly
+    rotate 6
+    size 1M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+
+# power-events.jsonl is the ONLY record of UPS load/runtime at the moment of
+# an outage, which is the measurement needed to tune the shutdown thresholds
+# honestly. Keep more history than the log, but still bounded.
+/var/lib/celeris-power/power-events.jsonl {
+    monthly
+    rotate 12
+    size 512k
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

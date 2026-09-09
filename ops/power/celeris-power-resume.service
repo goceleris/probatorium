@@ -1,0 +1,10 @@
+[Unit]
+Description=Evaluate and dispatch a power-loss run resume
+Documentation=https://github.com/goceleris/probatorium/blob/main/ops/power/README.md
+After=network-online.target apcupsd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cluster-power-resume
+StandardOutput=journal

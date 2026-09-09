@@ -94,10 +94,14 @@ type Config struct {
 	Cooldown time.Duration
 	Cells    string
 	Out      string
-	Services string
-	FailFast bool
-	FDTrace  bool
-	Seed     int64
+	// ResumeFrom is a results directory from an earlier, interrupted run.
+	// Cells that already reached a final verdict there are dropped from
+	// this run's schedule. Empty disables resume.
+	ResumeFrom string
+	Services   string
+	FailFast   bool
+	FDTrace    bool
+	Seed       int64
 
 	// Timeseries is the path for the gzip time-series sidecar. Empty
 	// means <Out>/timeseries.json.gz. The sidecar carries the per-run
@@ -215,6 +219,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.Cells, "cells", c.Cells,
 		`glob filter over "<scenario>/<server>" (e.g. "get-simple/*", "*/celeris-*"; supports "!neg" exclusions)`)
 	fs.StringVar(&c.Out, "out", c.Out, "output directory; default results/<timestamp>-<git-ref>/")
+	fs.StringVar(&c.ResumeFrom, "resume-from", c.ResumeFrom,
+		"results dir from an interrupted run; cells already final there are skipped (pass the same path as -out to accumulate in place)")
 	fs.StringVar(&c.Timeseries, "timeseries", c.Timeseries,
 		"gzip time-series sidecar path; empty = <out>/timeseries.json.gz")
 	fs.StringVar(&c.Services, "services", c.Services, `"local" (Docker on same host) | "none" (skip driver services)`)
@@ -570,6 +576,21 @@ func run(cfg Config) error {
 
 	schedule := interleave.Schedule(cfg.Runs, effSc, srvs)
 
+	if cfg.ResumeFrom != "" {
+		full := len(schedule)
+		var err error
+		schedule, err = dropCompletedCells(schedule, cfg.ResumeFrom)
+		if err != nil {
+			return fmt.Errorf("resume-from %s: %w", cfg.ResumeFrom, err)
+		}
+		fmt.Fprintf(os.Stderr, "probatorium-runner: resume: %d of %d cells already final in %s; %d to run\n",
+			full-len(schedule), full, cfg.ResumeFrom, len(schedule))
+		if len(schedule) == 0 {
+			fmt.Fprintln(os.Stderr, "probatorium-runner: resume: nothing left to run")
+			return nil
+		}
+	}
+
 	if cfg.DryRun {
 		_, _ = fmt.Fprintf(os.Stderr, "probatorium-runner: dry-run; %d cells across %d scenarios × %d adapters × %d runs\n",
 			len(schedule), len(effSc), len(effAdv), cfg.Runs)
@@ -593,6 +614,29 @@ func run(cfg Config) error {
 
 	var firstErr error
 	for i, cell := range schedule {
+		// Graceful drain (UPS power loss). Checked HERE, at the top of the
+		// iteration, so the cell that was running has already completed and
+		// flushed: the point of a drain is to keep that work, which the
+		// SIGTERM path below deliberately does not do (it marks the
+		// in-flight cell interrupted). ops/power/cluster-power-event writes
+		// the sentinel from apcupsd's onbattery hook.
+		//
+		// DO NOT move this to the bottom of the loop. The server-down fast
+		// path further down `continue`s past the cooldown, so a check placed
+		// after it would be skipped for every dead-SUT cell -- and if the
+		// remaining schedule is all server-down, it would never fire again.
+		//
+		// Top-of-loop also gets rated mode right for free: in rated mode one
+		// cell is a saturation pass plus one pass per cfg.RatedFractions
+		// entry (runRatedSweep), and a drain must never land between those
+		// passes or the cell's RatedSamples set is half-populated.
+		if drainRequested() {
+			fmt.Fprintf(os.Stderr, "probatorium-runner: drain requested; stopping cleanly with %d cell(s) unrun\n",
+				len(schedule)-i)
+			acknowledgeDrain(cfg, schedule[i:])
+			markCellsInterrupted(cfg, sink, schedule[i:])
+			break
+		}
 		if rootCtx.Err() != nil {
 			// First signal landed between cells: mark everything that
 			// never started as interrupted (per-cell JSON + final write)
@@ -866,6 +910,89 @@ func reduceCellStatus(runs []report.CellStatus, hasData, demoted bool) report.Ce
 // missing file, then flushes once. v3.8's hang-guard SIGTERM simply
 // stopped the loop here, and the in-flight truncation surfaced later as
 // bogus 354µs "zero-request cells" classified not_applicable.
+// cellsGlob renders cell identifiers as a BENCH_CELLS value: a
+// comma-separated list of path.Match patterns over "<scenario>/<server>".
+// Emitting it here means resuming a drained run is a copy-paste rather than
+// a derivation from the artefact.
+//
+// Deduplicated in first-seen order: the same scenario/server pair recurs once
+// per run index, and repeating a pattern would only pad the resume command.
+func cellsGlob(ids []string) string {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return strings.Join(out, ",")
+}
+
+// drainFile is the sentinel path ops/power/cluster-power-event writes when
+// apcupsd reports mains loss. It lives on tmpfs (/run) on purpose: a stale
+// sentinel that survived a reboot would silently drain the NEXT run at its
+// first cell -- the orphan-manifest failure mode in a new costume.
+func drainFile() string {
+	if p := os.Getenv("PROBATORIUM_DRAIN_FILE"); p != "" {
+		return p
+	}
+	return "/run/celeris/drain-requested"
+}
+
+// drainRequested reports whether a graceful stop has been asked for. Any
+// stat error other than "exists" is treated as "no drain": a runner must
+// never abandon a multi-hour matrix because /run was briefly unreadable.
+func drainRequested() bool {
+	_, err := os.Stat(drainFile())
+	return err == nil
+}
+
+// acknowledgeDrain records that the drain was honoured and, next to the
+// results, exactly which cells never ran. That list is what a resumed run
+// needs; without it, recovering the remainder means diffing the artefact
+// against the full schedule after the fact.
+//
+// The acknowledgement file also tells the offbattery hook not to cancel a
+// drain already under way: once we have decided to stop, finishing the stop
+// is cheaper and far less surprising than half-resuming.
+func acknowledgeDrain(cfg Config, remaining []interleave.Cell) {
+	ack := filepath.Join(filepath.Dir(drainFile()), "drain-acknowledged")
+	if err := os.WriteFile(ack, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "probatorium-runner: write drain ack: %v\n", err)
+	}
+	type remainingCell struct {
+		RunIdx   int    `json:"run_idx"`
+		Scenario string `json:"scenario"`
+		Server   string `json:"server"`
+	}
+	out := make([]remainingCell, 0, len(remaining))
+	for _, c := range remaining {
+		out = append(out, remainingCell{RunIdx: c.RunIdx, Scenario: c.Scenario.Name(), Server: c.Server.Name()})
+	}
+	ids := make([]string, 0, len(remaining))
+	for _, c := range remaining {
+		ids = append(ids, c.Scenario.Name()+"/"+c.Server.Name())
+	}
+	doc := struct {
+		UTC       string          `json:"utc"`
+		Reason    string          `json:"reason"`
+		CellsGlob string          `json:"cells_glob"`
+		Remaining []remainingCell `json:"remaining"`
+	}{time.Now().UTC().Format(time.RFC3339), "ups-drain", cellsGlob(ids), out}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(cfg.Out, 0o755); err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(cfg.Out, "drained-remaining.json"), b, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "probatorium-runner: write drained-remaining.json: %v\n", err)
+	}
+}
+
 func markCellsInterrupted(cfg Config, sink *resultsSink, cells []interleave.Cell) {
 	const reason = "interrupted: run cancelled before cell start"
 	for _, cell := range cells {

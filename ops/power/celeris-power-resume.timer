@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodically evaluate whether an interrupted run can be resumed
+Documentation=https://github.com/goceleris/probatorium/blob/main/ops/power/README.md
+
+[Timer]
+# Every 5 minutes, starting 5 minutes after boot. The interlocks -- not this
+# cadence -- decide when a resume actually happens; polling merely gives them
+# a chance to become true as mains steadies and the battery recharges.
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

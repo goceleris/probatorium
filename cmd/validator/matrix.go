@@ -37,6 +37,10 @@ type MatrixConfig struct {
 	SeedServices string
 	// Enabled flips the validator from single-cell to matrix mode.
 	Enabled bool
+	// ResumeFrom is a results dir from an earlier, interrupted run. Cells
+	// that already produced a verdict there are dropped from this run's
+	// plan. Empty disables resume.
+	ResumeFrom string
 
 	// Refapps is a comma-separated list of refapp slugs. The slug
 	// is the directory name under validation/refapp/. Empty (or
@@ -78,6 +82,8 @@ func (m *MatrixConfig) Bind(fs interface {
 		"comma-separated engine names; empty or 'auto' expands to the OS production set")
 	fs.StringVar(&m.RefappRoot, "matrix-refapp-root", m.RefappRoot,
 		"directory under which refapps live; default validation/refapp")
+	fs.StringVar(&m.ResumeFrom, "matrix-resume-from", m.ResumeFrom,
+		"results dir from an interrupted run; cells already final there are skipped")
 	fs.StringVar(&m.SeedServices, "seed-services", m.SeedServices,
 		"provision driver fixtures before the matrix: comma list of kind=addr (postgres=<dsn>,redis=<host:port>,memcached=<host:port>)")
 	fs.StringVar(&m.BinDir, "matrix-bin-dir", m.BinDir,
@@ -398,6 +404,17 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 	if cellBudget <= 0 {
 		cellBudget = time.Minute
 	}
+	if matrix.ResumeFrom != "" {
+		full := len(plan)
+		var skipped int
+		plan, skipped = dropCompletedMatrixCells(plan, matrix.ResumeFrom)
+		fmt.Fprintf(os.Stderr, "matrix: resume: %d of %d cells already final in %s; %d to run\n",
+			skipped, full, matrix.ResumeFrom, len(plan))
+		if len(plan) == 0 {
+			fmt.Fprintln(os.Stderr, "matrix: resume: nothing left to run")
+			return nil
+		}
+	}
 	fmt.Fprintf(os.Stderr, "matrix: per-cell budget = %s (total %s / %d cells)\n",
 		cellBudget, cfg.Duration, len(plan))
 
@@ -405,6 +422,17 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 	cells := make([]report.ValidationCellResult, 0, len(plan))
 	var aggErr error
 	for i, mc := range plan {
+		// Graceful drain (UPS power loss), checked at the TOP of the
+		// iteration so the cell that was running has already completed and
+		// been persisted. ops/power/cluster-power-event writes the sentinel
+		// from apcupsd's onbattery hook. Unlike the cancellation break
+		// below, this is not an error: the run stops deliberately, and
+		// -resume-from finishes it later.
+		if drainRequested() {
+			fmt.Fprintf(os.Stderr, "matrix: drain requested; stopping cleanly with %d cell(s) unrun\n",
+				len(plan)-i)
+			break
+		}
 		fmt.Fprintf(os.Stderr, "\nmatrix [%d/%d]: refapp=%s engine=%s\n",
 			i+1, len(plan), mc.Refapp, mc.Engine)
 		cell, err := runMatrixCell(ctx, cfg, matrix, mc, cellBudget, i)
@@ -415,6 +443,15 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 			}
 		}
 		cells = append(cells, cell)
+		// Persist after EVERY cell. Until now nothing was written until the
+		// whole matrix finished, so a hard kill -- a power cut, an OOM, a
+		// SIGKILL -- threw away every completed cell. A 24 h soak losing all
+		// 24 h to a mains blip is precisely what the UPS work exists to
+		// prevent, and a graceful cancel alone cannot cover it. The document
+		// is small (24-48 cells) and this makes it parseable at all times.
+		if err := writePartial(cfg, startedAt, cells); err != nil {
+			fmt.Fprintf(os.Stderr, "matrix: persist after cell %d: %v\n", i+1, err)
+		}
 		if ctx.Err() != nil {
 			// Whole-run cancelled — emit what we have and bail.
 			break

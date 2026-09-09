@@ -1,0 +1,177 @@
+---
+# power-guard.yml — install the UPS power-loss guard on every cluster host.
+#
+# This is PERSISTENT host provisioning, not per-run deploy: unlike deploy.yml /
+# bench.yml (whose state lives on tmpfs and is meant to vanish on reboot), the
+# power guard has to survive exactly the reboot it exists to handle. Run it
+# once per host, and again whenever ops/power/* changes.
+#
+#   mage PowerGuard          (or)
+#   ansible-playbook -i ansible/inventory.yml ansible/power-guard.yml
+#
+# Assumes apcupsd is already installed and configured: msa2-client owns the
+# UPS over USB and serves NIS on 3551; msr1 and msa2-server are net slaves
+# with HIGHER shutdown thresholds so they power down first and the
+# cable-holder is last. See ops/power/README.md.
+- name: Install the cluster power-loss guard
+  hosts: cluster
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Ensure apcupsd is present
+      ansible.builtin.package:
+        name: apcupsd
+        state: present
+
+    - name: Create persistent state directory
+      ansible.builtin.file:
+        path: /var/lib/celeris-power
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # /run is tmpfs: the drain sentinel MUST NOT survive a reboot, or a
+    # stale one would silently drain the next run at its first cell. This
+    # mirrors the orphan-manifest failure mode that wedged earlier dispatches.
+    # Owned by the bench user, NOT root. The hooks run as root and can write
+    # anywhere, but the RUNNER writes drain-acknowledged as ansible_user --
+    # and without that file, offbattery cancels a drain that is already under
+    # way, which is precisely the guarantee this directory exists to provide.
+    # Caught by an end-to-end drain test; a unit test using t.TempDir() cannot
+    # see it.
+    - name: Create tmpfs runtime directory via tmpfiles.d
+      ansible.builtin.copy:
+        dest: /etc/tmpfiles.d/celeris-power.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: "d /run/celeris 0755 {{ ansible_user }} {{ ansible_user }} -\n"
+
+    - name: Apply tmpfiles immediately
+      ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/celeris-power.conf
+      changed_when: false
+
+    - name: Install power guard scripts
+      ansible.builtin.copy:
+        src: "../ops/power/{{ item }}"
+        dest: "/usr/local/sbin/{{ item }}"
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - cluster-power-event
+        - cluster-power-snapshot
+        - cluster-resume-check
+        - cluster-power-restore
+        - cluster-power-resume
+
+    # apccontrol runs /etc/apcupsd/<event> if it is executable, then continues
+    # with its default action unless the hook exits 99. We exit 0 so apcupsd's
+    # own logging/shutdown behaviour is preserved -- the hook ADDS the drain
+    # and the snapshot, it does not replace apcupsd's decision making.
+    - name: Wire apcupsd event hooks
+      ansible.builtin.copy:
+        dest: "/etc/apcupsd/{{ item }}"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by probatorium ansible/power-guard.yml -- do not edit.
+          exec /usr/local/sbin/cluster-power-event {{ item }}
+      loop:
+        - onbattery
+        - offbattery
+        - doshutdown
+
+    # Both files the guard appends to are unrotated by default. On the same
+    # disk the tmpfs policy exists to protect, that is a slow leak.
+    - name: Bound the power guard's log files
+      ansible.builtin.copy:
+        src: ../ops/power/celeris-power.logrotate
+        dest: /etc/logrotate.d/celeris-power
+        owner: root
+        group: root
+        mode: "0644"
+
+    # msr1 (arm64) panics at "Powering off" in the out-of-tree r8127 driver,
+    # leaving the board powered but dead -- draining the UPS during the very
+    # outage it is meant to survive, and writing a vmcore each time. Only
+    # hosts actually using r8127 need the workaround.
+    - name: Detect r8127 NICs
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        for i in $(ls /sys/class/net); do
+          basename "$(readlink /sys/class/net/$i/device/driver 2>/dev/null)" 2>/dev/null;
+        done | grep -c '^r8127$' || true
+      args:
+        executable: /bin/bash
+      register: r8127_count
+      changed_when: false
+
+    - name: Install the r8127 power-off workaround
+      ansible.builtin.copy:
+        src: ../ops/power/quiesce-r8127.shutdown
+        dest: /usr/lib/systemd/system-shutdown/quiesce-r8127.shutdown
+        owner: root
+        group: root
+        mode: "0755"
+      when: r8127_count.stdout | trim | int > 0
+
+    - name: Cap kdump crash-dump retention
+      ansible.builtin.lineinfile:
+        path: /etc/default/kdump-tools
+        regexp: '^#?\s*KDUMP_NUM_DUMPS='
+        line: 'KDUMP_NUM_DUMPS=2'
+        create: false
+      failed_when: false
+
+    # Only the UPS master evaluates resume. Running it on all three would
+    # race three dispatches for the same interrupted run.
+    - name: Install the resume timer and its unit (UPS master only)
+      ansible.builtin.copy:
+        src: "../ops/power/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - celeris-power-resume.service
+        - celeris-power-resume.timer
+      when: inventory_hostname in groups['loadgen']
+      notify: reload systemd
+
+    - name: Enable the resume timer (UPS master only)
+      ansible.builtin.systemd:
+        name: celeris-power-resume.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: inventory_hostname in groups['loadgen']
+
+    - name: Install boot-time resume check unit
+      ansible.builtin.copy:
+        src: ../ops/power/celeris-resume-check.service
+        dest: /etc/systemd/system/celeris-resume-check.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload systemd
+
+    - name: Enable the resume check at boot
+      ansible.builtin.systemd:
+        name: celeris-resume-check.service
+        enabled: true
+        daemon_reload: true
+
+    - name: Ensure apcupsd is enabled and running
+      ansible.builtin.systemd:
+        name: apcupsd
+        enabled: true
+        state: started
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

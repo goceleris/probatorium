@@ -1,0 +1,46 @@
+#!/bin/sh
+# Runs from /usr/lib/systemd/system-shutdown/, i.e. at the very END of
+# shutdown, after filesystems are unmounted and immediately before the
+# firmware power-off call. $1 is the verb: halt | poweroff | reboot | kexec.
+#
+# WHY THIS EXISTS
+#
+# msr1 (arm64, Micro Computer MS-R1/P1WSB, BIOS 1.0 10/25/2025) panics at
+# "Powering off" on EVERY power-off:
+#
+#   shutdown[1]: Powering off.
+#   Internal error: synchronous external abort: 0000000096000010
+#   Workqueue: events_unbound linkwatch_event
+#   pc : mdio_real_direct_read_phy_ocp+0x8c/0x200 [r8127]
+#
+# A pending linkwatch_event runs as the machine powers down and calls the
+# out-of-tree Realtek r8127 DKMS driver (v11.015.00-NAPI) to read the PHY
+# over MDIO -- on a device already off the bus. The abort is fatal.
+#
+# Consequences, all of which matter for a UPS-backed cluster:
+#   - the board does NOT power off; it sits panicked, drawing from the
+#     battery during the very outage the UPS is meant to ride out, and it
+#     cannot auto-restore when mains returns because it is not off
+#   - it needs a physical power-cycle
+#   - kdump writes a full vmcore on every occurrence: /var/crash reached
+#     1.6 GB over 6 dumps, on the same NVMe whose wear killed a drive here
+#     in 2026-08
+#
+# Filesystems are already synced and detached before the panic, so DATA IS
+# SAFE. This is a liveness and battery-budget bug, not a corruption one.
+#
+# Unloading the driver cancels its pending work before the firmware call, so
+# there is nothing left to service the linkwatch event. Best-effort by
+# design: a failure here must never block the shutdown it is protecting.
+set -u
+
+for i in $(ls /sys/class/net 2>/dev/null); do
+    drv=$(basename "$(readlink "/sys/class/net/$i/device/driver" 2>/dev/null)" 2>/dev/null)
+    [ "$drv" = "r8127" ] || continue
+    ip link set "$i" down 2>/dev/null || true
+done
+
+# Let any linkwatch work already queued drain before the module goes.
+sleep 1
+modprobe -r r8127 2>/dev/null || true
+exit 0
