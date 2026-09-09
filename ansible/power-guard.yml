@@ -34,13 +34,19 @@
     # /run is tmpfs: the drain sentinel MUST NOT survive a reboot, or a
     # stale one would silently drain the next run at its first cell. This
     # mirrors the orphan-manifest failure mode that wedged earlier dispatches.
+    # Owned by the bench user, NOT root. The hooks run as root and can write
+    # anywhere, but the RUNNER writes drain-acknowledged as ansible_user --
+    # and without that file, offbattery cancels a drain that is already under
+    # way, which is precisely the guarantee this directory exists to provide.
+    # Caught by an end-to-end drain test; a unit test using t.TempDir() cannot
+    # see it.
     - name: Create tmpfs runtime directory via tmpfiles.d
       ansible.builtin.copy:
         dest: /etc/tmpfiles.d/celeris-power.conf
         owner: root
         group: root
         mode: "0644"
-        content: "d /run/celeris 0755 root root -\n"
+        content: "d /run/celeris 0755 {{ ansible_user }} {{ ansible_user }} -\n"
 
     - name: Apply tmpfiles immediately
       ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/celeris-power.conf
