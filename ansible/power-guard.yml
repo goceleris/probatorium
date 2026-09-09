@@ -1,0 +1,104 @@
+---
+# power-guard.yml — install the UPS power-loss guard on every cluster host.
+#
+# This is PERSISTENT host provisioning, not per-run deploy: unlike deploy.yml /
+# bench.yml (whose state lives on tmpfs and is meant to vanish on reboot), the
+# power guard has to survive exactly the reboot it exists to handle. Run it
+# once per host, and again whenever ops/power/* changes.
+#
+#   mage PowerGuard          (or)
+#   ansible-playbook -i ansible/inventory.yml ansible/power-guard.yml
+#
+# Assumes apcupsd is already installed and configured: msa2-client owns the
+# UPS over USB and serves NIS on 3551; msr1 and msa2-server are net slaves
+# with HIGHER shutdown thresholds so they power down first and the
+# cable-holder is last. See ops/power/README.md.
+- name: Install the cluster power-loss guard
+  hosts: cluster
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Ensure apcupsd is present
+      ansible.builtin.package:
+        name: apcupsd
+        state: present
+
+    - name: Create persistent state directory
+      ansible.builtin.file:
+        path: /var/lib/celeris-power
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # /run is tmpfs: the drain sentinel MUST NOT survive a reboot, or a
+    # stale one would silently drain the next run at its first cell. This
+    # mirrors the orphan-manifest failure mode that wedged earlier dispatches.
+    - name: Create tmpfs runtime directory via tmpfiles.d
+      ansible.builtin.copy:
+        dest: /etc/tmpfiles.d/celeris-power.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: "d /run/celeris 0755 root root -\n"
+
+    - name: Apply tmpfiles immediately
+      ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/celeris-power.conf
+      changed_when: false
+
+    - name: Install power guard scripts
+      ansible.builtin.copy:
+        src: "../ops/power/{{ item }}"
+        dest: "/usr/local/sbin/{{ item }}"
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - cluster-power-event
+        - cluster-power-snapshot
+        - cluster-resume-check
+
+    # apccontrol runs /etc/apcupsd/<event> if it is executable, then continues
+    # with its default action unless the hook exits 99. We exit 0 so apcupsd's
+    # own logging/shutdown behaviour is preserved -- the hook ADDS the drain
+    # and the snapshot, it does not replace apcupsd's decision making.
+    - name: Wire apcupsd event hooks
+      ansible.builtin.copy:
+        dest: "/etc/apcupsd/{{ item }}"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by probatorium ansible/power-guard.yml -- do not edit.
+          exec /usr/local/sbin/cluster-power-event {{ item }}
+      loop:
+        - onbattery
+        - offbattery
+        - doshutdown
+
+    - name: Install boot-time resume check unit
+      ansible.builtin.copy:
+        src: ../ops/power/celeris-resume-check.service
+        dest: /etc/systemd/system/celeris-resume-check.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload systemd
+
+    - name: Enable the resume check at boot
+      ansible.builtin.systemd:
+        name: celeris-resume-check.service
+        enabled: true
+        daemon_reload: true
+
+    - name: Ensure apcupsd is enabled and running
+      ansible.builtin.systemd:
+        name: apcupsd
+        enabled: true
+        state: started
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true

@@ -1,0 +1,14 @@
+[Unit]
+Description=celeris cluster power-loss resume check
+Documentation=https://github.com/goceleris/probatorium/blob/main/ops/power/README.md
+After=network-online.target apcupsd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cluster-resume-check
+RemainAfterExit=yes
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

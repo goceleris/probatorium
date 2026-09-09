@@ -1,0 +1,63 @@
+#!/bin/sh
+# cluster-power-snapshot — rescue in-flight run state off tmpfs before a
+# power-loss shutdown wipes it.
+#
+# ansible/inventory.yml puts ALL transient bench state on tmpfs on purpose:
+#
+#     bench_root:    /tmp/celeris-bench
+#     results_root:  /tmp/celeris-results
+#     manifest_path: /tmp/celeris-bench-manifest.json
+#     # All transient bench state lives under /tmp so a reboot wipes it.
+#
+# and the GitHub runner is provisioned at /tmp/actions-runner-<host>/ too.
+# That is the right default — the 2026-08-17 post-mortem found msa2-client's
+# QLC NVMe killed by a 29:1 write:read ratio, and moving bench artefacts to
+# tmpfs is part of the fix. But it means a power-loss reboot destroys a
+# partially-completed run with no way to resume it.
+#
+# So we copy, rarely and small: only the per-cell JSON results, only on an
+# actual power event. A validation run is 48 cells and a full bench 813, all
+# small JSON, so this is single-digit MB against a drive rated in hundreds of
+# TBW. It does not meaningfully move the wear needle, and it is the
+# difference between resuming a run and losing it.
+set -eu
+
+REASON="${1:-manual}"
+STATEDIR=/var/lib/celeris-power
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+DEST="$STATEDIR/partial/$STAMP"
+
+mkdir -p "$DEST" 2>/dev/null || true
+
+copied=0
+for src in /tmp/celeris-results /tmp/celeris-bench/results; do
+    [ -d "$src" ] || continue
+    name=$(echo "$src" | tr '/' '_')
+    if cp -a "$src" "$DEST/$name" 2>/dev/null; then
+        copied=$((copied+1))
+    fi
+done
+
+# The Actions runner workspace holds the results/ dir the workflow uploads.
+# Glob rather than hardcode: the runner root is per-host.
+for wsroot in /tmp/actions-runner-*/_work; do
+    [ -d "$wsroot" ] || continue
+    find "$wsroot" -maxdepth 4 -type d -name results 2>/dev/null | while read -r r; do
+        tgt="$DEST/workspace$(echo "$r" | tr '/' '_')"
+        cp -a "$r" "$tgt" 2>/dev/null && echo "snapshot: $r -> $tgt"
+    done
+    copied=$((copied+1))
+done
+
+[ -f /tmp/celeris-bench-manifest.json ] && cp -a /tmp/celeris-bench-manifest.json "$DEST/" 2>/dev/null || true
+
+SIZE=$(du -sh "$DEST" 2>/dev/null | cut -f1)
+printf '{"utc":"%s","reason":"%s","dest":"%s","sources":%d,"size":"%s","host":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$REASON" "$DEST" "$copied" "${SIZE:-unknown}" "$(hostname)" \
+    >"$STATEDIR/resume-pending.json" 2>/dev/null || true
+
+echo "cluster-power-snapshot: $copied source(s) -> $DEST (${SIZE:-unknown})"
+
+# Keep the last 5 snapshots; a storm week should not fill the disk.
+ls -1dt "$STATEDIR"/partial/*/ 2>/dev/null | tail -n +6 | while read -r old; do rm -rf "$old"; done
+exit 0

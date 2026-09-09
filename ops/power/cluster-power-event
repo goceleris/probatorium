@@ -1,0 +1,78 @@
+#!/bin/sh
+# cluster-power-event — apcupsd event hook for the celeris bench cluster.
+#
+# Installed on ALL THREE hosts and invoked by apccontrol as
+# /etc/apcupsd/{onbattery,offbattery,doshutdown}. Each host handles its own
+# event locally: every host runs apcupsd (msa2-client over USB, the other two
+# as NIS slaves), so all three observe ONBATT independently. That is
+# deliberate — an SSH fan-out from the master would add a network dependency
+# at exactly the moment the network may be going away.
+#
+# Contract with the runner:
+#   /run/celeris/drain-requested   present => finish the CURRENT cell, then
+#                                   stop cleanly. /run is tmpfs, so this can
+#                                   never survive a reboot and wedge a later
+#                                   run (the orphan-manifest failure mode).
+#
+# Why a drain rather than SIGTERM: SIGTERM cancels the runner's root context
+# and marks the in-flight cell "interrupted", throwing away a cell that was
+# nearly done. A drain lets it finish. Validation cells are ~150 s and bench
+# cells ~5 min, so draining costs minutes.
+#
+# BUDGET, measured 2026-09-09 on the BE1050G2: TIMELEFT reads 46 min at
+# LOADPCT 15% (~90 W, cluster idle) => only ~69 Wh usable. Under real bench
+# load (200-400 W) that is ~8-17 min, NOT 40. Never let the drain deadline
+# approach the loaded runtime; re-measure LOADPCT/TIMELEFT during an actual
+# run before widening it.
+set -eu
+
+EVENT="${1:-unknown}"
+RUNDIR=/run/celeris
+STATEDIR=/var/lib/celeris-power
+DRAIN="$RUNDIR/drain-requested"
+LOG=/var/log/cluster-power-event.log
+
+log() { printf '%s %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >>"$LOG" 2>/dev/null || true; }
+
+mkdir -p "$RUNDIR" "$STATEDIR" 2>/dev/null || true
+
+ups_field() { apcaccess status 2>/dev/null | awk -F: "/^$1/{gsub(/ /,\"\",\$2); print \$2; exit}"; }
+
+case "$EVENT" in
+onbattery)
+    TIMELEFT=$(ups_field TIMELEFT); BCHARGE=$(ups_field BCHARGE); LOADPCT=$(ups_field LOADPCT)
+    log "mains lost: timeleft=${TIMELEFT:-?}min charge=${BCHARGE:-?}% load=${LOADPCT:-?}%"
+    # Record the load at the moment of the outage. This is the ONLY place we
+    # ever see TIMELEFT under real load, and it is the number needed to tune
+    # the thresholds honestly.
+    printf '{"event":"onbattery","utc":"%s","timeleft_min":"%s","bcharge_pct":"%s","loadpct":"%s"}\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${TIMELEFT:-}" "${BCHARGE:-}" "${LOADPCT:-}" \
+        >>"$STATEDIR/power-events.jsonl" 2>/dev/null || true
+    # Request the drain. apcupsd's own BATTERYLEVEL/MINUTES thresholds remain
+    # the backstop if the runner ignores this or is not running at all.
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$DRAIN" 2>/dev/null || true
+    log "drain requested at $DRAIN"
+    ;;
+offbattery)
+    log "mains restored"
+    printf '{"event":"offbattery","utc":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        >>"$STATEDIR/power-events.jsonl" 2>/dev/null || true
+    # Cancel the drain ONLY if nothing has acted on it yet. Once the runner
+    # has begun draining, letting it finish is cheaper and far less
+    # surprising than resuming a half-drained run.
+    if [ -f "$RUNDIR/drain-acknowledged" ]; then
+        log "drain already acknowledged by the runner; letting it complete"
+    else
+        rm -f "$DRAIN" 2>/dev/null || true
+        log "drain cancelled"
+    fi
+    ;;
+doshutdown)
+    log "shutdown initiated by apcupsd; snapshotting before /tmp is lost"
+    /usr/local/sbin/cluster-power-snapshot "$EVENT" >>"$LOG" 2>&1 || log "snapshot FAILED (continuing to shutdown)"
+    ;;
+*)
+    log "unhandled event"
+    ;;
+esac
+exit 0

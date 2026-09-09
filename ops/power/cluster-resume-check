@@ -1,0 +1,47 @@
+#!/bin/sh
+# cluster-resume-check — runs once at boot. Reports whether this host came
+# back from a power-loss shutdown with a rescued partial run.
+#
+# It deliberately does NOT re-dispatch anything. During a storm, mains can cut
+# repeatedly; an unconditional auto-resume turns that into a thrash loop that
+# starts a 74-hour benchmark, dies 20 minutes in, and starts again. Resuming
+# is a decision that wants a stable-power precondition and a human (or a
+# deliberate, rate-limited policy) — not a boot script.
+#
+# What it does: surfaces the state so the decision is easy and the evidence
+# is not silently lost.
+set -eu
+
+STATEDIR=/var/lib/celeris-power
+PENDING="$STATEDIR/resume-pending.json"
+LOG=/var/log/cluster-power-event.log
+
+log() { printf '%s resume-check: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
+
+[ -f "$PENDING" ] || { log "clean boot, nothing pending"; exit 0; }
+
+log "PENDING RESUME: $(cat "$PENDING" 2>/dev/null)"
+
+# Only meaningful on the host that holds the UPS cable, but harmless anywhere.
+CHARGE=$(apcaccess status 2>/dev/null | awk -F: '/^BCHARGE/{gsub(/ /,"",$2); print $2; exit}')
+STATUS=$(apcaccess status 2>/dev/null | awk -F: '/^STATUS/{gsub(/^ +| +$/,"",$2); print $2; exit}')
+log "ups status=${STATUS:-unknown} charge=${CHARGE:-unknown}%"
+
+cat <<EOF
+================= celeris power-loss resume pending =================
+This host rebooted after a UPS-initiated shutdown.
+
+  rescued state : $(cat "$PENDING" 2>/dev/null)
+  ups status    : ${STATUS:-unknown} (charge ${CHARGE:-unknown}%)
+
+Nothing has been restarted automatically, by design.
+
+  snapshots     : ls -lt $STATEDIR/partial/
+  power history : $STATEDIR/power-events.jsonl
+  clear it      : rm $PENDING
+
+Before resuming, confirm mains has been stable and the UPS is recharged --
+a resumed multi-hour run that loses power again is worse than a late start.
+=====================================================================
+EOF
+exit 0

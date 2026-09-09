@@ -593,6 +593,19 @@ func run(cfg Config) error {
 
 	var firstErr error
 	for i, cell := range schedule {
+		// Graceful drain (UPS power loss). Checked HERE, at the top of the
+		// iteration, so the cell that was running has already completed and
+		// flushed: the point of a drain is to keep that work, which the
+		// SIGTERM path below deliberately does not do (it marks the
+		// in-flight cell interrupted). ops/power/cluster-power-event writes
+		// the sentinel from apcupsd's onbattery hook.
+		if drainRequested() {
+			fmt.Fprintf(os.Stderr, "probatorium-runner: drain requested; stopping cleanly with %d cell(s) unrun\n",
+				len(schedule)-i)
+			acknowledgeDrain(cfg, schedule[i:])
+			markCellsInterrupted(cfg, sink, schedule[i:])
+			break
+		}
 		if rootCtx.Err() != nil {
 			// First signal landed between cells: mark everything that
 			// never started as interrupted (per-cell JSON + final write)
@@ -866,6 +879,64 @@ func reduceCellStatus(runs []report.CellStatus, hasData, demoted bool) report.Ce
 // missing file, then flushes once. v3.8's hang-guard SIGTERM simply
 // stopped the loop here, and the in-flight truncation surfaced later as
 // bogus 354µs "zero-request cells" classified not_applicable.
+// drainFile is the sentinel path ops/power/cluster-power-event writes when
+// apcupsd reports mains loss. It lives on tmpfs (/run) on purpose: a stale
+// sentinel that survived a reboot would silently drain the NEXT run at its
+// first cell -- the orphan-manifest failure mode in a new costume.
+func drainFile() string {
+	if p := os.Getenv("PROBATORIUM_DRAIN_FILE"); p != "" {
+		return p
+	}
+	return "/run/celeris/drain-requested"
+}
+
+// drainRequested reports whether a graceful stop has been asked for. Any
+// stat error other than "exists" is treated as "no drain": a runner must
+// never abandon a multi-hour matrix because /run was briefly unreadable.
+func drainRequested() bool {
+	_, err := os.Stat(drainFile())
+	return err == nil
+}
+
+// acknowledgeDrain records that the drain was honoured and, next to the
+// results, exactly which cells never ran. That list is what a resumed run
+// needs; without it, recovering the remainder means diffing the artefact
+// against the full schedule after the fact.
+//
+// The acknowledgement file also tells the offbattery hook not to cancel a
+// drain already under way: once we have decided to stop, finishing the stop
+// is cheaper and far less surprising than half-resuming.
+func acknowledgeDrain(cfg Config, remaining []interleave.Cell) {
+	ack := filepath.Join(filepath.Dir(drainFile()), "drain-acknowledged")
+	if err := os.WriteFile(ack, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "probatorium-runner: write drain ack: %v\n", err)
+	}
+	type remainingCell struct {
+		RunIdx   int    `json:"run_idx"`
+		Scenario string `json:"scenario"`
+		Server   string `json:"server"`
+	}
+	out := make([]remainingCell, 0, len(remaining))
+	for _, c := range remaining {
+		out = append(out, remainingCell{RunIdx: c.RunIdx, Scenario: c.Scenario.Name(), Server: c.Server.Name()})
+	}
+	doc := struct {
+		UTC       string          `json:"utc"`
+		Reason    string          `json:"reason"`
+		Remaining []remainingCell `json:"remaining"`
+	}{time.Now().UTC().Format(time.RFC3339), "ups-drain", out}
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(cfg.Out, 0o755); err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(cfg.Out, "drained-remaining.json"), b, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "probatorium-runner: write drained-remaining.json: %v\n", err)
+	}
+}
+
 func markCellsInterrupted(cfg Config, sink *resultsSink, cells []interleave.Cell) {
 	const reason = "interrupted: run cancelled before cell start"
 	for _, cell := range cells {
