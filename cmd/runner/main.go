@@ -94,10 +94,14 @@ type Config struct {
 	Cooldown time.Duration
 	Cells    string
 	Out      string
-	Services string
-	FailFast bool
-	FDTrace  bool
-	Seed     int64
+	// ResumeFrom is a results directory from an earlier, interrupted run.
+	// Cells that already reached a final verdict there are dropped from
+	// this run's schedule. Empty disables resume.
+	ResumeFrom string
+	Services   string
+	FailFast   bool
+	FDTrace    bool
+	Seed       int64
 
 	// Timeseries is the path for the gzip time-series sidecar. Empty
 	// means <Out>/timeseries.json.gz. The sidecar carries the per-run
@@ -215,6 +219,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.Cells, "cells", c.Cells,
 		`glob filter over "<scenario>/<server>" (e.g. "get-simple/*", "*/celeris-*"; supports "!neg" exclusions)`)
 	fs.StringVar(&c.Out, "out", c.Out, "output directory; default results/<timestamp>-<git-ref>/")
+	fs.StringVar(&c.ResumeFrom, "resume-from", c.ResumeFrom,
+		"results dir from an interrupted run; cells already final there are skipped (pass the same path as -out to accumulate in place)")
 	fs.StringVar(&c.Timeseries, "timeseries", c.Timeseries,
 		"gzip time-series sidecar path; empty = <out>/timeseries.json.gz")
 	fs.StringVar(&c.Services, "services", c.Services, `"local" (Docker on same host) | "none" (skip driver services)`)
@@ -569,6 +575,21 @@ func run(cfg Config) error {
 	}
 
 	schedule := interleave.Schedule(cfg.Runs, effSc, srvs)
+
+	if cfg.ResumeFrom != "" {
+		full := len(schedule)
+		var err error
+		schedule, err = dropCompletedCells(schedule, cfg.ResumeFrom)
+		if err != nil {
+			return fmt.Errorf("resume-from %s: %w", cfg.ResumeFrom, err)
+		}
+		fmt.Fprintf(os.Stderr, "probatorium-runner: resume: %d of %d cells already final in %s; %d to run\n",
+			full-len(schedule), full, cfg.ResumeFrom, len(schedule))
+		if len(schedule) == 0 {
+			fmt.Fprintln(os.Stderr, "probatorium-runner: resume: nothing left to run")
+			return nil
+		}
+	}
 
 	if cfg.DryRun {
 		_, _ = fmt.Fprintf(os.Stderr, "probatorium-runner: dry-run; %d cells across %d scenarios × %d adapters × %d runs\n",
