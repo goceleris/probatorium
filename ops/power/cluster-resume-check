@@ -36,9 +36,14 @@ This host rebooted after a UPS-initiated shutdown.
 
 Nothing has been restarted automatically, by design.
 
-  snapshots     : ls -lt $STATEDIR/partial/
+  inspect       : cluster-power-restore --list
+  resume        : cluster-power-restore            (restores, then RECLAIMS the space)
+  give up on it : cluster-power-restore --discard  (deletes without restoring)
   power history : $STATEDIR/power-events.jsonl
-  clear it      : rm $PENDING
+
+Either path frees the persistent copy. Leaving snapshots to accumulate is
+what the tmpfs policy exists to prevent -- this cluster has already lost one
+NVMe to writes it did not need to be doing.
 
 Before resuming, confirm mains has been stable and the UPS is recharged --
 a resumed multi-hour run that loses power again is worse than a late start.

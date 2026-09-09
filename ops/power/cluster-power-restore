@@ -1,0 +1,98 @@
+#!/bin/sh
+# cluster-power-restore — put a rescued run back on tmpfs, then RECLAIM the
+# persistent space it was using.
+#
+# The snapshot exists only to bridge a reboot. Once its contents are back
+# where the harness expects them (or explicitly discarded), keeping the copy
+# on /var/lib is pure accumulation — and this cluster has already lost one
+# NVMe to writes it did not need to be doing. So restore and discard both
+# delete, and neither leaves the state directory holding anything.
+#
+#   cluster-power-restore            restore the newest snapshot, then delete it
+#   cluster-power-restore --discard  delete every snapshot without restoring
+#   cluster-power-restore --list     show what is held, change nothing
+set -eu
+
+STATEDIR=/var/lib/celeris-power
+PARTIAL="$STATEDIR/partial"
+PENDING="$STATEDIR/resume-pending.json"
+MODE="${1:---restore}"
+
+human_size() { du -sh "$1" 2>/dev/null | cut -f1; }
+
+case "$MODE" in
+--list)
+    if [ ! -d "$PARTIAL" ] || [ -z "$(ls -A "$PARTIAL" 2>/dev/null)" ]; then
+        echo "no snapshots held; $STATEDIR is clean"
+        exit 0
+    fi
+    echo "snapshots held under $PARTIAL:"
+    for d in "$PARTIAL"/*/; do
+        [ -d "$d" ] || continue
+        printf '  %-28s %6s  %s trees\n' "$(basename "$d")" "$(human_size "$d")" \
+            "$(wc -l <"$d/snapshot-manifest.tsv" 2>/dev/null || echo '?')"
+    done
+    echo "total: $(human_size "$STATEDIR")"
+    [ -f "$PENDING" ] && echo "resume-pending: $(cat "$PENDING")"
+    exit 0
+    ;;
+--discard)
+    if [ -d "$PARTIAL" ]; then
+        echo "discarding all snapshots ($(human_size "$STATEDIR"))"
+        rm -rf "${PARTIAL:?}"/*
+    fi
+    rm -f "$PENDING"
+    echo "reclaimed; $STATEDIR now $(human_size "$STATEDIR")"
+    exit 0
+    ;;
+--restore) : ;;
+*)
+    echo "usage: $0 [--restore|--discard|--list]" >&2
+    exit 2
+    ;;
+esac
+
+NEWEST=$(ls -1dt "$PARTIAL"/*/ 2>/dev/null | head -1 || true)
+if [ -z "$NEWEST" ]; then
+    echo "nothing to restore; $STATEDIR is clean"
+    rm -f "$PENDING"
+    exit 0
+fi
+
+MANIFEST="$NEWEST/snapshot-manifest.tsv"
+if [ ! -f "$MANIFEST" ]; then
+    echo "refusing to restore $NEWEST: no snapshot-manifest.tsv" >&2
+    echo "the mapping back to /tmp is unknown; inspect it by hand, then --discard" >&2
+    exit 1
+fi
+
+echo "restoring $NEWEST ($(human_size "$NEWEST"))"
+failed=0
+while IFS="$(printf '\t')" read -r name orig; do
+    [ -n "${name:-}" ] || continue
+    src="$NEWEST/$name"
+    [ -d "$src" ] || { echo "  MISSING in snapshot: $name" >&2; failed=1; continue; }
+    mkdir -p "$(dirname "$orig")"
+    if cp -a "$src" "$orig" 2>/dev/null; then
+        echo "  $name -> $orig"
+    else
+        echo "  FAILED: $name -> $orig" >&2
+        failed=1
+    fi
+done <"$MANIFEST"
+
+if [ -f "$NEWEST/celeris-bench-manifest.json" ]; then
+    cp -a "$NEWEST/celeris-bench-manifest.json" /tmp/celeris-bench-manifest.json 2>/dev/null || true
+fi
+
+# Only reclaim once everything landed. A partial restore that also deleted
+# its source would destroy the very evidence it failed to move.
+if [ "$failed" -ne 0 ]; then
+    echo "restore INCOMPLETE — snapshot KEPT at $NEWEST for inspection" >&2
+    exit 1
+fi
+
+rm -rf "$NEWEST"
+rm -f "$PENDING"
+echo "restored and reclaimed; $STATEDIR now $(human_size "$STATEDIR")"
+exit 0

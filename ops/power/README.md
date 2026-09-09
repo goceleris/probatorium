@@ -101,6 +101,38 @@ snapshot is the narrow exception: per-cell JSON only, only on an actual power
 event, single-digit MB against a drive rated in hundreds of TBW. It keeps five
 snapshots and prunes the rest.
 
+## Reclaiming the space
+
+A snapshot exists only to bridge a reboot. Once its contents are back on tmpfs
+— or explicitly abandoned — keeping the copy on `/var/lib` is pure
+accumulation, on the same disk the tmpfs policy exists to protect.
+
+```
+cluster-power-restore --list      # what is held, changes nothing
+cluster-power-restore             # restore the newest snapshot, then DELETE it
+cluster-power-restore --discard   # delete everything without restoring
+```
+
+Both restore and discard free the space; there is no path that consumes a
+snapshot and leaves it behind. A restore that fails part-way **keeps** the
+snapshot and exits non-zero — deleting the source of a move that did not
+finish would destroy the evidence it failed to move.
+
+Restore reads `snapshot-manifest.tsv` (stored-name → original-path) written at
+snapshot time, rather than trying to un-mangle a flattened directory name, so
+the mapping stays explicit if the naming scheme ever changes.
+
+Backstops, because "meant to be consumed" is not a guarantee:
+
+- at most **3** snapshots retained, oldest pruned first
+- anything older than **30 days** dropped regardless of count
+- `/var/log/cluster-power-event.log` and `power-events.jsonl` are rotated by
+  `/etc/logrotate.d/celeris-power` (6 and 12 months respectively) — both are
+  append-only and nothing else prunes them
+
+A storm week nobody follows up on therefore costs a bounded, small amount of
+disk instead of an unbounded pile.
+
 ## On the way back up
 
 `celeris-resume-check.service` runs once at boot and **reports**; it does not

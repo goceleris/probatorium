@@ -35,11 +35,18 @@ DEST="$STATEDIR/partial/$STAMP"
 
 mkdir -p "$DEST" 2>/dev/null || true
 
+# Every rescued tree is recorded as stored-name -> original-path. Restore
+# reads this rather than trying to un-mangle a flattened name, so the mapping
+# stays explicit and reversible even if the naming scheme changes later.
+MANIFEST="$DEST/snapshot-manifest.tsv"
+: >"$MANIFEST"
+
 copied=0
 for src in /tmp/celeris-results /tmp/celeris-bench/results; do
     [ -d "$src" ] || continue
     name=$(echo "$src" | tr '/' '_')
     if cp -a "$src" "$DEST/$name" 2>/dev/null; then
+        printf '%s\t%s\n' "$name" "$src" >>"$MANIFEST"
         copied=$((copied+1))
     fi
 done
@@ -53,8 +60,11 @@ for wsroot in /tmp/actions-runner-*/_work; do
     # state it does not have.
     found=$(find "$wsroot" -maxdepth 4 -type d -name results 2>/dev/null | wc -l | tr -d ' ')
     find "$wsroot" -maxdepth 4 -type d -name results 2>/dev/null | while read -r r; do
-        tgt="$DEST/workspace$(echo "$r" | tr '/' '_')"
-        cp -a "$r" "$tgt" 2>/dev/null && echo "snapshot: $r -> $tgt"
+        name="workspace$(echo "$r" | tr '/' '_')"
+        if cp -a "$r" "$DEST/$name" 2>/dev/null; then
+            printf '%s\t%s\n' "$name" "$r" >>"$MANIFEST"
+            echo "snapshot: $r -> $DEST/$name"
+        fi
     done
     copied=$((copied+found))
 done
@@ -68,6 +78,22 @@ printf '{"utc":"%s","reason":"%s","dest":"%s","sources":%d,"size":"%s","host":"%
 
 echo "cluster-power-snapshot: $copied source(s) -> $DEST (${SIZE:-unknown})"
 
-# Keep the last 5 snapshots; a storm week should not fill the disk.
-ls -1dt "$STATEDIR"/partial/*/ 2>/dev/null | tail -n +6 | while read -r old; do rm -rf "$old"; done
+# Retention. A snapshot is meant to be consumed and deleted by
+# cluster-power-restore; these bounds exist because "meant to" is not a
+# guarantee, and the whole reason bench state lives on tmpfs is that this
+# cluster already killed one NVMe by writing to it.
+#
+#   - keep at most 3 snapshots
+#   - drop anything older than 30 days regardless of count
+#
+# A storm week that nobody follows up on therefore costs a bounded, small
+# amount of disk rather than an unbounded pile.
+ls -1dt "$STATEDIR"/partial/*/ 2>/dev/null | tail -n +4 | while read -r old; do
+    echo "retention: pruning $old"
+    rm -rf "$old"
+done
+find "$STATEDIR/partial" -maxdepth 1 -mindepth 1 -type d -mtime +30 2>/dev/null | while read -r old; do
+    echo "retention: pruning $old (older than 30 days)"
+    rm -rf "$old"
+done
 exit 0

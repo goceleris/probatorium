@@ -57,6 +57,7 @@
         - cluster-power-event
         - cluster-power-snapshot
         - cluster-resume-check
+        - cluster-power-restore
 
     # apccontrol runs /etc/apcupsd/<event> if it is executable, then continues
     # with its default action unless the hook exits 99. We exit 0 so apcupsd's
@@ -76,6 +77,16 @@
         - onbattery
         - offbattery
         - doshutdown
+
+    # Both files the guard appends to are unrotated by default. On the same
+    # disk the tmpfs policy exists to protect, that is a slow leak.
+    - name: Bound the power guard's log files
+      ansible.builtin.copy:
+        src: ../ops/power/celeris-power.logrotate
+        dest: /etc/logrotate.d/celeris-power
+        owner: root
+        group: root
+        mode: "0644"
 
     - name: Install boot-time resume check unit
       ansible.builtin.copy:
