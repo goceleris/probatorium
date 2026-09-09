@@ -153,8 +153,12 @@ type tier1Tally struct {
 	// request count is the signature of broken auth.
 	walkerLogins   atomic.Int64
 	walkerRelogins atomic.Int64
-	requests5xx    atomic.Int64 // UNEXPECTED 5xx only (see requests5xxExpected)
-	requestsError  atomic.Int64
+	// walkerLogouts counts deliberate logouts the walk performed. Each one
+	// legitimately costs one 401 + one re-login, so relogins must be judged
+	// against this, not against the walker count (probatorium#292).
+	walkerLogouts atomic.Int64
+	requests5xx   atomic.Int64 // UNEXPECTED 5xx only (see requests5xxExpected)
+	requestsError atomic.Int64
 	// requests5xxExpected counts 5xx from states the corpus marks
 	// `expect: 5xx` (designed-to-fail routes such as observability's
 	// /api/error). Kept apart so requests5xx can be gated to zero.
@@ -768,6 +772,12 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 		// `request: METHOD path`; states without an entry are silent.
 		// See validation/markov/<refapp>.yaml.
 		if req, ok := m.Requests[state]; ok {
+			// A matrix-declared logout destroys the session on purpose;
+			// the 401 it causes on the next request is expected, so count
+			// it to keep the re-login budget honest.
+			if m.Logout.Method != "" && req.Method == m.Logout.Method && req.Path == m.Logout.Path {
+				tally.walkerLogouts.Add(1)
+			}
 			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, req.ExpectPanic, tally)
 			if status == 401 && hasLogin {
 				// Session likely expired — re-login and keep walking.
@@ -904,6 +914,7 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 		Requests429:    t.requests429.Load(),
 		WalkerLogins:   t.walkerLogins.Load(),
 		WalkerRelogins: t.walkerRelogins.Load(),
+		WalkerLogouts:  t.walkerLogouts.Load(),
 		Requests5xx:    t.requests5xx.Load(),
 		RequestsError:  t.requestsError.Load(),
 
@@ -941,6 +952,7 @@ type tier1TallySnapshot struct {
 	Requests429           int64               `json:"requests_429"`
 	WalkerLogins          int64               `json:"walker_logins"`
 	WalkerRelogins        int64               `json:"walker_relogins"`
+	WalkerLogouts         int64               `json:"walker_logouts"`
 	Requests5xx           int64               `json:"requests_5xx"`
 	RequestsError         int64               `json:"requests_error"`
 	Requests5xxExpected   int64               `json:"requests_5xx_expected"`

@@ -59,6 +59,14 @@ type Matrix struct {
 	// (kitchen_sink, observability, static_swagger_proxy, driver_*)
 	// — walker skips login entirely.
 	Login Request
+	// Logout, if set, names the request that deliberately destroys the
+	// session. The walker counts each time it fires this request, so the
+	// gate can tell a designed logout (which legitimately produces a 401
+	// and a re-login on the next request) apart from a server that is not
+	// honouring sessions at all. Parsed from a top-level
+	// `logout: METHOD path` line. Empty means the matrix never logs out,
+	// and every re-login is then unexplained (probatorium#292).
+	Logout Request
 }
 
 // Request describes the HTTP call associated with one Markov state.
@@ -260,6 +268,18 @@ func LoadMatrix(r io.Reader) (*Matrix, error) {
 				return nil, fmt.Errorf("markov: line %d: login path %q must start with /", lineNo, path)
 			}
 			m.Login = Request{Method: strings.ToUpper(method), Path: path}
+		case indent == 0 && strings.HasPrefix(body, "logout:"):
+			// Top-level `logout: METHOD path` directive, same shape as
+			// `login:`. Names the request that destroys the session.
+			spec := strings.TrimSpace(strings.TrimPrefix(body, "logout:"))
+			method, path, ok := strings.Cut(spec, " ")
+			if !ok || method == "" || path == "" {
+				return nil, fmt.Errorf("markov: line %d: logout %q must be \"METHOD path\"", lineNo, spec)
+			}
+			if !strings.HasPrefix(path, "/") {
+				return nil, fmt.Errorf("markov: line %d: logout path %q must start with /", lineNo, path)
+			}
+			m.Logout = Request{Method: strings.ToUpper(method), Path: path}
 		case indent == 0 && body == "states:":
 			// header; nothing to do.
 		case indent == 2:
