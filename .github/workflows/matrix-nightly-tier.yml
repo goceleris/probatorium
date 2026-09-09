@@ -13,6 +13,15 @@ on:
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
+      resume_from:
+        description: >-
+          Resume an interrupted run instead of starting a fresh matrix.
+          "auto" restores the newest run rescued by the UPS power guard on
+          the cluster host and continues it; a path resumes from that dir.
+          Empty (default) runs the full matrix.
+        required: false
+        default: ""
+        type: string
       duration:
         description: per-tier-total duration (default 1h)
         required: false
@@ -126,6 +135,7 @@ jobs:
           VALIDATE_DURATION: ${{ inputs.duration || '1h' }}
           VALIDATE_TARGET: both
           VALIDATE_MATRIX: "1"
+          VALIDATE_RESUME_FROM: ${{ inputs.resume_from || '' }}
           # The two bench_targets (msa2-server amd64, msr1 arm64) are
           # independent hosts driven by separate validator instances
           # on msa2-client — they have no shared state. Run them in

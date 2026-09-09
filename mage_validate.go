@@ -203,6 +203,13 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 			if v := os.Getenv("VALIDATE_MATRIX_ENGINES"); v != "" {
 				args = append(args, "--extra-vars", "validate_matrix_engines="+v)
 			}
+			// VALIDATE_RESUME_FROM points the validator at a previous
+			// run's results dir; cells already final there are skipped.
+			// "auto" asks the remote host to resolve the newest snapshot
+			// rescued by the UPS power guard (ops/power/README.md).
+			if v := os.Getenv("VALIDATE_RESUME_FROM"); v != "" {
+				args = append(args, "--extra-vars", "validate_resume_from="+v)
+			}
 		}
 		// VALIDATE_CONCURRENCY tunes the per-cell walker fan-out
 		// (see validation/runner.go). Threaded through to the

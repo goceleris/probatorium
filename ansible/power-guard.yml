@@ -64,6 +64,7 @@
         - cluster-power-snapshot
         - cluster-resume-check
         - cluster-power-restore
+        - cluster-power-resume
 
     # apccontrol runs /etc/apcupsd/<event> if it is executable, then continues
     # with its default action unless the hook exits 99. We exit 0 so apcupsd's
@@ -125,6 +126,29 @@
         line: 'KDUMP_NUM_DUMPS=2'
         create: false
       failed_when: false
+
+    # Only the UPS master evaluates resume. Running it on all three would
+    # race three dispatches for the same interrupted run.
+    - name: Install the resume timer and its unit (UPS master only)
+      ansible.builtin.copy:
+        src: "../ops/power/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - celeris-power-resume.service
+        - celeris-power-resume.timer
+      when: inventory_hostname in groups['loadgen']
+      notify: reload systemd
+
+    - name: Enable the resume timer (UPS master only)
+      ansible.builtin.systemd:
+        name: celeris-power-resume.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: inventory_hostname in groups['loadgen']
 
     - name: Install boot-time resume check unit
       ansible.builtin.copy:

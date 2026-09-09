@@ -133,6 +133,57 @@ Backstops, because "meant to be consumed" is not a guarantee:
 A storm week nobody follows up on therefore costs a bounded, small amount of
 disk instead of an unbounded pile.
 
+## Resuming an interrupted run
+
+Two halves: the runner/validator can *finish* a partial matrix, and the host
+decides *when* it is safe to ask for that.
+
+### Finishing a partial matrix
+
+```
+probatorium-runner  -resume-from <dir>        # bench   (pass the same path as -out)
+validator           -matrix-resume-from <dir> # nightly/soak
+```
+
+Both drop cells that already reached a final verdict and run the rest. The
+completeness test is status-aware, which is the crux: an interrupted run
+writes a per-cell record for cells that never ran, so "a record exists" would
+skip exactly the cells a resume must run. Only real verdicts count —
+`ok`/`suspect`/`not_applicable` for the bench, evidence of requests or a
+property verdict for validation. `dnf`, empty and unrecognised all re-run,
+because a wasted measurement window costs minutes while a wrongly skipped cell
+hands the absolute gate a matrix with a hole in it.
+
+The `matrix-nightly-tier` and `matrix-weekend-tier` workflows take a
+`resume_from` input. `auto` restores the newest rescued snapshot on the
+cluster host and continues it; a path resumes from that directory.
+
+### Deciding when to resume
+
+`cluster-power-resume`, on a 5-minute timer, on the UPS master only (three
+hosts racing three dispatches for one run would be worse than not resuming).
+
+| interlock | default | why |
+|---|---|---|
+| mains back | `ONLINE` | obvious |
+| mains stable | 15 min | a flapping supply resets the clock, so it can never accumulate credit |
+| battery | ≥ 80 % | enough headroom to survive the *next* cut, not just start |
+| attempts | ≤ 3 | a run that cannot survive three tries needs a person, not a fourth |
+
+```
+cluster-power-resume --status    # what it sees
+cluster-power-resume --dry-run   # evaluate, dispatch nothing
+```
+
+Dispatch needs a token with `actions:write` at
+`/etc/celeris-power/github-token` (0600 root). **Without it the interlocks
+still run and the script prints the exact command** — it degrades to telling a
+human rather than failing shut.
+
+The pending marker is cleared by `cluster-power-restore` when the resumed run
+actually restores the snapshot, not at dispatch time: clearing it early would
+lose the rescued state if the dispatch never produced a run.
+
 ## On the way back up
 
 `celeris-resume-check.service` runs once at boot and **reports**; it does not

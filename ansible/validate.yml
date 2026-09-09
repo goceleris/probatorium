@@ -60,6 +60,39 @@
         state: directory
         mode: '0755'
 
+    # Resume support. validate_resume_from is either an explicit results dir
+    # or the literal "auto", which asks this host to restore the newest run
+    # rescued by the UPS power guard (ops/power/README.md) and continue it.
+    # Restoring is what makes those cells visible again: the snapshot lives
+    # on ext4 precisely because /tmp is RAM and does not survive the power
+    # cut that created it.
+    - name: Restore the newest power-loss snapshot (resume=auto)
+      ansible.builtin.command: /usr/local/sbin/cluster-power-restore
+      become: true
+      register: power_restore
+      changed_when: false
+      failed_when: false
+      when: (validate_resume_from | default('')) == 'auto'
+
+    - name: Locate the restored results dir
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -1dt {{ results_root }}/*-validate-* 2>/dev/null | head -1
+      args:
+        executable: /bin/bash
+      register: restored_dir
+      changed_when: false
+      failed_when: false
+      when: (validate_resume_from | default('')) == 'auto'
+
+    - name: Resolve the resume dir
+      ansible.builtin.set_fact:
+        validate_resume_dir: "{{ (restored_dir.stdout | default('') | trim) if (validate_resume_from | default('')) == 'auto' else (validate_resume_from | default('')) }}"
+
+    - name: Report the resume decision
+      ansible.builtin.debug:
+        msg: "resume: {{ ('from ' ~ validate_resume_dir) if validate_resume_dir else 'disabled (nothing to resume)' }}"
+
     # ansible's async timeout MUST be greater than the validator's
     # natural exit window or we lose the final results fetch. mage passes
     # the soak window as INTEGER SECONDS (validate_duration_seconds) —
@@ -206,7 +239,7 @@
             ./validator \
               -target=localhost \
               -duration={{ validate_duration_seconds | default(600) }}s \
-              {% if validate_matrix | default('') == '1' %}-matrix -matrix-refapp-root={{ bench_root }}/validation/refapp -matrix-bin-dir={{ bench_root }}/refapps -markov={{ bench_root }}/markov/auth_session_ratelimit.yaml {% if validate_matrix_refapps | default('') %}-matrix-refapps={{ validate_matrix_refapps }}{% endif %} {% if validate_matrix_engines | default('') %}-matrix-engines={{ validate_matrix_engines }}{% endif %} {% if validate_refapp_workers | default('') %}-refapp-workers={{ validate_refapp_workers }}{% endif %} \
+              {% if validate_matrix | default('') == '1' %}-matrix -matrix-refapp-root={{ bench_root }}/validation/refapp -matrix-bin-dir={{ bench_root }}/refapps -markov={{ bench_root }}/markov/auth_session_ratelimit.yaml {% if validate_matrix_refapps | default('') %}-matrix-refapps={{ validate_matrix_refapps }}{% endif %} {% if validate_matrix_engines | default('') %}-matrix-engines={{ validate_matrix_engines }}{% endif %} {% if validate_resume_dir | default('') %}-matrix-resume-from={{ validate_resume_dir }}{% endif %} {% if validate_refapp_workers | default('') %}-refapp-workers={{ validate_refapp_workers }}{% endif %} \
               {% else %}-celeris-bin={{ bench_root }}/refapps/{{ refapp | default('auth_session_ratelimit') }} -celeris-addr=127.0.0.1:{{ bench_port | default(8080) }} -markov={{ bench_root }}/markov/{{ refapp | default('auth_session_ratelimit') }}.yaml {% if validate_refapp_engine | default('') %}-refapp-engine={{ validate_refapp_engine }}{% endif %} {% if validate_refapp_async | default('') %}-refapp-async-handlers={{ validate_refapp_async }}{% endif %} {% if validate_refapp_workers | default('') %}-refapp-workers={{ validate_refapp_workers }}{% endif %} \
               {% endif %}
               {% if validate_dbservices | default('') == '1' %}-seed-services="postgres=postgres://bench:bench@127.0.0.1:54321/bench?sslmode=disable,redis=127.0.0.1:63791,memcached=127.0.0.1:21211" {% endif %}\

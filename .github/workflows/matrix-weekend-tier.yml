@@ -14,6 +14,15 @@ on:
     - cron: "0 2 * * 0"
   workflow_dispatch:
     inputs:
+      resume_from:
+        description: >-
+          Resume an interrupted run instead of starting a fresh matrix.
+          "auto" restores the newest run rescued by the UPS power guard on
+          the cluster host and continues it; a path resumes from that dir.
+          Empty (default) runs the full matrix.
+        required: false
+        default: ""
+        type: string
       duration:
         description: per-tier-total duration (default 24h)
         required: false
@@ -126,6 +135,7 @@ jobs:
           SOAK_DURATION: ${{ inputs.duration || '24h' }}
           VALIDATE_TARGET: both
           VALIDATE_MATRIX: "1"
+          VALIDATE_RESUME_FROM: ${{ inputs.resume_from || '' }}
           # See matrix-nightly-tier.yml. Parallel msa2-server +
           # msr1 keeps wall-clock at inputs.duration instead of 2× it.
           VALIDATE_PARALLEL: "1"
