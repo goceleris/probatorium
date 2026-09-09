@@ -48,11 +48,15 @@ done
 # Glob rather than hardcode: the runner root is per-host.
 for wsroot in /tmp/actions-runner-*/_work; do
     [ -d "$wsroot" ] || continue
+    # Count only what is actually rescued: a runner root with no results/
+    # dir must not inflate the tally, or the resume record claims to hold
+    # state it does not have.
+    found=$(find "$wsroot" -maxdepth 4 -type d -name results 2>/dev/null | wc -l | tr -d ' ')
     find "$wsroot" -maxdepth 4 -type d -name results 2>/dev/null | while read -r r; do
         tgt="$DEST/workspace$(echo "$r" | tr '/' '_')"
         cp -a "$r" "$tgt" 2>/dev/null && echo "snapshot: $r -> $tgt"
     done
-    copied=$((copied+1))
+    copied=$((copied+found))
 done
 
 [ -f /tmp/celeris-bench-manifest.json ] && cp -a /tmp/celeris-bench-manifest.json "$DEST/" 2>/dev/null || true

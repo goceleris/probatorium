@@ -36,7 +36,11 @@ log() { printf '%s %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EVENT" "$*" >>"$
 
 mkdir -p "$RUNDIR" "$STATEDIR" 2>/dev/null || true
 
-ups_field() { apcaccess status 2>/dev/null | awk -F: "/^$1/{gsub(/ /,\"\",\$2); print \$2; exit}"; }
+# Extract the NUMBER only. apcaccess prints "TIMELEFT :  46.2 Minutes", and
+# stripping every space glues the unit on ("46.2Minutes"), which makes the
+# recorded history non-numeric -- useless for the threshold tuning this log
+# exists to enable.
+ups_field() { apcaccess status 2>/dev/null | awk -F: "/^$1/{split(\$2,a,\" \"); for(i=1;i<=2;i++) if(a[i]!=\"\"){print a[i]; exit}}"; }
 
 case "$EVENT" in
 onbattery)
