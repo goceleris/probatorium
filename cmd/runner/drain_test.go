@@ -72,6 +72,7 @@ func TestAcknowledgeDrainWritesAckAndRemaining(t *testing.T) {
 	}
 	var doc struct {
 		Reason    string `json:"reason"`
+		CellsGlob string `json:"cells_glob"`
 		Remaining []struct {
 			Scenario string `json:"scenario"`
 		} `json:"remaining"`
@@ -86,5 +87,29 @@ func TestAcknowledgeDrainWritesAckAndRemaining(t *testing.T) {
 	// a consumer can iterate it without a nil check.
 	if doc.Remaining == nil {
 		t.Fatal("remaining marshalled as null; want an empty array")
+	}
+	if doc.CellsGlob != "" {
+		t.Fatalf("cells_glob=%q for an empty remainder, want empty", doc.CellsGlob)
+	}
+}
+
+// The resume input has to be usable as-is. BENCH_CELLS is a comma-separated
+// list of path.Match patterns over the cell identifier "<scenario>/<server>",
+// so acknowledgeDrain emits exactly that -- deduplicated, because the same
+// scenario/server pair recurs once per run index and a repeated pattern would
+// only pad the resume command.
+func TestCellsGlobDeduplicatesInFirstSeenOrder(t *testing.T) {
+	got := cellsGlob([]string{
+		"plaintext/celeris-iouring",
+		"plaintext/celeris-iouring", // same pair, next run index
+		"json/celeris-epoll",
+		"plaintext/celeris-iouring",
+	})
+	want := "plaintext/celeris-iouring,json/celeris-epoll"
+	if got != want {
+		t.Fatalf("cellsGlob = %q, want %q", got, want)
+	}
+	if cellsGlob(nil) != "" {
+		t.Fatalf("cellsGlob(nil) = %q, want empty", cellsGlob(nil))
 	}
 }

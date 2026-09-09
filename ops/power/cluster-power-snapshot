@@ -10,6 +10,12 @@
 #     # All transient bench state lives under /tmp so a reboot wipes it.
 #
 # and the GitHub runner is provisioned at /tmp/actions-runner-<host>/ too.
+#
+# /tmp on all three hosts is tmpfs, i.e. RAM-backed: a power cut destroys
+# in-flight results INSTANTLY, not merely on the subsequent reboot. That is
+# why this runs from doshutdown, while the machine is still up on battery --
+# there is no post-hoc recovery to fall back on.
+#
 # That is the right default — the 2026-08-17 post-mortem found msa2-client's
 # QLC NVMe killed by a 29:1 write:read ratio, and moving bench artefacts to
 # tmpfs is part of the fix. But it means a power-loss reboot destroys a

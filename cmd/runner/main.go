@@ -599,6 +599,16 @@ func run(cfg Config) error {
 		// SIGTERM path below deliberately does not do (it marks the
 		// in-flight cell interrupted). ops/power/cluster-power-event writes
 		// the sentinel from apcupsd's onbattery hook.
+		//
+		// DO NOT move this to the bottom of the loop. The server-down fast
+		// path further down `continue`s past the cooldown, so a check placed
+		// after it would be skipped for every dead-SUT cell -- and if the
+		// remaining schedule is all server-down, it would never fire again.
+		//
+		// Top-of-loop also gets rated mode right for free: in rated mode one
+		// cell is a saturation pass plus one pass per cfg.RatedFractions
+		// entry (runRatedSweep), and a drain must never land between those
+		// passes or the cell's RatedSamples set is half-populated.
 		if drainRequested() {
 			fmt.Fprintf(os.Stderr, "probatorium-runner: drain requested; stopping cleanly with %d cell(s) unrun\n",
 				len(schedule)-i)
@@ -879,6 +889,26 @@ func reduceCellStatus(runs []report.CellStatus, hasData, demoted bool) report.Ce
 // missing file, then flushes once. v3.8's hang-guard SIGTERM simply
 // stopped the loop here, and the in-flight truncation surfaced later as
 // bogus 354µs "zero-request cells" classified not_applicable.
+// cellsGlob renders cell identifiers as a BENCH_CELLS value: a
+// comma-separated list of path.Match patterns over "<scenario>/<server>".
+// Emitting it here means resuming a drained run is a copy-paste rather than
+// a derivation from the artefact.
+//
+// Deduplicated in first-seen order: the same scenario/server pair recurs once
+// per run index, and repeating a pattern would only pad the resume command.
+func cellsGlob(ids []string) string {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return strings.Join(out, ",")
+}
+
 // drainFile is the sentinel path ops/power/cluster-power-event writes when
 // apcupsd reports mains loss. It lives on tmpfs (/run) on purpose: a stale
 // sentinel that survived a reboot would silently drain the NEXT run at its
@@ -920,11 +950,16 @@ func acknowledgeDrain(cfg Config, remaining []interleave.Cell) {
 	for _, c := range remaining {
 		out = append(out, remainingCell{RunIdx: c.RunIdx, Scenario: c.Scenario.Name(), Server: c.Server.Name()})
 	}
+	ids := make([]string, 0, len(remaining))
+	for _, c := range remaining {
+		ids = append(ids, c.Scenario.Name()+"/"+c.Server.Name())
+	}
 	doc := struct {
 		UTC       string          `json:"utc"`
 		Reason    string          `json:"reason"`
+		CellsGlob string          `json:"cells_glob"`
 		Remaining []remainingCell `json:"remaining"`
-	}{time.Now().UTC().Format(time.RFC3339), "ups-drain", out}
+	}{time.Now().UTC().Format(time.RFC3339), "ups-drain", cellsGlob(ids), out}
 	b, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return

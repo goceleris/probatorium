@@ -27,6 +27,12 @@ the cluster **idle**, and implies only **~69 Wh usable**.
 ~150 s and bench cells ~5 min, so draining the current cell is affordable; a
 "finish anything under 20 minutes" rule is not.
 
+In **rated** mode one cell is a saturation pass *plus* one pass per
+`RatedFractions` entry (`runRatedSweep`), so a drained cell waits for all of
+them. That is correct — a drain landing between passes would leave a
+half-populated `RatedSamples` set — and it is why the sentinel is checked at
+the top of the schedule loop rather than inside `executeCell`.
+
 `cluster-power-event` records `LOADPCT`/`TIMELEFT` into
 `/var/lib/celeris-power/power-events.jsonl` on every `onbattery`. That is the
 only place the loaded figure is ever observed — read it after the first real
@@ -61,8 +67,15 @@ network dependency exactly when the network may be going away.
    and appends the load snapshot to `power-events.jsonl`.
 2. The runner checks that sentinel **at the top of each cell iteration**, so
    the cell that was running completes and flushes first. It then writes
-   `drain-acknowledged` plus `drained-remaining.json` (the cells that never
-   ran) and marks the remainder interrupted.
+   `drain-acknowledged` plus `drained-remaining.json` — which carries both the
+   unrun cells and a ready-to-paste `cells_glob` in `BENCH_CELLS` form
+   (`<scenario>/<server>`, comma separated) — and marks the remainder
+   interrupted.
+
+   Because the runner exits *cleanly*, ansible proceeds to its results
+   collection play. That play is `any_errors_fatal` and only runs at the end
+   of a grid, so a run killed by a power cut fetches **nothing at all** —
+   which is precisely the difference a graceful drain buys.
 3. If mains returns before the runner has acknowledged, `offbattery` cancels
    the drain. Once acknowledged, the drain is allowed to finish — half-resuming
    is more surprising than stopping.
@@ -76,7 +89,10 @@ network dependency exactly when the network may be going away.
 
 `ansible/inventory.yml` puts all transient bench state on tmpfs on purpose —
 `results_root: /tmp/celeris-results`, and the Actions runner lives under
-`/tmp/actions-runner-<host>/`. That is correct: the 2026-08-17 post-mortem
+`/tmp/actions-runner-<host>/`. **`/tmp` is RAM-backed on all three hosts, so a
+power cut destroys in-flight results instantly — there is no post-hoc
+recovery.** That is why the snapshot runs from `doshutdown`, while the machine
+is still up on battery. That is correct: the 2026-08-17 post-mortem
 found msa2-client's QLC NVMe killed by a 29:1 write:read ratio, and moving
 bench artefacts off the disk is part of the fix.
 
