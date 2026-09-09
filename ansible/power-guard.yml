@@ -94,6 +94,38 @@
         group: root
         mode: "0644"
 
+    # msr1 (arm64) panics at "Powering off" in the out-of-tree r8127 driver,
+    # leaving the board powered but dead -- draining the UPS during the very
+    # outage it is meant to survive, and writing a vmcore each time. Only
+    # hosts actually using r8127 need the workaround.
+    - name: Detect r8127 NICs
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        for i in $(ls /sys/class/net); do
+          basename "$(readlink /sys/class/net/$i/device/driver 2>/dev/null)" 2>/dev/null;
+        done | grep -c '^r8127$' || true
+      args:
+        executable: /bin/bash
+      register: r8127_count
+      changed_when: false
+
+    - name: Install the r8127 power-off workaround
+      ansible.builtin.copy:
+        src: ../ops/power/quiesce-r8127.shutdown
+        dest: /usr/lib/systemd/system-shutdown/quiesce-r8127.shutdown
+        owner: root
+        group: root
+        mode: "0755"
+      when: r8127_count.stdout | trim | int > 0
+
+    - name: Cap kdump crash-dump retention
+      ansible.builtin.lineinfile:
+        path: /etc/default/kdump-tools
+        regexp: '^#?\s*KDUMP_NUM_DUMPS='
+        line: 'KDUMP_NUM_DUMPS=2'
+        create: false
+      failed_when: false
+
     - name: Install boot-time resume check unit
       ansible.builtin.copy:
         src: ../ops/power/celeris-resume-check.service
