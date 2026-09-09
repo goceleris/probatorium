@@ -399,12 +399,22 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			// Only judged when the tally carries the counters, so runs
 			// produced before they existed read exactly as they did.
 			if t.WalkerRelogins > 0 && t.WalkerLogins > 0 {
-				// One re-login per walker is ordinary session expiry over a
-				// long cell; an order of magnitude more is not.
-				if budget := t.WalkerLogins * 10; t.WalkerRelogins > budget {
+				// A deliberate logout costs exactly one 401 and one
+				// re-login, and the matrices walk through their logout
+				// state on purpose — auth_session_ratelimit reaches it
+				// from three other states, so a healthy cell logs out
+				// thousands of times. Judging relogins against the walker
+				// count alone therefore failed every run once this check
+				// landed, while sessions were provably working. What is
+				// still a true signal is re-logins the walk did NOT ask
+				// for: on top of every logout, allow ten per walker for
+				// ordinary expiry over a long cell.
+				budget := t.WalkerLogouts + t.WalkerLogins*10
+				if t.WalkerRelogins > budget {
 					add(c, "tier_1.walker_relogins", t.WalkerRelogins,
-						fmt.Sprintf("walkers re-logged in %d times against %d logins (budget %d): "+
-							"the server is not honouring the session", t.WalkerRelogins, t.WalkerLogins, budget))
+						fmt.Sprintf("walkers re-logged in %d times against %d deliberate logout(s) "+
+							"and %d login(s) (budget %d): the server is not honouring the session",
+							t.WalkerRelogins, t.WalkerLogouts, t.WalkerLogins, budget))
 				}
 			}
 			if t.PropertyViolations > 0 {

@@ -10,6 +10,11 @@
 # Walker pre-walk login + 401-retry endpoint.
 login: POST /login
 
+# The request that deliberately destroys the session. Declared so the gate
+# can tell a designed logout (one 401 + one re-login each) apart from a
+# server that is not honouring sessions at all (probatorium#292).
+logout: POST /logout
+
 start: me
 
 states:

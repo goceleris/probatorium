@@ -289,6 +289,37 @@ func TestGate_OrdinarySessionExpiryPasses(t *testing.T) {
 	}
 }
 
+// TestGate_DeliberateLogoutsExplainRelogins pins the other half of
+// probatorium#292: the matrices walk through their logout state on purpose,
+// and each logout costs exactly one 401 and one re-login. Judged against the
+// walker count alone, every nightly failed with ~90k relogins on all six
+// auth_session_ratelimit cells while sessions were provably working.
+func TestGate_DeliberateLogoutsExplainRelogins(t *testing.T) {
+	c := cleanCell("auth_session_ratelimit", "iouring", "amd64")
+	c.Tier1.WalkerLogins = 19
+	c.Tier1.WalkerLogouts = 90_000
+	c.Tier1.WalkerRelogins = 90_014 // every logout, plus a few real expiries
+
+	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{}); len(v) != 0 {
+		t.Fatalf("relogins explained by deliberate logouts must not fail the gate, got %+v", v)
+	}
+}
+
+// TestGate_ReloginStormBeyondLogoutsFails guards that the logout allowance did
+// not defang the check: re-logins the walk never asked for are still a
+// failure, even when it also logged out a lot.
+func TestGate_ReloginStormBeyondLogoutsFails(t *testing.T) {
+	c := cleanCell("auth_session_ratelimit", "iouring", "amd64")
+	c.Tier1.WalkerLogins = 19
+	c.Tier1.WalkerLogouts = 5_000
+	c.Tier1.WalkerRelogins = 500_000 // a re-login on essentially every request
+
+	v := Gate([]ValidationCellResult{c}, nil, GateOptions{})
+	if len(v) != 1 || v[0].Field != "tier_1.walker_relogins" {
+		t.Fatalf("unexplained relogins must still fail the gate, got %+v", v)
+	}
+}
+
 // TestGate_ReloginCountersAbsentIsSilent keeps older artifacts readable: runs
 // produced before these counters existed must gate exactly as they did.
 func TestGate_ReloginCountersAbsentIsSilent(t *testing.T) {

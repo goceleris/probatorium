@@ -184,6 +184,13 @@ func TestLoadMatrixFile_AuthSessionRatelimit(t *testing.T) {
 	if m.Login.Method != "POST" || m.Login.Path != "/login" {
 		t.Fatalf("expected login=POST /login, got %s %s", m.Login.Method, m.Login.Path)
 	}
+	// The matrix walks through logout on purpose, so it must declare it:
+	// the gate budgets re-logins against deliberate logouts, and without
+	// this directive every walk-driven logout reads as the server failing
+	// to honour the session (probatorium#292).
+	if m.Logout.Method != "POST" || m.Logout.Path != "/logout" {
+		t.Fatalf("expected logout=POST /logout, got %s %s", m.Logout.Method, m.Logout.Path)
+	}
 	wantStates := []string{"me", "list_users", "user_detail", "create_user", "update_user", "user_delete", "user_posts", "logout"}
 	for _, s := range wantStates {
 		if _, ok := m.Transitions[s]; !ok {

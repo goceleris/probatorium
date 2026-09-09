@@ -1267,6 +1267,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		Requests429:    s.Requests429,
 		WalkerLogins:   s.WalkerLogins,
 		WalkerRelogins: s.WalkerRelogins,
+		WalkerLogouts:  s.WalkerLogouts,
 		Requests5xx:    s.Requests5xx,
 		RequestsError:  s.RequestsError,
 

@@ -546,8 +546,14 @@ type Tier1Summary struct {
 	// count is the signature of a server not honouring sessions at all.
 	WalkerLogins   int64 `json:"walker_logins,omitempty"`
 	WalkerRelogins int64 `json:"walker_relogins,omitempty"`
-	Requests5xx    int64 `json:"requests_5xx"`
-	RequestsError  int64 `json:"requests_error"`
+	// WalkerLogouts counts logouts the walk performed on purpose (the
+	// matrix's `logout:` request). Each costs exactly one 401 and one
+	// re-login, so it is the correct baseline for WalkerRelogins: the
+	// auth_session_ratelimit matrix reaches its logout state from three
+	// others, so a healthy run logs out thousands of times.
+	WalkerLogouts int64 `json:"walker_logouts,omitempty"`
+	Requests5xx   int64 `json:"requests_5xx"`
+	RequestsError int64 `json:"requests_error"`
 	// Requests5xxExpected: 5xx from corpus states marked `expect: 5xx`
 	// (designed-to-fail routes). Requests5xx above is UNEXPECTED only.
 	Requests5xxExpected int64 `json:"requests_5xx_expected"`
