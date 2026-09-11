@@ -65,7 +65,7 @@ import (
 // apart: it is the refapp's own statement of what it can judge, and the
 // evaluator reports anything absent from it as not-instrumented rather than
 // as passed.
-const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, memstats.HeapInuse, memstats.HeapAlloc, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties"
+const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties"
 
 // Poll fetches url and projects the /debug/vars document into a
 // [properties.Snapshot] stamped with t. Missing keys default to zero.
@@ -129,6 +129,10 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	if ms, ok := doc["memstats"].(map[string]any); ok {
 		snap.HeapInuseBytes = readInt64(ms, "HeapInuse")
 		snap.HeapAllocBytes = readInt64(ms, "HeapAlloc")
+		snap.HeapObjects = readInt64(ms, "HeapObjects")
+		snap.HeapIdleBytes = readInt64(ms, "HeapIdle")
+		snap.HeapReleasedBytes = readInt64(ms, "HeapReleased")
+		snap.StackInuseBytes = readInt64(ms, "StackInuse")
 	}
 	return nil
 }

@@ -40,6 +40,10 @@ type propertyLoopConfig struct {
 	// propertyLoopSnapshotEvery ticks and once more on exit, so a long
 	// soak shows mid-run property progress.
 	SnapshotPath string
+	// SeriesPath, when non-empty, receives one CSV row per sample: the
+	// inputs the slope oracles judge, plus the columns that say which kind
+	// of growth a rising heap is. See seriesWriter (probatorium#319).
+	SeriesPath string
 	// BaselineHeapPath, when non-empty, receives ONE heap profile fetched
 	// the first time a sample lands at or after properties.SlopeWarmup()
 	// past run start -- i.e. the instant the slope oracles begin judging.
@@ -94,6 +98,8 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 	}
 	hc := &http.Client{Timeout: propertyPollTimeout}
 	ev := checker.NewEvaluator(cfg.Specs)
+	series := newSeriesWriter(cfg.SeriesPath)
+	defer series.Close()
 
 	// firstSampleAt mirrors the evaluator's RunStartedAt: both are set from
 	// the first SUCCESSFUL poll, so the baseline lands on the same clock the
@@ -152,6 +158,7 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		if cfg.ExpectedPanics != nil {
 			snap.ExpectedPanics = cfg.ExpectedPanics()
 		}
+		series.Record(snap)
 		for _, v := range ev.Observe(snap, t) {
 			if !v.First || cfg.Violations == nil {
 				continue
