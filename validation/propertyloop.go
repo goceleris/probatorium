@@ -6,6 +6,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/goceleris/probatorium/validation/checker"
@@ -40,6 +41,12 @@ type propertyLoopConfig struct {
 	// propertyLoopSnapshotEvery ticks and once more on exit, so a long
 	// soak shows mid-run property progress.
 	SnapshotPath string
+	// ResponseConformance, when non-nil, returns the wire scraper's running
+	// counts (validation/rfc_scrape.go). The loop copies them into every
+	// Snapshot so I-RFC-1 and I-RFC-2 judge what celeris actually wrote on
+	// the wire, rather than what celeris says it wrote -- the independence
+	// those predicates were specified with and never had.
+	ResponseConformance func() ResponseCounters
 	// SeriesPath, when non-empty, receives one CSV row per sample: the
 	// inputs the slope oracles judge, plus the columns that say which kind
 	// of growth a rising heap is. See seriesWriter (probatorium#319).
@@ -57,6 +64,24 @@ type propertyLoopConfig struct {
 	// which names the site directly. The v1.5.11 soak's I-MEM-1 failure
 	// could not be attributed for exactly this reason.
 	BaselineHeapPath string
+}
+
+// appendDeclared adds ids to a comma-separated instrumented-properties list,
+// which is how a cell tells the checker which predicates have a live data
+// source (see checker.DeclaredOnly). Refapps publish their own on
+// /debug/vars; these two are declared by the validator instead, because the
+// data source is the validator's wire scraper rather than the refapp.
+func appendDeclared(list string, ids ...string) string {
+	for _, id := range ids {
+		if list == "" {
+			list = id
+			continue
+		}
+		if !strings.Contains(list, id) {
+			list += "," + id
+		}
+	}
+	return list
 }
 
 // propertyLoopSnapshotEvery is the tick cadence of the SnapshotPath
@@ -157,6 +182,26 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		captureBaseline(t.Sub(firstSampleAt))
 		if cfg.ExpectedPanics != nil {
 			snap.ExpectedPanics = cfg.ExpectedPanics()
+		}
+		if cfg.ResponseConformance != nil {
+			rc := cfg.ResponseConformance()
+			// Declare the two predicates only once the scraper has actually
+			// parsed a response. Removing them from the waiver list outright
+			// would have made them PASS in every cell where the slice never
+			// ran -- structurally-zero counters reported as clean, which is
+			// the exact vacuity the waiver list exists to prevent. The
+			// checker's DeclaredOnly path already models "instrumented here
+			// but not there"; this reuses it.
+			if rc.Exchanges > 0 {
+				snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-RFC-1", "I-RFC-2")
+			}
+			snap.ResponsesBadFraming = rc.BadFraming
+			snap.ResponsesHeadWithBody = rc.HeadWithBody
+			snap.Responses204WithBody = rc.Body204
+			snap.Responses304WithBody = rc.Body304
+			snap.ResponsesMissingChunkEnd = rc.MissingChunkEnd
+			snap.ResponsesCRLFInHeader = rc.CRLFInHeader
+			snap.ResponsesNULInHeader = rc.NULInHeader
 		}
 		series.Record(snap)
 		for _, v := range ev.Observe(snap, t) {

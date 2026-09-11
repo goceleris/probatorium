@@ -19,15 +19,16 @@ const HistoryCap = 3600
 // not count them as passed: a predicate whose input is structurally
 // zero has not verified anything.
 //
-// Instrumented today (refapp /debug/vars + orchestrator /proc):
+// Instrumented today (refapp /debug/vars + orchestrator /proc + the Tier 1
+// wire scraper):
 // I-CONN-2, I-MEM-1, I-MEM-3, I-MEM-4 (linux local driver only -- the
 // Tally also lists it as not instrumented when RSS was never sampled),
-// I-PANIC, I-ENG-ADAPTIVE, plus the [DeclaredOnly] set below in the cells
-// whose refapp declares them.
+// I-PANIC, I-ENG-ADAPTIVE, I-RFC-1 and I-RFC-2 (validation/rfc_scrape.go
+// reads responses off the wire, so they judge what celeris wrote rather
+// than what celeris reports), plus the [DeclaredOnly] set below in the
+// cells whose refapp declares them.
 var Uninstrumented = map[string]string{
 	"I-CONN-1":      "needs a per-connection last-byte table (OldestOpenConnLastByteAgeMs is never populated)",
-	"I-RFC-1":       "needs the response-scraping MITM (Responses* counters are never populated)",
-	"I-RFC-2":       "needs the response-scraping MITM (Responses* counters are never populated)",
 	"I-RACE":        "refapps are not built with -race and no stderr marker counter exists",
 	"I-CHECKPTR":    "refapps are not built with -d=checkptr and no stderr marker counter exists",
 	"I-MEM-2":       "needs an orchestrator-driven idle window (Context.IdleMode is never set)",
@@ -50,6 +51,13 @@ var DeclaredOnly = map[string]string{
 	"I-MW-SESSION":   "only the refapps that install middleware/session keep the id→owner ledger the predicate judges",
 	"I-MW-JWT":       "only the refapps that install middleware/jwt mint tokens and re-verify their expiry",
 	"I-MW-RATELIMIT": "only the refapps that install the in-process middleware/ratelimit run the shadow token bucket",
+	// These two are declared by the VALIDATOR, not the refapp: their data
+	// source is the Tier 1 wire scraper (validation/rfc_scrape.go), which
+	// only runs at or above streamingWalkerMinConcurrency. A smoke run below
+	// that threshold has structurally-zero counters, and reporting those as
+	// a pass would be the same vacuity this map was built to stop.
+	"I-RFC-1": "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
+	"I-RFC-2": "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
 }
 
 // Violation is one failed predicate evaluation.
