@@ -97,6 +97,10 @@ type Vars struct {
 	// middleware.go.
 	mw middleware
 
+	// conns is the per-connection last-byte table behind I-CONN-1. See
+	// conntable.go for why this lives here rather than in the engine.
+	conns connTable
+
 	mu       sync.Mutex
 	cachedAt time.Time
 	memstats runtime.MemStats
@@ -120,16 +124,27 @@ func (v *Vars) Hook(cfg *celeris.Config) {
 	prevConnect, prevDisconnect := cfg.OnConnect, cfg.OnDisconnect
 	cfg.OnConnect = func(addr string) {
 		v.accepted.Add(1)
+		v.conns.open(addr, time.Now().UnixNano())
 		if prevConnect != nil {
 			prevConnect(addr)
 		}
 	}
 	cfg.OnDisconnect = func(addr string) {
 		v.closed.Add(1)
+		v.conns.close(addr)
 		if prevDisconnect != nil {
 			prevDisconnect(addr)
 		}
 	}
+}
+
+// TouchConn refreshes a connection's last-byte stamp from outside the
+// request path. Detached streams -- WebSocket and SSE -- stop producing
+// requests the moment they upgrade, so without this their entries age
+// forever and I-CONN-1 fires on a perfectly healthy long-lived stream.
+// Call it from the stream handler on each frame or event.
+func (v *Vars) TouchConn(addr string) {
+	v.conns.touch(addr, time.Now().UnixNano())
 }
 
 // RecordPanic bumps the panic counter. RecoveryLogger calls it; exposed
@@ -193,6 +208,16 @@ func (v *Vars) Mount(srv *celeris.Server) {
 // to loopback GET/HEAD requests for Path and passes everything else on.
 func (v *Vars) Handler() celeris.HandlerFunc {
 	return func(c *celeris.Context) error {
+		// Stamp every request, on every path, BEFORE the early return.
+		//
+		// This handler is mounted with srv.Pre, so it runs ahead of route
+		// lookup for all traffic. Putting the stamp in ordinary middleware
+		// instead would miss exactly one connection: the property loop's
+		// own 1 Hz poller, because /debug/vars is served from Pre and calls
+		// Abort, bypassing the Use chain. That keep-alive conn would then be
+		// the oldest entry in every cell and I-CONN-1 would fire on the
+		// checker itself within ~30s, everywhere.
+		v.conns.touch(c.RemoteAddr(), time.Now().UnixNano())
 		if c.Path() != Path {
 			return c.Next()
 		}
@@ -215,6 +240,11 @@ func (v *Vars) Document() map[string]any {
 		"celeris.closed_conn_total":   v.closed.Load(),
 		"celeris.panic_count":         v.PanicCount(),
 		"memstats":                    v.MemStats(),
+		// I-CONN-1's input. Always present, even at zero, so the document
+		// keeps a fixed shape and a missing key is distinguishable from a
+		// clean reading.
+		"celeris.oldest_open_conn_last_byte_age_ms": v.conns.oldestAgeMs(time.Now().UnixNano()),
+		"celeris.open_conns_tracked":                v.conns.liveConns(),
 	}
 	v.middlewareDocument(doc)
 	if srv := v.srv.Load(); srv != nil {

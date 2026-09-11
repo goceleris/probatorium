@@ -185,6 +185,12 @@ func (t *wsTally) snapshot() wsSnapshot {
 	}
 }
 
+// wsMaxHold bounds how long a torture fire holds a WebSocket. See
+// sseMaxHold and TestStreamHoldsStayUnderTheConnCloseBound: detached
+// streams are not stamped in the refapp's last-byte table, so this must
+// stay well under I-CONN-1's deadline.
+const wsMaxHold = 2 * time.Second
+
 // runWSTortureWalker dials hostPort + path (/ws on the refapp) per
 // tickInterval, completes a clean WS handshake, sends one torture
 // frame, then classifies the server's response. ctx-cancelled.
@@ -224,7 +230,7 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 	mode wsTortureMode, tally *wsTally,
 ) {
 	tally.sent.Add(1)
-	const timeout = 2 * time.Second
+	const timeout = wsMaxHold
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", hostPort)
 	if err != nil {
