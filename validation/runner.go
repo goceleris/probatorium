@@ -838,6 +838,9 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// exists; the property loop reads it on every snapshot so I-PANIC nets
 	// designed panics out.
 	var expectedPanicsFn atomic.Pointer[func() int64]
+	// responseCountersFn is set by Tier 1 once its wire scraper exists, so the
+	// property loop can read I-RFC-1 / I-RFC-2 counts it could not see at start.
+	var responseCountersFn atomic.Pointer[func() ResponseCounters]
 	go func() {
 		var addr string
 		select {
@@ -872,6 +875,14 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 					return (*f)()
 				}
 				return 0
+			},
+			// Same indirection as ExpectedPanics: the Tier 1 tally that owns
+			// the wire scraper does not exist yet when this loop starts.
+			ResponseConformance: func() ResponseCounters {
+				if f := responseCountersFn.Load(); f != nil {
+					return (*f)()
+				}
+				return ResponseCounters{}
 			},
 			PID:          p,
 			Specs:        checker.SelectPredicates(o.cfg.PropertyTier),
@@ -956,6 +967,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		AddrChan:              addrCh,
 		TallyCallback:         tallyCB,
 		OnLiveTally:           func(f func() int64) { expectedPanicsFn.Store(&f) },
+		OnResponseCounters:    func(f func() ResponseCounters) { responseCountersFn.Store(&f) },
 		TallyCallbackInterval: 2 * time.Second,
 		// Periodic snapshot to disk so long-running soaks (24h, 72h,
 		// 10d) surface mid-run progress without waiting for the

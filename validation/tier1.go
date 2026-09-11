@@ -119,6 +119,12 @@ type tier1Config struct {
 	// expected-panic count as soon as the tally exists, so the property
 	// loop can net designed panics out of I-PANIC while the tier runs.
 	OnLiveTally func(expectedPanics func() int64)
+	// OnResponseCounters, when non-nil, receives an accessor for the wire
+	// scraper's live counts as soon as its tally exists, so the property
+	// loop can judge I-RFC-1 / I-RFC-2 while the tier runs. Separate from
+	// OnLiveTally because the scraper's tally is built later, with the
+	// other slice tallies, rather than with the top-level one.
+	OnResponseCounters func(counters func() ResponseCounters)
 
 	// SnapshotPath, when non-empty, names the path the tier writes the
 	// current tally snapshot to on every TallyCallback tick. Letting
@@ -181,6 +187,7 @@ type tier1Tally struct {
 	ws            *wsTally
 	sse           *sseTally
 	liveness      *livenessTally
+	rfc           *rfcTally
 }
 
 // driveTier1 is the production Tier 1 entry point. Starts the refapp,
@@ -398,6 +405,11 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	tally.ws = wsTallyPtr
 	sseTallyPtr := &sseTally{}
 	tally.sse = sseTallyPtr
+	rfcTallyPtr := &rfcTally{}
+	tally.rfc = rfcTallyPtr
+	if cfg.OnResponseCounters != nil {
+		cfg.OnResponseCounters(rfcTallyPtr.counters)
+	}
 	// Walker budget. Higher-overhead slices activate only at higher
 	// concurrencies so single-walker smoke tests don't pay for them:
 	//   adv     — at concurrency >= 1 (always at least 1 walker)
@@ -520,6 +532,29 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			runSSEKillWalker(runCtx, hostPort, sseKillPath, seed, 200*time.Millisecond, sseTallyPtr)
 		}(i)
 	}
+	// Response-conformance slice (I-RFC-1, I-RFC-2). ONE connection at
+	// 250ms, and deliberately NOT budgeted out of markovCount.
+	//
+	// Every other slice takes a walker slot because it competes for load.
+	// This one does not compete: 4 requests/s against the ~219k/s a soak
+	// cell drives is 0.002% more traffic and one more concurrent conn, far
+	// below the run-to-run noise in any counter the gate reads. Taking a
+	// slot to be tidy would have changed the load profile of every cell and
+	// broken comparability with previous runs, to buy nothing.
+	//
+	// Rate is not the point here. Each of the rules it scores -- a
+	// Content-Length that disagrees with its body, a HEAD that carries one,
+	// a chunked response with no terminator -- is a property of a single
+	// response, so one malformed response is as diagnostic as a million.
+	if cfg.Concurrency >= streamingWalkerMinConcurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			seed := cfg.Seed ^ 0x8fc0_1e50_0000_0001
+			runRFCConformanceWalker(runCtx, hostPort, "/", seed, rfcConformanceInterval, rfcTallyPtr)
+		}()
+	}
+
 	// Optional periodic tally-callback + snapshot-to-disk for reactive
 	// incident emission AND mid-run progress visibility. Stops when ctx
 	// is done; doesn't participate in wg because the observation work
@@ -938,6 +973,9 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 	if t.liveness != nil {
 		s.Liveness = t.liveness.snapshot()
 	}
+	if t.rfc != nil {
+		s.RFCConformance = t.rfc.snapshot()
+	}
 	return s
 }
 
@@ -963,6 +1001,7 @@ type tier1TallySnapshot struct {
 	H2CChurn              h2cSnapshot         `json:"h2c_churn,omitempty"`
 	WSTorture             wsSnapshot          `json:"ws_torture,omitempty"`
 	SSEKill               sseSnapshot         `json:"sse_kill,omitempty"`
+	RFCConformance        rfcSnapshot         `json:"rfc_conformance,omitempty"`
 	Liveness              livenessSnapshot    `json:"liveness,omitempty"`
 	// Properties is the in-process property loop's tally
 	// (validation/propertyloop.go), attached by the orchestrator once
