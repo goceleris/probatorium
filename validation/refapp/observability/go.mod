@@ -22,9 +22,9 @@ require (
 )
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20260911041144-be12a9837711
-	github.com/goceleris/celeris/middleware/metrics v1.5.12-0.20260911041144-be12a9837711
-	github.com/goceleris/celeris/middleware/otel v1.5.12-0.20260911041144-be12a9837711
+	github.com/goceleris/celeris v1.5.12-0.20260911141320-1f3b43fe3716
+	github.com/goceleris/celeris/middleware/metrics v1.5.12-0.20260911141320-1f3b43fe3716
+	github.com/goceleris/celeris/middleware/otel v1.5.12-0.20260911141320-1f3b43fe3716
 	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
 	github.com/prometheus/client_golang v1.24.1
 )
