@@ -878,6 +878,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 			HardFail:     o.cfg.PropertyHardFail,
 			Violations:   violations,
 			SnapshotPath: filepath.Join(o.cfg.OutDir, "properties_tally.json"),
+			SeriesPath:   filepath.Join(o.cfg.OutDir, "properties_series.csv"),
 			// Captured once, the instant the slope oracles start judging, so
 			// an I-MEM incident can be diffed rather than inferred:
 			//   go tool pprof -inuse_space -base heap-warm.pprof <incident>/heap.pprof

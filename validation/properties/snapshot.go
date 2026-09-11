@@ -34,11 +34,23 @@ type Snapshot struct {
 	PID int
 
 	// Engine + runtime
-	GoroutineCount   int64
-	HeapInuseBytes   int64
-	HeapAllocBytes   int64
-	GCPauseP99Ns     int64
-	NumGoroutineDiff int64 // delta from process baseline
+	GoroutineCount int64
+	HeapInuseBytes int64
+	HeapAllocBytes int64
+	// HeapObjects, HeapIdleBytes, HeapReleasedBytes and StackInuseBytes are
+	// recorded but judged by no predicate. They exist so the per-cell series
+	// (probatorium#319) can separate the three things a rising HeapInuse can
+	// mean: live objects accumulating (HeapObjects rises with HeapAlloc),
+	// size-class fragmentation (HeapInuse rises while HeapAlloc does not), and
+	// the runtime holding spans back from the OS (HeapIdle / HeapReleased).
+	// Reading the 24h soak's I-MEM-1 failure needed exactly this split and the
+	// artifact did not carry it.
+	HeapObjects       int64
+	HeapIdleBytes     int64
+	HeapReleasedBytes int64
+	StackInuseBytes   int64
+	GCPauseP99Ns      int64
+	NumGoroutineDiff  int64 // delta from process baseline
 
 	// Connection lifecycle (celeris.* counters)
 	AcceptedConnTotal int64
