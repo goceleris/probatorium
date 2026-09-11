@@ -185,3 +185,28 @@ func assertNoViolations(t *testing.T, s rfcSnapshot) {
 		}
 	}
 }
+
+// TestSummariseRFCConformance pins the operator-facing summary line. Matches
+// the shape the WS-torture, SSE-kill and h2c-churn slices each use for their
+// own summary: the line is what a human reads when scanning a cell log, so
+// the counters that decide the verdict must all be in it.
+func TestSummariseRFCConformance(t *testing.T) {
+	got := summariseRFCConformance(rfcSnapshot{
+		Exchanges:       1400,
+		BadFraming:      3,
+		HeadWithBody:    2,
+		Body204:         1,
+		Body304:         4,
+		MissingChunkEnd: 5,
+		CRLFInHeader:    6,
+		NULInHeader:     7,
+	})
+	for _, want := range []string{
+		"1400 exchanges", "framing=3", "head_body=2", "204_body=1",
+		"304_body=4", "chunk_end=5", "crlf=6", "nul=7",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary missing %q: got %q", want, got)
+		}
+	}
+}
