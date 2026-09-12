@@ -30,7 +30,6 @@ const HistoryCap = 3600
 var Uninstrumented = map[string]string{
 	"I-RACE":        "refapps are not built with -race and no stderr marker counter exists",
 	"I-ENG-IOURING": "SQE/CQE counters and the sqe_corruptions assertion exist only in -tags=validation builds",
-	"I-DRV":         "needs the driver shadow map (Driver* counters are never populated)",
 }
 
 // DeclaredOnly lists the predicates whose data source exists only in the
@@ -50,6 +49,7 @@ var DeclaredOnly = map[string]string{
 	// burst, idle, load and idle again ever gets there; a 150 s nightly
 	// cell never idles and must not pass on a predicate that only skipped.
 	"I-MEM-2":        "judged only in a cell that idled the refapp twice; declared by the property loop when the second idle window begins",
+	"I-DRV":          "only the driver refapps read every write back inside the handler and publish the hit/miss tally",
 	"I-MW-SESSION":   "only the refapps that install middleware/session keep the id→owner ledger the predicate judges",
 	"I-MW-JWT":       "only the refapps that install middleware/jwt mint tokens and re-verify their expiry",
 	"I-MW-RATELIMIT": "only the refapps that install the in-process middleware/ratelimit run the shadow token bucket",

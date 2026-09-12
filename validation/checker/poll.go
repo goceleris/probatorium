@@ -65,7 +65,7 @@ import (
 // apart: it is the refapp's own statement of what it can judge, and the
 // evaluator reports anything absent from it as not-instrumented rather than
 // as passed.
-const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine, celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties"
+const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine, celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties, celeris.driver_writes_issued, celeris.driver_reads_issued, celeris.driver_read_hits, celeris.driver_read_misses"
 
 // Poll fetches url and projects the /debug/vars document into a
 // [properties.Snapshot] stamped with t. Missing keys default to zero.
@@ -131,6 +131,12 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	snap.JWTValidatedOK = readInt64(doc, "celeris.jwt_validated_ok")
 	snap.JWTValidatedFail = readInt64(doc, "celeris.jwt_validated_fail")
 	snap.JWTLateAdmits = readInt64(doc, "celeris.jwt_late_admits")
+	// Driver read-after-write oracle (I-DRV). Published by every refapp,
+	// declared only by the driver refapps, which read every write back.
+	snap.DriverWritesIssued = readInt64(doc, "celeris.driver_writes_issued")
+	snap.DriverReadsIssued = readInt64(doc, "celeris.driver_reads_issued")
+	snap.DriverReadHits = readInt64(doc, "celeris.driver_read_hits")
+	snap.DriverReadMisses = readInt64(doc, "celeris.driver_read_misses")
 	if s, ok := doc["celeris.instrumented_properties"].(string); ok {
 		snap.InstrumentedProperties = s
 	}

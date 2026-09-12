@@ -36,7 +36,9 @@
 //	  "celeris.ratelimit_allowed",        "celeris.ratelimit_rejected",
 //	  "celeris.ratelimit_token_violations",
 //	  "celeris.jwt_validated_ok",         "celeris.jwt_validated_fail",
-//	  "celeris.jwt_late_admits",          "celeris.instrumented_properties"
+//	  "celeris.jwt_late_admits",          "celeris.instrumented_properties",
+//	  "celeris.driver_writes_issued",     "celeris.driver_reads_issued",
+//	  "celeris.driver_read_hits",         "celeris.driver_read_misses"
 //	}
 //
 // Why the connection counters come from the refapp and not the engine:
@@ -96,6 +98,9 @@ type Vars struct {
 	// declaration of which property predicates it can judge. See
 	// middleware.go.
 	mw middleware
+
+	// drv is the read-after-write tally behind I-DRV. See driver.go.
+	drv driver
 
 	// conns is the per-connection last-byte table behind I-CONN-1. See
 	// conntable.go for why this lives here rather than in the engine.
@@ -253,6 +258,7 @@ func (v *Vars) Document() map[string]any {
 		"celeris.open_conns_tracked":                v.conns.liveConns(),
 	}
 	v.middlewareDocument(doc)
+	v.driverDocument(doc)
 	if srv := v.srv.Load(); srv != nil {
 		if info := srv.EngineInfo(); info != nil {
 			doc["celeris.active_conns"] = info.Metrics.ActiveConnections

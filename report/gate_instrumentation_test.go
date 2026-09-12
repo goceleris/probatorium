@@ -56,6 +56,11 @@ func TestWaivedUninstrumented_ReasonsAreOnRecord(t *testing.T) {
 			t.Errorf("%s is waived with an empty reason", id)
 		}
 	}
+	// I-DRV is instrumented in the driver cells now; a waiver would hide a
+	// regression of exactly that coverage.
+	if _, ok := WaivedUninstrumented["I-DRV"]; ok {
+		t.Error("I-DRV must not be waived: the driver refapps declare it")
+	}
 	// The three middleware predicates are instrumented now; waiving them
 	// would re-hide exactly the gap probatorium#297 closed.
 	for _, id := range []string{"I-MW-SESSION", "I-MW-JWT", "I-MW-RATELIMIT"} {

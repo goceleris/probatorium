@@ -123,6 +123,10 @@ func main() {
 	defer sstore.Close()
 
 	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	// Every write below is read back in the handler and tallied, so this
+	// refapp can judge I-DRV; the other refapps leave the counters at zero
+	// and the checker reports the predicate as not instrumented there.
+	dv.Declare("I-DRV")
 	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
@@ -228,12 +232,14 @@ func main() {
 		// Read-after-write: the row for this id must exist and carry the
 		// deterministic name. A concurrent writer can only have written the
 		// SAME name for this id, so a mismatch is a real I-DRV-1 violation.
+		dv.DriverWrite()
 		var roundtripName string
 		row := pool.QueryRow(c.Context(),
 			"SELECT name FROM users WHERE id = $1", id)
 		if err := row.Scan(&roundtripName); err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
 		}
+		dv.DriverRead(roundtripName == wantName)
 		if roundtripName != wantName {
 			// I-DRV-1 violation. The walker checks for this exact
 			// 500 shape and counts it as a HIGH-severity hit.
@@ -264,12 +270,14 @@ func main() {
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "update: "+err.Error())
 		}
+		dv.DriverWrite()
 		var got int
 		row := pool.QueryRow(c.Context(),
 			"SELECT score FROM users WHERE id = $1", id)
 		if err := row.Scan(&got); err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
 		}
+		dv.DriverRead(got == score)
 		if got != score {
 			return c.JSON(http.StatusInternalServerError, map[string]string{
 				"err":           "read-after-write mismatch",

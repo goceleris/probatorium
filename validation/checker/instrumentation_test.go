@@ -131,4 +131,12 @@ func TestUninstrumented_MiddlewarePredicatesAreInstrumentable(t *testing.T) {
 	if _, ok := DeclaredOnly["I-MEM-2"]; !ok {
 		t.Error("I-MEM-2 must be declared-only, so a cell that never idled is not a pass")
 	}
+	// I-DRV moved to declared-only: the driver refapps read every write back
+	// and publish the tally; everything else has structural zeros.
+	if _, ok := Uninstrumented["I-DRV"]; ok {
+		t.Error("I-DRV is blanket-waived again; the driver cells could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-DRV"]; !ok {
+		t.Error("I-DRV must be declared-only, so a refapp with no store is not a pass")
+	}
 }
