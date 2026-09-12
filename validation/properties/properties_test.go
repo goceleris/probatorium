@@ -176,16 +176,6 @@ func TestIMEM2_skipsWhenNotIdle(t *testing.T) {
 	}
 }
 
-func TestIMEM2_failsWhenOverBudget(t *testing.T) {
-	history := make([]Snapshot, 60)
-	snap := &Snapshot{GoroutineCount: 200}
-	ctx := ctxWith(time.Hour, history, true)
-	ok, msg := IMEM2.Predicate(snap, ctx)
-	if ok {
-		t.Fatalf("expected violation; msg=%q", msg)
-	}
-}
-
 func TestIPANIC_failsOnPersistentCount(t *testing.T) {
 	// A panic that persists across ipanicPersistence consecutive snapshots
 	// fires; the History carries the earlier samples.

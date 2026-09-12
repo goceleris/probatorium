@@ -192,6 +192,10 @@ jobs:
           # 8 refapps x 3 engines x 2 archs when refapps=all. A csv selection
           # runs fewer; the gate still requires every planned cell to report.
           VALIDATE_GATE_EXPECT_CELLS: ${{ (inputs.refapps == '' || inputs.refapps == 'all') && '48' || '' }}
+          # Every cell of this tier is a -tags=checkptr build and must have
+          # declared I-CHECKPTR; a refapp that silently lost the tag would
+          # otherwise hide behind the waiver.
+          VALIDATE_GATE_EXPECT_INSTRUMENTED: "I-CHECKPTR"
         run: mage ValidateGate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)

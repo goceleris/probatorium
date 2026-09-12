@@ -163,6 +163,11 @@ type Snapshot struct {
 	// single threshold cannot be correct for both.
 	EngineName             string
 	InstrumentedProperties string
+
+	// IdleWindow is the orchestrator's idle window this sample was taken
+	// in: 0 under load, n inside the n-th window (tier1Config.IdleWindows).
+	// I-MEM-2 takes the first window as its baseline and judges the rest.
+	IdleWindow int
 }
 
 // Context carries rolling-window state needed by predicates that look
@@ -179,13 +184,32 @@ type Context struct {
 	// evaluation order.
 	Now time.Time
 
-	// IdleMode is true if the orchestrator is in an idle window
-	// (post-warmup, pre-load-resume). I-MEM-2 only fires in this mode.
+	// IdleMode is true while the orchestrator holds an idle window
+	// (IdleWindow > 0). Kept alongside IdleWindow for the predicates that
+	// only ask whether load is off.
 	IdleMode bool
 
-	// BaselineGoroutines is the goroutine count snapshot taken after
-	// celeris is up but before the first request lands. Used by
-	// I-MEM-2's "goroutines return to baseline+N" assertion.
+	// IdleWindow is the current orchestrator idle window (0 under load).
+	IdleWindow int
+
+	// IdleBaselineGoroutines is the goroutine count at the END of the
+	// first idle window: the refapp's own settled idle level, pools and
+	// per-listener ladders included, measured after it has served load
+	// once. I-MEM-2 judges every later idle window against it. Zero
+	// until the first window has been left.
+	IdleBaselineGoroutines int64
+
+	// LoadStartedAt is when sustained load began after the first idle
+	// window; zero when the cell never idled. The slope predicates anchor
+	// their warm-up here when set, so the burst/idle prelude neither
+	// eats into the warm-up nor lands its resume transient in a fit.
+	LoadStartedAt time.Time
+
+	// BaselineGoroutines is the goroutine count of the first sample after
+	// the refapp announced ready. Kept for the soak summary; it is NOT
+	// I-MEM-2's reference, because every refapp grows past it under its
+	// first load (driver pools, the std engine's per-conn goroutines) and
+	// legitimately never comes back down.
 	BaselineGoroutines int64
 
 	// History is the rolling window of recent snapshots, most recent
