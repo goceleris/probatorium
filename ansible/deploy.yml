@@ -371,6 +371,21 @@
         - inventory_hostname in groups['bench_targets']
         - refapp_binaries is defined
 
+    # -tags=checkptr variants land in their OWN directory under the same
+    # slug filename. The validator discovers refapps by listing a directory,
+    # so a suffixed copy in refapps/ would be picked up as an extra refapp
+    # and double the matrix. Same slug + different dir is what keeps the
+    # cell plan, the markov matrix and the OpenAPI spec resolving as before.
+    - name: Push checkptr refapp binaries (bench_targets only)
+      ansible.builtin.copy:
+        src: "{{ (refapp_checkptr_binaries[item][arch] if arch in refapp_checkptr_binaries[item] else refapp_checkptr_binaries[item]['amd64']) }}"
+        dest: "{{ bench_root }}/refapps-checkptr/{{ item }}"
+        mode: '0755'
+      loop: "{{ refapp_checkptr_binaries | default({}) | list }}"
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - refapp_checkptr_binaries is defined
+
     # The Markov matrix is plain YAML — read by the validator at runtime
     # via -markov=<path>. Validator + matrix live side-by-side under
     # bench_root so the validate.yml command can hardcode the path
