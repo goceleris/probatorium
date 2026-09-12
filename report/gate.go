@@ -299,7 +299,12 @@ var gatedTier1Keys = []struct{ slice, key, why string }{
 	{"ws_torture", "ws_hang_no_close", "a WebSocket conn never completed its close"},
 	{"ws_torture", "ws_handshake_fail", "a WebSocket upgrade handshake failed"},
 	{"sse_kill", "sse_handshake_fail", "an SSE handshake failed"},
-	{"sse_kill", "sse_server_closed_early", "the server closed an SSE stream before the client did"},
+	{"sse_kill", "sse_server_closed_early", "the server sent FIN on an SSE stream before the client did"},
+	// Split out of sse_server_closed_early, which classified purely on
+	// timing and so asserted "the server closed it" for any read error.
+	// Both of these still fail: the split is for attribution, not tolerance.
+	{"sse_kill", "sse_peer_reset_early", "an SSE stream was reset before the client hung up (engine or transport -- see sse_early_errs)"},
+	{"sse_kill", "sse_read_err_early", "an SSE stream failed with an unclassified read error (see sse_early_errs)"},
 }
 
 // causeCounters maps a gated total to the cause counters that sum to it.

@@ -63,6 +63,10 @@ func TestTier1SummaryExportsEveryTallyField(t *testing.T) {
 		}
 	})
 
+	topLevel := map[string]bool{}
+	for st, i := reflect.TypeOf(*summary), 0; i < st.NumField(); i++ {
+		topLevel[strings.Split(st.Field(i).Tag.Get("json"), ",")[0]] = true
+	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := reflect.TypeOf(tc.snapshot)
@@ -76,9 +80,18 @@ func TestTier1SummaryExportsEveryTallyField(t *testing.T) {
 				if key == "" {
 					continue
 				}
-				if _, ok := tc.exported[key]; !ok {
-					missing = append(missing, key)
+				if _, ok := tc.exported[key]; ok {
+					continue
 				}
+				// A non-numeric field cannot live in the int64 map; it is
+				// exported as a typed top-level field carrying the same json
+				// tag instead (sse_early_errs is []string). That still
+				// satisfies the guarantee this test exists for -- the field
+				// reaches validate-results.json -- so accept it here.
+				if topLevel[key] {
+					continue
+				}
+				missing = append(missing, key)
 			}
 			if len(missing) > 0 {
 				t.Fatalf("%s: %d field(s) defined on %s but never exported into "+
