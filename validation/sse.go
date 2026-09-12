@@ -3,11 +3,15 @@ package validation
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -58,25 +62,100 @@ type sseTally struct {
 	eventsRead        atomic.Int64
 	killedMidStream   atomic.Int64
 	serverClosedEarly atomic.Int64
-	cutAtDeadline     atomic.Int64
-	handshakeFail     atomic.Int64
-	endpointAbsent    atomic.Int64
+	// peerResetEarly and readErrEarly split what serverClosedEarly used to
+	// absorb. The old classification was purely by TIMING -- any read error
+	// more than the margin before our own deadline became "the server closed
+	// the stream". A clean FIN and a transport reset are different events
+	// with different causes, and booking them together under a name that
+	// asserts the former is how a single occurrence became unattributable.
+	peerResetEarly atomic.Int64
+	readErrEarly   atomic.Int64
+	// earlyErrs keeps the first few error strings verbatim. Counting an
+	// error and discarding its value is what blocked the diagnosis of the
+	// one early close in soak 34616620237: six independent code reviews
+	// could not tell whether the server sent FIN or the transport broke,
+	// because the harness never kept the answer.
+	earlyErrMu     sync.Mutex
+	earlyErrs      []string
+	cutAtDeadline  atomic.Int64
+	handshakeFail  atomic.Int64
+	endpointAbsent atomic.Int64
 }
 
 type sseSnapshot struct {
-	RouteProbed       bool  `json:"sse_route_probed"`
-	RoutePresent      bool  `json:"sse_route_present"`
-	Sent              int64 `json:"sse_sent"`
-	Established       int64 `json:"sse_established"`
-	EventsRead        int64 `json:"sse_events_read"`
-	KilledMidStream   int64 `json:"sse_killed_mid_stream"`
-	ServerClosedEarly int64 `json:"sse_server_closed_early"`
-	CutAtDeadline     int64 `json:"sse_cut_at_deadline"`
-	HandshakeFail     int64 `json:"sse_handshake_fail"`
-	EndpointAbsent    int64 `json:"sse_endpoint_absent"`
+	RouteProbed       bool     `json:"sse_route_probed"`
+	RoutePresent      bool     `json:"sse_route_present"`
+	Sent              int64    `json:"sse_sent"`
+	Established       int64    `json:"sse_established"`
+	EventsRead        int64    `json:"sse_events_read"`
+	KilledMidStream   int64    `json:"sse_killed_mid_stream"`
+	ServerClosedEarly int64    `json:"sse_server_closed_early"`
+	PeerResetEarly    int64    `json:"sse_peer_reset_early"`
+	ReadErrEarly      int64    `json:"sse_read_err_early"`
+	EarlyErrs         []string `json:"sse_early_errs,omitempty"`
+	CutAtDeadline     int64    `json:"sse_cut_at_deadline"`
+	HandshakeFail     int64    `json:"sse_handshake_fail"`
+	EndpointAbsent    int64    `json:"sse_endpoint_absent"`
 }
 
 // recordRoute stores the pre-flight verdict for this cell.
+// sseEarlyCloseMargin is how much of our own hold must remain for a read
+// error to be the server's doing rather than our deadline tripping. Named
+// rather than inline so the classification below can be read as one rule.
+const sseEarlyCloseMargin = 50 * time.Millisecond
+
+// sseMaxEarlyErrs bounds the retained error strings. A handful is enough to
+// diagnose; an unbounded slice would turn a systematic failure into a memory
+// problem in the cell that is already failing.
+const sseMaxEarlyErrs = 8
+
+// recordEarly classifies a read error that arrived while we still meant to
+// be reading, and keeps the error itself.
+//
+// The previous code counted every such error as serverClosedEarly, on timing
+// alone. That conflates three different events:
+//
+//   - io.EOF          the server sent FIN. This is the one the counter's
+//     name actually claims, and the only one that is on its
+//     face a server-side defect.
+//   - ECONNRESET      the connection was reset. Could be the engine, could
+//     be the transport; the two are not distinguishable
+//     from here, so it gets its own counter rather than
+//     being asserted as a server close.
+//   - anything else   an errno the walker did not anticipate. Recorded
+//     verbatim, because the next reader will want it.
+//
+// All three still fail the absolute-zero gate. This splits them for
+// attribution, and deliberately does not loosen anything: soak 34616620237
+// failed on one of these and should have.
+func (t *sseTally) recordEarly(err error) {
+	switch {
+	case errors.Is(err, io.EOF):
+		t.serverClosedEarly.Add(1)
+	case errors.Is(err, syscall.ECONNRESET):
+		t.peerResetEarly.Add(1)
+	default:
+		t.readErrEarly.Add(1)
+	}
+	t.earlyErrMu.Lock()
+	defer t.earlyErrMu.Unlock()
+	if len(t.earlyErrs) < sseMaxEarlyErrs {
+		t.earlyErrs = append(t.earlyErrs, err.Error())
+	}
+}
+
+// earlyErrSnapshot copies the retained error strings for the cell document.
+func (t *sseTally) earlyErrSnapshot() []string {
+	t.earlyErrMu.Lock()
+	defer t.earlyErrMu.Unlock()
+	if len(t.earlyErrs) == 0 {
+		return nil
+	}
+	out := make([]string, len(t.earlyErrs))
+	copy(out, t.earlyErrs)
+	return out
+}
+
 func (t *sseTally) recordRoute(p routeProbe) {
 	t.routeProbed.Store(p.Probed)
 	t.routePresent.Store(p.Present)
@@ -91,6 +170,9 @@ func (t *sseTally) snapshot() sseSnapshot {
 		EventsRead:        t.eventsRead.Load(),
 		KilledMidStream:   t.killedMidStream.Load(),
 		ServerClosedEarly: t.serverClosedEarly.Load(),
+		PeerResetEarly:    t.peerResetEarly.Load(),
+		ReadErrEarly:      t.readErrEarly.Load(),
+		EarlyErrs:         t.earlyErrSnapshot(),
 		CutAtDeadline:     t.cutAtDeadline.Load(),
 		HandshakeFail:     t.handshakeFail.Load(),
 		EndpointAbsent:    t.endpointAbsent.Load(),
@@ -238,8 +320,8 @@ func fireSSEKill(ctx context.Context, hostPort, path string,
 				tally.cutAtDeadline.Add(1)
 				return
 			}
-			if time.Until(holdDeadline) > 50*time.Millisecond {
-				tally.serverClosedEarly.Add(1)
+			if time.Until(holdDeadline) > sseEarlyCloseMargin {
+				tally.recordEarly(err)
 				return
 			}
 			break
