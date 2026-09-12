@@ -231,6 +231,15 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_DBSERVICES"); v != "" {
 			args = append(args, "--extra-vars", "validate_dbservices="+v)
 		}
+		// VALIDATE_PROPERTY_TIER overrides the playbook's predicate tier
+		// filter (default core,middleware,engine,driver). The nightly ran
+		// for months on core,middleware and never evaluated I-DRV or
+		// I-ENG-IOURING: they were instrumented and then filtered out
+		// before the evaluator saw them, which no gate could tell from
+		// "not instrumented".
+		if v := os.Getenv("VALIDATE_PROPERTY_TIER"); v != "" {
+			args = append(args, "--extra-vars", "validate_property_tier="+v)
+		}
 		// VALIDATE_CHECKPTR=1 points matrix mode at the -tags=checkptr
 		// refapp set deployed under refapps-checkptr/ (see
 		// DEPLOY_CHECKPTR_REFAPPS in mage_cluster.go). Those cells declare
