@@ -28,7 +28,6 @@ const HistoryCap = 3600
 // than what celeris reports), plus the [DeclaredOnly] set below in the
 // cells whose refapp declares them.
 var Uninstrumented = map[string]string{
-	"I-CONN-1":      "needs a per-connection last-byte table (OldestOpenConnLastByteAgeMs is never populated)",
 	"I-RACE":        "refapps are not built with -race and no stderr marker counter exists",
 	"I-CHECKPTR":    "refapps are not built with -d=checkptr and no stderr marker counter exists",
 	"I-MEM-2":       "needs an orchestrator-driven idle window (Context.IdleMode is never set)",
@@ -56,8 +55,14 @@ var DeclaredOnly = map[string]string{
 	// only runs at or above streamingWalkerMinConcurrency. A smoke run below
 	// that threshold has structurally-zero counters, and reporting those as
 	// a pass would be the same vacuity this map was built to stop.
-	"I-RFC-1": "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
-	"I-RFC-2": "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
+	// Declared once the refapp's last-byte table reports a tracked conn.
+	// Every refapp installs it via debugvars.NewServer, so in practice this
+	// is every cell -- but an age of 0 from a MISSING table reads identically
+	// to an age of 0 with nothing open, and only a positive tracked count
+	// tells them apart.
+	"I-CONN-1": "declared once the refapp's connection table reports a tracked conn",
+	"I-RFC-1":  "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
+	"I-RFC-2":  "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
 }
 
 // Violation is one failed predicate evaluation.

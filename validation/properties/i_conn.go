@@ -2,11 +2,64 @@ package properties
 
 import "fmt"
 
-// connCloseDeadlineMs is the grace window between last-byte timestamp
-// and close. RFC 9112 §9.6 lets a server close idle conns at will, but
-// celeris's documented worst case is read+write timeout (30s default),
-// so anything older than that is a leak.
-const connCloseDeadlineMs = 30_000
+// Connection-close deadlines, per engine.
+//
+// The original single 30_000 ms bound was justified as "celeris's documented
+// worst case is read+write timeout (30s default)". Measured against the
+// deployed refapps that is wrong in both directions, and turning the
+// predicate on at that value would have failed every soak.
+//
+// All eight refapps configure ReadTimeout 30s / IdleTimeout 120s. On the
+// native engines checkTimeouts reads:
+//
+//	if IdleTimeout > 0 && elapsed > IdleTimeout { close }
+//	else if ReadTimeout > 0 && elapsed > ReadTimeout { close }
+//
+// The else-if is load-bearing: an idle conn at 31s fails the 120s test,
+// falls through, and is reaped by the 30s ReadTimeout. So the healthy
+// ceiling is min(Idle, Read) = 30s plus up to one sweep -- which is EXACTLY
+// the old threshold. A healthy connection sampled at 30.05s would fail a
+// predicate that has no persistence requirement.
+//
+// On std the ceiling is 120s, not 30s: net/http honours IdleTimeout for the
+// keep-alive wait and never applies ReadTimeout to an idle conn. Same
+// config, four times the legitimate age.
+//
+// Hence one bound per engine, each above its own ceiling with headroom, and
+// a persistence requirement so a boundary artifact that clears in one sweep
+// cannot fail a cell. A real leak grows without bound, blows through either
+// number, and stays failing. Losing ~15s of sensitivity on a one-hour cell
+// costs nothing.
+const (
+	// connCloseDeadlineNativeMs bounds epoll and io_uring: 30s ReadTimeout
+	// ceiling + 50% headroom for the sweep and sampling jitter.
+	connCloseDeadlineNativeMs = 45_000
+	// connCloseDeadlineStdMs bounds the std engine: 120s IdleTimeout
+	// ceiling + 25%.
+	connCloseDeadlineStdMs = 150_000
+	// connClosePersistSamples is how many consecutive samples must exceed
+	// the bound. At 1 Hz this is five seconds -- longer than any sweep
+	// boundary, far shorter than a leak.
+	connClosePersistSamples = 5
+)
+
+// ConnCloseDeadlineNativeMs exposes the native-engine bound so the Tier 1
+// walkers can assert their stream hold times stay well under it. See
+// validation.TestStreamHoldsStayUnderTheConnCloseBound for why that
+// relationship needs a test rather than a comment.
+func ConnCloseDeadlineNativeMs() int64 { return connCloseDeadlineNativeMs }
+
+// connCloseDeadlineMsFor returns the bound for the engine that produced a
+// snapshot. An unknown or absent engine name gets the stricter native bound:
+// under-reporting a leak is worse than an occasional false positive, and an
+// absent name means the refapp is too old to be trusted about anything else
+// either.
+func connCloseDeadlineMsFor(engine string) int64 {
+	if engine == "std" {
+		return connCloseDeadlineStdMs
+	}
+	return connCloseDeadlineNativeMs
+}
 
 // connDriftPersistSamples is how many consecutive samples the
 // accepted - closed - active balance must stay off zero WITH THE SAME
@@ -20,24 +73,29 @@ const connCloseDeadlineMs = 30_000
 // offset.
 const connDriftPersistSamples = 30
 
-// ICONN1 asserts every accepted connection closes within 30s of its
-// last observed byte. Catches FD leaks where the engine forgets a
-// peer-closed socket and the connection state machine never observes
-// EOF (the classic adaptive-standby phantom-socket bug, PR #49).
+// ICONN1 asserts every accepted connection closes within the engine's
+// close deadline of its last observed byte. Catches FD leaks where the
+// engine forgets a peer-closed socket and the connection state machine
+// never observes EOF (the classic adaptive-standby phantom-socket bug,
+// PR #49).
 //
-// NOT INSTRUMENTED: nothing populates OldestOpenConnLastByteAgeMs yet
-// (it needs a per-connection last-byte table in the refapp), so this
-// predicate cannot fire today. Kept registered so the gap stays
-// visible in plan.json.
+// The input is a per-connection last-byte table the refapps keep
+// (validation/refapp/internal/debugvars/conntable.go). It lives there
+// rather than in the engine on purpose: an engine-side gauge is a minimum
+// over the live-conn set, and a connection the engine has FORGOTTEN is in
+// no live set -- which is precisely the class this predicate exists to
+// catch.
 var ICONN1 = Spec{
 	ID:          "I-CONN-1",
-	Description: "every accepted conn closes within 30s of last byte",
+	Description: "every accepted conn closes within the engine's close deadline of its last byte",
 	Tier:        "core",
+	Persist:     connClosePersistSamples,
 	Predicate: func(snap *Snapshot, _ Context) (bool, string) {
-		if snap.OldestOpenConnLastByteAgeMs > connCloseDeadlineMs {
+		deadline := connCloseDeadlineMsFor(snap.EngineName)
+		if snap.OldestOpenConnLastByteAgeMs > deadline {
 			return false, fmt.Sprintf(
-				"I-CONN-1 violated: oldest open conn last-byte age %dms > %dms; suggests FD leak or stuck reader",
-				snap.OldestOpenConnLastByteAgeMs, connCloseDeadlineMs)
+				"I-CONN-1 violated: oldest open conn last-byte age %dms > %dms (engine %q); suggests FD leak or stuck reader",
+				snap.OldestOpenConnLastByteAgeMs, deadline, snap.EngineName)
 		}
 		return true, ""
 	},

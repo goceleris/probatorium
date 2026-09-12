@@ -87,7 +87,6 @@ type GateOptions struct {
 var WaivedUninstrumented = map[string]string{
 	"I-RACE":        "needs a -race build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
 	"I-CHECKPTR":    "needs a -d=checkptr build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
-	"I-CONN-1":      "needs a per-connection last-byte table in the refapps (OldestOpenConnLastByteAgeMs)",
 	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
 	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",
 	"I-MEM-2":       "needs an orchestrator-driven idle window (properties.Context.IdleMode)",

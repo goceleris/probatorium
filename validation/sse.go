@@ -179,6 +179,15 @@ func (t *sseTally) snapshot() sseSnapshot {
 	}
 }
 
+// sseMaxHold is the upper bound of the hold distribution below. Named so
+// the I-CONN-1 bound can be asserted against it: a detached stream is
+// deliberately NOT stamped in the refapp's last-byte table (the engine path
+// gives a WebSocket/SSE handler no peer address to key on), so a stream held
+// longer than that predicate's deadline would age into a violation. Today
+// every hold is far under it; the test couples the two so raising one
+// without the other fails loudly instead of reddening a soak.
+const sseMaxHold = 1500 * time.Millisecond
+
 // runSSEKillWalker dials hostPort + path per tickInterval, holds for
 // a per-fire randomised hold duration, then RSTs. ctx-cancelled.
 //
@@ -213,6 +222,7 @@ func runSSEKillWalker(ctx context.Context, hostPort, path string,
 			// disconnects, each of which is a distinct cleanup path.
 			//nolint:gosec
 			hold := time.Duration(50+rng.IntN(1450)) * time.Millisecond
+			_ = sseMaxHold // see TestStreamHoldsStayUnderTheConnCloseBound
 			fireSSEKill(ctx, hostPort, path, hold, tally)
 		}
 	}
