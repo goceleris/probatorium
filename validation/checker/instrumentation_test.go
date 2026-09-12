@@ -139,4 +139,12 @@ func TestUninstrumented_MiddlewarePredicatesAreInstrumentable(t *testing.T) {
 	if _, ok := DeclaredOnly["I-DRV"]; !ok {
 		t.Error("I-DRV must be declared-only, so a refapp with no store is not a pass")
 	}
+	// I-ENG-IOURING moved to declared-only: the property loop declares it
+	// for an io_uring cell whose refapp reports a -tags=validation build.
+	if _, ok := Uninstrumented["I-ENG-IOURING"]; ok {
+		t.Error("I-ENG-IOURING is blanket-waived again; the instrumented tier's io_uring cells could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-ENG-IOURING"]; !ok {
+		t.Error("I-ENG-IOURING must be declared-only, so a plain build's stub zero is not a pass")
+	}
 }

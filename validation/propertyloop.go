@@ -239,6 +239,13 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		if snap.CheckptrBuild {
 			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-CHECKPTR")
 		}
+		// The SQE monotonicity check lives in celeris's io_uring engine and
+		// only under -tags=validation: an epoll or std cell has no ring to
+		// check, and a plain build has no checker. Both facts come from the
+		// document, so the declaration is an observation, not an assumption.
+		if snap.ValidationBuild && snap.EngineName == "iouring" {
+			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-ENG-IOURING")
+		}
 		lastGood, haveLast = snap, true
 		if cfg.ResponseConformance != nil {
 			rc := cfg.ResponseConformance()

@@ -142,7 +142,10 @@ jobs:
           VALIDATE_TARGET: both
           VALIDATE_MATRIX: "1"
           # Run the cells from refapps-checkptr/ instead of refapps/. Those
-          # refapps publish celeris.checkptr_build and declare I-CHECKPTR, so
+          # refapps are built -tags=checkptr,validation: they publish
+          # celeris.checkptr_build and declare I-CHECKPTR in every cell, and
+          # celeris.validation_build, on which the io_uring cells also declare
+          # I-ENG-IOURING (celeris's own SQE monotonicity check). So
           # the gate judges it here and nowhere else.
           VALIDATE_CHECKPTR: "1"
           VALIDATE_RESUME_FROM: ${{ inputs.resume_from || '' }}
