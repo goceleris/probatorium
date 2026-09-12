@@ -615,6 +615,12 @@ type Tier1Summary struct {
 	H2CChurn    map[string]int64 `json:"h2c_churn,omitempty"`
 	WSTorture   map[string]int64 `json:"ws_torture,omitempty"`
 	SSEKill     map[string]int64 `json:"sse_kill,omitempty"`
+	// SSEEarlyErrs carries the verbatim read errors behind sse_kill's
+	// sse_server_closed_early / sse_peer_reset_early / sse_read_err_early.
+	// Strings, so they cannot live in the int64 map above; a separate field
+	// rather than a stringly-typed map value so the counters stay numeric
+	// for the gate. Bounded at the source (validation/sse.go sseMaxEarlyErrs).
+	SSEEarlyErrs []string `json:"sse_early_errs,omitempty"`
 }
 
 // Tier3Summary mirrors the validator's tier3TallySnapshot.

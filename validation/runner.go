@@ -1348,10 +1348,13 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"sse_events_read":         s.SSEKill.EventsRead,
 			"sse_killed_mid_stream":   s.SSEKill.KilledMidStream,
 			"sse_server_closed_early": s.SSEKill.ServerClosedEarly,
+			"sse_peer_reset_early":    s.SSEKill.PeerResetEarly,
+			"sse_read_err_early":      s.SSEKill.ReadErrEarly,
 			"sse_cut_at_deadline":     s.SSEKill.CutAtDeadline,
 			"sse_handshake_fail":      s.SSEKill.HandshakeFail,
 			"sse_endpoint_absent":     s.SSEKill.EndpointAbsent,
 		},
+		SSEEarlyErrs: s.SSEKill.EarlyErrs,
 	}
 }
 
