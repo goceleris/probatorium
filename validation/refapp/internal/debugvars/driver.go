@@ -22,7 +22,9 @@ type driver struct {
 func (v *Vars) DriverWrite() { v.drv.writes.Add(1) }
 
 // DriverRead records the read-back of a write: hit when it returned the
-// value just written, miss when it returned something else.
+// value just written, miss when it returned something else. reads is
+// bumped first: driverDocument relies on reads >= hits holding at every
+// instant (see there).
 func (v *Vars) DriverRead(hit bool) {
 	v.drv.reads.Add(1)
 	if hit {
@@ -35,9 +37,24 @@ func (v *Vars) DriverRead(hit bool) {
 // driverDocument adds the I-DRV keys to doc. Present in every refapp's
 // document (the checker reads a fixed shape); only a refapp that declared
 // I-DRV makes the zeros mean anything.
+//
+// Load order is load-bearing. The predicate's own sanity check is
+// hits <= reads, and the counters are four independent atomics, so a
+// poll that lands between a DriverRead's two adds sees a torn pair.
+// DriverRead bumps reads BEFORE hits, so at every instant reads >= hits;
+// reading hits (and misses) BEFORE reads therefore yields
+// hits_loaded <= reads_at_that_instant <= reads_loaded, and the pair is
+// consistent whatever interleaves. The first full-harness nightly read
+// them the other way round and two of 18 driver cells reported
+// hits(380748) > reads_issued(380747): a 1-in-400k torn poll, scored as
+// a violation.
 func (v *Vars) driverDocument(doc map[string]any) {
-	doc["celeris.driver_writes_issued"] = v.drv.writes.Load()
-	doc["celeris.driver_reads_issued"] = v.drv.reads.Load()
-	doc["celeris.driver_read_hits"] = v.drv.hits.Load()
-	doc["celeris.driver_read_misses"] = v.drv.misses.Load()
+	misses := v.drv.misses.Load()
+	hits := v.drv.hits.Load()
+	reads := v.drv.reads.Load()
+	writes := v.drv.writes.Load()
+	doc["celeris.driver_writes_issued"] = writes
+	doc["celeris.driver_reads_issued"] = reads
+	doc["celeris.driver_read_hits"] = hits
+	doc["celeris.driver_read_misses"] = misses
 }
