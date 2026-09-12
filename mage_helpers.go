@@ -119,17 +119,19 @@ func requireAnsible() error {
 // the wrong place). -trimpath + `-s -w` keep the binary reproducible
 // and small; CGO_ENABLED=0 keeps it statically linked so the cluster
 // nodes don't need a matching libc.
-func crossCompileGoBinary(moduleDir, pkgRel, outputPath, arch string) error {
+//
+// extraArgs are spliced in before -o, so a caller can add build tags or
+// -gcflags for a variant binary (the -tags=checkptr refapps) without the
+// default job list changing shape.
+func crossCompileGoBinary(moduleDir, pkgRel, outputPath, arch string, extraArgs ...string) error {
 	absOut, err := filepath.Abs(outputPath)
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("go", "build",
-		"-trimpath",
-		"-ldflags=-s -w",
-		"-o", absOut,
-		pkgRel,
-	)
+	args := []string{"build", "-trimpath", "-ldflags=-s -w"}
+	args = append(args, extraArgs...)
+	args = append(args, "-o", absOut, pkgRel)
+	cmd := exec.Command("go", args...)
 	cmd.Dir = moduleDir
 	cmd.Env = append(os.Environ(),
 		"GOOS=linux",

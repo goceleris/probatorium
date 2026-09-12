@@ -118,6 +118,9 @@ func Deploy() error {
 		pkg    string
 		out    string
 		arch   string
+		// args are extra `go build` arguments for a variant binary. Empty
+		// for every default job.
+		args []string
 	}
 
 	var jobs []bin
@@ -249,6 +252,53 @@ func Deploy() error {
 		}
 	}
 
+	// checkptr variants of the refapps (I-CHECKPTR). Off by default:
+	// DEPLOY_CHECKPTR_REFAPPS="" builds none, "all" builds every refapp, a
+	// csv of slugs builds those. The variant is a SEPARATE binary set,
+	// never a flag flip on the default jobs, because the checker costs
+	// +38% (celeris-scoped) to +58% (all packages) geomean CPU on celeris's
+	// own benchmarks, up to +263% on the full-stack header path -- flipping
+	// it globally would re-characterise all 48 soak cells.
+	//
+	// -tags=checkptr is what the refapp REPORTS (debugvars publishes
+	// celeris.checkptr_build and declares I-CHECKPTR); the gcflags are what
+	// makes the checker exist. Both are needed: the flags alone leave no
+	// trace a running process can announce, and the tag alone would declare
+	// a predicate whose checker is compiled out.
+	//
+	// Staged under a distinct name and published as a distinct ansible var,
+	// so deploy.yml lands them in refapps-checkptr/ rather than refapps/.
+	// That separation is load-bearing: cmd/validator/matrix.go treats every
+	// file under -matrix-bin-dir as a refapp slug, so a suffixed name in the
+	// normal directory would silently double the plan from 48 to 96 cells.
+	checkptrSel := envOrDefault("DEPLOY_CHECKPTR_REFAPPS", "")
+	if checkptrSel != "" {
+		want := map[string]bool{}
+		if checkptrSel != "all" {
+			for _, slug := range strings.Split(checkptrSel, ",") {
+				want[strings.TrimSpace(slug)] = true
+			}
+		}
+		for _, r := range refappModules {
+			if checkptrSel != "all" && !want[r.slug] {
+				continue
+			}
+			for _, arch := range r.archs {
+				jobs = append(jobs, bin{
+					label:  "refapp " + r.slug + " (checkptr) linux/" + arch,
+					module: r.module,
+					pkg:    ".",
+					out:    filepath.Join(stagingDir, "refapp-"+r.slug+"-checkptr-"+arch),
+					arch:   arch,
+					args: []string{
+						"-tags=checkptr",
+						"-gcflags=github.com/goceleris/celeris/...=-d=checkptr=1",
+					},
+				})
+			}
+		}
+	}
+
 	// Go competitors live under servers/<name>/ as their own modules
 	// (matches mage_helpers.go celerisVersion logic — competitor
 	// modules track their own deps). Filter via DEPLOY_COMPETITORS.
@@ -326,7 +376,7 @@ func Deploy() error {
 
 	for _, j := range jobs {
 		fmt.Printf("Cross-compiling %s...\n", j.label)
-		if err := crossCompileGoBinary(j.module, j.pkg, j.out, j.arch); err != nil {
+		if err := crossCompileGoBinary(j.module, j.pkg, j.out, j.arch, j.args...); err != nil {
 			return fmt.Errorf("cross-compile %s: %w", j.label, err)
 		}
 	}
@@ -360,9 +410,22 @@ func Deploy() error {
 	}
 	competitorBinaries := make(map[string]map[string]string)
 	refappBinaries := make(map[string]map[string]string)
+	refappCheckptrBinaries := make(map[string]map[string]string)
 	for _, j := range jobs {
 		base := filepath.Base(j.out)
 		logical := strings.TrimSuffix(base, "-"+j.arch)
+		// Variant refapps are routed BEFORE the generic refapp branch, or
+		// "refapp-kitchen_sink-checkptr" would land in refapp_binaries as
+		// slug "kitchen_sink-checkptr" and be deployed into refapps/ -- where
+		// the validator would discover it as a ninth refapp.
+		if strings.HasPrefix(logical, "refapp-") && strings.HasSuffix(logical, "-checkptr") {
+			slug := strings.TrimSuffix(strings.TrimPrefix(logical, "refapp-"), "-checkptr")
+			if refappCheckptrBinaries[slug] == nil {
+				refappCheckptrBinaries[slug] = make(map[string]string)
+			}
+			refappCheckptrBinaries[slug][j.arch] = j.out
+			continue
+		}
 		if coreSet[logical] {
 			// runner / loadgen / observer / validator / conformance /
 			// validator-checker / validator-replay
@@ -390,6 +453,9 @@ func Deploy() error {
 	}
 	if len(refappBinaries) > 0 {
 		vars["refapp_binaries"] = refappBinaries
+	}
+	if len(refappCheckptrBinaries) > 0 {
+		vars["refapp_checkptr_binaries"] = refappCheckptrBinaries
 	}
 	if len(competitorSources) > 0 {
 		vars["competitor_sources"] = competitorSources
