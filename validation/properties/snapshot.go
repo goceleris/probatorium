@@ -156,6 +156,11 @@ type Snapshot struct {
 	// compiled with -tags=checkptr (paired with -d=checkptr). I-CHECKPTR is
 	// declared only when it is set.
 	CheckptrBuild bool
+	// ValidationBuild is true when the refapp was compiled with
+	// -tags=validation, which compiles celeris's own assertion counters
+	// in. The property loop declares I-ENG-IOURING on it for an io_uring
+	// cell; without it IouringSQECorruptions is the stub's zero.
+	ValidationBuild bool
 	// EngineName is celeris.engine from /debug/vars ("io_uring", "epoll",
 	// "std"). Published by every refapp since the document was written and
 	// parsed by nothing until I-CONN-1 needed it: the legitimate idle

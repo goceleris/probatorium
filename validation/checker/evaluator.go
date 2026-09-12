@@ -28,8 +28,7 @@ const HistoryCap = 3600
 // than what celeris reports), plus the [DeclaredOnly] set below in the
 // cells whose refapp declares them.
 var Uninstrumented = map[string]string{
-	"I-RACE":        "refapps are not built with -race and no stderr marker counter exists",
-	"I-ENG-IOURING": "SQE/CQE counters and the sqe_corruptions assertion exist only in -tags=validation builds",
+	"I-RACE": "refapps are not built with -race and no stderr marker counter exists",
 }
 
 // DeclaredOnly lists the predicates whose data source exists only in the
@@ -48,8 +47,11 @@ var DeclaredOnly = map[string]string{
 	// begins (validation/propertyloop.go). Only a cell long enough to
 	// burst, idle, load and idle again ever gets there; a 150 s nightly
 	// cell never idles and must not pass on a predicate that only skipped.
-	"I-MEM-2":        "judged only in a cell that idled the refapp twice; declared by the property loop when the second idle window begins",
-	"I-DRV":          "only the driver refapps read every write back inside the handler and publish the hit/miss tally",
+	"I-MEM-2": "judged only in a cell that idled the refapp twice; declared by the property loop when the second idle window begins",
+	"I-DRV":   "only the driver refapps read every write back inside the handler and publish the hit/miss tally",
+	// Declared by the property loop for an io_uring cell whose refapp
+	// reports celeris.validation_build: the SQE check exists only there.
+	"I-ENG-IOURING":  "judged only in an io_uring cell whose refapp is a -tags=validation build; declared by the property loop on both facts",
 	"I-MW-SESSION":   "only the refapps that install middleware/session keep the id→owner ledger the predicate judges",
 	"I-MW-JWT":       "only the refapps that install middleware/jwt mint tokens and re-verify their expiry",
 	"I-MW-RATELIMIT": "only the refapps that install the in-process middleware/ratelimit run the shadow token bucket",

@@ -101,7 +101,7 @@ var WaivedUninstrumented = map[string]string{
 	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
 	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",
 	"I-MEM-2":       "instrumented only in cells long enough to idle the refapp twice (20 min or more; the soak's 1 h cells); a 150 s nightly cell never idles",
-	"I-ENG-IOURING": "SQE/CQE counters exist only in a -tags=validation build of celeris",
+	"I-ENG-IOURING": "instrumented only in the io_uring cells of the instrumented tier (refapps built -tags=checkptr,validation); a normal run deploys no such refapp",
 }
 
 // ranPropertyLoop reports whether the cell's in-process property loop

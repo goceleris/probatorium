@@ -38,7 +38,8 @@
 //	  "celeris.jwt_validated_ok",         "celeris.jwt_validated_fail",
 //	  "celeris.jwt_late_admits",          "celeris.instrumented_properties",
 //	  "celeris.driver_writes_issued",     "celeris.driver_reads_issued",
-//	  "celeris.driver_read_hits",         "celeris.driver_read_misses"
+//	  "celeris.driver_read_hits",         "celeris.driver_read_misses",
+//	  "celeris.validation_build",         "celeris.iouring_sqe_corruptions"
 //	}
 //
 // Why the connection counters come from the refapp and not the engine:
@@ -259,6 +260,12 @@ func (v *Vars) Document() map[string]any {
 	}
 	v.middlewareDocument(doc)
 	v.driverDocument(doc)
+	// True only in a -tags=validation build, where celeris's own assertion
+	// counters exist. The property loop declares I-ENG-IOURING on it (for
+	// an io_uring cell), so a plain build never reports the predicate as
+	// covered when its counter is merely the zero the stub returns.
+	doc["celeris.validation_build"] = validationBuild
+	doc["celeris.iouring_sqe_corruptions"] = int64(validation.Snapshot().IouringSQECorruptions)
 	if srv := v.srv.Load(); srv != nil {
 		if info := srv.EngineInfo(); info != nil {
 			doc["celeris.active_conns"] = info.Metrics.ActiveConnections

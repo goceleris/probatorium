@@ -266,6 +266,14 @@ func Deploy() error {
 	// trace a running process can announce, and the tag alone would declare
 	// a predicate whose checker is compiled out.
 	//
+	// -tags=validation rides along: it compiles celeris's own assertion
+	// counters in (celeris/validation), among them the io_uring SQE
+	// monotonicity check behind I-ENG-IOURING, which has no other data
+	// source. debugvars publishes celeris.validation_build and the loop
+	// declares the predicate for the variant's io_uring cells. Same
+	// reasoning for keeping it off the default set: the counters are
+	// atomic adds on hot paths and would re-characterise the soak.
+	//
 	// Staged under a distinct name and published as a distinct ansible var,
 	// so deploy.yml lands them in refapps-checkptr/ rather than refapps/.
 	// That separation is load-bearing: cmd/validator/matrix.go treats every
@@ -291,7 +299,7 @@ func Deploy() error {
 					out:    filepath.Join(stagingDir, "refapp-"+r.slug+"-checkptr-"+arch),
 					arch:   arch,
 					args: []string{
-						"-tags=checkptr",
+						"-tags=checkptr,validation",
 						"-gcflags=github.com/goceleris/celeris/...=-d=checkptr=1",
 					},
 				})
