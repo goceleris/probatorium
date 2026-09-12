@@ -41,6 +41,15 @@ type propertyLoopConfig struct {
 	// propertyLoopSnapshotEvery ticks and once more on exit, so a long
 	// soak shows mid-run property progress.
 	SnapshotPath string
+	// CrashReports, when non-nil, returns how many crash signatures named the
+	// pointer checker (validation/liveness.go). A -d=checkptr violation is a
+	// runtime throw, so by the time it could be polled the process is gone
+	// and every subsequent poll fails -- no tick will ever carry it. On
+	// shutdown the loop therefore makes ONE final Observe using a copy of
+	// the last good snapshot with CheckptrReports filled in from here. The
+	// copy keeps every other field as it was, so the slope predicates see a
+	// repeated sample rather than a synthetic zero.
+	CrashReports func() int64
 	// ResponseConformance, when non-nil, returns the wire scraper's running
 	// counts (validation/rfc_scrape.go). The loop copies them into every
 	// Snapshot so I-RFC-1 and I-RFC-2 judge what celeris actually wrote on
@@ -126,6 +135,11 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 	series := newSeriesWriter(cfg.SeriesPath)
 	defer series.Close()
 
+	// lastGood is the most recent snapshot the predicates judged; see
+	// propertyLoopConfig.CrashReports for the one place it is reused.
+	var lastGood properties.Snapshot
+	haveLast := false
+
 	// firstSampleAt mirrors the evaluator's RunStartedAt: both are set from
 	// the first SUCCESSFUL poll, so the baseline lands on the same clock the
 	// slope predicates use.
@@ -192,6 +206,10 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		if snap.OpenConnsTracked > 0 {
 			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-CONN-1")
 		}
+		if snap.CheckptrBuild {
+			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-CHECKPTR")
+		}
+		lastGood, haveLast = snap, true
 		if cfg.ResponseConformance != nil {
 			rc := cfg.ResponseConformance()
 			// Declare the two predicates only once the scraper has actually
@@ -248,6 +266,29 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 	for {
 		select {
 		case <-ctx.Done():
+			// A checkptr throw is only observable after the process has
+			// died, which is exactly when polling stops. Give the evaluator
+			// one last look at the final good sample, carrying the count
+			// the liveness scan collected, so I-CHECKPTR can fire.
+			if cfg.CrashReports != nil && haveLast {
+				if n := cfg.CrashReports(); n > 0 {
+					final := lastGood
+					final.CheckptrReports = n
+					final.InstrumentedProperties = appendDeclared(final.InstrumentedProperties, "I-CHECKPTR")
+					for _, v := range ev.Observe(final, time.Now()) {
+						if v.First && cfg.Violations != nil {
+							select {
+							case cfg.Violations <- Incident{
+								Tier: TierProperty, PredicateID: v.ID, Message: v.Message,
+								Snapshot: v.Snapshot, ObservedAt: time.Now().UTC(),
+								RefappPID: cfg.PID, RecordOnly: !cfg.HardFail,
+							}:
+							default:
+							}
+						}
+					}
+				}
+			}
 			snapshot()
 			return ev.Tally()
 		case t := <-tick.C:
