@@ -65,7 +65,7 @@ import (
 // apart: it is the refapp's own statement of what it can judge, and the
 // evaluator reports anything absent from it as not-instrumented rather than
 // as passed.
-const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine, celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties, celeris.driver_writes_issued, celeris.driver_reads_issued, celeris.driver_read_hits, celeris.driver_read_misses, celeris.validation_build, celeris.iouring_sqe_corruptions"
+const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine, celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties, celeris.driver_writes_issued, celeris.driver_reads_issued, celeris.driver_read_hits, celeris.driver_read_misses, celeris.validation_build, celeris.iouring_sqe_corruptions, celeris.race_build"
 
 // Poll fetches url and projects the /debug/vars document into a
 // [properties.Snapshot] stamped with t. Missing keys default to zero.
@@ -117,6 +117,9 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	}
 	if b, ok := doc["celeris.validation_build"].(bool); ok {
 		snap.ValidationBuild = b
+	}
+	if b, ok := doc["celeris.race_build"].(bool); ok {
+		snap.RaceBuild = b
 	}
 	// celeris's own io_uring SQE check (I-ENG-IOURING), folded into the
 	// document by debugvars from validation.Snapshot(); zero in a plain

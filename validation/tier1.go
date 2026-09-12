@@ -129,6 +129,10 @@ type tier1Config struct {
 	// scan's checkptr count as soon as that tally exists, so the property
 	// loop can feed I-CHECKPTR at cell end. See propertyLoopConfig.CrashReports.
 	OnCrashReports func(reports func() int64)
+	// OnRaceReports, when non-nil, receives an accessor for the liveness
+	// scan's race-report count, read by the property loop on every tick
+	// (I-RACE). See propertyLoopConfig.RaceReports.
+	OnRaceReports func(reports func() int64)
 
 	// IdleWindows runs the cell as burst, idle, load, idle instead of one
 	// uninterrupted fleet: idleBurstDuration of load, idleWindowDuration
@@ -269,6 +273,9 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	tally.liveness = &livenessTally{}
 	if cfg.OnCrashReports != nil {
 		cfg.OnCrashReports(tally.liveness.checkptrReports.Load)
+	}
+	if cfg.OnRaceReports != nil {
+		cfg.OnRaceReports(tally.liveness.raceReports.Load)
 	}
 
 	// Start the refapp. Driver.Start is non-blocking; the binary is

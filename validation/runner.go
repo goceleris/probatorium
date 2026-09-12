@@ -845,6 +845,8 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	var crashReportsFn atomic.Pointer[func() int64]
 	// idleWindowFn is set by Tier 1 once the refapp is ready; 0 until then.
 	var idleWindowFn atomic.Pointer[func() int]
+	// raceReportsFn is set by Tier 1 once its liveness tally exists.
+	var raceReportsFn atomic.Pointer[func() int64]
 	go func() {
 		var addr string
 		select {
@@ -896,6 +898,12 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 			},
 			IdleWindow: func() int {
 				if f := idleWindowFn.Load(); f != nil {
+					return (*f)()
+				}
+				return 0
+			},
+			RaceReports: func() int64 {
+				if f := raceReportsFn.Load(); f != nil {
 					return (*f)()
 				}
 				return 0
@@ -986,6 +994,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		OnResponseCounters: func(f func() ResponseCounters) { responseCountersFn.Store(&f) },
 		OnCrashReports:     func(f func() int64) { crashReportsFn.Store(&f) },
 		OnIdleWindow:       func(f func() int) { idleWindowFn.Store(&f) },
+		OnRaceReports:      func(f func() int64) { raceReportsFn.Store(&f) },
 		// Burst, idle, load, idle for I-MEM-2 -- only where the slope
 		// oracles still fit after the prelude (see idleWindowsMinDuration).
 		IdleWindows:           o.cfg.Duration >= idleWindowsMinDuration,

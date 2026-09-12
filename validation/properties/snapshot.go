@@ -161,6 +161,10 @@ type Snapshot struct {
 	// in. The property loop declares I-ENG-IOURING on it for an io_uring
 	// cell; without it IouringSQECorruptions is the stub's zero.
 	ValidationBuild bool
+	// RaceBuild is true when the refapp was compiled with -race. The
+	// property loop declares I-RACE on it and feeds RaceReports from the
+	// liveness scan; without it the count is structurally zero.
+	RaceBuild bool
 	// EngineName is celeris.engine from /debug/vars ("io_uring", "epoll",
 	// "std"). Published by every refapp since the document was written and
 	// parsed by nothing until I-CONN-1 needed it: the legitimate idle

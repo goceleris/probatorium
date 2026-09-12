@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -142,6 +144,88 @@ func crossCompileGoBinary(moduleDir, pkgRel, outputPath, arch string, extraArgs 
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
+
+// raceCompileGoBinary builds pkgRel for linux/arch with -race. The race
+// runtime is cgo, so unlike crossCompileGoBinary this needs a C compiler
+// for the TARGET: the host's own for its arch, the GNU cross compiler
+// (gcc-aarch64-linux-gnu / gcc-x86-64-linux-gnu) for the other. That is
+// why the race variants are built on a GitHub-hosted runner, where an
+// apt install is cheap and ephemeral, and shipped to the cluster as an
+// artifact: the nodes have no Go, and each has only its own compiler.
+// The result links glibc dynamically; the nodes' 2.43 is newer than
+// ubuntu-latest's, so symbols resolve.
+func raceCompileGoBinary(moduleDir, pkgRel, outputPath, arch string) error {
+	absOut, err := filepath.Abs(outputPath)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command("go", "build", "-race", "-trimpath", "-ldflags=-s -w", "-o", absOut, pkgRel)
+	cmd.Dir = moduleDir
+	cmd.Env = append(os.Environ(),
+		"GOOS=linux",
+		"GOARCH="+arch,
+		"CGO_ENABLED=1",
+	)
+	if cc := raceCrossCC(arch); cc != "" {
+		cmd.Env = append(cmd.Env, "CC="+cc)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// raceCrossCC names the C compiler for a linux/arch cgo build from this
+// host: empty (the default cc) when the host already is that arch.
+func raceCrossCC(arch string) string {
+	if runtime.GOOS == "linux" && runtime.GOARCH == arch {
+		return ""
+	}
+	switch arch {
+	case "arm64":
+		return "aarch64-linux-gnu-gcc"
+	case "amd64":
+		return "x86_64-linux-gnu-gcc"
+	}
+	return ""
+}
+
+// raceVariantName is the staged file name of a -race refapp: the slug
+// and arch are what Deploy's prebuilt ingestion parses back out.
+func raceVariantName(slug, arch string) string { return "refapp-" + slug + "-race-" + arch }
+
+// collectPrebuiltRace reads a directory of raceVariantName files (the
+// artifact BuildRaceRefapps produced on the GitHub-hosted runner) into
+// the slug -> arch -> path map deploy.yml's refapp_race_binaries expects.
+// Anything else in the directory is an error, not a skip: the validator
+// discovers refapps by listing a directory, so a stray file would become
+// a ninth slug on the nodes.
+func collectPrebuiltRace(dir string) (map[string]map[string]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]map[string]string{}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		m := raceVariantRe.FindStringSubmatch(e.Name())
+		if m == nil {
+			return nil, fmt.Errorf("prebuilt race dir %s: %q is not a refapp-<slug>-race-<arch> file", dir, e.Name())
+		}
+		abs, err := filepath.Abs(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if out[m[1]] == nil {
+			out[m[1]] = map[string]string{}
+		}
+		out[m[1]][m[2]] = abs
+	}
+	return out, nil
+}
+
+var raceVariantRe = regexp.MustCompile(`^refapp-([a-z0-9_]+)-race-(amd64|arm64)$`)
 
 // Manifest mirrors the JSON written to /tmp/celeris-bench-manifest.json
 // on each cluster node by the deploy playbook. The playbook is the

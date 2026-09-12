@@ -108,10 +108,18 @@ func TestUninstrumented_MiddlewarePredicatesAreInstrumentable(t *testing.T) {
 			t.Errorf("%s must be declared-only (instrumented in the refapps that install the middleware)", id)
 		}
 	}
-	// I-RACE needs a -race build of the refapps and is deliberately still
-	// out of reach; the reason stays on record.
-	if _, ok := Uninstrumented["I-RACE"]; !ok {
-		t.Error("I-RACE must stay on the uninstrumented record with its reason")
+	// I-RACE moved to declared-only: the race tier's refapps are -race
+	// builds that report celeris.race_build, and the liveness scan counts
+	// their reports. Nothing is left on the blanket waiver: every
+	// registered predicate now has a data source somewhere in the matrix.
+	if _, ok := Uninstrumented["I-RACE"]; ok {
+		t.Error("I-RACE is blanket-waived again; the race tier's cells could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-RACE"]; !ok {
+		t.Error("I-RACE must be declared-only, so a plain build's zero is not a pass")
+	}
+	if len(Uninstrumented) != 0 {
+		t.Errorf("every predicate has a data source now; the blanket waiver must be empty, got %v", Uninstrumented)
 	}
 	// I-CHECKPTR moved to declared-only: a -tags=checkptr refapp declares it
 	// and the liveness crash scan feeds it at cell end. It must NOT be back

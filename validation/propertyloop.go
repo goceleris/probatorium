@@ -50,6 +50,12 @@ type propertyLoopConfig struct {
 	// copy keeps every other field as it was, so the slope predicates see a
 	// repeated sample rather than a synthetic zero.
 	CrashReports func() int64
+	// RaceReports, when non-nil, returns how many race-detector reports
+	// the liveness scan has seen on stderr. Unlike CrashReports it is read
+	// on every tick: the detector reports and lets the process run, so the
+	// count is live. Declared as I-RACE only when the refapp reports a
+	// -race build; a plain build's zero says nothing.
+	RaceReports func() int64
 	// IdleWindow reports the orchestrator's current idle window (0 under
 	// load, n inside the n-th; see tier1Config.IdleWindows). nil when the
 	// tier never idles. Stamped on every sample; the loop declares
@@ -238,6 +244,12 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		}
 		if snap.CheckptrBuild {
 			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-CHECKPTR")
+		}
+		if cfg.RaceReports != nil {
+			snap.RaceReports = cfg.RaceReports()
+		}
+		if snap.RaceBuild {
+			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-RACE")
 		}
 		// The SQE monotonicity check lives in celeris's io_uring engine and
 		// only under -tags=validation: an epoll or std cell has no ring to
