@@ -1,0 +1,240 @@
+name: Checkptr Validation
+
+# Nightly matrix-mode validate run: every refapp × every engine, 1h
+# budget. Catches slow regressions the 10-minute PR tier doesn't
+# have time to surface (heap drift, goroutine creep, the 99th-
+# percentile invariant violations that need volume).
+#
+# Three-stage flow with cluster-runner bootstrap (see
+# matrix-pr-tier.yml for the architecture comment).
+
+on:
+  workflow_dispatch:
+    inputs:
+      refapps:
+        description: "Which refapps to build with the pointer checker (DEPLOY_CHECKPTR_REFAPPS): 'all', or a csv of slugs. Default all eight."
+        required: false
+        type: string
+        default: all
+      resume_from:
+        description: >-
+          Resume an interrupted run instead of starting a fresh matrix.
+          "auto" restores the newest run rescued by the UPS power guard on
+          the cluster host and continues it; a path resumes from that dir.
+          Empty (default) runs the full matrix.
+        required: false
+        default: ""
+        type: string
+      duration:
+        description: per-tier-total duration (default 1h)
+        required: false
+        type: string
+        default: 1h
+
+permissions:
+  contents: read
+
+concurrency:
+  group: matrix-tier-cluster
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    name: bootstrap cluster runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/cluster-runner-up
+        # The composite reads env.CLUSTER_SSH_KEY to write the private
+        # key for ansible. Scoped to this step (not the workflow) so no
+        # other step's process tree ever sees the cluster key.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          wait-for-manifest-clear:   "true"
+          wait-timeout-seconds:      "1800"
+
+  matrix:
+    name: matrix validate (checkptr tier)
+    needs: setup
+    runs-on: [self-hosted, celeris-cluster]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+          cache: true
+
+      - name: Install mage
+        # mage isn't in the root go.mod; install it into GOPATH/bin
+        # ahead of every mage invocation. Cheap (~5s) and avoids
+        # `go run github.com/magefile/mage` which needs mage in
+        # go.mod.
+        run: |
+          go install github.com/magefile/mage@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Use bootstrap-provisioned ansible
+        # runner-setup.yml provisioned an ansible-core venv at
+        # /tmp/actions-runner-<host>/ansible-venv/ and a collections
+        # path with ansible.posix at .../ansible-collections/. The
+        # runner-side env exports in nohup ./run.sh cover both, but
+        # writing GITHUB_PATH + GITHUB_ENV here is the explicit
+        # belt-and-braces guarantee that subsequent steps' shells
+        # find ansible-playbook + the collections it needs.
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          echo "${RUNNER_ROOT}/ansible-venv/bin" >> "$GITHUB_PATH"
+          echo "ANSIBLE_COLLECTIONS_PATH=${RUNNER_ROOT}/ansible-collections" >> "$GITHUB_ENV"
+
+      - name: Configure cluster SSH
+        # See matrix-pr-tier.yml for the full rationale. tl;dr:
+        # CLUSTER_USE_LAN=1 routes through the LACP fabric, the
+        # CLUSTER_SSH_KEY private half lets ansible reach peer hosts,
+        # PROBATORIUM_LOCAL_HOST switches inventory_hostname == self
+        # to ansible_connection=local.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        run: |
+          RUNNER_ROOT="/tmp/actions-runner-$(hostname -s)"
+          mkdir -p "${RUNNER_ROOT}/.ssh"
+          chmod 700 "${RUNNER_ROOT}/.ssh"
+          printf '%s\n' "$CLUSTER_SSH_KEY" > "${RUNNER_ROOT}/.ssh/id_ed25519"
+          chmod 600 "${RUNNER_ROOT}/.ssh/id_ed25519"
+          {
+            echo "ANSIBLE_PRIVATE_KEY_FILE=${RUNNER_ROOT}/.ssh/id_ed25519"
+            echo "PROBATORIUM_LOCAL_HOST=$(hostname -s)"
+            echo "CLUSTER_USE_LAN=1"
+            echo "CLUSTER_KNOWN_HOSTS=${RUNNER_ROOT}/.ssh/known_hosts"
+          } >> "$GITHUB_ENV"
+          # Rebuild the cluster host-key file for THIS run. Without it, a node
+          # that has been reinstalled presents a new key, accept-new refuses the
+          # change, and ansible reports UNREACHABLE — a healthy machine that
+          # looks dead. See the script header.
+          bash .github/scripts/refresh-cluster-known-hosts.sh \
+            ansible/inventory.yml "${RUNNER_ROOT}/.ssh/known_hosts"
+
+      - name: mage Deploy (stage refapps + validator)
+        env:
+          DEPLOY_COMPETITORS: none
+          # Build the -tags=checkptr / -d=checkptr=1 refapp set. Deployed to
+          # refapps-checkptr/ alongside the normal set, never in its place.
+          DEPLOY_CHECKPTR_REFAPPS: ${{ inputs.refapps || 'all' }}
+          # Provision docker + pull postgres/redis/memcached images so
+          # the validate step (below) can start them for driver_*
+          # refapps. Pull-only — containers start in validate.yml.
+          DEPLOY_NEEDS_DBSERVICES: "1"
+        run: mage Deploy
+
+      - name: mage Validate (matrix mode, both archs)
+        env:
+          VALIDATE_DURATION: ${{ inputs.duration || '1h' }}
+          VALIDATE_TARGET: both
+          VALIDATE_MATRIX: "1"
+          # Run the cells from refapps-checkptr/ instead of refapps/. Those
+          # refapps publish celeris.checkptr_build and declare I-CHECKPTR, so
+          # the gate judges it here and nowhere else.
+          VALIDATE_CHECKPTR: "1"
+          VALIDATE_RESUME_FROM: ${{ inputs.resume_from || '' }}
+          # The two bench_targets (msa2-server amd64, msr1 arm64) are
+          # independent hosts driven by separate validator instances
+          # on msa2-client — they have no shared state. Run them in
+          # parallel so the per-tier wall-clock matches inputs.duration
+          # instead of 2× it.
+          VALIDATE_PARALLEL: "1"
+          # Per-cell budget in matrix mode is ~150s (1h / 24 cells),
+          # which the duration-tiered default treats as "short smoke
+          # run" → concurrency=1. That leaves the h2c / ws / sse
+          # walker slices DORMANT (thresholds 10/20/20). Override to
+          # 30 so all five slices fire on every cell:
+          #   adv=6, h2c=3, ws=1, sse=1, markov=19.
+          VALIDATE_CONCURRENCY: "30"
+          # io_uring refapp worker count (celeris Workers) for the matrix.
+          # Was capped to "4": at GOMAXPROCS the heaviest refapp
+          # (kitchen_sink) couldn't pin 16 io_uring rings alongside its
+          # heap on the 28GB amd64 host -> io_uring_setup ENOMEM at
+          # startup (the 60GB arm64 host at 12 workers already survived
+          # unconstrained). msa2-server's RAM upgrade (1x32GB -> 64GB
+          # dual-channel, more than double msr1's already-safe headroom)
+          # removes that ceiling, so this is unset (0 = leave the
+          # GOMAXPROCS default, matching msr1's existing behavior) rather
+          # than raised to a new guessed number. If a future host regains
+          # this constraint, re-add the override with its own host-specific
+          # reasoning rather than reusing this comment.
+          VALIDATE_REFAPP_WORKERS: "0"
+          # Start postgres / redis / memcached containers on fixed
+          # ports so the driver_* refapps in matrix mode can connect
+          # to real backends. Without this, driver_postgres /
+          # driver_redis / driver_memcached cells produce 100% Tier 3
+          # errored (refapp exits before ready).
+          VALIDATE_DBSERVICES: "1"
+        run: mage Validate
+
+      - name: mage ValidateGate (absolute zero-signal gate)
+        # Fails on ANY nonzero true-signal counter in ANY cell (unexpected 5xx,
+        # transport errors, invariant hits, h2c hangs/crashes, adversarial
+        # wrong-accepts, WS bad frames/hangs, SSE failures, tier-3 seed
+        # failures, soak leaks) and on any dead or missing cell. ValidateDiff
+        # below is RELATIVE (cross-engine/arch) and cannot see a defect that
+        # is present on every engine; this gate can. probatorium#274.
+        if: success()
+        env:
+          # 8 refapps x 3 engines x 2 archs when refapps=all. A csv selection
+          # runs fewer; the gate still requires every planned cell to report.
+          VALIDATE_GATE_EXPECT_CELLS: ${{ (inputs.refapps == '' || inputs.refapps == 'all') && '48' || '' }}
+        run: mage ValidateGate
+
+      - name: mage ValidateDiff (cross-engine + cross-arch gate)
+        if: success()
+        env:
+          # MED divergences fail too. Without this the severity is permanently
+          # advisory: 3 of the 7 invariant counters are MED and 1 is LOW, so
+          # over half the table could never fail a build (probatorium#259).
+          # This gate is the arch-parity check -- arm64 and x86 are required to
+          # behave identically -- and a parity check that cannot fail is not a
+          # check.
+          VALIDATE_DIFF_STRICT: "1"
+        run: mage ValidateDiff
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: matrix-checkptr-results-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+
+      - name: mage Cleanup
+        if: always()
+        run: mage Cleanup
+
+  teardown:
+    name: teardown cluster runners
+    needs: [setup, matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/cluster-runner-down
+        # The composite reads env.CLUSTER_SSH_KEY to write the private
+        # key for ansible. Scoped to this step (not the workflow) so no
+        # other step's process tree ever sees the cluster key.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
