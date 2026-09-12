@@ -231,6 +231,14 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_DBSERVICES"); v != "" {
 			args = append(args, "--extra-vars", "validate_dbservices="+v)
 		}
+		// VALIDATE_CHECKPTR=1 points matrix mode at the -tags=checkptr
+		// refapp set deployed under refapps-checkptr/ (see
+		// DEPLOY_CHECKPTR_REFAPPS in mage_cluster.go). Those cells declare
+		// I-CHECKPTR and run several times slower, so they belong in their
+		// own run, never mixed into a normal nightly or soak.
+		if v := os.Getenv("VALIDATE_CHECKPTR"); v != "" {
+			args = append(args, "--extra-vars", "validate_checkptr="+v)
+		}
 		fmt.Printf("\n=== %s on %s (playbook=%s) ===\n", titleCase(kind), t, playbook)
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir
