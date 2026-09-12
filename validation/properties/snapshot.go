@@ -145,6 +145,19 @@ type Snapshot struct {
 	// A string and not a []string on purpose: Snapshot must stay a
 	// comparable value type (the rolling History is copied around and the
 	// checker's tests compare whole snapshots).
+	// OpenConnsTracked is how many connections the refapp's last-byte
+	// table currently holds. It is the liveness signal for I-CONN-1's
+	// instrumentation: an age of 0 with a non-empty table means every open
+	// conn was just active (clean), while an age of 0 with an EMPTY table
+	// is indistinguishable from a refapp that never installed the hook.
+	// The property loop declares I-CONN-1 only once this goes positive.
+	OpenConnsTracked int64
+	// EngineName is celeris.engine from /debug/vars ("io_uring", "epoll",
+	// "std"). Published by every refapp since the document was written and
+	// parsed by nothing until I-CONN-1 needed it: the legitimate idle
+	// ceiling differs fourfold between the native engines and std, so a
+	// single threshold cannot be correct for both.
+	EngineName             string
 	InstrumentedProperties string
 }
 

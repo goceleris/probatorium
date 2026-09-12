@@ -65,7 +65,7 @@ import (
 // apart: it is the refapp's own statement of what it can judge, and the
 // evaluator reports anything absent from it as not-instrumented rather than
 // as passed.
-const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties"
+const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine, celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties"
 
 // Poll fetches url and projects the /debug/vars document into a
 // [properties.Snapshot] stamped with t. Missing keys default to zero.
@@ -110,6 +110,11 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	snap.ActiveConns = readInt64(doc, "celeris.active_conns")
 	snap.PanicCount = readInt64(doc, "celeris.panic_count")
 	snap.AdaptiveSwitches = readInt64(doc, "celeris.adaptive_switches")
+	snap.OldestOpenConnLastByteAgeMs = readInt64(doc, "celeris.oldest_open_conn_last_byte_age_ms")
+	snap.OpenConnsTracked = readInt64(doc, "celeris.open_conns_tracked")
+	if e, ok := doc["celeris.engine"].(string); ok {
+		snap.EngineName = e
+	}
 	// Middleware oracles. See DebugVarsKeys: the refapps that install the
 	// middleware publish these, everything else leaves them at zero and
 	// omits the predicate from instrumented_properties.

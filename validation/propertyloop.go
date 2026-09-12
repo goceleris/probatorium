@@ -183,6 +183,15 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		if cfg.ExpectedPanics != nil {
 			snap.ExpectedPanics = cfg.ExpectedPanics()
 		}
+		// I-CONN-1's table is installed by debugvars.NewServer, which every
+		// refapp uses -- but "installed" is an assumption about source we
+		// do not re-read each run, and a zero age from a missing table is
+		// indistinguishable from a zero age with nothing open. Declaring on
+		// the first positive tracked count turns that assumption into an
+		// observation.
+		if snap.OpenConnsTracked > 0 {
+			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-CONN-1")
+		}
 		if cfg.ResponseConformance != nil {
 			rc := cfg.ResponseConformance()
 			// Declare the two predicates only once the scraper has actually
