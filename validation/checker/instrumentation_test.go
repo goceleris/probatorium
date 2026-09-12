@@ -122,4 +122,13 @@ func TestUninstrumented_MiddlewarePredicatesAreInstrumentable(t *testing.T) {
 	if _, ok := DeclaredOnly["I-CHECKPTR"]; !ok {
 		t.Error("I-CHECKPTR must be declared-only, so a normal build's structural zero is not a pass")
 	}
+	// I-MEM-2 moved to declared-only: the property loop declares it when
+	// the orchestrator's second idle window begins. A cell that never idled
+	// must report it as not instrumented, never as passed.
+	if _, ok := Uninstrumented["I-MEM-2"]; ok {
+		t.Error("I-MEM-2 is blanket-waived again; a cell that idled twice could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-MEM-2"]; !ok {
+		t.Error("I-MEM-2 must be declared-only, so a cell that never idled is not a pass")
+	}
 }

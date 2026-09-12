@@ -843,6 +843,8 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	var responseCountersFn atomic.Pointer[func() ResponseCounters]
 	// crashReportsFn is set by Tier 1 once its liveness tally exists.
 	var crashReportsFn atomic.Pointer[func() int64]
+	// idleWindowFn is set by Tier 1 once the refapp is ready; 0 until then.
+	var idleWindowFn atomic.Pointer[func() int]
 	go func() {
 		var addr string
 		select {
@@ -891,6 +893,12 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 					return (*f)()
 				}
 				return ResponseCounters{}
+			},
+			IdleWindow: func() int {
+				if f := idleWindowFn.Load(); f != nil {
+					return (*f)()
+				}
+				return 0
 			},
 			PID:          p,
 			Specs:        checker.SelectPredicates(o.cfg.PropertyTier),
@@ -971,12 +979,16 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// fires once the refapp is bound; the orchestrator stashes
 		// the value so handleIncident can drive /proc + pprof
 		// forensics against the same process Tier 1 is exercising.
-		PIDChan:               pidCh,
-		AddrChan:              addrCh,
-		TallyCallback:         tallyCB,
-		OnLiveTally:           func(f func() int64) { expectedPanicsFn.Store(&f) },
-		OnResponseCounters:    func(f func() ResponseCounters) { responseCountersFn.Store(&f) },
-		OnCrashReports:        func(f func() int64) { crashReportsFn.Store(&f) },
+		PIDChan:            pidCh,
+		AddrChan:           addrCh,
+		TallyCallback:      tallyCB,
+		OnLiveTally:        func(f func() int64) { expectedPanicsFn.Store(&f) },
+		OnResponseCounters: func(f func() ResponseCounters) { responseCountersFn.Store(&f) },
+		OnCrashReports:     func(f func() int64) { crashReportsFn.Store(&f) },
+		OnIdleWindow:       func(f func() int) { idleWindowFn.Store(&f) },
+		// Burst, idle, load, idle for I-MEM-2 -- only where the slope
+		// oracles still fit after the prelude (see idleWindowsMinDuration).
+		IdleWindows:           o.cfg.Duration >= idleWindowsMinDuration,
 		TallyCallbackInterval: 2 * time.Second,
 		// Periodic snapshot to disk so long-running soaks (24h, 72h,
 		// 10d) surface mid-run progress without waiting for the

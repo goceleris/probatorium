@@ -50,6 +50,11 @@ type propertyLoopConfig struct {
 	// copy keeps every other field as it was, so the slope predicates see a
 	// repeated sample rather than a synthetic zero.
 	CrashReports func() int64
+	// IdleWindow reports the orchestrator's current idle window (0 under
+	// load, n inside the n-th; see tier1Config.IdleWindows). nil when the
+	// tier never idles. Stamped on every sample; the loop declares
+	// I-MEM-2 once the second window begins.
+	IdleWindow func() int
 	// ResponseConformance, when non-nil, returns the wire scraper's running
 	// counts (validation/rfc_scrape.go). The loop copies them into every
 	// Snapshot so I-RFC-1 and I-RFC-2 judge what celeris actually wrote on
@@ -144,6 +149,11 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 	// the first SUCCESSFUL poll, so the baseline lands on the same clock the
 	// slope predicates use.
 	var firstSampleAt time.Time
+	// loadStartedAt is when the first idle window was left: the slope
+	// oracles' warm-up runs from here (properties.Context.LoadStartedAt),
+	// so the warm heap profile must too.
+	var loadStartedAt time.Time
+	prevIdle := 0
 	baselineDone := false
 	captureBaseline := func(elapsed time.Duration) {
 		if baselineDone || cfg.BaselineHeapPath == "" || cfg.MetricsURL == "" {
@@ -193,7 +203,27 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		if firstSampleAt.IsZero() {
 			firstSampleAt = t
 		}
-		captureBaseline(t.Sub(firstSampleAt))
+		if cfg.IdleWindow != nil {
+			snap.IdleWindow = cfg.IdleWindow()
+		}
+		if prevIdle == 1 && snap.IdleWindow == 0 {
+			loadStartedAt = t
+		}
+		prevIdle = snap.IdleWindow
+		if snap.IdleWindow == 0 {
+			anchor := firstSampleAt
+			if !loadStartedAt.IsZero() {
+				anchor = loadStartedAt
+			}
+			captureBaseline(t.Sub(anchor))
+		}
+		// I-MEM-2 judges idle window 2 and later against window 1; declare
+		// it only once that window exists, so a cell that never idled (or
+		// idled once and died) reports it as not instrumented rather than
+		// passing on a predicate that only ever skipped.
+		if snap.IdleWindow >= 2 {
+			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-MEM-2")
+		}
 		if cfg.ExpectedPanics != nil {
 			snap.ExpectedPanics = cfg.ExpectedPanics()
 		}

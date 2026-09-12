@@ -29,7 +29,6 @@ const HistoryCap = 3600
 // cells whose refapp declares them.
 var Uninstrumented = map[string]string{
 	"I-RACE":        "refapps are not built with -race and no stderr marker counter exists",
-	"I-MEM-2":       "needs an orchestrator-driven idle window (Context.IdleMode is never set)",
 	"I-ENG-IOURING": "SQE/CQE counters and the sqe_corruptions assertion exist only in -tags=validation builds",
 	"I-DRV":         "needs the driver shadow map (Driver* counters are never populated)",
 }
@@ -46,6 +45,11 @@ var Uninstrumented = map[string]string{
 // vacuity with another: eight of the nine matrix refapps do not install
 // session middleware, and I-MW-SESSION would have "passed" in all of them.
 var DeclaredOnly = map[string]string{
+	// Declared by the VALIDATOR once the orchestrator's second idle window
+	// begins (validation/propertyloop.go). Only a cell long enough to
+	// burst, idle, load and idle again ever gets there; a 150 s nightly
+	// cell never idles and must not pass on a predicate that only skipped.
+	"I-MEM-2":        "judged only in a cell that idled the refapp twice; declared by the property loop when the second idle window begins",
 	"I-MW-SESSION":   "only the refapps that install middleware/session keep the id→owner ledger the predicate judges",
 	"I-MW-JWT":       "only the refapps that install middleware/jwt mint tokens and re-verify their expiry",
 	"I-MW-RATELIMIT": "only the refapps that install the in-process middleware/ratelimit run the shadow token bucket",
@@ -139,6 +143,12 @@ type Tally struct {
 	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`
 	// PerPredicate maps every evaluated ID to its violation count.
 	PerPredicate map[string]int64 `json:"per_predicate,omitempty"`
+
+	// IdleWindows is the highest orchestrator idle window observed (0 when
+	// the cell never idled) and IdleBaselineGoroutines the goroutine count
+	// at the end of the first one: I-MEM-2's reference level.
+	IdleWindows            int   `json:"idle_windows"`
+	IdleBaselineGoroutines int64 `json:"idle_baseline_goroutines"`
 
 	// Baseline / end-of-run resource points for the soak summary.
 	BaselineGoroutines int64 `json:"baseline_goroutines"`
@@ -272,6 +282,22 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 		if id = strings.TrimSpace(id); id != "" {
 			e.declared[id] = true
 		}
+	}
+	// Idle-window bookkeeping. Leaving the FIRST window fixes I-MEM-2's
+	// baseline (the window's last sample is its most settled point) and
+	// starts the sustained-load clock the slope warm-ups run from.
+	if n := len(e.ctx.History); n > 0 {
+		prev := e.ctx.History[n-1]
+		if prev.IdleWindow == 1 && snap.IdleWindow == 0 && e.ctx.IdleBaselineGoroutines == 0 {
+			e.ctx.IdleBaselineGoroutines = prev.GoroutineCount
+			e.ctx.LoadStartedAt = now
+			e.tally.IdleBaselineGoroutines = prev.GoroutineCount
+		}
+	}
+	e.ctx.IdleWindow = snap.IdleWindow
+	e.ctx.IdleMode = snap.IdleWindow > 0
+	if snap.IdleWindow > e.tally.IdleWindows {
+		e.tally.IdleWindows = snap.IdleWindow
 	}
 	e.ctx.Now = now
 	e.ctx.History = append(e.ctx.History, snap)

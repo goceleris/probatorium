@@ -130,6 +130,18 @@ type tier1Config struct {
 	// loop can feed I-CHECKPTR at cell end. See propertyLoopConfig.CrashReports.
 	OnCrashReports func(reports func() int64)
 
+	// IdleWindows runs the cell as burst, idle, load, idle instead of one
+	// uninterrupted fleet: idleBurstDuration of load, idleWindowDuration
+	// with no walkers, the main fleet until idleTailDuration before ctx's
+	// deadline, then idle to the end. The two idle windows are what
+	// I-MEM-2 judges (properties.IMEM2). The orchestrator sets it for
+	// cells of idleWindowsMinDuration or longer.
+	IdleWindows bool
+	// OnIdleWindow, when non-nil, receives an accessor for the current
+	// idle window (0 under load, n inside the n-th window) as soon as the
+	// refapp is ready, so the property loop can stamp every sample.
+	OnIdleWindow func(window func() int)
+
 	// SnapshotPath, when non-empty, names the path the tier writes the
 	// current tally snapshot to on every TallyCallback tick. Letting
 	// long-running soaks (24h, 72h, 10d) surface mid-run progress to
@@ -138,6 +150,31 @@ type tier1Config struct {
 	// authoritative.
 	SnapshotPath string
 }
+
+// The I-MEM-2 idle-window schedule (tier1Config.IdleWindows). Vars, not
+// consts, so the tier test can run the whole sequence in a second.
+//
+//   - burst: long enough for every lazily-created pool and per-listener
+//     goroutine ladder to exist before the first window measures them;
+//   - window: IdleSettle (30 s) for the count to settle plus 30 s of
+//     samples for the evaluator to judge;
+//   - tail: the same, at the end of the cell.
+//
+// The minimum cell length keeps the slope oracles judgeable: their
+// warm-up (5 min) plus span (10 min) must fit AFTER the 2.5 min prelude
+// with room to spare, so a cell that idles can still judge I-MEM-1.
+var (
+	idleBurstDuration  = 60 * time.Second
+	idleWindowDuration = 60 * time.Second
+	idleTailDuration   = 60 * time.Second
+)
+
+const idleWindowsMinDuration = 20 * time.Minute
+
+// idleBurstSeedSalt is XORed into every walker seed of the burst fleet so
+// it walks a different deterministic path from the main fleet, which keeps
+// the seeds every cell has always run.
+const idleBurstSeedSalt uint64 = 0xb075_7000_0000_0001
 
 // tier1Tally accumulates Tier 1 progress across walker goroutines.
 // Atomic counters because every walker writes to them concurrently.
@@ -403,7 +440,6 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		}
 		cancelWarmup()
 	}
-	var wg sync.WaitGroup
 	advTally := &adversarialTally{}
 	tally.adv = advTally
 	h2cTallyPtr := &h2cTally{}
@@ -482,84 +518,92 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	if markovCount < 1 {
 		markovCount = 1
 	}
-	for i := 0; i < markovCount; i++ {
-		wg.Add(1)
-		go func(walkerID int) {
-			defer wg.Done()
-			seed := cfg.Seed ^ uint64(walkerID)*0x9e3779b97f4a7c15
-			runMarkovWalker(runCtx, httpc, baseURL, cfg.Matrix, seed, tally)
-		}(i)
-	}
-	for i := 0; i < advCount; i++ {
-		wg.Add(1)
-		go func(walkerID int) {
-			defer wg.Done()
-			seed := cfg.Seed ^ uint64(0xdead0000+walkerID)*0x9e3779b97f4a7c15
-			// Adversarial fires slower than Markov so it stays inside
-			// its budget share (~1/5 of the total request volume).
-			runAdversarialWalker(runCtx, hostPort, seed, 50*time.Millisecond, advTally)
-		}(i)
-	}
-	for i := 0; i < h2cCount; i++ {
-		wg.Add(1)
-		go func(walkerID int) {
-			defer wg.Done()
-			seed := cfg.Seed ^ uint64(0xc0de0000+walkerID)*0x9e3779b97f4a7c15
-			// h2c churn ticks slower than adversarial — the
-			// PauseAccept race we're hunting fires at H2-dial
-			// frequency, not header-parse frequency. 100ms keeps the
-			// rate below the engine's own listener turnover so we're
-			// racing the engine's state machine, not just creating
-			// backlog.
-			runH2CChurnWalker(runCtx, hostPort, seed, 100*time.Millisecond, h2cTallyPtr)
-		}(i)
-	}
-	for i := 0; i < wsCount; i++ {
-		wg.Add(1)
-		go func(walkerID int) {
-			defer wg.Done()
-			seed := cfg.Seed ^ uint64(0xfade0000+walkerID)*0x9e3779b97f4a7c15
-			// WS torture ticks slowest — each cell does a full HTTP
-			// upgrade + read 101 + send torture frame + classify. At
-			// 150ms tick and 2s per-fire timeout the worst-case rate
-			// is ~6 fires/sec per walker.
-			runWSTortureWalker(runCtx, hostPort, wsTorturePath, seed, 150*time.Millisecond, wsTallyPtr)
-		}(i)
-	}
-	for i := 0; i < sseCount; i++ {
-		wg.Add(1)
-		go func(walkerID int) {
-			defer wg.Done()
-			seed := cfg.Seed ^ uint64(0x55e50000+walkerID)*0x9e3779b97f4a7c15
-			// SSE kill ticks at 200ms — each fire holds a stream for
-			// 50ms–1.5s then RSTs, so realistic walker rate is one
-			// stream-kill per few hundred ms. The point is to keep
-			// fresh disconnect events flowing to the I-CONN-2 oracle,
-			// not to maximise throughput.
-			runSSEKillWalker(runCtx, hostPort, sseKillPath, seed, 200*time.Millisecond, sseTallyPtr)
-		}(i)
-	}
-	// Response-conformance slice (I-RFC-1, I-RFC-2). ONE connection at
-	// 250ms, and deliberately NOT budgeted out of markovCount.
-	//
-	// Every other slice takes a walker slot because it competes for load.
-	// This one does not compete: 4 requests/s against the ~219k/s a soak
-	// cell drives is 0.002% more traffic and one more concurrent conn, far
-	// below the run-to-run noise in any counter the gate reads. Taking a
-	// slot to be tidy would have changed the load profile of every cell and
-	// broken comparability with previous runs, to buy nothing.
-	//
-	// Rate is not the point here. Each of the rules it scores -- a
-	// Content-Length that disagrees with its body, a HEAD that carries one,
-	// a chunked response with no terminator -- is a property of a single
-	// response, so one malformed response is as diagnostic as a million.
-	if cfg.Concurrency >= streamingWalkerMinConcurrency {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			seed := cfg.Seed ^ 0x8fc0_1e50_0000_0001
-			runRFCConformanceWalker(runCtx, hostPort, "/", seed, rfcConformanceInterval, rfcTallyPtr)
-		}()
+	// launch starts one full walker fleet against ctx and returns its
+	// WaitGroup. salt is XORed into every seed: 0 is the walk every cell
+	// has always run, idleBurstSeedSalt the prelude's.
+	launch := func(ctx context.Context, salt uint64) *sync.WaitGroup {
+		var wg sync.WaitGroup
+		seedBase := cfg.Seed ^ salt
+		for i := 0; i < markovCount; i++ {
+			wg.Add(1)
+			go func(walkerID int) {
+				defer wg.Done()
+				seed := seedBase ^ uint64(walkerID)*0x9e3779b97f4a7c15
+				runMarkovWalker(ctx, httpc, baseURL, cfg.Matrix, seed, tally)
+			}(i)
+		}
+		for i := 0; i < advCount; i++ {
+			wg.Add(1)
+			go func(walkerID int) {
+				defer wg.Done()
+				seed := seedBase ^ uint64(0xdead0000+walkerID)*0x9e3779b97f4a7c15
+				// Adversarial fires slower than Markov so it stays inside
+				// its budget share (~1/5 of the total request volume).
+				runAdversarialWalker(ctx, hostPort, seed, 50*time.Millisecond, advTally)
+			}(i)
+		}
+		for i := 0; i < h2cCount; i++ {
+			wg.Add(1)
+			go func(walkerID int) {
+				defer wg.Done()
+				seed := seedBase ^ uint64(0xc0de0000+walkerID)*0x9e3779b97f4a7c15
+				// h2c churn ticks slower than adversarial — the
+				// PauseAccept race we're hunting fires at H2-dial
+				// frequency, not header-parse frequency. 100ms keeps the
+				// rate below the engine's own listener turnover so we're
+				// racing the engine's state machine, not just creating
+				// backlog.
+				runH2CChurnWalker(ctx, hostPort, seed, 100*time.Millisecond, h2cTallyPtr)
+			}(i)
+		}
+		for i := 0; i < wsCount; i++ {
+			wg.Add(1)
+			go func(walkerID int) {
+				defer wg.Done()
+				seed := seedBase ^ uint64(0xfade0000+walkerID)*0x9e3779b97f4a7c15
+				// WS torture ticks slowest — each cell does a full HTTP
+				// upgrade + read 101 + send torture frame + classify. At
+				// 150ms tick and 2s per-fire timeout the worst-case rate
+				// is ~6 fires/sec per walker.
+				runWSTortureWalker(ctx, hostPort, wsTorturePath, seed, 150*time.Millisecond, wsTallyPtr)
+			}(i)
+		}
+		for i := 0; i < sseCount; i++ {
+			wg.Add(1)
+			go func(walkerID int) {
+				defer wg.Done()
+				seed := seedBase ^ uint64(0x55e50000+walkerID)*0x9e3779b97f4a7c15
+				// SSE kill ticks at 200ms — each fire holds a stream for
+				// 50ms–1.5s then RSTs, so realistic walker rate is one
+				// stream-kill per few hundred ms. The point is to keep
+				// fresh disconnect events flowing to the I-CONN-2 oracle,
+				// not to maximise throughput.
+				runSSEKillWalker(ctx, hostPort, sseKillPath, seed, 200*time.Millisecond, sseTallyPtr)
+			}(i)
+		}
+		// Response-conformance slice (I-RFC-1, I-RFC-2). ONE connection at
+		// 250ms, and deliberately NOT budgeted out of markovCount.
+		//
+		// Every other slice takes a walker slot because it competes for load.
+		// This one does not compete: 4 requests/s against the ~219k/s a soak
+		// cell drives is 0.002% more traffic and one more concurrent conn, far
+		// below the run-to-run noise in any counter the gate reads. Taking a
+		// slot to be tidy would have changed the load profile of every cell and
+		// broken comparability with previous runs, to buy nothing.
+		//
+		// Rate is not the point here. Each of the rules it scores -- a
+		// Content-Length that disagrees with its body, a HEAD that carries one,
+		// a chunked response with no terminator -- is a property of a single
+		// response, so one malformed response is as diagnostic as a million.
+		if cfg.Concurrency >= streamingWalkerMinConcurrency {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				seed := seedBase ^ 0x8fc0_1e50_0000_0001
+				runRFCConformanceWalker(ctx, hostPort, "/", seed, rfcConformanceInterval, rfcTallyPtr)
+			}()
+		}
+		return &wg
 	}
 
 	// Optional periodic tally-callback + snapshot-to-disk for reactive
@@ -595,7 +639,35 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			}
 		}()
 	}
-	wg.Wait()
+	// One fleet for the whole cell, or -- for I-MEM-2 -- burst, idle,
+	// load, idle. Nothing but the property loop's polls and the
+	// responsiveness probe touch the refapp while a window is held.
+	var idleWindow atomic.Int32
+	if cfg.OnIdleWindow != nil {
+		cfg.OnIdleWindow(func() int { return int(idleWindow.Load()) })
+	}
+	if cfg.IdleWindows {
+		burstCtx, cancelBurst := context.WithTimeout(runCtx, idleBurstDuration)
+		launch(burstCtx, idleBurstSeedSalt).Wait()
+		cancelBurst()
+		holdIdle(runCtx, &idleWindow, 1, idleWindowDuration)
+		// The main fleet stops idleTailDuration before the cell's deadline
+		// so the second window fits; with no deadline it runs to cancel.
+		var loadCtx context.Context
+		var cancelLoad context.CancelFunc
+		if deadline, ok := ctx.Deadline(); ok {
+			loadCtx, cancelLoad = context.WithDeadline(runCtx, deadline.Add(-idleTailDuration))
+		} else {
+			loadCtx, cancelLoad = context.WithCancel(runCtx)
+		}
+		if runCtx.Err() == nil {
+			launch(loadCtx, 0).Wait()
+		}
+		cancelLoad()
+		holdIdle(runCtx, &idleWindow, 2, 0)
+	} else {
+		launch(runCtx, 0).Wait()
+	}
 	joinStderrIfDead()
 	snap := tally.snapshot()
 	// If the refapp crashed OR hung, the periodic ticker stopped at cancelRun
@@ -607,6 +679,26 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		cfg.TallyCallback(snap)
 	}
 	return snap, nil
+}
+
+// holdIdle publishes idle window n for d, then clears it; with d <= 0 it
+// holds the window until ctx is done and leaves it published, so the
+// property loop's last samples still carry it. A cancelled ctx (the
+// refapp died, the cell ended) publishes nothing.
+func holdIdle(ctx context.Context, w *atomic.Int32, n int32, d time.Duration) {
+	if ctx.Err() != nil {
+		return
+	}
+	w.Store(n)
+	if d <= 0 {
+		<-ctx.Done()
+		return
+	}
+	defer w.Store(0)
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
 }
 
 // waitForReady tails the refapp's combined stderr+stdout until it

@@ -2,6 +2,7 @@ package report
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -66,6 +67,16 @@ type GateOptions struct {
 	// ValidateGate defaults this off for them.
 	RequireCoverage bool
 
+	// ExpectInstrumented names predicates that every property-running cell
+	// of THIS run must have declared, waiver or not. The waiver record says
+	// "this hole may exist somewhere"; a tier built to close that hole (the
+	// soak's 1 h cells for I-MEM-2, the checkptr tier for I-CHECKPTR) must
+	// not be able to fall back on it: a regression in the declaration path
+	// would otherwise turn a covered predicate back into a waived one with
+	// the gate still green. Per cell, so the report names where it went
+	// missing.
+	ExpectInstrumented []string
+
 	// H2CUpgradeRefapps names the refapps whose cells must record at least
 	// one completed h1->h2c upgrade (tier_1.h2c_churn.h2c_upgraded > 0)
 	// once the churn slice has sent anything at all. Nil selects
@@ -89,7 +100,7 @@ var WaivedUninstrumented = map[string]string{
 	"I-CHECKPTR":    "instrumented only in cells whose refapp is a -tags=checkptr build; a run that deploys none has no cell that can judge it",
 	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
 	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",
-	"I-MEM-2":       "needs an orchestrator-driven idle window (properties.Context.IdleMode)",
+	"I-MEM-2":       "instrumented only in cells long enough to idle the refapp twice (20 min or more; the soak's 1 h cells); a 150 s nightly cell never idles",
 	"I-DRV":         "needs the validator's driver shadow map",
 	"I-ENG-IOURING": "SQE/CQE counters exist only in a -tags=validation build of celeris",
 }
@@ -480,6 +491,15 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 		}
 		if c.Soak.RestartedProcesses > 0 {
 			add(c, "soak_summary.restarted_processes", int64(c.Soak.RestartedProcesses), "a server process died and was restarted during the soak")
+		}
+	}
+	for _, id := range opts.ExpectInstrumented {
+		for _, c := range cells {
+			if !ranPropertyLoop(c) || !slices.Contains(c.PropertiesNotInstrumented, id) {
+				continue
+			}
+			add(c, "properties_not_instrumented."+id, 1,
+				"this tier expects the predicate instrumented in every cell (VALIDATE_GATE_EXPECT_INSTRUMENTED) and the cell never declared it; the waiver on record does not apply here")
 		}
 	}
 	if opts.RequireInstrumented {

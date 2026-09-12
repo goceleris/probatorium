@@ -159,6 +159,10 @@ jobs:
         env:
           VALIDATE_GATE_EXPECT_CELLS: "48" # 8 refapps x 3 engines x 2 archs
           VALIDATE_GATE_REQUIRE_SOAK: "1" # every cell must carry its soak block (probatorium#281)
+          # 1 h cells idle the refapp twice, so every cell must have declared and
+          # judged I-MEM-2; the waiver that excuses the 150 s nightly must not
+          # be able to excuse the soak.
+          VALIDATE_GATE_EXPECT_INSTRUMENTED: "I-MEM-2"
         run: mage ValidateGate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
