@@ -29,7 +29,6 @@ const HistoryCap = 3600
 // cells whose refapp declares them.
 var Uninstrumented = map[string]string{
 	"I-RACE":        "refapps are not built with -race and no stderr marker counter exists",
-	"I-CHECKPTR":    "refapps are not built with -d=checkptr and no stderr marker counter exists",
 	"I-MEM-2":       "needs an orchestrator-driven idle window (Context.IdleMode is never set)",
 	"I-ENG-IOURING": "SQE/CQE counters and the sqe_corruptions assertion exist only in -tags=validation builds",
 	"I-DRV":         "needs the driver shadow map (Driver* counters are never populated)",
@@ -61,8 +60,14 @@ var DeclaredOnly = map[string]string{
 	// to an age of 0 with nothing open, and only a positive tracked count
 	// tells them apart.
 	"I-CONN-1": "declared once the refapp's connection table reports a tracked conn",
-	"I-RFC-1":  "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
-	"I-RFC-2":  "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
+	// Declared only by a refapp compiled with -tags=checkptr (paired with
+	// -d=checkptr). A normal build has the checker compiled out, so its
+	// zero is structural rather than clean. The count itself comes from the
+	// liveness stderr scan at cell end, because a checkptr violation is a
+	// runtime throw and the process is gone before the next poll.
+	"I-CHECKPTR": "declared only by refapps built with -tags=checkptr; fed from the liveness crash scan at cell end",
+	"I-RFC-1":    "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
+	"I-RFC-2":    "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
 }
 
 // Violation is one failed predicate evaluation.

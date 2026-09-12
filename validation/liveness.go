@@ -48,6 +48,15 @@ type livenessTally struct {
 	hung      atomic.Bool
 	hangFails atomic.Int64 // consecutive health-probe timeouts that tripped it
 
+	// checkptrReports counts crash signatures that name the pointer checker.
+	// A -d=checkptr violation is a runtime THROW -- "fatal error: checkptr:
+	// misaligned pointer conversion" and three siblings -- so the process is
+	// gone before the property loop's next poll. The loop can therefore
+	// never sample CheckptrReports > 0 on its own; this counter, taken from
+	// the same stderr scan that already catches the crash, is what feeds
+	// I-CHECKPTR at cell end.
+	checkptrReports atomic.Int64
+
 	mu        sync.Mutex
 	signature string // first crash-signature line scraped from stderr
 	trace     string // bounded stderr tail captured around the crash
@@ -80,6 +89,17 @@ func (l *livenessTally) recordSignature(line string) {
 	}
 	l.mu.Unlock()
 	l.crashed.Store(true)
+	if isCheckptrSignature(line) {
+		l.checkptrReports.Add(1)
+	}
+}
+
+// isCheckptrSignature reports whether a crash line came from the pointer
+// checker. runtime/checkptr.go throws exactly four messages, every one
+// prefixed "checkptr: "; the runtime prints them as "fatal error: checkptr:
+// ...". Matched on the substring so a future fifth message is still caught.
+func isCheckptrSignature(line string) bool {
+	return strings.Contains(line, "checkptr:")
 }
 
 // attachTrace records the bounded crash trace captured after the signature
@@ -105,6 +125,8 @@ func (l *livenessTally) snapshot() livenessSnapshot {
 		Trace:     tr,
 		Hung:      l.hung.Load(),
 		HangFails: int(l.hangFails.Load()),
+
+		CheckptrReports: l.checkptrReports.Load(),
 	}
 }
 
@@ -134,6 +156,11 @@ type livenessSnapshot struct {
 	Hung bool `json:"hung,omitempty"`
 	// HangFails is the consecutive probe-timeout count that tripped Hung.
 	HangFails int `json:"hang_fails,omitempty"`
+	// CheckptrReports is how many crash signatures named the pointer
+	// checker. Non-zero means the refapp was a -d=checkptr build and it
+	// tripped. See livenessTally.checkptrReports for why this lives here
+	// rather than on the property-loop snapshot.
+	CheckptrReports int64 `json:"checkptr_reports,omitempty"`
 }
 
 // Reason renders a one-line human-readable cause for the incident message.

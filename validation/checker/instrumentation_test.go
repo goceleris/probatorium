@@ -108,11 +108,18 @@ func TestUninstrumented_MiddlewarePredicatesAreInstrumentable(t *testing.T) {
 			t.Errorf("%s must be declared-only (instrumented in the refapps that install the middleware)", id)
 		}
 	}
-	// I-RACE / I-CHECKPTR need a -race / -d=checkptr build of the refapps
-	// and are deliberately still out of reach; the reason stays on record.
-	for _, id := range []string{"I-RACE", "I-CHECKPTR"} {
-		if _, ok := Uninstrumented[id]; !ok {
-			t.Errorf("%s must stay on the uninstrumented record with its reason", id)
-		}
+	// I-RACE needs a -race build of the refapps and is deliberately still
+	// out of reach; the reason stays on record.
+	if _, ok := Uninstrumented["I-RACE"]; !ok {
+		t.Error("I-RACE must stay on the uninstrumented record with its reason")
+	}
+	// I-CHECKPTR moved to declared-only: a -tags=checkptr refapp declares it
+	// and the liveness crash scan feeds it at cell end. It must NOT be back
+	// on the blanket waiver, and it must NOT be judged in a normal build.
+	if _, ok := Uninstrumented["I-CHECKPTR"]; ok {
+		t.Error("I-CHECKPTR is blanket-waived again; a -tags=checkptr cell could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-CHECKPTR"]; !ok {
+		t.Error("I-CHECKPTR must be declared-only, so a normal build's structural zero is not a pass")
 	}
 }
