@@ -27,9 +27,7 @@ const HistoryCap = 3600
 // reads responses off the wire, so they judge what celeris wrote rather
 // than what celeris reports), plus the [DeclaredOnly] set below in the
 // cells whose refapp declares them.
-var Uninstrumented = map[string]string{
-	"I-RACE": "refapps are not built with -race and no stderr marker counter exists",
-}
+var Uninstrumented = map[string]string{}
 
 // DeclaredOnly lists the predicates whose data source exists only in the
 // refapps that install the matching middleware. Those refapps publish the
@@ -49,6 +47,10 @@ var DeclaredOnly = map[string]string{
 	// cell never idles and must not pass on a predicate that only skipped.
 	"I-MEM-2": "judged only in a cell that idled the refapp twice; declared by the property loop when the second idle window begins",
 	"I-DRV":   "only the driver refapps read every write back inside the handler and publish the hit/miss tally",
+	// Declared by the property loop when the refapp reports a -race build
+	// (celeris.race_build); the count comes from the liveness scan's
+	// "WARNING: DATA RACE" lines and is structurally zero everywhere else.
+	"I-RACE": "judged only in a cell whose refapp is a -race build (the race tier); declared by the property loop on celeris.race_build",
 	// Declared by the property loop for an io_uring cell whose refapp
 	// reports celeris.validation_build: the SQE check exists only there.
 	"I-ENG-IOURING":  "judged only in an io_uring cell whose refapp is a -tags=validation build; declared by the property loop on both facts",

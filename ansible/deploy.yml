@@ -386,6 +386,20 @@
         - inventory_hostname in groups['bench_targets']
         - refapp_checkptr_binaries is defined
 
+    # -race refapps (I-RACE), prebuilt on a GitHub-hosted runner because
+    # the race runtime is cgo. Same slug filename, own directory, for the
+    # same reason as the checkptr set. No amd64 fallback: a -race binary
+    # for the wrong arch cannot run, so a missing arch is a deploy error.
+    - name: Push race refapp binaries (bench_targets only)
+      ansible.builtin.copy:
+        src: "{{ refapp_race_binaries[item][arch] }}"
+        dest: "{{ bench_root }}/refapps-race/{{ item }}"
+        mode: '0755'
+      loop: "{{ refapp_race_binaries | default({}) | list }}"
+      when:
+        - inventory_hostname in groups['bench_targets']
+        - refapp_race_binaries is defined
+
     # The Markov matrix is plain YAML — read by the validator at runtime
     # via -markov=<path>. Validator + matrix live side-by-side under
     # bench_root so the validate.yml command can hardcode the path

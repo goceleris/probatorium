@@ -56,6 +56,11 @@ type livenessTally struct {
 	// the same stderr scan that already catches the crash, is what feeds
 	// I-CHECKPTR at cell end.
 	checkptrReports atomic.Int64
+	// raceReports counts "WARNING: DATA RACE" reports on stderr. The race
+	// detector prints one per distinct race and lets the process run, so
+	// unlike a checkptr throw this is a live counter the property loop
+	// reads on every tick (I-RACE), not a post-mortem one.
+	raceReports atomic.Int64
 
 	mu        sync.Mutex
 	signature string // first crash-signature line scraped from stderr
@@ -102,6 +107,13 @@ func isCheckptrSignature(line string) bool {
 	return strings.Contains(line, "checkptr:")
 }
 
+// isRaceReport reports whether line opens a race-detector report. The
+// runtime prints exactly "WARNING: DATA RACE" as the first line of every
+// report (runtime/race, ReportRace), between two "==================" rules.
+func isRaceReport(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "WARNING: DATA RACE")
+}
+
 // attachTrace records the bounded crash trace captured after the signature
 // line. Best-effort enrichment for the incident dossier.
 func (l *livenessTally) attachTrace(trace string) {
@@ -127,6 +139,7 @@ func (l *livenessTally) snapshot() livenessSnapshot {
 		HangFails: int(l.hangFails.Load()),
 
 		CheckptrReports: l.checkptrReports.Load(),
+		RaceReports:     l.raceReports.Load(),
 	}
 }
 
@@ -161,6 +174,9 @@ type livenessSnapshot struct {
 	// tripped. See livenessTally.checkptrReports for why this lives here
 	// rather than on the property-loop snapshot.
 	CheckptrReports int64 `json:"checkptr_reports,omitempty"`
+	// RaceReports is the number of race-detector reports seen on stderr;
+	// always 0 for a refapp not built with -race.
+	RaceReports int64 `json:"race_reports"`
 }
 
 // Reason renders a one-line human-readable cause for the incident message.
@@ -348,6 +364,9 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 				traceLines++
 			}
 			continue
+		}
+		if isRaceReport(line) {
+			l.raceReports.Add(1)
 		}
 		if looksLikeCrash(line) {
 			l.recordSignature(strings.TrimSpace(line))

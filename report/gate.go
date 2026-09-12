@@ -96,7 +96,7 @@ type GateOptions struct {
 // The reasons mirror validation/checker.Uninstrumented; report/ is a leaf
 // package and does not import it.
 var WaivedUninstrumented = map[string]string{
-	"I-RACE":        "needs a -race build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
+	"I-RACE":        "instrumented only in the race tier, whose refapps are -race builds (cgo, built on a GitHub-hosted runner and shipped to the nodes); a normal run deploys no such refapp",
 	"I-CHECKPTR":    "instrumented only in cells whose refapp is a -tags=checkptr build; a run that deploys none has no cell that can judge it",
 	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
 	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",

@@ -39,7 +39,8 @@
 //	  "celeris.jwt_late_admits",          "celeris.instrumented_properties",
 //	  "celeris.driver_writes_issued",     "celeris.driver_reads_issued",
 //	  "celeris.driver_read_hits",         "celeris.driver_read_misses",
-//	  "celeris.validation_build",         "celeris.iouring_sqe_corruptions"
+//	  "celeris.validation_build",         "celeris.iouring_sqe_corruptions",
+//	  "celeris.race_build"
 //	}
 //
 // Why the connection counters come from the refapp and not the engine:
@@ -265,6 +266,7 @@ func (v *Vars) Document() map[string]any {
 	// an io_uring cell), so a plain build never reports the predicate as
 	// covered when its counter is merely the zero the stub returns.
 	doc["celeris.validation_build"] = validationBuild
+	doc["celeris.race_build"] = raceBuild
 	doc["celeris.iouring_sqe_corruptions"] = int64(validation.Snapshot().IouringSQECorruptions)
 	if srv := v.srv.Load(); srv != nil {
 		if info := srv.EngineInfo(); info != nil {
