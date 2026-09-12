@@ -125,6 +125,10 @@ type tier1Config struct {
 	// OnLiveTally because the scraper's tally is built later, with the
 	// other slice tallies, rather than with the top-level one.
 	OnResponseCounters func(counters func() ResponseCounters)
+	// OnCrashReports, when non-nil, receives an accessor for the liveness
+	// scan's checkptr count as soon as that tally exists, so the property
+	// loop can feed I-CHECKPTR at cell end. See propertyLoopConfig.CrashReports.
+	OnCrashReports func(reports func() int64)
 
 	// SnapshotPath, when non-empty, names the path the tier writes the
 	// current tally snapshot to on every TallyCallback tick. Letting
@@ -226,6 +230,9 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	// Wired before Start so the watchers below can feed it from the first
 	// instant. See liveness.go for why the walkers alone can't see a death.
 	tally.liveness = &livenessTally{}
+	if cfg.OnCrashReports != nil {
+		cfg.OnCrashReports(tally.liveness.checkptrReports.Load)
+	}
 
 	// Start the refapp. Driver.Start is non-blocking; the binary is
 	// alive but may not have bound its port yet. Wait for the

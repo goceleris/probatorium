@@ -86,7 +86,7 @@ type GateOptions struct {
 // package and does not import it.
 var WaivedUninstrumented = map[string]string{
 	"I-RACE":        "needs a -race build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
-	"I-CHECKPTR":    "needs a -d=checkptr build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
+	"I-CHECKPTR":    "instrumented only in cells whose refapp is a -tags=checkptr build; a run that deploys none has no cell that can judge it",
 	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
 	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",
 	"I-MEM-2":       "needs an orchestrator-driven idle window (properties.Context.IdleMode)",

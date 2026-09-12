@@ -152,6 +152,10 @@ type Snapshot struct {
 	// is indistinguishable from a refapp that never installed the hook.
 	// The property loop declares I-CONN-1 only once this goes positive.
 	OpenConnsTracked int64
+	// CheckptrBuild is celeris.checkptr_build: true only when the refapp was
+	// compiled with -tags=checkptr (paired with -d=checkptr). I-CHECKPTR is
+	// declared only when it is set.
+	CheckptrBuild bool
 	// EngineName is celeris.engine from /debug/vars ("io_uring", "epoll",
 	// "std"). Published by every refapp since the document was written and
 	// parsed by nothing until I-CONN-1 needed it: the legitimate idle

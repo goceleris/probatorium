@@ -107,7 +107,13 @@ type Vars struct {
 }
 
 // New returns an empty Vars.
-func New() *Vars { return &Vars{} }
+func New() *Vars {
+	v := &Vars{}
+	if checkptrBuild {
+		v.Declare("I-CHECKPTR")
+	}
+	return v
+}
 
 // NewServer is Hook + celeris.New + Mount in one call: the refapp's
 // `srv := celeris.New(cfg)` becomes `srv := dv.NewServer(cfg)`.
