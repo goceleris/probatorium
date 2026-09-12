@@ -17,7 +17,10 @@ import (
 // (the responsiveness probe's /healthz is the only traffic).
 func TestDriveTier1_IdleWindowsBurstIdleLoadIdle(t *testing.T) {
 	saved := [3]time.Duration{idleBurstDuration, idleWindowDuration, idleTailDuration}
-	idleBurstDuration, idleWindowDuration, idleTailDuration = 300*time.Millisecond, 300*time.Millisecond, 300*time.Millisecond
+	// The windows are longer than the burst so a walker still winding down
+	// under a loaded -race run (in-flight request, goroutine scheduling)
+	// cannot eat a whole window before it is published or sampled.
+	idleBurstDuration, idleWindowDuration, idleTailDuration = 300*time.Millisecond, 500*time.Millisecond, time.Second
 	t.Cleanup(func() { idleBurstDuration, idleWindowDuration, idleTailDuration = saved[0], saved[1], saved[2] })
 
 	type stamp struct {
@@ -78,8 +81,12 @@ func TestDriveTier1_IdleWindowsBurstIdleLoadIdle(t *testing.T) {
 		IdleWindows:    true,
 		OnIdleWindow:   func(f func() int) { window.Store(&f) },
 	}
-	// burst 0.3 s, window 1 0.3 s, load until deadline-0.3 s, window 2 to the end.
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	// burst 0.3 s, window 1 0.5 s, load until deadline-1 s, window 2 to the
+	// end. The deadline is generous on purpose: readiness and the /healthz
+	// warm-up come off the same clock, and under a full -race package run
+	// they took over a second, which squeezed the burst into the deadline
+	// and left the sequence at [0] with nothing wrong in the schedule.
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	s, err := driveTier1(ctx, cfg)
 	close(stop)
@@ -106,10 +113,12 @@ func TestDriveTier1_IdleWindowsBurstIdleLoadIdle(t *testing.T) {
 			t.Fatalf("window sequence must be %v, got %v", want, seq)
 		}
 	}
-	// A request the server is still reading when the burst fleet is
-	// cancelled may be stamped a few ms into window 1; anything later is
-	// load inside a window, which the design forbids.
-	const grace = 50 * time.Millisecond
+	// A request the server is still reading when a fleet is cancelled may
+	// be stamped into the window that follows; under a loaded -race run
+	// that lag reached the low hundreds of ms. Anything later than the
+	// grace is load inside a window, which the design forbids -- a fleet
+	// that kept running would stamp requests through the whole window.
+	const grace = 250 * time.Millisecond
 	startOf := func(w int) time.Time {
 		for _, tr := range transitions {
 			if tr.window == w {

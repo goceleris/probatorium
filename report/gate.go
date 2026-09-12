@@ -101,7 +101,6 @@ var WaivedUninstrumented = map[string]string{
 	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
 	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",
 	"I-MEM-2":       "instrumented only in cells long enough to idle the refapp twice (20 min or more; the soak's 1 h cells); a 150 s nightly cell never idles",
-	"I-DRV":         "needs the validator's driver shadow map",
 	"I-ENG-IOURING": "SQE/CQE counters exist only in a -tags=validation build of celeris",
 }
 

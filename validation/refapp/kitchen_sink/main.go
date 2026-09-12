@@ -156,12 +156,38 @@ func main() {
 	// short-circuit the rest of the chain.
 	srv.Use(healthcheck.New())
 	// ratelimit: token bucket. Permissive so the walker doesn't
-	// saturate the budget; rate-limit specific behaviour is
-	// validated by the existing auth_session_ratelimit refapp.
+	// saturate the budget. The key function is the middleware's own
+	// default, spelled out so the shadow bucket below is keyed
+	// identically by construction.
+	rlKey := func(c *celeris.Context) string {
+		if ip := c.ClientIP(); ip != "" {
+			return ip
+		}
+		return c.RemoteAddr()
+	}
+	rlShadow := debugvars.NewTokenShadow(*rps, *burst)
 	srv.Use(ratelimit.New(ratelimit.Config{
-		RPS:   *rps,
-		Burst: *burst,
+		RPS:     *rps,
+		Burst:   *burst,
+		KeyFunc: rlKey,
+		ErrorHandler: func(c *celeris.Context, err error) error {
+			dv.RateLimitRejected()
+			return err // unchanged 429; the handler only counts
+		},
 	}))
+	// Installed immediately after the limiter, so reaching it means the
+	// limiter admitted the request. The shadow re-derives the bound the
+	// token bucket promises (burst + RPS*elapsed, per key, with slack);
+	// an admission it cannot pay for is I-MW-RATELIMIT's token violation.
+	// Same oracle as auth_session_ratelimit, now in six more cells.
+	srv.Use(func(c *celeris.Context) error {
+		dv.RateLimitAdmitted()
+		if !rlShadow.Admit(rlKey(c), time.Now()) {
+			dv.RecordRateLimitTokenViolation()
+		}
+		return c.Next()
+	})
+	dv.Declare("I-MW-RATELIMIT")
 	// timeout: per-handler deadline. Handlers below take <100ms
 	// normally; if a future bug introduces a hang the middleware
 	// returns 504.
