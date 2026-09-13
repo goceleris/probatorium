@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -43,7 +44,22 @@ type ObserverSample struct {
 	Goroutines     int64
 	HeapInuseBytes int64
 	GCPauseP99Ns   int64
+
+	// CPUTicks is the SUT process's cumulative utime+stime from
+	// /proc/<pid>/stat in USER_HZ ticks (100/s on every Linux arch the
+	// bench runs), written by observers that carry the cpu_utime_ticks /
+	// cpu_stime_ticks columns (schema v5.9, celeris#585). CPUTicksOK is
+	// false when the DB predates those columns, so a legitimate 0 tick
+	// reading is never confused with "absent".
+	CPUTicks   int64
+	CPUTicksOK bool
 }
+
+// userHZ is the Linux USER_HZ the /proc/<pid>/stat utime/stime fields
+// are expressed in. It is a fixed kernel ABI constant (100) on x86_64 and
+// arm64 regardless of the scheduler HZ, which is why the observer stores
+// raw ticks and the parser divides here.
+const userHZ = 100
 
 // CPUPoint is one per-second aggregate-CPU reading parsed from an mpstat
 // `all` row. Ordinal is the row's position in the log (mpstat emits
@@ -52,6 +68,19 @@ type ObserverSample struct {
 type CPUPoint struct {
 	Ordinal int
 	CPUPct  float64
+
+	// TSUnix is the row's wall-clock instant (unix seconds) reconstructed
+	// from the log's banner date plus the row's HH:MM:SS[ AM|PM] prefix,
+	// midnight-rollover aware. mpstat prints the SUT's LOCAL time with no
+	// zone; the bench launches it under TZ=UTC S_TIME_FORMAT=ISO
+	// (run_bench_cell.yml) so this is UTC and joins the runner's UTC
+	// started_at/completed_at. 0 when no banner date or row time could be
+	// parsed, in which case per-scenario windowing is impossible.
+	TSUnix int64
+
+	// SoftPct is the row's mpstat %soft (softirq) column; -1 when the log
+	// carries no %soft column.
+	SoftPct float64
 }
 
 // ParseObserverDB opens a per-cell observer.sqlite read-only and returns
@@ -68,7 +97,19 @@ func ParseObserverDB(path string) ([]ObserverSample, error) {
 	}
 	defer func() { _ = db.Close() }()
 
-	rows, err := db.Query(`SELECT ts, fd_count, rss_bytes, goroutine_count, heap_inuse_bytes, gc_pause_p99_ns FROM observations ORDER BY ts`)
+	// The cpu tick columns (schema v5.9) are optional: a DB written by an
+	// older observer has no such column and SELECTing it would fail the
+	// whole parse, so probe the table layout first and only read the
+	// ticks when both columns exist.
+	hasTicks, err := observerHasCPUTicks(db)
+	if err != nil {
+		return nil, fmt.Errorf("table_info %s: %w", path, err)
+	}
+	q := `SELECT ts, fd_count, rss_bytes, goroutine_count, heap_inuse_bytes, gc_pause_p99_ns FROM observations ORDER BY ts`
+	if hasTicks {
+		q = `SELECT ts, fd_count, rss_bytes, goroutine_count, heap_inuse_bytes, gc_pause_p99_ns, cpu_utime_ticks, cpu_stime_ticks FROM observations ORDER BY ts`
+	}
+	rows, err := db.Query(q)
 	if err != nil {
 		return nil, fmt.Errorf("query %s: %w", path, err)
 	}
@@ -77,7 +118,16 @@ func ParseObserverDB(path string) ([]ObserverSample, error) {
 	var out []ObserverSample
 	for rows.Next() {
 		var s ObserverSample
-		if err := rows.Scan(&s.TSUnix, &s.FDCount, &s.RSSBytes, &s.Goroutines, &s.HeapInuseBytes, &s.GCPauseP99Ns); err != nil {
+		if hasTicks {
+			var ut, st sql.NullInt64
+			if err := rows.Scan(&s.TSUnix, &s.FDCount, &s.RSSBytes, &s.Goroutines, &s.HeapInuseBytes, &s.GCPauseP99Ns, &ut, &st); err != nil {
+				return nil, fmt.Errorf("scan %s: %w", path, err)
+			}
+			if ut.Valid && st.Valid {
+				s.CPUTicks = ut.Int64 + st.Int64
+				s.CPUTicksOK = true
+			}
+		} else if err := rows.Scan(&s.TSUnix, &s.FDCount, &s.RSSBytes, &s.Goroutines, &s.HeapInuseBytes, &s.GCPauseP99Ns); err != nil {
 			return nil, fmt.Errorf("scan %s: %w", path, err)
 		}
 		out = append(out, s)
@@ -86,6 +136,32 @@ func ParseObserverDB(path string) ([]ObserverSample, error) {
 		return nil, fmt.Errorf("rows %s: %w", path, err)
 	}
 	return out, nil
+}
+
+// observerHasCPUTicks reports whether the observations table carries the
+// cpu_utime_ticks AND cpu_stime_ticks columns (observer >= schema v5.9).
+func observerHasCPUTicks(db *sql.DB) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(observations)`)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	var haveU, haveS bool
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		switch name {
+		case "cpu_utime_ticks":
+			haveU = true
+		case "cpu_stime_ticks":
+			haveS = true
+		}
+	}
+	return haveU && haveS, rows.Err()
 }
 
 // ParseMPStat parses an `mpstat -P ALL 1 <N>` text log and returns the
@@ -107,10 +183,17 @@ func ParseMPStat(path string) (mean float64, series []CPUPoint, ok bool, err err
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	cpuIdx, idleIdx := -1, -1
+	cpuIdx, idleIdx, softIdx := -1, -1, -1
 	var sum float64
 	var n int
 	ordinal := 0
+	// Wall-clock reconstruction: the banner's date anchors the day, each
+	// `all` row's leading HH:MM:SS[ AM|PM] gives the second-of-day, and a
+	// row whose second-of-day is below the previous one crossed midnight.
+	var day time.Time
+	haveDay := false
+	prevSec := -1
+	dayOffset := int64(0)
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
 		if len(fields) == 0 {
@@ -121,8 +204,14 @@ func ParseMPStat(path string) (mean float64, series []CPUPoint, ok bool, err err
 		if strings.HasPrefix(fields[0], "Average") {
 			break
 		}
-		if ci, ii, isHeader := mpstatHeader(fields); isHeader {
-			cpuIdx, idleIdx = ci, ii
+		if !haveDay && fields[0] == "Linux" {
+			if d, ok := mpstatBannerDate(fields); ok {
+				day, haveDay = d, true
+			}
+			continue
+		}
+		if ci, ii, si, isHeader := mpstatHeader(fields); isHeader {
+			cpuIdx, idleIdx, softIdx = ci, ii, si
 			continue
 		}
 		if cpuIdx < 0 || idleIdx < 0 {
@@ -139,7 +228,22 @@ func ParseMPStat(path string) (mean float64, series []CPUPoint, ok bool, err err
 			continue
 		}
 		busy := 100 - idle
-		series = append(series, CPUPoint{Ordinal: ordinal, CPUPct: busy})
+		pt := CPUPoint{Ordinal: ordinal, CPUPct: busy, SoftPct: -1}
+		if softIdx >= 0 && softIdx < len(fields) {
+			if soft, serr := strconv.ParseFloat(fields[softIdx], 64); serr == nil {
+				pt.SoftPct = soft
+			}
+		}
+		if haveDay {
+			if sec, ok := mpstatRowSecond(fields, cpuIdx); ok {
+				if prevSec >= 0 && sec < prevSec {
+					dayOffset += 24 * 3600
+				}
+				prevSec = sec
+				pt.TSUnix = day.Unix() + dayOffset + int64(sec)
+			}
+		}
+		series = append(series, pt)
 		sum += busy
 		n++
 		ordinal++
@@ -154,19 +258,61 @@ func ParseMPStat(path string) (mean float64, series []CPUPoint, ok bool, err err
 }
 
 // mpstatHeader detects an mpstat column header row and returns the
-// indices of the CPU and %idle columns. A header is any row carrying
-// both a "CPU" field and a "%idle" field.
-func mpstatHeader(fields []string) (cpuIdx, idleIdx int, ok bool) {
-	cpuIdx, idleIdx = -1, -1
+// indices of the CPU, %idle and %soft columns (softIdx is -1 when the
+// layout has no %soft). A header is any row carrying both a "CPU" field
+// and a "%idle" field.
+func mpstatHeader(fields []string) (cpuIdx, idleIdx, softIdx int, ok bool) {
+	cpuIdx, idleIdx, softIdx = -1, -1, -1
 	for i, f := range fields {
 		switch f {
 		case "CPU":
 			cpuIdx = i
 		case "%idle":
 			idleIdx = i
+		case "%soft":
+			softIdx = i
 		}
 	}
-	return cpuIdx, idleIdx, cpuIdx >= 0 && idleIdx >= 0
+	return cpuIdx, idleIdx, softIdx, cpuIdx >= 0 && idleIdx >= 0
+}
+
+// mpstatBannerDate extracts the run date from mpstat's first line
+// ("Linux 6.8.0 (host) \t2026-09-13 \t_x86_64_ \t(32 CPU)"). sysstat
+// prints the date with the locale's %x unless S_TIME_FORMAT=ISO, so three
+// layouts are accepted: ISO (what the bench forces), en_US MM/DD/YYYY and
+// the C locale's MM/DD/YY. The date is read as UTC — see CPUPoint.TSUnix.
+func mpstatBannerDate(fields []string) (time.Time, bool) {
+	for _, f := range fields {
+		for _, layout := range []string{"2006-01-02", "01/02/2006", "01/02/06"} {
+			if d, err := time.ParseInLocation(layout, f, time.UTC); err == nil {
+				return d, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+// mpstatRowSecond parses a data row's leading timestamp into a
+// second-of-day. The timestamp is fields[0] ("HH:MM:SS", 24 h under
+// S_TIME_FORMAT=ISO or the C locale) optionally followed by an AM/PM
+// field (12 h locales); cpuIdx tells how many prefix fields there are
+// (1 or 2), which is the robust way to know whether an AM/PM token is
+// present.
+func mpstatRowSecond(fields []string, cpuIdx int) (int, bool) {
+	var t time.Time
+	var err error
+	switch cpuIdx {
+	case 1:
+		t, err = time.Parse("15:04:05", fields[0])
+	case 2:
+		t, err = time.Parse("03:04:05 PM", fields[0]+" "+strings.ToUpper(fields[1]))
+	default:
+		return 0, false
+	}
+	if err != nil {
+		return 0, false
+	}
+	return t.Hour()*3600 + t.Minute()*60 + t.Second(), true
 }
 
 // SummarizeResources folds observer samples + parsed CPU into the
@@ -337,6 +483,11 @@ func ReduceResources(runs []*ResourceStats) *ResourceStats {
 	out.Summary.GoroutineHWM = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.GoroutineHWM }))
 	out.Summary.FDHWM = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.FDHWM }))
 	out.Summary.MeanCPUPct = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.MeanCPUPct }))
+	// Per-scenario window fields (schema v5.9): nil on every column-wide
+	// aggregate, so the column-wide reduction is byte-identical to before.
+	out.Summary.MeanSoftPct = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.MeanSoftPct }))
+	out.Summary.SUTProcessCPUPct = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.SUTProcessCPUPct }))
+	out.Window = present[len(present)-1].Window
 	return out
 }
 

@@ -82,7 +82,7 @@ func TestAggregateReconstructsColumnMissingRollup(t *testing.T) {
 		t.Fatalf("write intact rollup: %v", err)
 	}
 
-	if err := aggregatePerCellResults(resultsDir); err != nil {
+	if err := aggregatePerCellResults(resultsDir, 0); err != nil {
 		t.Fatalf("aggregatePerCellResults: %v", err)
 	}
 

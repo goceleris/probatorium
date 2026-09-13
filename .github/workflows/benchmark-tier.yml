@@ -67,6 +67,16 @@ on:
         required: false
         type: string
         default: "true"
+      sut_env:
+        description: "SUT process environment overrides (BENCH_SUT_ENV): KEY=VALUE[,KEY=VALUE], e.g. 'CELERIS_IOURING_SEND_ZC=off' for a celeris#585 A/B arm. Merged OVER the harness's own PROBATORIUM_*/DOTNET_* vars on the bench target, echoed as the first line of every cell's server.log ('[sut-env] {...}') and recorded in results.json environment.sut_env. Keys [A-Za-z_][A-Za-z0-9_]*, values [A-Za-z0-9_./:@+=-]* (no quotes/whitespace); PATH and LD_* are refused. Default '' = no overrides."
+        required: false
+        type: string
+        default: ""
+      cells:
+        description: "Cell glob(s) to bench (BENCH_CELLS) over '<scenario>/<competitor>', comma-separated, '!' prefix excludes — e.g. 'ws-large-echo/*,ws-echo/*,get-json/*' runs only those three scenarios on the columns `competitors` selects. Default '' = the profile's own full glob. NOTE: the budget projection still counts the profile's full grid (a scoped run passes it trivially), and one column pass still runs ONE mpstat/observer for all matched scenarios — read benchmarks[].scenario_resources (per-scenario window) rather than resources (column-wide mean) for per-cell CPU."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -136,6 +146,15 @@ jobs:
       # use them. h2 columns reuse their h1 sibling's binary, so this set
       # differs from BENCH_COMPETITORS.
       DEPLOY_COMPETITORS: ${{ github.event.inputs.deploy_competitors || 'all' }}
+      # SUT environment overrides for an A/B arm (celeris#585). Empty on
+      # schedule and by default; mage Bench validates the format and forwards
+      # it to ansible as bench_sut_env, run_bench_cell.yml merges it into the
+      # server process and echoes it into server.log.
+      BENCH_SUT_ENV: ${{ github.event.inputs.sut_env || '' }}
+      # Cell-glob restriction (celeris#585). Empty = the profile's own glob
+      # (mage_tier.go setBenchEnvFromProfile honours a non-blank preset the
+      # same way it honours BENCH_DURATION / BENCH_WARMUP).
+      BENCH_CELLS: ${{ github.event.inputs.cells || '' }}
       # PUBLISH POLICY. Two rules, in order:
       #
       #   1. profile=fast NEVER publishes — full stop, regardless of the

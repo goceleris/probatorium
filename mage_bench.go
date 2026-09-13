@@ -58,6 +58,13 @@ import (
 //	                               the server half is the competitor slug
 //	BENCH_SEED=                    deterministic loadgen seed (empty
 //	                               → random)
+//	BENCH_SUT_ENV=                 KEY=VALUE[,KEY=VALUE] merged into the
+//	                               SUT process environment on the bench
+//	                               target (celeris#585 A/B arms, e.g.
+//	                               CELERIS_IOURING_SEND_ZC=off); echoed
+//	                               as the first line of each cell's
+//	                               server.log and recorded in the merged
+//	                               Document's environment.sut_env
 //	CELERIS_VERSION=               override go.mod auto-detect
 //	CLUSTER_USE_LAN=1              LAN fabric instead of Tailscale
 //
@@ -190,6 +197,16 @@ func Bench() error {
 	// grid). A malformed file is an error — the operator should fix the
 	// JSON, not silently skip the safety check.
 	cells = applySkipFile(cells)
+	// SUT env passthrough (celeris#585): validated here so a malformed or
+	// shell-unsafe value fails the dispatch in seconds, never on the
+	// cluster after Deploy. Forwarded to ansible as a JSON extra-var dict.
+	sutEnv, err := parseSUTEnv(os.Getenv("BENCH_SUT_ENV"))
+	if err != nil {
+		return fmt.Errorf("BENCH_SUT_ENV: %w", err)
+	}
+	if len(sutEnv) > 0 {
+		fmt.Printf("  SUT env overrides (merged into the server process on the bench target): %s\n", sutEnvString(sutEnv))
+	}
 	seed := os.Getenv("BENCH_SEED")
 	// The bench ALWAYS runs exactly one pass. The BENCH_RUNS multi-run knob
 	// (median over N runs) was removed — if more passes are wanted, more
@@ -472,6 +489,11 @@ func Bench() error {
 		if seed != "" {
 			args = append(args, "--extra-vars", "bench_seed="+seed)
 		}
+		// JSON form ({"bench_sut_env": {...}}) so the values reach the
+		// playbook as a real dict for combine(), not a k=v string.
+		if len(sutEnv) > 0 {
+			args = append(args, "--extra-vars", sutEnvExtraVars(sutEnv))
+		}
 		if ratedOn {
 			args = append(args,
 				"--extra-vars", "bench_rated=1",
@@ -544,7 +566,7 @@ func Bench() error {
 	// resultsDir/<TS>-bench-<bench_target>/<RR>-<comp>/run0/<scenario>/<server>.json.
 	// Roll those up into per-host raw payloads under resultsDir/raw/
 	// so mergeBenchResults below can assemble the v5.0 results.json.
-	if err := aggregatePerCellResults(resultsDir); err != nil {
+	if err := aggregatePerCellResults(resultsDir, parseDurationOr(warmup)); err != nil {
 		return fmt.Errorf("aggregate per-cell results: %w", err)
 	}
 
@@ -556,6 +578,7 @@ func Bench() error {
 		Runs:       runs,
 		Seed:       seed,
 		StartedAt:  benchStart,
+		SUTEnv:     sutEnv,
 	}
 
 	// BENCH_TARGET=both emits ONE Document PER ARCH, never a blended one.
@@ -931,7 +954,11 @@ func applySkipFile(cells string) string {
 // `cells` is preserved verbatim so downstream tooling can still
 // compute richer aggregations (HdrHistogram merging, LatencyAtSLO
 // rated-mode sweeps, time-series stitching) without re-running bench.
-func aggregatePerCellResults(resultsDir string) error {
+//
+// warmup is the per-scenario loadgen warm-up the bench ran with; it is
+// trimmed off the front of every scenario's resource window (schema
+// v5.9, celeris#585) so the sliced CPU covers the measurement only.
+func aggregatePerCellResults(resultsDir string, warmup time.Duration) error {
 	rawDir := filepath.Join(resultsDir, "raw")
 	if err := os.MkdirAll(rawDir, 0o755); err != nil {
 		return err
@@ -996,12 +1023,25 @@ func aggregatePerCellResults(resultsDir string) error {
 			// Server-side resource sampling (#154) lands directly in the
 			// cell dir (observer.sqlite + cpu.log) next to the runner's
 			// nested run<N>/ output. Best-effort: a cell that ran without
-			// an observer simply carries no resources. The same aggregate
-			// applies to every scenario the runner expanded in this cell,
-			// since the observer scopes to the whole cell process.
-			res := readCellResources(cellDir)
+			// an observer simply carries no resources. The COLUMN-WIDE
+			// aggregate (one mpstat + one observer per column pass) is
+			// stamped onto every scenario exactly as before — Resources is
+			// unchanged — and, new in schema v5.9 (celeris#585), the same
+			// raw series is SLICED to each scenario's own runner window
+			// (started_at + warmup .. completed_at) into ScenarioResources,
+			// with the outcome in ScenarioResourcesStatus so a scenario
+			// whose window caught no sample reads "no_data", never a zero.
+			raw := readCellRawResources(cellDir)
+			res := raw.columnWide()
+			statuses := map[string]int{}
 			for i := range recs {
 				recs[i].Resources = res
+				recs[i].ScenarioResources, recs[i].ScenarioResourcesStatus =
+					raw.scenario(recs[i].StartedAt, recs[i].CompletedAt, warmup)
+				statuses[recs[i].ScenarioResourcesStatus]++
+			}
+			if len(recs) > 0 && res != nil {
+				fmt.Printf("  %s: per-scenario resource windows: %s\n", c.Name(), formatStatusCounts(statuses))
 			}
 			hostCells[host] = append(hostCells[host], recs...)
 		}
@@ -1137,6 +1177,12 @@ type runnerCellFile struct {
 	// derived from it. SaturationModeRPS echoes the saturation scale anchor.
 	SaturationModeRPS float64         `json:"saturation_mode_rps,omitempty"`
 	RatedPasses       []ratedPassWire `json:"rated_passes,omitempty"`
+
+	// StartedAt / CompletedAt are the runner's per-scenario wall-clock
+	// bounds (cmd/runner cellResultFile, UTC). They window the column's
+	// resource sidecar per scenario (schema v5.9, celeris#585).
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at"`
 }
 
 // ratedPassWire mirrors cmd/runner's ratedPassFile: one rated pass's offered
@@ -1235,6 +1281,7 @@ func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cel
 				// numbers never made it to the published summary (gap
 				// surfaced by v3.2 review).
 				rec.SaturationModeRPS = cf.SaturationModeRPS
+				rec.StartedAt, rec.CompletedAt = cf.StartedAt, cf.CompletedAt
 				if len(cf.RatedPasses) > 0 {
 					rec.RatedPasses = append(rec.RatedPasses, cf.RatedPasses...)
 				}
@@ -1306,6 +1353,22 @@ type cellRecord struct {
 	// the runner expanded — since the observer scopes the whole cell.
 	Resources *report.ResourceStats `json:"resources,omitempty"`
 
+	// StartedAt / CompletedAt are the runner's per-scenario bounds lifted
+	// from the per-cell JSON (schema v5.9, celeris#585). Zero on records
+	// ingested from pre-v5.9 runner output.
+	StartedAt   time.Time `json:"started_at,omitzero"`
+	CompletedAt time.Time `json:"completed_at,omitzero"`
+
+	// ScenarioResources is the SAME sidecar sliced to this scenario's own
+	// window (StartedAt + warmup .. CompletedAt) — the per-cell view a CPU
+	// comparison must read, since Resources is the column-wide mean
+	// stamped on every scenario. Nil unless ScenarioResourcesStatus is
+	// "ok"; the status names why (no_data / no_timestamps / empty_window /
+	// no_sidecar, see report.Window*), so "no data" is explicit and never
+	// a zero.
+	ScenarioResources       *report.ResourceStats `json:"scenario_resources,omitempty"`
+	ScenarioResourcesStatus string                `json:"scenario_resources_status,omitempty"`
+
 	// RatedPasses carries the rated sweep lifted from the runner's per-cell
 	// JSON (probatorium#156). Empty unless rated mode ran. Folded into the
 	// merged Document's latency_at_slo by mergeBenchResults so the gate has
@@ -1323,13 +1386,7 @@ type cellRecord struct {
 // the partial aggregate it can build (or nil when neither input exists),
 // so a cluster cell that ran without the sampler never fails the merge.
 func readCellResources(cellDir string) *report.ResourceStats {
-	samples, dbErr := report.ParseObserverDB(filepath.Join(cellDir, "observer.sqlite"))
-	cpuMean, cpuSeries, cpuOK, _ := report.ParseMPStat(filepath.Join(cellDir, "cpu.log"))
-	if dbErr != nil && !cpuOK {
-		return nil
-	}
-	stats := report.SummarizeResources(samples, cpuMean, cpuOK, cpuSeries)
-	return &stats
+	return readCellRawResources(cellDir).columnWide()
 }
 
 // summarizeCells folds the per-cell loadgen.Result blobs into one stats
@@ -1557,6 +1614,10 @@ type benchParams struct {
 	// StartedAt is the bench wall-clock start, captured once in Bench() so
 	// the merged BenchmarkConfig.started_at is real (not the zero time).
 	StartedAt time.Time
+	// SUTEnv is the parsed BENCH_SUT_ENV override set (celeris#585),
+	// recorded on the merged Document's environment.sut_env so an A/B arm
+	// is identifiable from results.json alone. Nil/empty when none.
+	SUTEnv map[string]string
 }
 
 // clusterScenarioName is the legacy single-scenario fallback. Since
@@ -1697,6 +1758,11 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 			if cell.Resources != nil {
 				cr.Resources = append(cr.Resources, cell.Resources)
 			}
+			// Per-scenario window slice (schema v5.9, celeris#585): only
+			// records whose window caught samples carry one.
+			if cell.ScenarioResources != nil {
+				cr.ScenarioResources = append(cr.ScenarioResources, cell.ScenarioResources)
+			}
 			// loadgen.Result.Histogram is ALREADY the hdr-encoded wire form:
 			// github.com/HdrHistogram/hdrhistogram-go Encode() base64-encodes
 			// its output (see loadgen latency.go EncodeHistogram), and that is
@@ -1795,6 +1861,9 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 		LoadgenHost:              "msa2-client",
 		Fabric:                   benchFabric(),
 		FabricLineRateBitsPerSec: benchFabricLineRate(),
+		// The SUT env overrides this run was dispatched with (celeris#585),
+		// so the arm is readable from results.json without server.log.
+		SUTEnv: p.SUTEnv,
 	}
 
 	archTarget := target

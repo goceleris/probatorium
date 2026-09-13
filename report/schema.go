@@ -97,6 +97,24 @@ import (
 //     (celeris#587). All additive: older readers ignore every field, the
 //     gate reads an absent map as all zeros, the gated totals keep their
 //     meaning and the new keys are not gated.
+//     Additive; older readers ignore every field. The gated totals keep
+//     their meaning and the new keys are not gated.
+//     Adds, in the same version, per-SCENARIO resource windows (celeris#585). Adds
+//     ServerResult.ScenarioResources: scenario → the column's raw 1 Hz
+//     mpstat + observer series SLICED to that scenario's own runner
+//     window (started_at + warmup .. completed_at), plus
+//     ResourceSummary.MeanSoftPct (mpstat %soft), SUTProcessCPUPct
+//     (SUT utime+stime from /proc, in percent of ONE core), and
+//     ResourceStats.Window (the slice bounds + sample counts). Until now
+//     ServerResult.Resources carried ONE column-wide mean stamped onto
+//     every scenario the column ran (the 27 scenarios of a celeris column
+//     all reported the identical mean_cpu_pct), so no per-cell CPU
+//     comparison — and no cpu-per-byte A/B — was possible. Resources is
+//     unchanged (still the column-wide aggregate); the new map is the
+//     per-scenario view. Also adds Environment.SUTEnv, the KEY=VALUE
+//     overrides the bench passed into the SUT process, so an A/B arm is
+//     identifiable from results.json alone. Additive — older readers
+//     ignore every new field.
 const SchemaVersion = "5.9"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
@@ -302,6 +320,14 @@ type Environment struct {
 	// omitted when the line rate is unknown (the Tailscale overlay), in
 	// which case no cell is flagged. Schema v5.5+.
 	FabricLineRateBitsPerSec int64 `json:"fabric_line_rate_bits_per_sec,omitempty"`
+
+	// SUTEnv records the KEY=VALUE environment overrides the bench merged
+	// into the SUT process (benchmark-tier.yml `sut_env` → BENCH_SUT_ENV →
+	// ansible bench_sut_env). Schema v5.9+ (celeris#585). Omitted when the
+	// run passed none, so an A/B arm (e.g. CELERIS_IOURING_SEND_ZC=off) is
+	// identifiable from results.json alone, next to the engine's own
+	// server.log arm line.
+	SUTEnv map[string]string `json:"sut_env,omitempty"`
 }
 
 // BenchmarkConfig records the orchestrator flags + tunables that
@@ -400,6 +426,19 @@ type ServerResult struct {
 	// every metric is a nullable pointer: non-Go competitors expose
 	// RSS/CPU/FD only, leaving goroutine/GC/heap null.
 	Resources map[string]*ResourceStats `json:"resources,omitempty"`
+
+	// ScenarioResources is the PER-SCENARIO slice of the same raw series
+	// (schema v5.9+, celeris#585), keyed by Scenario.Name(): the column's
+	// 1 Hz mpstat cpu.log and observer.sqlite rows windowed to the
+	// scenario's own runner window (started_at + warmup .. completed_at)
+	// and summarised on their own. Resources above is the COLUMN-WIDE
+	// aggregate stamped onto every scenario (one mpstat run covers the
+	// whole column pass); this map is what a per-cell CPU comparison must
+	// read. Entries carry ResourceStats.Window with the slice bounds and
+	// sample counts. A scenario whose window caught NO sample has no
+	// entry here — "no data", never a zero — so absence is the signal.
+	// Omitted when no scenario carried a windowed slice.
+	ScenarioResources map[string]*ResourceStats `json:"scenario_resources,omitempty"`
 
 	// NetworkBound flags, per scenario, the cells whose achieved egress
 	// bandwidth sat at/near the fabric line rate while the loadgen still
@@ -775,6 +814,24 @@ type ResourceStats struct {
 	// positionally between the observer's unix-second rows and mpstat's
 	// wall-clock rows; both sample at ~1 Hz over the same window.
 	Series []ResourcePoint `json:"series,omitempty"`
+
+	// Window is set ONLY on a per-scenario slice (schema v5.9+,
+	// ServerResult.ScenarioResources): the [start, end] the raw series was
+	// cut to and how many samples of each kind fell inside. Nil on the
+	// column-wide aggregate.
+	Window *ResourceWindow `json:"window,omitempty"`
+}
+
+// ResourceWindow describes the slice a per-scenario ResourceStats was
+// computed over (schema v5.9+, celeris#585). Start is the scenario's
+// runner started_at plus the warm-up, End its completed_at; both
+// inclusive at 1 s resolution. The counts are the samples that fell
+// inside — the denominators behind every mean in the summary.
+type ResourceWindow struct {
+	Start           time.Time `json:"start"`
+	End             time.Time `json:"end"`
+	CPUSamples      int       `json:"cpu_samples"`
+	ObserverSamples int       `json:"observer_samples"`
 }
 
 // ResourceSummary is the scalar headline of a cell's resource usage.
@@ -787,6 +844,20 @@ type ResourceSummary struct {
 	GCPauseP99Ns   *int64   `json:"gc_pause_p99_ns,omitempty"`
 	GoroutineHWM   *int64   `json:"goroutine_hwm,omitempty"`
 	FDHWM          *int64   `json:"fd_hwm,omitempty"`
+
+	// MeanSoftPct is the mean mpstat %soft (softirq) over the window
+	// (schema v5.9+). Nil when the cpu.log carried no %soft column or the
+	// stats were not windowed per scenario.
+	MeanSoftPct *float64 `json:"mean_soft_pct,omitempty"`
+
+	// SUTProcessCPUPct is the SUT process's own CPU over the window
+	// (schema v5.9+): (utime+stime delta from /proc/<pid>/stat) / wall
+	// time, in percent of ONE core (so 3200 means every one of 32 cores),
+	// the same convention as top/pidstat. Separates the server's CPU from
+	// host-wide softirq/kernel work that mean_cpu_pct folds in. Nil when
+	// the observer wrote no cpu tick columns (pre-v5.9 observer) or fewer
+	// than two ticks samples fell in the window.
+	SUTProcessCPUPct *float64 `json:"sut_process_cpu_pct,omitempty"`
 }
 
 // ResourcePoint is one downsampled sample in a ResourceStats.Series.
