@@ -77,10 +77,16 @@ jobs:
         with:
           go-version: "1.27.0"
           cache: true
-      - name: Install the aarch64 cross C compiler
+      - name: Install the aarch64 cross C compiler and its libc headers
+        # libc6-dev-arm64-cross is only a Recommends of the compiler package,
+        # so --no-install-recommends left the cross gcc reading the HOST's
+        # /usr/include and runtime/cgo failed on bits/libc-header-start.h
+        # (run 34727620439). Naming the headers keeps the install minimal
+        # and makes the cross build work; proven in an ubuntu:24.04
+        # container with and without the package.
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Install mage
         run: |
           go install github.com/magefile/mage@latest
