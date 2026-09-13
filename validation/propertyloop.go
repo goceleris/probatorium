@@ -104,6 +104,16 @@ func appendDeclared(list string, ids ...string) string {
 	return list
 }
 
+// isIOUringEngine reports whether a celeris.engine value names the io_uring
+// engine. celeris publishes engine.Type.String(), which is "io_uring" with
+// the underscore (engine/enginetype.go); the matrix, the cell names and
+// the -refapp-engine flag spell it "iouring". The first checkptr tier run
+// compared against the slug and declared I-ENG-IOURING in 0 of 16 io_uring
+// cells; both spellings are accepted so neither side can silently drift.
+func isIOUringEngine(name string) bool {
+	return name == "io_uring" || name == "iouring"
+}
+
 // propertyLoopSnapshotEvery is the tick cadence of the SnapshotPath
 // write (30 s at 1 Hz).
 const propertyLoopSnapshotEvery = 30
@@ -255,7 +265,7 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		// only under -tags=validation: an epoll or std cell has no ring to
 		// check, and a plain build has no checker. Both facts come from the
 		// document, so the declaration is an observation, not an assumption.
-		if snap.ValidationBuild && snap.EngineName == "iouring" {
+		if snap.ValidationBuild && isIOUringEngine(snap.EngineName) {
 			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-ENG-IOURING")
 		}
 		lastGood, haveLast = snap, true
