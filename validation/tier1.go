@@ -233,6 +233,9 @@ type tier1Tally struct {
 	sse           *sseTally
 	liveness      *livenessTally
 	rfc           *rfcTally
+	// readyAt is the unix-nano instant the refapp announced its bound
+	// address: the origin of the walkers' since_ready_ms (celeris#588).
+	readyAt atomic.Int64
 }
 
 // driveTier1 is the production Tier 1 entry point. Starts the refapp,
@@ -343,6 +346,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	select {
 	case <-readyCh:
 		// refapp bound — proceed to fan out walkers.
+		tally.readyAt.Store(time.Now().UnixNano())
 	case err := <-readyErrCh:
 		joinStderrIfDead()
 		return tally.snapshot(), fmt.Errorf("tier1: refapp not ready: %w", err)
@@ -457,6 +461,8 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	tally.sse = sseTallyPtr
 	rfcTallyPtr := &rfcTally{}
 	tally.rfc = rfcTallyPtr
+	// Per-fire capture for the h2c / WS walkers (walker_capture.go).
+	armWalkerCapture(runCtx, tally.readyAt.Load(), h2cTallyPtr, wsTallyPtr)
 	if cfg.OnResponseCounters != nil {
 		cfg.OnResponseCounters(rfcTallyPtr.counters)
 	}
@@ -1106,9 +1112,13 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 	}
 	if t.liveness != nil {
 		s.Liveness = t.liveness.snapshot()
+		s.RefappStderrTail = t.liveness.tailSnapshot()
 	}
 	if t.rfc != nil {
 		s.RFCConformance = t.rfc.snapshot()
+	}
+	if r := t.readyAt.Load(); r != 0 {
+		s.ReadyAt = time.Unix(0, r).UTC().Format(time.RFC3339Nano)
 	}
 	return s
 }
@@ -1137,6 +1147,12 @@ type tier1TallySnapshot struct {
 	SSEKill               sseSnapshot         `json:"sse_kill,omitempty"`
 	RFCConformance        rfcSnapshot         `json:"rfc_conformance,omitempty"`
 	Liveness              livenessSnapshot    `json:"liveness,omitempty"`
+	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
+	// bound address; RefappStderrTail the last lines it wrote after that
+	// (livenessTally.tailSnapshot). Both reach the cell document
+	// (celeris#588).
+	ReadyAt          string   `json:"ready_at,omitempty"`
+	RefappStderrTail []string `json:"refapp_stderr_tail,omitempty"`
 	// Properties is the in-process property loop's tally
 	// (validation/propertyloop.go), attached by the orchestrator once
 	// driveTier1 returns -- the loop runs beside the walkers, not inside

@@ -72,6 +72,48 @@ type livenessTally struct {
 	mu        sync.Mutex
 	signature string // first crash-signature line scraped from stderr
 	trace     string // bounded stderr tail captured around the crash
+
+	// tail is the rolling ring of the last refappTailMaxLines post-ready
+	// lines. It used to be local to superviseStderr and was read only when
+	// the process died, so for a LIVE refapp the engine's Warn/Error lines
+	// -- the epoll "accepted fd exceeds conn table cap; dropping", the
+	// EMFILE/ENFILE path, the io_uring "re-create listen socket" -- were
+	// discarded (celeris#588). Owned here so tailSnapshot can hand it to
+	// the cell document and to every incident dossier while the process
+	// is still up.
+	tail    [refappTailMaxLines]string
+	tailLen int
+	tailPos int
+}
+
+// pushTail appends one post-ready line to the ring.
+func (l *livenessTally) pushTail(line string) {
+	l.mu.Lock()
+	l.tail[l.tailPos] = line
+	l.tailPos = (l.tailPos + 1) % refappTailMaxLines
+	if l.tailLen < refappTailMaxLines {
+		l.tailLen++
+	}
+	l.mu.Unlock()
+}
+
+// tailSnapshot copies the ring oldest first. nil when nothing was written,
+// so a quiet refapp's cell document omits the key.
+func (l *livenessTally) tailSnapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.tailLen == 0 {
+		return nil
+	}
+	start := 0
+	if l.tailLen == refappTailMaxLines {
+		start = l.tailPos
+	}
+	out := make([]string, 0, l.tailLen)
+	for i := 0; i < l.tailLen; i++ {
+		out = append(out, l.tail[(start+i)%refappTailMaxLines])
+	}
+	return out
 }
 
 // recordHang marks the refapp as wedged: alive but unresponsive (health probe
@@ -373,10 +415,10 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 	capturing := false
 	var trace strings.Builder
 	traceLines := 0
-	// Rolling ring of the last refappTailMaxLines post-ready lines, so a death
-	// with NO recognised crash signature still records its final output.
-	ring := make([]string, refappTailMaxLines)
-	ringLen, ringPos := 0, 0
+	// The rolling ring of the last refappTailMaxLines post-ready lines lives
+	// on the tally (pushTail / tailSnapshot), so a death with NO recognised
+	// crash signature still records its final output AND a live refapp's
+	// engine warnings reach the cell document.
 	for sc.Scan() {
 		line := sc.Text()
 		if !ready {
@@ -391,11 +433,7 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 			}
 			continue
 		}
-		ring[ringPos] = line
-		ringPos = (ringPos + 1) % refappTailMaxLines
-		if ringLen < refappTailMaxLines {
-			ringLen++
-		}
+		l.pushTail(line)
 		if capturing {
 			if traceLines < crashTraceMaxLines && trace.Len() < crashTraceMaxBytes {
 				trace.WriteString(line)
@@ -447,18 +485,18 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 	switch {
 	case capturing:
 		l.attachTrace(trace.String())
-	case ready && ringLen > 0:
+	case ready:
 		// Died after ready with no recognised crash signature (e.g. a clean
 		// os.Exit(1) from the refapp's own log.Fatalf). Attach the tail of the
 		// merged stream so the incident records WHY instead of just "exit=1".
-		start := 0
-		if ringLen == refappTailMaxLines {
-			start = ringPos
+		lines := l.tailSnapshot()
+		if len(lines) == 0 {
+			return
 		}
 		var tail strings.Builder
 		tail.WriteString("--- refapp stdout+stderr tail (no crash signature) ---\n")
-		for i := 0; i < ringLen; i++ {
-			tail.WriteString(ring[(start+i)%refappTailMaxLines])
+		for _, line := range lines {
+			tail.WriteString(line)
 			tail.WriteByte('\n')
 		}
 		l.attachTrace(tail.String())

@@ -138,6 +138,8 @@ Each slice keeps its own `tally`. **HIGH-severity counters** are must-be-zero in
 | `h2c.crashed > 0` | `I-H2C-CRASHED` | Engine crashed on upgrade — PauseAccept race fired |
 | `ws.accepted_bad_frame > 0` | `I-WS-ACCEPTED` | Server accepted an RFC 6455 violation |
 | `ws.hang_no_close > 0` | `I-WS-HANG` | WebSocket goroutine wedged |
+| `h2c.hang > 0` | `I-H2C-HANG` | An h2c upgrade was neither answered nor declined within the 20 s budget (record-only: dossier without gcore, the cell runs on) |
+| `ws.handshake_fail > 0` | `I-WS-HANDSHAKE` | A WebSocket upgrade handshake did not complete within 2 s (record-only) |
 | `drv.read_after_write_mismatch > 0` | `I-DRV-1` | Postgres / Redis / Memcached driver lost a write |
 
 A zero is only health when the oracle ran. `mage ValidateGate` therefore also fails a `kitchen_sink` cell whose `h2c_churn.h2c_upgraded == 0` after sending preambles: every churn mode then degenerated into a plain declined GET, so `h2c_hang` / `h2c_crashed` judged a path the engine never entered. That was the state of every cell until `kitchen_sink` moved to `Protocol: celeris.Auto` — 172,656 preambles across the v1.5.11 nightly's 48 cells, zero 101s, gate green (probatorium#279). Same class as the dead-cell (`requests_sent == 0`) and never-evaluated-property rules.

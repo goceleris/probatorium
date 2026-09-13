@@ -89,7 +89,7 @@ func TestDebugVars_DocumentShape(t *testing.T) {
 	doc := getVars(t, base)
 	// Every key the checker parser reads must be a top-level JSON number
 	// (memstats nested, Go-cased).
-	for _, k := range []string{"goroutines", "celeris.accepted_conn_total", "celeris.closed_conn_total", "celeris.active_conns", "celeris.panic_count", "celeris.adaptive_switches"} {
+	for _, k := range []string{"goroutines", "celeris.accepted_conn_total", "celeris.closed_conn_total", "celeris.active_conns", "celeris.panic_count", "celeris.adaptive_switches", "celeris.engine_error_count"} {
 		num(t, doc, k)
 	}
 	if num(t, doc, "goroutines") < 1 {

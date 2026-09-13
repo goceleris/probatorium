@@ -57,6 +57,12 @@ type Snapshot struct {
 	ClosedConnTotal   int64
 	ActiveConns       int64
 	PanicCount        int64
+	// EngineErrorCount is celeris EngineMetrics.ErrorCount: the engine's
+	// accept-side and protocol error paths (epoll conn-table cap and
+	// EMFILE drops, io_uring listener re-creation). Judged by no
+	// predicate; recorded in the per-cell series so a step in it can be
+	// joined against a walker's slow-read record (celeris#588).
+	EngineErrorCount int64
 	// ExpectedPanics is the number of panics the workload DESIGNED so far
 	// (corpus states marked `expect: panic`, counted by the Tier 1 walker
 	// when their 5xx arrives). Zero when no accounting is wired (e.g. the
