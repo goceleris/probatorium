@@ -17,11 +17,12 @@ const seriesFlushEvery = 30
 //
 // Deliberately narrow. This is not a dump of Snapshot: it is the inputs the
 // slope oracles judge, plus the three columns that say WHICH KIND of growth a
-// rising heap is. See seriesWriter for why that distinction is the whole point.
+// rising heap is, plus the adaptive switch counter (only the adaptive engine
+// moves it; the series shows WHEN a cell promoted, celeris#580). See seriesWriter for why that distinction is the whole point.
 var seriesColumns = []string{
 	"ts", "goroutines", "heap_inuse", "heap_alloc", "heap_objects",
 	"heap_idle", "heap_released", "stack_inuse", "rss",
-	"accepted", "closed", "active",
+	"accepted", "closed", "active", "adaptive_switches",
 }
 
 // seriesWriter appends one row per property-loop sample to a CSV in the cell
@@ -84,6 +85,7 @@ func (s *seriesWriter) Record(snap properties.Snapshot) {
 		snap.HeapObjects, snap.HeapIdleBytes, snap.HeapReleasedBytes,
 		snap.StackInuseBytes, snap.RSSBytes,
 		snap.AcceptedConnTotal, snap.ClosedConnTotal, snap.ActiveConns,
+		snap.AdaptiveSwitches,
 	}
 	for i, x := range v {
 		s.row[i] = strconv.FormatInt(x, 10)

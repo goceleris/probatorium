@@ -180,7 +180,7 @@ Registered predicates judged only where their data source exists (listed under `
 
 A matrix run emits a v5.5 `validate-results.json` whose `Cells[]` holds one entry per `(refapp, engine, arch)`. `mage ValidateDiff` walks the two latest matrix docs and reports:
 
-- **Cross-engine** divergence: a HIGH-severity counter non-zero on one engine (e.g. `iouring`) but zero on another (`epoll` / `std`) for the same `(refapp, arch)` — typically an engine-specific bug.
+- **Cross-engine** divergence: a HIGH-severity counter non-zero on one engine (e.g. `iouring`) but zero on another (`epoll` / `std` / `adaptive`) for the same `(refapp, arch)` — typically an engine-specific bug.
 - **Cross-arch** divergence: the same shape, comparing amd64 ↔ arm64.
 
 It exits non-zero on HIGH severity and persists `validate-diff/diff.{txt,json}` for dashboards. It runs automatically in the CI tiers below.
@@ -227,7 +227,7 @@ Each follows the same shape: its own `go.mod`, an `engine.go` (`resolveEngine("a
 Iterates `(refapp × engine)` cells, runs a fresh orchestrator per cell with a per-cell budget of `total_duration / len(cells)`, and emits one matrix-aware v5.5 `validate-results.json` with `Cells[]` populated. It falls back to single-cell behaviour when unset (preserving back-compat). Filter the matrix with:
 
 - `VALIDATE_MATRIX_REFAPPS=driver_postgres,driver_redis` — limit refapps.
-- `VALIDATE_MATRIX_ENGINES=iouring,epoll` — limit engines (defaults to the OS production set: iouring + epoll + std on Linux, std elsewhere).
+- `VALIDATE_MATRIX_ENGINES=iouring,epoll` — limit engines (defaults to the OS production set: iouring + epoll + std + adaptive on Linux, std elsewhere).
 
 ## Result layout
 

@@ -1,6 +1,6 @@
 name: Race Validation
 
-# Nightly matrix-mode validate run: every refapp × every engine, 1h
+# Nightly matrix-mode validate run: every refapp × every engine, 80m
 # budget. Catches slow regressions the 10-minute PR tier doesn't
 # have time to surface (heap drift, goroutine creep, the 99th-
 # percentile invariant violations that need volume).
@@ -26,7 +26,7 @@ on:
         default: ""
         type: string
       duration:
-        description: per-tier-total duration (default 1h)
+        description: per-tier-total duration (default 80m)
         required: false
         type: string
         default: 1h
@@ -188,7 +188,7 @@ jobs:
 
       - name: mage Validate (matrix mode, both archs)
         env:
-          VALIDATE_DURATION: ${{ inputs.duration || '1h' }}
+          VALIDATE_DURATION: ${{ inputs.duration || '80m' }}
           VALIDATE_TARGET: both
           VALIDATE_MATRIX: "1"
           # Run the cells from refapps-race/ instead of refapps/. Those
@@ -204,7 +204,7 @@ jobs:
           # parallel so the per-tier wall-clock matches inputs.duration
           # instead of 2× it.
           VALIDATE_PARALLEL: "1"
-          # Per-cell budget in matrix mode is ~150s (1h / 24 cells),
+          # Per-cell budget in matrix mode is ~150s (80m / 32 cells),
           # which the duration-tiered default treats as "short smoke
           # run" → concurrency=1. That leaves the h2c / ws / sse
           # walker slices DORMANT (thresholds 10/20/20). Override to
@@ -241,9 +241,13 @@ jobs:
         # is present on every engine; this gate can. probatorium#274.
         if: success()
         env:
-          # 8 refapps x 3 engines x 2 archs when refapps=all. A csv selection
+          # 8 refapps x 4 engines x 2 archs when refapps=all. A csv selection
           # runs fewer; the gate still requires every planned cell to report.
-          VALIDATE_GATE_EXPECT_CELLS: ${{ (inputs.refapps == '' || inputs.refapps == 'all') && '48' || '' }}
+          VALIDATE_GATE_EXPECT_CELLS: ${{ (inputs.refapps == '' || inputs.refapps == 'all') && '64' || '' }}
+          # Every adaptive cell must promote epoll -> io_uring at least once;
+          # the matrix sizes those cells so the controller's threshold is
+          # reachable, and this proves it was (celeris#580).
+          VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH: "1"
           # Every cell of this tier is a -race build and must have declared
           # I-RACE; a refapp that silently lost the detector would otherwise
           # hide behind the waiver.

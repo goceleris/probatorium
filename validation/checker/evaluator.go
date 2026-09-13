@@ -23,7 +23,7 @@ const HistoryCap = 3600
 // wire scraper):
 // I-CONN-2, I-MEM-1, I-MEM-3, I-MEM-4 (linux local driver only -- the
 // Tally also lists it as not instrumented when RSS was never sampled),
-// I-PANIC, I-ENG-ADAPTIVE, I-RFC-1 and I-RFC-2 (validation/rfc_scrape.go
+// I-PANIC, I-RFC-1 and I-RFC-2 (validation/rfc_scrape.go
 // reads responses off the wire, so they judge what celeris wrote rather
 // than what celeris reports), plus the [DeclaredOnly] set below in the
 // cells whose refapp declares them.
@@ -54,6 +54,7 @@ var DeclaredOnly = map[string]string{
 	// Declared by the property loop for an io_uring cell whose refapp
 	// reports celeris.validation_build: the SQE check exists only there.
 	"I-ENG-IOURING":  "judged only in an io_uring cell whose refapp is a -tags=validation build; declared by the property loop on both facts",
+	"I-ENG-ADAPTIVE": "judged only in an adaptive cell; celeris.adaptive_switches is a structural zero on iouring, epoll and std, so the predicate verified nothing there (celeris#580)",
 	"I-MW-SESSION":   "only the refapps that install middleware/session keep the id→owner ledger the predicate judges",
 	"I-MW-JWT":       "only the refapps that install middleware/jwt mint tokens and re-verify their expiry",
 	"I-MW-RATELIMIT": "only the refapps that install the in-process middleware/ratelimit run the shadow token bucket",
@@ -118,6 +119,11 @@ type Tally struct {
 	// NotInstrumented are the evaluated IDs listed in Uninstrumented:
 	// they passed vacuously and are excluded from Passed.
 	NotInstrumented []string `json:"not_instrumented,omitempty"`
+	// AdaptiveSwitches is the highest celeris.adaptive_switches value
+	// sampled. Only the adaptive engine moves it; the gate's
+	// ExpectAdaptiveSwitch reads it to prove an adaptive cell actually
+	// promoted (celeris#580) instead of idling on its start engine.
+	AdaptiveSwitches int64 `json:"adaptive_switches"`
 	// NotJudged are the instrumented IDs whose every evaluation was a
 	// skip -- typically the slope predicates in a cell shorter than
 	// warm-up + window (15 min). They verified nothing and are excluded
@@ -302,6 +308,9 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 	e.ctx.IdleMode = snap.IdleWindow > 0
 	if snap.IdleWindow > e.tally.IdleWindows {
 		e.tally.IdleWindows = snap.IdleWindow
+	}
+	if snap.AdaptiveSwitches > e.tally.AdaptiveSwitches {
+		e.tally.AdaptiveSwitches = snap.AdaptiveSwitches
 	}
 	e.ctx.Now = now
 	e.ctx.History = append(e.ctx.History, snap)

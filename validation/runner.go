@@ -187,6 +187,15 @@ type Config struct {
 	// keeping every io_uring code path covered. Must be 0 or >= 2 (celeris
 	// rejects Workers in [1,2)).
 	RefappWorkers int
+
+	// ConcurrencyFloor, when > 0, raises the walker count to at least this
+	// many, after the duration-tiered default and the VALIDATE_CONCURRENCY
+	// override. The matrix sets it for adaptive cells: the adaptive
+	// controller promotes epoll to io_uring only at 24 active conns per
+	// worker sustained over two 1 s ticks, and a cell that never crosses
+	// that line validates the start engine, not the adaptive one. See
+	// adaptiveCellConcurrencyFloor in cmd/validator/matrix.go.
+	ConcurrencyFloor int
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -794,18 +803,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	//
 	// VALIDATE_CONCURRENCY env override wins over the duration-tiered
 	// default — ops can manually tune for capacity tests.
-	concurrency := 10
-	switch {
-	case o.cfg.Duration < 5*time.Minute:
-		concurrency = 1
-	case o.cfg.Duration >= time.Hour:
-		concurrency = 50
-	}
-	if v := os.Getenv("VALIDATE_CONCURRENCY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			concurrency = n
-		}
-	}
+	concurrency := resolveConcurrency(o.cfg.Duration, os.Getenv("VALIDATE_CONCURRENCY"), o.cfg.ConcurrencyFloor)
 
 	pidCh := make(chan int, 1)
 	var refappPID atomic.Int64 // 0 until the refapp is up; read by the incident emitters
@@ -1325,6 +1323,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		PropertyViolationIDs: append([]string(nil), s.Properties.ViolationIDs...),
 		PropertyPollErrors:   s.Properties.PollErrors,
 		PropertyLoopSkipped:  s.Properties.SkippedReason,
+		AdaptiveSwitches:     s.Properties.AdaptiveSwitches,
 		Adversarial: map[string]int64{
 			"adv_sent":               s.Adversarial.Sent,
 			"adv_well_rejected":      s.Adversarial.WellRejected,
@@ -1608,4 +1607,27 @@ func writeJSON(path string, v any) error {
 		return err
 	}
 	return os.WriteFile(path, buf, 0o644)
+}
+
+// resolveConcurrency picks the Tier 1 walker count: the duration-tiered
+// default, then the VALIDATE_CONCURRENCY override, then the cell's floor,
+// which wins over both because it encodes a property of the engine under
+// test rather than an operator preference (Config.ConcurrencyFloor).
+func resolveConcurrency(d time.Duration, envOverride string, floor int) int {
+	concurrency := 10
+	switch {
+	case d < 5*time.Minute:
+		concurrency = 1
+	case d >= time.Hour:
+		concurrency = 50
+	}
+	if envOverride != "" {
+		if n, err := strconv.Atoi(envOverride); err == nil && n > 0 {
+			concurrency = n
+		}
+	}
+	if floor > concurrency {
+		concurrency = floor
+	}
+	return concurrency
 }

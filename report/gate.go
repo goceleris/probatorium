@@ -76,6 +76,14 @@ type GateOptions struct {
 	// the gate still green. Per cell, so the report names where it went
 	// missing.
 	ExpectInstrumented []string
+	// ExpectAdaptiveSwitch fails every adaptive cell whose property loop ran
+	// and never sampled celeris.adaptive_switches >= 1: the engine stayed on
+	// its start engine (epoll) for the whole cell, so the adaptive
+	// promotion path, the one thing that makes the cell different from an
+	// epoll cell, was never exercised (celeris#580). The matrix sizes
+	// adaptive cells so that the promotion is reachable (see
+	// cmd/validator/matrix.go); this is the check that it happened.
+	ExpectAdaptiveSwitch bool
 
 	// H2CUpgradeRefapps names the refapps whose cells must record at least
 	// one completed h1->h2c upgrade (tier_1.h2c_churn.h2c_upgraded > 0)
@@ -96,12 +104,13 @@ type GateOptions struct {
 // The reasons mirror validation/checker.Uninstrumented; report/ is a leaf
 // package and does not import it.
 var WaivedUninstrumented = map[string]string{
-	"I-RACE":        "instrumented only in the race tier, whose refapps are -race builds (cgo, built on a GitHub-hosted runner and shipped to the nodes); a normal run deploys no such refapp",
-	"I-CHECKPTR":    "instrumented only in cells whose refapp is a -tags=checkptr build; a run that deploys none has no cell that can judge it",
-	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
-	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",
-	"I-MEM-2":       "instrumented only in cells long enough to idle the refapp twice (20 min or more; the soak's 1 h cells); a 150 s nightly cell never idles",
-	"I-ENG-IOURING": "instrumented only in the io_uring cells of the instrumented tier (refapps built -tags=checkptr,validation); a normal run deploys no such refapp",
+	"I-RACE":         "instrumented only in the race tier, whose refapps are -race builds (cgo, built on a GitHub-hosted runner and shipped to the nodes); a normal run deploys no such refapp",
+	"I-CHECKPTR":     "instrumented only in cells whose refapp is a -tags=checkptr build; a run that deploys none has no cell that can judge it",
+	"I-RFC-1":        "needs the response-scraping MITM in front of each refapp",
+	"I-RFC-2":        "needs the response-scraping MITM in front of each refapp",
+	"I-MEM-2":        "instrumented only in cells long enough to idle the refapp twice (20 min or more; the soak's 1 h cells); a 150 s nightly cell never idles",
+	"I-ENG-IOURING":  "instrumented only in the io_uring cells of the instrumented tier (refapps built -tags=checkptr,validation); a normal run deploys no such refapp",
+	"I-ENG-ADAPTIVE": "instrumented only in adaptive cells; a run whose engine subset excludes adaptive (VALIDATE_MATRIX_ENGINES) has no cell that can judge it",
 }
 
 // ranPropertyLoop reports whether the cell's in-process property loop
@@ -499,6 +508,15 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			}
 			add(c, "properties_not_instrumented."+id, 1,
 				"this tier expects the predicate instrumented in every cell (VALIDATE_GATE_EXPECT_INSTRUMENTED) and the cell never declared it; the waiver on record does not apply here")
+		}
+	}
+	if opts.ExpectAdaptiveSwitch {
+		for _, c := range cells {
+			if c.Engine != "adaptive" || !ranPropertyLoop(c) || c.Tier1.AdaptiveSwitches >= 1 {
+				continue
+			}
+			add(c, "tier_1.adaptive_switches", 0,
+				"this tier expects every adaptive cell to promote at least once (VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH) and the engine never left its start engine; the cell validated epoll, not the adaptive path")
 		}
 	}
 	if opts.RequireInstrumented {

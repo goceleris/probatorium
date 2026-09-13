@@ -110,6 +110,8 @@ func appendDeclared(list string, ids ...string) string {
 // the -refapp-engine flag spell it "iouring". The first checkptr tier run
 // compared against the slug and declared I-ENG-IOURING in 0 of 16 io_uring
 // cells; both spellings are accepted so neither side can silently drift.
+func isAdaptiveEngine(name string) bool { return name == "adaptive" }
+
 func isIOUringEngine(name string) bool {
 	return name == "io_uring" || name == "iouring"
 }
@@ -267,6 +269,14 @@ func runPropertyLoop(ctx context.Context, cfg propertyLoopConfig) checker.Tally 
 		// document, so the declaration is an observation, not an assumption.
 		if snap.ValidationBuild && isIOUringEngine(snap.EngineName) {
 			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-ENG-IOURING")
+		}
+		// I-ENG-ADAPTIVE reads celeris.adaptive_switches, a counter that
+		// only the adaptive engine ever moves: on iouring, epoll and std it
+		// is a structural zero and the predicate passed vacuously in every
+		// cell of every run before the adaptive engine joined the matrix
+		// (celeris#580). Declared from the engine name the refapp reports.
+		if isAdaptiveEngine(snap.EngineName) {
+			snap.InstrumentedProperties = appendDeclared(snap.InstrumentedProperties, "I-ENG-ADAPTIVE")
 		}
 		lastGood, haveLast = snap, true
 		if cfg.ResponseConformance != nil {
