@@ -61,6 +61,13 @@ type livenessTally struct {
 	// unlike a checkptr throw this is a live counter the property loop
 	// reads on every tick (I-RACE), not a post-mortem one.
 	raceReports atomic.Int64
+	// raceSamples keeps the text of the first raceSampleMax reports, so
+	// the site is in the cell document rather than only in a stderr tail
+	// that the next few thousand lines may have scrolled out of. Counting
+	// a report and discarding its text is the oracle shape that has
+	// blocked diagnosis before (RULE ELEVEN); the count is for the
+	// predicate, the sample is for the person who reads the dossier.
+	raceSamples []string
 
 	mu        sync.Mutex
 	signature string // first crash-signature line scraped from stderr
@@ -140,6 +147,29 @@ func (l *livenessTally) snapshot() livenessSnapshot {
 
 		CheckptrReports: l.checkptrReports.Load(),
 		RaceReports:     l.raceReports.Load(),
+		RaceReportSamples: func() []string {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			return append([]string(nil), l.raceSamples...)
+		}(),
+	}
+}
+
+// raceSampleMax bounds the report texts kept per cell; every report past
+// it is still counted. raceSampleMaxLines bounds one report: the runtime
+// prints a handful of frames per side plus the goroutine origins, and a
+// report never reaches sixty lines of substance.
+const (
+	raceSampleMax      = 3
+	raceSampleMaxLines = 60
+)
+
+// recordRaceSample keeps the text of a report while there is room.
+func (l *livenessTally) recordRaceSample(text string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.raceSamples) < raceSampleMax {
+		l.raceSamples = append(l.raceSamples, text)
 	}
 }
 
@@ -177,6 +207,11 @@ type livenessSnapshot struct {
 	// RaceReports is the number of race-detector reports seen on stderr;
 	// always 0 for a refapp not built with -race.
 	RaceReports int64 `json:"race_reports"`
+	// RaceReportSamples is the text of the first few reports (see
+	// raceSampleMax): the "WARNING: DATA RACE" header through the closing
+	// rule, with the read/write sites and goroutine origins the runtime
+	// prints between them.
+	RaceReportSamples []string `json:"race_report_samples,omitempty"`
 }
 
 // Reason renders a one-line human-readable cause for the incident message.
@@ -328,6 +363,10 @@ func looksLikeCrash(line string) bool {
 //     process from exiting and HIDE the crash from the exit watcher.
 func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), onReadyFail func(error), onCrash func()) {
 	sc := bufio.NewScanner(r)
+	// raceBuf collects one race-detector report from its header to its
+	// closing rule; raceLines is 0 outside a report.
+	var raceBuf strings.Builder
+	raceLines := 0
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	ready := false
 	var preReady strings.Builder
@@ -367,6 +406,23 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 		}
 		if isRaceReport(line) {
 			l.raceReports.Add(1)
+			raceBuf.Reset()
+			raceBuf.WriteString(line)
+			raceBuf.WriteByte('\n')
+			raceLines = 1
+			continue
+		}
+		if raceLines > 0 {
+			// Inside a report: the runtime closes it with a rule of '='.
+			// Keep the text up to and including that rule, or until the
+			// line budget runs out, then hand the sample over.
+			raceBuf.WriteString(line)
+			raceBuf.WriteByte('\n')
+			raceLines++
+			if strings.HasPrefix(strings.TrimSpace(line), "==================") || raceLines >= raceSampleMaxLines {
+				l.recordRaceSample(raceBuf.String())
+				raceLines = 0
+			}
 		}
 		if looksLikeCrash(line) {
 			l.recordSignature(strings.TrimSpace(line))

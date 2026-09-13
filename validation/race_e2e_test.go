@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +73,9 @@ func TestRaceReportIsCountedEndToEnd(t *testing.T) {
 	}
 	if s.Crashed {
 		t.Fatalf("a race report is not a crash, but the scan recorded one: %q", s.Signature)
+	}
+	if len(s.RaceReportSamples) == 0 || !strings.Contains(s.RaceReportSamples[0], "WARNING: DATA RACE") || !strings.Contains(s.RaceReportSamples[0], "racedemo") {
+		t.Fatalf("the report text must be kept and name the program, got %q", s.RaceReportSamples)
 	}
 }
 
