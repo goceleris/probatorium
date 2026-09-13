@@ -123,7 +123,13 @@ func ParseObserverDB(path string) ([]ObserverSample, error) {
 			if err := rows.Scan(&s.TSUnix, &s.FDCount, &s.RSSBytes, &s.Goroutines, &s.HeapInuseBytes, &s.GCPauseP99Ns, &ut, &st); err != nil {
 				return nil, fmt.Errorf("scan %s: %w", path, err)
 			}
-			if ut.Valid && st.Valid {
+			// A 0 total is "unreadable", not a measurement: the observer
+			// writes 0/0 when /proc/<pid>/stat is gone (the respawn
+			// supervisor replaced the PID it pinned), and a process that
+			// has bound a socket and served a warm-up cannot have 0 ticks.
+			// Treating it as absent keeps a respawned SUT's window at
+			// sut_process_cpu_pct=nil instead of a false 0.
+			if ut.Valid && st.Valid && ut.Int64+st.Int64 > 0 {
 				s.CPUTicks = ut.Int64 + st.Int64
 				s.CPUTicksOK = true
 			}

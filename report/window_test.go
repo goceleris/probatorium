@@ -240,6 +240,38 @@ func TestWindowResourcesLegacyObserverNoTicks(t *testing.T) {
 	}
 }
 
+// TestWindowResourcesZeroTicksAreAbsent: the observer writes 0/0 ticks
+// when /proc/<pid>/stat is unreadable (the respawn supervisor replaced
+// the PID it pinned). A window over such rows must report
+// sut_process_cpu_pct=nil — absent — never a false 0 %.
+func TestWindowResourcesZeroTicksAreAbsent(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "observer.sqlite")
+	base := utc(t, "2026-09-13T10:00:00Z").Unix()
+	writeObserverDBTicks(t, dbPath, []obsTickRow{
+		{ts: base, rss: 100, utime: 0, stime: 0},
+		{ts: base + 1, rss: 100, utime: 0, stime: 0},
+		{ts: base + 2, rss: 100, utime: 0, stime: 0},
+	})
+	samples, err := ParseObserverDB(dbPath)
+	if err != nil {
+		t.Fatalf("ParseObserverDB: %v", err)
+	}
+	for i, s := range samples {
+		if s.CPUTicksOK {
+			t.Fatalf("sample %d: 0/0 ticks must read as absent", i)
+		}
+	}
+	got, st := WindowResources(samples, nil, time.Unix(base, 0), time.Unix(base+2, 0))
+	if st != WindowOK || got == nil {
+		t.Fatalf("status=%q stats=%v", st, got)
+	}
+	if got.Summary.SUTProcessCPUPct != nil {
+		t.Errorf("sut_process_cpu_pct=%v want nil (dead-PID zeros are not a measurement)", *got.Summary.SUTProcessCPUPct)
+	}
+}
+
 // TestParseMPStatWallClockVariants pins the timestamp reconstruction
 // across the layouts the parser accepts: 12 h AM/PM rows with the C
 // locale MM/DD/YY banner, and a midnight rollover, plus a banner with no
