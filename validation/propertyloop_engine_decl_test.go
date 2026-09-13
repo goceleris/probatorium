@@ -30,13 +30,19 @@ func TestRunPropertyLoop_DeclaresIENGIOURingOnlyForValidationBuildOnIOUring(t *t
 			Specs:      []properties.Spec{properties.IENGIOURing},
 		})
 	}
+	// celeris publishes engine.Type.String(): "io_uring", underscore and
+	// all. The first checkptr tier run declared in 0 of 16 io_uring cells
+	// because the loop compared against the matrix slug "iouring".
+	if ni := run("io_uring", true).NotInstrumented; slices.Contains(ni, "I-ENG-IOURING") {
+		t.Errorf("validation build on io_uring (as celeris spells it) must declare I-ENG-IOURING, got not_instrumented=%v", ni)
+	}
 	if ni := run("iouring", true).NotInstrumented; slices.Contains(ni, "I-ENG-IOURING") {
-		t.Errorf("validation build on io_uring must declare I-ENG-IOURING, got not_instrumented=%v", ni)
+		t.Errorf("the slug spelling must declare too, got not_instrumented=%v", ni)
 	}
 	if ni := run("epoll", true).NotInstrumented; !slices.Contains(ni, "I-ENG-IOURING") {
 		t.Errorf("a validation build on epoll has no ring to check; must stay not-instrumented, got %v", ni)
 	}
-	if ni := run("iouring", false).NotInstrumented; !slices.Contains(ni, "I-ENG-IOURING") {
+	if ni := run("io_uring", false).NotInstrumented; !slices.Contains(ni, "I-ENG-IOURING") {
 		t.Errorf("a plain build on io_uring has no checker; must stay not-instrumented, got %v", ni)
 	}
 }
