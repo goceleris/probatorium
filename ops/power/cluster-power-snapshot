@@ -22,7 +22,7 @@
 # partially-completed run with no way to resume it.
 #
 # So we copy, rarely and small: only the per-cell JSON results, only on an
-# actual power event. A validation run is 48 cells and a full bench 813, all
+# actual power event. A validation run is 64 cells and a full bench 813, all
 # small JSON, so this is single-digit MB against a drive rated in hundreds of
 # TBW. It does not meaningfully move the wear needle, and it is the
 # difference between resuming a run and losing it.

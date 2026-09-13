@@ -144,14 +144,15 @@ func ValidateGate() error {
 		requireCoverage = false
 	}
 	opts := report.GateOptions{
-		ExpectedCells:       gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
-		RequireTier3:        os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
-		RequireSoak:         os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
-		RequireProperties:   requireProps,
-		RequireInstrumented: requireInstr,
-		RequireCoverage:     requireCoverage,
-		H2CUpgradeRefapps:   gateEnvRefapps("VALIDATE_GATE_H2C_UPGRADE_REFAPPS"),
-		ExpectInstrumented:  gateEnvRefapps("VALIDATE_GATE_EXPECT_INSTRUMENTED"),
+		ExpectedCells:        gateEnvInt("VALIDATE_GATE_EXPECT_CELLS", 0),
+		RequireTier3:         os.Getenv("VALIDATE_GATE_REQUIRE_TIER3") != "0",
+		RequireSoak:          os.Getenv("VALIDATE_GATE_REQUIRE_SOAK") == "1",
+		RequireProperties:    requireProps,
+		RequireInstrumented:  requireInstr,
+		RequireCoverage:      requireCoverage,
+		H2CUpgradeRefapps:    gateEnvRefapps("VALIDATE_GATE_H2C_UPGRADE_REFAPPS"),
+		ExpectInstrumented:   gateEnvRefapps("VALIDATE_GATE_EXPECT_INSTRUMENTED"),
+		ExpectAdaptiveSwitch: os.Getenv("VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH") == "1",
 	}
 	cellSoaks := 0
 	var propEvals, propViol int64

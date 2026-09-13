@@ -61,6 +61,12 @@ func TestWaivedUninstrumented_ReasonsAreOnRecord(t *testing.T) {
 	if _, ok := WaivedUninstrumented["I-DRV"]; ok {
 		t.Error("I-DRV must not be waived: the driver refapps declare it")
 	}
+	// I-ENG-ADAPTIVE has a data source only in adaptive cells; a run whose
+	// engine subset excludes adaptive must not fail RequireInstrumented on
+	// it, and a full-matrix run judges it in the adaptive cells.
+	if _, ok := WaivedUninstrumented["I-ENG-ADAPTIVE"]; !ok {
+		t.Error("I-ENG-ADAPTIVE must be waived for engine-subset runs (celeris#580)")
+	}
 	// The three middleware predicates are instrumented now; waiving them
 	// would re-hide exactly the gap probatorium#297 closed.
 	for _, id := range []string{"I-MW-SESSION", "I-MW-JWT", "I-MW-RATELIMIT"} {

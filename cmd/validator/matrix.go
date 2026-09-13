@@ -50,7 +50,7 @@ type MatrixConfig struct {
 
 	// Engines is a comma-separated list of celeris engine names
 	// (iouring|epoll|std|adaptive). Empty (or "auto") expands to
-	// the platform's production set: iouring+epoll+std on linux,
+	// the platform's production set: iouring+epoll+std+adaptive on linux,
 	// std on every other GOOS. Skips engines unsupported on the
 	// current host so a darwin developer can still smoke the
 	// matrix locally (only the std cell runs).
@@ -289,7 +289,7 @@ func expandEngines(spec string) []string {
 	switch strings.ToLower(spec) {
 	case "auto":
 		if runtime.GOOS == "linux" {
-			return []string{"iouring", "epoll", "std"}
+			return []string{"iouring", "epoll", "std", "adaptive"}
 		}
 		return []string{"std"}
 	}
@@ -300,13 +300,16 @@ func expandEngines(spec string) []string {
 		switch e {
 		case "":
 			continue
-		case "iouring", "epoll":
+		case "iouring", "epoll", "adaptive":
+			// adaptive composes epoll and io_uring, so celeris rejects it
+			// off Linux too ("engine adaptive requires Linux"); a darwin
+			// smoke that listed it would only produce a dead cell.
 			if runtime.GOOS != "linux" {
 				// Skip linux-only engines on other OSes.
 				continue
 			}
 			out = append(out, e)
-		case "std", "adaptive":
+		case "std":
 			out = append(out, e)
 		default:
 			// Unknown engine: keep it; the refapp will error out
@@ -609,7 +612,8 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		PropertyHardFail: cfg.PropertyHardFail,
 		ReplayBin:        cfg.ReplayBin,
 		RefappEngine:     mc.Engine,
-		RefappWorkers:    cfg.RefappWorkers,
+		RefappWorkers:    cellRefappWorkers(mc.Engine, cfg.RefappWorkers),
+		ConcurrencyFloor: cellConcurrencyFloor(mc.Engine),
 		DriverMode:       cfg.DriverMode,
 		DriverSSHUser:    cfg.DriverSSHUser,
 		DriverSSHHost:    cfg.DriverSSHHost,
@@ -706,4 +710,43 @@ func seedServicesWithRetry(ctx context.Context, spec string) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// The adaptive engine starts on epoll and promotes new connections to
+// io_uring only when the controller sees at least 24 active connections per
+// worker for two consecutive 1 s ticks (celeris adaptive/controller.go,
+// upThreshold; the load-driven revert is off in production). At the
+// cluster's default worker count (GOMAXPROCS: 12 and 32) a validation cell
+// of 30-50 walkers sits at 1-4 conns/worker and never promotes, so an
+// adaptive cell would validate epoll under another name. Two constants
+// make the promotion reachable and MEASURED (the gate's ExpectAdaptiveSwitch
+// fails an adaptive cell that never switched):
+//
+//   - adaptiveCellWorkers = 2, the smallest worker count celeris accepts
+//     (resource.MinWorkers), so the threshold is 48 active connections;
+//   - adaptiveCellConcurrencyFloor = 60 walkers. The last nightly and soak
+//     artifacts (34720853871, 34616620237) show 0.93-0.97 active conns per
+//     walker on every refapp (30 walkers → p50 28-30, 50 → 45-48), so 60
+//     walkers hold ~57 connections: 19% above the line, in every cell, on
+//     both arches.
+//
+// An explicit -refapp-workers cap still applies to every engine; the floor
+// only ever raises the walker count.
+const (
+	adaptiveCellWorkers          = 2
+	adaptiveCellConcurrencyFloor = 60
+)
+
+func cellRefappWorkers(engine string, capFromFlag int) int {
+	if capFromFlag > 0 || engine != "adaptive" {
+		return capFromFlag
+	}
+	return adaptiveCellWorkers
+}
+
+func cellConcurrencyFloor(engine string) int {
+	if engine != "adaptive" {
+		return 0
+	}
+	return adaptiveCellConcurrencyFloor
 }

@@ -600,6 +600,10 @@ type Tier1Summary struct {
 	// PropertyPollErrors: polls that yielded no sample (transport error,
 	// non-200, unparseable body). Informational.
 	PropertyPollErrors int64 `json:"property_poll_errors"`
+	// AdaptiveSwitches is the highest celeris.adaptive_switches the property
+	// loop sampled. Meaningful only for an adaptive cell, where the gate's
+	// ExpectAdaptiveSwitch requires it to be at least 1 (celeris#580).
+	AdaptiveSwitches int64 `json:"adaptive_switches,omitempty"`
 
 	// Per-slice sub-tallies (one per workload-mix slice from
 	// validator-prod issue #55). Each is a plain `map[string]int64`

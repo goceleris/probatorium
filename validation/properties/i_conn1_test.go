@@ -20,7 +20,9 @@ import (
 // one sweep -- exactly the old threshold. Turning the predicate on at that
 // value would have failed cells on healthy traffic, everywhere.
 func TestICONN1HealthyIdleConnDoesNotFire(t *testing.T) {
-	for _, engine := range []string{"io_uring", "epoll"} {
+	// adaptive only ever runs epoll or io_uring underneath, so it shares
+	// their 45 s bound rather than std's 150 s one.
+	for _, engine := range []string{"io_uring", "epoll", "adaptive"} {
 		t.Run(engine, func(t *testing.T) {
 			// A conn caught a few hundred ms past the reap deadline, before
 			// the sweep got to it. Entirely normal.
