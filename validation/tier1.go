@@ -615,14 +615,24 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 
 	// Optional periodic tally-callback + snapshot-to-disk for reactive
 	// incident emission AND mid-run progress visibility. Stops when ctx
-	// is done; doesn't participate in wg because the observation work
-	// is best-effort, not workload.
+	// is done; not part of the walker fleet's WaitGroup because the
+	// observation work is best-effort, not workload -- but it IS joined
+	// before driveTier1 returns (snapDone). Unjoined, a tick still inside
+	// its write when the tier returned left tier1_tally.json empty for a
+	// reader that came next (CI, run 34727613829), and on the cluster the
+	// same straggler could overwrite the orchestrator's FINAL tally with a
+	// stale one. The write is also atomic (temp file + rename) so no
+	// reader can ever see a truncated file.
+	snapDone := make(chan struct{})
+	close(snapDone)
 	if cfg.TallyCallback != nil || cfg.SnapshotPath != "" {
 		interval := cfg.TallyCallbackInterval
 		if interval <= 0 {
 			interval = 2 * time.Second
 		}
+		snapDone = make(chan struct{})
 		go func() {
+			defer close(snapDone)
 			tick := time.NewTicker(interval)
 			defer tick.Stop()
 			emit := func() {
@@ -631,9 +641,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 					cfg.TallyCallback(snap)
 				}
 				if cfg.SnapshotPath != "" {
-					if data, err := json.MarshalIndent(snap, "", "  "); err == nil {
-						_ = os.WriteFile(cfg.SnapshotPath, data, 0o644)
-					}
+					writeSnapshotAtomically(cfg.SnapshotPath, snap)
 				}
 			}
 			for {
@@ -675,6 +683,10 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	} else {
 		launch(runCtx, 0).Wait()
 	}
+	// Every path above ends with runCtx done, so the periodic writer is
+	// on its way out; wait for it so nothing of this tier writes after
+	// the caller has the tally.
+	<-snapDone
 	joinStderrIfDead()
 	snap := tally.snapshot()
 	// If the refapp crashed OR hung, the periodic ticker stopped at cancelRun
@@ -686,6 +698,22 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		cfg.TallyCallback(snap)
 	}
 	return snap, nil
+}
+
+// writeSnapshotAtomically marshals snap and lands it at path through a
+// sibling temp file and a rename, so a reader never sees a partially
+// written or truncated tally. Best-effort: the in-memory tally stays
+// authoritative and a failed write is not an error the tier reports.
+func writeSnapshotAtomically(path string, snap tier1TallySnapshot) {
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
 }
 
 // holdIdle publishes idle window n for d, then clears it; with d <= 0 it
