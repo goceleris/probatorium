@@ -3,13 +3,13 @@ module github.com/goceleris/probatorium/validation/refapp/driver_memcached
 go 1.27.0
 
 require (
-	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20260913015651-ededb6c2caa2
+	github.com/goceleris/celeris v1.5.12-0.20260913173206-5dfa6be3c030
 	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
 )
 
