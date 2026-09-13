@@ -45,6 +45,29 @@ var (
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}
+	// IH2CHang and IWSHandshake are the two gated walker counters that
+	// never had a reactive incident: h2c_hang and ws_handshake_fail failed
+	// the gate at end of run with a cause class and nothing else, so the
+	// v1.5.11 soak's one of each is unattributable forever (celeris#588).
+	// The orchestrator fires them RECORD-ONLY -- dossier without gcore,
+	// the cell keeps running -- so the per-event evidence (the walkers'
+	// slow-read rings, the refapp stderr tail, goroutine.pprof, /proc,
+	// dmesg) is on disk while the process is still up. The dossier is the
+	// fallback; the rings and the histograms are the primary evidence,
+	// because a dossier taken after a walker's budget expired lands after
+	// any stall shorter than that budget.
+	IH2CHang = Spec{
+		ID:          "I-H2C-HANG",
+		Description: "an h2c upgrade request must be answered or declined within the walker's budget (Tier 1 h2c.hang == 0)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
+	IWSHandshake = Spec{
+		ID:          "I-WS-HANDSHAKE",
+		Description: "a WebSocket upgrade handshake must complete (Tier 1 ws.handshake_fail == 0)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
 	// ILiveness is the engine-agnostic crash oracle: the refapp PROCESS must
 	// survive the whole run. Unlike the other walker predicates (which key on
 	// a protocol-specific torture counter), this fires on ANY process death —

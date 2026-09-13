@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/goceleris/probatorium/report"
 )
 
 // wsTortureMode names one shape of malformed WebSocket frame the
@@ -52,22 +54,29 @@ const (
 
 // recordHandshakeFail increments the total plus the cause-specific
 // counter. status is the received status line when the failure was a
-// non-101 response, empty otherwise.
-func (t *wsTally) recordHandshakeFail(err error, status string) {
+// non-101 response, empty otherwise. Returns the cause name, which the
+// slow-read ring files as the fire's outcome ("handshake-fail-" + cause).
+func (t *wsTally) recordHandshakeFail(err error, status string) string {
 	t.handshakeFail.Add(1)
 	switch {
 	case status != "":
 		t.handshakeFailStatus.Add(1)
+		return "status"
 	case err == nil:
 		t.handshakeFailOther.Add(1)
+		return "other"
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		t.handshakeFailTimeout.Add(1)
+		return "timeout"
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		t.handshakeFailEOF.Add(1)
+		return "eof"
 	case errors.Is(err, syscall.ECONNRESET):
 		t.handshakeFailReset.Add(1)
+		return "reset"
 	default:
 		t.handshakeFailOther.Add(1)
+		return "other"
 	}
 }
 
@@ -138,6 +147,16 @@ type wsTally struct {
 	acceptedBadFrame     atomic.Int64
 	hangNoClose          atomic.Int64
 	endpointAbsent       atomic.Int64
+	// dialFail / writeFail count fires that never reached the handshake
+	// read. Previously dropped without a counter. Informational, not
+	// gated (see h2cTally.dialFail).
+	dialFail  atomic.Int64
+	writeFail atomic.Int64
+	// capture is the per-fire latency histogram, the slow-read ring and
+	// the validator heartbeat (walker_capture.go, celeris#588). The read
+	// leg is the handshake: from the end of the upgrade write to the blank
+	// line that ends the response headers.
+	capture fireCapture
 }
 
 // wsSnapshot is the value-typed projection emitted into the tally
@@ -158,6 +177,14 @@ type wsSnapshot struct {
 	AcceptedBadFrame     int64 `json:"ws_accepted_bad_frame"`
 	HangNoClose          int64 `json:"ws_hang_no_close"`
 	EndpointAbsent       int64 `json:"ws_endpoint_absent"`
+
+	DialFail  int64 `json:"ws_dial_fail"`
+	WriteFail int64 `json:"ws_write_fail"`
+	// SlowReadsTotal counts every fire whose handshake read exceeded
+	// slowReadThreshold; SlowReads keeps the last slowFireRingSize of them.
+	SlowReadsTotal int64                `json:"ws_slow_reads_total"`
+	Latency        report.WalkerLatency `json:"ws_latency"`
+	SlowReads      []report.SlowFire    `json:"ws_slow_reads,omitempty"`
 }
 
 // recordRoute stores the pre-flight verdict for this cell.
@@ -182,6 +209,12 @@ func (t *wsTally) snapshot() wsSnapshot {
 		AcceptedBadFrame:     t.acceptedBadFrame.Load(),
 		HangNoClose:          t.hangNoClose.Load(),
 		EndpointAbsent:       t.endpointAbsent.Load(),
+
+		DialFail:       t.dialFail.Load(),
+		WriteFail:      t.writeFail.Load(),
+		SlowReadsTotal: t.capture.slow.total.Load(),
+		Latency:        t.capture.latency.snapshot(),
+		SlowReads:      t.capture.slow.snapshot(),
 	}
 }
 
@@ -231,10 +264,20 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 ) {
 	tally.sent.Add(1)
 	const timeout = wsMaxHold
+	// The dial has its own budget (the dialer's); the write and the
+	// handshake read share a fresh one set after the dial. Each leg is
+	// timed separately so the ring can say WHICH leg expired -- the
+	// design's ask -- without changing the 2 s hold the I-CONN-1 bound
+	// test asserts.
 	d := net.Dialer{Timeout: timeout}
+	dialStart := time.Now()
 	conn, err := d.DialContext(ctx, "tcp", hostPort)
+	dialD := time.Since(dialStart)
 	if err != nil {
-		// Dial failure is infra — don't fold into outcomes.
+		// Dial failure is infra — don't fold into outcomes. Counted and
+		// bucketed on its own so a deaf listener is at least visible.
+		tally.dialFail.Add(1)
+		tally.capture.recordDialFail(dialD, err)
 		return
 	}
 	defer func() { _ = conn.Close() }()
@@ -245,17 +288,33 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 	// RFC 6455 §1.3 and reply with the expected Sec-WebSocket-Accept.
 	const clientKey = "dGhlIHNhbXBsZSBub25jZQ==" // RFC 6455 example
 	upgrade := wsUpgradeRequest(hostPort, path, clientKey)
+	writeStart := time.Now()
 	if _, err := conn.Write(upgrade); err != nil {
+		tally.writeFail.Add(1)
+		tally.capture.recordWriteFail(dialD, time.Since(writeStart), err)
 		return
 	}
+	writeD := time.Since(writeStart)
 
 	// Read the response status line + headers. We don't need to fully
 	// parse — we just need to confirm the 101 and find the empty line
 	// separating headers from frame bytes.
+	//
+	// This is the read leg the ring keeps: a handshake that took over a
+	// second, failed or not, is filed with its instant, error and
+	// addresses (celeris#588).
 	br := bufio.NewReader(conn)
+	readStart := time.Now()
+	nRead := 0
+	fail := func(err error, status string) {
+		cause := tally.recordHandshakeFail(err, status)
+		tally.capture.record(conn, dialD, writeD, time.Since(readStart), err,
+			"handshake-fail-"+cause, status, nRead, readStart)
+	}
 	statusLine, err := br.ReadString('\n')
+	nRead += len(statusLine)
 	if err != nil {
-		tally.recordHandshakeFail(err, "")
+		fail(err, "")
 		return
 	}
 	if !strings.HasPrefix(statusLine, "HTTP/1.1 101") {
@@ -267,16 +326,19 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 		// handshake_fail.
 		if strings.HasPrefix(statusLine, "HTTP/1.1 404") {
 			tally.endpointAbsent.Add(1)
+			tally.capture.record(conn, dialD, writeD, time.Since(readStart), nil,
+				"endpoint-absent", strings.TrimSpace(statusLine), nRead, readStart)
 			return
 		}
-		tally.recordHandshakeFail(nil, strings.TrimSpace(statusLine))
+		fail(nil, strings.TrimSpace(statusLine))
 		return
 	}
 	// Eat headers until we see the blank line that ends them.
 	for {
 		line, err := br.ReadString('\n')
+		nRead += len(line)
 		if err != nil {
-			tally.recordHandshakeFail(err, "")
+			fail(err, "")
 			return
 		}
 		if line == "\r\n" || line == "\n" {
@@ -288,6 +350,7 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 	// the hash — that's the celeris middleware's job — but reaching
 	// this line means the response was at least well-formed.
 	tally.upgraded.Add(1)
+	tally.capture.record(conn, dialD, writeD, time.Since(readStart), nil, "upgraded", "", nRead, readStart)
 
 	// Send the torture frame.
 	switch mode {

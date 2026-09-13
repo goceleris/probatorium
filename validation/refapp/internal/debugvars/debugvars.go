@@ -272,6 +272,14 @@ func (v *Vars) Document() map[string]any {
 		if info := srv.EngineInfo(); info != nil {
 			doc["celeris.active_conns"] = info.Metrics.ActiveConnections
 			doc["celeris.adaptive_switches"] = int64(info.Metrics.AdaptiveSwitches)
+			// EngineMetrics.ErrorCount is bumped on the engine's
+			// accept-side error paths (the epoll conn-table cap and
+			// EMFILE/ENFILE drops, the io_uring listener re-creation).
+			// Exported so the property loop's 1 Hz series shows it
+			// STEP at the instant of a deaf-listener event, which is the
+			// one class a walker's timeout cannot tell from a stall
+			// (celeris#588). Not judged by any predicate.
+			doc["celeris.engine_error_count"] = int64(info.Metrics.ErrorCount)
 			doc["celeris.engine"] = info.Type.String()
 		}
 	}

@@ -39,6 +39,8 @@ func All() []Spec {
 		IH2CCrashed,
 		IWSAccepted,
 		IWSHang,
+		IH2CHang,
+		IWSHandshake,
 		ILiveness,
 		IHang,
 	}

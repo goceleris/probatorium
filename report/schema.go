@@ -81,7 +81,18 @@ import (
 //     list without the by-design one, so its short-cell oracles would
 //     every one of them read as coverage failures, and the check
 //     defaults off for it.
-const SchemaVersion = "5.8"
+//   - 5.9 — per-fire capture for the h2c-churn and WS-torture walkers
+//     (celeris#588). Adds, on Tier1Summary, the per-leg latency
+//     histograms (h2c_latency / ws_latency), the bounded rings of slow
+//     fires (h2c_slow_reads / ws_slow_reads: instant, per-leg elapsed,
+//     outcome, verbatim error, both socket addresses), the refapp's
+//     ready instant (ready_at) and the tail of its stderr
+//     (refapp_stderr_tail). Before these the v1.5.11 soak's single
+//     h2c_hang and single ws_handshake_fail were unattributable from
+//     the artifact: the cell kept a cause class and one max elapsed.
+//     Additive; older readers ignore every field. The gated totals keep
+//     their meaning and the new keys are not gated.
+const SchemaVersion = "5.9"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -625,6 +636,98 @@ type Tier1Summary struct {
 	// rather than a stringly-typed map value so the counters stay numeric
 	// for the gate. Bounded at the source (validation/sse.go sseMaxEarlyErrs).
 	SSEEarlyErrs []string `json:"sse_early_errs,omitempty"`
+
+	// H2CLatency / WSLatency are the per-leg latency histograms of every
+	// fire the h2c-churn and WS-torture walkers made (schema 5.9,
+	// celeris#588). A stall shorter than the walker's read budget never
+	// fails a fire -- it lands late as `declined` / `upgraded` -- so the
+	// gated totals alone cannot see the 1.5-8 s once-a-minute class that
+	// celeris#493 was; these can, as a burst in the 1-10 s read buckets.
+	// Nil when the slice never ran.
+	H2CLatency *WalkerLatency `json:"h2c_latency,omitempty"`
+	WSLatency  *WalkerLatency `json:"ws_latency,omitempty"`
+	// H2CSlowReads / WSSlowReads are the bounded rings (oldest first) of
+	// every fire whose read leg exceeded one second, failed or not. Every
+	// h2c_hang and every ws_handshake_fail_timeout is in here with its
+	// timestamp, error string and addresses; h2c_slow_reads_total /
+	// ws_slow_reads_total in the maps say how many the ring could not
+	// hold. Omitted on a cell with no slow fire.
+	H2CSlowReads []SlowFire `json:"h2c_slow_reads,omitempty"`
+	WSSlowReads  []SlowFire `json:"ws_slow_reads,omitempty"`
+	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
+	// bound address, i.e. the origin of every SlowFire.SinceReadyMs and
+	// of the mod-60 phase histogram the design computes offline.
+	ReadyAt string `json:"ready_at,omitempty"`
+	// RefappStderrTail is the last refappTailMaxLines (80) lines the refapp
+	// wrote to its merged stdout+stderr after ready. The refapps log the
+	// engine's Warn/Error lines there (fd-cap drops, EMFILE, listener
+	// re-creation) and nothing else; before 5.9 those were kept only when
+	// the process died. The same text is written to
+	// <cell>/refapp_stderr_tail.txt and into every incident dossier.
+	RefappStderrTail []string `json:"refapp_stderr_tail,omitempty"`
+}
+
+// LatencyBuckets is a fixed-edge histogram of one leg (dial, write or
+// read) of a walker fire. Timeout counts legs that ended with the walker's
+// own deadline, whatever their elapsed; the elapsed buckets classify every
+// other leg. Ge20s is structurally zero (no walker budget exceeds 20 s)
+// and exists so nothing is silently folded.
+type LatencyBuckets struct {
+	Lt100ms int64 `json:"lt_100ms"`
+	Lt1s    int64 `json:"lt_1s"`
+	Lt2s    int64 `json:"lt_2s"`
+	Lt5s    int64 `json:"lt_5s"`
+	Lt10s   int64 `json:"lt_10s"`
+	Lt20s   int64 `json:"lt_20s"`
+	Ge20s   int64 `json:"ge_20s"`
+	Timeout int64 `json:"timeout"`
+}
+
+// Total is the number of legs the histogram observed.
+func (b LatencyBuckets) Total() int64 {
+	return b.Lt100ms + b.Lt1s + b.Lt2s + b.Lt5s + b.Lt10s + b.Lt20s + b.Ge20s + b.Timeout
+}
+
+// WalkerLatency is the three legs of one walker's fires.
+type WalkerLatency struct {
+	Dial  LatencyBuckets `json:"dial"`
+	Write LatencyBuckets `json:"write"`
+	Read  LatencyBuckets `json:"read"`
+}
+
+// SlowFire is one walker fire whose read leg exceeded one second.
+type SlowFire struct {
+	// TS is the UTC instant (RFC3339Nano) the read leg ended.
+	TS string `json:"ts"`
+	// SinceReadyMs is TS minus the refapp's ready instant; 0 when the
+	// walker ran without one (unit tests).
+	SinceReadyMs int64 `json:"since_ready_ms,omitempty"`
+	DialMs       int64 `json:"dial_ms"`
+	WriteMs      int64 `json:"write_ms"`
+	ReadMs       int64 `json:"read_ms"`
+	// Outcome is the walker's classification: for h2c one of upgraded,
+	// declined, crashed, hang-timeout, hang-eof, hang-reset, hang-other;
+	// for WS one of upgraded, endpoint-absent, handshake-fail-timeout,
+	// handshake-fail-eof, handshake-fail-reset, handshake-fail-status,
+	// handshake-fail-other.
+	Outcome string `json:"outcome"`
+	// Err is the verbatim error that ended the read leg; empty when the
+	// read completed.
+	Err string `json:"err,omitempty"`
+	// Status is the non-101 status line a WS handshake was answered with.
+	Status string `json:"status,omitempty"`
+	// NRead is the bytes the read leg returned before it ended.
+	NRead int `json:"n_read"`
+	// LocalAddr / RemoteAddr are the walker's socket addresses: the
+	// engine<->client join key (celeris#562), and what an `ss -tnp`
+	// snapshot on the server side is matched against.
+	LocalAddr  string `json:"local_addr,omitempty"`
+	RemoteAddr string `json:"remote_addr,omitempty"`
+	// ValidatorSkewMs is the longest validator heartbeat gap (>500 ms)
+	// observed while this read was in flight: nonzero means the validator
+	// process itself was starved or frozen, so the elapsed is not the
+	// server's alone.
+	ValidatorSkewMs int64 `json:"validator_skew_ms,omitempty"`
 }
 
 // Tier3Summary mirrors the validator's tier3TallySnapshot.

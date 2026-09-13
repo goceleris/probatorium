@@ -354,6 +354,47 @@ func causeSuffix(m map[string]int64, key string) string {
 	return " (" + strings.Join(parts, ", ") + ")"
 }
 
+// slowFireDetail maps a gated total to the slow-fire ring that carries its
+// per-event records.
+func slowFireDetail(t *Tier1Summary, key string) []SlowFire {
+	switch key {
+	case "h2c_hang":
+		return t.H2CSlowReads
+	case "ws_handshake_fail":
+		return t.WSSlowReads
+	}
+	return nil
+}
+
+// FirstFailedSlowFire renders the first failed record of a slow-fire ring
+// as a message suffix, e.g. " first: 2026-09-06T04:32:31Z read=20000ms
+// outcome=hang-timeout err=\"read tcp ...: i/o timeout\" local=127.0.0.1:41234".
+// Empty when the ring holds no failed fire (a document from before the
+// rings existed reads exactly as it did). Informational: the violation is
+// still the total.
+func FirstFailedSlowFire(ring []SlowFire) string {
+	for _, f := range ring {
+		if !strings.HasPrefix(f.Outcome, "hang-") && !strings.HasPrefix(f.Outcome, "handshake-fail-") {
+			continue
+		}
+		s := fmt.Sprintf(" first: %s read=%dms outcome=%s", f.TS, f.ReadMs, f.Outcome)
+		if f.Err != "" {
+			s += fmt.Sprintf(" err=%q", f.Err)
+		}
+		if f.Status != "" {
+			s += fmt.Sprintf(" status=%q", f.Status)
+		}
+		if f.LocalAddr != "" {
+			s += " local=" + f.LocalAddr
+		}
+		if f.ValidatorSkewMs > 0 {
+			s += fmt.Sprintf(" validator_skew=%dms", f.ValidatorSkewMs)
+		}
+		return s
+	}
+	return ""
+}
+
 // Gate applies the ABSOLUTE zero-signal gate to every cell and, when present,
 // to each host's soak summary.
 //
@@ -470,7 +511,8 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 					m = t.SSEKill
 				}
 				if v := m[g.key]; v > 0 {
-					add(c, "tier_1."+g.slice+"."+g.key, v, g.why+causeSuffix(m, g.key))
+					add(c, "tier_1."+g.slice+"."+g.key, v,
+						g.why+causeSuffix(m, g.key)+FirstFailedSlowFire(slowFireDetail(t, g.key)))
 				}
 			}
 		}

@@ -23,6 +23,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -256,6 +257,13 @@ type Orchestrator struct {
 	// atomic.Pointer because the Tier 1 goroutine publishes it while the
 	// incident handler reads it.
 	resolvedAddr atomic.Pointer[string]
+
+	// stderrTail is the refapp's most recent stdout+stderr tail, as carried
+	// by every Tier 1 tally tick (tier1TallySnapshot.RefappStderrTail).
+	// Published by the tally callback, read by the incident handler so a
+	// dossier written while the refapp is still alive carries the engine's
+	// Warn/Error lines from the seconds before the event (celeris#588).
+	stderrTail atomic.Pointer[[]string]
 }
 
 // Plan is the deterministic schedule [Orchestrator.Run] would execute.
@@ -719,6 +727,14 @@ type Incident struct {
 	// Config.PropertyHardFail is off: the orchestrator writes the
 	// dossier and captures forensics but does NOT cancel the cell.
 	RecordOnly bool
+	// SkipCore leaves gcore out of the forensics. gcore SIGSTOPs the
+	// refapp for the length of the dump; on an incident raised by a
+	// walker whose whole finding is "the server was slow to answer"
+	// (I-H2C-HANG, I-WS-HANDSHAKE) that pause would manufacture the
+	// next occurrence of the very counter under investigation, in the
+	// cell that keeps running. The cheap legs (pprof, /proc, dmesg) are
+	// still taken.
+	SkipCore bool
 }
 
 // buildDriver constructs the remote.Driver per the orchestrator's
@@ -926,11 +942,15 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// hundreds of incidents per second once the bug catches.
 	alertedCounters := make(map[string]bool)
 	tallyCB := func(snap tier1TallySnapshot) {
+		// Publish the refapp's stderr tail for the dossier writer.
+		if tail := snap.RefappStderrTail; len(tail) > 0 {
+			o.stderrTail.Store(&tail)
+		}
 		// HIGH-severity sub-counters: anything non-zero is a bug.
 		// Mirror the canonical list from report.invariantCounters so
 		// the per-arch incident emission stays in sync with the
 		// cross-arch DiffValidation gate.
-		fire := func(counter, msg string, ok bool) {
+		fireIncident := func(counter, msg string, ok, recordOnly bool) {
 			if !ok || alertedCounters[counter] {
 				return
 			}
@@ -942,12 +962,19 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 				Message:     msg,
 				ObservedAt:  time.Now().UTC(),
 				RefappPID:   pid(),
+				RecordOnly:  recordOnly,
+				SkipCore:    recordOnly,
 			}:
 			default:
 				// Channel full or closed — orchestrator already
 				// handling a hard fail; nothing more to do.
 			}
 		}
+		fire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, false) }
+		// Record-only: dossier (no gcore) while the refapp is still up,
+		// and the cell runs on. The gate still fails on the total; this
+		// only adds evidence to it (celeris#588).
+		record := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, true) }
 		fire(properties.IADVAccepted.ID,
 			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
 			snap.Adversarial.WrongAccepted > 0)
@@ -960,6 +987,22 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		fire(properties.IWSHang.ID,
 			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
 			snap.WSTorture.HangNoClose > 0)
+		// The two gated walker totals that never had a reactive incident.
+		// Both carry the first slow-read record in the message so the
+		// incident.json alone names the instant, the error and the
+		// addresses; the full ring is in the tally snapshot beside it.
+		record(properties.IH2CHang.ID,
+			fmt.Sprintf("h2c upgrade request neither answered nor declined (count=%d: eof=%d timeout=%d reset=%d other=%d, max_elapsed=%dms)%s",
+				snap.H2CChurn.Hang, snap.H2CChurn.HangEOF, snap.H2CChurn.HangTimeout,
+				snap.H2CChurn.HangReset, snap.H2CChurn.HangOther, snap.H2CChurn.HangMaxElapsedMs,
+				report.FirstFailedSlowFire(snap.H2CChurn.SlowReads)),
+			snap.H2CChurn.Hang > 0)
+		record(properties.IWSHandshake.ID,
+			fmt.Sprintf("WebSocket upgrade handshake failed (count=%d: eof=%d timeout=%d reset=%d status=%d other=%d)%s",
+				snap.WSTorture.HandshakeFail, snap.WSTorture.HandshakeFailEOF, snap.WSTorture.HandshakeFailTimeout,
+				snap.WSTorture.HandshakeFailReset, snap.WSTorture.HandshakeFailStatus, snap.WSTorture.HandshakeFailOther,
+				report.FirstFailedSlowFire(snap.WSTorture.SlowReads)),
+			snap.WSTorture.HandshakeFail > 0)
 		// Engine-agnostic crash oracle: the refapp process died mid-run. This
 		// is the catch-all that the per-protocol counters above can't see — a
 		// dead server just looks like connection-refused to every walker.
@@ -1031,6 +1074,23 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	o.tier1Snapshot = tally
 	o.tier1Ran = true
 	_ = writeJSON(filepath.Join(o.cfg.OutDir, "tier1_tally.json"), tally)
+	// The refapp's stderr tail, unconditionally, so a cell that failed the
+	// gate on a walker counter has the engine's own last words next to the
+	// tally even when no incident fired (celeris#588).
+	_ = writeStderrTail(filepath.Join(o.cfg.OutDir, "refapp_stderr_tail.txt"), tally.RefappStderrTail)
+}
+
+// writeStderrTail writes the refapp's stderr tail to path with a header
+// that says how many lines it holds, so an empty file is a statement
+// ("the refapp wrote nothing after ready") rather than a missing capture.
+func writeStderrTail(path string, lines []string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# refapp stdout+stderr tail: %d line(s), last %d kept\n", len(lines), refappTailMaxLines)
+	for _, l := range lines {
+		b.WriteString(l)
+		b.WriteByte('\n')
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
 // runTierRESTler is Tier 2 — RESTler-style stateful fuzzer over the
@@ -1219,6 +1279,13 @@ func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
 	if err := writeJSON(filepath.Join(dir, "incident.json"), dossier); err != nil {
 		return "", err
 	}
+	// The refapp's stderr tail as of the last tally tick (at most 2 s
+	// old), while the process is still alive to have written it.
+	var tail []string
+	if p := o.stderrTail.Load(); p != nil {
+		tail = *p
+	}
+	_ = writeStderrTail(filepath.Join(dir, "refapp_stderr_tail.txt"), tail)
 	return dir, nil
 }
 
@@ -1290,7 +1357,7 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 	if r := o.resolvedAddr.Load(); r != nil && *r != "" {
 		addr = *r
 	}
-	return captureForensicsLive(ctx, dir, inc.RefappPID, addr)
+	return captureForensicsLiveOpts(ctx, dir, inc.RefappPID, addr, forensicsOpts{SkipCore: inc.SkipCore})
 }
 
 // Tier1Summary projects a tier1TallySnapshot into the public
@@ -1299,7 +1366,7 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 // writeValidateResults; kept exported here so callers outside the
 // validation package don't have to duplicate the map keys.
 func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
-	return &report.Tier1Summary{
+	out := &report.Tier1Summary{
 		RequestsSent:   s.RequestsSent,
 		Requests2xx:    s.Requests2xx,
 		Requests4xx:    s.Requests4xx,
@@ -1384,7 +1451,34 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"sse_endpoint_absent":     s.SSEKill.EndpointAbsent,
 		},
 		SSEEarlyErrs: s.SSEKill.EarlyErrs,
+		// Per-fire capture (celeris#588). The histograms are pointers so
+		// a cell whose slice never ran omits them rather than shipping
+		// twenty-four zeros; the rings are omitted when empty.
+		H2CLatency:       walkerLatencyIfRan(s.H2CChurn.Sent, s.H2CChurn.Latency),
+		WSLatency:        walkerLatencyIfRan(s.WSTorture.Sent, s.WSTorture.Latency),
+		H2CSlowReads:     append([]report.SlowFire(nil), s.H2CChurn.SlowReads...),
+		WSSlowReads:      append([]report.SlowFire(nil), s.WSTorture.SlowReads...),
+		ReadyAt:          s.ReadyAt,
+		RefappStderrTail: append([]string(nil), s.RefappStderrTail...),
 	}
+	m := out.H2CChurn
+	m["h2c_dial_fail"] = s.H2CChurn.DialFail
+	m["h2c_write_fail"] = s.H2CChurn.WriteFail
+	m["h2c_slow_reads_total"] = s.H2CChurn.SlowReadsTotal
+	m = out.WSTorture
+	m["ws_dial_fail"] = s.WSTorture.DialFail
+	m["ws_write_fail"] = s.WSTorture.WriteFail
+	m["ws_slow_reads_total"] = s.WSTorture.SlowReadsTotal
+	return out
+}
+
+// walkerLatencyIfRan returns a copy of l when the walker sent anything,
+// nil otherwise.
+func walkerLatencyIfRan(sent int64, l report.WalkerLatency) *report.WalkerLatency {
+	if sent == 0 {
+		return nil
+	}
+	return &l
 }
 
 // b2i renders a boolean tally field as the 0/1 the sub-tally maps
