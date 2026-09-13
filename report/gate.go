@@ -286,15 +286,21 @@ var DefaultH2CUpgradeRefapps = []string{"kitchen_sink"}
 // Informational counters are deliberately NOT here: *_sent, *_upgraded,
 // h2c_declined, h2c_intentional_rst, h2c_hang_max_elapsed_ms (a duration),
 // adv_well_rejected, ws_closed_correctly, sse_established, sse_events_read,
-// sse_killed_mid_stream (the validator kills on purpose) and *_endpoint_absent
-// (the refapp has no such endpoint). h2c_upgraded is informational as a
+// sse_killed_mid_stream (the validator kills on purpose), *_endpoint_absent
+// (the refapp has no such endpoint), and on the large-echo slice
+// ws_echo_fires, ws_echo_ok, ws_echo_close_ok, ws_echo_cut_at_deadline (the
+// budget ended mid-stream), ws_echo_frame_err (detail on a missing fire) and
+// ws_echo_handshake_fail -- the torture slice already gates a failed upgrade
+// on the very same route at many times the rate, and gating it twice would
+// report one routing defect as two violations. h2c_upgraded is informational as a
 // MAGNITUDE only -- its being zero is gated separately in Gate, because a
 // refapp that should upgrade and never did means the whole slice measured
 // nothing (probatorium#279).
 //
 // The CAUSE splits are also excluded, and deliberately so: h2c_hang_{eof,
-// timeout,reset,other} sum to h2c_hang, and ws_handshake_fail_{eof,timeout,
-// reset,status,other} sum to ws_handshake_fail. Gating both a total and its
+// timeout,reset,other} sum to h2c_hang, ws_handshake_fail_{eof,timeout,
+// reset,status,other} sum to ws_handshake_fail, and ws_echo_{egress_interleave,
+// other_corrupt} sum to ws_echo_corrupt. Gating both a total and its
 // parts reports one defect as two violations — the v1.5.11 soak printed "5
 // violations" for what were only THREE distinct events, because a single h2c
 // hang was counted once as h2c_hang and again as h2c_hang_timeout. The cause
@@ -324,6 +330,13 @@ var gatedTier1Keys = []struct{ slice, key, why string }{
 	// Both of these still fail: the split is for attribution, not tolerance.
 	{"sse_kill", "sse_peer_reset_early", "an SSE stream was reset before the client hung up (engine or transport -- see sse_early_errs)"},
 	{"sse_kill", "sse_read_err_early", "an SSE stream failed with an unclassified read error (see sse_early_errs)"},
+	// WebSocket large-echo slice (celeris#587): the wire-level oracle for
+	// large detached sends. Each row is a distinct defect shape; the
+	// corrupt row carries its attribution split as cause detail.
+	{"ws_echo", "ws_echo_corrupt", "a 64 KiB WebSocket echo was not the byte image of the frame sent"},
+	{"ws_echo", "ws_echo_reorder", "a 64 KiB WebSocket echo arrived out of sequence"},
+	{"ws_echo", "ws_echo_missing", "a WebSocket echo connection ended with frames still unanswered"},
+	{"ws_echo", "ws_echo_timeout", "a WebSocket echo connection stopped delivering before its hold expired"},
 }
 
 // causeCounters maps a gated total to the cause counters that sum to it.
@@ -332,6 +345,7 @@ var gatedTier1Keys = []struct{ slice, key, why string }{
 var causeCounters = map[string][]string{
 	"h2c_hang":          {"h2c_hang_eof", "h2c_hang_timeout", "h2c_hang_reset", "h2c_hang_other"},
 	"ws_handshake_fail": {"ws_handshake_fail_eof", "ws_handshake_fail_timeout", "ws_handshake_fail_reset", "ws_handshake_fail_status", "ws_handshake_fail_other"},
+	"ws_echo_corrupt":   {"ws_echo_egress_interleave", "ws_echo_other_corrupt"},
 }
 
 // causeSuffix renders the non-zero cause breakdown for a gated total, e.g.
@@ -509,6 +523,8 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 					m = t.WSTorture
 				case "sse_kill":
 					m = t.SSEKill
+				case "ws_echo":
+					m = t.WSEcho
 				}
 				if v := m[g.key]; v > 0 {
 					add(c, "tier_1."+g.slice+"."+g.key, v,
