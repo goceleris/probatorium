@@ -44,6 +44,7 @@ func TestStreamHoldsStayUnderTheConnCloseBound(t *testing.T) {
 		hold time.Duration
 	}{
 		{"WebSocket torture fire", wsMaxHold},
+		{"WebSocket large-echo fire", wsEchoMaxHold},
 		{"SSE kill fire", sseMaxHold},
 	} {
 		// Half the bound, not the bound itself: a hold that merely fits

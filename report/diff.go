@@ -70,6 +70,10 @@ var invariantCounters = []struct {
 	{"ws_torture", "ws_accepted_bad_frame", SeverityHigh},
 	{"ws_torture", "ws_hang_no_close", SeverityMed},
 	{"sse_kill", "sse_handshake_fail", SeverityLow},
+	{"ws_echo", "ws_echo_corrupt", SeverityHigh},
+	{"ws_echo", "ws_echo_reorder", SeverityHigh},
+	{"ws_echo", "ws_echo_missing", SeverityMed},
+	{"ws_echo", "ws_echo_timeout", SeverityMed},
 }
 
 // DiffValidation compares two ValidationResults (typically one per
@@ -159,6 +163,8 @@ func pickCounter(t *Tier1Summary, slice, counter string) int64 {
 		m = t.WSTorture
 	case "sse_kill":
 		m = t.SSEKill
+	case "ws_echo":
+		m = t.WSEcho
 	}
 	return m[counter]
 }

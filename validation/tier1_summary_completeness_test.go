@@ -36,6 +36,7 @@ func TestTier1SummaryExportsEveryTallyField(t *testing.T) {
 		{"h2c_churn", h2cSnapshot{}, summary.H2CChurn},
 		{"ws_torture", wsSnapshot{}, summary.WSTorture},
 		{"sse_kill", sseSnapshot{}, summary.SSEKill},
+		{"ws_echo", wsEchoSnapshot{}, summary.WSEcho},
 	}
 
 	// Top-level int64 fields of the snapshot must exist on the summary

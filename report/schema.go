@@ -90,8 +90,13 @@ import (
 //     (refapp_stderr_tail). Before these the v1.5.11 soak's single
 //     h2c_hang and single ws_handshake_fail were unattributable from
 //     the artifact: the cell kept a cause class and one max elapsed.
-//     Additive; older readers ignore every field. The gated totals keep
-//     their meaning and the new keys are not gated.
+//     Adds, in the same version, Tier1Summary.WSEcho (ws_echo_* keys):
+//     64 KiB frames echoed through the refapp's /ws and verified
+//     byte-for-byte, the wire-level oracle for the io_uring
+//     SEND_ZC-vs-inline-write window no earlier tier reached
+//     (celeris#587). All additive: older readers ignore every field, the
+//     gate reads an absent map as all zeros, the gated totals keep their
+//     meaning and the new keys are not gated.
 const SchemaVersion = "5.9"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
@@ -626,10 +631,13 @@ type Tier1Summary struct {
 	//   h2c_churn    → h2c_sent, h2c_upgraded, h2c_declined, h2c_crashed, h2c_hang
 	//   ws_torture   → ws_sent, ws_upgraded, ws_handshake_fail, ws_closed_correctly, ws_accepted_bad_frame, ws_hang_no_close, ws_endpoint_absent
 	//   sse_kill     → sse_sent, sse_established, sse_events_read, sse_killed_mid_stream, sse_server_closed_early, sse_handshake_fail, sse_endpoint_absent
+	//   ws_echo      → ws_echo_fires, ws_echo_upgraded, ws_echo_sent, ws_echo_ok, ws_echo_corrupt (= ws_echo_egress_interleave + ws_echo_other_corrupt), ws_echo_reorder, ws_echo_missing, ws_echo_timeout
 	Adversarial map[string]int64 `json:"adversarial,omitempty"`
 	H2CChurn    map[string]int64 `json:"h2c_churn,omitempty"`
 	WSTorture   map[string]int64 `json:"ws_torture,omitempty"`
 	SSEKill     map[string]int64 `json:"sse_kill,omitempty"`
+	// WSEcho is the WebSocket large-echo slice (schema 5.9, celeris#587).
+	WSEcho map[string]int64 `json:"ws_echo,omitempty"`
 	// SSEEarlyErrs carries the verbatim read errors behind sse_kill's
 	// sse_server_closed_early / sse_peer_reset_early / sse_read_err_early.
 	// Strings, so they cannot live in the int64 map above; a separate field

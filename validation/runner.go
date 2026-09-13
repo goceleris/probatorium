@@ -1003,6 +1003,14 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 				snap.WSTorture.HandshakeFailReset, snap.WSTorture.HandshakeFailStatus, snap.WSTorture.HandshakeFailOther,
 				report.FirstFailedSlowFire(snap.WSTorture.SlowReads)),
 			snap.WSTorture.HandshakeFail > 0)
+		// Large-echo wire oracle (celeris#587): any of the four failure
+		// classes is one incident; the message carries all four so the
+		// dossier says which.
+		e := snap.WSEcho
+		fire(properties.IWSEcho.ID,
+			fmt.Sprintf("64 KiB WebSocket echoes not byte-intact and in order (corrupt=%d [egress_interleave=%d other=%d] reorder=%d missing=%d timeout=%d, ok=%d)",
+				e.Corrupt, e.EgressInterleave, e.OtherCorrupt, e.Reorder, e.Missing, e.Timeout, e.OK),
+			e.Corrupt+e.Reorder+e.Missing+e.Timeout > 0)
 		// Engine-agnostic crash oracle: the refapp process died mid-run. This
 		// is the catch-all that the per-protocol counters above can't see — a
 		// dead server just looks like connection-refused to every walker.
@@ -1460,6 +1468,27 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		WSSlowReads:      append([]report.SlowFire(nil), s.WSTorture.SlowReads...),
 		ReadyAt:          s.ReadyAt,
 		RefappStderrTail: append([]string(nil), s.RefappStderrTail...),
+		WSEcho: map[string]int64{
+			"ws_echo_route_probed":    b2i(s.WSEcho.RouteProbed),
+			"ws_echo_route_present":   b2i(s.WSEcho.RoutePresent),
+			"ws_echo_fires":           s.WSEcho.Fires,
+			"ws_echo_upgraded":        s.WSEcho.Upgraded,
+			"ws_echo_handshake_fail":  s.WSEcho.HandshakeFail,
+			"ws_echo_endpoint_absent": s.WSEcho.EndpointAbsent,
+			"ws_echo_sent":            s.WSEcho.Sent,
+			"ws_echo_ok":              s.WSEcho.OK,
+			"ws_echo_corrupt":         s.WSEcho.Corrupt,
+			// Cause split (sums to ws_echo_corrupt): attribution, not
+			// tolerance -- see ws_echo.go.
+			"ws_echo_egress_interleave": s.WSEcho.EgressInterleave,
+			"ws_echo_other_corrupt":     s.WSEcho.OtherCorrupt,
+			"ws_echo_reorder":           s.WSEcho.Reorder,
+			"ws_echo_missing":           s.WSEcho.Missing,
+			"ws_echo_timeout":           s.WSEcho.Timeout,
+			"ws_echo_frame_err":         s.WSEcho.FrameErr,
+			"ws_echo_close_ok":          s.WSEcho.CloseOK,
+			"ws_echo_cut_at_deadline":   s.WSEcho.CutAtDeadline,
+		},
 	}
 	m := out.H2CChurn
 	m["h2c_dial_fail"] = s.H2CChurn.DialFail

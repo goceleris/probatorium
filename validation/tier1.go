@@ -236,6 +236,10 @@ type tier1Tally struct {
 	// readyAt is the unix-nano instant the refapp announced its bound
 	// address: the origin of the walkers' since_ready_ms (celeris#588).
 	readyAt atomic.Int64
+
+	// wsEcho is the WebSocket large-echo slice (ws_echo.go, celeris#587):
+	// one off-budget walker, like rfc, gated on the /ws route like ws.
+	wsEcho *wsEchoTally
 }
 
 // driveTier1 is the production Tier 1 entry point. Starts the refapp,
@@ -410,6 +414,10 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	//   ~5%  WS frame torture       — runWSTortureWalker, hostPort + "/ws".
 	//   ~5%  SSE kill-mid-stream    — runSSEKillWalker, hostPort + "/events".
 	//
+	// Plus two off-budget single-connection slices launched beside them:
+	// the response-conformance scraper (rfc_scrape.go) and the WebSocket
+	// large-echo walker (ws_echo.go, celeris#587).
+	//
 	// hostPort is BaseURL with the "http://" stripped — adversarial,
 	// h2c churn, WS torture, and SSE kill all speak raw TCP so they
 	// can send bytes net/http would otherwise rewrite (or, for h2c,
@@ -463,6 +471,8 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	tally.rfc = rfcTallyPtr
 	// Per-fire capture for the h2c / WS walkers (walker_capture.go).
 	armWalkerCapture(runCtx, tally.readyAt.Load(), h2cTallyPtr, wsTallyPtr)
+	wsEchoTallyPtr := &wsEchoTally{}
+	tally.wsEcho = wsEchoTallyPtr
 	if cfg.OnResponseCounters != nil {
 		cfg.OnResponseCounters(rfcTallyPtr.counters)
 	}
@@ -511,6 +521,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	if cfg.Concurrency >= streamingWalkerMinConcurrency {
 		wsRoute, sseRoute = probeStreamingRoutes(runCtx, hostPort, wsTorturePath, sseKillPath)
 		wsTallyPtr.recordRoute(wsRoute)
+		wsEchoTallyPtr.recordRoute(wsRoute)
 		sseTallyPtr.recordRoute(sseRoute)
 	}
 	wsCount := 0
@@ -614,6 +625,23 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 				defer wg.Done()
 				seed := seedBase ^ 0x8fc0_1e50_0000_0001
 				runRFCConformanceWalker(ctx, hostPort, "/", seed, rfcConformanceInterval, rfcTallyPtr)
+			}()
+		}
+		// WebSocket large-echo slice (celeris#587). ONE walker, off-budget
+		// for the same reason as the conformance slice: one connection at a
+		// time, held for about a second, is invisible next to the load the
+		// Markov fleet drives, and its oracle (a byte-intact, in-order echo
+		// of 64 KiB frames) is a property of a single connection. Gated
+		// exactly like the torture slice: streaming concurrency AND a /ws
+		// route the pre-flight probe did not find absent -- the torture
+		// walker's ws_endpoint_absent already showed what walking a 404
+		// buys.
+		if cfg.Concurrency >= streamingWalkerMinConcurrency && !wsRoute.absent() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				seed := seedBase ^ 0xec40_0000_0000_0001
+				runWSLargeEchoWalker(ctx, hostPort, wsTorturePath, seed, wsEchoInterval, wsEchoTallyPtr)
 			}()
 		}
 		return &wg
@@ -1120,6 +1148,9 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 	if r := t.readyAt.Load(); r != 0 {
 		s.ReadyAt = time.Unix(0, r).UTC().Format(time.RFC3339Nano)
 	}
+	if t.wsEcho != nil {
+		s.WSEcho = t.wsEcho.snapshot()
+	}
 	return s
 }
 
@@ -1146,6 +1177,7 @@ type tier1TallySnapshot struct {
 	WSTorture             wsSnapshot          `json:"ws_torture,omitempty"`
 	SSEKill               sseSnapshot         `json:"sse_kill,omitempty"`
 	RFCConformance        rfcSnapshot         `json:"rfc_conformance,omitempty"`
+	WSEcho                wsEchoSnapshot      `json:"ws_echo,omitempty"`
 	Liveness              livenessSnapshot    `json:"liveness,omitempty"`
 	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
 	// bound address; RefappStderrTail the last lines it wrote after that

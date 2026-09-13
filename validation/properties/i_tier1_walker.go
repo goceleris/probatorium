@@ -68,6 +68,16 @@ var (
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}
+	// IWSEcho is the wire-level oracle for large detached sends
+	// (celeris#587): 64 KiB WebSocket frames streamed through the refapp's
+	// /ws echo must come back byte-intact, in order, and all of them. Fires
+	// on any of ws_echo_{corrupt,reorder,missing,timeout}.
+	IWSEcho = Spec{
+		ID:          "I-WS-ECHO",
+		Description: "64 KiB WebSocket echoes must be byte-intact, in order and complete (Tier 1 ws_echo.{corrupt,reorder,missing,timeout} == 0)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
 	// ILiveness is the engine-agnostic crash oracle: the refapp PROCESS must
 	// survive the whole run. Unlike the other walker predicates (which key on
 	// a protocol-specific torture counter), this fires on ANY process death —

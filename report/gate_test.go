@@ -14,6 +14,7 @@ func cleanCell(r, e, a string) ValidationCellResult {
 			H2CChurn:    map[string]int64{"h2c_sent": 10, "h2c_upgraded": 3, "h2c_declined": 7, "h2c_intentional_rst": 3, "h2c_hang_max_elapsed_ms": 40},
 			WSTorture:   map[string]int64{"ws_sent": 10, "ws_upgraded": 10, "ws_closed_correctly": 10},
 			SSEKill:     map[string]int64{"sse_sent": 10, "sse_established": 10, "sse_events_read": 50, "sse_killed_mid_stream": 10},
+			WSEcho:      map[string]int64{"ws_echo_fires": 10, "ws_echo_upgraded": 10, "ws_echo_sent": 3000, "ws_echo_ok": 3000, "ws_echo_close_ok": 10},
 		},
 		Tier3: &Tier3Summary{SeedsAttempted: 11, SeedsPassed: 11},
 	}
@@ -50,6 +51,10 @@ func TestGate_EachSignalIsAViolation(t *testing.T) {
 		{"ws_hs_fail", "tier_1.ws_torture.ws_handshake_fail", func(c *ValidationCellResult) { c.Tier1.WSTorture["ws_handshake_fail"] = 1 }},
 		{"sse_hs_fail", "tier_1.sse_kill.sse_handshake_fail", func(c *ValidationCellResult) { c.Tier1.SSEKill["sse_handshake_fail"] = 1 }},
 		{"sse_closed_early", "tier_1.sse_kill.sse_server_closed_early", func(c *ValidationCellResult) { c.Tier1.SSEKill["sse_server_closed_early"] = 1 }},
+		{"ws_echo_corrupt", "tier_1.ws_echo.ws_echo_corrupt", func(c *ValidationCellResult) { c.Tier1.WSEcho["ws_echo_corrupt"] = 1 }},
+		{"ws_echo_reorder", "tier_1.ws_echo.ws_echo_reorder", func(c *ValidationCellResult) { c.Tier1.WSEcho["ws_echo_reorder"] = 1 }},
+		{"ws_echo_missing", "tier_1.ws_echo.ws_echo_missing", func(c *ValidationCellResult) { c.Tier1.WSEcho["ws_echo_missing"] = 1 }},
+		{"ws_echo_timeout", "tier_1.ws_echo.ws_echo_timeout", func(c *ValidationCellResult) { c.Tier1.WSEcho["ws_echo_timeout"] = 1 }},
 		{"seeds_failed", "tier_3.seeds_failed", func(c *ValidationCellResult) { c.Tier3.SeedsFailed = 1 }},
 		{"seeds_errored", "tier_3.seeds_errored", func(c *ValidationCellResult) { c.Tier3.SeedsErrored = 1 }},
 		{"tier3 not run", "tier_3.seeds_attempted", func(c *ValidationCellResult) { c.Tier3.SeedsAttempted = 0 }},
@@ -84,8 +89,95 @@ func TestGate_InformationalCountersAreNotGated(t *testing.T) {
 	c.Tier1.SSEKill["sse_endpoint_absent"] = 1_000_000
 	c.Tier1.WSTorture["ws_endpoint_absent"] = 1_000_000
 	c.Tier1.Adversarial["adv_well_rejected"] = 1_000_000
+	for _, k := range []string{"ws_echo_fires", "ws_echo_upgraded", "ws_echo_sent", "ws_echo_ok", "ws_echo_close_ok",
+		"ws_echo_cut_at_deadline", "ws_echo_frame_err", "ws_echo_handshake_fail", "ws_echo_endpoint_absent",
+		"ws_echo_route_probed", "ws_echo_route_present"} {
+		c.Tier1.WSEcho[k] = 1_000_000
+	}
 	if v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true}); len(v) != 0 {
 		t.Fatalf("informational counters must not be gated, got %v", v)
+	}
+}
+
+// wsEchoGatedKeys are the large-echo slice's defect classes (celeris#587).
+var wsEchoGatedKeys = []string{"ws_echo_corrupt", "ws_echo_reorder", "ws_echo_missing", "ws_echo_timeout"}
+
+// gateWSEchoKey runs the gate over a clean cell with one ws_echo key set
+// and reports the violations that name that key.
+func gateWSEchoKey(key string, value int64) []Violation {
+	c := cleanCell("auth_session_ratelimit", "iouring", "arm64")
+	c.Tier1.WSEcho[key] = value
+	var out []Violation
+	for _, v := range Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true}) {
+		if v.Field == "tier_1.ws_echo."+key {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// TestGate_WSEchoKeysAreLoadBearing pins the four large-echo rows, and
+// carries its own negative control: with the ws_echo rows stripped from
+// gatedTier1Keys the very same cells pass, which is what the positive half
+// would report if the rows went missing -- so the positive half fails
+// exactly when a key is ungated, and for no other reason.
+func TestGate_WSEchoKeysAreLoadBearing(t *testing.T) {
+	for _, k := range wsEchoGatedKeys {
+		if v := gateWSEchoKey(k, 3); len(v) != 1 || v[0].Value != 3 {
+			t.Errorf("gated: %s=3 must be exactly one violation naming it, got %v", k, v)
+		}
+	}
+	// The corrupt row carries its attribution split as cause detail, not as
+	// extra violations: one event, one violation, the split in Why.
+	c := cleanCell("auth_session_ratelimit", "iouring", "amd64")
+	c.Tier1.WSEcho["ws_echo_corrupt"] = 2
+	c.Tier1.WSEcho["ws_echo_egress_interleave"] = 1
+	c.Tier1.WSEcho["ws_echo_other_corrupt"] = 1
+	v := Gate([]ValidationCellResult{c}, nil, GateOptions{RequireTier3: true})
+	if len(v) != 1 || v[0].Field != "tier_1.ws_echo.ws_echo_corrupt" {
+		t.Fatalf("corrupt + its split must be ONE violation, got %v", v)
+	}
+	if !strings.Contains(v[0].Why, "egress_interleave=1") || !strings.Contains(v[0].Why, "other_corrupt=1") {
+		t.Errorf("Why must carry the attribution split, got %q", v[0].Why)
+	}
+
+	// Negative control: ungate the rows and the same inputs pass.
+	saved := gatedTier1Keys
+	defer func() { gatedTier1Keys = saved }()
+	var stripped []struct{ slice, key, why string }
+	for _, g := range saved {
+		if g.slice != "ws_echo" {
+			stripped = append(stripped, g)
+		}
+	}
+	gatedTier1Keys = stripped
+	for _, k := range wsEchoGatedKeys {
+		if v := gateWSEchoKey(k, 3); len(v) != 0 {
+			t.Errorf("control: with the ws_echo rows removed %s must NOT be a violation, got %v -- the positive half is not testing the rows", k, v)
+		}
+	}
+}
+
+// The relative diff sees the same keys, so a corruption on one arch only is
+// a cross-arch divergence.
+func TestDiffValidation_WSEchoKeysAreCompared(t *testing.T) {
+	a := &ValidationResults{Tier1: &Tier1Summary{WSEcho: map[string]int64{"ws_echo_corrupt": 4, "ws_echo_reorder": 0, "ws_echo_missing": 1, "ws_echo_timeout": 0}}}
+	b := &ValidationResults{Tier1: &Tier1Summary{WSEcho: map[string]int64{"ws_echo_corrupt": 0, "ws_echo_reorder": 0, "ws_echo_missing": 1, "ws_echo_timeout": 2}}}
+	got := map[string]Divergence{}
+	for _, d := range DiffValidation(a, b, "amd64", "arm64") {
+		got[d.Counter] = d
+	}
+	if d, ok := got["ws_echo_corrupt"]; !ok || d.Slice != "ws_echo" || d.ValA != 4 || d.ValB != 0 || d.Severity != SeverityHigh {
+		t.Errorf("ws_echo_corrupt asymmetric must diverge HIGH, got %+v", got)
+	}
+	if d, ok := got["ws_echo_timeout"]; !ok || d.ValA != 0 || d.ValB != 2 || d.Severity != SeverityMed {
+		t.Errorf("ws_echo_timeout asymmetric must diverge MED, got %+v", got)
+	}
+	if _, ok := got["ws_echo_missing"]; ok {
+		t.Errorf("symmetric ws_echo_missing must not diverge (Gate catches presence), got %+v", got["ws_echo_missing"])
+	}
+	if _, ok := got["ws_echo_reorder"]; ok {
+		t.Errorf("both-zero ws_echo_reorder must not diverge, got %+v", got["ws_echo_reorder"])
 	}
 }
 
