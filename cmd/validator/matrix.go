@@ -713,28 +713,36 @@ func seedServicesWithRetry(ctx context.Context, spec string) error {
 }
 
 // The adaptive engine starts on epoll and promotes new connections to
-// io_uring only when the controller sees at least 24 active connections per
-// worker for two consecutive 1 s ticks (celeris adaptive/controller.go,
-// upThreshold; the load-driven revert is off in production). At the
-// cluster's default worker count (GOMAXPROCS: 12 and 32) a validation cell
-// of 30-50 walkers sits at 1-4 conns/worker and never promotes, so an
-// adaptive cell would validate epoll under another name. Two constants
-// make the promotion reachable and MEASURED (the gate's ExpectAdaptiveSwitch
-// fails an adaptive cell that never switched):
+// io_uring only when the controller's conns-per-worker ratio crosses a
+// threshold (celeris adaptive/controller.go). An adaptive cell sized below
+// that line validates epoll under another name, so the matrix sizes these
+// cells deliberately and the gate's ExpectAdaptiveSwitch proves it worked.
 //
-//   - adaptiveCellWorkers = 2, the smallest worker count celeris accepts
-//     (resource.MinWorkers), so the threshold is 48 active connections;
-//   - adaptiveCellConcurrencyFloor = 60 walkers. The last nightly and soak
-//     artifacts (34720853871, 34616620237) show 0.93-0.97 active conns per
-//     walker on every refapp (30 walkers → p50 28-30, 50 → 45-48), so 60
-//     walkers hold ~57 connections: 19% above the line, in every cell, on
-//     both arches.
+// SIZED FOR THE FAST PATH, NOT THE SUSTAIN PATH — this is the whole point,
+// and the first 64-cell nightly (probatorium run 34864823296) is why. The
+// controller has two ways up: `cpw >= upThreshold` (24) held for
+// sustainTicks (2) consecutive one-second ticks, or `cpw >= highWatermark`
+// (48), which snaps on a SINGLE tick. The first sizing aimed at the
+// sustain path: 2 workers x 60 walkers gave ~56 active connections, i.e.
+// 28 per worker against a threshold of 24 — a 17% margin. Measured result:
+// **9 of 16 adaptive cells promoted and 7 did not**, with the active-
+// connection count IDENTICAL between the two groups (p50 54-56 in both),
+// on both architectures and across six different refapps. There was no
+// pattern to find: a 17% margin against a two-tick sustain requirement is
+// a coin flip, because either tick dipping under the line resets the streak.
+//
+// So size for the single-tick snap instead. At the celeris minimum of 2
+// workers the high watermark is 96 active connections, and the measured
+// ratio on this cluster is 0.93-0.97 active connections per walker (the
+// nightly and soak artifacts, and the 56/60 above), so 110 walkers hold
+// ~103-107. That clears 96 with room for the sampling dip, and promotion
+// stops depending on two consecutive lucky ticks.
 //
 // An explicit -refapp-workers cap still applies to every engine; the floor
 // only ever raises the walker count.
 const (
 	adaptiveCellWorkers          = 2
-	adaptiveCellConcurrencyFloor = 60
+	adaptiveCellConcurrencyFloor = 110
 )
 
 func cellRefappWorkers(engine string, capFromFlag int) int {
