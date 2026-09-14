@@ -23,9 +23,15 @@ func TestAdaptiveCellSizing(t *testing.T) {
 	if got := cellConcurrencyFloor("adaptive"); got != adaptiveCellConcurrencyFloor {
 		t.Errorf("adaptive floor = %d, want %d", got, adaptiveCellConcurrencyFloor)
 	}
-	// 2 workers x 24 conns/worker = 48 active connections; at the measured
-	// ~0.95 conns per walker the floor must clear that with margin.
-	if float64(adaptiveCellConcurrencyFloor)*0.93 < 48*1.1 {
-		t.Errorf("floor %d does not clear the 48-connection threshold with 10%% margin", adaptiveCellConcurrencyFloor)
+	// The floor must clear the controller's SINGLE-TICK snap, not its
+	// two-tick sustain: 2 workers x highWatermark 48 = 96 active
+	// connections. Sizing for the sustain path gave a 17% margin and
+	// promoted only 9 of 16 cells (probatorium run 34864823296), with the
+	// connection counts identical in the promoted and unpromoted groups.
+	// At the measured 0.93 active connections per walker the floor must
+	// still clear 96 with headroom for the sampling dip.
+	if got := float64(adaptiveCellConcurrencyFloor) * 0.93; got < 96*1.05 {
+		t.Errorf("floor %d yields ~%.0f active conns, which does not clear the 96-connection snap with 5%% margin",
+			adaptiveCellConcurrencyFloor, got)
 	}
 }
