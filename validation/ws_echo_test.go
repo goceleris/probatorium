@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -263,6 +264,65 @@ func echoServer(t *testing.T, mutate func(n int, fin bool, opcode byte, payload 
 	})
 }
 
+// echoServerEndingAfter echoes faithfully and then ENDS the stream after
+// the nth data frame, with the rest of the fire's frames unanswered.
+//
+// It ends it by half-closing -- FIN on the server->client direction only,
+// then draining whatever the client is still sending until the client
+// closes. echoServer's stop=true instead closes outright, and closing a
+// socket that still has unread inbound data makes the kernel send an RST;
+// an RST discards whatever the peer had received but not yet read, so
+// "the client saw all n echoes" became a race between its 3 ms read pace
+// (wsEchoReadPace) and the reset. CI lost two of three echoes that way
+// (run 34790609266: ok=1, want 3) with nothing wrong in the scorer.
+//
+// A half-close cannot lose them: the echoes and the FIN are bytes in one
+// stream, delivered in order, so the client reads all n and then EOF, on
+// any machine at any load. The property under test -- a peer that ENDS
+// the connection with echoes outstanding is one missing fire, not a
+// timeout -- is the same either way; which of FIN and RST ends it is not
+// something this test claims to pin.
+func echoServerEndingAfter(t *testing.T, n int) *fakeWSServer {
+	t.Helper()
+	return newFakeWSServer(t, false, func(c net.Conn) {
+		br := bufio.NewReaderSize(c, wsEchoFrameBytes)
+		seen := 0
+		for {
+			fin, op, payload, err := wsReadFrame(br, wsEchoFrameBytes)
+			if err != nil {
+				return
+			}
+			if op == 0x8 {
+				_, _ = c.Write(wsAppendFrame(nil, true, 0x8, payload, nil))
+				return
+			}
+			seen++
+			if _, err := c.Write(wsAppendFrame(nil, fin, op, payload, nil)); err != nil {
+				return
+			}
+			if seen < n {
+				continue
+			}
+			tcp, ok := c.(*net.TCPConn)
+			if !ok {
+				t.Errorf("fake WS server wants a TCP conn to half-close, got %T", c)
+				return
+			}
+			if err := tcp.CloseWrite(); err != nil {
+				t.Errorf("half-close: %v", err)
+				return
+			}
+			// Drain the rest of the client's stream so nothing is left
+			// unread when the conn is finally closed. The deadline is a
+			// wedge detector, not a budget: the client closes as soon as
+			// it sees the EOF just queued above.
+			_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+			_, _ = io.Copy(io.Discard, br)
+			return
+		}
+	})
+}
+
 func faithful(_ int, _ bool, _ byte, p []byte) ([]byte, bool) { return p, false }
 
 func fireOnce(t *testing.T, srv *fakeWSServer) wsEchoSnapshot {
@@ -408,14 +468,13 @@ func TestFireWSLargeEcho_SwappedEchoesAreReorder(t *testing.T) {
 	}
 }
 
-// A server that closes with echoes outstanding is one missing fire, not a
-// timeout.
+// A server that ends the connection with echoes outstanding is one
+// missing fire, not a timeout. See echoServerEndingAfter for why the
+// server half-closes rather than slamming the socket shut.
 func TestFireWSLargeEcho_DroppedEchoesAreMissing(t *testing.T) {
 	shortEchoFire(t, 2*time.Second)
 	started := time.Now()
-	s := fireOnce(t, echoServer(t, func(n int, _ bool, _ byte, p []byte) ([]byte, bool) {
-		return p, n == 3
-	}))
+	s := fireOnce(t, echoServerEndingAfter(t, 3))
 	if s.Missing != 1 {
 		t.Fatalf("missing=%d, want 1 (one fire, ended with frames unanswered)", s.Missing)
 	}
@@ -502,12 +561,15 @@ func TestRunWSLargeEchoWalker_FiresRepeatedly(t *testing.T) {
 	shortEchoFire(t, 2*time.Second)
 	srv := echoServer(t, faithful)
 	var tally wsEchoTally
-	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+	// Run until the walker HAS fired repeatedly, rather than for 900 ms
+	// and hoping two ~150 ms fires fit (tier1_until_test.go).
+	const want = 4
+	ctx, cancel := cancelWhen(t, func() bool { return tally.snapshot().Fires >= want })
 	defer cancel()
 	runWSLargeEchoWalker(ctx, srv.HostPort(), "/ws", 0xfeed, 20*time.Millisecond, &tally)
 	s := tally.snapshot()
-	if s.Fires < 2 {
-		t.Errorf("fires=%d, want >= 2", s.Fires)
+	if s.Fires < want {
+		t.Errorf("fires=%d, want >= %d", s.Fires, want)
 	}
 	if s.Corrupt+s.Reorder+s.Missing+s.Timeout != 0 {
 		t.Errorf("faithful echo under the walker scored a defect: %s", summariseWSEcho(s))
@@ -524,21 +586,25 @@ func TestRunWSLargeEchoWalker_FiresRepeatedly(t *testing.T) {
 // the threshold.
 func TestDriveTier1_WSEchoSliceGating(t *testing.T) {
 	shortEchoFire(t, time.Second)
-	present := driveAgainst(t, streamingRouteServer(t, http.StatusBadRequest), 10, 900*time.Millisecond)
+	present := driveAgainst(t, streamingRouteServer(t, http.StatusBadRequest), 10,
+		func(s tier1TallySnapshot) bool { return s.WSEcho.Fires >= 1 })
 	if present.WSEcho.Fires < 1 {
 		t.Errorf("present /ws at the matrix default concurrency: fires=%d, want >= 1", present.WSEcho.Fires)
 	}
 	if !present.WSEcho.RouteProbed || !present.WSEcho.RoutePresent {
 		t.Errorf("route verdict not recorded on the echo tally: probed=%v present=%v", present.WSEcho.RouteProbed, present.WSEcho.RoutePresent)
 	}
-	absent := driveAgainst(t, streamingRouteServer(t, http.StatusNotFound), 10, 700*time.Millisecond)
+	// "Never fires" needs a floor of serving time, not a ceiling on the
+	// whole cell: the echo walker paces at 250 ms, so 700 ms of a running
+	// cell is what gives a wrongly-scheduled slice room to show itself.
+	absent := driveAgainst(t, streamingRouteServer(t, http.StatusNotFound), 10, workedFor(700*time.Millisecond))
 	if absent.WSEcho.Fires != 0 {
 		t.Errorf("404 /ws: fires=%d, want 0 (absent=%d)", absent.WSEcho.Fires, absent.WSEcho.EndpointAbsent)
 	}
 	if !absent.WSEcho.RouteProbed || absent.WSEcho.RoutePresent {
 		t.Errorf("absent route verdict: probed=%v present=%v", absent.WSEcho.RouteProbed, absent.WSEcho.RoutePresent)
 	}
-	dormant := driveAgainst(t, streamingRouteServer(t, http.StatusBadRequest), 1, 400*time.Millisecond)
+	dormant := driveAgainst(t, streamingRouteServer(t, http.StatusBadRequest), 1, workedFor(400*time.Millisecond))
 	if dormant.WSEcho.Fires != 0 || dormant.WSEcho.RouteProbed {
 		t.Errorf("below the streaming threshold: fires=%d probed=%v, want 0/false", dormant.WSEcho.Fires, dormant.WSEcho.RouteProbed)
 	}
