@@ -1399,6 +1399,8 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		PropertyPollErrors:   s.Properties.PollErrors,
 		PropertyLoopSkipped:  s.Properties.SkippedReason,
 		AdaptiveSwitches:     s.Properties.AdaptiveSwitches,
+		PeakConnsPerWorker:   s.Properties.PeakConnsPerWorker,
+		MeanBytesPerReq:      s.Properties.MeanBytesPerReq,
 		Adversarial: map[string]int64{
 			"adv_sent":               s.Adversarial.Sent,
 			"adv_well_rejected":      s.Adversarial.WellRejected,

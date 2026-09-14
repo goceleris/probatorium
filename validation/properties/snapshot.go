@@ -63,6 +63,19 @@ type Snapshot struct {
 	// predicate; recorded in the per-cell series so a step in it can be
 	// joined against a walker's slow-read record (celeris#588).
 	EngineErrorCount int64
+	// EngineWorkers, EngineRequestsTotal, EngineBytesRead and
+	// EngineBytesWritten are celeris EngineMetrics.Workers, RequestCount,
+	// BytesRead and BytesWritten: the four inputs the adaptive controller
+	// turns into its two promotion signals (conns/worker = ActiveConns /
+	// Workers, and bytes/req = delta(BytesRead+BytesWritten) /
+	// delta(RequestCount)). Judged by no predicate; recorded so an
+	// adaptive cell that never promoted can be told apart from one that
+	// was never offered enough load, and from one the controller
+	// deliberately suppressed as link-bound.
+	EngineWorkers       int64
+	EngineRequestsTotal int64
+	EngineBytesRead     int64
+	EngineBytesWritten  int64
 	// ExpectedPanics is the number of panics the workload DESIGNED so far
 	// (corpus states marked `expect: panic`, counted by the Tier 1 walker
 	// when their 5xx arrives). Zero when no accounting is wired (e.g. the

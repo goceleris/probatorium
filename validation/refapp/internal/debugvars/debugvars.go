@@ -281,6 +281,19 @@ func (v *Vars) Document() map[string]any {
 			// (celeris#588). Not judged by any predicate.
 			doc["celeris.engine_error_count"] = int64(info.Metrics.ErrorCount)
 			doc["celeris.engine"] = info.Type.String()
+			// The four inputs to the adaptive controller's promotion
+			// decision, published so a cell that never promoted can say
+			// WHY instead of only that it did not (celeris#580 proved the
+			// switch counter; this proves the load that was offered).
+			// The controller divides ActiveConnections by Workers to get
+			// conns/worker, and derives bytes/req from the per-interval
+			// delta of (BytesRead+BytesWritten)/RequestCount -- so at the
+			// property loop's 1 Hz these four reconstruct both signals
+			// offline, per interval, from the series alone.
+			doc["celeris.engine_workers"] = int64(info.Metrics.Workers)
+			doc["celeris.engine_requests_total"] = int64(info.Metrics.RequestCount)
+			doc["celeris.engine_bytes_read"] = int64(info.Metrics.BytesRead)
+			doc["celeris.engine_bytes_written"] = int64(info.Metrics.BytesWritten)
 		}
 	}
 	return doc

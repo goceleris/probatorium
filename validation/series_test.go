@@ -29,6 +29,8 @@ func TestSeriesWriterRecordsEveryColumn(t *testing.T) {
 		RSSBytes:          65_638_400,
 		AcceptedConnTotal: 216_093, ClosedConnTotal: 216_044, ActiveConns: 49,
 		AdaptiveSwitches: 1, EngineErrorCount: 7,
+		EngineWorkers: 2, EngineRequestsTotal: 4_812_004,
+		EngineBytesRead: 901_000_000, EngineBytesWritten: 1_402_000_000,
 	}
 	w.Record(snap)
 	w.Close()
@@ -54,6 +56,8 @@ func TestSeriesWriterRecordsEveryColumn(t *testing.T) {
 		"heap_idle": 8_090_000, "heap_released": 7_659_520, "stack_inuse": 1_507_328,
 		"rss": 65_638_400, "accepted": 216_093, "closed": 216_044, "active": 49,
 		"adaptive_switches": 1, "engine_error_count": 7,
+		"engine_workers": 2, "engine_requests_total": 4_812_004,
+		"engine_bytes_read": 901_000_000, "engine_bytes_written": 1_402_000_000,
 	}
 	if len(want) != len(seriesColumns) {
 		t.Fatalf("test covers %d columns but the writer has %d — a new column needs a case here",
