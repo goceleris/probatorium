@@ -12,6 +12,9 @@ name: PR Validation
 #                  deregister after one job (--ephemeral).
 #   2. matrix    — self-hosted celeris-cluster. Drives mage Validate
 #                  with VALIDATE_MATRIX=1 against the cluster.
+#   (Run 34903656367 is the first job this workflow has executed since
+#   2026-05-30, and it passed all four stages.)
+#
 #   3. teardown  — ubuntu-latest + Tailscale + ansible. Kills any
 #                  Runner.Listener still alive, de-registers
 #                  whatever the matrix job didn't auto-clear, and
