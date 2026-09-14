@@ -159,7 +159,12 @@ func raceCompileGoBinary(moduleDir, pkgRel, outputPath, arch string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("go", "build", "-race", "-trimpath", "-ldflags=-s -w", "-o", absOut, pkgRel)
+	// -tags=validation: the race tier's refapps carry the validation
+	// counters (SQE checker, and the SEND_ZC exposure counters of
+	// celeris#591) so a clean race_reports=0 can be paired with proof that
+	// the instrumented branches actually ran (celeris#587); the tag adds
+	// one atomic per event, never per request.
+	cmd := exec.Command("go", "build", "-race", "-tags=validation", "-trimpath", "-ldflags=-s -w", "-o", absOut, pkgRel)
 	cmd.Dir = moduleDir
 	cmd.Env = append(os.Environ(),
 		"GOOS=linux",
