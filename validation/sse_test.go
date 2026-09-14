@@ -219,13 +219,15 @@ func TestRunSSEKillWalker_FiresMultipleStreams(t *testing.T) {
 		_, _ = c.Read(make([]byte, 1))
 	})
 	var tally sseTally
-	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	// Run until the walker HAS opened streams repeatedly. The per-fire
+	// hold is 50-1500 ms, so how many fires fit in a fixed 700 ms was
+	// never something the test could rely on (tier1_until_test.go).
+	const want = 2
+	ctx, cancel := cancelWhen(t, func() bool { return tally.snapshot().Sent >= want })
 	defer cancel()
-	// 100ms tick → ~6 fires in 700ms (but per-fire hold is 50-1500ms
-	// so effective rate is governed by hold + handshake budget).
 	runSSEKillWalker(ctx, srv.HostPort(), "/events", 0x5e5e, 100*time.Millisecond, &tally)
 	s := tally.snapshot()
-	if s.Sent < 1 {
-		t.Errorf("Sent: got %d, want >= 1", s.Sent)
+	if s.Sent < want {
+		t.Errorf("Sent: got %d, want >= %d", s.Sent, want)
 	}
 }

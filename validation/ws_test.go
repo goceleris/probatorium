@@ -350,11 +350,14 @@ func TestRunWSTortureWalker_FiresMultipleRequests(t *testing.T) {
 		_, _ = c.Write([]byte{0x88, 0x02, 0x03, 0xEA}) // close 1002
 	})
 	var tally wsTally
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	// Run until the walker HAS fired repeatedly, rather than for 350 ms
+	// and hoping the 50 ms ticks fit (tier1_until_test.go).
+	const want = 6
+	ctx, cancel := cancelWhen(t, func() bool { return tally.snapshot().Sent >= want })
 	defer cancel()
 	runWSTortureWalker(ctx, srv.HostPort(), "/ws", 0xfeed, 50*time.Millisecond, &tally)
 	s := tally.snapshot()
-	if s.Sent < 2 {
-		t.Errorf("Sent: got %d, want >= 2", s.Sent)
+	if s.Sent < want {
+		t.Errorf("Sent: got %d, want >= %d", s.Sent, want)
 	}
 }
