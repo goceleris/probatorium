@@ -11,6 +11,10 @@ name: Weekend Soak
 
 on:
   schedule:
+    # Sunday 02:00, and the nightly is deliberately Mon-Sat so nothing
+    # contends for `concurrency: matrix-tier-cluster` on this slot. Before
+    # that split the two crons were both "0 2" and the group's one-pending-run
+    # rule cancelled whichever queued first — the soak, every Sunday.
     - cron: "0 2 * * 0"
   workflow_dispatch:
     inputs:

@@ -10,7 +10,13 @@ name: Nightly Validation
 
 on:
   schedule:
-    - cron: "0 2 * * *"
+    # Mon-Sat only. The weekend soak fires at the same 02:00 on Sunday and
+    # both workflows declare `concurrency: matrix-tier-cluster`, which keeps
+    # ONE pending run per group: whichever queued second evicted the other.
+    # The soak lost that race every Sunday since at least 2026-07-05
+    # (cancelled 07-05, 07-12, 07-19, 08-30, 09-06, 09-13), and on other days
+    # a long-queued nightly was evicted too. Sunday now belongs to the soak.
+    - cron: "0 2 * * 1-6"
   workflow_dispatch:
     inputs:
       resume_from:
