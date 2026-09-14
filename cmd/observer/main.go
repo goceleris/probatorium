@@ -106,6 +106,16 @@ type Observation struct {
 	AcceptedConnTotal int64
 	ClosedConnTotal   int64
 	PanicCount        int64
+
+	// CPUUtimeTicks / CPUStimeTicks are the target process's cumulative
+	// user / system CPU time from /proc/<pid>/stat (fields 14 and 15) in
+	// USER_HZ ticks (100/s), schema v5.9 (celeris#585). Cumulative, so
+	// the reader takes deltas: report.WindowResources turns the first and
+	// last sample of a scenario window into the SUT's own CPU percent,
+	// separable from the host-wide mpstat number. Zero when /proc is
+	// unreadable (non-linux, process gone).
+	CPUUtimeTicks int64
+	CPUStimeTicks int64
 }
 
 const schemaSQL = `
@@ -120,7 +130,9 @@ CREATE TABLE IF NOT EXISTS observations (
 	gc_pause_p99_ns INTEGER,
 	accepted_conn_total INTEGER,
 	closed_conn_total INTEGER,
-	panic_count INTEGER
+	panic_count INTEGER,
+	cpu_utime_ticks INTEGER,
+	cpu_stime_ticks INTEGER
 );
 `
 
@@ -128,8 +140,9 @@ const insertSQL = `
 INSERT OR REPLACE INTO observations (
 	ts, host, pid, fd_count, rss_bytes, goroutine_count,
 	heap_inuse_bytes, gc_pause_p99_ns,
-	accepted_conn_total, closed_conn_total, panic_count
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	accepted_conn_total, closed_conn_total, panic_count,
+	cpu_utime_ticks, cpu_stime_ticks
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 `
 
 func main() {
@@ -186,6 +199,7 @@ func run(cfg Config) error {
 				obs.FDCount, obs.RSSBytes, obs.GoroutineCount,
 				obs.HeapInuseBytes, obs.GCPauseP99Ns,
 				obs.AcceptedConnTotal, obs.ClosedConnTotal, obs.PanicCount,
+				obs.CPUUtimeTicks, obs.CPUStimeTicks,
 			); err != nil {
 				fmt.Fprintf(os.Stderr, "probatorium-observer: insert: %v\n", err)
 			}
@@ -202,6 +216,7 @@ func sample(ctx context.Context, httpc *http.Client, cfg Config, host string, t 
 	if cfg.PID > 0 {
 		obs.FDCount = countFDs(cfg.PID)
 		obs.RSSBytes = readRSS(cfg.PID)
+		obs.CPUUtimeTicks, obs.CPUStimeTicks = readCPUTicks(cfg.PID)
 	}
 
 	if cfg.MetricsURL != "" {
@@ -225,6 +240,45 @@ func countFDs(pid int) int64 {
 		return 0
 	}
 	return int64(len(entries))
+}
+
+// readCPUTicks returns the process's cumulative user and system CPU time
+// from /proc/<pid>/stat (fields 14 utime and 15 stime) in USER_HZ ticks.
+// Zero pair when the file is unreadable or malformed.
+func readCPUTicks(pid int) (utime, stime int64) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, 0
+	}
+	u, s, ok := parseProcStatCPU(string(data))
+	if !ok {
+		return 0, 0
+	}
+	return u, s
+}
+
+// parseProcStatCPU extracts utime and stime from a /proc/<pid>/stat line.
+// Field 2 (comm) is parenthesised and may itself contain spaces or ')',
+// so the split starts after the LAST ')': from there field 3 (state) is
+// index 0, which puts utime (field 14) at index 11 and stime (15) at 12.
+func parseProcStatCPU(stat string) (utime, stime int64, ok bool) {
+	i := strings.LastIndex(stat, ")")
+	if i < 0 {
+		return 0, 0, false
+	}
+	fields := strings.Fields(stat[i+1:])
+	if len(fields) < 13 {
+		return 0, 0, false
+	}
+	u, err := strconv.ParseInt(fields[11], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	s, err := strconv.ParseInt(fields[12], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return u, s, true
 }
 
 // readRSS returns RSS in bytes from /proc/<pid>/status's "VmRSS" line.
