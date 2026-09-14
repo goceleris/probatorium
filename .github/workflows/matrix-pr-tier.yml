@@ -28,13 +28,30 @@ name: PR Validation
 # pull_request would let any contributor with write access (or any
 # future collaborator) execute arbitrary code on the cluster hosts.
 # This workflow ONLY runs when a maintainer explicitly adds the
-# `cluster-ok` label to the PR (or kicks it via workflow_dispatch).
-# The label must be re-added after every push the maintainer wants
-# to re-validate — there is no `synchronize` trigger by design.
+# `cluster-ok` label to the PR (or kicks it via workflow_dispatch),
+# AND the head branch lives in this repository — the label gates who
+# approves, the head-repo check gates whose code runs. A fork PR never
+# reaches the cluster, labelled or not.
+#
+# It also re-validates on `synchronize` while the label is still
+# present (probatorium#360). Requiring the label to be re-applied by
+# hand after every push meant nobody ever did: of the last 100 runs,
+# 56 skipped and 44 were cancelled, with zero successes and zero
+# failures since 2026-05-30. Every harness change in that window --
+# the 64-cell adaptive matrix, the hang capture, the WebSocket echo
+# walker, the per-scenario CPU windows -- reached main on unit tests
+# alone, while the checks list implied a cluster safety net that did
+# not exist.
+#
+# This grants no new capability. The head-repo check already confines
+# every cluster-touching run to a branch in this repository, which
+# requires write access; anyone who can push such a branch can already
+# add the label. What changes is only how often a maintainer has to
+# re-apply it, which was the whole reason the gate went unused.
 
 on:
   pull_request:
-    types: [labeled]
+    types: [labeled, synchronize]
     branches: [main]
     paths:
       - 'cmd/**'
@@ -69,8 +86,13 @@ permissions:
 # matrix-tier-cluster — GitHub keeps only one pending run per group, so
 # such a no-op run displaced a queued nightly/soak/bench. Runs that
 # cannot reach the cluster get a private per-run group instead.
+#
+# The claim condition must match the guard's `if` exactly, INCLUDING the
+# head-repo check: a fork PR carrying the label would otherwise claim the
+# shared group and then skip, displacing a queued nightly or soak -- the
+# same displacement #288 fixed for the wrong-label case.
 concurrency:
-  group: ${{ (github.event_name == 'workflow_dispatch' || github.event.label.name == 'cluster-ok') && 'matrix-tier-cluster' || format('matrix-pr-tier-noop-{0}', github.run_id) }}
+  group: ${{ (github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && ((github.event.action == 'labeled' && github.event.label.name == 'cluster-ok') || (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'cluster-ok'))))) && 'matrix-tier-cluster' || format('matrix-pr-tier-noop-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -84,21 +106,31 @@ jobs:
     # live in THIS repository: a fork PR must never reach the
     # self-hosted cluster, even if the label is applied — the label
     # gates who approves, this gates whose code runs.
+    #
+    # `labeled` fires for EVERY label, so it is matched on the label
+    # that was actually added; `synchronize` has no such field and is
+    # matched on the label set the PR carries at push time. Keeping the
+    # two actions separate is what stops an unrelated label on an
+    # already-approved PR from spending a cluster window.
     name: cluster-ok label gate
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
-       github.event.label.name == 'cluster-ok' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       ((github.event.action == 'labeled' &&
+         github.event.label.name == 'cluster-ok') ||
+        (github.event.action == 'synchronize' &&
+         contains(github.event.pull_request.labels.*.name, 'cluster-ok'))))
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
       - name: Approved
         env:
           EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
           LABEL: ${{ github.event.label.name }}
         run: |
-          echo "approved by event=$EVENT label=${LABEL:-none}"
+          echo "approved by event=$EVENT action=${ACTION:-none} label=${LABEL:-none}"
 
   setup:
     name: bootstrap cluster runners
