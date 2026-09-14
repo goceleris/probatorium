@@ -291,7 +291,7 @@ func TestAggregateWindowsScenarioResources(t *testing.T) {
 	if err := json.Unmarshal(docRaw, &doc); err != nil {
 		t.Fatalf("parse document: %v", err)
 	}
-	if doc.SchemaVersion != "5.9" {
+	if doc.SchemaVersion != "5.10" {
 		t.Errorf("schema_version=%q want 5.9", doc.SchemaVersion)
 	}
 	if doc.Environment.SUTEnv["CELERIS_IOURING_SEND_ZC"] != "off" {

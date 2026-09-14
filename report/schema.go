@@ -115,7 +115,19 @@ import (
 //     overrides the bench passed into the SUT process, so an A/B arm is
 //     identifiable from results.json alone. Additive — older readers
 //     ignore every new field.
-const SchemaVersion = "5.9"
+//   - 5.10 — the adaptive controller's own promotion signals
+//     (celeris#580 follow-up). Adds, on Tier1Summary,
+//     PeakConnsPerWorker and MeanBytesPerReq, and on the per-cell
+//     series the four raw counters they reduce
+//     (engine_workers, engine_requests_total, engine_bytes_read,
+//     engine_bytes_written). Nightly 34876253223 reported seven
+//     adaptive cells with adaptive_switches == 0 and the artifact
+//     carried no way to tell a harness that under-loaded them from a
+//     controller that deliberately suppressed a link-bound workload
+//     from a celeris defect: it recorded the decision and none of its
+//     inputs. Additive; older readers ignore every field and no new
+//     key is gated.
+const SchemaVersion = "5.10"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -659,6 +671,16 @@ type Tier1Summary struct {
 	// loop sampled. Meaningful only for an adaptive cell, where the gate's
 	// ExpectAdaptiveSwitch requires it to be at least 1 (celeris#580).
 	AdaptiveSwitches int64 `json:"adaptive_switches,omitempty"`
+	// PeakConnsPerWorker and MeanBytesPerReq are the adaptive controller's
+	// own two promotion signals as the property loop measured them: the
+	// highest ActiveConns/Workers ratio sampled, and the average payload
+	// bytes per request over the cell. An adaptive cell reporting
+	// AdaptiveSwitches == 0 is only actionable alongside these two --
+	// they separate "the load never reached the threshold" (a harness
+	// sizing bug) from "the controller suppressed a link-bound workload"
+	// (by design) from neither (a celeris defect).
+	PeakConnsPerWorker float64 `json:"peak_conns_per_worker,omitempty"`
+	MeanBytesPerReq    float64 `json:"mean_bytes_per_req,omitempty"`
 
 	// Per-slice sub-tallies (one per workload-mix slice from
 	// validator-prod issue #55). Each is a plain `map[string]int64`

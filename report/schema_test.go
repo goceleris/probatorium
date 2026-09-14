@@ -395,7 +395,7 @@ func TestBuildDocument(t *testing.T) {
 	if doc.SchemaVersion != SchemaVersion {
 		t.Errorf("SchemaVersion: want %q got %q", SchemaVersion, doc.SchemaVersion)
 	}
-	if doc.SchemaVersion != "5.9" {
+	if doc.SchemaVersion != "5.10" {
 		t.Errorf("SchemaVersion drift: want 5.9 got %q", doc.SchemaVersion)
 	}
 	if len(doc.Benchmarks) != 2 {
@@ -511,4 +511,30 @@ func TestBuildDocumentValidityTelemetry(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	validateAny(t, sch, raw)
+}
+
+// "5.10" is the first version whose minor is two digits, and the first that a
+// lexical comparison gets wrong: "5.10" < "5.9" as strings. mage ValidateGate
+// gates two whole checks on SchemaAtLeast(doc, "5.6") and "5.8", so a string
+// compare here would silently switch off the property-verdict and coverage
+// checks for every document produced from 5.10 on.
+func TestSchemaAtLeastOrdersTwoDigitMinorsNumerically(t *testing.T) {
+	for _, tc := range []struct {
+		version, want string
+		ok            bool
+	}{
+		{"5.10", "5.6", true},
+		{"5.10", "5.8", true},
+		{"5.10", "5.9", true},
+		{"5.10", "5.10", true},
+		{"5.9", "5.10", false},
+		{"5.10", "5.11", false},
+		{"6.0", "5.10", true},
+		{SchemaVersion, "5.6", true},
+		{SchemaVersion, "5.8", true},
+	} {
+		if got := SchemaAtLeast(tc.version, tc.want); got != tc.ok {
+			t.Errorf("SchemaAtLeast(%q, %q) = %v, want %v", tc.version, tc.want, got, tc.ok)
+		}
+	}
 }

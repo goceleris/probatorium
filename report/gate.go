@@ -574,7 +574,8 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 				continue
 			}
 			add(c, "tier_1.adaptive_switches", 0,
-				"this tier expects every adaptive cell to promote at least once (VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH) and the engine never left its start engine; the cell validated epoll, not the adaptive path")
+				fmt.Sprintf("this tier expects every adaptive cell to promote at least once (VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH) and the engine never left its start engine; the cell validated epoll, not the adaptive path. Offered load, as the property loop measured it: peak %.1f conns/worker, mean %.0f bytes/req -- the controller's own two signals, so a peak below its conns/worker threshold is a sizing bug here and a bytes/req above its large-payload threshold is a deliberate suppression, not a defect",
+					c.Tier1.PeakConnsPerWorker, c.Tier1.MeanBytesPerReq))
 		}
 	}
 	if opts.RequireInstrumented {

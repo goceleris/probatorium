@@ -26,6 +26,8 @@ var seriesColumns = []string{
 	"ts", "goroutines", "heap_inuse", "heap_alloc", "heap_objects",
 	"heap_idle", "heap_released", "stack_inuse", "rss",
 	"accepted", "closed", "active", "adaptive_switches", "engine_error_count",
+	"engine_workers", "engine_requests_total", "engine_bytes_read",
+	"engine_bytes_written",
 }
 
 // seriesWriter appends one row per property-loop sample to a CSV in the cell
@@ -89,6 +91,8 @@ func (s *seriesWriter) Record(snap properties.Snapshot) {
 		snap.StackInuseBytes, snap.RSSBytes,
 		snap.AcceptedConnTotal, snap.ClosedConnTotal, snap.ActiveConns,
 		snap.AdaptiveSwitches, snap.EngineErrorCount,
+		snap.EngineWorkers, snap.EngineRequestsTotal,
+		snap.EngineBytesRead, snap.EngineBytesWritten,
 	}
 	for i, x := range v {
 		s.row[i] = strconv.FormatInt(x, 10)

@@ -124,6 +124,17 @@ type Tally struct {
 	// ExpectAdaptiveSwitch reads it to prove an adaptive cell actually
 	// promoted (celeris#580) instead of idling on its start engine.
 	AdaptiveSwitches int64 `json:"adaptive_switches"`
+	// PeakConnsPerWorker is the highest ActiveConns/Workers ratio sampled,
+	// and MeanBytesPerReq the cell's average payload bytes per request
+	// over the whole observation window. They are the adaptive
+	// controller's own two promotion signals, recorded so a cell that
+	// reported AdaptiveSwitches == 0 can say which of the three reasons
+	// applies: the load never reached the controller's conns/worker
+	// threshold, the workload was link-bound and the controller
+	// deliberately suppressed the switch, or neither -- which would be a
+	// celeris defect. Zero when the refapp published no engine metrics.
+	PeakConnsPerWorker float64 `json:"peak_conns_per_worker,omitempty"`
+	MeanBytesPerReq    float64 `json:"mean_bytes_per_req,omitempty"`
 	// NotJudged are the instrumented IDs whose every evaluation was a
 	// skip -- typically the slope predicates in a cell shorter than
 	// warm-up + window (15 min). They verified nothing and are excluded
@@ -218,6 +229,13 @@ type Evaluator struct {
 	// firstPoll / lastPoll bound the observation window
 	// (Tally.Observed) over poll ATTEMPTS, not successes.
 	firstPoll, lastPoll time.Time
+
+	// Engine-metric deltas behind Tally.MeanBytesPerReq. baseReqs/baseBytes
+	// are taken at the first sample that carries a nonzero request count,
+	// so the warm-up's zero-request samples cannot divide into the mean.
+	haveBase            bool
+	baseReqs, baseBytes int64
+	lastReqs, lastBytes int64
 }
 
 // NewEvaluator returns an Evaluator over specs (typically
@@ -311,6 +329,22 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 	}
 	if snap.AdaptiveSwitches > e.tally.AdaptiveSwitches {
 		e.tally.AdaptiveSwitches = snap.AdaptiveSwitches
+	}
+	if snap.EngineWorkers > 0 {
+		if cpw := float64(snap.ActiveConns) / float64(snap.EngineWorkers); cpw > e.tally.PeakConnsPerWorker {
+			e.tally.PeakConnsPerWorker = cpw
+		}
+	}
+	if snap.EngineRequestsTotal > 0 {
+		bytes := snap.EngineBytesRead + snap.EngineBytesWritten
+		if !e.haveBase {
+			e.haveBase = true
+			e.baseReqs, e.baseBytes = snap.EngineRequestsTotal, bytes
+		}
+		e.lastReqs, e.lastBytes = snap.EngineRequestsTotal, bytes
+		if dr := e.lastReqs - e.baseReqs; dr > 0 {
+			e.tally.MeanBytesPerReq = float64(e.lastBytes-e.baseBytes) / float64(dr)
+		}
 	}
 	e.ctx.Now = now
 	e.ctx.History = append(e.ctx.History, snap)
