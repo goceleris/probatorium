@@ -1,0 +1,196 @@
+---
+# forensics.yml — post-hoc, read-only evidence capture from every cluster
+# host, driven by the OFF-CLUSTER teardown job (probatorium#354).
+#
+#   ansible-playbook -i ansible/inventory.yml ansible/forensics.yml \
+#       --extra-vars "forensics_local_dir=/abs/path/out"
+#
+# WHY IT RUNS OFF-CLUSTER
+#
+# The evidence is wanted precisely when the matrix job did NOT finish — when
+# the runner "lost communication with the server" and every in-band step
+# (mage Cleanup, Upload results) died with it. The teardown job is the only
+# thing that still runs in that case, and it runs on ubuntu-latest, so it can
+# reach a host whose runner is gone.
+#
+# ORDERING IS LOAD-BEARING
+#
+# In .github/actions/cluster-runner-down this play MUST come before the two
+# reclamation steps, because both of them destroy exactly what it collects:
+#
+#   cleanup.yml --extra-vars purge_results=true   rm -rf's {{ results_root }}
+#   runner-teardown.yml                            rm -rf's the runner dir,
+#                                                  and with it runner.stdout,
+#                                                  runner.stderr and _diag/
+#
+# Collect first, reclaim after.
+#
+# EVERY COMMAND IS A READ
+#
+# ops/forensics/cluster-forensics contains no kill, no signal, no systemctl
+# start/stop/restart, no docker, no sysctl write, no rm, and never `dmesg -c`.
+# The two ansible modules used here are `script` (copy to the remote tmp dir,
+# run, remove) and `fetch` (copy a file back). Neither can disturb a running
+# process. This play is therefore safe even in the case nobody plans for: a
+# teardown that overlaps something still running on the host.
+#
+# EVERY CALL IS BOUNDED
+#
+# The host we most want to hear from may be the one that is not answering, and
+# a capture that blocks for ten minutes on a dead host is worse than no
+# capture. Three independent bounds:
+#
+#   1. the play overrides the inventory's SSH tuning (below) — that tuning is
+#      deliberately patient, for a LIVE host under bench load, and would cost
+#      minutes per task against a dead one;
+#   2. `ansible_command_timeout` caps each remote command;
+#   3. the script caps every command it runs with `timeout`, and caps every
+#      output by both lines and bytes.
+#
+# Worst case per host is one connect timeout (10 s) plus one command timeout
+# (90 s); hosts run in parallel under ansible's default forks.
+
+- name: Collect post-hoc host forensics
+  hosts: cluster
+  gather_facts: false
+  become: true
+  # A dead host is the case this play exists for. It must not abort the
+  # collection from the hosts that ARE answering.
+  ignore_unreachable: true
+  vars:
+    forensics_local_dir: ""
+    forensics_window_hours: 6
+    forensics_max_lines: 1500
+    forensics_reason: unspecified
+    sampler_outdir: /var/log/celeris-host-sampler
+    # Short, deliberate SSH bounds for this play only. The inventory's values
+    # (ConnectTimeout=60, ServerAliveCountMax=18 => ~3 min of dead air
+    # tolerated) exist so a saturated host mid-bench is not dropped as
+    # UNREACHABLE; here the opposite is wanted. ControlMaster is switched OFF
+    # as well: a persisted mux socket left pointing at a host that has since
+    # gone away is its own way to hang.
+    ansible_ssh_common_args: >-
+      -o ControlMaster=no
+      -o ControlPath=none
+      -o ConnectTimeout=10
+      -o ServerAliveInterval=5
+      -o ServerAliveCountMax=3
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
+    ansible_connect_timeout: 10
+    ansible_command_timeout: 90
+    # No reconnection attempts. Each retry is another full connect timeout
+    # against a host we have already established is not answering, and the
+    # point of this play is to be bounded, not to try hard. Measured
+    # end-to-end against a blackholed address: ~20 s for the unreachable
+    # host, well inside the caller's 600 s backstop.
+    ansible_ssh_retries: 0
+  tasks:
+    - name: Require an output directory
+      ansible.builtin.assert:
+        that: forensics_local_dir | length > 0
+        fail_msg: "forensics_local_dir must be set to an absolute path"
+      # No run_once: the check is a variable test costing nothing, and
+      # run_once behaves differently under the `free` strategy (ansible-lint
+      # run-once[task]). Per host, delegated locally, is simply correct.
+      delegate_to: localhost
+      become: false
+
+    - name: Ensure the local output directory exists
+      ansible.builtin.file:
+        path: "{{ forensics_local_dir }}/{{ inventory_hostname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      # This one is local; a failure here is a real error worth surfacing.
+
+    # `script` copies the file to the remote temp dir, runs it, and removes
+    # it — no persistent host state, and the script stays a real file in the
+    # repo that shellcheck can see.
+    - name: Capture host forensics (read-only)
+      ansible.builtin.script:
+        cmd: >-
+          ../ops/forensics/cluster-forensics
+          {{ forensics_window_hours }}
+          {{ forensics_max_lines }}
+          {{ forensics_reason | quote }}
+      register: forensics
+      changed_when: false
+      # The capture must never fail the teardown. Its exit status is written
+      # into the artifact and echoed by the caller, so a failure is recorded
+      # rather than swallowed.
+      failed_when: false
+
+    # Fetch the sampler's series. This is the part that answers "what was the
+    # host doing on the way down", and it is a separate file rather than part
+    # of the text capture because it is a machine-readable series meant to be
+    # plotted, and because it is the one artefact that is deliberately NOT on
+    # tmpfs (see ops/host-sampler/celeris-host-sampler).
+    - name: Fetch the host sampler series
+      ansible.builtin.fetch:
+        src: "{{ sampler_outdir }}/{{ item }}"
+        dest: "{{ forensics_local_dir }}/{{ inventory_hostname }}/{{ item }}"
+        flat: true
+        fail_on_missing: false
+        validate_checksum: false
+      loop:
+        - samples.jsonl
+        - samples.jsonl.1
+        - kernel.log
+        - current-run.txt
+      failed_when: false
+      # Skip the whole loop on a host that already failed to answer. Without
+      # this each of the four items costs another full connect timeout
+      # against a host we have already proved is not there -- measured at
+      # 51 s for one dead host, against 11 s with the guard. Bounding the
+      # capture is the requirement; four retries of a known-dead connection
+      # is the opposite of it.
+      when: forensics.stdout is defined
+
+    # Past this point a host that never answered is allowed back into the
+    # play, so that its silence is RECORDED rather than just skipped. An
+    # unreachable host is not a gap in the evidence; it is evidence.
+    - name: Let unreachable hosts continue to the local write
+      ansible.builtin.meta: clear_host_errors
+
+    - name: Write the capture
+      ansible.builtin.copy:
+        content: "{{ forensics.stdout | default('') }}"
+        dest: "{{ forensics_local_dir }}/{{ inventory_hostname }}/host-forensics.txt"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      when: forensics.stdout is defined and forensics.stdout | length > 0
+
+    - name: Write the capture's own status
+      ansible.builtin.copy:
+        content: |
+          host: {{ inventory_hostname }}
+          reachable: {{ 'yes' if (forensics.stdout is defined) else 'NO' }}
+          rc: {{ forensics.rc | default('n/a') }}
+          reason: {{ forensics_reason }}
+          window_hours: {{ forensics_window_hours }}
+          {% if forensics.stderr is defined and forensics.stderr | length > 0 %}
+          stderr:
+          {{ forensics.stderr }}
+          {% endif %}
+          {% if forensics.stdout is not defined %}
+          NOTE: this host did not answer within the play's SSH bounds
+          (ConnectTimeout=10s). For a post-mortem that is a finding, not a
+          gap: a host that is unreachable AFTER the run ended did not merely
+          lose its runner. Compare with `last reboot` and the sampler series
+          on the hosts that did answer.
+          {% endif %}
+        dest: "{{ forensics_local_dir }}/{{ inventory_hostname }}/collection-status.txt"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          forensics {{ inventory_hostname }}:
+          {{ 'captured ' ~ (forensics.stdout | default('') | length) ~ ' bytes'
+             if forensics.stdout is defined else 'UNREACHABLE (recorded)' }}

@@ -126,6 +126,31 @@ jobs:
           bash .github/scripts/refresh-cluster-known-hosts.sh \
             ansible/inventory.yml "${RUNNER_ROOT}/.ssh/known_hosts"
 
+      # A 24 h soak died at 20 h 05 m with "the self-hosted runner lost
+      # communication with the server" and left nothing behind that could
+      # tell memory pressure from a reboot from a network event
+      # (probatorium#354). This starts a strictly read-only per-host sampler
+      # for the whole run so the next loss has an approach instead of a
+      # cliff: available memory, load, runner RSS, the monotonic OOM and
+      # link-flap counters, and the boot id that settles "did the host
+      # reboot" outright.
+      #
+      # Safe to run during a measurement: it never signals, kills or
+      # restarts anything (see ansible/host-sampler.yml), it self-terminates
+      # on a hard deadline, and it costs a measured ~24 ms of CPU per sample
+      # — 0.04-0.06% of one core at this cadence, against a harness whose own
+      # property loop samples sixty times more often.
+      #
+      # Best-effort by design: the playbook warns and continues if a host
+      # will not take it. Instrumentation that can fail a 24 h soak would be
+      # worse than no instrumentation.
+      - name: Start the host sampler (read-only, 1/min)
+        continue-on-error: true
+        env:
+          SOAK_DURATION: ${{ inputs.duration || '24h' }}
+          SAMPLER_TAG: weekend-${{ github.run_id }}
+        run: mage HostSamplerStart
+
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
@@ -185,6 +210,17 @@ jobs:
           VALIDATE_DIFF_STRICT: "1"
         run: mage ValidateDiff
 
+      # Before the upload, so the series travels with the run's own results.
+      # `continue-on-error` rather than `|| true`: a failure here is visible
+      # as a failed step but cannot turn a gate verdict into a teardown
+      # failure. On the path this exists for — the runner died — this step
+      # never runs at all, and the teardown job's forensics collection
+      # retrieves the same files instead.
+      - name: Stop the host sampler and collect its series
+        if: always()
+        continue-on-error: true
+        run: mage HostSamplerStop
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -217,3 +253,8 @@ jobs:
           tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
           gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          # The composite collects host forensics BEFORE it reclaims
+          # anything, and labels the capture with how the matrix job ended.
+          # `failure` here with no matrix results artifact is the lost-runner
+          # signature the whole capture exists for (probatorium#354).
+          forensics-reason:          "matrix=${{ needs.matrix.result }}"
