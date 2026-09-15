@@ -1,0 +1,64 @@
+# Every engine.EngineMetrics scalar field the refapps publish, and the
+# /debug/vars key it is published under: <key> TAB <EngineMetrics field> TAB <Go type>.
+#
+# GENERATED -- do not edit by hand. Written and checked by
+# TestEngineKeysManifestMatchesEngineMetrics in validation/refapp/internal/debugvars:
+#
+#   cd validation/refapp/internal/debugvars && go test -run TestEngineKeysManifestMatchesEngineMetrics -update-engine-keys
+#
+# which fails whenever this file and the celeris that module pins disagree. The
+# root module cannot import celeris, so its guards learn what is published from
+# here and hold ParseDebugVars, properties.Snapshot, the per-cell series and the
+# end-of-cell tally to it (probatorium#391).
+celeris.active_conns	ActiveConnections	int64
+celeris.adaptive_switches	AdaptiveSwitches	uint64
+celeris.engine_accept_count	AcceptCount	uint64
+celeris.engine_async_promoted_conns	AsyncPromotedConns	uint64
+celeris.engine_async_routes	AsyncRoutes	int
+celeris.engine_bytes_read	BytesRead	uint64
+celeris.engine_bytes_written	BytesWritten	uint64
+celeris.engine_close_count	CloseCount	uint64
+celeris.engine_close_missing_conn_state	CloseMissingConnState	uint64
+celeris.engine_detach_window_closes	DetachWindowCloses	uint64
+celeris.engine_detached_conns	DetachedConnections	int64
+celeris.engine_error_accept_cancelled	ErrorAcceptCancelled	uint64
+celeris.engine_error_accept_fd_limit	ErrorAcceptFDLimit	uint64
+celeris.engine_error_accept_other	ErrorAcceptOther	uint64
+celeris.engine_error_conn_register	ErrorConnRegister	uint64
+celeris.engine_error_conn_table_cap	ErrorConnTableCap	uint64
+celeris.engine_error_count	ErrorCount	uint64
+celeris.engine_error_handler	ErrorHandler	uint64
+celeris.engine_error_listener_recreate	ErrorListenerRecreate	uint64
+celeris.engine_error_request_body	ErrorRequestBody	uint64
+celeris.engine_error_send	ErrorSend	uint64
+celeris.engine_error_send_peer_gone	ErrorSendPeerGone	uint64
+celeris.engine_error_transplant_adopt	ErrorTransplantAdopt	uint64
+celeris.engine_inline_bytes	InlineBytes	uint64
+celeris.engine_recv_arm_declined	RecvArmDeclined	uint64
+celeris.engine_recv_cqe_unaccounted	RecvCQEUnaccounted	uint64
+celeris.engine_recv_double_armed	RecvDoubleArmed	uint64
+celeris.engine_recv_linked_arms	RecvLinkedArms	uint64
+celeris.engine_recv_linked_blocked_max_nanos	RecvLinkedBlockedMaxNanos	uint64
+celeris.engine_recv_linked_blocked_nanos	RecvLinkedBlockedNanos	uint64
+celeris.engine_recv_resume_while_cancel_pending	RecvResumeWhileCancelPending	uint64
+celeris.engine_recv_resume_while_recv_in_flight	RecvResumeWhileRecvInFlight	uint64
+celeris.engine_recv_sq_full	RecvSQFull	uint64
+celeris.engine_recv_stall_episodes	RecvStallEpisodes	uint64
+celeris.engine_recv_stall_max_nanos	RecvStallMaxNanos	uint64
+celeris.engine_recv_stall_nanos	RecvStallNanos	uint64
+celeris.engine_requests_total	RequestCount	uint64
+celeris.engine_ring_bytes	RingBytes	uint64
+celeris.engine_standby_active_conns	StandbyActiveConnections	int64
+celeris.engine_standby_close_count	StandbyCloseCount	uint64
+celeris.engine_standby_error_count	StandbyErrorCount	uint64
+celeris.engine_throughput	Throughput	float64
+celeris.engine_transplant_adopt_refused	TransplantAdoptRefused	uint64
+celeris.engine_transplant_adopt_slot_occupied	TransplantAdoptSlotOccupied	uint64
+celeris.engine_transplant_adopted	TransplantAdopted	uint64
+celeris.engine_transplant_detached	TransplantDetached	uint64
+celeris.engine_transplant_drain_stopped	TransplantDrainStopped	uint64
+celeris.engine_transplant_handoff_refused	TransplantHandoffRefused	uint64
+celeris.engine_transplant_stranded	TransplantStranded	uint64
+celeris.engine_workers	Workers	int
+celeris.engine_zc_notifs	ZCNotifs	uint64
+celeris.engine_zc_sends_submitted	ZCSendsSubmitted	uint64

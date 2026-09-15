@@ -91,8 +91,11 @@ func num(t *testing.T, doc map[string]any, key string) float64 {
 func TestDebugVars_DocumentShape(t *testing.T) {
 	base, _ := startRefapp(t)
 	doc := getVars(t, base)
-	// Every key the checker parser reads must be a top-level JSON number
-	// (memstats nested, Go-cased).
+	// A sample of the connection keys must be top-level JSON numbers
+	// (memstats nested, Go-cased). Every engine key is covered by
+	// TestDebugVarsPublishesEveryEngineMetricsField, and what the checker
+	// parses is held to the published set by the root module's guards
+	// through validation/internal/enginekeys -- this list is NOT that set.
 	for _, k := range []string{"goroutines", "celeris.accepted_conn_total", "celeris.closed_conn_total", "celeris.active_conns", "celeris.panic_count", "celeris.adaptive_switches", "celeris.engine_error_count"} {
 		num(t, doc, k)
 	}

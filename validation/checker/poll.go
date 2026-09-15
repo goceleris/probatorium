@@ -65,7 +65,23 @@ import (
 // apart: it is the refapp's own statement of what it can judge, and the
 // evaluator reports anything absent from it as not-instrumented rather than
 // as passed.
-const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine_error_count, celeris.engine,celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties, celeris.driver_writes_issued, celeris.driver_reads_issued, celeris.driver_read_hits, celeris.driver_read_misses, celeris.validation_build, celeris.iouring_sqe_corruptions, celeris.race_build, celeris.engine_workers, celeris.engine_requests_total, celeris.engine_bytes_read, celeris.engine_bytes_written, celeris.engine_accept_count, celeris.engine_close_count, celeris.engine_async_promoted_conns, celeris.engine_standby_active_conns, celeris.engine_standby_close_count, celeris.engine_transplant_detached, celeris.engine_transplant_adopted, celeris.engine_transplant_adopt_slot_occupied, celeris.engine_close_missing_conn_state, celeris.engine_recv_double_armed, celeris.engine_recv_cqe_unaccounted, celeris.engine_recv_sq_full, celeris.engine_recv_stall_episodes, celeris.engine_error_accept_fd_limit, celeris.engine_error_accept_cancelled, celeris.engine_error_accept_other, celeris.engine_error_conn_table_cap, celeris.engine_error_conn_register, celeris.engine_error_listener_recreate, celeris.engine_error_transplant_adopt, celeris.engine_error_send_peer_gone, celeris.engine_error_send, celeris.engine_error_request_body, celeris.engine_error_handler, celeris.engine_standby_error_count"
+//
+// Split on "," and trim: the guards compare it as a SET, because a substring
+// test cannot tell celeris.engine_error_send from
+// celeris.engine_error_send_peer_gone.
+const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine_error_count, celeris.engine, celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties, celeris.driver_writes_issued, celeris.driver_reads_issued, celeris.driver_read_hits, celeris.driver_read_misses, celeris.validation_build, celeris.iouring_sqe_corruptions, celeris.race_build, celeris.engine_workers, celeris.engine_requests_total, celeris.engine_bytes_read, celeris.engine_bytes_written, celeris.engine_accept_count, celeris.engine_close_count, celeris.engine_async_promoted_conns, celeris.engine_standby_active_conns, celeris.engine_standby_close_count, celeris.engine_transplant_detached, celeris.engine_transplant_adopted, celeris.engine_transplant_adopt_slot_occupied, celeris.engine_close_missing_conn_state, celeris.engine_recv_double_armed, celeris.engine_recv_cqe_unaccounted, celeris.engine_recv_sq_full, celeris.engine_recv_stall_episodes, celeris.engine_error_accept_fd_limit, celeris.engine_error_accept_cancelled, celeris.engine_error_accept_other, celeris.engine_error_conn_table_cap, celeris.engine_error_conn_register, celeris.engine_error_listener_recreate, celeris.engine_error_transplant_adopt, celeris.engine_error_send_peer_gone, celeris.engine_error_send, celeris.engine_error_request_body, celeris.engine_error_handler, celeris.engine_standby_error_count, celeris.engine_transplant_handoff_refused, celeris.engine_transplant_drain_stopped, celeris.engine_transplant_stranded, celeris.engine_transplant_adopt_refused, celeris.engine_recv_resume_while_cancel_pending, celeris.engine_recv_resume_while_recv_in_flight, celeris.engine_recv_arm_declined, celeris.engine_recv_stall_nanos, celeris.engine_recv_stall_max_nanos, celeris.engine_recv_linked_arms, celeris.engine_recv_linked_blocked_nanos, celeris.engine_recv_linked_blocked_max_nanos, celeris.engine_detached_conns, celeris.engine_detach_window_closes, celeris.engine_zc_sends_submitted, celeris.engine_zc_notifs, celeris.engine_inline_bytes, celeris.engine_ring_bytes, celeris.engine_async_routes"
+
+// EngineKeysNotParsed names the published engine.EngineMetrics keys
+// ParseDebugVars deliberately does not read, each with its reason.
+//
+// The published set is validation/internal/enginekeys, generated from the
+// struct at the celeris the refapps pin. TestParseDebugVarsReadsEveryPublishedEngineKey
+// fails on any key that is neither parsed into a Snapshot field of its own
+// nor listed here, and on any entry here that names a key no longer
+// published, so an excuse cannot outlive its field.
+var EngineKeysNotParsed = map[string]string{
+	"celeris.engine_throughput": "assigned by no celeris engine -- std, epoll and io_uring never write it and the adaptive engine sums two zeros (celeris#653) -- so parsed it would reach the artifact as a flat 0 that reads as a measured request rate. It is also the only float of the fifty-two, and every hop after this one carries int64. When celeris#653 resolves: removing the field fails this entry as stale, but POPULATING it fails nothing, which is why this entry names the issue",
+}
 
 // Poll fetches url and projects the /debug/vars document into a
 // [properties.Snapshot] stamped with t. Missing keys default to zero.
@@ -145,6 +161,29 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	snap.EngineRecvCQEUnaccounted = readInt64(doc, "celeris.engine_recv_cqe_unaccounted")
 	snap.EngineRecvSQFull = readInt64(doc, "celeris.engine_recv_sq_full")
 	snap.EngineRecvStallEpisodes = readInt64(doc, "celeris.engine_recv_stall_episodes")
+	// The keys probatorium#386 published and nothing parsed until
+	// probatorium#391. Every published key but the one EngineKeysNotParsed
+	// names is read, and TestParseDebugVarsReadsEveryPublishedEngineKey
+	// holds this block to the published set rather than to this list.
+	snap.EngineTransplantHandoffRefused = readInt64(doc, "celeris.engine_transplant_handoff_refused")
+	snap.EngineTransplantDrainStopped = readInt64(doc, "celeris.engine_transplant_drain_stopped")
+	snap.EngineTransplantStranded = readInt64(doc, "celeris.engine_transplant_stranded")
+	snap.EngineTransplantAdoptRefused = readInt64(doc, "celeris.engine_transplant_adopt_refused")
+	snap.EngineRecvResumeWhileCancelPending = readInt64(doc, "celeris.engine_recv_resume_while_cancel_pending")
+	snap.EngineRecvResumeWhileRecvInFlight = readInt64(doc, "celeris.engine_recv_resume_while_recv_in_flight")
+	snap.EngineRecvArmDeclined = readInt64(doc, "celeris.engine_recv_arm_declined")
+	snap.EngineRecvStallNanos = readInt64(doc, "celeris.engine_recv_stall_nanos")
+	snap.EngineRecvStallMaxNanos = readInt64(doc, "celeris.engine_recv_stall_max_nanos")
+	snap.EngineRecvLinkedArms = readInt64(doc, "celeris.engine_recv_linked_arms")
+	snap.EngineRecvLinkedBlockedNanos = readInt64(doc, "celeris.engine_recv_linked_blocked_nanos")
+	snap.EngineRecvLinkedBlockedMaxNanos = readInt64(doc, "celeris.engine_recv_linked_blocked_max_nanos")
+	snap.EngineDetachedConns = readInt64(doc, "celeris.engine_detached_conns")
+	snap.EngineDetachWindowCloses = readInt64(doc, "celeris.engine_detach_window_closes")
+	snap.EngineZCSendsSubmitted = readInt64(doc, "celeris.engine_zc_sends_submitted")
+	snap.EngineZCNotifs = readInt64(doc, "celeris.engine_zc_notifs")
+	snap.EngineInlineBytes = readInt64(doc, "celeris.engine_inline_bytes")
+	snap.EngineRingBytes = readInt64(doc, "celeris.engine_ring_bytes")
+	snap.EngineAsyncRoutes = readInt64(doc, "celeris.engine_async_routes")
 	snap.OldestOpenConnLastByteAgeMs = readInt64(doc, "celeris.oldest_open_conn_last_byte_age_ms")
 	snap.OpenConnsTracked = readInt64(doc, "celeris.open_conns_tracked")
 	if b, ok := doc["celeris.checkptr_build"].(bool); ok {

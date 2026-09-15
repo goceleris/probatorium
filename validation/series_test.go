@@ -51,6 +51,16 @@ func TestSeriesWriterRecordsEveryColumn(t *testing.T) {
 		EngineErrorConnTableCap:           37,
 		EngineErrorSendPeerGone:           977,
 		EngineStandbyErrorCount:           41,
+		EngineTransplantHandoffRefused:    43,
+		EngineTransplantDrainStopped:      47,
+		EngineTransplantStranded:          53,
+		EngineTransplantAdoptRefused:      59,
+		EngineRecvStallNanos:              67,
+		EngineRecvStallMaxNanos:           71,
+		EngineRecvLinkedArms:              73,
+		EngineRecvLinkedBlockedNanos:      79,
+		EngineRecvLinkedBlockedMaxNanos:   83,
+		EngineDetachedConns:               89,
 	}
 	w.Record(snap)
 	w.Close()
@@ -97,6 +107,16 @@ func TestSeriesWriterRecordsEveryColumn(t *testing.T) {
 		"engine_error_conn_table_cap":           37,
 		"engine_error_send_peer_gone":           977,
 		"engine_standby_error_count":            41,
+		"engine_transplant_handoff_refused":     43,
+		"engine_transplant_drain_stopped":       47,
+		"engine_transplant_stranded":            53,
+		"engine_transplant_adopt_refused":       59,
+		"engine_recv_stall_nanos":               67,
+		"engine_recv_stall_max_nanos":           71,
+		"engine_recv_linked_arms":               73,
+		"engine_recv_linked_blocked_nanos":      79,
+		"engine_recv_linked_blocked_max_nanos":  83,
+		"engine_detached_conns":                 89,
 	}
 	if len(want) != len(seriesColumns) {
 		t.Fatalf("test covers %d columns but the writer has %d — a new column needs a case here",

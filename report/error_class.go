@@ -14,8 +14,10 @@ type ErrorClass struct {
 	// Tier1Summary.EngineErrorClasses is the whole of what it can say.
 	//
 	// The split is a judgement, and Why records it. The series is written
-	// once a second for the whole cell and already carries thirty-one
-	// columns, so a bucket earns one only when the QUESTION asked of it is
+	// once a second for the whole cell (it carried thirty-one columns when
+	// this bar was set, and report.EngineCounters holds the rest of
+	// engine.EngineMetrics to the same one), so a bucket earns a column
+	// only when the QUESTION asked of it is
 	// "when", and the artifact carries something else timestamped to join
 	// that against: the promotion instant (adaptive_switches), the
 	// hand-off (engine_transplant_adopted), a walker's slow-read or

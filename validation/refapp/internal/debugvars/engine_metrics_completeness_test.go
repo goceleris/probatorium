@@ -1,8 +1,11 @@
 package debugvars
 
 import (
+	"flag"
+	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/goceleris/celeris/engine"
@@ -110,10 +113,7 @@ func TestDebugVarsPublishesEveryEngineMetricsField(t *testing.T) {
 			optedOut++
 			continue
 		}
-		key, ok := engineMetricsKeyAliases[f.Name]
-		if !ok {
-			key = "celeris.engine_" + snakeCase(f.Name)
-		}
+		key := engineMetricsKey(f.Name)
 		v, present := doc[key]
 		if !present {
 			missing = append(missing, f.Name+" -> "+key)
@@ -156,6 +156,121 @@ func TestDebugVarsPublishesEveryEngineMetricsField(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("no field was checked at all -- this guard is vacuous")
+	}
+}
+
+// engineMetricsKey is the /debug/vars key an EngineMetrics field is
+// published under: its alias when it has one, the default convention
+// otherwise. One function, so the publish guard above and the manifest
+// below cannot resolve the same field to two different keys.
+func engineMetricsKey(field string) string {
+	if key, ok := engineMetricsKeyAliases[field]; ok {
+		return key
+	}
+	return "celeris.engine_" + snakeCase(field)
+}
+
+// engineKeysManifestPath is the root module's copy of the published key set.
+// It lives in the ROOT module (validation/internal/enginekeys embeds it)
+// because that is where every consumer is; this module is the only one that
+// can compute it, because it is the only one that compiles against celeris.
+const engineKeysManifestPath = "../../../internal/enginekeys/engine_metrics_keys.txt"
+
+var updateEngineKeys = flag.Bool("update-engine-keys", false,
+	"rewrite "+engineKeysManifestPath+" from engine.EngineMetrics instead of comparing against it")
+
+const engineKeysManifestHeader = `# Every engine.EngineMetrics scalar field the refapps publish, and the
+# /debug/vars key it is published under: <key> TAB <EngineMetrics field> TAB <Go type>.
+#
+# GENERATED -- do not edit by hand. Written and checked by
+# TestEngineKeysManifestMatchesEngineMetrics in validation/refapp/internal/debugvars:
+#
+#   cd validation/refapp/internal/debugvars && go test -run TestEngineKeysManifestMatchesEngineMetrics -update-engine-keys
+#
+# which fails whenever this file and the celeris that module pins disagree. The
+# root module cannot import celeris, so its guards learn what is published from
+# here and hold ParseDebugVars, properties.Snapshot, the per-cell series and the
+# end-of-cell tally to it (probatorium#391).
+`
+
+// renderEngineKeysManifest walks engine.EngineMetrics and renders the
+// manifest: one line per published scalar field, sorted by key.
+func renderEngineKeysManifest() (text string, lines int) {
+	mt := reflect.TypeOf(engine.EngineMetrics{})
+	var rows []string
+	for i := range mt.NumField() {
+		f := mt.Field(i)
+		if !f.IsExported() || !isScalarKind(f.Type.Kind()) {
+			continue
+		}
+		if _, skip := engineMetricsNotPublished[f.Name]; skip {
+			continue
+		}
+		rows = append(rows, engineMetricsKey(f.Name)+"\t"+f.Name+"\t"+f.Type.String())
+	}
+	sort.Strings(rows)
+	return engineKeysManifestHeader + strings.Join(rows, "\n") + "\n", len(rows)
+}
+
+// TestEngineKeysManifestMatchesEngineMetrics carries the guard above across
+// the module boundary.
+//
+// TestDebugVarsPublishesEveryEngineMetricsField proves every EngineMetrics
+// field reaches a /debug/vars key. That was one hand-list of four: the
+// checker's ParseDebugVars, properties.Snapshot, the per-cell series and the
+// end-of-cell tally are each their own, and after probatorium#386 twenty
+// published keys -- celeris.engine_transplant_stranded among them -- still
+// reached none of them (probatorium#391). Those four live in the root module,
+// which cannot reflect over engine.EngineMetrics because it does not depend
+// on celeris. So the key set is written to a file the root module embeds,
+// and this test fails whenever the file and the struct disagree -- a field
+// added in celeris fails HERE first, and regenerating the file then fails
+// every root-module hop that does not carry it yet.
+func TestEngineKeysManifestMatchesEngineMetrics(t *testing.T) {
+	want, lines := renderEngineKeysManifest()
+	if *updateEngineKeys {
+		if err := os.WriteFile(engineKeysManifestPath, []byte(want), 0o644); err != nil {
+			t.Fatalf("write %s: %v", engineKeysManifestPath, err)
+		}
+		t.Logf("wrote %d key(s) to %s", lines, engineKeysManifestPath)
+		return
+	}
+	got, err := os.ReadFile(engineKeysManifestPath)
+	if err != nil {
+		// An unreadable manifest is not a pass: every root-module guard
+		// that reads it would have nothing to hold its hop to.
+		t.Fatalf("read %s: %v", engineKeysManifestPath, err)
+	}
+	if string(got) != want {
+		have := map[string]bool{}
+		for _, l := range strings.Split(string(got), "\n") {
+			have[l] = true
+		}
+		need := map[string]bool{}
+		for _, l := range strings.Split(want, "\n") {
+			need[l] = true
+		}
+		var added, removed []string
+		for l := range need {
+			if !have[l] {
+				added = append(added, l)
+			}
+		}
+		for l := range have {
+			if !need[l] {
+				removed = append(removed, l)
+			}
+		}
+		sort.Strings(added)
+		sort.Strings(removed)
+		t.Errorf("%s does not match engine.EngineMetrics at the pinned celeris.\n  missing from the file: %q\n  in the file but not the struct: %q\n"+
+			"Regenerate it with -update-engine-keys, then carry every new key through the root module "+
+			"(go test ./validation/... names each hop that drops one).",
+			engineKeysManifestPath, added, removed)
+	}
+	t.Logf("manifest covers %d published EngineMetrics key(s)", lines)
+	if lines < 52 {
+		t.Fatalf("the walk rendered only %d key(s) against a floor of 52: the reflective walk is broken, not celeris", lines)
 	}
 }
 

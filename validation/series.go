@@ -33,6 +33,15 @@ const seriesFlushEvery = 30
 // bucket at a time, and TestTheSeriesCarriesExactlyTheBucketsDeclaredForIt
 // fails if the two ever disagree.
 //
+// probatorium#391 (schema 5.15) applied the same bar to the rest of
+// engine.EngineMetrics and admitted TEN of its twenty keys: the four
+// celeris#647 hand-off outcomes, the five recv-stall and linked-recv duration
+// columns celeris#607 turned on, and engine_detached_conns, the only gauge.
+// report.EngineCounters records the call for each, and
+// TestTheSeriesCarriesExactlyTheEngineCountersDeclaredForIt enforces it.
+// TestEveryPublishedEngineKeyHasAColumnOrADeclaration fails on a published key
+// that has neither a column nor a declaration saying it is tally-only.
+//
 // New columns are APPENDED, never inserted: the header names every column and
 // a reader should key off it, but an appended column cannot invalidate a
 // column index somebody already wrote down against a shipped artifact.
@@ -61,6 +70,16 @@ var seriesColumns = []string{
 	"engine_error_conn_table_cap",
 	"engine_error_send_peer_gone",
 	"engine_standby_error_count",
+	"engine_transplant_handoff_refused",
+	"engine_transplant_drain_stopped",
+	"engine_transplant_stranded",
+	"engine_transplant_adopt_refused",
+	"engine_recv_stall_nanos",
+	"engine_recv_stall_max_nanos",
+	"engine_recv_linked_arms",
+	"engine_recv_linked_blocked_nanos",
+	"engine_recv_linked_blocked_max_nanos",
+	"engine_detached_conns",
 }
 
 // seriesWriter appends one row per property-loop sample to a CSV in the cell
@@ -145,6 +164,16 @@ func (s *seriesWriter) Record(snap properties.Snapshot) {
 		snap.EngineErrorConnTableCap,
 		snap.EngineErrorSendPeerGone,
 		snap.EngineStandbyErrorCount,
+		snap.EngineTransplantHandoffRefused,
+		snap.EngineTransplantDrainStopped,
+		snap.EngineTransplantStranded,
+		snap.EngineTransplantAdoptRefused,
+		snap.EngineRecvStallNanos,
+		snap.EngineRecvStallMaxNanos,
+		snap.EngineRecvLinkedArms,
+		snap.EngineRecvLinkedBlockedNanos,
+		snap.EngineRecvLinkedBlockedMaxNanos,
+		snap.EngineDetachedConns,
 	}
 	for i, x := range v {
 		s.row[i] = strconv.FormatInt(x, 10)

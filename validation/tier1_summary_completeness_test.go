@@ -1,6 +1,7 @@
 package validation
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -104,6 +105,147 @@ func TestTier1SummaryExportsEveryTallyField(t *testing.T) {
 					tc.name, len(missing), rt.Name(), missing)
 			}
 		})
+	}
+}
+
+// tallyTier1Renames maps a checker.Tally json name to the Tier1Summary json
+// name it is projected under, where the two differ. Property-loop counters
+// gain a property_ prefix on the summary so they cannot be confused with the
+// walker's own counters beside them.
+var tallyTier1Renames = map[string]string{
+	"evaluations":    "property_evaluations",
+	"skips":          "property_skips",
+	"violations":     "property_violations",
+	"violation_ids":  "property_violation_ids",
+	"poll_errors":    "property_poll_errors",
+	"skipped_reason": "property_loop_skipped",
+}
+
+// tallyNotInTier1Summary names the checker.Tally fields deliberately NOT
+// projected into tier_1, each with where the information goes instead. Every
+// entry must name a real field, and must not also be projected.
+var tallyNotInTier1Summary = map[string]string{
+	"Samples":                "the count of successful polls; property_evaluations and property_poll_errors carry what the gate reads, and properties_tally.json keeps the whole Tally",
+	"Predicates":             "rolled up into the cell's properties_passed / properties_failed (Tally.Passed and Failed)",
+	"NotInstrumented":        "a cell-level field, ValidationCellResult.PropertiesNotInstrumented, not tier_1",
+	"NotJudged":              "a cell-level field, ValidationCellResult.PropertiesNotJudged, not tier_1",
+	"NotJudgedByDesign":      "a cell-level field, ValidationCellResult.PropertiesNotJudgedByDesign, not tier_1",
+	"FailureSummaries":       "a cell- and document-level field (FailureSummaries), not tier_1",
+	"PerPredicate":           "per-predicate violation counts; property_violation_ids and property_violations carry the gated part, properties_tally.json the rest",
+	"Observed":               "the observation window, used by the tally itself to decide NotJudgedByDesign; kept in properties_tally.json",
+	"IdleWindows":            "orchestrator idle-window bookkeeping for I-MEM-2; kept in properties_tally.json",
+	"IdleBaselineGoroutines": "I-MEM-2's reference level; kept in properties_tally.json",
+	"BaselineGoroutines":     "a soak-summary input (validation.soak), not tier_1",
+	"LastGoroutines":         "a soak-summary input (validation.soak), not tier_1",
+	"FirstHeapInuse":         "a soak-summary input (validation.soak heap_growth_mb), not tier_1",
+	"LastHeapInuse":          "a soak-summary input (validation.soak heap_growth_mb), not tier_1",
+	"FirstRSS":               "a soak-summary input, not tier_1",
+	"LastRSS":                "a soak-summary input, not tier_1",
+}
+
+// TestTier1SummaryCarriesEveryPropertyTallyField closes the blind spot the
+// test above documents: it walks only int64 fields of tier1TallySnapshot, and
+// Properties is a struct, so the whole checker.Tally engine block -- where
+// celeris#627 dropped ten fields, and where probatorium#391 adds the
+// engine_counters map -- was unguarded.
+//
+// Every Tally field is set to a distinct sentinel by reflection, projected,
+// marshalled, and looked for under its json name on tier_1 (or its rename).
+// By value, so a line in the projection that copies the wrong source field
+// fails here too, not only a missing one.
+func TestTier1SummaryCarriesEveryPropertyTallyField(t *testing.T) {
+	var tl checker.Tally
+	tv := reflect.ValueOf(&tl).Elem()
+	tt := tv.Type()
+	for name := range tallyNotInTier1Summary {
+		if _, ok := tt.FieldByName(name); !ok {
+			t.Errorf("tallyNotInTier1Summary names %q, which is not a checker.Tally field", name)
+		}
+	}
+	for i := range tt.NumField() {
+		f, fv := tt.Field(i), tv.Field(i)
+		n := int64(7_000_019 + i*104_729)
+		tag := "sentinel_" + f.Name
+		switch fv.Kind() {
+		case reflect.Int, reflect.Int64:
+			fv.SetInt(n)
+		case reflect.Float64:
+			fv.SetFloat(float64(n) + 0.25)
+		case reflect.String:
+			fv.SetString(tag)
+		case reflect.Slice:
+			fv.Set(reflect.ValueOf([]string{tag}))
+		case reflect.Map:
+			switch f.Type.Elem().Kind() {
+			case reflect.Int64:
+				fv.Set(reflect.ValueOf(map[string]int64{tag: n}))
+			case reflect.String:
+				fv.Set(reflect.ValueOf(map[string]string{tag: tag}))
+			default:
+				t.Fatalf("Tally.%s is a %s; teach this guard its shape rather than skip it", f.Name, f.Type)
+			}
+		default:
+			t.Fatalf("Tally.%s is a %s; teach this guard its shape rather than skip it", f.Name, f.Type)
+		}
+	}
+
+	raw, err := json.Marshal(tier1TallySnapshot{Properties: tl}.Tier1Summary())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	var checked, optedOut int
+	var missing, wrong []string
+	for i := range tt.NumField() {
+		f, fv := tt.Field(i), tv.Field(i)
+		name := strings.Split(f.Tag.Get("json"), ",")[0]
+		key := name
+		if r, ok := tallyTier1Renames[name]; ok {
+			key = r
+		}
+		got, present := doc[key]
+		if _, ok := tallyNotInTier1Summary[f.Name]; ok {
+			optedOut++
+			if present {
+				t.Errorf("tallyNotInTier1Summary excuses Tally.%s, but tier_1 carries %q: the excuse is stale", f.Name, key)
+			}
+			continue
+		}
+		if !present {
+			missing = append(missing, f.Name+" -> "+key)
+			continue
+		}
+		want, err := json.Marshal(fv.Interface())
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotRaw, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotRaw) != string(want) {
+			wrong = append(wrong, f.Name+": tier_1."+key+" = "+string(gotRaw)+", want "+string(want))
+			continue
+		}
+		checked++
+	}
+	if len(missing) > 0 {
+		t.Errorf("%d checker.Tally field(s) never reach tier_1 in validate-results.json and are not declared as going elsewhere: %v", len(missing), missing)
+	}
+	for _, w := range wrong {
+		t.Error("projected from the wrong source: " + w)
+	}
+	walked := tt.NumField()
+	t.Logf("checked %d Tally field(s) of %d walked (%d opted out, %d missing, %d wrong)", checked, walked, optedOut, len(missing), len(wrong))
+	if want := 37; walked < want {
+		t.Fatalf("walked %d Tally field(s) against a floor of %d: the reflective walk is broken", walked, want)
+	}
+	if checked == 0 {
+		t.Fatal("no field was checked at all -- this guard is vacuous")
 	}
 }
 

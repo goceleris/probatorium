@@ -1525,6 +1525,9 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		EngineErrorCount:         s.Properties.EngineErrorCount,
 		EngineErrorClasses:       s.Properties.EngineErrorClasses,
 		EngineStandbyErrorCount:  s.Properties.EngineStandbyErrorCount,
+		// Cloned, not shared: the projection is written into a document
+		// while the tally it came from can still be read.
+		EngineCounters: maps.Clone(s.Properties.EngineCounters),
 		Adversarial: map[string]int64{
 			"adv_sent":               s.Adversarial.Sent,
 			"adv_well_rejected":      s.Adversarial.WellRejected,
