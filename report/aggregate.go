@@ -65,6 +65,12 @@ type CellResult struct {
 	// for the in-process loopback runner (no observer sidecar).
 	Resources []*ResourceStats
 
+	// ScenarioResources is the per-run PER-SCENARIO slice of the same
+	// sidecar (schema v5.9, celeris#585): the column's raw series cut to
+	// this scenario's own runner window. Like Resources it is not parallel
+	// to Samples — a run whose window caught no sample is simply absent.
+	ScenarioResources []*ResourceStats
+
 	// Status is the per-cell outcome classification (schema v5.3+). The
 	// zero value ("") is treated as [CellOK] when Samples are present —
 	// [Aggregate] derives the effective status from ErrorMsg via
@@ -200,6 +206,11 @@ type CellAggregate struct {
 	// the key lever for the network-bound large-payload cells, where raw RPS
 	// converges at the NIC ceiling but CPU cost per byte still differs.
 	Resources *ResourceStats
+
+	// ScenarioResources is the across-runs reduction of the per-scenario
+	// window slices (schema v5.9, celeris#585), surfaced on
+	// ServerResult.ScenarioResources. Nil when no run carried a slice.
+	ScenarioResources *ResourceStats
 }
 
 // ErrNotImplemented is returned by scaffold stubs that have not yet been
@@ -299,6 +310,7 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 		// Server-side resource reduction (#154): median each scalar across
 		// the runs that captured an observer sidecar. Nil when none did.
 		agg.Resources = ReduceResources(cell.Resources)
+		agg.ScenarioResources = ReduceResources(cell.ScenarioResources)
 
 		out[CellID(cell.ScenarioName, cell.ServerName)] = agg
 	}

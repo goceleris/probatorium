@@ -63,6 +63,48 @@ type Snapshot struct {
 	// predicate; recorded in the per-cell series so a step in it can be
 	// joined against a walker's slow-read record (celeris#588).
 	EngineErrorCount int64
+	// EngineWorkers, EngineRequestsTotal, EngineBytesRead and
+	// EngineBytesWritten are celeris EngineMetrics.Workers, RequestCount,
+	// BytesRead and BytesWritten: the four inputs the adaptive controller
+	// turns into its two promotion signals (conns/worker = ActiveConns /
+	// Workers, and bytes/req = delta(BytesRead+BytesWritten) /
+	// delta(RequestCount)). Judged by no predicate; recorded so an
+	// adaptive cell that never promoted can be told apart from one that
+	// was never offered enough load, and from one the controller
+	// deliberately suppressed as link-bound.
+	EngineWorkers       int64
+	EngineRequestsTotal int64
+	EngineBytesRead     int64
+	EngineBytesWritten  int64
+	// Engine-side connection accounting and the transplant hand-off.
+	// EngineAcceptCount / EngineCloseCount are the engine's own view of
+	// what the refapp counts through OnConnect / OnDisconnect, so the
+	// two together attribute an I-CONN-2 drift instead of merely
+	// reporting it (celeris#624): the engine running ahead means a
+	// close skipped its hook, the two agreeing while `active` is short
+	// means a connection was detached and never re-adopted. The standby
+	// pair splits the adaptive engine's two halves, which its Metrics()
+	// otherwise sums (celeris#627).
+	EngineAcceptCount        int64
+	EngineCloseCount         int64
+	EngineAsyncPromotedConns int64
+	EngineStandbyActiveConns int64
+	EngineStandbyCloseCount  int64
+	EngineTransplantDetached int64
+	EngineTransplantAdopted  int64
+	// Must-stay-zero defect witnesses, each naming one specific defect:
+	// the adoption path finding its slot occupied, a close decrementing
+	// the live gauge with no connection state so the hook is skipped
+	// (both celeris#624), a second recv armed while one is in flight and
+	// a recv completion accounting to nothing (both celeris#484), and
+	// the two celeris#607 guards. Judged by ZeroWitness in the gate: a
+	// nonzero value is the defect firing, not a note.
+	EngineTransplantAdoptSlotOccupied int64
+	EngineCloseMissingConnState       int64
+	EngineRecvDoubleArmed             int64
+	EngineRecvCQEUnaccounted          int64
+	EngineRecvSQFull                  int64
+	EngineRecvStallEpisodes           int64
 	// ExpectedPanics is the number of panics the workload DESIGNED so far
 	// (corpus states marked `expect: panic`, counted by the Tier 1 walker
 	// when their 5xx arrives). Zero when no accounting is wired (e.g. the

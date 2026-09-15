@@ -26,6 +26,21 @@ var seriesColumns = []string{
 	"ts", "goroutines", "heap_inuse", "heap_alloc", "heap_objects",
 	"heap_idle", "heap_released", "stack_inuse", "rss",
 	"accepted", "closed", "active", "adaptive_switches", "engine_error_count",
+	"engine_workers", "engine_requests_total", "engine_bytes_read",
+	"engine_bytes_written",
+	"engine_accept_count",
+	"engine_close_count",
+	"engine_async_promoted_conns",
+	"engine_standby_active_conns",
+	"engine_standby_close_count",
+	"engine_transplant_detached",
+	"engine_transplant_adopted",
+	"engine_transplant_adopt_slot_occupied",
+	"engine_close_missing_conn_state",
+	"engine_recv_double_armed",
+	"engine_recv_cqe_unaccounted",
+	"engine_recv_sq_full",
+	"engine_recv_stall_episodes",
 }
 
 // seriesWriter appends one row per property-loop sample to a CSV in the cell
@@ -89,6 +104,21 @@ func (s *seriesWriter) Record(snap properties.Snapshot) {
 		snap.StackInuseBytes, snap.RSSBytes,
 		snap.AcceptedConnTotal, snap.ClosedConnTotal, snap.ActiveConns,
 		snap.AdaptiveSwitches, snap.EngineErrorCount,
+		snap.EngineWorkers, snap.EngineRequestsTotal,
+		snap.EngineBytesRead, snap.EngineBytesWritten,
+		snap.EngineAcceptCount,
+		snap.EngineCloseCount,
+		snap.EngineAsyncPromotedConns,
+		snap.EngineStandbyActiveConns,
+		snap.EngineStandbyCloseCount,
+		snap.EngineTransplantDetached,
+		snap.EngineTransplantAdopted,
+		snap.EngineTransplantAdoptSlotOccupied,
+		snap.EngineCloseMissingConnState,
+		snap.EngineRecvDoubleArmed,
+		snap.EngineRecvCQEUnaccounted,
+		snap.EngineRecvSQFull,
+		snap.EngineRecvStallEpisodes,
 	}
 	for i, x := range v {
 		s.row[i] = strconv.FormatInt(x, 10)

@@ -65,7 +65,7 @@ import (
 // apart: it is the refapp's own statement of what it can judge, and the
 // evaluator reports anything absent from it as not-instrumented rather than
 // as passed.
-const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine_error_count, celeris.engine,celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties, celeris.driver_writes_issued, celeris.driver_reads_issued, celeris.driver_read_hits, celeris.driver_read_misses, celeris.validation_build, celeris.iouring_sqe_corruptions, celeris.race_build"
+const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine_error_count, celeris.engine,celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties, celeris.driver_writes_issued, celeris.driver_reads_issued, celeris.driver_read_hits, celeris.driver_read_misses, celeris.validation_build, celeris.iouring_sqe_corruptions, celeris.race_build, celeris.engine_workers, celeris.engine_requests_total, celeris.engine_bytes_read, celeris.engine_bytes_written, celeris.engine_accept_count, celeris.engine_close_count, celeris.engine_async_promoted_conns, celeris.engine_standby_active_conns, celeris.engine_standby_close_count, celeris.engine_transplant_detached, celeris.engine_transplant_adopted, celeris.engine_transplant_adopt_slot_occupied, celeris.engine_close_missing_conn_state, celeris.engine_recv_double_armed, celeris.engine_recv_cqe_unaccounted, celeris.engine_recv_sq_full, celeris.engine_recv_stall_episodes"
 
 // Poll fetches url and projects the /debug/vars document into a
 // [properties.Snapshot] stamped with t. Missing keys default to zero.
@@ -111,6 +111,23 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	snap.PanicCount = readInt64(doc, "celeris.panic_count")
 	snap.AdaptiveSwitches = readInt64(doc, "celeris.adaptive_switches")
 	snap.EngineErrorCount = readInt64(doc, "celeris.engine_error_count")
+	snap.EngineWorkers = readInt64(doc, "celeris.engine_workers")
+	snap.EngineRequestsTotal = readInt64(doc, "celeris.engine_requests_total")
+	snap.EngineBytesRead = readInt64(doc, "celeris.engine_bytes_read")
+	snap.EngineBytesWritten = readInt64(doc, "celeris.engine_bytes_written")
+	snap.EngineAcceptCount = readInt64(doc, "celeris.engine_accept_count")
+	snap.EngineCloseCount = readInt64(doc, "celeris.engine_close_count")
+	snap.EngineAsyncPromotedConns = readInt64(doc, "celeris.engine_async_promoted_conns")
+	snap.EngineStandbyActiveConns = readInt64(doc, "celeris.engine_standby_active_conns")
+	snap.EngineStandbyCloseCount = readInt64(doc, "celeris.engine_standby_close_count")
+	snap.EngineTransplantDetached = readInt64(doc, "celeris.engine_transplant_detached")
+	snap.EngineTransplantAdopted = readInt64(doc, "celeris.engine_transplant_adopted")
+	snap.EngineTransplantAdoptSlotOccupied = readInt64(doc, "celeris.engine_transplant_adopt_slot_occupied")
+	snap.EngineCloseMissingConnState = readInt64(doc, "celeris.engine_close_missing_conn_state")
+	snap.EngineRecvDoubleArmed = readInt64(doc, "celeris.engine_recv_double_armed")
+	snap.EngineRecvCQEUnaccounted = readInt64(doc, "celeris.engine_recv_cqe_unaccounted")
+	snap.EngineRecvSQFull = readInt64(doc, "celeris.engine_recv_sq_full")
+	snap.EngineRecvStallEpisodes = readInt64(doc, "celeris.engine_recv_stall_episodes")
 	snap.OldestOpenConnLastByteAgeMs = readInt64(doc, "celeris.oldest_open_conn_last_byte_age_ms")
 	snap.OpenConnsTracked = readInt64(doc, "celeris.open_conns_tracked")
 	if b, ok := doc["celeris.checkptr_build"].(bool); ok {
