@@ -10,12 +10,19 @@ name: Weekend Soak
 # matrix-pr-tier.yml for the architecture comment).
 
 on:
-  schedule:
-    # Sunday 02:00, and the nightly is deliberately Mon-Sat so nothing
-    # contends for `concurrency: matrix-tier-cluster` on this slot. Before
-    # that split the two crons were both "0 2" and the group's one-pending-run
-    # rule cancelled whichever queued first — the soak, every Sunday.
-    - cron: "0 2 * * 0"
+  # PAUSED 2026-09-15 for the v1.6.0 release: the cluster is reserved
+  # for release validation, and a scheduled run would evict or delay it
+  # (every tier shares the matrix-tier-cluster concurrency group, which
+  # keeps only ONE pending run). workflow_dispatch is deliberately left
+  # working so the release sequence can still drive each tier by hand.
+  # RESTORE by uncommenting the schedule block below.
+  #schedule:
+  #  # Sunday 02:00, and the nightly is deliberately Mon-Sat so nothing
+  #  # contends for `concurrency: matrix-tier-cluster` on this slot. Before
+  #  # that split the two crons were both "0 2" and the group's one-pending-run
+  #  # rule cancelled whichever queued first — the soak, every Sunday.
+  #  - cron: "0 2 * * 0"
+
   workflow_dispatch:
     inputs:
       resume_from:
@@ -175,6 +182,22 @@ jobs:
           # Start dbservice containers so driver_* cells validate
           # against real postgres/redis/memcached backends.
           VALIDATE_DBSERVICES: "1"
+          # Abort the matrix after 8 failed cells instead of the validator's
+          # default of half the plan (probatorium#359). This tier is the one
+          # where the count cap's worst case is expensive: at a 45-minute
+          # cell budget, 16 failed cells is 12 hours of the 24-hour window,
+          # and a run that has lost 16 cells cannot satisfy
+          # VALIDATE_GATE_EXPECT_CELLS anyway -- so those 12 hours buy a
+          # verdict that was already decided. Eight caps the waste at ~6
+          # hours and leaves ~18 hours of runway: enough to fix the cause
+          # and re-dispatch inside the same weekend. Learning the same fact
+          # at hour 12 leaves none. The asymmetry is the argument -- too
+          # early costs one re-dispatch, too late costs the week.
+          #
+          # The other tiers stay on the default: their windows are short
+          # enough (80m nightly, 10m PR) that the difference is minutes, and
+          # a second policy number per tier is not worth the confusion.
+          PROBATORIUM_MATRIX_MAX_FAILED_CELLS: "8"
         run: mage Soak
 
       - name: mage ValidateGate (absolute zero-signal gate)
@@ -184,7 +207,14 @@ jobs:
         # failures, soak leaks) and on any dead or missing cell. ValidateDiff
         # below is RELATIVE (cross-engine/arch) and cannot see a defect that
         # is present on every engine; this gate can. probatorium#274.
-        if: success()
+        # NOT success(): the runs worth judging are the ones that found
+        # something. mage Validate exits non-zero when any cell failed, and
+        # gating the judges on success() skipped them exactly then --
+        # nightly 34818888908 produced 64 complete cells, 8 of them bad, and
+        # adjudicated none of it (probatorium#359). A skipped step cannot
+        # turn a red run green: the failed Validate step already fails the
+        # job, and this gate fails it again on the cells themselves.
+        if: '!cancelled()'
         env:
           VALIDATE_GATE_EXPECT_CELLS: "64" # 8 refapps x 4 engines x 2 archs
           # Every adaptive cell must promote epoll -> io_uring at least once;
@@ -199,7 +229,14 @@ jobs:
         run: mage ValidateGate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
-        if: success()
+        # NOT success(): the runs worth judging are the ones that found
+        # something. mage Validate exits non-zero when any cell failed, and
+        # gating the judges on success() skipped them exactly then --
+        # nightly 34818888908 produced 64 complete cells, 8 of them bad, and
+        # adjudicated none of it (probatorium#359). A skipped step cannot
+        # turn a red run green: the failed Validate step already fails the
+        # job, and this gate fails it again on the cells themselves.
+        if: '!cancelled()'
         env:
           # MED divergences fail too. Without this the severity is permanently
           # advisory: 3 of the 7 invariant counters are MED and 1 is LOW, so

@@ -239,7 +239,14 @@ jobs:
         # failures, soak leaks) and on any dead or missing cell. ValidateDiff
         # below is RELATIVE (cross-engine/arch) and cannot see a defect that
         # is present on every engine; this gate can. probatorium#274.
-        if: success()
+        # NOT success(): the runs worth judging are the ones that found
+        # something. mage Validate exits non-zero when any cell failed, and
+        # gating the judges on success() skipped them exactly then --
+        # nightly 34818888908 produced 64 complete cells, 8 of them bad, and
+        # adjudicated none of it (probatorium#359). A skipped step cannot
+        # turn a red run green: the failed Validate step already fails the
+        # job, and this gate fails it again on the cells themselves.
+        if: '!cancelled()'
         env:
           # 8 refapps x 4 engines x 2 archs when refapps=all. A csv selection
           # runs fewer; the gate still requires every planned cell to report.
@@ -255,7 +262,14 @@ jobs:
         run: mage ValidateGate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
-        if: success()
+        # NOT success(): the runs worth judging are the ones that found
+        # something. mage Validate exits non-zero when any cell failed, and
+        # gating the judges on success() skipped them exactly then --
+        # nightly 34818888908 produced 64 complete cells, 8 of them bad, and
+        # adjudicated none of it (probatorium#359). A skipped step cannot
+        # turn a red run green: the failed Validate step already fails the
+        # job, and this gate fails it again on the cells themselves.
+        if: '!cancelled()'
         env:
           # MED divergences fail too. Without this the severity is permanently
           # advisory: 3 of the 7 invariant counters are MED and 1 is LOW, so
