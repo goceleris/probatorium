@@ -137,3 +137,122 @@ func readPlaybook(t *testing.T, name string) string {
 	}
 	return string(b)
 }
+
+// probatorium#392: #388 cached the runner tarball, but the same playbook
+// fetched four more tools on every run into the directory it wipes -- uv, a
+// python build, ansible-core and ansible.posix -- behind skip-if-present
+// guards that therefore never skipped, with no retries, and with ansible-core
+// and ansible.posix unpinned. A Galaxy timeout on one host failed nightly
+// 34981852841 although the other two hosts had already registered.
+//
+// Pinning comes first: caching an unpinned install silently freezes whichever
+// version happened to install first, with nothing recording which. Keying
+// each cache directory by its pin is what makes a bump install fresh.
+//
+// Six cluster workflows reach the venv and the collections through hardcoded
+// runner_root paths, not through anything the playbook exports, so the
+// playbook keeps those two paths alive as symlinks into the cache. A path
+// written in one file and consumed in six breaks silently, so the contract is
+// asserted here from both ends.
+func TestBootstrapToolchainIsPinnedAndCachedOutsideTheWipedDir(t *testing.T) {
+	setup := readPlaybook(t, "runner-setup.yml")
+
+	for _, p := range []string{"uv_version", "python_version", "ansible_core_version", "ansible_posix_version"} {
+		re := regexp.MustCompile(`(?m)^\s*` + p + `:\s*"\d+\.\d+(\.\d+)?"\s*$`)
+		if !re.MatchString(setup) {
+			t.Errorf("%s is not pinned to a concrete version: an unpinned tool that is also "+
+				"cached freezes whichever version installed first, with nothing recording which", p)
+		}
+	}
+
+	for what, want := range map[string]string{
+		"uv installer":              "astral.sh/uv/{{ uv_version }}/install.sh",
+		"venv python":               "--python {{ python_version }}",
+		"ansible-core":              "ansible-core=={{ ansible_core_version }}",
+		"ansible.posix from Galaxy": "ansible.posix:=={{ ansible_posix_version }}",
+		"ansible.posix from GitHub": "ansible.posix.git,{{ ansible_posix_version }}",
+	} {
+		if !strings.Contains(setup, want) {
+			t.Errorf("%s does not install its pin (want %q in runner-setup.yml)", what, want)
+		}
+	}
+
+	// No tool may keep its install target or its skip guard under runner_root.
+	for _, f := range []string{
+		"{{ runner_root }}/uv/",
+		"--collections-path {{ runner_root }}",
+		`creates: "{{ runner_root }}/ansible-venv`,
+		`creates: "{{ runner_root }}/ansible-collections`,
+	} {
+		if strings.Contains(setup, f) {
+			t.Errorf("runner-setup.yml still has %q: that target is inside the directory the "+
+				"bootstrap wipes, so its skip guard can never skip and the fetch repeats every run", f)
+		}
+	}
+
+	for _, want := range []string{
+		`tool_cache_dir: "{{ runner_cache_dir }}/`,
+		`uv_dir: "{{ tool_cache_dir }}/`,
+		`ansible_venv_dir: "{{ tool_cache_dir }}/`,
+		`ansible_collections_dir: "{{ tool_cache_dir }}/`,
+	} {
+		if !strings.Contains(setup, want) {
+			t.Errorf("want %q: every cached tool must live under runner_cache_dir, which "+
+				"TestRunnerTarballIsCachedOutsideTheWipedDir already keeps teardown away from", want)
+		}
+	}
+
+	// Without --managed-python uv prefers a matching python already on PATH
+	// over downloading into UV_PYTHON_INSTALL_DIR, so the cached venv would
+	// depend on a python outside the cache. An end-to-end run caught it.
+	if !strings.Contains(setup, "uv venv --clear --managed-python") {
+		t.Error("the ansible venv is not created with --managed-python: uv may build it on a " +
+			"python found on PATH, outside the cache, and the cached venv breaks when that python goes")
+	}
+
+	// A cache that skips on presence alone turns one bad install into every
+	// later run's problem, so ansible.posix is checked against its manifest.
+	if !strings.Contains(setup, "MANIFEST.json") {
+		t.Error("ansible.posix has no integrity check against its MANIFEST.json: a partial " +
+			"or mismatched cached collection would be skipped as present, forever")
+	}
+
+	// The six-workflow contract, from both ends.
+	links := map[string]string{
+		"ansible-venv":        `src: "{{ ansible_venv_dir }}", dest: "{{ runner_root }}/ansible-venv"`,
+		"ansible-collections": `src: "{{ ansible_collections_dir }}", dest: "{{ runner_root }}/ansible-collections"`,
+	}
+	consumers := map[string]int{}
+	entries, err := os.ReadDir(filepath.Join(".github", "workflows"))
+	if err != nil {
+		t.Fatalf("read workflows: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yml") {
+			continue
+		}
+		b, rerr := os.ReadFile(filepath.Join(".github", "workflows", e.Name()))
+		if rerr != nil {
+			t.Errorf("%s: %v", e.Name(), rerr)
+			continue
+		}
+		for path := range links {
+			if strings.Contains(string(b), "${RUNNER_ROOT}/"+path) {
+				consumers[path]++
+			}
+		}
+	}
+	for path, want := range links {
+		if consumers[path] == 0 {
+			t.Errorf("no workflow reads ${RUNNER_ROOT}/%s any more: this contract check is "+
+				"guarding nothing, so update or delete it", path)
+			continue
+		}
+		if !strings.Contains(setup, want) || !strings.Contains(setup, "state: link") {
+			t.Errorf("%d workflow(s) read ${RUNNER_ROOT}/%s but runner-setup.yml does not link it "+
+				"into the cache (want %q): every one of those tiers loses its ansible", consumers[path], path, want)
+		}
+	}
+	t.Logf("toolchain contract: %d workflow(s) read ansible-venv, %d read ansible-collections",
+		consumers["ansible-venv"], consumers["ansible-collections"])
+}
