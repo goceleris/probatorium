@@ -22,6 +22,20 @@ const seriesFlushEvery = 30
 // engine's own error counter (a step in it at the second of a walker's
 // slow-read record is the deaf-listener signature, celeris#588). See
 // seriesWriter for why that distinction is the whole point.
+//
+// celeris#646 split that error counter into eleven cause buckets, and only
+// SIX of the twelve new counters are here. The rest are end-of-cell totals on
+// Tier1Summary.EngineErrorClasses and nothing else. A bucket earns a column
+// when the question asked of it is "when" and the artifact carries something
+// timestamped to join that against -- the promotion instant, the transplant
+// hand-off, a walker's slow-read fire, or the per-second denominators a rate
+// needs. report.ErrorClasses records the call for each of the eleven, one
+// bucket at a time, and TestTheSeriesCarriesExactlyTheBucketsDeclaredForIt
+// fails if the two ever disagree.
+//
+// New columns are APPENDED, never inserted: the header names every column and
+// a reader should key off it, but an appended column cannot invalidate a
+// column index somebody already wrote down against a shipped artifact.
 var seriesColumns = []string{
 	"ts", "goroutines", "heap_inuse", "heap_alloc", "heap_objects",
 	"heap_idle", "heap_released", "stack_inuse", "rss",
@@ -41,6 +55,12 @@ var seriesColumns = []string{
 	"engine_recv_cqe_unaccounted",
 	"engine_recv_sq_full",
 	"engine_recv_stall_episodes",
+	"engine_error_accept_fd_limit",
+	"engine_error_accept_cancelled",
+	"engine_error_accept_other",
+	"engine_error_conn_table_cap",
+	"engine_error_send_peer_gone",
+	"engine_standby_error_count",
 }
 
 // seriesWriter appends one row per property-loop sample to a CSV in the cell
@@ -119,6 +139,12 @@ func (s *seriesWriter) Record(snap properties.Snapshot) {
 		snap.EngineRecvCQEUnaccounted,
 		snap.EngineRecvSQFull,
 		snap.EngineRecvStallEpisodes,
+		snap.EngineErrorAcceptFDLimit,
+		snap.EngineErrorAcceptCancelled,
+		snap.EngineErrorAcceptOther,
+		snap.EngineErrorConnTableCap,
+		snap.EngineErrorSendPeerGone,
+		snap.EngineStandbyErrorCount,
 	}
 	for i, x := range v {
 		s.row[i] = strconv.FormatInt(x, 10)

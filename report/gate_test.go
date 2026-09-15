@@ -628,3 +628,28 @@ func TestGateEngineRequestCoverageStillFiresOnACellThatRan(t *testing.T) {
 		t.Error("the engine-request-coverage check did not fire on celeris#626's own numbers")
 	}
 }
+
+// A merged document -- a resumed run's, since probatorium#376 -- is assembled
+// from two sources, so the cell COUNT stops being a coverage claim the moment
+// two entries can name the same cell. ExpectedCells counts entries; this is
+// the check that makes the count mean what the gate reads it as.
+func TestGate_DuplicateCellsAreNotCoverage(t *testing.T) {
+	cells := []ValidationCellResult{
+		cleanCell("kitchen_sink", "iouring", "arm64"),
+		cleanCell("kitchen_sink", "iouring", "arm64"), // the same cell, counted twice
+		cleanCell("observability", "std", "arm64"),
+	}
+	v := Gate(cells, nil, GateOptions{ExpectedCells: 3, RequireTier3: true})
+	if len(v) != 1 {
+		t.Fatalf("want exactly one violation for the duplicated cell, got %d: %v", len(v), v)
+	}
+	if v[0].Field != "cells.duplicate" || v[0].Refapp != "kitchen_sink" ||
+		v[0].Engine != "iouring" || v[0].Arch != "arm64" || v[0].Value != 2 {
+		t.Errorf("violation does not name the duplicated cell: %+v", v[0])
+	}
+	// The same three entries with distinct keys are three real cells.
+	cells[1] = cleanCell("kitchen_sink", "epoll", "arm64")
+	if v := Gate(cells, nil, GateOptions{ExpectedCells: 3, RequireTier3: true}); len(v) != 0 {
+		t.Fatalf("three distinct cells must pass, got %v", v)
+	}
+}

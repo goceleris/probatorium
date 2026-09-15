@@ -47,6 +47,16 @@ type matrixRunner struct {
 	// losing it means the cluster went out from under the run.
 	stagingDir string
 
+	// resume, when non-nil, carries the cells an earlier interrupted run
+	// already made final. They are seeded into this run's document so the
+	// absolute gate judges the whole soak rather than the remainder
+	// (probatorium#376), and they are deliberately kept OUT of the ledger:
+	// this run did not attempt them, their evidence directories are in the
+	// OTHER run's OutDir, and the failure caps below bound THIS run's
+	// wasted window. [matrixRunner.inheritedBad] is how their verdicts
+	// still reach the exit status.
+	resume *resumeMerge
+
 	// out receives the progress lines and the end-of-run summary.
 	// Defaults to os.Stderr.
 	out io.Writer
@@ -226,7 +236,13 @@ func (r *matrixRunner) run(ctx context.Context) error {
 		}
 	}
 
-	cells := make([]report.ValidationCellResult, 0, len(r.plan))
+	// Seeded with the inherited cells, so every write from here on -- the
+	// after-every-cell partial included -- is the merged document. That is
+	// also what makes a resume OF a resume work: whatever kills this run
+	// leaves behind a document carrying both halves.
+	inherited := r.resume.cells()
+	cells := make([]report.ValidationCellResult, 0, len(r.plan)+len(inherited))
+	cells = append(cells, inherited...)
 	ledger := make([]cellOutcome, 0, len(r.plan))
 	attempted := 0
 	consecutive := 0
@@ -277,7 +293,7 @@ func (r *matrixRunner) run(ctx context.Context) error {
 		// 24 h to a mains blip is precisely what the UPS work exists to
 		// prevent, and a graceful cancel alone cannot cover it. The document
 		// is small (24-48 cells) and this makes it parseable at all times.
-		persistErr := writePartial(r.cfg, r.startedAt, cells)
+		persistErr := writePartial(r.cfg, r.startedAt, cells, r.resume)
 		if persistErr != nil {
 			r.log("matrix: persist after cell %d: %v\n", i+1, persistErr)
 		}
@@ -349,31 +365,10 @@ func (r *matrixRunner) run(ctx context.Context) error {
 	// Run-wide property totals: the per-cell verdicts summed, with the
 	// first violation message of every failed predicate keyed
 	// "<refapp>/<engine>/<ID>" so the top-level document is readable
-	// without descending into cells.
-	var propsPassed, propsFailed int
-	var summaries map[string]string
-	for _, c := range cells {
-		propsPassed += c.PropertiesPassed
-		propsFailed += c.PropertiesFailed
-		for id, msg := range c.FailureSummaries {
-			if summaries == nil {
-				summaries = map[string]string{}
-			}
-			summaries[c.Refapp+"/"+c.Engine+"/"+id] = msg
-		}
-	}
-	doc := report.Document{
-		SchemaVersion: report.SchemaVersion,
-		HostArchPair:  r.cfg.Target + "-" + r.cfg.Arch,
-		Validation: &report.ValidationResults{
-			StartedAt:        r.startedAt,
-			FinishedAt:       time.Now().UTC(),
-			PropertiesPassed: propsPassed,
-			PropertiesFailed: propsFailed,
-			FailureSummaries: summaries,
-			Cells:            cells,
-		},
-	}
+	// without descending into cells. On a resumed run the sum spans the
+	// inherited cells too -- the document is the whole soak's verdict or it
+	// is not a verdict the gate can use.
+	doc := buildMatrixDoc(r.cfg, r.startedAt, cells, r.resume)
 	var writeErr error
 	if err := writeJSON(filepath.Join(r.cfg.OutDir, "validate-results.json"), doc); err != nil {
 		r.log("matrix: write results: %v\n", err)
@@ -383,11 +378,49 @@ func (r *matrixRunner) run(ctx context.Context) error {
 	return r.exitError(ledger, attempted, fatalErr, writeErr)
 }
 
+// inheritedBad returns the inherited cells whose RECORDED status is neither
+// ok nor absent. They are not in the ledger -- this run did not attempt
+// them -- but the merged document asserts them, so the run's exit status
+// has to. A resumed run that finishes its own cells cleanly over a soak
+// that had three real failures is not a passing soak.
+//
+// Two statuses cannot appear here, and both are worth saying out loud:
+// [report.ValidationCellNotRun], because the matrix classifies not_run with
+// the same [matrixCellIsFinal] the resume uses to decide a cell need not be
+// repeated, so such a cell is always re-run rather than carried over; and
+// "" from a document older than schema 5.12, which records no verdict at
+// all and must not be read as either pass or fail.
+func (r *matrixRunner) inheritedBad() []report.ValidationCellResult {
+	var bad []report.ValidationCellResult
+	for _, c := range r.resume.cells() {
+		if c.Status != "" && c.Status != report.ValidationCellOK {
+			bad = append(bad, c)
+		}
+	}
+	return bad
+}
+
 // exitError composes the process's exit error. Non-nil whenever a cell did
 // not pass, whatever else happened: the matrix is the release gate and a
 // resilient run must not become an advisory one.
 func (r *matrixRunner) exitError(ledger []cellOutcome, attempted int, fatalErr, writeErr error) error {
 	bad := badCells(ledger)
+	// Inherited cells the PREVIOUS run already judged as not passing. The
+	// document this run writes asserts them, so this run's exit status must
+	// too -- otherwise resuming a soak that had three real failures over
+	// eight clean remaining cells exits 0 and reads as a recovered soak.
+	// Reported as its own clause, never folded into "attempted": this run
+	// attempted none of them.
+	inheritedBad := r.inheritedBad()
+	var inheritedErr error
+	if len(inheritedBad) > 0 {
+		names := make([]string, 0, len(inheritedBad))
+		for _, c := range inheritedBad {
+			names = append(names, c.Refapp+"/"+c.Engine+" ("+string(c.Status)+")")
+		}
+		inheritedErr = fmt.Errorf("matrix: %d inherited cell(s) did not pass in the run they were measured in (%s): %s",
+			len(inheritedBad), r.resume.From, strings.Join(names, ", "))
+	}
 	switch {
 	case len(bad) > 0:
 		names := make([]string, 0, len(bad))
@@ -398,10 +431,9 @@ func (r *matrixRunner) exitError(ledger []cellOutcome, attempted int, fatalErr, 
 		err := fmt.Errorf("matrix: %d of %d attempted cell(s) did not pass (%d failed, %d never ran): %s — reasons in %s",
 			len(bad), attempted, failed, notRun, strings.Join(names, ", "),
 			filepath.Join(r.cfg.OutDir, "cell-failures.txt"))
-		if fatalErr != nil {
-			return errors.Join(err, fatalErr)
-		}
-		return err
+		return errors.Join(err, inheritedErr, fatalErr)
+	case inheritedErr != nil:
+		return errors.Join(inheritedErr, fatalErr)
 	case fatalErr != nil:
 		return fatalErr
 	case writeErr != nil:
@@ -492,6 +524,22 @@ func (r *matrixRunner) formatSummary(ledger []cellOutcome, attempted int, abortR
 	failed, notRun := countByStatus(bad)
 	fmt.Fprintf(&b, "matrix cell summary: %d planned, %d attempted, %d ok, %d failed, %d never ran, %d never attempted\n",
 		len(r.plan), attempted, attempted-len(bad), failed, notRun, len(r.plan)-attempted)
+	// On a resume those counts are about the REMAINDER. The document is
+	// about the whole soak, and so is the gate that reads it, so say both.
+	if inherited := r.resume.cells(); len(inherited) > 0 {
+		fmt.Fprintf(&b, "  resumed: %d cell(s) inherited from %s, not re-measured here; %d cell(s) in the merged document\n",
+			len(inherited), r.resume.From, len(inherited)+attempted)
+		for _, c := range r.inheritedBad() {
+			fmt.Fprintf(&b, "  %-8s %-40s inherited — evidence is in %s\n",
+				c.Status, c.Refapp+"/"+c.Engine, r.resume.From)
+			if c.FailureReason != "" {
+				fmt.Fprintf(&b, "           %s\n", c.FailureReason)
+			}
+		}
+		for _, why := range r.resume.NotInherited {
+			fmt.Fprintf(&b, "  not inherited: %s\n", why)
+		}
+	}
 	if abortReason != "" {
 		fmt.Fprintf(&b, "  run stopped early: %s\n", abortReason)
 	}

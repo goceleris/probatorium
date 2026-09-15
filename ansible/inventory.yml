@@ -56,6 +56,14 @@ all:
     bench_root: /tmp/celeris-bench
     results_root: /tmp/celeris-results
     manifest_path: /tmp/celeris-bench-manifest.json
+    # ...with ONE exception, and it is deliberate. rescue_root is the only
+    # probatorium path on real storage: ansible/rescue-results.yml copies an
+    # interrupted run's results here before the teardown purges results_root,
+    # and a rescue that a reboot destroys would be no rescue at all — a reboot
+    # is one of the three hypotheses for how a runner vanishes (#354/#376).
+    # ops/rescue/celeris-rescue-results bounds what accumulates: the newest
+    # three rescues, nothing older than 30 days.
+    rescue_root: /var/lib/celeris-rescue
     # ---------- SSD longevity (2026-08-17 incident) ----------
     # msa2-client's NVMe died mid-soak with unrecoverable read errors
     # (`critical medium error`, sct 0x2 / sc 0x81), taking PID 1 down with

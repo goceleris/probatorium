@@ -57,12 +57,51 @@ type Snapshot struct {
 	ClosedConnTotal   int64
 	ActiveConns       int64
 	PanicCount        int64
-	// EngineErrorCount is celeris EngineMetrics.ErrorCount: the engine's
-	// accept-side and protocol error paths (epoll conn-table cap and
-	// EMFILE drops, io_uring listener re-creation). Judged by no
+	// EngineErrorCount is celeris EngineMetrics.ErrorCount. Judged by no
 	// predicate; recorded in the per-cell series so a step in it can be
 	// joined against a walker's slow-read record (celeris#588).
+	//
+	// Since celeris#646 it is DERIVED: the exact sum of the eleven
+	// EngineError* buckets below, with no separate running total that
+	// could drift from its parts. Read it for how much, and the buckets
+	// for what.
 	EngineErrorCount int64
+	// The eleven cause buckets ErrorCount is the sum of (celeris#646).
+	// celeris#645 is why they exist: the adaptive engine recorded 421
+	// engine errors in a 112-second cell against io_uring's 63 and
+	// epoll's 0, and a single counter could bound the answer but never
+	// name it.
+	//
+	// Judged by NO predicate and gated by nothing. Unlike the
+	// must-stay-zero witnesses further down, every one of these counts
+	// something that legitimately happens — an abandoned response, an
+	// accept cancelled by the PauseAccept a promotion performs, a
+	// handler that returned an error — so a threshold before a run has
+	// said what normal looks like would be a number nobody measured.
+	// report.ErrorClasses carries what each one means and which of them
+	// the per-cell series samples at 1 Hz.
+	EngineErrorAcceptFDLimit    int64
+	EngineErrorAcceptCancelled  int64
+	EngineErrorAcceptOther      int64
+	EngineErrorConnTableCap     int64
+	EngineErrorConnRegister     int64
+	EngineErrorListenerRecreate int64
+	EngineErrorTransplantAdopt  int64
+	EngineErrorSendPeerGone     int64
+	EngineErrorSend             int64
+	EngineErrorRequestBody      int64
+	EngineErrorHandler          int64
+	// EngineStandbyErrorCount is the share of EngineErrorCount the
+	// adaptive engine's STANDBY sub-engine contributed — the same split
+	// EngineStandbyActiveConns and EngineStandbyCloseCount apply to the
+	// live gauge and the close count, and the other half of celeris#645's
+	// question. The buckets say WHAT went wrong; this says which
+	// sub-engine it went wrong on. Zero on every non-adaptive engine.
+	//
+	// Deliberately NOT a member of the eleven above: it cuts the same
+	// total along a different axis, so summing it with them would double
+	// count.
+	EngineStandbyErrorCount int64
 	// EngineWorkers, EngineRequestsTotal, EngineBytesRead and
 	// EngineBytesWritten are celeris EngineMetrics.Workers, RequestCount,
 	// BytesRead and BytesWritten: the four inputs the adaptive controller
