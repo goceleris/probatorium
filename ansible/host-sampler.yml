@@ -1,0 +1,231 @@
+---
+# host-sampler.yml — start and stop the read-only host sampler that runs
+# alongside a long cluster run (probatorium#354).
+#
+#   ansible-playbook -i ansible/inventory.yml ansible/host-sampler.yml \
+#       --extra-vars "sampler_action=start sampler_duration_seconds=90000 sampler_tag=weekend-123"
+#   ansible-playbook -i ansible/inventory.yml ansible/host-sampler.yml \
+#       --extra-vars "sampler_action=stop"
+#
+# or via `mage HostSamplerStart` / `mage HostSamplerStop`, which is how the
+# weekend soak drives it.
+#
+# SAFETY — this playbook runs against hosts that are MID-MEASUREMENT, so every
+# task is either a file write into the sampler's own paths or a read:
+#
+#   * it creates two directories and copies one script;
+#   * it starts ONE new detached process, the sampler, and nothing else;
+#   * it stops that process by creating a sentinel FILE the sampler polls.
+#     There is no kill, no pkill, no signal, no systemctl, no service
+#     restart, and no docker command anywhere in this file or in the script
+#     it installs. The wait-for-exit task reads /proc and gives up; it never
+#     escalates.
+#
+# The script is staged on TMPFS (/run/celeris, already the power guard's
+# runtime dir) rather than installed into /usr/local/sbin. It has no reason to
+# survive a reboot — after a reboot there is no run to sample — and staging it
+# there keeps the cluster-pristine rule intact: nothing persistent is
+# installed, so nothing has to be uninstalled. The sampler's OUTPUT is the one
+# thing that must outlive a reboot, and that goes to /var/log; see the script
+# header for why, and for the measured cost.
+#
+# Why 60 s: measured at 24 ms of CPU per sample (34 ms against a full 1 MB
+# kernel ring), i.e. ~1.5-2.0 s of CPU per hour, 0.04-0.06% of ONE core, and
+# ~1.0 MB/day of appended text. That is far below anything the soak measures —
+# the validator's own property loop samples /debug/vars once a SECOND, sixty
+# times more often than this. Going finer buys nothing that matters: the
+# events that are shorter than a minute (an OOM kill, a link flap) are
+# recorded as steps in MONOTONIC counters — oom_kill, carrier_changes, rx_err
+# — so they stay attributable to a 60 s bucket without being caught in the
+# act. Going coarser does cost something: at 5 min the final collapse of
+# available memory before a kill could be a single sample, and the approach is
+# the whole point.
+
+- name: Host sampler lifecycle
+  hosts: cluster
+  gather_facts: false
+  become: true
+  # A host that is already unreachable must not abort the sampler lifecycle on
+  # the others. Starting the sampler is best-effort by nature: it is
+  # instrumentation, and instrumentation that can fail a run is worse than no
+  # instrumentation.
+  ignore_unreachable: true
+  vars:
+    sampler_action: start
+    sampler_interval: 60
+    sampler_duration_seconds: 90000
+    sampler_tag: untagged
+    sampler_rundir: /run/celeris
+    sampler_outdir: /var/log/celeris-host-sampler
+    sampler_fetch_dir: ""
+  tasks:
+    - name: Validate the requested action
+      ansible.builtin.assert:
+        that: sampler_action in ['start', 'stop']
+        fail_msg: "sampler_action must be start or stop (got {{ sampler_action }})"
+      # No run_once: the check is a variable test costing nothing, and
+      # run_once behaves differently under the `free` strategy (ansible-lint
+      # run-once[task]). Per host, delegated locally, is simply correct.
+      delegate_to: localhost
+      become: false
+
+    # ------------------------------------------------------------ start
+    - name: Start | ensure the runtime and output directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ sampler_rundir }}"
+        - "{{ sampler_outdir }}"
+      when: sampler_action == 'start'
+
+    - name: Start | stage the sampler script on tmpfs
+      ansible.builtin.copy:
+        src: ../ops/host-sampler/celeris-host-sampler
+        dest: "{{ sampler_rundir }}/celeris-host-sampler"
+        owner: root
+        group: root
+        mode: "0755"
+      when: sampler_action == 'start'
+
+    # Launch detached. `setsid` + `nohup` + all three fds on /dev/null is what
+    # lets the ansible task return immediately instead of holding the SSH
+    # channel open for the next 24 hours (the same pattern runner-setup.yml
+    # uses for run.sh). The script's own takeover logic handles the case where
+    # a previous sampler is somehow still alive; ansible never has to reason
+    # about it, and never has to kill anything.
+    - name: Start | launch the sampler, detached
+      ansible.builtin.shell: |
+        setsid nohup "{{ sampler_rundir }}/celeris-host-sampler" >/dev/null 2>&1 </dev/null &
+        echo "launched"
+      args:
+        executable: /bin/bash
+      environment:
+        SAMPLER_OUTDIR: "{{ sampler_outdir }}"
+        SAMPLER_INTERVAL: "{{ sampler_interval }}"
+        SAMPLER_DURATION: "{{ sampler_duration_seconds }}"
+        SAMPLER_TAG: "{{ sampler_tag }}"
+        SAMPLER_RUNDIR: "{{ sampler_rundir }}"
+      changed_when: true
+      when: sampler_action == 'start'
+
+    # A sampler that silently failed to start is the same as no sampler, and
+    # we would only find that out after losing the next run. Confirm the
+    # pidfile appeared and names a live pid — by looking at /proc, not by
+    # signalling it.
+    - name: Start | confirm the sampler is alive
+      # Written without ${...} braces and without brace groups: ansible's
+      # argument splitter reads them as unbalanced jinja and refuses the
+      # playbook (the same trap runner-teardown.yml documents).
+      ansible.builtin.shell: |
+        n=0
+        while [ "$n" -lt 10 ]; do
+          pid=$(cat "{{ sampler_rundir }}/host-sampler.pid" 2>/dev/null || true)
+          if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+            echo "sampler pid=$pid alive"
+            exit 0
+          fi
+          sleep 1
+          n=$((n + 1))
+        done
+        echo "sampler did not report a live pid within 10s"
+        exit 1
+      args:
+        executable: /bin/bash
+      register: sampler_alive
+      changed_when: false
+      failed_when: false
+      when: sampler_action == 'start'
+
+    - name: Start | report
+      ansible.builtin.debug:
+        msg: >-
+          host sampler on {{ inventory_hostname }}:
+          {{ sampler_alive.stdout | default('no result') | trim }}
+          (interval={{ sampler_interval }}s duration={{ sampler_duration_seconds }}s
+          tag={{ sampler_tag }} out={{ sampler_outdir }})
+      when: sampler_action == 'start'
+
+    - name: Start | warn when the sampler failed to come up
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the host sampler did not start on {{ inventory_hostname }}.
+          The run continues without it — this is instrumentation, not a gate —
+          but a loss on this host will be as undecidable as probatorium#354.
+      when:
+        - sampler_action == 'start'
+        - sampler_alive is defined
+        - sampler_alive.rc | default(1) != 0
+
+    # ------------------------------------------------------------- stop
+    # Creating a file, not signalling a process. The sampler polls for this
+    # every 5 s and exits on its own; if it does not, its own hard deadline
+    # ends it. Nothing here can touch anything the run owns.
+    - name: Stop | ask the sampler to finish
+      ansible.builtin.file:
+        path: "{{ sampler_rundir }}/host-sampler-stop"
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+      when: sampler_action == 'stop'
+
+    # Deliberately NOT escalating past the sentinel: the hard deadline in the
+    # sampler will end it, and killing a process on a bench host to tidy up a
+    # log writer is not a trade this harness makes.
+    #
+    # The shell body below carries no apostrophes on purpose. Anything inside
+    # a shell block is part of the string ansible splits, and one unpaired
+    # single quote -- in a COMMENT -- is enough to make it refuse the whole
+    # playbook with "unbalanced jinja2 block or quotes".
+    - name: Stop | wait (read-only) for it to go
+      ansible.builtin.shell: |
+        pid=$(cat "{{ sampler_rundir }}/host-sampler.pid" 2>/dev/null || true)
+        if [ -z "$pid" ]; then
+          echo "no pidfile; nothing running"
+          exit 0
+        fi
+        n=0
+        while [ "$n" -lt 15 ]; do
+          if [ ! -d "/proc/$pid" ]; then
+            echo "sampler $pid exited"
+            exit 0
+          fi
+          sleep 2
+          n=$((n + 1))
+        done
+        echo "sampler $pid still present after 30s; leaving it to its deadline"
+        exit 0
+      args:
+        executable: /bin/bash
+      register: sampler_gone
+      changed_when: false
+      failed_when: false
+      when: sampler_action == 'stop'
+
+    - name: Stop | report
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ sampler_gone.stdout | default('') | trim }}"
+      when: sampler_action == 'stop'
+
+    # Optional convenience copy for the happy path: put the series next to the
+    # run's own artefacts so a reader has it without opening a second artifact.
+    # On the path this whole issue is about — the runner died — this task never
+    # runs, and the teardown job's forensics.yml is what retrieves the series.
+    - name: Stop | fetch the series into the run's results dir
+      ansible.builtin.fetch:
+        src: "{{ sampler_outdir }}/{{ item }}"
+        dest: "{{ sampler_fetch_dir }}/{{ inventory_hostname }}/{{ item }}"
+        flat: true
+        fail_on_missing: false
+        validate_checksum: false
+      loop:
+        - samples.jsonl
+        - kernel.log
+        - current-run.txt
+      when:
+        - sampler_action == 'stop'
+        - sampler_fetch_dir | length > 0
