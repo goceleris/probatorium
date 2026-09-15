@@ -1,0 +1,374 @@
+#!/bin/sh
+# celeris-host-sampler — a strictly read-only host sampler for the duration of
+# a cluster run, so that a runner that vanishes leaves a trace behind it.
+#
+# WHY THIS EXISTS (probatorium#354)
+#
+# The 24 h soak 34736980002 died at 20 h 05 m with "The self-hosted runner lost
+# communication with the server". Three hypotheses — the runner process was
+# starved/killed, the host rebooted, the network went away — and NOT ONE of
+# them was decidable afterwards, because nothing had been recording. The loss
+# was a cliff with no approach.
+#
+# This samples the small set of numbers that separate those three, once a
+# minute, for the whole run.
+#
+# WHAT MAKES IT SAFE TO RUN DURING A MEASUREMENT
+#
+#   - It never signals, kills, restarts or reconfigures anything. There is no
+#     kill, no pkill, no systemctl, no docker, no sysctl write, not even a
+#     `kill -0` existence probe: liveness is tested by the presence of
+#     /proc/<pid>, which is a directory lookup.
+#   - Every input is a read: /proc, /sys, and dmesg (the kernel ring buffer is
+#     only ever READ — `dmesg -c`, which would consume it and destroy evidence
+#     for everything else on the host, appears nowhere in this file).
+#   - Every output is an append to its own file under OUTDIR. It writes
+#     nowhere else.
+#   - It terminates on its own. DEADLINE is a hard wall-clock bound checked
+#     every tick, so even if the run dies, the orchestrator dies, and nobody
+#     ever asks it to stop, it exits by itself. Stopping it is a `touch` of
+#     STOPFILE, never a signal.
+#
+# WHY THE OUTPUT IS NOT ON tmpfs
+#
+# Every other piece of transient state on these hosts lives under /tmp, which
+# is RAM-backed (see ansible/inventory.yml and ops/power/README.md). That is
+# right for bench artefacts and wrong for this: a reboot is one of the three
+# hypotheses, and a sampler whose evidence is destroyed by the event it exists
+# to document proves nothing. So the series goes to /var/log, and the cost is
+# bounded and stated:
+#
+#   ~1440 samples/day × ~600 B ≈ 850 KB/day/host, self-rotated at MAXBYTES.
+#
+# Against a drive rated in hundreds of TBW that is not a measurable
+# contribution — three orders of magnitude under the fixture-container writes
+# that actually killed msa2-client's NVMe in 2026-08 (56.3 TB written).
+#
+# WHAT EACH FIELD IS FOR
+#
+#   boot_id      changes if and only if the host rebooted. This is the single
+#                decisive discriminator between "the process died" and "the
+#                host went away" — uptime can be argued about, a boot_id
+#                cannot.
+#   uptime_s     a reset confirms the reboot; a CONTINUOUS uptime across a gap
+#                in the series is the signature of a hang (celeris#312), where
+#                the host neither rebooted nor stayed responsive.
+#   oom_kill     /proc/vmstat's monotonic OOM-kill counter. A step in it is
+#                proof of hypothesis 1 that does not depend on catching the
+#                kernel message.
+#   mem_*        the approach, not just the event: a 20 h leak shows as a
+#                slope, and the last minutes before an OOM show as a collapse.
+#   runner_rss   whether the thing that was killed was actually growing.
+#   carrier_*    carrier_changes is a monotonic link-flap counter, so a switch
+#                blip inside a 60 s window is still attributable afterwards
+#                even though it is far shorter than the sample interval.
+#   rx/tx err    a NIC dropping frames rather than losing link.
+#
+# The monotonic counters (oom_kill, carrier_changes, *_err, *_drop) are what
+# make a 60 s cadence sufficient: sub-second events do not have to be caught
+# in the act, only attributed to a bucket.
+#
+# USAGE
+#
+#   celeris-host-sampler                  # honour the env below, then loop
+#   celeris-host-sampler --sample         # emit exactly one sample, exit
+#   celeris-host-sampler --stop           # ask a running instance to finish
+#
+#   SAMPLER_OUTDIR     default /var/log/celeris-host-sampler
+#   SAMPLER_INTERVAL   seconds between samples, default 60
+#   SAMPLER_DURATION   seconds to run for, default 90000 (25 h)
+#   SAMPLER_TAG        free-form label recorded in every line (run id, tier)
+#   SAMPLER_MAXBYTES   self-rotate the series past this size, default 8388608
+#   SAMPLER_RUNDIR     pid/stop sentinel dir, default /run/celeris (tmpfs, so
+#                      a reboot cannot leave a stale one behind)
+set -u
+
+OUTDIR="${SAMPLER_OUTDIR:-/var/log/celeris-host-sampler}"
+INTERVAL="${SAMPLER_INTERVAL:-60}"
+DURATION="${SAMPLER_DURATION:-90000}"
+TAG="${SAMPLER_TAG:-untagged}"
+MAXBYTES="${SAMPLER_MAXBYTES:-8388608}"
+RUNDIR="${SAMPLER_RUNDIR:-/run/celeris}"
+
+PIDFILE="$RUNDIR/host-sampler.pid"
+STOPFILE="$RUNDIR/host-sampler-stop"
+SERIES="$OUTDIR/samples.jsonl"
+KLOG="$OUTDIR/kernel.log"
+CURRENT="$OUTDIR/current-run.txt"
+
+HOST=$(hostname 2>/dev/null || echo unknown)
+
+# ---------------------------------------------------------------- helpers
+
+now_epoch() { date -u +%s; }
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# read_first <file> — first whitespace-delimited token, or empty. A `read`
+# builtin, so the common case of a dozen /sys reads per sample costs no forks.
+read_first() {
+    _v=""
+    [ -r "$1" ] && read -r _v _rest <"$1" 2>/dev/null
+    printf '%s' "${_v:-}"
+}
+
+# read_num <file> — the same, but guaranteed to print a bare integer. Every
+# numeric JSON field goes through this: an unreadable counter must degrade to
+# 0, never to an empty token, or one missing /sys file would emit
+# `"carrier_changes":,` and cost us the whole series at the moment it matters.
+read_num() {
+    _n=$(read_first "$1")
+    case "${_n:-}" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s' "$_n" ;;
+    esac
+}
+
+# pid_of <comm> — the pid of a process whose (15-char-truncated) comm matches,
+# or empty. pgrep only LISTS; it sends nothing. If procps is absent we fall
+# back to reading /proc, which is also a pure read.
+pid_of() {
+    _p=$(pgrep -x "$1" 2>/dev/null | head -1)
+    if [ -z "${_p:-}" ]; then
+        for _d in /proc/[0-9]*; do
+            [ -r "$_d/comm" ] || continue
+            read -r _c <"$_d/comm" 2>/dev/null || continue
+            if [ "$_c" = "$1" ]; then
+                _p=${_d#/proc/}
+                break
+            fi
+        done
+    fi
+    printf '%s' "${_p:-}"
+}
+
+# rss_kb <pid> — resident set in KB, or 0. The `v+0` in END is load-bearing:
+# a kernel thread's status has no VmRSS line, and printing nothing there would
+# emit `"runner_rss_kb":` and make the line unparseable.
+rss_kb() {
+    [ -n "${1:-}" ] || { printf '0'; return; }
+    [ -r "/proc/$1/status" ] || { printf '0'; return; }
+    awk '/^VmRSS:/{v=$2} END{print v+0}' "/proc/$1/status" 2>/dev/null || printf '0'
+}
+
+# proc_json <label> <comm> — "label_pid":N,"label_rss_kb":N
+proc_json() {
+    _pid=$(pid_of "$2")
+    printf '"%s_pid":%s,"%s_rss_kb":%s' \
+        "$1" "${_pid:-0}" "$1" "$(rss_kb "${_pid:-}")"
+}
+
+# net_json — one object per physical-ish interface. veth/docker/br- pairs are
+# skipped: the fixture containers churn them and they would dominate the line
+# without saying anything about the fabric.
+net_json() {
+    _sep=""
+    printf '['
+    for _if in /sys/class/net/*; do
+        [ -d "$_if" ] || continue
+        _n=${_if##*/}
+        case "$_n" in
+        lo | veth* | docker* | br-* | virbr* | \
+            gre* | erspan* | sit* | tunl* | ip6tnl* | ip6gre* | ip_vti* | ip6_vti* | \
+            nlmon* | dummy* | teql*) continue ;;
+        esac
+        [ -r "$_if/carrier_changes" ] || continue
+        printf '%s{"if":"%s","operstate":"%s","carrier":"%s","carrier_changes":%s,"rx_err":%s,"rx_drop":%s,"tx_err":%s,"tx_drop":%s}' \
+            "$_sep" "$_n" \
+            "$(read_first "$_if/operstate")" \
+            "$(read_first "$_if/carrier")" \
+            "$(read_num "$_if/carrier_changes")" \
+            "$(read_num "$_if/statistics/rx_errors")" \
+            "$(read_num "$_if/statistics/rx_dropped")" \
+            "$(read_num "$_if/statistics/tx_errors")" \
+            "$(read_num "$_if/statistics/tx_dropped")"
+        _sep=","
+    done
+    printf ']'
+}
+
+# Kernel messages go to their own plain-text file, never into the JSON. Two
+# reasons: a kernel line can contain anything at all, and a series that stops
+# parsing at the one line that mattered is worse than no series. Only what is
+# NEW since the previous sample is appended, capped, so a screaming kernel
+# cannot run away with the disk.
+DMESG_SEEN=0
+dmesg_delta() {
+    _all=$(dmesg --time-format=iso 2>/dev/null || dmesg 2>/dev/null) || _all=""
+    if [ -z "$_all" ]; then
+        printf '0 0'
+        return
+    fi
+    _n=$(printf '%s\n' "$_all" | wc -l | tr -d ' ')
+    # The ring buffer wrapped (or we lost read permission and regained it):
+    # re-baseline rather than replay the whole buffer.
+    if [ "$_n" -lt "$DMESG_SEEN" ]; then
+        DMESG_SEEN=$_n
+        printf '%s 0' "$_n"
+        return
+    fi
+    _new=$((_n - DMESG_SEEN))
+    if [ "$_new" -gt 0 ]; then
+        {
+            printf '== %s %s new=%d total=%d\n' "$(now_iso)" "$TAG" "$_new" "$_n"
+            printf '%s\n' "$_all" | tail -n "$_new" | tail -n 40
+        } >>"$KLOG" 2>/dev/null
+        DMESG_SEEN=$_n
+    fi
+    printf '%s %s' "$_n" "$_new"
+}
+
+# Self-rotation. One generation kept, so the series is bounded at 2×MAXBYTES
+# per host with no logrotate config and therefore no persistent host state to
+# install or clean up.
+rotate_if_big() {
+    [ -f "$1" ] || return 0
+    _sz=$(wc -c <"$1" 2>/dev/null | tr -d ' ')
+    [ -n "${_sz:-}" ] || return 0
+    [ "$_sz" -gt "$MAXBYTES" ] || return 0
+    mv -f "$1" "$1.1" 2>/dev/null || true
+}
+
+emit_sample() {
+    _i=$1
+    read -r _up _idle </proc/uptime 2>/dev/null || { _up=0; _idle=0; }
+    read -r _l1 _l5 _l15 _procs _lastpid </proc/loadavg 2>/dev/null || {
+        _l1=0; _l5=0; _l15=0; _procs="0/0"
+    }
+    _running=${_procs%%/*}
+    _total=${_procs##*/}
+
+    _mem=$(awk '
+        /^MemTotal:/      {t=$2}
+        /^MemAvailable:/  {a=$2}
+        /^MemFree:/       {f=$2}
+        /^SwapTotal:/     {st=$2}
+        /^SwapFree:/      {sf=$2}
+        /^Dirty:/         {d=$2}
+        END {printf "%d %d %d %d %d %d", t, a, f, st, sf, d}
+    ' /proc/meminfo 2>/dev/null) || _mem="0 0 0 0 0 0"
+    # shellcheck disable=SC2086  # deliberate: split the awk-produced field triple
+    set -- $_mem
+    _mtotal=${1:-0}; _mavail=${2:-0}; _mfree=${3:-0}
+    _stotal=${4:-0}; _sfree=${5:-0}; _dirty=${6:-0}
+
+    _vm=$(awk '
+        /^oom_kill /    {o=$2}
+        /^pgmajfault /  {p=$2}
+        /^pswpin /      {i=$2}
+        /^pswpout /     {w=$2}
+        END {printf "%d %d %d %d", o, p, i, w}
+    ' /proc/vmstat 2>/dev/null) || _vm="0 0 0 0"
+    # shellcheck disable=SC2086  # deliberate: split the awk-produced field triple
+    set -- $_vm
+    _oom=${1:-0}; _majflt=${2:-0}; _swpin=${3:-0}; _swpout=${4:-0}
+
+    _fdnr=$(awk '{print $1+0; exit}' /proc/sys/fs/file-nr 2>/dev/null)
+    _fdnr=${_fdnr:-0}
+    _bootid=$(read_first /proc/sys/kernel/random/boot_id)
+
+    _dm=$(dmesg_delta)
+    # shellcheck disable=SC2086  # deliberate: split the two-field dmesg tally
+    set -- $_dm
+    _dmtotal=${1:-0}; _dmnew=${2:-0}
+
+    printf '{"ts":"%s","epoch":%s,"host":"%s","tag":"%s","i":%d,"boot_id":"%s","uptime_s":%s,"load1":%s,"load5":%s,"load15":%s,"procs_running":%s,"procs_total":%s,"mem_total_kb":%s,"mem_available_kb":%s,"mem_free_kb":%s,"swap_total_kb":%s,"swap_free_kb":%s,"dirty_kb":%s,"oom_kill":%s,"pgmajfault":%s,"pswpin":%s,"pswpout":%s,"fd_allocated":%s,%s,%s,%s,"dmesg_lines":%s,"dmesg_new":%s,"net":%s}\n' \
+        "$(now_iso)" "$(now_epoch)" "$HOST" "$TAG" "$_i" "${_bootid:-unknown}" \
+        "${_up:-0}" "${_l1:-0}" "${_l5:-0}" "${_l15:-0}" "${_running:-0}" "${_total:-0}" \
+        "$_mtotal" "$_mavail" "$_mfree" "$_stotal" "$_sfree" "$_dirty" \
+        "$_oom" "$_majflt" "$_swpin" "$_swpout" "${_fdnr:-0}" \
+        "$(proc_json runner Runner.Listener)" \
+        "$(proc_json validator validator)" \
+        "$(proc_json refapp probatorium-runner)" \
+        "$_dmtotal" "$_dmnew" "$(net_json)" \
+        >>"$SERIES" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- modes
+
+mkdir -p "$OUTDIR" "$RUNDIR" 2>/dev/null || true
+
+case "${1:-}" in
+--stop)
+    # Asking, not signalling. The loop notices within STOP_POLL seconds and
+    # exits of its own accord; nothing is ever sent to the process.
+    : >"$STOPFILE" 2>/dev/null || true
+    echo "celeris-host-sampler: stop requested via $STOPFILE"
+    exit 0
+    ;;
+--sample)
+    emit_sample 0
+    echo "celeris-host-sampler: one sample -> $SERIES"
+    exit 0
+    ;;
+--help | -h)
+    sed -n '2,70p' "$0"
+    exit 0
+    ;;
+esac
+
+# Take over from any instance still running. It is asked to stop and then
+# WAITED FOR by watching /proc — no signal is sent, and if it declines to go
+# we start anyway rather than escalating, because two samplers appending
+# distinct lines is harmless and killing something on a bench host is not.
+_old=$(cat "$PIDFILE" 2>/dev/null || echo "")
+if [ -n "${_old:-}" ] && [ -d "/proc/$_old" ]; then
+    : >"$STOPFILE" 2>/dev/null || true
+    _waited=0
+    while [ -d "/proc/$_old" ] && [ "$_waited" -lt 75 ]; do
+        sleep 5
+        _waited=$((_waited + 5))
+    done
+fi
+rm -f "$STOPFILE" 2>/dev/null || true
+echo $$ >"$PIDFILE" 2>/dev/null || true
+
+START=$(now_epoch)
+DEADLINE=$((START + DURATION))
+# How often the stop sentinel is looked at while waiting out the interval.
+# Never coarser than the interval itself, so a short-interval test run does
+# not silently sample slower than it was asked to.
+STOP_POLL=5
+[ "$INTERVAL" -lt "$STOP_POLL" ] && STOP_POLL="$INTERVAL"
+
+{
+    printf '{"event":"sampler_start","ts":"%s","host":"%s","tag":"%s","interval_s":%s,"duration_s":%s,"deadline_epoch":%s,"pid":%s}\n' \
+        "$(now_iso)" "$HOST" "$TAG" "$INTERVAL" "$DURATION" "$DEADLINE" "$$"
+} >>"$SERIES" 2>/dev/null
+
+printf 'tag=%s pid=%s started=%s deadline=%s interval=%ss\n' \
+    "$TAG" "$$" "$(now_iso)" "$DEADLINE" "$INTERVAL" >"$CURRENT" 2>/dev/null || true
+
+i=0
+reason=deadline
+while :; do
+    if [ -e "$STOPFILE" ]; then
+        reason=stop_requested
+        break
+    fi
+    if [ "$(now_epoch)" -ge "$DEADLINE" ]; then
+        reason=deadline
+        break
+    fi
+    rotate_if_big "$SERIES"
+    rotate_if_big "$KLOG"
+    emit_sample "$i"
+    i=$((i + 1))
+    # Sleep in short chunks so a stop request lands in seconds rather than at
+    # the end of the sample interval. A handful of extra `sleep`s a minute is
+    # far below the noise floor of anything the soak measures.
+    _slept=0
+    while [ "$_slept" -lt "$INTERVAL" ]; do
+        [ -e "$STOPFILE" ] && break
+        sleep "$STOP_POLL"
+        _slept=$((_slept + STOP_POLL))
+    done
+done
+
+printf '{"event":"sampler_stop","ts":"%s","host":"%s","tag":"%s","reason":"%s","samples":%d}\n' \
+    "$(now_iso)" "$HOST" "$TAG" "$reason" "$i" >>"$SERIES" 2>/dev/null
+
+# Only drop the pidfile if it is still ours: a successor that took over while
+# we were finishing must keep its own claim.
+_cur=$(cat "$PIDFILE" 2>/dev/null || echo "")
+[ "${_cur:-}" = "$$" ] && rm -f "$PIDFILE" 2>/dev/null
+exit 0
