@@ -224,6 +224,17 @@
             # until the slope budgets have been calibrated on a real
             # nightly + weekend run.
             VALIDATE_PROPERTY_HARD_FAIL: "{{ validate_property_hard_fail | default('') }}"
+            # Matrix failure caps (probatorium#359). The validator aborts a
+            # run that is failing wholesale: N consecutive cell failures, or
+            # N failed in total. Both default inside the validator (8, and
+            # half the plan); these carry a per-tier override across the SSH
+            # boundary, which env vars set on the outer mage / GH-Actions
+            # process do not cross. Empty leaves the defaults alone.
+            #
+            # The weekend soak sets the total cap, because half of 32 cells
+            # at a 45-minute budget is 12 hours of its 24-hour window.
+            PROBATORIUM_MATRIX_MAX_CONSECUTIVE_FAILURES: "{{ probatorium_matrix_max_consecutive_failures | default('') }}"
+            PROBATORIUM_MATRIX_MAX_FAILED_CELLS: "{{ probatorium_matrix_max_failed_cells | default('') }}"
             # Driver-refapp backend addresses. The driver_postgres /
             # driver_redis / driver_memcached refapps look up these env
             # vars (or their -postgres-dsn / -redis-addr / -mc-addr

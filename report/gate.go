@@ -149,6 +149,30 @@ func everyCellLists(cells []ValidationCellResult, list func(ValidationCellResult
 	return out
 }
 
+// deadCellWhy explains a cell that sent nothing. The matrix runner records
+// WHY a cell is empty (schema 5.11); before that the gate could only say
+// "dead cell" and the reason lived in the run log, which for a 70-minute
+// cluster tier is nowhere (probatorium#359).
+func deadCellWhy(c ValidationCellResult) string {
+	const base = "dead cell: no requests were sent"
+	if c.FailureReason == "" {
+		return base
+	}
+	reason := c.FailureReason
+	if len(reason) > deadCellReasonMax {
+		reason = reason[:deadCellReasonMax] + "..."
+	}
+	status := string(c.Status)
+	if status == "" {
+		status = "unrecorded"
+	}
+	return base + " (" + status + ": " + reason + ")"
+}
+
+// deadCellReasonMax keeps the gate's one-line-per-violation table readable
+// when a cell's reason is a multi-clause wrapped error.
+const deadCellReasonMax = 160
+
 // UninstrumentedEverywhere returns the predicates that every property-running
 // cell reported as not-instrumented: they judged a structurally-zero input in
 // the whole run and verified nothing. Waivers are NOT applied here -- the
@@ -454,7 +478,7 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			add(c, "tier_1", 0, "tier 1 never ran")
 		} else {
 			if t.RequestsSent == 0 {
-				add(c, "tier_1.requests_sent", 0, "dead cell: no requests were sent")
+				add(c, "tier_1.requests_sent", 0, deadCellWhy(c))
 			}
 			if t.Requests5xx > 0 {
 				add(c, "tier_1.requests_5xx", t.Requests5xx, "unexpected 5xx (designed 5xx are tallied in requests_5xx_expected)")

@@ -492,3 +492,139 @@ func TestGate_H2CUpgradeRefappsOverride(t *testing.T) {
 		t.Fatalf("an explicit refapp set must be honoured, got %v", v)
 	}
 }
+
+// The gate is where a human reads the verdict, so "dead cell" has to say
+// which kind of dead. A cell whose refapp never started and a cell whose
+// oracle killed it both arrive with requests_sent == 0; until schema 5.11
+// the difference existed only in the validator's run log (probatorium#359).
+func TestGateDeadCellCarriesTheRecordedReason(t *testing.T) {
+	cells := []ValidationCellResult{
+		{
+			Refapp: "auth_jwt_csrf", Engine: "adaptive", Arch: "amd64",
+			Tier1:         &Tier1Summary{},
+			Status:        ValidationCellNotRun,
+			FailureReason: "cell run: validation: I-LIVENESS violated by tier-1-property: refapp process died mid-run: ambiguous configuration: Addr but Listener is bound",
+		},
+		{
+			// No status recorded: a document from before 5.11, or a path
+			// that does not go through the matrix runner. Must still gate,
+			// and must not claim the cell was ok.
+			Refapp: "kitchen_sink", Engine: "std", Arch: "amd64",
+			Tier1: &Tier1Summary{},
+		},
+	}
+	viol := Gate(cells, nil, GateOptions{})
+	var got []string
+	for _, v := range viol {
+		if v.Field == "tier_1.requests_sent" {
+			got = append(got, v.Why)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d dead-cell violations, want 2: %v", len(got), viol)
+	}
+	if !strings.Contains(got[0], "not_run") || !strings.Contains(got[0], "I-LIVENESS") {
+		t.Errorf("dead-cell verdict does not carry the recorded reason: %q", got[0])
+	}
+	if !strings.Contains(got[1], "dead cell") {
+		t.Errorf("unrecorded cell lost its verdict: %q", got[1])
+	}
+	if strings.Contains(got[1], "(") {
+		t.Errorf("unrecorded cell invented a reason: %q", got[1])
+	}
+}
+
+// A reason long enough to wrap has to be cut, or one bad cell makes the
+// gate's table unreadable.
+func TestGateDeadCellReasonIsBounded(t *testing.T) {
+	long := strings.Repeat("x", 600)
+	why := deadCellWhy(ValidationCellResult{Status: ValidationCellNotRun, FailureReason: long})
+	if len(why) > deadCellReasonMax+80 {
+		t.Errorf("dead-cell verdict is %d chars: %q", len(why), why)
+	}
+	if !strings.HasSuffix(why, "...)") {
+		t.Errorf("truncation is not marked: %q", why)
+	}
+}
+
+// A cell that never ran has no engine counters, because it had no engine.
+// The two unconditional engine checks added in schema 5.11 (#368) must not
+// manufacture a verdict out of that absence: "the engine counted 0 requests
+// while the walker sent 0, a factor of +Inf" is noise standing where the
+// real finding -- the refapp would not start -- should be.
+//
+// The fixture deliberately reaches BOTH checks: its property loop ran (every
+// evaluation a skip, which is what a loop polling a refapp that never came
+// up records), so ranPropertyLoop is true and neither check is short-
+// circuited by the guard that precedes them.
+func TestGateInventsNoEngineVerdictForACellThatNeverRan(t *testing.T) {
+	notRun := ValidationCellResult{
+		Refapp: "auth_jwt_csrf", Engine: "adaptive", Arch: "amd64",
+		Status:        ValidationCellNotRun,
+		FailureReason: "cell run: validation: I-LIVENESS violated by tier-1-property: refapp process died mid-run",
+		Tier1: &Tier1Summary{
+			PropertySkips: 12, // the loop ran and judged nothing
+			// No traffic and no engine: every counter below is absent,
+			// not zero-because-measured.
+			RequestsSent:        0,
+			EngineRequestsTotal: 0,
+			EngineZeroWitness: map[string]int64{
+				"engine_recv_double_armed":              0,
+				"engine_close_missing_conn_state":       0,
+				"engine_transplant_adopt_slot_occupied": 0,
+			},
+		},
+	}
+	// Non-vacuity: if the fixture did not reach the engine checks, this
+	// test would pass against code that fires on every empty cell.
+	if !ranPropertyLoop(notRun) {
+		t.Fatal("fixture does not reach the engine checks — the test would prove nothing")
+	}
+
+	viol := Gate([]ValidationCellResult{notRun}, nil, GateOptions{})
+	var fields []string
+	for _, v := range viol {
+		fields = append(fields, v.Field)
+		if strings.Contains(v.Field, "engine_") {
+			t.Errorf("a cell that never ran produced an engine verdict: %s = %d (%s)", v.Field, v.Value, v.Why)
+		}
+	}
+	// It must still fail, as the dead cell it is, with its reason attached.
+	var dead string
+	for _, v := range viol {
+		if v.Field == "tier_1.requests_sent" {
+			dead = v.Why
+		}
+	}
+	if dead == "" {
+		t.Fatalf("the cell stopped failing the gate entirely; violations: %v", fields)
+	}
+	if !strings.Contains(dead, "not_run") || !strings.Contains(dead, "I-LIVENESS") {
+		t.Errorf("dead-cell verdict lost the recorded reason: %q", dead)
+	}
+}
+
+// ... and the coverage check still bites on the defect it was written for:
+// a cell that DID run, whose engine under-counted by three orders of
+// magnitude (celeris#626). Without this, the test above could be satisfied
+// by a check that never fires at all.
+func TestGateEngineRequestCoverageStillFiresOnACellThatRan(t *testing.T) {
+	ran := ValidationCellResult{
+		Refapp: "auth_jwt_csrf", Engine: "epoll", Arch: "amd64",
+		Status: ValidationCellOK,
+		Tier1: &Tier1Summary{
+			RequestsSent: 3_306_726, Requests2xx: 3_306_726,
+			PropertyEvaluations: 1200,
+			EngineRequestsTotal: 3089,
+		},
+	}
+	var got bool
+	for _, v := range Gate([]ValidationCellResult{ran}, nil, GateOptions{}) {
+		if v.Field == "tier_1.engine_requests_total" {
+			got = true
+		}
+	}
+	if !got {
+		t.Error("the engine-request-coverage check did not fire on celeris#626's own numbers")
+	}
+}

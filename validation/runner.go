@@ -258,6 +258,24 @@ type Orchestrator struct {
 	// incident handler reads it.
 	resolvedAddr atomic.Pointer[string]
 
+	// driveFailure holds the last T*-DRIVE incident message: the refapp
+	// would not start, its dependency refused the connection, the fork
+	// failed. The orchestrator deliberately does NOT halt on these (one
+	// killed seed must not end a 6 h soak), so the cell runs out its
+	// budget and Run returns nil -- leaving the matrix runner to record
+	// "no requests and no property verdicts" as the reason when the real
+	// one was right here (probatorium#359, PR-tier run 34920929477).
+	driveFailure atomic.Pointer[string]
+
+	// driverUnavailable holds the reason the remote driver could not be
+	// constructed, when that happened. It is the run's TRANSPORT, not the
+	// cell's subject: with DriverMode=ssh a lost connection fails every
+	// remaining cell identically and produces no evidence from any of
+	// them, so the matrix runner treats it as fatal and stops
+	// (probatorium#359). atomic.Pointer because Tier 1 and Tier 3 build
+	// their drivers on separate goroutines.
+	driverUnavailable atomic.Pointer[string]
+
 	// stderrTail is the refapp's most recent stdout+stderr tail, as carried
 	// by every Tier 1 tally tick (tier1TallySnapshot.RefappStderrTail).
 	// Published by the tally callback, read by the incident handler so a
@@ -399,6 +417,19 @@ type CellResult struct {
 	// per-cell properties_passed / properties_failed without reaching
 	// into the tally.
 	Properties checker.Tally
+	// DriveFailure is the last T*-DRIVE incident message: why the refapp
+	// did not come up, in the driver's own words. Non-empty does not by
+	// itself mean the cell failed -- a single killed replay seed sets it
+	// too -- so a reader must weigh it against whether the cell produced
+	// any evidence.
+	DriveFailure string
+	// DriverUnavailable is non-empty when a tier could not construct its
+	// remote driver at all -- the ssh transport to the host under test is
+	// gone, or the driver mode is unusable. Every cell after this one
+	// would fail the same way and record nothing, so the matrix runner
+	// reads it as a fatal condition rather than a cell-level one
+	// (probatorium#359).
+	DriverUnavailable string
 }
 
 // Result returns a value-typed snapshot of the per-tier tallies
@@ -417,6 +448,19 @@ func (o *Orchestrator) Result() CellResult {
 		Tier3:      o.tier3Snapshot,
 		Soak:       o.soakSummary,
 		Properties: o.tier1Snapshot.Properties,
+
+		DriveFailure: func() string {
+			if p := o.driveFailure.Load(); p != nil {
+				return *p
+			}
+			return ""
+		}(),
+		DriverUnavailable: func() string {
+			if p := o.driverUnavailable.Load(); p != nil {
+				return *p
+			}
+			return ""
+		}(),
 	}
 }
 
@@ -624,6 +668,8 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			//     because one of 1200 seeds got killed by a ssh
 			//     hiccup. The orchestrator runs to completion.
 			if isInfraDriveIncident(inc) {
+				msg := inc.Message
+				o.driveFailure.Store(&msg)
 				dir := infraIncidentDir(o.cfg.OutDir, inc)
 				_ = writeJSON(filepath.Join(dir, "incident.json"), map[string]any{
 					"tier":        inc.Tier.String(),
@@ -747,6 +793,18 @@ type Incident struct {
 // share the underlying ssh.Client connection because each tier
 // constructs its own Driver via this helper at entry time.
 func (o *Orchestrator) buildDriver() (remote.Driver, error) {
+	d, err := o.newDriver()
+	if err != nil {
+		// Record it once, for the matrix runner: a driver that cannot be
+		// built is not a property of this cell.
+		why := err.Error()
+		o.driverUnavailable.CompareAndSwap(nil, &why)
+	}
+	return d, err
+}
+
+// newDriver is buildDriver without the bookkeeping.
+func (o *Orchestrator) newDriver() (remote.Driver, error) {
 	mode := o.cfg.DriverMode
 	if mode == "" {
 		mode = "local"
@@ -1062,6 +1120,16 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	cancelLoop()
 	tally.Properties = <-propDone
 	if err != nil && ctx.Err() == nil {
+		// The cell produced nothing measurable, so this file is the only
+		// place a reader can learn why -- and until probatorium#359 it
+		// was never written on this path at all, because the clean-path
+		// write below is unreachable from here. PR-tier run 34920929477
+		// left eight cells whose recorded evidence was an absent file
+		// while the cause (a refused dial to the memcached fixture) sat
+		// in the driver error nobody had put on disk.
+		_ = writeStderrTail(filepath.Join(o.cfg.OutDir, "refapp_stderr_tail.txt"),
+			tally.RefappStderrTail,
+			refappStartReport(o.cfg.CelerisBin, err, tally.Liveness))
 		// driveTier1 failure that isn't the parent-cancel — surface
 		// as a synthetic incident so the orchestrator captures
 		// forensics and aborts. The "predicate" name is a coarse
@@ -1085,20 +1153,65 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// The refapp's stderr tail, unconditionally, so a cell that failed the
 	// gate on a walker counter has the engine's own last words next to the
 	// tally even when no incident fired (celeris#588).
-	_ = writeStderrTail(filepath.Join(o.cfg.OutDir, "refapp_stderr_tail.txt"), tally.RefappStderrTail)
+	_ = writeStderrTail(filepath.Join(o.cfg.OutDir, "refapp_stderr_tail.txt"), tally.RefappStderrTail, nil)
 }
 
 // writeStderrTail writes the refapp's stderr tail to path with a header
 // that says how many lines it holds, so an empty file is a statement
 // ("the refapp wrote nothing after ready") rather than a missing capture.
-func writeStderrTail(path string, lines []string) error {
+func writeStderrTail(path string, lines []string, diagnostics []string) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# refapp stdout+stderr tail: %d line(s), last %d kept\n", len(lines), refappTailMaxLines)
 	for _, l := range lines {
 		b.WriteString(l)
 		b.WriteByte('\n')
 	}
+	if len(diagnostics) > 0 {
+		// Written as real lines, not comments: they are the cell's only
+		// account of itself when the refapp printed nothing, and a reader
+		// -- or a grep -- must not have to know which prefix means
+		// "content" to find them.
+		b.WriteString("# the cell did not complete; what the driver saw follows\n")
+		for _, d := range diagnostics {
+			b.WriteString(d)
+			b.WriteByte('\n')
+		}
+	}
 	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// refappStartReport is what the orchestrator can say about a refapp that
+// never got far enough to be measured: the driver's own error (which
+// embeds the refapp's pre-ready stderr), whether the binary it was asked
+// to run is even on disk, and how the process ended if it started at all.
+//
+// A cell that dies before ready has no tally to read and, on the evidence
+// of PR-tier run 34920929477, frequently no stderr tail either -- the
+// refapp's single line goes into the driver error and nowhere else. These
+// four facts are the difference between "the cell did not run" and "the
+// cell did not run because its memcached fixture refused the connection".
+func refappStartReport(binPath string, err error, live livenessSnapshot) []string {
+	var out []string
+	if err != nil {
+		out = append(out, "driver: "+err.Error())
+	}
+	switch st, statErr := os.Stat(binPath); {
+	case binPath == "":
+		out = append(out, "binary: none configured")
+	case statErr != nil:
+		out = append(out, fmt.Sprintf("binary: %s IS NOT ON DISK (%v)", binPath, statErr))
+	default:
+		out = append(out, fmt.Sprintf("binary: %s (%d bytes, mode %s)", binPath, st.Size(), st.Mode().Perm()))
+	}
+	switch {
+	case live.Exited:
+		out = append(out, "process: "+live.Reason())
+	case live.Crashed || live.Hung:
+		out = append(out, "process: "+live.Reason())
+	default:
+		out = append(out, "process: no exit was observed (it never became ready, or never started)")
+	}
+	return out
 }
 
 // runTierRESTler is Tier 2 — RESTler-style stateful fuzzer over the
@@ -1293,7 +1406,7 @@ func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
 	if p := o.stderrTail.Load(); p != nil {
 		tail = *p
 	}
-	_ = writeStderrTail(filepath.Join(dir, "refapp_stderr_tail.txt"), tail)
+	_ = writeStderrTail(filepath.Join(dir, "refapp_stderr_tail.txt"), tail, nil)
 	return dir, nil
 }
 
