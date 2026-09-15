@@ -22,7 +22,7 @@ require (
 )
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20260915093907-9aa258cf1362
+	github.com/goceleris/celeris v1.5.12-0.20260915174751-c40d0cb9d4b7
 	github.com/goceleris/celeris/middleware/metrics v1.5.12-0.20260914123751-3b6184af545f
 	github.com/goceleris/celeris/middleware/otel v1.5.12-0.20260914123751-3b6184af545f
 	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0

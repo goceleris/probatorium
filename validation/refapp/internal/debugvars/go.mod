@@ -2,7 +2,7 @@ module github.com/goceleris/probatorium/validation/refapp/internal/debugvars
 
 go 1.27.0
 
-require github.com/goceleris/celeris v1.5.12-0.20260915093907-9aa258cf1362
+require github.com/goceleris/celeris v1.5.12-0.20260915174751-c40d0cb9d4b7
 
 require (
 	golang.org/x/net v0.59.0 // indirect
