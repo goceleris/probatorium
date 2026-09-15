@@ -54,6 +54,10 @@ func (l *Local) Start(ctx context.Context, args []string) (Process, error) {
 	// it arrives. io.MultiReader is the wrong shape here: it serialises
 	// the streams (waits for the first to EOF before reading the
 	// second), which deadlocks on a long-running candidate.
+	// The fan-in is line-atomic (see fanInLines): interleaving between
+	// lines is the point, interleaving inside one corrupted a crash
+	// signature into something that read like real output
+	// (probatorium#382).
 	outR, outW, err := os.Pipe()
 	if err != nil {
 		_ = errR.Close()
@@ -74,10 +78,11 @@ func (l *Local) Start(ctx context.Context, args []string) (Process, error) {
 	_ = outW.Close()
 	mergedR, mergedW := io.Pipe()
 	drained := make(chan struct{})
+	var lineMu sync.Mutex
 	var copyWG sync.WaitGroup
 	copyWG.Add(2)
-	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, errR) }()
-	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, outR) }()
+	go func() { defer copyWG.Done(); fanInLines(mergedW, &lineMu, errR) }()
+	go func() { defer copyWG.Done(); fanInLines(mergedW, &lineMu, outR) }()
 	go func() { copyWG.Wait(); _ = mergedW.Close(); close(drained) }()
 	p := &localProcess{
 		cmd:       cmd,
