@@ -50,7 +50,12 @@ jobs:
   setup:
     name: bootstrap cluster runners
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not 15: the bootstrap fetches a 215 MiB actions-runner
+    # tarball per host on a cold cache, and a slow-network day took
+    # 13m05s of a 15-minute budget and cancelled the nightly
+    # (probatorium#387). The cache added there removes the fetch from
+    # every later run; this is the headroom for the first one.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
