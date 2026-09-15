@@ -188,6 +188,20 @@ type Tally struct {
 	// the same total along a different axis, so it is not a member of
 	// the sum.
 	EngineStandbyErrorCount int64 `json:"engine_standby_error_count,omitempty"`
+	// EngineCounters is every report.EngineCounters entry, keyed by its
+	// debugvars name, reduced over the samples whose document carried the
+	// engine block by its declared Kind: the highest reading of a running
+	// maximum, the last reading of every other kind (recordEngineCounters
+	// says why). Most of it is what
+	// probatorium#386 published and nothing downstream read until
+	// probatorium#391: the celeris#647 hand-off outcomes, the celeris#607
+	// recv-stall ledger, detach and zero-copy accounting.
+	//
+	// A map for the reason EngineZeroWitness is one. Absent means no sample
+	// carried engine metrics; present and zero means measured.
+	//
+	// Nothing here is gated.
+	EngineCounters map[string]int64 `json:"engine_counters,omitempty"`
 	// NotJudged are the instrumented IDs whose every evaluation was a
 	// skip -- typically the slope predicates in a cell shorter than
 	// warm-up + window (15 min). They verified nothing and are excluded
@@ -402,6 +416,7 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 	e.tally.EngineStandbyErrorCount = max(e.tally.EngineStandbyErrorCount, snap.EngineStandbyErrorCount)
 	e.recordZeroWitnesses(snap)
 	e.recordErrorClasses(snap)
+	e.recordEngineCounters(snap)
 	if snap.EngineRequestsTotal > 0 {
 		bytes := snap.EngineBytesRead + snap.EngineBytesWritten
 		if !e.haveBase {
@@ -522,6 +537,90 @@ func (e *Evaluator) recordErrorClasses(snap properties.Snapshot) {
 		if v > e.tally.EngineErrorClasses[k] {
 			e.tally.EngineErrorClasses[k] = v
 		}
+	}
+}
+
+// recordEngineCounters reduces, for every report.EngineCounters entry, the
+// readings of the samples whose document carried the engine block, by the
+// Kind the entry declares (reduceEngineCounter).
+//
+// Never a sum. Every counter here is cumulative, an engine-side running
+// maximum, a gauge or static, so one reading already IS the cell's value:
+// summing samples multiplies it by the sample count, and summing a
+// *_max_nanos manufactures an episode nothing observed. A running maximum
+// keeps its highest reading, the one rule report.CounterRunningMax allows;
+// every other kind keeps its last. For the cumulative counters and the
+// running maxima the two agree while nothing resets mid-cell (celeris's
+// adaptive engine builds each sub-engine at most once and never replaces
+// it), and max is what keeps a running maximum right if that ever stops
+// being true. For the gauges, last is the reading that keeps a persistent
+// drift visible in either direction, where a peak would hide the negative
+// one.
+//
+// A sample whose document carried no engine block (EngineName empty) is
+// skipped rather than recorded, since every engine key in it was absent and
+// an absent key parses as zero -- exactly the reading max() exists to stop
+// retracting a total. The map is created at the first sample that does carry
+// one, so an absent map means never measured and a present zero means
+// measured zero.
+func (e *Evaluator) recordEngineCounters(snap properties.Snapshot) {
+	if snap.EngineName == "" {
+		return
+	}
+	if e.tally.EngineCounters == nil {
+		e.tally.EngineCounters = make(map[string]int64, len(report.EngineCounters))
+	}
+	for k, v := range map[string]int64{
+		"engine_transplant_handoff_refused":       snap.EngineTransplantHandoffRefused,
+		"engine_transplant_drain_stopped":         snap.EngineTransplantDrainStopped,
+		"engine_transplant_stranded":              snap.EngineTransplantStranded,
+		"engine_transplant_adopt_refused":         snap.EngineTransplantAdoptRefused,
+		"engine_recv_resume_while_cancel_pending": snap.EngineRecvResumeWhileCancelPending,
+		"engine_recv_resume_while_recv_in_flight": snap.EngineRecvResumeWhileRecvInFlight,
+		"engine_recv_arm_declined":                snap.EngineRecvArmDeclined,
+		"engine_recv_stall_nanos":                 snap.EngineRecvStallNanos,
+		"engine_recv_stall_max_nanos":             snap.EngineRecvStallMaxNanos,
+		"engine_recv_linked_arms":                 snap.EngineRecvLinkedArms,
+		"engine_recv_linked_blocked_nanos":        snap.EngineRecvLinkedBlockedNanos,
+		"engine_recv_linked_blocked_max_nanos":    snap.EngineRecvLinkedBlockedMaxNanos,
+		"engine_detached_conns":                   snap.EngineDetachedConns,
+		"engine_detach_window_closes":             snap.EngineDetachWindowCloses,
+		"engine_zc_sends_submitted":               snap.EngineZCSendsSubmitted,
+		"engine_zc_notifs":                        snap.EngineZCNotifs,
+		"engine_inline_bytes":                     snap.EngineInlineBytes,
+		"engine_ring_bytes":                       snap.EngineRingBytes,
+		"engine_async_routes":                     snap.EngineAsyncRoutes,
+		"engine_standby_close_count":              snap.EngineStandbyCloseCount,
+		"engine_workers":                          snap.EngineWorkers,
+		"engine_bytes_read":                       snap.EngineBytesRead,
+		"engine_bytes_written":                    snap.EngineBytesWritten,
+	} {
+		held, seen := e.tally.EngineCounters[k]
+		e.tally.EngineCounters[k] = reduceEngineCounter(report.EngineCounters[k].Kind, held, seen, v)
+	}
+}
+
+// reduceEngineCounter folds one engine reading into the value the tally holds
+// for a counter of the given kind; the first reading is taken as it is.
+// TestEachEngineCounterIsReducedByItsDeclaredKind holds every case to the rule
+// its kind declares, over readings where sum, max, first and last all differ.
+func reduceEngineCounter(kind report.EngineCounterKind, held int64, seen bool, reading int64) int64 {
+	if !seen {
+		return reading
+	}
+	switch kind {
+	case report.CounterRunningMax:
+		return max(held, reading)
+	case report.CounterCumulative:
+		return reading
+	case report.CounterGauge:
+		return reading
+	case report.CounterStatic:
+		return reading
+	default:
+		// Unreachable for a recorded counter: every one is declared with one
+		// of the four kinds (TestEachEngineCounterIsDeclaredAndReadsItsOwnKey).
+		return reading
 	}
 }
 

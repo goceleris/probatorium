@@ -188,7 +188,36 @@ import (
 //     on a healthy io_uring load), so a threshold before a run has said
 //     what normal looks like would be a number nobody measured.
 //     Additive; older readers ignore every field.
-const SchemaVersion = "5.14"
+//   - 5.15 — every published engine counter reaches the artifact
+//     (probatorium#391). probatorium#386 made the refapps publish all
+//     fifty-two engine.EngineMetrics fields, and twenty of them still
+//     reached no artifact: ParseDebugVars, properties.Snapshot, the
+//     per-cell series and this struct were each a hand-list of their own,
+//     so celeris.engine_transplant_stranded was emitted by every refapp and
+//     recorded nowhere. Adds, on Tier1Summary, EngineCounters — each
+//     report.EngineCounters entry reduced over the samples that carried
+//     the engine block by its declared Kind (the highest reading for a
+//     running maximum, the last for every other kind, never a sum), keyed
+//     by its debugvars name: the four celeris#647
+//     hand-off outcomes (handoff_refused, drain_stopped, stranded,
+//     adopt_refused), the eight celeris#533 / celeris#607 recv-stall
+//     witnesses, detach and zero-copy accounting, the inline / ring egress
+//     split and async_routes, plus four keys the series already carried
+//     with no end-of-cell total (engine_standby_close_count,
+//     engine_workers, engine_bytes_read, engine_bytes_written). Adds TEN
+//     per-cell series columns: the four hand-off outcomes,
+//     engine_recv_stall_nanos, engine_recv_stall_max_nanos,
+//     engine_recv_linked_arms, engine_recv_linked_blocked_nanos,
+//     engine_recv_linked_blocked_max_nanos and engine_detached_conns.
+//     report.EngineCounters.Why records the column-or-total call key by
+//     key, and .Kind how readings may be combined (two are running maxima
+//     that must never be summed). celeris.engine_throughput is the one
+//     published key carried nowhere: no engine assigns it (celeris#653),
+//     so a carried 0 would read as a measured rate. Nothing new is gated:
+//     engine_transplant_stranded is documented must-stay-zero, but moving
+//     it into ZeroWitnessMeaning is a gate change this version does not
+//     make. Additive; older readers ignore every field.
+const SchemaVersion = "5.15"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -898,6 +927,19 @@ type Tier1Summary struct {
 	// a member of EngineErrorClasses -- it cuts the same total along the
 	// other axis, so summing it with the buckets would double count.
 	EngineStandbyErrorCount int64 `json:"engine_standby_error_count,omitempty"`
+	// EngineCounters is every published engine counter that has no named
+	// field or registry of its own above, keyed by its debugvars name
+	// (report.EngineCounters says what each counts, what KIND of reading it
+	// is, and whether the per-cell series samples it). Each value reduces the
+	// samples whose document carried the engine block by that kind: the
+	// highest reading of a running maximum, and the last reading of
+	// everything else -- the cell's final total, gauge level or static count
+	// -- never a sum over samples (schema 5.15, probatorium#391).
+	//
+	// A map for the reason EngineZeroWitness is one. Absent means no sample
+	// carried engine metrics; present and zero means measured. Diagnostic,
+	// not gated.
+	EngineCounters map[string]int64 `json:"engine_counters,omitempty"`
 
 	// Per-slice sub-tallies (one per workload-mix slice from
 	// validator-prod issue #55). Each is a plain `map[string]int64`

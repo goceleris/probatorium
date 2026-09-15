@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -206,13 +205,17 @@ func TestParseDebugVarsLeavesTheErrorClassesZeroWhenAbsent(t *testing.T) {
 // operators read it rather than the parser. A key parsed but undocumented is
 // how a counter comes to exist that nobody knows to look at.
 func TestDebugVarsKeysDocumentsEveryErrorClassKey(t *testing.T) {
+	// A set, not strings.Contains: celeris.engine_error_send is a substring
+	// of celeris.engine_error_send_peer_gone, so a substring test passed with
+	// the shorter key missing.
+	documented := debugVarsKeySet()
 	for name := range report.ErrorClasses {
-		if !strings.Contains(DebugVarsKeys, "celeris."+name) {
+		if !documented["celeris."+name] {
 			t.Errorf("DebugVarsKeys does not mention celeris.%s", name)
 		}
 	}
 	for _, k := range []string{"celeris.engine_error_count", "celeris.engine_standby_error_count"} {
-		if !strings.Contains(DebugVarsKeys, k) {
+		if !documented[k] {
 			t.Errorf("DebugVarsKeys does not mention %s", k)
 		}
 	}

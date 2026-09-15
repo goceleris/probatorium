@@ -144,6 +144,52 @@ type Snapshot struct {
 	EngineRecvCQEUnaccounted          int64
 	EngineRecvSQFull                  int64
 	EngineRecvStallEpisodes           int64
+	// The rest of engine.EngineMetrics (probatorium#391). probatorium#386
+	// published all fifty-two fields, and twenty of them stopped HERE: this
+	// struct did not have them, so ParseDebugVars had nowhere to put them
+	// and neither the series nor the tally could carry them. Judged by no
+	// predicate and gated by nothing; report.EngineCounters says what each
+	// counts, how its readings combine, and whether the per-cell series
+	// samples it. Named "Engine" + the EngineMetrics field, except
+	// EngineDetachedConns, which mirrors its debugvars key. The one
+	// published key with no field is celeris.engine_throughput, and
+	// checker.EngineKeysNotParsed says why.
+	//
+	// The four hand-off outcomes celeris#647 added so its celeris#624 fix is
+	// falsifiable. Stranded must stay zero; the other three are recoveries.
+	EngineTransplantHandoffRefused int64
+	EngineTransplantDrainStopped   int64
+	EngineTransplantStranded       int64
+	EngineTransplantAdoptRefused   int64
+	// The celeris#484 resume window -- the exposure witnesses for
+	// EngineRecvDoubleArmed -- and the #560 guard standing in it.
+	EngineRecvResumeWhileCancelPending int64
+	EngineRecvResumeWhileRecvInFlight  int64
+	EngineRecvArmDeclined              int64
+	// The duration half of the celeris#607 recv stall, and the linked-recv
+	// chain #607 was solved on. The two *MaxNanos are engine-side RUNNING
+	// MAXIMA: never sum them, never difference them into a rate. The
+	// nanosecond totals decode through a JSON float64, so they are exact
+	// only below 2^53 ns (about 104 days of summed stall), which no cell
+	// approaches.
+	EngineRecvStallNanos            int64
+	EngineRecvStallMaxNanos         int64
+	EngineRecvLinkedArms            int64
+	EngineRecvLinkedBlockedNanos    int64
+	EngineRecvLinkedBlockedMaxNanos int64
+	// Detach accounting (celeris#549, celeris#584). EngineDetachedConns is
+	// a GAUGE, the only one in this block.
+	EngineDetachedConns      int64
+	EngineDetachWindowCloses int64
+	// The io_uring egress split: zero-copy exposure, and the bytes that
+	// went out inline versus through the ring.
+	EngineZCSendsSubmitted int64
+	EngineZCNotifs         int64
+	EngineInlineBytes      int64
+	EngineRingBytes        int64
+	// EngineAsyncRoutes is static after Listen: the denominator for
+	// EngineAsyncPromotedConns.
+	EngineAsyncRoutes int64
 	// ExpectedPanics is the number of panics the workload DESIGNED so far
 	// (corpus states marked `expect: panic`, counted by the Tier 1 walker
 	// when their 5xx arrives). Zero when no accounting is wired (e.g. the
