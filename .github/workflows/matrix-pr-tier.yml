@@ -241,7 +241,14 @@ jobs:
         run: mage Validate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
-        if: success()
+        # NOT success(): the runs worth judging are the ones that found
+        # something. mage Validate exits non-zero when any cell failed, and
+        # gating the judges on success() skipped them exactly then --
+        # nightly 34818888908 produced 64 complete cells, 8 of them bad, and
+        # adjudicated none of it (probatorium#359). A skipped step cannot
+        # turn a red run green: the failed Validate step already fails the
+        # job, and this gate fails it again on the cells themselves.
+        if: '!cancelled()'
         env:
           # MED divergences fail too. Without this the severity is permanently
           # advisory: 3 of the 7 invariant counters are MED and 1 is LOW, so
