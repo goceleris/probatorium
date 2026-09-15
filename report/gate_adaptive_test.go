@@ -41,3 +41,46 @@ func TestGate_ExpectAdaptiveSwitchFailsAnAdaptiveCellThatNeverPromoted(t *testin
 		t.Fatalf("a cell without a property loop cannot vote, got %v", v)
 	}
 }
+
+// The violation is only actionable with the controller's own two inputs
+// beside it. Nightly 34876253223 reported seven cells at
+// adaptive_switches == 0 with no way to tell apart a harness that offered
+// too little load, a controller that deliberately suppressed a link-bound
+// workload, and a celeris defect -- the three have different owners and the
+// artifact named none of them.
+func TestGate_AdaptiveSwitchViolationCarriesTheMeasuredLoad(t *testing.T) {
+	stayed := cleanCell("driver_postgres", "adaptive", "arm64")
+	stayed.Tier1.AdaptiveSwitches = 0
+	stayed.Tier1.PeakConnsPerWorker = 50.5
+	stayed.Tier1.MeanBytesPerReq = 11_400
+
+	opts := GateOptions{RequireTier3: true, RequireProperties: true, ExpectAdaptiveSwitch: true}
+	v := Gate([]ValidationCellResult{stayed}, nil, opts)
+	if len(v) != 1 {
+		t.Fatalf("want one violation, got %v", v)
+	}
+	for _, want := range []string{"50.5 conns/worker", "11400 bytes/req"} {
+		if !strings.Contains(v[0].Why, want) {
+			t.Errorf("Why must carry %q, got %q", want, v[0].Why)
+		}
+	}
+}
+
+// The control for that: a cell whose refapp published no engine metrics must
+// read as zero, which is a visibly different sentence from a measured load.
+// Reporting 0.0/0 as though it were a reading would invite exactly the wrong
+// conclusion -- "the load never arrived" -- from a cell that simply was not
+// instrumented.
+func TestGate_AdaptiveSwitchViolationShowsZeroWhenNothingWasMeasured(t *testing.T) {
+	stayed := cleanCell("driver_postgres", "adaptive", "arm64")
+	stayed.Tier1.AdaptiveSwitches = 0
+
+	opts := GateOptions{RequireTier3: true, RequireProperties: true, ExpectAdaptiveSwitch: true}
+	v := Gate([]ValidationCellResult{stayed}, nil, opts)
+	if len(v) != 1 {
+		t.Fatalf("want one violation, got %v", v)
+	}
+	if !strings.Contains(v[0].Why, "peak 0.0 conns/worker, mean 0 bytes/req") {
+		t.Errorf("an unmeasured cell must say so, got %q", v[0].Why)
+	}
+}

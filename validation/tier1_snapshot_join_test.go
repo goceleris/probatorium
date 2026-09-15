@@ -1,7 +1,6 @@
 package validation
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -27,17 +26,29 @@ func TestDriveTier1_SnapshotIsCompleteWhenTheTierReturns(t *testing.T) {
 		_ = os.Remove(snapPath)
 		cfg := tier1Config{
 			Driver:                remote.NewLocal("/bin/sh"),
-			RefappArgs:            []string{"-c", `echo "ready addr=` + srv.URL + `"; sleep 10`},
+			RefappArgs:            readyThenIdle(srv.URL),
 			BaseURL:               srv.URL,
 			Matrix:                minimalMatrix(t),
 			Seed:                  42,
 			Concurrency:           1,
-			ReadyTimeout:          2 * time.Second,
+			ReadyTimeout:          tier1TestReadyTimeout,
 			RequestTimeout:        time.Second,
 			SnapshotPath:          snapPath,
 			TallyCallbackInterval: 20 * time.Millisecond,
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		// Cut the cell once the writer is demonstrably ticking. The cut
+		// still lands at an arbitrary phase of the write cycle -- the
+		// poller here and the writer's ticker are unsynchronised and run
+		// at different rates, over fifty iterations -- which is the race
+		// this test exists to stress. What it no longer does is spend the
+		// same budget on fork/exec and readiness: with a flat 150 ms cell
+		// a loaded box could end the tier before the writer had ticked at
+		// all, and the test then failed for having nothing to read rather
+		// than for reading something broken.
+		ctx, cancel := cancelWhen(t, func() bool {
+			_, serr := os.Stat(snapPath)
+			return serr == nil
+		})
 		_, err := driveTier1(ctx, cfg)
 		cancel()
 		if err != nil {

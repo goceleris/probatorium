@@ -145,6 +145,22 @@ type tier1Config struct {
 	// idle window (0 under load, n inside the n-th window) as soon as the
 	// refapp is ready, so the property loop can stamp every sample.
 	OnIdleWindow func(window func() int)
+	// OnIdleWindowChange, when non-nil, is called with every value the
+	// idle window takes, at the instant the schedule publishes it,
+	// beginning with the 0 the cell starts under.
+	//
+	// Observation only: it reports transitions the schedule was making
+	// anyway and changes nothing about when a window opens or closes.
+	// It exists because OnIdleWindow hands out a PULL accessor, which is
+	// all the property loop needs -- it stamps the window onto samples it
+	// is already taking -- but is not enough to prove the schedule ran
+	// burst, idle, load, idle. The only way to turn a pull accessor into
+	// a sequence is to poll it, and a poll loop cannot see a window
+	// shorter than its period; with the phase durations scaled down so a
+	// test finishes in a second, a loaded -race runner produces exactly
+	// those short windows. Reporting the transition is the honest way to
+	// assert on it (probatorium#357, run 34844660650).
+	OnIdleWindowChange func(window int)
 
 	// SnapshotPath, when non-empty, names the path the tier writes the
 	// current tally snapshot to on every TallyCallback tick. Letting
@@ -691,15 +707,16 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	// One fleet for the whole cell, or -- for I-MEM-2 -- burst, idle,
 	// load, idle. Nothing but the property loop's polls and the
 	// responsiveness probe touch the refapp while a window is held.
-	var idleWindow atomic.Int32
+	idleWindow := &idleWindowPublisher{notify: cfg.OnIdleWindowChange}
 	if cfg.OnIdleWindow != nil {
-		cfg.OnIdleWindow(func() int { return int(idleWindow.Load()) })
+		cfg.OnIdleWindow(idleWindow.get)
 	}
+	idleWindow.set(0) // the cell starts under load, window or no window
 	if cfg.IdleWindows {
 		burstCtx, cancelBurst := context.WithTimeout(runCtx, idleBurstDuration)
 		launch(burstCtx, idleBurstSeedSalt).Wait()
 		cancelBurst()
-		holdIdle(runCtx, &idleWindow, 1, idleWindowDuration)
+		holdIdle(runCtx, idleWindow, 1, idleWindowDuration)
 		// The main fleet stops idleTailDuration before the cell's deadline
 		// so the second window fits; with no deadline it runs to cancel.
 		var loadCtx context.Context
@@ -713,7 +730,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			launch(loadCtx, 0).Wait()
 		}
 		cancelLoad()
-		holdIdle(runCtx, &idleWindow, 2, 0)
+		holdIdle(runCtx, idleWindow, 2, 0)
 	} else {
 		launch(runCtx, 0).Wait()
 	}
@@ -750,20 +767,40 @@ func writeSnapshotAtomically(path string, snap tier1TallySnapshot) {
 	_ = os.Rename(tmp, path)
 }
 
+// idleWindowPublisher owns the cell's current idle window. The value is
+// an atomic because the property loop reads it from its own goroutine
+// through the OnIdleWindow accessor while the schedule writes it; the
+// optional notify is called inline, on the schedule's own goroutine, so
+// a listener sees every transition in order and none is lost to a
+// sampling period (tier1Config.OnIdleWindowChange).
+type idleWindowPublisher struct {
+	w      atomic.Int32
+	notify func(int)
+}
+
+func (p *idleWindowPublisher) get() int { return int(p.w.Load()) }
+
+func (p *idleWindowPublisher) set(n int32) {
+	p.w.Store(n)
+	if p.notify != nil {
+		p.notify(int(n))
+	}
+}
+
 // holdIdle publishes idle window n for d, then clears it; with d <= 0 it
 // holds the window until ctx is done and leaves it published, so the
 // property loop's last samples still carry it. A cancelled ctx (the
 // refapp died, the cell ended) publishes nothing.
-func holdIdle(ctx context.Context, w *atomic.Int32, n int32, d time.Duration) {
+func holdIdle(ctx context.Context, w *idleWindowPublisher, n int32, d time.Duration) {
 	if ctx.Err() != nil {
 		return
 	}
-	w.Store(n)
+	w.set(n)
 	if d <= 0 {
 		<-ctx.Done()
 		return
 	}
-	defer w.Store(0)
+	defer w.set(0)
 	select {
 	case <-ctx.Done():
 	case <-time.After(d):

@@ -31,7 +31,12 @@
           "description": "Sorted list of key=value pairs the ansible role wrote before the run started."
         },
         "loadgen_host": { "type": "string" },
-        "fabric": { "type": "string" }
+        "fabric": { "type": "string" },
+        "sut_env": {
+          "type": "object",
+          "description": "KEY=VALUE environment overrides the bench merged into the SUT process (v5.9+, celeris#585), so an A/B arm is identifiable from this file alone. Omitted when none were passed.",
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "benchmark_config": {
@@ -133,7 +138,12 @@
         },
         "resources": {
           "type": "object",
-          "description": "Per-scenario server-side resource aggregate (RSS/CPU/GC/FD), keyed by scenario name. Optional (v5.2+); per-metric leaves are nullable so non-Go competitors expose RSS/CPU/FD only.",
+          "description": "Per-scenario server-side resource aggregate (RSS/CPU/GC/FD), keyed by scenario name. Optional (v5.2+); per-metric leaves are nullable so non-Go competitors expose RSS/CPU/FD only. On the cluster path this is the COLUMN-WIDE aggregate (one mpstat/observer per column pass) stamped onto every scenario — see scenario_resources for the per-scenario window.",
+          "additionalProperties": { "$ref": "#/$defs/resourceStats" }
+        },
+        "scenario_resources": {
+          "type": "object",
+          "description": "Per-scenario WINDOW of the same raw sidecar (v5.9+, celeris#585), keyed by scenario name: the column's 1 Hz mpstat + observer series sliced to the scenario's own runner window (started_at + warmup .. completed_at) and summarised on their own, with the slice bounds and sample counts in `window`. Absent for a scenario whose window caught no sample (no data, never zero). This, not `resources`, is the per-cell CPU number.",
           "additionalProperties": { "$ref": "#/$defs/resourceStats" }
         },
         "cell_statuses": {
@@ -198,6 +208,17 @@
         "series": {
           "type": "array",
           "items": { "$ref": "#/$defs/resourcePoint" }
+        },
+        "window": {
+          "type": "object",
+          "description": "Set only on a per-scenario slice (v5.9+): the [start, end] the raw series was cut to (UTC, inclusive at 1 s) and how many samples of each kind fell inside — the denominators behind the summary means.",
+          "required": ["start", "end", "cpu_samples", "observer_samples"],
+          "properties": {
+            "start": { "type": "string", "format": "date-time" },
+            "end": { "type": "string", "format": "date-time" },
+            "cpu_samples": { "type": "integer", "minimum": 0 },
+            "observer_samples": { "type": "integer", "minimum": 0 }
+          }
         }
       }
     },
@@ -210,7 +231,9 @@
         "mean_cpu_pct": { "type": ["number", "null"] },
         "gc_pause_p99_ns": { "type": ["integer", "null"] },
         "goroutine_hwm": { "type": ["integer", "null"] },
-        "fd_hwm": { "type": ["integer", "null"] }
+        "fd_hwm": { "type": ["integer", "null"] },
+        "mean_soft_pct": { "type": ["number", "null"], "description": "Mean mpstat %soft (softirq) over the window (v5.9+, per-scenario slices only)." },
+        "sut_process_cpu_pct": { "type": ["number", "null"], "description": "SUT process utime+stime over the window as percent of ONE core (v5.9+, per-scenario slices only; 3200 = all 32 cores). Needs an observer that records cpu ticks." }
       }
     },
     "resourcePoint": {

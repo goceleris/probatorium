@@ -281,6 +281,71 @@ func (v *Vars) Document() map[string]any {
 			// (celeris#588). Not judged by any predicate.
 			doc["celeris.engine_error_count"] = int64(info.Metrics.ErrorCount)
 			doc["celeris.engine"] = info.Type.String()
+			// The four inputs to the adaptive controller's promotion
+			// decision, published so a cell that never promoted can say
+			// WHY instead of only that it did not (celeris#580 proved the
+			// switch counter; this proves the load that was offered).
+			// The controller divides ActiveConnections by Workers to get
+			// conns/worker, and derives bytes/req from the per-interval
+			// delta of (BytesRead+BytesWritten)/RequestCount -- so at the
+			// property loop's 1 Hz these four reconstruct both signals
+			// offline, per interval, from the series alone.
+			doc["celeris.engine_workers"] = int64(info.Metrics.Workers)
+			doc["celeris.engine_requests_total"] = int64(info.Metrics.RequestCount)
+			doc["celeris.engine_bytes_read"] = int64(info.Metrics.BytesRead)
+			doc["celeris.engine_bytes_written"] = int64(info.Metrics.BytesWritten)
+			// Engine-side connection accounting, against which the
+			// refapp's own OnConnect/OnDisconnect tallies are the
+			// independent witness. I-CONN-2 fires on
+			// accepted - closed - active, and celeris#624 showed a
+			// cell lose two connections from `active` with the hooks
+			// unmoved -- which the artifact could not attribute,
+			// because it carried only the hook side. With both sides
+			// recorded the drift forks itself: engine_close_count
+			// running AHEAD of the hook count means a close skipped
+			// its hook, and the two agreeing while `active` is short
+			// means nothing closed and a connection was detached
+			// without being re-adopted.
+			doc["celeris.engine_accept_count"] = int64(info.Metrics.AcceptCount)
+			doc["celeris.engine_close_count"] = int64(info.Metrics.CloseCount)
+			// How much of the cell's traffic took the async dispatch
+			// path. celeris#626 was invisible for as long as it was
+			// because nothing recorded this: the epoll request counter
+			// stopped advancing on exactly these connections, and a
+			// cell could not say how many it had.
+			doc["celeris.engine_async_promoted_conns"] = int64(info.Metrics.AsyncPromotedConns)
+			// The adaptive engine's two halves, separately. Its
+			// Metrics() sums the sub-engines, so a connection lost on
+			// one side is invisible in the total (celeris#627). Zero
+			// on every non-adaptive engine.
+			doc["celeris.engine_standby_active_conns"] = info.Metrics.StandbyActiveConnections
+			doc["celeris.engine_standby_close_count"] = int64(info.Metrics.StandbyCloseCount)
+			// The transplant hand-off, both directions. The epoll side
+			// decrements its live count and fires NO hook by design,
+			// and the io_uring side increments on adoption; a residual
+			// between them is a connection that left one engine and
+			// never arrived at the other.
+			doc["celeris.engine_transplant_detached"] = int64(info.Metrics.TransplantDetached)
+			doc["celeris.engine_transplant_adopted"] = int64(info.Metrics.TransplantAdopted)
+			// MUST-STAY-ZERO witnesses. Each names one specific
+			// defect, and a nonzero value is that defect firing, not a
+			// note: the adoption path finding its slot already
+			// occupied (celeris#624 hypothesis A), a close decrementing
+			// the gauge with no connection state so the hook is
+			// skipped (#624 hypothesis B), a second recv armed while
+			// one is already in flight (#484's stream corruption), a
+			// recv completion that accounts to nothing (#484), and the
+			// two #607 guards -- a submission queue that filled and a
+			// recv that stalled behind it. The #607 pair read zero
+			// across the whole investigation that produced them, which
+			// is exactly why they ship: a guard that has never fired is
+			// only worth keeping if it is still watching.
+			doc["celeris.engine_transplant_adopt_slot_occupied"] = int64(info.Metrics.TransplantAdoptSlotOccupied)
+			doc["celeris.engine_close_missing_conn_state"] = int64(info.Metrics.CloseMissingConnState)
+			doc["celeris.engine_recv_double_armed"] = int64(info.Metrics.RecvDoubleArmed)
+			doc["celeris.engine_recv_cqe_unaccounted"] = int64(info.Metrics.RecvCQEUnaccounted)
+			doc["celeris.engine_recv_sq_full"] = int64(info.Metrics.RecvSQFull)
+			doc["celeris.engine_recv_stall_episodes"] = int64(info.Metrics.RecvStallEpisodes)
 		}
 	}
 	return doc

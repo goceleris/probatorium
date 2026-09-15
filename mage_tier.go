@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/goceleris/probatorium/budget"
@@ -215,10 +216,25 @@ func BenchTier() error {
 // having to add a new profile. The function only sets the env if the
 // caller hasn't set it — a `mage Smoke` style command uses this to
 // override the profile's 90s/20s with 5s/2s for a 30-minute sweep.
+//
+// BENCH_CELLS is honoured the same way (celeris#585): a non-blank preset
+// (benchmark-tier.yml's `cells` input) scopes the run to those globs
+// instead of the profile's, so a 3-scenario A/B does not pay for the
+// column's whole catalogue. The budget projection (FitWithin, run before
+// this) still counts the profile's full grid, which a scoped run passes
+// trivially — logged, not hidden.
 func setBenchEnvFromProfile(p budget.Profile, rated bool) {
+	setCells := func(profileGlob string) {
+		glob, overridden := resolveBenchCells(os.Getenv("BENCH_CELLS"), profileGlob)
+		if overridden {
+			fmt.Printf("  BENCH_CELLS preset %q overrides the %s profile glob %q (the budget projection counted the profile's %d cells; this scoped run is strictly smaller)\n",
+				glob, p.Name, profileGlob, p.Cells)
+		}
+		_ = os.Setenv("BENCH_CELLS", glob)
+	}
 	if rated {
 		_ = os.Setenv("BENCH_RATED", "1")
-		_ = os.Setenv("BENCH_CELLS", budget.RatedGlob(p))
+		setCells(budget.RatedGlob(p))
 		if os.Getenv("BENCH_DURATION") == "" {
 			_ = os.Setenv("BENCH_DURATION", durString(p.RatedDuration))
 		}
@@ -234,7 +250,7 @@ func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 		// Publish() callers (without BENCH_RATED set) end up with
 		// BENCH_RATED unset, which is the correct behaviour for a
 		// pure-saturation call.
-		_ = os.Setenv("BENCH_CELLS", budget.CellsGlob(p))
+		setCells(budget.CellsGlob(p))
 		if os.Getenv("BENCH_DURATION") == "" {
 			_ = os.Setenv("BENCH_DURATION", durString(p.Duration))
 		}
@@ -242,6 +258,17 @@ func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 			_ = os.Setenv("BENCH_WARMUP", durString(p.Warmup))
 		}
 	}
+}
+
+// resolveBenchCells picks the cell glob a bench pass runs: a non-blank
+// caller preset (BENCH_CELLS from the workflow's `cells` input) wins over
+// the profile's glob; blank or whitespace falls through to the profile.
+// overridden reports which branch was taken so the caller can log it.
+func resolveBenchCells(preset, profileGlob string) (glob string, overridden bool) {
+	if p := strings.TrimSpace(preset); p != "" {
+		return p, true
+	}
+	return profileGlob, false
 }
 
 // durString renders a time.Duration as the Go-parseable string Bench()

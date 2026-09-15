@@ -267,13 +267,14 @@ func TestRunH2CChurnWalker_FiresMultipleRequests(t *testing.T) {
 		_, _ = c.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n"))
 	})
 	var tally h2cTally
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	// Run until the walker HAS churned repeatedly, rather than for 350 ms
+	// and hoping the 50 ms ticks fit (tier1_until_test.go).
+	const want = 6
+	ctx, cancel := cancelWhen(t, func() bool { return tally.snapshot().Sent >= want })
 	defer cancel()
-	// 50ms tick → ~6 churns in 350ms (allowing for the per-fire 2s
-	// timeout cap to fire well inside that on this fake server).
 	runH2CChurnWalker(ctx, srv.HostPort(), 0xa1b2, 50*time.Millisecond, &tally)
 	s := tally.snapshot()
-	if s.Sent < 2 {
-		t.Errorf("Sent: got %d, want >= 2", s.Sent)
+	if s.Sent < want {
+		t.Errorf("Sent: got %d, want >= %d", s.Sent, want)
 	}
 }
