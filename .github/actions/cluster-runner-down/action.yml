@@ -3,9 +3,12 @@ description: >-
   Mints a removal-token from the GitHub API, joins the tailnet as an
   ephemeral Tailscale node, then SSH-driven ansible: (0) COLLECTS
   post-hoc host forensics and the host-sampler series into an uploaded
-  artifact, before anything is reclaimed; (1) drives cleanup.yml to
-  reclaim ALL cluster host state — docker containers + their anonymous
-  volumes, bench/results dirs, and the manifest ownership lock; (2)
+  artifact, before anything is reclaimed; (0b) RESCUES the in-flight
+  results off tmpfs to persistent storage so a lost run can still be
+  resumed, and turns the purge below OFF when it cannot; (1) drives
+  cleanup.yml to reclaim ALL cluster host state — docker containers +
+  their anonymous volumes, bench/results dirs, and the manifest
+  ownership lock; (2)
   kills every Runner.Listener, de-registers from GitHub, and rm -rf's
   /tmp/actions-runner-<host>/; (3) sweeps orphan offline runner
   registrations. Pristine.
@@ -63,6 +66,13 @@ inputs:
     description: >-
       Set to "false" to skip the forensics capture entirely. Provided as
       an escape hatch; there is no reason to use it on a tier run.
+    required: false
+    default: "true"
+  rescue-results:
+    description: >-
+      Set to "false" to skip the results rescue and purge results_root the
+      way the teardown did before probatorium#376. Provided as an escape
+      hatch; there is no reason to use it on a tier run.
     required: false
     default: "true"
 
@@ -202,23 +212,113 @@ runs:
         # displaces the real one.
         if-no-files-found: warn
 
+    # RESCUE BEFORE THE PURGE (probatorium#376). The step below drives
+    # cleanup.yml with purge_results=true, whose last task is `rm -rf
+    # results_root` on every reachable host. results_root is tmpfs and holds
+    # the ONLY thing a resumed run can read: the validate-results.json the
+    # validator rewrites after every cell.
+    #
+    # That is what made the 20 h loss in probatorium#354 total. The forensics
+    # capture above now lists those directories — and, until this step, the
+    # same job deleted them a step later.
+    #
+    # It copies; it does not move. ops/rescue/celeris-rescue-results writes
+    # only under rescue_root (real storage, because a reboot is one of the
+    # hypotheses) and never touches results_root. When it cannot rescue a
+    # reachable host, the playbook exits nonzero and the purge below is
+    # turned OFF: a few MB left on a tmpfs is the cheaper mistake.
+    - name: Rescue in-flight results off tmpfs (before anything is purged)
+      id: rescue
+      if: always() && inputs.rescue-results != 'false'
+      shell: bash
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: "False"
+        RESCUE_LABEL: ${{ inputs.forensics-reason }}
+        INVENTORY_PATH: ${{ inputs.inventory-path }}
+      run: |
+        mkdir -p rescued-results
+        # Same reason as the forensics step: `--extra-vars "k=v"` splits on
+        # whitespace, and the label carries spaces and parentheses.
+        python3 - <<'PY'
+        import json, os
+        json.dump({
+            "rescue_local_dir": os.path.join(os.getcwd(), "rescued-results"),
+            "rescue_label": os.environ.get("RESCUE_LABEL", "unspecified"),
+        }, open("rescued-results/extra-vars.json", "w"), indent=2)
+        PY
+        set +e
+        timeout -k 30 900 ansible-playbook \
+          -i "${INVENTORY_PATH}" \
+          ansible/rescue-results.yml \
+          --extra-vars "@${PWD}/rescued-results/extra-vars.json" \
+          > rescued-results/ansible-rescue.log 2>&1
+        rc=$?
+        set -e
+        {
+          echo "ansible-playbook ansible/rescue-results.yml"
+          echo "rc: ${rc}"
+          echo "label: ${RESCUE_LABEL}"
+          echo "rescued_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > rescued-results/rescue-status.txt
+        if [ "${rc}" -ne 0 ]; then
+          echo "purge_results=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::results rescue exited ${rc}; results_root will NOT be purged so the partial run survives on the host. See the cluster-rescued-results artifact."
+        else
+          echo "purge_results=true" >> "$GITHUB_OUTPUT"
+        fi
+        # The paths to hand back as `resume_from`, where a human will look.
+        {
+          echo "### Resume candidates"
+          echo
+          echo "Pass one of these as the tier workflow's \`resume_from\` input."
+          echo
+          echo '```'
+          cat rescued-results/*/last-resume-from.txt 2>/dev/null || echo "(none — nothing resumable was rescued)"
+          echo '```'
+        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+        echo "--- rescued ---"
+        find rescued-results -type f -printf '%10s  %p\n' 2>/dev/null || ls -lR rescued-results
+
+    - name: Upload rescued results
+      if: always() && inputs.rescue-results != 'false'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: cluster-rescued-results-${{ github.run_id }}-${{ github.run_attempt }}
+        path: rescued-results/
+        retention-days: 90
+        # On a run that finished normally there is nothing to rescue, and an
+        # empty capture must be a visible warning rather than a failure that
+        # displaces the real one.
+        if-no-files-found: warn
+
     # KEYSTONE (2026-07-11 incident): reclaim ALL cluster host state — docker
     # volumes, bench_root, results, and the manifest ownership lock — from this
     # OFF-CLUSTER, always-run teardown job. The in-band `mage Cleanup` step runs
     # on the SUT runner and DIES WITH IT on a host wedge / SIGBUS / hard-cancel,
     # so it cannot be the only place reclamation happens. cleanup.yml is
-    # idempotent ("safe to run any number of times"); purge_results is safe
-    # because per-run results are already tar+fetched as CI artefacts.
+    # idempotent ("safe to run any number of times").
+    #
+    # purge_results used to be an unconditional `true`, on the reasoning that
+    # per-run results are already tar+fetched as CI artefacts. That holds only
+    # when the matrix job finished: the run this teardown exists for is the one
+    # where it did not, and where nothing was uploaded (probatorium#354). It is
+    # now gated on the rescue above having copied results_root somewhere the
+    # purge cannot reach.
     - name: Reclaim cluster host state (docker volumes / bench dirs / manifest)
       if: always()
       shell: bash
       env:
         ANSIBLE_HOST_KEY_CHECKING: "False"
+        # purge_results is no longer an unconditional `true` (probatorium#376):
+        # it is on only once the rescue step has copied results_root somewhere
+        # the purge cannot reach. A skipped rescue (the escape hatch) keeps the
+        # old behaviour; a FAILED one leaves the partial run on the host.
+        PURGE_RESULTS: ${{ (inputs.rescue-results == 'false' && 'true') || steps.rescue.outputs.purge_results }}
       run: |
         ansible-playbook \
           -i ${{ inputs.inventory-path }} \
           ansible/cleanup.yml \
-          --extra-vars "purge_results=true" \
+          --extra-vars "purge_results=${PURGE_RESULTS:-false}" \
           || echo "::warning::off-cluster cleanup.yml returned non-zero (a host may be unreachable); continuing teardown"
 
     - name: Run ansible runner-teardown

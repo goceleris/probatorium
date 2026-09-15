@@ -19,9 +19,17 @@ on:
       resume_from:
         description: >-
           Resume an interrupted run instead of starting a fresh matrix.
-          "auto" restores the newest run rescued by the UPS power guard on
-          the cluster host and continues it; a path resumes from that dir.
-          Empty (default) runs the full matrix.
+          Pass the PATH the teardown's "Resume candidates" job summary
+          printed (the rescued copy under /var/lib/celeris-rescue, not the
+          tmpfs original, which the purge removes). The cells already final
+          there are skipped and carried into this run's document, so the
+          gate still judges the whole matrix. A missing, truncated or
+          wrong-arch document aborts the run in the first seconds rather
+          than quietly re-running everything (probatorium#376).
+          "auto" is KNOWN BROKEN (probatorium#377) — it selects the empty
+          directory the run has just created, and now fails loudly instead
+          of silently running the full matrix. Empty (default) runs the
+          full matrix.
         required: false
         default: ""
         type: string
