@@ -10,12 +10,19 @@ name: Weekend Soak
 # matrix-pr-tier.yml for the architecture comment).
 
 on:
-  schedule:
-    # Sunday 02:00, and the nightly is deliberately Mon-Sat so nothing
-    # contends for `concurrency: matrix-tier-cluster` on this slot. Before
-    # that split the two crons were both "0 2" and the group's one-pending-run
-    # rule cancelled whichever queued first — the soak, every Sunday.
-    - cron: "0 2 * * 0"
+  # PAUSED 2026-09-15 for the v1.6.0 release: the cluster is reserved
+  # for release validation, and a scheduled run would evict or delay it
+  # (every tier shares the matrix-tier-cluster concurrency group, which
+  # keeps only ONE pending run). workflow_dispatch is deliberately left
+  # working so the release sequence can still drive each tier by hand.
+  # RESTORE by uncommenting the schedule block below.
+  #schedule:
+  #  # Sunday 02:00, and the nightly is deliberately Mon-Sat so nothing
+  #  # contends for `concurrency: matrix-tier-cluster` on this slot. Before
+  #  # that split the two crons were both "0 2" and the group's one-pending-run
+  #  # rule cancelled whichever queued first — the soak, every Sunday.
+  #  - cron: "0 2 * * 0"
+
   workflow_dispatch:
     inputs:
       resume_from:
