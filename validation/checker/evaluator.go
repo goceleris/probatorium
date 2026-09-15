@@ -163,6 +163,31 @@ type Tally struct {
 	// PeakStandbyActiveConns is the most connections the adaptive
 	// engine's standby half ever held. Zero on every other engine.
 	PeakStandbyActiveConns int64 `json:"peak_standby_active_conns,omitempty"`
+	// EngineErrorCount is the engine's final ErrorCount, and
+	// EngineErrorClasses the eleven cause buckets celeris#646 derives it
+	// from, keyed by their debugvars name. celeris assigns the total from
+	// the buckets and keeps no separate running total, so
+	// sum(EngineErrorClasses) == EngineErrorCount holds in the artifact
+	// and a reader can check the split adds up without trusting it.
+	//
+	// A map and not named fields for the reason
+	// [Tally.EngineZeroWitness] is one: celeris#646 leaves no generic
+	// "bump the error count" call, so a new error branch has to name a
+	// bucket, and this set will grow. A field-by-field literal is how
+	// celeris#627 silently dropped ten fields. Absent means the refapp
+	// published no engine metrics; present and zero means measured and
+	// clean.
+	//
+	// Nothing here is gated. See report.ErrorClasses.
+	EngineErrorCount   int64            `json:"engine_error_count,omitempty"`
+	EngineErrorClasses map[string]int64 `json:"engine_error_classes,omitempty"`
+	// EngineStandbyErrorCount is the share of EngineErrorCount the
+	// adaptive engine's standby half contributed -- the same split
+	// PeakStandbyActiveConns applies to the live gauge. Zero on every
+	// other engine. Kept out of EngineErrorClasses on purpose: it cuts
+	// the same total along a different axis, so it is not a member of
+	// the sum.
+	EngineStandbyErrorCount int64 `json:"engine_standby_error_count,omitempty"`
 	// NotJudged are the instrumented IDs whose every evaluation was a
 	// skip -- typically the slope predicates in a cell shorter than
 	// warm-up + window (15 min). They verified nothing and are excluded
@@ -373,7 +398,10 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 	e.tally.EngineAsyncPromotedConns = max(e.tally.EngineAsyncPromotedConns, snap.EngineAsyncPromotedConns)
 	e.tally.EngineRequestsTotal = max(e.tally.EngineRequestsTotal, snap.EngineRequestsTotal)
 	e.tally.PeakStandbyActiveConns = max(e.tally.PeakStandbyActiveConns, snap.EngineStandbyActiveConns)
+	e.tally.EngineErrorCount = max(e.tally.EngineErrorCount, snap.EngineErrorCount)
+	e.tally.EngineStandbyErrorCount = max(e.tally.EngineStandbyErrorCount, snap.EngineStandbyErrorCount)
 	e.recordZeroWitnesses(snap)
+	e.recordErrorClasses(snap)
 	if snap.EngineRequestsTotal > 0 {
 		bytes := snap.EngineBytesRead + snap.EngineBytesWritten
 		if !e.haveBase {
@@ -453,6 +481,46 @@ func (e *Evaluator) recordZeroWitnesses(snap properties.Snapshot) {
 	} {
 		if v > e.tally.EngineZeroWitness[k] {
 			e.tally.EngineZeroWitness[k] = v
+		}
+	}
+}
+
+// recordErrorClasses keeps the highest value each celeris#646 cause bucket
+// reached. Same shape and same reasoning as recordZeroWitnesses -- the
+// counters are cumulative, so the peak is the cell total, and max() rather
+// than assignment so a failed poll's zero snapshot cannot retract a reading.
+//
+// What it is NOT is a judgement. Every bucket here counts something a
+// correct engine does under load, so nothing reads these to fail a cell;
+// they exist so the next nightly can say WHICH branch produced an adaptive
+// cell's 421 errors instead of only that neither sub-engine alone accounts
+// for them (celeris#645).
+func (e *Evaluator) recordErrorClasses(snap properties.Snapshot) {
+	if e.tally.EngineErrorClasses == nil {
+		// Seed every declared bucket at zero, so the artifact records the
+		// full set the cell was measured against rather than only the
+		// ones that moved -- an absent key would otherwise be ambiguous
+		// between "clean" and "this build has no such bucket".
+		e.tally.EngineErrorClasses = make(map[string]int64, len(report.ErrorClasses))
+		for k := range report.ErrorClasses {
+			e.tally.EngineErrorClasses[k] = 0
+		}
+	}
+	for k, v := range map[string]int64{
+		"engine_error_accept_fd_limit":   snap.EngineErrorAcceptFDLimit,
+		"engine_error_accept_cancelled":  snap.EngineErrorAcceptCancelled,
+		"engine_error_accept_other":      snap.EngineErrorAcceptOther,
+		"engine_error_conn_table_cap":    snap.EngineErrorConnTableCap,
+		"engine_error_conn_register":     snap.EngineErrorConnRegister,
+		"engine_error_listener_recreate": snap.EngineErrorListenerRecreate,
+		"engine_error_transplant_adopt":  snap.EngineErrorTransplantAdopt,
+		"engine_error_send_peer_gone":    snap.EngineErrorSendPeerGone,
+		"engine_error_send":              snap.EngineErrorSend,
+		"engine_error_request_body":      snap.EngineErrorRequestBody,
+		"engine_error_handler":           snap.EngineErrorHandler,
+	} {
+		if v > e.tally.EngineErrorClasses[k] {
+			e.tally.EngineErrorClasses[k] = v
 		}
 	}
 }

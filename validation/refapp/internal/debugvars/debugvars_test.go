@@ -7,10 +7,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/middleware/recovery"
 )
 
@@ -201,5 +205,86 @@ func TestRecoveryLogger_CountsOnlyRecoveredPanics(t *testing.T) {
 	lg.With("request_id", "r1").Error("panic recovered")
 	if dv.PanicCount() != 2 {
 		t.Fatalf("panic_count=%d want 2", dv.PanicCount())
+	}
+}
+
+// celeris#646 split EngineMetrics.ErrorCount into eleven cause buckets plus
+// StandbyErrorCount, and celeris#645 cannot be answered unless the document
+// carries every one of them: the whole point of the split is that the bucket
+// that moved names the branch, and a bucket nobody publishes is the same
+// blind spot the single counter was.
+//
+// Reflective over celeris's own struct rather than a list of today's names.
+// A list one repo over is exactly how a set like this drifts -- and celeris
+// says outright that a new error branch has to name a bucket, so the set will
+// grow. When it does, this test fails in the refapp that has to publish it
+// rather than in a nightly that quietly reports one bucket short.
+func TestDebugVars_PublishesEveryEngineErrorBucket(t *testing.T) {
+	base, _ := startRefapp(t)
+	doc := getVars(t, base)
+
+	var checked int
+	mt := reflect.TypeOf(engine.EngineMetrics{})
+	for i := range mt.NumField() {
+		name := mt.Field(i).Name
+		if !strings.HasPrefix(name, "Error") {
+			continue
+		}
+		// ErrorCount -> celeris.engine_error_count, and each bucket
+		// alongside it under the same prefix.
+		num(t, doc, "celeris.engine_error_"+snakeCase(strings.TrimPrefix(name, "Error")))
+		checked++
+	}
+	// Eleven buckets plus the derived total. A smaller number means the
+	// loop stopped matching celeris's field names, not that celeris shrank.
+	if checked < 12 {
+		t.Fatalf("matched only %d EngineMetrics.Error* fields; the reflective match is broken, not the document", checked)
+	}
+	// The sub-engine split does not carry the Error prefix, so name it.
+	num(t, doc, "celeris.engine_standby_error_count")
+
+	// On the std engine every bucket but the two std ones is structurally
+	// unreachable, and both std ones are zero on a clean refapp -- so this
+	// test proves the keys are PRESENT, not that they move. That is the
+	// property that matters: probatorium#297 is the whole reason a missing
+	// key must not be indistinguishable from a clean counter.
+	if got := num(t, doc, "celeris.engine_error_count"); got != 0 {
+		t.Errorf("celeris.engine_error_count = %v on a refapp that served only /ok; want 0", got)
+	}
+}
+
+// snakeCase lowercases a Go field name into the document's key convention,
+// keeping acronym runs together: AcceptFDLimit -> accept_fd_limit, not
+// accept_f_d_limit.
+func snakeCase(s string) string {
+	r := []rune(s)
+	var parts []string
+	start := 0
+	for i := 1; i < len(r); i++ {
+		prevUpper, curUpper := unicode.IsUpper(r[i-1]), unicode.IsUpper(r[i])
+		atAcronymEnd := prevUpper && curUpper && i+1 < len(r) && !unicode.IsUpper(r[i+1])
+		if (!prevUpper && curUpper) || atAcronymEnd {
+			parts = append(parts, string(r[start:i]))
+			start = i
+		}
+	}
+	parts = append(parts, string(r[start:]))
+	return strings.ToLower(strings.Join(parts, "_"))
+}
+
+func TestSnakeCaseKeepsAcronymsTogether(t *testing.T) {
+	for in, want := range map[string]string{
+		"Count":            "count",
+		"Send":             "send",
+		"AcceptFDLimit":    "accept_fd_limit",
+		"AcceptCancelled":  "accept_cancelled",
+		"ConnTableCap":     "conn_table_cap",
+		"ListenerRecreate": "listener_recreate",
+		"SendPeerGone":     "send_peer_gone",
+		"RequestBody":      "request_body",
+	} {
+		if got := snakeCase(in); got != want {
+			t.Errorf("snakeCase(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

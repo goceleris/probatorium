@@ -167,7 +167,28 @@ import (
 //     An inherited cell keeps the 5.12 Status the run that MEASURED it
 //     recorded; ResumedFrom is what says that run was not this one.
 //     Additive; older readers ignore both fields and neither is gated.
-const SchemaVersion = "5.13"
+//   - 5.14 — the engine error-class split (celeris#645, celeris#646).
+//     celeris#646 turned EngineMetrics.ErrorCount from one atomic a dozen
+//     branches incremented into the derived SUM of eleven cause buckets,
+//     plus StandbyErrorCount, the adaptive engine's share-by-sub-engine
+//     split. Adds, on Tier1Summary, EngineErrorCount, EngineErrorClasses
+//     (the end-of-cell total of each bucket, keyed by its debugvars name;
+//     report.ErrorClasses says what each counts) and
+//     EngineStandbyErrorCount, and SIX of the twelve as per-cell series
+//     columns: engine_error_accept_fd_limit, engine_error_accept_cancelled,
+//     engine_error_accept_other, engine_error_conn_table_cap,
+//     engine_error_send_peer_gone and engine_standby_error_count. The
+//     other six are end-of-cell totals only — report.ErrorClasses.Why
+//     records the call bucket by bucket, and the short version is that a
+//     bucket earns a 1 Hz column when the question asked of it is "when"
+//     and the artifact carries something timestamped to join that
+//     against. Nothing here is gated, unlike the 5.11 witnesses beside
+//     it: these count things a correct engine does under load
+//     (celeris#646 measured 88,010 ErrorSendPeerGone over 88,776 accepts
+//     on a healthy io_uring load), so a threshold before a run has said
+//     what normal looks like would be a number nobody measured.
+//     Additive; older readers ignore every field.
+const SchemaVersion = "5.14"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -852,6 +873,31 @@ type Tier1Summary struct {
 	// walker that sent 3,306,726, and nothing noticed for as long as only
 	// one side was recorded.
 	EngineRequestsTotal int64 `json:"engine_requests_total,omitempty"`
+	// EngineErrorCount is the engine's final ErrorCount and
+	// EngineErrorClasses the eleven cause buckets celeris#646 derives it
+	// from, keyed by their debugvars name (report.ErrorClasses says what
+	// each one counts). celeris assigns the total from the buckets and
+	// keeps no separate running total, so sum(EngineErrorClasses) ==
+	// EngineErrorCount holds here and the split can be checked rather
+	// than trusted.
+	//
+	// Diagnostic, not gated -- deliberately, and unlike EngineZeroWitness
+	// directly above. Those counters each name an event that cannot
+	// happen in a correct engine; these count things that legitimately
+	// happen, and celeris#646 measured 88,010 ErrorSendPeerGone over
+	// 88,776 accepts on a healthy io_uring abandon-churn load. Until a
+	// run says what normal looks like per engine, a threshold would be a
+	// number nobody measured.
+	EngineErrorCount   int64            `json:"engine_error_count,omitempty"`
+	EngineErrorClasses map[string]int64 `json:"engine_error_classes,omitempty"`
+	// EngineStandbyErrorCount is the share of EngineErrorCount the
+	// adaptive engine's STANDBY sub-engine contributed, the same split
+	// PeakStandbyActiveConns applies to the live gauge. The buckets say
+	// what went wrong; this says which sub-engine it went wrong on, and
+	// celeris#645 needs both. Zero on every non-adaptive engine, and not
+	// a member of EngineErrorClasses -- it cuts the same total along the
+	// other axis, so summing it with the buckets would double count.
+	EngineStandbyErrorCount int64 `json:"engine_standby_error_count,omitempty"`
 
 	// Per-slice sub-tallies (one per workload-mix slice from
 	// validator-prod issue #55). Each is a plain `map[string]int64`

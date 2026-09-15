@@ -1522,6 +1522,9 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		EngineAsyncPromotedConns: s.Properties.EngineAsyncPromotedConns,
 		PeakStandbyActiveConns:   s.Properties.PeakStandbyActiveConns,
 		EngineRequestsTotal:      s.Properties.EngineRequestsTotal,
+		EngineErrorCount:         s.Properties.EngineErrorCount,
+		EngineErrorClasses:       s.Properties.EngineErrorClasses,
+		EngineStandbyErrorCount:  s.Properties.EngineStandbyErrorCount,
 		Adversarial: map[string]int64{
 			"adv_sent":               s.Adversarial.Sent,
 			"adv_well_rejected":      s.Adversarial.WellRejected,

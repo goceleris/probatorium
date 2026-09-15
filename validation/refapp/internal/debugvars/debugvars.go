@@ -26,6 +26,23 @@
 //	  "celeris.panic_count":         panics recovered by middleware/recovery,
 //	  "celeris.adaptive_switches":   EngineMetrics.AdaptiveSwitches,
 //	  "celeris.engine":              engine type name,
+//
+//	  // EngineMetrics.ErrorCount and the eleven cause buckets it is the
+//	  // exact sum of (celeris#646), plus the adaptive engine's
+//	  // share-by-sub-engine split. See report.ErrorClasses.
+//	  "celeris.engine_error_count",
+//	  "celeris.engine_error_accept_fd_limit",
+//	  "celeris.engine_error_accept_cancelled",
+//	  "celeris.engine_error_accept_other",
+//	  "celeris.engine_error_conn_table_cap",
+//	  "celeris.engine_error_conn_register",
+//	  "celeris.engine_error_listener_recreate",
+//	  "celeris.engine_error_transplant_adopt",
+//	  "celeris.engine_error_send_peer_gone",
+//	  "celeris.engine_error_send",
+//	  "celeris.engine_error_request_body",
+//	  "celeris.engine_error_handler",
+//	  "celeris.engine_standby_error_count",
 //	  "memstats":                    runtime.MemStats (cached, see MemStatsTTL)
 //
 //	  // Middleware oracles + this refapp's declaration of what it can
@@ -272,14 +289,32 @@ func (v *Vars) Document() map[string]any {
 		if info := srv.EngineInfo(); info != nil {
 			doc["celeris.active_conns"] = info.Metrics.ActiveConnections
 			doc["celeris.adaptive_switches"] = int64(info.Metrics.AdaptiveSwitches)
-			// EngineMetrics.ErrorCount is bumped on the engine's
-			// accept-side error paths (the epoll conn-table cap and
-			// EMFILE/ENFILE drops, the io_uring listener re-creation).
-			// Exported so the property loop's 1 Hz series shows it
-			// STEP at the instant of a deaf-listener event, which is the
-			// one class a walker's timeout cannot tell from a stall
+			// EngineMetrics.ErrorCount, and since celeris#646 the
+			// eleven cause buckets it is the exact sum of. Exported so
+			// the property loop's 1 Hz series shows it STEP at the
+			// instant of a deaf-listener event, which is the one class
+			// a walker's timeout cannot tell from a stall
 			// (celeris#588). Not judged by any predicate.
+			//
+			// The total alone could not answer celeris#645: the
+			// adaptive engine recorded 421 engine errors in a
+			// 112-second cell against io_uring's 63 and epoll's 0, and
+			// one number can bound the cause but never name it. Every
+			// bucket is published, even the ones the per-cell series
+			// does not sample, because the end-of-cell tally reads
+			// this document and nothing else.
 			doc["celeris.engine_error_count"] = int64(info.Metrics.ErrorCount)
+			doc["celeris.engine_error_accept_fd_limit"] = int64(info.Metrics.ErrorAcceptFDLimit)
+			doc["celeris.engine_error_accept_cancelled"] = int64(info.Metrics.ErrorAcceptCancelled)
+			doc["celeris.engine_error_accept_other"] = int64(info.Metrics.ErrorAcceptOther)
+			doc["celeris.engine_error_conn_table_cap"] = int64(info.Metrics.ErrorConnTableCap)
+			doc["celeris.engine_error_conn_register"] = int64(info.Metrics.ErrorConnRegister)
+			doc["celeris.engine_error_listener_recreate"] = int64(info.Metrics.ErrorListenerRecreate)
+			doc["celeris.engine_error_transplant_adopt"] = int64(info.Metrics.ErrorTransplantAdopt)
+			doc["celeris.engine_error_send_peer_gone"] = int64(info.Metrics.ErrorSendPeerGone)
+			doc["celeris.engine_error_send"] = int64(info.Metrics.ErrorSend)
+			doc["celeris.engine_error_request_body"] = int64(info.Metrics.ErrorRequestBody)
+			doc["celeris.engine_error_handler"] = int64(info.Metrics.ErrorHandler)
 			doc["celeris.engine"] = info.Type.String()
 			// The four inputs to the adaptive controller's promotion
 			// decision, published so a cell that never promoted can say
@@ -320,6 +355,13 @@ func (v *Vars) Document() map[string]any {
 			// on every non-adaptive engine.
 			doc["celeris.engine_standby_active_conns"] = info.Metrics.StandbyActiveConnections
 			doc["celeris.engine_standby_close_count"] = int64(info.Metrics.StandbyCloseCount)
+			// The same split applied to the error total (celeris#646).
+			// The buckets above say WHAT went wrong; this says which
+			// sub-engine it went wrong on, and celeris#645 needs both
+			// at the same second to distinguish "the standby's accepts
+			// were cancelled at the promotion" from "the promoted
+			// engine is failing sends".
+			doc["celeris.engine_standby_error_count"] = int64(info.Metrics.StandbyErrorCount)
 			// The transplant hand-off, both directions. The epoll side
 			// decrements its live count and fires NO hook by design,
 			// and the io_uring side increments on adoption; a residual
