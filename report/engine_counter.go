@@ -3,11 +3,12 @@ package report
 import "sort"
 
 // EngineCounterKind says what one reading of an engine counter IS, which
-// decides how readings may be combined. The harness itself combines nothing:
-// the tally keeps the last reading of each cell (see
-// Tier1Summary.EngineCounters). The kind is recorded for the reader who does
-// combine -- across samples of the series, or across cells and arches of a
-// run -- because the wrong rule produces a plausible number nothing flags.
+// decides how readings may be combined. The end-of-cell tally combines a
+// cell's samples by it -- a running maximum by max, every other kind by its
+// last reading, never by a sum (see Tier1Summary.EngineCounters) -- and it is
+// recorded for the reader who combines further -- across samples of the
+// series, or across cells and arches of a run -- because the wrong rule
+// produces a plausible number nothing flags.
 type EngineCounterKind string
 
 const (
@@ -209,7 +210,7 @@ var EngineCounters = map[string]EngineCounter{
 		Kind:   CounterGauge,
 		Counts: "I/O workers or event loops the engine runs. Static after Listen on a single engine; on the adaptive engine it is the sum of both sub-engines and steps up once, when the lazy standby is built",
 		Series: true,
-		Why:    "a column since 5.10: the adaptive controller divides active by it per interval, so conns/worker can only be rebuilt offline with both in the same row. In the tally so peak_conns_per_worker can be read against the divisor it was computed with",
+		Why:    "a column since 5.10: the adaptive controller divides active by it per interval, so conns/worker can only be rebuilt offline with both in the same row. The tally keeps its last reading, the worker count the cell ended with, and that is NOT necessarily the divisor behind peak_conns_per_worker: the evaluator divides each sample's active by that same sample's engine_workers and keeps the highest ratio, so on the adaptive engine a peak sampled before the lazy standby was built was computed against the smaller count. The divisor of the peak is in the series row where active / engine_workers is highest",
 	},
 	"engine_bytes_read": {
 		Kind:   CounterCumulative,

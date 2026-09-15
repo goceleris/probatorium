@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,6 +179,11 @@ func readCSV(t *testing.T, path string) [][]string {
 // Every hop is the production code; only the refapp is faked, with every
 // published key at its own sentinel.
 //
+// The readings RISE between polls, the way a live engine's counters do, and
+// the cell must yield at least two samples. With one sample, or the same
+// document on every poll, a tally that summed the samples or kept the first
+// of them holds the same number as one that kept the last, and passes.
+//
 // celeris.engine_transplant_stranded is the key the issue was filed about: it
 // was emitted by every refapp and recorded in no artifact.
 func TestAPublishedEngineKeyReachesValidateResultsAndTheSeries(t *testing.T) {
@@ -185,20 +191,47 @@ func TestAPublishedEngineKeyReachesValidateResultsAndTheSeries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc := enginekeys.SentinelDocument(keys)
-	doc["goroutines"] = 40
-	doc["memstats"] = map[string]any{"HeapInuse": 4194304, "HeapAlloc": 3000000}
-	body, err := json.Marshal(doc)
-	if err != nil {
-		t.Fatal(err)
-	}
 	sentinel := map[string]int64{}
 	for i, k := range keys {
 		sentinel[k.Name()] = int64(enginekeys.Sentinel(i, k))
 	}
+	// documentAt is the refapp's document at its n-th poll (from 0): every
+	// published key at its own sentinel plus n. n stays far below the
+	// spacing between sentinels, so a reading still names its key, and the
+	// row that carries it says which poll it recorded.
+	documentAt := func(n int64) ([]byte, error) {
+		doc := enginekeys.SentinelDocument(keys)
+		for i, k := range keys {
+			doc[k.Key] = enginekeys.Sentinel(i, k) + float64(n)
+		}
+		doc["goroutines"] = 40
+		doc["memstats"] = map[string]any{"HeapInuse": 4194304, "HeapAlloc": 3000000}
+		return json.Marshal(doc)
+	}
+
+	// The refapp serves servePolls documents and cancels the loop on the
+	// poll after the last one, so the cell ends on a count of polls rather
+	// than on a timer a slow host could expire after a single sample. The
+	// deadline is only a backstop.
+	const servePolls = 6
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var served atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/debug/vars" {
 			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n := served.Add(1) - 1
+		if n >= servePolls {
+			// Cancelled before this handler returns, so the loop sees its
+			// context done and does not count the empty reply as a poll error.
+			cancel()
+			return
+		}
+		body, err := documentAt(n)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		_, _ = w.Write(body)
@@ -209,16 +242,52 @@ func TestAPublishedEngineKeyReachesValidateResultsAndTheSeries(t *testing.T) {
 	cfg.OutDir = t.TempDir()
 	cfg.CelerisBin = "/usr/bin/true"
 	seriesPath := filepath.Join(cfg.OutDir, "properties_series.csv")
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
 	tally := runPropertyLoop(ctx, propertyLoopConfig{
 		MetricsURL: srv.URL + "/debug/vars",
 		Interval:   20 * time.Millisecond,
 		SeriesPath: seriesPath,
 	})
-	if tally.Samples == 0 || tally.PollErrors != 0 {
+	if tally.PollErrors != 0 {
 		t.Fatalf("the loop took %d sample(s) with %d poll error(s); nothing downstream can be judged", tally.Samples, tally.PollErrors)
 	}
+	if tally.Samples < 2 {
+		t.Fatalf("the loop took %d sample(s) of %d served: a tally that sums its samples or keeps the first one is only distinguishable over at least two samples whose readings differ", tally.Samples, servePolls)
+	}
+
+	// Which poll each series row recorded, read off the row itself: a poll
+	// the loop was cancelled out of leaves no row, so the rows, not the
+	// server's count, say what the tally saw.
+	rows := readCSV(t, seriesPath)
+	if got := int64(len(rows) - 1); got != tally.Samples {
+		t.Fatalf("properties_series.csv has %d sample row(s) and the tally %d sample(s): they are no longer the same samples, so neither can be checked against the other", got, tally.Samples)
+	}
+	index := map[string]int{}
+	for i, c := range rows[0] {
+		index[c] = i
+	}
+	const key = "engine_transplant_stranded"
+	// Looked up with its presence checked: a missing column must not borrow
+	// index 0 (ts) and print a plausible number under this name.
+	col, ok := index[key]
+	if !ok {
+		t.Fatalf("properties_series.csv has no %s column, so the series half of this chain is not carried", key)
+	}
+	polls := make([]int64, 0, len(rows)-1)
+	for r, row := range rows[1:] {
+		v, err := strconv.ParseInt(row[col], 10, 64)
+		if err != nil {
+			t.Fatalf("properties_series.csv row %d %s = %q: %v", r+1, key, row[col], err)
+		}
+		n := v - sentinel[key]
+		if n < 0 || n >= servePolls {
+			t.Fatalf("properties_series.csv row %d %s = %d, which no served document carried (%d + 0..%d)", r+1, key, v, sentinel[key], servePolls-1)
+		}
+		if r > 0 && n <= polls[r-1] {
+			t.Fatalf("properties_series.csv row %d recorded poll %d after poll %d: the rows are not the documents in the order they were served", r+1, n, polls[r-1])
+		}
+		polls = append(polls, n)
+	}
+	first, last := polls[0], polls[len(polls)-1]
 
 	o, err := New(cfg)
 	if err != nil {
@@ -241,9 +310,32 @@ func TestAPublishedEngineKeyReachesValidateResultsAndTheSeries(t *testing.T) {
 		t.Fatalf("validate-results.json has no tier_1:\n%s", raw)
 	}
 	counters := out.Validation.Tier1.EngineCounters
-	const key = "engine_transplant_stranded"
-	if got, want := counters[key], sentinel[key]; got != want {
-		t.Fatalf("validate-results.json tier_1.engine_counters.%s = %d, want %d", key, got, want)
+	// reduced names what a tally value is, against the readings the recorded
+	// samples carried for that counter.
+	reduced := func(name string, got int64) string {
+		var sum int64
+		for _, n := range polls {
+			sum += sentinel[name] + n
+		}
+		switch got {
+		case sentinel[name] + last:
+			return "the last sample's reading"
+		case sum:
+			return "the SUM of the samples"
+		case sentinel[name] + first:
+			return "the FIRST sample's reading"
+		default:
+			return "not the last sample's reading"
+		}
+	}
+	// Every counter's want is the last recorded sample's reading. The
+	// readings rise, so for a running maximum that is also its max: this
+	// test separates last from sum and first, and
+	// checker.TestEachEngineCounterIsReducedByItsDeclaredKind separates max
+	// from last.
+	if got, want := counters[key], sentinel[key]+last; got != want {
+		t.Fatalf("validate-results.json tier_1.engine_counters.%s = %d, %s; want %d, the reading of the last of %d samples (polls %v)",
+			key, got, reduced(key, got), want, len(polls), polls)
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
 		if strings.Contains(line, `"`+key+`"`) {
@@ -251,22 +343,15 @@ func TestAPublishedEngineKeyReachesValidateResultsAndTheSeries(t *testing.T) {
 		}
 	}
 	var checkedDoc int
-	for name := range report.EngineCounters {
-		if got, want := counters[name], sentinel[name]; got != want {
-			t.Errorf("validate-results.json tier_1.engine_counters.%s = %d, want %d", name, got, want)
+	for name, c := range report.EngineCounters {
+		if got, want := counters[name], sentinel[name]+last; got != want {
+			t.Errorf("validate-results.json tier_1.engine_counters.%s (%s) = %d, %s; want %d, the reading of the last of %d samples (polls %v)",
+				name, c.Kind, got, reduced(name, got), want, len(polls), polls)
 			continue
 		}
 		checkedDoc++
 	}
 
-	rows := readCSV(t, seriesPath)
-	if len(rows) < 2 {
-		t.Fatalf("properties_series.csv has %d row(s), want a header and samples", len(rows))
-	}
-	index := map[string]int{}
-	for i, c := range rows[0] {
-		index[c] = i
-	}
 	var checkedSeries int
 	for _, name := range report.SeriesEngineCounters() {
 		col, ok := index[name]
@@ -275,19 +360,16 @@ func TestAPublishedEngineKeyReachesValidateResultsAndTheSeries(t *testing.T) {
 			continue
 		}
 		for r, row := range rows[1:] {
-			if row[col] != strconv.FormatInt(sentinel[name], 10) {
-				t.Errorf("properties_series.csv row %d %s = %q, want %d", r+1, name, row[col], sentinel[name])
+			// The same document as the stranded column read above: a column
+			// holding another poll's reading, or another key's, fails here.
+			if want := strconv.FormatInt(sentinel[name]+polls[r], 10); row[col] != want {
+				t.Errorf("properties_series.csv row %d %s = %q, want %s (poll %d)", r+1, name, row[col], want, polls[r])
 			}
 		}
 		checkedSeries++
 	}
-	// Looked up with its presence checked: a missing column must not borrow
-	// index 0 (ts) and print a plausible number under this name.
-	col, ok := index[key]
-	if !ok {
-		t.Fatalf("properties_series.csv has no %s column, so the series half of this chain is not carried", key)
-	}
-	t.Logf("properties_series.csv: %d sample row(s), column %s (index %d) = %s in every row", len(rows)-1, key, col, rows[1][col])
+	t.Logf("properties_series.csv: %d sample row(s) recording polls %v of %d served; column %s (index %d) = %s in the first row and %s in the last",
+		len(rows)-1, polls, served.Load(), key, col, rows[1][col], rows[len(rows)-1][col])
 	t.Logf("checked %d engine counter(s) in validate-results.json and %d series column(s) over %d sample(s)",
 		checkedDoc, checkedSeries, tally.Samples)
 	if checkedDoc == 0 || checkedSeries == 0 {

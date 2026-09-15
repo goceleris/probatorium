@@ -2,8 +2,10 @@ package checker
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -371,11 +373,8 @@ func TestEachEngineCounterIsDeclaredAndReadsItsOwnKey(t *testing.T) {
 		if !validKind[c.Kind] {
 			t.Errorf("%s: kind %q is not one of the declared kinds", name, c.Kind)
 		}
-		// The one combining rule that is never safe to get wrong: a running
-		// maximum summed or differenced is a plausible number nothing flags.
-		if strings.HasSuffix(name, "_max_nanos") && c.Kind != report.CounterRunningMax {
-			t.Errorf("%s is an engine-side running maximum but is declared %q", name, c.Kind)
-		}
+		// Whether the kind is the RIGHT one for the field is
+		// TestEachEngineCounterKindFollowsItsEngineMetricsField's question.
 		if c.Counts == "" || c.Why == "" {
 			t.Errorf("%s: Counts and Why must both say something; the next counter has to make the same call", name)
 		}
@@ -418,11 +417,249 @@ func TestEachEngineCounterIsDeclaredAndReadsItsOwnKey(t *testing.T) {
 	}
 }
 
-// The tally keeps the LAST reading, and "last" must mean the last reading of
-// the engine, not the last document: a sample whose engine block was absent
-// parses every counter as zero, and recording it would erase the cell's
-// totals -- including a must-stay-zero engine_transplant_stranded that had
-// already fired.
+// reductionReadings are the readings TestEachEngineCounterIsReducedByItsDeclaredKind
+// publishes for every counter, one per sample, each counter offset by its own
+// thousand. Chosen so that sum (18), max (9), first (5) and last (4) are four
+// different numbers: with fewer samples, or with readings that only rise, two
+// of those rules coincide and a reducer applying the wrong one of the two
+// passes.
+var reductionReadings = []int64{5, 9, 4}
+
+// kindReductions is the rule each report.EngineCounterKind requires of the
+// end-of-cell tally, written here independently of reduceEngineCounter so the
+// guard is not the code restated. A kind with no entry fails the guard.
+var kindReductions = map[report.EngineCounterKind]struct {
+	rule   string
+	reduce func([]int64) int64
+}{
+	// A running total since the engine started: its last reading IS the cell
+	// total, and a sum multiplies it by the sample count.
+	report.CounterCumulative: {"last", lastReading},
+	// The longest single episode: combine only with max
+	// (report.CounterRunningMax). Last agrees only while nothing resets it.
+	report.CounterRunningMax: {"max", maxReading},
+	// A level that can fall: the last reading is where the cell ended, and a
+	// peak would keep a transient that settled back.
+	report.CounterGauge: {"last", lastReading},
+	// Fixed after Listen, so any reading is the value; the tally keeps the
+	// last, the one the engine ended on.
+	report.CounterStatic: {"last", lastReading},
+}
+
+func lastReading(r []int64) int64 { return r[len(r)-1] }
+
+func maxReading(r []int64) int64 { return slices.Max(r) }
+
+func sumReadings(r []int64) int64 {
+	var s int64
+	for _, v := range r {
+		s += v
+	}
+	return s
+}
+
+// TestEachEngineCounterIsReducedByItsDeclaredKind guards HOW the tally
+// combines a cell's samples, which no single-sample guard can see: with one
+// reading, sum, max, first and last are the same number, so a guard that
+// observes once passes a reducer that sums, or one that keeps a running
+// maximum's last reading instead of its highest.
+//
+// It walks report.EngineCounters, publishes every counter through the real
+// parse at reductionReadings, and requires the tally to hold what the
+// counter's declared Kind requires (kindReductions). A counter whose readings
+// cannot tell the four rules apart is a failure, not a pass.
+func TestEachEngineCounterIsReducedByItsDeclaredKind(t *testing.T) {
+	names := make([]string, 0, len(report.EngineCounters))
+	for name := range report.EngineCounters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	readings := make(map[string][]int64, len(names))
+	for j, name := range names {
+		base := int64(j+1) * 1_000
+		for _, r := range reductionReadings {
+			readings[name] = append(readings[name], base+r)
+		}
+	}
+
+	e := NewEvaluator(nil)
+	start := time.Unix(1_700_000_000, 0)
+	for s := range reductionReadings {
+		doc := map[string]any{"celeris.engine": "io_uring"}
+		for _, name := range names {
+			doc["celeris."+name] = readings[name][s]
+		}
+		body, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var snap properties.Snapshot
+		if err := ParseDebugVars(body, &snap); err != nil {
+			t.Fatalf("ParseDebugVars: %v", err)
+		}
+		e.Observe(snap, start.Add(time.Duration(s)*time.Second))
+	}
+	tally := e.Tally().EngineCounters
+
+	perKind := map[report.EngineCounterKind]int{}
+	var checked, blind int
+	for _, name := range names {
+		kind := report.EngineCounters[name].Kind
+		want, ok := kindReductions[kind]
+		if !ok {
+			t.Errorf("%s is declared %q, a kind kindReductions has no rule for: decide how the tally must reduce it, then add it", name, kind)
+			continue
+		}
+		r := readings[name]
+		candidates := []struct {
+			rule string
+			v    int64
+		}{{"sum", sumReadings(r)}, {"max", maxReading(r)}, {"first", r[0]}, {"last", lastReading(r)}}
+		coincide := ""
+		for i := range candidates {
+			for j := i + 1; j < len(candidates) && coincide == ""; j++ {
+				if candidates[i].v == candidates[j].v {
+					coincide = fmt.Sprintf("%s and %s are both %d", candidates[i].rule, candidates[j].rule, candidates[i].v)
+				}
+			}
+		}
+		if coincide != "" {
+			blind++
+			t.Errorf("%s (%s): readings %v cannot tell the reductions apart (%s), so a wrong rule would pass -- not checked", name, kind, r, coincide)
+			continue
+		}
+		wantV := want.reduce(r)
+		got, present := tally[name]
+		if !present {
+			t.Errorf("%s (%s) is absent from the tally after %d engine samples", name, kind, len(r))
+			continue
+		}
+		if got != wantV {
+			what := "none of sum, max, first or last"
+			for _, c := range candidates {
+				if c.v == got {
+					what = "the " + strings.ToUpper(c.rule)
+				}
+			}
+			t.Errorf("%s (%s) = %d, %s of readings %v; want the %s, %d", name, kind, got, what, r, want.rule, wantV)
+			continue
+		}
+		perKind[kind]++
+		checked++
+	}
+	t.Logf("checked the reduction of %d of %d declared engine counter(s) over %d sample(s): %d cumulative by last, %d running_max by max, %d gauge by last, %d static by last; %d could not discriminate",
+		checked, len(names), len(reductionReadings), perKind[report.CounterCumulative], perKind[report.CounterRunningMax],
+		perKind[report.CounterGauge], perKind[report.CounterStatic], blind)
+	if checked == 0 {
+		t.Fatal("no counter's reduction was checked at all -- this guard is vacuous")
+	}
+}
+
+// engineFieldKinds classifies every published EngineMetrics field whose kind
+// its Go type does not settle, keyed by the field name the manifest lists.
+// A uint64 field not named here is a cumulative counter.
+var engineFieldKinds = map[string]struct {
+	kind report.EngineCounterKind
+	why  string
+}{
+	"ActiveConnections":         {report.CounterGauge, "a signed int64 celeris documents as the current number of open connections"},
+	"StandbyActiveConnections":  {report.CounterGauge, "a signed int64, the standby sub-engine's share of ActiveConnections"},
+	"DetachedConnections":       {report.CounterGauge, "a signed int64 celeris documents as the current number of connections handed to a detached middleware goroutine (celeris#584)"},
+	"Workers":                   {report.CounterGauge, "an int celeris documents as static after Listen, but the adaptive engine reports pm.Workers + sm.Workers and its lazy standby adds nothing until it is built, so on that engine it steps up mid-cell"},
+	"AsyncRoutes":               {report.CounterStatic, "an int derived from the router's per-route async flags and fixed after Listen"},
+	"Throughput":                {report.CounterGauge, "a float64 recent requests-per-second rate, which falls as well as rises"},
+	"RecvStallMaxNanos":         {report.CounterRunningMax, "a uint64 that is the longest single recv-stall episode, not a total"},
+	"RecvLinkedBlockedMaxNanos": {report.CounterRunningMax, "a uint64 that is the longest single linked-recv wait, not a total"},
+}
+
+// TestEachEngineCounterKindFollowsItsEngineMetricsField ties each declared
+// Kind to the field it describes. The kind decides the reduction, so a wrong
+// kind is a wrong number in the artifact -- and
+// TestEachEngineCounterIsReducedByItsDeclaredKind cannot see it, because it
+// holds the reducer to whatever kind is declared.
+//
+// The authority is the field's Go type, which the manifest carries from a
+// reflective walk of the pinned celeris: a uint64 only rises, so it is
+// cumulative unless engineFieldKinds names it a running maximum; a field of
+// any other type has to be classified in engineFieldKinds; and a signed int64
+// exists to be decremented, so it can only be a gauge. The table holds the
+// decisions a type cannot make (Workers against AsyncRoutes, both int), each
+// with its reason.
+func TestEachEngineCounterKindFollowsItsEngineMetricsField(t *testing.T) {
+	keys, err := enginekeys.All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]enginekeys.Key{}
+	byField := map[string]enginekeys.Key{}
+	for _, k := range keys {
+		byName[k.Name()] = k
+		byField[k.Field] = k
+	}
+	for field, c := range engineFieldKinds {
+		k, ok := byField[field]
+		switch {
+		case !ok:
+			t.Errorf("engineFieldKinds classifies %q, which the manifest does not list: a stale entry", field)
+		case c.why == "":
+			t.Errorf("engineFieldKinds classifies %s without a reason", field)
+		case k.Type == "int64" && c.kind != report.CounterGauge:
+			t.Errorf("engineFieldKinds classifies %s as %q, but it is a signed int64, which the engine decrements: only a gauge", field, c.kind)
+		}
+	}
+	requiredKind := func(k enginekeys.Key) (report.EngineCounterKind, string, bool) {
+		if c, ok := engineFieldKinds[k.Field]; ok {
+			return c.kind, c.why, true
+		}
+		if k.Type == "uint64" {
+			return report.CounterCumulative, "a uint64, which only rises, and engineFieldKinds does not name it a running maximum", true
+		}
+		return "", "", false
+	}
+	for _, k := range keys {
+		if _, _, ok := requiredKind(k); !ok {
+			t.Errorf("%s (%s %s) is not a uint64 and engineFieldKinds does not classify it: its kind is a decision, not a default", k.Key, k.Field, k.Type)
+		}
+		if strings.HasSuffix(k.Key, "_max_nanos") {
+			if c, ok := engineFieldKinds[k.Field]; !ok || c.kind != report.CounterRunningMax {
+				t.Errorf("%s is an engine-side running maximum and engineFieldKinds does not classify %s as one", k.Key, k.Field)
+			}
+		}
+	}
+
+	var checked, byTable, byType, unpublished int
+	for name, c := range report.EngineCounters {
+		k, ok := byName[name]
+		if !ok {
+			unpublished++ // TestEachEngineCounterIsDeclaredAndReadsItsOwnKey names it
+			continue
+		}
+		want, why, ok := requiredKind(k)
+		if !ok {
+			continue // reported above
+		}
+		if c.Kind != want {
+			t.Errorf("report.EngineCounters declares %s %q, but %s is %s: want %q", name, c.Kind, k.Field, why, want)
+			continue
+		}
+		if _, ok := engineFieldKinds[k.Field]; ok {
+			byTable++
+		} else {
+			byType++
+		}
+		checked++
+	}
+	t.Logf("checked the kind of %d of %d declared engine counter(s) against the manifest: %d by engineFieldKinds, %d as uint64 cumulative (%d unpublished)",
+		checked, len(report.EngineCounters), byTable, byType, unpublished)
+	if checked == 0 {
+		t.Fatal("no counter's kind was checked at all -- this guard is vacuous")
+	}
+}
+
+// The tally reduces the ENGINE's readings, not every document's: a sample
+// whose engine block was absent parses every counter as zero, and recording
+// it would erase the cell's totals -- including a must-stay-zero
+// engine_transplant_stranded that had already fired.
 func TestAnEngineLessSampleCannotRetractTheEngineCounters(t *testing.T) {
 	e := NewEvaluator(nil)
 	base := time.Unix(1_700_000_000, 0)

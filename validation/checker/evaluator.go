@@ -189,8 +189,10 @@ type Tally struct {
 	// the sum.
 	EngineStandbyErrorCount int64 `json:"engine_standby_error_count,omitempty"`
 	// EngineCounters is every report.EngineCounters entry, keyed by its
-	// debugvars name, at the LAST sample whose document carried the engine
-	// block (recordEngineCounters says why last). Most of it is what
+	// debugvars name, reduced over the samples whose document carried the
+	// engine block by its declared Kind: the highest reading of a running
+	// maximum, the last reading of every other kind (recordEngineCounters
+	// says why). Most of it is what
 	// probatorium#386 published and nothing downstream read until
 	// probatorium#391: the celeris#647 hand-off outcomes, the celeris#607
 	// recv-stall ledger, detach and zero-copy accounting.
@@ -538,18 +540,22 @@ func (e *Evaluator) recordErrorClasses(snap properties.Snapshot) {
 	}
 }
 
-// recordEngineCounters keeps, for every report.EngineCounters entry, the
-// reading at the LAST sample whose document carried the engine block.
+// recordEngineCounters reduces, for every report.EngineCounters entry, the
+// readings of the samples whose document carried the engine block, by the
+// Kind the entry declares (reduceEngineCounter).
 //
-// Last -- and never a sum. Every counter here is cumulative, an engine-side
-// running maximum, a gauge or static, so the final reading IS the cell's
-// value: summing samples multiplies it by the sample count, and summing a
-// *_max_nanos manufactures an episode nothing observed. For the cumulative
-// counters and the running maxima, last equals the max the neighbouring
-// recorders take, because nothing resets mid-cell: celeris's adaptive engine
-// builds each sub-engine at most once and never replaces it. For the gauge,
-// engine_detached_conns, last is the reading that keeps a persistent drift
-// visible in either direction, where a peak would hide the negative one.
+// Never a sum. Every counter here is cumulative, an engine-side running
+// maximum, a gauge or static, so one reading already IS the cell's value:
+// summing samples multiplies it by the sample count, and summing a
+// *_max_nanos manufactures an episode nothing observed. A running maximum
+// keeps its highest reading, the one rule report.CounterRunningMax allows;
+// every other kind keeps its last. For the cumulative counters and the
+// running maxima the two agree while nothing resets mid-cell (celeris's
+// adaptive engine builds each sub-engine at most once and never replaces
+// it), and max is what keeps a running maximum right if that ever stops
+// being true. For the gauges, last is the reading that keeps a persistent
+// drift visible in either direction, where a peak would hide the negative
+// one.
 //
 // A sample whose document carried no engine block (EngineName empty) is
 // skipped rather than recorded, since every engine key in it was absent and
@@ -589,7 +595,32 @@ func (e *Evaluator) recordEngineCounters(snap properties.Snapshot) {
 		"engine_bytes_read":                       snap.EngineBytesRead,
 		"engine_bytes_written":                    snap.EngineBytesWritten,
 	} {
-		e.tally.EngineCounters[k] = v
+		held, seen := e.tally.EngineCounters[k]
+		e.tally.EngineCounters[k] = reduceEngineCounter(report.EngineCounters[k].Kind, held, seen, v)
+	}
+}
+
+// reduceEngineCounter folds one engine reading into the value the tally holds
+// for a counter of the given kind; the first reading is taken as it is.
+// TestEachEngineCounterIsReducedByItsDeclaredKind holds every case to the rule
+// its kind declares, over readings where sum, max, first and last all differ.
+func reduceEngineCounter(kind report.EngineCounterKind, held int64, seen bool, reading int64) int64 {
+	if !seen {
+		return reading
+	}
+	switch kind {
+	case report.CounterRunningMax:
+		return max(held, reading)
+	case report.CounterCumulative:
+		return reading
+	case report.CounterGauge:
+		return reading
+	case report.CounterStatic:
+		return reading
+	default:
+		// Unreachable for a recorded counter: every one is declared with one
+		// of the four kinds (TestEachEngineCounterIsDeclaredAndReadsItsOwnKey).
+		return reading
 	}
 }
 

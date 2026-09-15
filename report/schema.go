@@ -195,8 +195,10 @@ import (
 //     per-cell series and this struct were each a hand-list of their own,
 //     so celeris.engine_transplant_stranded was emitted by every refapp and
 //     recorded nowhere. Adds, on Tier1Summary, EngineCounters — each
-//     report.EngineCounters entry at the LAST sample that carried the
-//     engine block, keyed by its debugvars name: the four celeris#647
+//     report.EngineCounters entry reduced over the samples that carried
+//     the engine block by its declared Kind (the highest reading for a
+//     running maximum, the last for every other kind, never a sum), keyed
+//     by its debugvars name: the four celeris#647
 //     hand-off outcomes (handoff_refused, drain_stopped, stranded,
 //     adopt_refused), the eight celeris#533 / celeris#607 recv-stall
 //     witnesses, detach and zero-copy accounting, the inline / ring egress
@@ -928,9 +930,10 @@ type Tier1Summary struct {
 	// EngineCounters is every published engine counter that has no named
 	// field or registry of its own above, keyed by its debugvars name
 	// (report.EngineCounters says what each counts, what KIND of reading it
-	// is, and whether the per-cell series samples it). Each value is the
-	// reading at the LAST sample whose document carried the engine block:
-	// the cell's final total, running maximum, gauge level or static count
+	// is, and whether the per-cell series samples it). Each value reduces the
+	// samples whose document carried the engine block by that kind: the
+	// highest reading of a running maximum, and the last reading of
+	// everything else -- the cell's final total, gauge level or static count
 	// -- never a sum over samples (schema 5.15, probatorium#391).
 	//
 	// A map for the reason EngineZeroWitness is one. Absent means no sample
