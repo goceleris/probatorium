@@ -9,14 +9,21 @@ name: Nightly Validation
 # matrix-pr-tier.yml for the architecture comment).
 
 on:
-  schedule:
-    # Mon-Sat only. The weekend soak fires at the same 02:00 on Sunday and
-    # both workflows declare `concurrency: matrix-tier-cluster`, which keeps
-    # ONE pending run per group: whichever queued second evicted the other.
-    # The soak lost that race every Sunday since at least 2026-07-05
-    # (cancelled 07-05, 07-12, 07-19, 08-30, 09-06, 09-13), and on other days
-    # a long-queued nightly was evicted too. Sunday now belongs to the soak.
-    - cron: "0 2 * * 1-6"
+  # PAUSED 2026-09-15 for the v1.6.0 release: the cluster is reserved
+  # for release validation, and a scheduled run would evict or delay it
+  # (every tier shares the matrix-tier-cluster concurrency group, which
+  # keeps only ONE pending run). workflow_dispatch is deliberately left
+  # working so the release sequence can still drive each tier by hand.
+  # RESTORE by uncommenting the schedule block below.
+  #schedule:
+  #  # Mon-Sat only. The weekend soak fires at the same 02:00 on Sunday and
+  #  # both workflows declare `concurrency: matrix-tier-cluster`, which keeps
+  #  # ONE pending run per group: whichever queued second evicted the other.
+  #  # The soak lost that race every Sunday since at least 2026-07-05
+  #  # (cancelled 07-05, 07-12, 07-19, 08-30, 09-06, 09-13), and on other days
+  #  # a long-queued nightly was evicted too. Sunday now belongs to the soak.
+  #  - cron: "0 2 * * 1-6"
+
   workflow_dispatch:
     inputs:
       resume_from:
