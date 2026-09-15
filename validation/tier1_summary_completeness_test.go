@@ -4,6 +4,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/goceleris/probatorium/report"
+	"github.com/goceleris/probatorium/validation/checker"
 )
 
 // TestTier1SummaryExportsEveryTallyField guards a silent-data-loss trap.
@@ -101,5 +104,55 @@ func TestTier1SummaryExportsEveryTallyField(t *testing.T) {
 					tc.name, len(missing), rt.Name(), missing)
 			}
 		})
+	}
+}
+
+// The projection at runner.go's report.Tier1Summary literal is field by
+// field, and the test above cannot see the property tally because it is a
+// nested struct rather than a top-level int64. That blind spot is where
+// celeris#627 dropped ten fields, so the celeris#645 error split -- three
+// more entries in the same literal -- is asserted by value instead.
+//
+// Every value here is distinct, so a line that projects the wrong source
+// field lands the wrong number rather than the right number twice.
+func TestTier1SummaryCarriesTheEngineErrorSplit(t *testing.T) {
+	classes := map[string]int64{
+		"engine_error_accept_fd_limit":   2,
+		"engine_error_accept_cancelled":  3,
+		"engine_error_accept_other":      5,
+		"engine_error_conn_table_cap":    7,
+		"engine_error_conn_register":     11,
+		"engine_error_listener_recreate": 13,
+		"engine_error_transplant_adopt":  17,
+		"engine_error_send_peer_gone":    19,
+		"engine_error_send":              23,
+		"engine_error_request_body":      29,
+		"engine_error_handler":           31,
+	}
+	if len(classes) != len(report.ErrorClasses) {
+		t.Fatalf("this test covers %d buckets but %d are declared -- a new bucket needs a case here",
+			len(classes), len(report.ErrorClasses))
+	}
+	sum := tier1TallySnapshot{Properties: checker.Tally{
+		EngineErrorCount:        160, // the sum of the eleven above
+		EngineErrorClasses:      classes,
+		EngineStandbyErrorCount: 41,
+	}}.Tier1Summary()
+
+	if sum.EngineErrorCount != 160 {
+		t.Errorf("engine_error_count = %d, want 160", sum.EngineErrorCount)
+	}
+	if sum.EngineStandbyErrorCount != 41 {
+		t.Errorf("engine_standby_error_count = %d, want 41", sum.EngineStandbyErrorCount)
+	}
+	if !reflect.DeepEqual(sum.EngineErrorClasses, classes) {
+		t.Errorf("engine_error_classes = %v, want %v", sum.EngineErrorClasses, classes)
+	}
+	var total int64
+	for _, v := range sum.EngineErrorClasses {
+		total += v
+	}
+	if total != sum.EngineErrorCount {
+		t.Errorf("projected buckets sum to %d against engine_error_count %d", total, sum.EngineErrorCount)
 	}
 }

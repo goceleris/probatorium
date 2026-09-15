@@ -1,0 +1,161 @@
+---
+# rescue-results.yml — copy an interrupted run's results off tmpfs before the
+# teardown purges them (probatorium#376).
+#
+#   ansible-playbook -i ansible/inventory.yml ansible/rescue-results.yml \
+#       --extra-vars "rescue_local_dir=/abs/path/out"
+#
+# ORDERING IS LOAD-BEARING, AND IT IS THE WHOLE POINT
+#
+# In .github/actions/cluster-runner-down this play MUST come before
+#
+#   cleanup.yml --extra-vars purge_results=true   rm -rf's {{ results_root }}
+#
+# which is what turned the 20 h loss in probatorium#354 into a total one. The
+# forensics capture added in #371 lists the surviving run directories; without
+# this play the same job then deletes them, so the capture tells you what you
+# no longer have.
+#
+# The caller reads this play's exit status and does NOT purge when it is
+# nonzero. A few MB left on a tmpfs is the cheaper mistake.
+#
+# WHAT IT CHANGES ON A HOST
+#
+# Unlike ansible/forensics.yml, this play is not read-only: it writes to
+# {{ rescue_root }}, which is on real storage rather than tmpfs because a
+# reboot is one of the hypotheses for how a runner disappears. It writes
+# NOWHERE else. ops/rescue/celeris-rescue-results contains no kill, no
+# signal, no systemctl, no docker, and removes nothing outside
+# {{ rescue_root }} — in particular it never touches {{ results_root }}, the
+# thing it exists to preserve. The teardown's own purge removes that, after
+# this has succeeded.
+#
+# EVERY CALL IS BOUNDED, for the same reason forensics.yml is: the host worth
+# rescuing may be the one that stopped answering.
+
+- name: Rescue in-flight results off tmpfs
+  hosts: cluster
+  gather_facts: false
+  become: true
+  # A host that has gone away cannot be rescued, and must not stop the hosts
+  # that are still answering from being.
+  ignore_unreachable: true
+  vars:
+    rescue_local_dir: ""
+    rescue_label: unspecified
+    rescue_keep: 3
+    # Short, deliberate SSH bounds for this play only — see the same block in
+    # ansible/forensics.yml for why the inventory's patient tuning is wrong
+    # here.
+    ansible_ssh_common_args: >-
+      -o ControlMaster=no
+      -o ControlPath=none
+      -o ConnectTimeout=10
+      -o ServerAliveInterval=5
+      -o ServerAliveCountMax=3
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
+    ansible_connect_timeout: 10
+    ansible_command_timeout: 300
+    ansible_ssh_retries: 0
+  tasks:
+    - name: Require an output directory
+      ansible.builtin.assert:
+        that: rescue_local_dir | length > 0
+        fail_msg: "rescue_local_dir must be set to an absolute path"
+      delegate_to: localhost
+      become: false
+
+    - name: Ensure the local output directory exists
+      ansible.builtin.file:
+        path: "{{ rescue_local_dir }}/{{ inventory_hostname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    # `script` copies the file to the remote temp dir, runs it, and removes
+    # it — no persistent host state beyond the rescue itself, and the script
+    # stays a real file in the repo that shellcheck can see.
+    - name: Rescue the results tree
+      ansible.builtin.script:
+        cmd: >-
+          ../ops/rescue/celeris-rescue-results
+          {{ results_root }}
+          {{ rescue_root }}
+          {{ rescue_label | quote }}
+          {{ rescue_keep }}
+      register: rescue_run
+      changed_when: false
+      # Recorded, not swallowed: the caller turns a nonzero rc into "do not
+      # purge", and the assert at the end of the play makes the playbook fail
+      # after every host has been attempted.
+      failed_when: false
+
+    - name: Fetch the rescued documents
+      ansible.builtin.fetch:
+        src: "{{ rescue_root }}/{{ item }}"
+        dest: "{{ rescue_local_dir }}/{{ inventory_hostname }}/{{ item }}"
+        flat: true
+        fail_on_missing: false
+        validate_checksum: false
+      loop:
+        - last-rescue.json
+        - last-resume-from.txt
+        - last-rescue-documents.tar.gz
+      failed_when: false
+      # Skip the loop entirely on a host that never answered: each item would
+      # otherwise cost another full connect timeout against a host already
+      # proved absent (the same guard, and the same measurement, as
+      # forensics.yml).
+      when: rescue_run.stdout is defined
+
+    - name: Let unreachable hosts continue to the local write
+      ansible.builtin.meta: clear_host_errors
+
+    - name: Write the rescue's own status
+      ansible.builtin.copy:
+        content: |
+          host: {{ inventory_hostname }}
+          reachable: {{ 'yes' if (rescue_run.stdout is defined) else 'NO' }}
+          rc: {{ rescue_run.rc | default('n/a') }}
+          label: {{ rescue_label }}
+          results_root: {{ results_root }}
+          rescue_root: {{ rescue_root }}
+          {% if rescue_run.stdout is defined %}
+          stdout:
+          {{ rescue_run.stdout }}
+          {% endif %}
+          {% if rescue_run.stderr is defined and rescue_run.stderr | length > 0 %}
+          stderr:
+          {{ rescue_run.stderr }}
+          {% endif %}
+          {% if rescue_run.stdout is not defined %}
+          NOTE: this host did not answer within the play's SSH bounds, so
+          nothing could be rescued from it. Its results_root is untouched;
+          the caller is told not to purge.
+          {% endif %}
+        dest: "{{ rescue_local_dir }}/{{ inventory_hostname }}/rescue-status.txt"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          rescue {{ inventory_hostname }}:
+          {{ (rescue_run.stdout_lines | default([]) | last | default('(no output)'))
+             if rescue_run.stdout is defined else 'UNREACHABLE (recorded)' }}
+
+    # Last, so every host has been attempted and every status file written
+    # before the play's verdict. A nonzero verdict is what stops the caller
+    # purging results_root.
+    - name: Fail the play if a reachable host could not be rescued
+      ansible.builtin.assert:
+        that: (rescue_run.rc | default(0) | int) == 0
+        fail_msg: >-
+          {{ inventory_hostname }}: celeris-rescue-results exited
+          {{ rescue_run.rc | default('n/a') }} — results_root must NOT be purged
+        quiet: true
+      when: rescue_run.stdout is defined

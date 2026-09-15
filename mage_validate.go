@@ -205,9 +205,15 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 				args = append(args, "--extra-vars", "validate_matrix_engines="+v)
 			}
 			// VALIDATE_RESUME_FROM points the validator at a previous
-			// run's results dir; cells already final there are skipped.
+			// run's results dir; the cells already final there are skipped
+			// AND carried into this run's document, so the absolute gate
+			// still judges the whole matrix (probatorium#376). A missing,
+			// truncated or wrong-arch document aborts the run rather than
+			// quietly re-running everything.
 			// "auto" asks the remote host to resolve the newest snapshot
-			// rescued by the UPS power guard (ops/power/README.md).
+			// rescued by the UPS power guard (ops/power/README.md) and is
+			// KNOWN BROKEN (probatorium#377): it resolves to the empty
+			// directory the run has just created. It now fails loudly.
 			if v := os.Getenv("VALIDATE_RESUME_FROM"); v != "" {
 				args = append(args, "--extra-vars", "validate_resume_from="+v)
 			}

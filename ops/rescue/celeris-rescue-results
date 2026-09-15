@@ -1,0 +1,152 @@
+#!/bin/sh
+# celeris-rescue-results — copy an interrupted run's results off tmpfs BEFORE
+# the teardown reclaims them, so `resume_from` has something to read.
+#
+# WHY THIS EXISTS (probatorium#354 / #376)
+#
+# The 24 h soak 34736980002 died at 20 h 05 m: "the self-hosted runner lost
+# communication with the server". Every in-band step died with it, so no
+# results artifact was uploaded. The off-cluster teardown job DID run, and its
+# second step is:
+#
+#     ansible-playbook ansible/cleanup.yml --extra-vars purge_results=true
+#
+# whose last task is `rm -rf {{ results_root }}` on every reachable host. That
+# is what made the loss total. The forensics capture added in #371 now NAMES
+# the surviving run directories — a step before the same job deletes them.
+#
+# Twenty hours of both-arch cell data were on that tmpfs, and the per-cell
+# `validate-results.json` was current to the last completed cell: the validator
+# rewrites it after every cell precisely so a hard kill cannot cost the run.
+# Resuming needs exactly that file, and it needs it to still be there.
+#
+# WHAT IT DOES
+#
+# Copies each run directory under results_root to rescue_root, which is on
+# real storage rather than tmpfs — a reboot is one of the three hypotheses for
+# how a runner disappears, and a rescue destroyed by the event it exists for
+# proves nothing. Then it writes down, in one file, the exact paths to pass
+# back as `resume_from`.
+#
+# It never writes to, moves or deletes anything under results_root. The
+# teardown's purge is what removes the original, after this has succeeded;
+# when this fails, the caller does not purge (see cluster-runner-down), and
+# keeping a few MB on a tmpfs is the cheaper mistake.
+#
+# WEAR. The same argument as ops/power/cluster-power-snapshot: per-cell JSON
+# and text, single-digit MB for a 64-cell validation run, against drives rated
+# in hundreds of TBW. Retention keeps the newest few rescues and nothing else,
+# so a month of unattended tier runs costs a bounded amount of disk.
+#
+#   celeris-rescue-results [results_root] [rescue_root] [label] [keep]
+#
+# Exits 0 when everything asked for was copied (including "there was nothing
+# to copy"), 1 when a copy failed, 2 on a refused destination.
+set -eu
+
+RESULTS_ROOT="${1:-/tmp/celeris-results}"
+RESCUE_ROOT="${2:-/var/lib/celeris-rescue}"
+LABEL="${3:-unspecified}"
+KEEP="${4:-3}"
+
+# A destination that is a whole system directory would make the retention
+# prune below catastrophic. Refuse before creating anything.
+case "$RESCUE_ROOT" in
+"" | / | /tmp | /var | /var/lib | /home | /usr | /etc)
+    echo "celeris-rescue-results: refusing rescue_root=$RESCUE_ROOT" >&2
+    exit 2
+    ;;
+*/*) : ;;
+*)
+    echo "celeris-rescue-results: rescue_root must be an absolute path, got $RESCUE_ROOT" >&2
+    exit 2
+    ;;
+esac
+
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+DEST="$RESCUE_ROOT/$STAMP"
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+HOST=$(hostname 2>/dev/null || echo unknown)
+
+if [ ! -d "$RESULTS_ROOT" ]; then
+    echo "celeris-rescue-results: $RESULTS_ROOT does not exist; nothing to rescue"
+    exit 0
+fi
+
+mkdir -p "$DEST"
+MANIFEST="$DEST/rescue-manifest.tsv"
+RESUME="$DEST/resume-from.txt"
+printf 'rescued_path\toriginal_path\thas_document\tsize_kb\n' >"$MANIFEST"
+: >"$RESUME"
+
+copied=0
+withdoc=0
+failed=0
+for src in "$RESULTS_ROOT"/*; do
+    [ -d "$src" ] || continue
+    name=$(basename "$src")
+    if cp -a "$src" "$DEST/$name"; then
+        copied=$((copied + 1))
+    else
+        echo "celeris-rescue-results: FAILED to copy $src" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+    size=$(du -sk "$DEST/$name" 2>/dev/null | cut -f1)
+    if [ -f "$DEST/$name/validate-results.json" ]; then
+        printf '%s\t%s\tyes\t%s\n' "$DEST/$name" "$src" "${size:-0}" >>"$MANIFEST"
+        # THE line an operator needs: pass this verbatim as the workflow's
+        # resume_from input. It is the rescued copy, not the tmpfs original,
+        # because the original is about to be purged.
+        echo "$DEST/$name" >>"$RESUME"
+        withdoc=$((withdoc + 1))
+    else
+        # A run directory with no document cannot be resumed from. Recorded
+        # rather than dropped: "there was nothing to resume" and "nobody
+        # looked" have to be distinguishable afterwards.
+        printf '%s\t%s\tno\t%s\n' "$DEST/$name" "$src" "${size:-0}" >>"$MANIFEST"
+    fi
+done
+
+if [ "$copied" -eq 0 ] && [ "$failed" -eq 0 ]; then
+    echo "celeris-rescue-results: $RESULTS_ROOT holds no run directories; nothing to rescue"
+    rmdir "$DEST" 2>/dev/null || true
+    exit 0
+fi
+
+# A small, stable bundle of just the documents, for the teardown to fetch into
+# the run's artifact. The whole rescued tree stays on the host; this is the
+# part that has to survive the host itself.
+( cd "$DEST" && find . -name 'validate-results.json' -o -name 'streaming-coverage.txt' ) \
+    >"$DEST/.bundle-list" 2>/dev/null || true
+if [ -s "$DEST/.bundle-list" ]; then
+    tar -czf "$RESCUE_ROOT/last-rescue-documents.tar.gz" -C "$DEST" -T "$DEST/.bundle-list" 2>/dev/null || true
+fi
+rm -f "$DEST/.bundle-list"
+
+cp -f "$RESUME" "$RESCUE_ROOT/last-resume-from.txt" 2>/dev/null || true
+SIZE=$(du -sh "$DEST" 2>/dev/null | cut -f1)
+printf '{"utc":"%s","host":"%s","label":"%s","dest":"%s","rescued":%d,"resumable":%d,"failed":%d,"size":"%s"}\n' \
+    "$NOW" "$HOST" "$LABEL" "$DEST" "$copied" "$withdoc" "$failed" "${SIZE:-unknown}" \
+    >"$RESCUE_ROOT/last-rescue.json"
+
+echo "celeris-rescue-results: $copied dir(s) rescued to $DEST (${SIZE:-unknown}), $withdoc resumable, $failed failed"
+if [ "$withdoc" -gt 0 ]; then
+    echo "celeris-rescue-results: resume_from candidates ---"
+    cat "$RESUME"
+fi
+
+# Retention. Newest $KEEP rescues survive; anything older than 30 days goes
+# regardless of count. Only ever directories created by this script, directly
+# under the destination checked above.
+ls -1dt "$RESCUE_ROOT"/*/ 2>/dev/null | tail -n +"$((KEEP + 1))" | while read -r old; do
+    echo "celeris-rescue-results: retention: pruning $old"
+    rm -rf "$old"
+done
+find "$RESCUE_ROOT" -maxdepth 1 -mindepth 1 -type d -mtime +30 2>/dev/null | while read -r old; do
+    echo "celeris-rescue-results: retention: pruning $old (older than 30 days)"
+    rm -rf "$old"
+done
+
+[ "$failed" -eq 0 ] || exit 1
+exit 0
