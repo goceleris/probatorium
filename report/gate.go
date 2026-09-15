@@ -473,6 +473,29 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 		out = append(out, Violation{Refapp: "*", Engine: "*", Arch: "*", Field: "cells", Value: int64(len(cells)),
 			Why: fmt.Sprintf("expected %d cells, got %d: a cell crashed, was skipped, or never reported", opts.ExpectedCells, len(cells))})
 	}
+	// ExpectedCells counts ENTRIES, so the cell count is only a coverage
+	// claim while every entry is a distinct (refapp, engine, arch). A merged
+	// document -- a resumed run's, since probatorium#376 -- is assembled
+	// from two sources, and a merge that double-counted would reach 64 with
+	// fewer than 64 cells having run. The merge dedupes; this is the check
+	// that does not depend on the merge being right.
+	seen := make(map[string]int, len(cells))
+	for _, c := range cells {
+		seen[c.Refapp+"/"+c.Engine+"/"+c.Arch]++
+	}
+	dupes := make([]string, 0, len(seen))
+	for k, n := range seen {
+		if n > 1 {
+			dupes = append(dupes, k)
+		}
+	}
+	sort.Strings(dupes)
+	for _, k := range dupes {
+		parts := strings.SplitN(k, "/", 3)
+		out = append(out, Violation{Refapp: parts[0], Engine: parts[1], Arch: parts[2],
+			Field: "cells.duplicate", Value: int64(seen[k]),
+			Why: "the same cell is reported more than once: the cell count is not a coverage claim"})
+	}
 	for _, c := range cells {
 		if t := c.Tier1; t == nil {
 			add(c, "tier_1", 0, "tier 1 never ran")

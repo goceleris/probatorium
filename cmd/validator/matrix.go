@@ -407,15 +407,24 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 	if cellBudget <= 0 {
 		cellBudget = time.Minute
 	}
+	// Resume. The plan is filtered AND the prior run's final cells are
+	// carried into this run's document, so the absolute gate judges the
+	// whole soak instead of the remainder (probatorium#376). Every failure
+	// to read the prior document aborts: a resume that quietly degrades into
+	// a partial matrix reporting success is the failure mode the issue is
+	// about, and it costs another 24 h to discover.
+	var resume *resumeMerge
 	if matrix.ResumeFrom != "" {
 		full := len(plan)
-		var skipped int
-		plan, skipped = dropCompletedMatrixCells(plan, matrix.ResumeFrom)
-		fmt.Fprintf(os.Stderr, "matrix: resume: %d of %d cells already final in %s; %d to run\n",
-			skipped, full, matrix.ResumeFrom, len(plan))
-		if len(plan) == 0 {
-			fmt.Fprintln(os.Stderr, "matrix: resume: nothing left to run")
-			return nil
+		var err error
+		plan, resume, err = planResume(plan, matrix.ResumeFrom, cfg.Arch)
+		if err != nil {
+			return fmt.Errorf("matrix: resume from %s: %w", matrix.ResumeFrom, err)
+		}
+		fmt.Fprintf(os.Stderr, "matrix: resume: %d of %d cells inherited from %s; %d to run\n",
+			len(resume.Inherited), full, matrix.ResumeFrom, len(plan))
+		for _, why := range resume.NotInherited {
+			fmt.Fprintf(os.Stderr, "matrix: resume: NOT inherited: %s\n", why)
 		}
 	}
 	fmt.Fprintf(os.Stderr, "matrix: per-cell budget = %s (total %s / %d cells)\n",
@@ -426,6 +435,10 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 		plan:       plan,
 		startedAt:  time.Now().UTC(),
 		stagingDir: watchableStagingDir(matrix.BinDir),
+		// nil for an ordinary run. On a resume it carries the prior run's
+		// final cells, which the runner seeds its document with so the
+		// absolute gate judges the whole soak (probatorium#376).
+		resume: resume,
 		runCell: func(ctx context.Context, mc matrixCell, idx int) (report.ValidationCellResult, error) {
 			return runMatrixCell(ctx, cfg, matrix, mc, cellBudget, idx)
 		},

@@ -152,7 +152,22 @@ import (
 //     said nothing about any of them. Additive -- an absent status
 //     means "not recorded", never "ok" -- and no new key is gated: a
 //     not_run cell already fails [Gate] as a dead cell.
-const SchemaVersion = "5.12"
+//   - 5.13 — resume provenance (probatorium#376). Adds
+//     ValidationResults.Resume and ValidationCellResult.ResumedFrom.
+//     A run started with -matrix-resume-from now seeds its document
+//     with the cells the interrupted run already made final, so the
+//     absolute gate judges the whole soak rather than the remainder —
+//     the weekend tier asks for 64 cells and a resume of the last ten
+//     used to hand it ten. A document that claims cells the writing
+//     process did not measure has to be auditable, so Resume records
+//     the source directory, the prior run's window, the inherited /
+//     ran split and every prior entry deliberately NOT carried over
+//     (a cell that was mid-flight when the runner was lost is re-run,
+//     never inherited), and each inherited cell carries ResumedFrom.
+//     An inherited cell keeps the 5.12 Status the run that MEASURED it
+//     recorded; ResumedFrom is what says that run was not this one.
+//     Additive; older readers ignore both fields and neither is gated.
+const SchemaVersion = "5.13"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -554,6 +569,50 @@ type ValidationResults struct {
 	// existing cross-arch diff continues to work from the top-level
 	// (or first Cells entry) snapshot.
 	Cells []ValidationCellResult `json:"cells,omitempty"`
+
+	// Resume is set ONLY when this document is the union of an earlier,
+	// interrupted run's cells and this run's (schema 5.12,
+	// probatorium#376). Nil means every cell in Cells was measured by
+	// the run that wrote the document.
+	//
+	// The gate counts entries in Cells, so a merged document is a
+	// document that claims work this process did not do. That claim is
+	// legitimate -- the earlier run did do it -- but only if it is
+	// auditable, which is what this block and
+	// [ValidationCellResult.ResumedFrom] are for.
+	Resume *ResumeProvenance `json:"resume,omitempty"`
+}
+
+// ResumeProvenance records where a merged document's inherited cells came
+// from, so a reader can tell which half of a 64-cell verdict this run
+// actually measured (schema 5.13, probatorium#376).
+//
+// A 24 h soak has roughly a one-in-four history of losing its runner
+// mid-run, and `resume_from` is the mitigation. A resumed run has to reach
+// a whole-soak verdict -- the weekend tier's gate wants 64 cells -- without
+// letting "the previous run measured this" become indistinguishable from
+// "this run measured it".
+type ResumeProvenance struct {
+	// From is the results directory the inherited cells were read from,
+	// exactly as it was passed to -matrix-resume-from.
+	From string `json:"from"`
+	// PriorStartedAt / PriorFinishedAt are the earlier run's own window.
+	// They are NOT merged into StartedAt/FinishedAt: the merged
+	// document's window is this run's, and the fact that the two halves
+	// were measured hours apart is a property a reader must be able to
+	// see rather than one the document smooths over.
+	PriorStartedAt  time.Time `json:"prior_started_at,omitzero"`
+	PriorFinishedAt time.Time `json:"prior_finished_at,omitzero"`
+	// InheritedCells is how many entries in Cells carry ResumedFrom, and
+	// RanCells how many this run measured. Their sum is len(Cells).
+	InheritedCells int `json:"inherited_cells"`
+	RanCells       int `json:"ran_cells"`
+	// NotInherited names every cell the prior document recorded that was
+	// deliberately NOT carried over, with the reason -- "<refapp>/<engine>:
+	// <why>". The mid-flight cell an interrupted run leaves behind is the
+	// entry that matters: it is re-run, not inherited, and this is where
+	// that decision is on the record.
+	NotInherited []string `json:"not_inherited,omitempty"`
 }
 
 // ValidationCellResult is one (refapp × engine × arch) cell from a matrix
@@ -628,6 +687,28 @@ type ValidationCellResult struct {
 	// stays in the cell directory -- refapp_stderr_tail.txt for a cell
 	// that never came up, incidents/ for one whose oracle fired.
 	FailureReason string `json:"failure_reason,omitempty"`
+
+	// ResumedFrom marks a cell this run did NOT measure: it was carried
+	// over verbatim from the earlier, interrupted run whose results
+	// directory this names (schema 5.13, probatorium#376). Empty on
+	// every cell the writing run ran itself.
+	//
+	// Per-cell rather than only run-level, because the run-level
+	// [ResumeProvenance] says how many were inherited and this says
+	// WHICH -- and the tallies in a cell are indistinguishable from a
+	// freshly measured one, which is the whole hazard.
+	//
+	// It pairs with [Status], which is NOT rewritten on the way across:
+	// an inherited cell keeps the ok/failed verdict of the run that
+	// actually measured it, because that verdict is true and blanking it
+	// would throw away a real finding. What would be false is reading
+	// "ok" as "this run measured it" -- which is what ResumedFrom is
+	// here to prevent. [ValidationCellNotRun] cannot appear on an
+	// inherited cell at all: the matrix runner classifies not_run with
+	// the same predicate the resume uses to decide a cell need not be
+	// repeated, so a cell that never ran is always re-run, never
+	// carried over.
+	ResumedFrom string `json:"resumed_from,omitempty"`
 }
 
 // ValidationCellStatus is a matrix cell's outcome as a unit of work
