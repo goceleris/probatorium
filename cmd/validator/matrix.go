@@ -421,93 +421,16 @@ func runMatrix(ctx context.Context, cfg Config, matrix MatrixConfig) error {
 	fmt.Fprintf(os.Stderr, "matrix: per-cell budget = %s (total %s / %d cells)\n",
 		cellBudget, cfg.Duration, len(plan))
 
-	startedAt := time.Now().UTC()
-	cells := make([]report.ValidationCellResult, 0, len(plan))
-	var aggErr error
-	for i, mc := range plan {
-		// Graceful drain (UPS power loss), checked at the TOP of the
-		// iteration so the cell that was running has already completed and
-		// been persisted. ops/power/cluster-power-event writes the sentinel
-		// from apcupsd's onbattery hook. Unlike the cancellation break
-		// below, this is not an error: the run stops deliberately, and
-		// -resume-from finishes it later.
-		if drainRequested() {
-			fmt.Fprintf(os.Stderr, "matrix: drain requested; stopping cleanly with %d cell(s) unrun\n",
-				len(plan)-i)
-			break
-		}
-		fmt.Fprintf(os.Stderr, "\nmatrix [%d/%d]: refapp=%s engine=%s\n",
-			i+1, len(plan), mc.Refapp, mc.Engine)
-		cell, err := runMatrixCell(ctx, cfg, matrix, mc, cellBudget, i)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "matrix [%d/%d]: %v\n", i+1, len(plan), err)
-			if aggErr == nil {
-				aggErr = err
-			}
-		}
-		cells = append(cells, cell)
-		// Persist after EVERY cell. Until now nothing was written until the
-		// whole matrix finished, so a hard kill -- a power cut, an OOM, a
-		// SIGKILL -- threw away every completed cell. A 24 h soak losing all
-		// 24 h to a mains blip is precisely what the UPS work exists to
-		// prevent, and a graceful cancel alone cannot cover it. The document
-		// is small (24-48 cells) and this makes it parseable at all times.
-		if err := writePartial(cfg, startedAt, cells); err != nil {
-			fmt.Fprintf(os.Stderr, "matrix: persist after cell %d: %v\n", i+1, err)
-		}
-		if ctx.Err() != nil {
-			// Whole-run cancelled — emit what we have and bail.
-			break
-		}
-	}
-
-	// Streaming coverage rollup. The WS/SSE slices only run where the
-	// refapp routes the endpoint, so this table is the answer to "what
-	// did the ws_*/sse_* counters actually measure this run?" — printed
-	// to the run log and left beside the results for the same reason
-	// the soak's 87.5%-absent rate needed digging out of the totals
-	// (probatorium#300).
-	coverage := report.FormatStreamingCoverage(report.StreamingCoverage(cells))
-	fmt.Fprintf(os.Stderr, "\n%s", coverage)
-	if err := os.WriteFile(filepath.Join(cfg.OutDir, "streaming-coverage.txt"), []byte(coverage), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "matrix: write streaming coverage: %v\n", err)
-	}
-
-	// Run-wide property totals: the per-cell verdicts summed, with the
-	// first violation message of every failed predicate keyed
-	// "<refapp>/<engine>/<ID>" so the top-level document is readable
-	// without descending into cells.
-	var propsPassed, propsFailed int
-	var summaries map[string]string
-	for _, c := range cells {
-		propsPassed += c.PropertiesPassed
-		propsFailed += c.PropertiesFailed
-		for id, msg := range c.FailureSummaries {
-			if summaries == nil {
-				summaries = map[string]string{}
-			}
-			summaries[c.Refapp+"/"+c.Engine+"/"+id] = msg
-		}
-	}
-	doc := report.Document{
-		SchemaVersion: report.SchemaVersion,
-		HostArchPair:  cfg.Target + "-" + cfg.Arch,
-		Validation: &report.ValidationResults{
-			StartedAt:        startedAt,
-			FinishedAt:       time.Now().UTC(),
-			PropertiesPassed: propsPassed,
-			PropertiesFailed: propsFailed,
-			FailureSummaries: summaries,
-			Cells:            cells,
+	r := &matrixRunner{
+		cfg:        cfg,
+		plan:       plan,
+		startedAt:  time.Now().UTC(),
+		stagingDir: watchableStagingDir(matrix.BinDir),
+		runCell: func(ctx context.Context, mc matrixCell, idx int) (report.ValidationCellResult, error) {
+			return runMatrixCell(ctx, cfg, matrix, mc, cellBudget, idx)
 		},
 	}
-	if err := writeJSON(filepath.Join(cfg.OutDir, "validate-results.json"), doc); err != nil {
-		fmt.Fprintf(os.Stderr, "matrix: write results: %v\n", err)
-		if aggErr == nil {
-			aggErr = err
-		}
-	}
-	return aggErr
+	return r.run(ctx)
 }
 
 // runMatrixCell drives one orchestrator instance for the given
@@ -556,7 +479,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 	// in use") and died — surfacing as a spurious std-engine I-LIVENESS.
 	addr := "127.0.0.1:0"
 
-	cellOut := filepath.Join(cfg.OutDir, fmt.Sprintf("cell-%02d-%s-%s", idx, mc.Refapp, mc.Engine))
+	cellOut := filepath.Join(cfg.OutDir, cellOutDirName(idx, mc))
 	if err := os.MkdirAll(cellOut, 0o755); err != nil {
 		return cell, fmt.Errorf("mkdir cell out: %w", err)
 	}
@@ -641,10 +564,48 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		cell.Tier3 = res.Tier3.Tier3Summary()
 	}
 	cell.Soak = res.Soak
+	// The transport, not the subject: a tier that could not build its
+	// remote driver never reached the host under test, and neither will
+	// any later cell. Checked before runErr because a parked tier returns
+	// no error at all -- the cell just comes back empty (probatorium#359).
+	if res.DriverUnavailable != "" {
+		return cell, fatalDriverError(res.DriverUnavailable)
+	}
 	if runErr != nil && !errors.Is(runErr, context.DeadlineExceeded) {
 		return cell, fmt.Errorf("cell run: %w", runErr)
 	}
+	// The cell measured nothing and the orchestrator did not call that an
+	// error -- a T*-DRIVE incident is an infra flake by design, so the
+	// tier parks and Run returns nil. It is still a cell that did not run,
+	// and the driver's account of why is the only thing anyone wants from
+	// it (probatorium#359).
+	if !matrixCellIsFinal(cell) && res.DriveFailure != "" {
+		return cell, fmt.Errorf("cell never became ready: %s", cellFailureReason(res.DriveFailure))
+	}
 	return cell, nil
+}
+
+// watchableStagingDir returns dir when it is readable NOW, so its later
+// disappearance can be read as the cluster vanishing under the run. An
+// unreadable dir at start is not that: it is a dev machine pointed at a
+// stale -matrix-bin-dir, which has always degraded to `go build` per cell
+// and must keep doing so (probatorium#359).
+func watchableStagingDir(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	if _, err := os.ReadDir(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "matrix: refapp staging dir %s is not readable (%v); cells will build from source\n", dir, err)
+		return ""
+	}
+	return dir
+}
+
+// cellOutDirName is the per-cell artifact directory, relative to the run's
+// OutDir. Shared with the failure summary so the ledger can point at the
+// directory that holds a failed cell's evidence.
+func cellOutDirName(idx int, mc matrixCell) string {
+	return fmt.Sprintf("cell-%02d-%s-%s", idx, mc.Refapp, mc.Engine)
 }
 
 // writeJSON marshals v to path with indent=2 + trailing newline. A

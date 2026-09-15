@@ -143,7 +143,16 @@ import (
 //     and celeris#626 left epoll reporting 3,089 requests against a
 //     walker that sent 3,306,726 with nothing to compare it to.
 //     Additive; older readers ignore every field.
-const SchemaVersion = "5.11"
+//   - 5.12 — per-cell RUN OUTCOME (probatorium#359). Adds
+//     ValidationCellResult.Status (ok | failed | not_run) and
+//     FailureReason. A cell whose refapp never started and a cell whose
+//     oracle fired both land as an all-zero tally, and until now the
+//     only place that difference existed was the validator's run log:
+//     nightly 34818888908 recorded eight failed cells and the document
+//     said nothing about any of them. Additive -- an absent status
+//     means "not recorded", never "ok" -- and no new key is gated: a
+//     not_run cell already fails [Gate] as a dead cell.
+const SchemaVersion = "5.12"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -601,7 +610,46 @@ type ValidationCellResult struct {
 	// FailureSummaries maps a failed predicate ID to its first violation
 	// message.
 	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`
+
+	// Status is the matrix runner's verdict on the cell as a unit of work:
+	// did it run, and did it pass? Empty on documents written before
+	// schema 5.11 and on any path that does not go through the matrix
+	// runner -- readers must treat "" as "not recorded", never as ok.
+	//
+	// The distinction [ValidationCellNotRun] carries is the one the
+	// artifact could not previously express: a cell whose refapp never
+	// started says NOTHING about celeris under load, while a cell whose
+	// oracle fired is the finding. Both land as an all-zero tally, and
+	// telling them apart meant reading the run log (probatorium#359).
+	Status ValidationCellStatus `json:"status,omitempty"`
+	// FailureReason is the verbatim error that classified the cell as
+	// failed or not-run: the predicate violation, or the reason the
+	// refapp would not start. Empty for an ok cell. The fuller evidence
+	// stays in the cell directory -- refapp_stderr_tail.txt for a cell
+	// that never came up, incidents/ for one whose oracle fired.
+	FailureReason string `json:"failure_reason,omitempty"`
 }
+
+// ValidationCellStatus is a matrix cell's outcome as a unit of work
+// (schema 5.11, probatorium#359). It is deliberately NOT the cell's
+// verdict on celeris: a cell can be [ValidationCellOK] here and still
+// carry gated counters that fail [Gate].
+type ValidationCellStatus string
+
+const (
+	// ValidationCellOK: the cell ran and the run recorded no error for it.
+	ValidationCellOK ValidationCellStatus = "ok"
+	// ValidationCellFailed: the cell ran -- it sent traffic, its property
+	// loop reached verdicts -- and then something failed it. The tally is
+	// evidence and the failure is about celeris.
+	ValidationCellFailed ValidationCellStatus = "failed"
+	// ValidationCellNotRun: the cell produced no evidence at all (no
+	// requests, no property verdicts). Its refapp would not start, its
+	// binary was missing, or its orchestrator could not be built. The
+	// cell measured nothing, so it carries no opinion on celeris -- but
+	// it is still a hole in the matrix and still fails the gate.
+	ValidationCellNotRun ValidationCellStatus = "not_run"
+)
 
 // Tier1Summary mirrors the validator's tier1TallySnapshot in the
 // canonical v5 shape. The struct is duplicated (not imported from the

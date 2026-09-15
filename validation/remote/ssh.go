@@ -180,11 +180,15 @@ func (d *SSH) Start(ctx context.Context, args []string) (Process, error) {
 		return nil, fmt.Errorf("ssh: start remote command: %w", err)
 	}
 
+	// Same line-atomic fan-in as the local driver: the cluster runs on this
+	// path, so a byte-oriented merge would splice crash signatures here too
+	// (probatorium#382).
 	mergedR, mergedW := io.Pipe()
+	var lineMu sync.Mutex
 	var copyWG sync.WaitGroup
 	copyWG.Add(2)
-	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, stderrPipe) }()
-	go func() { defer copyWG.Done(); _, _ = io.Copy(mergedW, stdoutPipe) }()
+	go func() { defer copyWG.Done(); fanInLines(mergedW, &lineMu, stderrPipe) }()
+	go func() { defer copyWG.Done(); fanInLines(mergedW, &lineMu, stdoutPipe) }()
 	go func() { copyWG.Wait(); _ = mergedW.Close() }()
 
 	p := &sshProcess{
