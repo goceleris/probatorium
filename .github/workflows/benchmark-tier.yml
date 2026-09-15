@@ -26,19 +26,26 @@ name: Benchmark Tier
 # never runs from an untrusted PR surface).
 
 on:
-  schedule:
-    # Weekly RATED bench (the "headline" profile: full grid WITH the rated/SLO
-    # sweep, 40s/12s → ~16.7h, fits the 24h cluster slot). Wednesday 04:00 UTC
-    # keeps it clear of the weekend soak; the matrix-tier-cluster concurrency
-    # group serializes anyway.
-    #
-    # Was the "fast" profile until 2026-08-13. fast is saturation-ONLY, so the
-    # weekly kept publishing datasets with zero rated_mode_p99 / latency_at_slo
-    # over the rated release data (v1.5.8: 20260716 rated vs 20260722/29/0805
-    # fast) — progressively shadowing the very metric the rated mode exists to
-    # produce. Published results must always carry rated data; see the publish
-    # policy on BENCH_PUBLISH below.
-    - cron: "0 4 * * 3"
+  # PAUSED 2026-09-15 for the v1.6.0 release: the cluster is reserved
+  # for release validation, and a scheduled run would evict or delay it
+  # (every tier shares the matrix-tier-cluster concurrency group, which
+  # keeps only ONE pending run). workflow_dispatch is deliberately left
+  # working so the release sequence can still drive each tier by hand.
+  # RESTORE by uncommenting the schedule block below.
+  #schedule:
+  #  # Weekly RATED bench (the "headline" profile: full grid WITH the rated/SLO
+  #  # sweep, 40s/12s → ~16.7h, fits the 24h cluster slot). Wednesday 04:00 UTC
+  #  # keeps it clear of the weekend soak; the matrix-tier-cluster concurrency
+  #  # group serializes anyway.
+  #  #
+  #  # Was the "fast" profile until 2026-08-13. fast is saturation-ONLY, so the
+  #  # weekly kept publishing datasets with zero rated_mode_p99 / latency_at_slo
+  #  # over the rated release data (v1.5.8: 20260716 rated vs 20260722/29/0805
+  #  # fast) — progressively shadowing the very metric the rated mode exists to
+  #  # produce. Published results must always carry rated data; see the publish
+  #  # policy on BENCH_PUBLISH below.
+  #  - cron: "0 4 * * 3"
+
   workflow_dispatch:
     inputs:
       profile:

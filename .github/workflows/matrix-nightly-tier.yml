@@ -9,14 +9,21 @@ name: Nightly Validation
 # matrix-pr-tier.yml for the architecture comment).
 
 on:
-  schedule:
-    # Mon-Sat only. The weekend soak fires at the same 02:00 on Sunday and
-    # both workflows declare `concurrency: matrix-tier-cluster`, which keeps
-    # ONE pending run per group: whichever queued second evicted the other.
-    # The soak lost that race every Sunday since at least 2026-07-05
-    # (cancelled 07-05, 07-12, 07-19, 08-30, 09-06, 09-13), and on other days
-    # a long-queued nightly was evicted too. Sunday now belongs to the soak.
-    - cron: "0 2 * * 1-6"
+  # PAUSED 2026-09-15 for the v1.6.0 release: the cluster is reserved
+  # for release validation, and a scheduled run would evict or delay it
+  # (every tier shares the matrix-tier-cluster concurrency group, which
+  # keeps only ONE pending run). workflow_dispatch is deliberately left
+  # working so the release sequence can still drive each tier by hand.
+  # RESTORE by uncommenting the schedule block below.
+  #schedule:
+  #  # Mon-Sat only. The weekend soak fires at the same 02:00 on Sunday and
+  #  # both workflows declare `concurrency: matrix-tier-cluster`, which keeps
+  #  # ONE pending run per group: whichever queued second evicted the other.
+  #  # The soak lost that race every Sunday since at least 2026-07-05
+  #  # (cancelled 07-05, 07-12, 07-19, 08-30, 09-06, 09-13), and on other days
+  #  # a long-queued nightly was evicted too. Sunday now belongs to the soak.
+  #  - cron: "0 2 * * 1-6"
+
   workflow_dispatch:
     inputs:
       resume_from:
@@ -183,7 +190,14 @@ jobs:
         # failures, soak leaks) and on any dead or missing cell. ValidateDiff
         # below is RELATIVE (cross-engine/arch) and cannot see a defect that
         # is present on every engine; this gate can. probatorium#274.
-        if: success()
+        # NOT success(): the runs worth judging are the ones that found
+        # something. mage Validate exits non-zero when any cell failed, and
+        # gating the judges on success() skipped them exactly then --
+        # nightly 34818888908 produced 64 complete cells, 8 of them bad, and
+        # adjudicated none of it (probatorium#359). A skipped step cannot
+        # turn a red run green: the failed Validate step already fails the
+        # job, and this gate fails it again on the cells themselves.
+        if: '!cancelled()'
         env:
           VALIDATE_GATE_EXPECT_CELLS: "64" # 8 refapps x 4 engines x 2 archs
           # Every adaptive cell must promote epoll -> io_uring at least once;
@@ -193,7 +207,14 @@ jobs:
         run: mage ValidateGate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
-        if: success()
+        # NOT success(): the runs worth judging are the ones that found
+        # something. mage Validate exits non-zero when any cell failed, and
+        # gating the judges on success() skipped them exactly then --
+        # nightly 34818888908 produced 64 complete cells, 8 of them bad, and
+        # adjudicated none of it (probatorium#359). A skipped step cannot
+        # turn a red run green: the failed Validate step already fails the
+        # job, and this gate fails it again on the cells themselves.
+        if: '!cancelled()'
         env:
           # MED divergences fail too. Without this the severity is permanently
           # advisory: 3 of the 7 invariant counters are MED and 1 is LOW, so

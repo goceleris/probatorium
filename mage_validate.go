@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -222,6 +223,12 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_CONCURRENCY"); v != "" {
 			args = append(args, "--extra-vars", "validate_concurrency="+v)
 		}
+		// The matrix failure caps, same reason and same mechanism: the
+		// validator reads them from its own environment on the remote
+		// host, so each one has to be carried across as an extra-var and
+		// re-exported by the playbook. Setting them in the workflow alone
+		// would be inert (probatorium#359).
+		args = append(args, matrixCapExtraVars(os.Getenv)...)
 		// VALIDATE_DBSERVICES=1 starts the postgres/redis/memcached
 		// containers (assumed pre-pulled by deploy.yml's dbservices
 		// role) so the driver_* refapps in matrix-mode validate can
@@ -278,14 +285,65 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if err := runHostsParallel(targets, runOne); err != nil {
 			return err
 		}
-	} else {
-		for _, t := range targets {
-			if err := runOne(t); err != nil {
-				return err
-			}
-		}
+	} else if err := runValidateTargets(targets, runOne); err != nil {
+		return err
 	}
 	fmt.Printf("\n=== %s complete: %s ===\n", titleCase(kind), resultsDir)
+	return nil
+}
+
+// matrixCapNames are the matrix failure-cap env vars, spelled the same at
+// every hop: workflow env -> this process -> ansible extra-var
+// (lower-cased) -> the validator's own environment on the remote host.
+// One name, three hops: a rename that misses a hop is silent, and the
+// symptom is a cap that never fires.
+var matrixCapNames = []string{
+	"PROBATORIUM_MATRIX_MAX_CONSECUTIVE_FAILURES",
+	"PROBATORIUM_MATRIX_MAX_FAILED_CELLS",
+}
+
+// matrixCapExtraVars turns whichever caps are set in this process's
+// environment into ansible extra-vars. Unset caps are omitted entirely so
+// the playbook's default(”) leaves the validator on its own defaults.
+func matrixCapExtraVars(getenv func(string) string) []string {
+	var args []string
+	for _, name := range matrixCapNames {
+		v := strings.TrimSpace(getenv(name))
+		if v == "" {
+			continue
+		}
+		args = append(args, "--extra-vars", strings.ToLower(name)+"="+v)
+	}
+	return args
+}
+
+// runValidateTargets drives run for every target in sequence and reports
+// every failure at the end.
+//
+// It does NOT stop at the first target that fails. The two bench targets
+// are independent hosts with their own validator process, run directory
+// and results; msr1 dying says nothing about msa2-server except that it
+// was never measured, and half a cluster window spent proving a failure we
+// already hold is half a window wasted (probatorium#359). The cross-arch
+// parity gate needs both sides to say anything at all, so the second
+// target is the one run most worth finishing.
+//
+// Mirrors [runHostsParallel]'s aggregation so the sequential and parallel
+// paths report the same way.
+func runValidateTargets(targets []string, run func(target string) error) error {
+	var failed []error
+	for _, t := range targets {
+		if err := run(t); err != nil {
+			fmt.Printf("\n=== %s FAILED: %v (continuing with the remaining target(s)) ===\n", t, err)
+			// Name the target here rather than trusting the callback to
+			// name itself: the aggregate is what the CI log shows.
+			failed = append(failed, fmt.Errorf("%s: %w", t, err))
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("validate failed on %d of %d target(s): %w",
+			len(failed), len(targets), errors.Join(failed...))
+	}
 	return nil
 }
 
