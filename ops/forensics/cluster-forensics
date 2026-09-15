@@ -1,0 +1,217 @@
+#!/bin/sh
+# cluster-forensics — post-hoc, read-only evidence capture for a cluster host,
+# run from the OFF-CLUSTER teardown job after a run has ended (probatorium#354).
+#
+# WHAT IT IS FOR
+#
+# The 24 h soak 34736980002 died at 20 h 05 m with "The self-hosted runner lost
+# communication with the server", and nothing was captured that could tell
+# these apart:
+#
+#   1. the runner PROCESS died      (starved, OOM-killed, crashed)
+#   2. the HOST went away           (reboot, panic, power)
+#   3. the NETWORK went away        (link flap, switch, tailnet)
+#   4. the host HUNG                (celeris#312, closed as
+#                                    no-longer-reproduces, never root-caused)
+#
+# Every section below exists to separate those four. The decisive ones:
+#
+#   boot id + `last reboot` + uptime   1 keeps the boot id, 2 changes it.
+#   journalctl -k -b -1 (TAIL)         what the kernel said on the way out; a
+#                                      clean tail with no shutdown sequence is
+#                                      a power cut, an oops is 4.
+#   oom_kill / "Killed process"        1, positively, not by elimination.
+#   carrier_changes, link messages     3.
+#   sampler series gap vs boot id      4: samples stop, boot id unchanged,
+#                                      uptime continuous across the gap.
+#   apcupsd events                     turns "maybe the power blipped" into a
+#                                      timestamped yes or no.
+#
+# WHAT MAKES IT SAFE
+#
+# Every command here READS. There is no kill, no pkill, no signal, no
+# systemctl start/stop/restart, no docker, no sysctl write, no rm. `dmesg` is
+# only ever read — never `dmesg -c`, which would consume the ring buffer and
+# destroy the evidence for anyone looking after us. The one thing it writes is
+# its own stdout, which the caller captures.
+#
+# WHAT MAKES IT BOUNDED
+#
+# The host this runs on may be exactly the host that died, and a capture that
+# hangs for ten minutes against a dead host is worse than no capture. So:
+#
+#   * every command runs under `timeout`, and says so if it hits it;
+#   * every output is capped by lines AND by bytes, at the source where the
+#     tool can do it (journalctl -n) and at the sink where it cannot;
+#   * the kernel journal is windowed to the last WINDOW_H hours rather than
+#     the whole boot.
+#
+# Usage: cluster-forensics [window_hours] [max_lines] [reason]
+set -u
+
+WINDOW_H="${1:-6}"
+MAXLINES="${2:-1500}"
+REASON="${3:-unspecified}"
+MAXBYTES="${FORENSICS_MAX_BYTES:-262144}"
+
+# runsh <timeout_s> <label> <shell command>
+# The command is a shell string so pipelines and globs work. It is OUR string,
+# never anything read off the host, so there is nothing to inject into it.
+runsh() {
+    _t=$1
+    _l=$2
+    _c=$3
+    printf '\n===== %s =====\n' "$_l"
+    _out=$(timeout -k 5 "$_t" sh -c "$_c" 2>&1)
+    _rc=$?
+    if [ "$_rc" -eq 124 ] || [ "$_rc" -eq 137 ]; then
+        printf '(TIMED OUT after %ss -- this is itself evidence: the host is not answering)\n' "$_t"
+    fi
+    if [ -z "$_out" ]; then
+        printf '(no output, rc=%s)\n' "$_rc"
+        return 0
+    fi
+    printf '%s\n' "$_out" | tail -n "$MAXLINES" | head -c "$MAXBYTES"
+    printf '\n'
+}
+
+printf '########## cluster-forensics ##########\n'
+printf 'collected_at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+printf 'host:         %s\n' "$(hostname 2>/dev/null)"
+printf 'reason:       %s\n' "$REASON"
+printf 'window:       last %sh, %s lines / %s bytes per section\n' "$WINDOW_H" "$MAXLINES" "$MAXBYTES"
+printf 'euid:         %s\n' "$(id -u 2>/dev/null)"
+
+# ---------------------------------------------------------------- identity
+runsh 10 "uname" "uname -a"
+runsh 10 "uptime" "uptime; echo; cat /proc/uptime"
+runsh 10 "boot id (changes IF AND ONLY IF the host rebooted)" \
+    "cat /proc/sys/kernel/random/boot_id"
+
+# ------------------------------------------------------------ boot history
+# `last reboot` reads wtmp, `who -b` reads utmp, `--list-boots` reads the
+# journal: three independent records, so one of them being rotated away does
+# not leave the question open.
+runsh 15 "last reboot / shutdown (wtmp)" "last -x -F reboot shutdown 2>/dev/null | head -20"
+runsh 10 "who -b" "who -b"
+runsh 20 "journalctl --list-boots" "journalctl --list-boots --no-pager 2>/dev/null | tail -20"
+
+# ------------------------------------------------------------- kernel logs
+runsh 45 "kernel log, this boot, last ${WINDOW_H}h" \
+    "journalctl -k -b --no-pager --since '-${WINDOW_H}h' -n ${MAXLINES} 2>&1"
+# The TAIL of the previous boot is the single most informative capture when
+# the host rebooted: an orderly shutdown sequence means a reboot was asked
+# for, an oops means it fell over, and nothing at all means the power went.
+runsh 30 "kernel log, PREVIOUS boot, last 300 lines (how the last boot ended)" \
+    "journalctl -k -b -1 --no-pager -n 300 2>&1"
+runsh 30 "dmesg, errors and worse" \
+    "dmesg -T --level=err,crit,alert,emerg 2>&1 | tail -200"
+runsh 30 "OOM evidence (this boot and the previous one)" \
+    "journalctl -k -b --no-pager 2>/dev/null | grep -iE 'out of memory|oom-kill|oom_reaper|killed process' | tail -50; \
+     echo '--- previous boot ---'; \
+     journalctl -k -b -1 --no-pager 2>/dev/null | grep -iE 'out of memory|oom-kill|oom_reaper|killed process' | tail -50"
+runsh 10 "vmstat OOM / paging counters" \
+    "grep -E '^(oom_kill|pgmajfault|pswpin|pswpout) ' /proc/vmstat"
+runsh 20 "kernel crash dumps" "ls -la /var/crash 2>&1 | head -20"
+
+# ------------------------------------------------------- system journal
+runsh 45 "journal, warnings and worse, last ${WINDOW_H}h" \
+    "journalctl -b --no-pager -p warning --since '-${WINDOW_H}h' -n 800 2>&1"
+
+# ------------------------------------------------------------- the runner
+# The issue asks for `journalctl -b -u 'actions.runner.*'`. On THIS cluster
+# that is expected to be empty and the emptiness is worth recording: the
+# runner is deliberately not a systemd unit — ansible/runner-setup.yml starts
+# it with `nohup ./run.sh` under the cluster-pristine rule (nothing outside
+# /tmp, no unit, no lingering). So the unit query is kept, because it is the
+# first thing anyone will look for and a blank section with an explanation
+# beats a missing one, and the ACTUAL runner logs follow it.
+runsh 15 "systemd units matching actions.runner.* (expected: none on this cluster)" \
+    "systemctl list-units 'actions.runner.*' --all --no-legend --no-pager 2>&1; \
+     echo '--- unit files ---'; \
+     systemctl list-unit-files 'actions.runner.*' --no-legend --no-pager 2>&1"
+runsh 30 "journalctl -b -u 'actions.runner.*' (expected empty; the runner is a nohup child, not a unit)" \
+    "journalctl -b -u 'actions.runner.*' --no-pager -n 500 --since '-${WINDOW_H}h' 2>&1"
+
+# The real runner log. Note WHERE it lives: /tmp is tmpfs on these hosts, so
+# if the host rebooted this whole tree is gone — and its absence, next to a
+# changed boot id, is itself the answer.
+runsh 15 "runner workspace present?" "ls -lad /tmp/actions-runner-* 2>&1"
+runsh 20 "runner.stdout (tail)" \
+    "for d in /tmp/actions-runner-*; do [ -d \"\$d\" ] || continue; \
+       echo \"--- \$d/runner.stdout ---\"; tail -n 300 \"\$d/runner.stdout\" 2>&1; done"
+runsh 20 "runner.stderr (tail)" \
+    "for d in /tmp/actions-runner-*; do [ -d \"\$d\" ] || continue; \
+       echo \"--- \$d/runner.stderr ---\"; tail -n 200 \"\$d/runner.stderr\" 2>&1; done"
+# _diag is where the runner records its own view of losing the server: the
+# heartbeat failures and reconnect attempts that distinguish "we lost the
+# network" from "we were killed mid-heartbeat".
+runsh 30 "runner _diag, newest Runner_*.log (tail)" \
+    "for d in /tmp/actions-runner-*/_diag; do [ -d \"\$d\" ] || continue; \
+       f=\$(ls -1t \"\$d\"/Runner_*.log 2>/dev/null | head -1); \
+       [ -n \"\${f:-}\" ] || continue; echo \"--- \$f ---\"; tail -n 300 \"\$f\" 2>&1; done"
+runsh 30 "runner _diag, newest Worker_*.log (tail)" \
+    "for d in /tmp/actions-runner-*/_diag; do [ -d \"\$d\" ] || continue; \
+       f=\$(ls -1t \"\$d\"/Worker_*.log 2>/dev/null | head -1); \
+       [ -n \"\${f:-}\" ] || continue; echo \"--- \$f ---\"; tail -n 300 \"\$f\" 2>&1; done"
+runsh 15 "is a runner process alive now?" \
+    "ps -eo pid,etimes,rss,comm 2>/dev/null | grep -E 'Runner.Listener|run.sh' | head -10; echo '(end)'"
+
+# --------------------------------------------------------- load and memory
+runsh 15 "top 40 processes by RSS" \
+    "ps -eo pid,ppid,stat,etimes,rss,pcpu,comm --sort=-rss 2>&1 | head -40"
+runsh 10 "meminfo" "head -20 /proc/meminfo"
+runsh 10 "loadavg / pressure" \
+    "cat /proc/loadavg; echo '--- PSI ---'; cat /proc/pressure/* 2>/dev/null || echo '(no PSI)'"
+runsh 15 "disk" "df -h / /tmp /var 2>&1"
+
+# ---------------------------------------------------------------- network
+runsh 15 "addresses / links" "ip -br addr 2>&1; echo; ip -br link 2>&1"
+runsh 15 "link flap counters (carrier_changes is monotonic)" \
+    "for i in /sys/class/net/*; do n=\${i##*/}; case \"\$n\" in lo|veth*|docker*|br-*) continue;; esac; \
+       printf '%-14s operstate=%s carrier=%s changes=%s\n' \"\$n\" \
+         \"\$(cat \$i/operstate 2>/dev/null)\" \"\$(cat \$i/carrier 2>/dev/null)\" \
+         \"\$(cat \$i/carrier_changes 2>/dev/null)\"; done"
+runsh 15 "interface error counters" "cat /proc/net/dev"
+runsh 20 "tailscale" "tailscale status --peers=false 2>&1 | head -20"
+runsh 20 "NIC link messages in the kernel log" \
+    "journalctl -k -b --no-pager --since '-${WINDOW_H}h' 2>/dev/null | grep -iE 'link is (up|down)|link down|NIC Link|carrier' | tail -40"
+
+# ------------------------------------------------------------------- UPS
+# Collected on EVERY host, not just the UPS master. The master's event log
+# answers "did mains fail"; having the same window from all three answers the
+# sharper question — whether ONE host lost power (its own PSU, its own outlet)
+# or the whole rack did, which no single host's log can tell you.
+runsh 15 "apcupsd status (apcaccess, read-only NIS query)" "apcaccess status 2>&1 | head -40"
+runsh 15 "apcupsd events" \
+    "tail -n 200 /var/log/apcupsd.events 2>&1"
+runsh 15 "power guard event log" \
+    "tail -n 200 /var/log/cluster-power-event.log 2>&1"
+runsh 15 "power guard events (jsonl: LOADPCT/TIMELEFT at each outage)" \
+    "tail -n 100 /var/lib/celeris-power/power-events.jsonl 2>&1"
+runsh 15 "power guard rescued state" \
+    "cat /var/lib/celeris-power/resume-pending.json 2>&1; echo '--- snapshots ---'; \
+     ls -la /var/lib/celeris-power/partial 2>&1 | head -20; \
+     echo '--- drain sentinels ---'; ls -la /run/celeris 2>&1"
+
+# --------------------------------------------------------- the sampler
+# The full series is fetched separately by the playbook; this is the tail, so
+# the single text file is self-contained for a first read.
+runsh 15 "host sampler, last 5 samples" \
+    "cat /var/log/celeris-host-sampler/current-run.txt 2>&1; \
+     echo '--- tail ---'; tail -n 5 /var/log/celeris-host-sampler/samples.jsonl 2>&1; \
+     echo '--- size ---'; ls -la /var/log/celeris-host-sampler 2>&1"
+
+# ------------------------------------------------- resumable run material
+# Whether anything is left to resume from, and where. Printed here because
+# after a lost runner this is the first question asked, and because
+# `resume_from` takes a PATH that somebody has to be able to name.
+runsh 20 "results dirs still on the host (resume material)" \
+    "ls -la /tmp/celeris-results 2>&1 | head -30; echo '--- per-run documents ---'; \
+     find /tmp/celeris-results -maxdepth 2 -name validate-results.json \
+       -printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null | sort | tail -20"
+runsh 15 "bench manifest (the cluster ownership lock)" \
+    "ls -la /tmp/celeris-bench-manifest.json 2>&1"
+
+printf '\n########## end cluster-forensics ##########\n'
+exit 0

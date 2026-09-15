@@ -1,12 +1,14 @@
 name: Cluster runner down
 description: >-
   Mints a removal-token from the GitHub API, joins the tailnet as an
-  ephemeral Tailscale node, then SSH-driven ansible: (1) drives
-  cleanup.yml to reclaim ALL cluster host state — docker containers +
-  their anonymous volumes, bench/results dirs, and the manifest
-  ownership lock; (2) kills every Runner.Listener, de-registers from
-  GitHub, and rm -rf's /tmp/actions-runner-<host>/; (3) sweeps orphan
-  offline runner registrations. Pristine.
+  ephemeral Tailscale node, then SSH-driven ansible: (0) COLLECTS
+  post-hoc host forensics and the host-sampler series into an uploaded
+  artifact, before anything is reclaimed; (1) drives cleanup.yml to
+  reclaim ALL cluster host state — docker containers + their anonymous
+  volumes, bench/results dirs, and the manifest ownership lock; (2)
+  kills every Runner.Listener, de-registers from GitHub, and rm -rf's
+  /tmp/actions-runner-<host>/; (3) sweeps orphan offline runner
+  registrations. Pristine.
 
   Pair with cluster-runner-up/. Designed to run as a teardown job
   with `if: always()` so cluster state is cleaned up even when the
@@ -42,6 +44,27 @@ inputs:
     description: Path to the ansible inventory.
     required: false
     default: ansible/inventory.yml
+  forensics-reason:
+    description: >-
+      Free-form label recorded in the forensics capture, normally the
+      outcome of the matrix job (`needs.matrix.result`). It is what tells
+      a later reader whether they are looking at the aftermath of a clean
+      run or of a lost runner.
+    required: false
+    default: unspecified
+  forensics-window-hours:
+    description: >-
+      How far back the journal captures reach. The default is 6h because
+      a lost runner is noticed within minutes and a whole-boot kernel log
+      is both uninformative and too large to upload.
+    required: false
+    default: "6"
+  collect-forensics:
+    description: >-
+      Set to "false" to skip the forensics capture entirely. Provided as
+      an escape hatch; there is no reason to use it on a tier run.
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -94,6 +117,90 @@ runs:
         fi
         echo "::add-mask::${TOKEN}"
         echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------------
+    # FORENSICS FIRST (probatorium#354). This MUST precede both reclamation
+    # steps below, because each destroys exactly what it collects:
+    #
+    #   cleanup.yml --extra-vars purge_results=true  rm -rf's results_root
+    #   runner-teardown.yml                          rm -rf's the runner dir,
+    #                                                taking runner.stdout,
+    #                                                runner.stderr and _diag/
+    #
+    # The 24 h soak 34736980002 died at 20 h 05 m with "the self-hosted runner
+    # lost communication with the server", and every in-band step died with
+    # it. This job is the only thing that still ran — so this is the only
+    # place the evidence can be taken from.
+    #
+    # It cannot disturb a run: ansible/forensics.yml and the script it drives
+    # contain no kill, no signal, no systemctl start/stop/restart, no docker
+    # and no rm, and the kernel ring buffer is only ever read.
+    #
+    # It cannot hang the job: the play bounds every SSH connect at 10 s and
+    # every remote command at 90 s, the script bounds each command it runs
+    # with `timeout`, and the outer `timeout 600` here is the backstop for
+    # all of that.
+    #
+    # It cannot mask the real failure: the step never fails (the matrix job's
+    # failure is the one that must stand), but nothing is swallowed either —
+    # the exit status is annotated as a ::warning:: AND written into
+    # collection-status.txt inside the artifact, next to ansible's own log.
+    - name: Collect post-hoc host forensics (read-only, before any reclamation)
+      if: always() && inputs.collect-forensics != 'false'
+      shell: bash
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: "False"
+        FORENSICS_REASON: ${{ inputs.forensics-reason }}
+        FORENSICS_WINDOW_HOURS: ${{ inputs.forensics-window-hours }}
+        INVENTORY_PATH: ${{ inputs.inventory-path }}
+      run: |
+        mkdir -p forensics
+        # The vars go in as a JSON file, not as `key=value` strings.
+        # `--extra-vars "k=v"` is split on WHITESPACE, so a reason like
+        # "matrix=failure (lost runner)" silently truncates to
+        # "matrix=failure" and the rest is parsed as further variables.
+        # Caught by the end-to-end simulation of this step; the file also
+        # lands in the artifact, so what was asked for is on the record.
+        python3 - <<'PY'
+        import json, os
+        json.dump({
+            "forensics_local_dir": os.path.join(os.getcwd(), "forensics"),
+            "forensics_window_hours": os.environ.get("FORENSICS_WINDOW_HOURS", "6"),
+            "forensics_reason": os.environ.get("FORENSICS_REASON", "unspecified"),
+        }, open("forensics/extra-vars.json", "w"), indent=2)
+        PY
+        set +e
+        timeout -k 30 600 ansible-playbook \
+          -i "${INVENTORY_PATH}" \
+          ansible/forensics.yml \
+          --extra-vars "@${PWD}/forensics/extra-vars.json" \
+          > forensics/ansible-forensics.log 2>&1
+        rc=$?
+        set -e
+        {
+          echo "ansible-playbook ansible/forensics.yml"
+          echo "rc: ${rc}"
+          echo "reason: ${FORENSICS_REASON}"
+          echo "window_hours: ${FORENSICS_WINDOW_HOURS}"
+          echo "collected_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > forensics/collection-status.txt
+        if [ "${rc}" -ne 0 ]; then
+          echo "::warning::forensics collection exited ${rc} (a host may be unreachable); see the cluster-forensics artifact. Teardown continues."
+        fi
+        echo "--- collected ---"
+        find forensics -type f -printf '%10s  %p\n' 2>/dev/null || ls -lR forensics
+
+    - name: Upload cluster forensics
+      if: always() && inputs.collect-forensics != 'false'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: cluster-forensics-${{ github.run_id }}-${{ github.run_attempt }}
+        path: forensics/
+        retention-days: 90
+        # The whole point is the run where the matrix job produced nothing.
+        # An empty capture must be a visible warning, never a failure that
+        # displaces the real one.
+        if-no-files-found: warn
 
     # KEYSTONE (2026-07-11 incident): reclaim ALL cluster host state — docker
     # volumes, bench_root, results, and the manifest ownership lock — from this
