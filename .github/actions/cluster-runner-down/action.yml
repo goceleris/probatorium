@@ -94,8 +94,10 @@ runs:
         sudo apt-get install -y --no-install-recommends ansible-core
         # cleanup.yml (driven below) uses ansible.posix.sysctl, which ansible-core
         # does NOT bundle. Provision it explicitly so the off-cluster reclamation
-        # is deterministic regardless of what the runner image happens to ship —
-        # mirrors runner-setup.yml's provisioning on the self-hosted runners.
+        # is deterministic regardless of what the runner image happens to ship.
+        # This is NOT the self-hosted runners' provisioning: runner-setup.yml pins
+        # ansible.posix, caches it and falls back to its GitHub source. This is a
+        # plain install on the GitHub-hosted image, which carries ansible.posix.
         # Installs to ~/.ansible/collections, already on ansible's default path.
         ansible-galaxy collection install ansible.posix
 

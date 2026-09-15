@@ -3,9 +3,11 @@
 The matrix-tier workflows (`matrix-{pr,nightly,weekend}-tier.yml`)
 provision **ephemeral** GitHub Actions self-hosted runners on the
 three cluster hosts at the start of every run and tear them down
-when the run finishes — even on cancel/failure. Nothing persists on
-the cluster between tier runs; the pristine rule (no Go install, no
-runner daemon, no `~/actions-runner` dir) is preserved.
+when the run finishes — even on cancel/failure. The runner itself does
+not persist between tier runs, and the pristine rule (no Go install, no
+runner daemon, no `~/actions-runner` dir) is preserved. One thing does
+persist by design: the version-keyed tool cache described under
+[Persistent tool cache](#persistent-tool-cache).
 
 The dev-side machinery is in:
 
@@ -121,7 +123,8 @@ finish.
 4. Watch the three jobs progress: `setup` (~3 min) → `matrix`
    (10 min) → `teardown` (~2 min).
 5. Confirm no `/tmp/actions-runner-*` dirs remain on any cluster
-   host afterward.
+   host afterward. `/tmp/celeris-runner-tarballs/` is expected to
+   remain: it is the tool cache, not a leftover.
 
 ## Operator overrides
 
@@ -129,4 +132,39 @@ If you want to keep runners alive across multiple workflow runs
 (useful when iterating on a tier locally), set the input
 `wait-for-manifest-clear: "false"` and skip the `teardown` job. Not
 intended for production — the pristine rule means we don't leave
-state lying around between scheduled runs.
+state lying around between scheduled runs. The tool cache below is the
+one deliberate exception.
+
+## Persistent tool cache
+
+Every tier run needs the actions-runner tarball, uv, a python build, an
+ansible-core venv and the `ansible.posix` collection. Fetching them fresh
+on every run made each tier depend on four internet services at once
+(probatorium#387, #392), so they live in a cache that survives teardown:
+
+```
+/tmp/celeris-runner-tarballs/
+  actions-runner-linux-<arch>-<version>.tar.gz
+  tools/
+    uv-<version>/                         the uv binary
+    uv-python/  uv-cache/                 uv's python builds and wheel cache
+    ansible-venv-py<py>-core<core>-deps<cutoff>/
+    ansible-collections-posix<version>/
+    ansible-home/                         ansible-galaxy temp dirs and API cache
+```
+
+- **Keyed by pin.** Every directory name carries the version it holds, so a
+  bump in `runner-setup.yml` installs fresh instead of reusing a stale copy.
+  Old versions stay until a reboot; they are small (tens of MB each).
+- **Trusted only when verified, never on presence.** uv must report its
+  pinned version. The venv needs a completion stamp *and* a working
+  `ansible-playbook --version` naming the pinned core. `ansible.posix` needs
+  a completion stamp *and* `ansible-galaxy collection verify --offline`. Any
+  miss discards that tool and reinstalls it.
+- **Reached through symlinks.** Six cluster workflows hardcode
+  `/tmp/actions-runner-<host>/ansible-venv` and `.../ansible-collections`;
+  the bootstrap recreates those as links into the cache on every run.
+  Teardown removes the links and leaves the cache.
+- **Cleared by a reboot**, because `/tmp` is RAM-backed on these hosts. To
+  purge it by hand, run `rm -rf /tmp/celeris-runner-tarballs` on each host
+  while no cluster run is in progress; the next bootstrap repopulates it.

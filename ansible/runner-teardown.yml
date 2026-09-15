@@ -103,7 +103,10 @@
         path: "{{ manifest_path | default('/tmp/celeris-bench-manifest.json') }}"
         state: absent
 
-    - name: Confirm pristine state
+    # The runner dir must be gone. The version-keyed tool cache under
+    # /tmp/celeris-runner-tarballs is NOT removed and is not checked here: it
+    # survives teardown on purpose, so this confirms the runner dir only.
+    - name: Confirm the runner dir is gone
       ansible.builtin.stat:
         path: "{{ runner_root }}"
       register: post_teardown

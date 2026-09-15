@@ -170,7 +170,7 @@ func TestBootstrapToolchainIsPinnedAndCachedOutsideTheWipedDir(t *testing.T) {
 		"venv python":               "--python {{ python_version }}",
 		"ansible-core":              "ansible-core=={{ ansible_core_version }}",
 		"ansible.posix from Galaxy": "ansible.posix:=={{ ansible_posix_version }}",
-		"ansible.posix from GitHub": "ansible.posix.git,{{ ansible_posix_version }}",
+		"ansible.posix from GitHub": "ansible.posix.git,{{ ansible_posix_commit }}",
 	} {
 		if !strings.Contains(setup, want) {
 			t.Errorf("%s does not install its pin (want %q in runner-setup.yml)", what, want)
@@ -255,4 +255,104 @@ func TestBootstrapToolchainIsPinnedAndCachedOutsideTheWipedDir(t *testing.T) {
 	}
 	t.Logf("toolchain contract: %d workflow(s) read ansible-venv, %d read ansible-collections",
 		consumers["ansible-venv"], consumers["ansible-collections"])
+}
+
+// probatorium#393 review: a cache that skips on presence is a liability, and the
+// first cut still skipped on presence in three places. Ansible's `creates:`
+// checks with glob.glob, which counts a DANGLING bin/python symlink as present;
+// uv writes a wheel's entry-point scripts before its package data, metadata and
+// RECORD, so bin/ansible-playbook can exist over a half-finished install; and
+// ansible-galaxy writes MANIFEST.json before any collection file, so a manifest
+// naming the pin proves nothing about the files after it. A job killed by the
+// bootstrap timeout leaves exactly those states, and the cache now outlives the
+// run that left them.
+//
+// So each cached tool is trusted only when a stamp written after a verified
+// install exists AND a check that exercises the tool agrees: the venv is probed
+// by running ansible-playbook, and ansible.posix by verifying every file's hash.
+func TestBootstrapToolchainCacheIsTrustedOnlyWhenVerified(t *testing.T) {
+	setup := readPlaybook(t, "runner-setup.yml")
+
+	for name, re := range map[string]*regexp.Regexp{
+		"ansible_deps_exclude_newer":  regexp.MustCompile(`(?m)^\s*ansible_deps_exclude_newer:\s*"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"\s*$`),
+		"ansible_posix_commit":        regexp.MustCompile(`(?m)^\s*ansible_posix_commit:\s*"[0-9a-f]{40}"\s*$`),
+		"galaxy_attempt_timeout":      regexp.MustCompile(`(?m)^\s*galaxy_attempt_timeout:\s*\d+\s*$`),
+		"galaxy_git_fallback_timeout": regexp.MustCompile(`(?m)^\s*galaxy_git_fallback_timeout:\s*\d+\s*$`),
+	} {
+		if !re.MatchString(setup) {
+			t.Errorf("%s is not set to a concrete value", name)
+		}
+	}
+
+	for what, want := range map[string]string{
+		"ansible-core dependencies frozen at a cutoff":              "--exclude-newer {{ ansible_deps_exclude_newer }}",
+		"the cutoff keys the venv directory":                        `-core{{ ansible_core_version }}-deps{{ ansible_deps_exclude_newer`,
+		"venv trusted only with a completion stamp":                 "{{ ansible_venv_dir }}/.celeris-installed",
+		"venv trusted only if ansible-playbook runs":                "[core {{ ansible_core_version }}]",
+		"ansible.posix verified file by file":                       "collection verify --offline",
+		"ansible.posix trusted only with a stamp":                   ".celeris-installed-posix{{ ansible_posix_version }}",
+		"each Galaxy attempt is bounded":                            "timeout {{ galaxy_attempt_timeout }}",
+		"the GitHub fallback is bounded":                            "timeout {{ galaxy_git_fallback_timeout }}",
+		"ansible-galaxy keeps its temp and cache in the tool cache": `ANSIBLE_HOME: "{{ ansible_home_dir }}"`,
+		"ANSIBLE_HOME lives in the tool cache":                      `ansible_home_dir: "{{ tool_cache_dir }}/`,
+	} {
+		if !strings.Contains(setup, want) {
+			t.Errorf("%s: want %q in runner-setup.yml", what, want)
+		}
+	}
+
+	// A presence guard on the venv is exactly what the review caught.
+	if strings.Contains(setup, `creates: "{{ ansible_venv_dir }}`) {
+		t.Error("the venv is still guarded by creates:, which glob.glob satisfies with a dangling " +
+			"bin/python symlink and with a half-installed bin/ansible-playbook")
+	}
+
+	// force: true on the link task switches off ansible's only check that the
+	// link target exists, so a missing cache dir would become a dangling link
+	// and a WARNING instead of a failure.
+	const linkTask = "- name: Point the legacy runner_root tool paths at the cache"
+	i := strings.Index(setup, linkTask)
+	if i < 0 {
+		t.Fatal("runner-setup.yml has no link task to check")
+	}
+	task := setup[i+len(linkTask):]
+	if j := strings.Index(task, "\n    - name:"); j >= 0 {
+		task = task[:j]
+	}
+	// Match force as a YAML key, not as text: the task's own comment explains
+	// why there is no force, and a substring check tripped on that sentence.
+	// Any truthy spelling counts; ansible accepts yes/on/true in any case.
+	forceKey := regexp.MustCompile(`(?mi)^\s*force:\s*(true|yes|on)\s*$`)
+	if forceKey.MatchString(task) {
+		t.Error("the link task sets force: true, which turns off the check that its target exists")
+	}
+}
+
+// ansible-galaxy collection verify --offline checks every file against the
+// hashes recorded in FILES.json, but it does not hash MANIFEST.json itself.
+// The round-3 end-to-end run measured the consequence: a cached manifest whose
+// version had been altered to 0.0.0 passed the cached check, and the play
+// reported success over it. So the cached check must compare the manifest's
+// version to the pin as well as run verify.
+func TestCachedAnsiblePosixCheckComparesTheManifestVersion(t *testing.T) {
+	setup := readPlaybook(t, "runner-setup.yml")
+	const name = "- name: Check the cached ansible.posix is complete and the pinned version"
+	i := strings.Index(setup, name)
+	if i < 0 {
+		t.Fatal("runner-setup.yml has no cached ansible.posix check")
+	}
+	task := setup[i+len(name):]
+	if j := strings.Index(task, "\n        - name:"); j >= 0 {
+		task = task[:j]
+	}
+	for what, want := range map[string]string{
+		"the completion stamp":                 ".celeris-installed-posix{{ ansible_posix_version }}",
+		"a file-by-file hash check":            "collection verify --offline",
+		"the manifest version against the pin": `["collection_info"]["version"] != sys.argv[2]`,
+	} {
+		if !strings.Contains(task, want) {
+			t.Errorf("the cached ansible.posix check lacks %s (want %q): verify --offline does not hash "+
+				"MANIFEST.json, so a manifest naming the wrong version passes it", what, want)
+		}
+	}
 }
