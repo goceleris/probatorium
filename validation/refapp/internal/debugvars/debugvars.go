@@ -26,6 +26,23 @@
 //	  "celeris.panic_count":         panics recovered by middleware/recovery,
 //	  "celeris.adaptive_switches":   EngineMetrics.AdaptiveSwitches,
 //	  "celeris.engine":              engine type name,
+//
+//	  // EngineMetrics.ErrorCount and the eleven cause buckets it is the
+//	  // exact sum of (celeris#646), plus the adaptive engine's
+//	  // share-by-sub-engine split. See report.ErrorClasses.
+//	  "celeris.engine_error_count",
+//	  "celeris.engine_error_accept_fd_limit",
+//	  "celeris.engine_error_accept_cancelled",
+//	  "celeris.engine_error_accept_other",
+//	  "celeris.engine_error_conn_table_cap",
+//	  "celeris.engine_error_conn_register",
+//	  "celeris.engine_error_listener_recreate",
+//	  "celeris.engine_error_transplant_adopt",
+//	  "celeris.engine_error_send_peer_gone",
+//	  "celeris.engine_error_send",
+//	  "celeris.engine_error_request_body",
+//	  "celeris.engine_error_handler",
+//	  "celeris.engine_standby_error_count",
 //	  "memstats":                    runtime.MemStats (cached, see MemStatsTTL)
 //
 //	  // Middleware oracles + this refapp's declaration of what it can
@@ -59,6 +76,24 @@
 // Broken-pipe panics (peer went away mid-write) are logged under a
 // different message and are deliberately not counted. When the build IS
 // validation-tagged, validation.Snapshot().PanicCount is folded in.
+//
+// Why EVERY engine.EngineMetrics field is published, including the ones
+// no predicate reads: the projection below is by hand, and a hand-list
+// silently loses whatever celeris adds next. It already has. celeris#647
+// added TransplantStranded and TransplantAdoptRefused precisely so its
+// own fix for celeris#624 would be falsifiable, race tier run
+// 34961642523 was dispatched to test that prediction, and two of its
+// four clauses could not be evaluated at all because this document did
+// not carry the counters (probatorium#386). A key that is absent parses
+// as zero and is indistinguishable from a counter that is clean, which
+// is the same failure probatorium#297 cost two soaks.
+//
+// So the rule here is TOTAL PROJECTION: every scalar field of
+// engine.EngineMetrics gets a key, whether or not anything reads it yet.
+// TestDebugVarsPublishesEveryEngineMetricsField walks the struct by
+// reflection and fails the moment celeris grows a field this file does
+// not carry -- in the refapp that has to publish it, rather than in a
+// nightly that quietly reports one counter short.
 package debugvars
 
 import (
@@ -272,14 +307,32 @@ func (v *Vars) Document() map[string]any {
 		if info := srv.EngineInfo(); info != nil {
 			doc["celeris.active_conns"] = info.Metrics.ActiveConnections
 			doc["celeris.adaptive_switches"] = int64(info.Metrics.AdaptiveSwitches)
-			// EngineMetrics.ErrorCount is bumped on the engine's
-			// accept-side error paths (the epoll conn-table cap and
-			// EMFILE/ENFILE drops, the io_uring listener re-creation).
-			// Exported so the property loop's 1 Hz series shows it
-			// STEP at the instant of a deaf-listener event, which is the
-			// one class a walker's timeout cannot tell from a stall
+			// EngineMetrics.ErrorCount, and since celeris#646 the
+			// eleven cause buckets it is the exact sum of. Exported so
+			// the property loop's 1 Hz series shows it STEP at the
+			// instant of a deaf-listener event, which is the one class
+			// a walker's timeout cannot tell from a stall
 			// (celeris#588). Not judged by any predicate.
+			//
+			// The total alone could not answer celeris#645: the
+			// adaptive engine recorded 421 engine errors in a
+			// 112-second cell against io_uring's 63 and epoll's 0, and
+			// one number can bound the cause but never name it. Every
+			// bucket is published, even the ones the per-cell series
+			// does not sample, because the end-of-cell tally reads
+			// this document and nothing else.
 			doc["celeris.engine_error_count"] = int64(info.Metrics.ErrorCount)
+			doc["celeris.engine_error_accept_fd_limit"] = int64(info.Metrics.ErrorAcceptFDLimit)
+			doc["celeris.engine_error_accept_cancelled"] = int64(info.Metrics.ErrorAcceptCancelled)
+			doc["celeris.engine_error_accept_other"] = int64(info.Metrics.ErrorAcceptOther)
+			doc["celeris.engine_error_conn_table_cap"] = int64(info.Metrics.ErrorConnTableCap)
+			doc["celeris.engine_error_conn_register"] = int64(info.Metrics.ErrorConnRegister)
+			doc["celeris.engine_error_listener_recreate"] = int64(info.Metrics.ErrorListenerRecreate)
+			doc["celeris.engine_error_transplant_adopt"] = int64(info.Metrics.ErrorTransplantAdopt)
+			doc["celeris.engine_error_send_peer_gone"] = int64(info.Metrics.ErrorSendPeerGone)
+			doc["celeris.engine_error_send"] = int64(info.Metrics.ErrorSend)
+			doc["celeris.engine_error_request_body"] = int64(info.Metrics.ErrorRequestBody)
+			doc["celeris.engine_error_handler"] = int64(info.Metrics.ErrorHandler)
 			doc["celeris.engine"] = info.Type.String()
 			// The four inputs to the adaptive controller's promotion
 			// decision, published so a cell that never promoted can say
@@ -320,6 +373,13 @@ func (v *Vars) Document() map[string]any {
 			// on every non-adaptive engine.
 			doc["celeris.engine_standby_active_conns"] = info.Metrics.StandbyActiveConnections
 			doc["celeris.engine_standby_close_count"] = int64(info.Metrics.StandbyCloseCount)
+			// The same split applied to the error total (celeris#646).
+			// The buckets above say WHAT went wrong; this says which
+			// sub-engine it went wrong on, and celeris#645 needs both
+			// at the same second to distinguish "the standby's accepts
+			// were cancelled at the promotion" from "the promoted
+			// engine is failing sends".
+			doc["celeris.engine_standby_error_count"] = int64(info.Metrics.StandbyErrorCount)
 			// The transplant hand-off, both directions. The epoll side
 			// decrements its live count and fires NO hook by design,
 			// and the io_uring side increments on adoption; a residual
@@ -346,6 +406,108 @@ func (v *Vars) Document() map[string]any {
 			doc["celeris.engine_recv_cqe_unaccounted"] = int64(info.Metrics.RecvCQEUnaccounted)
 			doc["celeris.engine_recv_sq_full"] = int64(info.Metrics.RecvSQFull)
 			doc["celeris.engine_recv_stall_episodes"] = int64(info.Metrics.RecvStallEpisodes)
+			// The duration half of that same stall. The episode count
+			// says how OFTEN a connection was passed over while it was
+			// owed a recv arm; only the nanos say whether an episode was
+			// submission-queue pressure clearing inside a pass (normal)
+			// or a connection that received nothing for seconds with its
+			// peer's bytes already sitting in the kernel. celeris#607
+			// turns on exactly that distinction, so the count without
+			// the durations cannot reproduce the finding.
+			doc["celeris.engine_recv_stall_nanos"] = int64(info.Metrics.RecvStallNanos)
+			doc["celeris.engine_recv_stall_max_nanos"] = int64(info.Metrics.RecvStallMaxNanos)
+			// The IOSQE_IO_LINK chain celeris#607 was actually solved on:
+			// a RECV linked behind a SEND does not start until the SEND
+			// completes, so a peer that stops reading blocks the send and
+			// takes the recv down with it. `arms` is the exposure
+			// denominator -- the reading the fix was confirmed against
+			// was this counter at zero, and a cell cannot report "zero"
+			// for a counter it never published.
+			doc["celeris.engine_recv_linked_arms"] = int64(info.Metrics.RecvLinkedArms)
+			doc["celeris.engine_recv_linked_blocked_nanos"] = int64(info.Metrics.RecvLinkedBlockedNanos)
+			doc["celeris.engine_recv_linked_blocked_max_nanos"] = int64(info.Metrics.RecvLinkedBlockedMaxNanos)
+			// The celeris#484 resume window and the #560 guard standing
+			// in it. `cancel_pending` counts resumes processed while the
+			// pause's ASYNC_CANCEL was still in flight; `recv_in_flight`
+			// is the subset where the cancelled recv was still armed --
+			// the only state in which a second recv could be placed on
+			// top of a kernel-held one. Those two are the exposure
+			// witnesses for engine_recv_double_armed above: at zero, a
+			// clean double-armed count is unearned rather than
+			// reassuring, because the window was never reached
+			// (celeris#586). `arm_declined` is the guard itself firing.
+			doc["celeris.engine_recv_resume_while_cancel_pending"] = int64(info.Metrics.RecvResumeWhileCancelPending)
+			doc["celeris.engine_recv_resume_while_recv_in_flight"] = int64(info.Metrics.RecvResumeWhileRecvInFlight)
+			doc["celeris.engine_recv_arm_declined"] = int64(info.Metrics.RecvArmDeclined)
+			// The four remaining hand-off outcomes, so a nonzero
+			// detached - adopted residual can be READ rather than
+			// inferred. Every one of them used to be a silent close: the
+			// source had already dropped the descriptor from its loop,
+			// live set and conn table with no OnDisconnect, and the
+			// branch closed it with no counter moving -- the
+			// unattributable step celeris#624 chased.
+			//
+			// `stranded` MUST STAY ZERO: the two flags it sits between
+			// are mutually exclusive by construction, and the counter is
+			// what makes that argument checkable instead of asserted.
+			// The other three are recoveries, not faults --
+			// `handoff_refused` and `drain_stopped` re-adopt onto the
+			// source, so each is paired with a TransplantAdopted on the
+			// SAME engine and the residual returns to zero, and
+			// `adopt_refused` closes the descriptor AND fires
+			// OnDisconnect, so accepted - closed - active stays balanced.
+			// Which of the three moved is how an adopted count that rose
+			// without a hand-off is told apart from one that arrived.
+			doc["celeris.engine_transplant_handoff_refused"] = int64(info.Metrics.TransplantHandoffRefused)
+			doc["celeris.engine_transplant_drain_stopped"] = int64(info.Metrics.TransplantDrainStopped)
+			doc["celeris.engine_transplant_stranded"] = int64(info.Metrics.TransplantStranded)
+			doc["celeris.engine_transplant_adopt_refused"] = int64(info.Metrics.TransplantAdoptRefused)
+			// Detach accounting, the input to I-ENG-DETACH
+			// (probatorium#352). `detached_conns` is a GAUGE, not a
+			// total: the live number of connections handed to a detached
+			// middleware goroutine (WebSocket / SSE), summed over the
+			// io_uring workers, so a drift between it and the number of
+			// live streams is the celeris#549 accounting bug made visible
+			// (celeris#584). `detach_window_closes` counts the closes
+			// that landed between the middleware's Detach and the
+			// worker's deferred increment; before celeris#551 each of
+			// those decremented with no matching increment, so it is the
+			// proof the window was entered at all.
+			doc["celeris.engine_detached_conns"] = info.Metrics.DetachedConnections
+			doc["celeris.engine_detach_window_closes"] = int64(info.Metrics.DetachWindowCloses)
+			// The io_uring egress split. `zc_sends_submitted` is the
+			// exposure witness for the zero-copy send path: a bench or
+			// soak that reports a clean SEND_ZC result with this at 0
+			// never ran the branch (celeris#585/#587/#591), and
+			// submitted - notifs is the number of ZC sends whose buffer
+			// the kernel still holds pinned, which bounds how long the
+			// cycle stayed open. `inline_bytes` vs `ring_bytes` splits
+			// BytesWritten into the raw unix.Write(2) a detached stream
+			// takes -- bytes that can never be zero-copy -- and the bytes
+			// that went through the ring, which is the denominator any
+			// SEND_ZC A/B needs before a throughput delta means anything.
+			doc["celeris.engine_zc_sends_submitted"] = int64(info.Metrics.ZCSendsSubmitted)
+			doc["celeris.engine_zc_notifs"] = int64(info.Metrics.ZCNotifs)
+			doc["celeris.engine_inline_bytes"] = int64(info.Metrics.InlineBytes)
+			doc["celeris.engine_ring_bytes"] = int64(info.Metrics.RingBytes)
+			// Static after Listen: how many of this refapp's routes were
+			// registered with .Async(true), i.e. how many handlers CAN
+			// take the per-conn dispatch goroutine. It is the
+			// denominator for engine_async_promoted_conns above --
+			// promotions counted against a refapp with no async routes
+			// at all is a different reading from the same number against
+			// one that has them.
+			doc["celeris.engine_async_routes"] = int64(info.Metrics.AsyncRoutes)
+			// Published as a float, because it is the one non-integer
+			// field on EngineMetrics. No shipped engine assigns it --
+			// std, epoll and io_uring leave it at zero and the adaptive
+			// engine sums two zeros -- so it reads 0 everywhere today and
+			// a nonzero value means celeris started populating it. It is
+			// here anyway: a field that exists and is never published
+			// cannot be told apart from one that is published and never
+			// moves, and removing that ambiguity is what this document
+			// is for (probatorium#297).
+			doc["celeris.engine_throughput"] = info.Metrics.Throughput
 		}
 	}
 	return doc

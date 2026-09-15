@@ -36,6 +36,18 @@
   gather_facts: true
   vars:
     runner_root: "/tmp/actions-runner-{{ inventory_hostname }}"
+    # Deliberately OUTSIDE runner_root, which the wipe below deletes on
+    # every run. The tarball is immutable and already content-addressed
+    # by version in its filename, so it survives the wipe safely; the
+    # pristine-by-design rule is about the runner CONFIGURATION (a stale
+    # .runner pinning a deleted registration), not about 215 MiB of
+    # bytes GitHub will hand back byte-identical. Still under /tmp, so
+    # "nothing lands outside /tmp" holds and a reboot clears it.
+    # Name chosen so it cannot collide with runner_root for any
+    # inventory_hostname: "/tmp/actions-runner-cache" would BE
+    # runner_root on a host called "cache", and the wipe would take
+    # the cache with it.
+    runner_cache_dir: "/tmp/celeris-runner-tarballs"
     runner_arch_map:
       x86_64: x64
       aarch64: arm64
@@ -80,10 +92,28 @@
         state: directory
         mode: '0755'
 
-    - name: Download actions-runner tarball
+    - name: Ensure runner tarball cache dir
+      ansible.builtin.file:
+        path: "{{ runner_cache_dir }}"
+        state: directory
+        mode: '0755'
+
+    # 215 MiB per host. Pointing dest inside runner_root made force:false
+    # dead code -- the wipe above had just deleted the file it was meant
+    # to find -- so every cluster run re-fetched the whole tarball on all
+    # three hosts. On 2026-09-15 that took 13m05s and timed out the
+    # nightly's 15-minute bootstrap job (probatorium#387); the historical
+    # norm for the entire bootstrap is under three minutes, so the
+    # download is the variable and nothing else is.
+    #
+    # get_url's `timeout` is the URL-OPEN timeout, not a transfer cap, so
+    # retries never fire on a slow-but-progressing transfer -- it simply
+    # runs until the job is killed. Caching removes the transfer instead
+    # of trying to bound it.
+    - name: Download actions-runner tarball (cached across runs)
       ansible.builtin.get_url:
         url: "{{ runner_tarball_url }}"
-        dest: "{{ runner_root }}/{{ runner_tarball }}"
+        dest: "{{ runner_cache_dir }}/{{ runner_tarball }}"
         mode: '0644'
         force: false
         timeout: 60
@@ -92,12 +122,42 @@
       delay: 10
       until: runner_tarball_dl is succeeded
 
-    - name: Extract tarball
-      ansible.builtin.unarchive:
-        src: "{{ runner_root }}/{{ runner_tarball }}"
-        dest: "{{ runner_root }}"
-        remote_src: true
-        creates: "{{ runner_root }}/config.sh"
+    # A cache turns one bad download into every future run's problem, so
+    # the extract is the integrity check: if the cached tarball will not
+    # unpack, throw it away and fetch it once more. Without this, a
+    # corrupt cache file looks like a successful skip forever.
+    - name: Extract tarball, re-fetching once if the cached copy is bad
+      block:
+        - name: Extract tarball
+          ansible.builtin.unarchive:
+            src: "{{ runner_cache_dir }}/{{ runner_tarball }}"
+            dest: "{{ runner_root }}"
+            remote_src: true
+            creates: "{{ runner_root }}/config.sh"
+      rescue:
+        - name: Discard the unusable cached tarball
+          ansible.builtin.file:
+            path: "{{ runner_cache_dir }}/{{ runner_tarball }}"
+            state: absent
+
+        - name: Re-download actions-runner tarball
+          ansible.builtin.get_url:
+            url: "{{ runner_tarball_url }}"
+            dest: "{{ runner_cache_dir }}/{{ runner_tarball }}"
+            mode: '0644'
+            force: true
+            timeout: 60
+          register: runner_tarball_redl
+          retries: 5
+          delay: 10
+          until: runner_tarball_redl is succeeded
+
+        - name: Extract re-downloaded tarball
+          ansible.builtin.unarchive:
+            src: "{{ runner_cache_dir }}/{{ runner_tarball }}"
+            dest: "{{ runner_root }}"
+            remote_src: true
+            creates: "{{ runner_root }}/config.sh"
 
     - name: Register runner with GitHub (config.sh --unattended)
       # Note: NOT using --ephemeral.

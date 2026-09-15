@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goceleris/probatorium/report"
 )
@@ -118,6 +119,21 @@ func ValidateGate() error {
 				Tier1: doc.Validation.Tier1, Tier3: doc.Validation.Tier3}}
 		}
 		cells = append(cells, cs...)
+		// A resumed run's document is the union of two runs (schema 5.12,
+		// probatorium#376). The gate judges it as one matrix, which is the
+		// point -- but a 64-cell verdict of which 41 cells were measured
+		// eighteen hours earlier, on a different pin of the wall clock, is
+		// not the same artefact as a 64-cell verdict from one soak, and the
+		// run log is where a reader finds that out.
+		if r := doc.Validation.Resume; r != nil {
+			fmt.Printf("ValidateGate: %s is a RESUMED run: %d of %d cell(s) inherited from %s "+
+				"(prior window %s .. %s); %d measured by this run\n",
+				host, r.InheritedCells, r.InheritedCells+r.RanCells, r.From,
+				r.PriorStartedAt.Format(time.RFC3339), r.PriorFinishedAt.Format(time.RFC3339), r.RanCells)
+			for _, why := range r.NotInherited {
+				fmt.Printf("  not inherited: %s\n", why)
+			}
+		}
 		if doc.Soak != nil {
 			soaks[host] = doc.Soak
 		}

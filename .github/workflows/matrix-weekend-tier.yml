@@ -28,9 +28,17 @@ on:
       resume_from:
         description: >-
           Resume an interrupted run instead of starting a fresh matrix.
-          "auto" restores the newest run rescued by the UPS power guard on
-          the cluster host and continues it; a path resumes from that dir.
-          Empty (default) runs the full matrix.
+          Pass the PATH the teardown's "Resume candidates" job summary
+          printed (the rescued copy under /var/lib/celeris-rescue, not the
+          tmpfs original, which the purge removes). The cells already final
+          there are skipped and carried into this run's document, so the
+          gate still judges the whole matrix. A missing, truncated or
+          wrong-arch document aborts the run in the first seconds rather
+          than quietly re-running everything (probatorium#376).
+          "auto" is KNOWN BROKEN (probatorium#377) — it selects the empty
+          directory the run has just created, and now fails loudly instead
+          of silently running the full matrix. Empty (default) runs the
+          full matrix.
         required: false
         default: ""
         type: string
@@ -51,7 +59,12 @@ jobs:
   setup:
     name: bootstrap cluster runners
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not 15: the bootstrap fetches a 215 MiB actions-runner
+    # tarball per host on a cold cache, and a slow-network day took
+    # 13m05s of a 15-minute budget and cancelled the nightly
+    # (probatorium#387). The cache added there removes the fetch from
+    # every later run; this is the headroom for the first one.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
