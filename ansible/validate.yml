@@ -70,6 +70,15 @@
     # Restoring is what makes those cells visible again: the snapshot lives
     # on ext4 precisely because /tmp is RAM and does not survive the power
     # cut that created it.
+    #
+    # "auto" IS KNOWN BROKEN (probatorium#377) and the reason is right here:
+    # the locator below is `ls -1dt {{ results_root }}/*-validate-* | head -1`,
+    # and the "Create per-run output dir" task ABOVE has already created the
+    # newest match — this run's own empty directory. Since probatorium#376 the
+    # validator refuses an unreadable resume directory instead of silently
+    # running the full matrix, so "auto" now fails in the first seconds. Pass
+    # an explicit path (the teardown prints the rescued candidates) until #377
+    # is fixed.
     - name: Restore the newest power-loss snapshot (resume=auto)
       ansible.builtin.command: /usr/local/sbin/cluster-power-restore
       become: true
