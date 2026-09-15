@@ -231,6 +231,17 @@ jobs:
       - name: mage Deploy (stage refapps + validator)
         env:
           DEPLOY_COMPETITORS: none
+          # Pull postgres/redis/memcached so the validate step below can
+          # start them for the driver_* refapps. Without this the PR tier
+          # is the ONLY tier that cannot run them: every dbservices task,
+          # and the validator's own -seed-services flag, is gated on
+          # VALIDATE_DBSERVICES, so the run logged
+          # "dbservices | start postgres *** skipping" and twelve of
+          # thirty-two cells produced no requests and no property verdicts
+          # (probatorium#372). Pull-only here; containers start in
+          # validate.yml. The images are cached per host, so the cost lands
+          # once rather than on every ten-minute gate.
+          DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
 
       - name: mage Validate (matrix mode)
@@ -238,6 +249,9 @@ jobs:
           VALIDATE_DURATION: ${{ inputs.duration || '10m' }}
           VALIDATE_TARGET: msa2-server
           VALIDATE_MATRIX: "1"
+          # See DEPLOY_NEEDS_DBSERVICES above. This is the half that
+          # actually starts the containers and passes -seed-services.
+          VALIDATE_DBSERVICES: "1"
         run: mage Validate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)
