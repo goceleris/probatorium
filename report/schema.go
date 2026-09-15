@@ -127,7 +127,23 @@ import (
 //     from a celeris defect: it recorded the decision and none of its
 //     inputs. Additive; older readers ignore every field and no new
 //     key is gated.
-const SchemaVersion = "5.10"
+//   - 5.11 — engine-side connection accounting and the must-stay-zero
+//     defect witnesses. Adds, on Tier1Summary, EngineZeroWitness (the
+//     peak each witness reached, keyed by its debugvars name),
+//     EngineAcceptCount / EngineCloseCount / EngineTransplantDetached /
+//     EngineTransplantAdopted / EngineAsyncPromotedConns /
+//     PeakStandbyActiveConns / EngineRequestsTotal, and the matching
+//     thirteen columns on the per-cell series. The gate gains two
+//     unconditional checks: any nonzero witness fails its cell with the
+//     defect it witnesses, and an engine whose own request count falls
+//     more than a factor of ten below the walker's requests_sent fails
+//     as a counter defect. Both exist because the artifact recorded one
+//     side of a two-sided quantity: celeris#624's drift could not be
+//     attributed without the engine's close count beside the hook's,
+//     and celeris#626 left epoll reporting 3,089 requests against a
+//     walker that sent 3,306,726 with nothing to compare it to.
+//     Additive; older readers ignore every field.
+const SchemaVersion = "5.11"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -681,6 +697,32 @@ type Tier1Summary struct {
 	// (by design) from neither (a celeris defect).
 	PeakConnsPerWorker float64 `json:"peak_conns_per_worker,omitempty"`
 	MeanBytesPerReq    float64 `json:"mean_bytes_per_req,omitempty"`
+	// EngineZeroWitness is the highest value each must-stay-zero engine
+	// counter reached in this cell, keyed by its debugvars name. Each
+	// counts an event that cannot happen in a correct engine, so the
+	// gate fails a cell on any nonzero entry and prints the defect that
+	// entry witnesses (report.ZeroWitnessMeaning). A map rather than
+	// named fields because the set grows with every defect that earns a
+	// witness, and celeris#627 is what a field-by-field literal does to
+	// such a set.
+	EngineZeroWitness map[string]int64 `json:"engine_zero_witness,omitempty"`
+	// Engine-side connection accounting, against which
+	// AcceptedConnTotal / ClosedConnTotal are the independent hook-side
+	// witness. Their disagreement is what attributes an I-CONN-2 drift
+	// rather than merely reporting it (celeris#624).
+	EngineAcceptCount        int64 `json:"engine_accept_count,omitempty"`
+	EngineCloseCount         int64 `json:"engine_close_count,omitempty"`
+	EngineTransplantDetached int64 `json:"engine_transplant_detached,omitempty"`
+	EngineTransplantAdopted  int64 `json:"engine_transplant_adopted,omitempty"`
+	EngineAsyncPromotedConns int64 `json:"engine_async_promoted_conns,omitempty"`
+	PeakStandbyActiveConns   int64 `json:"peak_standby_active_conns,omitempty"`
+	// EngineRequestsTotal is the engine's own request counter at the end
+	// of the cell. RequestsSent is the walker's independent count of what
+	// it actually sent, so the two together catch an engine that stopped
+	// counting: celeris#626 left epoll reporting 3,089 requests against a
+	// walker that sent 3,306,726, and nothing noticed for as long as only
+	// one side was recorded.
+	EngineRequestsTotal int64 `json:"engine_requests_total,omitempty"`
 
 	// Per-slice sub-tallies (one per workload-mix slice from
 	// validator-prod issue #55). Each is a plain `map[string]int64`

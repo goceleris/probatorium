@@ -578,6 +578,49 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 					c.Tier1.PeakConnsPerWorker, c.Tier1.MeanBytesPerReq))
 		}
 	}
+	// Must-stay-zero engine witnesses. No option guards these: each counts
+	// an event that cannot happen in a correct engine, so one is a
+	// failure by the same rule the rest of this gate runs on -- a nonzero
+	// true-signal counter is a failure, not a note. The cell prints the
+	// defect the counter witnesses rather than the counter's name, so a
+	// reader does not have to know the codebase to act on it.
+	for _, c := range cells {
+		if !ranPropertyLoop(c) {
+			continue
+		}
+		for _, k := range sortedKeys(c.Tier1.EngineZeroWitness) {
+			if n := c.Tier1.EngineZeroWitness[k]; n > 0 {
+				add(c, "tier_1."+k, n, ZeroWitnessMeaning[k])
+			}
+		}
+	}
+	// An engine that stopped counting its own requests. The walker's
+	// requests_sent is an independent witness measured on the other side
+	// of the socket, so the two disagreeing by an order of magnitude is
+	// the engine's counter, not the workload.
+	//
+	// celeris#626 is why this exists: epoll reported 3,089 requests in a
+	// cell whose walker sent 3,306,726, because the counter advanced only
+	// on the inline read path and stopped the moment a connection moved to
+	// async dispatch. It went unnoticed through every nightly until the
+	// engine's own counter was recorded beside the walker's.
+	//
+	// The bound is deliberately a factor of ten, not a few percent. Some
+	// refapps answer one walker operation with several HTTP requests and
+	// legitimately run 20% above, and the defect this catches ran three
+	// orders of magnitude below -- so a loose bound costs nothing and a
+	// tight one would argue with the workload mix.
+	for _, c := range cells {
+		if !ranPropertyLoop(c) || c.Tier1.EngineRequestsTotal <= 0 || c.Tier1.RequestsSent <= 0 {
+			continue
+		}
+		if c.Tier1.EngineRequestsTotal*engineRequestCoverageFactor < c.Tier1.RequestsSent {
+			add(c, "tier_1.engine_requests_total", c.Tier1.EngineRequestsTotal,
+				fmt.Sprintf("the engine counted %d requests while the walker sent %d on the other side of the socket, a factor of %.0f. An engine that stops counting its own requests takes Throughput and the adaptive controller's bytes-per-request with it (celeris#626)",
+					c.Tier1.EngineRequestsTotal, c.Tier1.RequestsSent,
+					float64(c.Tier1.RequestsSent)/float64(c.Tier1.EngineRequestsTotal)))
+		}
+	}
 	if opts.RequireInstrumented {
 		for _, id := range UninstrumentedEverywhere(cells) {
 			if _, waived := WaivedUninstrumented[id]; waived {
