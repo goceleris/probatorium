@@ -50,7 +50,7 @@ type MatrixConfig struct {
 
 	// Engines is a comma-separated list of celeris engine names
 	// (iouring|epoll|std|adaptive). Empty (or "auto") expands to
-	// the platform's production set: iouring+epoll+std on linux,
+	// the platform's production set: iouring+epoll+std+adaptive on linux,
 	// std on every other GOOS. Skips engines unsupported on the
 	// current host so a darwin developer can still smoke the
 	// matrix locally (only the std cell runs).
@@ -289,7 +289,7 @@ func expandEngines(spec string) []string {
 	switch strings.ToLower(spec) {
 	case "auto":
 		if runtime.GOOS == "linux" {
-			return []string{"iouring", "epoll", "std"}
+			return []string{"iouring", "epoll", "std", "adaptive"}
 		}
 		return []string{"std"}
 	}
@@ -300,13 +300,16 @@ func expandEngines(spec string) []string {
 		switch e {
 		case "":
 			continue
-		case "iouring", "epoll":
+		case "iouring", "epoll", "adaptive":
+			// adaptive composes epoll and io_uring, so celeris rejects it
+			// off Linux too ("engine adaptive requires Linux"); a darwin
+			// smoke that listed it would only produce a dead cell.
 			if runtime.GOOS != "linux" {
 				// Skip linux-only engines on other OSes.
 				continue
 			}
 			out = append(out, e)
-		case "std", "adaptive":
+		case "std":
 			out = append(out, e)
 		default:
 			// Unknown engine: keep it; the refapp will error out
@@ -609,7 +612,8 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		PropertyHardFail: cfg.PropertyHardFail,
 		ReplayBin:        cfg.ReplayBin,
 		RefappEngine:     mc.Engine,
-		RefappWorkers:    cfg.RefappWorkers,
+		RefappWorkers:    cellRefappWorkers(mc.Engine, cfg.RefappWorkers),
+		ConcurrencyFloor: cellConcurrencyFloor(mc.Engine),
 		DriverMode:       cfg.DriverMode,
 		DriverSSHUser:    cfg.DriverSSHUser,
 		DriverSSHHost:    cfg.DriverSSHHost,
@@ -706,4 +710,51 @@ func seedServicesWithRetry(ctx context.Context, spec string) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// The adaptive engine starts on epoll and promotes new connections to
+// io_uring only when the controller's conns-per-worker ratio crosses a
+// threshold (celeris adaptive/controller.go). An adaptive cell sized below
+// that line validates epoll under another name, so the matrix sizes these
+// cells deliberately and the gate's ExpectAdaptiveSwitch proves it worked.
+//
+// SIZED FOR THE FAST PATH, NOT THE SUSTAIN PATH — this is the whole point,
+// and the first 64-cell nightly (probatorium run 34864823296) is why. The
+// controller has two ways up: `cpw >= upThreshold` (24) held for
+// sustainTicks (2) consecutive one-second ticks, or `cpw >= highWatermark`
+// (48), which snaps on a SINGLE tick. The first sizing aimed at the
+// sustain path: 2 workers x 60 walkers gave ~56 active connections, i.e.
+// 28 per worker against a threshold of 24 — a 17% margin. Measured result:
+// **9 of 16 adaptive cells promoted and 7 did not**, with the active-
+// connection count IDENTICAL between the two groups (p50 54-56 in both),
+// on both architectures and across six different refapps. There was no
+// pattern to find: a 17% margin against a two-tick sustain requirement is
+// a coin flip, because either tick dipping under the line resets the streak.
+//
+// So size for the single-tick snap instead. At the celeris minimum of 2
+// workers the high watermark is 96 active connections, and the measured
+// ratio on this cluster is 0.93-0.97 active connections per walker (the
+// nightly and soak artifacts, and the 56/60 above), so 110 walkers hold
+// ~103-107. That clears 96 with room for the sampling dip, and promotion
+// stops depending on two consecutive lucky ticks.
+//
+// An explicit -refapp-workers cap still applies to every engine; the floor
+// only ever raises the walker count.
+const (
+	adaptiveCellWorkers          = 2
+	adaptiveCellConcurrencyFloor = 110
+)
+
+func cellRefappWorkers(engine string, capFromFlag int) int {
+	if capFromFlag > 0 || engine != "adaptive" {
+		return capFromFlag
+	}
+	return adaptiveCellWorkers
+}
+
+func cellConcurrencyFloor(engine string) int {
+	if engine != "adaptive" {
+		return 0
+	}
+	return adaptiveCellConcurrencyFloor
 }

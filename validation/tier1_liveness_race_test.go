@@ -44,7 +44,7 @@ exit 2`
 		Matrix:         minimalMatrix(t),
 		Seed:           42,
 		Concurrency:    10,
-		ReadyTimeout:   2 * time.Second,
+		ReadyTimeout:   tier1TestReadyTimeout,
 		RequestTimeout: time.Second,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

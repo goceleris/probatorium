@@ -88,6 +88,10 @@ func main() {
 	}
 
 	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	// Every write below is read back in the handler and tallied, so this
+	// refapp can judge I-DRV; the other refapps leave the counters at zero
+	// and the checker reports the predicate as not instrumented there.
+	dv.Declare("I-DRV")
 	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
@@ -153,10 +157,12 @@ func main() {
 		if _, err := client.Do(c.Context(), "SET", k, v); err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "set: "+err.Error())
 		}
+		dv.DriverWrite()
 		got, err := client.DoString(c.Context(), "GET", k)
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
 		}
+		dv.DriverRead(got == v)
 		if got != v {
 			return c.JSON(http.StatusInternalServerError, map[string]string{
 				"err":           "read-after-write mismatch",
@@ -176,6 +182,7 @@ func main() {
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "incr: "+err.Error())
 		}
+		dv.DriverWrite()
 		got, err := client.DoString(c.Context(), "GET", k)
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
@@ -187,6 +194,7 @@ func main() {
 		// be a stale or misrouted read (a real I-DRV-1 hit). Demanding
 		// equality produced a 12% false-positive rate at concurrency 30.
 		gotN, perr := strconv.ParseInt(got, 10, 64)
+		dv.DriverRead(perr == nil && gotN >= n)
 		if perr != nil || gotN < n {
 			return c.JSON(http.StatusInternalServerError, map[string]any{
 				"err":           "incr read-after-write regression (GET < INCR return)",

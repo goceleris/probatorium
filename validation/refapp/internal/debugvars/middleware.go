@@ -236,6 +236,10 @@ func (v *Vars) middlewareDocument(doc map[string]any) {
 	doc["celeris.jwt_validated_fail"] = m.jwtFail.Load()
 	doc["celeris.jwt_late_admits"] = m.jwtLateAdmits.Load()
 	doc["celeris.instrumented_properties"] = v.InstrumentedProperties()
+	// True only in a -tags=checkptr build. The property loop declares
+	// I-CHECKPTR on it, so a normal build never reports the predicate as
+	// covered when its counter is merely zero.
+	doc["celeris.checkptr_build"] = checkptrBuild
 }
 
 // TokenShadow is an independent token bucket the refapp runs alongside

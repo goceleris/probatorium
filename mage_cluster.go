@@ -98,6 +98,9 @@ func Status() error {
 //	CLUSTER_USE_LAN=1          — connect via the LAN IP map (LACP
 //	                             fabric) instead of Tailscale overlay.
 //	DEPLOY_COMPETITORS=all|... — competitor selection (see above).
+//	DEPLOY_PREBUILT_RACE_DIR=  — a directory of refapp-<slug>-race-<arch>
+//	                             binaries (BuildRaceRefapps' artifact) to
+//	                             stage under refapps-race/ on the nodes.
 //
 // Idempotent: re-running with the same competitor set is a no-op for
 // the manifest (deploy.yml re-asserts each file).
@@ -118,6 +121,9 @@ func Deploy() error {
 		pkg    string
 		out    string
 		arch   string
+		// args are extra `go build` arguments for a variant binary. Empty
+		// for every default job.
+		args []string
 	}
 
 	var jobs []bin
@@ -166,77 +172,7 @@ func Deploy() error {
 	//
 	// Each refapp produces a `refapp-<slug>-<arch>` binary the deploy
 	// playbook pushes to {{ bench_root }}/refapps/<slug>.
-	refappModules := []struct {
-		slug   string
-		module string
-		archs  []string
-	}{
-		{
-			slug:   "auth_session_ratelimit",
-			module: "validation/refapp/auth_session_ratelimit",
-			archs:  []string{"amd64", "arm64"},
-		},
-		{
-			// kitchen_sink covers 16+ stateless middlewares (recovery,
-			// requestid, secure, cors, bodylimit, methodoverride,
-			// rewrite, redirect, healthcheck, ratelimit, timeout,
-			// circuitbreaker, idempotency, singleflight, basicauth +
-			// per-route etag, cache). Added per probatorium#103.
-			slug:   "kitchen_sink",
-			module: "validation/refapp/kitchen_sink",
-			archs:  []string{"amd64", "arm64"},
-		},
-		{
-			// auth_jwt_csrf covers the alternative-auth surface
-			// (jwt, csrf, keyauth) that conflicts with kitchen_sink's
-			// basicauth path. Added per probatorium#103.
-			slug:   "auth_jwt_csrf",
-			module: "validation/refapp/auth_jwt_csrf",
-			archs:  []string{"amd64", "arm64"},
-		},
-		{
-			// driver_postgres: native postgres driver + session
-			// + ratelimit on top. Tier 1 covers I-DRV-1 read-after-
-			// write and pool-cap invariants. Added per #110.
-			slug:   "driver_postgres",
-			module: "validation/refapp/driver_postgres",
-			archs:  []string{"amd64", "arm64"},
-		},
-		{
-			// driver_redis: same shape as driver_postgres but for
-			// redis. Exercises CAS-free token-bucket via EVALSHA.
-			// Added per #110.
-			slug:   "driver_redis",
-			module: "validation/refapp/driver_redis",
-			archs:  []string{"amd64", "arm64"},
-		},
-		{
-			// driver_memcached: same shape for memcached. Token-
-			// bucket uses CAS-loop retries since memcached has no
-			// scripting. Added per #110.
-			slug:   "driver_memcached",
-			module: "validation/refapp/driver_memcached",
-			archs:  []string{"amd64", "arm64"},
-		},
-		{
-			// observability: logger + metrics + otel mounted
-			// together. Exposes /metrics in Prometheus text-plain
-			// format + obs_log_drops gauge for the Tier 1 walker
-			// to scrape. Added per #111.
-			slug:   "observability",
-			module: "validation/refapp/observability",
-			archs:  []string{"amd64", "arm64"},
-		},
-		{
-			// static_swagger_proxy: static (embed.FS) + swagger
-			// (OpenAPI spec + UI) + proxy (X-Forwarded-For trust).
-			// Covers the last untested middleware band.
-			// Added per #112.
-			slug:   "static_swagger_proxy",
-			module: "validation/refapp/static_swagger_proxy",
-			archs:  []string{"amd64", "arm64"},
-		},
-	}
+	refappModules := refappModuleList()
 	for _, r := range refappModules {
 		for _, arch := range r.archs {
 			jobs = append(jobs, bin{
@@ -246,6 +182,61 @@ func Deploy() error {
 				out:    filepath.Join(stagingDir, "refapp-"+r.slug+"-"+arch),
 				arch:   arch,
 			})
+		}
+	}
+
+	// checkptr variants of the refapps (I-CHECKPTR). Off by default:
+	// DEPLOY_CHECKPTR_REFAPPS="" builds none, "all" builds every refapp, a
+	// csv of slugs builds those. The variant is a SEPARATE binary set,
+	// never a flag flip on the default jobs, because the checker costs
+	// +38% (celeris-scoped) to +58% (all packages) geomean CPU on celeris's
+	// own benchmarks, up to +263% on the full-stack header path -- flipping
+	// it globally would re-characterise all 48 soak cells.
+	//
+	// -tags=checkptr is what the refapp REPORTS (debugvars publishes
+	// celeris.checkptr_build and declares I-CHECKPTR); the gcflags are what
+	// makes the checker exist. Both are needed: the flags alone leave no
+	// trace a running process can announce, and the tag alone would declare
+	// a predicate whose checker is compiled out.
+	//
+	// -tags=validation rides along: it compiles celeris's own assertion
+	// counters in (celeris/validation), among them the io_uring SQE
+	// monotonicity check behind I-ENG-IOURING, which has no other data
+	// source. debugvars publishes celeris.validation_build and the loop
+	// declares the predicate for the variant's io_uring cells. Same
+	// reasoning for keeping it off the default set: the counters are
+	// atomic adds on hot paths and would re-characterise the soak.
+	//
+	// Staged under a distinct name and published as a distinct ansible var,
+	// so deploy.yml lands them in refapps-checkptr/ rather than refapps/.
+	// That separation is load-bearing: cmd/validator/matrix.go treats every
+	// file under -matrix-bin-dir as a refapp slug, so a suffixed name in the
+	// normal directory would silently double the plan from 48 to 96 cells.
+	checkptrSel := envOrDefault("DEPLOY_CHECKPTR_REFAPPS", "")
+	if checkptrSel != "" {
+		want := map[string]bool{}
+		if checkptrSel != "all" {
+			for _, slug := range strings.Split(checkptrSel, ",") {
+				want[strings.TrimSpace(slug)] = true
+			}
+		}
+		for _, r := range refappModules {
+			if checkptrSel != "all" && !want[r.slug] {
+				continue
+			}
+			for _, arch := range r.archs {
+				jobs = append(jobs, bin{
+					label:  "refapp " + r.slug + " (checkptr) linux/" + arch,
+					module: r.module,
+					pkg:    ".",
+					out:    filepath.Join(stagingDir, "refapp-"+r.slug+"-checkptr-"+arch),
+					arch:   arch,
+					args: []string{
+						"-tags=checkptr,validation",
+						"-gcflags=github.com/goceleris/celeris/...=-d=checkptr=1",
+					},
+				})
+			}
 		}
 	}
 
@@ -326,7 +317,7 @@ func Deploy() error {
 
 	for _, j := range jobs {
 		fmt.Printf("Cross-compiling %s...\n", j.label)
-		if err := crossCompileGoBinary(j.module, j.pkg, j.out, j.arch); err != nil {
+		if err := crossCompileGoBinary(j.module, j.pkg, j.out, j.arch, j.args...); err != nil {
 			return fmt.Errorf("cross-compile %s: %w", j.label, err)
 		}
 	}
@@ -360,9 +351,22 @@ func Deploy() error {
 	}
 	competitorBinaries := make(map[string]map[string]string)
 	refappBinaries := make(map[string]map[string]string)
+	refappCheckptrBinaries := make(map[string]map[string]string)
 	for _, j := range jobs {
 		base := filepath.Base(j.out)
 		logical := strings.TrimSuffix(base, "-"+j.arch)
+		// Variant refapps are routed BEFORE the generic refapp branch, or
+		// "refapp-kitchen_sink-checkptr" would land in refapp_binaries as
+		// slug "kitchen_sink-checkptr" and be deployed into refapps/ -- where
+		// the validator would discover it as a ninth refapp.
+		if strings.HasPrefix(logical, "refapp-") && strings.HasSuffix(logical, "-checkptr") {
+			slug := strings.TrimSuffix(strings.TrimPrefix(logical, "refapp-"), "-checkptr")
+			if refappCheckptrBinaries[slug] == nil {
+				refappCheckptrBinaries[slug] = make(map[string]string)
+			}
+			refappCheckptrBinaries[slug][j.arch] = j.out
+			continue
+		}
 		if coreSet[logical] {
 			// runner / loadgen / observer / validator / conformance /
 			// validator-checker / validator-replay
@@ -390,6 +394,27 @@ func Deploy() error {
 	}
 	if len(refappBinaries) > 0 {
 		vars["refapp_binaries"] = refappBinaries
+	}
+	if len(refappCheckptrBinaries) > 0 {
+		vars["refapp_checkptr_binaries"] = refappCheckptrBinaries
+	}
+	// -race refapps are not built here (the race runtime is cgo and the
+	// runner host has only its own C compiler): BuildRaceRefapps makes
+	// them on a GitHub-hosted runner and the race tier hands the artifact
+	// over in DEPLOY_PREBUILT_RACE_DIR. Same slug-named files, their own
+	// directory on the nodes, for the same reason as the checkptr set.
+	if dir := os.Getenv("DEPLOY_PREBUILT_RACE_DIR"); dir != "" {
+		raceBins, err := collectPrebuiltRace(dir)
+		if err != nil {
+			return err
+		}
+		if len(raceBins) == 0 {
+			return fmt.Errorf("DEPLOY_PREBUILT_RACE_DIR=%s holds no refapp-<slug>-race-<arch> binaries", dir)
+		}
+		for slug, byArch := range raceBins {
+			fmt.Printf("Staging prebuilt -race refapp %s (%d arch)...\n", slug, len(byArch))
+		}
+		vars["refapp_race_binaries"] = raceBins
 	}
 	if len(competitorSources) > 0 {
 		vars["competitor_sources"] = competitorSources
@@ -445,6 +470,130 @@ func Deploy() error {
 	}
 	fmt.Printf("\n=== Deploy complete (%d binaries cross-compiled, %d Go competitors, %d native competitors) ===\n",
 		len(jobs), len(competitorBinaries), len(competitorSources))
+	return nil
+}
+
+// refappModule names one refapp under validation/refapp/ and the arches
+// it is built for. Shared by Deploy (plain + checkptr variants) and
+// BuildRaceRefapps (-race variants) so the three sets cannot drift.
+type refappModule struct {
+	slug   string
+	module string
+	archs  []string
+}
+
+func refappModuleList() []refappModule {
+	return []refappModule{
+		{
+			slug:   "auth_session_ratelimit",
+			module: "validation/refapp/auth_session_ratelimit",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// kitchen_sink covers 16+ stateless middlewares (recovery,
+			// requestid, secure, cors, bodylimit, methodoverride,
+			// rewrite, redirect, healthcheck, ratelimit, timeout,
+			// circuitbreaker, idempotency, singleflight, basicauth +
+			// per-route etag, cache). Added per probatorium#103.
+			slug:   "kitchen_sink",
+			module: "validation/refapp/kitchen_sink",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// auth_jwt_csrf covers the alternative-auth surface
+			// (jwt, csrf, keyauth) that conflicts with kitchen_sink's
+			// basicauth path. Added per probatorium#103.
+			slug:   "auth_jwt_csrf",
+			module: "validation/refapp/auth_jwt_csrf",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// driver_postgres: native postgres driver + session
+			// + ratelimit on top. Tier 1 covers I-DRV-1 read-after-
+			// write and pool-cap invariants. Added per #110.
+			slug:   "driver_postgres",
+			module: "validation/refapp/driver_postgres",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// driver_redis: same shape as driver_postgres but for
+			// redis. Exercises CAS-free token-bucket via EVALSHA.
+			// Added per #110.
+			slug:   "driver_redis",
+			module: "validation/refapp/driver_redis",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// driver_memcached: same shape for memcached. Token-
+			// bucket uses CAS-loop retries since memcached has no
+			// scripting. Added per #110.
+			slug:   "driver_memcached",
+			module: "validation/refapp/driver_memcached",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// observability: logger + metrics + otel mounted
+			// together. Exposes /metrics in Prometheus text-plain
+			// format + obs_log_drops gauge for the Tier 1 walker
+			// to scrape. Added per #111.
+			slug:   "observability",
+			module: "validation/refapp/observability",
+			archs:  []string{"amd64", "arm64"},
+		},
+		{
+			// static_swagger_proxy: static (embed.FS) + swagger
+			// (OpenAPI spec + UI) + proxy (X-Forwarded-For trust).
+			// Covers the last untested middleware band.
+			// Added per #112.
+			slug:   "static_swagger_proxy",
+			module: "validation/refapp/static_swagger_proxy",
+			archs:  []string{"amd64", "arm64"},
+		},
+	}
+}
+
+// BuildRaceRefapps builds the -race variant of the refapps for both
+// arches into BUILD_RACE_OUT (default race-refapps/), named
+// refapp-<slug>-race-<arch>. BUILD_RACE_REFAPPS selects "all" (default)
+// or a csv of slugs. Meant for a GitHub-hosted runner with
+// gcc-aarch64-linux-gnu installed: the race runtime is cgo, the cluster
+// nodes have no Go, and the runner host has only its own C compiler. The
+// race tier uploads the directory as an artifact and hands it to Deploy
+// through DEPLOY_PREBUILT_RACE_DIR.
+//
+// A separate binary set for the same reason as the checkptr variants:
+// the detector costs 2-10x CPU and 5-10x memory and would re-characterise
+// every cell of a normal run.
+func BuildRaceRefapps() error {
+	outDir := envOrDefault("BUILD_RACE_OUT", "race-refapps")
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	sel := envOrDefault("BUILD_RACE_REFAPPS", "all")
+	want := map[string]bool{}
+	if sel != "all" {
+		for _, slug := range strings.Split(sel, ",") {
+			want[strings.TrimSpace(slug)] = true
+		}
+	}
+	n := 0
+	for _, r := range refappModuleList() {
+		if sel != "all" && !want[r.slug] {
+			continue
+		}
+		for _, arch := range r.archs {
+			out := filepath.Join(outDir, raceVariantName(r.slug, arch))
+			fmt.Printf("Compiling refapp %s (-race) linux/%s...\n", r.slug, arch)
+			if err := raceCompileGoBinary(r.module, ".", out, arch); err != nil {
+				return fmt.Errorf("race-compile %s linux/%s: %w", r.slug, arch, err)
+			}
+			n++
+		}
+	}
+	if n == 0 {
+		return fmt.Errorf("BUILD_RACE_REFAPPS=%q selected no refapp", sel)
+	}
+	fmt.Printf("Built %d -race refapp binaries into %s\n", n, outDir)
 	return nil
 }
 

@@ -188,6 +188,18 @@ func BuildDocument(in BuildInput) *Document {
 			sr.Resources[c.ScenarioName] = c.Resources
 		}
 
+		// Per-scenario resource window (schema v5.9, celeris#585): the
+		// column's raw mpstat + observer series sliced to THIS scenario's
+		// runner window. Resources above is the column-wide mean stamped on
+		// every scenario; this is the number a per-cell CPU comparison
+		// reads. Absent when the scenario's window caught no sample.
+		if c.ScenarioResources != nil {
+			if sr.ScenarioResources == nil {
+				sr.ScenarioResources = map[string]*ResourceStats{}
+			}
+			sr.ScenarioResources[c.ScenarioName] = c.ScenarioResources
+		}
+
 		// Network-bound annotation (schema v5.5): a large-payload cell whose
 		// achieved egress bandwidth sat at the fabric ceiling while the
 		// loadgen still had CPU headroom is NIC-limited, not server-limited.

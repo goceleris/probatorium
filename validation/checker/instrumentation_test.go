@@ -108,11 +108,51 @@ func TestUninstrumented_MiddlewarePredicatesAreInstrumentable(t *testing.T) {
 			t.Errorf("%s must be declared-only (instrumented in the refapps that install the middleware)", id)
 		}
 	}
-	// I-RACE / I-CHECKPTR need a -race / -d=checkptr build of the refapps
-	// and are deliberately still out of reach; the reason stays on record.
-	for _, id := range []string{"I-RACE", "I-CHECKPTR"} {
-		if _, ok := Uninstrumented[id]; !ok {
-			t.Errorf("%s must stay on the uninstrumented record with its reason", id)
-		}
+	// I-RACE moved to declared-only: the race tier's refapps are -race
+	// builds that report celeris.race_build, and the liveness scan counts
+	// their reports. Nothing is left on the blanket waiver: every
+	// registered predicate now has a data source somewhere in the matrix.
+	if _, ok := Uninstrumented["I-RACE"]; ok {
+		t.Error("I-RACE is blanket-waived again; the race tier's cells could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-RACE"]; !ok {
+		t.Error("I-RACE must be declared-only, so a plain build's zero is not a pass")
+	}
+	if len(Uninstrumented) != 0 {
+		t.Errorf("every predicate has a data source now; the blanket waiver must be empty, got %v", Uninstrumented)
+	}
+	// I-CHECKPTR moved to declared-only: a -tags=checkptr refapp declares it
+	// and the liveness crash scan feeds it at cell end. It must NOT be back
+	// on the blanket waiver, and it must NOT be judged in a normal build.
+	if _, ok := Uninstrumented["I-CHECKPTR"]; ok {
+		t.Error("I-CHECKPTR is blanket-waived again; a -tags=checkptr cell could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-CHECKPTR"]; !ok {
+		t.Error("I-CHECKPTR must be declared-only, so a normal build's structural zero is not a pass")
+	}
+	// I-MEM-2 moved to declared-only: the property loop declares it when
+	// the orchestrator's second idle window begins. A cell that never idled
+	// must report it as not instrumented, never as passed.
+	if _, ok := Uninstrumented["I-MEM-2"]; ok {
+		t.Error("I-MEM-2 is blanket-waived again; a cell that idled twice could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-MEM-2"]; !ok {
+		t.Error("I-MEM-2 must be declared-only, so a cell that never idled is not a pass")
+	}
+	// I-DRV moved to declared-only: the driver refapps read every write back
+	// and publish the tally; everything else has structural zeros.
+	if _, ok := Uninstrumented["I-DRV"]; ok {
+		t.Error("I-DRV is blanket-waived again; the driver cells could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-DRV"]; !ok {
+		t.Error("I-DRV must be declared-only, so a refapp with no store is not a pass")
+	}
+	// I-ENG-IOURING moved to declared-only: the property loop declares it
+	// for an io_uring cell whose refapp reports a -tags=validation build.
+	if _, ok := Uninstrumented["I-ENG-IOURING"]; ok {
+		t.Error("I-ENG-IOURING is blanket-waived again; the instrumented tier's io_uring cells could never count as covered")
+	}
+	if _, ok := DeclaredOnly["I-ENG-IOURING"]; !ok {
+		t.Error("I-ENG-IOURING must be declared-only, so a plain build's stub zero is not a pass")
 	}
 }

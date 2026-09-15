@@ -152,16 +152,22 @@ const rssSlopeMaxBytesPerSec = 64 * 1024.0
 // not a leak verdict).
 const rssRiseRelFloor = 0.05
 
-// goroutineSettleDuration is how long I-MEM-2 waits after Context.IdleMode
-// flips true before enforcing the baseline-return assertion. Most
-// pooled goroutines exit within a single GC cycle; 30s is generous.
-const goroutineSettleDuration = 30 * time.Second
+// IdleSettle is how long I-MEM-2 waits into an idle window before
+// judging it. Most pooled goroutines exit within a single GC cycle; 30s
+// is generous. A var, not a const, so the loop test can run a whole
+// burst/idle/load/idle sequence in under a second.
+var IdleSettle = 30 * time.Second
 
-// goroutineBaselinePad is the slack added to the post-idle goroutine
-// budget. The engine spins up a small ladder of background goroutines
-// (epoll readers, the scheduler timer, the metrics publisher) per
-// listener; +N=8 covers the worst case without masking a real leak.
+// goroutineBaselinePad is the slack over the first idle window's settled
+// count. The responsiveness probe and the property poller each hold a
+// keep-alive conn that the std engine serves from its own goroutine,
+// and the engines' timers wake in small ladders; +8 covers that jitter
+// without masking a per-request goroutine that never exits.
 const goroutineBaselinePad int64 = 8
+
+// idlePersistSamples is [Spec.Persist] for I-MEM-2: three consecutive
+// samples over budget, so a single probe-conn blip is not a leak.
+const idlePersistSamples = 3
 
 // slopeWindow returns the History samples inside the trailing window
 // that also fall after the warm-up period, filtered by keep (nil keeps
@@ -169,11 +175,18 @@ const goroutineBaselinePad int64 = 8
 // unknown run start, fewer than slopeMinSamples points, or a
 // first-to-last span shorter than slopeMinSpan.
 func slopeWindow(ctx Context, window time.Duration, keep func(Snapshot) bool) (samples []Snapshot, ok bool) {
-	if ctx.RunStartedAt.IsZero() {
+	// The warm-up is measured from the start of SUSTAINED load: when the
+	// cell ran the I-MEM-2 prelude (burst, idle), the resume transient
+	// would otherwise sit inside the first fit as a rising trough.
+	start := ctx.RunStartedAt
+	if !ctx.LoadStartedAt.IsZero() {
+		start = ctx.LoadStartedAt
+	}
+	if start.IsZero() {
 		return nil, false
 	}
 	cutoff := ctx.Now.Add(-window)
-	if warm := ctx.RunStartedAt.Add(slopeWarmup); warm.After(cutoff) {
+	if warm := start.Add(slopeWarmup); warm.After(cutoff) {
 		cutoff = warm
 	}
 	cutoffTS := cutoff.Unix()
@@ -509,40 +522,65 @@ var IMEM4 = Spec{
 	},
 }
 
-// IMEM2 asserts goroutine count returns to baseline+pad once the
-// orchestrator declares an idle window. Catches the classic
-// "stuck-handler" leak where a panicking middleware leaves its
-// per-request goroutine wedged.
+// IMEM2 asserts that goroutines return to the refapp's own idle level
+// once load stops: the classic stuck-handler leak, where a per-request
+// goroutine (a wedged middleware, a handler blocked on a channel nobody
+// closes) outlives its request and is invisible while load keeps the
+// count high.
 //
-// Gated on ctx.IdleMode (only the orchestrator can enter idle mode,
-// after letting the load die down) plus a 30s settle period after
-// idle-mode start. The settle period uses ctx.History as a proxy: if
-// the most recent in-history snapshot already has IdleMode==true for
-// at least goroutineSettleDuration of contiguous samples, the
-// assertion is live.
+// The reference is NOT the count at readiness. Measured over 48 one-hour
+// soak cells, every refapp sits above that for the rest of its life
+// after its first request -- +10 on the native engines for a static
+// route, +40 to +50 for a driver pool, +60 to +100 on the std engine,
+// which serves each conn from a goroutine -- and none of it is a leak.
+// So the orchestrator idles the refapp TWICE (tier1Config.IdleWindows):
+// once after a short burst, whose settled count is the baseline, and
+// once at the end of the cell. Whatever the first idle kept is the
+// refapp's own; whatever the second idle keeps on top of it accumulated
+// under load and never left.
+//
+// Judged only inside idle window 2 and later, IdleSettle after the
+// window began, against Context.IdleBaselineGoroutines + pad.
 var IMEM2 = Spec{
-	ID:          "I-MEM-2",
-	Description: "goroutines return to baseline+8 after 30s idle",
-	Tier:        "core",
+	ID: "I-MEM-2",
+	Description: fmt.Sprintf("idle goroutines ≤ first idle window's settled count + %d, judged %s into every later idle window",
+		goroutineBaselinePad, IdleSettle),
+	Tier:    "core",
+	Persist: idlePersistSamples,
 	Predicate: func(snap *Snapshot, ctx Context) (bool, string) {
-		if !ctx.IdleMode {
-			return Skip("no idle window (Context.IdleMode is false)")
+		switch {
+		case ctx.IdleWindow == 0:
+			return Skip("no idle window (the orchestrator is driving load)")
+		case ctx.IdleWindow == 1:
+			return Skip("first idle window: establishing the idle baseline")
+		case ctx.IdleBaselineGoroutines <= 0:
+			return Skip("no idle baseline (the first idle window was never left)")
 		}
-		// The orchestrator sets ctx.IdleMode for every snapshot inside
-		// an idle window; count how many of the trailing samples in
-		// History have a TS within the settle period. (The IdleMode
-		// field on Snapshot is the orchestrator's signal; if not yet
-		// fed through we conservatively skip.)
-		needed := int(goroutineSettleDuration / time.Second)
-		if len(ctx.History) < needed {
+		start, ok := idleWindowStart(ctx)
+		if !ok || time.Duration(snap.TS-start)*time.Second < IdleSettle {
 			return Skip("idle window has not settled yet")
 		}
-		budget := ctx.BaselineGoroutines + goroutineBaselinePad
+		budget := ctx.IdleBaselineGoroutines + goroutineBaselinePad
 		if snap.GoroutineCount > budget {
 			return false, fmt.Sprintf(
-				"I-MEM-2 violated: idle goroutine count %d exceeds baseline(%d)+%d=%d",
-				snap.GoroutineCount, ctx.BaselineGoroutines, goroutineBaselinePad, budget)
+				"I-MEM-2 violated: idle goroutine count %d in idle window %d exceeds first-idle baseline(%d)+%d=%d",
+				snap.GoroutineCount, ctx.IdleWindow, ctx.IdleBaselineGoroutines, goroutineBaselinePad, budget)
 		}
 		return true, ""
 	},
+}
+
+// idleWindowStart returns the TS of the first History sample of the
+// current idle window: the contiguous trailing samples that share
+// ctx.IdleWindow. ok is false when History holds none (the evaluator
+// appends the sample under judgement before evaluating, so a live
+// window always has at least one).
+func idleWindowStart(ctx Context) (start int64, ok bool) {
+	for i := len(ctx.History) - 1; i >= 0; i-- {
+		if ctx.History[i].IdleWindow != ctx.IdleWindow {
+			break
+		}
+		start, ok = ctx.History[i].TS, true
+	}
+	return start, ok
 }

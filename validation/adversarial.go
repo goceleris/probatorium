@@ -23,6 +23,13 @@ import (
 // Excludes timeout errors — the walker calls SetReadDeadline(now) for
 // non-blocking semantics, so a deadline-exceeded result means "no data
 // AND not closed (yet)" which is the keep-dripping case.
+// isTimeoutErr reports whether err is a deadline on OUR side of the
+// conn (net.Error.Timeout), which says nothing about what the server did.
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 func isCloseObservation(err error) bool {
 	if errors.Is(err, io.EOF) {
 		return true
@@ -182,7 +189,9 @@ func runAdversarialWalker(ctx context.Context, hostPort string,
 //
 // Refapps that set a longer ReadHeaderTimeout will still legitimately
 // trip the hang counter (i.e., they disabled their slowloris defence).
-const slowlorisDripBudget = 20 * time.Second
+// A var, not a const, so the hang test can shrink the budget and run
+// hundreds of walkers in seconds instead of one walker in twenty.
+var slowlorisDripBudget = 20 * time.Second
 
 // fireAdversarial opens one raw TCP conn, writes the mode's bad-bytes
 // payload, reads up to one short response, and classifies the result.
@@ -238,6 +247,19 @@ func fireAdversarial(ctx context.Context, hostPort string,
 		// v1.4.11 celeris-side fixes that bring iouring close to
 		// kernel-precision: residual hangs are walker-observation
 		// lag, not engine close failure.
+		// dripDeadline is the same instant as a wall-clock value so the
+		// ticker branch can re-check it. select picks uniformly among
+		// ready cases, and once the budget has elapsed BOTH cases are
+		// ready on every iteration (each loop takes >= 200ms, so a tick
+		// is always waiting): every iteration the timer lost was a coin
+		// flip that stretched the walk by one more 200ms drip. Five
+		// losses in a row (1/32) carried it past the conn's own write
+		// deadline at budget+1s, the Write failed with a timeout, and a
+		// server that never closed was scored as a rejection. Sixty
+		// concurrent walkers against a never-closing server measured
+		// exactly that geometric tail: 25, 19, 9, 4, 2, 1 exits at each
+		// successive 200ms step past the budget.
+		dripDeadline := time.Now().Add(slowlorisDripBudget)
 		slowDripDeadline := time.After(slowlorisDripBudget)
 		t := time.NewTicker(200 * time.Millisecond)
 		defer t.Stop()
@@ -253,7 +275,18 @@ func fireAdversarial(ctx context.Context, hostPort string,
 				tally.hang.Add(1)
 				return
 			case <-t.C:
+				if !time.Now().Before(dripDeadline) {
+					// The timer case lost the select; same verdict.
+					tally.hang.Add(1)
+					return
+				}
 				if _, err := conn.Write([]byte("X")); err != nil {
+					if isTimeoutErr(err) {
+						// Our own deadline, not the server's doing: the
+						// conn is still open and the budget is spent.
+						tally.hang.Add(1)
+						return
+					}
 					tally.wellReject.Add(1)
 					break slowloop
 				}

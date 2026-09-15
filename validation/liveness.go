@@ -48,9 +48,72 @@ type livenessTally struct {
 	hung      atomic.Bool
 	hangFails atomic.Int64 // consecutive health-probe timeouts that tripped it
 
+	// checkptrReports counts crash signatures that name the pointer checker.
+	// A -d=checkptr violation is a runtime THROW -- "fatal error: checkptr:
+	// misaligned pointer conversion" and three siblings -- so the process is
+	// gone before the property loop's next poll. The loop can therefore
+	// never sample CheckptrReports > 0 on its own; this counter, taken from
+	// the same stderr scan that already catches the crash, is what feeds
+	// I-CHECKPTR at cell end.
+	checkptrReports atomic.Int64
+	// raceReports counts "WARNING: DATA RACE" reports on stderr. The race
+	// detector prints one per distinct race and lets the process run, so
+	// unlike a checkptr throw this is a live counter the property loop
+	// reads on every tick (I-RACE), not a post-mortem one.
+	raceReports atomic.Int64
+	// raceSamples keeps the text of the first raceSampleMax reports, so
+	// the site is in the cell document rather than only in a stderr tail
+	// that the next few thousand lines may have scrolled out of. Counting
+	// a report and discarding its text is the oracle shape that has
+	// blocked diagnosis before (RULE ELEVEN); the count is for the
+	// predicate, the sample is for the person who reads the dossier.
+	raceSamples []string
+
 	mu        sync.Mutex
 	signature string // first crash-signature line scraped from stderr
 	trace     string // bounded stderr tail captured around the crash
+
+	// tail is the rolling ring of the last refappTailMaxLines post-ready
+	// lines. It used to be local to superviseStderr and was read only when
+	// the process died, so for a LIVE refapp the engine's Warn/Error lines
+	// -- the epoll "accepted fd exceeds conn table cap; dropping", the
+	// EMFILE/ENFILE path, the io_uring "re-create listen socket" -- were
+	// discarded (celeris#588). Owned here so tailSnapshot can hand it to
+	// the cell document and to every incident dossier while the process
+	// is still up.
+	tail    [refappTailMaxLines]string
+	tailLen int
+	tailPos int
+}
+
+// pushTail appends one post-ready line to the ring.
+func (l *livenessTally) pushTail(line string) {
+	l.mu.Lock()
+	l.tail[l.tailPos] = line
+	l.tailPos = (l.tailPos + 1) % refappTailMaxLines
+	if l.tailLen < refappTailMaxLines {
+		l.tailLen++
+	}
+	l.mu.Unlock()
+}
+
+// tailSnapshot copies the ring oldest first. nil when nothing was written,
+// so a quiet refapp's cell document omits the key.
+func (l *livenessTally) tailSnapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.tailLen == 0 {
+		return nil
+	}
+	start := 0
+	if l.tailLen == refappTailMaxLines {
+		start = l.tailPos
+	}
+	out := make([]string, 0, l.tailLen)
+	for i := 0; i < l.tailLen; i++ {
+		out = append(out, l.tail[(start+i)%refappTailMaxLines])
+	}
+	return out
 }
 
 // recordHang marks the refapp as wedged: alive but unresponsive (health probe
@@ -80,6 +143,24 @@ func (l *livenessTally) recordSignature(line string) {
 	}
 	l.mu.Unlock()
 	l.crashed.Store(true)
+	if isCheckptrSignature(line) {
+		l.checkptrReports.Add(1)
+	}
+}
+
+// isCheckptrSignature reports whether a crash line came from the pointer
+// checker. runtime/checkptr.go throws exactly four messages, every one
+// prefixed "checkptr: "; the runtime prints them as "fatal error: checkptr:
+// ...". Matched on the substring so a future fifth message is still caught.
+func isCheckptrSignature(line string) bool {
+	return strings.Contains(line, "checkptr:")
+}
+
+// isRaceReport reports whether line opens a race-detector report. The
+// runtime prints exactly "WARNING: DATA RACE" as the first line of every
+// report (runtime/race, ReportRace), between two "==================" rules.
+func isRaceReport(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "WARNING: DATA RACE")
 }
 
 // attachTrace records the bounded crash trace captured after the signature
@@ -105,6 +186,32 @@ func (l *livenessTally) snapshot() livenessSnapshot {
 		Trace:     tr,
 		Hung:      l.hung.Load(),
 		HangFails: int(l.hangFails.Load()),
+
+		CheckptrReports: l.checkptrReports.Load(),
+		RaceReports:     l.raceReports.Load(),
+		RaceReportSamples: func() []string {
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			return append([]string(nil), l.raceSamples...)
+		}(),
+	}
+}
+
+// raceSampleMax bounds the report texts kept per cell; every report past
+// it is still counted. raceSampleMaxLines bounds one report: the runtime
+// prints a handful of frames per side plus the goroutine origins, and a
+// report never reaches sixty lines of substance.
+const (
+	raceSampleMax      = 3
+	raceSampleMaxLines = 60
+)
+
+// recordRaceSample keeps the text of a report while there is room.
+func (l *livenessTally) recordRaceSample(text string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.raceSamples) < raceSampleMax {
+		l.raceSamples = append(l.raceSamples, text)
 	}
 }
 
@@ -134,6 +241,19 @@ type livenessSnapshot struct {
 	Hung bool `json:"hung,omitempty"`
 	// HangFails is the consecutive probe-timeout count that tripped Hung.
 	HangFails int `json:"hang_fails,omitempty"`
+	// CheckptrReports is how many crash signatures named the pointer
+	// checker. Non-zero means the refapp was a -d=checkptr build and it
+	// tripped. See livenessTally.checkptrReports for why this lives here
+	// rather than on the property-loop snapshot.
+	CheckptrReports int64 `json:"checkptr_reports,omitempty"`
+	// RaceReports is the number of race-detector reports seen on stderr;
+	// always 0 for a refapp not built with -race.
+	RaceReports int64 `json:"race_reports"`
+	// RaceReportSamples is the text of the first few reports (see
+	// raceSampleMax): the "WARNING: DATA RACE" header through the closing
+	// rule, with the read/write sites and goroutine origins the runtime
+	// prints between them.
+	RaceReportSamples []string `json:"race_report_samples,omitempty"`
 }
 
 // Reason renders a one-line human-readable cause for the incident message.
@@ -285,16 +405,20 @@ func looksLikeCrash(line string) bool {
 //     process from exiting and HIDE the crash from the exit watcher.
 func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), onReadyFail func(error), onCrash func()) {
 	sc := bufio.NewScanner(r)
+	// raceBuf collects one race-detector report from its header to its
+	// closing rule; raceLines is 0 outside a report.
+	var raceBuf strings.Builder
+	raceLines := 0
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	ready := false
 	var preReady strings.Builder
 	capturing := false
 	var trace strings.Builder
 	traceLines := 0
-	// Rolling ring of the last refappTailMaxLines post-ready lines, so a death
-	// with NO recognised crash signature still records its final output.
-	ring := make([]string, refappTailMaxLines)
-	ringLen, ringPos := 0, 0
+	// The rolling ring of the last refappTailMaxLines post-ready lines lives
+	// on the tally (pushTail / tailSnapshot), so a death with NO recognised
+	// crash signature still records its final output AND a live refapp's
+	// engine warnings reach the cell document.
 	for sc.Scan() {
 		line := sc.Text()
 		if !ready {
@@ -309,11 +433,7 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 			}
 			continue
 		}
-		ring[ringPos] = line
-		ringPos = (ringPos + 1) % refappTailMaxLines
-		if ringLen < refappTailMaxLines {
-			ringLen++
-		}
+		l.pushTail(line)
 		if capturing {
 			if traceLines < crashTraceMaxLines && trace.Len() < crashTraceMaxBytes {
 				trace.WriteString(line)
@@ -321,6 +441,26 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 				traceLines++
 			}
 			continue
+		}
+		if isRaceReport(line) {
+			l.raceReports.Add(1)
+			raceBuf.Reset()
+			raceBuf.WriteString(line)
+			raceBuf.WriteByte('\n')
+			raceLines = 1
+			continue
+		}
+		if raceLines > 0 {
+			// Inside a report: the runtime closes it with a rule of '='.
+			// Keep the text up to and including that rule, or until the
+			// line budget runs out, then hand the sample over.
+			raceBuf.WriteString(line)
+			raceBuf.WriteByte('\n')
+			raceLines++
+			if strings.HasPrefix(strings.TrimSpace(line), "==================") || raceLines >= raceSampleMaxLines {
+				l.recordRaceSample(raceBuf.String())
+				raceLines = 0
+			}
 		}
 		if looksLikeCrash(line) {
 			l.recordSignature(strings.TrimSpace(line))
@@ -345,18 +485,18 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 	switch {
 	case capturing:
 		l.attachTrace(trace.String())
-	case ready && ringLen > 0:
+	case ready:
 		// Died after ready with no recognised crash signature (e.g. a clean
 		// os.Exit(1) from the refapp's own log.Fatalf). Attach the tail of the
 		// merged stream so the incident records WHY instead of just "exit=1".
-		start := 0
-		if ringLen == refappTailMaxLines {
-			start = ringPos
+		lines := l.tailSnapshot()
+		if len(lines) == 0 {
+			return
 		}
 		var tail strings.Builder
 		tail.WriteString("--- refapp stdout+stderr tail (no crash signature) ---\n")
-		for i := 0; i < ringLen; i++ {
-			tail.WriteString(ring[(start+i)%refappTailMaxLines])
+		for _, line := range lines {
+			tail.WriteString(line)
 			tail.WriteByte('\n')
 		}
 		l.attachTrace(tail.String())

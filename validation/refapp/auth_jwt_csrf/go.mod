@@ -3,13 +3,13 @@ module github.com/goceleris/probatorium/validation/refapp/auth_jwt_csrf
 go 1.27.0
 
 require (
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20260909133624-c9f7dad43771
+	github.com/goceleris/celeris v1.5.12-0.20260915011209-7a651c31f2f0
 	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
 )
 

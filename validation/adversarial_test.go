@@ -187,13 +187,15 @@ func TestRunAdversarialWalker_FiresMultipleRequests(t *testing.T) {
 		_ = c.Close()
 	})
 	var tally adversarialTally
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	// Run until the walker HAS fired repeatedly, rather than for 300 ms
+	// and hoping six 50 ms ticks fit (tier1_until_test.go).
+	const want = 6
+	ctx, cancel := cancelWhen(t, func() bool { return tally.snapshot().Sent >= want })
 	defer cancel()
-	// 50ms tick → ~6 requests in 300ms.
 	runAdversarialWalker(ctx, srv.HostPort(), 0x1, 50*time.Millisecond, &tally)
 	s := tally.snapshot()
-	if s.Sent < 2 {
-		t.Errorf("Sent: got %d, want >= 2", s.Sent)
+	if s.Sent < want {
+		t.Errorf("Sent: got %d, want >= %d", s.Sent, want)
 	}
 }
 
@@ -229,25 +231,67 @@ func TestFireAdversarial_SlowlorisCloseWithinReadHeaderTimeoutNotHang(t *testing
 // TestFireAdversarial_SlowlorisServerNeverClosesIsHang complements the
 // above: a server that holds the conn open past the full drip budget
 // IS a hang (the bug the counter is meant to catch).
+//
+// Two hundred walkers at once, on a 2s budget, because the defect this
+// pins was a 1-in-32 coin flip per walker: with both the drip timer and
+// the tick ready, select could keep choosing the tick until the conn's
+// write deadline (budget+1s) fired and the never-closing server was
+// scored as a rejection. One walker passed 97% of the time; two hundred
+// fail 99.8% of the time against the old loop and never against the
+// fixed one, which exits within one drip of the budget.
 func TestFireAdversarial_SlowlorisServerNeverClosesIsHang(t *testing.T) {
 	if testing.Short() {
-		t.Skip("12s drip budget; skipped under -short")
+		t.Skip("drip budget; skipped under -short")
 	}
-	srv := newFakeAdversarialServer(t, func(c net.Conn) {
-		defer func() { _ = c.Close() }()
-		// Slow-drain incoming bytes forever; never close.
-		buf := make([]byte, 1)
-		for {
-			if _, err := c.Read(buf); err != nil {
-				return
+	saved := slowlorisDripBudget
+	slowlorisDripBudget = 2 * time.Second
+	t.Cleanup(func() { slowlorisDripBudget = saved })
+	budget := slowlorisDripBudget
+
+	const walkers = 200
+	type result struct {
+		elapsed   time.Duration
+		hang, rej int64
+	}
+	out := make(chan result, walkers)
+	for i := 0; i < walkers; i++ {
+		srv := newFakeAdversarialServer(t, func(c net.Conn) {
+			defer func() { _ = c.Close() }()
+			// Slow-drain incoming bytes forever; never close.
+			buf := make([]byte, 1)
+			for {
+				if _, err := c.Read(buf); err != nil {
+					return
+				}
 			}
+		})
+		go func() {
+			var tally adversarialTally
+			started := time.Now()
+			fireAdversarial(context.Background(), srv.HostPort(), ModeSlowloris, &tally)
+			s := tally.snapshot()
+			out <- result{time.Since(started), s.HangUntilTimeout, s.WellRejected}
+		}()
+	}
+	var notHang, late int
+	var slowest time.Duration
+	for i := 0; i < walkers; i++ {
+		r := <-out
+		if r.hang != 1 || r.rej != 0 {
+			notHang++
 		}
-	})
-	var tally adversarialTally
-	fireAdversarial(context.Background(), srv.HostPort(), ModeSlowloris, &tally)
-	s := tally.snapshot()
-	if s.HangUntilTimeout != 1 {
-		t.Errorf("never-closing server must count as hang, got %d", s.HangUntilTimeout)
+		// Past the conn's write deadline the old loop could no longer
+		// produce a hang at all; a fixed walker is out within one drip.
+		if r.elapsed >= budget+time.Second {
+			late++
+		}
+		slowest = max(slowest, r.elapsed)
+	}
+	if notHang != 0 {
+		t.Errorf("never-closing server must count as hang: %d/%d walkers scored otherwise", notHang, walkers)
+	}
+	if late != 0 {
+		t.Errorf("%d/%d walkers ran past the write deadline (slowest %s); the drip deadline must win the select", late, walkers, slowest)
 	}
 }
 

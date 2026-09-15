@@ -2,6 +2,7 @@ package report
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -66,6 +67,24 @@ type GateOptions struct {
 	// ValidateGate defaults this off for them.
 	RequireCoverage bool
 
+	// ExpectInstrumented names predicates that every property-running cell
+	// of THIS run must have declared, waiver or not. The waiver record says
+	// "this hole may exist somewhere"; a tier built to close that hole (the
+	// soak's 1 h cells for I-MEM-2, the checkptr tier for I-CHECKPTR) must
+	// not be able to fall back on it: a regression in the declaration path
+	// would otherwise turn a covered predicate back into a waived one with
+	// the gate still green. Per cell, so the report names where it went
+	// missing.
+	ExpectInstrumented []string
+	// ExpectAdaptiveSwitch fails every adaptive cell whose property loop ran
+	// and never sampled celeris.adaptive_switches >= 1: the engine stayed on
+	// its start engine (epoll) for the whole cell, so the adaptive
+	// promotion path, the one thing that makes the cell different from an
+	// epoll cell, was never exercised (celeris#580). The matrix sizes
+	// adaptive cells so that the promotion is reachable (see
+	// cmd/validator/matrix.go); this is the check that it happened.
+	ExpectAdaptiveSwitch bool
+
 	// H2CUpgradeRefapps names the refapps whose cells must record at least
 	// one completed h1->h2c upgrade (tier_1.h2c_churn.h2c_upgraded > 0)
 	// once the churn slice has sent anything at all. Nil selects
@@ -85,14 +104,13 @@ type GateOptions struct {
 // The reasons mirror validation/checker.Uninstrumented; report/ is a leaf
 // package and does not import it.
 var WaivedUninstrumented = map[string]string{
-	"I-RACE":        "needs a -race build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
-	"I-CHECKPTR":    "needs a -d=checkptr build of the refapps plus a stderr marker counter; out of scope for probatorium#297",
-	"I-CONN-1":      "needs a per-connection last-byte table in the refapps (OldestOpenConnLastByteAgeMs)",
-	"I-RFC-1":       "needs the response-scraping MITM in front of each refapp",
-	"I-RFC-2":       "needs the response-scraping MITM in front of each refapp",
-	"I-MEM-2":       "needs an orchestrator-driven idle window (properties.Context.IdleMode)",
-	"I-DRV":         "needs the validator's driver shadow map",
-	"I-ENG-IOURING": "SQE/CQE counters exist only in a -tags=validation build of celeris",
+	"I-RACE":         "instrumented only in the race tier, whose refapps are -race builds (cgo, built on a GitHub-hosted runner and shipped to the nodes); a normal run deploys no such refapp",
+	"I-CHECKPTR":     "instrumented only in cells whose refapp is a -tags=checkptr build; a run that deploys none has no cell that can judge it",
+	"I-RFC-1":        "needs the response-scraping MITM in front of each refapp",
+	"I-RFC-2":        "needs the response-scraping MITM in front of each refapp",
+	"I-MEM-2":        "instrumented only in cells long enough to idle the refapp twice (20 min or more; the soak's 1 h cells); a 150 s nightly cell never idles",
+	"I-ENG-IOURING":  "instrumented only in the io_uring cells of the instrumented tier (refapps built -tags=checkptr,validation); a normal run deploys no such refapp",
+	"I-ENG-ADAPTIVE": "instrumented only in adaptive cells; a run whose engine subset excludes adaptive (VALIDATE_MATRIX_ENGINES) has no cell that can judge it",
 }
 
 // ranPropertyLoop reports whether the cell's in-process property loop
@@ -268,15 +286,21 @@ var DefaultH2CUpgradeRefapps = []string{"kitchen_sink"}
 // Informational counters are deliberately NOT here: *_sent, *_upgraded,
 // h2c_declined, h2c_intentional_rst, h2c_hang_max_elapsed_ms (a duration),
 // adv_well_rejected, ws_closed_correctly, sse_established, sse_events_read,
-// sse_killed_mid_stream (the validator kills on purpose) and *_endpoint_absent
-// (the refapp has no such endpoint). h2c_upgraded is informational as a
+// sse_killed_mid_stream (the validator kills on purpose), *_endpoint_absent
+// (the refapp has no such endpoint), and on the large-echo slice
+// ws_echo_fires, ws_echo_ok, ws_echo_close_ok, ws_echo_cut_at_deadline (the
+// budget ended mid-stream), ws_echo_frame_err (detail on a missing fire) and
+// ws_echo_handshake_fail -- the torture slice already gates a failed upgrade
+// on the very same route at many times the rate, and gating it twice would
+// report one routing defect as two violations. h2c_upgraded is informational as a
 // MAGNITUDE only -- its being zero is gated separately in Gate, because a
 // refapp that should upgrade and never did means the whole slice measured
 // nothing (probatorium#279).
 //
 // The CAUSE splits are also excluded, and deliberately so: h2c_hang_{eof,
-// timeout,reset,other} sum to h2c_hang, and ws_handshake_fail_{eof,timeout,
-// reset,status,other} sum to ws_handshake_fail. Gating both a total and its
+// timeout,reset,other} sum to h2c_hang, ws_handshake_fail_{eof,timeout,
+// reset,status,other} sum to ws_handshake_fail, and ws_echo_{egress_interleave,
+// other_corrupt} sum to ws_echo_corrupt. Gating both a total and its
 // parts reports one defect as two violations — the v1.5.11 soak printed "5
 // violations" for what were only THREE distinct events, because a single h2c
 // hang was counted once as h2c_hang and again as h2c_hang_timeout. The cause
@@ -300,7 +324,19 @@ var gatedTier1Keys = []struct{ slice, key, why string }{
 	{"ws_torture", "ws_hang_no_close", "a WebSocket conn never completed its close"},
 	{"ws_torture", "ws_handshake_fail", "a WebSocket upgrade handshake failed"},
 	{"sse_kill", "sse_handshake_fail", "an SSE handshake failed"},
-	{"sse_kill", "sse_server_closed_early", "the server closed an SSE stream before the client did"},
+	{"sse_kill", "sse_server_closed_early", "the server sent FIN on an SSE stream before the client did"},
+	// Split out of sse_server_closed_early, which classified purely on
+	// timing and so asserted "the server closed it" for any read error.
+	// Both of these still fail: the split is for attribution, not tolerance.
+	{"sse_kill", "sse_peer_reset_early", "an SSE stream was reset before the client hung up (engine or transport -- see sse_early_errs)"},
+	{"sse_kill", "sse_read_err_early", "an SSE stream failed with an unclassified read error (see sse_early_errs)"},
+	// WebSocket large-echo slice (celeris#587): the wire-level oracle for
+	// large detached sends. Each row is a distinct defect shape; the
+	// corrupt row carries its attribution split as cause detail.
+	{"ws_echo", "ws_echo_corrupt", "a 64 KiB WebSocket echo was not the byte image of the frame sent"},
+	{"ws_echo", "ws_echo_reorder", "a 64 KiB WebSocket echo arrived out of sequence"},
+	{"ws_echo", "ws_echo_missing", "a WebSocket echo connection ended with frames still unanswered"},
+	{"ws_echo", "ws_echo_timeout", "a WebSocket echo connection stopped delivering before its hold expired"},
 }
 
 // causeCounters maps a gated total to the cause counters that sum to it.
@@ -309,6 +345,7 @@ var gatedTier1Keys = []struct{ slice, key, why string }{
 var causeCounters = map[string][]string{
 	"h2c_hang":          {"h2c_hang_eof", "h2c_hang_timeout", "h2c_hang_reset", "h2c_hang_other"},
 	"ws_handshake_fail": {"ws_handshake_fail_eof", "ws_handshake_fail_timeout", "ws_handshake_fail_reset", "ws_handshake_fail_status", "ws_handshake_fail_other"},
+	"ws_echo_corrupt":   {"ws_echo_egress_interleave", "ws_echo_other_corrupt"},
 }
 
 // causeSuffix renders the non-zero cause breakdown for a gated total, e.g.
@@ -329,6 +366,47 @@ func causeSuffix(m map[string]int64, key string) string {
 		return ""
 	}
 	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// slowFireDetail maps a gated total to the slow-fire ring that carries its
+// per-event records.
+func slowFireDetail(t *Tier1Summary, key string) []SlowFire {
+	switch key {
+	case "h2c_hang":
+		return t.H2CSlowReads
+	case "ws_handshake_fail":
+		return t.WSSlowReads
+	}
+	return nil
+}
+
+// FirstFailedSlowFire renders the first failed record of a slow-fire ring
+// as a message suffix, e.g. " first: 2026-09-06T04:32:31Z read=20000ms
+// outcome=hang-timeout err=\"read tcp ...: i/o timeout\" local=127.0.0.1:41234".
+// Empty when the ring holds no failed fire (a document from before the
+// rings existed reads exactly as it did). Informational: the violation is
+// still the total.
+func FirstFailedSlowFire(ring []SlowFire) string {
+	for _, f := range ring {
+		if !strings.HasPrefix(f.Outcome, "hang-") && !strings.HasPrefix(f.Outcome, "handshake-fail-") {
+			continue
+		}
+		s := fmt.Sprintf(" first: %s read=%dms outcome=%s", f.TS, f.ReadMs, f.Outcome)
+		if f.Err != "" {
+			s += fmt.Sprintf(" err=%q", f.Err)
+		}
+		if f.Status != "" {
+			s += fmt.Sprintf(" status=%q", f.Status)
+		}
+		if f.LocalAddr != "" {
+			s += " local=" + f.LocalAddr
+		}
+		if f.ValidatorSkewMs > 0 {
+			s += fmt.Sprintf(" validator_skew=%dms", f.ValidatorSkewMs)
+		}
+		return s
+	}
+	return ""
 }
 
 // Gate applies the ABSOLUTE zero-signal gate to every cell and, when present,
@@ -445,9 +523,12 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 					m = t.WSTorture
 				case "sse_kill":
 					m = t.SSEKill
+				case "ws_echo":
+					m = t.WSEcho
 				}
 				if v := m[g.key]; v > 0 {
-					add(c, "tier_1."+g.slice+"."+g.key, v, g.why+causeSuffix(m, g.key))
+					add(c, "tier_1."+g.slice+"."+g.key, v,
+						g.why+causeSuffix(m, g.key)+FirstFailedSlowFire(slowFireDetail(t, g.key)))
 				}
 			}
 		}
@@ -476,6 +557,68 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 		}
 		if c.Soak.RestartedProcesses > 0 {
 			add(c, "soak_summary.restarted_processes", int64(c.Soak.RestartedProcesses), "a server process died and was restarted during the soak")
+		}
+	}
+	for _, id := range opts.ExpectInstrumented {
+		for _, c := range cells {
+			if !ranPropertyLoop(c) || !slices.Contains(c.PropertiesNotInstrumented, id) {
+				continue
+			}
+			add(c, "properties_not_instrumented."+id, 1,
+				"this tier expects the predicate instrumented in every cell (VALIDATE_GATE_EXPECT_INSTRUMENTED) and the cell never declared it; the waiver on record does not apply here")
+		}
+	}
+	if opts.ExpectAdaptiveSwitch {
+		for _, c := range cells {
+			if c.Engine != "adaptive" || !ranPropertyLoop(c) || c.Tier1.AdaptiveSwitches >= 1 {
+				continue
+			}
+			add(c, "tier_1.adaptive_switches", 0,
+				fmt.Sprintf("this tier expects every adaptive cell to promote at least once (VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH) and the engine never left its start engine; the cell validated epoll, not the adaptive path. Offered load, as the property loop measured it: peak %.1f conns/worker, mean %.0f bytes/req -- the controller's own two signals, so a peak below its conns/worker threshold is a sizing bug here and a bytes/req above its large-payload threshold is a deliberate suppression, not a defect",
+					c.Tier1.PeakConnsPerWorker, c.Tier1.MeanBytesPerReq))
+		}
+	}
+	// Must-stay-zero engine witnesses. No option guards these: each counts
+	// an event that cannot happen in a correct engine, so one is a
+	// failure by the same rule the rest of this gate runs on -- a nonzero
+	// true-signal counter is a failure, not a note. The cell prints the
+	// defect the counter witnesses rather than the counter's name, so a
+	// reader does not have to know the codebase to act on it.
+	for _, c := range cells {
+		if !ranPropertyLoop(c) {
+			continue
+		}
+		for _, k := range sortedKeys(c.Tier1.EngineZeroWitness) {
+			if n := c.Tier1.EngineZeroWitness[k]; n > 0 {
+				add(c, "tier_1."+k, n, ZeroWitnessMeaning[k])
+			}
+		}
+	}
+	// An engine that stopped counting its own requests. The walker's
+	// requests_sent is an independent witness measured on the other side
+	// of the socket, so the two disagreeing by an order of magnitude is
+	// the engine's counter, not the workload.
+	//
+	// celeris#626 is why this exists: epoll reported 3,089 requests in a
+	// cell whose walker sent 3,306,726, because the counter advanced only
+	// on the inline read path and stopped the moment a connection moved to
+	// async dispatch. It went unnoticed through every nightly until the
+	// engine's own counter was recorded beside the walker's.
+	//
+	// The bound is deliberately a factor of ten, not a few percent. Some
+	// refapps answer one walker operation with several HTTP requests and
+	// legitimately run 20% above, and the defect this catches ran three
+	// orders of magnitude below -- so a loose bound costs nothing and a
+	// tight one would argue with the workload mix.
+	for _, c := range cells {
+		if !ranPropertyLoop(c) || c.Tier1.EngineRequestsTotal <= 0 || c.Tier1.RequestsSent <= 0 {
+			continue
+		}
+		if c.Tier1.EngineRequestsTotal*engineRequestCoverageFactor < c.Tier1.RequestsSent {
+			add(c, "tier_1.engine_requests_total", c.Tier1.EngineRequestsTotal,
+				fmt.Sprintf("the engine counted %d requests while the walker sent %d on the other side of the socket, a factor of %.0f. An engine that stops counting its own requests takes Throughput and the adaptive controller's bytes-per-request with it (celeris#626)",
+					c.Tier1.EngineRequestsTotal, c.Tier1.RequestsSent,
+					float64(c.Tier1.RequestsSent)/float64(c.Tier1.EngineRequestsTotal)))
 		}
 	}
 	if opts.RequireInstrumented {

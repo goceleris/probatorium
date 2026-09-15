@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/goceleris/probatorium/report"
 )
 
 // h2cChurnMode names one shape of HTTP/1.1 → HTTP/2 upgrade churn.
@@ -105,6 +107,17 @@ type h2cTally struct {
 	// value means the server closed early and the connection never had
 	// a chance to be slow.
 	hangMaxElapsedMs atomic.Int64
+	// dialFail / writeFail count fires that never reached the read leg.
+	// They used to return with no counter at all, so a listener that
+	// stopped accepting was invisible here (it showed only as a lower
+	// h2c_sent). Informational, not gated: a dial failure is as often the
+	// validator host's ephemeral-port state as the server.
+	dialFail  atomic.Int64
+	writeFail atomic.Int64
+	// capture is the per-fire latency histogram, the slow-read ring and
+	// the validator heartbeat (walker_capture.go, celeris#588). Every
+	// fire is filed; every read over slowReadThreshold is kept verbatim.
+	capture fireCapture
 }
 
 // h2cSnapshot is the value-typed projection emitted into the tally
@@ -122,6 +135,14 @@ type h2cSnapshot struct {
 	HangReset        int64 `json:"h2c_hang_reset"`
 	HangOther        int64 `json:"h2c_hang_other"`
 	HangMaxElapsedMs int64 `json:"h2c_hang_max_elapsed_ms"`
+
+	DialFail  int64 `json:"h2c_dial_fail"`
+	WriteFail int64 `json:"h2c_write_fail"`
+	// SlowReadsTotal counts every fire whose read leg exceeded
+	// slowReadThreshold; SlowReads keeps the last slowFireRingSize of them.
+	SlowReadsTotal int64                `json:"h2c_slow_reads_total"`
+	Latency        report.WalkerLatency `json:"h2c_latency"`
+	SlowReads      []report.SlowFire    `json:"h2c_slow_reads,omitempty"`
 }
 
 func (t *h2cTally) snapshot() h2cSnapshot {
@@ -138,6 +159,12 @@ func (t *h2cTally) snapshot() h2cSnapshot {
 		HangReset:        t.hangReset.Load(),
 		HangOther:        t.hangOther.Load(),
 		HangMaxElapsedMs: t.hangMaxElapsedMs.Load(),
+
+		DialFail:       t.dialFail.Load(),
+		WriteFail:      t.writeFail.Load(),
+		SlowReadsTotal: t.capture.slow.total.Load(),
+		Latency:        t.capture.latency.snapshot(),
+		SlowReads:      t.capture.slow.snapshot(),
 	}
 }
 
@@ -200,27 +227,34 @@ const (
 // recordHang increments the hang total plus the cause-specific counter,
 // and tracks the longest no-byte read seen. Classification is by errno /
 // sentinel rather than string matching so it stays correct across Go
-// versions.
-func (t *h2cTally) recordHang(err error, elapsed time.Duration) {
+// versions. Returns the cause name, which the slow-read ring files as the
+// fire's outcome ("hang-" + cause).
+func (t *h2cTally) recordHang(err error, elapsed time.Duration) string {
 	t.hang.Add(1)
+	var cause string
 	switch {
 	case err == nil:
 		// n == 0 with no error: a zero-length read. Rare; not a stall.
 		t.hangOther.Add(1)
+		cause = "other"
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		t.hangTimeout.Add(1)
+		cause = "timeout"
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		t.hangEOF.Add(1)
+		cause = "eof"
 	case errors.Is(err, syscall.ECONNRESET):
 		t.hangReset.Add(1)
+		cause = "reset"
 	default:
 		t.hangOther.Add(1)
+		cause = "other"
 	}
 	ms := elapsed.Milliseconds()
 	for {
 		cur := t.hangMaxElapsedMs.Load()
 		if ms <= cur || t.hangMaxElapsedMs.CompareAndSwap(cur, ms) {
-			return
+			return cause
 		}
 	}
 }
@@ -238,10 +272,15 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 ) {
 	tally.sent.Add(1)
 	d := net.Dialer{Timeout: h2cChurnDialTimeout}
+	dialStart := time.Now()
 	conn, err := d.DialContext(ctx, "tcp", hostPort)
+	dialD := time.Since(dialStart)
 	if err != nil {
 		// Dial failure is infra (server down, port unreachable); don't
-		// fold into the upgrade-outcome counters.
+		// fold into the upgrade-outcome counters. Counted and bucketed
+		// on its own so a deaf listener is at least visible.
+		tally.dialFail.Add(1)
+		tally.capture.recordDialFail(dialD, err)
 		return
 	}
 	defer func() { _ = conn.Close() }()
@@ -249,13 +288,17 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 	_ = conn.SetDeadline(time.Now().Add(h2cChurnDialTimeout))
 
 	preamble := h2cUpgradePreamble(hostPort)
+	writeStart := time.Now()
 	if _, err := conn.Write(preamble); err != nil {
 		// Server closed before we finished writing the upgrade headers.
 		// Coarse heuristic: anything that prevents us reaching the read
 		// step counts as "didn't upgrade." Not crashed — the server may
 		// have legitimately closed (e.g. accept-queue backpressure).
+		tally.writeFail.Add(1)
+		tally.capture.recordWriteFail(dialD, time.Since(writeStart), err)
 		return
 	}
+	writeD := time.Since(writeStart)
 
 	if mode == ChurnRSTBeforeRead {
 		// Slam the socket shut without reading. Server's PauseAccept
@@ -267,6 +310,7 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 		// we DID attempt a read and got nothing (a real server-wedge
 		// signal).
 		tally.intentionalRST.Add(1)
+		tally.capture.recordNoRead(dialD, writeD)
 		return
 	}
 
@@ -283,6 +327,7 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 	buf := make([]byte, 256)
 	readStart := time.Now()
 	n, err := conn.Read(buf)
+	readD := time.Since(readStart)
 	if err != nil || n == 0 {
 		// Read EOF / timeout before any bytes. If we never saw bytes
 		// after a valid upgrade request, that's the server hanging on
@@ -290,11 +335,26 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 		//
 		// Record WHICH of those it was: the bare `hang` total cannot
 		// distinguish a real >10s stall from an immediate close, and
-		// that distinction is the whole diagnosis.
-		tally.recordHang(err, time.Since(readStart))
+		// that distinction is the whole diagnosis. The fire itself --
+		// instant, per-leg elapsed, verbatim error, addresses -- goes to
+		// the slow-read ring, so the next one is attributable from the
+		// artifact alone (celeris#588).
+		cause := tally.recordHang(err, readD)
+		tally.capture.record(conn, dialD, writeD, readD, err, "hang-"+cause, "", n, readStart)
 		return
 	}
 	statusLine := string(buf[:n])
+	// A slow-but-answered read is what the hang counters cannot see: a
+	// stall shorter than the 20 s budget lands here as a normal outcome.
+	// The histogram files every read; the ring keeps the slow ones.
+	outcome := "crashed"
+	switch {
+	case strings.HasPrefix(statusLine, "HTTP/1.1 101"):
+		outcome = "upgraded"
+	case strings.HasPrefix(statusLine, "HTTP/1.0 ") || strings.HasPrefix(statusLine, "HTTP/1.1 "):
+		outcome = "declined"
+	}
+	tally.capture.record(conn, dialD, writeD, readD, nil, outcome, "", n, readStart)
 
 	switch {
 	case strings.HasPrefix(statusLine, "HTTP/1.1 101"):

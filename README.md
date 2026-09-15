@@ -138,6 +138,8 @@ Each slice keeps its own `tally`. **HIGH-severity counters** are must-be-zero in
 | `h2c.crashed > 0` | `I-H2C-CRASHED` | Engine crashed on upgrade — PauseAccept race fired |
 | `ws.accepted_bad_frame > 0` | `I-WS-ACCEPTED` | Server accepted an RFC 6455 violation |
 | `ws.hang_no_close > 0` | `I-WS-HANG` | WebSocket goroutine wedged |
+| `h2c.hang > 0` | `I-H2C-HANG` | An h2c upgrade was neither answered nor declined within the 20 s budget (record-only: dossier without gcore, the cell runs on) |
+| `ws.handshake_fail > 0` | `I-WS-HANDSHAKE` | A WebSocket upgrade handshake did not complete within 2 s (record-only) |
 | `drv.read_after_write_mismatch > 0` | `I-DRV-1` | Postgres / Redis / Memcached driver lost a write |
 
 A zero is only health when the oracle ran. `mage ValidateGate` therefore also fails a `kitchen_sink` cell whose `h2c_churn.h2c_upgraded == 0` after sending preambles: every churn mode then degenerated into a plain declined GET, so `h2c_hang` / `h2c_crashed` judged a path the engine never entered. That was the state of every cell until `kitchen_sink` moved to `Protocol: celeris.Auto` — 172,656 preambles across the v1.5.11 nightly's 48 cells, zero 101s, gate green (probatorium#279). Same class as the dead-cell (`requests_sent == 0`) and never-evaluated-property rules.
@@ -174,13 +176,13 @@ Instrumented today:
 
 The three slope oracles share a false-positive guard: the fit runs over per-150 s bucket **minima** (a GC sawtooth cannot masquerade as a slope), and a slope above budget is a verdict only if the rise across the window also clears `max(budget × 10 min, a fraction of the series' level (3 % heap / 5 % goroutines, RSS), 8× the sampling noise of the sawtooth at that heap size)`, so neither a single legitimate floor step (a cache filling once, a standby engine spinning up, the heap goal moving) nor the trough-sampling noise of a large live heap can fire them. A verdict must then persist for 150 consecutive evaluations (one bucket width, a complete re-bucketing of the window) before it is declared. These oracles need ≥ 15 min cells (warm-up + window): they judge in the weekend soak's 1 h cells, and are reported as `properties_not_judged` in the ~150 s nightly cells. Refapps whose in-memory TTL stores keep growing past warm-up (a session per cookieless request until celeris#487's fix reaches the pinned celeris) are expected true positives for `I-MEM-1`, not noise.
 
-Registered but **not instrumented** (they pass vacuously and are listed under `properties_not_instrumented` rather than counted as passed): `I-CONN-1` (needs a per-connection last-byte table), `I-RFC-1`/`I-RFC-2` (need the response scraper), `I-RACE`/`I-CHECKPTR` (refapps are not built with `-race`/`-d=checkptr`; `-race` needs cgo, which the `CGO_ENABLED=0` cross-compile forbids), `I-MEM-2` (needs an orchestrator-driven idle window), `I-MW-*`/`I-ENG-IOURING` (counters exist only in `-tags=validation` builds of celeris).
+Registered predicates judged only where their data source exists (listed under `properties_not_instrumented` in every other cell, never counted as passed): `I-MW-*` (only the refapps that install the middleware; `I-MW-RATELIMIT` in `auth_session_ratelimit` and `kitchen_sink`), `I-DRV` (the three driver refapps, which read every write back in the handler and publish the hit/miss tally), `I-RFC-1`/`I-RFC-2` (the wire-reading conformance walker, at concurrency ≥ 4), `I-CONN-1` (the refapps' per-connection last-byte table), `I-CHECKPTR` (only a `-tags=checkptr` refapp, which the checkptr tier builds), `I-ENG-IOURING` (only an io_uring cell of that same tier: its refapps are also `-tags=validation`, which compiles celeris's own SQE monotonicity check in), `I-MEM-2` (only cells of 20 min or more, which idle the refapp twice: after a 60 s burst and again at the end; the 1 h soak cells do, the 150 s nightly cells do not). `I-RACE` (only the race tier: its refapps are `-race` builds, which need cgo and are therefore built on a GitHub-hosted runner with a cross C compiler and shipped to the nodes; the property loop counts `WARNING: DATA RACE` reports on stderr). Nothing is left on the blanket waiver.
 
 ### Cross-engine and cross-arch divergence as an invariant
 
 A matrix run emits a v5.5 `validate-results.json` whose `Cells[]` holds one entry per `(refapp, engine, arch)`. `mage ValidateDiff` walks the two latest matrix docs and reports:
 
-- **Cross-engine** divergence: a HIGH-severity counter non-zero on one engine (e.g. `iouring`) but zero on another (`epoll` / `std`) for the same `(refapp, arch)` — typically an engine-specific bug.
+- **Cross-engine** divergence: a HIGH-severity counter non-zero on one engine (e.g. `iouring`) but zero on another (`epoll` / `std` / `adaptive`) for the same `(refapp, arch)` — typically an engine-specific bug.
 - **Cross-arch** divergence: the same shape, comparing amd64 ↔ arm64.
 
 It exits non-zero on HIGH severity and persists `validate-diff/diff.{txt,json}` for dashboards. It runs automatically in the CI tiers below.
@@ -227,7 +229,7 @@ Each follows the same shape: its own `go.mod`, an `engine.go` (`resolveEngine("a
 Iterates `(refapp × engine)` cells, runs a fresh orchestrator per cell with a per-cell budget of `total_duration / len(cells)`, and emits one matrix-aware v5.5 `validate-results.json` with `Cells[]` populated. It falls back to single-cell behaviour when unset (preserving back-compat). Filter the matrix with:
 
 - `VALIDATE_MATRIX_REFAPPS=driver_postgres,driver_redis` — limit refapps.
-- `VALIDATE_MATRIX_ENGINES=iouring,epoll` — limit engines (defaults to the OS production set: iouring + epoll + std on Linux, std elsewhere).
+- `VALIDATE_MATRIX_ENGINES=iouring,epoll` — limit engines (defaults to the OS production set: iouring + epoll + std + adaptive on Linux, std elsewhere).
 
 ## Result layout
 

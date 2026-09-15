@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goceleris/probatorium/report"
 	"github.com/goceleris/probatorium/validation/properties"
 )
 
@@ -19,21 +20,15 @@ const HistoryCap = 3600
 // not count them as passed: a predicate whose input is structurally
 // zero has not verified anything.
 //
-// Instrumented today (refapp /debug/vars + orchestrator /proc):
+// Instrumented today (refapp /debug/vars + orchestrator /proc + the Tier 1
+// wire scraper):
 // I-CONN-2, I-MEM-1, I-MEM-3, I-MEM-4 (linux local driver only -- the
 // Tally also lists it as not instrumented when RSS was never sampled),
-// I-PANIC, I-ENG-ADAPTIVE, plus the [DeclaredOnly] set below in the cells
-// whose refapp declares them.
-var Uninstrumented = map[string]string{
-	"I-CONN-1":      "needs a per-connection last-byte table (OldestOpenConnLastByteAgeMs is never populated)",
-	"I-RFC-1":       "needs the response-scraping MITM (Responses* counters are never populated)",
-	"I-RFC-2":       "needs the response-scraping MITM (Responses* counters are never populated)",
-	"I-RACE":        "refapps are not built with -race and no stderr marker counter exists",
-	"I-CHECKPTR":    "refapps are not built with -d=checkptr and no stderr marker counter exists",
-	"I-MEM-2":       "needs an orchestrator-driven idle window (Context.IdleMode is never set)",
-	"I-ENG-IOURING": "SQE/CQE counters and the sqe_corruptions assertion exist only in -tags=validation builds",
-	"I-DRV":         "needs the driver shadow map (Driver* counters are never populated)",
-}
+// I-PANIC, I-RFC-1 and I-RFC-2 (validation/rfc_scrape.go
+// reads responses off the wire, so they judge what celeris wrote rather
+// than what celeris reports), plus the [DeclaredOnly] set below in the
+// cells whose refapp declares them.
+var Uninstrumented = map[string]string{}
 
 // DeclaredOnly lists the predicates whose data source exists only in the
 // refapps that install the matching middleware. Those refapps publish the
@@ -47,9 +42,42 @@ var Uninstrumented = map[string]string{
 // vacuity with another: eight of the nine matrix refapps do not install
 // session middleware, and I-MW-SESSION would have "passed" in all of them.
 var DeclaredOnly = map[string]string{
+	// Declared by the VALIDATOR once the orchestrator's second idle window
+	// begins (validation/propertyloop.go). Only a cell long enough to
+	// burst, idle, load and idle again ever gets there; a 150 s nightly
+	// cell never idles and must not pass on a predicate that only skipped.
+	"I-MEM-2": "judged only in a cell that idled the refapp twice; declared by the property loop when the second idle window begins",
+	"I-DRV":   "only the driver refapps read every write back inside the handler and publish the hit/miss tally",
+	// Declared by the property loop when the refapp reports a -race build
+	// (celeris.race_build); the count comes from the liveness scan's
+	// "WARNING: DATA RACE" lines and is structurally zero everywhere else.
+	"I-RACE": "judged only in a cell whose refapp is a -race build (the race tier); declared by the property loop on celeris.race_build",
+	// Declared by the property loop for an io_uring cell whose refapp
+	// reports celeris.validation_build: the SQE check exists only there.
+	"I-ENG-IOURING":  "judged only in an io_uring cell whose refapp is a -tags=validation build; declared by the property loop on both facts",
+	"I-ENG-ADAPTIVE": "judged only in an adaptive cell; celeris.adaptive_switches is a structural zero on iouring, epoll and std, so the predicate verified nothing there (celeris#580)",
 	"I-MW-SESSION":   "only the refapps that install middleware/session keep the id→owner ledger the predicate judges",
 	"I-MW-JWT":       "only the refapps that install middleware/jwt mint tokens and re-verify their expiry",
 	"I-MW-RATELIMIT": "only the refapps that install the in-process middleware/ratelimit run the shadow token bucket",
+	// These two are declared by the VALIDATOR, not the refapp: their data
+	// source is the Tier 1 wire scraper (validation/rfc_scrape.go), which
+	// only runs at or above streamingWalkerMinConcurrency. A smoke run below
+	// that threshold has structurally-zero counters, and reporting those as
+	// a pass would be the same vacuity this map was built to stop.
+	// Declared once the refapp's last-byte table reports a tracked conn.
+	// Every refapp installs it via debugvars.NewServer, so in practice this
+	// is every cell -- but an age of 0 from a MISSING table reads identically
+	// to an age of 0 with nothing open, and only a positive tracked count
+	// tells them apart.
+	"I-CONN-1": "declared once the refapp's connection table reports a tracked conn",
+	// Declared only by a refapp compiled with -tags=checkptr (paired with
+	// -d=checkptr). A normal build has the checker compiled out, so its
+	// zero is structural rather than clean. The count itself comes from the
+	// liveness stderr scan at cell end, because a checkptr violation is a
+	// runtime throw and the process is gone before the next poll.
+	"I-CHECKPTR": "declared only by refapps built with -tags=checkptr; fed from the liveness crash scan at cell end",
+	"I-RFC-1":    "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
+	"I-RFC-2":    "the Tier 1 response scraper runs only at streamingWalkerMinConcurrency and above",
 }
 
 // Violation is one failed predicate evaluation.
@@ -92,6 +120,49 @@ type Tally struct {
 	// NotInstrumented are the evaluated IDs listed in Uninstrumented:
 	// they passed vacuously and are excluded from Passed.
 	NotInstrumented []string `json:"not_instrumented,omitempty"`
+	// AdaptiveSwitches is the highest celeris.adaptive_switches value
+	// sampled. Only the adaptive engine moves it; the gate's
+	// ExpectAdaptiveSwitch reads it to prove an adaptive cell actually
+	// promoted (celeris#580) instead of idling on its start engine.
+	AdaptiveSwitches int64 `json:"adaptive_switches"`
+	// PeakConnsPerWorker is the highest ActiveConns/Workers ratio sampled,
+	// and MeanBytesPerReq the cell's average payload bytes per request
+	// over the whole observation window. They are the adaptive
+	// controller's own two promotion signals, recorded so a cell that
+	// reported AdaptiveSwitches == 0 can say which of the three reasons
+	// applies: the load never reached the controller's conns/worker
+	// threshold, the workload was link-bound and the controller
+	// deliberately suppressed the switch, or neither -- which would be a
+	// celeris defect. Zero when the refapp published no engine metrics.
+	PeakConnsPerWorker float64 `json:"peak_conns_per_worker,omitempty"`
+	MeanBytesPerReq    float64 `json:"mean_bytes_per_req,omitempty"`
+	// EngineZeroWitness holds the highest value each must-stay-zero
+	// engine counter reached. A map and not a struct on purpose: this
+	// set grows every time a defect earns a witness, and a field-by-field
+	// literal silently drops whatever was added last -- which is exactly
+	// how celeris#627 lost ten fields, two of them the celeris#484
+	// witnesses, so that detector could never have fired on the adaptive
+	// engine. Keys are the debugvars names without their prefix.
+	// Absent means the refapp published nothing; present and zero means
+	// measured and clean.
+	EngineZeroWitness map[string]int64 `json:"engine_zero_witness,omitempty"`
+	// Engine-side connection accounting at the end of the cell, against
+	// which AcceptedConnTotal / ClosedConnTotal are the hook-side
+	// witness. EngineCloseCount running ahead of the hook count means a
+	// close skipped its hook; the two agreeing while the live count is
+	// short means a connection was detached and never re-adopted
+	// (celeris#624).
+	EngineAcceptCount        int64 `json:"engine_accept_count,omitempty"`
+	EngineCloseCount         int64 `json:"engine_close_count,omitempty"`
+	EngineTransplantDetached int64 `json:"engine_transplant_detached,omitempty"`
+	EngineTransplantAdopted  int64 `json:"engine_transplant_adopted,omitempty"`
+	EngineAsyncPromotedConns int64 `json:"engine_async_promoted_conns,omitempty"`
+	// EngineRequestsTotal is the engine's own final request count. The
+	// walker's RequestsSent is the independent witness against it.
+	EngineRequestsTotal int64 `json:"engine_requests_total,omitempty"`
+	// PeakStandbyActiveConns is the most connections the adaptive
+	// engine's standby half ever held. Zero on every other engine.
+	PeakStandbyActiveConns int64 `json:"peak_standby_active_conns,omitempty"`
 	// NotJudged are the instrumented IDs whose every evaluation was a
 	// skip -- typically the slope predicates in a cell shorter than
 	// warm-up + window (15 min). They verified nothing and are excluded
@@ -121,6 +192,12 @@ type Tally struct {
 	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`
 	// PerPredicate maps every evaluated ID to its violation count.
 	PerPredicate map[string]int64 `json:"per_predicate,omitempty"`
+
+	// IdleWindows is the highest orchestrator idle window observed (0 when
+	// the cell never idled) and IdleBaselineGoroutines the goroutine count
+	// at the end of the first one: I-MEM-2's reference level.
+	IdleWindows            int   `json:"idle_windows"`
+	IdleBaselineGoroutines int64 `json:"idle_baseline_goroutines"`
 
 	// Baseline / end-of-run resource points for the soak summary.
 	BaselineGoroutines int64 `json:"baseline_goroutines"`
@@ -180,6 +257,13 @@ type Evaluator struct {
 	// firstPoll / lastPoll bound the observation window
 	// (Tally.Observed) over poll ATTEMPTS, not successes.
 	firstPoll, lastPoll time.Time
+
+	// Engine-metric deltas behind Tally.MeanBytesPerReq. baseReqs/baseBytes
+	// are taken at the first sample that carries a nonzero request count,
+	// so the warm-up's zero-request samples cannot divide into the mean.
+	haveBase            bool
+	baseReqs, baseBytes int64
+	lastReqs, lastBytes int64
 }
 
 // NewEvaluator returns an Evaluator over specs (typically
@@ -255,6 +339,52 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 			e.declared[id] = true
 		}
 	}
+	// Idle-window bookkeeping. Leaving the FIRST window fixes I-MEM-2's
+	// baseline (the window's last sample is its most settled point) and
+	// starts the sustained-load clock the slope warm-ups run from.
+	if n := len(e.ctx.History); n > 0 {
+		prev := e.ctx.History[n-1]
+		if prev.IdleWindow == 1 && snap.IdleWindow == 0 && e.ctx.IdleBaselineGoroutines == 0 {
+			e.ctx.IdleBaselineGoroutines = prev.GoroutineCount
+			e.ctx.LoadStartedAt = now
+			e.tally.IdleBaselineGoroutines = prev.GoroutineCount
+		}
+	}
+	e.ctx.IdleWindow = snap.IdleWindow
+	e.ctx.IdleMode = snap.IdleWindow > 0
+	if snap.IdleWindow > e.tally.IdleWindows {
+		e.tally.IdleWindows = snap.IdleWindow
+	}
+	if snap.AdaptiveSwitches > e.tally.AdaptiveSwitches {
+		e.tally.AdaptiveSwitches = snap.AdaptiveSwitches
+	}
+	if snap.EngineWorkers > 0 {
+		if cpw := float64(snap.ActiveConns) / float64(snap.EngineWorkers); cpw > e.tally.PeakConnsPerWorker {
+			e.tally.PeakConnsPerWorker = cpw
+		}
+	}
+	// Monotonic engine counters: the last reading is the cell total.
+	// Guarded with max() rather than plain assignment so a poll that
+	// returned a zero snapshot cannot retract a total already observed.
+	e.tally.EngineAcceptCount = max(e.tally.EngineAcceptCount, snap.EngineAcceptCount)
+	e.tally.EngineCloseCount = max(e.tally.EngineCloseCount, snap.EngineCloseCount)
+	e.tally.EngineTransplantDetached = max(e.tally.EngineTransplantDetached, snap.EngineTransplantDetached)
+	e.tally.EngineTransplantAdopted = max(e.tally.EngineTransplantAdopted, snap.EngineTransplantAdopted)
+	e.tally.EngineAsyncPromotedConns = max(e.tally.EngineAsyncPromotedConns, snap.EngineAsyncPromotedConns)
+	e.tally.EngineRequestsTotal = max(e.tally.EngineRequestsTotal, snap.EngineRequestsTotal)
+	e.tally.PeakStandbyActiveConns = max(e.tally.PeakStandbyActiveConns, snap.EngineStandbyActiveConns)
+	e.recordZeroWitnesses(snap)
+	if snap.EngineRequestsTotal > 0 {
+		bytes := snap.EngineBytesRead + snap.EngineBytesWritten
+		if !e.haveBase {
+			e.haveBase = true
+			e.baseReqs, e.baseBytes = snap.EngineRequestsTotal, bytes
+		}
+		e.lastReqs, e.lastBytes = snap.EngineRequestsTotal, bytes
+		if dr := e.lastReqs - e.baseReqs; dr > 0 {
+			e.tally.MeanBytesPerReq = float64(e.lastBytes-e.baseBytes) / float64(dr)
+		}
+	}
 	e.ctx.Now = now
 	e.ctx.History = append(e.ctx.History, snap)
 	if len(e.ctx.History) > HistoryCap {
@@ -291,6 +421,42 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 
 // Context returns a copy of the current [properties.Context] (History
 // shares the backing array; callers must not mutate it).
+// recordZeroWitnesses keeps the highest value each witness reached. The
+// counters are cumulative, so the peak is the cell total; max() rather than
+// assignment so a failed poll's zero snapshot cannot retract a reading.
+func (e *Evaluator) recordZeroWitnesses(snap properties.Snapshot) {
+	if e.tally.EngineZeroWitness == nil {
+		// Seed every declared witness at zero, so the artifact records
+		// the full set the cell was watched against rather than only the
+		// ones that fired. An absent key would otherwise be ambiguous
+		// between "clean" and "this build has no such counter", which is
+		// the exact ambiguity that let celeris#484's witnesses read as a
+		// structural zero on the adaptive engine for as long as they did.
+		//
+		// A zero here still means "the counter read zero", not "the
+		// engine published it": a refapp whose engine metrics are absent
+		// reads zero for everything. The gate separates the two by
+		// requiring the cell to have reported a nonzero worker count
+		// before it credits the witnesses as measured.
+		e.tally.EngineZeroWitness = make(map[string]int64, len(report.ZeroWitnessMeaning))
+		for k := range report.ZeroWitnessMeaning {
+			e.tally.EngineZeroWitness[k] = 0
+		}
+	}
+	for k, v := range map[string]int64{
+		"engine_transplant_adopt_slot_occupied": snap.EngineTransplantAdoptSlotOccupied,
+		"engine_close_missing_conn_state":       snap.EngineCloseMissingConnState,
+		"engine_recv_double_armed":              snap.EngineRecvDoubleArmed,
+		"engine_recv_cqe_unaccounted":           snap.EngineRecvCQEUnaccounted,
+		"engine_recv_sq_full":                   snap.EngineRecvSQFull,
+		"engine_recv_stall_episodes":            snap.EngineRecvStallEpisodes,
+	} {
+		if v > e.tally.EngineZeroWitness[k] {
+			e.tally.EngineZeroWitness[k] = v
+		}
+	}
+}
+
 func (e *Evaluator) Context() properties.Context { return e.ctx }
 
 // Tally returns the current summary.

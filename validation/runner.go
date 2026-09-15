@@ -23,6 +23,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -187,6 +188,15 @@ type Config struct {
 	// keeping every io_uring code path covered. Must be 0 or >= 2 (celeris
 	// rejects Workers in [1,2)).
 	RefappWorkers int
+
+	// ConcurrencyFloor, when > 0, raises the walker count to at least this
+	// many, after the duration-tiered default and the VALIDATE_CONCURRENCY
+	// override. The matrix sets it for adaptive cells: the adaptive
+	// controller promotes epoll to io_uring only at 24 active conns per
+	// worker sustained over two 1 s ticks, and a cell that never crosses
+	// that line validates the start engine, not the adaptive one. See
+	// adaptiveCellConcurrencyFloor in cmd/validator/matrix.go.
+	ConcurrencyFloor int
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -247,6 +257,13 @@ type Orchestrator struct {
 	// atomic.Pointer because the Tier 1 goroutine publishes it while the
 	// incident handler reads it.
 	resolvedAddr atomic.Pointer[string]
+
+	// stderrTail is the refapp's most recent stdout+stderr tail, as carried
+	// by every Tier 1 tally tick (tier1TallySnapshot.RefappStderrTail).
+	// Published by the tally callback, read by the incident handler so a
+	// dossier written while the refapp is still alive carries the engine's
+	// Warn/Error lines from the seconds before the event (celeris#588).
+	stderrTail atomic.Pointer[[]string]
 }
 
 // Plan is the deterministic schedule [Orchestrator.Run] would execute.
@@ -710,6 +727,14 @@ type Incident struct {
 	// Config.PropertyHardFail is off: the orchestrator writes the
 	// dossier and captures forensics but does NOT cancel the cell.
 	RecordOnly bool
+	// SkipCore leaves gcore out of the forensics. gcore SIGSTOPs the
+	// refapp for the length of the dump; on an incident raised by a
+	// walker whose whole finding is "the server was slow to answer"
+	// (I-H2C-HANG, I-WS-HANDSHAKE) that pause would manufacture the
+	// next occurrence of the very counter under investigation, in the
+	// cell that keeps running. The cheap legs (pprof, /proc, dmesg) are
+	// still taken.
+	SkipCore bool
 }
 
 // buildDriver constructs the remote.Driver per the orchestrator's
@@ -794,18 +819,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	//
 	// VALIDATE_CONCURRENCY env override wins over the duration-tiered
 	// default — ops can manually tune for capacity tests.
-	concurrency := 10
-	switch {
-	case o.cfg.Duration < 5*time.Minute:
-		concurrency = 1
-	case o.cfg.Duration >= time.Hour:
-		concurrency = 50
-	}
-	if v := os.Getenv("VALIDATE_CONCURRENCY"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			concurrency = n
-		}
-	}
+	concurrency := resolveConcurrency(o.cfg.Duration, os.Getenv("VALIDATE_CONCURRENCY"), o.cfg.ConcurrencyFloor)
 
 	pidCh := make(chan int, 1)
 	var refappPID atomic.Int64 // 0 until the refapp is up; read by the incident emitters
@@ -838,6 +852,15 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// exists; the property loop reads it on every snapshot so I-PANIC nets
 	// designed panics out.
 	var expectedPanicsFn atomic.Pointer[func() int64]
+	// responseCountersFn is set by Tier 1 once its wire scraper exists, so the
+	// property loop can read I-RFC-1 / I-RFC-2 counts it could not see at start.
+	var responseCountersFn atomic.Pointer[func() ResponseCounters]
+	// crashReportsFn is set by Tier 1 once its liveness tally exists.
+	var crashReportsFn atomic.Pointer[func() int64]
+	// idleWindowFn is set by Tier 1 once the refapp is ready; 0 until then.
+	var idleWindowFn atomic.Pointer[func() int]
+	// raceReportsFn is set by Tier 1 once its liveness tally exists.
+	var raceReportsFn atomic.Pointer[func() int64]
 	go func() {
 		var addr string
 		select {
@@ -873,11 +896,38 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 				}
 				return 0
 			},
+			// Same indirection as ExpectedPanics: the Tier 1 tally that owns
+			// the wire scraper does not exist yet when this loop starts.
+			CrashReports: func() int64 {
+				if f := crashReportsFn.Load(); f != nil {
+					return (*f)()
+				}
+				return 0
+			},
+			ResponseConformance: func() ResponseCounters {
+				if f := responseCountersFn.Load(); f != nil {
+					return (*f)()
+				}
+				return ResponseCounters{}
+			},
+			IdleWindow: func() int {
+				if f := idleWindowFn.Load(); f != nil {
+					return (*f)()
+				}
+				return 0
+			},
+			RaceReports: func() int64 {
+				if f := raceReportsFn.Load(); f != nil {
+					return (*f)()
+				}
+				return 0
+			},
 			PID:          p,
 			Specs:        checker.SelectPredicates(o.cfg.PropertyTier),
 			HardFail:     o.cfg.PropertyHardFail,
 			Violations:   violations,
 			SnapshotPath: filepath.Join(o.cfg.OutDir, "properties_tally.json"),
+			SeriesPath:   filepath.Join(o.cfg.OutDir, "properties_series.csv"),
 			// Captured once, the instant the slope oracles start judging, so
 			// an I-MEM incident can be diffed rather than inferred:
 			//   go tool pprof -inuse_space -base heap-warm.pprof <incident>/heap.pprof
@@ -892,11 +942,15 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// hundreds of incidents per second once the bug catches.
 	alertedCounters := make(map[string]bool)
 	tallyCB := func(snap tier1TallySnapshot) {
+		// Publish the refapp's stderr tail for the dossier writer.
+		if tail := snap.RefappStderrTail; len(tail) > 0 {
+			o.stderrTail.Store(&tail)
+		}
 		// HIGH-severity sub-counters: anything non-zero is a bug.
 		// Mirror the canonical list from report.invariantCounters so
 		// the per-arch incident emission stays in sync with the
 		// cross-arch DiffValidation gate.
-		fire := func(counter, msg string, ok bool) {
+		fireIncident := func(counter, msg string, ok, recordOnly bool) {
 			if !ok || alertedCounters[counter] {
 				return
 			}
@@ -908,12 +962,19 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 				Message:     msg,
 				ObservedAt:  time.Now().UTC(),
 				RefappPID:   pid(),
+				RecordOnly:  recordOnly,
+				SkipCore:    recordOnly,
 			}:
 			default:
 				// Channel full or closed — orchestrator already
 				// handling a hard fail; nothing more to do.
 			}
 		}
+		fire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, false) }
+		// Record-only: dossier (no gcore) while the refapp is still up,
+		// and the cell runs on. The gate still fails on the total; this
+		// only adds evidence to it (celeris#588).
+		record := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, true) }
 		fire(properties.IADVAccepted.ID,
 			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
 			snap.Adversarial.WrongAccepted > 0)
@@ -926,6 +987,30 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		fire(properties.IWSHang.ID,
 			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
 			snap.WSTorture.HangNoClose > 0)
+		// The two gated walker totals that never had a reactive incident.
+		// Both carry the first slow-read record in the message so the
+		// incident.json alone names the instant, the error and the
+		// addresses; the full ring is in the tally snapshot beside it.
+		record(properties.IH2CHang.ID,
+			fmt.Sprintf("h2c upgrade request neither answered nor declined (count=%d: eof=%d timeout=%d reset=%d other=%d, max_elapsed=%dms)%s",
+				snap.H2CChurn.Hang, snap.H2CChurn.HangEOF, snap.H2CChurn.HangTimeout,
+				snap.H2CChurn.HangReset, snap.H2CChurn.HangOther, snap.H2CChurn.HangMaxElapsedMs,
+				report.FirstFailedSlowFire(snap.H2CChurn.SlowReads)),
+			snap.H2CChurn.Hang > 0)
+		record(properties.IWSHandshake.ID,
+			fmt.Sprintf("WebSocket upgrade handshake failed (count=%d: eof=%d timeout=%d reset=%d status=%d other=%d)%s",
+				snap.WSTorture.HandshakeFail, snap.WSTorture.HandshakeFailEOF, snap.WSTorture.HandshakeFailTimeout,
+				snap.WSTorture.HandshakeFailReset, snap.WSTorture.HandshakeFailStatus, snap.WSTorture.HandshakeFailOther,
+				report.FirstFailedSlowFire(snap.WSTorture.SlowReads)),
+			snap.WSTorture.HandshakeFail > 0)
+		// Large-echo wire oracle (celeris#587): any of the four failure
+		// classes is one incident; the message carries all four so the
+		// dossier says which.
+		e := snap.WSEcho
+		fire(properties.IWSEcho.ID,
+			fmt.Sprintf("64 KiB WebSocket echoes not byte-intact and in order (corrupt=%d [egress_interleave=%d other=%d] reorder=%d missing=%d timeout=%d, ok=%d)",
+				e.Corrupt, e.EgressInterleave, e.OtherCorrupt, e.Reorder, e.Missing, e.Timeout, e.OK),
+			e.Corrupt+e.Reorder+e.Missing+e.Timeout > 0)
 		// Engine-agnostic crash oracle: the refapp process died mid-run. This
 		// is the catch-all that the per-protocol counters above can't see — a
 		// dead server just looks like connection-refused to every walker.
@@ -951,10 +1036,17 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// fires once the refapp is bound; the orchestrator stashes
 		// the value so handleIncident can drive /proc + pprof
 		// forensics against the same process Tier 1 is exercising.
-		PIDChan:               pidCh,
-		AddrChan:              addrCh,
-		TallyCallback:         tallyCB,
-		OnLiveTally:           func(f func() int64) { expectedPanicsFn.Store(&f) },
+		PIDChan:            pidCh,
+		AddrChan:           addrCh,
+		TallyCallback:      tallyCB,
+		OnLiveTally:        func(f func() int64) { expectedPanicsFn.Store(&f) },
+		OnResponseCounters: func(f func() ResponseCounters) { responseCountersFn.Store(&f) },
+		OnCrashReports:     func(f func() int64) { crashReportsFn.Store(&f) },
+		OnIdleWindow:       func(f func() int) { idleWindowFn.Store(&f) },
+		OnRaceReports:      func(f func() int64) { raceReportsFn.Store(&f) },
+		// Burst, idle, load, idle for I-MEM-2 -- only where the slope
+		// oracles still fit after the prelude (see idleWindowsMinDuration).
+		IdleWindows:           o.cfg.Duration >= idleWindowsMinDuration,
 		TallyCallbackInterval: 2 * time.Second,
 		// Periodic snapshot to disk so long-running soaks (24h, 72h,
 		// 10d) surface mid-run progress without waiting for the
@@ -990,6 +1082,23 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	o.tier1Snapshot = tally
 	o.tier1Ran = true
 	_ = writeJSON(filepath.Join(o.cfg.OutDir, "tier1_tally.json"), tally)
+	// The refapp's stderr tail, unconditionally, so a cell that failed the
+	// gate on a walker counter has the engine's own last words next to the
+	// tally even when no incident fired (celeris#588).
+	_ = writeStderrTail(filepath.Join(o.cfg.OutDir, "refapp_stderr_tail.txt"), tally.RefappStderrTail)
+}
+
+// writeStderrTail writes the refapp's stderr tail to path with a header
+// that says how many lines it holds, so an empty file is a statement
+// ("the refapp wrote nothing after ready") rather than a missing capture.
+func writeStderrTail(path string, lines []string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# refapp stdout+stderr tail: %d line(s), last %d kept\n", len(lines), refappTailMaxLines)
+	for _, l := range lines {
+		b.WriteString(l)
+		b.WriteByte('\n')
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
 // runTierRESTler is Tier 2 — RESTler-style stateful fuzzer over the
@@ -1178,6 +1287,13 @@ func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
 	if err := writeJSON(filepath.Join(dir, "incident.json"), dossier); err != nil {
 		return "", err
 	}
+	// The refapp's stderr tail as of the last tally tick (at most 2 s
+	// old), while the process is still alive to have written it.
+	var tail []string
+	if p := o.stderrTail.Load(); p != nil {
+		tail = *p
+	}
+	_ = writeStderrTail(filepath.Join(dir, "refapp_stderr_tail.txt"), tail)
 	return dir, nil
 }
 
@@ -1249,7 +1365,7 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 	if r := o.resolvedAddr.Load(); r != nil && *r != "" {
 		addr = *r
 	}
-	return captureForensicsLive(ctx, dir, inc.RefappPID, addr)
+	return captureForensicsLiveOpts(ctx, dir, inc.RefappPID, addr, forensicsOpts{SkipCore: inc.SkipCore})
 }
 
 // Tier1Summary projects a tier1TallySnapshot into the public
@@ -1258,7 +1374,7 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 // writeValidateResults; kept exported here so callers outside the
 // validation package don't have to duplicate the map keys.
 func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
-	return &report.Tier1Summary{
+	out := &report.Tier1Summary{
 		RequestsSent:   s.RequestsSent,
 		Requests2xx:    s.Requests2xx,
 		Requests4xx:    s.Requests4xx,
@@ -1276,12 +1392,23 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		InvariantHits:         s.InvariantHits,
 		RequestsCutAtDeadline: s.RequestsCutAtDeadline,
 
-		PropertyEvaluations:  s.Properties.Evaluations,
-		PropertySkips:        s.Properties.Skips,
-		PropertyViolations:   s.Properties.Violations,
-		PropertyViolationIDs: append([]string(nil), s.Properties.ViolationIDs...),
-		PropertyPollErrors:   s.Properties.PollErrors,
-		PropertyLoopSkipped:  s.Properties.SkippedReason,
+		PropertyEvaluations:      s.Properties.Evaluations,
+		PropertySkips:            s.Properties.Skips,
+		PropertyViolations:       s.Properties.Violations,
+		PropertyViolationIDs:     append([]string(nil), s.Properties.ViolationIDs...),
+		PropertyPollErrors:       s.Properties.PollErrors,
+		PropertyLoopSkipped:      s.Properties.SkippedReason,
+		AdaptiveSwitches:         s.Properties.AdaptiveSwitches,
+		PeakConnsPerWorker:       s.Properties.PeakConnsPerWorker,
+		MeanBytesPerReq:          s.Properties.MeanBytesPerReq,
+		EngineZeroWitness:        s.Properties.EngineZeroWitness,
+		EngineAcceptCount:        s.Properties.EngineAcceptCount,
+		EngineCloseCount:         s.Properties.EngineCloseCount,
+		EngineTransplantDetached: s.Properties.EngineTransplantDetached,
+		EngineTransplantAdopted:  s.Properties.EngineTransplantAdopted,
+		EngineAsyncPromotedConns: s.Properties.EngineAsyncPromotedConns,
+		PeakStandbyActiveConns:   s.Properties.PeakStandbyActiveConns,
+		EngineRequestsTotal:      s.Properties.EngineRequestsTotal,
 		Adversarial: map[string]int64{
 			"adv_sent":               s.Adversarial.Sent,
 			"adv_well_rejected":      s.Adversarial.WellRejected,
@@ -1335,11 +1462,62 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"sse_events_read":         s.SSEKill.EventsRead,
 			"sse_killed_mid_stream":   s.SSEKill.KilledMidStream,
 			"sse_server_closed_early": s.SSEKill.ServerClosedEarly,
+			"sse_peer_reset_early":    s.SSEKill.PeerResetEarly,
+			"sse_read_err_early":      s.SSEKill.ReadErrEarly,
 			"sse_cut_at_deadline":     s.SSEKill.CutAtDeadline,
 			"sse_handshake_fail":      s.SSEKill.HandshakeFail,
 			"sse_endpoint_absent":     s.SSEKill.EndpointAbsent,
 		},
+		SSEEarlyErrs: s.SSEKill.EarlyErrs,
+		// Per-fire capture (celeris#588). The histograms are pointers so
+		// a cell whose slice never ran omits them rather than shipping
+		// twenty-four zeros; the rings are omitted when empty.
+		H2CLatency:       walkerLatencyIfRan(s.H2CChurn.Sent, s.H2CChurn.Latency),
+		WSLatency:        walkerLatencyIfRan(s.WSTorture.Sent, s.WSTorture.Latency),
+		H2CSlowReads:     append([]report.SlowFire(nil), s.H2CChurn.SlowReads...),
+		WSSlowReads:      append([]report.SlowFire(nil), s.WSTorture.SlowReads...),
+		ReadyAt:          s.ReadyAt,
+		RefappStderrTail: append([]string(nil), s.RefappStderrTail...),
+		WSEcho: map[string]int64{
+			"ws_echo_route_probed":    b2i(s.WSEcho.RouteProbed),
+			"ws_echo_route_present":   b2i(s.WSEcho.RoutePresent),
+			"ws_echo_fires":           s.WSEcho.Fires,
+			"ws_echo_upgraded":        s.WSEcho.Upgraded,
+			"ws_echo_handshake_fail":  s.WSEcho.HandshakeFail,
+			"ws_echo_endpoint_absent": s.WSEcho.EndpointAbsent,
+			"ws_echo_sent":            s.WSEcho.Sent,
+			"ws_echo_ok":              s.WSEcho.OK,
+			"ws_echo_corrupt":         s.WSEcho.Corrupt,
+			// Cause split (sums to ws_echo_corrupt): attribution, not
+			// tolerance -- see ws_echo.go.
+			"ws_echo_egress_interleave": s.WSEcho.EgressInterleave,
+			"ws_echo_other_corrupt":     s.WSEcho.OtherCorrupt,
+			"ws_echo_reorder":           s.WSEcho.Reorder,
+			"ws_echo_missing":           s.WSEcho.Missing,
+			"ws_echo_timeout":           s.WSEcho.Timeout,
+			"ws_echo_frame_err":         s.WSEcho.FrameErr,
+			"ws_echo_close_ok":          s.WSEcho.CloseOK,
+			"ws_echo_cut_at_deadline":   s.WSEcho.CutAtDeadline,
+		},
 	}
+	m := out.H2CChurn
+	m["h2c_dial_fail"] = s.H2CChurn.DialFail
+	m["h2c_write_fail"] = s.H2CChurn.WriteFail
+	m["h2c_slow_reads_total"] = s.H2CChurn.SlowReadsTotal
+	m = out.WSTorture
+	m["ws_dial_fail"] = s.WSTorture.DialFail
+	m["ws_write_fail"] = s.WSTorture.WriteFail
+	m["ws_slow_reads_total"] = s.WSTorture.SlowReadsTotal
+	return out
+}
+
+// walkerLatencyIfRan returns a copy of l when the walker sent anything,
+// nil otherwise.
+func walkerLatencyIfRan(sent int64, l report.WalkerLatency) *report.WalkerLatency {
+	if sent == 0 {
+		return nil
+	}
+	return &l
 }
 
 // b2i renders a boolean tally field as the 0/1 the sub-tally maps
@@ -1562,4 +1740,27 @@ func writeJSON(path string, v any) error {
 		return err
 	}
 	return os.WriteFile(path, buf, 0o644)
+}
+
+// resolveConcurrency picks the Tier 1 walker count: the duration-tiered
+// default, then the VALIDATE_CONCURRENCY override, then the cell's floor,
+// which wins over both because it encodes a property of the engine under
+// test rather than an operator preference (Config.ConcurrencyFloor).
+func resolveConcurrency(d time.Duration, envOverride string, floor int) int {
+	concurrency := 10
+	switch {
+	case d < 5*time.Minute:
+		concurrency = 1
+	case d >= time.Hour:
+		concurrency = 50
+	}
+	if envOverride != "" {
+		if n, err := strconv.Atoi(envOverride); err == nil && n > 0 {
+			concurrency = n
+		}
+	}
+	if floor > concurrency {
+		concurrency = floor
+	}
+	return concurrency
 }

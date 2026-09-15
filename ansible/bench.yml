@@ -33,6 +33,12 @@
 #   bench_cells           cell glob forwarded to runner -cells over
 #                         "<scenario>/<competitor>" (default: *). The
 #                         server half is the competitor slug.
+#   bench_sut_env         optional dict {KEY: VALUE} merged over the
+#                         harness's own SUT environment (PROBATORIUM_*,
+#                         DOTNET_*) in run_bench_cell.yml and echoed as
+#                         the first line of each cell's server.log
+#                         (celeris#585 A/B arms). mage Bench forwards
+#                         BENCH_SUT_ENV as a JSON extra-var; default {}.
 #   bench_rated           when true (1), the runner also drives a Gil-Tene
 #                         rated (closed-loop, CO-corrected) sweep per cell and
 #                         emits latency_at_slo for the regression gate. Default

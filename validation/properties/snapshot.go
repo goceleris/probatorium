@@ -34,17 +34,77 @@ type Snapshot struct {
 	PID int
 
 	// Engine + runtime
-	GoroutineCount   int64
-	HeapInuseBytes   int64
-	HeapAllocBytes   int64
-	GCPauseP99Ns     int64
-	NumGoroutineDiff int64 // delta from process baseline
+	GoroutineCount int64
+	HeapInuseBytes int64
+	HeapAllocBytes int64
+	// HeapObjects, HeapIdleBytes, HeapReleasedBytes and StackInuseBytes are
+	// recorded but judged by no predicate. They exist so the per-cell series
+	// (probatorium#319) can separate the three things a rising HeapInuse can
+	// mean: live objects accumulating (HeapObjects rises with HeapAlloc),
+	// size-class fragmentation (HeapInuse rises while HeapAlloc does not), and
+	// the runtime holding spans back from the OS (HeapIdle / HeapReleased).
+	// Reading the 24h soak's I-MEM-1 failure needed exactly this split and the
+	// artifact did not carry it.
+	HeapObjects       int64
+	HeapIdleBytes     int64
+	HeapReleasedBytes int64
+	StackInuseBytes   int64
+	GCPauseP99Ns      int64
+	NumGoroutineDiff  int64 // delta from process baseline
 
 	// Connection lifecycle (celeris.* counters)
 	AcceptedConnTotal int64
 	ClosedConnTotal   int64
 	ActiveConns       int64
 	PanicCount        int64
+	// EngineErrorCount is celeris EngineMetrics.ErrorCount: the engine's
+	// accept-side and protocol error paths (epoll conn-table cap and
+	// EMFILE drops, io_uring listener re-creation). Judged by no
+	// predicate; recorded in the per-cell series so a step in it can be
+	// joined against a walker's slow-read record (celeris#588).
+	EngineErrorCount int64
+	// EngineWorkers, EngineRequestsTotal, EngineBytesRead and
+	// EngineBytesWritten are celeris EngineMetrics.Workers, RequestCount,
+	// BytesRead and BytesWritten: the four inputs the adaptive controller
+	// turns into its two promotion signals (conns/worker = ActiveConns /
+	// Workers, and bytes/req = delta(BytesRead+BytesWritten) /
+	// delta(RequestCount)). Judged by no predicate; recorded so an
+	// adaptive cell that never promoted can be told apart from one that
+	// was never offered enough load, and from one the controller
+	// deliberately suppressed as link-bound.
+	EngineWorkers       int64
+	EngineRequestsTotal int64
+	EngineBytesRead     int64
+	EngineBytesWritten  int64
+	// Engine-side connection accounting and the transplant hand-off.
+	// EngineAcceptCount / EngineCloseCount are the engine's own view of
+	// what the refapp counts through OnConnect / OnDisconnect, so the
+	// two together attribute an I-CONN-2 drift instead of merely
+	// reporting it (celeris#624): the engine running ahead means a
+	// close skipped its hook, the two agreeing while `active` is short
+	// means a connection was detached and never re-adopted. The standby
+	// pair splits the adaptive engine's two halves, which its Metrics()
+	// otherwise sums (celeris#627).
+	EngineAcceptCount        int64
+	EngineCloseCount         int64
+	EngineAsyncPromotedConns int64
+	EngineStandbyActiveConns int64
+	EngineStandbyCloseCount  int64
+	EngineTransplantDetached int64
+	EngineTransplantAdopted  int64
+	// Must-stay-zero defect witnesses, each naming one specific defect:
+	// the adoption path finding its slot occupied, a close decrementing
+	// the live gauge with no connection state so the hook is skipped
+	// (both celeris#624), a second recv armed while one is in flight and
+	// a recv completion accounting to nothing (both celeris#484), and
+	// the two celeris#607 guards. Judged by ZeroWitness in the gate: a
+	// nonzero value is the defect firing, not a note.
+	EngineTransplantAdoptSlotOccupied int64
+	EngineCloseMissingConnState       int64
+	EngineRecvDoubleArmed             int64
+	EngineRecvCQEUnaccounted          int64
+	EngineRecvSQFull                  int64
+	EngineRecvStallEpisodes           int64
 	// ExpectedPanics is the number of panics the workload DESIGNED so far
 	// (corpus states marked `expect: panic`, counted by the Tier 1 walker
 	// when their 5xx arrives). Zero when no accounting is wired (e.g. the
@@ -133,7 +193,38 @@ type Snapshot struct {
 	// A string and not a []string on purpose: Snapshot must stay a
 	// comparable value type (the rolling History is copied around and the
 	// checker's tests compare whole snapshots).
+	// OpenConnsTracked is how many connections the refapp's last-byte
+	// table currently holds. It is the liveness signal for I-CONN-1's
+	// instrumentation: an age of 0 with a non-empty table means every open
+	// conn was just active (clean), while an age of 0 with an EMPTY table
+	// is indistinguishable from a refapp that never installed the hook.
+	// The property loop declares I-CONN-1 only once this goes positive.
+	OpenConnsTracked int64
+	// CheckptrBuild is celeris.checkptr_build: true only when the refapp was
+	// compiled with -tags=checkptr (paired with -d=checkptr). I-CHECKPTR is
+	// declared only when it is set.
+	CheckptrBuild bool
+	// ValidationBuild is true when the refapp was compiled with
+	// -tags=validation, which compiles celeris's own assertion counters
+	// in. The property loop declares I-ENG-IOURING on it for an io_uring
+	// cell; without it IouringSQECorruptions is the stub's zero.
+	ValidationBuild bool
+	// RaceBuild is true when the refapp was compiled with -race. The
+	// property loop declares I-RACE on it and feeds RaceReports from the
+	// liveness scan; without it the count is structurally zero.
+	RaceBuild bool
+	// EngineName is celeris.engine from /debug/vars ("io_uring", "epoll",
+	// "std"). Published by every refapp since the document was written and
+	// parsed by nothing until I-CONN-1 needed it: the legitimate idle
+	// ceiling differs fourfold between the native engines and std, so a
+	// single threshold cannot be correct for both.
+	EngineName             string
 	InstrumentedProperties string
+
+	// IdleWindow is the orchestrator's idle window this sample was taken
+	// in: 0 under load, n inside the n-th window (tier1Config.IdleWindows).
+	// I-MEM-2 takes the first window as its baseline and judges the rest.
+	IdleWindow int
 }
 
 // Context carries rolling-window state needed by predicates that look
@@ -150,13 +241,32 @@ type Context struct {
 	// evaluation order.
 	Now time.Time
 
-	// IdleMode is true if the orchestrator is in an idle window
-	// (post-warmup, pre-load-resume). I-MEM-2 only fires in this mode.
+	// IdleMode is true while the orchestrator holds an idle window
+	// (IdleWindow > 0). Kept alongside IdleWindow for the predicates that
+	// only ask whether load is off.
 	IdleMode bool
 
-	// BaselineGoroutines is the goroutine count snapshot taken after
-	// celeris is up but before the first request lands. Used by
-	// I-MEM-2's "goroutines return to baseline+N" assertion.
+	// IdleWindow is the current orchestrator idle window (0 under load).
+	IdleWindow int
+
+	// IdleBaselineGoroutines is the goroutine count at the END of the
+	// first idle window: the refapp's own settled idle level, pools and
+	// per-listener ladders included, measured after it has served load
+	// once. I-MEM-2 judges every later idle window against it. Zero
+	// until the first window has been left.
+	IdleBaselineGoroutines int64
+
+	// LoadStartedAt is when sustained load began after the first idle
+	// window; zero when the cell never idled. The slope predicates anchor
+	// their warm-up here when set, so the burst/idle prelude neither
+	// eats into the warm-up nor lands its resume transient in a fit.
+	LoadStartedAt time.Time
+
+	// BaselineGoroutines is the goroutine count of the first sample after
+	// the refapp announced ready. Kept for the soak summary; it is NOT
+	// I-MEM-2's reference, because every refapp grows past it under its
+	// first load (driver pools, the std engine's per-conn goroutines) and
+	// legitimately never comes back down.
 	BaselineGoroutines int64
 
 	// History is the rolling window of recent snapshots, most recent

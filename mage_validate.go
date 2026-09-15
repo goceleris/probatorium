@@ -231,6 +231,29 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		if v := os.Getenv("VALIDATE_DBSERVICES"); v != "" {
 			args = append(args, "--extra-vars", "validate_dbservices="+v)
 		}
+		// VALIDATE_PROPERTY_TIER overrides the playbook's predicate tier
+		// filter (default core,middleware,engine,driver). The nightly ran
+		// for months on core,middleware and never evaluated I-DRV or
+		// I-ENG-IOURING: they were instrumented and then filtered out
+		// before the evaluator saw them, which no gate could tell from
+		// "not instrumented".
+		if v := os.Getenv("VALIDATE_PROPERTY_TIER"); v != "" {
+			args = append(args, "--extra-vars", "validate_property_tier="+v)
+		}
+		// VALIDATE_CHECKPTR=1 points matrix mode at the -tags=checkptr
+		// refapp set deployed under refapps-checkptr/ (see
+		// DEPLOY_CHECKPTR_REFAPPS in mage_cluster.go). Those cells declare
+		// I-CHECKPTR and run several times slower, so they belong in their
+		// own run, never mixed into a normal nightly or soak.
+		if v := os.Getenv("VALIDATE_CHECKPTR"); v != "" {
+			args = append(args, "--extra-vars", "validate_checkptr="+v)
+		}
+		// VALIDATE_RACE=1 points matrix mode at the -race refapp set under
+		// refapps-race/ (DEPLOY_PREBUILT_RACE_DIR). Those cells declare
+		// I-RACE and run 2-10x slower; their own run, like checkptr.
+		if v := os.Getenv("VALIDATE_RACE"); v != "" {
+			args = append(args, "--extra-vars", "validate_race="+v)
+		}
 		fmt.Printf("\n=== %s on %s (playbook=%s) ===\n", titleCase(kind), t, playbook)
 		cmd := exec.Command("ansible-playbook", args...)
 		cmd.Dir = ansibleDir

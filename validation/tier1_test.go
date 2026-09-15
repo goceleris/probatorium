@@ -208,7 +208,15 @@ func TestRunMarkovWalker_LoginThenCookieFlow(t *testing.T) {
 
 	var tally tier1Tally
 	parent := &http.Client{Timeout: time.Second}
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	// The walker runs until it has done the thing being asserted -- a
+	// login plus a handful of authenticated requests -- rather than for a
+	// fixed 300 ms that a loaded box can spend on the login alone.
+	const wantAuthed = 5
+	ctx, cancel := cancelWhen(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return loginPosts >= 1 && authedReqs >= wantAuthed
+	})
 	defer cancel()
 	runMarkovWalker(ctx, parent, srv.URL, minimalMatrix(t), 0xa11ce, &tally)
 
@@ -220,7 +228,7 @@ func TestRunMarkovWalker_LoginThenCookieFlow(t *testing.T) {
 	if !got2xxAfter {
 		t.Errorf("no authed 2xx — cookie not flowing")
 	}
-	if authedReqs < 1 {
+	if authedReqs < wantAuthed {
 		t.Errorf("expected several authed requests after login, got %d", authedReqs)
 	}
 }
@@ -235,31 +243,79 @@ func TestRunMarkovWalker_LoginThenCookieFlow(t *testing.T) {
 //
 // The test asserts goroutine count stays bounded after many calls.
 func TestWaitForReady_NoGoroutineLeak(t *testing.T) {
-	// Drop GOMAXPROCS-dependent flakiness by sampling AFTER GC.
-	settle := func() {
-		for i := 0; i < 3; i++ {
+	// Some growth is normal (Go scheduler workers, test framework
+	// goroutines). Pre-fix this test would show ~`iterations` worth of
+	// orphans (~30 goroutines linearly accumulated). Cap at 10 — a
+	// generous bound that still detects a per-iteration linear leak.
+	const growthBound = 10
+	// settleUnder GCs and waits for the goroutine count to come back
+	// under base+growthBound, and reports the count it settled at.
+	//
+	// The old form was three GCs with a fixed 20 ms nap after each and a
+	// single sample at the end, which made the assertion "everything the
+	// 30 SIGTERMed shells own must be reaped within 60 ms". That is not a
+	// property of the code under test, it is a property of how busy the
+	// box is: CI sampled 23 survivors of 30 and called it a leak (run
+	// 34352461790). Waiting for the bound instead cannot produce a false
+	// red -- a real per-iteration leak never converges and still spends
+	// the whole budget before failing -- and it returns as soon as the
+	// count is where it should be, which is immediately on an idle box.
+	settleUnder := func(limit int) int {
+		deadline := time.Now().Add(tier1TestBudget)
+		for {
 			runtime.GC()
-			time.Sleep(20 * time.Millisecond)
+			if n := runtime.NumGoroutine(); n <= limit || time.Now().After(deadline) {
+				return n
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	settle()
+	// The baseline gets the old fixed settle, and that is fine: a
+	// baseline taken before an earlier test's goroutines have drained is
+	// too HIGH, which makes this test more permissive, never red. Only
+	// the final sample can produce a false failure, and that is the one
+	// that now waits.
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+		time.Sleep(20 * time.Millisecond)
+	}
 	base := runtime.NumGoroutine()
 
 	d := remote.NewLocal("/bin/sh")
 	const iterations = 30
 	for i := 0; i < iterations; i++ {
-		// Script prints `ready addr=foo` then loops printing more lines
-		// fast enough that the scanner goroutine's lineCh buffer fills
-		// — recreating the pre-fix deadlock scenario.
+		// Script prints `ready addr=foo` and then floods, so that by the
+		// time waitForReady returns on the first line the scanner
+		// goroutine is parked on the cap-1 lineCh — the pre-fix deadlock.
+		//
+		// The flood is one seq(1), not a shell loop around echo. seq's
+		// stdio buffers the whole ~700 bytes and flushes once, so all 200
+		// lines are in the pipe together and the scanner is certain to
+		// reach a blocking send; the shell loop issued 200 separate
+		// writes and had produced nothing at all by the time waitForReady
+		// returned, leaving the scanner parked in Scan on the pipe, where
+		// the SIGTERM below reaps it with or without the fix. Measured:
+		// with the pre-fix blocking send restored, the loop form grew the
+		// goroutine count by 3 over 30 iterations and PASSED — the test
+		// did not detect the defect it is named for. The seq form grows
+		// it by 23 (the same number CI reported) and fails.
+		//
+		// 200 lines, not 20000: 20000 overflows the 64 KiB pipe, so seq
+		// itself blocks in write, SIGTERM to the shell does not reach it,
+		// the pipe never closes, and the goroutine parked in Scan looks
+		// exactly like the leak.
 		args := []string{
 			"-c",
-			`echo "ready addr=127.0.0.1:0"; for i in $(seq 1 200); do echo "log line $i"; done; sleep 1`,
+			`echo "ready addr=127.0.0.1:0"; seq 1 200; sleep 5`,
 		}
 		proc, err := d.Start(context.Background(), args)
 		if err != nil {
 			t.Fatalf("start: %v", err)
 		}
-		addr, err := waitForReady(context.Background(), proc, time.Second)
+		// Generous ready timeout: how fast a loaded box can fork a shell
+		// and get one line back is not what this test measures, and a
+		// timeout here would be a second way for load alone to turn it red.
+		addr, err := waitForReady(context.Background(), proc, tier1TestReadyTimeout)
 		if err != nil {
 			t.Fatalf("waitForReady iter %d: %v", i, err)
 		}
@@ -269,16 +325,9 @@ func TestWaitForReady_NoGoroutineLeak(t *testing.T) {
 		// SIGTERM the refapp to free its pipe goroutines.
 		_ = proc.Signal(0xf)
 	}
-	// Allow background reaping.
-	settle()
-
-	final := runtime.NumGoroutine()
-	growth := final - base
-	// Some growth is normal (Go scheduler workers, test framework
-	// goroutines). Pre-fix this test would show ~`iterations` worth of
-	// orphans (~30 goroutines linearly accumulated). Cap at 10 — a
-	// generous bound that still detects a per-iteration linear leak.
-	if growth > 10 {
+	// Wait for the background reaping rather than budgeting for it.
+	final := settleUnder(base + growthBound)
+	if growth := final - base; growth > growthBound {
 		t.Errorf("goroutine count grew by %d over %d iterations (base=%d final=%d) — likely leak",
 			growth, iterations, base, final)
 	}
@@ -316,27 +365,25 @@ func TestDriveTier1_EndToEnd(t *testing.T) {
 	// driver's job is only to satisfy waitForReady.
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    2,
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 2,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	// Wait for enough traffic to make the error-rate assertion below
+	// live, instead of running for 500 ms and hoping. Pre-fix a slow box
+	// made the whole test vacuous: fewer than 100 requests got out and
+	// the ratio check silently skipped itself.
+	const want = 200
+	s, err := runTier1Until(t, cfg, sentAtLeast(want))
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
-	if s.RequestsSent < 1 {
-		t.Errorf("RequestsSent: got %d, want >= 1", s.RequestsSent)
+	if s.RequestsSent < want {
+		t.Errorf("RequestsSent: got %d, want >= %d", s.RequestsSent, want)
 	}
 	// Server returns 200 unconditionally — non-error responses
 	// should be 2xx only. Some RequestsError is allowed because the
@@ -372,17 +419,12 @@ func TestDriveTier1_TallyCallbackFires(t *testing.T) {
 		lastSnap  tier1TallySnapshot
 	)
 	cfg := tier1Config{
-		Driver: remote.NewLocal("/bin/sh"),
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    1,
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      remote.NewLocal("/bin/sh"),
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 1,
 		TallyCallback: func(snap tier1TallySnapshot) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -392,15 +434,21 @@ func TestDriveTier1_TallyCallbackFires(t *testing.T) {
 		TallyCallbackInterval: 100 * time.Millisecond,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
-	defer cancel()
-	if _, err := driveTier1(ctx, cfg); err != nil {
+	// Two ticks at the configured interval, waited for rather than
+	// budgeted for: "600 ms holds at least two 100 ms ticks" is only true
+	// if readiness left 200 ms of the 600 on the clock.
+	const wantCalls = 2
+	if _, err := runTier1Until(t, cfg, func(snap tier1TallySnapshot) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return callCount >= wantCalls && snap.RequestsSent > 0
+	}); err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if callCount < 2 {
-		t.Errorf("TallyCallback called %d times, want >= 2 over 600ms with 100ms interval", callCount)
+	if callCount < wantCalls {
+		t.Errorf("TallyCallback called %d times, want >= %d at a 100ms interval", callCount, wantCalls)
 	}
 	if lastSnap.RequestsSent == 0 {
 		t.Errorf("last snapshot has zero RequestsSent — callback didn't see live state")
@@ -420,35 +468,53 @@ func TestDriveTier1_SnapshotPathWritesPeriodically(t *testing.T) {
 	dir := t.TempDir()
 	snapPath := dir + "/tier1_tally.json"
 	cfg := tier1Config{
-		Driver: remote.NewLocal("/bin/sh"),
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
+		Driver:                remote.NewLocal("/bin/sh"),
+		RefappArgs:            readyThenIdle(srv.URL),
 		BaseURL:               srv.URL,
 		Matrix:                minimalMatrix(t),
 		Seed:                  42,
 		Concurrency:           1,
-		ReadyTimeout:          2 * time.Second,
-		RequestTimeout:        time.Second,
 		SnapshotPath:          snapPath,
 		TallyCallbackInterval: 100 * time.Millisecond,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-	defer cancel()
-	if _, err := driveTier1(ctx, cfg); err != nil {
+	// The claim is MID-RUN visibility, so read the file while the cell is
+	// still running and end the cell on that, rather than giving the cell
+	// 400 ms and hoping a tick fit inside it. Pre-fix the fork/exec and
+	// readiness prelude came out of the same 400 ms and CI saw the file
+	// still unwritten (run 34727613829); waiting for it also upgrades the
+	// assertion from "a file exists afterwards" to "a monitoring tool
+	// that catted it during the run would have seen a whole tally".
+	var midRun []byte
+	_, err := runTier1Until(t, cfg, func(tier1TallySnapshot) bool {
+		if midRun != nil {
+			return true
+		}
+		data, rerr := os.ReadFile(snapPath)
+		if rerr != nil || len(data) == 0 {
+			return false
+		}
+		midRun = data
+		return true
+	})
+	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
-	data, err := os.ReadFile(snapPath)
+	if len(midRun) == 0 {
+		t.Fatal("snapshot file never appeared while the cell was running")
+	}
+	if !strings.Contains(string(midRun), `"requests_sent"`) {
+		t.Errorf("snapshot missing canonical field; got:\n%s", midRun)
+	}
+	// And the file the run leaves behind is a complete document too --
+	// the tier joins its snapshot writer before returning, so no tick can
+	// still be mid-write (the truncated file of run 34727613829).
+	final, err := os.ReadFile(snapPath)
 	if err != nil {
 		t.Fatalf("snapshot path not written: %v", err)
 	}
-	if len(data) == 0 {
-		t.Fatal("snapshot file empty")
-	}
-	if !strings.Contains(string(data), `"requests_sent"`) {
-		t.Errorf("snapshot missing canonical field; got:\n%s", data)
+	if !strings.Contains(string(final), `"requests_sent"`) {
+		t.Errorf("final snapshot missing canonical field; got:\n%s", final)
 	}
 }
 
@@ -468,22 +534,15 @@ func TestDriveTier1_AdversarialSliceFires(t *testing.T) {
 
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    5, // ≥ 5 so one walker is adversarial
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 5, // ≥ 5 so one walker is adversarial
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	s, err := runTier1Until(t, cfg, func(s tier1TallySnapshot) bool { return s.Adversarial.Sent >= 1 })
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
@@ -510,22 +569,15 @@ func TestDriveTier1_H2CChurnSliceFires(t *testing.T) {
 
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    10, // ≥ 10 so one walker is h2c churn
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 10, // ≥ 10 so one walker is h2c churn
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	s, err := runTier1Until(t, cfg, func(s tier1TallySnapshot) bool { return s.H2CChurn.Sent >= 1 })
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
@@ -550,22 +602,15 @@ func TestDriveTier1_WSTortureSliceFires(t *testing.T) {
 
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    20, // ≥ 20 so one walker is WS torture
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 20, // ≥ 20 so one walker is WS torture
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	s, err := runTier1Until(t, cfg, func(s tier1TallySnapshot) bool { return s.WSTorture.Sent >= 1 })
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
@@ -590,22 +635,15 @@ func TestDriveTier1_SSEKillSliceFires(t *testing.T) {
 
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    20, // ≥ 20 so one walker is SSE kill
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 20, // ≥ 20 so one walker is SSE kill
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	s, err := runTier1Until(t, cfg, func(s tier1TallySnapshot) bool { return s.SSEKill.Sent >= 1 })
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
@@ -626,22 +664,20 @@ func TestDriveTier1_SSEDormantBelowThreshold(t *testing.T) {
 
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    streamingWalkerMinConcurrency - 1, // smoke: below threshold
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: streamingWalkerMinConcurrency - 1, // smoke: below threshold
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	// A "stays dormant" claim needs the cell to actually run for a while
+	// -- a walker that wrongly fired on a 150-200 ms tick has to get the
+	// chance to. workedFor makes that a floor on SERVING time rather than
+	// a 400 ms ceiling that fork/exec and readiness were also spending,
+	// which is what made this both flaky and liable to pass vacuously.
+	s, err := runTier1Until(t, cfg, workedFor(400*time.Millisecond))
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
@@ -661,22 +697,20 @@ func TestDriveTier1_WSDormantBelowThreshold(t *testing.T) {
 
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    streamingWalkerMinConcurrency - 1, // smoke: below threshold
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: streamingWalkerMinConcurrency - 1, // smoke: below threshold
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	// A "stays dormant" claim needs the cell to actually run for a while
+	// -- a walker that wrongly fired on a 150-200 ms tick has to get the
+	// chance to. workedFor makes that a floor on SERVING time rather than
+	// a 400 ms ceiling that fork/exec and readiness were also spending,
+	// which is what made this both flaky and liable to pass vacuously.
+	s, err := runTier1Until(t, cfg, workedFor(400*time.Millisecond))
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
@@ -698,22 +732,17 @@ func TestDriveTier1_StreamingActiveAtDefaultConcurrency(t *testing.T) {
 
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    10, // the matrix per-cell default
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 10, // the matrix per-cell default
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	s, err := runTier1Until(t, cfg, func(s tier1TallySnapshot) bool {
+		return s.WSTorture.Sent >= 1 && s.SSEKill.Sent >= 1
+	})
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}
@@ -753,7 +782,7 @@ exit 2`
 		Matrix:         minimalMatrix(t),
 		Seed:           42,
 		Concurrency:    10,
-		ReadyTimeout:   2 * time.Second,
+		ReadyTimeout:   tier1TestReadyTimeout,
 		RequestTimeout: time.Second,
 	}
 
@@ -787,22 +816,17 @@ func TestDriveTier1_H2CDormantBelowThreshold(t *testing.T) {
 
 	d := remote.NewLocal("/bin/sh")
 	cfg := tier1Config{
-		Driver: d,
-		RefappArgs: []string{
-			"-c",
-			`echo "ready addr=` + srv.URL + `"; sleep 10`,
-		},
-		BaseURL:        srv.URL,
-		Matrix:         minimalMatrix(t),
-		Seed:           42,
-		Concurrency:    5, // below threshold
-		ReadyTimeout:   2 * time.Second,
-		RequestTimeout: time.Second,
+		Driver:      d,
+		RefappArgs:  readyThenIdle(srv.URL),
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 5, // below threshold
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-	defer cancel()
-	s, err := driveTier1(ctx, cfg)
+	// See the note on the streaming dormancy tests: 400 ms of SERVING,
+	// not 400 ms that fork/exec and readiness also come out of.
+	s, err := runTier1Until(t, cfg, workedFor(400*time.Millisecond))
 	if err != nil {
 		t.Fatalf("driveTier1: %v", err)
 	}

@@ -81,7 +81,69 @@ import (
 //     list without the by-design one, so its short-cell oracles would
 //     every one of them read as coverage failures, and the check
 //     defaults off for it.
-const SchemaVersion = "5.8"
+//   - 5.9 — per-fire capture for the h2c-churn and WS-torture walkers
+//     (celeris#588). Adds, on Tier1Summary, the per-leg latency
+//     histograms (h2c_latency / ws_latency), the bounded rings of slow
+//     fires (h2c_slow_reads / ws_slow_reads: instant, per-leg elapsed,
+//     outcome, verbatim error, both socket addresses), the refapp's
+//     ready instant (ready_at) and the tail of its stderr
+//     (refapp_stderr_tail). Before these the v1.5.11 soak's single
+//     h2c_hang and single ws_handshake_fail were unattributable from
+//     the artifact: the cell kept a cause class and one max elapsed.
+//     Adds, in the same version, Tier1Summary.WSEcho (ws_echo_* keys):
+//     64 KiB frames echoed through the refapp's /ws and verified
+//     byte-for-byte, the wire-level oracle for the io_uring
+//     SEND_ZC-vs-inline-write window no earlier tier reached
+//     (celeris#587). All additive: older readers ignore every field, the
+//     gate reads an absent map as all zeros, the gated totals keep their
+//     meaning and the new keys are not gated.
+//     Additive; older readers ignore every field. The gated totals keep
+//     their meaning and the new keys are not gated.
+//     Adds, in the same version, per-SCENARIO resource windows (celeris#585). Adds
+//     ServerResult.ScenarioResources: scenario → the column's raw 1 Hz
+//     mpstat + observer series SLICED to that scenario's own runner
+//     window (started_at + warmup .. completed_at), plus
+//     ResourceSummary.MeanSoftPct (mpstat %soft), SUTProcessCPUPct
+//     (SUT utime+stime from /proc, in percent of ONE core), and
+//     ResourceStats.Window (the slice bounds + sample counts). Until now
+//     ServerResult.Resources carried ONE column-wide mean stamped onto
+//     every scenario the column ran (the 27 scenarios of a celeris column
+//     all reported the identical mean_cpu_pct), so no per-cell CPU
+//     comparison — and no cpu-per-byte A/B — was possible. Resources is
+//     unchanged (still the column-wide aggregate); the new map is the
+//     per-scenario view. Also adds Environment.SUTEnv, the KEY=VALUE
+//     overrides the bench passed into the SUT process, so an A/B arm is
+//     identifiable from results.json alone. Additive — older readers
+//     ignore every new field.
+//   - 5.10 — the adaptive controller's own promotion signals
+//     (celeris#580 follow-up). Adds, on Tier1Summary,
+//     PeakConnsPerWorker and MeanBytesPerReq, and on the per-cell
+//     series the four raw counters they reduce
+//     (engine_workers, engine_requests_total, engine_bytes_read,
+//     engine_bytes_written). Nightly 34876253223 reported seven
+//     adaptive cells with adaptive_switches == 0 and the artifact
+//     carried no way to tell a harness that under-loaded them from a
+//     controller that deliberately suppressed a link-bound workload
+//     from a celeris defect: it recorded the decision and none of its
+//     inputs. Additive; older readers ignore every field and no new
+//     key is gated.
+//   - 5.11 — engine-side connection accounting and the must-stay-zero
+//     defect witnesses. Adds, on Tier1Summary, EngineZeroWitness (the
+//     peak each witness reached, keyed by its debugvars name),
+//     EngineAcceptCount / EngineCloseCount / EngineTransplantDetached /
+//     EngineTransplantAdopted / EngineAsyncPromotedConns /
+//     PeakStandbyActiveConns / EngineRequestsTotal, and the matching
+//     thirteen columns on the per-cell series. The gate gains two
+//     unconditional checks: any nonzero witness fails its cell with the
+//     defect it witnesses, and an engine whose own request count falls
+//     more than a factor of ten below the walker's requests_sent fails
+//     as a counter defect. Both exist because the artifact recorded one
+//     side of a two-sided quantity: celeris#624's drift could not be
+//     attributed without the engine's close count beside the hook's,
+//     and celeris#626 left epoll reporting 3,089 requests against a
+//     walker that sent 3,306,726 with nothing to compare it to.
+//     Additive; older readers ignore every field.
+const SchemaVersion = "5.11"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -286,6 +348,14 @@ type Environment struct {
 	// omitted when the line rate is unknown (the Tailscale overlay), in
 	// which case no cell is flagged. Schema v5.5+.
 	FabricLineRateBitsPerSec int64 `json:"fabric_line_rate_bits_per_sec,omitempty"`
+
+	// SUTEnv records the KEY=VALUE environment overrides the bench merged
+	// into the SUT process (benchmark-tier.yml `sut_env` → BENCH_SUT_ENV →
+	// ansible bench_sut_env). Schema v5.9+ (celeris#585). Omitted when the
+	// run passed none, so an A/B arm (e.g. CELERIS_IOURING_SEND_ZC=off) is
+	// identifiable from results.json alone, next to the engine's own
+	// server.log arm line.
+	SUTEnv map[string]string `json:"sut_env,omitempty"`
 }
 
 // BenchmarkConfig records the orchestrator flags + tunables that
@@ -384,6 +454,19 @@ type ServerResult struct {
 	// every metric is a nullable pointer: non-Go competitors expose
 	// RSS/CPU/FD only, leaving goroutine/GC/heap null.
 	Resources map[string]*ResourceStats `json:"resources,omitempty"`
+
+	// ScenarioResources is the PER-SCENARIO slice of the same raw series
+	// (schema v5.9+, celeris#585), keyed by Scenario.Name(): the column's
+	// 1 Hz mpstat cpu.log and observer.sqlite rows windowed to the
+	// scenario's own runner window (started_at + warmup .. completed_at)
+	// and summarised on their own. Resources above is the COLUMN-WIDE
+	// aggregate stamped onto every scenario (one mpstat run covers the
+	// whole column pass); this map is what a per-cell CPU comparison must
+	// read. Entries carry ResourceStats.Window with the slice bounds and
+	// sample counts. A scenario whose window caught NO sample has no
+	// entry here — "no data", never a zero — so absence is the signal.
+	// Omitted when no scenario carried a windowed slice.
+	ScenarioResources map[string]*ResourceStats `json:"scenario_resources,omitempty"`
 
 	// NetworkBound flags, per scenario, the cells whose achieved egress
 	// bandwidth sat at/near the fabric line rate while the loadgen still
@@ -600,6 +683,46 @@ type Tier1Summary struct {
 	// PropertyPollErrors: polls that yielded no sample (transport error,
 	// non-200, unparseable body). Informational.
 	PropertyPollErrors int64 `json:"property_poll_errors"`
+	// AdaptiveSwitches is the highest celeris.adaptive_switches the property
+	// loop sampled. Meaningful only for an adaptive cell, where the gate's
+	// ExpectAdaptiveSwitch requires it to be at least 1 (celeris#580).
+	AdaptiveSwitches int64 `json:"adaptive_switches,omitempty"`
+	// PeakConnsPerWorker and MeanBytesPerReq are the adaptive controller's
+	// own two promotion signals as the property loop measured them: the
+	// highest ActiveConns/Workers ratio sampled, and the average payload
+	// bytes per request over the cell. An adaptive cell reporting
+	// AdaptiveSwitches == 0 is only actionable alongside these two --
+	// they separate "the load never reached the threshold" (a harness
+	// sizing bug) from "the controller suppressed a link-bound workload"
+	// (by design) from neither (a celeris defect).
+	PeakConnsPerWorker float64 `json:"peak_conns_per_worker,omitempty"`
+	MeanBytesPerReq    float64 `json:"mean_bytes_per_req,omitempty"`
+	// EngineZeroWitness is the highest value each must-stay-zero engine
+	// counter reached in this cell, keyed by its debugvars name. Each
+	// counts an event that cannot happen in a correct engine, so the
+	// gate fails a cell on any nonzero entry and prints the defect that
+	// entry witnesses (report.ZeroWitnessMeaning). A map rather than
+	// named fields because the set grows with every defect that earns a
+	// witness, and celeris#627 is what a field-by-field literal does to
+	// such a set.
+	EngineZeroWitness map[string]int64 `json:"engine_zero_witness,omitempty"`
+	// Engine-side connection accounting, against which
+	// AcceptedConnTotal / ClosedConnTotal are the independent hook-side
+	// witness. Their disagreement is what attributes an I-CONN-2 drift
+	// rather than merely reporting it (celeris#624).
+	EngineAcceptCount        int64 `json:"engine_accept_count,omitempty"`
+	EngineCloseCount         int64 `json:"engine_close_count,omitempty"`
+	EngineTransplantDetached int64 `json:"engine_transplant_detached,omitempty"`
+	EngineTransplantAdopted  int64 `json:"engine_transplant_adopted,omitempty"`
+	EngineAsyncPromotedConns int64 `json:"engine_async_promoted_conns,omitempty"`
+	PeakStandbyActiveConns   int64 `json:"peak_standby_active_conns,omitempty"`
+	// EngineRequestsTotal is the engine's own request counter at the end
+	// of the cell. RequestsSent is the walker's independent count of what
+	// it actually sent, so the two together catch an engine that stopped
+	// counting: celeris#626 left epoll reporting 3,089 requests against a
+	// walker that sent 3,306,726, and nothing noticed for as long as only
+	// one side was recorded.
+	EngineRequestsTotal int64 `json:"engine_requests_total,omitempty"`
 
 	// Per-slice sub-tallies (one per workload-mix slice from
 	// validator-prod issue #55). Each is a plain `map[string]int64`
@@ -611,10 +734,111 @@ type Tier1Summary struct {
 	//   h2c_churn    → h2c_sent, h2c_upgraded, h2c_declined, h2c_crashed, h2c_hang
 	//   ws_torture   → ws_sent, ws_upgraded, ws_handshake_fail, ws_closed_correctly, ws_accepted_bad_frame, ws_hang_no_close, ws_endpoint_absent
 	//   sse_kill     → sse_sent, sse_established, sse_events_read, sse_killed_mid_stream, sse_server_closed_early, sse_handshake_fail, sse_endpoint_absent
+	//   ws_echo      → ws_echo_fires, ws_echo_upgraded, ws_echo_sent, ws_echo_ok, ws_echo_corrupt (= ws_echo_egress_interleave + ws_echo_other_corrupt), ws_echo_reorder, ws_echo_missing, ws_echo_timeout
 	Adversarial map[string]int64 `json:"adversarial,omitempty"`
 	H2CChurn    map[string]int64 `json:"h2c_churn,omitempty"`
 	WSTorture   map[string]int64 `json:"ws_torture,omitempty"`
 	SSEKill     map[string]int64 `json:"sse_kill,omitempty"`
+	// WSEcho is the WebSocket large-echo slice (schema 5.9, celeris#587).
+	WSEcho map[string]int64 `json:"ws_echo,omitempty"`
+	// SSEEarlyErrs carries the verbatim read errors behind sse_kill's
+	// sse_server_closed_early / sse_peer_reset_early / sse_read_err_early.
+	// Strings, so they cannot live in the int64 map above; a separate field
+	// rather than a stringly-typed map value so the counters stay numeric
+	// for the gate. Bounded at the source (validation/sse.go sseMaxEarlyErrs).
+	SSEEarlyErrs []string `json:"sse_early_errs,omitempty"`
+
+	// H2CLatency / WSLatency are the per-leg latency histograms of every
+	// fire the h2c-churn and WS-torture walkers made (schema 5.9,
+	// celeris#588). A stall shorter than the walker's read budget never
+	// fails a fire -- it lands late as `declined` / `upgraded` -- so the
+	// gated totals alone cannot see the 1.5-8 s once-a-minute class that
+	// celeris#493 was; these can, as a burst in the 1-10 s read buckets.
+	// Nil when the slice never ran.
+	H2CLatency *WalkerLatency `json:"h2c_latency,omitempty"`
+	WSLatency  *WalkerLatency `json:"ws_latency,omitempty"`
+	// H2CSlowReads / WSSlowReads are the bounded rings (oldest first) of
+	// every fire whose read leg exceeded one second, failed or not. Every
+	// h2c_hang and every ws_handshake_fail_timeout is in here with its
+	// timestamp, error string and addresses; h2c_slow_reads_total /
+	// ws_slow_reads_total in the maps say how many the ring could not
+	// hold. Omitted on a cell with no slow fire.
+	H2CSlowReads []SlowFire `json:"h2c_slow_reads,omitempty"`
+	WSSlowReads  []SlowFire `json:"ws_slow_reads,omitempty"`
+	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
+	// bound address, i.e. the origin of every SlowFire.SinceReadyMs and
+	// of the mod-60 phase histogram the design computes offline.
+	ReadyAt string `json:"ready_at,omitempty"`
+	// RefappStderrTail is the last refappTailMaxLines (80) lines the refapp
+	// wrote to its merged stdout+stderr after ready. The refapps log the
+	// engine's Warn/Error lines there (fd-cap drops, EMFILE, listener
+	// re-creation) and nothing else; before 5.9 those were kept only when
+	// the process died. The same text is written to
+	// <cell>/refapp_stderr_tail.txt and into every incident dossier.
+	RefappStderrTail []string `json:"refapp_stderr_tail,omitempty"`
+}
+
+// LatencyBuckets is a fixed-edge histogram of one leg (dial, write or
+// read) of a walker fire. Timeout counts legs that ended with the walker's
+// own deadline, whatever their elapsed; the elapsed buckets classify every
+// other leg. Ge20s is structurally zero (no walker budget exceeds 20 s)
+// and exists so nothing is silently folded.
+type LatencyBuckets struct {
+	Lt100ms int64 `json:"lt_100ms"`
+	Lt1s    int64 `json:"lt_1s"`
+	Lt2s    int64 `json:"lt_2s"`
+	Lt5s    int64 `json:"lt_5s"`
+	Lt10s   int64 `json:"lt_10s"`
+	Lt20s   int64 `json:"lt_20s"`
+	Ge20s   int64 `json:"ge_20s"`
+	Timeout int64 `json:"timeout"`
+}
+
+// Total is the number of legs the histogram observed.
+func (b LatencyBuckets) Total() int64 {
+	return b.Lt100ms + b.Lt1s + b.Lt2s + b.Lt5s + b.Lt10s + b.Lt20s + b.Ge20s + b.Timeout
+}
+
+// WalkerLatency is the three legs of one walker's fires.
+type WalkerLatency struct {
+	Dial  LatencyBuckets `json:"dial"`
+	Write LatencyBuckets `json:"write"`
+	Read  LatencyBuckets `json:"read"`
+}
+
+// SlowFire is one walker fire whose read leg exceeded one second.
+type SlowFire struct {
+	// TS is the UTC instant (RFC3339Nano) the read leg ended.
+	TS string `json:"ts"`
+	// SinceReadyMs is TS minus the refapp's ready instant; 0 when the
+	// walker ran without one (unit tests).
+	SinceReadyMs int64 `json:"since_ready_ms,omitempty"`
+	DialMs       int64 `json:"dial_ms"`
+	WriteMs      int64 `json:"write_ms"`
+	ReadMs       int64 `json:"read_ms"`
+	// Outcome is the walker's classification: for h2c one of upgraded,
+	// declined, crashed, hang-timeout, hang-eof, hang-reset, hang-other;
+	// for WS one of upgraded, endpoint-absent, handshake-fail-timeout,
+	// handshake-fail-eof, handshake-fail-reset, handshake-fail-status,
+	// handshake-fail-other.
+	Outcome string `json:"outcome"`
+	// Err is the verbatim error that ended the read leg; empty when the
+	// read completed.
+	Err string `json:"err,omitempty"`
+	// Status is the non-101 status line a WS handshake was answered with.
+	Status string `json:"status,omitempty"`
+	// NRead is the bytes the read leg returned before it ended.
+	NRead int `json:"n_read"`
+	// LocalAddr / RemoteAddr are the walker's socket addresses: the
+	// engine<->client join key (celeris#562), and what an `ss -tnp`
+	// snapshot on the server side is matched against.
+	LocalAddr  string `json:"local_addr,omitempty"`
+	RemoteAddr string `json:"remote_addr,omitempty"`
+	// ValidatorSkewMs is the longest validator heartbeat gap (>500 ms)
+	// observed while this read was in flight: nonzero means the validator
+	// process itself was starved or frozen, so the elapsed is not the
+	// server's alone.
+	ValidatorSkewMs int64 `json:"validator_skew_ms,omitempty"`
 }
 
 // Tier3Summary mirrors the validator's tier3TallySnapshot.
@@ -654,6 +878,24 @@ type ResourceStats struct {
 	// positionally between the observer's unix-second rows and mpstat's
 	// wall-clock rows; both sample at ~1 Hz over the same window.
 	Series []ResourcePoint `json:"series,omitempty"`
+
+	// Window is set ONLY on a per-scenario slice (schema v5.9+,
+	// ServerResult.ScenarioResources): the [start, end] the raw series was
+	// cut to and how many samples of each kind fell inside. Nil on the
+	// column-wide aggregate.
+	Window *ResourceWindow `json:"window,omitempty"`
+}
+
+// ResourceWindow describes the slice a per-scenario ResourceStats was
+// computed over (schema v5.9+, celeris#585). Start is the scenario's
+// runner started_at plus the warm-up, End its completed_at; both
+// inclusive at 1 s resolution. The counts are the samples that fell
+// inside — the denominators behind every mean in the summary.
+type ResourceWindow struct {
+	Start           time.Time `json:"start"`
+	End             time.Time `json:"end"`
+	CPUSamples      int       `json:"cpu_samples"`
+	ObserverSamples int       `json:"observer_samples"`
 }
 
 // ResourceSummary is the scalar headline of a cell's resource usage.
@@ -666,6 +908,20 @@ type ResourceSummary struct {
 	GCPauseP99Ns   *int64   `json:"gc_pause_p99_ns,omitempty"`
 	GoroutineHWM   *int64   `json:"goroutine_hwm,omitempty"`
 	FDHWM          *int64   `json:"fd_hwm,omitempty"`
+
+	// MeanSoftPct is the mean mpstat %soft (softirq) over the window
+	// (schema v5.9+). Nil when the cpu.log carried no %soft column or the
+	// stats were not windowed per scenario.
+	MeanSoftPct *float64 `json:"mean_soft_pct,omitempty"`
+
+	// SUTProcessCPUPct is the SUT process's own CPU over the window
+	// (schema v5.9+): (utime+stime delta from /proc/<pid>/stat) / wall
+	// time, in percent of ONE core (so 3200 means every one of 32 cores),
+	// the same convention as top/pidstat. Separates the server's CPU from
+	// host-wide softirq/kernel work that mean_cpu_pct folds in. Nil when
+	// the observer wrote no cpu tick columns (pre-v5.9 observer) or fewer
+	// than two ticks samples fell in the window.
+	SUTProcessCPUPct *float64 `json:"sut_process_cpu_pct,omitempty"`
 }
 
 // ResourcePoint is one downsampled sample in a ResourceStats.Series.

@@ -176,16 +176,6 @@ func TestIMEM2_skipsWhenNotIdle(t *testing.T) {
 	}
 }
 
-func TestIMEM2_failsWhenOverBudget(t *testing.T) {
-	history := make([]Snapshot, 60)
-	snap := &Snapshot{GoroutineCount: 200}
-	ctx := ctxWith(time.Hour, history, true)
-	ok, msg := IMEM2.Predicate(snap, ctx)
-	if ok {
-		t.Fatalf("expected violation; msg=%q", msg)
-	}
-}
-
 func TestIPANIC_failsOnPersistentCount(t *testing.T) {
 	// A panic that persists across ipanicPersistence consecutive snapshots
 	// fires; the History carries the earlier samples.
@@ -383,7 +373,7 @@ func TestHeapSlope_Degenerate(t *testing.T) {
 }
 
 func TestTier1Walker_PredicatesRegistered(t *testing.T) {
-	for _, want := range []string{"I-ADV-ACCEPTED", "I-H2C-CRASHED", "I-WS-ACCEPTED", "I-WS-HANG", "I-LIVENESS", "I-HANG"} {
+	for _, want := range []string{"I-ADV-ACCEPTED", "I-H2C-CRASHED", "I-WS-ACCEPTED", "I-WS-HANG", "I-H2C-HANG", "I-WS-HANDSHAKE", "I-LIVENESS", "I-HANG", "I-WS-ECHO"} {
 		spec, ok := ByID(want)
 		if !ok {
 			t.Errorf("Spec %q missing from registry", want)
@@ -403,8 +393,8 @@ func TestTier1Walker_PredicatesRegistered(t *testing.T) {
 
 func TestTier1Walker_ByTierFiltersCorrectly(t *testing.T) {
 	got := ByTier("tier-1-walker")
-	if len(got) != 6 {
-		t.Errorf("ByTier(tier-1-walker): got %d specs, want 6", len(got))
+	if len(got) != 9 {
+		t.Errorf("ByTier(tier-1-walker): got %d specs, want 9", len(got))
 	}
 	for _, s := range got {
 		if s.Tier != "tier-1-walker" {

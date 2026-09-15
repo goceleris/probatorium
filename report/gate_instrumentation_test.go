@@ -56,6 +56,17 @@ func TestWaivedUninstrumented_ReasonsAreOnRecord(t *testing.T) {
 			t.Errorf("%s is waived with an empty reason", id)
 		}
 	}
+	// I-DRV is instrumented in the driver cells now; a waiver would hide a
+	// regression of exactly that coverage.
+	if _, ok := WaivedUninstrumented["I-DRV"]; ok {
+		t.Error("I-DRV must not be waived: the driver refapps declare it")
+	}
+	// I-ENG-ADAPTIVE has a data source only in adaptive cells; a run whose
+	// engine subset excludes adaptive must not fail RequireInstrumented on
+	// it, and a full-matrix run judges it in the adaptive cells.
+	if _, ok := WaivedUninstrumented["I-ENG-ADAPTIVE"]; !ok {
+		t.Error("I-ENG-ADAPTIVE must be waived for engine-subset runs (celeris#580)")
+	}
 	// The three middleware predicates are instrumented now; waiving them
 	// would re-hide exactly the gap probatorium#297 closed.
 	for _, id := range []string{"I-MW-SESSION", "I-MW-JWT", "I-MW-RATELIMIT"} {
@@ -83,5 +94,53 @@ func TestGate_InstrumentationIgnoresCellsWithoutALoop(t *testing.T) {
 	// No cell ran a loop at all: nothing to conclude, no violation.
 	if v := Gate([]ValidationCellResult{b}, nil, opts); len(v) != 0 {
 		t.Fatalf("no property loop anywhere means no instrumentation verdict, got %v", v)
+	}
+}
+
+// A tier built to cover a predicate must not be able to fall back on the
+// waiver: with ExpectInstrumented the cell that never declared the
+// predicate fails, by name, even though the ID is on the waiver record.
+func TestGate_ExpectInstrumentedOverridesTheWaiver(t *testing.T) {
+	a := cleanCell("auth_session_ratelimit", "iouring", "arm64")
+	b := cleanCell("kitchen_sink", "std", "amd64")
+	a.PropertiesNotInstrumented = []string{"I-MEM-2"}
+	b.PropertiesNotInstrumented = []string{"I-MEM-2"}
+	if _, waived := WaivedUninstrumented["I-MEM-2"]; !waived {
+		t.Fatal("this test needs I-MEM-2 on the waiver record")
+	}
+	base := GateOptions{RequireTier3: true, RequireProperties: true, RequireInstrumented: true}
+
+	// Waived, not expected: silent.
+	if v := Gate([]ValidationCellResult{a, b}, nil, base); len(v) != 0 {
+		t.Fatalf("a waived predicate must not fail by itself, got %v", v)
+	}
+
+	// Expected: one violation per cell that never declared it.
+	opts := base
+	opts.ExpectInstrumented = []string{"I-MEM-2"}
+	v := Gate([]ValidationCellResult{a, b}, nil, opts)
+	if len(v) != 2 {
+		t.Fatalf("want one violation per undeclaring cell, got %v", v)
+	}
+	for _, x := range v {
+		if x.Field != "properties_not_instrumented.I-MEM-2" || x.Refapp == "*" {
+			t.Fatalf("violation must name the predicate and the cell, got %+v", x)
+		}
+		if !strings.Contains(x.Why, "VALIDATE_GATE_EXPECT_INSTRUMENTED") {
+			t.Fatalf("Why must name the knob, got %q", x.Why)
+		}
+	}
+
+	// Declared in one cell, missing in the other: only the other fails.
+	a.PropertiesNotInstrumented = nil
+	v = Gate([]ValidationCellResult{a, b}, nil, opts)
+	if len(v) != 1 || v[0].Refapp != "kitchen_sink" {
+		t.Fatalf("only the undeclaring cell may fail, got %v", v)
+	}
+
+	// A cell whose property loop never ran (ssh driver) has nothing to say.
+	b.Tier1.PropertyLoopSkipped = "ssh driver"
+	if v := Gate([]ValidationCellResult{a, b}, nil, opts); len(v) != 0 {
+		t.Fatalf("a cell that ran no property loop cannot be expected to declare, got %v", v)
 	}
 }

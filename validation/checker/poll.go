@@ -65,7 +65,7 @@ import (
 // apart: it is the refapp's own statement of what it can judge, and the
 // evaluator reports anything absent from it as not-instrumented rather than
 // as passed.
-const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, memstats.HeapInuse, memstats.HeapAlloc, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties"
+const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_conn_total, celeris.active_conns, celeris.panic_count, celeris.adaptive_switches, celeris.engine_error_count, celeris.engine,celeris.oldest_open_conn_last_byte_age_ms, celeris.open_conns_tracked, celeris.checkptr_build, memstats.HeapInuse, memstats.HeapAlloc, memstats.HeapObjects, memstats.HeapIdle, memstats.HeapReleased, memstats.StackInuse, celeris.session_owner_mismatches, celeris.sessions_created_total, celeris.sessions_expired_total, celeris.session_cookie_drops, celeris.ratelimit_allowed, celeris.ratelimit_rejected, celeris.ratelimit_token_violations, celeris.jwt_validated_ok, celeris.jwt_validated_fail, celeris.jwt_late_admits, celeris.instrumented_properties, celeris.driver_writes_issued, celeris.driver_reads_issued, celeris.driver_read_hits, celeris.driver_read_misses, celeris.validation_build, celeris.iouring_sqe_corruptions, celeris.race_build, celeris.engine_workers, celeris.engine_requests_total, celeris.engine_bytes_read, celeris.engine_bytes_written, celeris.engine_accept_count, celeris.engine_close_count, celeris.engine_async_promoted_conns, celeris.engine_standby_active_conns, celeris.engine_standby_close_count, celeris.engine_transplant_detached, celeris.engine_transplant_adopted, celeris.engine_transplant_adopt_slot_occupied, celeris.engine_close_missing_conn_state, celeris.engine_recv_double_armed, celeris.engine_recv_cqe_unaccounted, celeris.engine_recv_sq_full, celeris.engine_recv_stall_episodes"
 
 // Poll fetches url and projects the /debug/vars document into a
 // [properties.Snapshot] stamped with t. Missing keys default to zero.
@@ -110,6 +110,42 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	snap.ActiveConns = readInt64(doc, "celeris.active_conns")
 	snap.PanicCount = readInt64(doc, "celeris.panic_count")
 	snap.AdaptiveSwitches = readInt64(doc, "celeris.adaptive_switches")
+	snap.EngineErrorCount = readInt64(doc, "celeris.engine_error_count")
+	snap.EngineWorkers = readInt64(doc, "celeris.engine_workers")
+	snap.EngineRequestsTotal = readInt64(doc, "celeris.engine_requests_total")
+	snap.EngineBytesRead = readInt64(doc, "celeris.engine_bytes_read")
+	snap.EngineBytesWritten = readInt64(doc, "celeris.engine_bytes_written")
+	snap.EngineAcceptCount = readInt64(doc, "celeris.engine_accept_count")
+	snap.EngineCloseCount = readInt64(doc, "celeris.engine_close_count")
+	snap.EngineAsyncPromotedConns = readInt64(doc, "celeris.engine_async_promoted_conns")
+	snap.EngineStandbyActiveConns = readInt64(doc, "celeris.engine_standby_active_conns")
+	snap.EngineStandbyCloseCount = readInt64(doc, "celeris.engine_standby_close_count")
+	snap.EngineTransplantDetached = readInt64(doc, "celeris.engine_transplant_detached")
+	snap.EngineTransplantAdopted = readInt64(doc, "celeris.engine_transplant_adopted")
+	snap.EngineTransplantAdoptSlotOccupied = readInt64(doc, "celeris.engine_transplant_adopt_slot_occupied")
+	snap.EngineCloseMissingConnState = readInt64(doc, "celeris.engine_close_missing_conn_state")
+	snap.EngineRecvDoubleArmed = readInt64(doc, "celeris.engine_recv_double_armed")
+	snap.EngineRecvCQEUnaccounted = readInt64(doc, "celeris.engine_recv_cqe_unaccounted")
+	snap.EngineRecvSQFull = readInt64(doc, "celeris.engine_recv_sq_full")
+	snap.EngineRecvStallEpisodes = readInt64(doc, "celeris.engine_recv_stall_episodes")
+	snap.OldestOpenConnLastByteAgeMs = readInt64(doc, "celeris.oldest_open_conn_last_byte_age_ms")
+	snap.OpenConnsTracked = readInt64(doc, "celeris.open_conns_tracked")
+	if b, ok := doc["celeris.checkptr_build"].(bool); ok {
+		snap.CheckptrBuild = b
+	}
+	if b, ok := doc["celeris.validation_build"].(bool); ok {
+		snap.ValidationBuild = b
+	}
+	if b, ok := doc["celeris.race_build"].(bool); ok {
+		snap.RaceBuild = b
+	}
+	// celeris's own io_uring SQE check (I-ENG-IOURING), folded into the
+	// document by debugvars from validation.Snapshot(); zero in a plain
+	// build. The unix-socket poll below may raise it, never lower it.
+	snap.IouringSQECorruptions = max(snap.IouringSQECorruptions, readInt64(doc, "celeris.iouring_sqe_corruptions"))
+	if e, ok := doc["celeris.engine"].(string); ok {
+		snap.EngineName = e
+	}
 	// Middleware oracles. See DebugVarsKeys: the refapps that install the
 	// middleware publish these, everything else leaves them at zero and
 	// omits the predicate from instrumented_properties.
@@ -123,12 +159,22 @@ func ParseDebugVars(body []byte, snap *properties.Snapshot) error {
 	snap.JWTValidatedOK = readInt64(doc, "celeris.jwt_validated_ok")
 	snap.JWTValidatedFail = readInt64(doc, "celeris.jwt_validated_fail")
 	snap.JWTLateAdmits = readInt64(doc, "celeris.jwt_late_admits")
+	// Driver read-after-write oracle (I-DRV). Published by every refapp,
+	// declared only by the driver refapps, which read every write back.
+	snap.DriverWritesIssued = readInt64(doc, "celeris.driver_writes_issued")
+	snap.DriverReadsIssued = readInt64(doc, "celeris.driver_reads_issued")
+	snap.DriverReadHits = readInt64(doc, "celeris.driver_read_hits")
+	snap.DriverReadMisses = readInt64(doc, "celeris.driver_read_misses")
 	if s, ok := doc["celeris.instrumented_properties"].(string); ok {
 		snap.InstrumentedProperties = s
 	}
 	if ms, ok := doc["memstats"].(map[string]any); ok {
 		snap.HeapInuseBytes = readInt64(ms, "HeapInuse")
 		snap.HeapAllocBytes = readInt64(ms, "HeapAlloc")
+		snap.HeapObjects = readInt64(ms, "HeapObjects")
+		snap.HeapIdleBytes = readInt64(ms, "HeapIdle")
+		snap.HeapReleasedBytes = readInt64(ms, "HeapReleased")
+		snap.StackInuseBytes = readInt64(ms, "StackInuse")
 	}
 	return nil
 }

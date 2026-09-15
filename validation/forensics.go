@@ -29,6 +29,19 @@ import (
 // outDir is created by the caller (handleIncident); this function
 // writes siblings under it.
 func captureForensicsLive(ctx context.Context, outDir string, pid int, listenAddr string) error {
+	return captureForensicsLiveOpts(ctx, outDir, pid, listenAddr, forensicsOpts{})
+}
+
+// forensicsOpts tunes one capture.
+type forensicsOpts struct {
+	// SkipCore leaves gcore out: the dump SIGSTOPs the target, which a
+	// record-only incident in a cell that keeps running must not do
+	// (Incident.SkipCore). A core.skipped marker says so.
+	SkipCore bool
+}
+
+// captureForensicsLiveOpts is captureForensicsLive with options.
+func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, listenAddr string, opts forensicsOpts) error {
 	// /proc snapshots — read once, write atomically. These reads
 	// are cheap (kilobyte-scale) so happen in series rather than
 	// fan-out — sequential reads keep the file order recoverable
@@ -84,7 +97,11 @@ func captureForensicsLive(ctx context.Context, outDir string, pid int, listenAdd
 	// this AFTER the pprof + /proc reads so an interrupt of the
 	// gcore step doesn't lose the cheaper artefacts. Requires a
 	// live PID — no-op for the pprof-only path.
-	if pid > 0 {
+	switch {
+	case pid > 0 && opts.SkipCore:
+		_ = writePlainText(filepath.Join(outDir, "core.skipped"),
+			"gcore skipped: record-only incident, the refapp must not be paused\n")
+	case pid > 0:
 		if hasBinary("gcore") {
 			if err := runGCore(ctx, pid, filepath.Join(outDir, "core")); err != nil {
 				_ = writePlainText(filepath.Join(outDir, "core.missing"),

@@ -15,16 +15,16 @@ require (
 	go.opentelemetry.io/otel v1.46.0 // indirect
 	go.opentelemetry.io/otel/metric v1.46.0 // indirect
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20260909133624-c9f7dad43771
-	github.com/goceleris/celeris/middleware/metrics v1.5.9
-	github.com/goceleris/celeris/middleware/otel v1.5.9
+	github.com/goceleris/celeris v1.5.12-0.20260915011209-7a651c31f2f0
+	github.com/goceleris/celeris/middleware/metrics v1.5.12-0.20260914123751-3b6184af545f
+	github.com/goceleris/celeris/middleware/otel v1.5.12-0.20260914123751-3b6184af545f
 	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
 	github.com/prometheus/client_golang v1.24.1
 )

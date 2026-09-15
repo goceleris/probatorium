@@ -87,6 +87,10 @@ func main() {
 	}
 
 	dv := debugvars.New() // /debug/vars + /debug/pprof for the validator's property loop
+	// Every write below is read back in the handler and tallied, so this
+	// refapp can judge I-DRV; the other refapps leave the counters at zero
+	// and the checker reports the predicate as not instrumented there.
+	dv.Declare("I-DRV")
 	srv := dv.NewServer(celeris.Config{
 		Addr:            *bind,
 		Engine:          resolveEngine(*engineFlag),
@@ -155,10 +159,12 @@ func main() {
 		if err := client.Set(c.Context(), k, v, 5*time.Minute); err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "set: "+err.Error())
 		}
+		dv.DriverWrite()
 		got, err := client.Get(c.Context(), k)
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
 		}
+		dv.DriverRead(got == v)
 		if got != v {
 			return c.JSON(http.StatusInternalServerError, map[string]string{
 				"err":           "read-after-write mismatch",
@@ -194,10 +200,12 @@ func main() {
 		if err := sstore.Set(c.Context(), k, v, 5*time.Minute); err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "set: "+err.Error())
 		}
+		dv.DriverWrite()
 		got, err := sstore.Get(c.Context(), k)
 		if err != nil {
 			return c.String(http.StatusInternalServerError, "%s", "raw read: "+err.Error())
 		}
+		dv.DriverRead(string(got) == string(v))
 		if string(got) != string(v) {
 			return c.JSON(http.StatusInternalServerError, map[string]string{
 				"err":           "store read-after-write mismatch",
