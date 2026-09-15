@@ -5,6 +5,10 @@
 # changes. The companion runner-teardown.yml wipes the directory and
 # de-registers from GitHub.
 #
+# One thing persists by design: the version-keyed tool cache under
+# /tmp/celeris-runner-tarballs -- the runner tarball, uv, a python build,
+# the ansible venv and ansible.posix. Teardown leaves it; a reboot clears it.
+#
 # This playbook follows the cluster-pristine rule: the runner ships
 # its own runtime tarball + supervises itself with `nohup ./run.sh`
 # (no systemd unit, no user lingering). When teardown runs the
@@ -48,6 +52,46 @@
     # runner_root on a host called "cache", and the wipe would take
     # the cache with it.
     runner_cache_dir: "/tmp/celeris-runner-tarballs"
+    # probatorium#392: every tool the bootstrap fetches is pinned and cached
+    # outside runner_root, keyed by its pin. Pinning has to come first --
+    # caching an unpinned install silently freezes whichever version happened
+    # to install first, with nothing recording which -- and keying each cache
+    # directory by its pin is what makes a bump install fresh instead of
+    # reusing a stale copy. All four pins were field-proven by the
+    # 2026-09-15 14:29Z bootstrap on all three hosts.
+    uv_version: "0.12.15"
+    python_version: "3.13"
+    ansible_core_version: "2.21.4"
+    ansible_posix_version: "2.2.2"
+    tool_cache_dir: "{{ runner_cache_dir }}/tools"
+    uv_dir: "{{ tool_cache_dir }}/uv-{{ uv_version }}"
+    # uv otherwise puts its python under $HOME/.local/share/uv/python and its
+    # cache under $HOME/.cache/uv, and ansible-galaxy puts its download temp
+    # dirs and API cache under $HOME/.ansible -- all outside /tmp, which quietly
+    # broke this playbook's own "nothing lands outside /tmp" rule. All three
+    # live under the tool cache now.
+    uv_python_install_dir: "{{ tool_cache_dir }}/uv-python"
+    uv_cache_dir: "{{ tool_cache_dir }}/uv-cache"
+    ansible_home_dir: "{{ tool_cache_dir }}/ansible-home"
+    # ansible-core is pinned; its dependencies (jinja2, PyYAML, cryptography,
+    # packaging, resolvelib) are frozen by resolving only what PyPI held at this
+    # cutoff. ansible-core 2.21.4 was uploaded 2026-09-08T16:51:47Z. The cutoff
+    # is part of the venv's directory name, so moving it builds a fresh venv
+    # instead of trusting one resolved under a different cutoff.
+    ansible_deps_exclude_newer: "2026-09-15T00:00:00Z"
+    ansible_venv_dir: "{{ tool_cache_dir }}/ansible-venv-py{{ python_version }}-core{{ ansible_core_version }}-deps{{ ansible_deps_exclude_newer | regex_replace('[^0-9]', '') }}"
+    ansible_collections_dir: "{{ tool_cache_dir }}/ansible-collections-posix{{ ansible_posix_version }}"
+    # The GitHub-source fallback installs this COMMIT, not the 2.2.2 tag: a tag
+    # can be moved or deleted upstream, and the manifest check after the install
+    # reads its version from the same repository, so a moved tag would pass it.
+    # 2.2.2 is a lightweight tag on exactly this commit.
+    ansible_posix_commit: "e98d9a0756458be1ac710988498000973889075c"
+    # Every Galaxy attempt is bounded. retries never bound a stalled transfer:
+    # at the 2m29s stall that failed nightly 34981852841, four unbounded
+    # attempts would spend ~11 minutes of a 25-minute bootstrap before the
+    # GitHub fallback ran. The fallback clones and builds, so it gets its own.
+    galaxy_attempt_timeout: 120
+    galaxy_git_fallback_timeout: 300
     runner_arch_map:
       x86_64: x64
       aarch64: arm64
@@ -97,6 +141,7 @@
         path: "{{ runner_cache_dir }}"
         state: directory
         mode: '0755'
+        owner: "{{ ansible_user_id }}"
 
     # 215 MiB per host. Pointing dest inside runner_root made force:false
     # dead code -- the wipe above had just deleted the file it was meant
@@ -193,77 +238,244 @@
       # as a secret regardless.
       no_log: true
 
-    - name: Install uv (static binary, self-contained)
+    - name: Ensure tool cache dir
+      # owner: the cache is under world-writable /tmp and the playbook executes
+      # what it finds there. On a directory another local user created first a
+      # non-root chown fails and the play stops, instead of trusting it.
+      ansible.builtin.file:
+        path: "{{ tool_cache_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user_id }}"
+
+    - name: Install uv (pinned, cached across runs)
       # mage Deploy / Validate / Soak shell out to ansible-playbook.
       # The cluster hosts don't have ansible system-installed (the
       # pristine rule forbids). Plain `python3 -m venv` fails on the
       # cluster because Ubuntu 26.04 ships python3.14 without
       # python3.14-venv / ensurepip, and there's no system pip either.
       #
-      # Use uv instead — single static binary that bootstraps its own
+      # Use uv instead -- single static binary that bootstraps its own
       # python + venv without depending on system python-venv. The
       # installer drops uv + uvx directly into UV_INSTALL_DIR (NOT a
       # bin/ subdir), so the binary lives at <UV_INSTALL_DIR>/uv.
       #
-      # Lives inside runner_root so runner-teardown.yml wipes it
-      # along with the rest of the runner dir.
+      # The versioned installer URL really pins: its script sets
+      # APP_VERSION to that release. A cached uv is only trusted if it
+      # reports the pinned version, so a partial install re-fetches
+      # instead of being skipped as present.
       ansible.builtin.shell: |
         set -e
-        if [ -x "{{ runner_root }}/uv/uv" ]; then
-          echo "uv already present"
+        if [ -x "{{ uv_dir }}/uv" ] && "{{ uv_dir }}/uv" --version | grep -qF "uv {{ uv_version }}"; then
+          echo "uv {{ uv_version }} already cached"
           exit 0
         fi
-        curl -LsSf https://astral.sh/uv/install.sh \
-          | env UV_INSTALL_DIR="{{ runner_root }}/uv" \
+        rm -rf "{{ uv_dir }}"
+        curl -LsSf "https://astral.sh/uv/{{ uv_version }}/install.sh" \
+          | env UV_INSTALL_DIR="{{ uv_dir }}" \
                 UV_NO_MODIFY_PATH=1 \
                 INSTALLER_NO_MODIFY_PATH=1 \
                 sh
+        "{{ uv_dir }}/uv" --version | grep -qF "uv {{ uv_version }}"
       args:
         executable: /bin/bash
-      changed_when: true
+      register: uv_install
+      changed_when: "'already cached' not in (uv_install.stdout | default(''))"
+      retries: 5
+      delay: 10
+      until: uv_install is succeeded
 
-    - name: Create ansible venv via uv (auto-downloads python if needed)
-      # uv venv brings its own python distribution if the system lacks
-      # one with ensurepip — exactly the cluster's situation.
-      ansible.builtin.command:
-        cmd: >-
-          {{ runner_root }}/uv/uv venv
-          --python 3.13
-          {{ runner_root }}/ansible-venv
-        creates: "{{ runner_root }}/ansible-venv/bin/python"
+    - name: Install ansible-core into a uv venv (pinned python, core and dependencies; cached across runs)
+      # mage Deploy / Validate / Soak shell out to ansible-playbook, and the
+      # cluster hosts have no system ansible (the pristine rule forbids it).
+      #
+      # The venv and ansible-core are ONE cached unit, trusted only when a
+      # completion stamp written after a verified install exists AND
+      # ansible-playbook actually runs and reports the pinned core. A presence
+      # check is not enough, twice over (probatorium#393 review):
+      #  - Ansible's `creates:` checks with glob.glob, which counts a DANGLING
+      #    bin/python symlink as present, so a venv whose interpreter was
+      #    deleted would be skipped and fail later inside a job.
+      #  - uv writes a wheel's entry-point scripts before its package data,
+      #    metadata and RECORD, so bin/ansible-playbook can exist over an
+      #    install the bootstrap timeout killed half way.
+      # The probe executes the interpreter and imports ansible, which neither a
+      # dangling link nor a partial install can pass, and the stamp is written
+      # last. A miss rebuilds the whole venv from scratch.
+      #
+      # --managed-python is what keeps that python inside the cache. Without it
+      # uv prefers any matching python already on PATH over downloading into
+      # UV_PYTHON_INSTALL_DIR, and the "cached" venv then depends on a python
+      # that lives somewhere else entirely. An end-to-end run caught exactly
+      # that: the venv linked to the test controller's python, and a fresh
+      # container could not execute it. The cluster only escapes today because
+      # its system python is 3.14.
+      ansible.builtin.shell: |
+        set -e
+        stamp="{{ ansible_venv_dir }}/.celeris-installed"
+        if [ -f "$stamp" ] && "{{ ansible_venv_dir }}/bin/ansible-playbook" --version 2>/dev/null | head -1 | grep -qF "[core {{ ansible_core_version }}]"; then
+          echo "ansible-core {{ ansible_core_version }} already cached"
+          exit 0
+        fi
+        rm -rf "{{ ansible_venv_dir }}"
+        {{ uv_dir }}/uv venv --clear --managed-python --python {{ python_version }} {{ ansible_venv_dir }}
+        {{ uv_dir }}/uv pip install --python {{ ansible_venv_dir }}/bin/python --exclude-newer {{ ansible_deps_exclude_newer }} ansible-core=={{ ansible_core_version }}
+        "{{ ansible_venv_dir }}/bin/ansible-playbook" --version | head -1 | grep -qF "[core {{ ansible_core_version }}]"
+        touch "$stamp"
+      args:
+        executable: /bin/bash
+      environment:
+        UV_PYTHON_INSTALL_DIR: "{{ uv_python_install_dir }}"
+        UV_CACHE_DIR: "{{ uv_cache_dir }}"
+      register: ansible_core_install
+      changed_when: "'already cached' not in (ansible_core_install.stdout | default(''))"
+      retries: 5
+      delay: 10
+      until: ansible_core_install is succeeded
 
-    - name: Install ansible-core into the venv via uv pip
-      ansible.builtin.command:
-        cmd: >-
-          {{ runner_root }}/uv/uv pip install
-          --python {{ runner_root }}/ansible-venv/bin/python
-          ansible-core
-        creates: "{{ runner_root }}/ansible-venv/bin/ansible-playbook"
+    # cleanup.yml + deploy.yml reference ansible.posix.sysctl /
+    # ansible.posix.synchronize, and ansible-core ships without bundled
+    # collections. On 2026-09-15 galaxy.ansible.com gave one host nothing
+    # for 2m29s (API time-to-first-byte 23s, while GitHub on the same host
+    # did 48 MB/s) and that one host failed the whole bootstrap.
+    #
+    # The cache is trusted only when a completion stamp written after a
+    # verified install exists AND `ansible-galaxy collection verify --offline`
+    # finds every file matching its recorded hash. The manifest alone proves
+    # nothing: ansible-galaxy writes MANIFEST.json BEFORE any other collection
+    # file, so an install killed half way leaves a manifest naming the pin over
+    # a partial collection.
+    #
+    # A miss fetches from Galaxy, and if Galaxy will not serve it, builds the
+    # collection from its GitHub source at a pinned COMMIT. ansible.posix
+    # publishes no release assets, so its git source is the only non-Galaxy
+    # route; git is present on every cluster host. Each attempt is bounded by
+    # coreutils timeout, because retries never bound a stall. ANSIBLE_HOME keeps
+    # ansible-galaxy's download temp dirs and API cache inside the tool cache.
+    - name: Install ansible.posix (pinned; Galaxy, then GitHub source; cached across runs)
+      environment:
+        ANSIBLE_HOME: "{{ ansible_home_dir }}"
+      block:
+        - name: Check the cached ansible.posix is complete and the pinned version
+          ansible.builtin.shell: |
+            set -e
+            test -f "{{ ansible_collections_dir }}/.celeris-installed-posix{{ ansible_posix_version }}"
+            # verify --offline hashes every file but not MANIFEST.json itself, so a
+            # manifest whose version was altered passes it (measured end to end).
+            "{{ ansible_venv_dir }}/bin/python" -c 'import json, sys; sys.exit(json.load(open(sys.argv[1]))["collection_info"]["version"] != sys.argv[2])' \
+              "{{ ansible_collections_dir }}/ansible_collections/ansible/posix/MANIFEST.json" "{{ ansible_posix_version }}"
+            "{{ ansible_venv_dir }}/bin/ansible-galaxy" collection verify --offline \
+              --collections-path "{{ ansible_collections_dir }}" \
+              "ansible.posix:=={{ ansible_posix_version }}"
+          args:
+            executable: /bin/bash
+          changed_when: false
+      rescue:
+        - name: Discard any partial or mismatched ansible.posix
+          ansible.builtin.file:
+            path: "{{ ansible_collections_dir }}"
+            state: absent
 
-    - name: Install ansible.posix collection
-      # cleanup.yml + deploy.yml reference ansible.posix.sysctl /
-      # ansible.posix.synchronize. ansible-core ships without bundled
-      # collections, so install into a runner-scoped collections dir
-      # (kept under runner_root for teardown wipe). ANSIBLE_COLLECTIONS_PATH
-      # gets exported in the Start runner task so the playbooks find it.
-      ansible.builtin.command:
-        cmd: >-
-          {{ runner_root }}/ansible-venv/bin/ansible-galaxy collection install
-          --collections-path {{ runner_root }}/ansible-collections
-          ansible.posix
-        creates: "{{ runner_root }}/ansible-collections/ansible_collections/ansible/posix"
+        - name: Fetch ansible.posix, from Galaxy or its GitHub source
+          block:
+            - name: Install ansible.posix from Galaxy
+              ansible.builtin.command:
+                cmd: >-
+                  timeout {{ galaxy_attempt_timeout }}
+                  {{ ansible_venv_dir }}/bin/ansible-galaxy collection install
+                  --timeout 30
+                  --collections-path {{ ansible_collections_dir }}
+                  ansible.posix:=={{ ansible_posix_version }}
+              register: ansible_posix_galaxy
+              retries: 1
+              delay: 15
+              until: ansible_posix_galaxy is succeeded
+          rescue:
+            - name: Install ansible.posix from its GitHub source commit
+              ansible.builtin.command:
+                cmd: >-
+                  timeout {{ galaxy_git_fallback_timeout }}
+                  {{ ansible_venv_dir }}/bin/ansible-galaxy collection install --force
+                  --collections-path {{ ansible_collections_dir }}
+                  git+https://github.com/ansible-collections/ansible.posix.git,{{ ansible_posix_commit }}
+              register: ansible_posix_git
+              retries: 2
+              delay: 15
+              until: ansible_posix_git is succeeded
+
+        - name: Read the installed ansible.posix manifest
+          ansible.builtin.slurp:
+            src: "{{ ansible_collections_dir }}/ansible_collections/ansible/posix/MANIFEST.json"
+          register: ansible_posix_manifest
+
+        - name: Check the installed ansible.posix is the pinned version
+          ansible.builtin.assert:
+            that:
+              - (ansible_posix_manifest.content | b64decode | from_json).collection_info.version == ansible_posix_version
+            fail_msg: "ansible.posix installed but its MANIFEST.json does not name {{ ansible_posix_version }}"
+
+        - name: Verify every installed ansible.posix file against its recorded hash
+          ansible.builtin.command:
+            cmd: >-
+              {{ ansible_venv_dir }}/bin/ansible-galaxy collection verify --offline
+              --collections-path {{ ansible_collections_dir }}
+              ansible.posix:=={{ ansible_posix_version }}
+          changed_when: false
+
+        - name: Stamp ansible.posix as completely installed
+          ansible.builtin.file:
+            path: "{{ ansible_collections_dir }}/.celeris-installed-posix{{ ansible_posix_version }}"
+            state: touch
+            mode: '0644'
+
+    - name: Confirm the cached tool directories exist before linking to them
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ ansible_venv_dir }}"
+        - "{{ ansible_collections_dir }}"
+      register: cached_tool_dir
+      failed_when: not (cached_tool_dir.stat.isdir | default(false))
+
+    - name: Point the legacy runner_root tool paths at the cache
+      # Six cluster workflows (nightly, weekend, benchmark, checkptr,
+      # race, pr-tier) never read the exports in "Start runner": each
+      # re-derives RUNNER_ROOT=/tmp/actions-runner-$(hostname -s) and puts
+      # ${RUNNER_ROOT}/ansible-venv/bin on GITHUB_PATH and
+      # ${RUNNER_ROOT}/ansible-collections into ANSIBLE_COLLECTIONS_PATH.
+      # Keeping those two paths alive as symlinks into the cache leaves
+      # all six untouched. Teardown's "Wipe runner dir" is
+      # ansible.builtin.file state=absent, which for a directory is
+      # shutil.rmtree -- that unlinks a symlink and never follows it
+      # (measured on Linux CPython 3.13: avoids_symlink_attacks=True and
+      # the target survives), so the wipe drops the links, not the cache.
+      #
+      # No force: true. The wipe above leaves both paths absent, replacing a
+      # stale link needs no force anyway, and force would switch off ansible's
+      # only check that the target exists: a missing cache dir would become a
+      # dangling link and a WARNING instead of a failure.
+      ansible.builtin.file:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        state: link
+      loop:
+        - { src: "{{ ansible_venv_dir }}", dest: "{{ runner_root }}/ansible-venv" }
+        - { src: "{{ ansible_collections_dir }}", dest: "{{ runner_root }}/ansible-collections" }
 
     - name: Start runner (nohup)
-      # Prepend the runner-scoped ansible venv to PATH so any job
+      # Prepend the ansible venv to PATH so any job
       # that lands on this runner finds ansible-playbook without
       # needing an explicit per-job install step. The export goes
       # into the runner's process environment because run.sh
       # inherits the shell's PATH.
       #
       # ANSIBLE_COLLECTIONS_PATH points ansible-playbook at the
-      # runner-scoped collections dir (ansible.posix lives there) —
+      # collections dir (ansible.posix lives there) —
       # without it ansible-galaxy's collection install is invisible
       # to ansible-playbook at runtime.
+      #
+      # Both paths are symlinks into the host's version-keyed tool cache;
+      # see "Point the legacy runner_root tool paths at the cache".
       ansible.builtin.shell: |
         cd {{ runner_root }}
         export PATH="{{ runner_root }}/ansible-venv/bin:$PATH"
