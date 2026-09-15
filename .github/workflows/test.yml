@@ -85,6 +85,29 @@ jobs:
             (cd "$d" && go build ./... && go vet ./...)
           done
 
+  # The mage build tag hides an entire layer from `go test ./...`: eleven
+  # source files (the bench driver, the release gate, the cluster
+  # orchestration, publish, the validate targets) and the 50-odd tests
+  # written against them. Lint only *compiles* the magefiles, so the
+  # tests never executed anywhere -- including the ones that pin the
+  # report schema version, which is exactly the constant a rebase has
+  # already auto-merged wrong once. Runs over ./... rather than the two
+  # packages that carry mage files today, so a mage-tagged test added to
+  # any other package is covered the moment it lands.
+  mage:
+    name: mage-tagged
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+          cache: true
+      - name: go test -tags mage
+        run: go test -count=1 -race -tags mage -timeout=10m ./...
+
   # Fan-in over every job above so branch protection can require ONE
   # stable check name ("ci-ok") instead of enumerating the adapter
   # matrix — adding or removing an adapter then never silently drops a
@@ -94,7 +117,7 @@ jobs:
   # listed in needs must stay unconditional on push + pull_request.
   ci-ok:
     name: ci-ok
-    needs: [root, adapters, refapps]
+    needs: [root, adapters, refapps, mage]
     if: always()
     runs-on: ubuntu-latest
     steps:
