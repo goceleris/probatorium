@@ -231,6 +231,14 @@ Iterates `(refapp × engine)` cells, runs a fresh orchestrator per cell with a p
 - `VALIDATE_MATRIX_REFAPPS=driver_postgres,driver_redis` — limit refapps.
 - `VALIDATE_MATRIX_ENGINES=iouring,epoll` — limit engines (defaults to the OS production set: iouring + epoll + std + adaptive on Linux, std elsewhere).
 
+**A failing cell does not stop the run.** Each cell's failure is recorded and the matrix carries on, because the window is the scarce resource: a 64-cell nightly costs ~70 minutes of exclusive cluster time and one broken refapp used to be worth a whole architecture's worth of nothing. Every cell carries a `status` — `ok`, `failed` (it ran, then something failed it) or `not_run` (it produced no requests and no property verdicts: its refapp never started) — plus the verbatim `failure_reason`, which for a cell that never came up is the driver's own account of why (`driver_memcached: probe: dial tcp 127.0.0.1:21211: connect: connection refused`) rather than the tautology that it measured nothing. The ledger names the cell's evidence — `refapp_stderr_tail.txt`, else the incident dossier — only when that evidence exists and has content in it; when there is none it says so, because a path to an empty file teaches a reader less than the line above it already did. The end of the run prints the ledger and leaves it in `cell-failures.txt` beside `validate-results.json`. The exit status is still non-zero for any cell that did not pass: this is a gate, not a report.
+
+A `not_run` cell carries no engine counters at all, and the two unconditional engine checks added in schema 5.11 do not fire on it: the must-stay-zero witnesses have nothing to iterate and the engine-request-coverage check skips a cell with no requests on either side of the socket. The cell still fails the gate as the dead cell it is, now with its reason attached.
+
+Three conditions are fatal and DO stop the run immediately, because none of them leave a later cell able to measure anything: the remote driver cannot be built (no host to test), the refapp staging dir is unreadable (no subject to test), or a write fails with `ENOSPC` (nowhere to record what was found). Everything about the cell's subject — a refapp that will not start, an oracle that fires, a per-cell build failure — is recoverable by design.
+
+Two caps bound the damage when the matrix is failing wholesale: **8 consecutive** failures (two entire refapps with no survivor, so the cause is scoped to neither an engine nor a refapp) and **half the plan** failed in total. Half is deliberately loose — the driver_* family going dark together is 12 of 32 cells, and aborting that run would throw away the five healthy refapps. Override with `PROBATORIUM_MATRIX_MAX_CONSECUTIVE_FAILURES` / `PROBATORIUM_MATRIX_MAX_FAILED_CELLS` (negative disables); both are carried across the SSH boundary by `mage Validate` as extra-vars, because the validator reads them from its own environment on the bench target. The weekend soak sets the total cap to 8: at its ~45 min per cell, half the plan is 12 hours of a 24-hour window, and 8 leaves ~18 hours of runway to fix the cause and re-dispatch inside the same weekend. Both caps are counts standing in for the quantity that matters, wall-clock burned on cells that will not produce a verdict — probatorium#370. Whatever stops a run early, the summary names the cells it never attempted and prints the `-matrix-resume-from` line that finishes them.
+
 ## Result layout
 
 ```
@@ -258,8 +266,11 @@ results/<ts>-validate-<version>/
 
 results/<ts>-validate-matrix-<arch>/       # matrix-mode runs
   validate-results.json                    # v5.5 top-level (Cells[] populated)
+  cell-failures.txt                        # every cell that failed or never ran, with its reason
+  streaming-coverage.txt                   # per-refapp ws/sse routing table
   cell-<NN>-<refapp>-<engine>/
     validate-results.json                  # per-cell single-doc
+    refapp_stderr_tail.txt                 # the refapp's last words (why a not_run cell never started)
 ```
 
 ## v5.5 result schema
