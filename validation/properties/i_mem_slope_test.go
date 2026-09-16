@@ -336,14 +336,16 @@ func TestIMEM1_sawtoothNeverFires(t *testing.T) {
 	// edit to it; that is what drifted a "~60 s" comment into a 3m39s
 	// run and timed out three CI runs.
 	//
-	// Deliberately no wall-clock figure here: the budget that binds is
-	// the package's, not this test's, and it is enforced by CI, not by
-	// prose. test.yml runs the root module as
-	// `go test -count=1 -race -timeout=5m ./...` and -timeout is per
+	// Deliberately no wall-clock figure for this test: the budget that
+	// binds is the package's, not this test's, and it is enforced by
+	// CI, not by prose. test.yml runs the root module as
+	// `go test -count=1 -race -timeout=5m ./...`, and -timeout is per
 	// test binary, so validation/properties gets 300 s. Measured on the
-	// GitHub runner: 12.042 s for the whole package on the commit that
-	// fixed #396 (root job of run 35039051118), against 300.020 s -- a
-	// timeout, in this test -- on its parent (run 35024709835).
+	// GitHub runner, root job, across this PR's commits: ~12 s for the
+	// whole package (runs 35039051118 and 35049310491), against
+	// 300.020 s -- a timeout, in this test -- on main 1a5b439 (run
+	// 35024709835). Quote the runner, never a laptop: a local container
+	// runs this package several times faster than CI does.
 	seeds := 12
 	if testing.Short() {
 		seeds = 4
