@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -323,8 +325,27 @@ func sawtoothHeap(rng *rand.Rand, n int, L float64, period, dup float64) []Snaps
 // this pass; the leak tests above are the true-positive bound.
 func TestIMEM1_sawtoothNeverFires(t *testing.T) {
 	// 12 seeds x 2 heap sizes x 3 GC periods, one hour each, evaluated
-	// every 5 s: ~60 s under -race, a few seconds without. (A one-off
-	// 30-seed / 3 s-stride run of the same model also stayed at zero.)
+	// every 5 s = 51,912 evaluations of the production predicate. (A
+	// one-off 30-seed / 3 s-stride run of the same model also stayed at
+	// zero.)
+	//
+	// What this costs scales with that evaluation count and with the
+	// length of each trace -- and, since probatorium#396, with nothing
+	// else. It used to scale with sizeof(Snapshot) as well, so every
+	// EngineMetrics counter celeris added made this test slower with no
+	// edit to it; that is what drifted a "~60 s" comment into a 3m39s
+	// run and timed out three CI runs.
+	//
+	// Deliberately no wall-clock figure for this test: the budget that
+	// binds is the package's, not this test's, and it is enforced by
+	// CI, not by prose. test.yml runs the root module as
+	// `go test -count=1 -race -timeout=5m ./...`, and -timeout is per
+	// test binary, so validation/properties gets 300 s. Measured on the
+	// GitHub runner, root job, across this PR's commits: ~12 s for the
+	// whole package (runs 35039051118 and 35049310491), against
+	// 300.020 s -- a timeout, in this test -- on main 1a5b439 (run
+	// 35024709835). Quote the runner, never a laptop: a local container
+	// runs this package several times faster than CI does.
 	seeds := 12
 	if testing.Short() {
 		seeds = 4
@@ -360,6 +381,73 @@ func TestIMEM1_sawtoothWithLeakFires(t *testing.T) {
 	}
 	if !strings.Contains(msg, "sampling noise") {
 		t.Fatalf("message must show the floors: %q", msg)
+	}
+}
+
+// One slope evaluation must cost a couple of machine words per sample,
+// not one whole [Snapshot] per sample.
+//
+// The slope window used to be a []Snapshot, so the cost of every
+// verdict scaled with sizeof(Snapshot) -- a flat struct that grew from
+// 41 fields to 103 as celeris gained EngineMetrics counters, while the
+// predicates still judge exactly one of them. Each judged sample was
+// copied through it four times per evaluation (the range variable, the
+// append, the range in buckets, the by-value y argument) over a window
+// the make had already sized in whole Snapshots, which is ~3 MB of
+// allocation per evaluation on a full history. Under -race that is what
+// took the sweep above to 3m39s of the root job's 5 min budget and
+// timed out three CI runs (probatorium#396).
+//
+// The budget is in BYTES, not wall clock, so this says the same thing
+// on a fast laptop and a slow shared runner.
+//
+// It bounds ALLOCATION, which is not in general the same thing as
+// copying -- but in this shape the two cannot come apart. Putting the
+// per-sample copy back means `for _, s := range ctx.History`, and
+// reaching keep and y from it means taking &s, which escapes: the copy
+// becomes a heap allocation this budget sees. Measured, that break
+// costs 914 B/sample and fails this test. Reintroducing the copy
+// WITHOUT the allocation would mean widening keep and y back to
+// by-value signatures -- every slopeSpec at once, not a silent drift.
+func TestSlopePredicates_allocationDoesNotScaleWithSnapshot(t *testing.T) {
+	// The L=32 MB / period=1.7 s / seed=0 trace of the sweep above, which
+	// that test proves never violates -- at this very last evaluation
+	// among others (3600 is a multiple of its stride).
+	rng := rand.New(rand.NewSource(1700))
+	h := sawtoothHeap(rng, 60*60, 32<<20, 1.7, 0.5)
+	for i := range h {
+		h[i].RSSBytes = 400 << 20 // so I-MEM-4 judges instead of skipping
+	}
+	ctx := slopeCtx(h)
+	snap := &h[len(h)-1]
+	// Two machine words per sample: the projected (timestamp, value)
+	// pair. The bucket and trough slices are per-BUCKET, ~1/150th of
+	// that, and fit in the same allowance.
+	const perSample = 32
+	limit := uint64(len(h)) * perSample
+	for _, s := range []Spec{IMEM1, IMEM3, IMEM4} {
+		s.Predicate(snap, ctx) // warm-up: nothing lazy left to allocate
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		ok, msg := s.Predicate(snap, ctx)
+		runtime.ReadMemStats(&after)
+		// Positive control: a skip returns before building the window
+		// and a violation formats a message, so neither would measure
+		// what this test is about. The budget is only meaningful against
+		// a real pass over a full window.
+		if !ok || IsSkip(ok, msg) {
+			t.Fatalf("%s: the probe must reach a passing verdict over a full window, got ok=%v msg=%q", s.ID, ok, msg)
+		}
+		got := after.TotalAlloc - before.TotalAlloc
+		// Logged on every run: this is the number that drifted for a
+		// year without anyone seeing it.
+		t.Logf("%s: %d B per evaluation over %d samples = %.1f B/sample (budget %d; sizeof(Snapshot)=%d B)",
+			s.ID, got, len(h), float64(got)/float64(len(h)), perSample, reflect.TypeOf(Snapshot{}).Size())
+		if got > limit {
+			t.Errorf("%s allocated %d B for ONE evaluation over %d samples (%.0f B/sample, budget %d B/sample; sizeof(Snapshot)=%d B): "+
+				"the slope window carries whole Snapshots, so every counter added to Snapshot makes every verdict more expensive (probatorium#396)",
+				s.ID, got, len(h), float64(got)/float64(len(h)), perSample, reflect.TypeOf(Snapshot{}).Size())
+		}
 	}
 }
 

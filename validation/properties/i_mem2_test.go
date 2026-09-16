@@ -104,16 +104,16 @@ func TestSlopeWindow_WarmsUpFromLoadStart(t *testing.T) {
 	ctx := Context{RunStartedAt: t0, Now: t0.Add(30 * time.Minute), History: h}
 
 	// No idle prelude: cutoff = max(now-20m, run+5m) = t0+10m.
-	got, ok := slopeWindow(ctx, 20*time.Minute, nil)
-	if !ok || got[0].TS != base+600 {
-		t.Fatalf("without LoadStartedAt the window must start at run+10m, got ok=%v first=%d", ok, got[0].TS-base)
+	got, ok := slopeWindow(ctx, 20*time.Minute, nil, heapSlopeSpec.y)
+	if !ok || got[0].ts != base+600 {
+		t.Fatalf("without LoadStartedAt the window must start at run+10m, got ok=%v first=%d", ok, got[0].ts-base)
 	}
 
 	// Sustained load began at t0+7m: warm-up ends at t0+12m, which now
 	// dominates the trailing window.
 	ctx.LoadStartedAt = t0.Add(7 * time.Minute)
-	got, ok = slopeWindow(ctx, 20*time.Minute, nil)
-	if !ok || got[0].TS != base+720 {
-		t.Fatalf("with LoadStartedAt=+7m the window must start at +12m, got ok=%v first=%d", ok, got[0].TS-base)
+	got, ok = slopeWindow(ctx, 20*time.Minute, nil, heapSlopeSpec.y)
+	if !ok || got[0].ts != base+720 {
+		t.Fatalf("with LoadStartedAt=+7m the window must start at +12m, got ok=%v first=%d", ok, got[0].ts-base)
 	}
 }
