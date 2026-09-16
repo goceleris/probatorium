@@ -325,12 +325,25 @@ func sawtoothHeap(rng *rand.Rand, n int, L float64, period, dup float64) []Snaps
 // this pass; the leak tests above are the true-positive bound.
 func TestIMEM1_sawtoothNeverFires(t *testing.T) {
 	// 12 seeds x 2 heap sizes x 3 GC periods, one hour each, evaluated
-	// every 5 s = 51,912 evaluations of the production predicate: ~3 s
-	// under -race. (A one-off 30-seed / 3 s-stride run of the same model
-	// also stayed at zero.) It was 19x that until probatorium#396 stopped
-	// the slope window from carrying whole Snapshots; what this costs is
-	// the evaluation count now, not sizeof(Snapshot), so the next
-	// EngineMetrics counter does not slow it down.
+	// every 5 s = 51,912 evaluations of the production predicate. (A
+	// one-off 30-seed / 3 s-stride run of the same model also stayed at
+	// zero.)
+	//
+	// What this costs scales with that evaluation count and with the
+	// length of each trace -- and, since probatorium#396, with nothing
+	// else. It used to scale with sizeof(Snapshot) as well, so every
+	// EngineMetrics counter celeris added made this test slower with no
+	// edit to it; that is what drifted a "~60 s" comment into a 3m39s
+	// run and timed out three CI runs.
+	//
+	// Deliberately no wall-clock figure here: the budget that binds is
+	// the package's, not this test's, and it is enforced by CI, not by
+	// prose. test.yml runs the root module as
+	// `go test -count=1 -race -timeout=5m ./...` and -timeout is per
+	// test binary, so validation/properties gets 300 s. Measured on the
+	// GitHub runner: 12.042 s for the whole package on the commit that
+	// fixed #396 (root job of run 35039051118), against 300.020 s -- a
+	// timeout, in this test -- on its parent (run 35024709835).
 	seeds := 12
 	if testing.Short() {
 		seeds = 4
@@ -376,16 +389,24 @@ func TestIMEM1_sawtoothWithLeakFires(t *testing.T) {
 // verdict scaled with sizeof(Snapshot) -- a flat struct that grew from
 // 41 fields to 103 as celeris gained EngineMetrics counters, while the
 // predicates still judge exactly one of them. Each judged sample was
-// copied through it about five times per evaluation (the make, the
-// range variable, the append, the range in buckets, the by-value y
-// argument), which is ~3 MB of allocation per evaluation on a full
-// history. Under -race that is what took the sweep above to 3m39s of
-// the root job's 5 min budget and timed out three CI runs
-// (probatorium#396).
+// copied through it four times per evaluation (the range variable, the
+// append, the range in buckets, the by-value y argument) over a window
+// the make had already sized in whole Snapshots, which is ~3 MB of
+// allocation per evaluation on a full history. Under -race that is what
+// took the sweep above to 3m39s of the root job's 5 min budget and
+// timed out three CI runs (probatorium#396).
 //
 // The budget is in BYTES, not wall clock, so this says the same thing
-// on a fast laptop and a slow shared runner -- and it fails on the
-// cause (the window carries Snapshots) rather than on the symptom.
+// on a fast laptop and a slow shared runner.
+//
+// It bounds ALLOCATION, which is not in general the same thing as
+// copying -- but in this shape the two cannot come apart. Putting the
+// per-sample copy back means `for _, s := range ctx.History`, and
+// reaching keep and y from it means taking &s, which escapes: the copy
+// becomes a heap allocation this budget sees. Measured, that break
+// costs 914 B/sample and fails this test. Reintroducing the copy
+// WITHOUT the allocation would mean widening keep and y back to
+// by-value signatures -- every slopeSpec at once, not a silent drift.
 func TestSlopePredicates_allocationDoesNotScaleWithSnapshot(t *testing.T) {
 	// The L=32 MB / period=1.7 s / seed=0 trace of the sweep above, which
 	// that test proves never violates -- at this very last evaluation

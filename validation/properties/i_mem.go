@@ -174,19 +174,28 @@ const idlePersistSamples = 3
 //
 // The window used to carry whole [Snapshot]s. Snapshot is a flat value
 // type that grew from 41 fields to 103 as celeris gained EngineMetrics
-// counters, and every judged sample was copied through it about five
-// times per evaluation -- the make, the range variable, the append, the
-// range in buckets, and the by-value y argument -- so the cost of a
-// slope verdict scaled with sizeof(Snapshot) rather than with the
-// length of the series. Under -race that took the 72-trace sawtooth
-// sweep in i_mem_slope_test.go to 3m39s of the root job's 5 min budget
-// and timed out three CI runs (probatorium#396), and the live
-// validator-checker paid the same ~3 MB per slope predicate per second.
-// Projecting once, at the window boundary, costs 16 bytes per sample
-// and leaves every verdict and every message bit-identical.
+// counters, and every judged sample was copied through it four times
+// per evaluation -- the range variable, the append, the range in
+// buckets, and the by-value y argument -- over a window the make had
+// already sized in whole Snapshots, so the cost of a slope verdict
+// scaled with sizeof(Snapshot) rather than with the length of the
+// series. Under -race that took the 72-trace sawtooth sweep in
+// i_mem_slope_test.go to 3m39s of the root job's 5 min budget and
+// timed out three CI runs (probatorium#396), and the live
+// validator-checker paid the same ~3 MB per slope predicate per
+// second. Projecting once, at the window boundary, costs 16 bytes per
+// judged sample and leaves every verdict and every message identical.
 type seriesPoint struct {
 	ts int64
 	v  float64
+}
+
+// inSeries reports whether s belongs in the judged series: at or after
+// the window cutoff, and kept by the predicate's filter. Both of
+// slopeWindow's passes go through this, so the count and the fill
+// cannot drift apart.
+func inSeries(s *Snapshot, cutoffTS int64, keep func(*Snapshot) bool) bool {
+	return s.TS >= cutoffTS && (keep == nil || keep(s))
 }
 
 // slopeWindow projects, through y, the History samples inside the
@@ -195,9 +204,10 @@ type seriesPoint struct {
 // yet judgeable: unknown run start, fewer than slopeMinSamples points,
 // or a first-to-last span shorter than slopeMinSpan.
 //
-// keep and y take a pointer only to avoid copying the Snapshot; they
-// must not write through it. Predicates are pure, and History belongs
-// to the evaluator and is shared with every other predicate of the tick.
+// y is required; keep may be nil, which keeps every sample. Both take
+// a pointer only to avoid copying the Snapshot and must not write
+// through it: predicates are pure, and History belongs to the evaluator
+// and is shared with every other predicate of the tick.
 func slopeWindow(ctx Context, window time.Duration, keep func(*Snapshot) bool, y func(*Snapshot) float64) (series []seriesPoint, ok bool) {
 	// The warm-up is measured from the start of SUSTAINED load: when the
 	// cell ran the I-MEM-2 prelude (burst, idle), the resume transient
@@ -214,16 +224,28 @@ func slopeWindow(ctx Context, window time.Duration, keep func(*Snapshot) bool, y
 		cutoff = warm
 	}
 	cutoffTS := cutoff.Unix()
-	// A linear scan over the whole history, deliberately: History is the
-	// evaluator's append-only window and nothing here may assume it is
-	// ordered by TS.
-	series = make([]seriesPoint, 0, len(ctx.History))
+	// Both loops are linear scans over the WHOLE history, deliberately:
+	// History is the evaluator's append-only window and nothing here may
+	// assume it is ordered by TS, so the window cannot be sliced out by
+	// a binary search.
+	//
+	// Counting first costs a second scan (a pointer and an int64
+	// compare per sample) and buys an exactly-sized window. Sizing to
+	// len(History) instead would allocate the whole history's worth on
+	// every evaluation -- 3601 points where I-MEM-3 judges ~600 -- which
+	// is the same "cost scales with the history rather than with the
+	// judged series" shape this projection exists to remove, one level
+	// down.
+	n := 0
+	for i := range ctx.History {
+		if inSeries(&ctx.History[i], cutoffTS, keep) {
+			n++
+		}
+	}
+	series = make([]seriesPoint, 0, n)
 	for i := range ctx.History {
 		s := &ctx.History[i]
-		if s.TS < cutoffTS {
-			continue
-		}
-		if keep != nil && !keep(s) {
+		if !inSeries(s, cutoffTS, keep) {
 			continue
 		}
 		series = append(series, seriesPoint{ts: s.TS, v: y(s)})
