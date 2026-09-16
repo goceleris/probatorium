@@ -169,12 +169,36 @@ const goroutineBaselinePad int64 = 8
 // samples over budget, so a single probe-conn blip is not a leak.
 const idlePersistSamples = 3
 
-// slopeWindow returns the History samples inside the trailing window
-// that also fall after the warm-up period, filtered by keep (nil keeps
-// every sample). ok is false while the window is not yet judgeable:
-// unknown run start, fewer than slopeMinSamples points, or a
-// first-to-last span shorter than slopeMinSpan.
-func slopeWindow(ctx Context, window time.Duration, keep func(Snapshot) bool) (samples []Snapshot, ok bool) {
+// seriesPoint is one History sample projected down to what a slope
+// predicate actually judges: its timestamp and the single series value.
+//
+// The window used to carry whole [Snapshot]s. Snapshot is a flat value
+// type that grew from 41 fields to 103 as celeris gained EngineMetrics
+// counters, and every judged sample was copied through it about five
+// times per evaluation -- the make, the range variable, the append, the
+// range in buckets, and the by-value y argument -- so the cost of a
+// slope verdict scaled with sizeof(Snapshot) rather than with the
+// length of the series. Under -race that took the 72-trace sawtooth
+// sweep in i_mem_slope_test.go to 3m39s of the root job's 5 min budget
+// and timed out three CI runs (probatorium#396), and the live
+// validator-checker paid the same ~3 MB per slope predicate per second.
+// Projecting once, at the window boundary, costs 16 bytes per sample
+// and leaves every verdict and every message bit-identical.
+type seriesPoint struct {
+	ts int64
+	v  float64
+}
+
+// slopeWindow projects, through y, the History samples inside the
+// trailing window that also fall after the warm-up period, filtered by
+// keep (nil keeps every sample). ok is false while the window is not
+// yet judgeable: unknown run start, fewer than slopeMinSamples points,
+// or a first-to-last span shorter than slopeMinSpan.
+//
+// keep and y take a pointer only to avoid copying the Snapshot; they
+// must not write through it. Predicates are pure, and History belongs
+// to the evaluator and is shared with every other predicate of the tick.
+func slopeWindow(ctx Context, window time.Duration, keep func(*Snapshot) bool, y func(*Snapshot) float64) (series []seriesPoint, ok bool) {
 	// The warm-up is measured from the start of SUSTAINED load: when the
 	// cell ran the I-MEM-2 prelude (burst, idle), the resume transient
 	// would otherwise sit inside the first fit as a rising trough.
@@ -190,24 +214,28 @@ func slopeWindow(ctx Context, window time.Duration, keep func(Snapshot) bool) (s
 		cutoff = warm
 	}
 	cutoffTS := cutoff.Unix()
-	samples = make([]Snapshot, 0, len(ctx.History))
-	for _, s := range ctx.History {
+	// A linear scan over the whole history, deliberately: History is the
+	// evaluator's append-only window and nothing here may assume it is
+	// ordered by TS.
+	series = make([]seriesPoint, 0, len(ctx.History))
+	for i := range ctx.History {
+		s := &ctx.History[i]
 		if s.TS < cutoffTS {
 			continue
 		}
 		if keep != nil && !keep(s) {
 			continue
 		}
-		samples = append(samples, s)
+		series = append(series, seriesPoint{ts: s.TS, v: y(s)})
 	}
-	if len(samples) < slopeMinSamples {
-		return samples, false
+	if len(series) < slopeMinSamples {
+		return series, false
 	}
-	span := samples[len(samples)-1].TS - samples[0].TS
+	span := series[len(series)-1].ts - series[0].ts
 	if span < int64(slopeMinSpan/time.Second) {
-		return samples, false
+		return series, false
 	}
-	return samples, true
+	return series, true
 }
 
 // point is one (x seconds, y) pair fed to the regression.
@@ -225,16 +253,16 @@ type bucket struct {
 	distinct int
 }
 
-// buckets reduces samples to one bucket per slopeBucket, anchored on
-// the first sample. A trailing bucket holding fewer than half a
-// bucket's worth of samples is dropped so an incomplete bucket (which
-// may not contain a trough yet) cannot bias the tail.
-func buckets(samples []Snapshot, y func(Snapshot) float64) []bucket {
-	if len(samples) == 0 {
+// buckets reduces a projected series to one bucket per slopeBucket,
+// anchored on the first sample. A trailing bucket holding fewer than
+// half a bucket's worth of samples is dropped so an incomplete bucket
+// (which may not contain a trough yet) cannot bias the tail.
+func buckets(series []seriesPoint) []bucket {
+	if len(series) == 0 {
 		return nil
 	}
 	width := int64(slopeBucket / time.Second)
-	t0 := samples[0].TS
+	t0 := series[0].ts
 	var out []bucket
 	var cur int64 = -1
 	var b bucket
@@ -244,9 +272,9 @@ func buckets(samples []Snapshot, y func(Snapshot) float64) []bucket {
 			out = append(out, b)
 		}
 	}
-	for _, s := range samples {
-		idx := (s.TS - t0) / width
-		v := y(s)
+	for _, p := range series {
+		idx := (p.ts - t0) / width
+		v := p.v
 		if idx != cur {
 			flush()
 			cur = idx
@@ -279,11 +307,11 @@ func troughs(bs []bucket) []point {
 	return out
 }
 
-// slopeOf returns the least-squares slope (units per second) of the
-// bucket-trough series of y over samples. Returns 0 for degenerate
-// inputs (fewer than two buckets, zero variance in x).
-func slopeOf(samples []Snapshot, y func(Snapshot) float64) float64 {
-	return slope(troughs(buckets(samples, y)))
+// slopeOf returns the least-squares slope (units per second) of a
+// projected series' bucket troughs. Returns 0 for degenerate inputs
+// (fewer than two buckets, zero variance in x).
+func slopeOf(series []seriesPoint) float64 {
+	return slope(troughs(buckets(series)))
 }
 
 // slope returns the least-squares slope of y against x over points.
@@ -348,15 +376,21 @@ func samplingNoise(bs []bucket) float64 {
 }
 
 // heapSlope returns the trough slope (bytes per second) of
-// HeapInuseBytes over samples.
+// HeapInuseBytes over samples. The predicates project inside
+// slopeWindow; this is the []Snapshot entry point the unit tests fit
+// against directly.
 func heapSlope(samples []Snapshot) float64 {
-	return slopeOf(samples, func(s Snapshot) float64 { return float64(s.HeapInuseBytes) })
+	series := make([]seriesPoint, 0, len(samples))
+	for i := range samples {
+		series = append(series, seriesPoint{ts: samples[i].TS, v: heapSlopeSpec.y(&samples[i])})
+	}
+	return slopeOf(series)
 }
 
 // windowSpan formats the judged window for violation messages.
-func windowSpan(samples []Snapshot) string {
-	first, last := samples[0], samples[len(samples)-1]
-	return fmt.Sprintf("%d samples over %s", len(samples), time.Duration(last.TS-first.TS)*time.Second)
+func windowSpan(series []seriesPoint) string {
+	first, last := series[0], series[len(series)-1]
+	return fmt.Sprintf("%d samples over %s", len(series), time.Duration(last.ts-first.ts)*time.Second)
 }
 
 // slopeSpec is one slope predicate's parameters; judge is the shared
@@ -367,9 +401,12 @@ type slopeSpec struct {
 	window   time.Duration
 	budget   float64 // units per second
 	relFloor float64 // fraction of the trough level
-	y        func(Snapshot) float64
-	keep     func(Snapshot) bool
-	fmtV     func(float64) string // formats a series value
+	// y projects a sample onto the judged series; keep filters it (nil
+	// keeps everything). Both take a pointer to avoid copying the
+	// Snapshot and must not write through it.
+	y    func(*Snapshot) float64
+	keep func(*Snapshot) bool
+	fmtV func(float64) string // formats a series value
 }
 
 // skipWindow is the [Skip] reason while a slope window is not judgeable.
@@ -388,12 +425,13 @@ var skipWindow = fmt.Sprintf("slope window not judgeable yet (needs %s warm-up, 
 // verdict on their own. The message carries every number so a triage
 // can see which floor was cleared and by how much.
 func (sp slopeSpec) judge(ctx Context) (bool, string) {
-	samples, ok := slopeWindow(ctx, sp.window, sp.keep)
+	series, ok := slopeWindow(ctx, sp.window, sp.keep, sp.y)
 	if !ok {
 		return Skip(skipWindow)
 	}
-	bs := buckets(samples, sp.y)
-	s := slope(troughs(bs))
+	bs := buckets(series)
+	pts := troughs(bs)
+	s := slope(pts)
 	if s <= sp.budget {
 		return true, ""
 	}
@@ -404,7 +442,6 @@ func (sp slopeSpec) judge(ctx Context) (bool, string) {
 	// rise of exactly D, and sawtooth noise moves them differently.
 	// The verdict uses the smaller one, so a step counts as its own
 	// size and both estimates have to clear the floor.
-	pts := troughs(bs)
 	fitted := s * (pts[len(pts)-1].x - pts[0].x)
 	raw := pts[len(pts)-1].y - pts[0].y
 	rise := math.Min(fitted, raw)
@@ -419,10 +456,10 @@ func (sp slopeSpec) judge(ctx Context) (bool, string) {
 	}
 	return false, fmt.Sprintf(
 		"%s violated: %s trough slope %s/s exceeds %s/s budget; rise %s (fitted %s, trough-to-trough %s) over %s (%d troughs) clears the floor %s = max(budget x %s = %s, %.0f%% of level %s = %s, %gx sampling noise %s = %s); %s -> %s",
-		sp.id, sp.what, sp.fmtV(s), sp.fmtV(sp.budget), sp.fmtV(rise), sp.fmtV(fitted), sp.fmtV(raw), windowSpan(samples), len(bs),
+		sp.id, sp.what, sp.fmtV(s), sp.fmtV(sp.budget), sp.fmtV(rise), sp.fmtV(fitted), sp.fmtV(raw), windowSpan(series), len(bs),
 		sp.fmtV(floor), slopeMinSpan, sp.fmtV(floorBudget), sp.relFloor*100, sp.fmtV(level), sp.fmtV(floorRel),
 		slopeNoiseK, sp.fmtV(noise), sp.fmtV(floorNoise),
-		sp.fmtV(sp.y(samples[0])), sp.fmtV(sp.y(samples[len(samples)-1])))
+		sp.fmtV(series[0].v), sp.fmtV(series[len(series)-1].v))
 }
 
 // fmtBytes renders a byte quantity for messages.
@@ -444,20 +481,20 @@ func fmtCount(v float64) string { return fmt.Sprintf("%.2f", v) }
 var heapSlopeSpec = slopeSpec{
 	id: "I-MEM-1", what: "heap_inuse", window: heapSlopeWindow,
 	budget: heapSlopeMaxBytesPerSec, relFloor: heapRiseRelFloor,
-	y: func(s Snapshot) float64 { return float64(s.HeapInuseBytes) }, fmtV: fmtBytes,
+	y: func(s *Snapshot) float64 { return float64(s.HeapInuseBytes) }, fmtV: fmtBytes,
 }
 
 var goroutineSlopeSpec = slopeSpec{
 	id: "I-MEM-3", what: "goroutine count", window: goroutineSlopeWindow,
 	budget: goroutineSlopeMaxPerSec, relFloor: goroutineRiseRelFloor,
-	y: func(s Snapshot) float64 { return float64(s.GoroutineCount) }, fmtV: fmtCount,
+	y: func(s *Snapshot) float64 { return float64(s.GoroutineCount) }, fmtV: fmtCount,
 }
 
 var rssSlopeSpec = slopeSpec{
 	id: "I-MEM-4", what: "RSS", window: rssSlopeWindow,
 	budget: rssSlopeMaxBytesPerSec, relFloor: rssRiseRelFloor,
-	y:    func(s Snapshot) float64 { return float64(s.RSSBytes) },
-	keep: func(s Snapshot) bool { return s.RSSBytes > 0 }, fmtV: fmtBytes,
+	y:    func(s *Snapshot) float64 { return float64(s.RSSBytes) },
+	keep: func(s *Snapshot) bool { return s.RSSBytes > 0 }, fmtV: fmtBytes,
 }
 
 // IMEM1 asserts heap_inuse trough slope is bounded over the trailing
