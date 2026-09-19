@@ -30,6 +30,14 @@ jobs:
       - name: go test
         run: go test -count=1 -race -timeout=5m ./...
 
+  # Every Go module under servers/ belongs in this list. `go test ./...`
+  # loads the module and compiles every package, test files or not, so a
+  # leg is also the adapter's build check. The bench builds each adapter
+  # with a plain `go build` in its own directory, and the adapters that
+  # `replace` the root module inherit its requirements: a root bump that
+  # dependabot does not carry into one of them leaves it untidy and
+  # unbuildable. gnet was missing from this list, which let that happen
+  # twice (b9ebe57, then #356 -> probatorium#399), with nbio the second time.
   adapters:
     name: servers/${{ matrix.adapter }}
     runs-on: ubuntu-latest
@@ -43,8 +51,11 @@ jobs:
           - fasthttp
           - fiber
           - gin
+          - gnet
+          - gorilla_ws
           - hertz
           - iris
+          - nbio
           - stdhttp
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
