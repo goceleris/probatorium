@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/dgrijalva/jwt-go v3.2.0+incompatible
 	github.com/goceleris/celeris v1.5.12-0.20260915174751-c40d0cb9d4b7
 	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
 )

@@ -119,6 +119,44 @@ jobs:
       - name: go test -tags mage
         run: go test -count=1 -race -tags mage -timeout=10m ./...
 
+  # govulncheck over every module whose code is ours: the root module,
+  # the celeris adapter, and the validation refapps with their shared
+  # debugvars helper. It fails only when that code can reach a vulnerable
+  # symbol. The competitor adapters under servers/ are not scanned: their
+  # code and dependency choices belong to other projects, dependabot
+  # already bumps their pins weekly, and a verdict on them would gate this
+  # repo on advisories it cannot fix. The testdata demo modules exist only
+  # to be broken on purpose. Each module is scanned even after one fails,
+  # so one run reports all of them. The scanner is pinned to a release;
+  # the vulnerability database is fetched live on every run.
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - name: govulncheck (every module of ours)
+        run: |
+          fail=0
+          n=0
+          for d in . servers/celeris validation/refapp/internal/debugvars validation/refapp/*/; do
+            case "$d" in */internal/) continue ;; esac
+            test -f "$d/go.mod" || { echo "::error::$d has no go.mod"; fail=1; continue; }
+            n=$((n + 1))
+            echo "::group::govulncheck $d"
+            (cd "$d" && govulncheck ./...) || { echo "::error::govulncheck failed in $d"; fail=1; }
+            echo "::endgroup::"
+          done
+          echo "scanned $n modules"
+          exit "$fail"
+
   # Fan-in over every job above so branch protection can require ONE
   # stable check name ("ci-ok") instead of enumerating the adapter
   # matrix — adding or removing an adapter then never silently drops a
@@ -128,7 +166,7 @@ jobs:
   # listed in needs must stay unconditional on push + pull_request.
   ci-ok:
     name: ci-ok
-    needs: [root, adapters, refapps, mage]
+    needs: [root, adapters, refapps, mage, vulncheck]
     if: always()
     runs-on: ubuntu-latest
     steps:
