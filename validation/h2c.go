@@ -326,7 +326,9 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 	// frames we ignore.
 	buf := make([]byte, 256)
 	readStart := time.Now()
+	disarm := tally.capture.watchRead(h2cStallThreshold)
 	n, err := conn.Read(buf)
+	disarm()
 	readD := time.Since(readStart)
 	if err != nil || n == 0 {
 		// Read EOF / timeout before any bytes. If we never saw bytes

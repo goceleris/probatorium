@@ -17,7 +17,7 @@ func TestArmWalkerCaptureStampsReadyAndHeartbeat(t *testing.T) {
 	var h2c h2cTally
 	var ws wsTally
 	ready := time.Now().Add(-90 * time.Second)
-	armWalkerCapture(ctx, ready.UnixNano(), &h2c, &ws)
+	armWalkerCapture(ctx, ready.UnixNano(), &h2c, &ws, nil)
 	if h2c.capture.hb.Load() == nil || ws.capture.hb.Load() == nil {
 		t.Fatal("heartbeat not armed on both tallies")
 	}
@@ -30,7 +30,7 @@ func TestArmWalkerCaptureStampsReadyAndHeartbeat(t *testing.T) {
 	}
 	var unstamped h2cTally
 	var unstampedWS wsTally
-	armWalkerCapture(ctx, 0, &unstamped, &unstampedWS)
+	armWalkerCapture(ctx, 0, &unstamped, &unstampedWS, nil)
 	unstamped.capture.record(c1, 0, 0, 2*time.Second, nil, "declined", "", 1, time.Now())
 	if got := unstamped.capture.slow.snapshot()[0].SinceReadyMs; got != 0 {
 		t.Fatalf("unstamped tally must leave since_ready_ms at 0, got %d", got)

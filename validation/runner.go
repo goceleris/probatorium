@@ -999,6 +999,34 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// bug (server accepts every malformed request) would generate
 	// hundreds of incidents per second once the bug catches.
 	alertedCounters := make(map[string]bool)
+	faultInjected := os.Getenv("PROBATORIUM_REFAPP_FAULT") != ""
+	// In-stall capture (celeris#588): a walker read that has waited past its
+	// stall threshold with no byte back takes a record-only dossier NOW,
+	// while the stall is still in force -- the one place a goroutine dump can
+	// still show who holds what. Bounded per kind per cell; a full violations
+	// channel drops the attempt rather than blocking the walker's timer.
+	var stallDossiers [2]atomic.Int32
+	onWalkerStall := func(kind string) {
+		i, spec, what, th := 0, properties.IH2CStall, "h2c preamble read", h2cStallThreshold
+		if kind == "ws" {
+			i, spec, what, th = 1, properties.IWSStall, "WebSocket handshake read", wsStallThreshold
+		}
+		if stallDossiers[i].Add(1) > stallDossiersPerKind {
+			return
+		}
+		select {
+		case violations <- Incident{
+			Tier:        TierProperty,
+			PredicateID: spec.ID,
+			Message:     fmt.Sprintf("%s in flight %s with no byte back: dossier taken inside the stall (celeris#588)", what, th),
+			ObservedAt:  time.Now().UTC(),
+			RefappPID:   pid(),
+			RecordOnly:  true,
+			SkipCore:    true,
+		}:
+		default:
+		}
+	}
 	tallyCB := func(snap tier1TallySnapshot) {
 		// Publish the refapp's stderr tail for the dossier writer.
 		if tail := snap.RefappStderrTail; len(tail) > 0 {
@@ -1029,20 +1057,27 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 			}
 		}
 		fire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, false) }
+		// walkerFire is fire for the walker oracles. A fault-injected
+		// control run (PROBATORIUM_REFAPP_FAULT set, celeris#588) records
+		// them instead: the injected stall trips them by design (a held /ws
+		// also times out the 64 KiB echo walker), and a hard fail would end
+		// the cell before the capture it exists to judge had run. Liveness
+		// and hang stay hard in every run.
+		walkerFire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, faultInjected) }
 		// Record-only: dossier (no gcore) while the refapp is still up,
 		// and the cell runs on. The gate still fails on the total; this
 		// only adds evidence to it (celeris#588).
 		record := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, true) }
-		fire(properties.IADVAccepted.ID,
+		walkerFire(properties.IADVAccepted.ID,
 			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
 			snap.Adversarial.WrongAccepted > 0)
-		fire(properties.IH2CCrashed.ID,
+		walkerFire(properties.IH2CCrashed.ID,
 			fmt.Sprintf("h2c churn returned non-HTTP babble (count=%d) — engine crash on upgrade", snap.H2CChurn.Crashed),
 			snap.H2CChurn.Crashed > 0)
-		fire(properties.IWSAccepted.ID,
+		walkerFire(properties.IWSAccepted.ID,
 			fmt.Sprintf("server accepted bad WebSocket frame (count=%d) — RFC 6455 violation", snap.WSTorture.AcceptedBadFrame),
 			snap.WSTorture.AcceptedBadFrame > 0)
-		fire(properties.IWSHang.ID,
+		walkerFire(properties.IWSHang.ID,
 			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
 			snap.WSTorture.HangNoClose > 0)
 		// The two gated walker totals that never had a reactive incident.
@@ -1065,7 +1100,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// classes is one incident; the message carries all four so the
 		// dossier says which.
 		e := snap.WSEcho
-		fire(properties.IWSEcho.ID,
+		walkerFire(properties.IWSEcho.ID,
 			fmt.Sprintf("64 KiB WebSocket echoes not byte-intact and in order (corrupt=%d [egress_interleave=%d other=%d] reorder=%d missing=%d timeout=%d, ok=%d)",
 				e.Corrupt, e.EgressInterleave, e.OtherCorrupt, e.Reorder, e.Missing, e.Timeout, e.OK),
 			e.Corrupt+e.Reorder+e.Missing+e.Timeout > 0)
@@ -1097,6 +1132,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		PIDChan:            pidCh,
 		AddrChan:           addrCh,
 		TallyCallback:      tallyCB,
+		OnWalkerStall:      onWalkerStall,
 		OnLiveTally:        func(f func() int64) { expectedPanicsFn.Store(&f) },
 		OnResponseCounters: func(f func() ResponseCounters) { responseCountersFn.Store(&f) },
 		OnCrashReports:     func(f func() int64) { crashReportsFn.Store(&f) },
@@ -1375,6 +1411,11 @@ func livenessDeathMessage(s livenessSnapshot) string {
 // instant; gcore on a multi-GB refapp is the only thing that can
 // approach this.
 const forensicsBudget = 30 * time.Second
+
+// stallDossiersPerKind bounds the in-stall dossiers (celeris#588) per
+// walker kind per cell: enough to catch a stall that recurs, few enough that
+// a host under sustained slow reads cannot spend its cell on forensics.
+const stallDossiersPerKind = 4
 
 // writeIncidentDossier creates the per-incident directory and writes
 // incident.json into it. Returns the directory.
