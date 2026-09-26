@@ -78,3 +78,35 @@ func TestValidateGatesJudgeTheArtifactEvenWhenValidateFailed(t *testing.T) {
 		}
 	}
 }
+
+// TestNightlyFaultControlReplacesTheGates (celeris#588): a refapp_fault
+// dispatch fails the absolute gate by design, so exactly one of the two
+// judgements may run -- ValidateGate and ValidateDiff on a routine nightly,
+// ValidateFaultControl on a fault-control run. A condition that lets both
+// run turns every capture-control run red; one that lets neither run turns
+// a routine nightly unjudged.
+func TestNightlyFaultControlReplacesTheGates(t *testing.T) {
+	b, err := os.ReadFile(".github/workflows/matrix-nightly-tier.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conds := map[string]string{}
+	for _, step := range adjudicationSteps(string(b)) {
+		m := stepIfRe.FindStringSubmatch(step)
+		if m == nil {
+			continue
+		}
+		for _, target := range []string{"ValidateGate", "ValidateDiff", "ValidateFaultControl"} {
+			if strings.Contains(step, "run: mage "+target+"\n") {
+				conds[target] = strings.TrimSpace(m[1])
+			}
+		}
+	}
+	routine := "(inputs.refapp_fault || '') == ''"
+	fault := "(inputs.refapp_fault || '') != ''"
+	for target, want := range map[string]string{"ValidateGate": routine, "ValidateDiff": routine, "ValidateFaultControl": fault} {
+		if c := conds[target]; !strings.Contains(c, want) || !strings.Contains(c, "!cancelled()") {
+			t.Errorf("%s runs on `if: %s`; want !cancelled() && %s", target, c, want)
+		}
+	}
+}
