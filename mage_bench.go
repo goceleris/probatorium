@@ -380,10 +380,16 @@ func Bench() error {
 		return err
 	}
 	colSlugs := make([]string, len(columns))
-	colMap := make(map[string]map[string]string, len(columns))
+	colMap := make(map[string]map[string]any, len(columns))
 	for i, c := range columns {
 		colSlugs[i] = c.Slug
-		colMap[c.Slug] = map[string]string{"bin": c.Bin, "engine": c.Engine}
+		colMap[c.Slug] = map[string]any{"bin": c.Bin, "engine": c.Engine}
+		if len(c.Env) > 0 {
+			// run_bench_cell.yml combines this over bench_sut_env and
+			// checks it in the launched process's environ (celeris#585).
+			colMap[c.Slug]["env"] = c.Env
+			fmt.Printf("  column env:   %s: %s\n", c.Slug, sutEnvString(c.Env))
+		}
 	}
 	competitorSetCSV := strings.Join(colSlugs, ",")
 	benchVars := map[string]any{"competitor_columns": colMap}
@@ -620,6 +626,8 @@ type benchColumn struct {
 	Slug   string
 	Bin    string
 	Engine string
+	// Env is the column's registry SUTEnv (celeris#585), validated.
+	Env map[string]string
 }
 
 // resolveBenchColumns expands the BENCH_COMPETITORS arg into the matrix
@@ -715,6 +723,12 @@ func resolveBenchColumns(arg string) ([]benchColumn, error) {
 			col.Engine = engineFlagValue(a.Engine)
 		} else {
 			col.Bin = n
+		}
+		if len(a.SUTEnv) > 0 {
+			if err := validateSUTEnvMap(a.SUTEnv); err != nil {
+				return nil, fmt.Errorf("servers.Registry[%q].SUTEnv: %w", n, err)
+			}
+			col.Env = a.SUTEnv
 		}
 		cols = append(cols, col)
 	}

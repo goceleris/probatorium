@@ -135,11 +135,15 @@ func main() {
 	mountChainHandlers(srv, lifetime)
 	streaming := mountStreamingHandlers(srv, lifetime)
 
+	// The observer's /debug/vars, on a side listener (debugvars.go).
+	_, stopDebugVars := startDebugVars(srv)
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		<-sig
 		log.Printf("celeris: signal received, shutting down")
+		stopDebugVars()
 		cancelLifetime()
 		streaming.close()
 		clients.close()

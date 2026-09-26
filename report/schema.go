@@ -234,7 +234,21 @@ import (
 //     documents as must-stay-zero carry their meaning in EngineCounter.MustStayZero,
 //     and moving any of them into ZeroWitnessMeaning is a gate change this
 //     version does not make. Additive; older readers ignore every field.
-const SchemaVersion = "5.16"
+//   - 5.17 — the bench SUT's CPU and egress become attributable
+//     (celeris#585). Adds, on ResourceSummary (column-wide Resources and
+//     every per-scenario ScenarioResources slice), MeanIOWaitPct and
+//     MeanCPUExIOWaitPct -- mean_cpu_pct counts %iowait as busy, and an
+//     io_uring worker waiting in io_uring_enter is charged as iowait, so
+//     the 20260829 io_uring column's 96.3 % "busy" was 55.4 % executing --
+//     and the engine egress deltas ZCSendsSubmitted, ZCNotifs,
+//     InlineBytes, RingBytes, BytesWritten and RingBytesFraction, read
+//     from the SUT's /debug/vars, which the bench server now serves on a
+//     side listener (servers/celeris/debugvars.go) and cmd/observer
+//     records per second. Without them a SEND_ZC on/off A/B could not
+//     tell "zero-copy costs nothing" from "zero-copy never ran". Additive;
+//     older readers ignore every field, mean_cpu_pct keeps its meaning,
+//     and nothing is gated.
+const SchemaVersion = "5.17"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -1157,6 +1171,35 @@ type ResourceSummary struct {
 	// the observer wrote no cpu tick columns (pre-v5.9 observer) or fewer
 	// than two ticks samples fell in the window.
 	SUTProcessCPUPct *float64 `json:"sut_process_cpu_pct,omitempty"`
+
+	// MeanIOWaitPct is the mean mpstat %iowait over the same rows as
+	// MeanCPUPct, and MeanCPUExIOWaitPct the mean of (100 - %idle -
+	// %iowait): host CPU that was actually executing (schema v5.17,
+	// celeris#585). MeanCPUPct counts %iowait as busy, and io_uring
+	// charges a worker waiting in io_uring_enter as iowait, so an io_uring
+	// column's MeanCPUPct is not comparable with an epoll column's; this
+	// pair is. Nil when the cpu.log carried no %iowait column.
+	MeanIOWaitPct      *float64 `json:"mean_iowait_pct,omitempty"`
+	MeanCPUExIOWaitPct *float64 `json:"mean_cpu_ex_iowait_pct,omitempty"`
+
+	// The SUT engine's egress over the window (schema v5.17, celeris#585),
+	// each the delta of the cumulative engine.EngineMetrics counter
+	// between the first and last observer sample that carried it. They are
+	// the exposure witnesses a SEND_ZC A/B cannot be read without:
+	// ZCSendsSubmitted / ZCNotifs say whether the zero-copy arm ran at all
+	// (0 in an OFF arm; 0 in an ON arm means the treatment never fired),
+	// and InlineBytes / RingBytes split BytesWritten into the bytes a
+	// detached stream wrote with a raw write(2) -- never zero-copy -- and
+	// the bytes the io_uring ring sent. RingBytesFraction = ring / (inline
+	// + ring). Nil when the SUT published no such counter (non-celeris,
+	// pre-#585 bench server, celeris before the field existed); 0 is a
+	// reading.
+	ZCSendsSubmitted  *int64   `json:"zc_sends_submitted,omitempty"`
+	ZCNotifs          *int64   `json:"zc_notifs,omitempty"`
+	InlineBytes       *int64   `json:"inline_bytes,omitempty"`
+	RingBytes         *int64   `json:"ring_bytes,omitempty"`
+	BytesWritten      *int64   `json:"bytes_written,omitempty"`
+	RingBytesFraction *float64 `json:"ring_bytes_fraction,omitempty"`
 }
 
 // ResourcePoint is one downsampled sample in a ResourceStats.Series.

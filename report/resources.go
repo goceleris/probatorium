@@ -53,6 +53,36 @@ type ObserverSample struct {
 	// reading is never confused with "absent".
 	CPUTicks   int64
 	CPUTicksOK bool
+
+	// Egress holds the SUT engine's cumulative egress counters (schema
+	// v5.17, celeris#585) in Egress* index order, read from the observer's
+	// engine_* columns; EgressOK[i] says whether Egress[i] is a reading.
+	// It is false when that scrape did not publish the counter (no metrics
+	// URL, failed or foreign-PID scrape, a celeris without the field --
+	// the observer writes -1 -- or a DB written before the columns
+	// existed), so 0 stays a reading and the zero value is "absent".
+	Egress   [NumEgressCounters]int64
+	EgressOK [NumEgressCounters]bool
+}
+
+// The engine egress counters the observer records, in ObserverSample.Egress
+// order, by observer column name.
+const (
+	EgressZCSendsSubmitted = iota
+	EgressZCNotifs
+	EgressInlineBytes
+	EgressRingBytes
+	EgressBytesWritten
+	NumEgressCounters
+)
+
+// egressColumns are the observations columns behind ObserverSample.Egress.
+var egressColumns = [NumEgressCounters]string{
+	"engine_zc_sends_submitted",
+	"engine_zc_notifs",
+	"engine_inline_bytes",
+	"engine_ring_bytes",
+	"engine_bytes_written",
 }
 
 // userHZ is the Linux USER_HZ the /proc/<pid>/stat utime/stime fields
@@ -81,6 +111,15 @@ type CPUPoint struct {
 	// SoftPct is the row's mpstat %soft (softirq) column; -1 when the log
 	// carries no %soft column.
 	SoftPct float64
+
+	// IOWaitPct is the row's mpstat %iowait column; -1 when the log carries
+	// none. CPUPct (100 - %idle) COUNTS iowait as busy, and io_uring charges
+	// a worker blocked in io_uring_enter waiting for completions as iowait:
+	// on the retained 20260829 amd64 run the io_uring column read 96.3 %
+	// "busy" of which 40.9 points were iowait (celeris#585 review). CPUPct
+	// stays as it was, so historical data keeps its meaning; the
+	// iowait-excluding reading is derived from this field.
+	IOWaitPct float64
 }
 
 // ParseObserverDB opens a per-cell observer.sqlite read-only and returns
@@ -97,18 +136,27 @@ func ParseObserverDB(path string) ([]ObserverSample, error) {
 	}
 	defer func() { _ = db.Close() }()
 
-	// The cpu tick columns (schema v5.9) are optional: a DB written by an
-	// older observer has no such column and SELECTing it would fail the
-	// whole parse, so probe the table layout first and only read the
-	// ticks when both columns exist.
-	hasTicks, err := observerHasCPUTicks(db)
+	// The cpu tick columns (schema v5.9) and the engine egress columns
+	// (schema v5.17) are optional: a DB written by an older observer has
+	// no such column and SELECTing it would fail the whole parse, so probe
+	// the table layout first and only read the columns that exist.
+	cols, err := observerColumns(db)
 	if err != nil {
 		return nil, fmt.Errorf("table_info %s: %w", path, err)
 	}
-	q := `SELECT ts, fd_count, rss_bytes, goroutine_count, heap_inuse_bytes, gc_pause_p99_ns FROM observations ORDER BY ts`
+	hasTicks := cols["cpu_utime_ticks"] && cols["cpu_stime_ticks"]
+	q := `SELECT ts, fd_count, rss_bytes, goroutine_count, heap_inuse_bytes, gc_pause_p99_ns`
 	if hasTicks {
-		q = `SELECT ts, fd_count, rss_bytes, goroutine_count, heap_inuse_bytes, gc_pause_p99_ns, cpu_utime_ticks, cpu_stime_ticks FROM observations ORDER BY ts`
+		q += `, cpu_utime_ticks, cpu_stime_ticks`
 	}
+	var egressIdx []int // Egress slots whose column exists, in SELECT order
+	for i, c := range egressColumns {
+		if cols[c] {
+			q += `, ` + c
+			egressIdx = append(egressIdx, i)
+		}
+	}
+	q += ` FROM observations ORDER BY ts`
 	rows, err := db.Query(q)
 	if err != nil {
 		return nil, fmt.Errorf("query %s: %w", path, err)
@@ -118,23 +166,35 @@ func ParseObserverDB(path string) ([]ObserverSample, error) {
 	var out []ObserverSample
 	for rows.Next() {
 		var s ObserverSample
+		var ut, st sql.NullInt64
+		eg := make([]sql.NullInt64, len(egressIdx))
+		dest := []any{&s.TSUnix, &s.FDCount, &s.RSSBytes, &s.Goroutines, &s.HeapInuseBytes, &s.GCPauseP99Ns}
 		if hasTicks {
-			var ut, st sql.NullInt64
-			if err := rows.Scan(&s.TSUnix, &s.FDCount, &s.RSSBytes, &s.Goroutines, &s.HeapInuseBytes, &s.GCPauseP99Ns, &ut, &st); err != nil {
-				return nil, fmt.Errorf("scan %s: %w", path, err)
-			}
-			// A 0 total is "unreadable", not a measurement: the observer
-			// writes 0/0 when /proc/<pid>/stat is gone (the respawn
-			// supervisor replaced the PID it pinned), and a process that
-			// has bound a socket and served a warm-up cannot have 0 ticks.
-			// Treating it as absent keeps a respawned SUT's window at
-			// sut_process_cpu_pct=nil instead of a false 0.
-			if ut.Valid && st.Valid && ut.Int64+st.Int64 > 0 {
-				s.CPUTicks = ut.Int64 + st.Int64
-				s.CPUTicksOK = true
-			}
-		} else if err := rows.Scan(&s.TSUnix, &s.FDCount, &s.RSSBytes, &s.Goroutines, &s.HeapInuseBytes, &s.GCPauseP99Ns); err != nil {
+			dest = append(dest, &ut, &st)
+		}
+		for i := range eg {
+			dest = append(dest, &eg[i])
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("scan %s: %w", path, err)
+		}
+		// A 0 total is "unreadable", not a measurement: the observer
+		// writes 0/0 when /proc/<pid>/stat is gone (the respawn
+		// supervisor replaced the PID it pinned), and a process that
+		// has bound a socket and served a warm-up cannot have 0 ticks.
+		// Treating it as absent keeps a respawned SUT's window at
+		// sut_process_cpu_pct=nil instead of a false 0.
+		if hasTicks && ut.Valid && st.Valid && ut.Int64+st.Int64 > 0 {
+			s.CPUTicks = ut.Int64 + st.Int64
+			s.CPUTicksOK = true
+		}
+		// Egress: NULL and negative (the observer's -1) are both "not
+		// published by that scrape".
+		for i, slot := range egressIdx {
+			if eg[i].Valid && eg[i].Int64 >= 0 {
+				s.Egress[slot] = eg[i].Int64
+				s.EgressOK[slot] = true
+			}
 		}
 		out = append(out, s)
 	}
@@ -144,30 +204,26 @@ func ParseObserverDB(path string) ([]ObserverSample, error) {
 	return out, nil
 }
 
-// observerHasCPUTicks reports whether the observations table carries the
-// cpu_utime_ticks AND cpu_stime_ticks columns (observer >= schema v5.9).
-func observerHasCPUTicks(db *sql.DB) (bool, error) {
+// observerColumns returns the set of column names of the observations
+// table, so optional columns (cpu ticks, v5.9; engine egress, v5.17) are
+// read only from DBs whose observer wrote them.
+func observerColumns(db *sql.DB) (map[string]bool, error) {
 	rows, err := db.Query(`PRAGMA table_info(observations)`)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var haveU, haveS bool
+	cols := map[string]bool{}
 	for rows.Next() {
 		var cid, notnull, pk int
 		var name, ctype string
 		var dflt sql.NullString
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return false, err
+			return nil, err
 		}
-		switch name {
-		case "cpu_utime_ticks":
-			haveU = true
-		case "cpu_stime_ticks":
-			haveS = true
-		}
+		cols[name] = true
 	}
-	return haveU && haveS, rows.Err()
+	return cols, rows.Err()
 }
 
 // ParseMPStat parses an `mpstat -P ALL 1 <N>` text log and returns the
@@ -189,7 +245,7 @@ func ParseMPStat(path string) (mean float64, series []CPUPoint, ok bool, err err
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	cpuIdx, idleIdx, softIdx := -1, -1, -1
+	cpuIdx, idleIdx, softIdx, iowaitIdx := -1, -1, -1, -1
 	var sum float64
 	var n int
 	ordinal := 0
@@ -216,8 +272,8 @@ func ParseMPStat(path string) (mean float64, series []CPUPoint, ok bool, err err
 			}
 			continue
 		}
-		if ci, ii, si, isHeader := mpstatHeader(fields); isHeader {
-			cpuIdx, idleIdx, softIdx = ci, ii, si
+		if h, isHeader := mpstatHeader(fields); isHeader {
+			cpuIdx, idleIdx, softIdx, iowaitIdx = h.cpu, h.idle, h.soft, h.iowait
 			continue
 		}
 		if cpuIdx < 0 || idleIdx < 0 {
@@ -234,10 +290,15 @@ func ParseMPStat(path string) (mean float64, series []CPUPoint, ok bool, err err
 			continue
 		}
 		busy := 100 - idle
-		pt := CPUPoint{Ordinal: ordinal, CPUPct: busy, SoftPct: -1}
+		pt := CPUPoint{Ordinal: ordinal, CPUPct: busy, SoftPct: -1, IOWaitPct: -1}
 		if softIdx >= 0 && softIdx < len(fields) {
 			if soft, serr := strconv.ParseFloat(fields[softIdx], 64); serr == nil {
 				pt.SoftPct = soft
+			}
+		}
+		if iowaitIdx >= 0 && iowaitIdx < len(fields) {
+			if iow, ierr := strconv.ParseFloat(fields[iowaitIdx], 64); ierr == nil {
+				pt.IOWaitPct = iow
 			}
 		}
 		if haveDay {
@@ -263,23 +324,29 @@ func ParseMPStat(path string) (mean float64, series []CPUPoint, ok bool, err err
 	return sum / float64(n), series, true, nil
 }
 
+// mpstatCols are the column indices an mpstat header row names; -1 for
+// a column the layout does not carry.
+type mpstatCols struct{ cpu, idle, soft, iowait int }
+
 // mpstatHeader detects an mpstat column header row and returns the
-// indices of the CPU, %idle and %soft columns (softIdx is -1 when the
-// layout has no %soft). A header is any row carrying both a "CPU" field
-// and a "%idle" field.
-func mpstatHeader(fields []string) (cpuIdx, idleIdx, softIdx int, ok bool) {
-	cpuIdx, idleIdx, softIdx = -1, -1, -1
+// indices of the CPU, %idle, %soft and %iowait columns (soft / iowait are
+// -1 when the layout has none). A header is any row carrying both a "CPU"
+// field and a "%idle" field.
+func mpstatHeader(fields []string) (mpstatCols, bool) {
+	h := mpstatCols{-1, -1, -1, -1}
 	for i, f := range fields {
 		switch f {
 		case "CPU":
-			cpuIdx = i
+			h.cpu = i
 		case "%idle":
-			idleIdx = i
+			h.idle = i
 		case "%soft":
-			softIdx = i
+			h.soft = i
+		case "%iowait":
+			h.iowait = i
 		}
 	}
-	return cpuIdx, idleIdx, softIdx, cpuIdx >= 0 && idleIdx >= 0
+	return h, h.cpu >= 0 && h.idle >= 0
 }
 
 // mpstatBannerDate extracts the run date from mpstat's first line
@@ -374,7 +441,23 @@ func SummarizeResources(samples []ObserverSample, cpuMean float64, cpuOK bool, c
 	}
 	if cpuOK {
 		stats.Summary.MeanCPUPct = ptrF64(cpuMean)
+		// The same busy reading without %iowait (celeris#585): only over
+		// rows that carried the column, and absent when none did.
+		var iowSum, exSum float64
+		iowN := 0
+		for _, c := range cpuSeries {
+			if c.IOWaitPct >= 0 {
+				iowSum += c.IOWaitPct
+				exSum += c.CPUPct - c.IOWaitPct
+				iowN++
+			}
+		}
+		if iowN > 0 {
+			stats.Summary.MeanIOWaitPct = ptrF64(iowSum / float64(iowN))
+			stats.Summary.MeanCPUExIOWaitPct = ptrF64(exSum / float64(iowN))
+		}
 	}
+	summarizeEgress(&stats.Summary, samples)
 	if anyGoroutine {
 		stats.Summary.GoroutineHWM = ptrI64(goroutineHWM)
 	}
@@ -384,6 +467,43 @@ func SummarizeResources(samples []ObserverSample, cpuMean float64, cpuOK bool, c
 
 	stats.Series = buildSeries(samples, cpuSeries, anyGoroutine, anyHeap)
 	return stats
+}
+
+// summarizeEgress fills the engine egress fields of sum from the samples
+// (celeris#585): each counter's delta between the first and the last
+// sample that published it, i.e. what the SUT's engine did over exactly
+// the span the samples cover. A counter no sample published stays nil; a
+// counter that went BACKWARDS (a different process answered, or the
+// engine restarted) is dropped rather than reported as a negative or
+// wrapped delta. RingBytesFraction = ring / (inline + ring) needs both
+// byte counters and a non-zero denominator.
+func summarizeEgress(sum *ResourceSummary, samples []ObserverSample) {
+	var deltas [NumEgressCounters]*int64
+	for k := 0; k < NumEgressCounters; k++ {
+		first, last := int64(-1), int64(-1)
+		for _, s := range samples {
+			if !s.EgressOK[k] {
+				continue
+			}
+			if first < 0 {
+				first = s.Egress[k]
+			}
+			last = s.Egress[k]
+		}
+		if first >= 0 && last >= first {
+			deltas[k] = ptrI64(last - first)
+		}
+	}
+	sum.ZCSendsSubmitted = deltas[EgressZCSendsSubmitted]
+	sum.ZCNotifs = deltas[EgressZCNotifs]
+	sum.InlineBytes = deltas[EgressInlineBytes]
+	sum.RingBytes = deltas[EgressRingBytes]
+	sum.BytesWritten = deltas[EgressBytesWritten]
+	if sum.InlineBytes != nil && sum.RingBytes != nil {
+		if den := *sum.InlineBytes + *sum.RingBytes; den > 0 {
+			sum.RingBytesFraction = ptrF64(float64(*sum.RingBytes) / float64(den))
+		}
+	}
 }
 
 // steadyRSS returns the median of the trailing steadyTrailingFraction of
@@ -493,6 +613,16 @@ func ReduceResources(runs []*ResourceStats) *ResourceStats {
 	// aggregate, so the column-wide reduction is byte-identical to before.
 	out.Summary.MeanSoftPct = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.MeanSoftPct }))
 	out.Summary.SUTProcessCPUPct = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.SUTProcessCPUPct }))
+	// schema v5.17 (celeris#585): nil wherever the inputs were absent, so a
+	// reduction over pre-5.17 runs is byte-identical to before.
+	out.Summary.MeanIOWaitPct = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.MeanIOWaitPct }))
+	out.Summary.MeanCPUExIOWaitPct = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.MeanCPUExIOWaitPct }))
+	out.Summary.ZCSendsSubmitted = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.ZCSendsSubmitted }))
+	out.Summary.ZCNotifs = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.ZCNotifs }))
+	out.Summary.InlineBytes = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.InlineBytes }))
+	out.Summary.RingBytes = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.RingBytes }))
+	out.Summary.BytesWritten = medianI64Ptr(collectResI64(present, func(s ResourceSummary) *int64 { return s.BytesWritten }))
+	out.Summary.RingBytesFraction = medianF64Ptr(collectResF64(present, func(s ResourceSummary) *float64 { return s.RingBytesFraction }))
 	out.Window = present[len(present)-1].Window
 	return out
 }

@@ -28,6 +28,13 @@
 //	accepted_conn_total INTEGER
 //	closed_conn_total INTEGER
 //	panic_count INTEGER
+//	cpu_utime_ticks INTEGER     — schema v5.9 (celeris#585)
+//	cpu_stime_ticks INTEGER
+//	engine_zc_sends_submitted INTEGER — schema v5.17 (celeris#585): the
+//	engine_zc_notifs INTEGER            SUT's cumulative engine egress
+//	engine_inline_bytes INTEGER         counters; -1 = not published by
+//	engine_ring_bytes INTEGER           this scrape (never 0, which is a
+//	engine_bytes_written INTEGER        reading an OFF arm must be able to make)
 //
 // Linux is the canonical target; non-linux returns zeroes for every
 // /proc-derived field so a dev-host smoke test still exercises the
@@ -116,6 +123,21 @@ type Observation struct {
 	// unreadable (non-linux, process gone).
 	CPUUtimeTicks int64
 	CPUStimeTicks int64
+
+	// Engine egress counters (schema v5.17, celeris#585), cumulative, read
+	// off the SUT's /debug/vars: SEND_ZC SQEs submitted and notifications
+	// completed, and BytesWritten split into the bytes a detached stream
+	// wrote with a raw write(2) (inline, never zero-copy) and the bytes the
+	// io_uring ring sent. -1 when the scrape carried no such counter (no
+	// metrics URL, scrape failed, a document from another PID, or a celeris
+	// that predates the field), so that 0 stays a measurement: the OFF arm
+	// of a SEND_ZC A/B must read exactly 0 submits, and "absent" must not
+	// look like that.
+	EngineZCSendsSubmitted int64
+	EngineZCNotifs         int64
+	EngineInlineBytes      int64
+	EngineRingBytes        int64
+	EngineBytesWritten     int64
 }
 
 const schemaSQL = `
@@ -132,7 +154,12 @@ CREATE TABLE IF NOT EXISTS observations (
 	closed_conn_total INTEGER,
 	panic_count INTEGER,
 	cpu_utime_ticks INTEGER,
-	cpu_stime_ticks INTEGER
+	cpu_stime_ticks INTEGER,
+	engine_zc_sends_submitted INTEGER,
+	engine_zc_notifs INTEGER,
+	engine_inline_bytes INTEGER,
+	engine_ring_bytes INTEGER,
+	engine_bytes_written INTEGER
 );
 `
 
@@ -141,8 +168,10 @@ INSERT OR REPLACE INTO observations (
 	ts, host, pid, fd_count, rss_bytes, goroutine_count,
 	heap_inuse_bytes, gc_pause_p99_ns,
 	accepted_conn_total, closed_conn_total, panic_count,
-	cpu_utime_ticks, cpu_stime_ticks
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	cpu_utime_ticks, cpu_stime_ticks,
+	engine_zc_sends_submitted, engine_zc_notifs,
+	engine_inline_bytes, engine_ring_bytes, engine_bytes_written
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 `
 
 func main() {
@@ -200,6 +229,8 @@ func run(cfg Config) error {
 				obs.HeapInuseBytes, obs.GCPauseP99Ns,
 				obs.AcceptedConnTotal, obs.ClosedConnTotal, obs.PanicCount,
 				obs.CPUUtimeTicks, obs.CPUStimeTicks,
+				obs.EngineZCSendsSubmitted, obs.EngineZCNotifs,
+				obs.EngineInlineBytes, obs.EngineRingBytes, obs.EngineBytesWritten,
 			); err != nil {
 				fmt.Fprintf(os.Stderr, "probatorium-observer: insert: %v\n", err)
 			}
@@ -211,7 +242,9 @@ func run(cfg Config) error {
 // non-linux; metrics-backed fields are zero when the metrics endpoint
 // is unreachable.
 func sample(ctx context.Context, httpc *http.Client, cfg Config, host string, t time.Time) Observation {
-	obs := Observation{TS: t.Unix(), Host: host, PID: cfg.PID}
+	obs := Observation{TS: t.Unix(), Host: host, PID: cfg.PID,
+		EngineZCSendsSubmitted: -1, EngineZCNotifs: -1,
+		EngineInlineBytes: -1, EngineRingBytes: -1, EngineBytesWritten: -1}
 
 	if cfg.PID > 0 {
 		obs.FDCount = countFDs(cfg.PID)
@@ -220,13 +253,18 @@ func sample(ctx context.Context, httpc *http.Client, cfg Config, host string, t 
 	}
 
 	if cfg.MetricsURL != "" {
-		mv := fetchMetrics(ctx, httpc, cfg.MetricsURL)
+		mv := fetchMetrics(ctx, httpc, cfg.MetricsURL, cfg.PID)
 		obs.GoroutineCount = mv.Goroutines
 		obs.HeapInuseBytes = mv.HeapInuse
 		obs.GCPauseP99Ns = mv.GCPauseP99
 		obs.AcceptedConnTotal = mv.AcceptedConn
 		obs.ClosedConnTotal = mv.ClosedConn
 		obs.PanicCount = mv.Panics
+		obs.EngineZCSendsSubmitted = mv.Engine[0]
+		obs.EngineZCNotifs = mv.Engine[1]
+		obs.EngineInlineBytes = mv.Engine[2]
+		obs.EngineRingBytes = mv.Engine[3]
+		obs.EngineBytesWritten = mv.Engine[4]
 	}
 	return obs
 }
@@ -314,6 +352,32 @@ type metricsValues struct {
 	AcceptedConn int64
 	ClosedConn   int64
 	Panics       int64
+
+	// Engine holds the engineKeys counters in order; -1 = absent.
+	Engine [len(engineKeys)]int64
+}
+
+// engineKeys are the engine egress counters the observer records, each
+// under the two spellings a celeris SUT publishes: the validation refapps'
+// flat debugvars key, and the bench server's "celeris.engine_metrics"
+// object, which is the engine.EngineMetrics struct under its Go field
+// names (servers/celeris/debugvars.go).
+var engineKeys = [...]struct{ flat, field string }{
+	{"celeris.engine_zc_sends_submitted", "ZCSendsSubmitted"},
+	{"celeris.engine_zc_notifs", "ZCNotifs"},
+	{"celeris.engine_inline_bytes", "InlineBytes"},
+	{"celeris.engine_ring_bytes", "RingBytes"},
+	{"celeris.engine_bytes_written", "BytesWritten"},
+}
+
+// absentMetrics is the zero reading: runtime fields 0 (their historical
+// "absent" convention) and every engine counter -1.
+func absentMetrics() metricsValues {
+	var v metricsValues
+	for i := range v.Engine {
+		v.Engine[i] = -1
+	}
+	return v
 }
 
 // fetchMetrics GETs metricsURL, parses the expvar JSON shape, and
@@ -325,25 +389,45 @@ type metricsValues struct {
 // space for engine-specific counters. The reader here is forgiving:
 // every field is optional, and any parse error short-circuits to a
 // zero-value snapshot.
-func fetchMetrics(ctx context.Context, httpc *http.Client, url string) metricsValues {
+//
+// wantPID > 0 arms the process guard: a document that names its own "pid"
+// (the bench server's does) and names a different one is refused whole,
+// because it was served by some other process than the one whose /proc
+// fields this row carries -- a leftover SUT still holding the sidecar
+// port, or a respawned SUT after the observer pinned the original.
+func fetchMetrics(ctx context.Context, httpc *http.Client, url string, wantPID int) metricsValues {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return metricsValues{}
+		return absentMetrics()
 	}
 	resp, err := httpc.Do(req)
 	if err != nil {
-		return metricsValues{}
+		return absentMetrics()
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return absentMetrics()
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return metricsValues{}
+		return absentMetrics()
 	}
 	var doc map[string]any
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return metricsValues{}
+		return absentMetrics()
 	}
-	v := metricsValues{}
+	if p, ok := doc["pid"].(float64); ok && wantPID > 0 && int(p) != wantPID {
+		return absentMetrics()
+	}
+	v := absentMetrics()
+	em, _ := doc["celeris.engine_metrics"].(map[string]any)
+	for i, k := range engineKeys {
+		if n, ok := readPresentInt64(doc, k.flat); ok {
+			v.Engine[i] = n
+		} else if n, ok := readPresentInt64(em, k.field); ok {
+			v.Engine[i] = n
+		}
+	}
 	v.Goroutines = readInt64(doc, "goroutines")
 	v.AcceptedConn = readInt64(doc, "celeris.accepted_conn_total")
 	v.ClosedConn = readInt64(doc, "celeris.closed_conn_total")
@@ -378,6 +462,18 @@ func readInt64(m map[string]any, key string) int64 {
 	default:
 		return 0
 	}
+}
+
+// readPresentInt64 is readInt64 that also says whether the key held a
+// number at all, for counters whose 0 is a reading.
+func readPresentInt64(m map[string]any, key string) (int64, bool) {
+	if m == nil {
+		return 0, false
+	}
+	if f, ok := m[key].(float64); ok && f >= 0 {
+		return int64(f), true
+	}
+	return 0, false
 }
 
 // readInt64Slice indexes a JSON array of numbers; mirrors readInt64 for
