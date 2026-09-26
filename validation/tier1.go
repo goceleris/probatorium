@@ -112,6 +112,13 @@ type tier1Config struct {
 	// need to be safe for concurrent invocation.
 	TallyCallback func(tier1TallySnapshot)
 
+	// OnWalkerStall, when non-nil, is called (from a timer goroutine) when
+	// an h2c-churn preamble read or a WS-torture handshake read has been in
+	// flight past its stall threshold with no byte back -- kind is "h2c" or
+	// "ws" -- so the orchestrator can take a dossier INSIDE the stall
+	// (celeris#588). See wsStallThreshold / h2cStallThreshold.
+	OnWalkerStall func(kind string)
+
 	// TallyCallbackInterval is how often TallyCallback fires. Zero
 	// defaults to 2 seconds; only used when TallyCallback is non-nil.
 	TallyCallbackInterval time.Duration
@@ -486,7 +493,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	rfcTallyPtr := &rfcTally{}
 	tally.rfc = rfcTallyPtr
 	// Per-fire capture for the h2c / WS walkers (walker_capture.go).
-	armWalkerCapture(runCtx, tally.readyAt.Load(), h2cTallyPtr, wsTallyPtr)
+	armWalkerCapture(runCtx, tally.readyAt.Load(), h2cTallyPtr, wsTallyPtr, cfg.OnWalkerStall)
 	wsEchoTallyPtr := &wsEchoTally{}
 	tally.wsEcho = wsEchoTallyPtr
 	if cfg.OnResponseCounters != nil {

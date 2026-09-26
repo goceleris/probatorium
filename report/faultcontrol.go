@@ -48,12 +48,20 @@ var (
 	faultReleaseRE = regexp.MustCompile(`\[fault\] release path=(\S+) end=(\S+) waiters=(\d+)`)
 )
 
-// ParseFaultLog extracts the holds from a refapp log, oldest first.
+// ParseFaultLog extracts the holds from a refapp log, oldest first. The
+// same line may arrive twice (the cell summary's stderr tail and the cell's
+// refapp_stderr_tail.txt carry the same text); a hold is identified by its
+// path and start instant and kept once.
 func ParseFaultLog(lines []string) []FaultInjection {
 	var out []FaultInjection
 	idx := map[string]int{}
+	seen := map[string]bool{}
 	for _, l := range lines {
 		if m := faultHoldRE.FindStringSubmatch(l); m != nil {
+			if seen[m[1]+" "+m[3]] {
+				continue
+			}
+			seen[m[1]+" "+m[3]] = true
 			hold, _ := time.ParseDuration(m[2])
 			start, _ := time.Parse(time.RFC3339Nano, m[3])
 			idx[m[1]] = len(out)
@@ -90,7 +98,8 @@ type faultClass struct {
 	outcome               string // SlowFire.Outcome of the failed fire
 	minReadMs             int64  // the walker's read budget, less slack
 	errPart               string // substring of SlowFire.Err
-	predicate             string // incident dossier predicate ID
+	predicate             string // the gated counter's record-only dossier
+	stallPredicate        string // the in-stall dossier (taken while a read still waits)
 	ring                  func(*Tier1Summary) []SlowFire
 	counters              func(*Tier1Summary) map[string]int64
 }
@@ -98,11 +107,11 @@ type faultClass struct {
 var faultClasses = map[string]faultClass{
 	// The WS-torture handshake: 2 s budget for dial + write + 101.
 	"/ws": {slice: "ws_torture", total: "ws_handshake_fail", timeout: "ws_handshake_fail_timeout",
-		outcome: "handshake-fail-timeout", minReadMs: 1500, errPart: "timeout", predicate: "I-WS-HANDSHAKE",
+		outcome: "handshake-fail-timeout", minReadMs: 1500, errPart: "timeout", predicate: "I-WS-HANDSHAKE", stallPredicate: "I-WS-STALL",
 		ring: func(t *Tier1Summary) []SlowFire { return t.WSSlowReads }, counters: func(t *Tier1Summary) map[string]int64 { return t.WSTorture }},
 	// The h2c-churn preamble (GET / with Upgrade: h2c): 20 s read budget.
 	"/": {slice: "h2c_churn", total: "h2c_hang", timeout: "h2c_hang_timeout",
-		outcome: "hang-timeout", minReadMs: 19000, errPart: "timeout", predicate: "I-H2C-HANG",
+		outcome: "hang-timeout", minReadMs: 19000, errPart: "timeout", predicate: "I-H2C-HANG", stallPredicate: "I-H2C-STALL",
 		ring: func(t *Tier1Summary) []SlowFire { return t.H2CSlowReads }, counters: func(t *Tier1Summary) map[string]int64 { return t.H2CChurn }},
 }
 
@@ -194,35 +203,51 @@ func CheckFaultControlCell(cellDir string, cell ValidationCellResult, wantPaths 
 			note("%s: %d %q record(s) inside the hold; first at +%s after its start: dial %d ms, write %d ms, read %d ms, err %q, %s -> %s, validator skew 0",
 				path, len(in), fc.outcome, tsSince(sf.TS, inj.Start), sf.DialMs, sf.WriteMs, sf.ReadMs, sf.Err, sf.LocalAddr, sf.RemoteAddr)
 		}
-		// The dossier, and whether it was taken inside the stall.
-		d := findDossier(dossiers, fc.predicate)
-		if d == "" {
+		// The dossiers. The gated counter's own record-only dossier must
+		// exist (it is what the gate's failure points at), and at least one
+		// dossier -- that one, or the in-stall one taken while a read was
+		// still waiting -- must have been observed INSIDE the hold with a
+		// goroutine dump that names both the holder and a waiter: that is
+		// the dump from which the stall can be root-caused. A dossier taken
+		// after the release shows a healthy process and names nothing.
+		gated := findDossier(dossiers, fc.predicate)
+		if gated == "" {
 			fail("%s: no incidents/*-%s dossier", path, fc.predicate)
-			continue
 		}
-		obs := dossierObservedAt(d)
-		stacks, serr := os.ReadFile(filepath.Join(d, "goroutine-stacks.txt"))
-		holder := strings.Count(string(stacks), FaultHolderFrame+"(")
-		waiters := strings.Count(string(stacks), FaultWaiterFrame+"(")
-		switch {
-		case serr != nil:
-			fail("%s: dossier %s has no goroutine-stacks.txt: %v", path, filepath.Base(d), serr)
-		case holder < 1 || waiters < 1:
-			fail("%s: dossier %s goroutine dump shows %d holder / %d waiter frame(s): it was not taken inside the stall, or does not name it",
-				path, filepath.Base(d), holder, waiters)
-		default:
-			note("%s: dossier %s observed at +%s after the hold's start: its goroutine dump shows %d request goroutine(s) blocked in %s and the holder asleep in %s -- the stall is a held lock on %s",
-				path, filepath.Base(d), obs.Sub(inj.Start).Round(time.Millisecond), waiters, FaultWaiterFrame, FaultHolderFrame, path)
+		var inside []string
+		for _, d := range dossiers {
+			base := filepath.Base(d)
+			if !strings.HasSuffix(base, "-"+fc.predicate) && !strings.HasSuffix(base, "-"+fc.stallPredicate) {
+				continue
+			}
+			obs := dossierObservedAt(d)
+			stacks, serr := os.ReadFile(filepath.Join(d, "goroutine-stacks.txt"))
+			holder := strings.Count(string(stacks), FaultHolderFrame+"(")
+			waiters := strings.Count(string(stacks), FaultWaiterFrame+"(")
+			in := !obs.IsZero() && !obs.Before(inj.Start) && !obs.After(end)
+			switch {
+			case serr != nil:
+				note("%s: dossier %s has no goroutine-stacks.txt (%v)", path, base, serr)
+			case !in:
+				note("%s: dossier %s observed at %s, outside the hold [+0, +%s]: its dump (%d holder / %d waiter frame(s)) cannot name the stall",
+					path, base, obs.Sub(inj.Start).Round(time.Millisecond), end.Sub(inj.Start).Round(time.Millisecond), holder, waiters)
+			case holder < 1 || waiters < 1:
+				note("%s: dossier %s observed inside the hold but its dump shows %d holder / %d waiter frame(s)", path, base, holder, waiters)
+			default:
+				inside = append(inside, base)
+				note("%s: dossier %s observed at +%s after the hold's start: its goroutine dump shows %d request goroutine(s) blocked in %s and the holder asleep in %s -- the stall is a held lock on %s",
+					path, base, obs.Sub(inj.Start).Round(time.Millisecond), waiters, FaultWaiterFrame, FaultHolderFrame, path)
+			}
+			if tail, err := os.ReadFile(filepath.Join(d, "refapp_stderr_tail.txt")); err != nil || !strings.Contains(string(tail), "[fault] hold path="+path+" ") {
+				fail("%s: dossier %s refapp_stderr_tail.txt lacks the hold line (err=%v)", path, base, err)
+			}
+			if _, err := os.Stat(filepath.Join(d, "core.skipped")); err != nil {
+				fail("%s: dossier %s has no core.skipped marker: a record-only incident must not have paused the refapp", path, base)
+			}
 		}
-		if tail, err := os.ReadFile(filepath.Join(d, "refapp_stderr_tail.txt")); err != nil || !strings.Contains(string(tail), "[fault] hold path="+path+" ") {
-			fail("%s: dossier refapp_stderr_tail.txt lacks the hold line (err=%v)", path, err)
-		}
-		if _, err := os.Stat(filepath.Join(d, "core.skipped")); err != nil {
-			fail("%s: dossier has no core.skipped marker: a record-only incident must not have paused the refapp", path)
-		}
-		if !obs.IsZero() && (obs.Before(inj.Start) || obs.After(end)) {
-			fail("%s: dossier observed at %s, outside the hold [%s, %s]", path,
-				obs.Format(time.RFC3339Nano), inj.Start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano))
+		if len(inside) == 0 {
+			fail("%s: no %s or %s dossier was observed inside the hold with a goroutine dump naming holder and waiter: the stall is not root-causable from this artifact",
+				path, fc.predicate, fc.stallPredicate)
 		}
 	}
 

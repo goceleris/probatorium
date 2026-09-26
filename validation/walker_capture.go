@@ -43,6 +43,21 @@ import (
 // were slow for a reason.
 const slowReadThreshold = time.Second
 
+// In-stall capture thresholds (celeris#588; review 1 item 3, review 2
+// item 2): a read leg that has been in flight this long with no byte back
+// fires the orchestrator's in-stall dossier WHILE the stall is still in
+// force. The dossier taken when a fire finally FAILS lands after the
+// walker's budget and up to one tally tick later -- for a WS stall of a
+// few seconds that is after the stall has ended, and the goroutine dump
+// shows a healthy process (measured: the first fault-injected container
+// run caught an 8 s /ws hold 12 ms AFTER its release). Half the WS budget,
+// and 3 s of h2c's 20 s: well past a healthy loopback round trip, well
+// inside the budget.
+const (
+	wsStallThreshold  = time.Second
+	h2cStallThreshold = 3 * time.Second
+)
+
 // slowFireRingSize bounds the ring. Sixteen to sixty-four per the design;
 // thirty-two keeps an hour-long systematic stall from costing more than a
 // few KB in the cell document while holding more than one minute of a
@@ -173,6 +188,21 @@ type fireCapture struct {
 	slow    slowFireRing
 	readyAt atomic.Int64 // unix nanos; 0 = unknown
 	hb      atomic.Pointer[heartbeat]
+	// onStall is the in-stall trigger armWalkerCapture installs; nil in
+	// unit tests that fire a walker directly.
+	onStall atomic.Pointer[func()]
+}
+
+// watchRead arms the in-stall trigger for one read leg: if the returned
+// disarm is not called within threshold, the trigger runs (on a timer
+// goroutine) while the read is still waiting. Free when nothing is armed.
+func (c *fireCapture) watchRead(threshold time.Duration) (disarm func()) {
+	fn := c.onStall.Load()
+	if fn == nil {
+		return func() {}
+	}
+	t := time.AfterFunc(threshold, *fn)
+	return func() { t.Stop() }
 }
 
 // record files the three legs of one fire into the histogram and, when the
@@ -322,14 +352,21 @@ func (h *heartbeat) maxGapSince(since time.Time) time.Duration {
 }
 
 // armWalkerCapture stamps the refapp's ready instant (unix nanos, 0 =
-// unknown) on the walker tallies and starts the validator heartbeat for
-// them. One call from driveTier1 once the tallies exist.
-func armWalkerCapture(ctx context.Context, readyAtNanos int64, h2c *h2cTally, ws *wsTally) {
+// unknown) on the walker tallies, starts the validator heartbeat for them
+// and installs the in-stall trigger (onStall("h2c") / onStall("ws"); nil
+// = none). One call from driveTier1 once the tallies exist.
+func armWalkerCapture(ctx context.Context, readyAtNanos int64, h2c *h2cTally, ws *wsTally, onStall func(kind string)) {
 	hb := startHeartbeat(ctx)
 	for _, c := range []*fireCapture{&h2c.capture, &ws.capture} {
 		if readyAtNanos != 0 {
 			c.readyAt.Store(readyAtNanos)
 		}
 		c.hb.Store(hb)
+	}
+	if onStall != nil {
+		h := func() { onStall("h2c") }
+		w := func() { onStall("ws") }
+		h2c.capture.onStall.Store(&h)
+		ws.capture.onStall.Store(&w)
 	}
 }

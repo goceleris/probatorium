@@ -107,42 +107,84 @@ func TestFaultControlWSInjectionPasses(t *testing.T) {
 
 // Each capture defect the control exists to catch fails the cell.
 func TestFaultControlCatchesEachCaptureDefect(t *testing.T) {
+	const notRootCausable = "not root-causable"
 	for _, tc := range []struct {
 		name    string
 		breakIt func(*testing.T, *fcCell)
 		part    string
+		finding string // optional: a Findings line the reader gets as the reason
 	}{
-		{"counter never moved", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSTorture["ws_handshake_fail_timeout"] = 0 }, "gated counter"},
-		{"no record in the ring", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads = nil }, "no \"handshake-fail-timeout\" record"},
-		{"record outside the hold", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads[0].TS = fcTS(30 * time.Second) }, "no \"handshake-fail-timeout\" record"},
-		{"record without addresses", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads[0].LocalAddr = "" }, "no socket addresses"},
-		{"wrong leg expired", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads[0].ReadMs = 5 }, "READ leg"},
-		{"validator stalled", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads[0].ValidatorSkewMs = 1800 }, "validator itself stalled"},
+		{"counter never moved", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSTorture["ws_handshake_fail_timeout"] = 0 }, "gated counter", ""},
+		{"no record in the ring", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads = nil }, "no \"handshake-fail-timeout\" record", ""},
+		{"record outside the hold", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads[0].TS = fcTS(30 * time.Second) }, "no \"handshake-fail-timeout\" record", ""},
+		{"record without addresses", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads[0].LocalAddr = "" }, "no socket addresses", ""},
+		{"wrong leg expired", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads[0].ReadMs = 5 }, "READ leg", ""},
+		{"validator stalled", func(_ *testing.T, c *fcCell) { c.cell.Tier1.WSSlowReads[0].ValidatorSkewMs = 1800 }, "validator itself stalled", ""},
 		{"dump taken after the release", func(t *testing.T, c *fcCell) {
 			inc, _ := json.Marshal(map[string]any{"observed_at": fcTS(11 * time.Second)})
 			c.write(t, "incident.json", string(inc))
-		}, "outside the hold"},
+		}, notRootCausable, "outside the hold"},
 		{"dump does not name the holder", func(t *testing.T, c *fcCell) {
 			c.write(t, "goroutine-stacks.txt", "goroutine 1 [running]:\nmain.main()\n")
-		}, "holder / 0 waiter"},
+		}, notRootCausable, "0 holder / 0 waiter"},
 		{"dump shows waiters but no holder", func(t *testing.T, c *fcCell) {
 			c.write(t, "goroutine-stacks.txt", "goroutine 88 [sync.Mutex.Lock]:\ngithub.com/x/debugvars.(*FaultHold).wait(...)\n")
-		}, "0 holder / 1 waiter"},
+		}, notRootCausable, "0 holder / 1 waiter"},
 		{"dump shows the holder but no waiter", func(t *testing.T, c *fcCell) {
 			c.write(t, "goroutine-stacks.txt", "goroutine 7 [sleep]:\ngithub.com/x/debugvars.(*FaultHold).run(...)\n")
-		}, "1 holder / 0 waiter"},
-		{"no text dump", func(t *testing.T, c *fcCell) { _ = os.Remove(filepath.Join(c.dossier(), "goroutine-stacks.txt")) }, "no goroutine-stacks.txt"},
-		{"gcore paused the refapp", func(t *testing.T, c *fcCell) { _ = os.Remove(filepath.Join(c.dossier(), "core.skipped")) }, "core.skipped"},
-		{"no dossier", func(t *testing.T, c *fcCell) { _ = os.RemoveAll(filepath.Join(c.dir, "incidents")) }, "no incidents/*-I-WS-HANDSHAKE dossier"},
+		}, notRootCausable, "1 holder / 0 waiter"},
+		{"no text dump", func(t *testing.T, c *fcCell) { _ = os.Remove(filepath.Join(c.dossier(), "goroutine-stacks.txt")) }, notRootCausable, "no goroutine-stacks.txt"},
+		{"gcore paused the refapp", func(t *testing.T, c *fcCell) { _ = os.Remove(filepath.Join(c.dossier(), "core.skipped")) }, "core.skipped", ""},
+		{"no dossier", func(t *testing.T, c *fcCell) { _ = os.RemoveAll(filepath.Join(c.dir, "incidents")) }, "no incidents/*-I-WS-HANDSHAKE dossier", ""},
 		{"fault never fired", func(t *testing.T, c *fcCell) {
 			_ = os.WriteFile(filepath.Join(c.dir, "refapp_stderr_tail.txt"), []byte("nothing\n"), 0o644)
-		}, "never logged the hold"},
+		}, "never logged the hold", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newFCCell(t)
 			tc.breakIt(t, c)
-			wantFail(t, CheckFaultControlCell(c.dir, c.cell, []string{"/ws"}), tc.part)
+			r := CheckFaultControlCell(c.dir, c.cell, []string{"/ws"})
+			wantFail(t, r, tc.part)
+			if tc.finding != "" && !strings.Contains(strings.Join(r.Findings, "\n"), tc.finding) {
+				t.Errorf("findings do not give the reason %q: %v", tc.finding, r.Findings)
+			}
 		})
+	}
+}
+
+// The in-stall dossier is what makes a stall shorter than the walker's
+// budget root-causable: with the gated dossier landing after the release
+// (as the first live container run measured, 12 ms after an 8 s /ws hold),
+// an I-WS-STALL dossier taken while a read was still waiting passes the
+// cell; without it the same artifact fails.
+func TestFaultControlInStallDossierMakesAShortStallRootCausable(t *testing.T) {
+	c := newFCCell(t)
+	late, _ := json.Marshal(map[string]any{"observed_at": fcTS(8*time.Second + 12*time.Millisecond)})
+	c.write(t, "incident.json", string(late))
+	c.write(t, "goroutine-stacks.txt", "goroutine 1 [running]:\nmain.main()\n")
+	wantFail(t, CheckFaultControlCell(c.dir, c.cell, []string{"/ws"}), "not root-causable")
+
+	d := filepath.Join(c.dir, "incidents", "20260926-120005-I-WS-STALL")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inc, _ := json.Marshal(map[string]any{"observed_at": fcTS(5 * time.Second)})
+	for name, body := range map[string]string{
+		"incident.json":          string(inc),
+		"goroutine-stacks.txt":   "goroutine 7 [sleep]:\ngithub.com/x/debugvars.(*FaultHold).run(...)\ngoroutine 9 [sync.Mutex.Lock]:\ngithub.com/x/debugvars.(*FaultHold).wait(...)\n",
+		"refapp_stderr_tail.txt": "[fault] hold path=/ws hold=8s start=" + fcTS(0) + "\n",
+		"core.skipped":           "x\n",
+	} {
+		if err := os.WriteFile(filepath.Join(d, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := CheckFaultControlCell(c.dir, c.cell, []string{"/ws"})
+	if !r.Pass() {
+		t.Fatalf("an in-stall dossier inside the hold must pass the cell: %v", r.Failures)
+	}
+	if all := strings.Join(r.Findings, "\n"); !strings.Contains(all, "I-WS-STALL observed at +5s") || !strings.Contains(all, "outside the hold") {
+		t.Errorf("findings should credit the in-stall dossier and say why the gated one could not: %s", all)
 	}
 }
 
@@ -169,6 +211,7 @@ func TestParseFaultLogPairsHoldAndRelease(t *testing.T) {
 	inj := ParseFaultLog([]string{
 		"noise",
 		"[fault] hold path=/ws hold=8s start=" + fcTS(0),
+		"[fault] hold path=/ws hold=8s start=" + fcTS(0), // the same line from the second copy of the tail
 		"[fault] hold path=/ hold=40s start=" + fcTS(30*time.Second),
 		"[fault] release path=/ws end=" + fcTS(8*time.Second) + " waiters=3",
 	})

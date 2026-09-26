@@ -162,3 +162,44 @@ func TestHasBinary(t *testing.T) {
 		t.Error("hasBinary returned true for non-existent")
 	}
 }
+
+// TestCaptureForensicsLive_SocketSnapshot (celeris#588): every dossier
+// carries the socket view -- listener queues and every TCP socket with its
+// owner -- captured with ss. A fake ss on PATH stands in for iproute2.
+func TestCaptureForensicsLive_SocketSnapshot(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\necho \"fake-ss $*\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "ss"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dir := t.TempDir()
+	if err := captureForensicsLive(context.Background(), dir, 0, ""); err != nil {
+		t.Fatalf("captureForensicsLive: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "ss.txt"))
+	if err != nil {
+		t.Fatalf("ss.txt: %v", err)
+	}
+	for _, want := range []string{"### ss -ltn", "fake-ss -ltn", "### ss -tanpi", "fake-ss -tanpi"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("ss.txt lacks %q:\n%s", want, body)
+		}
+	}
+	status, _ := os.ReadFile(filepath.Join(dir, "forensics_status.txt"))
+	if !strings.Contains(string(status), "ss=true") {
+		t.Errorf("forensics_status.txt does not record ss: %s", status)
+	}
+}
+
+// Without ss the dossier says so instead of silently lacking the view.
+func TestCaptureForensicsLive_NoSocketToolLeavesAMarker(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	dir := t.TempDir()
+	if err := captureForensicsLive(context.Background(), dir, 0, ""); err != nil {
+		t.Fatalf("captureForensicsLive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ss.txt.missing")); err != nil {
+		t.Fatalf("no ss.txt.missing marker: %v", err)
+	}
+}
