@@ -34,15 +34,15 @@ It never touches the benchmark cluster: no self-hosted label, no share of the
    - every FAIL with its first failure lines, the shard and its `-shuffle` seed;
    - every shard's status.
 
-The summary job is red unless the run PASSed: at least one test passed, no
-test failed, and every shard is `complete`.
+The summary job is red unless the run PASSed: on every arch at least one test
+passed, no test failed, and every shard is `complete`.
 
 ### How the tally counts
 
 Only `--- PASS: `, `--- FAIL: ` and `--- SKIP: ` lines count, subtests
 included. A SKIP is its own column: it is never a pass and never in the
-denominator of a rate. A run in which nothing but skips happened does not
-PASS (`nothing-ran`).
+denominator of a rate. A run in which nothing but skips happened on an arch
+does not PASS (`nothing-ran`), whatever the other arch did.
 
 A shard is one of:
 
@@ -106,8 +106,8 @@ gh api -X PATCH repos/goceleris/probatorium/git/refs/heads/stress/runs \
   -f sha="$(gh api repos/goceleris/probatorium/commits/main --jq .sha)" -F force=true   # refresh
 ```
 
-Do not re-run a failed shard job to "fix" a run: the summary would count the
-retried shard's log, which biases a rate. Dispatch a new run instead.
+Do not re-run failed shard jobs to "fix" a run: retrying only the shards that
+failed selects for passes and biases the rate. Dispatch a new run instead.
 
 ## Examples
 

@@ -202,7 +202,6 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 	})
 
 	// Per-arch totals and the case's problems.
-	var pass, fail int
 	for _, arch := range c.Arches {
 		t := ArchTotal{Arch: arch, Kernels: []string{}, Images: []string{}}
 		for _, s := range rep.Shards {
@@ -237,8 +236,6 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 			t.Skip += r.Skip
 			t.NoVerdict += r.NoVerdict
 		}
-		pass += t.Pass
-		fail += t.Fail
 		rep.Arches = append(rep.Arches, t)
 		addIf := func(cond bool, p string) {
 			if cond && !slices.Contains(rep.Problems, p) {
@@ -249,9 +246,9 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 		addIf(t.Unparsed > 0, problemUnparsed)
 		addIf(t.Missing > 0, problemMissing)
 		addIf(t.WrongShape > 0, problemWrongShape)
-	}
-	if pass+fail == 0 {
-		rep.Problems = append(rep.Problems, problemNothingRan)
+		// Per arch: an arch on which every test skipped is no evidence
+		// for that arch, whatever the other arch did.
+		addIf(t.Pass+t.Fail == 0, problemNothingRan)
 	}
 	slices.Sort(rep.Problems)
 	rep.Verdict = "PASS"

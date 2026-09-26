@@ -85,6 +85,24 @@ func TestSkipIsNeverAPass(t *testing.T) {
 	}
 }
 
+// The release gate asks arm64 == x86. An arch on which every test skipped
+// says nothing about that arch, so the case fails although the other passed.
+func TestAnArchWhereNothingRanFailsTheCase(t *testing.T) {
+	dir := t.TempDir()
+	c := sampleCase("onearch")
+	c.Packages, c.Count, c.Arches = []string{"./a"}, 3, []string{"x86", "arm64"}
+	pass := strings.ReplaceAll(corpus(t, "skiponly"), "--- SKIP: TestSkip", "--- PASS: TestSkip")
+	writeShard(t, dir, c, "x86", 1, pass, "0", nil)
+	writeShard(t, dir, c, "arm64", 1, corpus(t, "skiponly"), "0", nil)
+	r := judgeCase(c, dir, testSHA)
+	if got := row(t, r, pkgA, "TestSkip", "x86"); got.Pass != 3 {
+		t.Fatalf("x86 %+v, want 3 passes", got)
+	}
+	if r.Verdict != "FAIL" || !slices.Equal(r.Problems, []string{problemNothingRan}) {
+		t.Errorf("verdict %s problems %v, want FAIL [nothing-ran] for the arm64 that only skipped", r.Verdict, r.Problems)
+	}
+}
+
 func TestFailIsCountedAndListedWithItsFirstLines(t *testing.T) {
 	c := sampleCase("fail")
 	c.Packages, c.Count = []string{"./a"}, 1
