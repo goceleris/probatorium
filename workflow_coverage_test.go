@@ -39,14 +39,19 @@ func TestCoverageWorkflowStaysOffTheCluster(t *testing.T) {
 	}
 }
 
-// Only the upload may mint an OIDC token: the workflow grants nothing at the
-// top level, and id-token: write is granted to exactly the job that runs the
-// Codecov action.
+// Only the upload may mint an OIDC token. The workflow grants nothing at the
+// top level and no job gets write-all; id-token: write is granted to exactly
+// the job that runs the Codecov action; and that job runs no script. A job
+// granted id-token: write hands the token request to every step in it, so
+// the pull request's tests must run somewhere else.
 func TestCoverageWorkflowScopesTheIDToken(t *testing.T) {
 	src := readCoverageWorkflow(t)
 
 	if !regexp.MustCompile(`(?m)^permissions: \{\}\s*$`).MatchString(src) {
 		t.Error("top-level permissions must be {} so every job states what it needs")
+	}
+	if regexp.MustCompile(`(?m)^\s*permissions:\s*write-all\s*$`).MatchString(src) {
+		t.Error("permissions: write-all grants id-token: write along with everything else")
 	}
 
 	upload := jobsWithLine(src, `^\s+(- )?uses: codecov/codecov-action@`)
@@ -55,6 +60,10 @@ func TestCoverageWorkflowScopesTheIDToken(t *testing.T) {
 	}
 	if granted := jobsWithLine(src, `^\s+id-token: write\s*$`); !slices.Equal(granted, upload) {
 		t.Errorf("id-token: write is granted to jobs %v, want exactly the upload job %v", granted, upload)
+	}
+	if slices.Contains(jobsWithLine(src, `^\s+(- )?run:`), upload[0]) {
+		t.Errorf("job %q can mint an OIDC token and also runs a script; run the tests in a job "+
+			"without id-token: write and hand the profile over as an artifact", upload[0])
 	}
 }
 
