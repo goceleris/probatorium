@@ -201,7 +201,7 @@ type Snapshot struct {
 	// Process resources. RSSBytes is the refapp's VmRSS, read from
 	// /proc/<pid>/status by checker.ReadRSS (validation/propertyloop.go and
 	// cmd/validator-checker) and judged by I-MEM-4. The fd and GC-pause series
-	// live on report.ResourceSample, filled by cmd/observer. FDCount,
+	// live on report.ObserverSample, filled by cmd/observer. FDCount,
 	// SoftFDLimit, GCPauseP99Ns and NumGoroutineDiff used to be declared here
 	// as well, and nothing wrote or read these copies; they only made a name
 	// search look as if a predicate could judge them (probatorium#395). A field

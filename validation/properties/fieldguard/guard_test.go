@@ -27,7 +27,7 @@ import (
 // evaluations in every run report. Nine predicates went the same way in
 // probatorium#297.
 //
-// A name search cannot catch it: report.ResourceSample and cmd/observer's
+// A name search cannot catch it: report.ObserverSample and cmd/observer's
 // struct both have an FDCount, so `git grep -w FDCount` finds "writers" for a
 // properties.Snapshot field nothing feeds. So this guard decides with the type
 // checker: a selector counts only when go/types resolves it to one of
