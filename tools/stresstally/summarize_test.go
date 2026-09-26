@@ -401,3 +401,27 @@ func TestKernelOrImageMismatchBetweenArchesIsFlagged(t *testing.T) {
 		})
 	}
 }
+
+// Text from a shard's log comes from the code under test, which may be
+// anyone's pull request: in the job summary it renders as text, never as a
+// link or HTML. A test name keeps its brackets inside its code span.
+func TestSummaryRendersLogTextAsText(t *testing.T) {
+	c := sampleCase("inert")
+	c.Packages, c.Count = []string{"./a"}, 1
+	dir := t.TempDir()
+	body := verdictBlock("TestPass", "PASS", "[a](b)") + "signal: killed [click](https://example.invalid/) <img src=x>\n"
+	writeShard(t, dir, c, "x86", 1, body, "1", nil)
+	var md strings.Builder
+	judgeCase(c, dir, testSHA).Markdown(&md)
+	s := md.String()
+	for _, want := range []string{`\[click\](https://example.invalid/) &lt;img src=x&gt;`, "| `TestPass/[a](b)` |"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("summary lacks %q:\n%s", want, s)
+		}
+	}
+	for _, bad := range []string{"[click](", "<img"} {
+		if strings.Contains(s, bad) {
+			t.Errorf("summary renders %q from the log as Markdown or HTML:\n%s", bad, s)
+		}
+	}
+}

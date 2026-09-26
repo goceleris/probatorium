@@ -64,7 +64,16 @@ func clean(s string) string {
 // inline makes a value safe inside a code span outside a table.
 func inline(s string) string { return strings.ReplaceAll(clean(s), "`", "'") }
 
+// cell makes a value safe in a table cell or a line of the summary. Much of
+// it comes from the log of the code under test, which may be anyone's pull
+// request, so link and HTML syntax is escaped and renders as text.
 func cell(s string) string {
+	return strings.NewReplacer("|", `\|`, "`", "'", "[", `\[`, "]", `\]`, "<", "&lt;", ">", "&gt;").Replace(clean(s))
+}
+
+// codeCell makes a value safe in a code span inside a table cell, where
+// Markdown and HTML are inert already and a backslash escape would show.
+func codeCell(s string) string {
 	return strings.NewReplacer("|", `\|`, "`", "'").Replace(clean(s))
 }
 
@@ -81,7 +90,7 @@ func testTable(w *strings.Builder, rows []TestRow, limit int) int {
 			break
 		}
 		say(w, "| `%s` | %s | %s | %s | %s | %s | %d | %d | %d | %d |\n",
-			cell(r.Name), cell(shortPkg(r.Package)), r.Arch, procs(r), pct(r.ProcFailRate), ci(r), r.Pass, r.Fail, r.Skip, r.NoVerdict)
+			codeCell(r.Name), cell(shortPkg(r.Package)), r.Arch, procs(r), pct(r.ProcFailRate), ci(r), r.Pass, r.Fail, r.Skip, r.NoVerdict)
 		n++
 	}
 	return n
