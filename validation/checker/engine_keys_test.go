@@ -365,6 +365,7 @@ func TestEachEngineCounterIsDeclaredAndReadsItsOwnKey(t *testing.T) {
 	validKind := map[report.EngineCounterKind]bool{
 		report.CounterCumulative: true, report.CounterRunningMax: true,
 		report.CounterGauge: true, report.CounterStatic: true,
+		report.CounterPeakGauge: true,
 	}
 	for name, c := range report.EngineCounters {
 		if _, ok := sentinelOf[name]; !ok {
@@ -444,6 +445,10 @@ var kindReductions = map[report.EngineCounterKind]struct {
 	// Fixed after Listen, so any reading is the value; the tally keeps the
 	// last, the one the engine ended on.
 	report.CounterStatic: {"last", lastReading},
+	// A level whose question is whether it ever stood above zero
+	// (report.CounterPeakGauge): the highest reading, so a zero clears every
+	// sample and not only the last one.
+	report.CounterPeakGauge: {"max", maxReading},
 }
 
 func lastReading(r []int64) int64 { return r[len(r)-1] }
@@ -547,9 +552,9 @@ func TestEachEngineCounterIsReducedByItsDeclaredKind(t *testing.T) {
 		perKind[kind]++
 		checked++
 	}
-	t.Logf("checked the reduction of %d of %d declared engine counter(s) over %d sample(s): %d cumulative by last, %d running_max by max, %d gauge by last, %d static by last; %d could not discriminate",
+	t.Logf("checked the reduction of %d of %d declared engine counter(s) over %d sample(s): %d cumulative by last, %d running_max by max, %d gauge by last, %d static by last, %d peak_gauge by max; %d could not discriminate",
 		checked, len(names), len(reductionReadings), perKind[report.CounterCumulative], perKind[report.CounterRunningMax],
-		perKind[report.CounterGauge], perKind[report.CounterStatic], blind)
+		perKind[report.CounterGauge], perKind[report.CounterStatic], perKind[report.CounterPeakGauge], blind)
 	if checked == 0 {
 		t.Fatal("no counter's reduction was checked at all -- this guard is vacuous")
 	}
@@ -570,6 +575,15 @@ var engineFieldKinds = map[string]struct {
 	"Throughput":                {report.CounterGauge, "a float64 recent requests-per-second rate, which falls as well as rises"},
 	"RecvStallMaxNanos":         {report.CounterRunningMax, "a uint64 that is the longest single recv-stall episode, not a total"},
 	"RecvLinkedBlockedMaxNanos": {report.CounterRunningMax, "a uint64 that is the longest single linked-recv wait, not a total"},
+	// celeris#687's residual gauges are uint64 -- each loop publishes a delta
+	// against what it published last, so the engine-wide value falls as well
+	// as rises without ever going negative -- and celeris documents them as
+	// GAUGES read at every switch verdict, hence peak_gauge.
+	"TransplantResidualDetached":  {report.CounterPeakGauge, "a uint64 celeris#687 documents as a GAUGE: the WebSocket/SSE connections a draining engine still holds"},
+	"TransplantResidualH2":        {report.CounterPeakGauge, "a uint64 celeris#687 documents as a GAUGE: the H2/h2c connections a draining engine still holds"},
+	"TransplantResidualPinned":    {report.CounterPeakGauge, "a uint64 celeris#687 documents as a GAUGE: the connections a draining engine holds that cannot be handed over at all"},
+	"TransplantResidualUnstarted": {report.CounterPeakGauge, "a uint64 celeris#687 documents as a GAUGE: the accepted connections a draining engine holds that have sent nothing yet"},
+	"TransplantResidualBusy":      {report.CounterPeakGauge, "a uint64 celeris#687 documents as a GAUGE: the mid-request connections a draining engine holds, whose standing nonzero value after a switch settles is the placement bug"},
 }
 
 // TestEachEngineCounterKindFollowsItsEngineMetricsField ties each declared
@@ -579,8 +593,9 @@ var engineFieldKinds = map[string]struct {
 // holds the reducer to whatever kind is declared.
 //
 // The authority is the field's Go type, which the manifest carries from a
-// reflective walk of the pinned celeris: a uint64 only rises, so it is
-// cumulative unless engineFieldKinds names it a running maximum; a field of
+// reflective walk of the pinned celeris: a uint64 is cumulative unless
+// engineFieldKinds names it a running maximum or a peak gauge (the
+// TransplantResidual* uint64 gauges fall); a field of
 // any other type has to be classified in engineFieldKinds; and a signed int64
 // exists to be decremented, so it can only be a gauge. The table holds the
 // decisions a type cannot make (Workers against AsyncRoutes, both int), each
@@ -623,6 +638,13 @@ func TestEachEngineCounterKindFollowsItsEngineMetricsField(t *testing.T) {
 		if strings.HasSuffix(k.Key, "_max_nanos") {
 			if c, ok := engineFieldKinds[k.Field]; !ok || c.kind != report.CounterRunningMax {
 				t.Errorf("%s is an engine-side running maximum and engineFieldKinds does not classify %s as one", k.Key, k.Field)
+			}
+		}
+		// A sixth refusal class celeris adds is a uint64 too, and would
+		// default to cumulative -- kept as its last reading -- unless named.
+		if strings.HasPrefix(k.Field, "TransplantResidual") {
+			if c, ok := engineFieldKinds[k.Field]; !ok || c.kind != report.CounterPeakGauge {
+				t.Errorf("%s is one of celeris#687's residual gauges and engineFieldKinds does not classify %s as a peak gauge", k.Key, k.Field)
 			}
 		}
 	}

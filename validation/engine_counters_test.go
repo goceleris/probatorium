@@ -329,7 +329,8 @@ func TestAPublishedEngineKeyReachesValidateResultsAndTheSeries(t *testing.T) {
 		}
 	}
 	// Every counter's want is the last recorded sample's reading. The
-	// readings rise, so for a running maximum that is also its max: this
+	// readings rise, so for a running maximum and a peak gauge that is also
+	// its max: this
 	// test separates last from sum and first, and
 	// checker.TestEachEngineCounterIsReducedByItsDeclaredKind separates max
 	// from last.

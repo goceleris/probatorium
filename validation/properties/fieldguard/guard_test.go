@@ -40,16 +40,18 @@ var snapshotType = reflect.TypeFor[properties.Snapshot]()
 
 // Vacuity floors. An analysis that stopped seeing the code would find no
 // unfed field and pass, so these assert it is still looking. On the tree
-// probatorium#403 merges it loads 24 packages and sees 96 of Snapshot's 97
-// fields read, at 248 sites (97 in validation/properties, 84 in
-// validation/checker, 65 in validation, 2 in cmd/validator-checker), and all
-// 97 fed, at 112 sites (89 in validation/checker, 21 in validation, 2 in
-// cmd/validator-checker). Each floor sits closer to its total than any one
-// of those packages contributes, so going blind to one trips it;
-// TestGuardControlVacuity checks that it does.
+// probatorium#410 carries (celeris 9f4d89b's eighteen hand-off counters) it
+// loads 24 packages and sees 114 of Snapshot's 115 fields read, at 278 sites
+// (97 in validation/properties, 102 in validation/checker, 77 in validation,
+// 2 in cmd/validator-checker), and all 115 fed, at 130 sites (107 in
+// validation/checker, 21 in validation, 2 in cmd/validator-checker). Each
+// floor sits closer to its total than any one of those packages contributes,
+// so going blind to one trips it; TestGuardControlVacuity checks that it
+// does, and fails when growth elsewhere lets a blind analysis clear a floor
+// (probatorium#403 set them at 200 and 100 for 248 and 112 sites).
 const (
-	floorReadSites  = 200
-	floorWriteSites = 100
+	floorReadSites  = 230
+	floorWriteSites = 120
 )
 
 // use is one read or one write of a Snapshot field.

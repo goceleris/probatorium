@@ -61,6 +61,18 @@ func TestSeriesWriterRecordsEveryColumn(t *testing.T) {
 		EngineRecvLinkedBlockedNanos:      79,
 		EngineRecvLinkedBlockedMaxNanos:   83,
 		EngineDetachedConns:               89,
+		EngineStaleRecvDataTransplanted:   101,
+		EngineStaleRecvDataUnattributed:   103,
+		EngineTransplantHandoffInFlight:   107,
+		EngineTransplantHoldRescued:       109,
+		EngineTransplantDoubleClaim:       113,
+		EngineTransplantReapFailed:        127,
+		EngineTransplantSweepPasses:       131,
+		EngineTransplantResidualDetached:  137,
+		EngineTransplantResidualH2:        139,
+		EngineTransplantResidualPinned:    149,
+		EngineTransplantResidualUnstarted: 151,
+		EngineTransplantResidualBusy:      157,
 	}
 	w.Record(snap)
 	w.Close()
@@ -117,6 +129,18 @@ func TestSeriesWriterRecordsEveryColumn(t *testing.T) {
 		"engine_recv_linked_blocked_nanos":      79,
 		"engine_recv_linked_blocked_max_nanos":  83,
 		"engine_detached_conns":                 89,
+		"engine_stale_recv_data_transplanted":   101,
+		"engine_stale_recv_data_unattributed":   103,
+		"engine_transplant_handoff_in_flight":   107,
+		"engine_transplant_hold_rescued":        109,
+		"engine_transplant_double_claim":        113,
+		"engine_transplant_reap_failed":         127,
+		"engine_transplant_sweep_passes":        131,
+		"engine_transplant_residual_detached":   137,
+		"engine_transplant_residual_h2":         139,
+		"engine_transplant_residual_pinned":     149,
+		"engine_transplant_residual_unstarted":  151,
+		"engine_transplant_residual_busy":       157,
 	}
 	if len(want) != len(seriesColumns) {
 		t.Fatalf("test covers %d columns but the writer has %d — a new column needs a case here",
