@@ -27,15 +27,19 @@ on:
 
 permissions: {}
 
-# One run per ref. A newer push to a pull request cancels the older run; runs
-# on main are never cancelled, since each is the baseline a PR compares with.
+# A newer push to a pull request cancels that PR's older run. A push to main
+# gets a group of its own commit: GitHub keeps one pending run per group and
+# replaces it when a third arrives, even without cancel-in-progress, and every
+# main commit's report is a baseline some PR compares with.
 concurrency:
-  group: coverage-${{ github.ref }}
+  group: coverage-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   root:
-    name: root module
+    # Not "root module": test.yml's job has that name, and a check is
+    # addressed by job name alone in a ruleset's required checks.
+    name: coverage (root module)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

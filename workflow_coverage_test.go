@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -39,16 +40,52 @@ func TestCoverageWorkflowStaysOffTheCluster(t *testing.T) {
 }
 
 // Only the upload may mint an OIDC token: the workflow grants nothing at the
-// top level, and id-token: write appears on exactly one job.
+// top level, and id-token: write is granted to exactly the job that runs the
+// Codecov action.
 func TestCoverageWorkflowScopesTheIDToken(t *testing.T) {
 	src := readCoverageWorkflow(t)
 
 	if !regexp.MustCompile(`(?m)^permissions: \{\}\s*$`).MatchString(src) {
 		t.Error("top-level permissions must be {} so every job states what it needs")
 	}
-	if n := len(regexp.MustCompile(`(?m)^\s+id-token: write\b`).FindAllString(src, -1)); n != 1 {
-		t.Errorf("id-token: write appears %d times, want exactly 1 (the Codecov upload job)", n)
+
+	upload := jobsWithLine(src, `^\s+(- )?uses: codecov/codecov-action@`)
+	if len(upload) != 1 {
+		t.Fatalf("the Codecov action runs in jobs %v, want exactly one", upload)
 	}
+	if granted := jobsWithLine(src, `^\s+id-token: write\s*$`); !slices.Equal(granted, upload) {
+		t.Errorf("id-token: write is granted to jobs %v, want exactly the upload job %v", granted, upload)
+	}
+}
+
+// jobsWithLine returns, in order, the keys of the jobs whose body holds a line
+// matching pattern. Lines outside `jobs:` belong to no job and are ignored.
+func jobsWithLine(src, pattern string) []string {
+	re := regexp.MustCompile(pattern)
+	header := regexp.MustCompile(`^  ([A-Za-z0-9_-]+):\s*$`)
+	var jobs []string
+	inJobs, job := false, ""
+	for line := range strings.SplitSeq(src, "\n") {
+		switch {
+		case line == "jobs:":
+			inJobs, job = true, ""
+			continue
+		case line != "" && line[0] != ' ':
+			inJobs, job = false, ""
+			continue
+		}
+		if !inJobs {
+			continue
+		}
+		if m := header.FindStringSubmatch(line); m != nil {
+			job = m[1]
+			continue
+		}
+		if job != "" && re.MatchString(line) && !slices.Contains(jobs, job) {
+			jobs = append(jobs, job)
+		}
+	}
+	return jobs
 }
 
 // readCoverageWorkflow returns the workflow with its YAML comments removed.

@@ -35,10 +35,10 @@ reviews:
   # approves; the code owner's approval stays the only one that counts.
   request_changes_workflow: false
 
-  # Keep the author's PR description untouched: the summary goes into the
-  # walkthrough comment instead. Writing `@coderabbitai summary` in a
-  # description still asks for it there.
-  high_level_summary: false
+  # Generate the summary, but put it in the walkthrough comment instead of
+  # the author's PR description. (`high_level_summary: false` would turn it
+  # off altogether, in_walkthrough included.)
+  high_level_summary: true
   high_level_summary_in_walkthrough: true
   review_status: true
   # Shows the configuration source, the profile and the files the path
