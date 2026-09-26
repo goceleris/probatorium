@@ -97,3 +97,33 @@ func TestGate_AMissingEngineRequestCounterIsNotAFailure(t *testing.T) {
 		t.Fatalf("an unpublished counter must not fail the cell, got %v", v)
 	}
 }
+
+// A counter celeris documents as must-stay-zero but probatorium has not gated
+// yet (EngineCounter.MustStayZero) must NOT fail its cell: it is a record
+// until a run on the cluster has said what normal looks like for it, and the
+// gate decision is moving it into ZeroWitnessMeaning. This is the reverse of
+// TestGate_AnyNonzeroEngineWitnessFailsTheCell, and it is what "report, don't
+// gate" means in code.
+func TestGate_AMustStayZeroEngineCounterIsRecordedNotGated(t *testing.T) {
+	var checked int
+	for name, c := range EngineCounters {
+		if c.MustStayZero == "" {
+			continue
+		}
+		if _, gated := ZeroWitnessMeaning[name]; gated {
+			t.Errorf("%s is marked MustStayZero AND declared in ZeroWitnessMeaning: it is gated after all", name)
+			continue
+		}
+		cell := cleanCell("kitchen_sink", "adaptive", "arm64")
+		cell.Tier1.EngineCounters = map[string]int64{name: 1}
+		if v := Gate([]ValidationCellResult{cell}, nil, GateOptions{RequireTier3: true, RequireProperties: true}); len(v) != 0 {
+			t.Errorf("%s = 1 failed the cell (%v); an ungated must-stay-zero counter is a record, not a gate", name, v)
+			continue
+		}
+		checked++
+	}
+	t.Logf("checked %d ungated must-stay-zero engine counter(s): a nonzero reading is carried, and fails nothing", checked)
+	if checked == 0 {
+		t.Fatal("no EngineCounters entry is marked MustStayZero -- this test is vacuous")
+	}
+}

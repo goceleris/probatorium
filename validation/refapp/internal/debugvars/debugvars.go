@@ -462,6 +462,52 @@ func (v *Vars) Document() map[string]any {
 			doc["celeris.engine_transplant_drain_stopped"] = int64(info.Metrics.TransplantDrainStopped)
 			doc["celeris.engine_transplant_stranded"] = int64(info.Metrics.TransplantStranded)
 			doc["celeris.engine_transplant_adopt_refused"] = int64(info.Metrics.TransplantAdoptRefused)
+			// celeris#657: the io_uring -> epoll hand-off that lost
+			// requests while the #624 ledger above kept balancing. A
+			// recv armed before the hand-off outlived it, read the
+			// client's next request off the socket epoll now owned, and
+			// was dropped as stale with nothing counting it.
+			//
+			// The loss witnesses (celeris#676). `stale_recv_data_*` count
+			// recv completions that READ BYTES for an identity that no
+			// longer owns the descriptor, split by what the engine still
+			// holds for it: `transplanted` is the #657 loss itself,
+			// `unattributed` a gap in attribution, `closed` usually a
+			// client's bytes racing a server-side close.
+			// `handoff_in_flight` is a hand-off made with an op still
+			// outstanding, the precondition of every transplanted loss.
+			// celeris#681's gate is transplanted + unattributed (W1) and
+			// handoff_in_flight (W2) reading zero.
+			doc["celeris.engine_stale_recv_data_closed"] = int64(info.Metrics.StaleRecvDataClosed)
+			doc["celeris.engine_stale_recv_data_transplanted"] = int64(info.Metrics.StaleRecvDataTransplanted)
+			doc["celeris.engine_stale_recv_data_unattributed"] = int64(info.Metrics.StaleRecvDataUnattributed)
+			doc["celeris.engine_transplant_handoff_in_flight"] = int64(info.Metrics.TransplantHandoffInFlight)
+			// The fd-lifetime rule's counters (celeris#681): a connection
+			// leaves io_uring only when no read can still resolve its
+			// descriptor. `held`, `reaps`, `reap_misses`,
+			// `claim_deferred` and `reap_unsupported` are rates of the
+			// mechanism; `hold_rescued`, `double_claim` and
+			// `reap_failed` celeris documents MUST STAY ZERO.
+			doc["celeris.engine_transplant_held"] = int64(info.Metrics.TransplantHeld)
+			doc["celeris.engine_transplant_reaps"] = int64(info.Metrics.TransplantReaps)
+			doc["celeris.engine_transplant_reap_misses"] = int64(info.Metrics.TransplantReapMisses)
+			doc["celeris.engine_transplant_hold_rescued"] = int64(info.Metrics.TransplantHoldRescued)
+			doc["celeris.engine_transplant_double_claim"] = int64(info.Metrics.TransplantDoubleClaim)
+			doc["celeris.engine_transplant_claim_deferred"] = int64(info.Metrics.TransplantClaimDeferred)
+			doc["celeris.engine_transplant_reap_failed"] = int64(info.Metrics.TransplantReapFailed)
+			doc["celeris.engine_transplant_reap_unsupported"] = int64(info.Metrics.TransplantReapUnsupported)
+			// The post-switch sweep (celeris#687). `sweep_passes` is a
+			// rate, the sweep's cost. The five `residual_*` are GAUGES,
+			// not totals: the connections a draining engine still holds,
+			// by the reason the hand-off refused them. A standing
+			// nonzero `busy` after a switch settles is the placement bug
+			// itself; the other four are the expected residue.
+			doc["celeris.engine_transplant_sweep_passes"] = int64(info.Metrics.TransplantSweepPasses)
+			doc["celeris.engine_transplant_residual_detached"] = int64(info.Metrics.TransplantResidualDetached)
+			doc["celeris.engine_transplant_residual_h2"] = int64(info.Metrics.TransplantResidualH2)
+			doc["celeris.engine_transplant_residual_pinned"] = int64(info.Metrics.TransplantResidualPinned)
+			doc["celeris.engine_transplant_residual_unstarted"] = int64(info.Metrics.TransplantResidualUnstarted)
+			doc["celeris.engine_transplant_residual_busy"] = int64(info.Metrics.TransplantResidualBusy)
 			// Detach accounting, the input to I-ENG-DETACH
 			// (probatorium#352). `detached_conns` is a GAUGE, not a
 			// total: the live number of connections handed to a detached

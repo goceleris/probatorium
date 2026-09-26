@@ -191,8 +191,8 @@ type Tally struct {
 	// EngineCounters is every report.EngineCounters entry, keyed by its
 	// debugvars name, reduced over the samples whose document carried the
 	// engine block by its declared Kind: the highest reading of a running
-	// maximum, the last reading of every other kind (recordEngineCounters
-	// says why). Most of it is what
+	// maximum or a peak gauge, the last reading of every other kind
+	// (recordEngineCounters says why). Most of it is what
 	// probatorium#386 published and nothing downstream read until
 	// probatorium#391: the celeris#647 hand-off outcomes, the celeris#607
 	// recv-stall ledger, detach and zero-copy accounting.
@@ -545,17 +545,20 @@ func (e *Evaluator) recordErrorClasses(snap properties.Snapshot) {
 // Kind the entry declares (reduceEngineCounter).
 //
 // Never a sum. Every counter here is cumulative, an engine-side running
-// maximum, a gauge or static, so one reading already IS the cell's value:
-// summing samples multiplies it by the sample count, and summing a
-// *_max_nanos manufactures an episode nothing observed. A running maximum
-// keeps its highest reading, the one rule report.CounterRunningMax allows;
-// every other kind keeps its last. For the cumulative counters and the
-// running maxima the two agree while nothing resets mid-cell (celeris's
-// adaptive engine builds each sub-engine at most once and never replaces
-// it), and max is what keeps a running maximum right if that ever stops
-// being true. For the gauges, last is the reading that keeps a persistent
-// drift visible in either direction, where a peak would hide the negative
-// one.
+// maximum, a gauge, a peak gauge or static, so one reading already IS the
+// cell's value: summing samples multiplies it by the sample count, and
+// summing a *_max_nanos manufactures an episode nothing observed. A running
+// maximum keeps its highest reading, the one rule report.CounterRunningMax
+// allows, and so does a peak gauge (report.CounterPeakGauge); every other
+// kind keeps its last. For the cumulative counters and the running maxima the
+// two agree while nothing resets mid-cell (celeris's adaptive engine builds
+// each sub-engine at most once and never replaces it), and max is what keeps
+// a running maximum right if that ever stops being true. For the gauges,
+// last is the reading that keeps a persistent drift visible in either
+// direction, where a peak would hide the negative one. The peak gauges --
+// celeris#687's residual gauges, which cannot go negative -- keep the peak
+// for the opposite reason: their question is whether any switch left residue
+// standing, and only a zero peak answers it for every switch the cell made.
 //
 // A sample whose document carried no engine block (EngineName empty) is
 // skipped rather than recorded, since every engine key in it was absent and
@@ -594,6 +597,25 @@ func (e *Evaluator) recordEngineCounters(snap properties.Snapshot) {
 		"engine_workers":                          snap.EngineWorkers,
 		"engine_bytes_read":                       snap.EngineBytesRead,
 		"engine_bytes_written":                    snap.EngineBytesWritten,
+		// The celeris#657 hand-off counters celeris 9f4d89b added.
+		"engine_stale_recv_data_closed":        snap.EngineStaleRecvDataClosed,
+		"engine_stale_recv_data_transplanted":  snap.EngineStaleRecvDataTransplanted,
+		"engine_stale_recv_data_unattributed":  snap.EngineStaleRecvDataUnattributed,
+		"engine_transplant_handoff_in_flight":  snap.EngineTransplantHandoffInFlight,
+		"engine_transplant_held":               snap.EngineTransplantHeld,
+		"engine_transplant_reaps":              snap.EngineTransplantReaps,
+		"engine_transplant_reap_misses":        snap.EngineTransplantReapMisses,
+		"engine_transplant_hold_rescued":       snap.EngineTransplantHoldRescued,
+		"engine_transplant_double_claim":       snap.EngineTransplantDoubleClaim,
+		"engine_transplant_claim_deferred":     snap.EngineTransplantClaimDeferred,
+		"engine_transplant_reap_failed":        snap.EngineTransplantReapFailed,
+		"engine_transplant_reap_unsupported":   snap.EngineTransplantReapUnsupported,
+		"engine_transplant_sweep_passes":       snap.EngineTransplantSweepPasses,
+		"engine_transplant_residual_detached":  snap.EngineTransplantResidualDetached,
+		"engine_transplant_residual_h2":        snap.EngineTransplantResidualH2,
+		"engine_transplant_residual_pinned":    snap.EngineTransplantResidualPinned,
+		"engine_transplant_residual_unstarted": snap.EngineTransplantResidualUnstarted,
+		"engine_transplant_residual_busy":      snap.EngineTransplantResidualBusy,
 	} {
 		held, seen := e.tally.EngineCounters[k]
 		e.tally.EngineCounters[k] = reduceEngineCounter(report.EngineCounters[k].Kind, held, seen, v)
@@ -617,9 +639,11 @@ func reduceEngineCounter(kind report.EngineCounterKind, held int64, seen bool, r
 		return reading
 	case report.CounterStatic:
 		return reading
+	case report.CounterPeakGauge:
+		return max(held, reading)
 	default:
 		// Unreachable for a recorded counter: every one is declared with one
-		// of the four kinds (TestEachEngineCounterIsDeclaredAndReadsItsOwnKey).
+		// of the five kinds (TestEachEngineCounterIsDeclaredAndReadsItsOwnKey).
 		return reading
 	}
 }
