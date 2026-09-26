@@ -56,6 +56,10 @@
   ansible.builtin.set_fact:
     cell_bin: "{{ competitor_columns[cell.1].bin if (competitor_columns is defined and cell.1 in competitor_columns) else cell.1 }}"
     cell_engine: "{{ competitor_columns[cell.1].engine if (competitor_columns is defined and cell.1 in competitor_columns) else '' }}"
+    # The column's own runtime env (servers.Adapter.SUTEnv, celeris#585):
+    # empty for every registry column today; an A/B branch uses it to give
+    # two columns of one binary + -engine different runtime knobs.
+    cell_col_env: "{{ (competitor_columns[cell.1].env | default({})) if (competitor_columns is defined and cell.1 in competitor_columns) else {} }}"
 
 # PRIVILEGE GATE. Only the celeris SUT is launched as root; every
 # third-party competitor runs as the unprivileged bench user.
@@ -209,7 +213,9 @@
   # with bench_sut_env, the caller's KEY=VALUE overrides (celeris#585: mage
   # Bench forwards BENCH_SUT_ENV as a JSON extra-var so an A/B arm such as
   # CELERIS_IOURING_SEND_ZC=off is dispatchable without a code change).
-  # combine() lets an override win over the base. The merged mapping is
+  # combine() lets an override win over the base, and the column's own
+  # cell_col_env (servers.Adapter.SUTEnv) wins over both: it is the most
+  # specific. The merged mapping is
   # echoed as the FIRST line of server.log ('[sut-env] {...}') so the arm
   # is recorded next to the engine's own 'send_zc=' line and can be
   # asserted per cell. mage validates keys/values to a shell-safe charset
@@ -244,7 +250,18 @@
       # host). Both inert for every non-.NET binary.
       DOTNET_ROOT: "{{ bench_root }}/dotnet"
       DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
-    cell_sut_env: "{{ sut_base_env | combine(bench_sut_env | default({})) }}"
+      # The celeris bench server's /debug/vars SIDE listener
+      # (servers/celeris/debugvars.go, celeris#585): runtime + engine
+      # counters for the observer below, served off the benched engine so
+      # the scrape adds no route and no connection to what is measured.
+      # Loopback only. bench_tuning widens ip_local_port_range to
+      # 1024-65535, so no fixed port is guaranteed free of an outbound
+      # connection's local port; a bind failure is tolerated by the server
+      # (it logs and runs without the sidecar) and shows up as absent
+      # engine counters, never as a wrong reading. Inert for every other
+      # binary.
+      PROBATORIUM_DEBUG_ADDR: "127.0.0.1:{{ bench_debug_port | default(18089) }}"
+    cell_sut_env: "{{ sut_base_env | combine(bench_sut_env | default({})) | combine(cell_col_env | default({})) }}"
   environment: "{{ cell_sut_env }}"
   ansible.builtin.shell:
     cmd: |
@@ -318,6 +335,17 @@
     bp={{ bench_port | default(8080) }}
     want_bin="competitors/{{ cell_bin }}"
     want_engine="{{ cell_engine | default('') }}"
+    # The column env (celeris#585) must be in the listener environ: two
+    # columns may share binary and -engine and differ only there, so the
+    # binary + engine match alone cannot tell an A arm from a B arm.
+    # Values are mage-validated to a charset without whitespace or quotes.
+    want_env="{% for k, v in (cell_col_env | default({})).items() %}{{ k }}={{ v }} {% endfor %}"
+    env_ok() {
+      for kv in $want_env; do
+        tr '\0' '\n' < /proc/$1/environ 2>/dev/null | grep -qxF -- "$kv" || return 1
+      done
+      return 0
+    }
     for i in $(seq 1 40); do
       pids=$(ss -ltnp "sport = :${bp}" 2>/dev/null | tail -n +2 | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
       for holder in $pids; do
@@ -330,7 +358,9 @@
             # never accepted for an -engine h2c column).
             if printf '%s' "$cmd" | grep -qF -- "$want_bin"; then
               if [ -z "$want_engine" ] || printf '%s' "$cmd" | grep -qF -- "-engine $want_engine "; then
-                exit 0
+                if env_ok "$holder"; then
+                  exit 0
+                fi
               fi
             fi
             ;;
@@ -342,7 +372,7 @@
       done
       sleep 0.25
     done
-    echo "our server ({{ cell.1 }}: $want_bin${want_engine:+ -engine $want_engine}) did not own :${bp} within 10s" >&2
+    echo "our server ({{ cell.1 }}: $want_bin${want_engine:+ -engine $want_engine}${want_env:+ env $want_env}) did not own :${bp} within 10s" >&2
     tail -50 {{ cell_dir }}/server.log >&2
     exit 1
   args:
@@ -421,16 +451,19 @@
 - name: "{{ cell.1 }} run={{ cell.0 }} | start observer sampler (server side)"
   # The observer sidecars the server during the cell and emits a 1Hz
   # SQLite time series of FD count, RSS, goroutine count, GC pause,
-  # and accept/close totals. /proc-derived fields (RSS, FDs) carry the
-  # leak-detection signal for EVERY adapter; the Go-runtime fields
-  # (goroutine count, heap, GC pause) come from -metrics-url scraping
-  # the SUT's expvar /debug/vars, which only celeris exposes among the
-  # benched adapters. The bench-cell playbook only knows the competitor
-  # slug (cell.1), not the adapter language, so we gate the metrics URL
-  # on the celeris-* name prefix: celeris cells scrape the local expvar
-  # endpoint (the SUT binds 0.0.0.0:{{ bench_port }} on this host), and
-  # every non-celeris cell keeps an empty -metrics-url so no non-Go
-  # competitor is asked for Go expvar it doesn't serve.
+  # accept/close totals and (schema v5.17) the engine egress counters
+  # a SEND_ZC A/B needs. /proc-derived fields (RSS, FDs, CPU ticks)
+  # carry the signal for EVERY adapter; the Go-runtime and engine fields
+  # come from -metrics-url scraping the celeris SUT's /debug/vars. Until
+  # celeris#585 the bench server served no such route and this URL
+  # answered 404 for every celeris cell; it is now the server's side
+  # listener on PROBATORIUM_DEBUG_ADDR (see the start task), NOT the
+  # bench port. The bench-cell playbook only knows the competitor slug
+  # (cell.1), not the adapter language, so we gate the metrics URL on
+  # the celeris-* name prefix, and every non-celeris cell keeps an empty
+  # -metrics-url so no non-Go competitor is asked for Go expvar it
+  # doesn't serve. The observer refuses a document whose "pid" is not
+  # the -pid it samples.
   #
   # Runs as root (`become: true`) because the bench server above is
   # started under root (it needs `ulimit -l unlimited` to lift
@@ -442,7 +475,7 @@
     cd {{ bench_root }}
     nohup ./observer \
       -pid $(cat {{ cell_dir }}/server.pid) \
-      -metrics-url '{{ ("http://127.0.0.1:" ~ (bench_port | default(8080)) ~ "/debug/vars") if (cell.1 | regex_search("^celeris")) else "" }}' \
+      -metrics-url '{{ ("http://127.0.0.1:" ~ (bench_debug_port | default(18089)) ~ "/debug/vars") if (cell.1 | regex_search("^celeris")) else "" }}' \
       -out {{ cell_dir }}/observer.sqlite \
       -interval 1s \
       > {{ cell_dir }}/observer.log 2>&1 &

@@ -149,6 +149,30 @@ func parseSUTEnv(s string) (map[string]string, error) {
 	return out, nil
 }
 
+// validateSUTEnvMap applies parseSUTEnv's per-entry rules to an env given
+// as a map (a registry column's SUTEnv, celeris#585): the same key and
+// value charsets and the same forbidden keys, because the map reaches the
+// same root-launched process through the same playbook.
+func validateSUTEnvMap(env map[string]string) error {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if !sutEnvKeyRE.MatchString(k) {
+			return fmt.Errorf("key %q must match %s", k, sutEnvKeyRE)
+		}
+		if sutEnvForbiddenKeys[k] {
+			return fmt.Errorf("key %q is not allowed through the SUT env passthrough", k)
+		}
+		if v := env[k]; !sutEnvValueRE.MatchString(v) {
+			return fmt.Errorf("value of %s (%q) must match %s (no whitespace, quotes or shell metacharacters)", k, v, sutEnvValueRE)
+		}
+	}
+	return nil
+}
+
 // sutEnvExtraVars renders the override set as the JSON `--extra-vars`
 // payload ({"bench_sut_env": {KEY: VALUE}}) so the playbook receives a
 // real dict for `combine()`.
