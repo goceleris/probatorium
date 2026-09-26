@@ -6,7 +6,8 @@
 //	stresstally summarize   judge every case of a run from its shard logs
 //	stresstally tally DIR   judge a directory of shard logs (local use)
 //
-// plan reads STRESS_EVENT, STRESS_RUN_ID and the dispatch inputs from
+// plan reads STRESS_EVENT, STRESS_RUN_ID, STRESS_REF, STRESS_DEFAULT_BRANCH
+// (a dispatch on the default branch is refused) and the dispatch inputs from
 // IN_CELERIS_REF, IN_PACKAGES, IN_RUN, IN_COUNT, IN_SHARDS, IN_ARCHES,
 // IN_MEMLOCK, IN_RACE, IN_TIMEOUT and IN_EXTRA, and writes the outputs
 // `plan`, `matrix` and `celeris_ref` to $GITHUB_OUTPUT. Inputs arrive through
@@ -66,6 +67,10 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 	var plan Plan
 	switch ev := getenv("STRESS_EVENT"); ev {
 	case "workflow_dispatch":
+		if err := refuseDefaultBranch(getenv("STRESS_REF"), getenv("STRESS_DEFAULT_BRANCH")); err != nil {
+			say(stdout, "::error::%v\n", err)
+			return 2
+		}
 		p, err := planDispatch(Inputs{
 			CelerisRef: getenv("IN_CELERIS_REF"),
 			Packages:   getenv("IN_PACKAGES"),
@@ -141,6 +146,27 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 		return 2
 	}
 	return 0
+}
+
+// refuseDefaultBranch keeps the code under test out of the default branch's
+// Actions cache scope. A shard runs whatever celeris commit it was given, and
+// any code a job runs can write cache entries in the scope of the run's ref
+// (it can read the runner's runtime token). A run on the default branch would
+// write where every workflow of this repository restores from, the cluster
+// tiers included (setup-go cache: true), which is what CodeQL's
+// actions/cache-poisoning/poisonable-step warns about. Dispatched from any
+// other branch, the run's cache writes stay in that branch's scope. Fails
+// closed when either value is missing.
+func refuseDefaultBranch(ref, defaultBranch string) error {
+	if ref == "" || defaultBranch == "" {
+		return fmt.Errorf("cannot tell which ref this run is on (ref %q, default branch %q); refusing", ref, defaultBranch)
+	}
+	if ref == "refs/heads/"+defaultBranch {
+		return fmt.Errorf("dispatch this workflow from a branch other than %s, e.g. gh workflow run celeris-stress.yml --ref stress/runs: "+
+			"a shard runs the celeris code under test, and on %s that code could write to the Actions cache every workflow here "+
+			"restores from, the cluster tiers included (see docs/STRESS.md)", defaultBranch, defaultBranch)
+	}
+	return nil
 }
 
 // cmdSummarize judges every case of the plan and writes the reports.

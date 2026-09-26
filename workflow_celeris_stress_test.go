@@ -170,3 +170,27 @@ func TestStressWorkflowSelfTestsItsOwnChanges(t *testing.T) {
 		}
 	}
 }
+
+// A shard runs the celeris code under test. On the default branch that code
+// could write to the Actions cache every workflow here restores from, so the
+// plan must learn the run's ref and the default branch (and refuse a match),
+// and the shard job must keep the same rule.
+func TestStressWorkflowKeepsTheCodeUnderTestOffTheDefaultBranch(t *testing.T) {
+	src := readStressWorkflow(t)
+	for _, want := range []string{
+		"          STRESS_REF: ${{ github.ref }}\n",
+		"          STRESS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}\n",
+		"    if: ${{ github.event_name == 'pull_request' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}\n    runs-on: ${{ matrix.runner }}\n",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the workflow lacks %q", strings.TrimSpace(want))
+		}
+	}
+	tool, err := os.ReadFile("tools/stresstally/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(tool), `refuseDefaultBranch(getenv("STRESS_REF"), getenv("STRESS_DEFAULT_BRANCH"))`) {
+		t.Error("stresstally plan no longer refuses a dispatch on the default branch")
+	}
+}

@@ -20,6 +20,11 @@ name: Celeris Stress
 #
 # Security: inputs reach steps only through env:, never through ${{ }} in a
 # run: script; every action is pinned by commit sha; the token is read-only.
+# A shard runs the celeris code under test, and code a job runs can write to
+# the Actions cache of the run's ref. So a dispatch must come from a branch
+# other than the default one (plan refuses main): the cache entries that
+# every workflow here restores from, the cluster tiers included, stay out of
+# its reach. Use a standing branch such as stress/runs (docs/STRESS.md).
 #
 # The pull_request trigger is the workflow's self-test. A pull request that
 # changes this file or the tool runs a fixed set of cases (see selfTestCases
@@ -113,6 +118,8 @@ jobs:
         env:
           STRESS_EVENT: ${{ github.event_name }}
           STRESS_RUN_ID: ${{ github.run_id }}
+          STRESS_REF: ${{ github.ref }}
+          STRESS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           IN_CELERIS_REF: ${{ inputs.celeris_ref }}
           IN_PACKAGES: ${{ inputs.packages }}
           IN_RUN: ${{ inputs.run }}
@@ -148,6 +155,9 @@ jobs:
   shard:
     name: ${{ matrix.case }} ${{ matrix.arch }} ${{ matrix.shard }}
     needs: plan
+    # plan already refuses this; the job keeps the rule on its own, since it
+    # is the job that runs the celeris code under test.
+    if: ${{ github.event_name == 'pull_request' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:

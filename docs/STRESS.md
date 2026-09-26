@@ -12,15 +12,17 @@ It never touches the benchmark cluster: no self-hosted label, no share of the
 
 ## What a run does
 
-1. **plan** checks every input against an allow-list
-   (`tools/stresstally plan`) and resolves `celeris_ref` to one commit, so every
-   shard tests the same code even if the branch moves during the run.
+1. **plan** refuses a dispatch on the default branch (see below), checks every
+   input against an allow-list (`tools/stresstally plan`) and resolves
+   `celeris_ref` to one commit, so every shard tests the same code even if the
+   branch moves during the run.
 2. **shard**, one job per shard per arch, checks out celeris at that commit,
    sets `RLIMIT_MEMLOCK` with `sudo prlimit` on its shell (as celeris
    `ci.yml` does), and runs
    `go test -v -count=<count> -shuffle=<seed> -timeout=<timeout> -run=<run> [-race] <extra flags> <packages>`.
    The log header records the machine, kernel, `nproc`, runner image, the
-   memlock actually in force, the commit and the exact command. A shard that
+   memlock the runner started with and the one actually in force, the commit
+   and the exact command. A shard that
    finds itself in another shape (memlock not applied, another commit, another
    arch) refuses to run. The raw log is uploaded as `stress-log-<case>-<arch>-<shard>`.
 3. **summary** downloads every log and tallies it (`tools/stresstally summarize`).
@@ -83,10 +85,34 @@ knobs; `CELERIS_REQUIRE_IOURING_WORKERS=1` and `CELERIS_REQUIRE_UPSWITCH=1`
 turn an environment skip into a failure, the way celeris CI runs its
 skipping-forbidden steps.
 
+## Where to dispatch from
+
+Not from `main`. A shard runs the celeris code under test, and any code a job
+runs can write to the GitHub Actions cache of the run's ref (it can read the
+runner's runtime token). On `main` that is the cache every workflow in this
+repository restores from, the cluster tiers included (`setup-go` with
+`cache: true` on the self-hosted runners). CodeQL reports it as
+`actions/cache-poisoning/poisonable-step`. A run dispatched from any other
+branch writes only to that branch's cache scope. So `plan` refuses a dispatch
+on the default branch, and the shard job carries the same rule.
+
+Keep a standing branch for it. Refresh it from `main` when the workflow changes
+(the run uses the branch's copy of the workflow and of `tools/stresstally`):
+
+```sh
+gh api repos/goceleris/probatorium/git/refs -f ref=refs/heads/stress/runs \
+  -f sha="$(gh api repos/goceleris/probatorium/commits/main --jq .sha)"      # once
+gh api -X PATCH repos/goceleris/probatorium/git/refs/heads/stress/runs \
+  -f sha="$(gh api repos/goceleris/probatorium/commits/main --jq .sha)" -F force=true   # refresh
+```
+
+Do not re-run a failed shard job to "fix" a run: the summary would count the
+retried shard's log, which biases a rate. Dispatch a new run instead.
+
 ## Examples
 
-A dispatch needs the workflow on the default branch. Every command names the
-repository explicitly.
+A dispatch needs the workflow on the default branch, and runs from the branch
+named by `--ref`. Every command names the repository explicitly.
 
 ### 1. celeris#674: TestDriverHTTPZeroOverhead, full package, base vs branch
 
@@ -97,7 +123,7 @@ commit:
 
 ```sh
 for ref in 9f4d89b171db7838dbcc3ece2107191bc15b25f8 <branch-sha>; do
-  gh workflow run celeris-stress.yml --repo goceleris/probatorium \
+  gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \
     -f celeris_ref="$ref" -f packages=./engine/iouring -f run= \
     -f count=3 -f shards=10 -f arches=both -f memlock=8m -f race=false -f timeout=45m
 done
@@ -118,7 +144,7 @@ awk -F'\t' 'FNR == 1 || $3 == "TestDriverHTTPZeroOverhead"' base/tests.tsv branc
 ### 2. The rate of one flaky test under -race
 
 ```sh
-gh workflow run celeris-stress.yml --repo goceleris/probatorium \
+gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \
   -f celeris_ref=main -f packages=./internal/wakefd -f run='^TestConcurrentSetAndSignal$' \
   -f count=200 -f shards=10 -f arches=both -f memlock=8m -f race=true -f timeout=20m
 ```
@@ -131,7 +157,7 @@ The celeris#656 init-failure tests need two io_uring workers; at 8 MiB they
 skip. Raise memlock and forbid the skip:
 
 ```sh
-gh workflow run celeris-stress.yml --repo goceleris/probatorium \
+gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \
   -f celeris_ref=main -f packages=./engine/iouring \
   -f run='^TestListenCloses(ListenSocketsWhenEveryWorkerRingSetupFails|ListenSocketWhenOneWorkerRingSetupFails|ListenSocketRingAndEventfdWhenInitialSubmitFails)$' \
   -f count=50 -f shards=4 -f arches=both -f memlock=unlimited -f race=true -f timeout=20m \

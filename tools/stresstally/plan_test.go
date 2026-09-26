@@ -265,6 +265,7 @@ func TestCmdPlanWritesSingleLineOutputs(t *testing.T) {
 	}
 	env := map[string]string{
 		"STRESS_EVENT": "workflow_dispatch", "STRESS_RUN_ID": "42", "GITHUB_OUTPUT": out,
+		"STRESS_REF": "refs/heads/stress/runs", "STRESS_DEFAULT_BRANCH": "main",
 		"IN_CELERIS_REF": "main", "IN_PACKAGES": "./engine/iouring", "IN_RUN": "^TestA$", "IN_COUNT": "2",
 		"IN_SHARDS": "2", "IN_ARCHES": "both", "IN_MEMLOCK": "8m", "IN_RACE": "true", "IN_TIMEOUT": "10m", "IN_EXTRA": "-short",
 	}
@@ -291,5 +292,44 @@ func TestCmdPlanWritesSingleLineOutputs(t *testing.T) {
 	log.Reset()
 	if code := cmdPlan(&log, func(k string) string { return env[k] }); code != 2 {
 		t.Errorf("push event: exit %d", code)
+	}
+}
+
+// A dispatch on the default branch would run the code under test in the
+// default branch's cache scope; it is refused before anything else, and the
+// refusal fails closed.
+func TestCmdPlanRefusesTheDefaultBranch(t *testing.T) {
+	base := map[string]string{
+		"STRESS_EVENT": "workflow_dispatch", "IN_CELERIS_REF": "main", "IN_PACKAGES": "./engine/iouring",
+		"IN_COUNT": "1", "IN_SHARDS": "1", "IN_ARCHES": "x86", "IN_MEMLOCK": "8m", "IN_RACE": "false", "IN_TIMEOUT": "5m",
+	}
+	for name, c := range map[string]struct {
+		ref, def string
+		code     int
+	}{
+		"default branch":       {"refs/heads/main", "main", 2},
+		"other default":        {"refs/heads/trunk", "trunk", 2},
+		"no ref":               {"", "main", 2},
+		"no default branch":    {"refs/heads/stress/runs", "", 2},
+		"a branch":             {"refs/heads/stress/runs", "main", 0},
+		"a branch named main2": {"refs/heads/main2", "main", 0},
+		"a tag":                {"refs/tags/v1", "main", 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := map[string]string{"STRESS_REF": c.ref, "STRESS_DEFAULT_BRANCH": c.def}
+			for k, v := range base {
+				env[k] = v
+			}
+			var log strings.Builder
+			if code := cmdPlan(&log, func(k string) string { return env[k] }); code != c.code {
+				t.Errorf("exit %d, want %d: %s", code, c.code, log.String())
+			}
+		})
+	}
+	// The self-test runs on pull_request, whose ref is the merge ref.
+	env := map[string]string{"STRESS_EVENT": "pull_request", "STRESS_REF": "refs/pull/1/merge", "STRESS_DEFAULT_BRANCH": "main"}
+	var log strings.Builder
+	if code := cmdPlan(&log, func(k string) string { return env[k] }); code != 0 {
+		t.Errorf("pull_request: exit %d: %s", code, log.String())
 	}
 }
