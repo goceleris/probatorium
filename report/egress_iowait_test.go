@@ -212,6 +212,28 @@ func TestWindowEgressAbsentIsNil(t *testing.T) {
 	}
 }
 
+// A scrape that failed on the window's LAST second (the observer wrote -1)
+// is a gap, not a reading: the delta runs to the last sample that did
+// publish, and the window keeps its egress figures.
+func TestWindowEgressScrapeGapAtTheEdge(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "observer.sqlite")
+	base := utc(t, "2026-09-13T10:00:00Z").Unix()
+	writeObserverDBEgress(t, dbPath, []egRow{
+		{base + 0, 10, 10, 100, 100, 200},
+		{base + 1, -1, -1, -1, -1, -1},
+		{base + 2, 25, 24, 150, 400, 550},
+		{base + 3, -1, -1, -1, -1, -1},
+	})
+	samples, err := ParseObserverDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := SummarizeResources(samples, 0, false, nil)
+	wantI(t, "zc_sends_submitted", s.Summary.ZCSendsSubmitted, 15)
+	wantI(t, "ring_bytes", s.Summary.RingBytes, 300)
+	wantI(t, "inline_bytes", s.Summary.InlineBytes, 50)
+}
+
 // ReduceResources must carry the v5.17 fields as medians across runs.
 func TestReduceResourcesCarriesEgressAndIOWait(t *testing.T) {
 	mk := func(zc int64, iow, ex, frac float64) *ResourceStats {
