@@ -125,6 +125,12 @@ func TestFaultControlCatchesEachCaptureDefect(t *testing.T) {
 		{"dump does not name the holder", func(t *testing.T, c *fcCell) {
 			c.write(t, "goroutine-stacks.txt", "goroutine 1 [running]:\nmain.main()\n")
 		}, "holder / 0 waiter"},
+		{"dump shows waiters but no holder", func(t *testing.T, c *fcCell) {
+			c.write(t, "goroutine-stacks.txt", "goroutine 88 [sync.Mutex.Lock]:\ngithub.com/x/debugvars.(*FaultHold).wait(...)\n")
+		}, "0 holder / 1 waiter"},
+		{"dump shows the holder but no waiter", func(t *testing.T, c *fcCell) {
+			c.write(t, "goroutine-stacks.txt", "goroutine 7 [sleep]:\ngithub.com/x/debugvars.(*FaultHold).run(...)\n")
+		}, "1 holder / 0 waiter"},
 		{"no text dump", func(t *testing.T, c *fcCell) { _ = os.Remove(filepath.Join(c.dossier(), "goroutine-stacks.txt")) }, "no goroutine-stacks.txt"},
 		{"gcore paused the refapp", func(t *testing.T, c *fcCell) { _ = os.Remove(filepath.Join(c.dossier(), "core.skipped")) }, "core.skipped"},
 		{"no dossier", func(t *testing.T, c *fcCell) { _ = os.RemoveAll(filepath.Join(c.dir, "incidents")) }, "no incidents/*-I-WS-HANDSHAKE dossier"},
