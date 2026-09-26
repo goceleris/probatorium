@@ -140,6 +140,14 @@ type tier1Config struct {
 	// scan's race-report count, read by the property loop on every tick
 	// (I-RACE). See propertyLoopConfig.RaceReports.
 	OnRaceReports func(reports func() int64)
+	// OnDossierInputs, when non-nil, receives two LIVE accessors for the
+	// incident dossier (celeris#588): the refapp's debug side-listener
+	// address from its "debug addr=" banner ("" when none), and its
+	// stdout+stderr tail as of the call. The tally tick's copy of the tail
+	// is up to one tick old and a tick waits behind a synchronous capture,
+	// so a dossier taken inside a stall read a tail that predated the
+	// stall's own log line (the #588 control at probatorium 5f6b6e6).
+	OnDossierInputs func(debugAddr func() string, stderrTail func() []string)
 
 	// IdleWindows runs the cell as burst, idle, load, idle instead of one
 	// uninterrupted fleet: idleBurstDuration of load, idleWindowDuration
@@ -306,6 +314,9 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	}
 	if cfg.OnRaceReports != nil {
 		cfg.OnRaceReports(tally.liveness.raceReports.Load)
+	}
+	if cfg.OnDossierInputs != nil {
+		cfg.OnDossierInputs(tally.liveness.debugAddrLoad, tally.liveness.tailSnapshot)
 	}
 
 	// Start the refapp. Driver.Start is non-blocking; the binary is

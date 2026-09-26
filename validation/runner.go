@@ -282,6 +282,12 @@ type Orchestrator struct {
 	// dossier written while the refapp is still alive carries the engine's
 	// Warn/Error lines from the seconds before the event (celeris#588).
 	stderrTail atomic.Pointer[[]string]
+	// liveTail and debugAddr are Tier 1's live accessors for the dossier
+	// (tier1Config.OnDossierInputs): the refapp's stderr tail as of the
+	// capture, and its debug side listener, which the pprof leg prefers
+	// over the engine (celeris#588). nil before Tier 1 has started a refapp.
+	liveTail  atomic.Pointer[func() []string]
+	debugAddr atomic.Pointer[func() string]
 }
 
 // Plan is the deterministic schedule [Orchestrator.Run] would execute.
@@ -322,6 +328,17 @@ type TierPlan struct {
 // missing.
 func New(cfg Config) (*Orchestrator, error) {
 	o := &Orchestrator{cfg: cfg}
+
+	// celeris#588: every refapp launched on THIS host also serves
+	// /debug/pprof on a side listener (debugvars.DebugAddrEnv, inherited by
+	// the child) and announces it on its "debug addr=" banner, so a dossier
+	// can take a goroutine dump while the engine's loops are parked by the
+	// stall it is recording. The ssh driver launches on another host, where
+	// a loopback address announced there means nothing here. An operator's
+	// own value is kept.
+	if cfg.DriverMode != "ssh" && os.Getenv(refappDebugAddrEnv) == "" {
+		_ = os.Setenv(refappDebugAddrEnv, "127.0.0.1:0")
+	}
 
 	if cfg.MarkovPath != "" {
 		m, err := markov.LoadMatrixFile(cfg.MarkovPath)
@@ -1138,6 +1155,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		OnCrashReports:     func(f func() int64) { crashReportsFn.Store(&f) },
 		OnIdleWindow:       func(f func() int) { idleWindowFn.Store(&f) },
 		OnRaceReports:      func(f func() int64) { raceReportsFn.Store(&f) },
+		OnDossierInputs: func(addr func() string, tail func() []string) {
+			o.debugAddr.Store(&addr)
+			o.liveTail.Store(&tail)
+		},
 		// Burst, idle, load, idle for I-MEM-2 -- only where the slope
 		// oracles still fit after the prelude (see idleWindowsMinDuration).
 		IdleWindows:           o.cfg.Duration >= idleWindowsMinDuration,
@@ -1441,10 +1462,15 @@ func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
 	if err := writeJSON(filepath.Join(dir, "incident.json"), dossier); err != nil {
 		return "", err
 	}
-	// The refapp's stderr tail as of the last tally tick (at most 2 s
-	// old), while the process is still alive to have written it.
+	// The refapp's stderr tail as of NOW, from Tier 1's live ring
+	// (celeris#588): the tally tick's copy is up to a tick old, and a tick
+	// that waits behind a synchronous capture is older still -- the #588
+	// control's in-stall dossiers carried a tail that predated the stall's
+	// own "[fault] hold" line. The tick's copy remains the fallback.
 	var tail []string
-	if p := o.stderrTail.Load(); p != nil {
+	if f := o.liveTail.Load(); f != nil {
+		tail = (*f)()
+	} else if p := o.stderrTail.Load(); p != nil {
 		tail = *p
 	}
 	_ = writeStderrTail(filepath.Join(dir, "refapp_stderr_tail.txt"), tail, nil)
@@ -1519,7 +1545,14 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 	if r := o.resolvedAddr.Load(); r != nil && *r != "" {
 		addr = *r
 	}
-	return captureForensicsLiveOpts(ctx, dir, inc.RefappPID, addr, forensicsOpts{SkipCore: inc.SkipCore})
+	// The pprof leg prefers the refapp's debug side listener: on the
+	// event-loop engines the engine-routed /debug/pprof is parked by the
+	// stalls a dossier exists for (celeris#588).
+	var side string
+	if f := o.debugAddr.Load(); f != nil {
+		side = (*f)()
+	}
+	return captureForensicsLiveOpts(ctx, dir, inc.RefappPID, addr, forensicsOpts{SkipCore: inc.SkipCore, PprofAddr: side})
 }
 
 // Tier1Summary projects a tier1TallySnapshot into the public

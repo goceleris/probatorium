@@ -64,6 +64,14 @@ const (
 // once-a-minute burst.
 const slowFireRingSize = 32
 
+// slowFirePinnedFailures is how many of the FIRST failed fires (outcome
+// hang-* or handshake-fail-*, report.IsFailedSlowFire) the ring keeps
+// beyond its overwrite window. celeris#588: the onset of an episode is the
+// part that names its cause, and a later engine-wide wedge can overwrite a
+// 32-deep ring in seconds -- the #588 control's adaptive cell lost every
+// record of its 8 s /ws hold to the WS failures of the 40 s / hold after it.
+const slowFirePinnedFailures = 16
+
 // latencyBuckets is a fixed-edge histogram for one leg of a fire. The
 // edges are those the design names; ge_20s and timeout are the two ways a
 // leg can fall off the end.
@@ -140,24 +148,36 @@ func isDeadline(err error) bool {
 // slowFireRing keeps the last slowFireRingSize slow fires in arrival order.
 // Overwrite-oldest, not first-N: a stall that recurs is more diagnostic in
 // its most recent shape, and total counts how many the ring could not hold.
+// The first slowFirePinnedFailures FAILED fires are also pinned, so the
+// onset of the first episodes survives any later flood.
 type slowFireRing struct {
 	mu    sync.Mutex
 	buf   [slowFireRingSize]report.SlowFire
 	n     int // entries written so far, unbounded
 	total atomic.Int64
+
+	pinned    [slowFirePinnedFailures]report.SlowFire
+	pinnedSeq [slowFirePinnedFailures]int // each pinned fire's arrival index
+	nPinned   int
 }
 
 // add files one slow fire.
 func (r *slowFireRing) add(f report.SlowFire) {
 	r.total.Add(1)
 	r.mu.Lock()
+	if r.nPinned < slowFirePinnedFailures && report.IsFailedSlowFire(f) {
+		r.pinned[r.nPinned] = f
+		r.pinnedSeq[r.nPinned] = r.n
+		r.nPinned++
+	}
 	r.buf[r.n%slowFireRingSize] = f
 	r.n++
 	r.mu.Unlock()
 }
 
-// snapshot returns the retained fires oldest first. nil when empty, so the
-// cell document omits the key on a clean cell.
+// snapshot returns the retained fires oldest first: the pinned failures the
+// ring has since overwritten, then the ring. nil when empty, so the cell
+// document omits the key on a clean cell.
 func (r *slowFireRing) snapshot() []report.SlowFire {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -165,10 +185,15 @@ func (r *slowFireRing) snapshot() []report.SlowFire {
 		return nil
 	}
 	kept := min(r.n, slowFireRingSize)
-	out := make([]report.SlowFire, 0, kept)
 	start := 0
 	if r.n > slowFireRingSize {
 		start = r.n % slowFireRingSize
+	}
+	out := make([]report.SlowFire, 0, kept+r.nPinned)
+	for i := 0; i < r.nPinned; i++ {
+		if r.pinnedSeq[i] < r.n-kept { // overwritten in the ring
+			out = append(out, r.pinned[i])
+		}
 	}
 	for i := 0; i < kept; i++ {
 		out = append(out, r.buf[(start+i)%slowFireRingSize])
