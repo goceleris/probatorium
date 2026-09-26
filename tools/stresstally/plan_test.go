@@ -34,7 +34,7 @@ func TestPlanAcceptsTheDocumentedExamples(t *testing.T) {
 		"root package":     func(in *Inputs) { in.Packages = ". ./engine/iouring" },
 		"every extra": func(in *Inputs) {
 			in.Extra = "-short -failfast -cpu=1,2,4 -parallel=8 -skip=^TestSlow$ -tags=integration -shuffle=off " +
-				"CELERIS_REQUIRE_IOURING_WORKERS=1 WS484_CONNS=16 DRAIN583_REPS=3 GOTEST_BACKPRESSURE=1 CELERIS_REQUIRE_SYNACK0=1"
+				"CELERIS_REQUIRE_IOURING_WORKERS=1 WS484_CONNS=16 DRAIN583_REPS=3 GOTEST_BACKPRESSURE=1 CELERIS_SOME_NEW_KNOB=1"
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -275,7 +275,10 @@ func TestCelerisTestEnvIsSafe(t *testing.T) {
 			t.Errorf("%s=1 is refused: %v", n, err)
 		}
 	}
-	for _, n := range []string{"PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT"} {
+	// Refused by name, before any list is consulted, so no later addition to
+	// the list (or a celeris test that reads one of them) can let them in.
+	for _, n := range []string{"PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+		"GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT", "RUNNER_TEMP", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_CACHE_MODE"} {
 		if envRefused(n) == "" {
 			t.Errorf("%s is not refused by name", n)
 		}

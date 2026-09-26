@@ -151,8 +151,8 @@ var (
 //
 // resolving every name passed through a constant or a helper (envInt,
 // envInt589). Knobs in the CELERIS_ namespace are accepted by prefix instead
-// (celerisEnvPrefix), because a branch under test adds its own (the #674
-// branch reads CELERIS_REQUIRE_SYNACK0). A knob outside that namespace that
+// (celerisEnvPrefix): it is celeris's own, and a branch under test adds its
+// knobs there before main has them. A knob outside that namespace that
 // a later celeris adds must be added here, with the grep that found it.
 // Nothing in this list can change which binary or library runs: PATH and
 // LD_* are refused by name before the list is consulted (envRefused).

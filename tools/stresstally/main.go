@@ -5,6 +5,10 @@
 //	stresstally plan        validate the dispatch inputs and emit the matrix
 //	stresstally summarize   judge every case of a run from its shard logs
 //	stresstally tally DIR   judge a directory of shard logs (local use)
+//	stresstally compare BASE BRANCH
+//	                        set two runs' per-process counts side by side,
+//	                        refusing a pair that differs in more than the
+//	                        celeris commit (local use)
 //
 // plan reads STRESS_EVENT, STRESS_RUN_ID, STRESS_REF, STRESS_DEFAULT_BRANCH
 // (a dispatch on the default branch is refused) and the dispatch inputs from
@@ -24,7 +28,10 @@
 // verdict, a panic, a timeout, no trailer, or a test that ran without a
 // verdict is UNPARSED, a shard with no log is MISSING, and a shard that ran
 // in another shape than the one asked for is WRONG-SHAPE; each is its own
-// class and fails the case.
+// class and fails the case. So does a test that reached a verdict on one
+// arch and never on the other (arch-gap). The fail rate is per process (one
+// package in one shard), with its exact interval; -count iterations share
+// their process and are reported as counts only.
 package main
 
 import (
@@ -51,6 +58,8 @@ func main() {
 		code = cmdSummarize(os.Args[2:], os.Stdout, os.Getenv)
 	case "tally":
 		code = cmdTally(os.Args[2:], os.Stdout)
+	case "compare":
+		code = cmdCompare(os.Args[2:], os.Stdout)
 	default:
 		usage()
 	}
@@ -58,7 +67,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: stresstally plan | summarize -logs DIR -out DIR | tally [-case NAME] DIR")
+	fmt.Fprintln(os.Stderr, "usage: stresstally plan | summarize -logs DIR -out DIR | tally [-case NAME] DIR | compare BASE BRANCH")
 	os.Exit(2)
 }
 

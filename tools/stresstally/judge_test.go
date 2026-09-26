@@ -417,6 +417,8 @@ func TestExpectationsCatchEveryDeviation(t *testing.T) {
 		"verdict":      func(c *Case) { c.Expect.Verdict = "PASS" },
 		"problems":     func(c *Case) { c.Expect.Problems = []string{} },
 		"fail count":   func(c *Case) { c.Expect.Tests["TestFail"] = CountExpect{Fail: "2"} },
+		"processes":    func(c *Case) { c.Expect.Tests["TestFail"] = CountExpect{Processes: "2"} },
+		"failed procs": func(c *Case) { c.Expect.Tests["TestFail"] = CountExpect{FailedProcesses: "0"} },
 		"skip as pass": func(c *Case) { c.Expect.Tests["TestSkip"] = CountExpect{Pass: ">=1"} },
 		"shard status": func(c *Case) { c.Expect.ShardStatus = statusUnparsed },
 		"reason":       func(c *Case) { c.Expect.ShardReasons = []string{reasonTimeout} },
