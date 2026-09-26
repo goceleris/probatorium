@@ -134,7 +134,7 @@ func parseShardFile(path string) *shardLog {
 		s.reason(reasonUnreadable, err.Error())
 		return s
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return parseShard(f)
 }
 

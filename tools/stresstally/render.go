@@ -11,6 +11,10 @@ import (
 // write. The full per-test table is always in tests.tsv and report.json.
 const maxSummaryBytes = 900 << 10
 
+// say writes to the job log or a report being built. A failed write there
+// is not a verdict, so its error is dropped here, in one place.
+func say(w io.Writer, format string, a ...any) { _, _ = fmt.Fprintf(w, format, a...) }
+
 func pct(p *float64) string {
 	if p == nil {
 		return "n/a"
@@ -62,7 +66,7 @@ func testTable(w *strings.Builder, rows []TestRow, limit int) int {
 		if w.Len() > limit {
 			break
 		}
-		fmt.Fprintf(w, "| `%s` | %s | %s | %d | %d | %d | %d | %s | %s |\n",
+		say(w, "| `%s` | %s | %s | %d | %d | %d | %d | %s | %s |\n",
 			cell(r.Name), cell(shortPkg(r.Package)), r.Arch, r.Pass, r.Fail, r.Skip, r.NoVerdict, pct(r.FailRate), ci(r))
 		n++
 	}
@@ -80,33 +84,33 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 	if !r.OK() {
 		state = "NOT as expected"
 	}
-	fmt.Fprintf(w, "## Case `%s`: %s (expected %s, %s)\n\n", c.Name, r.Verdict, c.Expect.Verdict, state)
+	say(w, "## Case `%s`: %s (expected %s, %s)\n\n", c.Name, r.Verdict, c.Expect.Verdict, state)
 	if c.Purpose != "" {
-		fmt.Fprintf(w, "%s\n\n", clean(c.Purpose))
+		say(w, "%s\n\n", clean(c.Purpose))
 	}
 	if len(r.Problems) > 0 {
-		fmt.Fprintf(w, "Problems: %s\n\n", strings.Join(r.Problems, ", "))
+		say(w, "Problems: %s\n\n", strings.Join(r.Problems, ", "))
 	}
 	for _, m := range r.Mismatches {
-		fmt.Fprintf(w, "- **Mismatch:** %s\n", cell(m))
+		say(w, "- **Mismatch:** %s\n", cell(m))
 	}
 	if len(r.Mismatches) > 0 {
 		w.WriteString("\n")
 	}
-	fmt.Fprintf(w, "celeris `%s`; packages `%s`; -run `%s`; %d run(s) x %d shard(s) per arch; memlock %s; race %t; timeout %s",
+	say(w, "celeris `%s`; packages `%s`; -run `%s`; %d run(s) x %d shard(s) per arch; memlock %s; race %t; timeout %s",
 		cell(r.CelerisSHA), cell(strings.Join(c.Packages, " ")), cell(c.Run), c.Count, c.Shards, c.Memlock, c.Race, c.Timeout)
 	if len(c.Flags) > 0 {
-		fmt.Fprintf(w, "; flags `%s`", cell(strings.Join(c.Flags, " ")))
+		say(w, "; flags `%s`", cell(strings.Join(c.Flags, " ")))
 	}
 	if len(c.Env) > 0 {
-		fmt.Fprintf(w, "; env `%s`", cell(strings.Join(c.Env, " ")))
+		say(w, "; env `%s`", cell(strings.Join(c.Env, " ")))
 	}
 	w.WriteString("\n\n")
 
 	w.WriteString("| arch | shards | complete | UNPARSED | MISSING | WRONG-SHAPE | tests | pass | fail | skip | no verdict | kernel | image |\n")
 	w.WriteString("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|---|\n")
 	for _, t := range r.Arches {
-		fmt.Fprintf(w, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %s | %s |\n",
+		say(w, "| %s | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %s | %s |\n",
 			t.Arch, t.Shards, t.Complete, t.Unparsed, t.Missing, t.WrongShape, t.Tests, t.Pass, t.Fail, t.Skip, t.NoVerdict,
 			cell(strings.Join(t.Kernels, ", ")), cell(strings.Join(t.Images, ", ")))
 	}
@@ -122,7 +126,7 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 		if s.Races > 0 {
 			reasons += fmt.Sprintf(" (%d DATA RACE report(s))", s.Races)
 		}
-		fmt.Fprintf(w, "| %s | %d | %s | %s | %d | %d | %d | %d | %s | %ss | %s |\n",
+		say(w, "| %s | %d | %s | %s | %d | %d | %d | %d | %s | %ss | %s |\n",
 			s.Arch, s.Shard, s.Status, cell(s.Exit), s.Pass, s.Fail, s.Skip, s.NoVerdict, cell(s.Shuffle), cell(s.Elapsed), cell(reasons))
 	}
 	w.WriteString("\n")
@@ -146,7 +150,7 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 				w.WriteString("(more in report.json)\n\n")
 				break
 			}
-			fmt.Fprintf(w, "<details><summary><code>%s</code> in %s, %s shard %d (-shuffle=%s)</summary>\n\n```text\n",
+			say(w, "<details><summary><code>%s</code> in %s, %s shard %d (-shuffle=%s)</summary>\n\n```text\n",
 				cell(f.Name), cell(shortPkg(f.Package)), f.Arch, f.Shard, cell(f.Shuffle))
 			for _, l := range f.Lines {
 				w.WriteString(clean(l) + "\n")
@@ -155,9 +159,9 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 		}
 	}
 
-	fmt.Fprintf(w, "<details><summary>All %d test rows</summary>\n\n", len(r.Tests))
+	say(w, "<details><summary>All %d test rows</summary>\n\n", len(r.Tests))
 	if n := testTable(w, r.Tests, maxSummaryBytes); n < len(r.Tests) {
-		fmt.Fprintf(w, "\n%d more rows in tests.tsv (the job summary is capped).\n", len(r.Tests)-n)
+		say(w, "\n%d more rows in tests.tsv (the job summary is capped).\n", len(r.Tests)-n)
 	}
 	w.WriteString("\n</details>\n\n")
 }
@@ -165,36 +169,36 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 // Text renders one case for the job log.
 func (r CaseReport) Text(w io.Writer) {
 	c := r.Config
-	fmt.Fprintf(w, "== case %s: verdict %s (expected %s)", c.Name, r.Verdict, c.Expect.Verdict)
+	say(w, "== case %s: verdict %s (expected %s)", c.Name, r.Verdict, c.Expect.Verdict)
 	if len(r.Problems) > 0 {
-		fmt.Fprintf(w, "; problems: %s", strings.Join(r.Problems, ", "))
+		say(w, "; problems: %s", strings.Join(r.Problems, ", "))
 	}
-	fmt.Fprintln(w)
+	say(w, "\n")
 	for _, t := range r.Arches {
-		fmt.Fprintf(w, "   %-5s shards %d (complete %d, UNPARSED %d, MISSING %d, WRONG-SHAPE %d); tests %d: pass %d, fail %d, skip %d, no verdict %d; kernel %s; image %s\n",
+		say(w, "   %-5s shards %d (complete %d, UNPARSED %d, MISSING %d, WRONG-SHAPE %d); tests %d: pass %d, fail %d, skip %d, no verdict %d; kernel %s; image %s\n",
 			t.Arch, t.Shards, t.Complete, t.Unparsed, t.Missing, t.WrongShape, t.Tests, t.Pass, t.Fail, t.Skip, t.NoVerdict,
 			strings.Join(t.Kernels, ","), strings.Join(t.Images, ","))
 	}
 	for _, s := range r.Shards {
 		if s.Status != statusComplete {
-			fmt.Fprintf(w, "   shard %s/%d %s: %s\n", s.Arch, s.Shard, s.Status, strings.Join(s.Reasons, "; "))
+			say(w, "   shard %s/%d %s: %s\n", s.Arch, s.Shard, s.Status, strings.Join(s.Reasons, "; "))
 		}
 	}
-	fmt.Fprintf(w, "   %-60s %-5s %6s %6s %6s %6s  %-8s %s\n", "test", "arch", "pass", "fail", "skip", "noverd", "rate", "95% CI")
+	say(w, "   %-60s %-5s %6s %6s %6s %6s  %-8s %s\n", "test", "arch", "pass", "fail", "skip", "noverd", "rate", "95% CI")
 	for _, t := range r.Tests {
 		if !interesting(t) {
 			continue
 		}
-		fmt.Fprintf(w, "   %-60s %-5s %6d %6d %6d %6d  %-8s %s\n", t.Name, t.Arch, t.Pass, t.Fail, t.Skip, t.NoVerdict, pct(t.FailRate), ci(t))
+		say(w, "   %-60s %-5s %6d %6d %6d %6d  %-8s %s\n", t.Name, t.Arch, t.Pass, t.Fail, t.Skip, t.NoVerdict, pct(t.FailRate), ci(t))
 	}
 	for _, f := range r.Failures {
-		fmt.Fprintf(w, "   --- first failure lines of %s (%s, %s shard %d, -shuffle=%s):\n", f.Name, shortPkg(f.Package), f.Arch, f.Shard, f.Shuffle)
+		say(w, "   --- first failure lines of %s (%s, %s shard %d, -shuffle=%s):\n", f.Name, shortPkg(f.Package), f.Arch, f.Shard, f.Shuffle)
 		for _, l := range f.Lines {
-			fmt.Fprintf(w, "       %s\n", clean(l))
+			say(w, "       %s\n", clean(l))
 		}
 	}
 	for _, m := range r.Mismatches {
-		fmt.Fprintf(w, "   MISMATCH: %s\n", m)
+		say(w, "   MISMATCH: %s\n", m)
 	}
 }
 
@@ -207,7 +211,7 @@ func (r CaseReport) TSV(w io.Writer) {
 			}
 			return fmt.Sprintf("%.6f", *p)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+		say(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
 			r.Case, t.Package, t.Name, t.Arch, t.Pass, t.Fail, t.Skip, t.NoVerdict, f(t.FailRate), f(t.CILow), f(t.CIHigh))
 	}
 }

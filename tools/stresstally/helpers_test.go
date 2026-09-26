@@ -80,8 +80,6 @@ func writeShard(t *testing.T, dir string, c Case, arch string, shard int, body, 
 	}
 }
 
-func parseText(s string) *shardLog { return parseShard(strings.NewReader(s)) }
-
 func row(t *testing.T, r CaseReport, pkg, name, arch string) TestRow {
 	t.Helper()
 	for _, x := range r.Tests {

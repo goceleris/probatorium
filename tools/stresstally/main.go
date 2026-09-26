@@ -80,7 +80,7 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 		})
 		if err != nil {
 			for _, line := range strings.Split(err.Error(), "\n") {
-				fmt.Fprintf(stdout, "::error::%s\n", line)
+				say(stdout, "::error::%s\n", line)
 			}
 			return 2
 		}
@@ -88,7 +88,7 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 	case "pull_request":
 		plan = planSelfTest()
 	default:
-		fmt.Fprintf(stdout, "::error::stresstally plan: event %q is not supported (workflow_dispatch or pull_request)\n", ev)
+		say(stdout, "::error::stresstally plan: event %q is not supported (workflow_dispatch or pull_request)\n", ev)
 		return 2
 	}
 
@@ -96,7 +96,7 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 	if s := getenv("STRESS_RUN_ID"); s != "" {
 		n, err := strconv.ParseInt(s, 10, 64)
 		if err != nil || n < 0 || n > 1<<50 {
-			fmt.Fprintf(stdout, "::error::STRESS_RUN_ID %q is not a run id\n", s)
+			say(stdout, "::error::STRESS_RUN_ID %q is not a run id\n", s)
 			return 2
 		}
 		runID = n
@@ -104,37 +104,40 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 	entries := plan.Entries(runID)
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
-		fmt.Fprintf(stdout, "::error::%v\n", err)
+		say(stdout, "::error::%v\n", err)
 		return 2
 	}
 	matrixJSON, err := json.Marshal(map[string][]Entry{"include": entries})
 	if err != nil {
-		fmt.Fprintf(stdout, "::error::%v\n", err)
+		say(stdout, "::error::%v\n", err)
 		return 2
 	}
 
-	fmt.Fprintf(stdout, "event %s; celeris ref %s; %d case(s), %d shard job(s)\n", plan.Event, plan.CelerisRef, len(plan.Cases), len(entries))
+	say(stdout, "event %s; celeris ref %s; %d case(s), %d shard job(s)\n", plan.Event, plan.CelerisRef, len(plan.Cases), len(entries))
 	for _, c := range plan.Cases {
-		fmt.Fprintf(stdout, "  case %s: packages %q run %q count %d shards %d arches %v memlock %s race %t timeout %s flags %q env %q shuffle %q; expect %s\n",
+		say(stdout, "  case %s: packages %q run %q count %d shards %d arches %v memlock %s race %t timeout %s flags %q env %q shuffle %q; expect %s\n",
 			c.Name, strings.Join(c.Packages, " "), c.Run, c.Count, c.Shards, c.Arches, c.Memlock, c.Race, c.Timeout,
 			strings.Join(c.Flags, " "), strings.Join(c.Env, " "), c.Shuffle, c.Expect.Verdict)
 	}
 
 	out := getenv("GITHUB_OUTPUT")
 	if out == "" {
-		fmt.Fprintf(stdout, "plan=%s\nmatrix=%s\nceleris_ref=%s\n", planJSON, matrixJSON, plan.CelerisRef)
+		say(stdout, "plan=%s\nmatrix=%s\nceleris_ref=%s\n", planJSON, matrixJSON, plan.CelerisRef)
 		return 0
 	}
 	f, err := os.OpenFile(out, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
-		fmt.Fprintf(stdout, "::error::open GITHUB_OUTPUT: %v\n", err)
+		say(stdout, "::error::open GITHUB_OUTPUT: %v\n", err)
 		return 2
 	}
-	defer f.Close()
 	// Single-line values only: JSON never contains a raw newline, and the
 	// validated ref cannot contain one.
-	if _, err := fmt.Fprintf(f, "plan=%s\nmatrix=%s\nceleris_ref=%s\n", planJSON, matrixJSON, plan.CelerisRef); err != nil {
-		fmt.Fprintf(stdout, "::error::write GITHUB_OUTPUT: %v\n", err)
+	_, err = fmt.Fprintf(f, "plan=%s\nmatrix=%s\nceleris_ref=%s\n", planJSON, matrixJSON, plan.CelerisRef)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		say(stdout, "::error::write GITHUB_OUTPUT: %v\n", err)
 		return 2
 	}
 	return 0
@@ -150,7 +153,7 @@ func cmdSummarize(args []string, stdout io.Writer, getenv func(string) string) i
 	}
 	var plan Plan
 	if err := json.Unmarshal([]byte(getenv("STRESS_PLAN")), &plan); err != nil || len(plan.Cases) == 0 {
-		fmt.Fprintf(stdout, "::error::STRESS_PLAN is not a plan with at least one case (%v)\n", err)
+		say(stdout, "::error::STRESS_PLAN is not a plan with at least one case (%v)\n", err)
 		return 2
 	}
 	sha := getenv("STRESS_CELERIS_SHA")
@@ -159,7 +162,7 @@ func cmdSummarize(args []string, stdout io.Writer, getenv func(string) string) i
 		reports = append(reports, judgeCase(c, *logs, sha))
 	}
 	if err := writeReports(*outDir, plan, sha, reports); err != nil {
-		fmt.Fprintf(stdout, "::error::%v\n", err)
+		say(stdout, "::error::%v\n", err)
 		return 2
 	}
 	return verdictText(stdout, plan, reports)
@@ -173,7 +176,7 @@ func cmdTally(args []string, stdout io.Writer) int {
 	only := fs.String("case", "", "judge only this case")
 	outDir := fs.String("out", "", "also write summary.md, report.json and tests.tsv here")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 1 {
-		fmt.Fprintln(stdout, "usage: stresstally tally [-case NAME] [-out DIR] DIR")
+		say(stdout, "%v\n", "usage: stresstally tally [-case NAME] [-out DIR] DIR")
 		return 2
 	}
 	dir := fs.Arg(0)
@@ -194,7 +197,7 @@ func cmdTally(args []string, stdout io.Writer) int {
 		return nil
 	})
 	if err != nil || len(paths) == 0 {
-		fmt.Fprintf(stdout, "no <case>__<arch>__<shard>.log files under %s (%v)\n", dir, err)
+		say(stdout, "no <case>__<arch>__<shard>.log files under %s (%v)\n", dir, err)
 		return 2
 	}
 	plan := Plan{Event: "local"}
@@ -242,7 +245,7 @@ func cmdTally(args []string, stdout io.Writer) int {
 	}
 	if *outDir != "" {
 		if err := writeReports(*outDir, plan, "", reports); err != nil {
-			fmt.Fprintln(stdout, err)
+			say(stdout, "%v\n", err)
 			return 2
 		}
 	}
@@ -269,12 +272,12 @@ func writeReports(dir string, plan Plan, sha string, reports []CaseReport) error
 			ok++
 		}
 	}
-	fmt.Fprintf(&md, "# celeris stress: %d of %d case(s) as expected\n\n", ok, len(reports))
+	say(&md, "# celeris stress: %d of %d case(s) as expected\n\n", ok, len(reports))
 	if plan.Event == "pull_request" {
 		md.WriteString("This pull request run is the workflow's self-test: each case has a fixed configuration and a fixed expected outcome, " +
 			"including the cases that must FAIL. The run is green only when every case comes out exactly as expected.\n\n")
 	}
-	fmt.Fprintf(&md, "celeris ref `%s`, commit `%s`.\n\n", cell(plan.CelerisRef), cell(sha))
+	say(&md, "celeris ref `%s`, commit `%s`.\n\n", cell(plan.CelerisRef), cell(sha))
 	for _, r := range reports {
 		r.Markdown(&md)
 	}
@@ -304,10 +307,10 @@ func verdictText(w io.Writer, plan Plan, reports []CaseReport) int {
 		r.Text(w)
 		if !r.OK() {
 			bad++
-			fmt.Fprintf(w, "::error::case %s: %s\n", r.Case, strings.Join(r.Mismatches, "; "))
+			say(w, "::error::case %s: %s\n", r.Case, strings.Join(r.Mismatches, "; "))
 		}
 	}
-	fmt.Fprintf(w, "stress summary: %d of %d case(s) as expected\n", len(reports)-bad, len(reports))
+	say(w, "stress summary: %d of %d case(s) as expected\n", len(reports)-bad, len(reports))
 	if bad > 0 {
 		return 1
 	}
