@@ -43,6 +43,9 @@ probatorium runs two kinds of tier on the same cluster: bench tiers measure, val
 - **The same checks under instrumented builds.** Race Validation rebuilds the reference apps with
   `-race`; Checkptr Validation rebuilds them with the pointer checker, which also compiles in celeris's
   own io_uring SQE checks.
+- **Flake rates, off the cluster.** Celeris Stress runs celeris's own tests many times on GitHub-hosted
+  x86 and arm64 runners and reports, per test and architecture, the per-process failure rate with an
+  exact 95 % interval ([`docs/STRESS.md`](docs/STRESS.md)).
 
 ## Where the latest results live
 
@@ -463,6 +466,7 @@ single-cell run leaves `Cells[]` empty and fills `tier_1` / `tier_3` at the top 
 | `matrix-checkptr-tier.yml` (Checkptr Validation) | manual | cluster | Full matrix with pointer-checker apps |
 | `benchmark-tier.yml` (Benchmark Tier) | manual (schedule paused) | cluster | `mage BenchTier`; publishes rated profiles |
 | `publish-results.yml` | manual; also logs `benchmark-published` dispatches | GitHub-hosted | Re-send the pointer for a cell already pushed to goceleris/docs |
+| `celeris-stress.yml` (Celeris Stress) | manual; pull requests that change it or `tools/stresstally` (self-test) | GitHub-hosted x86 and arm64 | Run celeris tests many times to measure a flake and its rate; see [`docs/STRESS.md`](docs/STRESS.md) |
 
 The cluster tiers share `concurrency: matrix-tier-cluster` with `cancel-in-progress: false`, so they never
 overlap on the cluster. The group keeps only one pending run, so a newer queued run replaces an older
