@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"html"
 	"io"
 	"regexp"
 	"strings"
@@ -154,7 +155,7 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 				break
 			}
 			say(w, "<details><summary><code>%s</code> in %s, %s shard %d (-shuffle=%s)</summary>\n\n```text\n",
-				cell(f.Name), cell(shortPkg(f.Package)), f.Arch, f.Shard, cell(f.Shuffle))
+				html.EscapeString(clean(f.Name)), html.EscapeString(clean(shortPkg(f.Package))), f.Arch, f.Shard, html.EscapeString(clean(f.Shuffle)))
 			for _, l := range f.Lines {
 				w.WriteString(clean(l) + "\n")
 			}

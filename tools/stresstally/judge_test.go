@@ -431,11 +431,11 @@ func TestCountMatches(t *testing.T) {
 
 func TestMarkdownEscapesWhatALogCanContain(t *testing.T) {
 	r := CaseReport{Case: "x", Config: sampleCase("x"), Tests: []TestRow{{Name: "TestA/a|b`c", Arch: "x86", Fail: 1}},
-		Failures: []Failure{{Name: "TestA", Lines: []string{"```", "\x1b[31mred\x1b[0m", "</details>"}}}}
+		Failures: []Failure{{Name: "TestA/<img_src=x>", Lines: []string{"```", "\x1b[31mred\x1b[0m", "</details>"}}}}
 	var b strings.Builder
 	r.Markdown(&b)
 	out := b.String()
-	for _, bad := range []string{"a|b", "\x1b", "````"} {
+	for _, bad := range []string{"a|b", "\x1b", "````", "<img"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("markdown contains %q:\n%s", bad, out)
 		}
