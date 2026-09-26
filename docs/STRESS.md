@@ -15,7 +15,9 @@ It never touches the benchmark cluster: no self-hosted label, no share of the
 1. **plan** refuses a dispatch on the default branch (see below), checks every
    input against an allow-list (`tools/stresstally plan`) and resolves
    `celeris_ref` to one commit, so every shard tests the same code even if the
-   branch moves during the run.
+   branch moves during the run. The plan also records the probatorium commit
+   the run came from (`github.sha`): the workflow and the tally are that
+   commit's.
 2. **shard**, one job per shard per arch, checks out celeris at that commit,
    sets `RLIMIT_MEMLOCK` with `sudo prlimit` on its shell (as celeris
    `ci.yml` does), and runs
@@ -46,12 +48,13 @@ reached a verdict on one arch reached one on the other.
 A **process** is one test binary: one package in one shard. go test runs a
 package's `-count` iterations one after another inside that one process, so
 they share its state: a leaked goroutine or descriptor, a package-level
-variable, and the `RLIMIT_MEMLOCK` budget. That last one is measured in
-exactly the package this workflow is built for: an io_uring ring's locked
-memory is given back asynchronously, 12 to 23 ms after the ring is closed, so
-a test that starts engines back to back can leave the next test without
-budget (celeris#662 r6 gate2, T2). Iterations are therefore not independent
-trials, and a rate over them with an interval would be too narrow.
+variable, and the `RLIMIT_MEMLOCK` budget. That last one matters for
+io_uring: Linux gives a ring's locked memory back only when a work item
+queued at close has run (`io_ring_exit_work` in `io_uring/io_uring.c`), not
+when the ring's descriptor is closed, so a test that starts engines back to
+back can leave the next test without budget. Iterations are therefore not
+independent trials, and a rate over them with an interval would be too
+narrow.
 
 Processes are independent: each shard is its own job on its own runner. So
 the rate the summary puts an interval on is **per process**: processes in
@@ -160,11 +163,18 @@ pull request would wait behind it.
 The shard matrix is capped at `max-parallel: 4`. The cap is sized for the
 largest use this document describes, a base-vs-branch pair (two runs side by
 side): the pair holds at most 8 slots (a run's `plan` and `summary` never
-overlap its own shards), which leaves at least 12. One celeris CI push is 8
-Linux jobs (`ci.yml` at `9f4d89b`: lint, unit, adaptive, iouring,
-conformance, driver-conformance, build, vulncheck), so it still starts in full
-while a pair runs. A probatorium pull request's CI is about 22 jobs and queues
-on its own; the cap keeps a pair from taking more than 8 of its slots.
+overlap its own shards), which leaves at least 12. A push to a celeris pull
+request is 11 jobs: `ci.yml`'s 9 (lint, unit, adaptive, iouring,
+conformance, driver-conformance, vulncheck and build on Linux, build on
+macOS) and CodeQL default setup's 2 (`actions`, `go`). A push to celeris
+`main` adds Scorecard: 12. Either still starts in full while a pair runs. A
+celeris pull request that touches the driver paths also runs `drivers.yml`,
+24 more jobs (a gate and 23 conformance jobs), 35 in all; like a probatorium
+pull request's CI (25 jobs: Test 18, Coverage 2, Lint 1, CodeQL 4), it queues
+on its own, pair or no pair, and the cap keeps a pair from taking more than 8
+of its slots. (Counted on 2026-09-26 from celeris `main` `9f4d89b`'s
+workflow files and from the jobs GitHub ran for the heads of celeris#696 and
+probatorium#412.)
 
 The price is time: 40 shard jobs run in 10 waves of 4. Do not dispatch more
 than one pair at a time; the cap is per run, and GitHub has no cap across
@@ -201,7 +211,8 @@ cannot be satisfied by anything short of dropping `workflow_dispatch` or
 hiding the checkout from it. By its source, a checkout whose ref is a field
 named like `*sha*`, `*head*` or `*commit*` counts as untrusted
 (`UntrustedCheckoutQuery.qll`); renaming `celeris_sha` might silence the
-alert and would change nothing, which is why it is not done.
+alert and would change nothing, which is why it is not done. The alert it
+raised on this workflow is dismissed as a false positive for these reasons.
 
 Keep a standing branch for it. Refresh it from `main` when the workflow changes
 (the run uses the branch's copy of the workflow and of `tools/stresstally`):
@@ -229,11 +240,10 @@ What is known. `TestDriverHTTPZeroOverhead` (`./engine/iouring`) fails
 because of celeris#691, a defect on `main`: `UnregisterConn` only queues a
 cancel keyed by the descriptor number, the drivers close the descriptor right
 after, and a RECV already armed stays armed on a socket the process no longer
-has, so `onClose` never fires. A deterministic reproduction (R1, R3) fails
-5 of 5 on `main` (`9f4d89b`) and on the #674 branch alike, and the natural
-test failed on `main` with no other test running
-(`evidence/celeris-662/r6/gate2/90-GATE2.md`, T1). celeris#696 is the proposed
-fix, with R3 as its regression test.
+has, so `onClose` never fires. celeris#691 gives the measurements: a
+deterministic reproduction (R1, R3) fails 5 of 5 on `main` (`9f4d89b`) and on
+the #674 branch alike, and passes 10 of 10 with the fix. celeris#696 is the
+proposed fix, with R3 as its regression test.
 
 The open question. How often the natural test fails on the CI runners, per
 process, on `main` and with #696. The deterministic test answers whether the
@@ -244,9 +254,12 @@ The arms:
 - **base**: the commit #696 branches from, as a full sha; **branch**: #696's
   head, as a full sha. A branch name could move between the two dispatches.
 - **Everything else identical**, down to the probatorium commit: both
-  dispatched from the same `stress/runs`, back to back. `compare` refuses a
-  pair that differs in any input but the commit; the per-process rate grows
-  with `count`, so even that must match.
+  dispatched from the same `stress/runs`, back to back, with no refresh of
+  `stress/runs` in between. `compare` refuses a pair that differs in any
+  input but the celeris commit, or in the probatorium commit the two runs
+  came from (`github.sha`, which `report.json` records as
+  `plan.probatorium_sha`); the per-process rate grows with `count`, so even
+  that must match.
 - **One test**, by `-run`, that exists on both commits (the defect needs no
   other test). A test only one arm has shows as "not in this arm".
 - **CI's shape** for this package: `-race` at the runner's 8 MiB memlock, as
@@ -280,9 +293,16 @@ kernel or image that differs between the arms.
 
 What the pair can and cannot say, at 20 processes per arch per arm:
 
-- **The fix takes the failure off the runners** only if the base fails in at
-  least 5 of 20 processes on an arch and the branch in none: 5 of 20 against
-  0 of 20 is p = 0.047, 4 of 20 against 0 of 20 is p = 0.106.
+- **The fix takes the failure off the runners** only if, on an arch, the
+  base fails in at least 6 of 20 processes and the branch in none: 6 of 20
+  against 0 of 20 is p = 0.0202. The rule is tried on two arches, so each
+  arch is held to 0.05 / 2 = 0.025 (Bonferroni), and the chance that
+  either arch says "fixed" when neither arm differs is at most
+  2 x 0.0202 = 0.040. At 0.05 per arch it would be up to 2 x 0.047 = 0.094
+  (0.092 if the arches are independent): 5 of 20 against 0 of 20 is
+  p = 0.047 and does not suffice, nor does 4 of 20 (p = 0.106). `compare`
+  marks p < 0.05 with `*`, uncorrected, and prints the corrected threshold
+  for the rows it compared.
 - If the base fails in fewer, the pair cannot tell the arms apart at this
   size, whatever the branch does. 0 failing processes of 20 bounds the
   per-process rate at 16.8% (exact, 95%). The evidence that the fix works is
@@ -389,7 +409,8 @@ Expected:
    `dispatch this workflow from a branch other than main`; no shard job
    starts and `summary` is skipped.
 2. The run on `stress/runs` is green. `plan` prints `event workflow_dispatch`,
-   1 case and 4 shard jobs with a 25-minute job limit; all four shards are
+   `stress/runs`'s commit as the probatorium commit, 1 case and 4 shard jobs
+   with a 25-minute job limit; all four shards are
    `complete` on `ubuntu-24.04` and `ubuntu-24.04-arm`; the summary says
    `1 of 1 case(s) as expected` and case `stress` PASS; per arch,
    `TestSockaddrString`, `TestSockaddrString/ipv4`,
