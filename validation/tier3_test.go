@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -504,6 +507,73 @@ func TestReplayOneSeed_ReapsTheRefapp(t *testing.T) {
 	}
 	if state, ok := kids[res.RefappPID]; ok {
 		t.Fatalf("refapp pid %d is still a child of this process (state %s) after replayOneSeed returned: signalled, never reaped", res.RefappPID, state)
+	}
+}
+
+// unstoppableRefapp is a remote.Process that announces ready and whose exit
+// the driver can never observe: every Wait fails. It records the signals it
+// was sent.
+type unstoppableRefapp struct {
+	mu      sync.Mutex
+	signals []int
+}
+
+func (p *unstoppableRefapp) PID() int { return 424242 }
+func (p *unstoppableRefapp) Signal(sig int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.signals = append(p.signals, sig)
+	return nil
+}
+func (p *unstoppableRefapp) Wait(context.Context) (remote.WaitResult, error) {
+	return remote.WaitResult{}, errors.New("lost the process")
+}
+func (p *unstoppableRefapp) Stderr() io.Reader {
+	return strings.NewReader("ready addr=127.0.0.1:1\n")
+}
+
+type unstoppableDriver struct{ proc *unstoppableRefapp }
+
+func (d unstoppableDriver) Start(context.Context, []string) (remote.Process, error) {
+	return d.proc, nil
+}
+func (d unstoppableDriver) Close() error { return nil }
+
+// TestReplayOneSeed_TeardownFailureIsReported: a refapp that cannot be stopped
+// and reaped is a driver failure, so a seed whose replay passed comes back
+// errored (T3-DRIVE) with the teardown error, never as a pass; a seed whose
+// replay failed keeps its failing exit code, so a teardown problem cannot hide
+// what the replay found.
+func TestReplayOneSeed_TeardownFailureIsReported(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		replay   func(*testing.T) string
+		wantExit int
+	}{
+		{"passing replay becomes errored", buildPassingReplay, -1},
+		{"failing replay keeps its exit code", buildFailingReplay, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proc := &unstoppableRefapp{}
+			cfg := tier3Config{
+				Driver:          unstoppableDriver{proc: proc},
+				ReplayBin:       tc.replay(t),
+				PerSeedDuration: 5 * time.Second,
+				ReadyTimeout:    tier1TestReadyTimeout,
+			}
+			res := replayOneSeed(context.Background(), cfg, corpus.Seed{Value: 0x1})
+			if res.ExitCode != tc.wantExit {
+				t.Errorf("ExitCode = %d, want %d (Stderr=%q)", res.ExitCode, tc.wantExit, res.Stderr)
+			}
+			if !strings.Contains(res.Stderr, "stop refapp pid 424242: lost the process") {
+				t.Errorf("teardown error missing from Stderr: %q", res.Stderr)
+			}
+			proc.mu.Lock()
+			defer proc.mu.Unlock()
+			if len(proc.signals) == 0 || proc.signals[0] != int(syscall.SIGTERM) {
+				t.Errorf("signals sent = %v, want SIGTERM first", proc.signals)
+			}
+		})
 	}
 }
 

@@ -39,8 +39,10 @@ const zombieGuardBound = 0
 // pays one sample.
 const zombieGuardSettle = 10 * time.Second
 
-// errZombieCountUnsupported means this platform offers no way to list this
-// process's children. The guard reports it and passes: absent, not green.
+// errZombieCountUnsupported means this host offers no way to list this
+// process's children: /proc is unreadable (or absent) and there is no ps.
+// The guard then FAILS the package. It runs from TestMain, where a skip would
+// print nothing under a plain `go test` and read as a pass.
 var errZombieCountUnsupported = errors.New("cannot list child processes on this platform")
 
 // zombieChildren returns the PIDs of this process's children that have exited
@@ -156,11 +158,7 @@ func zombieGuard(w io.Writer) int {
 	for {
 		pids, err := zombieChildren()
 		if err != nil {
-			if errors.Is(err, errZombieCountUnsupported) {
-				_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): SKIPPED, %v\n", err)
-				return 0
-			}
-			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, could not count child processes: %v\n", err)
+			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, could not count this binary's child processes, so it cannot show that none was left unreaped: %v\n", err)
 			return 1
 		}
 		if len(pids) <= zombieGuardBound {

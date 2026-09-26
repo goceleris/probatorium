@@ -265,21 +265,26 @@ const refappStopGrace = 5 * time.Second
 //
 // It Waits once, with a bound, and escalates to SIGKILL from a timer. One
 // Wait call is all a Process has to support: a refapp that ignores SIGTERM
-// is killed at refappStopGrace and reaped inside the same Wait.
-func stopAndReapRefapp(proc remote.Process) {
+// is killed at refappStopGrace and reaped inside the same Wait. The error is
+// that Wait's: the refapp outlived SIGKILL for the whole bound, or the driver
+// could not observe its exit.
+func stopAndReapRefapp(proc remote.Process) error {
 	_ = proc.Signal(int(syscall.SIGTERM))
 	kill := time.AfterFunc(refappStopGrace, func() { _ = proc.Signal(int(syscall.SIGKILL)) })
 	defer kill.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*refappStopGrace)
 	defer cancel()
-	_, _ = proc.Wait(ctx)
+	if _, err := proc.Wait(ctx); err != nil {
+		return fmt.Errorf("tier3: stop refapp pid %d: %w", proc.PID(), err)
+	}
+	return nil
 }
 
 // replayOneSeed runs the per-seed lifecycle. Errors during refapp
 // boot are surfaced as ExitCode = -1 with the cause in Stderr.
-func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3Result {
+func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) (res tier3Result) {
 	started := time.Now()
-	res := tier3Result{Seed: seed.Value, Tag: seed.Tag}
+	res = tier3Result{Seed: seed.Value, Tag: seed.Tag}
 
 	// Per-seed context bounds the whole boot+replay+teardown cycle so
 	// a stuck refapp doesn't stall the whole soak.
@@ -293,7 +298,23 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3
 		res.Duration = time.Since(started)
 		return res
 	}
-	defer stopAndReapRefapp(proc)
+	defer func() {
+		err := stopAndReapRefapp(proc)
+		if err == nil {
+			return
+		}
+		// A refapp that could not be stopped is a driver failure, so a seed
+		// that otherwise passed is reported as errored (T3-DRIVE) rather than
+		// passed. A seed that already failed or errored keeps its exit code:
+		// a teardown problem must never hide what the replay found.
+		if res.ExitCode == 0 {
+			res.ExitCode = -1
+		}
+		if res.Stderr != "" {
+			res.Stderr += "\n"
+		}
+		res.Stderr += err.Error()
+	}()
 
 	readyAddr, err := waitForReady(seedCtx, proc, cfg.ReadyTimeout)
 	if err != nil {
