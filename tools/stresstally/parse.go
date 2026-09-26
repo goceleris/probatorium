@@ -154,6 +154,7 @@ func parseShard(r io.Reader) *shardLog {
 
 	var (
 		headerState  = 0 // 0 reading the header, 1 header complete, -1 header missing or broken
+		bodyLines    int
 		lastNonEmpty string
 		verdicts     int
 		pending      []pendingVerdict
@@ -231,10 +232,13 @@ func parseShard(r io.Reader) *shardLog {
 				continue
 			}
 		}
-		if rest, ok := strings.CutPrefix(line, "stress-refused: "); ok {
+		// shard.sh writes its refusal right after the header, before go
+		// test could print anything; later, the same text is test output.
+		if rest, ok := strings.CutPrefix(line, "stress-refused: "); ok && bodyLines == 0 {
 			s.refused = rest
 			continue
 		}
+		bodyLines++
 		if strings.HasPrefix(line, "stress-trailer: ") {
 			continue // judged below, and only if it is the last line
 		}

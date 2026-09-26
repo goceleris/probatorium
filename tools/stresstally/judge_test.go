@@ -357,6 +357,17 @@ func TestRefusedShardIsWrongShape(t *testing.T) {
 	}
 }
 
+// A test cannot make its own shard WRONG-SHAPE by printing the refusal.
+func TestRefusalTextInTestOutputIsNotARefusal(t *testing.T) {
+	body := "=== RUN   TestPass\nstress-refused: memlock\n--- PASS: TestPass (0.00s)\nPASS\nok  \t" + pkgA + "\t0.1s\n"
+	c := sampleCase("fakerefusal")
+	c.Count = 1
+	r := judgeOne(t, c, body, "0", nil)
+	if s := r.Shards[0]; s.Status != statusComplete || r.Verdict != "PASS" {
+		t.Errorf("shard %s %v verdict %s", s.Status, s.Reasons, r.Verdict)
+	}
+}
+
 func TestOverlongLineIsTruncatedNotFatal(t *testing.T) {
 	body := corpus(t, "good")
 	i := strings.Index(body, "=== RUN   TestPanic\n") + len("=== RUN   TestPanic\n")
