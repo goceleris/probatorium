@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/goceleris/probatorium/report"
+	"github.com/goceleris/probatorium/validation/remote"
 )
 
 // The celeris#588 capture control's second live run (probatorium 5f6b6e6,
@@ -217,5 +218,49 @@ func TestSlowFireRingPinsTheFirstFailures(t *testing.T) {
 	got = flood.snapshot()
 	if len(got) != slowFirePinnedFailures+slowFireRingSize || got[slowFirePinnedFailures-1].ReadMs != slowFirePinnedFailures-1 {
 		t.Fatalf("a failure flood keeps the first %d + the ring: got %d entries", slowFirePinnedFailures, len(got))
+	}
+}
+
+// TestDriveTier1_PublishesDossierInputs: Tier 1 hands the orchestrator live
+// accessors for the refapp's announced side listener and its stderr tail --
+// the tail as of the call, not as of the last tick.
+func TestDriveTier1_PublishesDossierInputs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	var addrFn atomic.Pointer[func() string]
+	var tailFn atomic.Pointer[func() []string]
+	cfg := tier1Config{
+		Driver: remote.NewLocal("/bin/sh"),
+		RefappArgs: []string{"-c", `echo "debug addr=127.0.0.1:41999"; echo "ready addr=` + srv.URL +
+			`"; echo "[fault] hold path=/ws hold=8s"; sleep 120`},
+		BaseURL:     srv.URL,
+		Matrix:      minimalMatrix(t),
+		Seed:        42,
+		Concurrency: 1,
+		OnDossierInputs: func(a func() string, tl func() []string) {
+			addrFn.Store(&a)
+			tailFn.Store(&tl)
+		},
+	}
+	liveHasHold := func() bool {
+		f := tailFn.Load()
+		if f == nil {
+			return false
+		}
+		for _, l := range (*f)() {
+			if strings.Contains(l, "[fault] hold path=/ws") {
+				return true
+			}
+		}
+		return false
+	}
+	if _, err := runTier1Until(t, cfg, func(tier1TallySnapshot) bool { return liveHasHold() }); err != nil {
+		t.Fatalf("driveTier1: %v", err)
+	}
+	if !liveHasHold() {
+		t.Fatal("the live tail accessor never showed the post-ready line")
+	}
+	if f := addrFn.Load(); f == nil || (*f)() != "127.0.0.1:41999" {
+		t.Fatal("the debug-addr accessor did not return the announced side listener")
 	}
 }
