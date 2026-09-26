@@ -21,7 +21,7 @@ import (
 // A skipped step is not a failed step, so running the judges anyway cannot
 // turn a red run green: the failed Validate step already fails the job.
 var adjudicationTiers = map[string]int{
-	".github/workflows/matrix-nightly-tier.yml":  2, // ValidateGate + ValidateDiff
+	".github/workflows/matrix-nightly-tier.yml":  3, // ValidateGate + ValidateDiff, or ValidateFaultControl (celeris#588)
 	".github/workflows/matrix-checkptr-tier.yml": 2,
 	".github/workflows/matrix-race-tier.yml":     2,
 	".github/workflows/matrix-weekend-tier.yml":  2,
@@ -40,7 +40,8 @@ func adjudicationSteps(src string) []string {
 			end = idx[i+1][0]
 		}
 		block := src[loc[0]:end]
-		if strings.Contains(block, "run: mage ValidateGate") || strings.Contains(block, "run: mage ValidateDiff") {
+		if strings.Contains(block, "run: mage ValidateGate") || strings.Contains(block, "run: mage ValidateDiff") ||
+			strings.Contains(block, "run: mage ValidateFaultControl") {
 			steps = append(steps, block)
 		}
 	}

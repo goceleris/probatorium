@@ -189,6 +189,15 @@ func main() {
 		IdleTimeout:     120 * time.Second,
 		ShutdownTimeout: 10 * time.Second,
 	})
+	// Validation-only fault injection (celeris#588 control, probatorium#351):
+	// PROBATORIUM_REFAPP_FAULT="<path>:<hold>@<at>,..." holds a lock that
+	// every request on <path> needs, starting <at> after the ready line.
+	// Unset in every routine tier; see debugvars/faults.go.
+	faults, err := debugvars.ParseFaults(os.Getenv(debugvars.FaultEnv))
+	if err != nil {
+		log.Fatalf("auth_session_ratelimit: %s: %v", debugvars.FaultEnv, err)
+	}
+	debugvars.InstallFaults(srv, faults)
 	// Recovery middleware logger: explicit io.Discard sink, NOT
 	// slog.Default(). The stdlib default routes through Go's text
 	// handler whose defaultHandler mutex serializes a blocking
@@ -289,6 +298,7 @@ func main() {
 		log.Fatalf("auth_session_ratelimit: listen: %v", err)
 	}
 	fmt.Printf("ready addr=%s\n", ln.Addr().String())
+	debugvars.StartFaults(faults, time.Now(), os.Stderr)
 	if err := srv.StartWithListener(ln); err != nil {
 		log.Fatalf("auth_session_ratelimit: start: %v", err)
 	}

@@ -48,6 +48,40 @@ on:
         required: false
         type: string
         default: 1h
+      refapps:
+        description: >-
+          Comma-separated refapps to run (VALIDATE_MATRIX_REFAPPS). Empty
+          (default) runs every refapp.
+        required: false
+        default: ""
+        type: string
+      engines:
+        description: >-
+          Comma-separated engines to run (VALIDATE_MATRIX_ENGINES). Empty
+          (default) runs the production set.
+        required: false
+        default: ""
+        type: string
+      refapp_fault:
+        description: >-
+          celeris#588 CAPTURE CONTROL (probatorium#351). A
+          PROBATORIUM_REFAPP_FAULT spec, e.g. "/ws:8s@30s,/:40s@60s": the
+          refapps that implement it hold a lock on each path at the given
+          offset after ready. A faulted run fails the absolute gate by
+          design, so this replaces ValidateGate and ValidateDiff with
+          ValidateFaultControl, which passes only if every injected stall
+          was counted, recorded and named from the artifact alone. Empty
+          (default) is the routine nightly.
+        required: false
+        default: ""
+        type: string
+      fault_expect_cells:
+        description: >-
+          With refapp_fault: the number of injected cells the run must
+          contain (refapps implementing the fault x engines x 2 arches).
+        required: false
+        default: "0"
+        type: string
 
 permissions:
   contents: read
@@ -194,6 +228,11 @@ jobs:
           # driver_redis / driver_memcached cells produce 100% Tier 3
           # errored (refapp exits before ready).
           VALIDATE_DBSERVICES: "1"
+          # Matrix scope and the celeris#588 capture-control fault; all
+          # empty on a routine nightly (see the dispatch inputs).
+          VALIDATE_MATRIX_REFAPPS: ${{ inputs.refapps || '' }}
+          VALIDATE_MATRIX_ENGINES: ${{ inputs.engines || '' }}
+          PROBATORIUM_REFAPP_FAULT: ${{ inputs.refapp_fault || '' }}
         run: mage Validate
 
       - name: mage ValidateGate (absolute zero-signal gate)
@@ -210,7 +249,9 @@ jobs:
         # adjudicated none of it (probatorium#359). A skipped step cannot
         # turn a red run green: the failed Validate step already fails the
         # job, and this gate fails it again on the cells themselves.
-        if: '!cancelled()'
+        # A refapp_fault run fails this gate by design and is judged by
+        # ValidateFaultControl below instead.
+        if: ${{ !cancelled() && (inputs.refapp_fault || '') == '' }}
         env:
           VALIDATE_GATE_EXPECT_CELLS: "64" # 8 refapps x 4 engines x 2 archs
           # Every adaptive cell must promote epoll -> io_uring at least once;
@@ -227,7 +268,9 @@ jobs:
         # adjudicated none of it (probatorium#359). A skipped step cannot
         # turn a red run green: the failed Validate step already fails the
         # job, and this gate fails it again on the cells themselves.
-        if: '!cancelled()'
+        # A refapp_fault run fails this gate by design and is judged by
+        # ValidateFaultControl below instead.
+        if: ${{ !cancelled() && (inputs.refapp_fault || '') == '' }}
         env:
           # MED divergences fail too. Without this the severity is permanently
           # advisory: 3 of the 7 invariant counters are MED and 1 is LOW, so
@@ -237,6 +280,17 @@ jobs:
           # check.
           VALIDATE_DIFF_STRICT: "1"
         run: mage ValidateDiff
+
+      - name: mage ValidateFaultControl (celeris#588 capture control)
+        # Only on a refapp_fault dispatch: every injected stall must be
+        # counted, recorded (instant, leg, error, addresses) and named by a
+        # goroutine dump taken inside it, and every path not injected must
+        # stay clean. report.CheckFaultControlCell says what each check is.
+        if: ${{ !cancelled() && (inputs.refapp_fault || '') != '' }}
+        env:
+          VALIDATE_FAULT_CONTROL: ${{ inputs.refapp_fault }}
+          VALIDATE_FAULT_CONTROL_EXPECT_CELLS: ${{ inputs.fault_expect_cells || '0' }}
+        run: mage ValidateFaultControl
 
       - name: Upload results
         if: always()
