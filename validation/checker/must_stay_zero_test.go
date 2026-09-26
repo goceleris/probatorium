@@ -1,6 +1,7 @@
 package checker
 
 import (
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -49,8 +50,8 @@ func TestEveryDocumentedMustStayZeroCounterIsRecordedButNotGated(t *testing.T) {
 	}
 	sort.Strings(declared)
 	sort.Strings(documented)
-	if len(declared) != len(documented) {
-		t.Errorf("report.EngineCounters marks %d counter(s) MustStayZero and celeris documents %d:\n  marked:     %v\n  documented: %v",
+	if !slices.Equal(declared, documented) {
+		t.Errorf("report.EngineCounters marks %d counter(s) MustStayZero and celeris documents %d; the sets differ:\n  marked:     %v\n  documented: %v",
 			len(declared), len(documented), declared, documented)
 	}
 

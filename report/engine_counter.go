@@ -35,9 +35,13 @@ const (
 	// question is whether it ever stood above zero, not where the cell
 	// ended. celeris#687's residual gauges are the case: celeris asks for
 	// them to be read at every switch verdict, and a cell makes several
-	// switches. The cell's value is its HIGHEST reading, so a zero means zero
-	// at every sample and therefore at every verdict the cell reached;
-	// CounterGauge's last reading clears only the final instant and says
+	// switches. The cell's value is its HIGHEST SAMPLED reading, so a zero
+	// means zero at every sampled instant. The property loop samples at
+	// 1 Hz and verdicts fall between samples, so a zero does not prove zero
+	// at an unsampled verdict; a residue that STANDS after a switch is still
+	// sampled, which is the case that matters. A verdict-complete reading
+	// would need the peak captured at the verdict source. CounterGauge's last
+	// reading clears only the final instant and says
 	// nothing about the switches before it. Never sum it across samples (a
 	// level held for n samples is not n times the level), never difference it
 	// into a rate, and combine cells with max. The peak can be a transient --

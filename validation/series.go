@@ -48,7 +48,8 @@ const seriesFlushEvery = 30
 // engine_transplant_handoff_in_flight), the three celeris#681 counters
 // documented must-stay-zero, the sweep's pass count, and the five residual
 // gauges, whose question is their level at each switch verdict -- a row joined
-// to adaptive_switches. The six rates of the hand-off mechanism are totals.
+// to adaptive_switches. The other six are totals: five rates of the hand-off mechanism and
+// engine_stale_recv_data_closed, which counts close races.
 //
 // New columns are APPENDED, never inserted: the header names every column and
 // a reader should key off it, but an appended column cannot invalidate a

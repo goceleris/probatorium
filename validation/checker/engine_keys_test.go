@@ -593,8 +593,9 @@ var engineFieldKinds = map[string]struct {
 // holds the reducer to whatever kind is declared.
 //
 // The authority is the field's Go type, which the manifest carries from a
-// reflective walk of the pinned celeris: a uint64 only rises, so it is
-// cumulative unless engineFieldKinds names it a running maximum; a field of
+// reflective walk of the pinned celeris: a uint64 is cumulative unless
+// engineFieldKinds names it a running maximum or a peak gauge (the
+// TransplantResidual* uint64 gauges fall); a field of
 // any other type has to be classified in engineFieldKinds; and a signed int64
 // exists to be decremented, so it can only be a gauge. The table holds the
 // decisions a type cannot make (Workers against AsyncRoutes, both int), each

@@ -227,10 +227,11 @@ import (
 //     must-stay-zero hold_rescued, double_claim and reap_failed, the
 //     sweep's passes and the five engine_transplant_residual_* gauges).
 //     Adds the report.CounterPeakGauge kind: the five residual gauges are
-//     reduced by their HIGHEST reading, because celeris asks for them to be
-//     read at every switch verdict and only a zero peak clears every switch
-//     of the cell. Nothing new is gated: the six counters celeris documents
-//     as must-stay-zero carry their meaning in EngineCounter.MustStayZero,
+//     reduced by their HIGHEST SAMPLED reading. A zero peak clears every
+//     sampled instant (the property loop samples at 1 Hz); it does not prove
+//     zero at an unsampled switch verdict, though a residue that stands after
+//     a switch is sampled. Nothing new is gated: the six counters celeris
+//     documents as must-stay-zero carry their meaning in EngineCounter.MustStayZero,
 //     and moving any of them into ZeroWitnessMeaning is a gate change this
 //     version does not make. Additive; older readers ignore every field.
 const SchemaVersion = "5.16"
