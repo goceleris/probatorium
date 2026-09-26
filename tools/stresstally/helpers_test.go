@@ -99,3 +99,13 @@ func hasReason(reasons []string, r string) bool {
 	}
 	return false
 }
+
+// mustSelfTest plans the pull_request self-test the way cmdPlan does.
+func mustSelfTest(t *testing.T) Plan {
+	t.Helper()
+	p, err := planSelfTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

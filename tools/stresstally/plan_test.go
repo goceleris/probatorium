@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -30,9 +31,10 @@ func TestPlanAcceptsTheDocumentedExamples(t *testing.T) {
 		"raised memlock":   func(in *Inputs) { in.Memlock = "unlimited"; in.Race = "true" },
 		"x86 only":         func(in *Inputs) { in.Arches = "x86" },
 		"limits":           func(in *Inputs) { in.Count, in.Shards, in.Timeout = "1000", "20", "5h30m" },
+		"root package":     func(in *Inputs) { in.Packages = ". ./engine/iouring" },
 		"every extra": func(in *Inputs) {
 			in.Extra = "-short -failfast -cpu=1,2,4 -parallel=8 -skip=^TestSlow$ -tags=integration -shuffle=off " +
-				"CELERIS_REQUIRE_IOURING_WORKERS=1 WS484_CONNS=16 DRAIN583_REPS=3"
+				"CELERIS_REQUIRE_IOURING_WORKERS=1 WS484_CONNS=16 DRAIN583_REPS=3 GOTEST_BACKPRESSURE=1 CELERIS_REQUIRE_SYNACK0=1"
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -100,6 +102,16 @@ func TestPlanRefusesBadInputs(t *testing.T) {
 		"env LD_PRELOAD":       {func(in *Inputs) { in.Extra = "LD_PRELOAD=/x.so" }, "LD_PRELOAD"},
 		"env PATH":             {func(in *Inputs) { in.Extra = "PATH=/x" }, "PATH"},
 		"env GITHUB":           {func(in *Inputs) { in.Extra = "GITHUB_ENV=/x" }, "GITHUB_ENV"},
+		"env LD other":         {func(in *Inputs) { in.Extra = "LD_LIBRARY_PATH=/x" }, "LD_LIBRARY_PATH"},
+		"env runner":           {func(in *Inputs) { in.Extra = "RUNNER_TEMP=/x" }, "RUNNER_TEMP"},
+		"env cache mode":       {func(in *Inputs) { in.Extra = "ACTIONS_CACHE_MODE=write" }, "ACTIONS_CACHE_MODE"},
+		"env no test reads it": {func(in *Inputs) { in.Extra = "FOO=1" }, "FOO"},
+		"env unread knob":      {func(in *Inputs) { in.Extra = "WS999_CONNS=1" }, "WS999_CONNS"},
+		"env GODEBUG":          {func(in *Inputs) { in.Extra = "GODEBUG=x" }, "GODEBUG"},
+		"env empty celeris":    {func(in *Inputs) { in.Extra = "CELERIS_=1" }, "CELERIS_"},
+		"env lower case":       {func(in *Inputs) { in.Extra = "celeris_x=1" }, "celeris_x"},
+		"package dot dot":      {func(in *Inputs) { in.Packages = ".." }, "packages"},
+		"package dot slash":    {func(in *Inputs) { in.Packages = "./." }, "packages"},
 		"env value substitute": {func(in *Inputs) { in.Extra = "CELERIS_X=$(id)" }, "CELERIS_X"},
 		"env value quote":      {func(in *Inputs) { in.Extra = "CELERIS_X='a'" }, "CELERIS_X"},
 		"extra too many":       {func(in *Inputs) { in.Extra = strings.Repeat("-short ", maxExtraTokens+1) }, "tokens"},
@@ -163,7 +175,7 @@ func TestEntriesShardAndSeed(t *testing.T) {
 	}
 	seeds := map[string]string{}
 	for _, e := range es {
-		if e.Runner != runners[e.Arch] || (e.Arch == "x86") != (e.Runner == "ubuntu-latest") {
+		if e.Runner != runners[e.Arch] || (e.Arch == "x86") != (e.Runner == "ubuntu-24.04") {
 			t.Errorf("entry %s runs on %s", e.Arch, e.Runner)
 		}
 		if strings.Contains(e.Runner, "self-hosted") || strings.Contains(e.Runner, "celeris-cluster") {
@@ -198,7 +210,7 @@ func TestJobTimeoutStaysUnderTheHostedLimit(t *testing.T) {
 }
 
 func TestSelfTestPlan(t *testing.T) {
-	p := planSelfTest()
+	p := mustSelfTest(t)
 	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(p.CelerisRef) {
 		t.Errorf("self-test ref %q is not a pinned commit", p.CelerisRef)
 	}
@@ -207,14 +219,6 @@ func TestSelfTestPlan(t *testing.T) {
 		names = append(names, c.Name)
 		if !slices.Equal(c.Arches, []string{"x86", "arm64"}) {
 			t.Errorf("case %s arches %v, want both", c.Name, c.Arches)
-		}
-		// A self-test case must itself pass the dispatch validation, so it
-		// exercises the same input space a dispatch can.
-		in := Inputs{CelerisRef: p.CelerisRef, Packages: strings.Join(c.Packages, " "), Run: c.Run,
-			Count: itoa(c.Count), Shards: itoa(c.Shards), Arches: "both", Memlock: c.Memlock,
-			Race: boolStr(c.Race), Timeout: c.Timeout, Extra: strings.Join(append(append([]string{}, c.Flags...), c.Env...), " ")}
-		if _, err := planDispatch(in); err != nil {
-			t.Errorf("case %s is not a valid dispatch: %v", c.Name, err)
 		}
 	}
 	if !slices.Equal(names, []string{"good", "fail", "skip", "timeout", "none"}) {
@@ -225,18 +229,91 @@ func TestSelfTestPlan(t *testing.T) {
 	}
 }
 
-func itoa(n int) string { b, _ := json.Marshal(n); return string(b) }
-func boolStr(b bool) string {
-	if b {
-		return "true"
+// The self-test is planned by the dispatch code: every case is exactly what
+// planDispatch makes of its IN_* inputs, with only the name, purpose and
+// expectation added. The fail case's environment setting, for instance,
+// exists only as the IN_EXTRA string until parseExtra splits it out.
+func TestSelfTestTakesTheDispatchPath(t *testing.T) {
+	p := mustSelfTest(t)
+	for i, st := range selfTests() {
+		d, err := planDispatch(inputsFrom(func(k string) string { return st.inputs[k] }))
+		if err != nil {
+			t.Fatalf("case %s: %v", st.name, err)
+		}
+		want := d.Cases[0]
+		want.Name, want.Purpose, want.Expect = st.name, st.purpose, st.expect
+		got, _ := json.Marshal(p.Cases[i])
+		exp, _ := json.Marshal(want)
+		if string(got) != string(exp) {
+			t.Errorf("case %s\n got %s\nwant %s", st.name, got, exp)
+		}
 	}
-	return "false"
+	fail := p.Cases[1]
+	if fail.Name != "fail" || !slices.Equal(fail.Env, []string{"CELERIS_REQUIRE_IOURING_WORKERS=1"}) || fail.Count != 2 {
+		t.Errorf("fail case %+v: want count 2 and the require variable parsed out of IN_EXTRA", fail)
+	}
+	// Every self-test input is a key the workflow passes, and no other.
+	want := []string{"IN_ARCHES", "IN_CELERIS_REF", "IN_COUNT", "IN_EXTRA", "IN_MEMLOCK", "IN_PACKAGES", "IN_RACE", "IN_RUN", "IN_SHARDS", "IN_TIMEOUT"}
+	for _, st := range selfTests() {
+		if keys := slices.Sorted(maps.Keys(st.inputs)); !slices.Equal(keys, want) {
+			t.Errorf("case %s inputs %v, want exactly %v", st.name, keys, want)
+		}
+	}
+}
+
+// The environment allow-list is what celeris's tests read, and nothing in it
+// may choose a binary or a library or steer the runner.
+func TestCelerisTestEnvIsSafe(t *testing.T) {
+	if !slices.IsSorted(celerisTestEnv) || len(slices.Compact(slices.Clone(celerisTestEnv))) != len(celerisTestEnv) {
+		t.Errorf("celerisTestEnv must be sorted and without duplicates: %v", celerisTestEnv)
+	}
+	for _, n := range celerisTestEnv {
+		if !envNameRe.MatchString(n) || envRefused(n) != "" || strings.HasPrefix(n, celerisEnvPrefix) {
+			t.Errorf("%s: not a plain name, refused, or in the CELERIS_ namespace (accepted by prefix)", n)
+		}
+		if err := checkEnv(n + "=1"); err != nil {
+			t.Errorf("%s=1 is refused: %v", n, err)
+		}
+	}
+	for _, n := range []string{"PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT"} {
+		if envRefused(n) == "" {
+			t.Errorf("%s is not refused by name", n)
+		}
+	}
+}
+
+// go test's -timeout bounds each test binary, one per package: the job limit
+// allows one timeout per package, and the hosted maximum when a `...`
+// pattern hides how many packages there are.
+func TestJobMinutesAllowOneTimeoutPerPackage(t *testing.T) {
+	for _, c := range []struct {
+		pkgs    []string
+		timeout string
+		want    int
+	}{
+		{[]string{"./engine/iouring"}, "30m", 30 + jobSlack},
+		{[]string{"./engine/iouring", "./engine/epoll", "."}, "30m", 3*30 + jobSlack},
+		{[]string{"./engine/iouring"}, "1s", 1 + jobSlack},
+		{[]string{"./engine/iouring"}, "90s", 2 + jobSlack},
+		{[]string{"./engine/iouring"}, "5h30m", 330 + jobSlack},
+		{[]string{"./a", "./b"}, "5h30m", maxJobMinutes},
+		{[]string{"./engine/iouring", "./adaptive/..."}, "5m", maxJobMinutes},
+		{[]string{"./..."}, "1s", maxJobMinutes},
+	} {
+		got := jobMinutes(Case{Packages: c.pkgs, Timeout: c.timeout})
+		if got != c.want {
+			t.Errorf("packages %v timeout %s: job limit %d, want %d", c.pkgs, c.timeout, got, c.want)
+		}
+		if got > maxJobMinutes {
+			t.Errorf("job limit %d over the hosted maximum", got)
+		}
+	}
 }
 
 // The plan crosses a job boundary as JSON; the expectations must survive it,
 // including the difference between "no problems" and "don't care".
 func TestPlanSurvivesJSON(t *testing.T) {
-	p := planSelfTest()
+	p := mustSelfTest(t)
 	b, err := json.Marshal(p)
 	if err != nil {
 		t.Fatal(err)
@@ -326,10 +403,23 @@ func TestCmdPlanRefusesTheDefaultBranch(t *testing.T) {
 			}
 		})
 	}
-	// The self-test runs on pull_request, whose ref is the merge ref.
-	env := map[string]string{"STRESS_EVENT": "pull_request", "STRESS_REF": "refs/pull/1/merge", "STRESS_DEFAULT_BRANCH": "main"}
-	var log strings.Builder
-	if code := cmdPlan(&log, func(k string) string { return env[k] }); code != 0 {
-		t.Errorf("pull_request: exit %d: %s", code, log.String())
+	// The self-test runs on pull_request, whose ref is the merge ref; it
+	// meets the same refusal (which a real pull_request never trips) and
+	// fails closed the same way.
+	for name, c := range map[string]struct {
+		ref  string
+		code int
+	}{
+		"merge ref":      {"refs/pull/1/merge", 0},
+		"default branch": {"refs/heads/main", 2},
+		"no ref":         {"", 2},
+	} {
+		t.Run("pull_request "+name, func(t *testing.T) {
+			env := map[string]string{"STRESS_EVENT": "pull_request", "STRESS_REF": c.ref, "STRESS_DEFAULT_BRANCH": "main"}
+			var log strings.Builder
+			if code := cmdPlan(&log, func(k string) string { return env[k] }); code != c.code {
+				t.Errorf("exit %d, want %d: %s", code, c.code, log.String())
+			}
+		})
 	}
 }

@@ -80,7 +80,10 @@ hdr memlock_default "$memlock_default"
 hdr memlock_in_force "$in_force"
 hdr race "$STRESS_RACE"
 hdr count "$STRESS_COUNT"
+# go test's -timeout bounds each test binary (one per package), not the
+# whole command; the job limit allows one timeout per package.
 hdr timeout "$STRESS_TIMEOUT"
+hdr job_timeout_minutes "${STRESS_JOB_TIMEOUT-}"
 hdr run "$STRESS_RUN"
 hdr packages "$STRESS_PACKAGES"
 hdr flags "$STRESS_FLAGS"

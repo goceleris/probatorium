@@ -32,8 +32,8 @@ func TestStressWorkflowStaysOffTheCluster(t *testing.T) {
 		}
 	}
 	for _, m := range regexp.MustCompile(`(?m)^\s*runs-on:\s*(.+)$`).FindAllStringSubmatch(src, -1) {
-		if v := strings.TrimSpace(m[1]); v != "ubuntu-latest" && v != "${{ matrix.runner }}" {
-			t.Errorf("runs-on %q: only ubuntu-latest, or the planned GitHub-hosted label", v)
+		if v := strings.TrimSpace(m[1]); v != "ubuntu-24.04" && v != "${{ matrix.runner }}" {
+			t.Errorf("runs-on %q: only ubuntu-24.04, or the planned GitHub-hosted label", v)
 		}
 	}
 	plan, err := os.ReadFile("tools/stresstally/plan.go")
@@ -45,8 +45,77 @@ func TestStressWorkflowStaysOffTheCluster(t *testing.T) {
 	for _, l := range labels {
 		got[l[1]] = l[2]
 	}
-	if got["x86"] != "ubuntu-latest" || got["arm64"] != "ubuntu-24.04-arm" {
-		t.Errorf("planned runner labels %v; want the GitHub-hosted ubuntu-latest and ubuntu-24.04-arm", got)
+	// Both arches pinned to the same Ubuntu release; a floating alias on
+	// one arch would let the arches drift onto different images.
+	if got["x86"] != "ubuntu-24.04" || got["arm64"] != "ubuntu-24.04-arm" {
+		t.Errorf("planned runner labels %v; want the GitHub-hosted ubuntu-24.04 and ubuntu-24.04-arm", got)
+	}
+}
+
+// A shard runs the code under test, which may be anyone's pull request. Its
+// job token must have no Actions cache access (cache-mode: none, enforced by
+// GitHub with scoped cache tokens), on the workflow and again on the shard
+// job; and no job may restore or save a cache on its own, or a later run's
+// test binary could be built from what an earlier run's code under test saved.
+func TestStressWorkflowNeverTouchesTheActionsCache(t *testing.T) {
+	src := withoutComments(readStressWorkflow(t))
+	if !regexp.MustCompile(`(?m)^cache-mode: none$`).MatchString(src) {
+		t.Error("the workflow lacks a top-level cache-mode: none")
+	}
+	shard := regexp.MustCompile(`(?s)\n  shard:\n(.*?)\n  summary:\n`).FindStringSubmatch(src)
+	if shard == nil || !regexp.MustCompile(`(?m)^    cache-mode: none$`).MatchString(shard[1]) {
+		t.Error("the shard job, which runs the code under test, lacks its own cache-mode: none")
+	}
+	for _, m := range regexp.MustCompile(`(?m)^\s*cache-mode:\s*(\S+)`).FindAllStringSubmatch(src, -1) {
+		if m[1] != "none" {
+			t.Errorf("cache-mode %s: every job of this workflow must have none", m[1])
+		}
+	}
+	if strings.Contains(src, "actions/cache") {
+		t.Error("the workflow uses actions/cache")
+	}
+	setups := regexp.MustCompile(`(?m)^\s*- uses: actions/setup-go@\S+ # v\S+\n\s+with:\n((?:\s{10}.*\n)+)`).FindAllStringSubmatch(src, -1)
+	if len(setups) == 0 || len(setups) != strings.Count(src, "actions/setup-go@") {
+		t.Fatalf("found %d setup-go steps with a with: block, %d setup-go uses", len(setups), strings.Count(src, "actions/setup-go@"))
+	}
+	for _, s := range setups {
+		if !strings.Contains(s[1], "cache: false\n") {
+			t.Errorf("a setup-go step without cache: false:\n%s", s[1])
+		}
+	}
+	// actionlint does not know cache-mode yet; its ignore must stay limited
+	// to that one message in this one file.
+	cfg, err := os.ReadFile(".github/actionlint.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ign := regexp.MustCompile(`(?s)\npaths:\n(.*)$`).FindStringSubmatch(string(cfg))
+	if ign == nil {
+		t.Fatal("no paths: section in .github/actionlint.yaml")
+	}
+	var entries []string
+	for _, l := range strings.Split(withoutComments(ign[1]), "\n") {
+		if strings.TrimSpace(l) != "" {
+			entries = append(entries, strings.TrimSpace(l))
+		}
+	}
+	want := []string{".github/workflows/celeris-stress.yml:", "ignore:", `- 'unexpected key "cache-mode" for "(workflow|job)" section'`}
+	if !slices.Equal(entries, want) {
+		t.Errorf("actionlint paths: section %q, want exactly %q", entries, want)
+	}
+}
+
+// goceleris is on the Free plan: 20 hosted jobs at once across the whole
+// organization. One run may hold 4 shard jobs, so the base-vs-branch pair
+// the docs describe holds 8 and leaves 12, a whole celeris CI push's 8.
+func TestStressWorkflowCapsItsShareOfTheOrgRunners(t *testing.T) {
+	src := withoutComments(readStressWorkflow(t))
+	strat := regexp.MustCompile(`(?s)\n    strategy:\n((?:      .*\n)+)`).FindAllStringSubmatch(src, -1)
+	if len(strat) != 1 {
+		t.Fatalf("%d strategy blocks, want the shard job's one", len(strat))
+	}
+	if !strings.Contains(strat[0][1], "      max-parallel: 4\n") {
+		t.Errorf("the shard matrix is not capped at max-parallel: 4:\n%s", strat[0][1])
 	}
 }
 

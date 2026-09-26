@@ -14,34 +14,51 @@ name: Celeris Stress
 #            even if the branch moves during the run.
 #   shard    one job per shard per arch: go test -v -count=N -shuffle=<seed>
 #            in the requested memlock shape; the raw log is the artifact.
-#   summary  tallies every log (tools/stresstally summarize): PASS/FAIL/SKIP
-#            per test and arch with an exact 95% interval on the fail rate,
-#            and a shard that did not finish cleanly as its own class.
+#   summary  tallies every log (tools/stresstally summarize): per test and
+#            arch, the per-process fail rate with an exact 95% interval and
+#            the PASS/FAIL/SKIP iteration counts, and a shard that did not
+#            finish cleanly as its own class.
 #
 # Security: inputs reach steps only through env:, never through ${{ }} in a
 # run: script; every action is pinned by commit sha; the token is read-only.
-# A shard runs the celeris code under test, and code a job runs can write to
-# the Actions cache of the run's ref. So a dispatch must come from a branch
-# other than the default one (plan refuses main): the cache entries that
-# every workflow here restores from, the cluster tiers included, stay out of
-# its reach. Use a standing branch such as stress/runs (docs/STRESS.md).
+# A shard runs the celeris code under test, which may be anyone's pull
+# request, and code a job runs holds that job's runtime token. So:
+#   - cache-mode: none (workflow and shard job) gives every job's token no
+#     Actions cache access at all, neither restore nor save. GitHub enforces
+#     it with scoped cache tokens, so it holds against the code under test,
+#     not only against well-behaved actions. No job here needs a cache
+#     (setup-go runs with cache: false, and nothing uses actions/cache):
+#     a shard restoring what an earlier run's code under test saved could
+#     have its test binary, and so its verdicts, forged.
+#   - plan refuses a dispatch on the default branch, and the shard job keeps
+#     the same rule: defence in depth. If cache-mode were ever dropped, a
+#     run elsewhere could still reach only its own branch's cache scope, and
+#     no run on main is ever the code under test's. Dispatch from a standing
+#     branch such as stress/runs (docs/STRESS.md).
+#
+# goceleris is on the Free plan: 20 GitHub-hosted jobs run at once across
+# the WHOLE organization, celeris and probatorium CI included. max-parallel
+# keeps one run to 4 shard jobs, so the base-vs-branch pair docs/STRESS.md
+# describes holds at most 8 slots and leaves at least 12: one celeris CI
+# push (8 Linux jobs in its ci.yml) still starts at once.
 #
 # The pull_request trigger is the workflow's self-test. A pull request that
-# changes this file or the tool runs a fixed set of cases (see selfTestCases
-# in tools/stresstally/plan.go) with fixed expected outcomes: a clean run
-# must PASS, and a failing test, a run of only skips, a go test timeout and
-# a -run that matches nothing must each be reported as exactly that. The run
-# is green only when every case comes out as expected.
+# changes this file or the tool runs a fixed set of cases (selfTests in
+# tools/stresstally/plan.go), each written as dispatch inputs and planned by
+# the dispatch code, with fixed expected outcomes: a clean run must PASS,
+# and a failing test, a run of only skips, a go test timeout and a -run that
+# matches nothing must each be reported as exactly that. The run is green
+# only when every case comes out as expected.
 
 on:
   workflow_dispatch:
     inputs:
       celeris_ref:
-        description: "celeris branch, tag or full commit sha"
+        description: "celeris branch, tag, full commit sha or refs/pull/N/head"
         type: string
         default: main
       packages:
-        description: "Package patterns under the celeris module, space-separated (./engine/iouring, ./adaptive/...)"
+        description: "Package patterns under the celeris module, space-separated (. ./engine/iouring ./adaptive/...)"
         type: string
         default: ./engine/iouring
       run:
@@ -49,11 +66,11 @@ on:
         type: string
         default: ""
       count:
-        description: "go test -count per shard (1-1000)"
+        description: "go test -count per shard (1-1000): iterations inside ONE process per package"
         type: string
         default: "10"
       shards:
-        description: "Shards per arch (1-20); one job each, each with its own -shuffle seed"
+        description: "Shards per arch (1-20); one job and one process per package each, each with its own -shuffle seed"
         type: string
         default: "5"
       arches:
@@ -71,11 +88,11 @@ on:
         type: boolean
         default: false
       timeout:
-        description: "go test -timeout per shard (1s to 5h30m)"
+        description: "go test -timeout, which applies to EACH test binary (one per package), 1s to 5h30m"
         type: string
         default: 30m
       extra:
-        description: "Allow-listed only: -short -failfast -cpu=N[,N] -parallel=N -skip=RE -tags=LIST -shuffle=off|N CELERIS_*=V WS484_*=V"
+        description: "Allow-listed only: -short -failfast -cpu=N[,N] -parallel=N -skip=RE -tags=LIST -shuffle=off|N, and NAME=V for a variable celeris tests read (CELERIS_*, GOTEST_BACKPRESSURE, WS484_CONNS, ...)"
         type: string
         default: ""
   pull_request:
@@ -87,6 +104,8 @@ on:
 permissions:
   contents: read
 
+cache-mode: none
+
 # Dispatched runs never cancel each other (a base run and a branch run are
 # meant to run side by side); a pull request's newer push cancels its older
 # self-test.
@@ -97,7 +116,7 @@ concurrency:
 jobs:
   plan:
     name: plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       plan: ${{ steps.plan.outputs.plan }}
@@ -112,6 +131,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      # The same path for both events: the default-branch refusal, then
+      # planDispatch on IN_* inputs (the self-test's are fixed in the tool).
       - name: Validate the inputs and plan the shards
         id: plan
         shell: bash
@@ -159,9 +180,17 @@ jobs:
     # is the job that runs the celeris code under test.
     if: ${{ github.event_name == 'pull_request' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ${{ matrix.runner }}
+    # Stated again on the job that runs the code under test, so an edit of
+    # the workflow-level key cannot give this job's token cache access.
+    cache-mode: none
+    # The job limit allows one go test -timeout per package (jobMinutes in
+    # tools/stresstally/plan.go): -timeout bounds each test binary.
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
+      # 4 of the organization's 20 concurrent hosted jobs per run (see the
+      # header): a base-vs-branch pair never holds more than 8.
+      max-parallel: 4
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Check out the shard script
@@ -201,6 +230,7 @@ jobs:
           STRESS_MEMLOCK_LIMIT: ${{ matrix.memlock_limit }}
           STRESS_RACE: ${{ matrix.race }}
           STRESS_TIMEOUT: ${{ matrix.timeout }}
+          STRESS_JOB_TIMEOUT: ${{ matrix.job_timeout }}
           STRESS_FLAGS: ${{ matrix.flags }}
           STRESS_ENV: ${{ matrix.env }}
           STRESS_CELERIS_REF: ${{ needs.plan.outputs.celeris_ref }}
@@ -222,7 +252,7 @@ jobs:
     # Runs when shards failed too (their logs are the evidence), but not when
     # the plan itself was refused or the run was cancelled.
     if: ${{ !cancelled() && needs.plan.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

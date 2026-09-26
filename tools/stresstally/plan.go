@@ -17,10 +17,11 @@ import (
 //
 // A workflow_dispatch run has exactly one case, "stress", built from the
 // dispatch inputs and expected to PASS. A pull_request run has the fixed
-// self-test cases in selfTestCases instead: every pull request that touches
-// the workflow or this tool proves again, on real runner logs, that a clean
-// run passes and that a failure, a skip-only run, a timeout and a run of
-// nothing are each reported as what they are.
+// self-test cases in selfTests instead, each planned from its own dispatch
+// inputs by planDispatch: every pull request that touches the workflow or
+// this tool proves again, on real runner logs, that a clean run passes and
+// that a failure, a skip-only run, a timeout and a run of nothing are each
+// reported as what they are.
 type Plan struct {
 	Event      string `json:"event"`
 	CelerisRef string `json:"celeris_ref"`
@@ -73,13 +74,16 @@ type Inputs struct {
 	CelerisRef, Packages, Run, Count, Shards, Arches, Memlock, Race, Timeout, Extra string
 }
 
-// runners maps an architecture to its GitHub-hosted runner label. x86 uses
-// the label celeris's own ci.yml uses, so a flake measured here is measured
-// on the image celeris CI runs; arm64 has no "latest" alias, so it names the
-// image. Both are free for public repositories. Each shard records the image
-// it got (ImageOS/ImageVersion, uname), and the summary prints them per arch.
+// runners maps an architecture to its GitHub-hosted runner label. Both name
+// the same Ubuntu release, so the two arches run the same OS generation; a
+// floating alias (ubuntu-latest) could move x86 to a newer image while arm64
+// stays, and an arch difference would then be an image difference. celeris
+// CI runs on ubuntu-latest, which is ubuntu-24.04 today: when that alias
+// moves, change both labels here together. Both are free for public
+// repositories. Each shard records the image and kernel it got, and the
+// summary warns when they differ between the arches.
 var runners = map[string]string{
-	"x86":   "ubuntu-latest",
+	"x86":   "ubuntu-24.04",
 	"arm64": "ubuntu-24.04-arm",
 }
 
@@ -99,11 +103,17 @@ const (
 	maxCount       = 1000
 	maxShards      = 20
 	minTimeout     = time.Second
-	// A GitHub-hosted job may run 6 h. The job limit is the go test timeout
-	// plus jobSlack (checkout, toolchain, compiling with -race), so go test
-	// always times out first and prints its goroutine dump.
-	maxTimeout = 5*time.Hour + 30*time.Minute
-	jobSlack   = 20
+	// The timeout input is go test's -timeout, which go test applies to
+	// EACH test binary (one per package) on its own, not to the whole
+	// command; binaries run up to -p (GOMAXPROCS) at a time. So a shard of n
+	// packages can legitimately run up to n timeouts end to end. The job
+	// limit (jobMinutes) is therefore n timeouts plus jobSlack (checkout,
+	// toolchain, compiling with -race), capped at the 360 minutes a
+	// GitHub-hosted job may run; with a `...` pattern n is unknown and the
+	// limit is the cap.
+	maxTimeout    = 5*time.Hour + 30*time.Minute
+	jobSlack      = 20
+	maxJobMinutes = 360
 )
 
 var (
@@ -111,9 +121,11 @@ var (
 	// actions/checkout and `git fetch` accept. The first character is
 	// alphanumeric so the value can never be read as an option.
 	refRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$`)
-	// A package pattern relative to the celeris module root: ./..., ./a/b,
-	// ./a/b/... . No component may start with '.', so ".." cannot appear.
-	pkgRe = regexp.MustCompile(`^\./(\.\.\.|[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*(/\.\.\.)?)$`)
+	// A package pattern relative to the celeris module root: . (the root
+	// package itself, where celeris keeps most of its adaptive and server
+	// tests), ./..., ./a/b, ./a/b/... . No component may start with '.', so
+	// ".." cannot appear.
+	pkgRe = regexp.MustCompile(`^(\.|\./(\.\.\.|[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*(/\.\.\.)?))$`)
 	// A -run or -skip regex: printable ASCII without spaces. It reaches go
 	// test as one argv element, so no character here can reach a shell.
 	regexCharsRe = regexp.MustCompile(`^[!-~]*$`)
@@ -123,14 +135,88 @@ var (
 	tagsRe       = regexp.MustCompile(`^-tags=[A-Za-z0-9_.,]{1,128}$`)
 	shuffleRe    = regexp.MustCompile(`^-shuffle=(off|[0-9]{1,18})$`)
 	timeoutRe    = regexp.MustCompile(`^([0-9]{1,4}h)?([0-9]{1,4}m)?([0-9]{1,5}s)?$`)
-	// Environment settings for the celeris tests' own knobs, and nothing
-	// else: CELERIS_* (CELERIS_REQUIRE_IOURING_WORKERS=1 turns an
-	// environment skip into a failure, the way celeris CI runs its
-	// skipping-forbidden steps) and issue-numbered test knobs such as
-	// WS484_CONNS or DRAIN583_REPS. GO*, LD_*, PATH and the runner's own
-	// variables cannot match either name pattern.
-	envRe = regexp.MustCompile(`^(CELERIS_[A-Z0-9_]{1,60}|[A-Z]{2,12}[0-9]{3}_[A-Z0-9_]{1,40})=[A-Za-z0-9_.,:/+-]{0,128}$`)
+	// An environment setting in extra: NAME=VALUE, the name upper case (so
+	// it can never be read as a flag), the value from a character set no
+	// shell or go test flag parser gives a meaning to.
+	envTokRe   = regexp.MustCompile(`^[A-Z][A-Z0-9_]*=`)
+	envNameRe  = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+	envValueRe = regexp.MustCompile(`^[A-Za-z0-9_.,:/+-]{0,128}$`)
 )
+
+// celerisTestEnv lists every environment variable celeris's own tests read,
+// outside the CELERIS_ namespace, at celeris 9f4d89b171db7838dbcc3ece2107191bc15b25f8.
+// It was built by hand from
+//
+//	git grep -nE 'os\.(Getenv|LookupEnv)\(' 9f4d89b -- '*_test.go'
+//
+// resolving every name passed through a constant or a helper (envInt,
+// envInt589). Knobs in the CELERIS_ namespace are accepted by prefix instead
+// (celerisEnvPrefix), because a branch under test adds its own (the #674
+// branch reads CELERIS_REQUIRE_SYNACK0). A knob outside that namespace that
+// a later celeris adds must be added here, with the grep that found it.
+// Nothing in this list can change which binary or library runs: PATH and
+// LD_* are refused by name before the list is consulted (envRefused).
+var celerisTestEnv = []string{
+	"CHAOS_CONC",                   // test/conformance/memcached/cluster_failover_test.go
+	"CHAOS_DURATION",               // test/conformance/memcached/cluster_failover_test.go
+	"CHAOS_P99_CEILING_MS",         // test/conformance/memcached/cluster_failover_test.go
+	"DEBUG_TOKEN",                  // middleware/debug/example_test.go
+	"DRAIN583_REPS",                // internal/sockopts/drain_recv_tcp_linux_test.go
+	"GOTEST_BACKPRESSURE",          // engine/epoll/backpressure_test.go: =1 runs a test skipped on CI as nondeterministic
+	"PPROF_TOKEN",                  // middleware/pprof/example_test.go
+	"SOAK_CLIENTS",                 // middleware/websocket/soak_test.go
+	"SOAK_DURATION",                // middleware/websocket/soak_test.go
+	"TESTING_STRICT_ALLOC_BUDGETS", // driver/*, middleware/* alloc_guard tests
+	"WS482_BP",                     // middleware/websocket/pause_cancel_linux_test.go
+	"WS482_BURSTS",
+	"WS482_BURST_BYTES",
+	"WS482_CONNS",
+	"WS484_BP", // middleware/websocket/inbound_sequence_linux_test.go
+	"WS484_BURSTS",
+	"WS484_BURST_FRAMES",
+	"WS484_CONNS",
+	"WS583_BP", // middleware/websocket/server_close_drain_linux_test.go
+	"WS583_CELLS",
+	"WS583_CLIENT_RCVBUF",
+	"WS583_CONNS",
+	"WS583_ECHO_FRAMES",
+	"WS583_POSTPAUSE_BYTES",
+}
+
+const celerisEnvPrefix = "CELERIS_"
+
+// envRefused reports why a variable may never be set, whatever the lists
+// say: PATH and LD_* choose which binaries and libraries run, and the
+// runner's own GITHUB_*, RUNNER_* and ACTIONS_* variables steer the job
+// (file commands, the runtime token, the cache mode).
+func envRefused(name string) string {
+	switch {
+	case name == "PATH" || strings.HasPrefix(name, "LD_"):
+		return "it chooses which binaries or libraries run"
+	case strings.HasPrefix(name, "GITHUB_"), strings.HasPrefix(name, "RUNNER_"), strings.HasPrefix(name, "ACTIONS_"):
+		return "it belongs to the runner"
+	}
+	return ""
+}
+
+// checkEnv validates one NAME=VALUE token of the extra input.
+func checkEnv(tok string) error {
+	name, value, _ := strings.Cut(tok, "=")
+	switch {
+	case !envNameRe.MatchString(name):
+		return fmt.Errorf("extra: %q is not an environment variable name", name)
+	case envRefused(name) != "":
+		return fmt.Errorf("extra: %s may not be set: %s", name, envRefused(name))
+	case !strings.HasPrefix(name, celerisEnvPrefix) && !slices.Contains(celerisTestEnv, name):
+		return fmt.Errorf("extra: %s is not a variable celeris's tests read (allowed: CELERIS_*, or one of %s)",
+			name, strings.Join(celerisTestEnv, " "))
+	case strings.HasPrefix(name, celerisEnvPrefix) && len(name) == len(celerisEnvPrefix):
+		return fmt.Errorf("extra: %s names no variable", name)
+	case !envValueRe.MatchString(value):
+		return fmt.Errorf("extra: the value of %s may use only A-Z a-z 0-9 _ . , : / + - (at most 128)", name)
+	}
+	return nil
+}
 
 // Flags that have their own input; naming one in extra is refused rather
 // than silently overriding the input.
@@ -323,10 +409,15 @@ func parseExtra(extra string) (flags, env []string, shuffle string, errs []error
 			}
 		case shuffleRe.MatchString(tok):
 			shuffle = strings.TrimPrefix(tok, "-shuffle=")
-		case envRe.MatchString(tok):
-			env = append(env, tok)
+		case envTokRe.MatchString(tok):
+			if err := checkEnv(tok); err != nil {
+				errs = append(errs, err)
+			} else {
+				env = append(env, tok)
+			}
 		default:
-			errs = append(errs, fmt.Errorf("extra: %q is not allowed (allowed: -short -failfast -cpu=N[,N] -parallel=N -skip=REGEXP -tags=LIST -shuffle=off|N, and CELERIS_*=VALUE or issue-numbered knobs like WS484_CONNS=16)", tok))
+			errs = append(errs, fmt.Errorf("extra: %q is not allowed (allowed: -short -failfast -cpu=N[,N] -parallel=N -skip=REGEXP -tags=LIST -shuffle=off|N, "+
+				"and NAME=VALUE for a variable celeris's tests read: CELERIS_*, GOTEST_BACKPRESSURE, WS484_CONNS, ...)", tok))
 		}
 	}
 	return flags, env, shuffle, errs
@@ -340,8 +431,7 @@ func parseExtra(extra string) (flags, env []string, shuffle string, errs []error
 func (p Plan) Entries(runID int64) []Entry {
 	var out []Entry
 	for _, c := range p.Cases {
-		d, _ := checkTimeout(c.Timeout)
-		job := int(math.Ceil(d.Minutes())) + jobSlack
+		job := jobMinutes(c)
 		for _, arch := range c.Arches {
 			for s := 1; s <= c.Shards; s++ {
 				shuffle := c.Shuffle
@@ -371,6 +461,26 @@ func (p Plan) Entries(runID int64) []Entry {
 	return out
 }
 
+// jobMinutes is a shard job's timeout-minutes. go test's -timeout bounds
+// each test binary, one per package, and a shard runs one binary per package
+// the patterns match; so the longest a shard's go test can legitimately run
+// is one timeout per package (fewer when -p runs them side by side, never
+// more). With a `...` pattern the number of packages is not known here, and
+// the job gets the hosted maximum.
+func jobMinutes(c Case) int {
+	d, err := checkTimeout(c.Timeout)
+	if err != nil {
+		return maxJobMinutes
+	}
+	per := int(math.Ceil(d.Minutes()))
+	for _, p := range c.Packages {
+		if strings.HasSuffix(p, "...") {
+			return maxJobMinutes
+		}
+	}
+	return min(maxJobMinutes, len(c.Packages)*per+jobSlack)
+}
+
 // selfTestSHA pins the celeris commit the pull_request self-test runs, so the
 // self-test judges this tool and workflow, not whatever celeris main is that
 // day. It is celeris main as of 2026-09-26 (celeris#687 merged).
@@ -386,11 +496,34 @@ var celeris656 = []string{
 	"TestListenClosesListenSocketRingAndEventfdWhenInitialSubmitFails",
 }
 
-// selfTestCases is the fixed configuration of a pull_request run. Each case
-// is small; each must come out exactly as its Expect says.
-func selfTestCases() []Case {
-	both := []string{"x86", "arm64"}
-	pkg := []string{"./engine/iouring"}
+// selfTest is one case of the pull_request self-test. It is written as the
+// dispatch inputs a person would type, keyed exactly as the workflow passes
+// them to `stresstally plan` (IN_*), and it is planned by the same code a
+// dispatch is: inputsFrom, then planDispatch, then Entries. Only its name,
+// its purpose and its expected outcome are added afterwards. So every pull
+// request that touches the workflow or this tool runs the dispatch path's
+// input handling and validation on a runner, not a parallel copy of it.
+type selfTest struct {
+	name, purpose string
+	inputs        map[string]string
+	expect        Expect
+}
+
+// selfTestInputs is a dispatch of the pinned celeris commit's
+// ./engine/iouring on both arches at celeris CI's 8 MiB memlock.
+func selfTestInputs(run, count, shards, race, timeout, extra string) map[string]string {
+	return map[string]string{
+		"IN_CELERIS_REF": selfTestSHA, "IN_PACKAGES": "./engine/iouring", "IN_RUN": run,
+		"IN_COUNT": count, "IN_SHARDS": shards, "IN_ARCHES": "both", "IN_MEMLOCK": "8m",
+		"IN_RACE": race, "IN_TIMEOUT": timeout, "IN_EXTRA": extra,
+	}
+}
+
+// selfTests is the fixed configuration of a pull_request run. Each case is
+// small; each must come out exactly as its expectation says, counts of
+// iterations and of processes included. A process is one test binary: one
+// package in one shard.
+func selfTests() []selfTest {
 	run656 := "^(" + strings.Join(celeris656, "|") + ")$"
 	each := func(c CountExpect, names ...string) map[string]CountExpect {
 		m := map[string]CountExpect{}
@@ -399,59 +532,70 @@ func selfTestCases() []Case {
 		}
 		return m
 	}
-	good := each(CountExpect{Pass: "6", Fail: "0", Skip: "0", NoVerdict: "0"},
+	good := each(CountExpect{Pass: "6", Fail: "0", Skip: "0", NoVerdict: "0", Processes: "2", FailedProcesses: "0"},
 		"TestSockaddrString", "TestSockaddrString/ipv4", "TestSockaddrString/ipv6-loopback",
 		"TestParseSendZCResult", "TestUseSendZC", "TestUseSendZC/large-linked")
-	good["TestAbandonedResponseCountsAsSendPeerGone"] = CountExpect{Pass: "0", Fail: "0", Skip: "6", NoVerdict: "0"}
-	return []Case{
+	good["TestAbandonedResponseCountsAsSendPeerGone"] = CountExpect{Pass: "0", Fail: "0", Skip: "6", NoVerdict: "0", Processes: "0", FailedProcesses: "0"}
+	return []selfTest{
 		{
-			Name: "good",
-			Purpose: "pure, deterministic tests with subtests, under -race, 3 runs on each of 2 shards per arch: " +
-				"every one must PASS exactly 6 times per arch; one more test skips under -short and must show as SKIP, not PASS",
-			Packages: pkg,
-			Run:      "^(TestSockaddrString|TestParseSendZCResult|TestUseSendZC|TestAbandonedResponseCountsAsSendPeerGone)$",
-			Count:    3, Shards: 2, Arches: both, Memlock: "8m", Race: true, Timeout: "5m",
-			Flags:  []string{"-short"},
-			Expect: Expect{Verdict: "PASS", Problems: []string{}, Tests: good, ShardStatus: statusComplete},
+			name: "good",
+			purpose: "pure, deterministic tests with subtests, under -race, 3 runs in each of 2 shards per arch: " +
+				"every one must PASS exactly 6 times in 2 processes per arch; one more test skips under -short and must show as SKIP, not PASS",
+			inputs: selfTestInputs("^(TestSockaddrString|TestParseSendZCResult|TestUseSendZC|TestAbandonedResponseCountsAsSendPeerGone)$",
+				"3", "2", "true", "5m", "-short"),
+			expect: Expect{Verdict: "PASS", Problems: []string{}, Tests: good, ShardStatus: statusComplete},
 		},
 		{
-			Name:     "fail",
-			Purpose:  "the celeris#656 tests at 8 MiB with CELERIS_REQUIRE_IOURING_WORKERS=1: each must FAIL once per arch, and the case must FAIL",
-			Packages: pkg, Run: run656,
-			Count: 1, Shards: 1, Arches: both, Memlock: "8m", Timeout: "5m",
-			Env: []string{"CELERIS_REQUIRE_IOURING_WORKERS=1"},
-			Expect: Expect{Verdict: "FAIL", Problems: []string{problemFailures},
-				Tests: each(CountExpect{Pass: "0", Fail: "1", Skip: "0", NoVerdict: "0"}, celeris656...), ShardStatus: statusComplete},
+			name: "fail",
+			purpose: "the celeris#656 tests at 8 MiB with CELERIS_REQUIRE_IOURING_WORKERS=1, 2 runs in one process per arch: " +
+				"each must FAIL twice per arch, in 1 failing process of 1, and the case must FAIL",
+			inputs: selfTestInputs(run656, "2", "1", "false", "5m", "CELERIS_REQUIRE_IOURING_WORKERS=1"),
+			expect: Expect{Verdict: "FAIL", Problems: []string{problemFailures},
+				Tests:       each(CountExpect{Pass: "0", Fail: "2", Skip: "0", NoVerdict: "0", Processes: "1", FailedProcesses: "1"}, celeris656...),
+				ShardStatus: statusComplete},
 		},
 		{
-			Name:     "skip",
-			Purpose:  "the same tests at 8 MiB without the require variable: each must SKIP, and a run in which nothing but skips happened must not PASS",
-			Packages: pkg, Run: run656,
-			Count: 1, Shards: 1, Arches: both, Memlock: "8m", Timeout: "5m",
-			Expect: Expect{Verdict: "FAIL", Problems: []string{problemNothingRan},
-				Tests: each(CountExpect{Pass: "0", Fail: "0", Skip: "1", NoVerdict: "0"}, celeris656...), ShardStatus: statusComplete},
+			name:    "skip",
+			purpose: "the same tests at 8 MiB without the require variable: each must SKIP, and a run in which nothing but skips happened must not PASS",
+			inputs:  selfTestInputs(run656, "1", "1", "false", "5m", ""),
+			expect: Expect{Verdict: "FAIL", Problems: []string{problemNothingRan},
+				Tests:       each(CountExpect{Pass: "0", Fail: "0", Skip: "1", NoVerdict: "0", Processes: "0", FailedProcesses: "0"}, celeris656...),
+				ShardStatus: statusComplete},
 		},
 		{
-			Name: "timeout",
-			Purpose: "a test that churns for 1 s and then sleeps 300 ms, under a 1 s go test timeout: the panic must make every shard UNPARSED " +
+			name: "timeout",
+			purpose: "a test that churns for 1 s and then sleeps 300 ms, under a 1 s go test timeout: the panic must make every shard UNPARSED " +
 				"(timeout), with the test counted as run without a verdict",
-			Packages: pkg, Run: "^TestAbandonedResponseCountsAsSendPeerGone$",
-			Count: 1, Shards: 1, Arches: both, Memlock: "8m", Timeout: "1s",
-			Expect: Expect{Verdict: "FAIL", Problems: []string{problemNothingRan, problemUnparsed},
-				Tests:       map[string]CountExpect{"TestAbandonedResponseCountsAsSendPeerGone": {Pass: "0", Fail: "0", Skip: "0", NoVerdict: "1"}},
+			inputs: selfTestInputs("^TestAbandonedResponseCountsAsSendPeerGone$", "1", "1", "false", "1s", ""),
+			expect: Expect{Verdict: "FAIL", Problems: []string{problemNothingRan, problemUnparsed},
+				Tests: map[string]CountExpect{"TestAbandonedResponseCountsAsSendPeerGone": {
+					Pass: "0", Fail: "0", Skip: "0", NoVerdict: "1", Processes: "0", FailedProcesses: "0"}},
 				ShardStatus: statusUnparsed, ShardReasons: []string{reasonTimeout}},
 		},
 		{
-			Name:     "none",
-			Purpose:  "a -run that matches no test: go test exits 0, and the shard must still be UNPARSED (no verdict lines), never a pass",
-			Packages: pkg, Run: "^TestStressSelfTestMatchesNoTest$",
-			Count: 1, Shards: 1, Arches: both, Memlock: "8m", Timeout: "5m",
-			Expect: Expect{Verdict: "FAIL", Problems: []string{problemNothingRan, problemUnparsed},
+			name:    "none",
+			purpose: "a -run that matches no test: go test exits 0, and the shard must still be UNPARSED (no verdict lines), never a pass",
+			inputs:  selfTestInputs("^TestStressSelfTestMatchesNoTest$", "1", "1", "false", "5m", ""),
+			expect: Expect{Verdict: "FAIL", Problems: []string{problemNothingRan, problemUnparsed},
 				ShardStatus: statusUnparsed, ShardReasons: []string{reasonNoVerdicts}},
 		},
 	}
 }
 
-func planSelfTest() Plan {
-	return Plan{Event: "pull_request", CelerisRef: selfTestSHA, Cases: selfTestCases()}
+// planSelfTest plans every self-test case through the dispatch path.
+func planSelfTest() (Plan, error) {
+	p := Plan{Event: "pull_request", CelerisRef: selfTestSHA}
+	for _, st := range selfTests() {
+		d, err := planDispatch(inputsFrom(func(k string) string { return st.inputs[k] }))
+		if err != nil {
+			return Plan{}, fmt.Errorf("self-test case %s is not a valid dispatch: %w", st.name, err)
+		}
+		if d.CelerisRef != p.CelerisRef || len(d.Cases) != 1 {
+			return Plan{}, fmt.Errorf("self-test case %s planned %d case(s) of celeris %s", st.name, len(d.Cases), d.CelerisRef)
+		}
+		c := d.Cases[0]
+		c.Name, c.Purpose, c.Expect = st.name, st.purpose, st.expect
+		p.Cases = append(p.Cases, c)
+	}
+	return p, nil
 }

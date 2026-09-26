@@ -62,38 +62,54 @@ func usage() {
 	os.Exit(2)
 }
 
-// cmdPlan validates the inputs and writes the workflow outputs.
+// inputsFrom reads the dispatch inputs the workflow passes as IN_<NAME>. A
+// dispatch reads them from the environment; the self-test cases are written
+// as the same IN_* values and read through this same function.
+func inputsFrom(getenv func(string) string) Inputs {
+	return Inputs{
+		CelerisRef: getenv("IN_CELERIS_REF"),
+		Packages:   getenv("IN_PACKAGES"),
+		Run:        getenv("IN_RUN"),
+		Count:      getenv("IN_COUNT"),
+		Shards:     getenv("IN_SHARDS"),
+		Arches:     getenv("IN_ARCHES"),
+		Memlock:    getenv("IN_MEMLOCK"),
+		Race:       getenv("IN_RACE"),
+		Timeout:    getenv("IN_TIMEOUT"),
+		Extra:      getenv("IN_EXTRA"),
+	}
+}
+
+// cmdPlan validates the inputs and writes the workflow outputs. A dispatch
+// and the pull_request self-test take the same path: the default-branch
+// refusal, then planDispatch on IN_* inputs (the self-test's are fixed, see
+// selfTests), then Entries.
 func cmdPlan(stdout io.Writer, getenv func(string) string) int {
-	var plan Plan
-	switch ev := getenv("STRESS_EVENT"); ev {
-	case "workflow_dispatch":
-		if err := refuseDefaultBranch(getenv("STRESS_REF"), getenv("STRESS_DEFAULT_BRANCH")); err != nil {
-			say(stdout, "::error::%v\n", err)
-			return 2
-		}
-		p, err := planDispatch(Inputs{
-			CelerisRef: getenv("IN_CELERIS_REF"),
-			Packages:   getenv("IN_PACKAGES"),
-			Run:        getenv("IN_RUN"),
-			Count:      getenv("IN_COUNT"),
-			Shards:     getenv("IN_SHARDS"),
-			Arches:     getenv("IN_ARCHES"),
-			Memlock:    getenv("IN_MEMLOCK"),
-			Race:       getenv("IN_RACE"),
-			Timeout:    getenv("IN_TIMEOUT"),
-			Extra:      getenv("IN_EXTRA"),
-		})
-		if err != nil {
-			for _, line := range strings.Split(err.Error(), "\n") {
-				say(stdout, "::error::%s\n", line)
-			}
-			return 2
-		}
-		plan = p
-	case "pull_request":
-		plan = planSelfTest()
-	default:
+	ev := getenv("STRESS_EVENT")
+	if ev != "workflow_dispatch" && ev != "pull_request" {
 		say(stdout, "::error::stresstally plan: event %q is not supported (workflow_dispatch or pull_request)\n", ev)
+		return 2
+	}
+	// A pull_request run is on refs/pull/<n>/merge, never on the default
+	// branch, so the self-test passes this check on every run and a
+	// dispatch meets the very same code.
+	if err := refuseDefaultBranch(getenv("STRESS_REF"), getenv("STRESS_DEFAULT_BRANCH")); err != nil {
+		say(stdout, "::error::%v\n", err)
+		return 2
+	}
+	var (
+		plan Plan
+		err  error
+	)
+	if ev == "workflow_dispatch" {
+		plan, err = planDispatch(inputsFrom(getenv))
+	} else {
+		plan, err = planSelfTest()
+	}
+	if err != nil {
+		for _, line := range strings.Split(err.Error(), "\n") {
+			say(stdout, "::error::%s\n", line)
+		}
 		return 2
 	}
 
@@ -120,8 +136,8 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 
 	say(stdout, "event %s; celeris ref %s; %d case(s), %d shard job(s)\n", plan.Event, plan.CelerisRef, len(plan.Cases), len(entries))
 	for _, c := range plan.Cases {
-		say(stdout, "  case %s: packages %q run %q count %d shards %d arches %v memlock %s race %t timeout %s flags %q env %q shuffle %q; expect %s\n",
-			c.Name, strings.Join(c.Packages, " "), c.Run, c.Count, c.Shards, c.Arches, c.Memlock, c.Race, c.Timeout,
+		say(stdout, "  case %s: packages %q run %q count %d shards %d arches %v memlock %s race %t timeout %s per test binary (job limit %d min) flags %q env %q shuffle %q; expect %s\n",
+			c.Name, strings.Join(c.Packages, " "), c.Run, c.Count, c.Shards, c.Arches, c.Memlock, c.Race, c.Timeout, jobMinutes(c),
 			strings.Join(c.Flags, " "), strings.Join(c.Env, " "), c.Shuffle, c.Expect.Verdict)
 	}
 
@@ -148,15 +164,17 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 	return 0
 }
 
-// refuseDefaultBranch keeps the code under test out of the default branch's
-// Actions cache scope. A shard runs whatever celeris commit it was given, and
-// any code a job runs can write cache entries in the scope of the run's ref
-// (it can read the runner's runtime token). A run on the default branch would
-// write where every workflow of this repository restores from, the cluster
-// tiers included (setup-go cache: true), which is what CodeQL's
-// actions/cache-poisoning/poisonable-step warns about. Dispatched from any
-// other branch, the run's cache writes stay in that branch's scope. Fails
-// closed when either value is missing.
+// refuseDefaultBranch keeps the code under test out of every run on the
+// default branch. A shard runs whatever celeris commit it was given, and code
+// a job runs holds that job's runtime token. The workflow's cache-mode: none
+// already gives that token no cache access at all (enforced by GitHub, not by
+// any action), so the code cannot write the cache that every workflow here
+// restores from, the cluster tiers included. This refusal is the second
+// wall, kept for defence in depth: if cache-mode were ever removed or not
+// honoured, a run on a branch other than the default one could still write
+// only that branch's cache scope; and no artifact or commit status on the
+// default branch is ever produced by the code under test. Fails closed when
+// either value is missing.
 func refuseDefaultBranch(ref, defaultBranch string) error {
 	if ref == "" || defaultBranch == "" {
 		return fmt.Errorf("cannot tell which ref this run is on (ref %q, default branch %q); refusing", ref, defaultBranch)
@@ -331,6 +349,9 @@ func verdictText(w io.Writer, plan Plan, reports []CaseReport) int {
 	bad := 0
 	for _, r := range reports {
 		r.Text(w)
+		for _, x := range r.Warnings {
+			say(w, "::warning::case %s: %s\n", r.Case, x)
+		}
 		if !r.OK() {
 			bad++
 			say(w, "::error::case %s: %s\n", r.Case, strings.Join(r.Mismatches, "; "))

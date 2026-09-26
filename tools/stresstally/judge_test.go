@@ -74,8 +74,8 @@ func TestSkipIsNeverAPass(t *testing.T) {
 	if got.Pass != 0 || got.Skip != 3 {
 		t.Errorf("TestSkip pass %d skip %d, want 0 and 3", got.Pass, got.Skip)
 	}
-	if got.FailRate != nil {
-		t.Errorf("a test that only skipped has a fail rate %v; it never ran", *got.FailRate)
+	if got.ProcFailRate != nil {
+		t.Errorf("a test that only skipped has a fail rate %v; it never ran", *got.ProcFailRate)
 	}
 	if r.Verdict != "FAIL" || !slices.Equal(r.Problems, []string{problemNothingRan}) {
 		t.Errorf("verdict %s problems %v, want FAIL [nothing-ran]", r.Verdict, r.Problems)
@@ -86,7 +86,8 @@ func TestSkipIsNeverAPass(t *testing.T) {
 }
 
 // The release gate asks arm64 == x86. An arch on which every test skipped
-// says nothing about that arch, so the case fails although the other passed.
+// says nothing about that arch, so the case fails although the other passed;
+// the test that passed on x86 alone is also an arch gap.
 func TestAnArchWhereNothingRanFailsTheCase(t *testing.T) {
 	dir := t.TempDir()
 	c := sampleCase("onearch")
@@ -98,8 +99,8 @@ func TestAnArchWhereNothingRanFailsTheCase(t *testing.T) {
 	if got := row(t, r, pkgA, "TestSkip", "x86"); got.Pass != 3 {
 		t.Fatalf("x86 %+v, want 3 passes", got)
 	}
-	if r.Verdict != "FAIL" || !slices.Equal(r.Problems, []string{problemNothingRan}) {
-		t.Errorf("verdict %s problems %v, want FAIL [nothing-ran] for the arm64 that only skipped", r.Verdict, r.Problems)
+	if r.Verdict != "FAIL" || !slices.Equal(r.Problems, []string{problemArchGap, problemNothingRan}) {
+		t.Errorf("verdict %s problems %v, want FAIL [arch-gap nothing-ran] for the arm64 that only skipped", r.Verdict, r.Problems)
 	}
 }
 
@@ -118,8 +119,8 @@ func TestFailIsCountedAndListedWithItsFirstLines(t *testing.T) {
 		}
 	}
 	fr := row(t, r, pkgA, "TestFail", "x86")
-	if fr.FailRate == nil || *fr.FailRate != 1 || !near(*fr.CILow, 0.025) || *fr.CIHigh != 1 {
-		t.Errorf("TestFail rate/CI %s %s, want 100%% and 2.50%% to 100.00%% (1 of 1)", pct(fr.FailRate), ci(fr))
+	if fr.ProcFailRate == nil || *fr.ProcFailRate != 1 || !near(*fr.ProcCILow, 0.025) || *fr.ProcCIHigh != 1 {
+		t.Errorf("TestFail rate/CI %s %s, want 100%% and 2.50%% to 100.00%% (1 of 1)", pct(fr.ProcFailRate), ci(fr))
 	}
 	lines := map[string]string{}
 	for _, f := range r.Failures {

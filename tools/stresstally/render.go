@@ -23,12 +23,22 @@ func pct(p *float64) string {
 	return fmt.Sprintf("%.2f%%", *p*100)
 }
 
+// ci is the exact 95% interval of the per-process fail rate.
 func ci(r TestRow) string {
-	if r.CILow == nil {
-		return "n/a (never ran)"
+	if r.ProcCILow == nil {
+		return "n/a (no process ran it)"
 	}
-	return fmt.Sprintf("%s to %s", pct(r.CILow), pct(r.CIHigh))
+	return fmt.Sprintf("%s to %s", pct(r.ProcCILow), pct(r.ProcCIHigh))
 }
+
+// procs is "failed / ran" in processes.
+func procs(r TestRow) string { return fmt.Sprintf("%d / %d", r.FailedProcesses, r.Processes) }
+
+// rateNote explains the two kinds of count every table shows.
+const rateNote = "A process is one test binary: one package in one shard. Its -count iterations run inside that one process " +
+	"and share its state, so they are not independent trials; the fail rate and its exact (Clopper-Pearson) 95% interval " +
+	"are per process: processes in which the test failed at least once, over processes in which it reached a PASS or FAIL. " +
+	"pass, fail, skip and no verdict count iterations (verdict lines) and carry no interval. SKIP is its own column and never counts as a pass.\n\n"
 
 var ansiRe = regexp.MustCompile("\x1b\\[[0-9;?]*[A-Za-z]")
 
@@ -63,15 +73,15 @@ func cell(s string) string {
 func interesting(r TestRow) bool { return r.Fail > 0 || r.Skip > 0 || r.NoVerdict > 0 }
 
 func testTable(w *strings.Builder, rows []TestRow, limit int) int {
-	w.WriteString("| test | package | arch | pass | fail | skip | no verdict | fail rate | 95% CI (exact) |\n")
-	w.WriteString("|---|---|---|--:|--:|--:|--:|--:|---|\n")
+	w.WriteString("| test | package | arch | processes failed / ran | per-process fail rate | 95% CI (exact) | pass | fail | skip | no verdict |\n")
+	w.WriteString("|---|---|---|--:|--:|---|--:|--:|--:|--:|\n")
 	n := 0
 	for _, r := range rows {
 		if w.Len() > limit {
 			break
 		}
-		say(w, "| `%s` | %s | %s | %d | %d | %d | %d | %s | %s |\n",
-			cell(r.Name), cell(shortPkg(r.Package)), r.Arch, r.Pass, r.Fail, r.Skip, r.NoVerdict, pct(r.FailRate), ci(r))
+		say(w, "| `%s` | %s | %s | %s | %s | %s | %d | %d | %d | %d |\n",
+			cell(r.Name), cell(shortPkg(r.Package)), r.Arch, procs(r), pct(r.ProcFailRate), ci(r), r.Pass, r.Fail, r.Skip, r.NoVerdict)
 		n++
 	}
 	return n
@@ -101,6 +111,18 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 	if len(r.Mismatches) > 0 {
 		w.WriteString("\n")
 	}
+	for _, g := range r.ArchGaps {
+		say(w, "- **Arch gap:** %s\n", cell(g))
+	}
+	if len(r.ArchGaps) > 0 {
+		w.WriteString("\n")
+	}
+	for _, x := range r.Warnings {
+		say(w, "- **Warning:** %s\n", cell(x))
+	}
+	if len(r.Warnings) > 0 {
+		w.WriteString("\n")
+	}
 	say(w, "celeris `%s`; packages `%s`; -run `%s`; %d run(s) x %d shard(s) per arch; memlock %s; race %t; timeout %s",
 		inline(r.CelerisSHA), inline(strings.Join(c.Packages, " ")), inline(c.Run), c.Count, c.Shards, c.Memlock, c.Race, c.Timeout)
 	if len(c.Flags) > 0 {
@@ -118,7 +140,7 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 			t.Arch, t.Shards, t.Complete, t.Unparsed, t.Missing, t.WrongShape, t.Tests, t.Pass, t.Fail, t.Skip, t.NoVerdict,
 			cell(strings.Join(t.Kernels, ", ")), cell(strings.Join(t.Images, ", ")))
 	}
-	w.WriteString("\nSKIP is its own column and never counts as a pass; the fail rate is fail / (pass + fail).\n\n")
+	w.WriteString("\n" + rateNote)
 
 	w.WriteString("### Shards\n\n| arch | shard | status | exit | pass | fail | skip | no verdict | shuffle | elapsed | reasons |\n")
 	w.WriteString("|---|--:|---|--:|--:|--:|--:|--:|--:|--:|---|\n")
@@ -188,12 +210,18 @@ func (r CaseReport) Text(w io.Writer) {
 			say(w, "   shard %s/%d %s: %s\n", s.Arch, s.Shard, s.Status, strings.Join(s.Reasons, "; "))
 		}
 	}
-	say(w, "   %-60s %-5s %6s %6s %6s %6s  %-8s %s\n", "test", "arch", "pass", "fail", "skip", "noverd", "rate", "95% CI")
+	for _, g := range r.ArchGaps {
+		say(w, "   ARCH GAP: %s\n", g)
+	}
+	for _, x := range r.Warnings {
+		say(w, "   WARNING: %s\n", x)
+	}
+	say(w, "   %-60s %-5s %-11s %-8s %-18s %6s %6s %6s %6s\n", "test", "arch", "procs f/ran", "rate", "95% CI (process)", "pass", "fail", "skip", "noverd")
 	for _, t := range r.Tests {
 		if !interesting(t) {
 			continue
 		}
-		say(w, "   %-60s %-5s %6d %6d %6d %6d  %-8s %s\n", t.Name, t.Arch, t.Pass, t.Fail, t.Skip, t.NoVerdict, pct(t.FailRate), ci(t))
+		say(w, "   %-60s %-5s %-11s %-8s %-18s %6d %6d %6d %6d\n", t.Name, t.Arch, procs(t), pct(t.ProcFailRate), ci(t), t.Pass, t.Fail, t.Skip, t.NoVerdict)
 	}
 	for _, f := range r.Failures {
 		say(w, "   --- first failure lines of %s (%s, %s shard %d, -shuffle=%s):\n", f.Name, shortPkg(f.Package), f.Arch, f.Shard, f.Shuffle)
@@ -206,7 +234,8 @@ func (r CaseReport) Text(w io.Writer) {
 	}
 }
 
-// TSV renders every test row of the case.
+// TSV renders every test row of the case: the per-process counts, rate and
+// interval first, then the iteration counts.
 func (r CaseReport) TSV(w io.Writer) {
 	for _, t := range r.Tests {
 		f := func(p *float64) string {
@@ -215,9 +244,10 @@ func (r CaseReport) TSV(w io.Writer) {
 			}
 			return fmt.Sprintf("%.6f", *p)
 		}
-		say(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
-			r.Case, t.Package, t.Name, t.Arch, t.Pass, t.Fail, t.Skip, t.NoVerdict, f(t.FailRate), f(t.CILow), f(t.CIHigh))
+		say(w, "%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%d\t%d\n",
+			r.Case, t.Package, t.Name, t.Arch, t.Processes, t.FailedProcesses, f(t.ProcFailRate), f(t.ProcCILow), f(t.ProcCIHigh),
+			t.Pass, t.Fail, t.Skip, t.NoVerdict)
 	}
 }
 
-const tsvHeader = "case\tpackage\ttest\tarch\tpass\tfail\tskip\tno_verdict\tfail_rate\tci95_low\tci95_high\n"
+const tsvHeader = "case\tpackage\ttest\tarch\tprocesses\tfailed_processes\tprocess_fail_rate\tprocess_ci95_low\tprocess_ci95_high\tpass\tfail\tskip\tno_verdict\n"
