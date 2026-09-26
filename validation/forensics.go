@@ -78,6 +78,12 @@ func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, liste
 		}{
 			{"/debug/pprof/heap", "heap.pprof"},
 			{"/debug/pprof/goroutine", "goroutine.pprof"},
+			// The same goroutines as text with every frame, wait reason and
+			// wait duration ("[sync.Mutex.Lock, 3 minutes]"). celeris#588:
+			// the stall classes this dossier exists for are named by WHO
+			// holds what and who waits for it, which the text answers with
+			// grep and the proto needs go tool pprof -traces for.
+			{"/debug/pprof/goroutine?debug=2", "goroutine-stacks.txt"},
 			{"/debug/pprof/block", "block.pprof"},
 			{"/debug/pprof/mutex", "mutex.pprof"},
 			{"/debug/pprof/threadcreate", "threadcreate.pprof"},

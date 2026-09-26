@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -235,6 +236,10 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		// re-exported by the playbook. Setting them in the workflow alone
 		// would be inert (probatorium#359).
 		args = append(args, matrixCapExtraVars(os.Getenv)...)
+		// PROBATORIUM_REFAPP_FAULT: the celeris#588 capture control's fault
+		// (validation/refapp/internal/debugvars/faults.go), carried across
+		// the same three hops. Unset in every routine tier.
+		args = append(args, refappFaultExtraVars(os.Getenv)...)
 		// VALIDATE_DBSERVICES=1 starts the postgres/redis/memcached
 		// containers (assumed pre-pulled by deploy.yml's dbservices
 		// role) so the driver_* refapps in matrix-mode validate can
@@ -321,6 +326,23 @@ func matrixCapExtraVars(getenv func(string) string) []string {
 		args = append(args, "--extra-vars", strings.ToLower(name)+"="+v)
 	}
 	return args
+}
+
+// refappFaultExtraVars carries PROBATORIUM_REFAPP_FAULT to the remote
+// validator (and so to every refapp it launches), as a JSON extra-var: the
+// value holds ':' '@' ',' and '/' and must reach the playbook as one string.
+// Unset or blank adds nothing, so validate.yml's default(”) leaves the
+// refapp un-faulted.
+func refappFaultExtraVars(getenv func(string) string) []string {
+	v := strings.TrimSpace(getenv("PROBATORIUM_REFAPP_FAULT"))
+	if v == "" {
+		return nil
+	}
+	b, err := json.Marshal(map[string]string{"probatorium_refapp_fault": v})
+	if err != nil {
+		panic(fmt.Sprintf("marshal probatorium_refapp_fault: %v", err))
+	}
+	return []string{"--extra-vars", string(b)}
 }
 
 // runValidateTargets drives run for every target in sequence and reports

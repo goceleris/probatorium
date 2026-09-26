@@ -244,6 +244,12 @@
             # at a 45-minute budget is 12 hours of its 24-hour window.
             PROBATORIUM_MATRIX_MAX_CONSECUTIVE_FAILURES: "{{ probatorium_matrix_max_consecutive_failures | default('') }}"
             PROBATORIUM_MATRIX_MAX_FAILED_CELLS: "{{ probatorium_matrix_max_failed_cells | default('') }}"
+            # The celeris#588 capture control's injected fault
+            # (debugvars/faults.go): every refapp the validator launches
+            # inherits it and the ones that implement it hold a lock on the
+            # named path at a known instant. Empty in every routine tier;
+            # set only by a matrix-nightly-tier dispatch with refapp_fault.
+            PROBATORIUM_REFAPP_FAULT: "{{ probatorium_refapp_fault | default('') }}"
             # Driver-refapp backend addresses. The driver_postgres /
             # driver_redis / driver_memcached refapps look up these env
             # vars (or their -postgres-dsn / -redis-addr / -mc-addr

@@ -72,9 +72,14 @@ func TestCaptureForensicsLive_NonLinuxStillWritesStatus(t *testing.T) {
 }
 
 func TestCaptureForensicsLive_PprofCurl(t *testing.T) {
-	// Fake pprof server returns a small body for every /debug/pprof/* request.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// Fake pprof server returns a small body for every /debug/pprof/*
+	// request, and the full-text goroutine dump for ?debug=2 only.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
+		if r.URL.Path == "/debug/pprof/goroutine" && r.URL.Query().Get("debug") == "2" {
+			_, _ = w.Write([]byte("goroutine 1 [running]:"))
+			return
+		}
 		_, _ = w.Write([]byte("pprof-bytes"))
 	}))
 	defer srv.Close()
@@ -101,6 +106,10 @@ func TestCaptureForensicsLive_PprofCurl(t *testing.T) {
 		if string(body) != "pprof-bytes" {
 			t.Errorf("%s body: got %q, want pprof-bytes", want, body)
 		}
+	}
+	// celeris#588: the text stacks, fetched with debug=2.
+	if body, err := os.ReadFile(filepath.Join(dir, "goroutine-stacks.txt")); err != nil || string(body) != "goroutine 1 [running]:" {
+		t.Errorf("goroutine-stacks.txt: %q %v, want the debug=2 text dump", body, err)
 	}
 }
 
