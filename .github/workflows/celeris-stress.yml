@@ -1,0 +1,255 @@
+name: Celeris Stress
+
+# Runs celeris tests many times on GitHub-hosted runners, x86 and arm64, so a
+# flake and its rate can be measured in minutes instead of hours on a laptop.
+# A local timing is not the runner's timing: for a CI flake the runner is the
+# truth. celeris is public, so these runners (arm64 included) cost nothing.
+# How to dispatch it, with examples: docs/STRESS.md.
+#
+# GitHub-hosted runners ONLY. This workflow never names a self-hosted or
+# cluster label and never joins the matrix-tier-cluster concurrency group.
+#
+#   plan     validates every input (tools/stresstally plan) and resolves the
+#            celeris ref to ONE commit, so every shard tests the same code
+#            even if the branch moves during the run.
+#   shard    one job per shard per arch: go test -v -count=N -shuffle=<seed>
+#            in the requested memlock shape; the raw log is the artifact.
+#   summary  tallies every log (tools/stresstally summarize): PASS/FAIL/SKIP
+#            per test and arch with an exact 95% interval on the fail rate,
+#            and a shard that did not finish cleanly as its own class.
+#
+# Security: inputs reach steps only through env:, never through ${{ }} in a
+# run: script; every action is pinned by commit sha; the token is read-only.
+#
+# The pull_request trigger is the workflow's self-test. A pull request that
+# changes this file or the tool runs a fixed set of cases (see selfTestCases
+# in tools/stresstally/plan.go) with fixed expected outcomes: a clean run
+# must PASS, and a failing test, a run of only skips, a go test timeout and
+# a -run that matches nothing must each be reported as exactly that. The run
+# is green only when every case comes out as expected.
+
+on:
+  workflow_dispatch:
+    inputs:
+      celeris_ref:
+        description: "celeris branch, tag or full commit sha"
+        type: string
+        default: main
+      packages:
+        description: "Package patterns under the celeris module, space-separated (./engine/iouring, ./adaptive/...)"
+        type: string
+        default: ./engine/iouring
+      run:
+        description: "go test -run regexp (empty runs every test in the packages)"
+        type: string
+        default: ""
+      count:
+        description: "go test -count per shard (1-1000)"
+        type: string
+        default: "10"
+      shards:
+        description: "Shards per arch (1-20); one job each, each with its own -shuffle seed"
+        type: string
+        default: "5"
+      arches:
+        description: "Architectures"
+        type: choice
+        options: [both, x86, arm64]
+        default: both
+      memlock:
+        description: "RLIMIT_MEMLOCK for go test (8m is celeris CI's unit-job shape)"
+        type: choice
+        options: [8m, 128m, unlimited]
+        default: 8m
+      race:
+        description: "go test -race"
+        type: boolean
+        default: false
+      timeout:
+        description: "go test -timeout per shard (1s to 5h30m)"
+        type: string
+        default: 30m
+      extra:
+        description: "Allow-listed only: -short -failfast -cpu=N[,N] -parallel=N -skip=RE -tags=LIST -shuffle=off|N CELERIS_*=V WS484_*=V"
+        type: string
+        default: ""
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/celeris-stress.yml
+      - tools/stresstally/**
+
+permissions:
+  contents: read
+
+# Dispatched runs never cancel each other (a base run and a branch run are
+# meant to run side by side); a pull request's newer push cancels its older
+# self-test.
+concurrency:
+  group: celeris-stress-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      celeris_ref: ${{ steps.plan.outputs.celeris_ref }}
+      celeris_sha: ${{ steps.resolve.outputs.celeris_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Validate the inputs and plan the shards
+        id: plan
+        shell: bash
+        env:
+          STRESS_EVENT: ${{ github.event_name }}
+          STRESS_RUN_ID: ${{ github.run_id }}
+          IN_CELERIS_REF: ${{ inputs.celeris_ref }}
+          IN_PACKAGES: ${{ inputs.packages }}
+          IN_RUN: ${{ inputs.run }}
+          IN_COUNT: ${{ inputs.count }}
+          IN_SHARDS: ${{ inputs.shards }}
+          IN_ARCHES: ${{ inputs.arches }}
+          IN_MEMLOCK: ${{ inputs.memlock }}
+          IN_RACE: ${{ inputs.race }}
+          IN_TIMEOUT: ${{ inputs.timeout }}
+          IN_EXTRA: ${{ inputs.extra }}
+        run: go run ./tools/stresstally plan
+      # The ref was validated above (a branch, tag, full sha or pull ref that
+      # cannot be read as an option). Fetching it here pins the run to one
+      # commit; every shard checks out that sha and records it in its log.
+      - name: Resolve the celeris ref to one commit
+        id: resolve
+        shell: bash
+        env:
+          CELERIS_REF: ${{ steps.plan.outputs.celeris_ref }}
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/celeris-ref"
+          git init -q "$repo"
+          git -C "$repo" fetch -q --depth=1 --no-tags https://github.com/goceleris/celeris.git "$CELERIS_REF"
+          sha=$(git -C "$repo" rev-parse --verify 'FETCH_HEAD^{commit}')
+          if ! [[ $sha =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::celeris ref $CELERIS_REF resolved to '$sha', not a commit"
+            exit 1
+          fi
+          echo "celeris $CELERIS_REF is $sha"
+          echo "celeris_sha=$sha" >>"$GITHUB_OUTPUT"
+
+  shard:
+    name: ${{ matrix.case }} ${{ matrix.arch }} ${{ matrix.shard }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.job_timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out the shard script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: probatorium
+          sparse-checkout: tools/stresstally
+      - name: Check out celeris at the planned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: goceleris/celeris
+          ref: ${{ needs.plan.outputs.celeris_sha }}
+          path: celeris
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: celeris/go.mod
+          cache: false
+      # shard.sh sets memlock with `sudo prlimit` on its own shell, as celeris
+      # ci.yml does, records the machine, the memlock in force and the commit
+      # in the log header, refuses to run in any other shape, and exits 0
+      # whenever go test ran: the summary is the verdict.
+      - name: go test
+        shell: bash
+        env:
+          STRESS_LOG: ${{ runner.temp }}/stress/${{ matrix.case }}__${{ matrix.arch }}__${{ matrix.shard }}.log
+          STRESS_CASE: ${{ matrix.case }}
+          STRESS_ARCH: ${{ matrix.arch }}
+          STRESS_RUNNER: ${{ matrix.runner }}
+          STRESS_SHARD: ${{ matrix.shard }}
+          STRESS_SHUFFLE: ${{ matrix.shuffle }}
+          STRESS_PACKAGES: ${{ matrix.packages }}
+          STRESS_RUN: ${{ matrix.run }}
+          STRESS_COUNT: ${{ matrix.count }}
+          STRESS_MEMLOCK: ${{ matrix.memlock }}
+          STRESS_MEMLOCK_LIMIT: ${{ matrix.memlock_limit }}
+          STRESS_RACE: ${{ matrix.race }}
+          STRESS_TIMEOUT: ${{ matrix.timeout }}
+          STRESS_FLAGS: ${{ matrix.flags }}
+          STRESS_ENV: ${{ matrix.env }}
+          STRESS_CELERIS_REF: ${{ needs.plan.outputs.celeris_ref }}
+          STRESS_CELERIS_SHA: ${{ needs.plan.outputs.celeris_sha }}
+          STRESS_CELERIS_DIR: celeris
+        run: bash probatorium/tools/stresstally/shard.sh
+      - name: Upload the log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-log-${{ matrix.case }}-${{ matrix.arch }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/stress/
+          if-no-files-found: warn
+          retention-days: 30
+
+  summary:
+    name: summary
+    needs: [plan, shard]
+    # Runs when shards failed too (their logs are the evidence), but not when
+    # the plan itself was refused or the run was cancelled.
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Download every shard log
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: stress-log-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/logs
+      # A shard with no log is MISSING, not skipped: the plan says which
+      # shards must be there.
+      - name: Tally and judge every case
+        shell: bash
+        env:
+          STRESS_PLAN: ${{ needs.plan.outputs.plan }}
+          STRESS_CELERIS_SHA: ${{ needs.plan.outputs.celeris_sha }}
+          LOGS: ${{ runner.temp }}/logs
+          OUT: ${{ runner.temp }}/summary
+        run: |
+          set -u
+          rc=0
+          go run ./tools/stresstally summarize -logs "$LOGS" -out "$OUT" || rc=$?
+          if [ -f "$OUT/summary.md" ]; then
+            cat "$OUT/summary.md" >>"$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
+      - name: Upload the summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-summary
+          path: ${{ runner.temp }}/summary/
+          if-no-files-found: warn
+          retention-days: 30
