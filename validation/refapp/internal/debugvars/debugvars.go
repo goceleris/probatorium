@@ -131,6 +131,10 @@ type Vars struct {
 
 	srv atomic.Pointer[celeris.Server]
 
+	// debugAddr is the side listener's bound address (sidelistener.go),
+	// nil when DebugAddrEnv is unset.
+	debugAddr atomic.Pointer[string]
+
 	// mw carries the middleware-oracle counters and the refapp's
 	// declaration of which property predicates it can judge. See
 	// middleware.go.
@@ -246,10 +250,12 @@ func (h *countingHandler) WithGroup(name string) slog.Handler {
 }
 
 // Mount registers the /debug/vars and /debug/pprof pre-routing handlers
-// on srv. Must run before srv.Start.
+// on srv, and starts the debug side listener when DebugAddrEnv is set
+// (sidelistener.go). Must run before srv.Start.
 func (v *Vars) Mount(srv *celeris.Server) {
 	v.srv.Store(srv)
 	srv.Pre(v.Handler(), pprof.New())
+	v.startDebugListenerFromEnv()
 }
 
 // Handler is the /debug/vars pre-routing handler: serves the document

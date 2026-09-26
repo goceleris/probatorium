@@ -41,6 +41,8 @@ func All() []Spec {
 		IWSHang,
 		IH2CHang,
 		IWSHandshake,
+		IH2CStall,
+		IWSStall,
 		IWSEcho,
 		ILiveness,
 		IHang,

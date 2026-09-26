@@ -72,9 +72,14 @@ func TestCaptureForensicsLive_NonLinuxStillWritesStatus(t *testing.T) {
 }
 
 func TestCaptureForensicsLive_PprofCurl(t *testing.T) {
-	// Fake pprof server returns a small body for every /debug/pprof/* request.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// Fake pprof server returns a small body for every /debug/pprof/*
+	// request, and the full-text goroutine dump for ?debug=2 only.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
+		if r.URL.Path == "/debug/pprof/goroutine" && r.URL.Query().Get("debug") == "2" {
+			_, _ = w.Write([]byte("goroutine 1 [running]:"))
+			return
+		}
 		_, _ = w.Write([]byte("pprof-bytes"))
 	}))
 	defer srv.Close()
@@ -101,6 +106,10 @@ func TestCaptureForensicsLive_PprofCurl(t *testing.T) {
 		if string(body) != "pprof-bytes" {
 			t.Errorf("%s body: got %q, want pprof-bytes", want, body)
 		}
+	}
+	// celeris#588: the text stacks, fetched with debug=2.
+	if body, err := os.ReadFile(filepath.Join(dir, "goroutine-stacks.txt")); err != nil || string(body) != "goroutine 1 [running]:" {
+		t.Errorf("goroutine-stacks.txt: %q %v, want the debug=2 text dump", body, err)
 	}
 }
 
@@ -151,5 +160,46 @@ func TestHasBinary(t *testing.T) {
 	}
 	if hasBinary("definitely-not-a-binary-anywhere-on-PATH") {
 		t.Error("hasBinary returned true for non-existent")
+	}
+}
+
+// TestCaptureForensicsLive_SocketSnapshot (celeris#588): every dossier
+// carries the socket view -- listener queues and every TCP socket with its
+// owner -- captured with ss. A fake ss on PATH stands in for iproute2.
+func TestCaptureForensicsLive_SocketSnapshot(t *testing.T) {
+	bin := t.TempDir()
+	script := "#!/bin/sh\necho \"fake-ss $*\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "ss"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dir := t.TempDir()
+	if err := captureForensicsLive(context.Background(), dir, 0, ""); err != nil {
+		t.Fatalf("captureForensicsLive: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "ss.txt"))
+	if err != nil {
+		t.Fatalf("ss.txt: %v", err)
+	}
+	for _, want := range []string{"### ss -ltn", "fake-ss -ltn", "### ss -tanpi", "fake-ss -tanpi"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("ss.txt lacks %q:\n%s", want, body)
+		}
+	}
+	status, _ := os.ReadFile(filepath.Join(dir, "forensics_status.txt"))
+	if !strings.Contains(string(status), "ss=true") {
+		t.Errorf("forensics_status.txt does not record ss: %s", status)
+	}
+}
+
+// Without ss the dossier says so instead of silently lacking the view.
+func TestCaptureForensicsLive_NoSocketToolLeavesAMarker(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	dir := t.TempDir()
+	if err := captureForensicsLive(context.Background(), dir, 0, ""); err != nil {
+		t.Fatalf("captureForensicsLive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ss.txt.missing")); err != nil {
+		t.Fatalf("no ss.txt.missing marker: %v", err)
 	}
 }

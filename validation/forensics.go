@@ -38,10 +38,35 @@ type forensicsOpts struct {
 	// record-only incident in a cell that keeps running must not do
 	// (Incident.SkipCore). A core.skipped marker says so.
 	SkipCore bool
+	// PprofAddr, when set, is the refapp's debug side listener
+	// (debugvars.DebugAddrEnv, announced on its "debug addr=" banner): the
+	// pprof leg fetches from it instead of listenAddr. celeris#588: on the
+	// event-loop engines a stall that parks the loops also parks the
+	// engine-routed /debug/pprof, so the dump that names the stall could
+	// only be taken after it -- or not at all -- through listenAddr.
+	PprofAddr string
 }
 
 // captureForensicsLiveOpts is captureForensicsLive with options.
 func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, listenAddr string, opts forensicsOpts) error {
+	// Socket state FIRST (celeris#588): the one view that says whether a
+	// walker's connection was never accepted -- ESTAB with no owning
+	// process, i.e. still in a listener's accept queue -- or accepted and
+	// never read (owned by the refapp, Recv-Q > 0), joined on the slow-fire
+	// record's local_addr; plus every listener's queue depth. It is also the
+	// most perishable artefact: the walker closes its end at its own
+	// deadline. The first natural ws_handshake_fail the fault-control
+	// container leg caught (adaptive, 1 of 2983 handshakes, nothing stuck in
+	// the goroutine dump, no engine error) is exactly the event this is the
+	// only discriminator for. Needs ss (iproute2); a marker says when absent.
+	if hasBinary("ss") {
+		if err := snapshotSockets(ctx, filepath.Join(outDir, "ss.txt")); err != nil {
+			_ = writePlainText(filepath.Join(outDir, "ss.txt.missing"),
+				fmt.Sprintf("ss failed: %v\n", err))
+		}
+	} else {
+		_ = writePlainText(filepath.Join(outDir, "ss.txt.missing"), "ss not available on this host\n")
+	}
 	// /proc snapshots — read once, write atomically. These reads
 	// are cheap (kilobyte-scale) so happen in series rather than
 	// fan-out — sequential reads keep the file order recoverable
@@ -70,21 +95,32 @@ func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, liste
 
 	// pprof profiles — only fire if the refapp exposes
 	// /debug/pprof (celeris validation build does; competitor
-	// adapters don't). Listen-addr empty disables the pprof leg.
-	if listenAddr != "" {
+	// adapters don't). Both addresses empty disable the pprof leg.
+	pprofAddr, pprofSource := listenAddr, "engine"
+	if opts.PprofAddr != "" {
+		pprofAddr, pprofSource = opts.PprofAddr, "side-listener"
+	}
+	if pprofAddr != "" {
 		pprofProfiles := []struct {
 			path string
 			out  string
 		}{
-			{"/debug/pprof/heap", "heap.pprof"},
+			// The goroutines as text with every frame, wait reason and
+			// wait duration ("[sync.Mutex.Lock, 3 minutes]"), FIRST:
+			// celeris#588's stall classes are named by WHO holds what and
+			// who waits for it, which the text answers with grep, and it
+			// is the one profile that must be taken while the stall is
+			// still in force -- not after five others.
+			{"/debug/pprof/goroutine?debug=2", "goroutine-stacks.txt"},
 			{"/debug/pprof/goroutine", "goroutine.pprof"},
+			{"/debug/pprof/heap", "heap.pprof"},
 			{"/debug/pprof/block", "block.pprof"},
 			{"/debug/pprof/mutex", "mutex.pprof"},
 			{"/debug/pprof/threadcreate", "threadcreate.pprof"},
 		}
 		hc := &http.Client{Timeout: 5 * time.Second}
 		for _, p := range pprofProfiles {
-			if err := curlPprof(ctx, hc, "http://"+listenAddr+p.path,
+			if err := curlPprof(ctx, hc, "http://"+pprofAddr+p.path,
 				filepath.Join(outDir, p.out)); err != nil {
 				_ = writePlainText(filepath.Join(outDir, p.out+".missing"),
 					fmt.Sprintf("pprof fetch failed: %v\n", err))
@@ -126,8 +162,26 @@ func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, liste
 	// readers know whether a missing file is "we tried and failed"
 	// vs "we never tried."
 	return writePlainText(filepath.Join(outDir, "forensics_status.txt"),
-		fmt.Sprintf("pid=%d listen=%q gcore=%v dmesg=%v\n",
-			pid, listenAddr, hasBinary("gcore"), hasBinary("dmesg")))
+		fmt.Sprintf("pid=%d listen=%q pprof=%q pprof_source=%s gcore=%v dmesg=%v ss=%v\n",
+			pid, listenAddr, pprofAddr, pprofSource, hasBinary("gcore"), hasBinary("dmesg"), hasBinary("ss")))
+}
+
+// snapshotSockets writes the host's TCP sockets (`ss -tanpi`: every state,
+// numeric, owning process, TCP internals) and its listeners' queues
+// (`ss -ltn`: Recv-Q = connections waiting to be accepted) to dst, each
+// under a header naming the command and the instant. Bounded by ctx.
+func snapshotSockets(ctx context.Context, dst string) error {
+	var buf bytes.Buffer
+	for _, argv := range [][]string{{"-ltn"}, {"-tanpi"}} {
+		fmt.Fprintf(&buf, "### ss %s  (%s)\n", strings.Join(argv, " "), time.Now().UTC().Format(time.RFC3339Nano))
+		out, err := exec.CommandContext(ctx, "ss", argv...).CombinedOutput()
+		buf.Write(out)
+		if err != nil {
+			_ = os.WriteFile(dst, buf.Bytes(), 0o644) // keep what we have
+			return fmt.Errorf("ss %s: %w", strings.Join(argv, " "), err)
+		}
+	}
+	return os.WriteFile(dst, buf.Bytes(), 0o644)
 }
 
 // snapshotFile copies /proc/<pid>/<name> into dst. Errors out if the

@@ -68,6 +68,24 @@ var (
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}
+	// IH2CStall and IWSStall are not violations: they label the RECORD-ONLY
+	// dossier the orchestrator takes when a walker read has waited past its
+	// stall threshold with no byte back (h2c 3 s, WS 1 s), i.e. INSIDE a
+	// stall, where the I-H2C-HANG / I-WS-HANDSHAKE dossier -- taken after
+	// the budget expired -- is too late for any stall shorter than the
+	// budget (celeris#588). Never gated; the gated counters are unchanged.
+	IH2CStall = Spec{
+		ID:          "I-H2C-STALL",
+		Description: "in-stall capture: an h2c preamble read waited 3 s with no byte back (record-only dossier, not a violation)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
+	IWSStall = Spec{
+		ID:          "I-WS-STALL",
+		Description: "in-stall capture: a WebSocket handshake read waited 1 s with no byte back (record-only dossier, not a violation)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
 	// IWSEcho is the wire-level oracle for large detached sends
 	// (celeris#587): 64 KiB WebSocket frames streamed through the refapp's
 	// /ws echo must come back byte-intact, in order, and all of them. Fires
