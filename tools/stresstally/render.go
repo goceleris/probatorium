@@ -123,7 +123,7 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 	if len(r.Warnings) > 0 {
 		w.WriteString("\n")
 	}
-	say(w, "celeris `%s`; packages `%s`; -run `%s`; %d run(s) x %d shard(s) per arch; memlock %s; race %t; timeout %s",
+	say(w, "celeris `%s`; packages `%s`; -run `%s`; %d run(s) x %d shard(s) per arch; memlock %s; race %t; timeout %s per test binary",
 		inline(r.CelerisSHA), inline(strings.Join(c.Packages, " ")), inline(c.Run), c.Count, c.Shards, c.Memlock, c.Race, c.Timeout)
 	if len(c.Flags) > 0 {
 		say(w, "; flags `%s`", inline(strings.Join(c.Flags, " ")))
