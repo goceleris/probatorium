@@ -74,7 +74,7 @@ func TestFetchMetrics_FlatCelerisCounters(t *testing.T) {
 		"celeris.panic_count":         0.0,
 	})
 	httpc := &http.Client{Timeout: time.Second}
-	v := fetchMetrics(context.Background(), httpc, srv.URL)
+	v := fetchMetrics(context.Background(), httpc, srv.URL, 0)
 	if v.Goroutines != 123 || v.AcceptedConn != 4567 || v.ClosedConn != 4500 {
 		t.Errorf("metrics: %+v", v)
 	}
@@ -91,7 +91,7 @@ func TestFetchMetrics_MemstatsHeapInuse(t *testing.T) {
 			"PauseNs":   []any{1.0, 2.0, 3.0, 4.0, 250000.0},
 		},
 	})
-	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL)
+	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL, 0)
 	if v.HeapInuse != 4096 {
 		t.Errorf("HeapInuse: got %d, want 4096", v.HeapInuse)
 	}
@@ -103,7 +103,7 @@ func TestFetchMetrics_MemstatsHeapInuse(t *testing.T) {
 
 func TestFetchMetrics_BadURLReturnsZero(t *testing.T) {
 	httpc := &http.Client{Timeout: 100 * time.Millisecond}
-	v := fetchMetrics(context.Background(), httpc, "http://127.0.0.1:1/")
+	v := fetchMetrics(context.Background(), httpc, "http://127.0.0.1:1/", 0)
 	if v.Goroutines != 0 || v.HeapInuse != 0 {
 		t.Errorf("expected zero on connection error, got %+v", v)
 	}
@@ -114,7 +114,7 @@ func TestFetchMetrics_NonJSONReturnsZero(t *testing.T) {
 		_, _ = w.Write([]byte("not json"))
 	}))
 	defer srv.Close()
-	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL)
+	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL, 0)
 	if v.Goroutines != 0 || v.HeapInuse != 0 {
 		t.Errorf("expected zero on malformed body, got %+v", v)
 	}
@@ -122,9 +122,93 @@ func TestFetchMetrics_NonJSONReturnsZero(t *testing.T) {
 
 func TestFetchMetrics_MissingFieldsDefaultZero(t *testing.T) {
 	srv := fakeExpvar(t, map[string]any{}) // empty doc, every field absent
-	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL)
-	if v != (metricsValues{}) {
-		t.Errorf("empty doc must yield zero values, got %+v", v)
+	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL, 0)
+	if v != absentMetrics() {
+		t.Errorf("empty doc must yield zero runtime values and absent (-1) engine counters, got %+v", v)
+	}
+}
+
+// celeris#585: the bench server publishes engine.EngineMetrics whole under
+// "celeris.engine_metrics"; the observer must lift the egress counters out
+// of it by Go field name.
+func TestFetchMetrics_BenchEngineMetricsBlock(t *testing.T) {
+	srv := fakeExpvar(t, map[string]any{
+		"pid":        123.0,
+		"goroutines": 9.0,
+		"celeris.engine_metrics": map[string]any{
+			"ZCSendsSubmitted": 16.0, "ZCNotifs": 15.0,
+			"InlineBytes": 2158592.0, "RingBytes": 31400960.0, "BytesWritten": 33559552.0,
+			"RequestCount": 7.0,
+		},
+	})
+	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL, 123)
+	want := [len(engineKeys)]int64{16, 15, 2158592, 31400960, 33559552}
+	if v.Engine != want || v.Goroutines != 9 {
+		t.Errorf("engine=%v goroutines=%d, want %v / 9", v.Engine, v.Goroutines, want)
+	}
+}
+
+// The validation refapps publish the same counters as flat debugvars keys.
+func TestFetchMetrics_RefappFlatEngineKeys(t *testing.T) {
+	srv := fakeExpvar(t, map[string]any{
+		"celeris.engine_zc_sends_submitted": 4.0,
+		"celeris.engine_zc_notifs":          4.0,
+		"celeris.engine_inline_bytes":       10.0,
+		"celeris.engine_ring_bytes":         20.0,
+		"celeris.engine_bytes_written":      30.0,
+	})
+	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL, 0)
+	if want := ([len(engineKeys)]int64{4, 4, 10, 20, 30}); v.Engine != want {
+		t.Errorf("engine=%v want %v", v.Engine, want)
+	}
+}
+
+// 0 is a reading, -1 is absence: the OFF arm of a SEND_ZC A/B reads exactly
+// 0 submits and must not be confused with a celeris that has no counter.
+func TestFetchMetrics_ZeroIsAReadingAbsenceIsNot(t *testing.T) {
+	srv := fakeExpvar(t, map[string]any{
+		"celeris.engine_metrics": map[string]any{"ZCSendsSubmitted": 0.0, "InlineBytes": 5.0},
+	})
+	v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL, 0)
+	if want := ([len(engineKeys)]int64{0, -1, 5, -1, -1}); v.Engine != want {
+		t.Errorf("engine=%v want %v", v.Engine, want)
+	}
+}
+
+// A document served by another process is refused whole: a leftover SUT
+// holding the sidecar port, or a respawn after the observer pinned its PID.
+func TestFetchMetrics_ForeignPIDIsAbsent(t *testing.T) {
+	srv := fakeExpvar(t, map[string]any{
+		"pid": 111.0, "goroutines": 5.0,
+		"celeris.engine_metrics": map[string]any{"ZCSendsSubmitted": 3.0},
+	})
+	c := &http.Client{Timeout: time.Second}
+	if v := fetchMetrics(context.Background(), c, srv.URL, 222); v != absentMetrics() {
+		t.Errorf("pid 111 document read for pid 222: %+v", v)
+	}
+	if v := fetchMetrics(context.Background(), c, srv.URL, 111); v.Engine[0] != 3 || v.Goroutines != 5 {
+		t.Errorf("own-pid document refused: %+v", v)
+	}
+	if v := fetchMetrics(context.Background(), c, srv.URL, 0); v.Engine[0] != 3 {
+		t.Errorf("no pid to check (metrics-only mode) must read the document: %+v", v)
+	}
+}
+
+// The pre-#585 bench server answered the scrape with a 404: that is
+// absence, never a reading.
+func TestFetchMetrics_Non200IsAbsent(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	if v := fetchMetrics(context.Background(), &http.Client{Timeout: time.Second}, srv.URL, 0); v != absentMetrics() {
+		t.Errorf("404 must be absent, got %+v", v)
+	}
+}
+
+func TestSample_NoMetricsURLLeavesEngineCountersAbsent(t *testing.T) {
+	obs := sample(context.Background(), &http.Client{Timeout: time.Second}, Config{}, "h", time.Unix(1, 0))
+	if obs.EngineZCSendsSubmitted != -1 || obs.EngineZCNotifs != -1 || obs.EngineInlineBytes != -1 ||
+		obs.EngineRingBytes != -1 || obs.EngineBytesWritten != -1 {
+		t.Errorf("no metrics URL must leave every engine counter at -1, got %+v", obs)
 	}
 }
 
