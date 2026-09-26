@@ -225,6 +225,14 @@ func CheckFaultControlCell(cellDir string, cell ValidationCellResult, wantPaths 
 			holder := strings.Count(string(stacks), FaultHolderFrame+"(")
 			waiters := strings.Count(string(stacks), FaultWaiterFrame+"(")
 			in := !obs.IsZero() && !obs.Before(inj.Start) && !obs.After(end)
+			// The hold's own log line must be in the dossier's stderr tail
+			// for the dossier to tie its dump to the ground truth. Judged
+			// only on the dossiers that could root-cause THIS hold: one
+			// taken before it (on the event-loop engines a hold on another
+			// path parks the loops and stalls this path's walker too, the
+			// #588 control at 3a62131) predates the line by construction.
+			tail, terr := os.ReadFile(filepath.Join(d, "refapp_stderr_tail.txt"))
+			tailOK := terr == nil && strings.Contains(string(tail), "[fault] hold path="+path+" ")
 			switch {
 			case serr != nil:
 				note("%s: dossier %s has no goroutine-stacks.txt (%v)", path, base, serr)
@@ -233,20 +241,20 @@ func CheckFaultControlCell(cellDir string, cell ValidationCellResult, wantPaths 
 					path, base, obs.Sub(inj.Start).Round(time.Millisecond), end.Sub(inj.Start).Round(time.Millisecond), holder, waiters)
 			case holder < 1 || waiters < 1:
 				note("%s: dossier %s observed inside the hold but its dump shows %d holder / %d waiter frame(s)", path, base, holder, waiters)
+			case !tailOK:
+				note("%s: dossier %s names the stall inside the hold, but its refapp_stderr_tail.txt lacks the hold line (err=%v): it cannot be tied to the injected hold",
+					path, base, terr)
 			default:
 				inside = append(inside, base)
 				note("%s: dossier %s observed at +%s after the hold's start: its goroutine dump shows %d request goroutine(s) blocked in %s and the holder asleep in %s -- the stall is a held lock on %s",
 					path, base, obs.Sub(inj.Start).Round(time.Millisecond), waiters, FaultWaiterFrame, FaultHolderFrame, path)
-			}
-			if tail, err := os.ReadFile(filepath.Join(d, "refapp_stderr_tail.txt")); err != nil || !strings.Contains(string(tail), "[fault] hold path="+path+" ") {
-				fail("%s: dossier %s refapp_stderr_tail.txt lacks the hold line (err=%v)", path, base, err)
 			}
 			if _, err := os.Stat(filepath.Join(d, "core.skipped")); err != nil {
 				fail("%s: dossier %s has no core.skipped marker: a record-only incident must not have paused the refapp", path, base)
 			}
 		}
 		if len(inside) == 0 {
-			fail("%s: no %s or %s dossier was observed inside the hold with a goroutine dump naming holder and waiter: the stall is not root-causable from this artifact",
+			fail("%s: no %s or %s dossier was observed inside the hold with a goroutine dump naming holder and waiter and the hold line in its stderr tail: the stall is not root-causable from this artifact",
 				path, fc.predicate, fc.stallPredicate)
 		}
 	}

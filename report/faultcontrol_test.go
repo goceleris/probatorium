@@ -134,6 +134,9 @@ func TestFaultControlCatchesEachCaptureDefect(t *testing.T) {
 			c.write(t, "goroutine-stacks.txt", "goroutine 7 [sleep]:\ngithub.com/x/debugvars.(*FaultHold).run(...)\n")
 		}, notRootCausable, "1 holder / 0 waiter"},
 		{"no text dump", func(t *testing.T, c *fcCell) { _ = os.Remove(filepath.Join(c.dossier(), "goroutine-stacks.txt")) }, notRootCausable, "no goroutine-stacks.txt"},
+		{"the in-hold dossier's tail lacks the hold line", func(t *testing.T, c *fcCell) {
+			c.write(t, "refapp_stderr_tail.txt", "2026/09/26 12:00:00 INFO io_uring engine listening\n")
+		}, notRootCausable, "lacks the hold line"},
 		{"gcore paused the refapp", func(t *testing.T, c *fcCell) { _ = os.Remove(filepath.Join(c.dossier(), "core.skipped")) }, "core.skipped", ""},
 		{"no dossier", func(t *testing.T, c *fcCell) { _ = os.RemoveAll(filepath.Join(c.dir, "incidents")) }, "no incidents/*-I-WS-HANDSHAKE dossier", ""},
 		{"fault never fired", func(t *testing.T, c *fcCell) {
@@ -218,5 +221,36 @@ func TestParseFaultLogPairsHoldAndRelease(t *testing.T) {
 	if len(inj) != 2 || inj[0].Path != "/ws" || inj[0].Waiters != 3 || !inj[0].End.Equal(fcT0.Add(8*time.Second)) ||
 		inj[1].Path != "/" || inj[1].Hold != 40*time.Second || inj[1].Waiters != -1 || !inj[1].End.IsZero() {
 		t.Fatalf("parsed %+v", inj)
+	}
+}
+
+// A dossier of the injected path's kind taken BEFORE its hold -- on the
+// event-loop engines a hold on another path parks the loops and stalls this
+// path's walker too -- predates the hold's log line by construction. It is
+// reported, and it must not fail a cell whose in-hold dossier is complete
+// (the false negative the #588 control hit at probatorium 3a62131).
+func TestFaultControlDossierBeforeTheHoldIsNotHeldToItsLine(t *testing.T) {
+	c := newFCCell(t)
+	d := filepath.Join(c.dir, "incidents", "20260926-115938-I-WS-STALL")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inc, _ := json.Marshal(map[string]any{"observed_at": fcTS(-22 * time.Second)})
+	for name, body := range map[string]string{
+		"incident.json":          string(inc),
+		"goroutine-stacks.txt":   "goroutine 7 [sleep]:\ngithub.com/x/debugvars.(*FaultHold).run(...)\ngoroutine 9 [sync.Mutex.Lock]:\ngithub.com/x/debugvars.(*FaultHold).wait(...)\n",
+		"refapp_stderr_tail.txt": "[fault] hold path=/ hold=40s start=" + fcTS(-24*time.Second) + "\n",
+		"core.skipped":           "x\n",
+	} {
+		if err := os.WriteFile(filepath.Join(d, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := CheckFaultControlCell(c.dir, c.cell, []string{"/ws"})
+	if !r.Pass() {
+		t.Fatalf("a dossier from before the hold failed the cell: %v", r.Failures)
+	}
+	if all := strings.Join(r.Findings, "\n"); !strings.Contains(all, "20260926-115938-I-WS-STALL observed at -22s, outside the hold") {
+		t.Errorf("findings should report the earlier dossier as outside the hold: %s", all)
 	}
 }
