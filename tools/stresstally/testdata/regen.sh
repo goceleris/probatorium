@@ -15,10 +15,10 @@ run() { # name expected-exit env... -- go test args...
 	local envs=()
 	while [ "$1" != "--" ]; do envs+=("$1"); shift; done
 	shift
-	env "${envs[@]}" go test "$@" >"$here/$name.out.tmp" 2>&1
+	env "${envs[@]}" go test "$@" >"$here/$name.txt.tmp" 2>&1
 	local rc=$?
-	sed -e "s#$here/samplemod#/src#g" -e "s#$goroot#/goroot#g" "$here/$name.out.tmp" >"$here/$name.out"
-	rm -f "$here/$name.out.tmp"
+	sed -e "s#$here/samplemod#/src#g" -e "s#$goroot#/goroot#g" "$here/$name.txt.tmp" >"$here/$name.txt"
+	rm -f "$here/$name.txt.tmp"
 	echo "$name: go test exit $rc (want $want)"
 	[ "$rc" = "$want" ] || { echo "regen: $name exited $rc, want $want" >&2; exit 1; }
 }

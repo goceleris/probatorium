@@ -1,0 +1,6 @@
+testing: warning: no tests to run
+PASS
+ok  	example.com/stresstally/samples/a	0.052s [no tests to run]
+testing: warning: no tests to run
+PASS
+ok  	example.com/stresstally/samples/b	0.051s [no tests to run]
