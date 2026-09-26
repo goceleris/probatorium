@@ -205,7 +205,10 @@ type Snapshot struct {
 	// SoftFDLimit, GCPauseP99Ns and NumGoroutineDiff used to be declared here
 	// as well, and nothing wrote or read these copies; they only made a name
 	// search look as if a predicate could judge them (probatorium#395). A field
-	// belongs here once something feeds it.
+	// belongs here once something feeds it:
+	// TestEveryFieldReadFromASnapshotHasAWriter, in the nested module
+	// validation/properties/fieldguard, fails on one that is read and never
+	// written.
 	RSSBytes int64
 
 	// Race + checkptr signal counters. Populated by the validator-checker
