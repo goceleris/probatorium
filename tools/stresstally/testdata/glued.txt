@@ -1,0 +1,7 @@
+=== RUN   TestPass
+    a_test.go:10: hello from TestPass
+--- PASS: TestPass (0.00s)
+=== RUN   TestNoNewline
+partial line without newline--- PASS: TestNoNewline (0.00s)
+PASS
+ok  	example.com/stresstally/samples/a	0.050s

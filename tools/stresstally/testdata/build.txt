@@ -1,0 +1,10 @@
+# example.com/stresstally/samples/broken [example.com/stresstally/samples/broken.test]
+broken/broken_test.go:6:33: undefined: undefinedOnPurpose
+=== RUN   TestPass
+--- PASS: TestPass (0.00s)
+=== RUN   TestOnlyB
+--- PASS: TestOnlyB (0.00s)
+PASS
+ok  	example.com/stresstally/samples/b	0.048s
+FAIL	example.com/stresstally/samples/broken [build failed]
+FAIL

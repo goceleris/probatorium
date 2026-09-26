@@ -1,0 +1,11 @@
+=== RUN   TestSkip
+    a_test.go:20: skipped on purpose
+--- SKIP: TestSkip (0.00s)
+=== RUN   TestSkip
+    a_test.go:20: skipped on purpose
+--- SKIP: TestSkip (0.00s)
+=== RUN   TestSkip
+    a_test.go:20: skipped on purpose
+--- SKIP: TestSkip (0.00s)
+PASS
+ok  	example.com/stresstally/samples/a	0.052s

@@ -1,0 +1,117 @@
+-test.shuffle 42
+=== RUN   TestSkip
+    a_test.go:20: skipped on purpose
+--- SKIP: TestSkip (0.00s)
+=== RUN   TestParallel
+=== RUN   TestParallel/p0
+=== PAUSE TestParallel/p0
+=== RUN   TestParallel/p1
+=== PAUSE TestParallel/p1
+=== RUN   TestParallel/p2
+=== PAUSE TestParallel/p2
+=== CONT  TestParallel/p0
+=== CONT  TestParallel/p1
+=== CONT  TestParallel/p2
+    a_test.go:43: parallel log
+=== NAME  TestParallel/p0
+    a_test.go:43: parallel log
+=== NAME  TestParallel/p1
+    a_test.go:43: parallel log
+--- PASS: TestParallel (0.00s)
+    --- PASS: TestParallel/p2 (0.01s)
+    --- PASS: TestParallel/p0 (0.01s)
+    --- PASS: TestParallel/p1 (0.01s)
+=== RUN   TestPanic
+--- PASS: TestPanic (0.00s)
+=== RUN   TestSlow
+--- PASS: TestSlow (0.00s)
+=== RUN   TestGoroutinePanic
+--- PASS: TestGoroutinePanic (0.00s)
+=== RUN   TestSub
+=== RUN   TestSub/one
+=== RUN   TestSub/two_words
+=== RUN   TestSub/two_words/deep
+=== RUN   TestSub/skipper
+    a_test.go:17: nope
+--- PASS: TestSub (0.00s)
+    --- PASS: TestSub/one (0.00s)
+    --- PASS: TestSub/two_words (0.00s)
+        --- PASS: TestSub/two_words/deep (0.00s)
+    --- SKIP: TestSub/skipper (0.00s)
+=== RUN   TestSubFail
+=== RUN   TestSubFail/ok
+=== RUN   TestSubFail/bad
+--- PASS: TestSubFail (0.00s)
+    --- PASS: TestSubFail/ok (0.00s)
+    --- PASS: TestSubFail/bad (0.00s)
+=== RUN   TestPass
+    a_test.go:10: hello from TestPass
+--- PASS: TestPass (0.00s)
+=== RUN   TestFail
+--- PASS: TestFail (0.00s)
+=== RUN   TestSkip
+    a_test.go:20: skipped on purpose
+--- SKIP: TestSkip (0.00s)
+=== RUN   TestParallel
+=== RUN   TestParallel/p0
+=== PAUSE TestParallel/p0
+=== RUN   TestParallel/p1
+=== PAUSE TestParallel/p1
+=== RUN   TestParallel/p2
+=== PAUSE TestParallel/p2
+=== CONT  TestParallel/p0
+=== CONT  TestParallel/p1
+=== CONT  TestParallel/p2
+    a_test.go:43: parallel log
+=== NAME  TestParallel/p1
+    a_test.go:43: parallel log
+=== NAME  TestParallel/p0
+    a_test.go:43: parallel log
+--- PASS: TestParallel (0.00s)
+    --- PASS: TestParallel/p2 (0.01s)
+    --- PASS: TestParallel/p1 (0.01s)
+    --- PASS: TestParallel/p0 (0.01s)
+=== RUN   TestPanic
+--- PASS: TestPanic (0.00s)
+=== RUN   TestSlow
+--- PASS: TestSlow (0.00s)
+=== RUN   TestGoroutinePanic
+--- PASS: TestGoroutinePanic (0.00s)
+=== RUN   TestSub
+=== RUN   TestSub/one
+=== RUN   TestSub/two_words
+=== RUN   TestSub/two_words/deep
+=== RUN   TestSub/skipper
+    a_test.go:17: nope
+--- PASS: TestSub (0.00s)
+    --- PASS: TestSub/one (0.00s)
+    --- PASS: TestSub/two_words (0.00s)
+        --- PASS: TestSub/two_words/deep (0.00s)
+    --- SKIP: TestSub/skipper (0.00s)
+=== RUN   TestSubFail
+=== RUN   TestSubFail/ok
+=== RUN   TestSubFail/bad
+--- PASS: TestSubFail (0.00s)
+    --- PASS: TestSubFail/ok (0.00s)
+    --- PASS: TestSubFail/bad (0.00s)
+=== RUN   TestPass
+    a_test.go:10: hello from TestPass
+--- PASS: TestPass (0.00s)
+=== RUN   TestFail
+--- PASS: TestFail (0.00s)
+=== RUN   Example
+--- PASS: Example (0.00s)
+PASS
+ok  	example.com/stresstally/samples/a	0.186s
+-test.shuffle 42
+=== RUN   TestOnlyB
+--- PASS: TestOnlyB (0.00s)
+=== RUN   TestPass
+--- PASS: TestPass (0.00s)
+=== RUN   TestOnlyB
+--- PASS: TestOnlyB (0.00s)
+=== RUN   TestPass
+--- PASS: TestPass (0.00s)
+PASS
+ok  	example.com/stresstally/samples/b	0.160s
+?   	example.com/stresstally/samples/c	[no test files]

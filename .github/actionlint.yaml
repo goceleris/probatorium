@@ -7,3 +7,13 @@ self-hosted-runner:
   labels:
     - celeris-cluster
     - msr1
+
+paths:
+  # `cache-mode` is a GitHub Actions workflow and job key (docs: "Dependency
+  # caching reference", cache-mode) that actionlint 1.7.12 does not know
+  # yet. The stress workflow needs it: it runs the code under test and must
+  # give that code's token no cache access. Only this one message, and only
+  # in this one file, is ignored; any other unknown key still fails.
+  .github/workflows/celeris-stress.yml:
+    ignore:
+      - 'unexpected key "cache-mode" for "(workflow|job)" section'
