@@ -277,7 +277,7 @@ func writeReports(dir string, plan Plan, sha string, reports []CaseReport) error
 		md.WriteString("This pull request run is the workflow's self-test: each case has a fixed configuration and a fixed expected outcome, " +
 			"including the cases that must FAIL. The run is green only when every case comes out exactly as expected.\n\n")
 	}
-	say(&md, "celeris ref `%s`, commit `%s`.\n\n", cell(plan.CelerisRef), cell(sha))
+	say(&md, "celeris ref `%s`, commit `%s`.\n\n", inline(plan.CelerisRef), inline(sha))
 	for _, r := range reports {
 		r.Markdown(&md)
 	}

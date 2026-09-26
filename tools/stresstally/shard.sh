@@ -30,15 +30,24 @@ mkdir -p "$(dirname "$STRESS_LOG")"
 : >"$STRESS_LOG"
 hdr() { printf 'stress-header: %s=%s\n' "$1" "$2" >>"$STRESS_LOG"; }
 
+# What the runner gave us before any change, recorded for the record: the
+# arm64 image's default is not documented.
+memlock_default=$(awk '/^Max locked memory/ {print $4 ":" $5}' /proc/self/limits)
+
 # RLIMIT_MEMLOCK for this shell; go test and the test binary inherit it. This
 # is how celeris's own ci.yml sets it (sudo prlimit on the step's shell). The
 # 8m shape is set explicitly rather than trusted to be the runner default,
 # because the default is not documented for the arm64 image.
-if command -v sudo >/dev/null 2>&1; then
-	sudo prlimit --pid "$$" --memlock="${STRESS_MEMLOCK_LIMIT}:${STRESS_MEMLOCK_LIMIT}"
-else
-	prlimit --pid "$$" --memlock="${STRESS_MEMLOCK_LIMIT}:${STRESS_MEMLOCK_LIMIT}"
-fi
+# If prlimit fails, carry on: the shape check below then refuses the shard
+# with the memlock actually in force, in the log, instead of dying silently.
+set_memlock() {
+	if command -v sudo >/dev/null 2>&1; then
+		sudo prlimit --pid "$$" --memlock="${STRESS_MEMLOCK_LIMIT}:${STRESS_MEMLOCK_LIMIT}"
+	else
+		prlimit --pid "$$" --memlock="${STRESS_MEMLOCK_LIMIT}:${STRESS_MEMLOCK_LIMIT}"
+	fi
+}
+set_memlock || echo "::warning::prlimit could not set memlock to ${STRESS_MEMLOCK_LIMIT}"
 # Read back from a CHILD process, which is what the test binary will be.
 in_force=$(awk '/^Max locked memory/ {print $4 ":" $5}' /proc/self/limits)
 
@@ -67,6 +76,7 @@ hdr celeris_sha "$actual_sha"
 hdr expected_sha "$STRESS_CELERIS_SHA"
 hdr memlock "$STRESS_MEMLOCK"
 hdr memlock_limit "$STRESS_MEMLOCK_LIMIT"
+hdr memlock_default "$memlock_default"
 hdr memlock_in_force "$in_force"
 hdr race "$STRESS_RACE"
 hdr count "$STRESS_COUNT"

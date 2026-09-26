@@ -40,7 +40,7 @@ func headerFor(c Case, arch string, shard int, override map[string]string) strin
 		{"case", c.Name}, {"arch", arch}, {"runner", runners[arch]}, {"shard", strconv.Itoa(shard)},
 		{"shuffle", "4200" + strconv.Itoa(shard)}, {"celeris_ref", "main"}, {"celeris_sha", testSHA},
 		{"expected_sha", testSHA}, {"memlock", c.Memlock}, {"memlock_limit", limit},
-		{"memlock_in_force", limit + ":" + limit}, {"race", strconv.FormatBool(c.Race)},
+		{"memlock_default", "8388608:8388608"}, {"memlock_in_force", limit + ":" + limit}, {"race", strconv.FormatBool(c.Race)},
 		{"count", strconv.Itoa(c.Count)}, {"timeout", c.Timeout}, {"run", c.Run},
 		{"packages", strings.Join(c.Packages, " ")}, {"flags", strings.Join(c.Flags, " ")},
 		{"env", strings.Join(c.Env, " ")}, {"machine", machine}, {"kernel", "6.11.0-test"},
