@@ -1,0 +1,294 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit review configuration for goceleris/probatorium (celeris#690).
+#
+# CodeRabbit reads this file from the HEAD branch of the pull request under
+# review, so a change to it takes effect on the PR that makes it. Every key
+# below is checked against the schema named on the first line; keys left out
+# take CodeRabbit's defaults. Reference:
+# https://docs.coderabbit.ai/reference/configuration
+#
+# Two repository facts shape most of the choices here:
+#
+#   * The main ruleset requires every review thread to be resolved before a
+#     merge. Each inline CodeRabbit comment is a thread, so noise costs a
+#     click per comment. The profile stays at the balanced default and the
+#     decorative extras are off.
+#   * The `cluster-ok` label dispatches PR code to the self-hosted bench
+#     cluster. A GitHub App that applies a label triggers workflows, so
+#     CodeRabbit never suggests or applies labels, and only organization
+#     members can drive it from comments.
+
+language: en-US
+tone_instructions: >-
+  Be terse and specific. Cite file:line and the concrete input or state that
+  breaks. No praise and no restating what the diff already says. Say when you
+  are unsure instead of guessing.
+# Inheritance off: this file plus CodeRabbit's defaults is the whole
+# configuration, and organization UI settings cannot silently change it.
+inheritance: false
+early_access: false
+
+reviews:
+  profile: chill
+  # Comment-only reviews. CodeRabbit never submits "Request changes" and never
+  # approves; the code owner's approval stays the only one that counts.
+  request_changes_workflow: false
+
+  # Keep the author's PR description untouched: the summary goes into the
+  # walkthrough comment instead. Writing `@coderabbitai summary` in a
+  # description still asks for it there.
+  high_level_summary: false
+  high_level_summary_in_walkthrough: true
+  review_status: true
+  # Shows the configuration source, the profile and the files the path
+  # filters skipped, which is how to confirm this file was read.
+  review_details: true
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  # Labels are control flow in this repo (`cluster-ok` starts a cluster run).
+  suggested_labels: false
+  auto_apply_labels: false
+  # CODEOWNERS already requests the right reviewer.
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: true
+  abort_on_close: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 5
+    drafts: false
+    # Only PRs into the default branch (main) are reviewed.
+    base_branches: []
+    # Case-insensitive SUBSTRING match against the title. A bare "wip" would
+    # also skip titles containing "wipe", which this repo uses (#388), so
+    # only bracketed markers are listed.
+    ignore_title_keywords:
+      - "[wip]"
+      - "[skip review]"
+    # Dependabot's weekly bumps touch lockfiles (filtered below) and
+    # manifests only. Ask for a review on one with `@coderabbitai review`.
+    ignore_usernames:
+      - "dependabot[bot]"
+
+  # Excluded from review. Lockfiles and go.sum are machine-written; the
+  # engine-keys manifest is generated and checked by
+  # TestEngineKeysManifestMatchesEngineMetrics in the debugvars module; the
+  # testdata trees hold fixtures and demo modules that are broken on purpose
+  # (racedemo, checkptrdemo).
+  path_filters:
+    - "!**/go.sum"
+    - "!**/*.lock"
+    - "!**/package-lock.json"
+    - "!validation/internal/enginekeys/*.txt"
+    - "!**/testdata/**"
+
+  path_instructions:
+    - path: "validation/**"
+      instructions: |
+        This is the validation oracle. Its job is to find defects in the
+        server under test, so a check that cannot fail is worse than no check.
+        Review against these rules:
+        - An error the oracle observes must be counted AND surfaced (a tally,
+          a verdict, an artifact line). Flag any path that counts an error and
+          then discards it, only logs it, or maps it to success: that hides a
+          defect.
+        - A SKIP is never a PASS. A predicate that never reached a verdict
+          belongs in properties_not_judged and one with no data source in
+          properties_not_instrumented; neither may be counted as passed. Flag
+          any change that folds skipped, not_run or never-evaluated cases
+          into a pass.
+        - A zero is health only when the oracle ran. For every counter that
+          is expected to be zero, ask whether it can be non-zero on that path
+          at all. A structural zero (an engine that never calls the code that
+          increments it) proves nothing, and comparing zero with zero is
+          vacuous.
+        - Guards go vacuous. A guard over a list, a key set or a struct must
+          fail when the thing it guards is empty or unfed. Look for early
+          returns on n == 0 and loops over a possibly empty set that pass by
+          default. A new or changed check needs a test that fails on bad input
+          (a negative control), not only one that passes on good input.
+        - Tallies come from the individual assertion or verdict records, not
+          from a summary line or a total computed before the run settled.
+        - Tests wait for the condition they need, never for a wall-clock
+          interval.
+    - path: "report/**"
+      instructions: |
+        The report package defines the published result schema and the
+        release gate.
+        - Every number the report publishes must be reproducible from the
+          run's artifacts by a script. Flag a value computed from state the
+          artifacts do not record, or aggregated in a way that cannot be
+          recomputed from them.
+        - A schema change must bump SchemaVersion and re-pin it in
+          report/schema_test.go, mage_bench_sutenv_test.go and
+          validation/runner_test.go, and keep schema_v5.json in step with the
+          Go structs.
+        - The gate never passes what was not measured: a dead cell
+          (requests_sent == 0), a not_run cell, or a property that was never
+          evaluated must fail or be reported, never pass silently. A SKIP is
+          never a PASS, and a zero is health only when the oracle ran.
+        - Absent must stay distinguishable from zero. Flag omitempty or
+          default values that make a missing counter read as a measured 0.
+    - path: "mage_*.go"
+      instructions: |
+        Magefiles carry //go:build mage: they are the bench driver, the
+        release gate and the cluster orchestration, and `go test ./...`
+        without -tags mage does not compile them. A failing step must fail
+        the target, not log and continue. A SKIP is never a PASS in the gate.
+        Anything installed on a cluster host must be recorded so that
+        `mage Cleanup` can undo exactly it.
+    - path: ".github/workflows/**"
+      instructions: |
+        - A job that runs on the self-hosted bench cluster (runs-on includes
+          self-hosted, celeris-cluster or msr1) belongs to concurrency group
+          `matrix-tier-cluster` with cancel-in-progress: false. A workflow on
+          GitHub-hosted runners must NOT join that group: it would queue
+          behind a cluster run or displace a queued one.
+        - Code from a fork pull request must never reach a self-hosted
+          runner. Cluster jobs gate on
+          github.event.pull_request.head.repo.full_name == github.repository
+          (plus the cluster-ok label for the PR tier). Never use
+          pull_request_target, or workflow_run over PR artifacts, to run PR
+          code with elevated rights.
+        - Pin every action by full commit SHA with the version in a trailing
+          comment. Set persist-credentials: false on checkout. Keep top-level
+          permissions at {} or contents: read and widen per job only, e.g.
+          id-token: write only on the job that needs OIDC.
+        - Never interpolate ${{ }} expressions inside run: scripts; pass them
+          through env:. Keep workflows actionlint- and zizmor-clean, and
+          declare any new self-hosted label in .github/actionlint.yaml.
+        - The workflow_*_test.go files at the repository root pin properties
+          of these workflows; a change here may need one of them updated.
+    - path: ".github/actions/**"
+      instructions: |
+        Composite actions used by the cluster tiers. Same rules as the
+        workflows: actions pinned by SHA, no ${{ }} inside run: scripts,
+        secrets never echoed. Each composite needs its own directory entry in
+        .github/dependabot.yml or its pins never move.
+    - path: "servers/**"
+      instructions: |
+        Competitor adapters for the benchmark. Fairness between the columns
+        is the point of the benchmark.
+        - Each adapter is configured the way its own project recommends for
+          production throughput. Flag a change that tunes one column and not
+          its peers, or gives celeris an advantage the others cannot have.
+        - Dependencies are pinned by committed lockfiles and installed frozen
+          (cargo build --locked, npm ci, bun install --frozen-lockfile,
+          pip --require-hashes against requirements.lock). Flag any install
+          that can resolve versions at deploy time.
+        - Every Go adapter module is listed in the adapters matrix of
+          .github/workflows/test.yml and in .github/dependabot.yml. The Go
+          adapters replace the root module, so a root dependency bump must
+          leave each of them tidy and buildable.
+    - path: "ansible/**"
+      instructions: |
+        Playbooks that drive the bench cluster.
+        - Tasks must be idempotent: re-running a playbook reaches the same
+          state from any starting state. Flag a command or shell task without
+          creates/removes, changed_when or an equivalent guard.
+        - Never leak secrets to logs. A task that handles the runner
+          registration or removal token, RUNNER_PAT or any credential needs
+          no_log: true, and a secret must not appear on a command line that
+          -v output or ps can show.
+        - Toolchains and tarballs are pinned and cached outside the directory
+          the teardown wipes; a per-run fetch of an unpinned artifact is a
+          regression.
+        - Whatever an install adds to a host is recorded so cleanup removes
+          exactly that and nothing else.
+
+  finishing_touches:
+    # Generated docstrings and generated tests are off: a test in this repo
+    # has to be shown to fail on bad input, which a generated one is not.
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: warning
+      requirements: >-
+        A conventional-commit title: type(optional scope): summary, with type
+        one of feat, fix, perf, refactor, test, docs, ci, build, chore, deps,
+        revert, in lower case, and the summary saying what changes and why.
+    description:
+      mode: warning
+    issue_assessment:
+      mode: warning
+    custom_checks:
+      - name: Negative control for changed checks
+        mode: warning
+        instructions: >-
+          PASS if the pull request changes no file under validation/ or
+          report/, no mage_*.go file and no workflow_*_test.go file. Otherwise
+          PASS only if the description states how each added or changed
+          check, gate, guard, predicate or oracle was shown to FAIL on bad
+          input as well as to pass on good input. FAIL if such a file changed
+          and the description does not name that negative control.
+
+  tools:
+    golangci-lint:
+      enabled: true
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    shellcheck:
+      enabled: true
+    yamllint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    markdownlint:
+      enabled: true
+    ast-grep:
+      essential_rules: true
+    github-checks:
+      enabled: true
+
+chat:
+  auto_reply: true
+  # Only goceleris members can steer CodeRabbit from a comment, so nobody
+  # outside the organization can have it push a commit to a branch that
+  # carries the cluster-ok label.
+  allow_non_org_members: false
+  art: false
+
+knowledge_base:
+  opt_out: false
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "CONTRIBUTING.md"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+  learnings:
+    scope: auto
+  issues:
+    scope: auto
+  pull_requests:
+    scope: auto
+  linked_repositories:
+    - repository: goceleris/celeris
+      instructions: >-
+        The server under test. The refapps under validation/refapp, the
+        debugvars helper and servers/celeris pin a celeris commit; the
+        /debug/vars keys the validation reads come from its
+        engine.EngineMetrics.
+    - repository: goceleris/loadgen
+      instructions: >-
+        The load generator the benchmark and validation drive; the root
+        module requires it.

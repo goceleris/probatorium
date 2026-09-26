@@ -1,0 +1,68 @@
+# Codecov configuration for goceleris/probatorium (celeris#690).
+#
+# Coverage comes from .github/workflows/coverage.yml: one upload per commit,
+# flag `root`, for the root module with the mage-tagged layer compiled in.
+# Codecov reads this file from the commit being processed, so a change here
+# takes effect on the PR that makes it.
+#
+# Reference: https://docs.codecov.com/docs/codecovyml-reference
+# Validate:  curl --data-binary @codecov.yml https://codecov.io/validate
+#
+# Everything here is NON-BLOCKING to start with. The statuses are
+# informational (they always report success) and neither is a required
+# check. How to make one blocking is in the comment above `status:`.
+
+codecov:
+  # Report even when an unrelated check failed or is still running. The
+  # cluster tiers can hold a PR's check suite open for hours, and coverage
+  # does not depend on them.
+  require_ci_to_pass: false
+  notify:
+    wait_for_ci: false
+    # Exactly one upload per commit (the `root` flag), so notify after it.
+    after_n_builds: 1
+
+coverage:
+  precision: 2
+  round: down
+  # To make a status blocking later: set `informational: false` on it (and
+  # a `target` / `threshold` you mean), then add its check name
+  # (codecov/project or codecov/patch) to the required status checks of the
+  # "Main — CI" ruleset.
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        informational: true
+    patch:
+      default:
+        target: auto
+        informational: true
+
+comment:
+  layout: "condensed_header, diff, flags, condensed_files, condensed_footer"
+  # Edit one comment in place rather than posting a new one per push.
+  behavior: default
+  # Comment only when there is something to act on.
+  require_changes: "coverage_drop OR uncovered_patch"
+  require_base: false
+  require_head: true
+
+# Line annotations in "Files changed" repeat what the comment says, on every
+# uncovered line of the diff.
+github_checks:
+  annotations: false
+
+flag_management:
+  default_rules:
+    carryforward: false
+  individual_flags:
+    # The root module (`go test -tags mage ./...` at the repository root).
+    # A second module added to the coverage workflow gets its own flag here,
+    # with `paths:` set to its directory.
+    - name: root
+
+# Fixtures and deliberately broken demo modules, never production code.
+ignore:
+  - "**/testdata/**"

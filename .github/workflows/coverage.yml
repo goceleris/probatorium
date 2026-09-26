@@ -1,0 +1,83 @@
+name: Coverage
+
+# Measures statement coverage of the root module and uploads it to Codecov
+# (celeris#690). Informational only: the Codecov statuses always pass (see
+# codecov.yml) and this job is not a required check.
+#
+# Scope. The root module with -tags mage, so the magefiles (the bench driver,
+# the release gate, the cluster orchestration) are measured along with
+# everything `go test ./...` sees; the tag only adds files. The adapters
+# under servers/ and the refapps are separate modules and thin wrappers;
+# they are built and tested by test.yml, not measured here.
+#
+# Runners. GitHub-hosted only. This workflow never targets the self-hosted
+# bench cluster and never joins the matrix-tier-cluster concurrency group,
+# so it cannot queue behind a cluster run or displace one;
+# workflow_coverage_test.go holds it to that.
+#
+# Authentication. OIDC, so no Codecov token is stored anywhere. Only the
+# upload job may mint an ID token (id-token: write), and the action skips
+# OIDC for a fork pull request, whose upload Codecov accepts tokenless.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+# One run per ref. A newer push to a pull request cancels the older run; runs
+# on main are never cancelled, since each is the baseline a PR compares with.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  root:
+    name: root module
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # check out the repository
+      id-token: write # mint the OIDC token the Codecov upload authenticates with
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+          cache: true
+      # -count=1: the setup-go cache restores the test-result cache, and a
+      # cached result would report coverage for code that did not run here.
+      - name: go test -cover (root module, mage-tagged)
+        run: go test -count=1 -tags mage -covermode=atomic -coverprofile=coverage.out -timeout=15m ./...
+      # An empty profile would upload as a clean 0% or as nothing at all. Fail
+      # here instead, and print the total the upload should match.
+      - name: Check the profile
+        run: |
+          blocks=$(grep -vc '^mode:' coverage.out || true)
+          if [ "$blocks" -eq 0 ]; then
+            echo "::error::coverage.out holds no coverage blocks"
+            exit 1
+          fi
+          total=$(go tool cover -func=coverage.out | tail -n 1)
+          echo "$blocks coverage blocks; $total"
+          {
+            echo "### Root module coverage"
+            echo
+            echo "\`$total\` over $blocks blocks (flag \`root\`, -tags mage)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: true
+          files: coverage.out
+          disable_search: true
+          flags: root
+          name: root-module
+          # A failed upload fails the run on main, where the baseline every
+          # PR compares against would otherwise go missing unnoticed. On a
+          # pull request it only logs, so a Codecov outage cannot redden one.
+          fail_ci_if_error: ${{ github.event_name == 'push' }}
