@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
-	github.com/lesismal/nbio v1.6.12
+	github.com/lesismal/nbio v1.7.0
 )
 
 require (
