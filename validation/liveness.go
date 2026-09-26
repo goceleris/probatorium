@@ -69,6 +69,13 @@ type livenessTally struct {
 	// predicate, the sample is for the person who reads the dossier.
 	raceSamples []string
 
+	// debugAddr is the refapp's debug side listener, from its pre-ready
+	// "debug addr=" banner (refappDebugBannerPrefix); nil when it announced
+	// none. celeris#588: the dossier's pprof leg reads it, because the
+	// engine-routed /debug/pprof is parked by the very stalls the dossier
+	// exists for on the event-loop engines.
+	debugAddr atomic.Pointer[string]
+
 	mu        sync.Mutex
 	signature string // first crash-signature line scraped from stderr
 	trace     string // bounded stderr tail captured around the crash
@@ -84,6 +91,23 @@ type livenessTally struct {
 	tail    [refappTailMaxLines]string
 	tailLen int
 	tailPos int
+}
+
+// refappDebugBannerPrefix starts the refapp's side-listener banner line
+// (debugvars.DebugBannerPrefix in the refapp module, which this package
+// cannot import; TestRefappDebugBannerMatchesDebugvars keeps them equal).
+const refappDebugBannerPrefix = "debug addr="
+
+// refappDebugAddrEnv is debugvars.DebugAddrEnv: set, the refapp binds its
+// debug side listener there (New sets 127.0.0.1:0 for local launches).
+const refappDebugAddrEnv = "PROBATORIUM_REFAPP_DEBUG_ADDR"
+
+// debugAddrLoad returns the announced side-listener address, "" if none.
+func (l *livenessTally) debugAddrLoad() string {
+	if p := l.debugAddr.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // pushTail appends one post-ready line to the ring.
@@ -426,6 +450,11 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 				ready = true
 				onReady(strings.TrimSpace(strings.TrimPrefix(line, "ready addr=")))
 				continue
+			}
+			if a, ok := strings.CutPrefix(line, refappDebugBannerPrefix); ok {
+				if a = strings.TrimSpace(a); a != "" {
+					l.debugAddr.Store(&a)
+				}
 			}
 			if preReady.Len() < refappOutputCapMax {
 				preReady.WriteString(line)
