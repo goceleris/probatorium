@@ -188,6 +188,41 @@ type Snapshot struct {
 	// EngineAsyncRoutes is static after Listen: the denominator for
 	// EngineAsyncPromotedConns.
 	EngineAsyncRoutes int64
+	// The celeris#657 hand-off counters (celeris#676, #681, #687), the
+	// eighteen fields celeris 9f4d89b added. Same rules as the block above:
+	// judged by no predicate, gated by nothing, and report.EngineCounters
+	// says what each counts, how its readings combine and whether the series
+	// samples it.
+	//
+	// The loss witnesses (celeris#676): recv completions that read bytes for
+	// an identity no longer owning the descriptor, split by what the engine
+	// still held for it, and the hand-offs made with an op in flight.
+	// Transplanted + Unattributed (W1) and HandoffInFlight (W2) are the
+	// quantities celeris#681's fix takes to zero.
+	EngineStaleRecvDataClosed       int64
+	EngineStaleRecvDataTransplanted int64
+	EngineStaleRecvDataUnattributed int64
+	EngineTransplantHandoffInFlight int64
+	// The fd-lifetime rule (celeris#681). HoldRescued, DoubleClaim and
+	// ReapFailed are documented must-stay-zero; the other five are rates.
+	EngineTransplantHeld            int64
+	EngineTransplantReaps           int64
+	EngineTransplantReapMisses      int64
+	EngineTransplantHoldRescued     int64
+	EngineTransplantDoubleClaim     int64
+	EngineTransplantClaimDeferred   int64
+	EngineTransplantReapFailed      int64
+	EngineTransplantReapUnsupported int64
+	// The post-switch sweep (celeris#687). SweepPasses is a rate; the five
+	// Residual fields are GAUGES -- the connections a draining engine still
+	// holds, by the reason the hand-off refused them -- so they fall as well
+	// as rise, and a reading is one instant.
+	EngineTransplantSweepPasses       int64
+	EngineTransplantResidualDetached  int64
+	EngineTransplantResidualH2        int64
+	EngineTransplantResidualPinned    int64
+	EngineTransplantResidualUnstarted int64
+	EngineTransplantResidualBusy      int64
 	// ExpectedPanics is the number of panics the workload DESIGNED so far
 	// (corpus states marked `expect: panic`, counted by the Tier 1 walker
 	// when their 5xx arrives). Zero when no accounting is wired (e.g. the

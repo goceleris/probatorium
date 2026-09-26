@@ -217,7 +217,23 @@ import (
 //     engine_transplant_stranded is documented must-stay-zero, but moving
 //     it into ZeroWitnessMeaning is a gate change this version does not
 //     make. Additive; older readers ignore every field.
-const SchemaVersion = "5.15"
+//   - 5.16 — the celeris#657 hand-off counters (probatorium#410). celeris
+//     9f4d89b (celeris#676, #681, #687) added eighteen EngineMetrics
+//     fields: the stale-recv loss witnesses, the fd-lifetime rule's holds,
+//     reaps and refusals, and the post-switch sweep with its five residual
+//     gauges. Adds all eighteen to Tier1Summary.EngineCounters and TWELVE
+//     per-cell series columns (W1 = engine_stale_recv_data_transplanted +
+//     _unattributed, W2 = engine_transplant_handoff_in_flight, the
+//     must-stay-zero hold_rescued, double_claim and reap_failed, the
+//     sweep's passes and the five engine_transplant_residual_* gauges).
+//     Adds the report.CounterPeakGauge kind: the five residual gauges are
+//     reduced by their HIGHEST reading, because celeris asks for them to be
+//     read at every switch verdict and only a zero peak clears every switch
+//     of the cell. Nothing new is gated: the six counters celeris documents
+//     as must-stay-zero carry their meaning in EngineCounter.MustStayZero,
+//     and moving any of them into ZeroWitnessMeaning is a gate change this
+//     version does not make. Additive; older readers ignore every field.
+const SchemaVersion = "5.16"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -932,7 +948,8 @@ type Tier1Summary struct {
 	// (report.EngineCounters says what each counts, what KIND of reading it
 	// is, and whether the per-cell series samples it). Each value reduces the
 	// samples whose document carried the engine block by that kind: the
-	// highest reading of a running maximum, and the last reading of
+	// highest reading of a running maximum or of a peak gauge (the
+	// celeris#687 residual gauges, schema 5.16), and the last reading of
 	// everything else -- the cell's final total, gauge level or static count
 	// -- never a sum over samples (schema 5.15, probatorium#391).
 	//

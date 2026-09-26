@@ -42,6 +42,14 @@ const seriesFlushEvery = 30
 // TestEveryPublishedEngineKeyHasAColumnOrADeclaration fails on a published key
 // that has neither a column nor a declaration saying it is tally-only.
 //
+// Schema 5.16 applied it to the eighteen celeris#657 counters celeris 9f4d89b
+// added and admitted TWELVE: the three loss witnesses W1 and W2
+// (engine_stale_recv_data_transplanted, _unattributed and
+// engine_transplant_handoff_in_flight), the three celeris#681 counters
+// documented must-stay-zero, the sweep's pass count, and the five residual
+// gauges, whose question is their level at each switch verdict -- a row joined
+// to adaptive_switches. The six rates of the hand-off mechanism are totals.
+//
 // New columns are APPENDED, never inserted: the header names every column and
 // a reader should key off it, but an appended column cannot invalidate a
 // column index somebody already wrote down against a shipped artifact.
@@ -80,6 +88,18 @@ var seriesColumns = []string{
 	"engine_recv_linked_blocked_nanos",
 	"engine_recv_linked_blocked_max_nanos",
 	"engine_detached_conns",
+	"engine_stale_recv_data_transplanted",
+	"engine_stale_recv_data_unattributed",
+	"engine_transplant_handoff_in_flight",
+	"engine_transplant_hold_rescued",
+	"engine_transplant_double_claim",
+	"engine_transplant_reap_failed",
+	"engine_transplant_sweep_passes",
+	"engine_transplant_residual_detached",
+	"engine_transplant_residual_h2",
+	"engine_transplant_residual_pinned",
+	"engine_transplant_residual_unstarted",
+	"engine_transplant_residual_busy",
 }
 
 // seriesWriter appends one row per property-loop sample to a CSV in the cell
@@ -174,6 +194,18 @@ func (s *seriesWriter) Record(snap properties.Snapshot) {
 		snap.EngineRecvLinkedBlockedNanos,
 		snap.EngineRecvLinkedBlockedMaxNanos,
 		snap.EngineDetachedConns,
+		snap.EngineStaleRecvDataTransplanted,
+		snap.EngineStaleRecvDataUnattributed,
+		snap.EngineTransplantHandoffInFlight,
+		snap.EngineTransplantHoldRescued,
+		snap.EngineTransplantDoubleClaim,
+		snap.EngineTransplantReapFailed,
+		snap.EngineTransplantSweepPasses,
+		snap.EngineTransplantResidualDetached,
+		snap.EngineTransplantResidualH2,
+		snap.EngineTransplantResidualPinned,
+		snap.EngineTransplantResidualUnstarted,
+		snap.EngineTransplantResidualBusy,
 	}
 	for i, x := range v {
 		s.row[i] = strconv.FormatInt(x, 10)
