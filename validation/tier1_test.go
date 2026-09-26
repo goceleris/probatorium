@@ -322,8 +322,15 @@ func TestWaitForReady_NoGoroutineLeak(t *testing.T) {
 		if addr != "127.0.0.1:0" {
 			t.Fatalf("waitForReady iter %d: addr=%q, want 127.0.0.1:0", i, addr)
 		}
-		// SIGTERM the refapp to free its pipe goroutines.
+		// SIGTERM the refapp to free its pipe goroutines, and reap it: a
+		// signalled child that is never waited for stays a zombie of this
+		// test binary until it exits (probatorium#415).
 		_ = proc.Signal(0xf)
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), tier1TestBudget)
+		if _, err := proc.Wait(waitCtx); err != nil {
+			t.Errorf("reap iter %d: %v", i, err)
+		}
+		waitCancel()
 	}
 	// Wait for the background reaping rather than budgeting for it.
 	final := settleUnder(base + growthBound)

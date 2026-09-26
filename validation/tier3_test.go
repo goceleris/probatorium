@@ -3,6 +3,7 @@ package validation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -90,6 +91,11 @@ func main() {
 		_ = os.Remove(cachedSlowReplayPath)
 		_ = os.Remove(cachedSlowReplayPath + ".go")
 	}
+	// The zombie guard (probatorium#415): fail the package if any test, or
+	// the code under test, left an exited child of this binary unreaped.
+	if guard := zombieGuard(os.Stderr); code == 0 {
+		code = guard
+	}
 	os.Exit(code)
 }
 
@@ -135,15 +141,21 @@ func compileHelperBin(namePat, src string) (string, error) {
 	return bin, nil
 }
 
-// fakeRefappCmd returns a /bin/sh script as RefappArgs that prints
-// `ready addr=<url>` then serves an HTTP server until killed. The
-// HTTP server isn't strictly necessary for Tier 3 (validator-replay
-// uses celeris-pid not -url) but keeps the refapp alive for the
-// duration of the fork.
+// fakeRefappArgs returns a /bin/sh script as RefappArgs that prints
+// `ready addr=<url>` and then sleeps until killed. Tier 3 never dials the
+// URL (validator-replay targets -celeris-pid, not -url); the sleep keeps
+// the refapp alive for the duration of the fork.
+//
+// The sleep is exec'd so the process the driver signals IS the sleeper.
+// A shell that forks its last command (bash does) dies on SIGTERM and
+// leaves `sleep 30` running as an orphan, and a seed loop whose replay
+// exits at once turns over about a hundred seeds a second: more than a
+// thousand live orphans at once, on top of the refapps themselves
+// (probatorium#415).
 func fakeRefappArgs(srv *httptest.Server) []string {
 	return []string{
 		"-c",
-		`echo "ready addr=` + srv.URL + `"; sleep 30`,
+		`echo "ready addr=` + srv.URL + `"; exec sleep 30`,
 	}
 }
 
@@ -454,6 +466,44 @@ func TestDriveTier3_RefappNeverReadyErrors(t *testing.T) {
 	}
 	if tally.SeedsPassed > 0 || tally.SeedsFailed > 0 {
 		t.Errorf("infra error should not count as passed/failed: %+v", tally)
+	}
+}
+
+// TestReplayOneSeed_ReapsTheRefapp: a seed's teardown must reap its refapp,
+// not only signal it. The loop used to SIGTERM the refapp and move on, so
+// every seed left an exited child in the process table as a zombie of the
+// validator for as long as it ran: ~1,100 of them during
+// `go test ./validation/...`, enough to exhaust a laptop's per-user process
+// limit (probatorium#415). Once replayOneSeed returns, the refapp must not be
+// a child of this process in any state: alive means it was never stopped,
+// zombie means it was stopped and never reaped.
+func TestReplayOneSeed_ReapsTheRefapp(t *testing.T) {
+	if _, err := childProcesses(); errors.Is(err, errZombieCountUnsupported) {
+		t.Skipf("cannot list this process's children here: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	cfg := tier3Config{
+		Driver:          remote.NewLocal("/bin/sh"),
+		RefappArgs:      fakeRefappArgs(srv),
+		ReplayBin:       buildPassingReplay(t),
+		PerSeedDuration: 2 * time.Second,
+		// How fast a loaded box forks a shell is not what this measures.
+		ReadyTimeout: tier1TestReadyTimeout,
+	}
+	res := replayOneSeed(context.Background(), cfg, corpus.Seed{Value: 0x1, Tag: "reap"})
+	if res.RefappPID == 0 {
+		t.Fatalf("refapp never announced ready, so there is nothing to check: %+v", res)
+	}
+	kids, err := childProcesses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state, ok := kids[res.RefappPID]; ok {
+		t.Fatalf("refapp pid %d is still a child of this process (state %s) after replayOneSeed returned: signalled, never reaped", res.RefappPID, state)
 	}
 }
 

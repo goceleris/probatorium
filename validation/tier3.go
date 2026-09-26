@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/goceleris/probatorium/validation/corpus"
@@ -141,8 +142,8 @@ type tier3Result struct {
 //  4. Fork validator-replay with -seed -celeris-pid -celeris-port
 //     -duration. Wait up to PerSeedDuration.
 //  5. Capture exit code + stderr.
-//  6. SIGTERM the refapp; wait for it to exit cleanly (5s grace
-//     handled by Driver implementations).
+//  6. SIGTERM the refapp and reap it: it gets refappStopGrace to
+//     exit cleanly, then SIGKILL (stopAndReapRefapp).
 //  7. Emit one tier3Result on the results channel.
 //
 // Returns when ctx is cancelled. The returned tally snapshot is the
@@ -250,6 +251,30 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 	return tally.snapshot(), nil
 }
 
+// refappStopGrace is how long a seed's teardown waits for its refapp to exit
+// after SIGTERM before it sends SIGKILL, and how long it then waits again.
+const refappStopGrace = 5 * time.Second
+
+// stopAndReapRefapp ends one seed's refapp and reaps it. SIGTERM alone is not
+// enough: an exited child stays in the process table as a zombie until its
+// parent Waits for it, so a loop that only signals leaves one zombie per seed
+// for as long as the validator runs. `go test ./validation/...` built up
+// ~1,100 of them in about 60 s, enough to exhaust a 2,666-process per-user
+// limit (probatorium#415), and the cluster's validator runs this same loop
+// with the local driver.
+//
+// It Waits once, with a bound, and escalates to SIGKILL from a timer. One
+// Wait call is all a Process has to support: a refapp that ignores SIGTERM
+// is killed at refappStopGrace and reaped inside the same Wait.
+func stopAndReapRefapp(proc remote.Process) {
+	_ = proc.Signal(int(syscall.SIGTERM))
+	kill := time.AfterFunc(refappStopGrace, func() { _ = proc.Signal(int(syscall.SIGKILL)) })
+	defer kill.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*refappStopGrace)
+	defer cancel()
+	_, _ = proc.Wait(ctx)
+}
+
 // replayOneSeed runs the per-seed lifecycle. Errors during refapp
 // boot are surfaced as ExitCode = -1 with the cause in Stderr.
 func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3Result {
@@ -268,7 +293,7 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) tier3
 		res.Duration = time.Since(started)
 		return res
 	}
-	defer func() { _ = proc.Signal(0xf) /* SIGTERM */ }()
+	defer stopAndReapRefapp(proc)
 
 	readyAddr, err := waitForReady(seedCtx, proc, cfg.ReadyTimeout)
 	if err != nil {
