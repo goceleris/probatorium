@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// The reference intervals come from scipy (beta.ppf, cross-checked against
-// binomtest(...).proportion_ci(method="exact") to 1e-12); the script that
-// printed them is kept with the lane's evidence as cp_ref.py.
+// Each reference interval is scipy.stats.beta.ppf(0.025, k, n-k+1) and
+// beta.ppf(0.975, k+1, n-k) (0 when k = 0, 1 when k = n), cross-checked
+// against scipy.stats.binomtest(k, n).proportion_ci(method="exact") to 1e-12.
 func TestClopperPearsonMatchesScipy(t *testing.T) {
 	for _, c := range []struct {
 		k, n   int

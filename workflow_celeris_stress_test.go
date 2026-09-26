@@ -107,7 +107,8 @@ func TestStressWorkflowNeverTouchesTheActionsCache(t *testing.T) {
 
 // goceleris is on the Free plan: 20 hosted jobs at once across the whole
 // organization. One run may hold 4 shard jobs, so the base-vs-branch pair
-// the docs describe holds 8 and leaves 12, a whole celeris CI push's 8.
+// the docs describe holds 8 and leaves 12: room for a whole celeris CI push,
+// 11 jobs on a pull request and 12 on main (docs/STRESS.md).
 func TestStressWorkflowCapsItsShareOfTheOrgRunners(t *testing.T) {
 	src := withoutComments(readStressWorkflow(t))
 	strat := regexp.MustCompile(`(?s)\n    strategy:\n((?:      .*\n)+)`).FindAllStringSubmatch(src, -1)
@@ -261,5 +262,23 @@ func TestStressWorkflowKeepsTheCodeUnderTestOffTheDefaultBranch(t *testing.T) {
 	}
 	if !strings.Contains(string(tool), `refuseDefaultBranch(getenv("STRESS_REF"), getenv("STRESS_DEFAULT_BRANCH"))`) {
 		t.Error("stresstally plan no longer refuses a dispatch on the default branch")
+	}
+}
+
+// The plan records the probatorium commit the run came from, so compare can
+// refuse two arms that ran different workflows or tallies; the tool refuses
+// to plan without it.
+func TestStressWorkflowRecordsTheProbatoriumCommit(t *testing.T) {
+	src := readStressWorkflow(t)
+	plan := regexp.MustCompile(`(?s)\n      - name: Validate the inputs and plan the shards\n(.*?)\n        run: go run ./tools/stresstally plan\n`).FindStringSubmatch(src)
+	if plan == nil || !strings.Contains(plan[1], "\n          STRESS_PROBATORIUM_SHA: ${{ github.sha }}\n") {
+		t.Error("the plan step does not pass STRESS_PROBATORIUM_SHA: ${{ github.sha }}")
+	}
+	tool, err := os.ReadFile("tools/stresstally/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(tool), `getenv("STRESS_PROBATORIUM_SHA")`) {
+		t.Error("stresstally plan no longer reads STRESS_PROBATORIUM_SHA")
 	}
 }

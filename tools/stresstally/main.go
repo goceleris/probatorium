@@ -8,10 +8,12 @@
 //	stresstally compare BASE BRANCH
 //	                        set two runs' per-process counts side by side,
 //	                        refusing a pair that differs in more than the
-//	                        celeris commit (local use)
+//	                        celeris commit, the probatorium commit included
+//	                        (local use)
 //
 // plan reads STRESS_EVENT, STRESS_RUN_ID, STRESS_REF, STRESS_DEFAULT_BRANCH
-// (a dispatch on the default branch is refused) and the dispatch inputs from
+// (a dispatch on the default branch is refused), STRESS_PROBATORIUM_SHA (the
+// run's github.sha, recorded in the plan) and the dispatch inputs from
 // IN_CELERIS_REF, IN_PACKAGES, IN_RUN, IN_COUNT, IN_SHARDS, IN_ARCHES,
 // IN_MEMLOCK, IN_RACE, IN_TIMEOUT and IN_EXTRA, and writes the outputs
 // `plan`, `matrix` and `celeris_ref` to $GITHUB_OUTPUT. Inputs arrive through
@@ -41,6 +43,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -106,6 +109,14 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 		say(stdout, "::error::%v\n", err)
 		return 2
 	}
+	// The probatorium commit this run's workflow and tool come from
+	// (github.sha). It goes into the plan, and so into report.json, where
+	// compare checks that both arms of a pair ran the same one.
+	probatorium := getenv("STRESS_PROBATORIUM_SHA")
+	if !commitRe.MatchString(probatorium) {
+		say(stdout, "::error::STRESS_PROBATORIUM_SHA %q is not the full commit sha of this run (github.sha); refusing\n", probatorium)
+		return 2
+	}
 	var (
 		plan Plan
 		err  error
@@ -121,6 +132,7 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 		}
 		return 2
 	}
+	plan.ProbatoriumSHA = probatorium
 
 	var runID int64
 	if s := getenv("STRESS_RUN_ID"); s != "" {
@@ -143,7 +155,8 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 		return 2
 	}
 
-	say(stdout, "event %s; celeris ref %s; %d case(s), %d shard job(s)\n", plan.Event, plan.CelerisRef, len(plan.Cases), len(entries))
+	say(stdout, "event %s; probatorium commit %s; celeris ref %s; %d case(s), %d shard job(s)\n",
+		plan.Event, plan.ProbatoriumSHA, plan.CelerisRef, len(plan.Cases), len(entries))
 	for _, c := range plan.Cases {
 		say(stdout, "  case %s: packages %q run %q count %d shards %d arches %v memlock %s race %t timeout %s per test binary (job limit %d min) flags %q env %q shuffle %q; expect %s\n",
 			c.Name, strings.Join(c.Packages, " "), c.Run, c.Count, c.Shards, c.Arches, c.Memlock, c.Race, c.Timeout, jobMinutes(c),
@@ -172,6 +185,9 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 	}
 	return 0
 }
+
+// commitRe is a full git commit sha, as github.sha is.
+var commitRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // refuseDefaultBranch keeps the code under test out of every run on the
 // default branch. A shard runs whatever celeris commit it was given, and code
@@ -330,7 +346,11 @@ func writeReports(dir string, plan Plan, sha string, reports []CaseReport) error
 		md.WriteString("This pull request run is the workflow's self-test: each case has a fixed configuration and a fixed expected outcome, " +
 			"including the cases that must FAIL. The run is green only when every case comes out exactly as expected.\n\n")
 	}
-	say(&md, "celeris ref `%s`, commit `%s`.\n\n", inline(plan.CelerisRef), inline(sha))
+	say(&md, "celeris ref `%s`, commit `%s`", inline(plan.CelerisRef), inline(sha))
+	if plan.ProbatoriumSHA != "" {
+		say(&md, "; probatorium commit `%s`", inline(plan.ProbatoriumSHA))
+	}
+	md.WriteString(".\n\n")
 	for _, r := range reports {
 		r.Markdown(&md)
 	}

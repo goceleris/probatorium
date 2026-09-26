@@ -14,9 +14,10 @@ import (
 )
 
 // A base-vs-branch comparison is two dispatches that differ in the celeris
-// commit and in nothing else. compare checks that from the two runs' own
-// reports, then sets each test's per-process counts side by side, per arch,
-// with Fisher's exact test on them.
+// commit and in nothing else, down to the probatorium commit the workflow and
+// this tool ran from. compare checks that from the two runs' own reports,
+// then sets each test's per-process counts side by side, per arch, with
+// Fisher's exact test on them.
 
 // runReport is report.json as summarize and tally write it.
 type runReport struct {
@@ -42,12 +43,21 @@ func readReport(path string) (runReport, error) {
 	if len(r.Cases) != 1 {
 		return r, fmt.Errorf("%s holds %d cases; compare takes the report of a dispatch, which has one", path, len(r.Cases))
 	}
+	// Without it, two arms that ran different workflows or tallies would
+	// look alike; fail closed, as for any other part of the configuration.
+	if r.Plan.ProbatoriumSHA == "" {
+		return r, fmt.Errorf("%s records no probatorium commit (plan.probatorium_sha), so compare cannot tell whether both arms ran the same workflow and tool; "+
+			"it takes the stress-summary of a run of this workflow", path)
+	}
 	return r, nil
 }
 
-// configDiffs lists every way the two arms' configurations differ, apart
-// from the celeris commit, which is what a comparison varies.
-func configDiffs(a, b Case) []string {
+// configDiffs lists every way the two arms differ, apart from the celeris
+// commit, which is what a comparison varies: the probatorium commit the run
+// came from (a change to the workflow or the tally between two dispatches is
+// a second cause), then every input.
+func configDiffs(base, branch runReport) []string {
+	a, b := base.Cases[0].Config, branch.Cases[0].Config
 	var d []string
 	diff := func(what string, x, y any) {
 		xs, ys := fmt.Sprint(x), fmt.Sprint(y)
@@ -55,6 +65,7 @@ func configDiffs(a, b Case) []string {
 			d = append(d, fmt.Sprintf("%s: base %s, branch %s", what, xs, ys))
 		}
 	}
+	diff("probatorium commit", base.Plan.ProbatoriumSHA, branch.Plan.ProbatoriumSHA)
 	diff("packages", a.Packages, b.Packages)
 	diff("run", strconv.Quote(a.Run), strconv.Quote(b.Run))
 	diff("count", a.Count, b.Count)
@@ -80,6 +91,7 @@ type CompareRow struct {
 // Comparison is the judged pair.
 type Comparison struct {
 	BaseSHA, BranchSHA string
+	ProbatoriumSHA     string // the same in both arms
 	Config             Case
 	Notes              []string
 	Rows               []CompareRow
@@ -89,11 +101,11 @@ type Comparison struct {
 // one configuration, and otherwise lines the arms up.
 func compareReports(base, branch runReport) (Comparison, error) {
 	a, b := base.Cases[0], branch.Cases[0]
-	if d := configDiffs(a.Config, b.Config); len(d) > 0 {
+	if d := configDiffs(base, branch); len(d) > 0 {
 		return Comparison{}, errors.New("the two runs differ in more than the celeris commit, so a difference between them has more than one cause:\n  " +
 			strings.Join(d, "\n  "))
 	}
-	cmp := Comparison{BaseSHA: a.CelerisSHA, BranchSHA: b.CelerisSHA, Config: a.Config, Notes: []string{}}
+	cmp := Comparison{BaseSHA: a.CelerisSHA, BranchSHA: b.CelerisSHA, ProbatoriumSHA: base.Plan.ProbatoriumSHA, Config: a.Config, Notes: []string{}}
 	note := func(format string, x ...any) { cmp.Notes = append(cmp.Notes, fmt.Sprintf(format, x...)) }
 	if a.CelerisSHA == b.CelerisSHA {
 		note("both arms tested celeris %s: this is an A/A comparison, a control, not base against branch", a.CelerisSHA)
@@ -172,8 +184,8 @@ func compareReports(base, branch runReport) (Comparison, error) {
 func (c Comparison) Text(w io.Writer) {
 	cfg := c.Config
 	say(w, "base celeris %s vs branch celeris %s\n", c.BaseSHA, c.BranchSHA)
-	say(w, "both: packages %q run %q count %d shards %d arches %v memlock %s race %t timeout %s flags %q env %q\n",
-		strings.Join(cfg.Packages, " "), cfg.Run, cfg.Count, cfg.Shards, cfg.Arches, cfg.Memlock, cfg.Race, cfg.Timeout,
+	say(w, "both: probatorium %s packages %q run %q count %d shards %d arches %v memlock %s race %t timeout %s flags %q env %q\n",
+		c.ProbatoriumSHA, strings.Join(cfg.Packages, " "), cfg.Run, cfg.Count, cfg.Shards, cfg.Arches, cfg.Memlock, cfg.Race, cfg.Timeout,
 		strings.Join(cfg.Flags, " "), strings.Join(cfg.Env, " "))
 	for _, n := range c.Notes {
 		say(w, "NOTE: %s\n", n)
@@ -201,8 +213,12 @@ func (c Comparison) Text(w io.Writer) {
 		}
 		say(w, "%-60s %-5s %-12s %-12s %-10s %-22s %s\n", r.Name, r.Arch, bp, cp, p, bi, ci)
 	}
-	say(w, "%d test/arch row(s) compared; %d below p = 0.05 (marked *). With %d comparisons about %.1f come out below 0.05 by chance alone; no correction is applied.\n",
+	say(w, "%d test/arch row(s) compared; %d below p = 0.05 (marked *). With %d comparisons about %.1f come out below 0.05 by chance alone; no correction is applied",
 		tested, below, tested, 0.05*float64(tested))
+	if tested > 1 {
+		say(w, ": for a familywise 0.05, hold each p to 0.05/%d = %.4g (Bonferroni)", tested, 0.05/float64(tested))
+	}
+	say(w, ".\n")
 }
 
 // cmdCompare compares a base run with a branch run.

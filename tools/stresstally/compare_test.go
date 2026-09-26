@@ -1,15 +1,17 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// The reference p-values come from scipy.stats.fisher_exact (two-sided),
-// cross-checked against an exact rational computation; the script is kept
-// with the lane's evidence as fisher_ref.py. Two rows are celeris#662 r6
-// gate2's own figures (2/15 vs 0/15, p = 0.48; 1/38 vs 2/37, p = 0.61).
+// Each reference p-value is scipy.stats.fisher_exact([[a, b], [c, d]],
+// alternative="two-sided"), cross-checked against the same sum computed in
+// exact rational arithmetic. The first three rows are docs/STRESS.md
+// example 1's figures: 5, 4 and 6 of 20 against 0 of 20.
 func TestFisherMatchesScipy(t *testing.T) {
 	for _, c := range []struct {
 		a, b, c, d int
@@ -17,6 +19,7 @@ func TestFisherMatchesScipy(t *testing.T) {
 	}{
 		{5, 15, 0, 20, 0.0471240471240471},
 		{4, 16, 0, 20, 0.106029106029106},
+		{6, 14, 0, 20, 0.0201960201960202},
 		{6, 34, 0, 40, 0.0255466052934407},
 		{5, 35, 0, 40, 0.0547427256288016},
 		{0, 15, 2, 13, 0.482758620689655},
@@ -41,6 +44,7 @@ func armReport(t *testing.T, sha, count, shards string, fails map[string]int, ov
 	t.Helper()
 	p, c := dispatchPlan(t, count, shards)
 	p.CelerisRef = sha
+	p.ProbatoriumSHA = testProbatoriumSHA
 	logs := t.TempDir()
 	for _, arch := range c.Arches {
 		for s := 1; s <= c.Shards; s++ {
@@ -65,6 +69,24 @@ func armReport(t *testing.T, sha, count, shards string, fails map[string]int, ov
 
 const branchSHA = "fedcba9876543210fedcba9876543210fedcba98"
 
+// setProbatorium rewrites an arm's report.json as if its run had come from
+// probatorium commit sha ("" for a report that records none).
+func setProbatorium(t *testing.T, dir, sha string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, "report.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r runReport
+	if err := json.Unmarshal(b, &r); err != nil {
+		t.Fatal(err)
+	}
+	r.Plan.ProbatoriumSHA = sha
+	if err := writeReports(dir, r.Plan, r.CelerisSHA, r.Cases); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The arms line up per test and arch, as failed / ran processes, with
 // Fisher's exact p on those counts; iteration counts ride along.
 func TestCompareSetsProcessesSideBySide(t *testing.T) {
@@ -77,9 +99,11 @@ func TestCompareSetsProcessesSideBySide(t *testing.T) {
 	s := out.String()
 	for _, want := range []string{
 		"base celeris " + testSHA + " vs branch celeris " + branchSHA,
+		"both: probatorium " + testProbatoriumSHA + " packages ",
 		"TestFlaky                                                    x86   5 / 20       0 / 20       0.04712 *  55/5/0                 60/0/0",
 		"TestFlaky                                                    arm64 4 / 20       0 / 20       0.106      56/4/0                 60/0/0",
 		"2 test/arch row(s) compared; 1 below p = 0.05",
+		"for a familywise 0.05, hold each p to 0.05/2 = 0.025 (Bonferroni)",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("comparison lacks %q:\n%s", want, s)
@@ -109,6 +133,23 @@ func TestCompareRefusesAPairThatDiffersInMoreThanTheCommit(t *testing.T) {
 			}
 		})
 	}
+	// The same inputs from two probatorium commits (stress/runs moved between
+	// the dispatches) ran two workflows and two tallies: refused. From the
+	// same commit, the same pair is a comparison.
+	t.Run("probatorium commit", func(t *testing.T) {
+		branch := armReport(t, branchSHA, "3", "4", nil, nil)
+		var out strings.Builder
+		if code := cmdCompare([]string{base, branch}, &out); code != 0 {
+			t.Fatalf("one probatorium commit in both arms: exit %d, want 0:\n%s", code, out.String())
+		}
+		const other = "76543210fedcba9876543210fedcba9876543210"
+		setProbatorium(t, branch, other)
+		out.Reset()
+		want := "probatorium commit: base " + testProbatoriumSHA + ", branch " + other
+		if code := cmdCompare([]string{base, branch}, &out); code != 2 || !strings.Contains(out.String(), want) {
+			t.Errorf("exit %d, want 2 naming %q:\n%s", code, want, out.String())
+		}
+	})
 	// A self-test report is not a dispatch.
 	selfDir := t.TempDir()
 	p := mustSelfTest(t)
@@ -155,5 +196,47 @@ func TestCompareNotesWhatQualifiesIt(t *testing.T) {
 				t.Errorf("exit %d, want a note %q:\n%s", code, c.want, out.String())
 			}
 		})
+	}
+}
+
+// A report that records no probatorium commit (written before the plan
+// recorded one, or by a local tally) cannot show that both arms ran the same
+// workflow and tool, so compare refuses it, even when neither arm has one.
+func TestCompareRefusesAReportWithoutTheProbatoriumCommit(t *testing.T) {
+	for name, c := range map[string]struct{ base, branch string }{
+		"branch lacks it": {testProbatoriumSHA, ""},
+		"base lacks it":   {"", testProbatoriumSHA},
+		"both lack it":    {"", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := armReport(t, testSHA, "3", "2", nil, nil)
+			branch := armReport(t, branchSHA, "3", "2", nil, nil)
+			setProbatorium(t, base, c.base)
+			setProbatorium(t, branch, c.branch)
+			var out strings.Builder
+			if code := cmdCompare([]string{base, branch}, &out); code != 2 || !strings.Contains(out.String(), "records no probatorium commit") {
+				t.Errorf("exit %d, want 2 naming the missing probatorium commit:\n%s", code, out.String())
+			}
+		})
+	}
+}
+
+// The probatorium commit the plan records reaches both halves of the
+// stress-summary: report.json, which compare reads, and the job summary.
+func TestReportsRecordTheProbatoriumCommit(t *testing.T) {
+	dir := armReport(t, testSHA, "3", "2", nil, nil)
+	r, err := readReport(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Plan.ProbatoriumSHA != testProbatoriumSHA {
+		t.Errorf("report.json records probatorium commit %q, want %q", r.Plan.ProbatoriumSHA, testProbatoriumSHA)
+	}
+	md, err := os.ReadFile(filepath.Join(dir, "summary.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "; probatorium commit `" + testProbatoriumSHA + "`."; !strings.Contains(string(md), want) {
+		t.Errorf("summary.md lacks %q:\n%s", want, md)
 	}
 }

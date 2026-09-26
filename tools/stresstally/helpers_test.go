@@ -14,6 +14,10 @@ import (
 
 const testSHA = "0123456789abcdef0123456789abcdef01234567"
 
+// testProbatoriumSHA stands for the probatorium commit a run came from
+// (github.sha, STRESS_PROBATORIUM_SHA).
+const testProbatoriumSHA = "89abcdef0123456789abcdef0123456789abcdef"
+
 func sampleCase(name string) Case {
 	return Case{
 		Name: name, Packages: []string{"./a", "./b"}, Run: "", Count: 2, Shards: 1,

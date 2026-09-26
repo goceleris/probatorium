@@ -25,7 +25,10 @@ import (
 type Plan struct {
 	Event      string `json:"event"`
 	CelerisRef string `json:"celeris_ref"`
-	Cases      []Case `json:"cases"`
+	// ProbatoriumSHA is the probatorium commit the run's workflow, plan and
+	// tally come from (github.sha). Two arms of a comparison must share it.
+	ProbatoriumSHA string `json:"probatorium_sha,omitempty"`
+	Cases          []Case `json:"cases"`
 }
 
 // Case is one go test configuration.

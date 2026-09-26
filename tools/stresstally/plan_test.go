@@ -345,7 +345,7 @@ func TestCmdPlanWritesSingleLineOutputs(t *testing.T) {
 	}
 	env := map[string]string{
 		"STRESS_EVENT": "workflow_dispatch", "STRESS_RUN_ID": "42", "GITHUB_OUTPUT": out,
-		"STRESS_REF": "refs/heads/stress/runs", "STRESS_DEFAULT_BRANCH": "main",
+		"STRESS_REF": "refs/heads/stress/runs", "STRESS_DEFAULT_BRANCH": "main", "STRESS_PROBATORIUM_SHA": testProbatoriumSHA,
 		"IN_CELERIS_REF": "main", "IN_PACKAGES": "./engine/iouring", "IN_RUN": "^TestA$", "IN_COUNT": "2",
 		"IN_SHARDS": "2", "IN_ARCHES": "both", "IN_MEMLOCK": "8m", "IN_RACE": "true", "IN_TIMEOUT": "10m", "IN_EXTRA": "-short",
 	}
@@ -380,7 +380,7 @@ func TestCmdPlanWritesSingleLineOutputs(t *testing.T) {
 // refusal fails closed.
 func TestCmdPlanRefusesTheDefaultBranch(t *testing.T) {
 	base := map[string]string{
-		"STRESS_EVENT": "workflow_dispatch", "IN_CELERIS_REF": "main", "IN_PACKAGES": "./engine/iouring",
+		"STRESS_EVENT": "workflow_dispatch", "STRESS_PROBATORIUM_SHA": testProbatoriumSHA, "IN_CELERIS_REF": "main", "IN_PACKAGES": "./engine/iouring",
 		"IN_COUNT": "1", "IN_SHARDS": "1", "IN_ARCHES": "x86", "IN_MEMLOCK": "8m", "IN_RACE": "false", "IN_TIMEOUT": "5m",
 	}
 	for name, c := range map[string]struct {
@@ -418,10 +418,64 @@ func TestCmdPlanRefusesTheDefaultBranch(t *testing.T) {
 		"no ref":         {"", 2},
 	} {
 		t.Run("pull_request "+name, func(t *testing.T) {
-			env := map[string]string{"STRESS_EVENT": "pull_request", "STRESS_REF": c.ref, "STRESS_DEFAULT_BRANCH": "main"}
+			env := map[string]string{"STRESS_EVENT": "pull_request", "STRESS_REF": c.ref, "STRESS_DEFAULT_BRANCH": "main", "STRESS_PROBATORIUM_SHA": testProbatoriumSHA}
 			var log strings.Builder
 			if code := cmdPlan(&log, func(k string) string { return env[k] }); code != c.code {
 				t.Errorf("exit %d, want %d: %s", code, c.code, log.String())
+			}
+		})
+	}
+}
+
+// The plan records the probatorium commit the run came from (github.sha), so
+// report.json carries it and compare can refuse two arms that ran different
+// workflows or tallies. Without a full sha the plan fails closed.
+func TestCmdPlanRecordsTheProbatoriumCommit(t *testing.T) {
+	for name, c := range map[string]struct {
+		event, sha string
+		code       int
+	}{
+		"dispatch":             {"workflow_dispatch", testProbatoriumSHA, 0},
+		"self-test":            {"pull_request", testProbatoriumSHA, 0},
+		"missing":              {"workflow_dispatch", "", 2},
+		"a branch name":        {"workflow_dispatch", "stress/runs", 2},
+		"short sha":            {"workflow_dispatch", testProbatoriumSHA[:12], 2},
+		"upper case":           {"workflow_dispatch", strings.ToUpper(testProbatoriumSHA), 2},
+		"missing on self-test": {"pull_request", "", 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "out")
+			if err := os.WriteFile(out, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			env := map[string]string{
+				"STRESS_EVENT": c.event, "STRESS_RUN_ID": "42", "GITHUB_OUTPUT": out, "STRESS_PROBATORIUM_SHA": c.sha,
+				"STRESS_REF": "refs/heads/stress/runs", "STRESS_DEFAULT_BRANCH": "main",
+				"IN_CELERIS_REF": "main", "IN_PACKAGES": "./engine/iouring", "IN_RUN": "^TestA$", "IN_COUNT": "2",
+				"IN_SHARDS": "2", "IN_ARCHES": "both", "IN_MEMLOCK": "8m", "IN_RACE": "true", "IN_TIMEOUT": "10m",
+			}
+			var log strings.Builder
+			code := cmdPlan(&log, func(k string) string { return env[k] })
+			if code != c.code {
+				t.Fatalf("exit %d, want %d: %s", code, c.code, log.String())
+			}
+			if code != 0 {
+				if !strings.Contains(log.String(), "::error::STRESS_PROBATORIUM_SHA") {
+					t.Errorf("the refusal does not name STRESS_PROBATORIUM_SHA: %s", log.String())
+				}
+				return
+			}
+			b, _ := os.ReadFile(out)
+			line, _, _ := strings.Cut(string(b), "\n")
+			var p Plan
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "plan=")), &p); err != nil {
+				t.Fatalf("plan output %q: %v", line, err)
+			}
+			if p.ProbatoriumSHA != c.sha {
+				t.Errorf("the plan records probatorium commit %q, want %q", p.ProbatoriumSHA, c.sha)
+			}
+			if !strings.Contains(log.String(), "probatorium commit "+c.sha+";") {
+				t.Errorf("plan does not print the probatorium commit: %s", log.String())
 			}
 		})
 	}

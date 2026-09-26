@@ -39,8 +39,11 @@ name: Celeris Stress
 # goceleris is on the Free plan: 20 GitHub-hosted jobs run at once across
 # the WHOLE organization, celeris and probatorium CI included. max-parallel
 # keeps one run to 4 shard jobs, so the base-vs-branch pair docs/STRESS.md
-# describes holds at most 8 slots and leaves at least 12: one celeris CI
-# push (8 Linux jobs in its ci.yml) still starts at once.
+# describes holds at most 8 slots and leaves at least 12. A push to a celeris
+# pull request is 11 jobs (ci.yml: 8 Linux, 1 macOS; CodeQL default setup:
+# actions, go), a push to its main 12 (Scorecard): either still starts at
+# once. A pull request that touches celeris's driver paths adds drivers.yml's
+# 24 jobs and queues on its own, with or without a pair running.
 #
 # The pull_request trigger is the workflow's self-test. A pull request that
 # changes this file or the tool runs a fixed set of cases (selfTests in
@@ -141,6 +144,9 @@ jobs:
           STRESS_RUN_ID: ${{ github.run_id }}
           STRESS_REF: ${{ github.ref }}
           STRESS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # The probatorium commit this run's workflow and tool come from,
+          # recorded in the plan: compare refuses two arms that differ in it.
+          STRESS_PROBATORIUM_SHA: ${{ github.sha }}
           IN_CELERIS_REF: ${{ inputs.celeris_ref }}
           IN_PACKAGES: ${{ inputs.packages }}
           IN_RUN: ${{ inputs.run }}
