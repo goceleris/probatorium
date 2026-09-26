@@ -23,6 +23,7 @@ updates:
       - /servers/iris
       - /servers/nbio
       - /servers/stdhttp
+      - /validation/properties/fieldguard
       - /validation/refapp/auth_jwt_csrf
       - /validation/refapp/auth_session_ratelimit
       - /validation/refapp/driver_memcached

@@ -49,8 +49,6 @@ type Snapshot struct {
 	HeapIdleBytes     int64
 	HeapReleasedBytes int64
 	StackInuseBytes   int64
-	GCPauseP99Ns      int64
-	NumGoroutineDiff  int64 // delta from process baseline
 
 	// Connection lifecycle (celeris.* counters)
 	AcceptedConnTotal int64
@@ -200,10 +198,18 @@ type Snapshot struct {
 	// (only stub-populated until wave 7 adds the validation build tag).
 	OldestOpenConnLastByteAgeMs int64
 
-	// Process resources
-	FDCount     int64
-	RSSBytes    int64
-	SoftFDLimit int64
+	// Process resources. RSSBytes is the refapp's VmRSS, read from
+	// /proc/<pid>/status by checker.ReadRSS (validation/propertyloop.go and
+	// cmd/validator-checker) and judged by I-MEM-4. The fd and GC-pause series
+	// live on report.ObserverSample, filled by cmd/observer. FDCount,
+	// SoftFDLimit, GCPauseP99Ns and NumGoroutineDiff used to be declared here
+	// as well, and nothing wrote or read these copies; they only made a name
+	// search look as if a predicate could judge them (probatorium#395). A field
+	// belongs here once something feeds it:
+	// TestEveryFieldReadFromASnapshotHasAWriter, in the nested module
+	// validation/properties/fieldguard, fails on one that is read and never
+	// written.
+	RSSBytes int64
 
 	// Race + checkptr signal counters. Populated by the validator-checker
 	// itself when it observes the celeris stderr stream (-race / -checkptr
@@ -238,11 +244,16 @@ type Snapshot struct {
 	DriverReadHits     int64
 	DriverReadMisses   int64
 
-	// Engine-specific counters. Stubbed (zero) until wave 7's
-	// -tags=validation build exposes engine-internal queues / SQEs.
-	IOUringSQEsSubmitted int64
-	IOUringCQEsCompleted int64
-	AdaptiveSwitches     int64
+	// Engine-specific counters.
+	//
+	// IOUringSQEsSubmitted and IOUringCQEsCompleted used to sit here,
+	// declared "stubbed (zero) until wave 7's -tags=validation build
+	// exposes engine-internal queues / SQEs". That build shipped and never
+	// fed them, so I-ENG-IOURING's two accounting branches compared 0 with
+	// 0 on every evaluation and could not fail (probatorium#395). They are
+	// gone rather than left reading zero: celeris publishes no SQE/CQE totals
+	// today, and wiring them needs new celeris counters first (celeris#688).
+	AdaptiveSwitches int64
 
 	// HTTP wire-format counters. Populated by the validator's response
 	// scraper (it MITMs each adapter under test, parsing bytes).

@@ -218,7 +218,6 @@ func TestMWStubs_failOnNegative(t *testing.T) {
 		{"ratelimit-neg-allowed", Snapshot{RateLimitAllowed: -1}, IMWRateLimit},
 		{"session-neg-created", Snapshot{SessionsCreatedTotal: -1}, IMWSession},
 		{"jwt-neg-ok", Snapshot{JWTValidatedOK: -1}, IMWJWT},
-		{"iouring-cqe-leads-sqe", Snapshot{IOUringSQEsSubmitted: 1, IOUringCQEsCompleted: 2}, IENGIOURing},
 		{"adaptive-neg", Snapshot{AdaptiveSwitches: -1}, IENGAdaptive},
 	}
 	for _, tc := range cases {

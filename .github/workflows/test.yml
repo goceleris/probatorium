@@ -119,6 +119,85 @@ jobs:
       - name: go test -tags mage
         run: go test -count=1 -race -tags mage -timeout=10m ./...
 
+  # The Snapshot field guard (probatorium#395): every properties.Snapshot
+  # field the root module reads must be written somewhere in it, or the
+  # predicate reading it compares zero with zero and cannot fail. It needs
+  # golang.org/x/tools for full type information, so it is a module of its
+  # own -- a requirement of the root module would reach all twelve adapter
+  # modules through their replace lines -- and it type-checks the ROOT
+  # module's packages from source. Its tests are the guard and the guard's
+  # own controls, so green must mean each of them ran and passed: the tally
+  # fails on any FAIL, on any SKIP (a skipped control is an absent one), and
+  # on a required test that never printed a PASS line because it was
+  # removed, renamed or not run.
+  fieldguard:
+    name: validation/properties/fieldguard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            validation/properties/fieldguard/go.sum
+      - name: go test -v, tallied
+        working-directory: validation/properties/fieldguard
+        run: |
+          out="$RUNNER_TEMP/fieldguard.out"
+          rc=0
+          go test -count=1 -v -timeout=10m ./... > "$out" 2>&1 || rc=$?
+          cat "$out"
+          pass=$(grep -c -- '--- PASS: ' "$out" || true)
+          fail=$(grep -c -- '--- FAIL: ' "$out" || true)
+          skip=$(grep -c -- '--- SKIP: ' "$out" || true)
+          echo "fieldguard tally: PASS=$pass FAIL=$fail SKIP=$skip go-test-rc=$rc"
+          bad=0
+          if [ "$rc" -ne 0 ]; then echo "::error::go test exited $rc"; bad=1; fi
+          if [ "$fail" -ne 0 ]; then echo "::error::$fail FAIL line(s)"; bad=1; fi
+          if [ "$skip" -ne 0 ]; then echo "::error::$skip SKIP line(s): a skipped control proves nothing"; bad=1; fi
+          for t in \
+            TestEveryFieldReadFromASnapshotHasAWriter \
+            TestGuardControlVacuity \
+            TestGuardControlVacuity/blind_to_reads_in_validation_properties \
+            TestGuardControlVacuity/blind_to_reads_in_validation_checker \
+            TestGuardControlVacuity/blind_to_reads_in_validation \
+            TestGuardControlVacuity/blind_to_writes_in_validation_checker \
+            TestGuardControlVacuity/blind_to_writes_in_validation \
+            TestGuardControlVacuity/a_positive_control_loses_its_writer \
+            TestGuardControlVacuity/a_tree_that_does_not_type_check_is_refused \
+            TestGuardControlWriteSide \
+            TestGuardControlWriteSide/writer_removed \
+            TestGuardControlWriteSide/writer_moved_to_a_lookalike_struct \
+            TestGuardControlWriteSide/writer_stores_a_constant_zero \
+            TestGuardControlReadSide \
+            TestGuardControlReadSide/read_by_range_over_ctx_History \
+            TestGuardControlReadSide/read_by_index_into_ctx_History \
+            TestGuardControlReadSide/read_through_a_struct_field_chain \
+            TestGuardControlReadSide/read_through_a_slice_parameter \
+            TestGuardControlReadSide/read_through_a_map_of_pointers \
+            TestGuardControlReadSide/read_as_a_promoted_field \
+            TestGuardControlReadSide/read_through_atomic_Load_of_its_address \
+            TestGuardControlReadSide/read_in_a_mage_tagged_file \
+            TestGuardControlReadSide/fed_only_by_a_test_file \
+            TestGuardControlReadSide/set_only_to_a_constant_zero \
+            TestGuardControlReadSide/fed_by_an_assignment_into_History \
+            TestGuardControlReadSide/fed_by_an_increment \
+            TestGuardControlReadSide/fed_by_the_second_operand_of_a_tuple_assignment \
+            TestGuardControlReadSide/fed_by_a_composite_literal \
+            TestGuardControlReadSide/fed_by_atomic_Add \
+            TestGuardControlReadSide/a_lookalike_read_is_not_a_Snapshot_read
+          do
+            if ! grep -q -F -- "--- PASS: $t (" "$out"; then
+              echo "::error::$t did not PASS (removed, renamed or not run)"
+              bad=1
+            fi
+          done
+          exit "$bad"
+
   # govulncheck over every module whose code is ours: the root module,
   # the celeris adapter, and the validation refapps with their shared
   # debugvars helper. It fails only when that code can reach a vulnerable
@@ -166,7 +245,7 @@ jobs:
   # listed in needs must stay unconditional on push + pull_request.
   ci-ok:
     name: ci-ok
-    needs: [root, adapters, refapps, mage, vulncheck]
+    needs: [root, adapters, refapps, mage, fieldguard, vulncheck]
     if: always()
     runs-on: ubuntu-latest
     steps:
