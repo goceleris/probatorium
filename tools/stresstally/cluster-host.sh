@@ -15,8 +15,9 @@
 #     never gets quiet refuses every observation (no data is taken, so none
 #     is ever dropped after the fact);
 #   - chooses the CPUs every observation is pinned to: STRESS_CPUS primary
-#     SMT threads of the fastest core class (cpu_capacity), never cpu0's
-#     core; their SMT siblings stay idle. Too few such CPUs refuses;
+#     SMT threads of the fastest core class (cpu_capacity; on arm64 also the
+#     core type and cluster frequency), never cpu0's core; their SMT
+#     siblings stay idle. Too few such CPUs refuses;
 #   - probes `perf stat -e instructions:u` (needs perf installed and
 #     kernel.perf_event_paranoid <= 2, or privilege). pmu=required refuses
 #     every observation without it.
@@ -99,20 +100,26 @@ host_facts() {
 		echo "taskset: $(command -v taskset || echo absent)"
 		echo "memlock of this job: $(awk '/^Max locked memory/ {print $4 ":" $5}' /proc/self/limits)"
 		echo "io_uring_disabled: $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo n/a)"
-		echo "cpu  capacity  siblings  governor  cur_khz  max_khz"
+		echo "cpu  capacity  siblings  governor  cur_khz  max_khz  cpuinfo_max_khz  midr"
 		local d
 		for d in "$sysfs"/cpu[0-9]*; do
-			printf '%s  %s  %s  %s  %s  %s\n' "${d##*cpu}" "$(cat "$d/cpu_capacity" 2>/dev/null || echo -)" \
+			printf '%s  %s  %s  %s  %s  %s  %s  %s\n' "${d##*cpu}" "$(cat "$d/cpu_capacity" 2>/dev/null || echo -)" \
 				"$(cat "$d/topology/thread_siblings_list" 2>/dev/null || echo -)" "$(cat "$d/cpufreq/scaling_governor" 2>/dev/null || echo -)" \
-				"$(cat "$d/cpufreq/scaling_cur_freq" 2>/dev/null || echo -)" "$(cat "$d/cpufreq/scaling_max_freq" 2>/dev/null || echo -)"
+				"$(cat "$d/cpufreq/scaling_cur_freq" 2>/dev/null || echo -)" "$(cat "$d/cpufreq/scaling_max_freq" 2>/dev/null || echo -)" \
+				"$(cat "$d/cpufreq/cpuinfo_max_freq" 2>/dev/null || echo -)" "$(cat "$d/regs/identification/midr_el1" 2>/dev/null || echo -)"
 		done
 	} >>"$STRESS_FACTS" 2>&1
 }
 
 # pick_cpus N: the N highest-numbered primary SMT threads of the fastest core
-# class, cpu0's core excluded. Prints the list, or a reason on stderr.
+# class, cpu0's core excluded. A class is the cores the kernel reports as the
+# same: equal cpu_capacity, and on arm64 (where a kernel may report every
+# core of a big.LITTLE SoC at capacity 1024) also the same core type (MIDR)
+# and the same cluster maximum frequency. The fastest class has the highest
+# capacity, then the highest maximum frequency. Prints the list on stdout
+# and the classes found on stderr, or a reason on stderr and fails.
 pick_cpus() {
-	local n=$1 d c first sib cap best=0
+	local n=$1 d c first sib cap midr khz
 	local -a cand=()
 	for d in "$sysfs"/cpu[0-9]*; do
 		c=${d##*cpu}
@@ -123,18 +130,38 @@ pick_cpus() {
 		[ "$first" = "$c" ] || continue
 		case "$sib" in 0 | 0,* | 0-*) continue ;; esac
 		cap=$(cat "$d/cpu_capacity" 2>/dev/null || echo 1024)
-		cand+=("$cap:$c")
-		[ "$cap" -le "$best" ] || best=$cap
+		midr=- khz=0
+		if [ -r "$d/regs/identification/midr_el1" ]; then
+			midr=$(cat "$d/regs/identification/midr_el1")
+			khz=$(cat "$d/cpufreq/cpuinfo_max_freq" 2>/dev/null || echo 0)
+		fi
+		cand+=("$cap $khz $midr $c")
 	done
-	local -a pick=()
-	local x
-	for x in "${cand[@]}"; do
-		[ "${x%%:*}" = "$best" ] && pick+=("${x#*:}")
-	done
-	if [ "${#pick[@]}" -lt "$n" ]; then
-		echo "only ${#pick[@]} primary CPU(s) of the fastest class (capacity $best) besides cpu0's core; asked for $n" >&2
+	if [ "${#cand[@]}" -eq 0 ]; then
+		echo "no primary CPU besides cpu0's core; asked for $n" >&2
 		return 1
 	fi
+	local classes best bcap bkhz bmidr class x
+	classes=$(printf '%s\n' "${cand[@]}" | awk '{k = "capacity " $1; if ($3 != "-") k = k " max " $2 " kHz midr " $3; n[k]++}
+		END {for (k in n) print k " x" n[k]}' | sort | paste -sd';' -)
+	best=$(printf '%s\n' "${cand[@]}" | awk 'NR == 1 || $1 > bc || ($1 == bc && $2 > bk) {bc = $1; bk = $2; bl = $0} END {print bl}')
+	read -r bcap bkhz bmidr _ <<<"$best"
+	class="capacity $bcap"
+	[ "$bmidr" = - ] || class="$class, max $bkhz kHz, midr $bmidr"
+	if printf '%s\n' "${cand[@]}" | awk -v c="$bcap" -v k="$bkhz" -v m="$bmidr" '$1 == c && $2 == k && $3 != m {x = 1} END {exit !x}'; then
+		echo "two core types share the fastest capacity and frequency ($class); cannot choose one class (classes: $classes); asked for $n" >&2
+		return 1
+	fi
+	local -a pick=()
+	for x in "${cand[@]}"; do
+		read -r cap khz midr c <<<"$x"
+		[ "$cap $khz $midr" != "$bcap $bkhz $bmidr" ] || pick+=("$c")
+	done
+	if [ "${#pick[@]}" -lt "$n" ]; then
+		echo "only ${#pick[@]} primary CPU(s) of the fastest class ($class) besides cpu0's core; asked for $n (classes: $classes)" >&2
+		return 1
+	fi
+	echo "fastest class: $class; classes: $classes" >&2
 	printf '%s\n' "${pick[@]}" | sort -n | tail -n "$n" | paste -sd, -
 }
 
@@ -247,7 +274,9 @@ main() {
 	if [ "$STRESS_MODE" = "timing" ]; then
 		: "${STRESS_CPUS:?}" "${STRESS_PMU:?}"
 		command -v taskset >/dev/null || pre_refuse="taskset is not installed"
-		if ! cpuset=$(pick_cpus "$STRESS_CPUS" 2>"$TMPDIR/pick.err"); then
+		if cpuset=$(pick_cpus "$STRESS_CPUS" 2>"$TMPDIR/pick.err"); then
+			note "cpu classes: $(cat "$TMPDIR/pick.err")"
+		else
 			cpuset=""
 			pre_refuse="${pre_refuse:+$pre_refuse; }$(cat "$TMPDIR/pick.err")"
 		fi
@@ -257,6 +286,11 @@ main() {
 		case "$perf_state" in
 		unusable*) { echo "perf's output:"; cat "$TMPDIR/probe.perf" "$TMPDIR/probe.err" 2>/dev/null; } >>"$STRESS_FACTS" ;;
 		esac
+		# Decided here once, so a refused timing builds nothing and waits for
+		# nothing (shard.sh keeps the same rule on its own).
+		if [ "$STRESS_PMU" = "required" ] && [ "$perf_state" != "ok" ]; then
+			pre_refuse="${pre_refuse:+$pre_refuse; }pmu required but perf is $perf_state"
+		fi
 		if [ -z "$pre_refuse" ]; then
 			prebuild_arms
 			quiet_wait

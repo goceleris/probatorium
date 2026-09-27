@@ -348,10 +348,15 @@ question. Two arms may name the same commit: an A/A control.
   1.0); a host that never gets quiet refuses every observation, so no data is
   taken, and none is ever dropped afterwards. Every observation is pinned
   (`taskset`) to `cpus` primary SMT threads of the host's fastest core class,
-  never cpu0's core; their SMT siblings stay idle. GOMAXPROCS follows.
-  Governor, boost and `perf_event_paranoid` are recorded, never changed.
-  `pmu=required` refuses every observation when `perf` cannot count
-  (not installed, or `perf_event_paranoid` above 2).
+  never cpu0's core; their SMT siblings stay idle. GOMAXPROCS follows. A
+  class is one `cpu_capacity` and, on arm64 (where a kernel may report every
+  core of a big.LITTLE SoC at 1024), one core type and cluster frequency;
+  the host facts list every class found, and too few CPUs in the fastest
+  one refuses every observation. Governor, boost and `perf_event_paranoid`
+  are recorded, never changed. `pmu=required` refuses every observation when
+  `perf` cannot count (not installed, or `perf_event_paranoid` above 2). A
+  refused timing builds nothing and waits for nothing: each shard's log says
+  why, and go test never starts.
 - **Output.** Each arm is a case that must PASS, judged against its own
   commit. The summary adds `observations.tsv` (one row per observation in run
   order: arch, host, block, arm, its position in the block, commit, binary
