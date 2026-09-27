@@ -5,11 +5,12 @@ name: Celeris Stress (cluster)
 # this whole workflow. This file declares NO concurrency: a second hold of
 # the same group here would wait on the caller forever.
 #
-#   bootstrap  (hosted) reports any cluster run cancelled since the caller's
-#              guard looked (tools/stresstally/eviction-audit.sh), then
+#   bootstrap  (hosted) reports any cluster run cancelled while this run
+#              entered the group (tools/stresstally/eviction-audit.sh), then
 #              provisions a runner on every cluster host exactly as the tiers
 #              do (cluster-runner-up, waiting for a manual experiment's
-#              manifest to clear).
+#              manifest to clear), and fails unless the runner of every
+#              planned host is online (tools/stresstally/runners-online.sh).
 #   host       (self-hosted, one job per arch on its bare-metal host: x86 on
 #              msa2-server, arm64 on msr1) checks out each case's commit and
 #              runs tools/stresstally/cluster-host.sh: host facts, in timing
@@ -98,6 +99,17 @@ jobs:
           gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
           wait-for-manifest-clear:   "true"
           wait-timeout-seconds:      "1800"
+      # Each host job waits for ONE named runner; cluster-runner-up only warns
+      # when runners are missing. Fail here, so the host jobs are skipped and
+      # teardown runs, instead of a host job queueing for up to 24 h while the
+      # run holds matrix-tier-cluster.
+      - name: Confirm the planned hosts' runners are online
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+          REPO: ${{ github.repository }}
+          MATRIX: ${{ inputs.matrix }}
+        run: bash tools/stresstally/runners-online.sh
 
   # A host job runs only on runners its own attempt's bootstrap registered.
   # A re-run of this job alone (or of failed jobs, which reuses a bootstrap

@@ -280,6 +280,12 @@ msa2-server, every arm64 shard on msr1, never msa2-client. What changes:
   setup, plus 10 for a timing's quiet wait, plus per shard one `timeout` per
   package and 1 more. The plan log prints the bound and how long the group
   can be held (bootstrap 25 + the bound + teardown 15). Teardown always runs.
+  Two waits are not bounded: the wait to enter the group (as for every
+  tier), and a host job's wait for its runner. Each host job can run only on
+  its host's one runner, so the bootstrap fails (host jobs skipped, teardown
+  run) unless every planned host's runner is online; a runner that drops
+  after that check still leaves its job queued, for up to the 24 h GitHub
+  keeps a self-hosted job queued.
 - **Only maintainers' code.** A cluster shard runs on bare metal as a user
   with sudo. `refs/pull/*` is refused for the cluster, and the plan job
   proves every commit is contained in a goceleris/celeris branch or tag (a
