@@ -112,6 +112,23 @@ func TestValidateFaultControlJudgesARun(t *testing.T) {
 	}
 }
 
+// A matrix that repeats a (refapp, engine) pair leaves two cell directories
+// for it; judging the first for both would credit one cell's dossiers to the
+// other. The control must refuse to attribute them (CodeRabbit on
+// probatorium#412, mage_fault_control.go:88).
+func TestValidateFaultControlRefusesAnAmbiguousCellDirectory(t *testing.T) {
+	run := writeFaultRun(t, true)
+	if err := os.MkdirAll(filepath.Join(run, "msa2-server", "cell-02-auth_session_ratelimit-iouring"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VALIDATE_FAULT_CONTROL", "/ws:8s@30s")
+	t.Setenv("VALIDATE_FAULT_CONTROL_EXPECT_CELLS", "")
+	t.Setenv("VALIDATE_FAULT_CONTROL_RESULTS", run)
+	if err := ValidateFaultControl(); err == nil || !strings.Contains(err.Error(), "1 cell(s) failed") {
+		t.Fatalf("two cell directories for one (refapp, engine) must fail that cell, got %v", err)
+	}
+}
+
 func TestRefappFaultExtraVars(t *testing.T) {
 	env := map[string]string{"PROBATORIUM_REFAPP_FAULT": " /ws:8s@30s,/:40s@60s "}
 	got := refappFaultExtraVars(func(k string) string { return env[k] })

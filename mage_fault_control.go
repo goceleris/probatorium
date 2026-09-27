@@ -82,10 +82,20 @@ func ValidateFaultControl() error {
 				want = paths
 				injected++
 			}
-			cellDir := ""
-			if m, _ := filepath.Glob(filepath.Join(hostDir, "cell-*-"+cell.Refapp+"-"+cell.Engine)); len(m) > 0 {
-				cellDir = m[0]
+			// Exactly one directory, or the cell's dossiers cannot be
+			// attributed: a matrix that repeats a (refapp, engine) pair
+			// leaves two, and taking the first would judge one cell's
+			// artifacts for both (CodeRabbit on probatorium#412). The
+			// document's slice index is no substitute: a resumed document
+			// prepends inherited cells.
+			m, _ := filepath.Glob(filepath.Join(hostDir, "cell-*-"+cell.Refapp+"-"+cell.Engine))
+			if len(m) != 1 {
+				failed++
+				fmt.Printf("\n  FAIL  %s/%s/%s  want exactly one cell directory cell-*-%s-%s under %s, found %d: its artifacts cannot be attributed\n",
+					cell.Refapp, cell.Engine, cell.Arch, cell.Refapp, cell.Engine, hostDir, len(m))
+				continue
 			}
+			cellDir := m[0]
 			r := report.CheckFaultControlCell(cellDir, cell, want)
 			verdict := "PASS"
 			if !r.Pass() {
