@@ -30,20 +30,28 @@ import (
 //     (t.Cleanup wouldn't work because it'd nuke the binary
 //     after the first test, leaving later ones stuck on missing
 //     files).
+//
+// A helper that fails to compile FAILS every test that needs it, with the
+// build error. It used to skip them, and a skip prints nothing under a plain
+// `go test`: every Tier 3 test, the reaping regression tests among them,
+// could pass the package without running, and the zombie guard would then
+// pass on the zombies nobody had produced (probatorium#415).
 var (
 	cachedPassingReplayPath string
 	cachedFailingReplayPath string
 	cachedSlowReplayPath    string
+
+	passingReplayErr error
+	failingReplayErr error
+	slowReplayErr    error
 )
 
 func TestMain(m *testing.M) {
-	if pp, err := compileHelperBin("passing-replay-*.go", `package main
+	cachedPassingReplayPath, passingReplayErr = compileHelperBin("passing-replay-*.go", `package main
 import "fmt"
 func main() { fmt.Println("ok"); }
-`); err == nil {
-		cachedPassingReplayPath = pp
-	}
-	if pp, err := compileHelperBin("failing-replay-*.go", `package main
+`)
+	cachedFailingReplayPath, failingReplayErr = compileHelperBin("failing-replay-*.go", `package main
 import (
     "fmt"
     "os"
@@ -52,16 +60,14 @@ func main() {
     fmt.Fprintln(os.Stderr, "I-PANIC violated: 1 panic(s) observed")
     os.Exit(1)
 }
-`); err == nil {
-		cachedFailingReplayPath = pp
-	}
+`)
 	// "slow" replay parses the same -duration flag the real
 	// validator-replay does, then exits cleanly after a sleep equal
 	// to that duration. Used to verify the grace-window fix: the
 	// replay should be allowed to complete normally inside its
 	// declared -duration window, without exec.CommandContext sending
 	// SIGKILL the moment the parent's per-seed deadline expires.
-	if pp, err := compileHelperBin("slow-replay-*.go", `package main
+	cachedSlowReplayPath, slowReplayErr = compileHelperBin("slow-replay-*.go", `package main
 import (
     "flag"
     "fmt"
@@ -78,9 +84,7 @@ func main() {
     time.Sleep(dur)
     fmt.Println("slow-replay clean exit")
 }
-`); err == nil {
-		cachedSlowReplayPath = pp
-	}
+`)
 	code := m.Run()
 	if cachedPassingReplayPath != "" {
 		_ = os.Remove(cachedPassingReplayPath)
@@ -104,26 +108,27 @@ func main() {
 
 func buildPassingReplay(t *testing.T) string {
 	t.Helper()
-	if cachedPassingReplayPath == "" {
-		t.Skip("helper binary not compiled (likely no `go` on PATH)")
-	}
-	return cachedPassingReplayPath
+	return helperBin(t, "passing-replay", cachedPassingReplayPath, passingReplayErr)
 }
 
 func buildFailingReplay(t *testing.T) string {
 	t.Helper()
-	if cachedFailingReplayPath == "" {
-		t.Skip("helper binary not compiled (likely no `go` on PATH)")
-	}
-	return cachedFailingReplayPath
+	return helperBin(t, "failing-replay", cachedFailingReplayPath, failingReplayErr)
 }
 
 func buildSlowReplay(t *testing.T) string {
 	t.Helper()
-	if cachedSlowReplayPath == "" {
-		t.Skip("helper binary not compiled (likely no `go` on PATH)")
+	return helperBin(t, "slow-replay", cachedSlowReplayPath, slowReplayErr)
+}
+
+// helperBin returns a helper TestMain compiled, and fails the test, never
+// skips it, when the helper did not compile.
+func helperBin(t *testing.T, name, path string, err error) string {
+	t.Helper()
+	if path == "" {
+		t.Fatalf("helper %s did not compile, and this test cannot run without it: %v", name, err)
 	}
-	return cachedSlowReplayPath
+	return path
 }
 
 func compileHelperBin(namePat, src string) (string, error) {
@@ -481,9 +486,6 @@ func TestDriveTier3_RefappNeverReadyErrors(t *testing.T) {
 // a child of this process in any state: alive means it was never stopped,
 // zombie means it was stopped and never reaped.
 func TestReplayOneSeed_ReapsTheRefapp(t *testing.T) {
-	if _, err := childProcesses(); errors.Is(err, errZombieCountUnsupported) {
-		t.Skipf("cannot list this process's children here: %v", err)
-	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 	}))
@@ -501,12 +503,123 @@ func TestReplayOneSeed_ReapsTheRefapp(t *testing.T) {
 	if res.RefappPID == 0 {
 		t.Fatalf("refapp never announced ready, so there is nothing to check: %+v", res)
 	}
-	kids, err := childProcesses()
+	assertReaped(t, res.RefappPID)
+}
+
+// assertReaped fails the test when pid is still a child of this process, in
+// any state.
+func assertReaped(t *testing.T, pid int) {
+	t.Helper()
+	kids, source, err := childProcesses()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state, ok := kids[res.RefappPID]; ok {
-		t.Fatalf("refapp pid %d is still a child of this process (state %s) after replayOneSeed returned: signalled, never reaped", res.RefappPID, state)
+	if state, ok := kids[pid]; ok {
+		t.Fatalf("refapp pid %d is still a child of this process (state %s, via %s) after replayOneSeed returned: signalled, never reaped", pid, state, source)
+	}
+}
+
+// TestReplayOneSeed_StopEscalatesToSIGKILL: a refapp's teardown gives it the
+// stop grace to exit on SIGTERM, and a refapp that ignores SIGTERM is
+// SIGKILLed at the grace and reaped inside the same bounded Wait. The fixture
+// ignores TERM, INT and HUP (a trap with an empty action sets SIG_IGN, and the
+// exec'd sleep inherits it). A teardown that never escalates, or escalates
+// with one of those, times out and reports the seed errored; one that
+// escalates with any other signal leaves a refapp that did not die of
+// SIGKILL; one that escalates before the grace ends it too early. A refapp
+// that honours SIGTERM must not pay the grace.
+func TestReplayOneSeed_StopEscalatesToSIGKILL(t *testing.T) {
+	const grace = time.Second
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	for _, tc := range []struct {
+		name       string
+		script     string
+		wantKilled bool
+	}{
+		{"refapp that exits on SIGTERM", `echo "ready addr=` + srv.URL + `"; exec sleep 30`, false},
+		{"refapp that ignores SIGTERM", `trap '' TERM INT HUP; echo "ready addr=` + srv.URL + `"; exec sleep 30`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tier3Config{
+				Driver:          remote.NewLocal("/bin/sh"),
+				RefappArgs:      []string{"-c", tc.script},
+				ReplayBin:       buildPassingReplay(t),
+				PerSeedDuration: 2 * time.Second,
+				ReadyTimeout:    tier1TestReadyTimeout,
+				RefappStopGrace: grace,
+			}
+			res := replayOneSeed(context.Background(), cfg, corpus.Seed{Value: 0x1, Tag: "stop"})
+			if res.RefappPID == 0 {
+				t.Fatalf("refapp never announced ready, so there is nothing to check: %+v", res)
+			}
+			if res.ExitCode != 0 || strings.Contains(res.Stderr, "stop refapp") {
+				t.Errorf("teardown failed: ExitCode=%d Stderr=%q (TeardownDuration=%s)", res.ExitCode, res.Stderr, res.TeardownDuration)
+			}
+			if res.TeardownKilled != tc.wantKilled {
+				t.Errorf("TeardownKilled = %v, want %v (TeardownDuration=%s)", res.TeardownKilled, tc.wantKilled, res.TeardownDuration)
+			}
+			if tc.wantKilled && res.TeardownDuration < grace {
+				t.Errorf("TeardownDuration = %s: the SIGKILL came before the %s grace", res.TeardownDuration, grace)
+			}
+			if !tc.wantKilled && res.TeardownDuration >= grace {
+				t.Errorf("TeardownDuration = %s: a refapp that exits on SIGTERM paid the whole %s grace", res.TeardownDuration, grace)
+			}
+			assertReaped(t, res.RefappPID)
+		})
+	}
+}
+
+// TestDriveTier3_TeardownIsTallied: the teardown's cost reaches the tally and
+// the tier3_tally.json snapshot, which is how a nightly shows it: a refapp
+// that ignores SIGTERM is counted as killed on every seed, and the longest
+// teardown is at least the grace.
+func TestDriveTier3_TeardownIsTallied(t *testing.T) {
+	const grace = 200 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	snap := filepath.Join(t.TempDir(), "tier3_tally.json")
+	cfg := tier3Config{
+		Driver:          remote.NewLocal("/bin/sh"),
+		RefappArgs:      []string{"-c", `trap '' TERM INT HUP; echo "ready addr=` + srv.URL + `"; exec sleep 30`},
+		ReplayBin:       buildPassingReplay(t),
+		PerSeedDuration: 2 * time.Second,
+		ReadyTimeout:    tier1TestReadyTimeout,
+		RefappStopGrace: grace,
+		Seeds:           []corpus.Seed{{Value: 0x1, Tag: "tally"}},
+		SnapshotPath:    snap,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tally, err := driveTier3(ctx, cfg, nil)
+	if err != nil {
+		t.Fatalf("driveTier3: %v", err)
+	}
+	if tally.SeedsPassed == 0 {
+		t.Fatalf("no seed passed, so no teardown was tallied: %s", tally)
+	}
+	// Every passed seed had a refapp to tear down, and every such refapp
+	// ignored SIGTERM. (A seed whose refapp never started has no teardown.)
+	if tally.SeedsTeardownKilled < tally.SeedsPassed {
+		t.Errorf("SeedsTeardownKilled = %d, want at least every passed seed (%d): %s", tally.SeedsTeardownKilled, tally.SeedsPassed, tally)
+	}
+	if time.Duration(tally.TeardownMaxNS) < grace || tally.TeardownTotalNS < tally.TeardownMaxNS {
+		t.Errorf("teardown times not tallied: %s", tally)
+	}
+	data, err := os.ReadFile(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk tier3TallySnapshot
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.SeedsTeardownKilled == 0 || onDisk.TeardownMaxNS == 0 || !strings.Contains(string(data), `"seeds_teardown_killed"`) {
+		t.Errorf("tier3_tally.json does not carry the teardown counters: %s", data)
 	}
 }
 
@@ -532,12 +645,48 @@ func (p *unstoppableRefapp) Stderr() io.Reader {
 	return strings.NewReader("ready addr=127.0.0.1:1\n")
 }
 
-type unstoppableDriver struct{ proc *unstoppableRefapp }
+// oneProcDriver is a remote.Driver whose every Start returns proc.
+type oneProcDriver struct{ proc remote.Process }
 
-func (d unstoppableDriver) Start(context.Context, []string) (remote.Process, error) {
+func (d oneProcDriver) Start(context.Context, []string) (remote.Process, error) {
 	return d.proc, nil
 }
-func (d unstoppableDriver) Close() error { return nil }
+func (d oneProcDriver) Close() error { return nil }
+
+// pidlessRefapp is a remote.Process whose PID the driver never learned (the
+// SSH driver's pidfile read failed): it announces ready, cannot be signalled,
+// and its Wait returns only when its context ends.
+type pidlessRefapp struct{}
+
+func (pidlessRefapp) PID() int         { return 0 }
+func (pidlessRefapp) Signal(int) error { return nil }
+func (pidlessRefapp) Wait(ctx context.Context) (remote.WaitResult, error) {
+	<-ctx.Done()
+	return remote.WaitResult{}, ctx.Err()
+}
+func (pidlessRefapp) Stderr() io.Reader {
+	return strings.NewReader("ready addr=127.0.0.1:1\n")
+}
+
+// TestReplayOneSeed_UnknownPIDFailsAtOnce: a refapp whose PID is unknown
+// cannot be signalled, so its teardown reports that at once. Waiting it out
+// cost twice the stop grace, 10 s, on every such seed, for a Wait that
+// nothing was ever going to end.
+func TestReplayOneSeed_UnknownPIDFailsAtOnce(t *testing.T) {
+	cfg := tier3Config{
+		Driver:          oneProcDriver{proc: pidlessRefapp{}},
+		ReplayBin:       buildPassingReplay(t),
+		PerSeedDuration: 5 * time.Second,
+		ReadyTimeout:    tier1TestReadyTimeout,
+	}
+	res := replayOneSeed(context.Background(), cfg, corpus.Seed{Value: 0x1})
+	if res.ExitCode != -1 || !strings.Contains(res.Stderr, "its pid is unknown") {
+		t.Errorf("ExitCode=%d Stderr=%q, want -1 and the unknown-pid teardown error", res.ExitCode, res.Stderr)
+	}
+	if res.TeardownDuration > time.Second {
+		t.Errorf("TeardownDuration = %s, want an immediate report", res.TeardownDuration)
+	}
+}
 
 // TestReplayOneSeed_TeardownFailureIsReported: a refapp that cannot be stopped
 // and reaped is a driver failure, so a seed whose replay passed comes back
@@ -556,7 +705,7 @@ func TestReplayOneSeed_TeardownFailureIsReported(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			proc := &unstoppableRefapp{}
 			cfg := tier3Config{
-				Driver:          unstoppableDriver{proc: proc},
+				Driver:          oneProcDriver{proc: proc},
 				ReplayBin:       tc.replay(t),
 				PerSeedDuration: 5 * time.Second,
 				ReadyTimeout:    tier1TestReadyTimeout,

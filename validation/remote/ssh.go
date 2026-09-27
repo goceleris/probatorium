@@ -47,6 +47,16 @@ type SSH struct {
 	mu     sync.Mutex
 	client *ssh.Client
 	closed bool
+
+	// signalTimeout overrides sshControlTimeout; tests set it.
+	signalTimeout time.Duration
+}
+
+func (d *SSH) controlTimeout() time.Duration {
+	if d.signalTimeout > 0 {
+		return d.signalTimeout
+	}
+	return sshControlTimeout
 }
 
 // SSHConfig groups the optional knobs NewSSH accepts. Zero-value is
@@ -225,22 +235,52 @@ func (d *SSH) readPIDFile(ctx context.Context, pidFile string) int {
 	return 0
 }
 
+// sshControlTimeout bounds a control-plane command that has no deadline of
+// its own: a signal, and the pidfile cleanup after an exit. Each is one short
+// command over a connection that is already up, so it normally takes
+// milliseconds; the bound only matters when the host or the link stops
+// answering. Unbounded, the SIGTERM of a seed's teardown would stall it
+// forever before its SIGKILL timer was even armed (probatorium#415).
+const sshControlTimeout = 5 * time.Second
+
 // runQuick executes a one-shot remote command and returns its stdout.
 // Used for control-plane operations (read pidfile, send signal).
 // NOT used for the long-running candidate — that's Start's job.
-func (d *SSH) runQuick(_ context.Context, cmd string) ([]byte, error) {
+//
+// It returns ctx's error once ctx is done, and closes the session then, so the
+// command's goroutine ends as soon as the transport lets it. A session whose
+// open the server never confirms keeps that goroutine until the connection
+// closes.
+func (d *SSH) runQuick(ctx context.Context, cmd string) ([]byte, error) {
 	d.mu.Lock()
 	client := d.client
 	d.mu.Unlock()
 	if client == nil {
 		return nil, errors.New("ssh: driver closed")
 	}
-	sess, err := client.NewSession()
-	if err != nil {
-		return nil, err
+	type result struct {
+		out []byte
+		err error
 	}
-	defer func() { _ = sess.Close() }()
-	return sess.CombinedOutput(cmd)
+	done := make(chan result, 1)
+	go func() {
+		sess, err := client.NewSession()
+		if err != nil {
+			done <- result{nil, err}
+			return
+		}
+		defer func() { _ = sess.Close() }()
+		stop := context.AfterFunc(ctx, func() { _ = sess.Close() })
+		defer stop()
+		out, err := sess.CombinedOutput(cmd)
+		done <- result{out, err}
+	}()
+	select {
+	case r := <-done:
+		return r.out, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // ensureClient establishes the underlying SSH connection on first
@@ -348,7 +388,9 @@ func (p *sshProcess) Signal(sig int) error {
 	// So: kill children first (pkill -P <pid>), then kill the
 	// parent (kill -<sig> <pid>). Trailing `true` because pkill
 	// returns 1 when nothing matched (the don't-fork case).
-	_, err := p.driver.runQuick(context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), p.driver.controlTimeout())
+	defer cancel()
+	_, err := p.driver.runQuick(ctx,
 		fmt.Sprintf(
 			"pkill -%d -P %d 2>/dev/null; kill -%d %d 2>/dev/null; true",
 			sig, p.pid, sig, p.pid))
@@ -397,9 +439,12 @@ func (p *sshProcess) Wait(ctx context.Context) (WaitResult, error) {
 		return WaitResult{}, fmt.Errorf("ssh wait: %w", err)
 	}
 
-	// Clean up the remote pidfile. Best-effort.
-	_, _ = p.driver.runQuick(context.Background(),
-		"rm -f "+shellQuote(p.pidFile))
+	// Clean up the remote pidfile. Best-effort, and bounded like a signal:
+	// the command has exited, so a link that stops answering here must not
+	// hold up the caller's reap.
+	rmCtx, rmCancel := context.WithTimeout(context.Background(), p.driver.controlTimeout())
+	_, _ = p.driver.runQuick(rmCtx, "rm -f "+shellQuote(p.pidFile))
+	rmCancel()
 
 	p.mu.Lock()
 	p.result = res

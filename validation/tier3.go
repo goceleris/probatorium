@@ -58,6 +58,11 @@ type tier3Config struct {
 	// Zero defaults to 10s.
 	ReadyTimeout time.Duration
 
+	// RefappStopGrace is how long a seed's teardown waits for its refapp
+	// to exit after SIGTERM before it sends SIGKILL (stopAndReapRefapp).
+	// Zero defaults to 5s.
+	RefappStopGrace time.Duration
+
 	// Seeds is the corpus to walk. Caller filters / orders; Tier 3
 	// walks the slice in order and loops back to index 0 on
 	// exhaustion (so 6h runs against a 100-seed corpus replay 12
@@ -93,6 +98,13 @@ type tier3Tally struct {
 	seedsPassed    atomic.Int64
 	seedsFailed    atomic.Int64
 	seedsErrored   atomic.Int64
+
+	// What the refapp teardowns of the attempted seeds cost: how many
+	// refapps had to be SIGKILLed, and the total and the longest time from
+	// SIGTERM to reap (probatorium#415).
+	seedsTeardownKilled atomic.Int64
+	teardownTotalNS     atomic.Int64
+	teardownMaxNS       atomic.Int64
 }
 
 // tier3TallySnapshot is the value-typed projection of tier3Tally.
@@ -101,20 +113,47 @@ type tier3TallySnapshot struct {
 	SeedsPassed    int64 `json:"seeds_passed"`
 	SeedsFailed    int64 `json:"seeds_failed"`
 	SeedsErrored   int64 `json:"seeds_errored"`
+
+	// SeedsTeardownKilled counts the attempted seeds whose refapp did not
+	// exit within the stop grace of its SIGTERM and died of SIGKILL.
+	// TeardownTotalNS and TeardownMaxNS are the sum and the longest of
+	// their SIGTERM-to-reap times. All three reach the artifacts through
+	// each cell's tier3_tally.json; they are recorded, not gated.
+	SeedsTeardownKilled int64 `json:"seeds_teardown_killed"`
+	TeardownTotalNS     int64 `json:"teardown_total_ns"`
+	TeardownMaxNS       int64 `json:"teardown_max_ns"`
 }
 
 // String formats the tally for the run summary log line.
 func (s tier3TallySnapshot) String() string {
-	return fmt.Sprintf("attempted=%d passed=%d failed=%d errored=%d",
-		s.SeedsAttempted, s.SeedsPassed, s.SeedsFailed, s.SeedsErrored)
+	return fmt.Sprintf("attempted=%d passed=%d failed=%d errored=%d teardown_killed=%d teardown_total=%s teardown_max=%s",
+		s.SeedsAttempted, s.SeedsPassed, s.SeedsFailed, s.SeedsErrored,
+		s.SeedsTeardownKilled, time.Duration(s.TeardownTotalNS), time.Duration(s.TeardownMaxNS))
 }
 
 func (t *tier3Tally) snapshot() tier3TallySnapshot {
 	return tier3TallySnapshot{
-		SeedsAttempted: t.seedsAttempted.Load(),
-		SeedsPassed:    t.seedsPassed.Load(),
-		SeedsFailed:    t.seedsFailed.Load(),
-		SeedsErrored:   t.seedsErrored.Load(),
+		SeedsAttempted:      t.seedsAttempted.Load(),
+		SeedsPassed:         t.seedsPassed.Load(),
+		SeedsFailed:         t.seedsFailed.Load(),
+		SeedsErrored:        t.seedsErrored.Load(),
+		SeedsTeardownKilled: t.seedsTeardownKilled.Load(),
+		TeardownTotalNS:     t.teardownTotalNS.Load(),
+		TeardownMaxNS:       t.teardownMaxNS.Load(),
+	}
+}
+
+// addTeardown records one attempted seed's refapp teardown.
+func (t *tier3Tally) addTeardown(d time.Duration, killed bool) {
+	if killed {
+		t.seedsTeardownKilled.Add(1)
+	}
+	t.teardownTotalNS.Add(int64(d))
+	for {
+		cur := t.teardownMaxNS.Load()
+		if int64(d) <= cur || t.teardownMaxNS.CompareAndSwap(cur, int64(d)) {
+			return
+		}
 	}
 }
 
@@ -127,12 +166,17 @@ type tier3Result struct {
 	Stderr   string
 	Stdout   string
 	Duration time.Duration
-	// RefappPID is the OS pid of the refapp that hosted this seed.
-	// Recorded so the orchestrator's forensics path can sample /proc
-	// + pprof from the same process the failing replay observed —
-	// even if the refapp has since been SIGTERMed, the dossier
-	// records the PID for postmortem cross-reference.
+	// RefappPID is the OS pid of the refapp that hosted this seed. By
+	// the time the result is emitted that refapp has been stopped and
+	// reaped (stopAndReapRefapp), so nothing can be sampled from it any
+	// more and the PID may already belong to another process: it is a
+	// cross-reference for the dossier, not a live target.
 	RefappPID int
+	// TeardownDuration is the refapp teardown's SIGTERM-to-reap time, and
+	// TeardownKilled whether the refapp died of SIGKILL rather than
+	// exiting on the SIGTERM. Zero when no refapp was started.
+	TeardownDuration time.Duration
+	TeardownKilled   bool
 }
 
 // driveTier3 walks the seed corpus until ctx is done. For each seed:
@@ -142,7 +186,7 @@ type tier3Result struct {
 //  4. Fork validator-replay with -seed -celeris-pid -celeris-port
 //     -duration. Wait up to PerSeedDuration.
 //  5. Capture exit code + stderr.
-//  6. SIGTERM the refapp and reap it: it gets refappStopGrace to
+//  6. SIGTERM the refapp and reap it: it gets RefappStopGrace to
 //     exit cleanly, then SIGKILL (stopAndReapRefapp).
 //  7. Emit one tier3Result on the results channel.
 //
@@ -164,6 +208,9 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 	}
 	if cfg.ReadyTimeout <= 0 {
 		cfg.ReadyTimeout = 10 * time.Second
+	}
+	if cfg.RefappStopGrace <= 0 {
+		cfg.RefappStopGrace = defaultRefappStopGrace
 	}
 	if cfg.CelerisListenPort == 0 {
 		cfg.CelerisListenPort = 8080
@@ -192,6 +239,7 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 			return tally.snapshot(), nil
 		}
 		tally.seedsAttempted.Add(1)
+		tally.addTeardown(res.TeardownDuration, res.TeardownKilled)
 		exitClass := "passed"
 		switch {
 		case res.ExitCode == 0:
@@ -251,9 +299,20 @@ func driveTier3(ctx context.Context, cfg tier3Config, results chan<- tier3Result
 	return tally.snapshot(), nil
 }
 
-// refappStopGrace is how long a seed's teardown waits for its refapp to exit
-// after SIGTERM before it sends SIGKILL, and how long it then waits again.
-const refappStopGrace = 5 * time.Second
+// defaultRefappStopGrace is tier3Config.RefappStopGrace's default.
+const defaultRefappStopGrace = 5 * time.Second
+
+// refappTeardown is what stopping and reaping one seed's refapp cost.
+type refappTeardown struct {
+	// Duration runs from just before the SIGTERM to the reap, or to the
+	// error.
+	Duration time.Duration
+	// Killed: the refapp died of SIGKILL rather than exiting on the
+	// SIGTERM, whether our timer sent it or the per-seed context's kill
+	// got there first (see stopAndReapRefapp). It is read from the exit
+	// status, so it says how the refapp died, not which signals were sent.
+	Killed bool
+}
 
 // stopAndReapRefapp ends one seed's refapp and reaps it. SIGTERM alone is not
 // enough: an exited child stays in the process table as a zombie until its
@@ -263,21 +322,43 @@ const refappStopGrace = 5 * time.Second
 // limit (probatorium#415), and the cluster's validator runs this same loop
 // with the local driver.
 //
-// It Waits once, with a bound, and escalates to SIGKILL from a timer. One
-// Wait call is all a Process has to support: a refapp that ignores SIGTERM
-// is killed at refappStopGrace and reaped inside the same Wait. The error is
-// that Wait's: the refapp outlived SIGKILL for the whole bound, or the driver
-// could not observe its exit.
-func stopAndReapRefapp(proc remote.Process) error {
-	_ = proc.Signal(int(syscall.SIGTERM))
-	kill := time.AfterFunc(refappStopGrace, func() { _ = proc.Signal(int(syscall.SIGKILL)) })
-	defer kill.Stop()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*refappStopGrace)
-	defer cancel()
-	if _, err := proc.Wait(ctx); err != nil {
-		return fmt.Errorf("tier3: stop refapp pid %d: %w", proc.PID(), err)
+// It Waits once, with a bound of twice the grace, and escalates to SIGKILL
+// from a timer at the grace. One Wait call is all a Process has to support: a
+// refapp that ignores SIGTERM is killed at the grace and reaped inside the
+// same Wait. The error is that Wait's: the refapp outlived SIGKILL for the
+// whole bound, or the driver could not observe its exit.
+//
+// The grace is an upper bound, not a promise. The local driver started the
+// refapp under the per-seed context, which SIGKILLs it the moment that
+// context ends, so the refapp really gets min(grace, time left on the seed's
+// context): none at all when the run itself is ending. Killed covers both
+// routes, because it reads how the refapp died.
+//
+// A refapp whose PID the driver never learned (the SSH driver's pidfile read
+// failed) cannot be signalled at all; that is reported at once rather than
+// after a Wait that nothing would ever end.
+func stopAndReapRefapp(proc remote.Process, grace time.Duration) (refappTeardown, error) {
+	if grace <= 0 {
+		grace = defaultRefappStopGrace
 	}
-	return nil
+	start := time.Now()
+	if proc.PID() <= 0 {
+		return refappTeardown{}, errors.New("tier3: stop refapp: its pid is unknown, so it cannot be signalled")
+	}
+	_ = proc.Signal(int(syscall.SIGTERM))
+	kill := time.AfterFunc(grace, func() { _ = proc.Signal(int(syscall.SIGKILL)) })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*grace)
+	defer cancel()
+	wr, err := proc.Wait(ctx)
+	kill.Stop()
+	td := refappTeardown{
+		Duration: time.Since(start),
+		Killed:   wr.Signaled && wr.Signal == int(syscall.SIGKILL),
+	}
+	if err != nil {
+		return td, fmt.Errorf("tier3: stop refapp pid %d: %w", proc.PID(), err)
+	}
+	return td, nil
 }
 
 // replayOneSeed runs the per-seed lifecycle. Errors during refapp
@@ -299,7 +380,9 @@ func replayOneSeed(ctx context.Context, cfg tier3Config, seed corpus.Seed) (res 
 		return res
 	}
 	defer func() {
-		err := stopAndReapRefapp(proc)
+		td, err := stopAndReapRefapp(proc, cfg.RefappStopGrace)
+		res.TeardownDuration = td.Duration
+		res.TeardownKilled = td.Killed
 		if err == nil {
 			return
 		}
@@ -469,6 +552,8 @@ func writeSeedFailureLog(dir, class string, r tier3Result) {
 		ExitCode   int    `json:"exit_code"`
 		DurationNS int64  `json:"duration_ns"`
 		RefappPID  int    `json:"refapp_pid,omitempty"`
+		TeardownNS int64  `json:"teardown_ns,omitempty"`
+		Killed     bool   `json:"teardown_killed,omitempty"`
 		Stderr     string `json:"stderr,omitempty"`
 		Stdout     string `json:"stdout,omitempty"`
 		LoggedAt   string `json:"logged_at"`
@@ -479,6 +564,8 @@ func writeSeedFailureLog(dir, class string, r tier3Result) {
 		ExitCode:   r.ExitCode,
 		DurationNS: r.Duration.Nanoseconds(),
 		RefappPID:  r.RefappPID,
+		TeardownNS: r.TeardownDuration.Nanoseconds(),
+		Killed:     r.TeardownKilled,
 		Stderr:     truncateAt(r.Stderr, 4096),
 		Stdout:     truncateAt(r.Stdout, 4096),
 		LoggedAt:   time.Now().UTC().Format(time.RFC3339Nano),

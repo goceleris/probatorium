@@ -25,7 +25,10 @@ import (
 // The guard runs after m.Run() in TestMain and fails the package when this
 // test binary still has unreaped children. It counts ONLY children of this
 // process (PPID == os.Getpid()) in state Z: the host-wide zombie count belongs
-// to whatever else runs on the box and is never asserted on.
+// to whatever else runs on the box and is never asserted on. It always prints
+// one verdict line naming the lister it used, so a `go test -v` log shows
+// that it ran and how (a plain `go test` shows a package's output only when
+// the package fails).
 
 // zombieGuardBound is how many unreaped children may survive the settle
 // window. Zero: a child whose owner does Wait is reaped within microseconds of
@@ -39,19 +42,41 @@ const zombieGuardBound = 0
 // pays one sample.
 const zombieGuardSettle = 10 * time.Second
 
-// errZombieCountUnsupported means this host offers no way to list this
-// process's children: /proc is unreadable (or absent) and there is no ps.
-// The guard then FAILS the package. It runs from TestMain, where a skip would
-// print nothing under a plain `go test` and read as a pass.
-var errZombieCountUnsupported = errors.New("cannot list child processes on this platform")
+// childLister lists a process's children, live or zombie, as PID -> state
+// letter(s).
+type childLister struct {
+	name string
+	list func(self int) (map[int]string, error)
+}
 
-// zombieChildren returns the PIDs of this process's children that have exited
-// and have not been reaped.
-func zombieChildren() ([]int, error) {
-	kids, err := childProcesses()
-	if err != nil {
-		return nil, err
+// childListers are the ways this platform can list a process's children, in
+// the order childProcesses tries them: /proc on Linux, then ps.
+func childListers() []childLister {
+	var ls []childLister
+	if runtime.GOOS == "linux" {
+		ls = append(ls, childLister{"/proc", childProcessesProc})
 	}
+	return append(ls, childLister{"ps", childProcessesPS})
+}
+
+// childProcesses maps every child of this process, live or zombie, to its
+// state letter(s), and names the lister that answered. It fails only when no
+// lister could answer at all.
+func childProcesses() (map[int]string, string, error) {
+	self := os.Getpid()
+	var errs []error
+	for _, l := range childListers() {
+		kids, err := l.list(self)
+		if err == nil {
+			return kids, l.name, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", l.name, err))
+	}
+	return nil, "", errors.Join(errs...)
+}
+
+// zombiesIn returns the PIDs in kids whose state is Z, sorted.
+func zombiesIn(kids map[int]string) []int {
 	var pids []int
 	for pid, state := range kids {
 		if strings.HasPrefix(state, "Z") {
@@ -59,19 +84,7 @@ func zombieChildren() ([]int, error) {
 		}
 	}
 	slices.Sort(pids)
-	return pids, nil
-}
-
-// childProcesses maps every child of this process, live or zombie, to its
-// state letter(s).
-func childProcesses() (map[int]string, error) {
-	self := os.Getpid()
-	if runtime.GOOS == "linux" {
-		if kids, err := childProcessesProc(self); err == nil {
-			return kids, nil
-		}
-	}
-	return childProcessesPS(self)
+	return pids
 }
 
 // childProcessesProc reads /proc/<pid>/stat for every process. The fields
@@ -117,17 +130,18 @@ func parseProcStat(b []byte) (state string, ppid int, ok bool) {
 }
 
 // childProcessesPS asks ps(1) for every process's PID, PPID and state, and
-// keeps this process's children. The ps child it forks is reaped by Output
-// before the list is parsed, so it never counts itself.
+// keeps this process's children. ps is running while it lists, so its own row
+// is in the output as a live child of this process; it is dropped here, and
+// being live it never counted as a zombie anyway.
 func childProcessesPS(self int) (map[int]string, error) {
-	out, err := exec.Command("ps", "-A", "-o", "pid=,ppid=,stat=").Output()
+	cmd := exec.Command("ps", "-A", "-o", "pid=,ppid=,stat=")
+	out, err := cmd.Output()
 	if err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return nil, fmt.Errorf("%w: %v", errZombieCountUnsupported, err)
-		}
 		return nil, fmt.Errorf("ps: %w", err)
 	}
-	return parsePSChildren(out, self), nil
+	kids := parsePSChildren(out, self)
+	delete(kids, cmd.Process.Pid)
+	return kids, nil
 }
 
 func parsePSChildren(out []byte, self int) map[int]string {
@@ -149,19 +163,29 @@ func parsePSChildren(out []byte, self int) map[int]string {
 	return kids
 }
 
-// zombieGuard re-samples this process's zombie children until the count is at
-// or under zombieGuardBound or zombieGuardSettle has passed, writes a verdict
-// to w, and returns the exit code the package should get: 0 to pass, 1 to
-// fail.
+// zombieGuard is the guard TestMain runs over this test binary's children.
 func zombieGuard(w io.Writer) int {
-	deadline := time.Now().Add(zombieGuardSettle)
-	for {
-		pids, err := zombieChildren()
+	return runZombieGuard(w, os.Getpid(), childProcesses, zombieGuardSettle)
+}
+
+// runZombieGuard re-samples list until the zombie count is at or under
+// zombieGuardBound or settle has passed, writes one verdict line to w, and
+// returns the exit code the package should get: 0 to pass, 1 to fail. It
+// fails closed: a list that cannot be taken is a FAIL, because a guard that
+// cannot count cannot show that nothing was left unreaped, and a skip inside
+// TestMain would print nothing under a plain `go test` and read as a pass.
+func runZombieGuard(w io.Writer, self int, list func() (map[int]string, string, error), settle time.Duration) int {
+	deadline := time.Now().Add(settle)
+	for samples := 1; ; samples++ {
+		kids, source, err := list()
 		if err != nil {
 			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, could not count this binary's child processes, so it cannot show that none was left unreaped: %v\n", err)
 			return 1
 		}
+		pids := zombiesIn(kids)
 		if len(pids) <= zombieGuardBound {
+			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): PASS, %d unreaped children of this test binary (pid %d), listed via %s after %d sample(s) (bound %d)\n",
+				len(pids), self, source, samples, zombieGuardBound)
 			return 0
 		}
 		if time.Now().After(deadline) {
@@ -169,8 +193,8 @@ func zombieGuard(w io.Writer) int {
 			if len(shown) > 20 {
 				shown = shown[:20]
 			}
-			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, %d exited children of this test binary (pid %d) were never reaped after %s (bound %d); first pids: %v. Something Start()ed a process and never Wait()ed it.\n",
-				len(pids), os.Getpid(), zombieGuardSettle, zombieGuardBound, shown)
+			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, %d exited children of this test binary (pid %d) were never reaped after %s, listed via %s (bound %d); first pids: %v. Something Start()ed a process and never Wait()ed it.\n",
+				len(pids), self, settle, source, zombieGuardBound, shown)
 			return 1
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -211,46 +235,119 @@ func TestZombieGuard_ParsesPS(t *testing.T) {
 	}
 }
 
+// TestZombieGuard_Verdicts: the guard's decision on its own, with the
+// children list stubbed. A list it cannot take FAILS (fail closed); a zombie
+// that outlasts the settle window FAILS; one that is reaped inside it PASSES;
+// every verdict is printed with the lister that produced it.
+func TestZombieGuard_Verdicts(t *testing.T) {
+	const self = 500
+	listed := func(steps ...map[int]string) func() (map[int]string, string, error) {
+		i := 0
+		return func() (map[int]string, string, error) {
+			kids := steps[min(i, len(steps)-1)]
+			i++
+			return kids, "stub", nil
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		list     func() (map[int]string, string, error)
+		wantCode int
+		wantLine string
+	}{
+		{
+			name:     "children cannot be listed",
+			list:     func() (map[int]string, string, error) { return nil, "", errors.New("no /proc, no ps") },
+			wantCode: 1,
+			wantLine: "FAIL, could not count this binary's child processes, so it cannot show that none was left unreaped: no /proc, no ps",
+		},
+		{
+			name:     "a zombie outlasts the settle window",
+			list:     listed(map[int]string{900: "Z", 901: "S"}),
+			wantCode: 1,
+			wantLine: "FAIL, 1 exited children of this test binary (pid 500) were never reaped after 300ms, listed via stub (bound 0); first pids: [900]",
+		},
+		{
+			name:     "a zombie is reaped inside the settle window",
+			list:     listed(map[int]string{900: "Z"}, map[int]string{900: "Z"}, map[int]string{901: "S"}),
+			wantCode: 0,
+			wantLine: "PASS, 0 unreaped children of this test binary (pid 500), listed via stub after 3 sample(s) (bound 0)",
+		},
+		{
+			name:     "no children at all",
+			list:     listed(map[int]string{}),
+			wantCode: 0,
+			wantLine: "PASS, 0 unreaped children of this test binary (pid 500), listed via stub after 1 sample(s) (bound 0)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			code := runZombieGuard(&buf, self, tc.list, 300*time.Millisecond)
+			if code != tc.wantCode {
+				t.Errorf("exit code %d, want %d; verdict %q", code, tc.wantCode, buf.String())
+			}
+			if !strings.Contains(buf.String(), "zombie guard (probatorium#415): "+tc.wantLine) {
+				t.Errorf("verdict %q, want it to contain %q", buf.String(), tc.wantLine)
+			}
+		})
+	}
+}
+
 // TestZombieGuard_SeesAnUnreapedChild proves the guard is not vacuous on this
-// platform: a child that has exited but was not waited for must show up as a
-// zombie of this process, and must be gone once it is reaped.
+// platform, for every way it can list children here (on Linux both /proc,
+// which it uses first, and ps when installed; elsewhere ps): a child that has
+// exited but was not waited for must show up as a zombie of this process, and
+// must be gone once it is reaped. It never skips: a platform where children
+// cannot be listed fails the guard itself.
 func TestZombieGuard_SeesAnUnreapedChild(t *testing.T) {
-	if _, err := zombieChildren(); errors.Is(err, errZombieCountUnsupported) {
-		t.Skipf("the guard cannot count children here: %v", err)
-	}
-	cmd := exec.Command("/bin/sh", "-c", "exit 0")
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	pid := cmd.Process.Pid
-	reaped := false
-	reap := func() {
-		if !reaped {
-			reaped = true
-			_ = cmd.Wait()
+	listers := childListers()
+	if runtime.GOOS == "linux" {
+		if _, err := exec.LookPath("ps"); err != nil {
+			listers = listers[:1] // /proc only
 		}
 	}
-	t.Cleanup(reap)
-	deadline := time.Now().Add(tier1TestBudget)
-	for {
-		pids, err := zombieChildren()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if slices.Contains(pids, pid) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("pid %d exited unreaped but was never counted as a zombie of pid %d (saw %v)", pid, os.Getpid(), pids)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	reap()
-	kids, err := childProcesses()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state, ok := kids[pid]; ok {
-		t.Fatalf("pid %d still listed as a child (state %s) after it was reaped", pid, state)
+	for _, l := range listers {
+		// "proc", not "/proc": a slash in a subtest name splits it for -run.
+		t.Run(strings.TrimPrefix(l.name, "/"), func(t *testing.T) {
+			self := os.Getpid()
+			if _, err := l.list(self); err != nil {
+				t.Fatalf("%s cannot list this process's children: %v", l.name, err)
+			}
+			cmd := exec.Command("/bin/sh", "-c", "exit 0")
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			pid := cmd.Process.Pid
+			reaped := false
+			reap := func() {
+				if !reaped {
+					reaped = true
+					_ = cmd.Wait()
+				}
+			}
+			t.Cleanup(reap)
+			deadline := time.Now().Add(tier1TestBudget)
+			for {
+				kids, err := l.list(self)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if slices.Contains(zombiesIn(kids), pid) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("pid %d exited unreaped but %s never listed it as a zombie of pid %d (saw %v)", pid, l.name, self, kids)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			reap()
+			kids, err := l.list(self)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state, ok := kids[pid]; ok {
+				t.Fatalf("pid %d still listed by %s as a child (state %s) after it was reaped", pid, l.name, state)
+			}
+		})
 	}
 }

@@ -66,6 +66,15 @@ func (l *Local) Start(ctx context.Context, args []string) (Process, error) {
 	}
 	cmd.Stderr = errW
 	cmd.Stdout = outW
+	// The process leads a process group of its own, and every signal the
+	// driver sends goes to that whole group (see Signal), so a stop reaches
+	// whatever the process forked too. A shell that forks its last command
+	// (bash does, for `...; sleep 30`) dies on a SIGTERM sent to it alone and
+	// leaves the forked child running with PPID 1, where no Wait of ours can
+	// ever reach it (probatorium#415). The context's kill takes the same
+	// route, so a cancelled Start does not leave the forks behind either.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return signalGroup(cmd.Process.Pid, syscall.SIGKILL) }
 	if err := cmd.Start(); err != nil {
 		for _, f := range []*os.File{errR, errW, outR, outW} {
 			_ = f.Close()
@@ -130,22 +139,38 @@ func (p *localProcess) PID() int {
 	return p.cmd.Process.Pid
 }
 
-// Signal forwards sig to the underlying process. Returns nil if the
-// process is already gone (matches orchestrator's "fire and forget"
+// Signal sends sig to the process's whole process group: the process and
+// everything it forked that has not moved to a group of its own. Returns nil
+// if the process is already gone (matches orchestrator's "fire and forget"
 // idiom for shutdown).
+//
+// Once Wait has reaped the process its PID, and so its group ID, is free for
+// the kernel to hand out again, so a reaped process is never signalled. What
+// is left is the moment between the reap inside Wait and Wait recording it,
+// in which a signal could reach a new group only if the PID had been reused
+// and made a group leader in between.
 func (p *localProcess) Signal(sig int) error {
 	if p.cmd == nil || p.cmd.Process == nil {
 		return nil
 	}
-	err := p.cmd.Process.Signal(syscall.Signal(sig))
-	// os.ErrProcessDone landed in Go 1.16 and means the process
-	// already exited. The wrapped error from Signal on a finished
-	// process is "os: process already finished" — match either.
-	if err == nil || errors.Is(err, errProcessDone) {
+	p.mu.Lock()
+	waited := p.waited
+	p.mu.Unlock()
+	if waited {
 		return nil
 	}
-	if err.Error() == "os: process already finished" {
-		return nil
+	if err := signalGroup(p.cmd.Process.Pid, syscall.Signal(sig)); !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
+}
+
+// signalGroup sends sig to the process group pgid. ESRCH means no process is
+// left in the group, which a stop counts as done.
+func signalGroup(pgid int, sig syscall.Signal) error {
+	err := syscall.Kill(-pgid, sig)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
 	}
 	return err
 }
@@ -219,15 +244,3 @@ func (p *localProcess) Wait(ctx context.Context) (WaitResult, error) {
 
 // Stderr returns a reader streaming stderr+stdout until process exit.
 func (p *localProcess) Stderr() io.Reader { return p.errReader }
-
-// errProcessDone is os.ErrProcessDone, threaded through a package-
-// level var so callers don't need to import os. Defined here so the
-// import graph is explicit at the file head.
-var errProcessDone = newErrProcessDone()
-
-func newErrProcessDone() error {
-	// os.ErrProcessDone is a stable sentinel since Go 1.16. We
-	// indirect through this constructor so a future stdlib rename
-	// only touches one place.
-	return errors.New("os: process already finished")
-}
