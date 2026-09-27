@@ -404,6 +404,13 @@ func slowFireDetail(t *Tier1Summary, key string) []SlowFire {
 	return nil
 }
 
+// IsFailedSlowFire reports whether a slow fire is a failure the gate
+// counts -- an h2c hang (hang-*) or a WS handshake failure
+// (handshake-fail-*) -- rather than a slow success or a decline.
+func IsFailedSlowFire(f SlowFire) bool {
+	return strings.HasPrefix(f.Outcome, "hang-") || strings.HasPrefix(f.Outcome, "handshake-fail-")
+}
+
 // FirstFailedSlowFire renders the first failed record of a slow-fire ring
 // as a message suffix, e.g. " first: 2026-09-06T04:32:31Z read=20000ms
 // outcome=hang-timeout err=\"read tcp ...: i/o timeout\" local=127.0.0.1:41234".
@@ -412,7 +419,7 @@ func slowFireDetail(t *Tier1Summary, key string) []SlowFire {
 // still the total.
 func FirstFailedSlowFire(ring []SlowFire) string {
 	for _, f := range ring {
-		if !strings.HasPrefix(f.Outcome, "hang-") && !strings.HasPrefix(f.Outcome, "handshake-fail-") {
+		if !IsFailedSlowFire(f) {
 			continue
 		}
 		s := fmt.Sprintf(" first: %s read=%dms outcome=%s", f.TS, f.ReadMs, f.Outcome)

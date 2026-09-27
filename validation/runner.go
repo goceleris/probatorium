@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -282,6 +283,12 @@ type Orchestrator struct {
 	// dossier written while the refapp is still alive carries the engine's
 	// Warn/Error lines from the seconds before the event (celeris#588).
 	stderrTail atomic.Pointer[[]string]
+	// liveTail and debugAddr are Tier 1's live accessors for the dossier
+	// (tier1Config.OnDossierInputs): the refapp's stderr tail as of the
+	// capture, and its debug side listener, which the pprof leg prefers
+	// over the engine (celeris#588). nil before Tier 1 has started a refapp.
+	liveTail  atomic.Pointer[func() []string]
+	debugAddr atomic.Pointer[func() string]
 }
 
 // Plan is the deterministic schedule [Orchestrator.Run] would execute.
@@ -322,6 +329,19 @@ type TierPlan struct {
 // missing.
 func New(cfg Config) (*Orchestrator, error) {
 	o := &Orchestrator{cfg: cfg}
+
+	// celeris#588: in a stall-capture run (stallCaptureEnabled: a
+	// fault-control run, or PROBATORIUM_STALL_CAPTURE=1 -- never a routine
+	// run) every refapp launched on THIS host also serves /debug/pprof on a
+	// side listener (debugvars.DebugAddrEnv, inherited by the child) and
+	// announces it on its "debug addr=" banner, so a dossier can take a
+	// goroutine dump while the engine's loops are parked by the stall it is
+	// recording. The ssh driver launches on another host, where a loopback
+	// address announced there means nothing here. An operator's own value
+	// is kept.
+	if cfg.DriverMode != "ssh" && stallCaptureEnabled(os.Getenv) && os.Getenv(refappDebugAddrEnv) == "" {
+		_ = os.Setenv(refappDebugAddrEnv, "127.0.0.1:0")
+	}
 
 	if cfg.MarkovPath != "" {
 		m, err := markov.LoadMatrixFile(cfg.MarkovPath)
@@ -748,10 +768,43 @@ func isInfraDriveIncident(inc Incident) bool {
 // infra-flake records. Same shape as handleIncident's dossier dir
 // so postmortem tooling can read both with one walker.
 func infraIncidentDir(outDir string, inc Incident) string {
-	ts := time.Now().UTC().Format("20060102-150405")
-	dir := filepath.Join(outDir, "incidents", ts+"-"+inc.PredicateID)
-	_ = os.MkdirAll(dir, 0o755)
+	dir, err := newIncidentDir(outDir, inc.PredicateID)
+	if err != nil {
+		// Best-effort, as before: the caller writes incident.json into it.
+		dir = filepath.Join(outDir, "incidents", time.Now().UTC().Format("20060102-150405")+"-"+inc.PredicateID)
+		_ = os.MkdirAll(dir, 0o755)
+	}
 	return dir
+}
+
+// newIncidentDir creates a NEW directory for one incident under
+// <outDir>/incidents: <UTC second>-<predicate>, or, when that exists
+// already, <UTC second>.<n>-<predicate> for the first free n >= 2. Two
+// incidents of one predicate in one second used to share the first name,
+// and the second's files overwrote the first's; the in-stall hook sends
+// such pairs routinely (celeris#588 round-2 container run). The name still
+// ends in -<predicate> and still sorts by time.
+func newIncidentDir(outDir, predicate string) (string, error) {
+	parent := filepath.Join(outDir, "incidents")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", err
+	}
+	ts := time.Now().UTC().Format("20060102-150405")
+	for n := 1; n <= 1000; n++ {
+		name := ts + "-" + predicate
+		if n > 1 {
+			name = ts + "." + strconv.Itoa(n) + "-" + predicate
+		}
+		dir := filepath.Join(parent, name)
+		err := os.Mkdir(dir, 0o755)
+		if err == nil {
+			return dir, nil
+		}
+		if !os.IsExist(err) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("incident dossier: 1000 dossiers named %s-%s already", ts, predicate)
 }
 
 // Incident is one invariant violation. Captured by the validator-
@@ -993,94 +1046,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		})
 	}()
 
-	// alertedCounters tracks which sub-tally counters we've already
-	// emitted an Incident for, so the periodic callback fires AT MOST
-	// ONCE per counter per run. Without this, a steady-rate adversarial
-	// bug (server accepts every malformed request) would generate
-	// hundreds of incidents per second once the bug catches.
-	alertedCounters := make(map[string]bool)
-	tallyCB := func(snap tier1TallySnapshot) {
-		// Publish the refapp's stderr tail for the dossier writer.
-		if tail := snap.RefappStderrTail; len(tail) > 0 {
-			o.stderrTail.Store(&tail)
-		}
-		// HIGH-severity sub-counters: anything non-zero is a bug.
-		// Mirror the canonical list from report.invariantCounters so
-		// the per-arch incident emission stays in sync with the
-		// cross-arch DiffValidation gate.
-		fireIncident := func(counter, msg string, ok, recordOnly bool) {
-			if !ok || alertedCounters[counter] {
-				return
-			}
-			alertedCounters[counter] = true
-			select {
-			case violations <- Incident{
-				Tier:        TierProperty,
-				PredicateID: counter,
-				Message:     msg,
-				ObservedAt:  time.Now().UTC(),
-				RefappPID:   pid(),
-				RecordOnly:  recordOnly,
-				SkipCore:    recordOnly,
-			}:
-			default:
-				// Channel full or closed — orchestrator already
-				// handling a hard fail; nothing more to do.
-			}
-		}
-		fire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, false) }
-		// Record-only: dossier (no gcore) while the refapp is still up,
-		// and the cell runs on. The gate still fails on the total; this
-		// only adds evidence to it (celeris#588).
-		record := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, true) }
-		fire(properties.IADVAccepted.ID,
-			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
-			snap.Adversarial.WrongAccepted > 0)
-		fire(properties.IH2CCrashed.ID,
-			fmt.Sprintf("h2c churn returned non-HTTP babble (count=%d) — engine crash on upgrade", snap.H2CChurn.Crashed),
-			snap.H2CChurn.Crashed > 0)
-		fire(properties.IWSAccepted.ID,
-			fmt.Sprintf("server accepted bad WebSocket frame (count=%d) — RFC 6455 violation", snap.WSTorture.AcceptedBadFrame),
-			snap.WSTorture.AcceptedBadFrame > 0)
-		fire(properties.IWSHang.ID,
-			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
-			snap.WSTorture.HangNoClose > 0)
-		// The two gated walker totals that never had a reactive incident.
-		// Both carry the first slow-read record in the message so the
-		// incident.json alone names the instant, the error and the
-		// addresses; the full ring is in the tally snapshot beside it.
-		record(properties.IH2CHang.ID,
-			fmt.Sprintf("h2c upgrade request neither answered nor declined (count=%d: eof=%d timeout=%d reset=%d other=%d, max_elapsed=%dms)%s",
-				snap.H2CChurn.Hang, snap.H2CChurn.HangEOF, snap.H2CChurn.HangTimeout,
-				snap.H2CChurn.HangReset, snap.H2CChurn.HangOther, snap.H2CChurn.HangMaxElapsedMs,
-				report.FirstFailedSlowFire(snap.H2CChurn.SlowReads)),
-			snap.H2CChurn.Hang > 0)
-		record(properties.IWSHandshake.ID,
-			fmt.Sprintf("WebSocket upgrade handshake failed (count=%d: eof=%d timeout=%d reset=%d status=%d other=%d)%s",
-				snap.WSTorture.HandshakeFail, snap.WSTorture.HandshakeFailEOF, snap.WSTorture.HandshakeFailTimeout,
-				snap.WSTorture.HandshakeFailReset, snap.WSTorture.HandshakeFailStatus, snap.WSTorture.HandshakeFailOther,
-				report.FirstFailedSlowFire(snap.WSTorture.SlowReads)),
-			snap.WSTorture.HandshakeFail > 0)
-		// Large-echo wire oracle (celeris#587): any of the four failure
-		// classes is one incident; the message carries all four so the
-		// dossier says which.
-		e := snap.WSEcho
-		fire(properties.IWSEcho.ID,
-			fmt.Sprintf("64 KiB WebSocket echoes not byte-intact and in order (corrupt=%d [egress_interleave=%d other=%d] reorder=%d missing=%d timeout=%d, ok=%d)",
-				e.Corrupt, e.EgressInterleave, e.OtherCorrupt, e.Reorder, e.Missing, e.Timeout, e.OK),
-			e.Corrupt+e.Reorder+e.Missing+e.Timeout > 0)
-		// Engine-agnostic crash oracle: the refapp process died mid-run. This
-		// is the catch-all that the per-protocol counters above can't see — a
-		// dead server just looks like connection-refused to every walker.
-		fire(properties.ILiveness.ID,
-			livenessDeathMessage(snap.Liveness),
-			snap.Liveness.Crashed)
-		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
-		// connection errors). Complements I-LIVENESS for the hang class.
-		fire(properties.IHang.ID,
-			fmt.Sprintf("refapp wedged mid-run: %s", snap.Liveness.Reason()),
-			snap.Liveness.Hung)
-	}
+	// In-stall capture (celeris#588), in a stall-capture run only: nil
+	// leaves Tier 1's walkers with no stall timer at all.
+	onWalkerStall := walkerStallHook(os.Getenv, violations, pid)
+	tallyCB := o.tallyIncidentCallback(ctx, violations, pid)
 
 	cfg := tier1Config{
 		Driver:      driver,
@@ -1097,11 +1066,16 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		PIDChan:            pidCh,
 		AddrChan:           addrCh,
 		TallyCallback:      tallyCB,
+		OnWalkerStall:      onWalkerStall,
 		OnLiveTally:        func(f func() int64) { expectedPanicsFn.Store(&f) },
 		OnResponseCounters: func(f func() ResponseCounters) { responseCountersFn.Store(&f) },
 		OnCrashReports:     func(f func() int64) { crashReportsFn.Store(&f) },
 		OnIdleWindow:       func(f func() int) { idleWindowFn.Store(&f) },
 		OnRaceReports:      func(f func() int64) { raceReportsFn.Store(&f) },
+		OnDossierInputs: func(addr func() string, tail func() []string) {
+			o.debugAddr.Store(&addr)
+			o.liveTail.Store(&tail)
+		},
 		// Burst, idle, load, idle for I-MEM-2 -- only where the slope
 		// oracles still fit after the prelude (see idleWindowsMinDuration).
 		IdleWindows:           o.cfg.Duration >= idleWindowsMinDuration,
@@ -1114,6 +1088,14 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		SnapshotPath: filepath.Join(o.cfg.OutDir, "tier1_tally.json"),
 	}
 	tally, err := driveTier1(ctx, cfg)
+	// The refapp is gone: its side listener with it. A later dossier (a
+	// Tier 3 incident, or one still queued) must not point its pprof leg at
+	// the dead address and label the dump "side-listener". The dossier of the
+	// crash or wedge that ended Tier 1 was taken before this: the final tick
+	// waited for it (awaitTerminalCapture). The live tail
+	// accessor stays: the dead refapp's ring still holds its last lines,
+	// fresher than the tick's copy, for the dossier of whatever ended it.
+	o.debugAddr.Store(nil)
 	// The refapp is down (or going down) once driveTier1 returns: stop
 	// the property loop and collect its tally. Joined on every path so
 	// the goroutine never outlives the tier.
@@ -1379,12 +1361,361 @@ func livenessDeathMessage(s livenessSnapshot) string {
 // approach this.
 const forensicsBudget = 30 * time.Second
 
+// stallDossiersPerKind bounds the in-stall dossiers (celeris#588) per
+// walker kind per cell: enough to catch a stall that recurs, few enough that
+// a host under sustained slow reads cannot spend its cell on forensics.
+const stallDossiersPerKind = 4
+
+// stallDossierCooldown is how long after an in-stall dossier of one kind the
+// next trigger of that kind is ignored (celeris#588 round 2). Every read that
+// started at a stall's onset crosses the threshold within the same
+// millisecond, and the orchestrator drains the channel between their timer
+// callbacks, so without it one stall took several dossiers and spent the
+// kind's budget on a single moment: the adaptive cell of the round-2
+// container run had no h2c budget left when the / hold began. A later
+// episode of the same kind, seconds apart, still gets its own dossier.
+const stallDossierCooldown = 2 * time.Second
+
+// tallyIncidentCallback is Tier 1's TallyCallback for this run: each tick
+// it publishes the refapp's stderr tail for the dossier writer and turns the
+// tally snapshot into the property tier's reactive incidents on violations.
+// ctx is the run's context (rootCtx); pid reads the live refapp's PID.
+//
+// A tick offers its incidents in an order of its own, not in the order the
+// oracles are listed (probatorium#412 review round 3). violations holds ONE
+// incident, and offerOnce re-offers every incident a busy loop dropped, so
+// the order decides who gets a free slot.
+//
+// A tick that sees the refapp crashed or wedged (I-LIVENESS / I-HANG) ends
+// the cell, and Run's incident loop stops receiving at the first hard
+// incident. On a crash or a wedge the final synchronous tick in driveTier1
+// is often the only offer left: the periodic ticker stopped when the tier
+// cancelled its run. On that tick EVERY incident it delivers waits for the
+// slot (deliverWaiting, bounded by the run and terminalIncidentWait):
+//   - first the record-only incidents still pending -- the loop writes their
+//     dossiers and keeps receiving. Offered after the wedge they were lost:
+//     the round-3 live run's adaptive cell lost its gated I-H2C-HANG so;
+//   - then I-LIVENESS / I-HANG. Offered without waiting it was dropped when
+//     a retried record-only incident, or a busy loop, held the slot, and the
+//     cell was never aborted. Once it is delivered the tick waits for the
+//     run to end (awaitTerminalCapture): Run's loop cancels the run right
+//     after it has captured that incident's dossier. A tick that returned
+//     at the send let driveTier1 return under the capture -- its deferred
+//     SIGTERM stopped the refapp and runTierProperty reset the side-listener
+//     accessor -- so every I-HANG dossier read pprof_source=engine against
+//     the wedged engine and had no goroutine dump (re-review of round 3);
+//     the record-only dossiers delivered ahead of it are captured while the
+//     tick waits too;
+//   - then the hard walker incidents, offered as usual (the cell is ending).
+//
+// On every other tick nothing waits: the hard walker incidents (a hard fail
+// in a routine run) go before the record-only ones, which only add a
+// dossier.
+func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations chan<- Incident, pid func() int) func(tier1TallySnapshot) {
+	// alertedCounters tracks which sub-tally counters we've already
+	// emitted an Incident for, so the periodic callback fires AT MOST
+	// ONCE per counter per run. Without this, a steady-rate adversarial
+	// bug (server accepts every malformed request) would generate
+	// hundreds of incidents per second once the bug catches.
+	alertedCounters := make(map[string]bool)
+	faultInjected := strings.TrimSpace(os.Getenv(refappFaultEnv)) != ""
+	return func(snap tier1TallySnapshot) {
+		// Publish the refapp's stderr tail for the dossier writer.
+		if tail := snap.RefappStderrTail; len(tail) > 0 {
+			o.stderrTail.Store(&tail)
+		}
+		// HIGH-severity sub-counters: anything non-zero is a bug.
+		// Mirror the canonical list from report.invariantCounters so
+		// the per-arch incident emission stays in sync with the
+		// cross-arch DiffValidation gate.
+		//
+		// Collected here, offered by severity at the end of the tick.
+		var terminal, hard, recorded []Incident
+		fireIncident := func(counter, msg string, ok, recordOnly bool) {
+			if !ok || alertedCounters[counter] {
+				return
+			}
+			inc := Incident{
+				Tier:        TierProperty,
+				PredicateID: counter,
+				Message:     msg,
+				ObservedAt:  time.Now().UTC(),
+				RefappPID:   pid(),
+				RecordOnly:  recordOnly,
+				SkipCore:    recordOnly,
+			}
+			if recordOnly {
+				recorded = append(recorded, inc)
+			} else {
+				hard = append(hard, inc)
+			}
+		}
+		// fatal is for the two oracles that end the cell (the refapp died,
+		// or it is wedged): delivered even into a full slot (deliverWaiting),
+		// after the record-only incidents still pending.
+		fatal := func(counter, msg string, ok bool) {
+			if !ok || alertedCounters[counter] {
+				return
+			}
+			terminal = append(terminal, Incident{
+				Tier:        TierProperty,
+				PredicateID: counter,
+				Message:     msg,
+				ObservedAt:  time.Now().UTC(),
+				RefappPID:   pid(),
+			})
+		}
+		// walkerFire is a hard incident for the walker oracles. A fault-injected
+		// control run (PROBATORIUM_REFAPP_FAULT set, celeris#588) records
+		// them instead: the injected stall trips them by design (a held /ws
+		// also times out the 64 KiB echo walker), and a hard fail would end
+		// the cell before the capture it exists to judge had run. Liveness
+		// and hang stay hard in every run.
+		walkerFire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, faultInjected) }
+		// Record-only: dossier (no gcore) while the refapp is still up,
+		// and the cell runs on. The gate still fails on the total; this
+		// only adds evidence to it (celeris#588).
+		record := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, true) }
+		walkerFire(properties.IADVAccepted.ID,
+			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
+			snap.Adversarial.WrongAccepted > 0)
+		walkerFire(properties.IH2CCrashed.ID,
+			fmt.Sprintf("h2c churn returned non-HTTP babble (count=%d) — engine crash on upgrade", snap.H2CChurn.Crashed),
+			snap.H2CChurn.Crashed > 0)
+		walkerFire(properties.IWSAccepted.ID,
+			fmt.Sprintf("server accepted bad WebSocket frame (count=%d) — RFC 6455 violation", snap.WSTorture.AcceptedBadFrame),
+			snap.WSTorture.AcceptedBadFrame > 0)
+		walkerFire(properties.IWSHang.ID,
+			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
+			snap.WSTorture.HangNoClose > 0)
+		// The two gated walker totals that never had a reactive incident.
+		// Both carry the first slow-read record in the message so the
+		// incident.json alone names the instant, the error and the
+		// addresses; the full ring is in the tally snapshot beside it.
+		record(properties.IH2CHang.ID,
+			fmt.Sprintf("h2c upgrade request neither answered nor declined (count=%d: eof=%d timeout=%d reset=%d other=%d, max_elapsed=%dms)%s",
+				snap.H2CChurn.Hang, snap.H2CChurn.HangEOF, snap.H2CChurn.HangTimeout,
+				snap.H2CChurn.HangReset, snap.H2CChurn.HangOther, snap.H2CChurn.HangMaxElapsedMs,
+				report.FirstFailedSlowFire(snap.H2CChurn.SlowReads)),
+			snap.H2CChurn.Hang > 0)
+		record(properties.IWSHandshake.ID,
+			fmt.Sprintf("WebSocket upgrade handshake failed (count=%d: eof=%d timeout=%d reset=%d status=%d other=%d)%s",
+				snap.WSTorture.HandshakeFail, snap.WSTorture.HandshakeFailEOF, snap.WSTorture.HandshakeFailTimeout,
+				snap.WSTorture.HandshakeFailReset, snap.WSTorture.HandshakeFailStatus, snap.WSTorture.HandshakeFailOther,
+				report.FirstFailedSlowFire(snap.WSTorture.SlowReads)),
+			snap.WSTorture.HandshakeFail > 0)
+		// Large-echo wire oracle (celeris#587): any of the four failure
+		// classes is one incident; the message carries all four so the
+		// dossier says which.
+		e := snap.WSEcho
+		walkerFire(properties.IWSEcho.ID,
+			fmt.Sprintf("64 KiB WebSocket echoes not byte-intact and in order (corrupt=%d [egress_interleave=%d other=%d] reorder=%d missing=%d timeout=%d, ok=%d)",
+				e.Corrupt, e.EgressInterleave, e.OtherCorrupt, e.Reorder, e.Missing, e.Timeout, e.OK),
+			e.Corrupt+e.Reorder+e.Missing+e.Timeout > 0)
+		// Engine-agnostic crash oracle: the refapp process died mid-run. This
+		// is the catch-all that the per-protocol counters above can't see — a
+		// dead server just looks like connection-refused to every walker.
+		fatal(properties.ILiveness.ID,
+			livenessDeathMessage(snap.Liveness),
+			snap.Liveness.Crashed)
+		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
+		// connection errors). Complements I-LIVENESS for the hang class.
+		fatal(properties.IHang.ID,
+			fmt.Sprintf("refapp wedged mid-run: %s", snap.Liveness.Reason()),
+			snap.Liveness.Hung)
+
+		if len(terminal) > 0 {
+			for _, inc := range recorded {
+				deliverWaiting(ctx, alertedCounters, violations, inc)
+			}
+			for _, inc := range terminal {
+				if deliverWaiting(ctx, alertedCounters, violations, inc) {
+					awaitTerminalCapture(ctx)
+				}
+			}
+			for _, inc := range hard {
+				offerOnce(alertedCounters, violations, inc)
+			}
+			return
+		}
+		for _, inc := range hard {
+			offerOnce(alertedCounters, violations, inc)
+		}
+		for _, inc := range recorded {
+			offerOnce(alertedCounters, violations, inc)
+		}
+	}
+}
+
+// terminalIncidentWait bounds how long deliverWaiting waits for the
+// violations slot, per incident: the loop may be inside one synchronous
+// capture (forensicsBudget) with one more incident queued in the slot ahead
+// (another forensicsBudget), plus the dossier writes. A waiting sender is
+// taken as soon as the loop receives the one ahead of it, so each wait on a
+// terminal tick is bounded by that, not by the sum. It also bounds
+// awaitTerminalCapture: a delivered I-LIVENESS / I-HANG sits in the slot
+// behind at most one capture, then takes its own. A variable so a test can
+// shorten it.
+var terminalIncidentWait = 2*forensicsBudget + 10*time.Second
+
+// awaitTerminalCapture holds a terminal tick -- and with it Tier 1, its
+// refapp and the refapp's side listener -- after it delivered I-LIVENESS or
+// I-HANG, until Run's incident loop has taken that incident's dossier. The
+// loop's hard-fail path writes the dossier, captures the forensics and then
+// cancels the run (ctx is rootCtx), so the end of the run is the end of the
+// capture; no other signal is needed. Bounded by terminalIncidentWait: the
+// incident may sit in the slot behind one more capture, and its own capture
+// is bounded by forensicsBudget.
+//
+// It cannot deadlock the orchestrator, for the reasons deliverWaiting
+// cannot: the loop reaches cancel() without waiting on this goroutine (its
+// capture reads atomics, the live tail under the liveness ring's own mutex,
+// the refapp over HTTP and /proc; the tick holds no lock), and it waits on
+// this goroutine only through wg.Wait, after cancel().
+func awaitTerminalCapture(ctx context.Context) {
+	t := time.NewTimer(terminalIncidentWait)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+// deliverWaiting delivers an incident of a terminal tick (the record-only
+// incidents still pending, then I-LIVENESS / I-HANG) the way offerOnce
+// offers the others -- at most once per run, marked only when sent --
+// except that a full slot does not drop it: it waits for the slot, for the
+// run to end (ctx), or for terminalIncidentWait, whichever is first.
+//
+// It cannot deadlock the orchestrator. The only receiver is Run's incident
+// loop, which returns to its receive after every incident it handles
+// (record-only: one bounded capture; infra: a JSON write) and waits on this
+// goroutine only through wg.Wait -- after cancel() on a hard fail, or once
+// rootCtx is done -- and ctx IS rootCtx, so the wait ends there. No lock is
+// held across the send: driveTier1 calls TallyCallback with a snapshot
+// value, outside every tally mutex. A sender that blocks is also served
+// before the non-blocking offers of other goroutines: a receive from a full
+// buffered channel moves the first waiting sender's value into the buffer
+// in the same step, so an offer in between sees the slot full.
+func deliverWaiting(ctx context.Context, alerted map[string]bool, ch chan<- Incident, inc Incident) bool {
+	if alerted[inc.PredicateID] {
+		return false
+	}
+	if offerOnce(alerted, ch, inc) {
+		return true
+	}
+	t := time.NewTimer(terminalIncidentWait)
+	defer t.Stop()
+	select {
+	case ch <- inc:
+		alerted[inc.PredicateID] = true
+		return true
+	case <-ctx.Done():
+	case <-t.C:
+	}
+	return false
+}
+
+// offerOnce sends inc on ch unless inc.PredicateID already produced an
+// incident this run (alerted), and marks it only when the send happened.
+// It never blocks: a full channel -- the orchestrator is busy with a
+// synchronous dossier, or with a hard fail -- drops THIS attempt and leaves
+// the counter unmarked, so the next tally tick offers it again. Marking
+// before the send (as the property tier did until probatorium#412's review)
+// lost a counter's incident for the rest of the run whenever its first
+// offer met a busy loop. alerted is owned by the single tally goroutine.
+func offerOnce(alerted map[string]bool, ch chan<- Incident, inc Incident) bool {
+	if alerted[inc.PredicateID] {
+		return false
+	}
+	select {
+	case ch <- inc:
+		alerted[inc.PredicateID] = true
+		return true
+	default:
+		return false
+	}
+}
+
+// walkerStallHook is tier1Config.OnWalkerStall for this run: the in-stall
+// dossier hook in a stall-capture run (stallCaptureEnabled), nil -- no stall
+// timer on any walker read -- in every other run.
+func walkerStallHook(getenv func(string) string, violations chan<- Incident, pid func() int) func(kind string) {
+	if !stallCaptureEnabled(getenv) {
+		return nil
+	}
+	return newStallDossierHook(violations, pid, stallDossiersPerKind)
+}
+
+// newStallDossierHook is tier1Config.OnWalkerStall for a stall-capture run
+// (celeris#588): a walker read that has waited past its stall threshold
+// with no byte back takes a record-only dossier NOW, while the stall is
+// still in force -- the one place a goroutine dump can still show who holds
+// what. At most perKind dossiers per walker kind per cell, and at most one
+// per kind per stallDossierCooldown: a burst of triggers from one stall is
+// one dossier. It never blocks the walker's timer goroutine: a full
+// violations channel drops the attempt, and a dropped attempt gives back
+// both its budget slot and the cooldown, so the budget counts dossiers
+// taken, not attempts. Safe for concurrent calls (one timer goroutine per
+// stalled read).
+func newStallDossierHook(violations chan<- Incident, pid func() int, perKind int32) func(kind string) {
+	var taken [2]atomic.Int32
+	// last is when the kind's last dossier was taken, in nanoseconds since
+	// epoch; noDossier = none. Measured with time.Time.Sub between readings
+	// that carry the monotonic clock, not with wall-clock UnixNano: a wall
+	// clock stepped back by X would make now-prev negative and suppress the
+	// kind's dossiers for ~X+cooldown (probatorium#412 review round 3).
+	const noDossier = math.MinInt64
+	var last [2]atomic.Int64
+	last[0].Store(noDossier)
+	last[1].Store(noDossier)
+	epoch := stallHookNow()
+	return func(kind string) {
+		i, spec, what, th := 0, properties.IH2CStall, "h2c preamble read", h2cStallThreshold
+		if kind == "ws" {
+			i, spec, what, th = 1, properties.IWSStall, "WebSocket handshake read", wsStallThreshold
+		}
+		// Claim the cooldown window first (compare-and-swap, so of a burst
+		// of concurrent triggers exactly one proceeds), then a budget slot;
+		// give both back if the send does not happen.
+		now := int64(stallHookNow().Sub(epoch))
+		prev := last[i].Load()
+		if prev != noDossier && now-prev < int64(stallDossierCooldown) {
+			return
+		}
+		if !last[i].CompareAndSwap(prev, now) {
+			return // another trigger of this burst won the window
+		}
+		if taken[i].Add(1) > perKind {
+			taken[i].Add(-1)
+			last[i].CompareAndSwap(now, prev)
+			return
+		}
+		select {
+		case violations <- Incident{
+			Tier:        TierProperty,
+			PredicateID: spec.ID,
+			Message:     fmt.Sprintf("%s in flight %s with no byte back: dossier taken inside the stall (celeris#588)", what, th),
+			ObservedAt:  time.Now().UTC(),
+			RefappPID:   pid(),
+			RecordOnly:  true,
+			SkipCore:    true,
+		}:
+		default:
+			taken[i].Add(-1)
+			last[i].CompareAndSwap(now, prev)
+		}
+	}
+}
+
+// stallHookNow is the in-stall hook's clock; a variable so a test can step it.
+var stallHookNow = time.Now
+
 // writeIncidentDossier creates the per-incident directory and writes
 // incident.json into it. Returns the directory.
 func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
-	ts := time.Now().UTC().Format("20060102-150405")
-	dir := filepath.Join(o.cfg.OutDir, "incidents", ts+"-"+inc.PredicateID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir, err := newIncidentDir(o.cfg.OutDir, inc.PredicateID)
+	if err != nil {
 		return "", err
 	}
 	dossier := map[string]any{
@@ -1403,10 +1734,15 @@ func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
 	if err := writeJSON(filepath.Join(dir, "incident.json"), dossier); err != nil {
 		return "", err
 	}
-	// The refapp's stderr tail as of the last tally tick (at most 2 s
-	// old), while the process is still alive to have written it.
+	// The refapp's stderr tail as of NOW, from Tier 1's live ring
+	// (celeris#588): the tally tick's copy is up to a tick old, and a tick
+	// that waits behind a synchronous capture is older still -- the #588
+	// control's in-stall dossiers carried a tail that predated the stall's
+	// own "[fault] hold" line. The tick's copy remains the fallback.
 	var tail []string
-	if p := o.stderrTail.Load(); p != nil {
+	if f := o.liveTail.Load(); f != nil {
+		tail = (*f)()
+	} else if p := o.stderrTail.Load(); p != nil {
 		tail = *p
 	}
 	_ = writeStderrTail(filepath.Join(dir, "refapp_stderr_tail.txt"), tail, nil)
@@ -1481,7 +1817,21 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 	if r := o.resolvedAddr.Load(); r != nil && *r != "" {
 		addr = *r
 	}
-	return captureForensicsLiveOpts(ctx, dir, inc.RefappPID, addr, forensicsOpts{SkipCore: inc.SkipCore})
+	// The pprof leg prefers the refapp's debug side listener: on the
+	// event-loop engines the engine-routed /debug/pprof is parked by the
+	// stalls a dossier exists for (celeris#588).
+	var side string
+	if f := o.debugAddr.Load(); f != nil {
+		side = (*f)()
+	}
+	// The text goroutine dump stops the refapp's world for the whole
+	// traceback. A record-only dossier of a routine run -- a cell that
+	// keeps running, and a dossier taken after its event -- goes without
+	// it. A stall-capture run takes it (its in-stall dossiers exist for
+	// it), and so does every hard fail, which ends the cell anyway
+	// (probatorium#412 review round 3).
+	skipText := inc.RecordOnly && !stallCaptureEnabled(os.Getenv)
+	return captureForensicsLiveOpts(ctx, dir, inc.RefappPID, addr, forensicsOpts{SkipCore: inc.SkipCore, PprofAddr: side, SkipStacksText: skipText})
 }
 
 // Tier1Summary projects a tier1TallySnapshot into the public
