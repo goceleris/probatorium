@@ -96,6 +96,11 @@ type shardLog struct {
 	failures []Failure
 	races    int
 	timedOut []string // tests running when go test's timeout fired
+	// after holds the stress-after line shard.sh writes once go test has
+	// exited (the host's load then); obs the stress-obs lines, one per run
+	// of the test binary in timing mode (obs.sh).
+	after map[string]string
+	obs   []map[string]string
 }
 
 func (s *shardLog) reason(r string, detail ...string) {
@@ -139,7 +144,18 @@ func parseShardFile(path string) *shardLog {
 }
 
 func newShardLog() *shardLog {
-	return &shardLog{header: map[string]string{}, results: map[testKey]*counts{}}
+	return &shardLog{header: map[string]string{}, results: map[testKey]*counts{}, after: map[string]string{}}
+}
+
+// fields reads space-separated key=value pairs; a token without = is skipped.
+func fields(s string) map[string]string {
+	m := map[string]string{}
+	for _, tok := range strings.Fields(s) {
+		if k, v, ok := strings.Cut(tok, "="); ok {
+			m[k] = v
+		}
+	}
+	return m
 }
 
 type pendingVerdict struct {
@@ -241,6 +257,16 @@ func parseShard(r io.Reader) *shardLog {
 		bodyLines++
 		if strings.HasPrefix(line, "stress-trailer: ") {
 			continue // judged below, and only if it is the last line
+		}
+		// shard.sh's own lines after go test: the host's load, and in timing
+		// mode the observation obs.sh recorded. Never test output.
+		if rest, ok := strings.CutPrefix(line, "stress-after: "); ok {
+			s.after = fields(rest)
+			continue
+		}
+		if rest, ok := strings.CutPrefix(line, "stress-obs: "); ok {
+			s.obs = append(s.obs, fields(rest))
+			continue
 		}
 
 		// The lines after a panic are its excerpt; a timeout also names
