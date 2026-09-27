@@ -265,6 +265,16 @@ msa2-server, every arm64 shard on msr1, never msa2-client. What changes:
   as the pending one, and a later tier dispatch cancels this run, never the
   other way round. The first job inside the group reports, as an error, any
   cluster run cancelled in the seconds between the guard's look and the entry.
+- **Never re-run.** "Re-run failed jobs" re-runs a failed cluster job but
+  reuses the verdict of a `cluster-guard` that succeeded, possibly hours
+  ago, and would enter the group on it, cancelling whatever is pending there
+  now; a re-run host job would queue for a runner the first attempt's
+  teardown already removed. So the `cluster` job runs only when its guard
+  ran in the same attempt, and each host job only on runners its own
+  attempt's bootstrap registered. Otherwise they are skipped (teardown still
+  runs), and the summary fails with "a re-run never enters
+  matrix-tier-cluster on an old guard verdict". "Re-run all jobs" runs the
+  guard again, but do not re-run a cluster run at all: dispatch a new one.
 - **Bounded.** The plan refuses a `...` pattern (the bound needs the package
   count) and any plan whose host job could run over 480 minutes: 15 for
   setup, plus 10 for a timing's quiet wait, plus per shard one `timeout` per

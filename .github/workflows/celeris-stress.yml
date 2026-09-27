@@ -335,6 +335,9 @@ jobs:
       contents: read
     outputs:
       checked_at: ${{ steps.guard.outputs.checked_at }}
+      # The attempt this verdict belongs to: the cluster job enters the group
+      # only on a verdict from its own attempt (see the cluster job).
+      attempt: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -368,10 +371,18 @@ jobs:
   # The cluster run, inside matrix-tier-cluster for its whole length
   # (bootstrap, host jobs, teardown), as every tier is. The called workflow
   # declares no group of its own: this job holds it.
+  #
+  # A re-run never re-enters the group on an old verdict. "Re-run failed
+  # jobs" re-runs this job (and its dependents) but reuses the result and
+  # outputs of a cluster-guard that succeeded, which may be hours old; this
+  # job would then cancel whatever is pending in the group now. So it runs
+  # only when cluster-guard ran in this same attempt; otherwise it is skipped
+  # and the summary says why. "Re-run all jobs" runs the guard again and is
+  # allowed. Never re-run a cluster run: dispatch a new one (docs/STRESS.md).
   cluster:
     name: cluster
     needs: [plan, cluster-guard]
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.target == 'cluster' && needs.cluster-guard.result == 'success' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.target == 'cluster' && needs.cluster-guard.result == 'success' && needs.cluster-guard.outputs.attempt == github.run_attempt && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
     concurrency:
       group: matrix-tier-cluster
       cancel-in-progress: false
@@ -400,6 +411,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      # A cluster job skipped although the guard allowed the run can only be
+      # a re-run on an earlier attempt's guard (see the cluster job): nothing
+      # ran on the cluster in this attempt, so there is nothing new to judge.
+      - name: Refuse a re-run that skipped the cluster
+        if: ${{ needs.plan.outputs.target == 'cluster' && needs.cluster.result == 'skipped' }}
+        shell: bash
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+          GUARD_ATTEMPT: ${{ needs.cluster-guard.outputs.attempt }}
+        run: |
+          echo "::error::attempt $ATTEMPT re-runs a cluster run whose guard ran in attempt ${GUARD_ATTEMPT:-?}. The cluster job did not run: a re-run never enters matrix-tier-cluster on an old guard verdict, and its host jobs never wait for runners the first attempt's teardown removed. Nothing was measured again. Dispatch a new run."
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

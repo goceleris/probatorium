@@ -73,6 +73,9 @@ jobs:
     permissions:
       actions: read
       contents: read
+    # The attempt these runners were registered in (see the host job).
+    outputs:
+      attempt: ${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -96,9 +99,15 @@ jobs:
           wait-for-manifest-clear:   "true"
           wait-timeout-seconds:      "1800"
 
+  # A host job runs only on runners its own attempt's bootstrap registered.
+  # A re-run of this job alone (or of failed jobs, which reuses a bootstrap
+  # that succeeded) would otherwise queue for a runner the first attempt's
+  # teardown removed, for up to 24 h, holding matrix-tier-cluster. It is
+  # skipped instead, and teardown still runs.
   host:
     name: host ${{ matrix.arch }} (${{ matrix.host }})
     needs: bootstrap
+    if: ${{ needs.bootstrap.outputs.attempt == github.run_attempt }}
     runs-on: [self-hosted, celeris-cluster, '${{ matrix.host }}']
     # Stated again on the job that runs the code under test.
     cache-mode: none
