@@ -21,3 +21,18 @@ func init() {
 		Registry[base.Name] = base
 	}
 }
+
+func init() { // bisect arms for celeris-iouring-h1-sync only (PERF-CHECKPOINT §3.6 step 4)
+	for _, bl := range []struct{ suffix, dir, ver string }{
+		{"-v159", "servers/bl159_celeris", "v1.5.9"},
+		{"-v1510", "servers/bl1510_celeris", "v1.5.10"},
+		{"-v1511", "servers/bl1511_celeris", "v1.5.11"},
+		{"-vc40d0cb", "servers/blc40d0cb_celeris", "v1.5.12-0.20260915174751-c40d0cb9d4b7"},
+	} {
+		a := Registry["celeris-iouring-h1-sync"]
+		a.Name = "celeris-iouring-h1-sync" + bl.suffix
+		a.Framework, a.FrameworkVersion = "celeris-"+bl.ver, bl.ver
+		a.Bin = GoBinary{ModuleDir: bl.dir}
+		Registry[a.Name] = a
+	}
+}
