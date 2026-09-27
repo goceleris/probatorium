@@ -86,7 +86,7 @@ func TestStressWorkflowReachesTheClusterOnlyThroughItsGatedJob(t *testing.T) {
 		t.Errorf("the cluster job must need exactly [plan, cluster-guard]:\n%s", cluster)
 	}
 	guard := jobBlock(t, src, "cluster-guard")
-	for _, want := range []string{"github.event_name == 'workflow_dispatch'", "needs.plan.outputs.target == 'cluster'", "go run ./tools/stresstally guard"} {
+	for _, want := range []string{"github.event_name == 'workflow_dispatch'", "needs.plan.outputs.target == 'cluster'", "bash tools/stresstally/guard.sh"} {
 		if !strings.Contains(guard, want) {
 			t.Errorf("the cluster-guard job lacks %q", want)
 		}

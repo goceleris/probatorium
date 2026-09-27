@@ -184,8 +184,11 @@ func TestHostJobMinutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := hostJobMinutes(tp), clusterFixedMinutes+timingQuietMinutes+8*(2+clusterShardMinutes); got != want {
-		t.Errorf("timing limit %d, want %d (2 arms x 4 blocks)", got, want)
+	// A timing adds the quiet wait and, per arm, 3 minutes to build its test
+	// binary before the quiet check (cluster-host.sh prebuild_arms), so no
+	// observation's budget carries a compile.
+	if got, want := hostJobMinutes(tp), clusterFixedMinutes+timingQuietMinutes+2*3+8*(2+clusterShardMinutes); got != want {
+		t.Errorf("timing limit %d, want %d (2 arms x 4 blocks, each arm prebuilt)", got, want)
 	}
 	for _, e := range tp.HostEntries(7) {
 		if e.JobTimeout != hostJobMinutes(tp) || e.CPUs != defaultCPUs || e.PMU != "optional" || e.Mode != "timing" ||
