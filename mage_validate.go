@@ -240,6 +240,13 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		// (validation/refapp/internal/debugvars/faults.go), carried across
 		// the same three hops. Unset in every routine tier.
 		args = append(args, refappFaultExtraVars(os.Getenv)...)
+		// PROBATORIUM_STALL_CAPTURE: the same capture with NO fault -- the
+		// in-stall dossiers and the refapp's debug side listener
+		// (validation/liveness.go stallCaptureEnabled) -- for a tier
+		// dispatched with stall_capture (celeris#588's release soak, and
+		// the capture's own no-fault control). Same three hops; unset in
+		// every routine tier, which leaves the capture off.
+		args = append(args, stallCaptureExtraVars(os.Getenv)...)
 		// VALIDATE_DBSERVICES=1 starts the postgres/redis/memcached
 		// containers (assumed pre-pulled by deploy.yml's dbservices
 		// role) so the driver_* refapps in matrix-mode validate can
@@ -341,6 +348,23 @@ func refappFaultExtraVars(getenv func(string) string) []string {
 	b, err := json.Marshal(map[string]string{"probatorium_refapp_fault": v})
 	if err != nil {
 		panic(fmt.Sprintf("marshal probatorium_refapp_fault: %v", err))
+	}
+	return []string{"--extra-vars", string(b)}
+}
+
+// stallCaptureExtraVars carries PROBATORIUM_STALL_CAPTURE to the remote
+// validator as a JSON extra-var, like refappFaultExtraVars. The value goes
+// as set (trimmed): the validator alone decides what turns the capture on
+// ("1"). Unset or blank adds nothing, so validate.yml's empty default
+// leaves the capture off.
+func stallCaptureExtraVars(getenv func(string) string) []string {
+	v := strings.TrimSpace(getenv("PROBATORIUM_STALL_CAPTURE"))
+	if v == "" {
+		return nil
+	}
+	b, err := json.Marshal(map[string]string{"probatorium_stall_capture": v})
+	if err != nil {
+		panic(fmt.Sprintf("marshal probatorium_stall_capture: %v", err))
 	}
 	return []string{"--extra-vars", string(b)}
 }

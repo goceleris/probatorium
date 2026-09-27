@@ -139,3 +139,14 @@ func TestRefappFaultExtraVars(t *testing.T) {
 		t.Fatalf("unset must add nothing, got %q", got)
 	}
 }
+
+func TestStallCaptureExtraVars(t *testing.T) {
+	env := map[string]string{"PROBATORIUM_STALL_CAPTURE": " 1 "}
+	got := stallCaptureExtraVars(func(k string) string { return env[k] })
+	if len(got) != 2 || got[0] != "--extra-vars" || got[1] != `{"probatorium_stall_capture":"1"}` {
+		t.Fatalf("got %q", got)
+	}
+	if got := stallCaptureExtraVars(func(string) string { return " " }); got != nil {
+		t.Fatalf("unset or blank must add nothing (the capture stays off), got %q", got)
+	}
+}
