@@ -139,3 +139,43 @@ func TestExecuteCellRatesOnlyTheRatedCells(t *testing.T) {
 		}
 	}
 }
+
+// TestRatedCellsScope pins the rest of -rated-cells: rated mode off rates
+// nothing whatever the glob; an empty glob rates every cell (what an ad-hoc
+// `runner -rated` always did); "!" exclusions work as in -cells; and a
+// malformed glob fails the run before any cell instead of silently rating
+// nothing.
+func TestRatedCellsScope(t *testing.T) {
+	grid := realizedGrid(t)
+	count := func(cfg Config) int {
+		n := 0
+		for _, id := range grid {
+			if cfg.ratesCell(id) {
+				n++
+			}
+		}
+		return n
+	}
+	if n := count(Config{RatedMode: false, RatedCells: "*"}); n != 0 {
+		t.Errorf("rated mode off rates %d cells, want 0", n)
+	}
+	if n := count(Config{RatedMode: true}); n != len(grid) {
+		t.Errorf("-rated with no -rated-cells rates %d of %d cells, want all of them", n, len(grid))
+	}
+
+	cfg := Config{RatedMode: true, RatedCells: "get-json/*, !get-json/celeris-*"}
+	for id, want := range map[string]bool{
+		"get-json/gin-h1":                true,
+		"get-json/celeris-epoll-h1-sync": false,
+		"post-4k/gin-h1":                 false,
+	} {
+		if got := cfg.ratesCell(id); got != want {
+			t.Errorf("-rated-cells %q: ratesCell(%q) = %v, want %v", cfg.RatedCells, id, got, want)
+		}
+	}
+
+	err := run(Config{Runs: 1, Services: "none", DryRun: true, RatedMode: true, RatedCells: "get-json/[", Cells: "nonexistent/*"})
+	if err == nil || !strings.Contains(err.Error(), "-rated-cells") {
+		t.Errorf("run with a malformed -rated-cells: err = %v, want a -rated-cells error", err)
+	}
+}

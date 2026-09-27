@@ -144,13 +144,20 @@ func maxDryRunCellsPerServer(dryRunOut string, colSlugs []string) int {
 }
 
 // ratedBench is the rated half of a Bench: whether the runner drives the
-// rated sweep, and how long each rated pass measures.
+// rated sweep, on which cells, and how long each rated pass measures.
 type ratedBench struct {
 	On          bool
 	DurationSec int
+	// Cells is the runner's -rated-cells glob over "<scenario>/<server>".
+	// Only a cell that matches it (and whose saturation pass is clean) gets
+	// the rated sweep.
+	Cells string
 }
 
-// resolveRatedBench reads the rated sweep's BENCH_* env.
+// resolveRatedBench reads the rated sweep's BENCH_* env. BENCH_RATED_CELLS
+// defaults to the budget model's rated cells (budget.RatedCellsGlob), so a
+// hand-run `mage Bench BENCH_RATED=1` rates what the model plans too; set
+// it to "*" to rate every cell.
 func resolveRatedBench() (ratedBench, error) {
 	on := os.Getenv("BENCH_RATED") == "1" || os.Getenv("BENCH_RATED") == "true"
 	d := envOrDefault("BENCH_RATED_DURATION", "30s")
@@ -158,7 +165,11 @@ func resolveRatedBench() (ratedBench, error) {
 	if err != nil {
 		return ratedBench{}, fmt.Errorf("BENCH_RATED_DURATION %q: %w", d, err)
 	}
-	return ratedBench{On: on, DurationSec: sec}, nil
+	cells := strings.TrimSpace(os.Getenv("BENCH_RATED_CELLS"))
+	if cells == "" {
+		cells = budget.RatedCellsGlob()
+	}
+	return ratedBench{On: on, DurationSec: sec, Cells: cells}, nil
 }
 
 // extraVars are the ansible extra-vars that turn the rated sweep on in
@@ -170,6 +181,7 @@ func (r ratedBench) extraVars() []string {
 	return []string{
 		"--extra-vars", "bench_rated=1",
 		"--extra-vars", "bench_rated_duration_seconds=" + strconv.Itoa(r.DurationSec),
+		"--extra-vars", "bench_rated_cells=" + r.Cells,
 	}
 }
 
@@ -352,7 +364,11 @@ func Bench() error {
 	fmt.Printf("  connections:  %s\n", conns)
 	fmt.Printf("  cells:        %s\n", cells)
 	fmt.Printf("  runs:         %s\n", runs)
-	fmt.Printf("  rated:        %v\n", ratedOn)
+	if ratedOn {
+		fmt.Printf("  rated:        true (%ds passes on %s)\n", rated.DurationSec, rated.Cells)
+	} else {
+		fmt.Printf("  rated:        false\n")
+	}
 	fmt.Printf("  celeris ver:  %s\n", version)
 	fmt.Printf("  results:      %s\n\n", resultsDir)
 
@@ -477,6 +493,9 @@ func Bench() error {
 		return fmt.Errorf("BENCH_CELLS %q schedules zero cells on every column "+
 			"(glob halves are <scenario>/<server> — e.g. '*/celeris-*', not 'celeris-*/*')", cells)
 	}
+	// The guard charges the rated sweep to every scenario of the busiest
+	// column, although only the cells matching rated.Cells run it: an upper
+	// bound, which is what a hang guard needs.
 	ratedPasses := 0
 	if ratedOn {
 		ratedPasses = budget.DefaultRatedPasses

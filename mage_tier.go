@@ -31,13 +31,15 @@ import (
 // JSON carries both panels on the same scenario.
 //
 // Per-cell execution: a cell visits ONE (server, scenario) pair and
-// runs the saturation pass unconditionally. If the scenario is in
-// the rated subset (currently get-json / post-4k) and the runner is
-// launched with BENCH_RATED=1, the same cell ALSO runs the rated
-// sweep after the saturation pass. The cell's JSON carries both maps
-// on the same row; the bench's published Document has a per-scenario
-// SaturationModeRPS (every scenario) + a per-scenario LatencyAtSLO
-// (only the rated 2).
+// runs the saturation pass unconditionally. If the profile is rated and
+// the cell matches the profile's rated glob (budget.RatedGlob: every
+// budget.RatedScenarios scenario on every capable server, 388 cells), the
+// same cell ALSO runs the rated sweep once its saturation pass is clean.
+// The cell's JSON carries both maps on the same row; the published
+// Document has a per-scenario SaturationModeRPS (every scenario) and a
+// per-scenario LatencyAtSLO / RatedModeP99AtTargetRPS (rated scenarios
+// only). Before probatorium#418 the rated glob never reached the runner,
+// which then rated every clean cell (~770 of 813).
 //
 // Flow:
 //
@@ -49,9 +51,10 @@ import (
 //  3. Set BENCH_START_DATE to the bench start timestamp (UTC yyyymmdd) and
 //     reuse it for Publish so the whole run lands under a single date even
 //     when it crosses midnight.
-//  4. One Bench + one Publish onto run-1. BENCH_RATED=1 is set so every
-//     cell does its rated sweep; BENCH_SKIP_RATED=1 disables the rated
-//     subpass for throughput-only runs.
+//  4. One Bench + one Publish onto run-1. For a rated profile BENCH_RATED=1,
+//     BENCH_RATED_CELLS (the rated glob) and BENCH_RATED_DURATION (the
+//     profile's rated pass window) are set, so the rated cells do their
+//     rated sweep; BENCH_SKIP_RATED=1 disables it for throughput-only runs.
 //
 // Env knobs (in addition to every BENCH_*/PUBLISH_*/DOCS_TOKEN knob):
 //
@@ -120,8 +123,8 @@ func BenchTier() error {
 	benchStartDate := time.Now().UTC().Format("20060102")
 	_ = os.Setenv("BENCH_START_DATE", benchStartDate)
 
-	// One bench: the runner does BOTH the saturation pass and the rated
-	// sweep (per rated-scenario) inside each cell. The published per-cell
+	// One bench: the runner does BOTH the saturation pass and, on the rated
+	// cells, the rated sweep inside each cell. The published per-cell
 	// JSON carries both maps on the same row. The rated sweep is opt-in via
 	// BENCH_SKIP_RATED=1 (set when the caller wants throughput-only — e.g.
 	// for the weekly smoke test). Per-scenario rated data lands in
@@ -203,18 +206,19 @@ func benchTierEnv(p budget.Profile) {
 	} else {
 		_ = os.Setenv("BENCH_RATED", "1")
 	}
-	setBenchEnvFromProfile(p, false)
+	setBenchEnvFromProfile(p, !skipRated)
 }
 
 // setBenchEnvFromProfile pushes the resolved profile's per-cell tuning +
-// cell glob into the BENCH_* env Bench() reads. The new design does
-// NOT have a separate rated pass — every cell does BOTH the saturation
-// pass and the rated sweep inside one execution, so BENCH_RATED is
-// managed by the caller (BenchTier) and this function only sets the
-// per-pass tuning + cell glob. The `rated` argument is preserved for
-// the legacy "two-pass" callers (Bench, Publish when BENCH_RATED is
-// not set) — when true, the cell glob scopes to the rated subset
-// AND BENCH_RATED is toggled.
+// cell glob into the BENCH_* env Bench() reads. There is no separate
+// rated pass: a rated cell does BOTH the saturation pass and the rated
+// sweep inside one execution, so the saturation glob and window are set
+// either way. BENCH_RATED itself is the caller's (benchTierEnv). With
+// rated, it also scopes the sweep and sizes its passes from the profile:
+// BENCH_RATED_CELLS = budget.RatedGlob(p) (the runner's -rated-cells)
+// and BENCH_RATED_DURATION = p.RatedDuration. Without those two the
+// runner rated every clean cell at mage Bench's 30 s default
+// (probatorium#418), whatever the budget model planned.
 //
 // Honour a pre-set BENCH_DURATION / BENCH_WARMUP. The bench (and the
 // BenchTier entrypoint) read BENCH_DURATION before setBenchEnvFromProfile
@@ -238,31 +242,23 @@ func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 		}
 		_ = os.Setenv("BENCH_CELLS", glob)
 	}
-	if rated {
-		_ = os.Setenv("BENCH_RATED", "1")
-		setCells(budget.RatedGlob(p))
-		if os.Getenv("BENCH_DURATION") == "" {
-			_ = os.Setenv("BENCH_DURATION", durString(p.RatedDuration))
-		}
-		if os.Getenv("BENCH_WARMUP") == "" {
-			_ = os.Setenv("BENCH_WARMUP", durString(p.RatedWarmup))
-		}
+	setCells(budget.CellsGlob(p))
+	if os.Getenv("BENCH_DURATION") == "" {
+		_ = os.Setenv("BENCH_DURATION", durString(p.Duration))
+	}
+	if os.Getenv("BENCH_WARMUP") == "" {
+		_ = os.Setenv("BENCH_WARMUP", durString(p.Warmup))
+	}
+	if !rated {
+		return
+	}
+	// A preset wins here too, like BENCH_CELLS above: a caller may widen or
+	// narrow the rated scope, or shorten the passes, for a scoped run.
+	if strings.TrimSpace(os.Getenv("BENCH_RATED_CELLS")) == "" {
+		_ = os.Setenv("BENCH_RATED_CELLS", budget.RatedGlob(p))
+	}
+	if os.Getenv("BENCH_RATED_DURATION") == "" {
 		_ = os.Setenv("BENCH_RATED_DURATION", durString(p.RatedDuration))
-	} else {
-		// Saturation-pass tuning: full cell glob, saturation
-		// duration. Do NOT touch BENCH_RATED — the caller in the
-		// unified path has already set it to "1" so the runner does
-		// the rated sweep inside every cell. The legacy Bench() +
-		// Publish() callers (without BENCH_RATED set) end up with
-		// BENCH_RATED unset, which is the correct behaviour for a
-		// pure-saturation call.
-		setCells(budget.CellsGlob(p))
-		if os.Getenv("BENCH_DURATION") == "" {
-			_ = os.Setenv("BENCH_DURATION", durString(p.Duration))
-		}
-		if os.Getenv("BENCH_WARMUP") == "" {
-			_ = os.Setenv("BENCH_WARMUP", durString(p.Warmup))
-		}
 	}
 }
 

@@ -68,3 +68,54 @@ func TestBenchTierForwardsTheModelsRatedScope(t *testing.T) {
 		})
 	}
 }
+
+// TestBenchTierRatedScopeEdges: presets win (a scoped run may widen, narrow
+// or shorten the rated sweep), a run with the rated sweep off sets no rated
+// scope and forwards no rated extra-vars, and a hand-run `mage Bench
+// BENCH_RATED=1` without BENCH_RATED_CELLS rates the model's cells, not every
+// cell.
+func TestBenchTierRatedScopeEdges(t *testing.T) {
+	t.Run("presets win", func(t *testing.T) {
+		unsetBenchEnv(t)
+		t.Setenv("BENCH_RATED_CELLS", "get-json/celeris-*")
+		t.Setenv("BENCH_RATED_DURATION", "5s")
+		benchTierEnv(budget.Full())
+		r, err := resolveRatedBench()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Cells != "get-json/celeris-*" || r.DurationSec != 5 {
+			t.Errorf("presets lost: cells %q duration %d s, want get-json/celeris-* and 5 s", r.Cells, r.DurationSec)
+		}
+	})
+	for name, set := range map[string]func(t *testing.T) budget.Profile{
+		"fast profile":       func(t *testing.T) budget.Profile { return budget.Fast() },
+		"BENCH_SKIP_RATED=1": func(t *testing.T) budget.Profile { t.Setenv("BENCH_SKIP_RATED", "1"); return budget.Full() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			unsetBenchEnv(t)
+			benchTierEnv(set(t))
+			if v, ok := os.LookupEnv("BENCH_RATED_CELLS"); ok {
+				t.Errorf("rated sweep off, but BENCH_RATED_CELLS=%q", v)
+			}
+			r, err := resolveRatedBench()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.On || len(r.extraVars()) != 0 {
+				t.Errorf("rated sweep off, but rated=%v extra-vars %q", r.On, r.extraVars())
+			}
+		})
+	}
+	t.Run("hand-run Bench", func(t *testing.T) {
+		unsetBenchEnv(t)
+		t.Setenv("BENCH_RATED", "1")
+		r, err := resolveRatedBench()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Cells != budget.RatedCellsGlob() {
+			t.Errorf("BENCH_RATED=1 without BENCH_RATED_CELLS rates %q, want the model's %q", r.Cells, budget.RatedCellsGlob())
+		}
+	})
+}

@@ -270,3 +270,14 @@ func TestRatedCostIsTheSweepTheRunnerRuns(t *testing.T) {
 		}
 	}
 }
+
+// TestRatedCellsGlobIsTheRatedProfilesGlob: mage Bench rates
+// RatedCellsGlob() when BENCH_RATED=1 comes without BENCH_RATED_CELLS, so it
+// must be the rated glob BenchTier forwards for either rated profile.
+func TestRatedCellsGlobIsTheRatedProfilesGlob(t *testing.T) {
+	for _, p := range []Profile{HeadlineWeekly(), Full()} {
+		if got := RatedGlob(p); got != RatedCellsGlob() {
+			t.Errorf("%s: RatedGlob = %q, RatedCellsGlob = %q", p.Name, got, RatedCellsGlob())
+		}
+	}
+}

@@ -95,9 +95,11 @@ const (
 // artefact is keyed by bench_target (bench_run_dir AND the loadgen transport
 // tarball) and msa2-client is far from saturation while driving one arch.
 //
-// Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~11.0h
-// rated (388 rated cells x (10+4*20+12)s) = ~26.6h bench (~29.4h wall-clock
-// incl deploy) — this NO LONGER fits 24h. The v1.5.5 audit expanded rated to
+// Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~13.8h
+// rated (388 rated cells x 4 x (12+20)s, each rated pass re-running the
+// saturation warmup) = ~29.4h bench — this NO LONGER fits 24h. (Until
+// probatorium#418 the runner rated every clean cell, ~770, at 30s passes,
+// and the measured run was ~53h.) The v1.5.5 audit expanded rated to
 // run the meaningful scenarios (drivers + static headline + churn-close) on
 // EVERY participating server (RatedGlobs) so each rated row ranks against its
 // real field leader, which is the whole point of the rated table. Headline and
@@ -116,7 +118,6 @@ func HeadlineWeekly() Profile {
 		RatedCells:    HeadlineRatedRealizedCells,
 		RatedPasses:   4,
 		RatedDuration: 20 * time.Second,
-		RatedWarmup:   10 * time.Second,
 		Globs:         []string{"*/*"},
 		RatedGlobs:    ratedGlobs(),
 	}
@@ -166,6 +167,11 @@ func Fast() Profile {
 // over the 24h weekly budget with the long window — Full is a manual
 // dispatch that raises BENCH_BUDGET above 24h; FitWithin asserts the
 // single-pass config fits the (raised) budget and fails loudly otherwise.
+//
+// Budget: 813 cells x (20+90+5+12)s = ~28.7h saturation + 388 rated cells
+// x 4 x (20+30)s = ~21.6h rated = ~50.2h on one arch (the arches run in
+// parallel). Until probatorium#418 every clean cell (~770) was rated and a
+// full run measured ~69h.
 func Full() Profile {
 	return Profile{
 		Name:          "full",
@@ -179,7 +185,6 @@ func Full() Profile {
 		RatedCells:    FullRatedRealizedCells,
 		RatedPasses:   4,
 		RatedDuration: 30 * time.Second,
-		RatedWarmup:   15 * time.Second,
 		Globs:         []string{"*/*"},
 		RatedGlobs:    ratedGlobs(),
 	}
