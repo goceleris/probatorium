@@ -321,6 +321,50 @@ jobs:
           echo "scanned $n modules"
           exit "$fail"
 
+  # ansible/load-check.sh loads every playbook, tasks file and role task
+  # list the way ansible-playbook does on the cluster. include_tasks and
+  # include_role are dynamic, so `--syntax-check bench.yml` never opens
+  # tasks/run_bench_cell.yml: an apostrophe in a comment inside that file's
+  # free-form shell block failed every Benchmark Tier dispatch at its first
+  # cell (probatorium#411; runs 36306263697 and 36306273363) while every job
+  # here stayed green. The script imports each tasks file statically, so
+  # ansible parses every task in it. ansible-core and ansible.posix are the
+  # versions ansible/runner-setup.yml pins on the cluster
+  # (workflow_ansible_load_test.go keeps them equal).
+  ansible:
+    name: ansible loads every playbook and tasks file
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install ansible-core and ansible.posix (the cluster pins)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ansible"
+          "$RUNNER_TEMP/ansible/bin/pip" install --quiet "ansible-core==2.21.4"
+          # Galaxy first, bounded and retried; then the collection's GitHub
+          # source at the commit runner-setup.yml pins, as the cluster does.
+          ok=0
+          for i in 1 2 3; do
+            if timeout 120 "$RUNNER_TEMP/ansible/bin/ansible-galaxy" collection install --timeout 30 \
+                -p "$RUNNER_TEMP/collections" "ansible.posix:==2.2.2"; then
+              ok=1
+              break
+            fi
+            echo "galaxy attempt $i failed"
+            sleep 10
+          done
+          if [ "$ok" != 1 ]; then
+            timeout 300 "$RUNNER_TEMP/ansible/bin/ansible-galaxy" collection install --force \
+              -p "$RUNNER_TEMP/collections" \
+              "git+https://github.com/ansible-collections/ansible.posix.git,e98d9a0756458be1ac710988498000973889075c"
+          fi
+          echo "$RUNNER_TEMP/ansible/bin" >> "$GITHUB_PATH"
+      - name: ansible/load-check.sh
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: bash ansible/load-check.sh
+
   # Fan-in over every job above so branch protection can require ONE
   # stable check name ("ci-ok") instead of enumerating the adapter
   # matrix — adding or removing an adapter then never silently drops a
@@ -330,7 +374,7 @@ jobs:
   # listed in needs must stay unconditional on push + pull_request.
   ci-ok:
     name: ci-ok
-    needs: [root, adapters, refapps, mage, zombieguard, fieldguard, vulncheck]
+    needs: [root, adapters, refapps, mage, zombieguard, fieldguard, vulncheck, ansible]
     if: always()
     runs-on: ubuntu-latest
     steps:

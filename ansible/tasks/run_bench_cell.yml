@@ -148,7 +148,6 @@
 
 # ---------- bench target side: start server + mpstat ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop any prior server + wait for bench port free"
-  become: true
   # The previous column's teardown is best-effort (failed_when:false) and its
   # port sweep is time-boxed (~3s), so a server that drains slowly (graceful
   # http.Server.Shutdown keeps the listen socket bound for up to 10s) can still
@@ -339,10 +338,13 @@
     # two columns may share binary and -engine and differ only in the
     # column env, and two dispatches only in bench_sut_env, so the binary +
     # engine match alone cannot tell an A arm from a B arm. The expected set
-    # is the launch's own merge minus sut_base_env (bench_sut_env, then the
+    # is the merge the launch used minus sut_base_env (bench_sut_env, then the
     # column env winning), so a leftover listener from a dispatch with other
     # overrides is refused too. Values are mage-validated to a charset
     # without whitespace or quotes.
+    # NB: no apostrophes or unpaired quote chars anywhere in this free-form
+    # block, comments included (see the port-free task above); CI loads
+    # every tasks file with ansible/load-check.sh, which fails on one.
     want_env="{% for k, v in ((bench_sut_env | default({})) | combine(cell_col_env | default({}))).items() %}{{ k }}={{ v }} {% endfor %}"
     env_ok() {
       for kv in $want_env; do
