@@ -60,7 +60,10 @@ type FaultHold struct {
 // ParseFaults parses a PROBATORIUM_REFAPP_FAULT value. Empty yields nil.
 // Every entry must be <path>:<hold>@<at> with an absolute path, a positive
 // hold of at most five minutes and a non-negative offset; a path may be
-// held only once. Entries come back sorted by offset.
+// held only once, and no two holds may overlap (one may start as another
+// ends): every hold has the same waiter and holder frames, so a goroutine
+// dump taken in an overlap could not say which path's requests it shows.
+// Entries come back sorted by offset.
 func ParseFaults(spec string) ([]*FaultHold, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
@@ -94,6 +97,12 @@ func ParseFaults(spec string) ([]*FaultHold, error) {
 		out = append(out, &FaultHold{Path: path, Hold: hold, At: at})
 	}
 	sort.SliceStable(out, func(a, b int) bool { return out[a].At < out[b].At })
+	for k := 1; k < len(out); k++ {
+		if prev, h := out[k-1], out[k]; h.At < prev.At+prev.Hold {
+			return nil, fmt.Errorf("fault %s:%s@%s overlaps %s:%s@%s: a dump taken in the overlap could not say which path's waiters it shows",
+				h.Path, h.Hold, h.At, prev.Path, prev.Hold, prev.At)
+		}
+	}
 	return out, nil
 }
 

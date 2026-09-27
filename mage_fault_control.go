@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/goceleris/probatorium/report"
 )
@@ -136,25 +137,46 @@ func ValidateFaultControl() error {
 }
 
 // faultControlPaths is the set of paths a PROBATORIUM_REFAPP_FAULT spec
-// holds, each of which the checker must know how to judge. The spec's full
-// validation is the refapp's (debugvars.ParseFaults); this only needs the
-// paths and refuses one no walker exercises.
+// holds, each of which the checker must know how to judge. The refapp
+// validates the spec in full (debugvars.ParseFaults); this refuses a path no
+// walker exercises and, like the refapp, holds that overlap: every hold has
+// the same waiter and holder frames, so a dump taken in an overlap would be
+// credited to both paths.
 func faultControlPaths(spec string) ([]string, error) {
 	known := map[string]bool{}
 	for _, p := range report.FaultControlPaths() {
 		known[p] = true
 	}
+	type window struct {
+		entry     string
+		from, end time.Duration
+	}
 	var out []string
+	var windows []window
 	for _, e := range strings.Split(spec, ",") {
 		e = strings.TrimSpace(e)
 		i := strings.LastIndex(e, ":")
-		if i <= 0 {
+		j := strings.LastIndex(e, "@")
+		if i <= 0 || j < i {
 			return nil, fmt.Errorf("VALIDATE_FAULT_CONTROL entry %q: want <path>:<hold>@<at>", e)
 		}
 		if !known[e[:i]] {
 			return nil, fmt.Errorf("VALIDATE_FAULT_CONTROL entry %q: no walker judges path %s (judged: %v)", e, e[:i], report.FaultControlPaths())
 		}
+		hold, herr := time.ParseDuration(e[i+1 : j])
+		at, aerr := time.ParseDuration(e[j+1:])
+		if herr != nil || aerr != nil || hold <= 0 || at < 0 {
+			return nil, fmt.Errorf("VALIDATE_FAULT_CONTROL entry %q: want <path>:<hold>@<at>, hold > 0, at >= 0", e)
+		}
 		out = append(out, e[:i])
+		windows = append(windows, window{e, at, at + hold})
+	}
+	sort.Slice(windows, func(a, b int) bool { return windows[a].from < windows[b].from })
+	for k := 1; k < len(windows); k++ {
+		if windows[k].from < windows[k-1].end {
+			return nil, fmt.Errorf("VALIDATE_FAULT_CONTROL entries %q and %q overlap: a dump taken in the overlap would be credited to both paths",
+				windows[k-1].entry, windows[k].entry)
+		}
 	}
 	return out, nil
 }
