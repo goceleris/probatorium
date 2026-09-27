@@ -13,6 +13,13 @@ var fcT0 = time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
 
 func fcTS(d time.Duration) string { return fcT0.Add(d).Format(time.RFC3339Nano) }
 
+// fcStatus is a dossier's forensics_status.txt as validation/forensics.go
+// writes it, with the text goroutine dump fetched from +from to +to.
+func fcStatus(from, to time.Duration) string {
+	return `pid=4242 listen="127.0.0.1:8080" pprof="127.0.0.1:41999" pprof_source=side-listener stacks_from=` +
+		fcTS(from) + " stacks_to=" + fcTS(to) + " gcore=false dmesg=true ss=true\n"
+}
+
 // fcCell builds a synthetic artifact for one cell in which /ws was held for
 // 8 s at fcT0 and the capture did everything right, then lets a test break
 // one piece.
@@ -42,6 +49,7 @@ func newFCCell(t *testing.T) *fcCell {
 		"incident.json":          string(inc),
 		"goroutine-stacks.txt":   stacks,
 		"refapp_stderr_tail.txt": tail,
+		"forensics_status.txt":   fcStatus(3210*time.Millisecond, 3260*time.Millisecond),
 		"core.skipped":           "gcore skipped\n",
 	} {
 		if err := os.WriteFile(filepath.Join(d, name), []byte(body), 0o644); err != nil {
@@ -95,7 +103,7 @@ func TestFaultControlWSInjectionPasses(t *testing.T) {
 		t.Fatalf("failures: %v", r.Failures)
 	}
 	all := strings.Join(r.Findings, "\n")
-	for _, want := range []string{"+2.1s after its start", "read 2000 ms", "127.0.0.1:51234", "observed at +3.2s", "1 request goroutine(s) blocked", "held lock on /ws"} {
+	for _, want := range []string{"+2.1s after its start", "read 2000 ms", "127.0.0.1:51234", "observed at +3.2s", "dumped between +3.21s and +3.26s", "1 request goroutine(s) blocked", "held lock on /ws"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("findings lack %q:\n%s", want, all)
 		}
@@ -124,6 +132,12 @@ func TestFaultControlCatchesEachCaptureDefect(t *testing.T) {
 			inc, _ := json.Marshal(map[string]any{"observed_at": fcTS(11 * time.Second)})
 			c.write(t, "incident.json", string(inc))
 		}, notRootCausable, "outside the hold"},
+		{"triggered inside the hold, dump fetched after the release", func(t *testing.T, c *fcCell) {
+			c.write(t, "forensics_status.txt", fcStatus(7900*time.Millisecond, 8100*time.Millisecond))
+		}, notRootCausable, "fetched between +7.9s and +8.1s: not inside the hold"},
+		{"dump instant unknown", func(t *testing.T, c *fcCell) {
+			c.write(t, "forensics_status.txt", "pid=4242 listen=\"127.0.0.1:8080\" pprof=\"127.0.0.1:41999\" pprof_source=side-listener gcore=false dmesg=true ss=true\n")
+		}, notRootCausable, "at an unknown instant"},
 		{"dump does not name the holder", func(t *testing.T, c *fcCell) {
 			c.write(t, "goroutine-stacks.txt", "goroutine 1 [running]:\nmain.main()\n")
 		}, notRootCausable, "0 holder / 0 waiter"},
@@ -176,6 +190,7 @@ func TestFaultControlInStallDossierMakesAShortStallRootCausable(t *testing.T) {
 		"incident.json":          string(inc),
 		"goroutine-stacks.txt":   "goroutine 7 [sleep]:\ngithub.com/x/debugvars.(*FaultHold).run(...)\ngoroutine 9 [sync.Mutex.Lock]:\ngithub.com/x/debugvars.(*FaultHold).wait(...)\n",
 		"refapp_stderr_tail.txt": "[fault] hold path=/ws hold=8s start=" + fcTS(0) + "\n",
+		"forensics_status.txt":   fcStatus(5010*time.Millisecond, 5040*time.Millisecond),
 		"core.skipped":           "x\n",
 	} {
 		if err := os.WriteFile(filepath.Join(d, name), []byte(body), 0o644); err != nil {
@@ -195,13 +210,13 @@ func TestFaultControlInStallDossierMakesAShortStallRootCausable(t *testing.T) {
 // of its events, and a clean un-injected cell passes.
 func TestFaultControlUninjectedPathMustBeClean(t *testing.T) {
 	clean := ValidationCellResult{Refapp: "kitchen_sink", Engine: "epoll", Arch: "amd64", Tier1: &Tier1Summary{
-		H2CChurn: map[string]int64{"h2c_sent": 500}, WSTorture: map[string]int64{"ws_sent": 0}}}
+		H2CChurn: map[string]int64{"h2c_sent": 500}, WSTorture: map[string]int64{"ws_sent": 300}}}
 	dir := t.TempDir()
 	if r := CheckFaultControlCell(dir, clean, nil); !r.Pass() {
 		t.Fatalf("clean un-injected cell failed: %v", r.Failures)
 	}
 	dirty := clean
-	dirty.Tier1 = &Tier1Summary{H2CChurn: map[string]int64{"h2c_sent": 500, "h2c_hang": 1}}
+	dirty.Tier1 = &Tier1Summary{H2CChurn: map[string]int64{"h2c_sent": 500, "h2c_hang": 1}, WSTorture: map[string]int64{"ws_sent": 300}}
 	wantFail(t, CheckFaultControlCell(dir, dirty, nil), "(not injected): h2c_churn.h2c_hang=1")
 
 	// And in an injected cell, the OTHER path is held to zero too.
@@ -253,4 +268,83 @@ func TestFaultControlDossierBeforeTheHoldIsNotHeldToItsLine(t *testing.T) {
 	if all := strings.Join(r.Findings, "\n"); !strings.Contains(all, "20260926-115938-I-WS-STALL observed at -22s, outside the hold") {
 		t.Errorf("findings should report the earlier dossier as outside the hold: %s", all)
 	}
+}
+
+// A zero is health only when the oracle ran (probatorium#412 review): an
+// un-injected path whose walker sent nothing -- no attempt, so no chance to
+// fail -- is not judged, and the cell must not pass on it. The same cell
+// passes once the walker has attempts on record.
+func TestFaultControlUninjectedPathWhoseWalkerNeverRanIsNotJudged(t *testing.T) {
+	dir := t.TempDir()
+	for name, t1 := range map[string]*Tier1Summary{
+		"ws walker never ran": {H2CChurn: map[string]int64{"h2c_sent": 500}, WSTorture: map[string]int64{"ws_sent": 0}},
+		"h2c walker absent":   {WSTorture: map[string]int64{"ws_sent": 300}},
+		"both slices absent":  {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cell := ValidationCellResult{Refapp: "kitchen_sink", Engine: "epoll", Arch: "amd64", Tier1: t1}
+			wantFail(t, CheckFaultControlCell(dir, cell, nil), "walker never ran, so this path was not judged")
+		})
+	}
+}
+
+// Every file check reads the cell's directory; a cell the artifact has no
+// directory for (mage_fault_control leaves cellDir empty when its glob
+// misses) must fail, not be judged against the working directory
+// (CodeRabbit on probatorium#412, faultcontrol.go:155).
+func TestFaultControlCellWithoutADirectoryFails(t *testing.T) {
+	clean := ValidationCellResult{Refapp: "kitchen_sink", Engine: "epoll", Arch: "amd64", Tier1: &Tier1Summary{
+		H2CChurn: map[string]int64{"h2c_sent": 500}, WSTorture: map[string]int64{"ws_sent": 300}}}
+	for _, dir := range []string{"", filepath.Join(t.TempDir(), "cell-07-kitchen_sink-epoll")} {
+		wantFail(t, CheckFaultControlCell(dir, clean, nil), "no cell directory in the artifact")
+	}
+}
+
+// The case the trigger instant alone got wrong (probatorium#412 review): a
+// /ws dossier TRIGGERED inside the /ws hold whose dump the serial incident
+// loop fetched only later, inside the / hold. That dump shows the same
+// holder and waiter frames -- the / hold's -- so judged by its trigger it
+// was credited to /ws. By its fetch window it is not.
+func TestFaultControlLateDumpInsideALaterHoldIsNotCredited(t *testing.T) {
+	c := newFCCell(t)
+	tail := "[fault] hold path=/ws hold=8s start=" + fcTS(0) + "\n[fault] release path=/ws end=" + fcTS(8*time.Second) + " waiters=14\n" +
+		"[fault] hold path=/ hold=40s start=" + fcTS(30*time.Second) + "\n"
+	if err := os.WriteFile(filepath.Join(c.dir, "refapp_stderr_tail.txt"), []byte(tail), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.write(t, "refapp_stderr_tail.txt", tail)
+	c.write(t, "forensics_status.txt", fcStatus(31*time.Second, 31200*time.Millisecond))
+	r := CheckFaultControlCell(c.dir, c.cell, []string{"/ws"})
+	wantFail(t, r, "not root-causable")
+	if all := strings.Join(r.Findings, "\n"); !strings.Contains(all, "fetched between +31s and +31.2s: not inside the hold [+0, +8s]") {
+		t.Errorf("findings should say the dump was fetched in the later hold: %s", all)
+	}
+}
+
+// CodeRabbit on probatorium#412 (faultcontrol_test.go:227-256): a dossier
+// taken BEFORE the hold, even one whose tail carries the hold line, cannot
+// be the corroboration by itself. With the gated dossier moved after the
+// release, the cell must fail.
+func TestFaultControlPreHoldDossierCannotRootCauseTheCell(t *testing.T) {
+	c := newFCCell(t)
+	late, _ := json.Marshal(map[string]any{"observed_at": fcTS(11 * time.Second)})
+	c.write(t, "incident.json", string(late))
+	c.write(t, "forensics_status.txt", fcStatus(11*time.Second, 11100*time.Millisecond))
+	d := filepath.Join(c.dir, "incidents", "20260926-115938-I-WS-STALL")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inc, _ := json.Marshal(map[string]any{"observed_at": fcTS(-22 * time.Second)})
+	for name, body := range map[string]string{
+		"incident.json":          string(inc),
+		"goroutine-stacks.txt":   "goroutine 7 [sleep]:\ngithub.com/x/debugvars.(*FaultHold).run(...)\ngoroutine 9 [sync.Mutex.Lock]:\ngithub.com/x/debugvars.(*FaultHold).wait(...)\n",
+		"refapp_stderr_tail.txt": "[fault] hold path=/ws hold=8s start=" + fcTS(0) + "\n",
+		"forensics_status.txt":   fcStatus(-22*time.Second+10*time.Millisecond, -22*time.Second+40*time.Millisecond),
+		"core.skipped":           "x\n",
+	} {
+		if err := os.WriteFile(filepath.Join(d, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantFail(t, CheckFaultControlCell(c.dir, c.cell, []string{"/ws"}), "not root-causable")
 }

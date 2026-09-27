@@ -95,6 +95,7 @@ func (r FaultControlResult) Pass() bool { return len(r.Failures) == 0 }
 // faultClass is what one path's walker must show.
 type faultClass struct {
 	slice, total, timeout string // Tier1Summary map and keys
+	sent                  string // the walker's attempts: 0 = it never ran
 	outcome               string // SlowFire.Outcome of the failed fire
 	minReadMs             int64  // the walker's read budget, less slack
 	errPart               string // substring of SlowFire.Err
@@ -106,11 +107,11 @@ type faultClass struct {
 
 var faultClasses = map[string]faultClass{
 	// The WS-torture handshake: 2 s budget for dial + write + 101.
-	"/ws": {slice: "ws_torture", total: "ws_handshake_fail", timeout: "ws_handshake_fail_timeout",
+	"/ws": {slice: "ws_torture", total: "ws_handshake_fail", timeout: "ws_handshake_fail_timeout", sent: "ws_sent",
 		outcome: "handshake-fail-timeout", minReadMs: 1500, errPart: "timeout", predicate: "I-WS-HANDSHAKE", stallPredicate: "I-WS-STALL",
 		ring: func(t *Tier1Summary) []SlowFire { return t.WSSlowReads }, counters: func(t *Tier1Summary) map[string]int64 { return t.WSTorture }},
 	// The h2c-churn preamble (GET / with Upgrade: h2c): 20 s read budget.
-	"/": {slice: "h2c_churn", total: "h2c_hang", timeout: "h2c_hang_timeout",
+	"/": {slice: "h2c_churn", total: "h2c_hang", timeout: "h2c_hang_timeout", sent: "h2c_sent",
 		outcome: "hang-timeout", minReadMs: 19000, errPart: "timeout", predicate: "I-H2C-HANG", stallPredicate: "I-H2C-STALL",
 		ring: func(t *Tier1Summary) []SlowFire { return t.H2CSlowReads }, counters: func(t *Tier1Summary) map[string]int64 { return t.H2CChurn }},
 }
@@ -141,6 +142,14 @@ func CheckFaultControlCell(cellDir string, cell ValidationCellResult, wantPaths 
 	t1 := cell.Tier1
 	if t1 == nil {
 		fail("no tier-1 summary: the walkers never ran")
+		return r
+	}
+	// Every file check below reads the cell's directory. An empty cellDir
+	// would resolve them against the working directory and judge the
+	// dossiers of no cell at all -- a vacuous pass on every un-injected
+	// path (CodeRabbit on probatorium#412, faultcontrol.go:155).
+	if st, err := os.Stat(cellDir); cellDir == "" || err != nil || !st.IsDir() {
+		fail("no cell directory in the artifact (%q): its dossiers and stderr tail cannot be judged", cellDir)
 		return r
 	}
 	lines := t1.RefappStderrTail
@@ -225,6 +234,15 @@ func CheckFaultControlCell(cellDir string, cell ValidationCellResult, wantPaths 
 			holder := strings.Count(string(stacks), FaultHolderFrame+"(")
 			waiters := strings.Count(string(stacks), FaultWaiterFrame+"(")
 			in := !obs.IsZero() && !obs.Before(inj.Start) && !obs.After(end)
+			// The trigger instant is not the dump instant: a dossier
+			// triggered inside this hold can be dumped after its release
+			// -- inside a LATER hold, whose holder and waiters carry the
+			// same frames -- when the serial incident loop is behind. The
+			// dump counts only if it was fetched entirely inside this hold
+			// (forensics_status.txt stacks_from/stacks_to, probatorium#412
+			// review).
+			dumpFrom, dumpTo := dossierStacksWindow(d)
+			dumpIn := !dumpFrom.IsZero() && !dumpTo.IsZero() && !dumpFrom.Before(inj.Start) && !dumpTo.After(end)
 			// The hold's own log line must be in the dossier's stderr tail
 			// for the dossier to tie its dump to the ground truth. Judged
 			// only on the dossiers that could root-cause THIS hold: one
@@ -239,6 +257,9 @@ func CheckFaultControlCell(cellDir string, cell ValidationCellResult, wantPaths 
 			case !in:
 				note("%s: dossier %s observed at %s, outside the hold [+0, +%s]: its dump (%d holder / %d waiter frame(s)) cannot name the stall",
 					path, base, obs.Sub(inj.Start).Round(time.Millisecond), end.Sub(inj.Start).Round(time.Millisecond), holder, waiters)
+			case !dumpIn:
+				note("%s: dossier %s observed inside the hold, but its goroutine dump was fetched %s: not inside the hold [+0, +%s], so its frames (%d holder / %d waiter) cannot be credited to it",
+					path, base, dumpWindowSince(dumpFrom, dumpTo, inj.Start), end.Sub(inj.Start).Round(time.Millisecond), holder, waiters)
 			case holder < 1 || waiters < 1:
 				note("%s: dossier %s observed inside the hold but its dump shows %d holder / %d waiter frame(s)", path, base, holder, waiters)
 			case !tailOK:
@@ -246,15 +267,15 @@ func CheckFaultControlCell(cellDir string, cell ValidationCellResult, wantPaths 
 					path, base, terr)
 			default:
 				inside = append(inside, base)
-				note("%s: dossier %s observed at +%s after the hold's start: its goroutine dump shows %d request goroutine(s) blocked in %s and the holder asleep in %s -- the stall is a held lock on %s",
-					path, base, obs.Sub(inj.Start).Round(time.Millisecond), waiters, FaultWaiterFrame, FaultHolderFrame, path)
+				note("%s: dossier %s observed at +%s after the hold's start, dumped %s: its goroutine dump shows %d request goroutine(s) blocked in %s and the holder asleep in %s -- the stall is a held lock on %s",
+					path, base, obs.Sub(inj.Start).Round(time.Millisecond), dumpWindowSince(dumpFrom, dumpTo, inj.Start), waiters, FaultWaiterFrame, FaultHolderFrame, path)
 			}
 			if _, err := os.Stat(filepath.Join(d, "core.skipped")); err != nil {
 				fail("%s: dossier %s has no core.skipped marker: a record-only incident must not have paused the refapp", path, base)
 			}
 		}
 		if len(inside) == 0 {
-			fail("%s: no %s or %s dossier was observed inside the hold with a goroutine dump naming holder and waiter and the hold line in its stderr tail: the stall is not root-causable from this artifact",
+			fail("%s: no %s or %s dossier was observed inside the hold with a goroutine dump, fetched inside the hold, naming holder and waiter and the hold line in its stderr tail: the stall is not root-causable from this artifact",
 				path, fc.predicate, fc.stallPredicate)
 		}
 	}
@@ -271,6 +292,15 @@ func CheckFaultControlCell(cellDir string, cell ValidationCellResult, wantPaths 
 		}
 		fc := faultClasses[path]
 		cnt := fc.counters(t1)
+		// A zero is health only when the oracle ran: a path whose walker
+		// sent nothing was not judged, and must not pass as clean
+		// (probatorium#412 review).
+		if cnt[fc.sent] <= 0 {
+			fail("%s (not injected): %s.%s=%d: its walker never ran, so this path was not judged",
+				path, fc.slice, fc.sent, cnt[fc.sent])
+			continue
+		}
+		note("%s (not injected): judged on %d walker attempt(s) (%s.%s)", path, cnt[fc.sent], fc.slice, fc.sent)
 		if cnt[fc.total] != 0 {
 			fail("%s (not injected): %s.%s=%d, want 0", path, fc.slice, fc.total, cnt[fc.total])
 		}
@@ -309,6 +339,38 @@ func dossierObservedAt(dir string) time.Time {
 	}
 	t, _ := time.Parse(time.RFC3339Nano, inc.ObservedAt)
 	return t
+}
+
+// dossierStacksWindow reads when the dossier's text goroutine dump was
+// fetched (validation/forensics.go writes stacks_from= and stacks_to= on
+// its forensics_status.txt line). Zero instants when either is absent: a
+// dossier written before the stamps existed, or one whose dump fetch failed.
+func dossierStacksWindow(dir string) (from, to time.Time) {
+	b, err := os.ReadFile(filepath.Join(dir, "forensics_status.txt"))
+	if err != nil {
+		return time.Time{}, time.Time{}
+	}
+	for _, f := range strings.Fields(string(b)) {
+		k, v, ok := strings.Cut(f, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "stacks_from":
+			from, _ = time.Parse(time.RFC3339Nano, v)
+		case "stacks_to":
+			to, _ = time.Parse(time.RFC3339Nano, v)
+		}
+	}
+	return from, to
+}
+
+// dumpWindowSince renders a dump window relative to origin.
+func dumpWindowSince(from, to, origin time.Time) string {
+	if from.IsZero() || to.IsZero() {
+		return "at an unknown instant (no stacks_from/stacks_to in forensics_status.txt)"
+	}
+	return fmt.Sprintf("between +%s and +%s", from.Sub(origin).Round(time.Millisecond), to.Sub(origin).Round(time.Millisecond))
 }
 
 func tsSince(ts string, origin time.Time) time.Duration {

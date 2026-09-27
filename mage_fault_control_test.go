@@ -38,7 +38,10 @@ func writeFaultRun(t *testing.T, good bool) string {
 		filepath.Join(d, "refapp_stderr_tail.txt"):    tail,
 		filepath.Join(d, "incident.json"):             string(inc),
 		filepath.Join(d, "goroutine-stacks.txt"):      stacks,
-		filepath.Join(d, "core.skipped"):              "x\n",
+		// The dump's fetch window, inside the hold (validation/forensics.go).
+		filepath.Join(d, "forensics_status.txt"): "pid=1 pprof_source=side-listener stacks_from=" + ts(3010*time.Millisecond) +
+			" stacks_to=" + ts(3050*time.Millisecond) + " gcore=false\n",
+		filepath.Join(d, "core.skipped"): "x\n",
 	}
 	for p, b := range files {
 		if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
@@ -50,11 +53,13 @@ func writeFaultRun(t *testing.T, good bool) string {
 	}
 	doc := report.Document{SchemaVersion: report.SchemaVersion, Validation: &report.ValidationResults{Cells: []report.ValidationCellResult{
 		{Refapp: "auth_session_ratelimit", Engine: "iouring", Arch: "amd64", Tier1: &report.Tier1Summary{
-			WSTorture: map[string]int64{"ws_handshake_fail": 3, "ws_handshake_fail_timeout": 3},
+			WSTorture: map[string]int64{"ws_sent": 900, "ws_handshake_fail": 3, "ws_handshake_fail_timeout": 3},
+			H2CChurn:  map[string]int64{"h2c_sent": 400},
 			WSSlowReads: []report.SlowFire{{TS: ts(2 * time.Second), ReadMs: 2000, Outcome: "handshake-fail-timeout",
 				Err: "i/o timeout", LocalAddr: "127.0.0.1:40000", RemoteAddr: "127.0.0.1:8080"}},
 		}},
-		{Refapp: "kitchen_sink", Engine: "iouring", Arch: "amd64", Tier1: &report.Tier1Summary{H2CChurn: map[string]int64{"h2c_sent": 10}}},
+		{Refapp: "kitchen_sink", Engine: "iouring", Arch: "amd64", Tier1: &report.Tier1Summary{
+			H2CChurn: map[string]int64{"h2c_sent": 10}, WSTorture: map[string]int64{"ws_sent": 20}}},
 	}}}
 	b, _ := json.Marshal(doc)
 	if err := os.WriteFile(filepath.Join(host, "validate-results.json"), b, 0o644); err != nil {
@@ -88,7 +93,7 @@ func TestValidateFaultControlJudgesARun(t *testing.T) {
 		t.Fatal("no-fault mode over an artifact WITH handshake failures must fail")
 	}
 	clean := writeFaultRun(t, true)
-	_ = os.RemoveAll(filepath.Join(clean, "msa2-server", "cell-00-auth_session_ratelimit-iouring"))
+	_ = os.RemoveAll(filepath.Join(clean, "msa2-server", "cell-00-auth_session_ratelimit-iouring", "incidents"))
 	doc := report.Document{SchemaVersion: report.SchemaVersion, Validation: &report.ValidationResults{Cells: []report.ValidationCellResult{
 		{Refapp: "auth_session_ratelimit", Engine: "iouring", Arch: "amd64", Tier1: &report.Tier1Summary{
 			WSTorture: map[string]int64{"ws_sent": 50}, H2CChurn: map[string]int64{"h2c_sent": 50}}}}}}
