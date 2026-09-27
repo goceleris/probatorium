@@ -15,9 +15,10 @@ import (
 // (celeris#588). When set, Mount also serves /debug/pprof/ from net/http on
 // that address -- its own listener and goroutines, outside the benched
 // engine -- and announces the bound address on stdout, before the ready
-// banner, as DebugBannerPrefix + host:port. The validator sets it to
-// 127.0.0.1:0 for every refapp it launches locally and points the incident
-// dossier's pprof leg at the announced address.
+// banner, as DebugBannerPrefix + host:port. In a stall-capture run (a
+// fault-control run, or PROBATORIUM_STALL_CAPTURE=1; never a routine run)
+// the validator sets it to 127.0.0.1:0 for every refapp it launches locally
+// and points the incident dossier's pprof leg at the announced address.
 //
 // Why a second listener: on celeris's event-loop engines (epoll, io_uring,
 // adaptive) a handler runs on its loop, so a stall that parks handlers --

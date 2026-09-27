@@ -329,14 +329,16 @@ type TierPlan struct {
 func New(cfg Config) (*Orchestrator, error) {
 	o := &Orchestrator{cfg: cfg}
 
-	// celeris#588: every refapp launched on THIS host also serves
-	// /debug/pprof on a side listener (debugvars.DebugAddrEnv, inherited by
-	// the child) and announces it on its "debug addr=" banner, so a dossier
-	// can take a goroutine dump while the engine's loops are parked by the
-	// stall it is recording. The ssh driver launches on another host, where
-	// a loopback address announced there means nothing here. An operator's
-	// own value is kept.
-	if cfg.DriverMode != "ssh" && os.Getenv(refappDebugAddrEnv) == "" {
+	// celeris#588: in a stall-capture run (stallCaptureEnabled: a
+	// fault-control run, or PROBATORIUM_STALL_CAPTURE=1 -- never a routine
+	// run) every refapp launched on THIS host also serves /debug/pprof on a
+	// side listener (debugvars.DebugAddrEnv, inherited by the child) and
+	// announces it on its "debug addr=" banner, so a dossier can take a
+	// goroutine dump while the engine's loops are parked by the stall it is
+	// recording. The ssh driver launches on another host, where a loopback
+	// address announced there means nothing here. An operator's own value
+	// is kept.
+	if cfg.DriverMode != "ssh" && stallCaptureEnabled(os.Getenv) && os.Getenv(refappDebugAddrEnv) == "" {
 		_ = os.Setenv(refappDebugAddrEnv, "127.0.0.1:0")
 	}
 
@@ -1016,34 +1018,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// bug (server accepts every malformed request) would generate
 	// hundreds of incidents per second once the bug catches.
 	alertedCounters := make(map[string]bool)
-	faultInjected := os.Getenv("PROBATORIUM_REFAPP_FAULT") != ""
-	// In-stall capture (celeris#588): a walker read that has waited past its
-	// stall threshold with no byte back takes a record-only dossier NOW,
-	// while the stall is still in force -- the one place a goroutine dump can
-	// still show who holds what. Bounded per kind per cell; a full violations
-	// channel drops the attempt rather than blocking the walker's timer.
-	var stallDossiers [2]atomic.Int32
-	onWalkerStall := func(kind string) {
-		i, spec, what, th := 0, properties.IH2CStall, "h2c preamble read", h2cStallThreshold
-		if kind == "ws" {
-			i, spec, what, th = 1, properties.IWSStall, "WebSocket handshake read", wsStallThreshold
-		}
-		if stallDossiers[i].Add(1) > stallDossiersPerKind {
-			return
-		}
-		select {
-		case violations <- Incident{
-			Tier:        TierProperty,
-			PredicateID: spec.ID,
-			Message:     fmt.Sprintf("%s in flight %s with no byte back: dossier taken inside the stall (celeris#588)", what, th),
-			ObservedAt:  time.Now().UTC(),
-			RefappPID:   pid(),
-			RecordOnly:  true,
-			SkipCore:    true,
-		}:
-		default:
-		}
-	}
+	faultInjected := strings.TrimSpace(os.Getenv(refappFaultEnv)) != ""
+	// In-stall capture (celeris#588), in a stall-capture run only: nil
+	// leaves Tier 1's walkers with no stall timer at all.
+	onWalkerStall := walkerStallHook(os.Getenv, violations, pid)
 	tallyCB := func(snap tier1TallySnapshot) {
 		// Publish the refapp's stderr tail for the dossier writer.
 		if tail := snap.RefappStderrTail; len(tail) > 0 {
@@ -1054,12 +1032,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		// the per-arch incident emission stays in sync with the
 		// cross-arch DiffValidation gate.
 		fireIncident := func(counter, msg string, ok, recordOnly bool) {
-			if !ok || alertedCounters[counter] {
+			if !ok {
 				return
 			}
-			alertedCounters[counter] = true
-			select {
-			case violations <- Incident{
+			offerOnce(alertedCounters, violations, Incident{
 				Tier:        TierProperty,
 				PredicateID: counter,
 				Message:     msg,
@@ -1067,11 +1043,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 				RefappPID:   pid(),
 				RecordOnly:  recordOnly,
 				SkipCore:    recordOnly,
-			}:
-			default:
-				// Channel full or closed — orchestrator already
-				// handling a hard fail; nothing more to do.
-			}
+			})
 		}
 		fire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, false) }
 		// walkerFire is fire for the walker oracles. A fault-injected
@@ -1171,6 +1143,12 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		SnapshotPath: filepath.Join(o.cfg.OutDir, "tier1_tally.json"),
 	}
 	tally, err := driveTier1(ctx, cfg)
+	// The refapp is gone: its side listener with it. A later dossier (a
+	// Tier 3 incident, or one still queued) must not point its pprof leg at
+	// the dead address and label the dump "side-listener". The live tail
+	// accessor stays: the dead refapp's ring still holds its last lines,
+	// fresher than the tick's copy, for the dossier of whatever ended it.
+	o.debugAddr.Store(nil)
 	// The refapp is down (or going down) once driveTier1 returns: stop
 	// the property loop and collect its tally. Joined on every path so
 	// the goroutine never outlives the tier.
@@ -1440,6 +1418,75 @@ const forensicsBudget = 30 * time.Second
 // walker kind per cell: enough to catch a stall that recurs, few enough that
 // a host under sustained slow reads cannot spend its cell on forensics.
 const stallDossiersPerKind = 4
+
+// offerOnce sends inc on ch unless inc.PredicateID already produced an
+// incident this run (alerted), and marks it only when the send happened.
+// It never blocks: a full channel -- the orchestrator is busy with a
+// synchronous dossier, or with a hard fail -- drops THIS attempt and leaves
+// the counter unmarked, so the next tally tick offers it again. Marking
+// before the send (as the property tier did until probatorium#412's review)
+// lost a counter's incident for the rest of the run whenever its first
+// offer met a busy loop. alerted is owned by the single tally goroutine.
+func offerOnce(alerted map[string]bool, ch chan<- Incident, inc Incident) bool {
+	if alerted[inc.PredicateID] {
+		return false
+	}
+	select {
+	case ch <- inc:
+		alerted[inc.PredicateID] = true
+		return true
+	default:
+		return false
+	}
+}
+
+// walkerStallHook is tier1Config.OnWalkerStall for this run: the in-stall
+// dossier hook in a stall-capture run (stallCaptureEnabled), nil -- no stall
+// timer on any walker read -- in every other run.
+func walkerStallHook(getenv func(string) string, violations chan<- Incident, pid func() int) func(kind string) {
+	if !stallCaptureEnabled(getenv) {
+		return nil
+	}
+	return newStallDossierHook(violations, pid, stallDossiersPerKind)
+}
+
+// newStallDossierHook is tier1Config.OnWalkerStall for a stall-capture run
+// (celeris#588): a walker read that has waited past its stall threshold
+// with no byte back takes a record-only dossier NOW, while the stall is
+// still in force -- the one place a goroutine dump can still show who holds
+// what. At most perKind dossiers per walker kind per cell. It never blocks
+// the walker's timer goroutine: a full violations channel drops the attempt,
+// and a dropped attempt gives its slot back, so the budget counts dossiers
+// taken, not attempts. Safe for concurrent calls (one timer goroutine per
+// stalled read).
+func newStallDossierHook(violations chan<- Incident, pid func() int, perKind int32) func(kind string) {
+	var taken [2]atomic.Int32
+	return func(kind string) {
+		i, spec, what, th := 0, properties.IH2CStall, "h2c preamble read", h2cStallThreshold
+		if kind == "ws" {
+			i, spec, what, th = 1, properties.IWSStall, "WebSocket handshake read", wsStallThreshold
+		}
+		// Reserve a slot first, so concurrent stalls cannot overshoot the
+		// bound; give it back if the send does not happen.
+		if taken[i].Add(1) > perKind {
+			taken[i].Add(-1)
+			return
+		}
+		select {
+		case violations <- Incident{
+			Tier:        TierProperty,
+			PredicateID: spec.ID,
+			Message:     fmt.Sprintf("%s in flight %s with no byte back: dossier taken inside the stall (celeris#588)", what, th),
+			ObservedAt:  time.Now().UTC(),
+			RefappPID:   pid(),
+			RecordOnly:  true,
+			SkipCore:    true,
+		}:
+		default:
+			taken[i].Add(-1)
+		}
+	}
+}
 
 // writeIncidentDossier creates the per-incident directory and writes
 // incident.json into it. Returns the directory.

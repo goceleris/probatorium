@@ -27,7 +27,12 @@ import (
 //	                                        "none" judges EVERY cell as un-injected:
 //	                                        the no-fault control, run on an
 //	                                        artifact recorded without the fault
-//	                                        (VALIDATE_FAULT_CONTROL may then be empty)
+//	                                        (VALIDATE_FAULT_CONTROL may then be empty).
+//	                                        To judge the stall capture itself, record
+//	                                        it with PROBATORIUM_STALL_CAPTURE=1: a
+//	                                        routine run takes no in-stall dossier and
+//	                                        starts no side listener
+//	                                        (validation.stallCaptureEnabled)
 //	VALIDATE_FAULT_CONTROL_EXPECT_CELLS=N   injected cells the run must contain (0 = no check)
 //	VALIDATE_FAULT_CONTROL_RESULTS=<dir>    judge this run dir (holding <host>/validate-results.json)
 //	                                        instead of the newest under results/

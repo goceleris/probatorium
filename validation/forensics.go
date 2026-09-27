@@ -100,6 +100,14 @@ func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, liste
 	if opts.PprofAddr != "" {
 		pprofAddr, pprofSource = opts.PprofAddr, "side-listener"
 	}
+	// stacksWindow is when the text goroutine dump was fetched: the request
+	// left at its start and the whole dump was on disk at its end, so the
+	// refapp took the dump inside it. A dossier is triggered at one instant
+	// and dumped at another (a synchronous loop can queue it seconds behind
+	// the trigger), and only the second says what the dump can show: the
+	// #588 checker requires this window to lie inside the hold it credits
+	// (report.CheckFaultControlCell). Empty when the fetch failed.
+	var stacksWindow string
 	if pprofAddr != "" {
 		pprofProfiles := []struct {
 			path string
@@ -120,10 +128,14 @@ func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, liste
 		}
 		hc := &http.Client{Timeout: 5 * time.Second}
 		for _, p := range pprofProfiles {
+			from := time.Now().UTC()
 			if err := curlPprof(ctx, hc, "http://"+pprofAddr+p.path,
 				filepath.Join(outDir, p.out)); err != nil {
 				_ = writePlainText(filepath.Join(outDir, p.out+".missing"),
 					fmt.Sprintf("pprof fetch failed: %v\n", err))
+			} else if p.out == "goroutine-stacks.txt" {
+				stacksWindow = fmt.Sprintf(" stacks_from=%s stacks_to=%s",
+					from.Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano))
 			}
 		}
 	}
@@ -162,8 +174,8 @@ func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, liste
 	// readers know whether a missing file is "we tried and failed"
 	// vs "we never tried."
 	return writePlainText(filepath.Join(outDir, "forensics_status.txt"),
-		fmt.Sprintf("pid=%d listen=%q pprof=%q pprof_source=%s gcore=%v dmesg=%v ss=%v\n",
-			pid, listenAddr, pprofAddr, pprofSource, hasBinary("gcore"), hasBinary("dmesg"), hasBinary("ss")))
+		fmt.Sprintf("pid=%d listen=%q pprof=%q pprof_source=%s%s gcore=%v dmesg=%v ss=%v\n",
+			pid, listenAddr, pprofAddr, pprofSource, stacksWindow, hasBinary("gcore"), hasBinary("dmesg"), hasBinary("ss")))
 }
 
 // snapshotSockets writes the host's TCP sockets (`ss -tanpi`: every state,

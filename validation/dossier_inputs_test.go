@@ -37,11 +37,14 @@ func newTestOrch(t *testing.T, mode string) *Orchestrator {
 	return o
 }
 
-// TestNewAsksLocalRefappsForTheSideListener: a local launch inherits
+// TestNewAsksLocalRefappsForTheSideListener: in a stall-capture run (here a
+// fault-control run; stallCaptureEnabled) a local launch inherits
 // PROBATORIUM_REFAPP_DEBUG_ADDR=127.0.0.1:0 from the validator; an ssh
 // launch does not (its loopback is another host's); an operator's own value
-// stands.
+// stands. A routine run asks for none (stall_capture_gate_test.go).
 func TestNewAsksLocalRefappsForTheSideListener(t *testing.T) {
+	t.Setenv(refappFaultEnv, "/ws:8s@30s")
+	t.Setenv(stallCaptureEnv, "")
 	t.Setenv(refappDebugAddrEnv, "")
 	newTestOrch(t, "local")
 	if got := os.Getenv(refappDebugAddrEnv); got != "127.0.0.1:0" {
