@@ -1093,15 +1093,15 @@ func aggregatePerCellResults(resultsDir string, warmup time.Duration) error {
 	return nil
 }
 
-// writeClusterTimeseries is the control-side time-series merge for the
+// buildClusterTimeseries is the control-side time-series merge for the
 // cluster path (#153). Cluster nodes stay pristine: each node only emits
 // per-cell loadgen.json carrying .timeseries; this folds them here.
 //
 // The cluster pipeline never builds report.CellResult, so we go through
 // report.BuildScenarioSeries on a []loadgen.Result assembled per
-// (host, competitor, scenario), in RunIndex order. The result is written
-// to path, labelled with arch (the publish arch tag of the Document it
-// sits beside).
+// (host, competitor, scenario), in RunIndex order. The result is returned
+// gzipped, labelled with arch (the publish arch tag of the Document it
+// sits beside); commitResultsPair writes it.
 //
 // hostCells must be scoped exactly like that Document: nothing in a
 // ScenarioSeries names its host, so two hosts' cells here become two
@@ -1110,7 +1110,7 @@ func aggregatePerCellResults(resultsDir string, warmup time.Duration) error {
 //
 // Per-cell unmarshal errors are skipped (mirroring the missing-result
 // skip in readRunnerCellResults) rather than failing the whole bench.
-func writeClusterTimeseries(path, arch string, hostCells map[string][]cellRecord) error {
+func buildClusterTimeseries(arch string, hostCells map[string][]cellRecord) ([]byte, error) {
 	type seriesKey struct {
 		Host, Competitor, Scenario string
 	}
@@ -1172,11 +1172,84 @@ func writeClusterTimeseries(path, arch string, hostCells map[string][]cellRecord
 			report.BuildScenarioSeries(k.Scenario, k.Competitor, cat, results))
 	}
 
-	data, err := doc.MarshalGzip()
+	return doc.MarshalGzip()
+}
+
+// commitResultsPair puts a merged results document and its time-series
+// sidecar into dir as one pair. Publish keys on the results document
+// (latestBenchResults, or PUBLISH_RESULTS) and then reads whatever sits
+// beside it under timeseriesSidecarName, so the document must never be
+// visible without the sidecar it was merged with.
+//
+// Both files are first written in full to hidden temp names in dir
+// (".<name>.tmp-*": the same directory, so each rename below is atomic,
+// and a name Publish never reads). Only when both writes have succeeded
+// is the sidecar renamed into place, and the results document last. Any
+// failure removes the temps, and a results document that cannot be
+// renamed into place takes the just-renamed sidecar back out: a failed
+// commit leaves no new file in dir, and never a results document beside
+// another merge's sidecar.
+//
+// Crash safety (the process killed mid-commit: SIGKILL, OOM, a cancelled
+// job): before the first rename only hidden temps exist; between the two
+// renames the new sidecar has no results document yet, which Publish
+// never selects; after the second the pair is complete. The one mixed
+// state left is a crash between the renames of a RE-merge, over a results
+// document already at that name: the old document with the new sidecar.
+// Bench never re-merges: every run gets a fresh timestamped dir and
+// merges each results name once. Nothing is fsynced: a host that loses
+// power loses the job and its artifact upload with it.
+func commitResultsPair(dir, resultsName string, results []byte, sidecarName string, sidecar []byte) error {
+	tsTmp, err := stageFile(dir, sidecarName, sidecar)
 	if err != nil {
-		return err
+		return fmt.Errorf("stage timeseries sidecar %s: %w", sidecarName, err)
 	}
-	return os.WriteFile(path, data, 0o644)
+	resTmp, err := stageFile(dir, resultsName, results)
+	if err != nil {
+		_ = os.Remove(tsTmp)
+		return fmt.Errorf("stage %s: %w", resultsName, err)
+	}
+	tsPath := filepath.Join(dir, sidecarName)
+	if err := os.Rename(tsTmp, tsPath); err != nil {
+		_ = os.Remove(tsTmp)
+		_ = os.Remove(resTmp)
+		return fmt.Errorf("commit timeseries sidecar %s: %w", tsPath, err)
+	}
+	if err := os.Rename(resTmp, filepath.Join(dir, resultsName)); err != nil {
+		_ = os.Remove(resTmp)
+		_ = os.Remove(tsPath)
+		return fmt.Errorf("commit %s: %w", filepath.Join(dir, resultsName), err)
+	}
+	return nil
+}
+
+// writeStaged writes a staged file's bytes. A var so a test can fail the
+// write part-way through, as a full disk would.
+var writeStaged = func(f *os.File, data []byte) error {
+	_, err := f.Write(data)
+	return err
+}
+
+// stageFile writes data in full to a new hidden temp file in dir named
+// after name, at os.WriteFile's historical 0644 (CreateTemp gives 0600),
+// and returns its path. On any error it removes the temp file.
+func stageFile(dir, name string, data []byte) (string, error) {
+	f, err := os.CreateTemp(dir, "."+name+".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	err = writeStaged(f, data)
+	if err == nil {
+		err = f.Chmod(0o644)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // timeseriesSidecarName is the time-series sidecar that belongs to a merged
@@ -1929,22 +2002,25 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 		Agg:             agg,
 	})
 
-	out := filepath.Join(resultsDir, outName)
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(out, data, 0o644); err != nil {
 		return "", err
 	}
 	// The sidecar is labelled with the arch Publish will file this
 	// Document under (the same archTagFromHostArchPair of its
 	// HostArchPair), so report.WriteTree can refuse it under any other.
-	tsPath := filepath.Join(resultsDir, timeseriesSidecarName(outName))
-	if err := writeClusterTimeseries(tsPath, archTagFromHostArchPair(doc.HostArchPair), scoped); err != nil {
-		return "", fmt.Errorf("write timeseries sidecar %s: %w", tsPath, err)
+	tsName := timeseriesSidecarName(outName)
+	tsGz, err := buildClusterTimeseries(archTagFromHostArchPair(doc.HostArchPair), scoped)
+	if err != nil {
+		return "", fmt.Errorf("build timeseries sidecar %s: %w", tsName, err)
 	}
-	return out, nil
+	// Both are built; nothing is on disk yet. Commit them as one pair,
+	// the results document last, so a Document is never left without its
+	// sidecar (commitResultsPair).
+	if err := commitResultsPair(resultsDir, outName, data, tsName, tsGz); err != nil {
+		return "", err
+	}
+	return filepath.Join(resultsDir, outName), nil
 }
 
 // clusterServerMeta projects the competitors seen in the raw payloads

@@ -3,9 +3,11 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,6 +114,49 @@ func TestMergeCommitsResultsWithItsSidecar(t *testing.T) {
 				t.Errorf("failed merge changed the run dir:\n before %q\n after  %q", before, after)
 			}
 		})
+	}
+}
+
+// TestMergeStagingFailureLeavesNoPartialFile: a write that fails part-way
+// (a full disk) while staging either file of the pair must leave nothing
+// in the run dir: no results document, no truncated sidecar, no staged
+// temp. os.WriteFile truncates its target first, so a sidecar that failed
+// mid-write used to leave a partial file under its real name.
+func TestMergeStagingFailureLeavesNoPartialFile(t *testing.T) {
+	errDiskFull := errors.New("injected: no space left on device")
+	for _, r := range pairRuns() {
+		for _, failing := range []string{r.sidecarName, r.resultsName} {
+			t.Run(r.name+"/"+failing, func(t *testing.T) {
+				resultsDir := t.TempDir()
+				merge := r.setup(t, resultsDir)
+				before := runDirEntries(t, resultsDir)
+
+				orig := writeStaged
+				t.Cleanup(func() { writeStaged = orig })
+				hit := false
+				writeStaged = func(f *os.File, data []byte) error {
+					if !strings.HasPrefix(filepath.Base(f.Name()), "."+failing+".tmp-") {
+						return orig(f, data)
+					}
+					hit = true
+					if _, err := f.Write(data[:len(data)/2]); err != nil {
+						return err
+					}
+					return errDiskFull
+				}
+
+				_, err := merge()
+				if !hit {
+					t.Fatalf("%s was never staged", failing)
+				}
+				if !errors.Is(err, errDiskFull) {
+					t.Fatalf("merge error %v, want the injected write failure", err)
+				}
+				if after := runDirEntries(t, resultsDir); !slices.Equal(after, before) {
+					t.Errorf("failed merge changed the run dir:\n before %q\n after  %q", before, after)
+				}
+			})
+		}
 	}
 }
 
