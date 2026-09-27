@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -328,6 +329,309 @@ func TestHostJobKillsItsShardWhenTheRunnerDirGoes(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Errorf("cluster-host.sh still runs after its runner dir was deleted:\n%s", out.String())
 	}
+}
+
+// syncBuffer is a bytes.Buffer a test may read while a command writes it.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// procFields is what /proc/PID/stat holds after the command name: state,
+// ppid, pgrp, session, ... (nil when PID is gone).
+func procFields(pid int) []string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return nil
+	}
+	s := string(b)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return nil
+	}
+	return strings.Fields(s[i+1:])
+}
+
+// procTable lists every process as pid -> its /proc/PID/stat fields.
+func procTable() map[int][]string {
+	out := map[int][]string{}
+	ents, _ := os.ReadDir("/proc")
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		if f := procFields(pid); len(f) > 3 {
+			out[pid] = f
+		}
+	}
+	return out
+}
+
+// sessionLeft lists the live (not zombie) processes of session sid, as
+// "pid (comm)".
+func sessionLeft(sid int) []string {
+	var left []string
+	for pid, f := range procTable() {
+		if f[0] != "Z" && f[3] == strconv.Itoa(sid) {
+			comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+			left = append(left, fmt.Sprintf("%d (%s)", pid, strings.TrimSpace(string(comm))))
+		}
+	}
+	slices.Sort(left)
+	return left
+}
+
+// sessionGoneWithin waits up to d for session sid to have no live process
+// and returns what still runs then.
+func sessionGoneWithin(sid int, d time.Duration) []string {
+	deadline := time.Now().Add(d)
+	for {
+		left := sessionLeft(sid)
+		if len(left) == 0 || time.Now().After(deadline) {
+			return left
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// killEverything SIGKILLs session sid and every process whose command line
+// names root: whatever a test's host job left behind.
+func killEverything(sid int, root string) {
+	for pid, f := range procTable() {
+		cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if (sid > 0 && f[3] == strconv.Itoa(sid)) || bytes.Contains(cmdline, []byte(root)) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+}
+
+const (
+	stressClusterWorkflow = "../../.github/workflows/celeris-stress-cluster.yml"
+	hostStepName          = "go test on the bare-metal host"
+)
+
+// hostStepRun is the `run:` line of the workflow's host step, the one that
+// runs cluster-host.sh.
+func hostStepRun(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.FromSlash(stressClusterWorkflow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := false
+	for _, l := range strings.Split(string(b), "\n") {
+		s := strings.TrimSpace(l)
+		if strings.HasPrefix(s, "- ") {
+			name, ok := strings.CutPrefix(s, "- name: ")
+			in = ok && name == hostStepName
+		} else if run, ok := strings.CutPrefix(s, "run: "); ok && in {
+			if !strings.Contains(run, "cluster-host.sh") || strings.HasPrefix(run, "|") || strings.HasPrefix(run, ">") {
+				t.Fatalf("the host step's run is %q; this test runs a one-line run that runs cluster-host.sh", run)
+			}
+			return run
+		}
+	}
+	t.Fatalf("no step %q with a run line in %s", hostStepName, stressClusterWorkflow)
+	return ""
+}
+
+// cancelledHost is a stress host job in the layout of the workflow's host
+// step (the scripts under probatorium/tools/stresstally), with a fake
+// shard.sh: its "test binary" runs for 5 minutes and, like a wedged one,
+// ignores SIGINT and SIGTERM, so only SIGKILL stops it. The shard records the
+// signals it started with ignored, and the workload's pid.
+type cancelledHost struct {
+	cmd      *exec.Cmd
+	out      *syncBuffer
+	done     chan struct{} // closed once cmd.Wait returned
+	shardSID int
+}
+
+func startCancelledHost(t *testing.T, step bool, watchdogSeconds string) *cancelledHost {
+	t.Helper()
+	root := t.TempDir()
+	tools := filepath.Join(root, "probatorium", "tools", "stresstally")
+	for _, f := range []string{"cluster-host.sh", "gostate.sh"} {
+		b, err := os.ReadFile(script(t, f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeExec(t, filepath.Join(tools, f), string(b))
+	}
+	pidfile := filepath.Join(root, "shard.pid")
+	writeExec(t, filepath.Join(tools, "shard.sh"), `#!/usr/bin/env bash
+awk '/^SigIgn:/ {print $2}' "/proc/$$/status" >"$SHARD_PIDFILE.sigign"
+trap '' INT TERM
+sleep 300 </dev/null >/dev/null 2>&1 &
+echo $! >"$SHARD_PIDFILE"
+wait
+`)
+	rt := filepath.Join(root, "runner", "_work", "_temp")
+	if err := os.MkdirAll(rt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := &cancelledHost{out: &syncBuffer{}, done: make(chan struct{})}
+	if step {
+		// The runner writes the step's run to a file and runs it with the
+		// step's shell (shell: bash).
+		stepFile := filepath.Join(root, "step.sh")
+		writeFile(t, stepFile, hostStepRun(t)+"\n")
+		h.cmd = exec.Command("bash", "--noprofile", "--norc", "-e", "-o", "pipefail", stepFile)
+		// The runner reads the step's output until it closes, at most 5 s
+		// after the step's process exited.
+		h.cmd.WaitDelay = 5 * time.Second
+	} else {
+		h.cmd = exec.Command("bash", filepath.Join(tools, "cluster-host.sh"))
+	}
+	h.cmd.Dir = root
+	h.cmd.Env = bashEnv(map[string]string{
+		"RUNNER_TEMP": rt, "STRESS_ARCH": "x86", "STRESS_HOST": "h", "STRESS_MODE": "stress", "STRESS_SEQUENCE": "stress:1:1",
+		"STRESS_CASE_SHAS": "stress=" + testSHA, "STRESS_LOG_DIR": filepath.Join(rt, "stress", "logs"),
+		"STRESS_FACTS": filepath.Join(rt, "stress", "host", "facts.txt"), "STRESS_BUSY_SECONDS": "0",
+		"STRESS_WATCHDOG_SECONDS": watchdogSeconds, "STRESS_GO_TMPDIR": filepath.Join(root, "gotmp"), "SHARD_PIDFILE": pidfile,
+	})
+	h.cmd.Stdout, h.cmd.Stderr = h.out, h.out
+	h.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := h.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var waitErr error
+	go func() { waitErr = h.cmd.Wait(); close(h.done) }()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-h.cmd.Process.Pid, syscall.SIGKILL)
+		killEverything(h.shardSID, root)
+		select {
+		case <-h.done:
+		case <-time.After(10 * time.Second):
+		}
+	})
+	workload := 0
+	for deadline := time.Now().Add(60 * time.Second); workload == 0; time.Sleep(100 * time.Millisecond) {
+		if b, err := os.ReadFile(pidfile); err == nil && strings.TrimSpace(string(b)) != "" {
+			workload, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+			break
+		}
+		select {
+		case <-h.done:
+			t.Fatalf("the host job exited before its shard started (%v):\n%s", waitErr, h.out.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the shard never started:\n%s", h.out.String())
+		}
+	}
+	f := procFields(workload)
+	if f == nil {
+		t.Fatalf("the shard's workload (pid %d) is already gone:\n%s", workload, h.out.String())
+	}
+	h.shardSID, _ = strconv.Atoi(f[3])
+	if own := procFields(os.Getpid()); own == nil || own[3] == f[3] {
+		t.Fatalf("the shard runs in the test's own session (%s), not one of its own", f[3])
+	}
+	// On GitHub the shard runs in the step's foreground: SIGINT and SIGQUIT
+	// at their defaults. On the cluster they must be too.
+	b, err := os.ReadFile(pidfile + ".sigign")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ign, err := strconv.ParseUint(strings.TrimSpace(string(b)), 16, 64); err != nil || ign&(1<<(syscall.SIGINT-1)|1<<(syscall.SIGQUIT-1)) != 0 {
+		t.Errorf("the shard started with SigIgn %s (%v): SIGINT or SIGQUIT ignored, which a shard on GitHub never has", strings.TrimSpace(string(b)), err)
+	}
+	return h
+}
+
+// runnerCancel does to the step's process what the runner does when the job
+// is cancelled or times out (actions/runner src/Runner.Sdk/ProcessInvoker.cs,
+// Unix): SIGINT to that process alone; if the step has not ended 7.5 s
+// later, SIGTERM; 2.5 s after that, SIGKILL. The step has ended once its
+// process exited and its output closed, or 5 s after the exit
+// (cmd.WaitDelay); the runner then moves on to the job's always() steps.
+// It returns the signal the step ended on.
+func (h *cancelledHost) runnerCancel(t *testing.T) string {
+	t.Helper()
+	for _, s := range []struct {
+		name string
+		sig  syscall.Signal
+		wait time.Duration
+	}{{"SIGINT", syscall.SIGINT, 7500 * time.Millisecond}, {"SIGTERM", syscall.SIGTERM, 2500 * time.Millisecond}, {"SIGKILL", syscall.SIGKILL, 30 * time.Second}} {
+		_ = h.cmd.Process.Signal(s.sig)
+		select {
+		case <-h.done:
+			return s.name
+		case <-time.After(s.wait):
+		}
+	}
+	t.Fatalf("the step has not ended 30 s after the runner's SIGKILL:\n%s", h.out.String())
+	return ""
+}
+
+// A cancel or a timeout must kill the running shard before the job's
+// always() steps run: the Go-state wipe (gostate.sh wipe) is one of them, and
+// a go test still running under it can recreate what it deletes, in
+// $RUNNER_TEMP/go or in /tmp/cstress, outside the runner dir. The P6 cancel
+// of the cluster proof campaign (run 36323766722) ran the wipe with go and
+// iouring.test still alive; only the runner's end-of-job orphan cleanup
+// killed them. A shard runs in a session of its own, so no signal to the host
+// script's process group reaches it: the host script must kill it on SIGINT
+// and SIGTERM, and a watchdog in a session of its own must kill it when the
+// host script dies of SIGKILL.
+func TestHostJobKillsItsShardOnCancel(t *testing.T) {
+	linuxOnly(t)
+	// The trap's arms: a watchdog that looks once a minute cannot be what
+	// kills the shard within their bound.
+	for name, sig := range map[string]syscall.Signal{"SIGINT": syscall.SIGINT, "SIGTERM": syscall.SIGTERM} {
+		t.Run(name+" to the host script's process group", func(t *testing.T) {
+			h := startCancelledHost(t, false, "60")
+			sent := time.Now()
+			if err := syscall.Kill(-h.cmd.Process.Pid, sig); err != nil {
+				t.Fatal(err)
+			}
+			if left := sessionGoneWithin(h.shardSID, 5*time.Second); len(left) > 0 {
+				t.Errorf("5 s after %s to the host script's process group, the shard's session still runs %v:\n%s", name, left, h.out.String())
+			}
+			for alive(h.cmd.Process.Pid) && time.Since(sent) < 10*time.Second {
+				time.Sleep(50 * time.Millisecond)
+			}
+			if alive(h.cmd.Process.Pid) {
+				t.Errorf("the host script still runs 10 s after %s:\n%s", name, h.out.String())
+			}
+		})
+	}
+	// No trap runs on SIGKILL: the watchdog, in a session of its own, must.
+	t.Run("SIGKILL to the host script's process group", func(t *testing.T) {
+		h := startCancelledHost(t, false, "1")
+		if err := syscall.Kill(-h.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			t.Fatal(err)
+		}
+		if left := sessionGoneWithin(h.shardSID, 10*time.Second); len(left) > 0 {
+			t.Errorf("10 s after SIGKILL to the host script's process group (watchdog every 1 s), the shard's session still runs %v:\n%s", left, h.out.String())
+		}
+	})
+	// What the runner really does: signals to the step's process only, never
+	// to a group, and the always() steps start as soon as the step has
+	// ended. The watchdog looks once a minute here, so the step itself must
+	// kill the shard.
+	t.Run("the runner's cancel of the workflow's host step", func(t *testing.T) {
+		h := startCancelledHost(t, true, "60")
+		ended := h.runnerCancel(t)
+		if left := sessionGoneWithin(h.shardSID, time.Second); len(left) > 0 {
+			t.Errorf("the step ended on %s and the runner moved on to the always() steps (the Go-state wipe among them), but 1 s later the shard's session still runs %v:\n%s",
+				ended, left, h.out.String())
+		}
+	})
 }
 
 // fakeGH is `gh api [--paginate] PATH [--jq FILTER]` over fixture files: a
