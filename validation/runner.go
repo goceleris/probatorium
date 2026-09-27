@@ -1377,6 +1377,20 @@ const stallDossierCooldown = 2 * time.Second
 // it publishes the refapp's stderr tail for the dossier writer and turns the
 // tally snapshot into the property tier's reactive incidents on violations.
 // ctx is the run's context (rootCtx); pid reads the live refapp's PID.
+//
+// A tick offers its incidents by severity, not in the order the oracles are
+// listed (probatorium#412 review round 3). violations holds ONE incident,
+// and offerOnce re-offers every incident a busy loop dropped, so the order
+// decides who gets a free slot:
+//   - I-LIVENESS and I-HANG first, and they WAIT for the slot
+//     (deliverTerminal). On a crash or a wedge the final synchronous tick
+//     in driveTier1 is often the only offer they get: the periodic ticker
+//     stopped when the tier cancelled its run. Offered after a record-only
+//     incident an earlier busy loop had dropped, the wedge lost the free
+//     slot to it; offered into a full slot, it was dropped. Either way the
+//     cell was never aborted and the wedged process never dumped or cored.
+//   - then the hard walker incidents (a hard fail in a routine run),
+//   - then the record-only ones, which only add a dossier.
 func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations chan<- Incident, pid func() int) func(tier1TallySnapshot) {
 	// alertedCounters tracks which sub-tally counters we've already
 	// emitted an Incident for, so the periodic callback fires AT MOST
@@ -1394,11 +1408,14 @@ func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations cha
 		// Mirror the canonical list from report.invariantCounters so
 		// the per-arch incident emission stays in sync with the
 		// cross-arch DiffValidation gate.
+		//
+		// Collected here, offered by severity at the end of the tick.
+		var terminal, hard, recorded []Incident
 		fireIncident := func(counter, msg string, ok, recordOnly bool) {
-			if !ok {
+			if !ok || alertedCounters[counter] {
 				return
 			}
-			offerOnce(alertedCounters, violations, Incident{
+			inc := Incident{
 				Tier:        TierProperty,
 				PredicateID: counter,
 				Message:     msg,
@@ -1406,10 +1423,29 @@ func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations cha
 				RefappPID:   pid(),
 				RecordOnly:  recordOnly,
 				SkipCore:    recordOnly,
+			}
+			if recordOnly {
+				recorded = append(recorded, inc)
+			} else {
+				hard = append(hard, inc)
+			}
+		}
+		// fatal is for the two oracles that end the cell (the refapp died,
+		// or it is wedged): offered first, and delivered even into a full
+		// slot (deliverTerminal).
+		fatal := func(counter, msg string, ok bool) {
+			if !ok || alertedCounters[counter] {
+				return
+			}
+			terminal = append(terminal, Incident{
+				Tier:        TierProperty,
+				PredicateID: counter,
+				Message:     msg,
+				ObservedAt:  time.Now().UTC(),
+				RefappPID:   pid(),
 			})
 		}
-		fire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, false) }
-		// walkerFire is fire for the walker oracles. A fault-injected
+		// walkerFire is a hard incident for the walker oracles. A fault-injected
 		// control run (PROBATORIUM_REFAPP_FAULT set, celeris#588) records
 		// them instead: the injected stall trips them by design (a held /ws
 		// also times out the 64 KiB echo walker), and a hard fail would end
@@ -1459,15 +1495,66 @@ func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations cha
 		// Engine-agnostic crash oracle: the refapp process died mid-run. This
 		// is the catch-all that the per-protocol counters above can't see — a
 		// dead server just looks like connection-refused to every walker.
-		fire(properties.ILiveness.ID,
+		fatal(properties.ILiveness.ID,
 			livenessDeathMessage(snap.Liveness),
 			snap.Liveness.Crashed)
 		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
 		// connection errors). Complements I-LIVENESS for the hang class.
-		fire(properties.IHang.ID,
+		fatal(properties.IHang.ID,
 			fmt.Sprintf("refapp wedged mid-run: %s", snap.Liveness.Reason()),
 			snap.Liveness.Hung)
+
+		for _, inc := range terminal {
+			deliverTerminal(ctx, alertedCounters, violations, inc)
+		}
+		for _, inc := range hard {
+			offerOnce(alertedCounters, violations, inc)
+		}
+		for _, inc := range recorded {
+			offerOnce(alertedCounters, violations, inc)
+		}
 	}
+}
+
+// terminalIncidentWait bounds how long deliverTerminal waits for the
+// violations slot: the loop may be inside one synchronous capture
+// (forensicsBudget) with one more incident queued in the slot ahead of the
+// wedge (another forensicsBudget), plus the dossier writes. A variable so a
+// test can shorten it.
+var terminalIncidentWait = 2*forensicsBudget + 10*time.Second
+
+// deliverTerminal delivers a cell-ending incident (I-LIVENESS, I-HANG) the
+// way offerOnce offers the others -- at most once per run, marked only when
+// sent -- except that a full slot does not drop it: it waits for the slot,
+// for the run to end (ctx), or for terminalIncidentWait, whichever is first.
+//
+// It cannot deadlock the orchestrator. The only receiver is Run's incident
+// loop, which returns to its receive after every incident it handles
+// (record-only: one bounded capture; infra: a JSON write) and waits on this
+// goroutine only through wg.Wait -- after cancel() on a hard fail, or once
+// rootCtx is done -- and ctx IS rootCtx, so the wait ends there. No lock is
+// held across the send: driveTier1 calls TallyCallback with a snapshot
+// value, outside every tally mutex. A sender that blocks is also served
+// before the non-blocking offers of other goroutines: a receive from a full
+// buffered channel moves the first waiting sender's value into the buffer
+// in the same step, so an offer in between sees the slot full.
+func deliverTerminal(ctx context.Context, alerted map[string]bool, ch chan<- Incident, inc Incident) bool {
+	if alerted[inc.PredicateID] {
+		return false
+	}
+	if offerOnce(alerted, ch, inc) {
+		return true
+	}
+	t := time.NewTimer(terminalIncidentWait)
+	defer t.Stop()
+	select {
+	case ch <- inc:
+		alerted[inc.PredicateID] = true
+		return true
+	case <-ctx.Done():
+	case <-t.C:
+	}
+	return false
 }
 
 // offerOnce sends inc on ch unless inc.PredicateID already produced an

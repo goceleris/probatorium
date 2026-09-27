@@ -760,9 +760,11 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	snap := tally.snapshot()
 	// If the refapp crashed OR hung, the periodic ticker stopped at cancelRun
 	// and may not have ticked between the event and here. Fire the callback
-	// once more, synchronously, so the I-LIVENESS / I-HANG incident is
-	// guaranteed to reach the orchestrator (fire() is deduped, so a double tick
-	// is harmless).
+	// once more, synchronously, so the I-LIVENESS / I-HANG incident reaches
+	// the orchestrator: the property tier's callback offers it before any
+	// other incident and waits for a full slot (runner.go deliverTerminal,
+	// bounded by the run and by terminalIncidentWait). Incidents are deduped
+	// per counter, so a double tick is harmless.
 	if (snap.Liveness.Crashed || snap.Liveness.Hung) && cfg.TallyCallback != nil {
 		cfg.TallyCallback(snap)
 	}
