@@ -33,9 +33,11 @@ const DefaultErrorBudget = 0.05
 
 // ErrorBudgeter is an optional [Scenario] facet: a scenario whose
 // workload legitimately produces loadgen-side errors above
-// [DefaultErrorBudget] (e.g. connection churn, where refused dials are
-// part of what is being measured) implements it to declare its own
-// ceiling. Resolved via [ErrorBudgetFor].
+// [DefaultErrorBudget] implements it to declare its own ceiling.
+// Resolved via [ErrorBudgetFor]. No registered scenario raises its
+// ceiling above the default today; churn-close did (0.5) until the
+// loadgen v1.4.14 re-pin (probatorium#424), because the errors it
+// tolerated were a loadgen artifact.
 type ErrorBudgeter interface {
 	// ErrorBudget returns the error-ratio ceiling in (0,1].
 	ErrorBudget() float64

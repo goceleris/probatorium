@@ -17,6 +17,7 @@ import (
 
 	"github.com/goceleris/probatorium/interleave"
 	"github.com/goceleris/probatorium/report"
+	"github.com/goceleris/probatorium/scenarios"
 	"github.com/goceleris/probatorium/servers"
 )
 
@@ -26,6 +27,10 @@ import (
 // v3.9 hardening, so each row is a regression lock.
 func TestClassifyCompletedCell(t *testing.T) {
 	const refused = "dial tcp 192.168.50.65:8080: connect: connection refused"
+	// churn-close rows carry the budget the runner would hand the
+	// classifier for that scenario (executeCell: scenarios.ErrorBudgetFor), so
+	// they move with scenarios/static.go instead of pinning a copy.
+	churnBudget := churnCloseBudget(t)
 	cases := []struct {
 		name         string
 		in           completedCell
@@ -116,13 +121,13 @@ func TestClassifyCompletedCell(t *testing.T) {
 		{
 			// v3.8 churn-close/ntex: 12,081,484 requests vs
 			// 290,204,598 errors (ratio 0.960) published as status=ok.
-			// Over the explicit 0.5 churn budget → suspect, data kept.
+			// Over the churn-close budget → suspect, data kept.
 			name: "v3.8 churn-close error storm is suspect",
 			in: completedCell{
 				ScenarioName: "churn-close", ServerName: "ntex",
 				Category: "static", Requests: 12081484, Errors: 290204598,
 				Duration: 90004545724, ServerAlive: true,
-				ErrorBudget: 0.5,
+				ErrorBudget: churnBudget,
 			},
 			wantPrefix: "suspect:", wantHard: false, wantStatus: report.CellSuspect,
 		},
@@ -186,7 +191,7 @@ func TestClassifyCompletedCell(t *testing.T) {
 				Category: "static", Requests: 12081484, Errors: 290204598,
 				ConnectErrors: 290204598,
 				Duration:      90004545724, ServerAlive: true,
-				ErrorBudget: 0.5,
+				ErrorBudget: churnBudget,
 			},
 			wantPrefix: "suspect:", wantContains: "overage is connect-class (connect_errors=290204598)",
 			wantHard: false, wantStatus: report.CellSuspect,
@@ -200,19 +205,48 @@ func TestClassifyCompletedCell(t *testing.T) {
 				Category: "static", Requests: 12081484, Errors: 290204598,
 				ConnectErrors: 1024,
 				Duration:      90004545724, ServerAlive: true,
-				ErrorBudget: 0.5,
+				ErrorBudget: churnBudget,
 			},
 			wantPrefix: "suspect:", wantHard: false, wantStatus: report.CellSuspect,
 		},
 		{
-			// Churn with failed dials under half of completed requests
-			// stays clean under the 0.5 budget.
+			// Churn with a few failed dials (3.8% of attempts) stays
+			// clean under the churn-close budget.
 			name: "churn-close under budget is clean",
 			in: completedCell{
 				ScenarioName: "churn-close", ServerName: "axum",
-				Category: "static", Requests: 1000000, Errors: 900000,
+				Category: "static", Requests: 1000000, Errors: 40000,
 				Duration: 90 * time.Second, ServerAlive: true,
-				ErrorBudget: 0.5,
+				ErrorBudget: churnBudget,
+			},
+			wantPrefix: "", wantHard: false, wantStatus: report.CellOK,
+		},
+		{
+			// goceleris/loadgen#90 "Measured": loadgen main a89f02d (the
+			// v1.4.13 client) in close mode against net/http, 26,753
+			// requests and 26,746 errors, one EOF error per success
+			// (goceleris/loadgen#87), ratio 0.49993. The 0.5 budget let
+			// every such cell through; under loadgen v1.4.14 those counts
+			// mean a server that fails half its churn attempts, so the
+			// cell is suspect (probatorium#424).
+			name: "churn-close half-failing cell is suspect",
+			in: completedCell{
+				ScenarioName: "churn-close", ServerName: "stdhttp-h1",
+				Category: "static", Requests: 26753, Errors: 26746,
+				Duration: time.Second, ServerAlive: true,
+				ErrorBudget: churnBudget,
+			},
+			wantPrefix: "suspect:", wantHard: false, wantStatus: report.CellSuspect,
+		},
+		{
+			// The same measurement with loadgen v1.4.14's client
+			// (c913657): 31,419 requests, 0 errors.
+			name: "churn-close with the fixed client is clean",
+			in: completedCell{
+				ScenarioName: "churn-close", ServerName: "stdhttp-h1",
+				Category: "static", Requests: 31419, Errors: 0,
+				Duration: time.Second, ServerAlive: true,
+				ErrorBudget: churnBudget,
 			},
 			wantPrefix: "", wantHard: false, wantStatus: report.CellOK,
 		},
@@ -258,6 +292,19 @@ func TestClassifyCompletedCell(t *testing.T) {
 			}
 		})
 	}
+}
+
+// churnCloseBudget returns the error budget the runner applies to the
+// registered churn-close scenario.
+func churnCloseBudget(t *testing.T) float64 {
+	t.Helper()
+	for _, s := range scenarios.Registry() {
+		if s.Name() == "churn-close" {
+			return scenarios.ErrorBudgetFor(s)
+		}
+	}
+	t.Fatal("churn-close is not registered")
+	return 0
 }
 
 // TestReduceCellStatus pins the multi-run reduction: an OK run keeps the
