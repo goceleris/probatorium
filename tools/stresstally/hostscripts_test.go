@@ -407,12 +407,22 @@ func sessionGoneWithin(sid int, d time.Duration) []string {
 	}
 }
 
-// killEverything SIGKILLs session sid and every process whose command line
-// names root: whatever a test's host job left behind.
+// killEverything SIGKILLs whatever a test's host job left behind: session
+// sid, every process whose command line names root, and every process in
+// the process group or session of one of those (a watchdog's sleep).
 func killEverything(sid int, root string) {
-	for pid, f := range procTable() {
-		cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-		if (sid > 0 && f[3] == strconv.Itoa(sid)) || bytes.Contains(cmdline, []byte(root)) {
+	table := procTable()
+	ids := map[string]bool{}
+	if sid > 0 {
+		ids[strconv.Itoa(sid)] = true
+	}
+	for pid := range table {
+		if cmdline, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); bytes.Contains(cmdline, []byte(root)) {
+			ids[strconv.Itoa(pid)] = true
+		}
+	}
+	for pid, f := range table {
+		if pid != os.Getpid() && (ids[strconv.Itoa(pid)] || ids[f[2]] || ids[f[3]]) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
@@ -452,7 +462,9 @@ func hostStepRun(t *testing.T) string {
 // step (the scripts under probatorium/tools/stresstally), with a fake
 // shard.sh: its "test binary" runs for 5 minutes and, like a wedged one,
 // ignores SIGINT and SIGTERM, so only SIGKILL stops it. The shard records the
-// signals it started with ignored, and the workload's pid.
+// signals a command it starts (go test, on the host) starts with ignored, and
+// the workload's pid. (Not its own: bash ignores SIGQUIT itself, and gives a
+// command it starts the disposition it found.)
 type cancelledHost struct {
 	cmd      *exec.Cmd
 	out      *syncBuffer
@@ -473,7 +485,7 @@ func startCancelledHost(t *testing.T, step bool, watchdogSeconds string) *cancel
 	}
 	pidfile := filepath.Join(root, "shard.pid")
 	writeExec(t, filepath.Join(tools, "shard.sh"), `#!/usr/bin/env bash
-awk '/^SigIgn:/ {print $2}' "/proc/$$/status" >"$SHARD_PIDFILE.sigign"
+awk '/^SigIgn:/ {print $2}' /proc/self/status >"$SHARD_PIDFILE.sigign"
 trap '' INT TERM
 sleep 300 </dev/null >/dev/null 2>&1 &
 echo $! >"$SHARD_PIDFILE"
@@ -541,14 +553,15 @@ wait
 	if own := procFields(os.Getpid()); own == nil || own[3] == f[3] {
 		t.Fatalf("the shard runs in the test's own session (%s), not one of its own", f[3])
 	}
-	// On GitHub the shard runs in the step's foreground: SIGINT and SIGQUIT
-	// at their defaults. On the cluster they must be too.
+	// On GitHub the shard runs in the step's foreground, so its go test
+	// starts with SIGINT and SIGQUIT at their defaults. On the cluster it must
+	// too.
 	b, err := os.ReadFile(pidfile + ".sigign")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ign, err := strconv.ParseUint(strings.TrimSpace(string(b)), 16, 64); err != nil || ign&(1<<(syscall.SIGINT-1)|1<<(syscall.SIGQUIT-1)) != 0 {
-		t.Errorf("the shard started with SigIgn %s (%v): SIGINT or SIGQUIT ignored, which a shard on GitHub never has", strings.TrimSpace(string(b)), err)
+		t.Errorf("the shard's commands start with SigIgn %s (%v): SIGINT or SIGQUIT ignored, which a shard's go test on GitHub never has", strings.TrimSpace(string(b)), err)
 	}
 	return h
 }
