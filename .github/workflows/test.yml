@@ -119,14 +119,16 @@ jobs:
       - name: go test -tags mage
         run: go test -count=1 -race -tags mage -timeout=10m ./...
 
-  # The zombie guard (probatorium#415) and the tests that hold the Tier 3
-  # refapp teardown to reaping, run with -v so the log names each of them
-  # and carries the guard's verdict line. The root module job runs them too,
-  # but without -v, and a passing package prints only "ok": it cannot show
-  # that the tests ran rather than skipped, or that the guard counted this
-  # binary's children through /proc, the Linux path. So green here must mean:
-  # no FAIL, no SKIP (a skipped control is an absent one), every required test
-  # printed a PASS line, and the guard passed via /proc.
+  # The zombie guard (probatorium#415), the tests that hold the Tier 3
+  # refapp teardown to reaping, and the local driver's tests that it signals
+  # only processes it has not reaped, run with -v so the log names each of
+  # them and carries the guard's verdict line. The root module job runs them
+  # too, but without -v, and a passing package prints only "ok": it cannot
+  # show that the tests ran rather than skipped, that the Linux-only test
+  # (TestLocal_StopSweepRunsBeforeTheReap) ran at all, or that the guard
+  # counted this binary's children through /proc, the Linux path. So green
+  # here must mean: no FAIL, no SKIP (a skipped control is an absent one),
+  # every required test printed a PASS line, and the guard passed via /proc.
   zombieguard:
     name: validation zombie guard (Linux /proc)
     runs-on: ubuntu-latest
@@ -143,7 +145,7 @@ jobs:
           out="$RUNNER_TEMP/zombieguard.out"
           rc=0
           go test -count=1 -race -v -timeout=10m \
-            -run '^(TestZombieGuard_.*|TestReplayOneSeed_.*|TestDriveTier3_PassingSeeds|TestDriveTier3_TeardownIsTallied|TestLocal_SignalReachesForkedChildren|TestSSH_SignalIsBounded)$' \
+            -run '^(TestZombieGuard_.*|TestReplayOneSeed_.*|TestDriveTier3_PassingSeeds|TestDriveTier3_TeardownIsTallied|TestLocal_SignalReachesForkedChildren|TestLocal_NoSignalOnceTheExitIsRecorded|TestLocal_WaitAfterACancelledWaitSendsNothing|TestLocal_OverlappingWaitsGetOneResult|TestLocal_StopSweepRunsBeforeTheReap|TestSSH_SignalIsBounded)$' \
             ./validation/ ./validation/remote/ > "$out" 2>&1 || rc=$?
           cat "$out"
           pass=$(grep -c -- '--- PASS: ' "$out" || true)
@@ -182,6 +184,12 @@ jobs:
             TestLocal_SignalReachesForkedChildren/foreground_child \
             TestLocal_SignalReachesForkedChildren/background_child \
             TestLocal_SignalReachesForkedChildren/child_that_ignores_SIGTERM \
+            TestLocal_NoSignalOnceTheExitIsRecorded \
+            TestLocal_NoSignalOnceTheExitIsRecorded/a_Wait_timed_out_then_the_process_exited_on_its_own \
+            TestLocal_NoSignalOnceTheExitIsRecorded/the_run_context_ended_as_at_the_end_of_a_Tier_1_cell \
+            TestLocal_WaitAfterACancelledWaitSendsNothing \
+            TestLocal_OverlappingWaitsGetOneResult \
+            TestLocal_StopSweepRunsBeforeTheReap \
             TestSSH_SignalIsBounded
           do
             if ! grep -q -F -- "--- PASS: $t (" "$out"; then
@@ -322,7 +330,7 @@ jobs:
   # listed in needs must stay unconditional on push + pull_request.
   ci-ok:
     name: ci-ok
-    needs: [root, adapters, refapps, mage, fieldguard, vulncheck]
+    needs: [root, adapters, refapps, mage, zombieguard, fieldguard, vulncheck]
     if: always()
     runs-on: ubuntu-latest
     steps:
