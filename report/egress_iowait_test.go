@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -232,6 +233,75 @@ func TestWindowEgressScrapeGapAtTheEdge(t *testing.T) {
 	wantI(t, "zc_sends_submitted", s.Summary.ZCSendsSubmitted, 15)
 	wantI(t, "ring_bytes", s.Summary.RingBytes, 300)
 	wantI(t, "inline_bytes", s.Summary.InlineBytes, 50)
+}
+
+// A window in which ONE sample published the counters spans zero seconds:
+// its first-to-last delta is 0, and a 0 there reads as a measured "the ZC arm
+// never fired" -- exactly the B-arm proof (zc_sends_submitted == 0, present)
+// the #585 verdict requires. It must be absent, as processCPUPct is when
+// first == last (probatorium#411 review). Includes the realistic shape: a
+// window whose other scrapes all failed (-1).
+func TestWindowEgressOneSampleIsNotAReading(t *testing.T) {
+	base := utc(t, "2026-09-13T10:00:00Z").Unix()
+	for name, rows := range map[string][]egRow{
+		"one row":            {{base + 0, 10, 10, 100, 100, 200}},
+		"one published of 3": {{base + 0, -1, -1, -1, -1, -1}, {base + 1, 10, 10, 100, 100, 200}, {base + 2, -1, -1, -1, -1, -1}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "observer.sqlite")
+			writeObserverDBEgress(t, dbPath, rows)
+			samples, err := ParseObserverDB(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := SummarizeResources(samples, 0, false, nil).Summary
+			if s.ZCSendsSubmitted != nil || s.ZCNotifs != nil || s.InlineBytes != nil || s.RingBytes != nil || s.BytesWritten != nil || s.RingBytesFraction != nil {
+				t.Errorf("one published sample: zc=%v notifs=%v inline=%v ring=%v written=%v frac=%v, want all nil (a zero-second window measured nothing)",
+					fmtI(s.ZCSendsSubmitted), fmtI(s.ZCNotifs), fmtI(s.InlineBytes), fmtI(s.RingBytes), fmtI(s.BytesWritten), fmtF(s.RingBytesFraction))
+			}
+		})
+	}
+}
+
+// A counter that decreased BETWEEN the first and last published samples
+// (another process answered one scrape, or the engine restarted) has no
+// window delta, even when last >= first: 900 -> 3 -> 950 is not +50
+// (CodeRabbit on probatorium#411, resources.go:507). The other counters of
+// the same window, monotonic, keep theirs.
+func TestWindowEgressIntermediateDecreaseIsNil(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "observer.sqlite")
+	base := utc(t, "2026-09-13T10:00:00Z").Unix()
+	//                        zc   notifs inline ring  written
+	writeObserverDBEgress(t, dbPath, []egRow{
+		{base + 0, 900, 900, 50, 900, 950},
+		{base + 1, 3, 901, 60, 3, 1000},
+		{base + 2, 950, 902, 70, 960, 1100},
+	})
+	samples, err := ParseObserverDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := SummarizeResources(samples, 0, false, nil).Summary
+	if s.ZCSendsSubmitted != nil || s.RingBytes != nil || s.RingBytesFraction != nil {
+		t.Errorf("zc 900->3->950, ring 900->3->960: zc=%v ring=%v frac=%v, want nil", fmtI(s.ZCSendsSubmitted), fmtI(s.RingBytes), fmtF(s.RingBytesFraction))
+	}
+	wantI(t, "zc_notifs (monotonic)", s.ZCNotifs, 2)
+	wantI(t, "inline_bytes (monotonic)", s.InlineBytes, 20)
+	wantI(t, "bytes_written (monotonic)", s.BytesWritten, 150)
+}
+
+func fmtI(p *int64) string {
+	if p == nil {
+		return "nil"
+	}
+	return strconv.FormatInt(*p, 10)
+}
+
+func fmtF(p *float64) string {
+	if p == nil {
+		return "nil"
+	}
+	return strconv.FormatFloat(*p, 'g', 6, 64)
 }
 
 // ReduceResources must carry the v5.17 fields as medians across runs.

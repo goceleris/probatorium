@@ -472,25 +472,33 @@ func SummarizeResources(samples []ObserverSample, cpuMean float64, cpuOK bool, c
 // summarizeEgress fills the engine egress fields of sum from the samples
 // (celeris#585): each counter's delta between the first and the last
 // sample that published it, i.e. what the SUT's engine did over exactly
-// the span the samples cover. A counter no sample published stays nil; a
-// counter that went BACKWARDS (a different process answered, or the
-// engine restarted) is dropped rather than reported as a negative or
-// wrapped delta. RingBytesFraction = ring / (inline + ring) needs both
-// byte counters and a non-zero denominator.
+// the span the samples cover. A counter stays nil when fewer than TWO
+// samples published it -- one sample spans zero seconds, and its delta of
+// 0 would read as a measured "the treatment never fired" (the arm proof
+// requires zc_sends_submitted == 0 in an OFF arm) -- and when it DECREASED
+// anywhere between consecutive published samples (a different process
+// answered, or the engine restarted: a 900 -> 3 -> 950 window is not +50),
+// rather than being reported as a negative, wrapped or spliced delta.
+// RingBytesFraction = ring / (inline + ring) needs both byte counters and
+// a non-zero denominator.
 func summarizeEgress(sum *ResourceSummary, samples []ObserverSample) {
 	var deltas [NumEgressCounters]*int64
 	for k := 0; k < NumEgressCounters; k++ {
-		first, last := int64(-1), int64(-1)
+		first, last, n, backwards := int64(-1), int64(-1), 0, false
 		for _, s := range samples {
 			if !s.EgressOK[k] {
 				continue
 			}
-			if first < 0 {
+			if n > 0 && s.Egress[k] < last {
+				backwards = true
+			}
+			if n == 0 {
 				first = s.Egress[k]
 			}
 			last = s.Egress[k]
+			n++
 		}
-		if first >= 0 && last >= first {
+		if n >= 2 && !backwards && first >= 0 {
 			deltas[k] = ptrI64(last - first)
 		}
 	}

@@ -1172,19 +1172,23 @@ type ResourceSummary struct {
 	// than two ticks samples fell in the window.
 	SUTProcessCPUPct *float64 `json:"sut_process_cpu_pct,omitempty"`
 
-	// MeanIOWaitPct is the mean mpstat %iowait over the same rows as
-	// MeanCPUPct, and MeanCPUExIOWaitPct the mean of (100 - %idle -
-	// %iowait): host CPU that was actually executing (schema v5.17,
-	// celeris#585). MeanCPUPct counts %iowait as busy, and io_uring
-	// charges a worker waiting in io_uring_enter as iowait, so an io_uring
-	// column's MeanCPUPct is not comparable with an epoll column's; this
-	// pair is. Nil when the cpu.log carried no %iowait column.
+	// MeanIOWaitPct is the mean mpstat %iowait over the rows whose
+	// %iowait parsed (a non-negative value), and MeanCPUExIOWaitPct the
+	// mean of (100 - %idle - %iowait) over those same rows: host CPU that
+	// was actually executing (schema v5.17, celeris#585). MeanCPUPct stays
+	// the mean over every valid CPU row, iowait column or not. It counts
+	// %iowait as busy, and io_uring charges a worker waiting in
+	// io_uring_enter as iowait, so an io_uring column's MeanCPUPct is not
+	// comparable with an epoll column's; this pair is. Nil when no row
+	// carried a %iowait value.
 	MeanIOWaitPct      *float64 `json:"mean_iowait_pct,omitempty"`
 	MeanCPUExIOWaitPct *float64 `json:"mean_cpu_ex_iowait_pct,omitempty"`
 
 	// The SUT engine's egress over the window (schema v5.17, celeris#585),
 	// each the delta of the cumulative engine.EngineMetrics counter
-	// between the first and last observer sample that carried it. They are
+	// between the first and last observer sample that carried it -- nil
+	// unless at least two samples carried it and it never decreased
+	// between them (summarizeEgress). They are
 	// the exposure witnesses a SEND_ZC A/B cannot be read without:
 	// ZCSendsSubmitted / ZCNotifs say whether the zero-copy arm ran at all
 	// (0 in an OFF arm; 0 in an ON arm means the treatment never fired),
