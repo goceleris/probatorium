@@ -23,6 +23,85 @@ import (
 //     base-vs-branch comparison of the arms' failures.
 //   - a DESCRIPTIVE section appended to summary.md: per-arm medians and the
 //     per-block ratio against the first arm. It is not a verdict.
+//   - the binaries: the witness that an arm difference is a code difference.
+//     Every observation of an arm on one host must have run the same bytes,
+//     and two arms of one commit (an A/A control) the same bytes as each
+//     other there (-trimpath makes that possible across two checkouts). An
+//     arm that breaks either FAILs (checkBinaries); the two hosts' binaries
+//     always differ, being two architectures.
+
+// Timing problems, from the binaries.
+const (
+	// An arm's observations on one host ran more than one binary.
+	problemBinaryDrift = "binary-drift"
+	// Two arms of one commit ran different binaries on one host: the build
+	// is not reproducible, so a difference between them need not be a code
+	// difference.
+	problemAABinaries = "aa-binaries-differ"
+)
+
+// checkBinaries reads the binary (binary_sha256) every observation ran, per
+// host and arm, skipping WRONG-SHAPE shards, and adds a problem to each arm
+// that breaks the timing's premise. It returns what it found, for
+// summary.md.
+func checkBinaries(plan Plan, reports []CaseReport) []string {
+	if len(plan.Cases) == 0 {
+		return nil
+	}
+	var lines []string
+	for _, arch := range plan.Cases[0].Arches {
+		bins := make([][]string, len(reports))
+		for i, r := range reports {
+			for _, s := range r.Shards {
+				if s.Arch != arch || s.Status == statusWrongShape {
+					continue
+				}
+				for _, o := range s.obs {
+					if h := o["binary_sha256"]; h != "" && !slices.Contains(bins[i], h) {
+						bins[i] = append(bins[i], h)
+					}
+				}
+			}
+			switch len(bins[i]) {
+			case 0:
+				lines = append(lines, fmt.Sprintf("%s recorded no binary on %s", r.Case, arch))
+			case 1:
+				lines = append(lines, fmt.Sprintf("%s ran one binary on %s (`%s`)", r.Case, arch, short(bins[i][0])))
+			default:
+				addProblem(&reports[i], problemBinaryDrift)
+				lines = append(lines, fmt.Sprintf("%s ran %d different binaries on %s: its observations did not all run the same bytes", r.Case, len(bins[i]), arch))
+			}
+		}
+		for i := range reports {
+			for j := i + 1; j < len(reports); j++ {
+				if reports[i].CelerisSHA != reports[j].CelerisSHA || len(bins[i]) != 1 || len(bins[j]) != 1 {
+					continue
+				}
+				a, b := reports[i].Case, reports[j].Case
+				if bins[i][0] == bins[j][0] {
+					lines = append(lines, fmt.Sprintf("%s and %s test the same commit and ran the same binary on %s (`%s`)", a, b, arch, short(bins[i][0])))
+					continue
+				}
+				addProblem(&reports[i], problemAABinaries)
+				addProblem(&reports[j], problemAABinaries)
+				lines = append(lines, fmt.Sprintf("%s and %s test the same commit but ran different binaries on %s (`%s`, `%s`): "+
+					"the build is not reproducible, so a difference between them need not be a code difference", a, b, arch, short(bins[i][0]), short(bins[j][0])))
+			}
+		}
+	}
+	return lines
+}
+
+// addProblem fails a case report for a problem found after it was judged.
+func addProblem(r *CaseReport, p string) {
+	if slices.Contains(r.Problems, p) {
+		return
+	}
+	r.Problems = append(r.Problems, p)
+	slices.Sort(r.Problems)
+	r.Verdict = "FAIL"
+	r.Mismatches = checkExpect(*r, r.Config.Expect)
+}
 
 // obsColumns are observations.tsv's columns. The stress-obs keys are obs.sh's.
 var obsColumns = []string{
@@ -84,9 +163,9 @@ func position(plan Plan, arm string, block int) int {
 	return 0
 }
 
-// writeTiming writes observations.tsv, the per-arm reports and the
-// descriptive section of summary.md.
-func writeTiming(dir string, plan Plan, reports []CaseReport) error {
+// writeTiming writes observations.tsv, the per-arm reports and the timing
+// sections of summary.md (binaries, what checkBinaries found).
+func writeTiming(dir string, plan Plan, reports []CaseReport, binaries []string) error {
 	rows := timingRows(plan, reports)
 	var tsv strings.Builder
 	tsv.WriteString(strings.Join(obsColumns, "\t") + "\n")
@@ -129,15 +208,22 @@ func writeTiming(dir string, plan Plan, reports []CaseReport) error {
 	}
 	var b strings.Builder
 	b.Write(md)
-	b.WriteString(timingMarkdown(plan, reports, rows))
+	b.WriteString(timingMarkdown(plan, reports, rows, binaries))
 	return os.WriteFile(filepath.Join(dir, "summary.md"), []byte(b.String()), 0o644)
 }
 
-// timingMarkdown is the descriptive section: medians per arm and arch, the
-// per-block ratio of each arm to the first, and what the witnesses say.
-func timingMarkdown(plan Plan, reports []CaseReport, rows []obsRow) string {
+// timingMarkdown is the timing's part of summary.md: the binaries (checked:
+// they can fail an arm), then the descriptive section: medians per arm and
+// arch and the per-block ratio of each arm to the first.
+func timingMarkdown(plan Plan, reports []CaseReport, rows []obsRow, binaries []string) string {
 	var b strings.Builder
-	b.WriteString("## Timing (descriptive only)\n\n")
+	b.WriteString("## Timing binaries (checked)\n\n")
+	b.WriteString("Every observation of an arm on one host must run the same binary, and two arms of one commit the same binary as each other " +
+		"(an arm that does not FAILs: binary-drift, aa-binaries-differ). The two hosts' binaries always differ.\n\n")
+	for _, l := range binaries {
+		say(&b, "- %s\n", l)
+	}
+	b.WriteString("\n## Timing (descriptive only)\n\n")
 	b.WriteString("One observation is one run of the test binary, measured by obs.sh around the binary alone. These medians describe the run; " +
 		"the verdict on an A/B question is the pre-registered analysis of `observations.tsv`, never this table.\n\n")
 	order := plan.Sequence(0)
@@ -199,8 +285,6 @@ func timingMarkdown(plan Plan, reports []CaseReport, rows []obsRow) string {
 				medianText(wall, "%.2f"), medianText(cpu, "%.2f"), medianText(ins, "%.0f"), len(bins), rat)
 		}
 	}
-	b.WriteString("\nA binaries count above 1 means an arm did not run the same bytes in every observation; " +
-		"two arms of one commit that each show 1 binary with the same sha256 (see observations.tsv) ran identical code.\n")
 	return b.String()
 }
 

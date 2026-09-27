@@ -179,16 +179,19 @@ const (
 	// (HostEntry), so its limits are about the whole job, and it holds the
 	// matrix-tier-cluster group while it runs. A host job's limit is
 	// clusterFixedMinutes (checking out each case, the toolchain, modules and
-	// the first compile), plus timingQuietMinutes in timing mode (the wait
-	// for a quiet host), plus, per shard or observation, one -timeout per
+	// the first compile), plus in timing mode timingQuietMinutes (the wait
+	// for a quiet host) and timingPrebuildMinutes per arm (each arm's test
+	// binary is built once before the quiet check, so no observation's budget
+	// carries a compile), plus, per shard or observation, one -timeout per
 	// package and clusterShardMinutes (go test's own start and link). A plan
 	// over maxClusterJobMinutes is refused: the cluster is shared with the
 	// release tiers.
-	maxClusterShards     = 200
-	clusterFixedMinutes  = 15
-	timingQuietMinutes   = 10
-	clusterShardMinutes  = 1
-	maxClusterJobMinutes = 480
+	maxClusterShards      = 200
+	clusterFixedMinutes   = 15
+	timingQuietMinutes    = 10
+	timingPrebuildMinutes = 3
+	clusterShardMinutes   = 1
+	maxClusterJobMinutes  = 480
 	// The bootstrap and teardown jobs' limits (celeris-stress-cluster.yml),
 	// for the group-hold bound the plan prints.
 	clusterBootstrapMinutes = 25
@@ -864,11 +867,11 @@ func (p Plan) HostEntries(runID int64) []HostEntry {
 }
 
 // hostJobMinutes is a cluster host job's timeout-minutes: the fixed setup,
-// the quiet wait of a timing, and for every shard or observation of the host
-// one go test -timeout per package plus go test's own start and link. It is
-// the bound on how long the run can hold matrix-tier-cluster (with the
-// bootstrap and teardown limits), and planDispatch refuses a plan whose
-// bound is over maxClusterJobMinutes.
+// a timing's quiet wait and per-arm prebuild, and for every shard or
+// observation of the host one go test -timeout per package plus go test's
+// own start and link. It is the bound on how long the run can hold
+// matrix-tier-cluster (with the bootstrap and teardown limits), and
+// planDispatch refuses a plan whose bound is over maxClusterJobMinutes.
 func hostJobMinutes(p Plan) int {
 	if len(p.Cases) == 0 {
 		return 0
@@ -881,7 +884,7 @@ func hostJobMinutes(p Plan) int {
 	per := len(c.Packages)*int(math.Ceil(d.Minutes())) + clusterShardMinutes
 	m := clusterFixedMinutes + len(p.Sequence(0))*per
 	if p.IsTiming() {
-		m += timingQuietMinutes
+		m += timingQuietMinutes + timingPrebuildMinutes*len(p.Cases)
 	}
 	return m
 }
@@ -892,7 +895,7 @@ func hostJobFormula(p Plan) string {
 	d, _ := checkTimeout(c.Timeout)
 	quiet := ""
 	if p.IsTiming() {
-		quiet = fmt.Sprintf(" + %d quiet wait", timingQuietMinutes)
+		quiet = fmt.Sprintf(" + %d quiet wait + %d arm(s) x %d prebuild", timingQuietMinutes, len(p.Cases), timingPrebuildMinutes)
 	}
 	return fmt.Sprintf("%d setup%s + %d shard(s) x (%d package(s) x %d min timeout + %d)",
 		clusterFixedMinutes, quiet, len(p.Sequence(0)), len(c.Packages), int(math.Ceil(d.Minutes())), clusterShardMinutes)

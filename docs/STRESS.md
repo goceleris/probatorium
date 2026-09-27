@@ -277,8 +277,8 @@ msa2-server, every arm64 shard on msr1, never msa2-client. What changes:
   guard again, but do not re-run a cluster run at all: dispatch a new one.
 - **Bounded.** The plan refuses a `...` pattern (the bound needs the package
   count) and any plan whose host job could run over 480 minutes: 15 for
-  setup, plus 10 for a timing's quiet wait, plus per shard one `timeout` per
-  package and 1 more. The plan log prints the bound and how long the group
+  setup, plus 10 for a timing's quiet wait and 3 per arm to build it, plus
+  per shard one `timeout` per package and 1 more. The plan log prints the bound and how long the group
   can be held (bootstrap 25 + the bound + teardown 15). Teardown always runs.
   Two waits are not bounded: the wait to enter the group (as for every
   tier), and a host job's wait for its runner. Each host job can run only on
@@ -325,17 +325,20 @@ question. Two arms may name the same commit: an A/A control.
   observation is one `go test` process of one arm; go test runs the test
   binary through `-exec tools/stresstally/obs.sh`, which measures only the
   binary (go test re-links it every time): wall time, user and system CPU,
-  the load before and after, the binary's sha256 (every observation of an
-  arm must be the same bytes), and, when `perf` works on the host, user-mode
-  instructions, cycles and task clock (`perf stat`). It writes one
-  `stress-obs:` line into the shard's log.
+  the load before and after, the binary's sha256, and, when `perf` works on
+  the host, user-mode instructions, cycles and task clock (`perf stat`). It
+  writes one `stress-obs:` line into the shard's log. Every timing `go test`
+  builds with `-trimpath`, so each arm's checkout directory is not in its
+  binary and two arms of one commit build the same bytes.
 - **Counterbalanced.** A block runs every arm once, in a Williams order:
   every arm comes first equally often and follows every other arm equally
   often (two arms: AB, BA, AB, BA, ...). `shards` is the number of blocks and
   must be a multiple of the order's period (2 for two arms, 6 for three, 4 for
   four). All arms of a block share one `-shuffle` seed.
 - **Exclusive, pinned, quiet.** The group keeps every other cluster run off
-  the hosts. Before the first observation the host job waits up to 10 minutes
+  the hosts. Before the first observation the host job builds every arm's
+  test binary once (so the build cache holds every compile and no
+  observation directly follows one), then waits up to 10 minutes
   for a quiet host (busy CPU under 5 % over 5 s and a 1-minute load under
   1.0); a host that never gets quiet refuses every observation, so no data is
   taken, and none is ever dropped afterwards. Every observation is pinned
@@ -352,6 +355,13 @@ question. Two arms may name the same commit: an A/A control.
   `stresstally compare out/arms/A out/arms/B` compares the arms' failures),
   and a descriptive table. The verdict on the A/B question is the
   pre-registered analysis of `observations.tsv`, never that table.
+- **The binaries are checked.** On each host every observation of an arm
+  must have run one binary (else the arm fails with `binary-drift`), and two
+  arms of one commit the same binary as each other (else both fail with
+  `aa-binaries-differ`: the build was not reproducible, so a difference
+  between them need not be a code difference). An A/A control therefore
+  shows one sha256 per host, the same for both arms; the two hosts' differ,
+  being two architectures. The summary lists what it found.
 
 ```sh
 gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \

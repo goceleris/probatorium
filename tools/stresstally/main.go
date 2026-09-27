@@ -335,12 +335,18 @@ func cmdSummarize(args []string, stdout io.Writer, getenv func(string) string) i
 		}
 		reports = append(reports, judgeCase(c, *logs, s))
 	}
+	// A timing's binaries can fail an arm, so they are checked before any
+	// report is written.
+	var binaries []string
+	if plan.IsTiming() {
+		binaries = checkBinaries(plan, reports)
+	}
 	if err := writeReports(*outDir, plan, sha, reports); err != nil {
 		say(stdout, "::error::%v\n", err)
 		return 2
 	}
 	if plan.IsTiming() {
-		if err := writeTiming(*outDir, plan, reports); err != nil {
+		if err := writeTiming(*outDir, plan, reports, binaries); err != nil {
 			say(stdout, "::error::%v\n", err)
 			return 2
 		}

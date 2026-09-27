@@ -104,10 +104,13 @@ fi
 # Timing: go test re-links the test binary on every run, so the observation
 # is taken INSIDE go test's -exec: obs.sh runs the binary once and measures
 # only it. The whole go test is pinned to the host's chosen CPUs (taskset),
-# so the binary inherits them and GOMAXPROCS follows.
+# so the binary inherits them and GOMAXPROCS follows. -trimpath keeps each
+# arm's checkout directory out of the binary (and out of cmd/go's action
+# IDs), so two arms of one commit build the same bytes: the A/A witness the
+# summary checks.
 prefix=()
 if [ "$mode" = "timing" ]; then
-	args+=("-exec=${STRESS_OBS_WRAPPER:?}")
+	args+=(-trimpath "-exec=${STRESS_OBS_WRAPPER:?}")
 	prefix=(taskset -c "${STRESS_CPUSET:-}")
 	STRESS_OBS_FILE="${TMPDIR:-/tmp}/stress-obs.$$"
 	: >"$STRESS_OBS_FILE"

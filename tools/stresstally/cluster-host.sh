@@ -8,6 +8,8 @@
 # Before the first shard it records the host (host-facts file: CPU, cores and
 # their classes, governor, boost, perf, load, the busiest processes), and in
 # timing mode it
+#   - builds every arm's test binary once (prebuild_arms), so the build
+#     cache holds every compile before the quiet check;
 #   - waits up to 10 minutes for a quiet host: host-wide busy CPU under 5%
 #     over 5 s AND a 1-minute load under 1.0, polled every 15 s; a host that
 #     never gets quiet refuses every observation (no data is taken, so none
@@ -169,6 +171,36 @@ quiet_wait() {
 	done
 }
 
+# prebuild_arms (timing): build every arm's test binary once, with the
+# observations' build flags (-trimpath, and -race and -tags when asked), so
+# the build cache holds every compile before the quiet check and no
+# observation directly follows a compile. Records each binary's sha256 (with
+# -trimpath, two arms of one commit share it). A failed build is recorded;
+# its observations then report the build failure themselves.
+prebuild_arms() {
+	local kv arm out rc f
+	local -a build=(-trimpath) flags=() pkgs=()
+	[ "${STRESS_RACE:-false}" != "true" ] || build+=(-race)
+	read -r -a flags <<<"${STRESS_FLAGS-}"
+	for f in ${flags[@]+"${flags[@]}"}; do
+		case "$f" in -tags=*) build+=("$f") ;; esac
+	done
+	read -r -a pkgs <<<"$STRESS_PACKAGES"
+	for kv in $STRESS_CASE_SHAS; do
+		arm=${kv%%=*}
+		out="$TMPDIR/prebuild-$arm.test"
+		rc=0
+		(cd "celeris-$arm" && go test -c -o "$out" "${build[@]}" "${pkgs[@]}") >"$TMPDIR/prebuild-$arm.log" 2>&1 || rc=$?
+		if [ "$rc" = 0 ]; then
+			note "prebuild $arm: binary $(sha256sum "$out" | awk '{print $1}') (go test -c ${build[*]})"
+		else
+			note "prebuild $arm: go test -c exited $rc; its observations will report the build failure"
+			tail -n 30 "$TMPDIR/prebuild-$arm.log" >>"$STRESS_FACTS" 2>/dev/null || true
+		fi
+		rm -f "$out"
+	done
+}
+
 # watch_runner PID SIDFILE: while PID (this script) lives, watch the runner
 # dir ($RUNNER_TEMP). A runner GitHub gave up on can keep running its job on
 # the host while the teardown kills the listener and deletes that dir;
@@ -218,9 +250,14 @@ main() {
 		note "cpuset: ${cpuset:-none}"
 		perf_probe
 		note "perf: $perf_state"
-		quiet_wait
-		note "quiet check: $quiet"
-		snapshot "after the quiet check"
+		if [ -z "$pre_refuse" ]; then
+			prebuild_arms
+			quiet_wait
+			note "quiet check: $quiet"
+			snapshot "after the quiet check"
+		else
+			note "no prebuild and no quiet check: every observation is refused ($pre_refuse)"
+		fi
 	fi
 
 	export STRESS_TARGET=cluster STRESS_HOST STRESS_RUNNER="$STRESS_HOST" STRESS_MODE STRESS_CPUS STRESS_PMU
