@@ -16,7 +16,8 @@
 //     gzipped. The heavy payload, fetched only for a latency view.
 //   - timeseries.json.gz    — the existing request-rate sidecar
 //     ([TimeseriesDoc]). Not produced here; copied verbatim by the
-//     publisher because it is already written next to results.json.
+//     publisher because it is already written next to results.json,
+//     after [CheckTimeseriesForArch] has accepted it for the cell's arch.
 //   - env.json              — provenance + run environment ([EnvDoc]),
 //     self-describing so the tree is debuggable in isolation.
 //
@@ -196,7 +197,16 @@ func MergeSplit(summary *Document, hist *HistogramDoc) *Document {
 // only when tsGz is non-nil — the publisher passes the bytes of the
 // existing timeseries.json.gz sidecar verbatim so the request-rate
 // series is preserved without re-deriving it. Returns the cell dir.
+//
+// A timeseries that [CheckTimeseriesForArch] refuses for meta.Arch fails
+// the call before anything is written: the cell's four files are one
+// machine's data or nothing (probatorium#422).
 func WriteTree(root string, doc *Document, tsGz []byte, meta SplitMeta) (string, error) {
+	if tsGz != nil {
+		if err := CheckTimeseriesForArch(tsGz, meta.Arch); err != nil {
+			return "", fmt.Errorf("refusing %s for %s: %w", TimeseriesFile, CellRelDir(meta), err)
+		}
+	}
 	summary, hist, env := SplitDocument(doc, meta)
 
 	cellDir := filepath.Join(root, CellRelDir(meta))
