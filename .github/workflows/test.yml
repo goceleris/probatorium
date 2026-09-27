@@ -119,6 +119,91 @@ jobs:
       - name: go test -tags mage
         run: go test -count=1 -race -tags mage -timeout=10m ./...
 
+  # The zombie guard (probatorium#415), the tests that hold the Tier 3
+  # refapp teardown to reaping, and the local driver's tests that it signals
+  # only processes it has not reaped, run with -v so the log names each of
+  # them and carries the guard's verdict line. The root module job runs them
+  # too, but without -v, and a passing package prints only "ok": it cannot
+  # show that the tests ran rather than skipped, that the Linux-only test
+  # (TestLocal_StopSweepRunsBeforeTheReap) ran at all, or that the guard
+  # counted this binary's children through /proc, the Linux path. So green
+  # here must mean: no FAIL, no SKIP (a skipped control is an absent one),
+  # every required test printed a PASS line, and the guard passed via /proc.
+  zombieguard:
+    name: validation zombie guard (Linux /proc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.0"
+          cache: true
+      - name: go test -race -v, tallied
+        run: |
+          out="$RUNNER_TEMP/zombieguard.out"
+          rc=0
+          go test -count=1 -race -v -timeout=10m \
+            -run '^(TestZombieGuard_.*|TestReplayOneSeed_.*|TestDriveTier3_PassingSeeds|TestDriveTier3_TeardownIsTallied|TestLocal_SignalReachesForkedChildren|TestLocal_NoSignalOnceTheExitIsRecorded|TestLocal_WaitAfterACancelledWaitSendsNothing|TestLocal_OverlappingWaitsGetOneResult|TestLocal_StopSweepRunsBeforeTheReap|TestSSH_SignalIsBounded)$' \
+            ./validation/ ./validation/remote/ > "$out" 2>&1 || rc=$?
+          cat "$out"
+          pass=$(grep -c -- '--- PASS: ' "$out" || true)
+          fail=$(grep -c -- '--- FAIL: ' "$out" || true)
+          skip=$(grep -c -- '--- SKIP: ' "$out" || true)
+          echo "zombie guard tally: PASS=$pass FAIL=$fail SKIP=$skip go-test-rc=$rc"
+          bad=0
+          if [ "$rc" -ne 0 ]; then echo "::error::go test exited $rc"; bad=1; fi
+          if [ "$fail" -ne 0 ]; then echo "::error::$fail FAIL line(s)"; bad=1; fi
+          if [ "$skip" -ne 0 ]; then echo "::error::$skip SKIP line(s): a skipped control proves nothing"; bad=1; fi
+          for t in \
+            TestZombieGuard_ParsesProcStat \
+            TestZombieGuard_ParsesPS \
+            TestZombieGuard_Verdicts \
+            TestZombieGuard_Verdicts/children_cannot_be_listed \
+            TestZombieGuard_Verdicts/a_zombie_outlasts_the_settle_window \
+            TestZombieGuard_Verdicts/a_zombie_is_reaped_inside_the_settle_window \
+            TestZombieGuard_Verdicts/no_children_at_all \
+            TestZombieGuard_Verdicts/a_child_still_running_at_the_first_sample_exits_unreaped \
+            TestZombieGuard_Verdicts/a_child_is_still_running_at_the_end_of_the_settle_window \
+            TestZombieGuard_Verdicts/a_running_child_is_reaped_inside_the_settle_window \
+            TestZombieGuard_SeesAnUnreapedChild \
+            TestZombieGuard_SeesAnUnreapedChild/proc \
+            TestZombieGuard_SeesAnUnreapedChild/ps \
+            TestReplayOneSeed_ReapsTheRefapp \
+            TestReplayOneSeed_StopEscalatesToSIGKILL \
+            TestReplayOneSeed_StopEscalatesToSIGKILL/refapp_that_exits_on_SIGTERM \
+            TestReplayOneSeed_StopEscalatesToSIGKILL/refapp_that_ignores_SIGTERM \
+            TestReplayOneSeed_UnknownPIDFailsAtOnce \
+            TestReplayOneSeed_TeardownFailureIsReported \
+            TestReplayOneSeed_TeardownFailureIsReported/passing_replay_becomes_errored \
+            TestReplayOneSeed_TeardownFailureIsReported/failing_replay_keeps_its_exit_code \
+            TestDriveTier3_PassingSeeds \
+            TestDriveTier3_TeardownIsTallied \
+            TestLocal_SignalReachesForkedChildren \
+            TestLocal_SignalReachesForkedChildren/foreground_child \
+            TestLocal_SignalReachesForkedChildren/background_child \
+            TestLocal_SignalReachesForkedChildren/child_that_ignores_SIGTERM \
+            TestLocal_NoSignalOnceTheExitIsRecorded \
+            TestLocal_NoSignalOnceTheExitIsRecorded/a_Wait_timed_out_then_the_process_exited_on_its_own \
+            TestLocal_NoSignalOnceTheExitIsRecorded/the_run_context_ended_as_at_the_end_of_a_Tier_1_cell \
+            TestLocal_WaitAfterACancelledWaitSendsNothing \
+            TestLocal_OverlappingWaitsGetOneResult \
+            TestLocal_StopSweepRunsBeforeTheReap \
+            TestSSH_SignalIsBounded
+          do
+            if ! grep -q -F -- "--- PASS: $t (" "$out"; then
+              echo "::error::$t did not PASS (removed, renamed or not run)"
+              bad=1
+            fi
+          done
+          if ! grep -q -F 'zombie guard (probatorium#415): PASS, 0 unreaped children of this test binary' "$out" \
+            || ! grep -q -F 'listed via /proc after' "$out"; then
+            echo "::error::the zombie guard did not print a PASS verdict counted through /proc"
+            bad=1
+          fi
+          exit "$bad"
+
   # The Snapshot field guard (probatorium#395): every properties.Snapshot
   # field the root module reads must be written somewhere in it, or the
   # predicate reading it compares zero with zero and cannot fail. It needs
@@ -245,7 +330,7 @@ jobs:
   # listed in needs must stay unconditional on push + pull_request.
   ci-ok:
     name: ci-ok
-    needs: [root, adapters, refapps, mage, fieldguard, vulncheck]
+    needs: [root, adapters, refapps, mage, zombieguard, fieldguard, vulncheck]
     if: always()
     runs-on: ubuntu-latest
     steps:

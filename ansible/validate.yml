@@ -296,13 +296,25 @@
           changed_when: false
           when: validate_dbservices | default('') == '1'
 
+        # Each refapp leads a process group of its own (remote.Local,
+        # probatorium#415). When the validator overruns `async:`, ansible's
+        # async wrapper SIGKILLs the validator's process group, and that kill
+        # no longer reaches the refapps. This task is then what stops them, so
+        # it ends with SIGKILL as that kill did. The pattern covers every
+        # directory -matrix-bin-dir names: refapps, refapps-race (race tier)
+        # and refapps-checkptr (checkptr tier). pkill -f also matches the argv
+        # of the shell running this block, so the block itself must never
+        # spell a refapp path; the bracket keeps it from matching itself.
+        # workflow_validate_cleanup_test.go holds both rules.
         - name: Stop any leftover validator / refapp processes
           become: true
           ansible.builtin.shell: |
             pkill -x validator 2>/dev/null
             pkill -x validator-checker 2>/dev/null
             pkill -x validator-replay 2>/dev/null
-            pkill -f "[/]refapps/" 2>/dev/null
+            pkill -f "[/]refapps(-race|-checkptr)?/" 2>/dev/null
+            for i in 1 2 3 4 5; do pgrep -f "[/]refapps(-race|-checkptr)?/" > /dev/null || break; sleep 1; done
+            pkill -KILL -f "[/]refapps(-race|-checkptr)?/" 2>/dev/null
             true
           changed_when: false
 

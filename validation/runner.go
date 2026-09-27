@@ -1331,6 +1331,9 @@ func (o *Orchestrator) runTierReplay(ctx context.Context, violations chan<- Inci
 	o.tier3Snapshot = tally
 	o.tier3Ran = true
 	_ = writeJSON(filepath.Join(o.cfg.OutDir, "tier3_tally.json"), tally)
+	// One line per run (per cell in matrix mode) in validator.stderr, so the
+	// refapp teardown cost is visible without opening the artifacts.
+	fmt.Fprintf(os.Stderr, "validation: tier3: %s\n", tally)
 }
 
 // summariseTier3Stderr collapses a tier3Result into the one-line
