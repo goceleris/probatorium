@@ -390,11 +390,13 @@ func absentMetrics() metricsValues {
 // every field is optional, and any parse error short-circuits to a
 // zero-value snapshot.
 //
-// wantPID > 0 arms the process guard: a document that names its own "pid"
-// (the bench server's does) and names a different one is refused whole,
-// because it was served by some other process than the one whose /proc
-// fields this row carries -- a leftover SUT still holding the sidecar
-// port, or a respawned SUT after the observer pinned the original.
+// wantPID > 0 arms the process guard: the document must name its own
+// "pid" (the bench server's does, servers/celeris/debugvars.go) and it must
+// be wantPID; otherwise it is refused whole, because it cannot be shown to
+// come from the process whose /proc fields this row carries -- a leftover
+// SUT still holding the sidecar port, a respawned SUT after the observer
+// pinned the original, or some other server that publishes no pid at all.
+// wantPID <= 0 (metrics-only mode) reads any document.
 func fetchMetrics(ctx context.Context, httpc *http.Client, url string, wantPID int) metricsValues {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -416,8 +418,10 @@ func fetchMetrics(ctx context.Context, httpc *http.Client, url string, wantPID i
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return absentMetrics()
 	}
-	if p, ok := doc["pid"].(float64); ok && wantPID > 0 && int(p) != wantPID {
-		return absentMetrics()
+	if wantPID > 0 {
+		if p, ok := doc["pid"].(float64); !ok || p != float64(wantPID) {
+			return absentMetrics()
+		}
 	}
 	v := absentMetrics()
 	em, _ := doc["celeris.engine_metrics"].(map[string]any)

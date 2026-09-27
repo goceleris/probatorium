@@ -194,6 +194,27 @@ func TestFetchMetrics_ForeignPIDIsAbsent(t *testing.T) {
 	}
 }
 
+// With the guard armed (-pid > 0) a document that does not name its pid, or
+// names it as something other than a number, cannot be tied to the process
+// whose /proc fields the row carries: refused whole, like a foreign pid
+// (CodeRabbit on probatorium#411, cmd/observer/main.go:421). Without -pid it
+// is still read.
+func TestFetchMetrics_PIDGuardNeedsTheDocumentsPID(t *testing.T) {
+	c := &http.Client{Timeout: time.Second}
+	for name, doc := range map[string]map[string]any{
+		"no pid":     {"goroutines": 5.0, "celeris.engine_metrics": map[string]any{"ZCSendsSubmitted": 3.0}},
+		"string pid": {"pid": "222", "goroutines": 5.0, "celeris.engine_metrics": map[string]any{"ZCSendsSubmitted": 3.0}},
+	} {
+		srv := fakeExpvar(t, doc)
+		if v := fetchMetrics(context.Background(), c, srv.URL, 222); v != absentMetrics() {
+			t.Errorf("%s, guard armed for pid 222: document read: %+v", name, v)
+		}
+		if v := fetchMetrics(context.Background(), c, srv.URL, 0); v.Engine[0] != 3 || v.Goroutines != 5 {
+			t.Errorf("%s, metrics-only mode: document refused: %+v", name, v)
+		}
+	}
+}
+
 // The pre-#585 bench server answered the scrape with a 404: that is
 // absence, never a reading.
 func TestFetchMetrics_Non200IsAbsent(t *testing.T) {
