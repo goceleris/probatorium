@@ -466,14 +466,52 @@ func hostStepRun(t *testing.T) string {
 // the workload's pid. (Not its own: bash ignores SIGQUIT itself, and gives a
 // command it starts the disposition it found.)
 type cancelledHost struct {
-	cmd      *exec.Cmd
-	out      *syncBuffer
-	done     chan struct{} // closed once cmd.Wait returned
-	shardSID int
+	cmd         *exec.Cmd
+	out         *syncBuffer
+	done        chan struct{} // closed once cmd.Wait returned
+	shardSID    int
+	shardSigIgn uint64 // SigIgn of a command the shard starts
 }
 
-func startCancelledHost(t *testing.T, step bool, watchdogSeconds string) *cancelledHost {
+// hostStart is how a cancelled host job's first process starts.
+type hostStart int
+
+const (
+	// hostScript: bash cluster-host.sh, every signal at its default.
+	hostScript hostStart = iota
+	// hostStep: the workflow's host step, run as a runner that was started
+	// with every signal at its default runs it (as systemd starts one).
+	hostStep
+	// hostStepOnCluster: the workflow's host step, run as the cluster's
+	// runner runs it, with SIGINT, SIGQUIT and SIGHUP ignored (see
+	// clusterRunnerStart).
+	hostStepOnCluster
+)
+
+// clusterRunnerStart runs "$@" with the signals the cluster's runner leaves
+// ignored in every step it runs. ansible/runner-setup.yml starts the runner
+// as `nohup ./run.sh ... &` from a non-interactive shell: that asynchronous
+// list starts with SIGINT and SIGQUIT ignored, nohup adds SIGHUP, and a
+// signal ignored across exec stays ignored. The runner (.NET) installs no
+// handler for a SIGINT or SIGQUIT it found ignored, so its steps inherit
+// them. P6b (run 36338683576) saw the result: the host script's INT trap
+// never fired on either arch, and the step ended on the runner's SIGTERM,
+// 7.5 s after its SIGINT (probatorium#435). exec keeps the pid, so the
+// command's process is the step's, as it is the runner's child on the host.
+const clusterRunnerStart = `trap '' INT QUIT HUP; exec "$@"`
+
+// hupIntQuit is SIGHUP, SIGINT and SIGQUIT as bits of a /proc SigIgn mask.
+const hupIntQuit = 1<<(syscall.SIGHUP-1) | 1<<(syscall.SIGINT-1) | 1<<(syscall.SIGQUIT-1)
+
+func startCancelledHost(t *testing.T, start hostStart, watchdogSeconds string) *cancelledHost {
 	t.Helper()
+	if start == hostStepOnCluster {
+		// The stand-in must do what it stands in for.
+		out, err := exec.Command("sh", "-c", clusterRunnerStart, "sh", "awk", "/^SigIgn:/ {print $2}", "/proc/self/status").Output()
+		if ign, perr := strconv.ParseUint(strings.TrimSpace(string(out)), 16, 64); err != nil || perr != nil || ign&hupIntQuit != hupIntQuit {
+			t.Fatalf("clusterRunnerStart leaves SigIgn %q (%v, %v), not SIGHUP, SIGINT and SIGQUIT ignored", out, err, perr)
+		}
+	}
 	root := t.TempDir()
 	tools := filepath.Join(root, "probatorium", "tools", "stresstally")
 	for _, f := range []string{"cluster-host.sh", "gostate.sh"} {
@@ -496,16 +534,21 @@ wait
 		t.Fatal(err)
 	}
 	h := &cancelledHost{out: &syncBuffer{}, done: make(chan struct{})}
-	if step {
+	switch start {
+	case hostStep, hostStepOnCluster:
 		// The runner writes the step's run to a file and runs it with the
 		// step's shell (shell: bash).
 		stepFile := filepath.Join(root, "step.sh")
 		writeFile(t, stepFile, hostStepRun(t)+"\n")
-		h.cmd = exec.Command("bash", "--noprofile", "--norc", "-e", "-o", "pipefail", stepFile)
+		argv := []string{"bash", "--noprofile", "--norc", "-e", "-o", "pipefail", stepFile}
+		if start == hostStepOnCluster {
+			argv = append([]string{"sh", "-c", clusterRunnerStart, "sh"}, argv...)
+		}
+		h.cmd = exec.Command(argv[0], argv[1:]...)
 		// The runner reads the step's output until it closes, at most 5 s
 		// after the step's process exited.
 		h.cmd.WaitDelay = 5 * time.Second
-	} else {
+	default:
 		h.cmd = exec.Command("bash", filepath.Join(tools, "cluster-host.sh"))
 	}
 	h.cmd.Dir = root
@@ -560,9 +603,11 @@ wait
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ign, err := strconv.ParseUint(strings.TrimSpace(string(b)), 16, 64); err != nil || ign&(1<<(syscall.SIGINT-1)|1<<(syscall.SIGQUIT-1)) != 0 {
+	ign, err := strconv.ParseUint(strings.TrimSpace(string(b)), 16, 64)
+	if err != nil || ign&(1<<(syscall.SIGINT-1)|1<<(syscall.SIGQUIT-1)) != 0 {
 		t.Errorf("the shard's commands start with SigIgn %s (%v): SIGINT or SIGQUIT ignored, which a shard's go test on GitHub never has", strings.TrimSpace(string(b)), err)
 	}
+	h.shardSigIgn = ign
 	return h
 }
 
@@ -600,14 +645,16 @@ func (h *cancelledHost) runnerCancel(t *testing.T) string {
 // killed them. A shard runs in a session of its own, so no signal to the host
 // script's process group reaches it: the host script must kill it on SIGINT
 // and SIGTERM, and a watchdog in a session of its own must kill it when the
-// host script dies of SIGKILL.
+// host script dies of SIGKILL. Its re-proof, P6b (run 36338683576), then
+// showed that on the cluster the host script never gets the SIGINT: the
+// cluster's runner starts every step with SIGINT ignored.
 func TestHostJobKillsItsShardOnCancel(t *testing.T) {
 	linuxOnly(t)
 	// The trap's arms: a watchdog that looks once a minute cannot be what
 	// kills the shard within their bound.
 	for name, sig := range map[string]syscall.Signal{"SIGINT": syscall.SIGINT, "SIGTERM": syscall.SIGTERM} {
 		t.Run(name+" to the host script's process group", func(t *testing.T) {
-			h := startCancelledHost(t, false, "60")
+			h := startCancelledHost(t, hostScript, "60")
 			sent := time.Now()
 			if err := syscall.Kill(-h.cmd.Process.Pid, sig); err != nil {
 				t.Fatal(err)
@@ -625,7 +672,7 @@ func TestHostJobKillsItsShardOnCancel(t *testing.T) {
 	}
 	// No trap runs on SIGKILL: the watchdog, in a session of its own, must.
 	t.Run("SIGKILL to the host script's process group", func(t *testing.T) {
-		h := startCancelledHost(t, false, "1")
+		h := startCancelledHost(t, hostScript, "1")
 		if err := syscall.Kill(-h.cmd.Process.Pid, syscall.SIGKILL); err != nil {
 			t.Fatal(err)
 		}
@@ -637,14 +684,39 @@ func TestHostJobKillsItsShardOnCancel(t *testing.T) {
 	// to a group, and the always() steps start as soon as the step has
 	// ended. The watchdog looks once a minute here, so the step itself must
 	// kill the shard.
-	t.Run("the runner's cancel of the workflow's host step", func(t *testing.T) {
-		h := startCancelledHost(t, true, "60")
-		ended := h.runnerCancel(t)
-		if left := sessionGoneWithin(h.shardSID, time.Second); len(left) > 0 {
-			t.Errorf("the step ended on %s and the runner moved on to the always() steps (the Go-state wipe among them), but 1 s later the shard's session still runs %v:\n%s",
-				ended, left, h.out.String())
-		}
-	})
+	//
+	// The step must end on the runner's SIGINT, not on its SIGTERM 7.5 s
+	// later, also where the runner starts every step with SIGINT ignored, as
+	// the cluster's does (clusterRunnerStart): bash cannot trap a signal
+	// ignored when it started, so there the host step must reset it before
+	// it runs cluster-host.sh. P6b (run 36338683576) ended on SIGTERM.
+	for name, start := range map[string]hostStart{
+		"the runner's cancel of the workflow's host step":                                   hostStep,
+		"the cluster runner's cancel of the workflow's host step (SIGINT ignored at start)": hostStepOnCluster,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := startCancelledHost(t, start, "60")
+			sent := time.Now()
+			ended := h.runnerCancel(t)
+			took := time.Since(sent).Round(10 * time.Millisecond)
+			if left := sessionGoneWithin(h.shardSID, time.Second); len(left) > 0 {
+				t.Errorf("the step ended on %s and the runner moved on to the always() steps (the Go-state wipe among them), but 1 s later the shard's session still runs %v:\n%s",
+					ended, left, h.out.String())
+			}
+			if ended != "SIGINT" || !strings.Contains(h.out.String(), "::warning::cluster-host.sh got SIGINT") {
+				t.Errorf("the step ended on %s, %v after the runner's SIGINT, and the host script's trap did not report SIGINT: the SIGINT did nothing:\n%s", ended, took, h.out.String())
+			}
+			// Nor may a command the shard starts inherit what the runner left
+			// ignored: on GitHub a shard's go test starts with SIGHUP at its
+			// default too.
+			if h.shardSigIgn&hupIntQuit != 0 {
+				t.Errorf("the shard's commands start with SigIgn %x: SIGHUP, SIGINT or SIGQUIT still ignored", h.shardSigIgn)
+			}
+			if strings.Contains(h.out.String(), "started with SIGINT ignored") {
+				t.Errorf("the host script says it started with SIGINT ignored:\n%s", h.out.String())
+			}
+		})
+	}
 }
 
 // fakeGH is `gh api [--paginate] PATH [--jq FILTER]` over fixture files: a
