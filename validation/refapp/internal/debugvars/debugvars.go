@@ -551,15 +551,20 @@ func (v *Vars) Document() map[string]any {
 			// one that has them.
 			doc["celeris.engine_async_routes"] = int64(info.Metrics.AsyncRoutes)
 			// Published as a float, because it is the one non-integer
-			// field on EngineMetrics. No shipped engine assigns it --
-			// std, epoll and io_uring leave it at zero and the adaptive
-			// engine sums two zeros -- so it reads 0 everywhere today and
-			// a nonzero value means celeris started populating it. It is
-			// here anyway: a field that exists and is never published
-			// cannot be told apart from one that is published and never
-			// moves, and removing that ambiguity is what this document
-			// is for (probatorium#297).
-			doc["celeris.engine_throughput"] = info.Metrics.Throughput
+			// field on EngineMetrics. No engine has ever assigned it, and
+			// since celeris#695 (celeris#653) it is Deprecated and
+			// documented to always read 0: the adaptive engine stopped
+			// summing its sub-engines' zeros, and v2.0.0 removes the field
+			// (celeris#651). A nonzero value would mean celeris broke that
+			// contract. It is here anyway, because the projection is
+			// total while the field exists: a field that exists and is
+			// never published cannot be told apart from one that is
+			// published and never moves, and removing that ambiguity is
+			// what this document is for (probatorium#297). The removal
+			// stops this line compiling, so it cannot be missed; the
+			// manifest then drops the key (-update-engine-keys), and
+			// checker.EngineKeysNotParsed's entry for it fails as stale.
+			doc["celeris.engine_throughput"] = info.Metrics.Throughput //nolint:staticcheck // SA1019: published until celeris removes the field (celeris#651); see above
 		}
 	}
 	return doc
