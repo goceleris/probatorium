@@ -69,6 +69,13 @@ type livenessTally struct {
 	// predicate, the sample is for the person who reads the dossier.
 	raceSamples []string
 
+	// debugAddr is the refapp's debug side listener, from its pre-ready
+	// "debug addr=" banner (refappDebugBannerPrefix); nil when it announced
+	// none. celeris#588: the dossier's pprof leg reads it, because the
+	// engine-routed /debug/pprof is parked by the very stalls the dossier
+	// exists for on the event-loop engines.
+	debugAddr atomic.Pointer[string]
+
 	mu        sync.Mutex
 	signature string // first crash-signature line scraped from stderr
 	trace     string // bounded stderr tail captured around the crash
@@ -84,6 +91,48 @@ type livenessTally struct {
 	tail    [refappTailMaxLines]string
 	tailLen int
 	tailPos int
+}
+
+// refappDebugBannerPrefix starts the refapp's side-listener banner line
+// (debugvars.DebugBannerPrefix in the refapp module, which this package
+// cannot import; TestRefappDebugBannerMatchesDebugvars keeps them equal).
+const refappDebugBannerPrefix = "debug addr="
+
+// refappDebugAddrEnv is debugvars.DebugAddrEnv: set, the refapp binds its
+// debug side listener there (New sets 127.0.0.1:0 for local launches of a
+// stall-capture run, stallCaptureEnabled).
+const refappDebugAddrEnv = "PROBATORIUM_REFAPP_DEBUG_ADDR"
+
+// refappFaultEnv is debugvars.FaultEnv: the celeris#588 capture control's
+// injected fault, inherited by every refapp the validator launches.
+const refappFaultEnv = "PROBATORIUM_REFAPP_FAULT"
+
+// stallCaptureEnv turns the celeris#588 stall capture on in a run with no
+// injected fault: "1" is the only value that does. It exists for the
+// capture's own false-positive control (the same capture, nothing injected).
+const stallCaptureEnv = "PROBATORIUM_STALL_CAPTURE"
+
+// stallCaptureEnabled reports whether this run takes the celeris#588 stall
+// capture: the in-stall dossiers (tier1Config.OnWalkerStall) and the
+// refapp's debug side listener. On only in a fault-control run
+// (refappFaultEnv set) or with stallCaptureEnv=1 -- never in a routine
+// validation run. Both are unmeasured on a routine run's shape: an in-stall
+// dossier runs synchronous forensics (an ss snapshot, then six pprof
+// fetches) on the orchestrator's serial incident loop, where it can delay
+// or crowd out a hard incident, and the side listener adds a listener and
+// its goroutines to every refapp the property oracles judge. Turning them
+// on routinely needs a routine-shaped measurement first (probatorium#412
+// review).
+func stallCaptureEnabled(getenv func(string) string) bool {
+	return strings.TrimSpace(getenv(refappFaultEnv)) != "" || strings.TrimSpace(getenv(stallCaptureEnv)) == "1"
+}
+
+// debugAddrLoad returns the announced side-listener address, "" if none.
+func (l *livenessTally) debugAddrLoad() string {
+	if p := l.debugAddr.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // pushTail appends one post-ready line to the ring.
@@ -426,6 +475,11 @@ func superviseStderr(r io.Reader, l *livenessTally, onReady func(addr string), o
 				ready = true
 				onReady(strings.TrimSpace(strings.TrimPrefix(line, "ready addr=")))
 				continue
+			}
+			if a, ok := strings.CutPrefix(line, refappDebugBannerPrefix); ok {
+				if a = strings.TrimSpace(a); a != "" {
+					l.debugAddr.Store(&a)
+				}
 			}
 			if preReady.Len() < refappOutputCapMax {
 				preReady.WriteString(line)

@@ -43,11 +43,34 @@ import (
 // were slow for a reason.
 const slowReadThreshold = time.Second
 
+// In-stall capture thresholds (celeris#588; review 1 item 3, review 2
+// item 2): a read leg that has been in flight this long with no byte back
+// fires the orchestrator's in-stall dossier WHILE the stall is still in
+// force. The dossier taken when a fire finally FAILS lands after the
+// walker's budget and up to one tally tick later -- for a WS stall of a
+// few seconds that is after the stall has ended, and the goroutine dump
+// shows a healthy process (measured: the first fault-injected container
+// run caught an 8 s /ws hold 12 ms AFTER its release). Half the WS budget,
+// and 3 s of h2c's 20 s: well past a healthy loopback round trip, well
+// inside the budget.
+const (
+	wsStallThreshold  = time.Second
+	h2cStallThreshold = 3 * time.Second
+)
+
 // slowFireRingSize bounds the ring. Sixteen to sixty-four per the design;
 // thirty-two keeps an hour-long systematic stall from costing more than a
 // few KB in the cell document while holding more than one minute of a
 // once-a-minute burst.
 const slowFireRingSize = 32
+
+// slowFirePinnedFailures is how many of the FIRST failed fires (outcome
+// hang-* or handshake-fail-*, report.IsFailedSlowFire) the ring keeps
+// beyond its overwrite window. celeris#588: the onset of an episode is the
+// part that names its cause, and a later engine-wide wedge can overwrite a
+// 32-deep ring in seconds -- the #588 control's adaptive cell lost every
+// record of its 8 s /ws hold to the WS failures of the 40 s / hold after it.
+const slowFirePinnedFailures = 16
 
 // latencyBuckets is a fixed-edge histogram for one leg of a fire. The
 // edges are those the design names; ge_20s and timeout are the two ways a
@@ -125,24 +148,36 @@ func isDeadline(err error) bool {
 // slowFireRing keeps the last slowFireRingSize slow fires in arrival order.
 // Overwrite-oldest, not first-N: a stall that recurs is more diagnostic in
 // its most recent shape, and total counts how many the ring could not hold.
+// The first slowFirePinnedFailures FAILED fires are also pinned, so the
+// onset of the first episodes survives any later flood.
 type slowFireRing struct {
 	mu    sync.Mutex
 	buf   [slowFireRingSize]report.SlowFire
 	n     int // entries written so far, unbounded
 	total atomic.Int64
+
+	pinned    [slowFirePinnedFailures]report.SlowFire
+	pinnedSeq [slowFirePinnedFailures]int // each pinned fire's arrival index
+	nPinned   int
 }
 
 // add files one slow fire.
 func (r *slowFireRing) add(f report.SlowFire) {
 	r.total.Add(1)
 	r.mu.Lock()
+	if r.nPinned < slowFirePinnedFailures && report.IsFailedSlowFire(f) {
+		r.pinned[r.nPinned] = f
+		r.pinnedSeq[r.nPinned] = r.n
+		r.nPinned++
+	}
 	r.buf[r.n%slowFireRingSize] = f
 	r.n++
 	r.mu.Unlock()
 }
 
-// snapshot returns the retained fires oldest first. nil when empty, so the
-// cell document omits the key on a clean cell.
+// snapshot returns the retained fires oldest first: the pinned failures the
+// ring has since overwritten, then the ring. nil when empty, so the cell
+// document omits the key on a clean cell.
 func (r *slowFireRing) snapshot() []report.SlowFire {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -150,10 +185,15 @@ func (r *slowFireRing) snapshot() []report.SlowFire {
 		return nil
 	}
 	kept := min(r.n, slowFireRingSize)
-	out := make([]report.SlowFire, 0, kept)
 	start := 0
 	if r.n > slowFireRingSize {
 		start = r.n % slowFireRingSize
+	}
+	out := make([]report.SlowFire, 0, kept+r.nPinned)
+	for i := 0; i < r.nPinned; i++ {
+		if r.pinnedSeq[i] < r.n-kept { // overwritten in the ring
+			out = append(out, r.pinned[i])
+		}
 	}
 	for i := 0; i < kept; i++ {
 		out = append(out, r.buf[(start+i)%slowFireRingSize])
@@ -173,6 +213,21 @@ type fireCapture struct {
 	slow    slowFireRing
 	readyAt atomic.Int64 // unix nanos; 0 = unknown
 	hb      atomic.Pointer[heartbeat]
+	// onStall is the in-stall trigger armWalkerCapture installs; nil in
+	// unit tests that fire a walker directly.
+	onStall atomic.Pointer[func()]
+}
+
+// watchRead arms the in-stall trigger for one read leg: if the returned
+// disarm is not called within threshold, the trigger runs (on a timer
+// goroutine) while the read is still waiting. Free when nothing is armed.
+func (c *fireCapture) watchRead(threshold time.Duration) (disarm func()) {
+	fn := c.onStall.Load()
+	if fn == nil {
+		return func() {}
+	}
+	t := time.AfterFunc(threshold, *fn)
+	return func() { t.Stop() }
 }
 
 // record files the three legs of one fire into the histogram and, when the
@@ -322,14 +377,21 @@ func (h *heartbeat) maxGapSince(since time.Time) time.Duration {
 }
 
 // armWalkerCapture stamps the refapp's ready instant (unix nanos, 0 =
-// unknown) on the walker tallies and starts the validator heartbeat for
-// them. One call from driveTier1 once the tallies exist.
-func armWalkerCapture(ctx context.Context, readyAtNanos int64, h2c *h2cTally, ws *wsTally) {
+// unknown) on the walker tallies, starts the validator heartbeat for them
+// and installs the in-stall trigger (onStall("h2c") / onStall("ws"); nil
+// = none). One call from driveTier1 once the tallies exist.
+func armWalkerCapture(ctx context.Context, readyAtNanos int64, h2c *h2cTally, ws *wsTally, onStall func(kind string)) {
 	hb := startHeartbeat(ctx)
 	for _, c := range []*fireCapture{&h2c.capture, &ws.capture} {
 		if readyAtNanos != 0 {
 			c.readyAt.Store(readyAtNanos)
 		}
 		c.hb.Store(hb)
+	}
+	if onStall != nil {
+		h := func() { onStall("h2c") }
+		w := func() { onStall("ws") }
+		h2c.capture.onStall.Store(&h)
+		ws.capture.onStall.Store(&w)
 	}
 }

@@ -47,6 +47,19 @@ on:
         required: false
         type: string
         default: 24h
+      stall_capture:
+        description: >-
+          celeris#588 stall capture with no injected fault: every refapp
+          serves /debug/pprof on a side listener, and a walker read that
+          waits past its stall threshold (h2c 3 s, WS 1 s) takes a
+          record-only dossier inside the stall (ss snapshot and a
+          side-listener goroutine dump). Off (default) on routine and
+          scheduled runs; the release soak is dispatched with it on
+          (celeris#588's release criterion). The dossiers are not gated:
+          the gates judge the run as usual.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -211,6 +224,9 @@ jobs:
           # enough (80m nightly, 10m PR) that the difference is minutes, and
           # a second policy number per tier is not worth the confusion.
           PROBATORIUM_MATRIX_MAX_FAILED_CELLS: "8"
+          # celeris#588 stall capture (dispatch input stall_capture); empty
+          # on a scheduled run and on a routine dispatch.
+          PROBATORIUM_STALL_CAPTURE: ${{ inputs.stall_capture && '1' || '' }}
         run: mage Soak
 
       - name: mage ValidateGate (absolute zero-signal gate)
