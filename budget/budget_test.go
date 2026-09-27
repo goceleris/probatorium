@@ -251,3 +251,22 @@ func TestColumnWallClock(t *testing.T) {
 			"a smaller projection means the data-loss bug is back", rated, v38OldGuard)
 	}
 }
+
+// TestRatedCostIsTheSweepTheRunnerRuns is probatorium#418: FitWithin and the
+// hang guard must price a rated cell the same way. The runner's rated sweep is
+// RatedPasses closed-loop passes, and each re-runs the saturation warmup
+// (runRatedSweep clones the saturation loadgen.Config), which is what
+// ColumnWallClock charges. FitWithin charged one RatedWarmup plus the passes,
+// so the projection of every rated profile came in short of what the runner
+// spends even on the model's own rated cells.
+func TestRatedCostIsTheSweepTheRunnerRuns(t *testing.T) {
+	for _, p := range []Profile{HeadlineWeekly(), Full()} {
+		p.Arches = 1
+		sweep := ColumnWallClock(1, p.RatedPasses, p.Warmup, p.Duration, p.RatedDuration) -
+			ColumnWallClock(1, 0, p.Warmup, p.Duration, p.RatedDuration)
+		if want := time.Duration(p.RatedCells) * sweep; p.Rated() != want {
+			t.Errorf("%s: Rated() = %v for %d rated cells, want %v (%d cells x %v, the sweep ColumnWallClock charges: %d x (warmup %v + rated %v))",
+				p.Name, p.Rated(), p.RatedCells, want, p.RatedCells, sweep, p.RatedPasses, p.Warmup, p.RatedDuration)
+		}
+	}
+}

@@ -132,13 +132,7 @@ func BenchTier() error {
 	// no rated sweep (RatedPasses==0, e.g. the "fast" routine/weekly profile).
 	// Rated is the dominant per-cell cost (4 closed-loop passes), so the
 	// default fast profile leaves it off and runs the full grid saturation-only.
-	skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true" || p.RatedPasses == 0
-	if skipRated {
-		_ = os.Unsetenv("BENCH_RATED")
-	} else {
-		_ = os.Setenv("BENCH_RATED", "1")
-	}
-	setBenchEnvFromProfile(p, false)
+	benchTierEnv(p)
 
 	// Publish preflight: if this run WILL publish at the end, prove NOW (before
 	// the multi-hour bench) that the docs token + version resolve. A missing
@@ -198,6 +192,18 @@ func BenchTier() error {
 	_ = os.Unsetenv("BENCH_START_DATE")
 	fmt.Printf("\n=== BenchTier complete (single pass) ===\n")
 	return nil
+}
+
+// benchTierEnv resolves the BENCH_* env the one Bench of a BenchTier run of
+// profile p reads.
+func benchTierEnv(p budget.Profile) {
+	skipRated := os.Getenv("BENCH_SKIP_RATED") == "1" || os.Getenv("BENCH_SKIP_RATED") == "true" || p.RatedPasses == 0
+	if skipRated {
+		_ = os.Unsetenv("BENCH_RATED")
+	} else {
+		_ = os.Setenv("BENCH_RATED", "1")
+	}
+	setBenchEnvFromProfile(p, false)
 }
 
 // setBenchEnvFromProfile pushes the resolved profile's per-cell tuning +

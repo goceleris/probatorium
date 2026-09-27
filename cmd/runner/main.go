@@ -148,6 +148,11 @@ type Config struct {
 	// offered load and converges faster.
 	RatedDuration time.Duration
 
+	// RatedCells scopes the rated sweep to the cells matching this glob over
+	// "<scenario>/<server>" (the -cells syntax, "!" exclusions included).
+	// Empty means every cell.
+	RatedCells string
+
 	// RatedFractions are the offered loads for the rated sweep, expressed as
 	// fractions of the measured saturation RPS (adapter-relative so the
 	// targets stay comparable across servers of wildly different throughput).
@@ -237,6 +242,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.BoolVar(&c.RatedMode, "rated", c.RatedMode,
 		"run a Gil-Tene rated (closed-loop, CO-corrected) sweep after each saturation pass (opt-in; multiplies per-cell time)")
 	fs.DurationVar(&c.RatedDuration, "rated-duration", c.RatedDuration, "measurement window for each rated pass")
+	fs.StringVar(&c.RatedCells, "rated-cells", c.RatedCells,
+		`glob over "<scenario>/<server>" (the -cells syntax) scoping the rated sweep; empty = every cell`)
 	fs.StringVar(&c.TLSTerminator, "tls-terminator", c.TLSTerminator,
 		"https base URL of the shared TLS terminator fronting the adapters; empty disables all tls-* scenarios")
 	fs.StringVar(&c.SeedServices, "seed-services", c.SeedServices,
@@ -1256,7 +1263,7 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	// correction is applied by loadgen itself — never hand-roll a pacer here,
 	// which would defeat the correction. The saturation pass is reused as the
 	// scale anchor, so the targets stay adapter-relative.
-	if cfg.RatedMode && res != nil && res.RequestsPerSec > 0 {
+	if cfg.ratesCell(cell.Scenario.Name()+"/"+cell.Server.Name()) && res != nil && res.RequestsPerSec > 0 {
 		cellRes.SaturationModeRPS = res.RequestsPerSec
 		samples, passes := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
 		oc.RatedSamples = samples
@@ -1492,6 +1499,12 @@ func hostPortFromURL(raw string) (string, bool) {
 		}
 	}
 	return net.JoinHostPort(u.Hostname(), port), true
+}
+
+// ratesCell reports whether the cell "<scenario>/<server>" gets the rated
+// sweep once its saturation pass comes back clean.
+func (c Config) ratesCell(id string) bool {
+	return c.RatedMode
 }
 
 // runRatedSweep drives one rated (closed-loop, CO-corrected) pass per
