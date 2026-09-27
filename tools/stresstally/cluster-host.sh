@@ -43,9 +43,9 @@
 # which is this script, because the workflow's host step execs it, through
 # env --default-signal, since the cluster's runner starts its steps with
 # SIGINT ignored and bash cannot trap that) it kills that session before it
-# exits (on_signal). A watchdog in a session of its own
-# kills it when this script is gone (SIGKILL runs no trap) or the runner dir
-# is (a lost runner's teardown) (watch_runner). It kills nothing else.
+# exits (on_signal). A watchdog in a session of its own kills it when this
+# script is gone (SIGKILL runs no trap) or the runner dir is (a lost runner's
+# teardown) (watch_runner). It kills nothing else.
 #
 # Run, it runs main; run as `cluster-host.sh watch SIDFILE PID`, the watchdog
 # main starts. Sourced (the tests do), it only defines its functions; the
@@ -296,14 +296,15 @@ kill_session() {
 # they start. It runs asynchronously and is waited for, because bash runs no
 # trap until a foreground command has ended, and a shard can run for hours.
 # Bash starts an asynchronous command with SIGINT and SIGQUIT ignored, and a
-# signal ignored across exec stays ignored; but the exec builtin first
-# restores the dispositions the shell was started with. So, run as
-# `(exec ...) &`, CMD starts with a foreground command's signal dispositions
-# (and stdin), as a shard does on GitHub.
+# signal ignored across exec stays ignored. Bash 5.2's exec builtin restored
+# the dispositions the shell was started with first; bash 5.3's (Ubuntu
+# 26.04, the cluster hosts) does not. So env resets the two, and CMD starts
+# with a foreground command's signal dispositions (and stdin), as a shard
+# does on GitHub.
 in_session() {
 	local rc=0
 	# shellcheck disable=SC2016 # $$, $1 and $@ are the inner shell's
-	(exec setsid bash -c 'printf %s "$$" >"$1" && shift && exec "$@"' _ "$shard_sidfile" "$@") <&0 &
+	(exec env --default-signal=INT,QUIT setsid bash -c 'printf %s "$$" >"$1" && shift && exec "$@"' _ "$shard_sidfile" "$@") <&0 &
 	shard_pid=$!
 	wait "$shard_pid" || rc=$?
 	shard_pid=""
