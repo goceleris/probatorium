@@ -284,7 +284,8 @@ main() {
 		perf_probe
 		note "perf: $perf_state"
 		case "$perf_state" in
-		unusable*) { echo "perf's output:"; cat "$TMPDIR/probe.perf" "$TMPDIR/probe.err" 2>/dev/null; } >>"$STRESS_FACTS" ;;
+		# perf may have written neither file: never let that end the job.
+		unusable*) { echo "perf's output:"; cat "$TMPDIR/probe.perf" "$TMPDIR/probe.err" 2>/dev/null || true; } >>"$STRESS_FACTS" ;;
 		esac
 		# Decided here once, so a refused timing builds nothing and waits for
 		# nothing (shard.sh keeps the same rule on its own).

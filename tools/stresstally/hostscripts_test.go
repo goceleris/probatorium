@@ -841,7 +841,7 @@ func TestTimingHostJobRefusesPMURequiredWithoutPerf(t *testing.T) {
 	for _, arm := range []string{"A", "B"} {
 		log, err := os.ReadFile(filepath.Join(h.env["STRESS_LOG_DIR"], arm+"__"+h.env["STRESS_ARCH"]+"__1.log"))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%v; cluster-host.sh said:\n%s", err, out)
 		}
 		if !strings.Contains(string(log), "stress-refused: ") || !strings.Contains(string(log), "pmu required but perf is unusable:paranoid=") ||
 			!strings.HasSuffix(strings.TrimSpace(string(log)), "stress-trailer: exit=refused elapsed_s=0") {
