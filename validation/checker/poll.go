@@ -80,7 +80,7 @@ const DebugVarsKeys = "goroutines, celeris.accepted_conn_total, celeris.closed_c
 // nor listed here, and on any entry here that names a key no longer
 // published, so an excuse cannot outlive its field.
 var EngineKeysNotParsed = map[string]string{
-	"celeris.engine_throughput": "assigned by no celeris engine -- std, epoll and io_uring never write it and the adaptive engine sums two zeros (celeris#653) -- so parsed it would reach the artifact as a flat 0 that reads as a measured request rate. It is also the only float EngineMetrics carries, and every hop after this one carries int64. When celeris#653 resolves: removing the field fails this entry as stale, but POPULATING it fails nothing, which is why this entry names the issue",
+	"celeris.engine_throughput": "assigned by no celeris engine, and since celeris#695 (celeris#653) Deprecated and documented to always read 0 -- so parsed it would reach the artifact as a flat 0 that reads as a measured request rate. It is also the only float EngineMetrics carries, and every hop after this one carries int64. A request rate is the delta of engine_requests_total between adjacent series rows, which is what celeris's deprecation note prescribes. v2.0.0 removes the field (celeris#651), which fails this entry as stale; POPULATING it would break celeris's documented contract but fails nothing here, which is why this entry names the issues",
 }
 
 // Poll fetches url and projects the /debug/vars document into a
