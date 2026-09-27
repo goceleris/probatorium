@@ -43,6 +43,7 @@ func TestParseSUTEnv(t *testing.T) {
 		{name: "trailing comma", in: "A=1,", errPart: "entry 2 is empty"},
 		{name: "PATH refused", in: "PATH=/x", errPart: "not allowed"},
 		{name: "LD_PRELOAD refused", in: "LD_PRELOAD=/x.so", errPart: "not allowed"},
+		{name: "harness debug addr refused", in: "PROBATORIUM_DEBUG_ADDR=127.0.0.1:18090", errPart: "not allowed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseSUTEnv(tc.in)

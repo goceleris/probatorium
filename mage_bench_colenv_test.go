@@ -67,6 +67,7 @@ func TestResolveBenchColumnsRejectsABadColumnEnv(t *testing.T) {
 		errPart string
 	}{
 		{map[string]string{"LD_PRELOAD": "/x.so"}, "not allowed"},
+		{map[string]string{"PROBATORIUM_DEBUG_ADDR": "127.0.0.1:18090"}, "not allowed"},
 		{map[string]string{"A B": "x"}, "must match"},
 		{map[string]string{"K": "has space"}, "no whitespace"},
 		{map[string]string{"K": "q'uote"}, "no whitespace"},
