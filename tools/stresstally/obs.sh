@@ -73,11 +73,19 @@ rm -f "$times_file"
 user_s=$(awk -v a="$(secs "$cu0")" -v b="$(secs "$cu1")" 'BEGIN { printf "%.3f", b - a }')
 sys_s=$(awk -v a="$(secs "$cs0")" -v b="$(secs "$cs1")" 'BEGIN { printf "%.3f", b - a }')
 
+# perf -x, prints one line per event and PMU: the count, the unit, the event.
+# On a heterogeneous host (arm64 big.LITTLE) each core type has its own PMU
+# and the event is qualified by it ("armv8_cortex_a720/instructions/u"); a
+# PMU whose cores never ran the binary prints "<not counted>". The count is
+# the sum over the PMUs that counted; none counted is empty.
+perf_sum() {
+	awk -F, -v ev="$1" '$3 ~ ev && $1 ~ /^[0-9]+$/ {s += $1; n++} END {if (n) printf "%.0f", s}' "$2"
+}
 ins="" cyc="" tc=""
 if [ -f "$perf_out" ]; then
-	ins=$(awk -F, '$3 ~ /^instructions/ {print $1; exit}' "$perf_out")
-	cyc=$(awk -F, '$3 ~ /^cycles/ {print $1; exit}' "$perf_out")
-	tc=$(awk -F, '$3 ~ /^task-clock/ {print $1; exit}' "$perf_out")
+	ins=$(perf_sum instructions "$perf_out")
+	cyc=$(perf_sum cycles "$perf_out")
+	tc=$(awk -F, '$3 ~ /task-clock/ && $1 ~ /^[0-9.]+$/ {print $1; exit}' "$perf_out")
 	rm -f "$perf_out"
 fi
 

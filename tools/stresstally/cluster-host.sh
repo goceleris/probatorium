@@ -139,12 +139,16 @@ pick_cpus() {
 }
 
 # perf_probe sets perf_state: ok when `perf stat -e instructions:u` counts,
-# absent without perf, else unusable (with the paranoid level).
+# absent without perf, else unusable (with the paranoid level; perf's own
+# output is left in $TMPDIR/probe.perf and probe.err for the host facts).
+# On a heterogeneous host perf prints one line per core type's PMU, the
+# event qualified by the PMU ("armv8_cortex_a720/instructions/u"): any PMU
+# that counted is enough (obs.sh sums them).
 perf_probe() {
 	if ! command -v perf >/dev/null; then
 		perf_state="absent"
-	elif perf stat "-x," -e instructions:u -o "$TMPDIR/probe.perf" -- true >/dev/null 2>&1 &&
-		awk -F, '$3 ~ /^instructions/ && $1 ~ /^[0-9]+$/ {ok = 1} END {exit !ok}' "$TMPDIR/probe.perf"; then
+	elif perf stat "-x," -e instructions:u -o "$TMPDIR/probe.perf" -- true >/dev/null 2>"$TMPDIR/probe.err" &&
+		awk -F, '$3 ~ /instructions/ && $1 ~ /^[0-9]+$/ {ok = 1} END {exit !ok}' "$TMPDIR/probe.perf"; then
 		perf_state="ok"
 	else
 		perf_state="unusable:paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo n/a)"
@@ -250,6 +254,9 @@ main() {
 		note "cpuset: ${cpuset:-none}"
 		perf_probe
 		note "perf: $perf_state"
+		case "$perf_state" in
+		unusable*) { echo "perf's output:"; cat "$TMPDIR/probe.perf" "$TMPDIR/probe.err" 2>/dev/null; } >>"$STRESS_FACTS" ;;
+		esac
 		if [ -z "$pre_refuse" ]; then
 			prebuild_arms
 			quiet_wait

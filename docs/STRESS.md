@@ -326,7 +326,9 @@ question. Two arms may name the same commit: an A/A control.
   binary through `-exec tools/stresstally/obs.sh`, which measures only the
   binary (go test re-links it every time): wall time, user and system CPU,
   the load before and after, the binary's sha256, and, when `perf` works on
-  the host, user-mode instructions, cycles and task clock (`perf stat`). It
+  the host, user-mode instructions, cycles and task clock (`perf stat`; on a
+  heterogeneous host such as msr1's big.LITTLE SoC, perf counts each core
+  type on its own PMU and the observation records the sum). It
   writes one `stress-obs:` line into the shard's log; a shard with no such
   line, two, or one without its wall time, binary or (under
   `pmu=required`) instruction count is UNPARSED (reason `observation`), not
