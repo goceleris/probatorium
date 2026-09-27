@@ -45,6 +45,14 @@ type forensicsOpts struct {
 	// engine-routed /debug/pprof, so the dump that names the stall could
 	// only be taken after it -- or not at all -- through listenAddr.
 	PprofAddr string
+	// SkipStacksText leaves the text goroutine dump (goroutine?debug=2)
+	// out. It is runtime.Stack(all): the refapp's world stops for the
+	// whole traceback. A record-only dossier of a routine run (no stall
+	// capture) is taken in a cell that keeps running, after its event, so
+	// it keeps the profile set it had before celeris#588 (the proto
+	// goroutine profile and the rest); a goroutine-stacks.txt.skipped
+	// marker says so (probatorium#412 review round 3).
+	SkipStacksText bool
 }
 
 // captureForensicsLiveOpts is captureForensicsLive with options.
@@ -128,6 +136,11 @@ func captureForensicsLiveOpts(ctx context.Context, outDir string, pid int, liste
 		}
 		hc := &http.Client{Timeout: 5 * time.Second}
 		for _, p := range pprofProfiles {
+			if p.out == "goroutine-stacks.txt" && opts.SkipStacksText {
+				_ = writePlainText(filepath.Join(outDir, p.out+".skipped"),
+					"text goroutine dump skipped: record-only incident with the stall capture off; runtime.Stack(all) would stop the refapp's world in a cell that keeps running (goroutine.pprof has the stacks)\n")
+				continue
+			}
 			from := time.Now().UTC()
 			if err := curlPprof(ctx, hc, "http://"+pprofAddr+p.path,
 				filepath.Join(outDir, p.out)); err != nil {

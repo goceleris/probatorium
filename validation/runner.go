@@ -1766,7 +1766,14 @@ func (o *Orchestrator) captureForensics(ctx context.Context, dir string, inc Inc
 	if f := o.debugAddr.Load(); f != nil {
 		side = (*f)()
 	}
-	return captureForensicsLiveOpts(ctx, dir, inc.RefappPID, addr, forensicsOpts{SkipCore: inc.SkipCore, PprofAddr: side})
+	// The text goroutine dump stops the refapp's world for the whole
+	// traceback. A record-only dossier of a routine run -- a cell that
+	// keeps running, and a dossier taken after its event -- goes without
+	// it. A stall-capture run takes it (its in-stall dossiers exist for
+	// it), and so does every hard fail, which ends the cell anyway
+	// (probatorium#412 review round 3).
+	skipText := inc.RecordOnly && !stallCaptureEnabled(os.Getenv)
+	return captureForensicsLiveOpts(ctx, dir, inc.RefappPID, addr, forensicsOpts{SkipCore: inc.SkipCore, PprofAddr: side, SkipStacksText: skipText})
 }
 
 // Tier1Summary projects a tier1TallySnapshot into the public
