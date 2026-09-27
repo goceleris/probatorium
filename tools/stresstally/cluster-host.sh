@@ -19,9 +19,11 @@
 #     kernel.perf_event_paranoid <= 2, or privilege). pmu=required refuses
 #     every observation without it.
 # It changes no host setting: governor, boost, paranoid and isolation are
-# recorded, never set. It kills nothing. Go's caches, modules and temporary
-# files live under $RUNNER_TEMP (tools/stresstally/gostate.sh), never in the
-# host's shared ~/go or ~/.cache/go-build that the tiers build from.
+# recorded, never set. It kills nothing but its own shards. Go's caches and
+# modules live under $RUNNER_TEMP and its temporary files in /tmp/cstress
+# (tools/stresstally/gostate.sh: all writable, and wiped by the job's last
+# step), never in the host's shared ~/go or ~/.cache/go-build that the tiers
+# build from.
 #
 # Inputs (validated by `stresstally plan`): STRESS_ARCH, STRESS_HOST,
 # STRESS_MODE (stress|timing), STRESS_SEQUENCE (CASE:SHARD:SHUFFLE tokens in

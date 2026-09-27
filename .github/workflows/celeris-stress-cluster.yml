@@ -24,8 +24,10 @@ name: Celeris Stress (cluster)
 # Security: the host job runs the celeris code under test on bare metal. It
 # gets no secret (the four below are read only by the hosted bootstrap and
 # teardown jobs), a contents: read token, cache-mode: none, and Go caches
-# under its own RUNNER_TEMP; the caller's plan job has already proven every
-# commit it runs is reachable from a goceleris/celeris branch or tag.
+# under its own RUNNER_TEMP (writable, -modcacherw, and wiped by its last
+# step: tools/stresstally/gostate.sh); the caller's plan job has already
+# proven every commit it runs is reachable from a goceleris/celeris branch or
+# tag.
 
 on:
   workflow_call:
@@ -162,6 +164,14 @@ jobs:
           path: ${{ runner.temp }}/stress/host/
           if-no-files-found: warn
           retention-days: 30
+      # Last, whatever happened before: delete the job's Go state (module
+      # cache, build cache, /tmp/cstress), so teardown's runner-dir wipe and
+      # the next bootstrap's, which run as the runner's user without chmod,
+      # never meet a read-only directory (tools/stresstally/gostate.sh).
+      - name: Wipe the job's Go state
+        if: ${{ always() }}
+        shell: bash
+        run: bash probatorium/tools/stresstally/gostate.sh wipe
 
   teardown:
     name: teardown cluster runners
