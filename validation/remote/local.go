@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -129,6 +130,11 @@ type localProcess struct {
 	mu     sync.Mutex
 	result WaitResult
 	waited bool
+
+	// stopping is set by the first Signal: the owner is ending the process,
+	// so whatever is left of its group is killed the moment it is reaped
+	// (see Wait).
+	stopping atomic.Bool
 }
 
 // PID returns the spawned process id, or 0 before Start has finished.
@@ -159,6 +165,7 @@ func (p *localProcess) Signal(sig int) error {
 	if waited {
 		return nil
 	}
+	p.stopping.Store(true)
 	if err := signalGroup(p.cmd.Process.Pid, syscall.Signal(sig)); !errors.Is(err, os.ErrProcessDone) {
 		return err
 	}
@@ -190,6 +197,17 @@ func (p *localProcess) Wait(ctx context.Context) (WaitResult, error) {
 	waitErr := make(chan error, 1)
 	go func() {
 		err := p.cmd.Wait()
+		// A process that was being stopped takes its group with it. A forked
+		// child that ignores the stop signal would otherwise outlive the
+		// leader, orphaned and holding its pipes, and once the leader is
+		// reaped Signal no longer reaches it. This runs straight after the
+		// reap: while any of the group is left its ID stays in use, so the
+		// kill can only reach this group. A process that exits on its own
+		// keeps its children, because a crash banner a child writes after
+		// the exit must still arrive (probatorium#276).
+		if p.stopping.Load() {
+			_ = signalGroup(p.cmd.Process.Pid, syscall.SIGKILL)
+		}
 		// The readers normally reach EOF at exit. If an orphaned descendant
 		// still holds the write ends, close our read ends after a grace
 		// period so the copy goroutines (and the caller's scanner) finish.

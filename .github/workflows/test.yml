@@ -181,6 +181,7 @@ jobs:
             TestLocal_SignalReachesForkedChildren \
             TestLocal_SignalReachesForkedChildren/foreground_child \
             TestLocal_SignalReachesForkedChildren/background_child \
+            TestLocal_SignalReachesForkedChildren/child_that_ignores_SIGTERM \
             TestSSH_SignalIsBounded
           do
             if ! grep -q -F -- "--- PASS: $t (" "$out"; then

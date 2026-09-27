@@ -20,7 +20,8 @@ import (
 // alone, and the forked child lives on with PPID 1 where no Wait can reach it.
 // In `go test ./validation/...` that left hundreds of live sleeps behind on
 // top of the zombies (probatorium#415). Each script prints the PID of the
-// child it forked; after SIGTERM and the reap, that child must be dead too.
+// child it forked; after SIGTERM and the reap, that child must be dead too,
+// including a child that ignores SIGTERM while its parent exits on it.
 func TestLocal_SignalReachesForkedChildren(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -31,6 +32,10 @@ func TestLocal_SignalReachesForkedChildren(t *testing.T) {
 		// shell prints its own PID and becomes the sleeper.
 		{"foreground child", `sh -c 'echo "child=$$"; exec sleep 30'; true`},
 		{"background child", `sleep 30 & echo "child=$!"; wait`},
+		// The child ignores SIGTERM and the leader does not: the leader dies,
+		// and the child must still go, killed with its group when the
+		// leader is reaped.
+		{"child that ignores SIGTERM", `sh -c 'trap "" TERM; echo "child=$$"; exec sleep 30' & wait`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
