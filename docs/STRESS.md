@@ -327,7 +327,10 @@ question. Two arms may name the same commit: an A/A control.
   binary (go test re-links it every time): wall time, user and system CPU,
   the load before and after, the binary's sha256, and, when `perf` works on
   the host, user-mode instructions, cycles and task clock (`perf stat`). It
-  writes one `stress-obs:` line into the shard's log. Every timing `go test`
+  writes one `stress-obs:` line into the shard's log; a shard with no such
+  line, two, or one without its wall time, binary or (under
+  `pmu=required`) instruction count is UNPARSED (reason `observation`), not
+  an observation. Every timing `go test`
   builds with `-trimpath`, so each arm's checkout directory is not in its
   binary and two arms of one commit build the same bytes.
 - **Counterbalanced.** A block runs every arm once, in a Williams order:

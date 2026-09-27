@@ -193,12 +193,9 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 			sr.Nproc, sr.CelerisSHA, sr.GoVersion = h["nproc"], h["celeris_sha"], h["go_version"]
 			sr.Host, sr.CPUModel, sr.Governor, sr.LoadBefore = h["host"], h["cpu_model"], h["governor"], h["loadavg_before"]
 			sr.LoadAfter, sr.CPUSet, sr.Perf, sr.Observations, sr.obs = sl.after["loadavg"], h["cpuset"], h["perf"], len(sl.obs), sl.obs
-			if c.Mode == "timing" && len(sl.obs) != 1 && sl.refused == "" {
-				// One process per observation: a timing shard that ran go
-				// test must carry exactly one observation of the binary.
-				sr.Notes = append(sr.Notes, fmt.Sprintf("%d observation line(s), want 1: the test binary did not run exactly once", len(sl.obs)))
-			}
+			obsReasons := observationReasons(c, sl)
 			sr.Reasons = append(sr.Reasons, sl.reasons...)
+			sr.Reasons = append(sr.Reasons, obsReasons...)
 			shape := checkShape(h, c, arch, shard, celerisSHA)
 			switch {
 			case sl.refused != "" || sl.exit == "refused" || (len(shape) > 0 && !sl.hasReason(reasonNoHeader)):
@@ -206,7 +203,7 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 				for _, m := range shape {
 					sr.Reasons = append(sr.Reasons, reasonShape+": "+m)
 				}
-			case len(sl.reasons) > 0:
+			case len(sl.reasons) > 0 || len(obsReasons) > 0:
 				sr.Status = statusUnparsed
 			default:
 				sr.Status = statusComplete
@@ -323,6 +320,36 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 	}
 	rep.Mismatches = checkExpect(rep, c.Expect)
 	return rep
+}
+
+// reasonObservation marks a timing shard that is not one complete
+// observation: it is UNPARSED, whatever its tests did.
+const reasonObservation = "observation"
+
+// observationReasons says why a timing shard that ran (was not refused) is
+// not exactly one complete observation: one process per observation means
+// exactly one stress-obs line, and the pre-registered analysis reads its
+// wall time and binary, and under pmu=required its instruction count.
+func observationReasons(c Case, sl *shardLog) []string {
+	if c.Mode != "timing" || sl.refused != "" || sl.exit == "refused" {
+		return nil
+	}
+	if len(sl.obs) != 1 {
+		return []string{fmt.Sprintf("%s: %d stress-obs line(s), want exactly 1: the test binary did not run exactly once", reasonObservation, len(sl.obs))}
+	}
+	var out []string
+	o := sl.obs[0]
+	for _, k := range []string{"wall_ns", "binary_sha256", "exit"} {
+		if o[k] == "" {
+			out = append(out, fmt.Sprintf("%s: no %s", reasonObservation, k))
+		}
+	}
+	if c.PMU == "required" {
+		if _, err := strconv.ParseFloat(o["instructions_u"], 64); err != nil {
+			out = append(out, fmt.Sprintf("%s: pmu required but no instructions_u (perf=%s)", reasonObservation, o["perf"]))
+		}
+	}
+	return out
 }
 
 // archGaps lists every test (per package) that reached a PASS or FAIL verdict
