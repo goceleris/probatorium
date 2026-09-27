@@ -159,26 +159,31 @@ func TestTimingPlanCounterbalancesTheArms(t *testing.T) {
 }
 
 // Two runs that differ in where or how they ran are not a comparison of two
-// commits: a GitHub arm against a cluster arm has two causes.
+// commits: a GitHub arm against a cluster arm has two causes, and so do two
+// arms of different modes, CPU counts or PMU rules.
 func TestCompareRefusesAPairThatDiffersInTarget(t *testing.T) {
-	base := armReport(t, testSHA, "3", "2", nil, nil)
-	branch := armReport(t, branchSHA, "3", "2", nil, nil)
-	path := filepath.Join(branch, "report.json")
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var r map[string]any
-	if err := json.Unmarshal(b, &r); err != nil {
-		t.Fatal(err)
-	}
-	r["cases"].([]any)[0].(map[string]any)["config"].(map[string]any)["target"] = "cluster"
-	b, _ = json.Marshal(r)
-	if err := os.WriteFile(path, b, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var out strings.Builder
-	if code := cmdCompare([]string{base, branch}, &out); code != 2 || !strings.Contains(out.String(), "target") {
-		t.Errorf("a github arm and a cluster arm were compared: exit %d\n%s", code, out.String())
+	for key, value := range map[string]any{"target": "cluster", "mode": "timing", "cpus": 4, "pmu": "required"} {
+		t.Run(key, func(t *testing.T) {
+			base := armReport(t, testSHA, "3", "2", nil, nil)
+			branch := armReport(t, branchSHA, "3", "2", nil, nil)
+			path := filepath.Join(branch, "report.json")
+			b, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var r map[string]any
+			if err := json.Unmarshal(b, &r); err != nil {
+				t.Fatal(err)
+			}
+			r["cases"].([]any)[0].(map[string]any)["config"].(map[string]any)[key] = value
+			b, _ = json.Marshal(r)
+			if err := os.WriteFile(path, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var out strings.Builder
+			if code := cmdCompare([]string{base, branch}, &out); code != 2 || !strings.Contains(out.String(), key) {
+				t.Errorf("two arms that differ in %s were compared: exit %d\n%s", key, code, out.String())
+			}
+		})
 	}
 }

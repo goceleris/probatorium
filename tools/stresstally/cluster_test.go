@@ -466,6 +466,12 @@ func TestGuardClassifiesTheGroup(t *testing.T) {
 		"stress in group, running": {[]ghRun{guardRun(1, stressWorkflowPath, "in_progress", "workflow_dispatch", "Celeris Stress [cluster/timing] A=main B=x")},
 			map[int64][]ghJob{1: {{Name: "cluster-guard", Status: "completed", Conclusion: "success"}, {Name: "cluster / bootstrap cluster runners", Status: "completed", Conclusion: "success"},
 				{Name: "cluster / host x86 (msa2-server)", Status: "in_progress"}}}, true, classHolder},
+		// A cluster job that has finished still means the run entered the
+		// group: bootstrap done and host jobs queued for their runners is a
+		// holder, not a run about to enter.
+		"stress in group, bootstrap done": {[]ghRun{guardRun(1, stressWorkflowPath, "in_progress", "workflow_dispatch", "Celeris Stress [cluster/stress] main")},
+			map[int64][]ghJob{1: {{Name: "cluster-guard", Status: "completed", Conclusion: "success"}, {Name: "cluster / bootstrap cluster runners", Status: "completed", Conclusion: "success"},
+				{Name: "cluster / host x86 (msa2-server)", Status: "queued"}}}, true, classHolder},
 		"holder and pending": {[]ghRun{guardRun(1, nightly, "in_progress", "workflow_dispatch", "Nightly Validation"), guardRun(2, bench, "pending", "workflow_dispatch", "Benchmark Tier")}, nil, false, classHolder},
 	}
 	for name, c := range cases {
