@@ -30,9 +30,11 @@ import (
 // The bubble's clock is fake, so the 5 s and 10 s give-ups cost nothing.
 
 // runLoop mimics Run's incident loop: once start is closed it receives until
-// the first hard incident (the hard-fail path returns), recording every
-// predicate it received. It gives up after 5 s with nothing to receive.
-func runLoop(ch chan Incident, start <-chan struct{}) (*[]string, <-chan struct{}) {
+// the first hard incident, recording every predicate it received; on that
+// one it ends the run (end), as Run's hard-fail path cancels the run once
+// the dossier is captured, and returns. It gives up after 5 s with nothing
+// to receive.
+func runLoop(ch chan Incident, start <-chan struct{}, end context.CancelFunc) (*[]string, <-chan struct{}) {
 	var ids []string
 	done := make(chan struct{})
 	go func() {
@@ -43,6 +45,7 @@ func runLoop(ch chan Incident, start <-chan struct{}) (*[]string, <-chan struct{
 			case inc := <-ch:
 				ids = append(ids, inc.PredicateID)
 				if !inc.RecordOnly {
+					end()
 					return
 				}
 			case <-time.After(5 * time.Second):
@@ -77,7 +80,7 @@ func TestFinalTickRecordReachesTheLoopBeforeTheWedgeEndsIt(t *testing.T) {
 
 		violations <- Incident{PredicateID: properties.IH2CStall.ID, RecordOnly: true} // the loop is busy
 		start := make(chan struct{})
-		got, loopDone := runLoop(violations, start)
+		got, loopDone := runLoop(violations, start, cancel)
 
 		var snap tier1TallySnapshot
 		snap.H2CChurn.Hang = 15   // the reads timed out after the last periodic tick
@@ -117,7 +120,7 @@ func TestFinalTickDeliversARetriedRecordAndTheWedge(t *testing.T) {
 		}
 
 		start := make(chan struct{})
-		got, loopDone := runLoop(violations, start)
+		got, loopDone := runLoop(violations, start, cancel)
 		snap.Liveness.Hung = true
 		tickDone := make(chan struct{})
 		go func() { cb(snap); close(tickDone) }()

@@ -1090,7 +1090,9 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	tally, err := driveTier1(ctx, cfg)
 	// The refapp is gone: its side listener with it. A later dossier (a
 	// Tier 3 incident, or one still queued) must not point its pprof leg at
-	// the dead address and label the dump "side-listener". The live tail
+	// the dead address and label the dump "side-listener". The dossier of the
+	// crash or wedge that ended Tier 1 was taken before this: the final tick
+	// waited for it (awaitTerminalCapture). The live tail
 	// accessor stays: the dead refapp's ring still holds its last lines,
 	// fresher than the tick's copy, for the dossier of whatever ended it.
 	o.debugAddr.Store(nil)
@@ -1394,8 +1396,16 @@ const stallDossierCooldown = 2 * time.Second
 //     dossiers and keeps receiving. Offered after the wedge they were lost:
 //     the round-3 live run's adaptive cell lost its gated I-H2C-HANG so;
 //   - then I-LIVENESS / I-HANG. Offered without waiting it was dropped when
-//     a retried record-only incident, or a busy loop, held the slot: the
-//     cell was never aborted and the wedged process never dumped or cored;
+//     a retried record-only incident, or a busy loop, held the slot, and the
+//     cell was never aborted. Once it is delivered the tick waits for the
+//     run to end (awaitTerminalCapture): Run's loop cancels the run right
+//     after it has captured that incident's dossier. A tick that returned
+//     at the send let driveTier1 return under the capture -- its deferred
+//     SIGTERM stopped the refapp and runTierProperty reset the side-listener
+//     accessor -- so every I-HANG dossier read pprof_source=engine against
+//     the wedged engine and had no goroutine dump (re-review of round 3);
+//     the record-only dossiers delivered ahead of it are captured while the
+//     tick waits too;
 //   - then the hard walker incidents, offered as usual (the cell is ending).
 //
 // On every other tick nothing waits: the hard walker incidents (a hard fail
@@ -1519,7 +1529,9 @@ func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations cha
 				deliverWaiting(ctx, alertedCounters, violations, inc)
 			}
 			for _, inc := range terminal {
-				deliverWaiting(ctx, alertedCounters, violations, inc)
+				if deliverWaiting(ctx, alertedCounters, violations, inc) {
+					awaitTerminalCapture(ctx)
+				}
 			}
 			for _, inc := range hard {
 				offerOnce(alertedCounters, violations, inc)
@@ -1540,9 +1552,34 @@ func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations cha
 // capture (forensicsBudget) with one more incident queued in the slot ahead
 // (another forensicsBudget), plus the dossier writes. A waiting sender is
 // taken as soon as the loop receives the one ahead of it, so each wait on a
-// terminal tick is bounded by that, not by the sum. A variable so a test can
+// terminal tick is bounded by that, not by the sum. It also bounds
+// awaitTerminalCapture: a delivered I-LIVENESS / I-HANG sits in the slot
+// behind at most one capture, then takes its own. A variable so a test can
 // shorten it.
 var terminalIncidentWait = 2*forensicsBudget + 10*time.Second
+
+// awaitTerminalCapture holds a terminal tick -- and with it Tier 1, its
+// refapp and the refapp's side listener -- after it delivered I-LIVENESS or
+// I-HANG, until Run's incident loop has taken that incident's dossier. The
+// loop's hard-fail path writes the dossier, captures the forensics and then
+// cancels the run (ctx is rootCtx), so the end of the run is the end of the
+// capture; no other signal is needed. Bounded by terminalIncidentWait: the
+// incident may sit in the slot behind one more capture, and its own capture
+// is bounded by forensicsBudget.
+//
+// It cannot deadlock the orchestrator, for the reasons deliverWaiting
+// cannot: the loop reaches cancel() without waiting on this goroutine (its
+// capture reads atomics, the live tail under the liveness ring's own mutex,
+// the refapp over HTTP and /proc; the tick holds no lock), and it waits on
+// this goroutine only through wg.Wait, after cancel().
+func awaitTerminalCapture(ctx context.Context) {
+	t := time.NewTimer(terminalIncidentWait)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
 
 // deliverWaiting delivers an incident of a terminal tick (the record-only
 // incidents still pending, then I-LIVENESS / I-HANG) the way offerOnce

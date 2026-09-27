@@ -18,7 +18,9 @@ import (
 // tick the retried record took the free slot and the wedge was dropped for
 // good: no abort, no gcore, no goroutine dump of the wedged process. A full
 // slot on that tick (the loop inside a slow capture with one incident
-// queued) dropped the wedge too.
+// queued) dropped the wedge too. (Delivering the wedge restored the abort;
+// the dump also needs the tick to hold Tier 1 until the wedge's dossier is
+// captured: tally_incident_capture_test.go.)
 
 // tallyIDs drains ch without blocking and returns the predicate IDs in
 // arrival order.
@@ -90,10 +92,11 @@ func TestFinalTickWaitsForTheSlotToDeliverTheWedge(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("the final tick met a full slot and dropped I-HANG: the loop never receives the wedge")
 		}
+		cancel() // Run's hard-fail path: the wedge's dossier is captured, the run ends
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			t.Fatal("the tick did not return after its incident was delivered")
+			t.Fatal("the tick did not return after its incident was delivered and the run ended")
 		}
 	})
 }

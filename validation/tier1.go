@@ -764,8 +764,10 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	// the orchestrator: the property tier's callback delivers the record-only
 	// incidents still pending and then the terminal one, each waiting for a
 	// full slot (runner.go deliverWaiting, bounded by the run and by
-	// terminalIncidentWait). Incidents are deduped per counter, so a double
-	// tick is harmless.
+	// terminalIncidentWait), and then waits for the orchestrator to capture
+	// the terminal one's dossier (awaitTerminalCapture): only after that does
+	// this function return, SIGTERM the refapp and let its side listener go.
+	// Incidents are deduped per counter, so a double tick is harmless.
 	if (snap.Liveness.Crashed || snap.Liveness.Hung) && cfg.TallyCallback != nil {
 		cfg.TallyCallback(snap)
 	}
