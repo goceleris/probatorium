@@ -3,6 +3,7 @@ package validation
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/goceleris/probatorium/validation/properties"
@@ -63,37 +64,38 @@ func TestTickOffersAHardWalkerIncidentBeforeARecord(t *testing.T) {
 // of being dropped, and arrives once the loop takes the queued incident.
 func TestFinalTickWaitsForTheSlotToDeliverTheWedge(t *testing.T) {
 	t.Setenv(refappFaultEnv, "")
-	o := &Orchestrator{}
-	violations := make(chan Incident, 1)
-	cb := o.tallyIncidentCallback(context.Background(), violations, func() int { return 4242 })
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		o := &Orchestrator{}
+		violations := make(chan Incident, 1)
+		cb := o.tallyIncidentCallback(ctx, violations, func() int { return 4242 })
 
-	violations <- Incident{PredicateID: properties.IWSStall.ID}
-	var snap tier1TallySnapshot
-	snap.Liveness.Hung = true
-	done := make(chan struct{})
-	go func() { cb(snap); close(done) }()
-	// Give the tick time to find the slot full. A tick that dropped the
-	// wedge returns here; one that waits for the slot does not.
-	select {
-	case <-done:
-	case <-time.After(300 * time.Millisecond):
-	}
-	if first := <-violations; first.PredicateID != properties.IWSStall.ID {
-		t.Fatalf("premise: the queued incident comes first, got %q", first.PredicateID)
-	}
-	select {
-	case inc := <-violations:
-		if inc.PredicateID != properties.IHang.ID {
-			t.Fatalf("after the queued incident the loop received %q, want %s", inc.PredicateID, properties.IHang.ID)
+		violations <- Incident{PredicateID: properties.IWSStall.ID}
+		var snap tier1TallySnapshot
+		snap.Liveness.Hung = true
+		done := make(chan struct{})
+		go func() { cb(snap); close(done) }()
+		// The tick has met the full slot: it waits there (the fix) or has
+		// dropped the wedge and returned (synctest.Wait, not a sleep).
+		synctest.Wait()
+		if first := <-violations; first.PredicateID != properties.IWSStall.ID {
+			t.Fatalf("premise: the queued incident comes first, got %q", first.PredicateID)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the final tick met a full slot and dropped I-HANG: the loop never receives the wedge")
-	}
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the tick did not return after its incident was delivered")
-	}
+		select {
+		case inc := <-violations:
+			if inc.PredicateID != properties.IHang.ID {
+				t.Fatalf("after the queued incident the loop received %q, want %s", inc.PredicateID, properties.IHang.ID)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the final tick met a full slot and dropped I-HANG: the loop never receives the wedge")
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the tick did not return after its incident was delivered")
+		}
+	})
 }
 
 // The wait never outlives the run: when the orchestrator ends the run
@@ -101,22 +103,25 @@ func TestFinalTickWaitsForTheSlotToDeliverTheWedge(t *testing.T) {
 // tick returns at once, so Tier 1 can return and the WaitGroup completes.
 func TestFinalTickWaitEndsWithTheRun(t *testing.T) {
 	t.Setenv(refappFaultEnv, "")
-	o := &Orchestrator{}
-	violations := make(chan Incident, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	cb := o.tallyIncidentCallback(ctx, violations, func() int { return 4242 })
+	synctest.Test(t, func(t *testing.T) {
+		o := &Orchestrator{}
+		violations := make(chan Incident, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cb := o.tallyIncidentCallback(ctx, violations, func() int { return 4242 })
 
-	violations <- Incident{PredicateID: properties.IWSStall.ID} // never drained
-	var snap tier1TallySnapshot
-	snap.H2CChurn.Hang = 1 // a record-only incident waits ahead of the crash
-	snap.Liveness.Crashed = true
-	done := make(chan struct{})
-	go func() { cb(snap); close(done) }()
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the run ended but the tick is still waiting for the slot: Tier 1 cannot return, and the orchestrator's wg.Wait deadlocks")
-	}
+		violations <- Incident{PredicateID: properties.IWSStall.ID} // never drained
+		var snap tier1TallySnapshot
+		snap.H2CChurn.Hang = 1 // a record-only incident waits ahead of the crash
+		snap.Liveness.Crashed = true
+		done := make(chan struct{})
+		go func() { cb(snap); close(done) }()
+		synctest.Wait() // the tick is blocked in its wait before the run ends
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the run ended but the tick is still waiting for the slot: Tier 1 cannot return, and the orchestrator's wg.Wait deadlocks")
+		}
+	})
 }
