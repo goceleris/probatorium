@@ -135,6 +135,20 @@ type Adapter struct {
 	Engine           string
 	Bin              BuildSpec
 
+	// SUTEnv is the RUN-TIME environment this column's server process is
+	// launched with (celeris#585), merged over the harness's own base env
+	// and the dispatch-wide BENCH_SUT_ENV, the column winning on a shared
+	// key. GoBinary.Env is BUILD-time only, so before this field two
+	// columns could differ only by binary or -engine; with it, two columns
+	// can share one binary and one -engine and differ in a runtime knob
+	// (CELERIS_IOURING_SEND_ZC=on vs off), which is what lets an A/B and
+	// its in-run A/A twin run minutes apart in one dispatch instead of
+	// hours apart in several. Keys and values obey the BENCH_SUT_ENV rules
+	// (mage validates them); run_bench_cell.yml refuses to bench a
+	// listener whose /proc/<pid>/environ lacks them. Nil for every column
+	// the registry ships today.
+	SUTEnv map[string]string
+
 	// Capabilities is the declared Phase-2 capability manifest for this
 	// adapter — the single source of truth the scheduler trusts instead of
 	// guessing driver / middleware / streaming support from the Category
@@ -253,7 +267,7 @@ var Registry = map[string]Adapter{
 	//     their binding constraint.
 	//
 	// gin / echo / chi / iris — net/http-based routers. Each carries an
-	// h1 and an h2c (h2c.NewHandler-wrapped) variant.
+	// h1 and an h2c variant; h2c is net/http's own (Server.Protocols).
 	"gin-h1": {
 		Name: "gin-h1", Category: "go-net-http", Language: "go", Framework: "gin", FrameworkVersion: "v1.12.0", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/gin"},

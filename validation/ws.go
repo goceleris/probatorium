@@ -311,7 +311,9 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 		tally.capture.record(conn, dialD, writeD, time.Since(readStart), err,
 			"handshake-fail-"+cause, status, nRead, readStart)
 	}
+	disarm := tally.capture.watchRead(wsStallThreshold)
 	statusLine, err := br.ReadString('\n')
+	disarm()
 	nRead += len(statusLine)
 	if err != nil {
 		fail(err, "")

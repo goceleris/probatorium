@@ -132,6 +132,70 @@ func TestAggregateReconstructsColumnMissingRollup(t *testing.T) {
 	}
 }
 
+// TestAggregateCarriesLoadgenResultVerbatim is the harness catch-up check for
+// the loadgen v1.4.14 re-pin (probatorium#424): a field loadgen adds to
+// Result must reach the bench artifacts without a probatorium change. The
+// runner embeds the whole *loadgen.Result in its per-cell JSON and the
+// ingest keeps `result` as raw JSON (runnerCellFile.Result ->
+// cellRecord.Loadgen), so raw/<host>.json, which the Benchmark Tier uploads
+// with the rest of results/, carries every field. v1.4.14 adds close_aborts
+// (goceleris/loadgen#90): the connections the client reset because the
+// server's FIN had not arrived 50 ms after the response. #424's first
+// post-bump check reads it per cell (about `requests` on lithium, which
+// ignores Connection: close; about 0 elsewhere). It is not a published
+// summary field, like its sibling diagnostics dial_retries and recvq_high.
+func TestAggregateCarriesLoadgenResultVerbatim(t *testing.T) {
+	resultsDir := t.TempDir()
+	col := filepath.Join(resultsDir, "20260927T120000-bench-msa2-server", "00-lithium")
+	want := &loadgen.Result{
+		Requests:       4_500_000,
+		Duration:       90 * time.Second,
+		RequestsPerSec: 50_000,
+		ConnectErrors:  3,
+		DialRetries:    2,
+		CloseAborts:    4_499_990,
+	}
+	writeRunnerCell(t, col, "churn-close", "lithium", "ok", "", want)
+	if err := os.WriteFile(filepath.Join(col, "results.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write rollup: %v", err)
+	}
+
+	if err := aggregatePerCellResults(resultsDir, 0); err != nil {
+		t.Fatalf("aggregatePerCellResults: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(resultsDir, "raw", "msa2-server.json"))
+	if err != nil {
+		t.Fatalf("read raw payload: %v", err)
+	}
+	var payload struct {
+		Cells []cellRecord `json:"cells"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("parse raw payload: %v", err)
+	}
+	if len(payload.Cells) != 1 {
+		t.Fatalf("cells: want 1 got %d", len(payload.Cells))
+	}
+	raw := payload.Cells[0].Loadgen
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("parse cell loadgen payload %q: %v", raw, err)
+	}
+	if got := string(keys["close_aborts"]); got != "4499990" {
+		t.Errorf("raw cell loadgen close_aborts = %q, want 4499990 (payload %s)", got, raw)
+	}
+	var got loadgen.Result
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode cell loadgen payload: %v", err)
+	}
+	if got.CloseAborts != want.CloseAborts || got.ConnectErrors != want.ConnectErrors ||
+		got.DialRetries != want.DialRetries || got.Requests != want.Requests {
+		t.Errorf("round trip: got close_aborts=%d connect_errors=%d dial_retries=%d requests=%d, want %d %d %d %d",
+			got.CloseAborts, got.ConnectErrors, got.DialRetries, got.Requests,
+			want.CloseAborts, want.ConnectErrors, want.DialRetries, want.Requests)
+	}
+}
+
 func keysOf[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

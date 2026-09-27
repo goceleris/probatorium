@@ -41,8 +41,9 @@ type StaticScenario struct {
 	HTTP2 bool
 
 	// ErrBudget, when > 0, overrides [DefaultErrorBudget] as this
-	// scenario's loadgen error-ratio ceiling (see [ErrorBudgeter]). Only
-	// churn-close sets it today.
+	// scenario's loadgen error-ratio ceiling (see [ErrorBudgeter]). No
+	// scenario sets it today: churn-close carried 0.5 until the loadgen
+	// v1.4.14 re-pin (probatorium#424; see its registration below).
 	ErrBudget float64
 }
 
@@ -229,28 +230,42 @@ func init() {
 		Path:             "/",
 		Connections:      32,
 		DisableKeepAlive: true,
-		// Churn legitimately produces refused dials — the accept-backlog
-		// overflowing under connection churn is part of what the scenario
-		// measures — so the default 5% budget would flag every healthy
-		// run. But the v3.8 evidence (and every archived run before it)
-		// shows errors at 28x–97x REQUESTS on every server: under loadgen
-		// <= v1.4.7 a refused dial is retried in a hot loop with no
-		// backoff, so the counter records loadgen's retry-spin rate
-		// (~10^5/s), not the SUT's failure rate, and the published RPS
-		// describes a SUT in permanent accept-overload. Budget 0.5 means
-		// "failed dial attempts may not outnumber completed requests":
-		// generous headroom for the benign churn fraction, while every
-		// historical 0.96+-ratio cell — previously status=ok — is now
-		// flagged suspect until the loadgen dial-backoff fix lands.
-		ErrBudget: 0.5,
+		// No ErrBudget: churn-close uses DefaultErrorBudget (5%) like
+		// every other scenario (probatorium#424).
+		//
+		// It carried 0.5 ("failed attempts may not outnumber completed
+		// requests") until the loadgen v1.4.14 re-pin, and that value was
+		// calibrated against a loadgen artifact, not against the servers.
+		// Up to v1.4.13, loadgen wrote the next request into a connection
+		// the server had closed as asked, so every successful close-mode
+		// request was followed by one counted EOF error
+		// (goceleris/loadgen#87): errors/(errors+requests) was 0.4999
+		// against net/http and celeris in goceleris/loadgen#90's
+		// measurement, and every published churn-close cell of a server
+		// that closes as asked sat at a delta of ~100%, a coin flip
+		// around 0.5. loadgen v1.4.14 (goceleris/loadgen#90) dials a fresh
+		// connection instead, so the ratio is the genuine failure rate:
+		// 0 errors in the same measurement, and connect_errors was 0 in
+		// every published churn-close cell. Under 0.5, a server that
+		// failed half its churn attempts would now publish as ok.
+		//
+		// Accept-backlog overflow, which this scenario exercises, is not
+		// an error: Linux drops the SYN of a full accept queue and the
+		// client resends it after 1 s, so it lands in the latency of a
+		// recorded success (a mode at 1 s or more is backlog drops, not a
+		// server latency regression). The expected close never counts; a
+		// failed dial, a reset, a truncated response or a timeout does.
 	})
 
 	// HTTP/2 prior-knowledge variants. Paired with the H1 versions on the
 	// same endpoints so an H2 regression shows up as a delta against its
 	// H1 twin rather than an isolated number. Connection count is kept
-	// lower than H1 because H2 multiplexes streams — 32 TCP conns ×
-	// default 100 concurrent streams gives the same or higher effective
-	// concurrency as H1's 128 conns.
+	// lower than H1 because H2 multiplexes streams: the runner sets
+	// loadgen's Workers = Connections (cmd/runner buildCellConfig) and
+	// loadgen multiplies HTTP/2 workers by 4, so each cell runs 128
+	// workers on 32 TCP conns, 4 streams in flight per conn: the same 128
+	// requests in flight as H1's 128 conns. The default MaxStreams of 100
+	// never binds.
 	Register(&StaticScenario{
 		name:        "get-json-h2",
 		Method:      "GET",

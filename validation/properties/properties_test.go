@@ -372,7 +372,7 @@ func TestHeapSlope_Degenerate(t *testing.T) {
 }
 
 func TestTier1Walker_PredicatesRegistered(t *testing.T) {
-	for _, want := range []string{"I-ADV-ACCEPTED", "I-H2C-CRASHED", "I-WS-ACCEPTED", "I-WS-HANG", "I-H2C-HANG", "I-WS-HANDSHAKE", "I-LIVENESS", "I-HANG", "I-WS-ECHO"} {
+	for _, want := range []string{"I-ADV-ACCEPTED", "I-H2C-CRASHED", "I-WS-ACCEPTED", "I-WS-HANG", "I-H2C-HANG", "I-WS-HANDSHAKE", "I-H2C-STALL", "I-WS-STALL", "I-LIVENESS", "I-HANG", "I-WS-ECHO"} {
 		spec, ok := ByID(want)
 		if !ok {
 			t.Errorf("Spec %q missing from registry", want)
@@ -392,8 +392,8 @@ func TestTier1Walker_PredicatesRegistered(t *testing.T) {
 
 func TestTier1Walker_ByTierFiltersCorrectly(t *testing.T) {
 	got := ByTier("tier-1-walker")
-	if len(got) != 9 {
-		t.Errorf("ByTier(tier-1-walker): got %d specs, want 9", len(got))
+	if len(got) != 11 { // 9 + the two celeris#588 in-stall capture labels
+		t.Errorf("ByTier(tier-1-walker): got %d specs, want 11", len(got))
 	}
 	for _, s := range got {
 		if s.Tier != "tier-1-walker" {

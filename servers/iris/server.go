@@ -1,6 +1,6 @@
 // Command iris serves the probatorium contract endpoints with the Iris
 // framework (kataras/iris/v12). Two engine modes: h1 (plain) and h2c
-// (h2c.NewHandler-wrapped). Iris expresses path params as
+// (net/http's own HTTP/2). Iris expresses path params as
 // "{id:string}".
 package main
 

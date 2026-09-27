@@ -21,7 +21,7 @@ import (
 // A skipped step is not a failed step, so running the judges anyway cannot
 // turn a red run green: the failed Validate step already fails the job.
 var adjudicationTiers = map[string]int{
-	".github/workflows/matrix-nightly-tier.yml":  2, // ValidateGate + ValidateDiff
+	".github/workflows/matrix-nightly-tier.yml":  3, // ValidateGate + ValidateDiff, or ValidateFaultControl (celeris#588)
 	".github/workflows/matrix-checkptr-tier.yml": 2,
 	".github/workflows/matrix-race-tier.yml":     2,
 	".github/workflows/matrix-weekend-tier.yml":  2,
@@ -40,7 +40,8 @@ func adjudicationSteps(src string) []string {
 			end = idx[i+1][0]
 		}
 		block := src[loc[0]:end]
-		if strings.Contains(block, "run: mage ValidateGate") || strings.Contains(block, "run: mage ValidateDiff") {
+		if strings.Contains(block, "run: mage ValidateGate") || strings.Contains(block, "run: mage ValidateDiff") ||
+			strings.Contains(block, "run: mage ValidateFaultControl") {
 			steps = append(steps, block)
 		}
 	}
@@ -74,6 +75,38 @@ func TestValidateGatesJudgeTheArtifactEvenWhenValidateFailed(t *testing.T) {
 					"mage Validate (use `!cancelled()`), or a run that found bad cells is never judged:\n%s",
 					wf, cond, step)
 			}
+		}
+	}
+}
+
+// TestNightlyFaultControlReplacesTheGates (celeris#588): a refapp_fault
+// dispatch fails the absolute gate by design, so exactly one of the two
+// judgements may run -- ValidateGate and ValidateDiff on a routine nightly,
+// ValidateFaultControl on a fault-control run. A condition that lets both
+// run turns every capture-control run red; one that lets neither run turns
+// a routine nightly unjudged.
+func TestNightlyFaultControlReplacesTheGates(t *testing.T) {
+	b, err := os.ReadFile(".github/workflows/matrix-nightly-tier.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conds := map[string]string{}
+	for _, step := range adjudicationSteps(string(b)) {
+		m := stepIfRe.FindStringSubmatch(step)
+		if m == nil {
+			continue
+		}
+		for _, target := range []string{"ValidateGate", "ValidateDiff", "ValidateFaultControl"} {
+			if strings.Contains(step, "run: mage "+target+"\n") {
+				conds[target] = strings.TrimSpace(m[1])
+			}
+		}
+	}
+	routine := "(inputs.refapp_fault || '') == ''"
+	fault := "(inputs.refapp_fault || '') != ''"
+	for target, want := range map[string]string{"ValidateGate": routine, "ValidateDiff": routine, "ValidateFaultControl": fault} {
+		if c := conds[target]; !strings.Contains(c, want) || !strings.Contains(c, "!cancelled()") {
+			t.Errorf("%s runs on `if: %s`; want !cancelled() && %s", target, c, want)
 		}
 	}
 }

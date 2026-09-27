@@ -161,18 +161,14 @@ func TestChurnCloseUsesConnectionClose(t *testing.T) {
 }
 
 // TestErrorBudgets pins the per-scenario error-ratio ceilings the runner's
-// suspect gate keys on (schema v5.4). churn-close carries an explicit 0.5
-// budget — refused dials are inherent to churn, but the v3.8 evidence
-// (errors 28x–97x requests on EVERY server, published status=ok) must flag
-// as suspect. Every other scenario uses the 5% default.
+// suspect gate keys on (schema v5.4). Every registered scenario uses the 5%
+// default. churn-close carried an explicit 0.5 until the loadgen v1.4.14
+// re-pin (probatorium#424): TestChurnCloseErrorBudget holds the evidence.
 func TestErrorBudgets(t *testing.T) {
 	t.Parallel()
-	if got := ErrorBudgetFor(findScenario(t, "churn-close")); got != 0.5 {
-		t.Errorf("churn-close ErrorBudget = %v, want 0.5", got)
-	}
-	for _, name := range []string{"get-json", "post-4k", "sse-fanout-1024"} {
-		if got := ErrorBudgetFor(findScenario(t, name)); got != DefaultErrorBudget {
-			t.Errorf("%s ErrorBudget = %v, want DefaultErrorBudget (%v)", name, got, DefaultErrorBudget)
+	for _, s := range Registry() {
+		if got := ErrorBudgetFor(s); got != DefaultErrorBudget {
+			t.Errorf("%s ErrorBudget = %v, want DefaultErrorBudget (%v)", s.Name(), got, DefaultErrorBudget)
 		}
 	}
 	// A zero/negative declared budget falls back to the default rather
@@ -180,11 +176,48 @@ func TestErrorBudgets(t *testing.T) {
 	if got := ErrorBudgetFor(&StaticScenario{name: "x"}); got != DefaultErrorBudget {
 		t.Errorf("zero-ErrBudget scenario = %v, want DefaultErrorBudget fallback", got)
 	}
-	// The v3.8 churn-close numbers themselves: ntex ran 12,081,484
-	// requests against 290,204,598 errors (ratio 0.960) — over budget.
-	ratio := 290204598.0 / (290204598.0 + 12081484.0)
-	if budget := ErrorBudgetFor(findScenario(t, "churn-close")); ratio <= budget {
-		t.Errorf("v3.8 churn-close ratio %.3f must exceed the 0.5 budget", ratio)
+	// No registered scenario raises its budget, so the loop above cannot
+	// tell a working override from an ignored one. The override stays the
+	// fallback for churn-close if the first post-bump run shows genuine
+	// refused dials above 5% (probatorium#424), so a scenario that declares
+	// one must get it.
+	if got := ErrorBudgetFor(&StaticScenario{name: "x", ErrBudget: 0.2}); got != 0.2 {
+		t.Errorf("ErrBudget 0.2 scenario = %v, want its declared 0.2", got)
+	}
+}
+
+// TestChurnCloseErrorBudget checks churn-close's budget against measured
+// error ratios, computed as the runner's suspect gate computes them:
+// errors/(errors+requests), suspect when strictly above the budget.
+//
+// Both measured rows come from goceleris/loadgen#90's "Measured" table
+// (net/http, close mode, PoolSize=1, 1 s, 8 workers). The half-failing
+// row is what the 0.5 budget let through: loadgen main a89f02d (the
+// v1.4.13 client code) counted one EOF error per success
+// (goceleris/loadgen#87), ratio 0.49993. Under loadgen v1.4.14 the same
+// counts can only mean a server that fails half its churn attempts, and
+// such a cell must not publish as ok. The clean row is the fixed client
+// (c913657, shipped in v1.4.14) against the same server: 0 errors.
+func TestChurnCloseErrorBudget(t *testing.T) {
+	t.Parallel()
+	budget := ErrorBudgetFor(findScenario(t, "churn-close"))
+	cases := []struct {
+		name             string
+		requests, errors int64
+		wantSuspect      bool
+	}{
+		{"loadgen v1.4.13 close artifact / half-failing server", 26753, 26746, true},
+		{"v3.8 retry spin (ntex)", 12081484, 290204598, true},
+		{"one failed attempt in ten", 900, 100, true},
+		{"loadgen v1.4.14, server closes as asked", 31419, 0, false},
+		{"one failed attempt in a hundred", 990, 10, false},
+	}
+	for _, tc := range cases {
+		ratio := float64(tc.errors) / float64(tc.errors+tc.requests)
+		if got := ratio > budget; got != tc.wantSuspect {
+			t.Errorf("%s: ratio %.5f against churn-close budget %v: suspect = %v, want %v",
+				tc.name, ratio, budget, got, tc.wantSuspect)
+		}
 	}
 }
 

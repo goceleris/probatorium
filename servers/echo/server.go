@@ -1,6 +1,6 @@
 // Command echo serves the probatorium contract endpoints with the Echo
 // framework (labstack/echo/v4). Two engine modes: h1 (plain) and h2c
-// (h2c.NewHandler-wrapped).
+// (net/http's own HTTP/2: Server.Protocols with UnencryptedHTTP2).
 package main
 
 import (

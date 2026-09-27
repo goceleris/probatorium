@@ -244,6 +244,18 @@
             # at a 45-minute budget is 12 hours of its 24-hour window.
             PROBATORIUM_MATRIX_MAX_CONSECUTIVE_FAILURES: "{{ probatorium_matrix_max_consecutive_failures | default('') }}"
             PROBATORIUM_MATRIX_MAX_FAILED_CELLS: "{{ probatorium_matrix_max_failed_cells | default('') }}"
+            # The celeris#588 capture control's injected fault
+            # (debugvars/faults.go): every refapp the validator launches
+            # inherits it and the ones that implement it hold a lock on the
+            # named path at a known instant. Empty in every routine tier;
+            # set only by a matrix-nightly-tier dispatch with refapp_fault.
+            PROBATORIUM_REFAPP_FAULT: "{{ probatorium_refapp_fault | default('') }}"
+            # The same stall capture with NO injected fault (in-stall
+            # dossiers + the refapp's debug side listener): "1" turns it on
+            # (validation/liveness.go stallCaptureEnabled). Empty in every
+            # routine tier; set by a tier dispatched with stall_capture
+            # (celeris#588's release soak).
+            PROBATORIUM_STALL_CAPTURE: "{{ probatorium_stall_capture | default('') }}"
             # Driver-refapp backend addresses. The driver_postgres /
             # driver_redis / driver_memcached refapps look up these env
             # vars (or their -postgres-dsn / -redis-addr / -mc-addr
@@ -296,13 +308,25 @@
           changed_when: false
           when: validate_dbservices | default('') == '1'
 
+        # Each refapp leads a process group of its own (remote.Local,
+        # probatorium#415). When the validator overruns `async:`, ansible's
+        # async wrapper SIGKILLs the validator's process group, and that kill
+        # no longer reaches the refapps. This task is then what stops them, so
+        # it ends with SIGKILL as that kill did. The pattern covers every
+        # directory -matrix-bin-dir names: refapps, refapps-race (race tier)
+        # and refapps-checkptr (checkptr tier). pkill -f also matches the argv
+        # of the shell running this block, so the block itself must never
+        # spell a refapp path; the bracket keeps it from matching itself.
+        # workflow_validate_cleanup_test.go holds both rules.
         - name: Stop any leftover validator / refapp processes
           become: true
           ansible.builtin.shell: |
             pkill -x validator 2>/dev/null
             pkill -x validator-checker 2>/dev/null
             pkill -x validator-replay 2>/dev/null
-            pkill -f "[/]refapps/" 2>/dev/null
+            pkill -f "[/]refapps(-race|-checkptr)?/" 2>/dev/null
+            for i in 1 2 3 4 5; do pgrep -f "[/]refapps(-race|-checkptr)?/" > /dev/null || break; sleep 1; done
+            pkill -KILL -f "[/]refapps(-race|-checkptr)?/" 2>/dev/null
             true
           changed_when: false
 
