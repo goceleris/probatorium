@@ -117,20 +117,25 @@ func TestClusterTargetPlansOneJobPerHost(t *testing.T) {
 // The cluster runs code on bare metal as a user with sudo: only commits a
 // celeris maintainer pushed. A pull ref (anyone's fork) is refused there,
 // though it stays allowed on GitHub-hosted runners.
+// (memlock 8m throughout, so this isolates the ref rule from the memlock
+// default: the first failing-first run on the old code failed here on
+// memlock "default" before it reached the ref.)
 func TestClusterTargetRefusesPullRefs(t *testing.T) {
-	if code, log, _ := runPlan(t, map[string]string{"IN_CELERIS_REF": "refs/pull/674/head"}); code != 0 {
+	if code, log, _ := runPlan(t, map[string]string{"IN_CELERIS_REF": "refs/pull/674/head", "IN_MEMLOCK": "8m"}); code != 0 {
 		t.Fatalf("github refused a pull ref: %s", log)
 	}
-	code, log, _ := runPlan(t, map[string]string{"IN_TARGET": "cluster", "IN_CELERIS_REF": "refs/pull/674/head"})
+	code, log, _ := runPlan(t, map[string]string{"IN_TARGET": "cluster", "IN_CELERIS_REF": "refs/pull/674/head", "IN_MEMLOCK": "8m"})
 	if code != 2 || !strings.Contains(log, "refs/pull/674/head") {
 		t.Errorf("cluster accepted a pull ref: exit %d\n%s", code, log)
 	}
 }
 
-// Timing needs the cluster's exclusive hosts; on GitHub it is refused.
+// Timing needs the cluster's exclusive hosts; on GitHub it is refused, and
+// the refusal names that rule (memlock 8m, so the memlock default plays no
+// part; the old code accepted this dispatch outright).
 func TestTimingModeNeedsTheCluster(t *testing.T) {
-	code, log, _ := runPlan(t, map[string]string{"IN_MODE": "timing", "IN_CELERIS_REF": "A=" + testSHA + " B=" + branchSHA, "IN_SHARDS": "2"})
-	if code != 2 || !strings.Contains(log, "timing") {
+	code, log, _ := runPlan(t, map[string]string{"IN_MODE": "timing", "IN_SHARDS": "2", "IN_MEMLOCK": "8m"})
+	if code != 2 || !strings.Contains(log, "mode timing needs target cluster") {
 		t.Errorf("timing on github accepted: exit %d\n%s", code, log)
 	}
 }
