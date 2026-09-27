@@ -33,10 +33,14 @@
 # Exit status: 0 when every shard ran (the summary judges them), 1 when any
 # shard refused to run in the shape asked for.
 #
+# Each shard runs in its own session (setsid), and a watchdog kills that
+# session when the runner dir disappears (a lost runner's teardown); a cancel
+# is the runner's to handle, as on GitHub. It kills nothing else.
+#
 # Run, it runs main. Sourced (the tests do), it only defines its functions;
 # the tests point sysfs and procfs at fixtures (STRESS_SYSFS, STRESS_PROCFS)
 # and shorten the waits (STRESS_BUSY_SECONDS, STRESS_QUIET_SECONDS,
-# STRESS_QUIET_POLL). The workflow sets none of these.
+# STRESS_QUIET_POLL, STRESS_WATCHDOG_SECONDS). The workflow sets none of these.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -165,6 +169,29 @@ quiet_wait() {
 	done
 }
 
+# watch_runner PID SIDFILE: while PID (this script) lives, watch the runner
+# dir ($RUNNER_TEMP). A runner GitHub gave up on can keep running its job on
+# the host while the teardown kills the listener and deletes that dir;
+# nothing would then stop the running shard, which could run on into the
+# next cluster run for up to its -timeout (5h30m at most). Once the dir is
+# gone, kill the running shard's whole session (its id is in SIDFILE, which
+# lives in TMPDIR, outside the runner dir), then this script.
+watch_runner() {
+	local pid=$1 sidfile=$2 sid
+	while kill -0 "$pid" 2>/dev/null; do
+		if [ ! -d "$RUNNER_TEMP" ]; then
+			echo "::error::the runner dir $RUNNER_TEMP is gone (teardown ran while this job was still running): killing the shard" >&2
+			sid=$(cat "$sidfile" 2>/dev/null || true)
+			if [[ $sid =~ ^[0-9]+$ ]]; then
+				kill -KILL -- "-$sid" 2>/dev/null || true
+			fi
+			kill -TERM "$pid" 2>/dev/null || true
+			return
+		fi
+		sleep "${STRESS_WATCHDOG_SECONDS:-10}"
+	done
+}
+
 main() {
 	: "${STRESS_ARCH:?}" "${STRESS_HOST:?}" "${STRESS_MODE:?}" "${STRESS_SEQUENCE:?}" "${STRESS_CASE_SHAS:?}"
 	: "${STRESS_LOG_DIR:?}" "${STRESS_FACTS:?}" "${RUNNER_TEMP:?}"
@@ -200,8 +227,16 @@ main() {
 	export STRESS_CPUSET="$cpuset" STRESS_PERF="$perf_state" STRESS_QUIET="$quiet" STRESS_PRE_REFUSE="$pre_refuse"
 	export STRESS_OBS_WRAPPER="$here/obs.sh"
 
+	# Each shard runs in the foreground (so its signal dispositions are the
+	# GitHub target's) in a session of its own (setsid), whose id it writes
+	# to sidfile first, so the watchdog can kill all of it: shard.sh, go test,
+	# the test binary and anything that started.
+	local sidfile="$TMPDIR/stress-shard.sid"
+	watch_runner "$$" "$sidfile" &
+	local watchdog=$!
+
 	local -a seq
-	local refused=0 i=0 tok c shard shuffle
+	local refused=0 i=0 tok c shard shuffle rc
 	read -r -a seq <<<"$STRESS_SEQUENCE"
 	for tok in "${seq[@]}"; do
 		i=$((i + 1))
@@ -211,12 +246,17 @@ main() {
 		fi
 		c=${BASH_REMATCH[1]} shard=${BASH_REMATCH[2]} shuffle=${BASH_REMATCH[3]}
 		echo "=== [$i/${#seq[@]}] case $c shard $shard (-shuffle=$shuffle)"
+		rc=0
+		# shellcheck disable=SC2016 # $$, $1 and $2 are the inner shell's
 		STRESS_CASE=$c STRESS_SHARD=$shard STRESS_SHUFFLE=$shuffle STRESS_OBS_SEQ=$i \
 			STRESS_CELERIS_SHA=${sha_of[$c]:?no commit for case $c} STRESS_CELERIS_REF=${ref_of[$c]-} \
 			STRESS_CELERIS_DIR="celeris-$c" STRESS_LOG="$STRESS_LOG_DIR/${c}__${STRESS_ARCH}__${shard}.log" \
-			bash "$here/shard.sh" || refused=$((refused + 1))
+			setsid bash -c 'printf %s "$$" >"$1" && exec bash "$2"' _ "$sidfile" "$here/shard.sh" || rc=$?
+		rm -f "$sidfile"
+		[ "$rc" = 0 ] || refused=$((refused + 1))
 		note "$(date -u +%H:%M:%SZ) [$i/${#seq[@]}] $c shard $shard: $(tail -n 1 "$STRESS_LOG_DIR/${c}__${STRESS_ARCH}__${shard}.log" 2>/dev/null || echo no log)"
 	done
+	kill "$watchdog" 2>/dev/null || true
 
 	snapshot "after the last shard"
 	if [ "$refused" -gt 0 ]; then
