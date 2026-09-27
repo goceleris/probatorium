@@ -767,10 +767,43 @@ func isInfraDriveIncident(inc Incident) bool {
 // infra-flake records. Same shape as handleIncident's dossier dir
 // so postmortem tooling can read both with one walker.
 func infraIncidentDir(outDir string, inc Incident) string {
-	ts := time.Now().UTC().Format("20060102-150405")
-	dir := filepath.Join(outDir, "incidents", ts+"-"+inc.PredicateID)
-	_ = os.MkdirAll(dir, 0o755)
+	dir, err := newIncidentDir(outDir, inc.PredicateID)
+	if err != nil {
+		// Best-effort, as before: the caller writes incident.json into it.
+		dir = filepath.Join(outDir, "incidents", time.Now().UTC().Format("20060102-150405")+"-"+inc.PredicateID)
+		_ = os.MkdirAll(dir, 0o755)
+	}
 	return dir
+}
+
+// newIncidentDir creates a NEW directory for one incident under
+// <outDir>/incidents: <UTC second>-<predicate>, or, when that exists
+// already, <UTC second>.<n>-<predicate> for the first free n >= 2. Two
+// incidents of one predicate in one second used to share the first name,
+// and the second's files overwrote the first's; the in-stall hook sends
+// such pairs routinely (celeris#588 round-2 container run). The name still
+// ends in -<predicate> and still sorts by time.
+func newIncidentDir(outDir, predicate string) (string, error) {
+	parent := filepath.Join(outDir, "incidents")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", err
+	}
+	ts := time.Now().UTC().Format("20060102-150405")
+	for n := 1; n <= 1000; n++ {
+		name := ts + "-" + predicate
+		if n > 1 {
+			name = ts + "." + strconv.Itoa(n) + "-" + predicate
+		}
+		dir := filepath.Join(parent, name)
+		err := os.Mkdir(dir, 0o755)
+		if err == nil {
+			return dir, nil
+		}
+		if !os.IsExist(err) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("incident dossier: 1000 dossiers named %s-%s already", ts, predicate)
 }
 
 // Incident is one invariant violation. Captured by the validator-
@@ -1419,6 +1452,16 @@ const forensicsBudget = 30 * time.Second
 // a host under sustained slow reads cannot spend its cell on forensics.
 const stallDossiersPerKind = 4
 
+// stallDossierCooldown is how long after an in-stall dossier of one kind the
+// next trigger of that kind is ignored (celeris#588 round 2). Every read that
+// started at a stall's onset crosses the threshold within the same
+// millisecond, and the orchestrator drains the channel between their timer
+// callbacks, so without it one stall took several dossiers and spent the
+// kind's budget on a single moment: the adaptive cell of the round-2
+// container run had no h2c budget left when the / hold began. A later
+// episode of the same kind, seconds apart, still gets its own dossier.
+const stallDossierCooldown = 2 * time.Second
+
 // offerOnce sends inc on ch unless inc.PredicateID already produced an
 // incident this run (alerted), and marks it only when the send happened.
 // It never blocks: a full channel -- the orchestrator is busy with a
@@ -1454,22 +1497,35 @@ func walkerStallHook(getenv func(string) string, violations chan<- Incident, pid
 // (celeris#588): a walker read that has waited past its stall threshold
 // with no byte back takes a record-only dossier NOW, while the stall is
 // still in force -- the one place a goroutine dump can still show who holds
-// what. At most perKind dossiers per walker kind per cell. It never blocks
-// the walker's timer goroutine: a full violations channel drops the attempt,
-// and a dropped attempt gives its slot back, so the budget counts dossiers
+// what. At most perKind dossiers per walker kind per cell, and at most one
+// per kind per stallDossierCooldown: a burst of triggers from one stall is
+// one dossier. It never blocks the walker's timer goroutine: a full
+// violations channel drops the attempt, and a dropped attempt gives back
+// both its budget slot and the cooldown, so the budget counts dossiers
 // taken, not attempts. Safe for concurrent calls (one timer goroutine per
 // stalled read).
 func newStallDossierHook(violations chan<- Incident, pid func() int, perKind int32) func(kind string) {
 	var taken [2]atomic.Int32
+	var last [2]atomic.Int64 // unix nanos of the kind's last dossier taken; 0 = none
 	return func(kind string) {
 		i, spec, what, th := 0, properties.IH2CStall, "h2c preamble read", h2cStallThreshold
 		if kind == "ws" {
 			i, spec, what, th = 1, properties.IWSStall, "WebSocket handshake read", wsStallThreshold
 		}
-		// Reserve a slot first, so concurrent stalls cannot overshoot the
-		// bound; give it back if the send does not happen.
+		// Claim the cooldown window first (compare-and-swap, so of a burst
+		// of concurrent triggers exactly one proceeds), then a budget slot;
+		// give both back if the send does not happen.
+		now := stallHookNow().UnixNano()
+		prev := last[i].Load()
+		if prev != 0 && now-prev < int64(stallDossierCooldown) {
+			return
+		}
+		if !last[i].CompareAndSwap(prev, now) {
+			return // another trigger of this burst won the window
+		}
 		if taken[i].Add(1) > perKind {
 			taken[i].Add(-1)
+			last[i].CompareAndSwap(now, prev)
 			return
 		}
 		select {
@@ -1484,16 +1540,19 @@ func newStallDossierHook(violations chan<- Incident, pid func() int, perKind int
 		}:
 		default:
 			taken[i].Add(-1)
+			last[i].CompareAndSwap(now, prev)
 		}
 	}
 }
 
+// stallHookNow is the in-stall hook's clock; a variable so a test can step it.
+var stallHookNow = time.Now
+
 // writeIncidentDossier creates the per-incident directory and writes
 // incident.json into it. Returns the directory.
 func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
-	ts := time.Now().UTC().Format("20060102-150405")
-	dir := filepath.Join(o.cfg.OutDir, "incidents", ts+"-"+inc.PredicateID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir, err := newIncidentDir(o.cfg.OutDir, inc.PredicateID)
+	if err != nil {
 		return "", err
 	}
 	dossier := map[string]any{

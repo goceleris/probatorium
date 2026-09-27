@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The seams probatorium#412's review round added to runner.go / liveness.go:
@@ -71,15 +72,22 @@ func TestOfferOnceRetriesADroppedIncident(t *testing.T) {
 }
 
 // The in-stall dossier budget counts dossiers TAKEN, not attempts: an
-// attempt a busy loop dropped gives its slot back. And the bound holds when
-// the stall timers of many reads fire at once.
+// attempt a busy loop dropped gives its slot (and its cooldown) back. The
+// bound holds across stall episodes, and concurrent triggers of one burst
+// take one dossier.
 func TestStallDossierHookBudgetCountsTakenDossiers(t *testing.T) {
+	clock := time.Date(2026, 9, 27, 4, 0, 0, 0, time.UTC)
+	prev := stallHookNow
+	stallHookNow = func() time.Time { return clock }
+	t.Cleanup(func() { stallHookNow = prev })
+	next := func() { clock = clock.Add(stallDossierCooldown + time.Second) } // a later stall episode
+
 	ch := make(chan Incident, 1)
 	hook := newStallDossierHook(ch, func() int { return 4242 }, 1)
 	ch <- Incident{PredicateID: "I-WS-HANDSHAKE"} // busy
 	hook("ws")                                    // dropped
 	<-ch
-	hook("ws")
+	hook("ws") // same instant: the dropped attempt gave its cooldown back too
 	select {
 	case inc := <-ch:
 		if inc.PredicateID != "I-WS-STALL" || !inc.RecordOnly || !inc.SkipCore || inc.RefappPID != 4242 {
@@ -88,26 +96,45 @@ func TestStallDossierHookBudgetCountsTakenDossiers(t *testing.T) {
 	default:
 		t.Fatal("a dropped attempt spent the kind's only dossier: the next stall took none")
 	}
+	next()
 	hook("ws")
 	if len(ch) != 0 {
 		t.Fatal("the bound of 1 ws dossier was exceeded")
 	}
-	hook("h2c") // the other kind has its own budget
+	hook("h2c") // the other kind has its own budget and cooldown
 	if inc := <-ch; inc.PredicateID != "I-H2C-STALL" {
 		t.Fatalf("h2c stall dossier %+v", inc)
 	}
 
-	// Concurrent timers: never more than perKind sends.
+	// Episodes: never more than perKind dossiers in all.
 	big := make(chan Incident, 64)
 	hook = newStallDossierHook(big, func() int { return 1 }, 4)
-	var wg sync.WaitGroup
-	for range 32 {
-		wg.Add(1)
-		go func() { defer wg.Done(); hook("ws") }()
+	for range 8 {
+		next()
+		hook("ws")
 	}
-	wg.Wait()
 	if n := len(big); n != 4 {
-		t.Fatalf("32 concurrent stalls took %d ws dossiers, want exactly 4", n)
+		t.Fatalf("8 stall episodes took %d ws dossiers, want exactly 4", n)
+	}
+
+	// Bursts of concurrent triggers, released together: one dossier each.
+	// The cooldown window is claimed by compare-and-swap; a check-then-store
+	// lets two triggers of one burst both through.
+	for b := range 200 {
+		burst := make(chan Incident, 64)
+		hook := newStallDossierHook(burst, func() int { return 1 }, 4)
+		next()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 64 {
+			wg.Add(1)
+			go func() { defer wg.Done(); <-start; hook("ws") }()
+		}
+		close(start)
+		wg.Wait()
+		if n := len(burst); n != 1 {
+			t.Fatalf("burst %d: 64 concurrent triggers of one stall took %d ws dossiers, want 1", b, n)
+		}
 	}
 }
 
