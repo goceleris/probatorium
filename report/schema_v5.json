@@ -233,7 +233,15 @@
         "goroutine_hwm": { "type": ["integer", "null"] },
         "fd_hwm": { "type": ["integer", "null"] },
         "mean_soft_pct": { "type": ["number", "null"], "description": "Mean mpstat %soft (softirq) over the window (v5.9+, per-scenario slices only)." },
-        "sut_process_cpu_pct": { "type": ["number", "null"], "description": "SUT process utime+stime over the window as percent of ONE core (v5.9+, per-scenario slices only; 3200 = all 32 cores). Needs an observer that records cpu ticks." }
+        "sut_process_cpu_pct": { "type": ["number", "null"], "description": "SUT process utime+stime over the window as percent of ONE core (v5.9+, per-scenario slices only; 3200 = all 32 cores). Needs an observer that records cpu ticks." },
+        "mean_iowait_pct": { "type": ["number", "null"], "description": "Mean mpstat %iowait over the rows that carried the column (v5.17+, celeris#585). Null when the cpu.log had no %iowait column." },
+        "mean_cpu_ex_iowait_pct": { "type": ["number", "null"], "description": "Mean of (100 - %idle - %iowait) over the same rows as mean_iowait_pct: host CPU that was executing, comparable across io_uring and epoll columns (v5.17+, celeris#585). mean_cpu_pct stays the mean over every CPU row." },
+        "zc_sends_submitted": { "type": ["integer", "null"], "description": "SUT engine SEND_ZC submits over the window: the delta between the first and last observer samples that published the counter (v5.17+, celeris#585). Null unless at least two samples published it and it never decreased; 0 is a reading." },
+        "zc_notifs": { "type": ["integer", "null"], "description": "SUT engine SEND_ZC notifications over the window (v5.17+, celeris#585); same delta rule as zc_sends_submitted." },
+        "inline_bytes": { "type": ["integer", "null"], "description": "Bytes the SUT's detached streams wrote with a raw write(2), never zero-copy, over the window (v5.17+, celeris#585); same delta rule as zc_sends_submitted." },
+        "ring_bytes": { "type": ["integer", "null"], "description": "Bytes the SUT's io_uring ring sent over the window (v5.17+, celeris#585); same delta rule as zc_sends_submitted." },
+        "bytes_written": { "type": ["integer", "null"], "description": "Total bytes the SUT engine wrote over the window (v5.17+, celeris#585); same delta rule as zc_sends_submitted." },
+        "ring_bytes_fraction": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "description": "ring_bytes / (inline_bytes + ring_bytes) (v5.17+, celeris#585). Null when either is null or both are 0." }
       }
     },
     "resourcePoint": {
