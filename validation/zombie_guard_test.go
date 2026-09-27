@@ -38,8 +38,8 @@ import (
 const zombieGuardBound = 0
 
 // zombieGuardSettle bounds how long the guard re-samples before it decides.
-// It returns at the first sample at or under the bound, so a clean package
-// pays one sample.
+// It passes at the first sample with no zombie and no child still running, so
+// a clean package pays one sample.
 const zombieGuardSettle = 10 * time.Second
 
 // childLister lists a process's children, live or zombie, as PID -> state
@@ -80,6 +80,18 @@ func zombiesIn(kids map[int]string) []int {
 	var pids []int
 	for pid, state := range kids {
 		if strings.HasPrefix(state, "Z") {
+			pids = append(pids, pid)
+		}
+	}
+	slices.Sort(pids)
+	return pids
+}
+
+// runningIn returns the PIDs in kids that have not exited, sorted.
+func runningIn(kids map[int]string) []int {
+	var pids []int
+	for pid, state := range kids {
+		if !strings.HasPrefix(state, "Z") {
 			pids = append(pids, pid)
 		}
 	}
@@ -168,12 +180,20 @@ func zombieGuard(w io.Writer) int {
 	return runZombieGuard(w, os.Getpid(), childProcesses, zombieGuardSettle)
 }
 
-// runZombieGuard re-samples list until the zombie count is at or under
-// zombieGuardBound or settle has passed, writes one verdict line to w, and
-// returns the exit code the package should get: 0 to pass, 1 to fail. It
-// fails closed: a list that cannot be taken is a FAIL, because a guard that
-// cannot count cannot show that nothing was left unreaped, and a skip inside
-// TestMain would print nothing under a plain `go test` and read as a pass.
+// runZombieGuard re-samples list until this binary has no zombie child and
+// no child still running, or settle has passed; writes one verdict line to w;
+// and returns the exit code the package should get: 0 to pass, 1 to fail.
+//
+// A child that is still running counts as well. Once m.Run has returned every
+// test and its cleanups are done, so a child that has not been reaped is one
+// nobody will reap: if it has not exited yet, it becomes a zombie a moment
+// later. Deciding on zombies alone passed a package whose last test left a
+// child that had not quite exited when the guard took its first sample.
+//
+// It fails closed: a list that cannot be taken is a FAIL, because a guard
+// that cannot count cannot show that nothing was left unreaped, and a skip
+// inside TestMain would print nothing under a plain `go test` and read as a
+// pass.
 func runZombieGuard(w io.Writer, self int, list func() (map[int]string, string, error), settle time.Duration) int {
 	deadline := time.Now().Add(settle)
 	for samples := 1; ; samples++ {
@@ -182,23 +202,31 @@ func runZombieGuard(w io.Writer, self int, list func() (map[int]string, string, 
 			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, could not count this binary's child processes, so it cannot show that none was left unreaped: %v\n", err)
 			return 1
 		}
-		pids := zombiesIn(kids)
-		if len(pids) <= zombieGuardBound {
-			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): PASS, %d unreaped children of this test binary (pid %d), listed via %s after %d sample(s) (bound %d)\n",
-				len(pids), self, source, samples, zombieGuardBound)
+		zombies, running := zombiesIn(kids), runningIn(kids)
+		if len(zombies) <= zombieGuardBound && len(running) == 0 {
+			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): PASS, %d unreaped children of this test binary (pid %d) and none still running, listed via %s after %d sample(s) (bound %d)\n",
+				len(zombies), self, source, samples, zombieGuardBound)
 			return 0
 		}
 		if time.Now().After(deadline) {
-			shown := pids
-			if len(shown) > 20 {
-				shown = shown[:20]
+			if len(zombies) > zombieGuardBound {
+				_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, %d exited children of this test binary (pid %d) were never reaped after %s, listed via %s (bound %d); first pids: %v. Something Start()ed a process and never Wait()ed it.\n",
+					len(zombies), self, settle, source, zombieGuardBound, first20(zombies))
+				return 1
 			}
-			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, %d exited children of this test binary (pid %d) were never reaped after %s, listed via %s (bound %d); first pids: %v. Something Start()ed a process and never Wait()ed it.\n",
-				len(pids), self, settle, source, zombieGuardBound, shown)
+			_, _ = fmt.Fprintf(w, "zombie guard (probatorium#415): FAIL, %d children of this test binary (pid %d) were still running %s after the last test, listed via %s; first pids: %v. Something Start()ed a process and neither stopped nor Wait()ed it.\n",
+				len(running), self, settle, source, first20(running))
 			return 1
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func first20(pids []int) []int {
+	if len(pids) > 20 {
+		return pids[:20]
+	}
+	return pids
 }
 
 // TestZombieGuard_ParsesProcStat: the Linux path reads state and PPID from
@@ -238,7 +266,9 @@ func TestZombieGuard_ParsesPS(t *testing.T) {
 // TestZombieGuard_Verdicts: the guard's decision on its own, with the
 // children list stubbed. A list it cannot take FAILS (fail closed); a zombie
 // that outlasts the settle window FAILS; one that is reaped inside it PASSES;
-// every verdict is printed with the lister that produced it.
+// a child still running when the guard starts is waited out, and FAILS if it
+// exits unreaped or is still running at the end; every verdict is printed
+// with the lister that produced it.
 func TestZombieGuard_Verdicts(t *testing.T) {
 	const self = 500
 	listed := func(steps ...map[int]string) func() (map[int]string, string, error) {
@@ -268,16 +298,34 @@ func TestZombieGuard_Verdicts(t *testing.T) {
 			wantLine: "FAIL, 1 exited children of this test binary (pid 500) were never reaped after 300ms, listed via stub (bound 0); first pids: [900]",
 		},
 		{
-			name:     "a zombie is reaped inside the settle window",
-			list:     listed(map[int]string{900: "Z"}, map[int]string{900: "Z"}, map[int]string{901: "S"}),
+			name:     "a child still running at the first sample exits unreaped",
+			list:     listed(map[int]string{900: "S"}, map[int]string{900: "Z"}),
+			wantCode: 1,
+			wantLine: "FAIL, 1 exited children of this test binary (pid 500) were never reaped after 300ms, listed via stub (bound 0); first pids: [900]",
+		},
+		{
+			name:     "a child is still running at the end of the settle window",
+			list:     listed(map[int]string{900: "S"}),
+			wantCode: 1,
+			wantLine: "FAIL, 1 children of this test binary (pid 500) were still running 300ms after the last test, listed via stub; first pids: [900]",
+		},
+		{
+			name:     "a running child is reaped inside the settle window",
+			list:     listed(map[int]string{900: "R"}, map[int]string{}),
 			wantCode: 0,
-			wantLine: "PASS, 0 unreaped children of this test binary (pid 500), listed via stub after 3 sample(s) (bound 0)",
+			wantLine: "PASS, 0 unreaped children of this test binary (pid 500) and none still running, listed via stub after 2 sample(s) (bound 0)",
+		},
+		{
+			name:     "a zombie is reaped inside the settle window",
+			list:     listed(map[int]string{900: "Z"}, map[int]string{900: "Z"}, map[int]string{}),
+			wantCode: 0,
+			wantLine: "PASS, 0 unreaped children of this test binary (pid 500) and none still running, listed via stub after 3 sample(s) (bound 0)",
 		},
 		{
 			name:     "no children at all",
 			list:     listed(map[int]string{}),
 			wantCode: 0,
-			wantLine: "PASS, 0 unreaped children of this test binary (pid 500), listed via stub after 1 sample(s) (bound 0)",
+			wantLine: "PASS, 0 unreaped children of this test binary (pid 500) and none still running, listed via stub after 1 sample(s) (bound 0)",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
