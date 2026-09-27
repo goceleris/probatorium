@@ -14,9 +14,9 @@ import (
 
 // startHeld builds a refapp-shaped server on engine e (NewServer, so Mount
 // and its side listener run exactly as in a refapp) with a hold on /slow,
-// starts it, and returns its base URL. The hold starts holdAt after the
-// server answers.
-func startHeld(t *testing.T, e celeris.EngineType, workers int, spec string) (dv *Vars, base string, log *syncBuf) {
+// starts it, and returns its base URL, the fault log and the holds. The
+// hold starts holdAt after the server answers.
+func startHeld(t *testing.T, e celeris.EngineType, workers int, spec string) (dv *Vars, base string, log *syncBuf, holds []*FaultHold) {
 	t.Helper()
 	holds, err := ParseFaults(spec)
 	if err != nil {
@@ -51,7 +51,7 @@ func startHeld(t *testing.T, e celeris.EngineType, workers int, spec string) (dv
 	}
 	log = &syncBuf{}
 	StartFaults(holds, time.Now(), log)
-	return dv, base, log
+	return dv, base, log, holds
 }
 
 // getDump fetches a text goroutine dump with a client timeout.
@@ -79,7 +79,7 @@ func TestDebugListenerFromEnv(t *testing.T) {
 	t.Cleanup(func() { debugBannerOut = prev })
 
 	t.Setenv(DebugAddrEnv, "127.0.0.1:0")
-	dv, base, _ := startHeld(t, celeris.Std, 0, "/slow:1500ms@100ms")
+	dv, base, log, holds := startHeld(t, celeris.Std, 0, "/slow:1500ms@100ms")
 	side := dv.DebugAddr()
 	if side == "" {
 		t.Fatalf("%s set, but Mount bound no side listener", DebugAddrEnv)
@@ -90,9 +90,9 @@ func TestDebugListenerFromEnv(t *testing.T) {
 	if side == strings.TrimPrefix(base, "http://") {
 		t.Fatalf("side listener %s is the engine's own address", side)
 	}
-	time.Sleep(250 * time.Millisecond) // inside the hold (100 ms .. 1600 ms)
+	waitUntil(t, "the hold to start", 5*time.Second, func() bool { return strings.Contains(log.String(), "[fault] hold path=/slow") })
 	go func() { _, _ = (&http.Client{Timeout: 5 * time.Second}).Get(base + "/slow") }()
-	time.Sleep(150 * time.Millisecond)
+	waitUntil(t, "the /slow request to block on the hold", time.Second, func() bool { return holds[0].waiters.Load() >= 1 })
 	dump, d, err := getDump("http://"+side, 2*time.Second)
 	if err != nil {
 		t.Fatalf("side listener dump inside the hold: %v", err)

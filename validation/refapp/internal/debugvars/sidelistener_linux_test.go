@@ -26,8 +26,8 @@ func TestDebugListenerAnswersWhileEveryLoopIsParked(t *testing.T) {
 	t.Setenv(DebugAddrEnv, "127.0.0.1:0")
 
 	const loops = 2
-	dv, base, _ := startHeld(t, celeris.Epoll, loops, "/slow:3s@100ms")
-	time.Sleep(250 * time.Millisecond) // inside the hold (100 ms .. 3100 ms)
+	dv, base, log, holds := startHeld(t, celeris.Epoll, loops, "/slow:3s@100ms")
+	waitUntil(t, "the hold to start", 5*time.Second, func() bool { return strings.Contains(log.String(), "[fault] hold path=/slow") })
 
 	// Enough held requests that every loop accepts one and parks on it.
 	var wg sync.WaitGroup
@@ -41,7 +41,10 @@ func TestDebugListenerAnswersWhileEveryLoopIsParked(t *testing.T) {
 		}()
 	}
 	t.Cleanup(wg.Wait)
-	time.Sleep(300 * time.Millisecond)
+	// Every loop parked: a parked loop holds exactly one blocked request,
+	// so `loops` requests blocked in the hold means none is left to answer.
+	// Bounded well inside the 3 s hold, so the checks below still run in it.
+	waitUntil(t, "a request blocked on every loop", 1500*time.Millisecond, func() bool { return holds[0].waiters.Load() >= loops })
 
 	if _, d, err := getDump(base, 800*time.Millisecond); err == nil {
 		t.Fatalf("premise: the engine answered /debug/pprof in %s with every loop held -- the wedge did not reproduce here", d)

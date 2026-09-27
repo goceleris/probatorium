@@ -50,6 +50,22 @@ func (s *syncBuf) String() string {
 	return s.b.String()
 }
 
+// waitUntil polls cond every 5 ms until it holds, and fails the test if it
+// has not within bound. Tests wait for the state they need, never for a
+// wall-clock interval (.coderabbit.yaml; probatorium#412 review).
+func waitUntil(t *testing.T, what string, bound time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %s waiting for %s", bound, what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// timedGet GETs url and fails the test on an error. It calls t.Fatalf, so
+// only from the test's own goroutine.
 func timedGet(t *testing.T, url string) (time.Duration, int) {
 	t.Helper()
 	start := time.Now()
@@ -102,11 +118,24 @@ func TestFaultHoldStallsOnlyItsPath(t *testing.T) {
 	}
 	var log syncBuf
 	StartFaults(holds, time.Now(), &log)
-	time.Sleep(300 * time.Millisecond) // inside the hold (150 ms .. 1050 ms)
+	waitUntil(t, "the hold to start", 5*time.Second, func() bool { return strings.Contains(log.String(), "[fault] hold path=/slow") })
 
+	// Not timedGet: t.Fatalf from this goroutine would leave slowDone
+	// unsent and hang the test until the binary's timeout.
 	slowDone := make(chan time.Duration, 1)
-	go func() { d, _ := timedGet(t, base+"/slow"); slowDone <- d }()
-	time.Sleep(100 * time.Millisecond)
+	go func() {
+		start := time.Now()
+		resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(base + "/slow")
+		if err != nil {
+			t.Errorf("GET /slow: %v", err)
+			slowDone <- -1
+			return
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		slowDone <- time.Since(start)
+	}()
+	waitUntil(t, "the /slow request to block on the hold", 5*time.Second, func() bool { return holds[0].waiters.Load() >= 1 })
 
 	if d, code := timedGet(t, base+"/fast"); code != 200 || d > 300*time.Millisecond {
 		t.Errorf("/fast during the hold: %d in %s, want 200 promptly", code, d)
@@ -125,10 +154,10 @@ func TestFaultHoldStallsOnlyItsPath(t *testing.T) {
 			t.Errorf("goroutine dump taken inside the hold lacks %s (%d bytes)", frame, len(dump))
 		}
 	}
-	if d := <-slowDone; d < 450*time.Millisecond {
-		t.Errorf("/slow returned in %s, want it held until the release (~650 ms after it was sent)", d)
+	if d := <-slowDone; d >= 0 && d < 450*time.Millisecond {
+		t.Errorf("/slow returned in %s, want it held until the release (up to 900 ms after it was sent)", d)
 	}
-	time.Sleep(100 * time.Millisecond)
+	waitUntil(t, "the release line", 5*time.Second, func() bool { return strings.Contains(log.String(), "[fault] release path=/slow") })
 	out := log.String()
 	if !strings.Contains(out, "[fault] hold path=/slow hold=900ms start=") || !strings.Contains(out, "[fault] release path=/slow end=") {
 		t.Errorf("fault log lacks the hold / release ground truth:\n%s", out)
