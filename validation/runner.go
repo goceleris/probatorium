@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -1601,7 +1602,16 @@ func walkerStallHook(getenv func(string) string, violations chan<- Incident, pid
 // stalled read).
 func newStallDossierHook(violations chan<- Incident, pid func() int, perKind int32) func(kind string) {
 	var taken [2]atomic.Int32
-	var last [2]atomic.Int64 // unix nanos of the kind's last dossier taken; 0 = none
+	// last is when the kind's last dossier was taken, in nanoseconds since
+	// epoch; noDossier = none. Measured with time.Time.Sub between readings
+	// that carry the monotonic clock, not with wall-clock UnixNano: a wall
+	// clock stepped back by X would make now-prev negative and suppress the
+	// kind's dossiers for ~X+cooldown (probatorium#412 review round 3).
+	const noDossier = math.MinInt64
+	var last [2]atomic.Int64
+	last[0].Store(noDossier)
+	last[1].Store(noDossier)
+	epoch := stallHookNow()
 	return func(kind string) {
 		i, spec, what, th := 0, properties.IH2CStall, "h2c preamble read", h2cStallThreshold
 		if kind == "ws" {
@@ -1610,9 +1620,9 @@ func newStallDossierHook(violations chan<- Incident, pid func() int, perKind int
 		// Claim the cooldown window first (compare-and-swap, so of a burst
 		// of concurrent triggers exactly one proceeds), then a budget slot;
 		// give both back if the send does not happen.
-		now := stallHookNow().UnixNano()
+		now := int64(stallHookNow().Sub(epoch))
 		prev := last[i].Load()
-		if prev != 0 && now-prev < int64(stallDossierCooldown) {
+		if prev != noDossier && now-prev < int64(stallDossierCooldown) {
 			return
 		}
 		if !last[i].CompareAndSwap(prev, now) {
