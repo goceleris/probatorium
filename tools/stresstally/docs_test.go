@@ -37,20 +37,27 @@ func workflowDefaults(t *testing.T) map[string]string {
 			out[name] = strings.Trim(m[1], `"`)
 		}
 	}
-	if len(out) != 10 {
-		t.Fatalf("read %d defaults, want 10: %v", len(out), out)
+	if len(out) != 13 {
+		t.Fatalf("read %d defaults, want 13: %v", len(out), out)
 	}
 	return out
 }
 
 func inputsOf(m map[string]string) Inputs {
 	return Inputs{CelerisRef: m["celeris_ref"], Packages: m["packages"], Run: m["run"], Count: m["count"], Shards: m["shards"],
-		Arches: m["arches"], Memlock: m["memlock"], Race: m["race"], Timeout: m["timeout"], Extra: m["extra"]}
+		Arches: m["arches"], Memlock: m["memlock"], Race: m["race"], Timeout: m["timeout"], Extra: m["extra"],
+		Target: m["target"], Mode: m["mode"], Timing: m["timing"]}
 }
 
+// The defaults are a valid dispatch, and still today's: GitHub-hosted, stress,
+// celeris CI's 8 MiB memlock.
 func TestWorkflowDefaultsAreAValidDispatch(t *testing.T) {
-	if _, err := planDispatch(inputsOf(workflowDefaults(t))); err != nil {
-		t.Errorf("the dispatch defaults are refused: %v", err)
+	p, err := planDispatch(inputsOf(workflowDefaults(t)))
+	if err != nil {
+		t.Fatalf("the dispatch defaults are refused: %v", err)
+	}
+	if p.IsCluster() || p.IsTiming() || p.Cases[0].Memlock != "8m" {
+		t.Errorf("the defaults plan target cluster %v, timing %v, memlock %s; want github, stress, 8m", p.IsCluster(), p.IsTiming(), p.Cases[0].Memlock)
 	}
 }
 

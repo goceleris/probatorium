@@ -253,7 +253,8 @@ func TestSelfTestTakesTheDispatchPath(t *testing.T) {
 		t.Errorf("fail case %+v: want count 2 and the require variable parsed out of IN_EXTRA", fail)
 	}
 	// Every self-test input is a key the workflow passes, and no other.
-	want := []string{"IN_ARCHES", "IN_CELERIS_REF", "IN_COUNT", "IN_EXTRA", "IN_MEMLOCK", "IN_PACKAGES", "IN_RACE", "IN_RUN", "IN_SHARDS", "IN_TIMEOUT"}
+	want := []string{"IN_ARCHES", "IN_CELERIS_REF", "IN_COUNT", "IN_EXTRA", "IN_MEMLOCK", "IN_MODE", "IN_PACKAGES", "IN_RACE", "IN_RUN",
+		"IN_SHARDS", "IN_TARGET", "IN_TIMEOUT", "IN_TIMING"}
 	for _, st := range selfTests() {
 		if keys := slices.Sorted(maps.Keys(st.inputs)); !slices.Equal(keys, want) {
 			t.Errorf("case %s inputs %v, want exactly %v", st.name, keys, want)
@@ -355,7 +356,8 @@ func TestCmdPlanWritesSingleLineOutputs(t *testing.T) {
 	}
 	b, _ := os.ReadFile(out)
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	if len(lines) != 3 || !strings.HasPrefix(lines[0], "plan=") || !strings.HasPrefix(lines[1], "matrix=") || lines[2] != "celeris_ref=main" {
+	if len(lines) != 6 || !strings.HasPrefix(lines[0], "plan=") || !strings.HasPrefix(lines[1], "matrix=") || lines[2] != "celeris_ref=main" ||
+		lines[3] != "target=github" || lines[4] != "mode=stress" || lines[5] != "refs=stress=main" {
 		t.Fatalf("outputs:\n%s", b)
 	}
 	var m struct{ Include []Entry }

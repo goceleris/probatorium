@@ -73,6 +73,19 @@ type ShardReport struct {
 	Nproc      string   `json:"nproc"`
 	CelerisSHA string   `json:"celeris_sha"`
 	GoVersion  string   `json:"go_version"`
+	// Host facts, recorded by shard.sh on every target and shown for the
+	// cluster (on GitHub the runner is a fresh VM each time).
+	Host       string `json:"host,omitempty"`
+	CPUModel   string `json:"cpu_model,omitempty"`
+	Governor   string `json:"governor,omitempty"`
+	LoadBefore string `json:"loadavg_before,omitempty"`
+	LoadAfter  string `json:"loadavg_after,omitempty"`
+	CPUSet     string `json:"cpuset,omitempty"`
+	Perf       string `json:"perf,omitempty"`
+	// Observations is the number of stress-obs lines (timing: exactly one).
+	Observations int `json:"observations,omitempty"`
+	// obs are those lines, for observations.tsv; not part of report.json.
+	obs []map[string]string
 }
 
 // TestRow is one test (subtests included) on one arch.
@@ -178,6 +191,13 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 			sr.Exit, sr.Elapsed, sr.Races, sr.TimedOut, sr.Notes = sl.exit, sl.elapsed, sl.races, sl.timedOut, sl.notes
 			sr.Shuffle, sr.Kernel, sr.Image, sr.Memlock = h["shuffle"], h["kernel"], h["image"], h["memlock_in_force"]
 			sr.Nproc, sr.CelerisSHA, sr.GoVersion = h["nproc"], h["celeris_sha"], h["go_version"]
+			sr.Host, sr.CPUModel, sr.Governor, sr.LoadBefore = h["host"], h["cpu_model"], h["governor"], h["loadavg_before"]
+			sr.LoadAfter, sr.CPUSet, sr.Perf, sr.Observations, sr.obs = sl.after["loadavg"], h["cpuset"], h["perf"], len(sl.obs), sl.obs
+			if c.Mode == "timing" && len(sl.obs) != 1 && sl.refused == "" {
+				// One process per observation: a timing shard that ran go
+				// test must carry exactly one observation of the binary.
+				sr.Notes = append(sr.Notes, fmt.Sprintf("%d observation line(s), want 1: the test binary did not run exactly once", len(sl.obs)))
+			}
 			sr.Reasons = append(sr.Reasons, sl.reasons...)
 			shape := checkShape(h, c, arch, shard, celerisSHA)
 			switch {
@@ -421,6 +441,18 @@ func checkShape(h map[string]string, c Case, arch string, shard int, celerisSHA 
 	}
 	if c.Shuffle != "" {
 		want("shuffle", c.Shuffle)
+	}
+	// The cluster: the right bare-metal host, and for a timing the asked-for
+	// pinning and PMU rule (shard.sh refuses an observation it cannot give
+	// them; this catches a log that claims another shape).
+	if c.Target == "cluster" {
+		want("target", "cluster")
+		want("host", clusterHosts[arch])
+	}
+	if c.Mode == "timing" {
+		want("mode", "timing")
+		want("cpus_asked", strconv.Itoa(c.CPUs))
+		want("pmu_asked", c.PMU)
 	}
 	return bad
 }

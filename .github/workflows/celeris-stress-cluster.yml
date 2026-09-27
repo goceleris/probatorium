@@ -1,0 +1,186 @@
+name: Celeris Stress (cluster)
+
+# The cluster half of celeris-stress.yml (target cluster), called by its
+# `cluster` job, which holds the matrix-tier-cluster concurrency group for
+# this whole workflow. This file declares NO concurrency: a second hold of
+# the same group here would wait on the caller forever.
+#
+#   bootstrap  (hosted) reports any cluster run cancelled since the caller's
+#              guard looked (tools/stresstally/eviction-audit.sh), then
+#              provisions a runner on every cluster host exactly as the tiers
+#              do (cluster-runner-up, waiting for a manual experiment's
+#              manifest to clear).
+#   host       (self-hosted, one job per arch on its bare-metal host: x86 on
+#              msa2-server, arm64 on msr1) checks out each case's commit and
+#              runs tools/stresstally/cluster-host.sh: host facts, in timing
+#              mode the quiet check, the CPU set and the perf probe, then
+#              every shard or observation of the arch in the planned order,
+#              one go test process each, through shard.sh, which writes each
+#              log exactly as on GitHub. Its limit is the plan's bound
+#              (stresstally plan refuses a plan over 480 minutes).
+#   teardown   (hosted, always) the tiers' cluster-runner-down: forensics,
+#              rescue, cleanup, de-registration, orphan sweep.
+#
+# Security: the host job runs the celeris code under test on bare metal. It
+# gets no secret (the four below are read only by the hosted bootstrap and
+# teardown jobs), a contents: read token, cache-mode: none, and Go caches
+# under its own RUNNER_TEMP; the caller's plan job has already proven every
+# commit it runs is reachable from a goceleris/celeris branch or tag.
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: The plan's cluster matrix (one HostEntry per arch).
+        type: string
+        required: true
+      case_shas:
+        description: CASE=SHA for every case, proven by the caller's plan job.
+        type: string
+        required: true
+      refs:
+        description: CASE=REF for every case, for the log headers.
+        type: string
+        required: true
+      guard_checked_at:
+        description: When the caller's guard listed the open runs (UTC).
+        type: string
+        required: true
+    secrets:
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_OAUTH_SECRET:
+        required: true
+      RUNNER_PAT:
+        required: true
+      CLUSTER_SSH_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+cache-mode: none
+
+jobs:
+  bootstrap:
+    name: bootstrap cluster runners
+    runs-on: ubuntu-24.04
+    # As every tier's bootstrap: a cold runner-tarball cache once took 13
+    # minutes (probatorium#387).
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report any cluster run cancelled since the guard looked
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          CHECKED_AT: ${{ inputs.guard_checked_at }}
+        run: bash tools/stresstally/eviction-audit.sh
+      - uses: ./.github/actions/cluster-runner-up
+        # The composite reads env.CLUSTER_SSH_KEY; scoped to this step.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          wait-for-manifest-clear:   "true"
+          wait-timeout-seconds:      "1800"
+
+  host:
+    name: host ${{ matrix.arch }} (${{ matrix.host }})
+    needs: bootstrap
+    runs-on: [self-hosted, celeris-cluster, '${{ matrix.host }}']
+    # Stated again on the job that runs the code under test.
+    cache-mode: none
+    timeout-minutes: ${{ matrix.job_timeout }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - name: Check out the host scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: probatorium
+          sparse-checkout: tools/stresstally
+      - name: Check out each case's celeris commit
+        shell: bash
+        env:
+          CASE_SHAS: ${{ inputs.case_shas }}
+        run: bash probatorium/tools/stresstally/checkout-cases.sh
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: celeris-${{ matrix.first_case }}/go.mod
+          cache: false
+      - name: go test on the bare-metal host
+        shell: bash
+        env:
+          STRESS_ARCH: ${{ matrix.arch }}
+          STRESS_HOST: ${{ matrix.host }}
+          STRESS_MODE: ${{ matrix.mode }}
+          STRESS_SEQUENCE: ${{ matrix.sequence }}
+          STRESS_CASE_SHAS: ${{ inputs.case_shas }}
+          STRESS_CASE_REFS: ${{ inputs.refs }}
+          STRESS_PACKAGES: ${{ matrix.packages }}
+          STRESS_RUN: ${{ matrix.run }}
+          STRESS_COUNT: ${{ matrix.count }}
+          STRESS_MEMLOCK: ${{ matrix.memlock }}
+          STRESS_MEMLOCK_LIMIT: ${{ matrix.memlock_limit }}
+          STRESS_RACE: ${{ matrix.race }}
+          STRESS_TIMEOUT: ${{ matrix.timeout }}
+          STRESS_JOB_TIMEOUT: ${{ matrix.job_timeout }}
+          STRESS_FLAGS: ${{ matrix.flags }}
+          STRESS_ENV: ${{ matrix.env }}
+          STRESS_CPUS: ${{ matrix.cpus }}
+          STRESS_PMU: ${{ matrix.pmu }}
+          STRESS_LOG_DIR: ${{ runner.temp }}/stress/logs
+          STRESS_FACTS: ${{ runner.temp }}/stress/host/host-facts-${{ matrix.arch }}.txt
+        run: bash probatorium/tools/stresstally/cluster-host.sh
+      - name: Upload the logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-log-cluster-${{ matrix.arch }}
+          path: ${{ runner.temp }}/stress/logs/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload the host facts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-host-${{ matrix.arch }}
+          path: ${{ runner.temp }}/stress/host/
+          if-no-files-found: warn
+          retention-days: 30
+
+  teardown:
+    name: teardown cluster runners
+    needs: [bootstrap, host]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/cluster-runner-down
+        # The composite reads env.CLUSTER_SSH_KEY; scoped to this step.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          forensics-reason:          celeris-stress host=${{ needs.host.result }}

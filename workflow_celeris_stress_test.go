@@ -510,3 +510,20 @@ func TestActionlintKnowsTheStressHosts(t *testing.T) {
 		}
 	}
 }
+
+// The guard tells a github dispatch (which never joins matrix-tier-cluster)
+// from one that may by the run's title; the title's format is set here, and
+// the guard's pattern must match what it produces for target github.
+func TestStressWorkflowRunNameIsWhatTheGuardReads(t *testing.T) {
+	src := readStressWorkflow(t)
+	if !strings.Contains(src, "format('Celeris Stress [{0}/{1}] {2}', inputs.target, inputs.mode, inputs.celeris_ref)") {
+		t.Error("run-name no longer titles a dispatch 'Celeris Stress [<target>/<mode>] <ref>'")
+	}
+	guard, err := os.ReadFile("tools/stresstally/guard.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(guard), "regexp.MustCompile(`^Celeris Stress \\[github/`)") {
+		t.Error("the guard's github-title pattern is not the run-name's github form")
+	}
+}

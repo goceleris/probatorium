@@ -140,6 +140,12 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 	if len(c.Env) > 0 {
 		say(w, "; env `%s`", inline(strings.Join(c.Env, " ")))
 	}
+	if c.Target == "cluster" {
+		say(w, "; bare-metal cluster")
+	}
+	if c.Mode == "timing" {
+		say(w, "; timing, pinned to %d CPU(s), pmu %s", c.CPUs, cell(c.PMU))
+	}
 	w.WriteString("\n\n")
 
 	w.WriteString("| arch | shards | complete | UNPARSED | MISSING | WRONG-SHAPE | tests | pass | fail | skip | no verdict | kernel | image |\n")
@@ -165,6 +171,18 @@ func (r CaseReport) Markdown(w *strings.Builder) {
 			s.Arch, s.Shard, s.Status, cell(s.Exit), s.Pass, s.Fail, s.Skip, s.NoVerdict, cell(s.Shuffle), cell(s.Elapsed), cell(reasons))
 	}
 	w.WriteString("\n")
+	if c.Target == "cluster" {
+		// The cluster's host is the same machine for every shard, so what
+		// else ran on it matters: the load before and after each shard, and
+		// for a timing where it was pinned and whether perf counted.
+		w.WriteString("### Host facts\n\n| arch | shard | host | cpu | governor | loadavg before | loadavg after | cpuset | perf | notes |\n")
+		w.WriteString("|---|--:|---|---|---|---|---|---|---|---|\n")
+		for _, s := range r.Shards {
+			say(w, "| %s | %d | %s | %s | %s | %s | %s | %s | %s | %s |\n", s.Arch, s.Shard, cell(s.Host), cell(s.CPUModel), cell(s.Governor),
+				cell(s.LoadBefore), cell(s.LoadAfter), cell(s.CPUSet), cell(s.Perf), cell(strings.Join(s.Notes, "; ")))
+		}
+		w.WriteString("\n")
+	}
 
 	var flagged []TestRow
 	for _, t := range r.Tests {
