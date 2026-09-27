@@ -33,44 +33,16 @@ func tallyIDs(ch chan Incident) []string {
 	}
 }
 
-func hasID(ids []string, id string) bool {
-	for _, x := range ids {
-		if x == id {
-			return true
-		}
-	}
-	return false
-}
+// (TestFinalTickOffersTheWedgeBeforeARetriedRecord, which pinned "the wedge
+// first" on the final tick, is replaced by tally_incident_final_tick_test.go:
+// the wedge first lost the record-only incidents still pending on that tick,
+// and the round-3 live run lost its gated I-H2C-HANG so. The final tick now
+// delivers those records first and then the wedge, each waiting for the
+// slot, and TestFinalTickDeliversARetriedRecordAndTheWedge pins that the
+// wedge is still delivered.)
 
-// The final tick of a wedged cell offers I-HANG before a record-only
-// incident an earlier busy loop dropped.
-func TestFinalTickOffersTheWedgeBeforeARetriedRecord(t *testing.T) {
-	t.Setenv(refappFaultEnv, "")
-	o := &Orchestrator{}
-	violations := make(chan Incident, 1)
-	cb := o.tallyIncidentCallback(context.Background(), violations, func() int { return 4242 })
-
-	var snap tier1TallySnapshot
-	snap.H2CChurn.Hang = 1
-	// A tick while the loop is busy: an in-stall incident is queued, so the
-	// record-only I-H2C-HANG offer is dropped (and left unmarked, to retry).
-	violations <- Incident{PredicateID: properties.IH2CStall.ID}
-	cb(snap)
-	if ids := tallyIDs(violations); len(ids) != 1 || ids[0] != properties.IH2CStall.ID {
-		t.Fatalf("premise: the busy tick should have left only the queued in-stall incident, got %v", ids)
-	}
-
-	// The final synchronous tick of a wedged cell: the slot is free.
-	snap.Liveness.Hung = true
-	cb(snap)
-	ids := tallyIDs(violations)
-	if !hasID(ids, properties.IHang.ID) {
-		t.Fatalf("the final tick of a wedged cell delivered %v: I-HANG lost the one slot to a retried record-only incident, so the wedge is never aborted or dumped", ids)
-	}
-}
-
-// A hard walker incident (a routine run's I-WS-ECHO) is offered before a
-// record-only one pending on the same tick.
+// On a tick that ends nothing, a hard walker incident (a routine run's
+// I-WS-ECHO) is offered before a record-only one pending on the same tick.
 func TestTickOffersAHardWalkerIncidentBeforeARecord(t *testing.T) {
 	t.Setenv(refappFaultEnv, "")
 	o := &Orchestrator{}
@@ -136,6 +108,7 @@ func TestFinalTickWaitEndsWithTheRun(t *testing.T) {
 
 	violations <- Incident{PredicateID: properties.IWSStall.ID} // never drained
 	var snap tier1TallySnapshot
+	snap.H2CChurn.Hang = 1 // a record-only incident waits ahead of the crash
 	snap.Liveness.Crashed = true
 	done := make(chan struct{})
 	go func() { cb(snap); close(done) }()

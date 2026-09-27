@@ -1379,19 +1379,28 @@ const stallDossierCooldown = 2 * time.Second
 // tally snapshot into the property tier's reactive incidents on violations.
 // ctx is the run's context (rootCtx); pid reads the live refapp's PID.
 //
-// A tick offers its incidents by severity, not in the order the oracles are
-// listed (probatorium#412 review round 3). violations holds ONE incident,
-// and offerOnce re-offers every incident a busy loop dropped, so the order
-// decides who gets a free slot:
-//   - I-LIVENESS and I-HANG first, and they WAIT for the slot
-//     (deliverTerminal). On a crash or a wedge the final synchronous tick
-//     in driveTier1 is often the only offer they get: the periodic ticker
-//     stopped when the tier cancelled its run. Offered after a record-only
-//     incident an earlier busy loop had dropped, the wedge lost the free
-//     slot to it; offered into a full slot, it was dropped. Either way the
-//     cell was never aborted and the wedged process never dumped or cored.
-//   - then the hard walker incidents (a hard fail in a routine run),
-//   - then the record-only ones, which only add a dossier.
+// A tick offers its incidents in an order of its own, not in the order the
+// oracles are listed (probatorium#412 review round 3). violations holds ONE
+// incident, and offerOnce re-offers every incident a busy loop dropped, so
+// the order decides who gets a free slot.
+//
+// A tick that sees the refapp crashed or wedged (I-LIVENESS / I-HANG) ends
+// the cell, and Run's incident loop stops receiving at the first hard
+// incident. On a crash or a wedge the final synchronous tick in driveTier1
+// is often the only offer left: the periodic ticker stopped when the tier
+// cancelled its run. On that tick EVERY incident it delivers waits for the
+// slot (deliverWaiting, bounded by the run and terminalIncidentWait):
+//   - first the record-only incidents still pending -- the loop writes their
+//     dossiers and keeps receiving. Offered after the wedge they were lost:
+//     the round-3 live run's adaptive cell lost its gated I-H2C-HANG so;
+//   - then I-LIVENESS / I-HANG. Offered without waiting it was dropped when
+//     a retried record-only incident, or a busy loop, held the slot: the
+//     cell was never aborted and the wedged process never dumped or cored;
+//   - then the hard walker incidents, offered as usual (the cell is ending).
+//
+// On every other tick nothing waits: the hard walker incidents (a hard fail
+// in a routine run) go before the record-only ones, which only add a
+// dossier.
 func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations chan<- Incident, pid func() int) func(tier1TallySnapshot) {
 	// alertedCounters tracks which sub-tally counters we've already
 	// emitted an Incident for, so the periodic callback fires AT MOST
@@ -1432,8 +1441,8 @@ func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations cha
 			}
 		}
 		// fatal is for the two oracles that end the cell (the refapp died,
-		// or it is wedged): offered first, and delivered even into a full
-		// slot (deliverTerminal).
+		// or it is wedged): delivered even into a full slot (deliverWaiting),
+		// after the record-only incidents still pending.
 		fatal := func(counter, msg string, ok bool) {
 			if !ok || alertedCounters[counter] {
 				return
@@ -1505,8 +1514,17 @@ func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations cha
 			fmt.Sprintf("refapp wedged mid-run: %s", snap.Liveness.Reason()),
 			snap.Liveness.Hung)
 
-		for _, inc := range terminal {
-			deliverTerminal(ctx, alertedCounters, violations, inc)
+		if len(terminal) > 0 {
+			for _, inc := range recorded {
+				deliverWaiting(ctx, alertedCounters, violations, inc)
+			}
+			for _, inc := range terminal {
+				deliverWaiting(ctx, alertedCounters, violations, inc)
+			}
+			for _, inc := range hard {
+				offerOnce(alertedCounters, violations, inc)
+			}
+			return
 		}
 		for _, inc := range hard {
 			offerOnce(alertedCounters, violations, inc)
@@ -1517,17 +1535,20 @@ func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations cha
 	}
 }
 
-// terminalIncidentWait bounds how long deliverTerminal waits for the
-// violations slot: the loop may be inside one synchronous capture
-// (forensicsBudget) with one more incident queued in the slot ahead of the
-// wedge (another forensicsBudget), plus the dossier writes. A variable so a
-// test can shorten it.
+// terminalIncidentWait bounds how long deliverWaiting waits for the
+// violations slot, per incident: the loop may be inside one synchronous
+// capture (forensicsBudget) with one more incident queued in the slot ahead
+// (another forensicsBudget), plus the dossier writes. A waiting sender is
+// taken as soon as the loop receives the one ahead of it, so each wait on a
+// terminal tick is bounded by that, not by the sum. A variable so a test can
+// shorten it.
 var terminalIncidentWait = 2*forensicsBudget + 10*time.Second
 
-// deliverTerminal delivers a cell-ending incident (I-LIVENESS, I-HANG) the
-// way offerOnce offers the others -- at most once per run, marked only when
-// sent -- except that a full slot does not drop it: it waits for the slot,
-// for the run to end (ctx), or for terminalIncidentWait, whichever is first.
+// deliverWaiting delivers an incident of a terminal tick (the record-only
+// incidents still pending, then I-LIVENESS / I-HANG) the way offerOnce
+// offers the others -- at most once per run, marked only when sent --
+// except that a full slot does not drop it: it waits for the slot, for the
+// run to end (ctx), or for terminalIncidentWait, whichever is first.
 //
 // It cannot deadlock the orchestrator. The only receiver is Run's incident
 // loop, which returns to its receive after every incident it handles
@@ -1539,7 +1560,7 @@ var terminalIncidentWait = 2*forensicsBudget + 10*time.Second
 // before the non-blocking offers of other goroutines: a receive from a full
 // buffered channel moves the first waiting sender's value into the buffer
 // in the same step, so an offer in between sees the slot full.
-func deliverTerminal(ctx context.Context, alerted map[string]bool, ch chan<- Incident, inc Incident) bool {
+func deliverWaiting(ctx context.Context, alerted map[string]bool, ch chan<- Incident, inc Incident) bool {
 	if alerted[inc.PredicateID] {
 		return false
 	}
