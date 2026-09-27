@@ -66,6 +66,12 @@ func configDiffs(base, branch runReport) []string {
 		}
 	}
 	diff("probatorium commit", base.Plan.ProbatoriumSHA, branch.Plan.ProbatoriumSHA)
+	// Where and how the arms ran: a GitHub-hosted arm against a cluster arm,
+	// or a stress arm against a timing arm, differs in machine and shape.
+	diff("target", orDefault(a.Target, "github"), orDefault(b.Target, "github"))
+	diff("mode", orDefault(a.Mode, "stress"), orDefault(b.Mode, "stress"))
+	diff("cpus", a.CPUs, b.CPUs)
+	diff("pmu", strconv.Quote(a.PMU), strconv.Quote(b.PMU))
 	diff("packages", a.Packages, b.Packages)
 	diff("run", strconv.Quote(a.Run), strconv.Quote(b.Run))
 	diff("count", a.Count, b.Count)
@@ -78,6 +84,13 @@ func configDiffs(base, branch runReport) []string {
 	diff("env", a.Env, b.Env)
 	diff("shuffle", strconv.Quote(a.Shuffle), strconv.Quote(b.Shuffle))
 	return d
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 // CompareRow is one test on one arch in both arms.

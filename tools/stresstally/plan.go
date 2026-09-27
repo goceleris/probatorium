@@ -15,8 +15,10 @@ import (
 // each a go test configuration run on some shards of some architectures, and
 // what each case's summary must show for the run to pass.
 //
-// A workflow_dispatch run has exactly one case, "stress", built from the
-// dispatch inputs and expected to PASS. A pull_request run has the fixed
+// A workflow_dispatch run in stress mode has exactly one case, "stress",
+// built from the dispatch inputs and expected to PASS; in timing mode (the
+// cluster only) it has one case per arm, named after the arm, each with the
+// same configuration and a commit of its own. A pull_request run has the fixed
 // self-test cases in selfTests instead, each planned from its own dispatch
 // inputs by planDispatch: every pull request that touches the workflow or
 // this tool proves again, on real runner logs, that a clean run passes and
@@ -29,6 +31,15 @@ type Plan struct {
 	// tally come from (github.sha). Two arms of a comparison must share it.
 	ProbatoriumSHA string `json:"probatorium_sha,omitempty"`
 	Cases          []Case `json:"cases"`
+	// Arms are a timing plan's arms, in the order the dispatch named them:
+	// one case per arm, named after it. Empty for a stress plan.
+	Arms []Arm `json:"arms,omitempty"`
+}
+
+// Arm is one arm of a timing plan: a name and the celeris ref it tests.
+type Arm struct {
+	Name string `json:"name"`
+	Ref  string `json:"ref"`
 }
 
 // Case is one go test configuration.
@@ -50,6 +61,14 @@ type Case struct {
 	Env     []string `json:"env"`
 	Shuffle string   `json:"shuffle,omitempty"`
 	Expect  Expect   `json:"expect"`
+	// Target is "cluster" for the bare-metal cluster and empty for the
+	// GitHub-hosted runners, so a github plan's JSON is what it always was.
+	// Mode is "timing" or empty (stress). CPUs and PMU are timing options.
+	// All four are configuration: compare refuses two arms that differ in them.
+	Target string `json:"target,omitempty"`
+	Mode   string `json:"mode,omitempty"`
+	CPUs   int    `json:"cpus,omitempty"`
+	PMU    string `json:"pmu,omitempty"`
 }
 
 // Entry is one shard job: an element of the workflow's matrix include list.
@@ -72,9 +91,36 @@ type Entry struct {
 	JobTimeout   int    `json:"job_timeout"`
 }
 
+// HostEntry is one cluster host job: every shard (stress) or observation
+// (timing) of one arch, run one after another on that arch's bare-metal
+// host, one go test process each. Sequence lists them in run order as
+// CASE:SHARD:SHUFFLE tokens; every other value is the configuration all of
+// them share, already validated.
+type HostEntry struct {
+	Arch         string `json:"arch"`
+	Host         string `json:"host"`
+	Mode         string `json:"mode"`
+	Cases        string `json:"cases"`
+	FirstCase    string `json:"first_case"`
+	Sequence     string `json:"sequence"`
+	Packages     string `json:"packages"`
+	Run          string `json:"run"`
+	Count        int    `json:"count"`
+	Memlock      string `json:"memlock"`
+	MemlockLimit string `json:"memlock_limit"`
+	Race         string `json:"race"`
+	Timeout      string `json:"timeout"`
+	Flags        string `json:"flags"`
+	Env          string `json:"env"`
+	CPUs         int    `json:"cpus"`
+	PMU          string `json:"pmu"`
+	JobTimeout   int    `json:"job_timeout"`
+}
+
 // Inputs are the raw workflow_dispatch inputs, exactly as typed.
 type Inputs struct {
 	CelerisRef, Packages, Run, Count, Shards, Arches, Memlock, Race, Timeout, Extra string
+	Target, Mode, Timing                                                            string
 }
 
 // runners maps an architecture to its GitHub-hosted runner label. Both name
@@ -90,9 +136,20 @@ var runners = map[string]string{
 	"arm64": "ubuntu-24.04-arm",
 }
 
+// clusterHosts maps an architecture to its bare-metal cluster host: the
+// runner label cluster-runner-up gives that host's runner, and the name
+// `hostname -s` must print there. msa2-client, the load generator, is
+// never one.
+var clusterHosts = map[string]string{
+	"x86":   "msa2-server",
+	"arm64": "msr1",
+}
+
 // memlocks maps the memlock input to the value handed to prlimit. 8m is the
 // GitHub-hosted default and the shape celeris CI's unit job runs in; it is
 // set explicitly anyway, because the arm64 image's default is not documented.
+// The input "default" is not here: it is the target's own shape
+// (defaultMemlock), and the plan records what it resolved to.
 var memlocks = map[string]string{
 	"8m":        "8388608",
 	"128m":      "134217728",
@@ -117,6 +174,32 @@ const (
 	maxTimeout    = 5*time.Hour + 30*time.Minute
 	jobSlack      = 20
 	maxJobMinutes = 360
+
+	// The cluster runs every shard of an arch in one job, one after another
+	// (HostEntry), so its limits are about the whole job, and it holds the
+	// matrix-tier-cluster group while it runs. A host job's limit is
+	// clusterFixedMinutes (checking out each case, the toolchain, modules and
+	// the first compile), plus in timing mode timingQuietMinutes (the wait
+	// for a quiet host) and timingPrebuildMinutes per arm (each arm's test
+	// binary is built once before the quiet check, so no observation's budget
+	// carries a compile), plus, per shard or observation, one -timeout per
+	// package and clusterShardMinutes (go test's own start and link). A plan
+	// over maxClusterJobMinutes is refused: the cluster is shared with the
+	// release tiers.
+	maxClusterShards      = 200
+	clusterFixedMinutes   = 15
+	timingQuietMinutes    = 10
+	timingPrebuildMinutes = 3
+	clusterShardMinutes   = 1
+	maxClusterJobMinutes  = 480
+	// The bootstrap and teardown jobs' limits (celeris-stress-cluster.yml),
+	// for the group-hold bound the plan prints.
+	clusterBootstrapMinutes = 25
+	clusterTeardownMinutes  = 15
+
+	maxArms     = 4
+	defaultCPUs = 4
+	maxCPUs     = 16
 )
 
 var (
@@ -144,6 +227,9 @@ var (
 	envTokRe   = regexp.MustCompile(`^[A-Z][A-Z0-9_]*=`)
 	envNameRe  = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 	envValueRe = regexp.MustCompile(`^[A-Za-z0-9_.,:/+-]{0,128}$`)
+	// A timing arm's name: it becomes a case name, a log file name and a
+	// directory name (celeris-<arm>), so it is short and plain.
+	armNameRe = regexp.MustCompile(`^[A-Z][A-Za-z0-9]{0,7}$`)
 )
 
 // celerisTestEnv lists every environment variable celeris's own tests read,
@@ -225,19 +311,49 @@ func checkEnv(tok string) error {
 // than silently overriding the input.
 var ownInputFlags = []string{"-run", "-count", "-timeout", "-race", "-v"}
 
-// planDispatch validates every workflow_dispatch input and returns the plan
-// for a run of one case, "stress", that must PASS.
+// planDispatch validates every workflow_dispatch input and returns the plan:
+// in stress mode one case, "stress", that must PASS; in timing mode one case
+// per arm, each of which must PASS.
 func planDispatch(in Inputs) (Plan, error) {
 	var errs []error
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
+	// Where and how first: every other rule below may depend on them. An
+	// empty value is the default (the self-test's inputs name neither).
+	target := strings.TrimSpace(in.Target)
+	switch target {
+	case "", "github":
+		target = "github"
+	case "cluster":
+	default:
+		bad("target %q: want github or cluster", in.Target)
+	}
+	cluster := target == "cluster"
+	mode := strings.TrimSpace(in.Mode)
+	switch mode {
+	case "", "stress":
+		mode = "stress"
+	case "timing":
+		if target == "github" {
+			bad("mode timing needs target cluster: a timing needs an exclusive host with fixed CPUs, which a GitHub-hosted runner is not")
+		}
+	default:
+		bad("mode %q: want stress or timing", in.Mode)
+	}
+	timing := mode == "timing"
+
+	var arms []Arm
 	ref := strings.TrimSpace(in.CelerisRef)
-	switch {
-	case !refRe.MatchString(ref):
-		bad("celeris_ref %q: want a branch, a tag or a full commit sha ([A-Za-z0-9._/-], starting with a letter or digit, at most 200 characters)", in.CelerisRef)
-	case strings.Contains(ref, "..") || strings.Contains(ref, "//") || strings.HasSuffix(ref, "/") ||
-		strings.HasSuffix(ref, ".") || strings.HasSuffix(ref, ".lock"):
-		bad("celeris_ref %q is not a valid git ref name", in.CelerisRef)
+	if timing {
+		arms = parseArms(ref, bad)
+	} else {
+		if err := checkRef("celeris_ref", ref); err != nil {
+			errs = append(errs, err)
+		} else if cluster {
+			if err := checkClusterRef("celeris_ref", ref); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
 
 	pkgs := strings.Fields(in.Packages)
@@ -250,10 +366,15 @@ func planDispatch(in Inputs) (Plan, error) {
 	for _, p := range pkgs {
 		if !pkgRe.MatchString(p) {
 			bad("packages: %q is not a package pattern under the celeris module (./dir, ./dir/..., or ./...)", p)
+		} else if cluster && strings.HasSuffix(p, "...") {
+			bad("packages: %q: a cluster run must bound its runtime from the plan, so it names its packages (no ... pattern)", p)
 		}
 	}
 	if hasDup(pkgs) {
 		bad("packages: a pattern is listed twice")
+	}
+	if timing && len(pkgs) != 1 {
+		bad("packages: a timing runs exactly one package, so each observation is one test binary (got %d)", len(pkgs))
 	}
 
 	run := strings.TrimSpace(in.Run)
@@ -265,9 +386,19 @@ func planDispatch(in Inputs) (Plan, error) {
 	if err != nil {
 		errs = append(errs, err)
 	}
-	shards, err := boundedInt("shards", in.Shards, 1, maxShards)
+	shardMax := maxShards
+	if cluster {
+		shardMax = maxClusterShards
+	}
+	shards, err := boundedInt("shards", in.Shards, 1, shardMax)
 	if err != nil {
 		errs = append(errs, err)
+	}
+	if timing && err == nil && len(arms) >= 2 {
+		if period := len(williams(len(arms))); shards%period != 0 {
+			bad("shards %d: a timing of %d arms runs its blocks in a counterbalanced order that repeats every %d blocks; want a multiple of %d",
+				shards, len(arms), period, period)
+		}
 	}
 
 	var arches []string
@@ -283,8 +414,11 @@ func planDispatch(in Inputs) (Plan, error) {
 	}
 
 	mem := strings.TrimSpace(in.Memlock)
+	if mem == "default" {
+		mem = defaultMemlock(target)
+	}
 	if _, ok := memlocks[mem]; !ok {
-		bad("memlock %q: want 8m, 128m or unlimited", in.Memlock)
+		bad("memlock %q: want default, 8m, 128m or unlimited", in.Memlock)
 	}
 
 	var race bool
@@ -304,28 +438,196 @@ func planDispatch(in Inputs) (Plan, error) {
 	flags, env, shuffle, extraErrs := parseExtra(in.Extra)
 	errs = append(errs, extraErrs...)
 
+	var (
+		cpus int
+		pmu  string
+	)
+	if timing {
+		var terrs []error
+		cpus, pmu, terrs = parseTiming(in.Timing)
+		errs = append(errs, terrs...)
+	} else if strings.TrimSpace(in.Timing) != "" {
+		bad("timing %q: timing options apply only to mode timing", in.Timing)
+	}
+
 	if len(errs) > 0 {
 		return Plan{}, errors.Join(errs...)
 	}
-	return Plan{
-		Event:      "workflow_dispatch",
-		CelerisRef: ref,
-		Cases: []Case{{
-			Name:     "stress",
-			Packages: pkgs,
-			Run:      run,
-			Count:    count,
-			Shards:   shards,
-			Arches:   arches,
-			Memlock:  mem,
-			Race:     race,
-			Timeout:  timeout,
-			Flags:    flags,
-			Env:      env,
-			Shuffle:  shuffle,
-			Expect:   Expect{Verdict: "PASS"},
-		}},
-	}, nil
+	c := Case{
+		Name:     "stress",
+		Packages: pkgs,
+		Run:      run,
+		Count:    count,
+		Shards:   shards,
+		Arches:   arches,
+		Memlock:  mem,
+		Race:     race,
+		Timeout:  timeout,
+		Flags:    flags,
+		Env:      env,
+		Shuffle:  shuffle,
+		Expect:   Expect{Verdict: "PASS"},
+	}
+	if cluster {
+		c.Target = "cluster"
+	}
+	p := Plan{Event: "workflow_dispatch", CelerisRef: ref, Cases: []Case{c}}
+	if timing {
+		c.Mode, c.CPUs, c.PMU = "timing", cpus, pmu
+		p.Cases, p.Arms = nil, arms
+		var refs []string
+		for _, a := range arms {
+			ac := c
+			ac.Name = a.Name
+			p.Cases = append(p.Cases, ac)
+			refs = append(refs, a.Name+"="+a.Ref)
+		}
+		p.CelerisRef = strings.Join(refs, " ")
+	}
+	if cluster {
+		if m := hostJobMinutes(p); m > maxClusterJobMinutes {
+			return Plan{}, fmt.Errorf("the cluster host job could run %d minutes (%s), over the %d a cluster run may hold matrix-tier-cluster; "+
+				"lower shards or timeout, or name fewer packages", m, hostJobFormula(p), maxClusterJobMinutes)
+		}
+	}
+	return p, nil
+}
+
+// defaultMemlock is the memlock input "default": celeris CI's 8 MiB shape
+// on GitHub, so a github dispatch that names no memlock runs exactly as it
+// always did; the host's own unlimited on the bare-metal cluster, where
+// io_uring runs without a cap unless a dispatch asks for one.
+func defaultMemlock(target string) string {
+	if target == "cluster" {
+		return "unlimited"
+	}
+	return "8m"
+}
+
+// checkRef validates one celeris ref: a branch, a tag, a full commit sha or
+// refs/pull/N/head that can never be read as an option.
+func checkRef(name, ref string) error {
+	switch {
+	case !refRe.MatchString(ref):
+		return fmt.Errorf("%s %q: want a branch, a tag or a full commit sha ([A-Za-z0-9._/-], starting with a letter or digit, at most 200 characters)", name, ref)
+	case strings.Contains(ref, "..") || strings.Contains(ref, "//") || strings.HasSuffix(ref, "/") ||
+		strings.HasSuffix(ref, ".") || strings.HasSuffix(ref, ".lock"):
+		return fmt.Errorf("%s %q is not a valid git ref name", name, ref)
+	}
+	return nil
+}
+
+// checkClusterRef keeps anyone's pull request off the cluster. A cluster
+// shard runs on bare metal as a user with sudo, so it runs only code a
+// celeris maintainer pushed: a branch, a tag, or a commit the plan job
+// proves is reachable from one (a fork's commit can be fetched by sha from
+// goceleris/celeris through its pull ref, so a sha alone proves nothing).
+func checkClusterRef(name, ref string) error {
+	if strings.HasPrefix(ref, "refs/pull/") || strings.HasPrefix(ref, "pull/") {
+		return fmt.Errorf("%s %q: the cluster runs only goceleris/celeris branches, tags and commits reachable from them; "+
+			"a pull ref may be anyone's fork, and a cluster shard runs on bare metal as a user with sudo. "+
+			"Use target github for a pull request, or push the branch to goceleris/celeris", name, ref)
+	}
+	return nil
+}
+
+// parseArms reads a timing's celeris_ref: 2 to maxArms NAME=REF tokens,
+// names distinct. Two arms may name the same ref (an A/A control).
+func parseArms(s string, bad func(string, ...any)) []Arm {
+	toks := strings.Fields(s)
+	if len(toks) < 2 || len(toks) > maxArms {
+		bad("celeris_ref %q: a timing names 2 to %d arms as NAME=REF, e.g. A=9f4d89b171db7838dbcc3ece2107191bc15b25f8 B=fix/branch", s, maxArms)
+		return nil
+	}
+	var arms []Arm
+	seen := map[string]bool{}
+	for _, tok := range toks {
+		name, ref, ok := strings.Cut(tok, "=")
+		switch {
+		case !ok || !armNameRe.MatchString(name):
+			bad("celeris_ref: %q is not NAME=REF with a NAME of 1 to 8 letters and digits starting with a capital", tok)
+			continue
+		case seen[name]:
+			bad("celeris_ref: arm %s is named twice", name)
+			continue
+		}
+		seen[name] = true
+		if err := checkRef("celeris_ref arm "+name, ref); err != nil {
+			bad("%v", err)
+			continue
+		}
+		if err := checkClusterRef("celeris_ref arm "+name, ref); err != nil {
+			bad("%v", err)
+			continue
+		}
+		arms = append(arms, Arm{Name: name, Ref: ref})
+	}
+	return arms
+}
+
+// parseTiming reads the timing input: cpus=N (the CPUs each observation is
+// pinned to, default defaultCPUs) and pmu=required|optional (whether an
+// observation without hardware instruction counts is refused; default
+// optional). Anything else is refused by name.
+func parseTiming(s string) (cpus int, pmu string, errs []error) {
+	cpus, pmu = defaultCPUs, "optional"
+	seen := map[string]bool{}
+	for _, tok := range strings.Fields(s) {
+		k, v, _ := strings.Cut(tok, "=")
+		if seen[k] {
+			errs = append(errs, fmt.Errorf("timing: %s is given twice", k))
+			continue
+		}
+		seen[k] = true
+		switch k {
+		case "cpus":
+			n, err := boundedInt("timing cpus", v, 1, maxCPUs)
+			if err != nil {
+				errs = append(errs, err)
+			}
+			cpus = n
+		case "pmu":
+			if v != "required" && v != "optional" {
+				errs = append(errs, fmt.Errorf("timing pmu %q: want required or optional", v))
+			}
+			pmu = v
+		default:
+			errs = append(errs, fmt.Errorf("timing: %q is not allowed (allowed: cpus=N with N 1 to %d, pmu=required|optional)", tok, maxCPUs))
+		}
+	}
+	return cpus, pmu, errs
+}
+
+// williams returns the rows of a Williams design for k arms: every arm comes
+// first in a block equally often, and every arm directly follows every other
+// arm equally often, so neither a drift over the run nor what ran just before
+// can favour one arm. For an even k it is one k x k square whose first row is
+// 0, 1, k-1, 2, k-2, ...; for an odd k that square and its mirror, 2k rows.
+// Two arms give AB, BA.
+func williams(k int) [][]int {
+	std := []int{0}
+	for i := 1; len(std) < k; i++ {
+		std = append(std, i)
+		if len(std) < k {
+			std = append(std, k-i)
+		}
+	}
+	var rows [][]int
+	for r := range k {
+		row := make([]int, k)
+		for j := range std {
+			row[j] = (std[j] + r) % k
+		}
+		rows = append(rows, row)
+	}
+	if k%2 == 1 {
+		for r := range k {
+			row := slices.Clone(rows[r])
+			slices.Reverse(row)
+			rows = append(rows, row)
+		}
+	}
+	return rows
 }
 
 func hasDup(s []string) bool {
@@ -484,6 +786,121 @@ func jobMinutes(c Case) int {
 	return min(maxJobMinutes, len(c.Packages)*per+jobSlack)
 }
 
+// IsCluster reports whether the plan runs on the bare-metal cluster.
+func (p Plan) IsCluster() bool { return len(p.Cases) > 0 && p.Cases[0].Target == "cluster" }
+
+// IsTiming reports whether the plan is a timing (one case per arm).
+func (p Plan) IsTiming() bool { return len(p.Arms) > 0 }
+
+// Sequence is what one cluster host runs, in order, as CASE:SHARD:SHUFFLE
+// tokens: every shard of a stress plan; every observation of a timing plan,
+// block by block, the arms of block b in row b of williams(len(arms)), all of
+// them on one -shuffle seed (so an arm difference is never an order
+// difference). A cluster seed is the run id times 1000 plus the shard or
+// block (a cluster plan may have up to 200); the same shard or block on both
+// hosts gets the same seed, as on GitHub.
+func (p Plan) Sequence(runID int64) []string {
+	var out []string
+	seed := func(c Case, n int) string {
+		if c.Shuffle != "" {
+			return c.Shuffle
+		}
+		return strconv.FormatInt(runID*1000+int64(n), 10)
+	}
+	if !p.IsTiming() {
+		for _, c := range p.Cases {
+			for s := 1; s <= c.Shards; s++ {
+				out = append(out, fmt.Sprintf("%s:%d:%s", c.Name, s, seed(c, s)))
+			}
+		}
+		return out
+	}
+	rows := williams(len(p.Cases))
+	for b := 1; b <= p.Cases[0].Shards; b++ {
+		for _, i := range rows[(b-1)%len(rows)] {
+			c := p.Cases[i]
+			out = append(out, fmt.Sprintf("%s:%d:%s", c.Name, b, seed(c, b)))
+		}
+	}
+	return out
+}
+
+// HostEntries expands a cluster plan into its host jobs, one per arch.
+func (p Plan) HostEntries(runID int64) []HostEntry {
+	if len(p.Cases) == 0 {
+		return nil
+	}
+	c := p.Cases[0]
+	var names []string
+	for _, x := range p.Cases {
+		names = append(names, x.Name)
+	}
+	mode := "stress"
+	if p.IsTiming() {
+		mode = "timing"
+	}
+	seq := strings.Join(p.Sequence(runID), " ")
+	var out []HostEntry
+	for _, arch := range c.Arches {
+		out = append(out, HostEntry{
+			Arch:         arch,
+			Host:         clusterHosts[arch],
+			Mode:         mode,
+			Cases:        strings.Join(names, " "),
+			FirstCase:    names[0],
+			Sequence:     seq,
+			Packages:     strings.Join(c.Packages, " "),
+			Run:          c.Run,
+			Count:        c.Count,
+			Memlock:      c.Memlock,
+			MemlockLimit: memlocks[c.Memlock],
+			Race:         strconv.FormatBool(c.Race),
+			Timeout:      c.Timeout,
+			Flags:        strings.Join(c.Flags, " "),
+			Env:          strings.Join(c.Env, " "),
+			CPUs:         c.CPUs,
+			PMU:          c.PMU,
+			JobTimeout:   hostJobMinutes(p),
+		})
+	}
+	return out
+}
+
+// hostJobMinutes is a cluster host job's timeout-minutes: the fixed setup,
+// a timing's quiet wait and per-arm prebuild, and for every shard or
+// observation of the host one go test -timeout per package plus go test's
+// own start and link. It is the bound on how long the run can hold
+// matrix-tier-cluster (with the bootstrap and teardown limits), and
+// planDispatch refuses a plan whose bound is over maxClusterJobMinutes.
+func hostJobMinutes(p Plan) int {
+	if len(p.Cases) == 0 {
+		return 0
+	}
+	c := p.Cases[0]
+	d, err := checkTimeout(c.Timeout)
+	if err != nil {
+		return maxClusterJobMinutes + 1
+	}
+	per := len(c.Packages)*int(math.Ceil(d.Minutes())) + clusterShardMinutes
+	m := clusterFixedMinutes + len(p.Sequence(0))*per
+	if p.IsTiming() {
+		m += timingQuietMinutes + timingPrebuildMinutes*len(p.Cases)
+	}
+	return m
+}
+
+// hostJobFormula spells hostJobMinutes out for a refusal or the plan log.
+func hostJobFormula(p Plan) string {
+	c := p.Cases[0]
+	d, _ := checkTimeout(c.Timeout)
+	quiet := ""
+	if p.IsTiming() {
+		quiet = fmt.Sprintf(" + %d quiet wait + %d arm(s) x %d prebuild", timingQuietMinutes, len(p.Cases), timingPrebuildMinutes)
+	}
+	return fmt.Sprintf("%d setup%s + %d shard(s) x (%d package(s) x %d min timeout + %d)",
+		clusterFixedMinutes, quiet, len(p.Sequence(0)), len(c.Packages), int(math.Ceil(d.Minutes())), clusterShardMinutes)
+}
+
 // selfTestSHA pins the celeris commit the pull_request self-test runs, so the
 // self-test judges this tool and workflow, not whatever celeris main is that
 // day. It is celeris main as of 2026-09-26 (celeris#687 merged).
@@ -513,12 +930,14 @@ type selfTest struct {
 }
 
 // selfTestInputs is a dispatch of the pinned celeris commit's
-// ./engine/iouring on both arches at celeris CI's 8 MiB memlock.
+// ./engine/iouring on both arches at celeris CI's 8 MiB memlock, on the
+// GitHub-hosted runners: the self-test never reaches the cluster.
 func selfTestInputs(run, count, shards, race, timeout, extra string) map[string]string {
 	return map[string]string{
 		"IN_CELERIS_REF": selfTestSHA, "IN_PACKAGES": "./engine/iouring", "IN_RUN": run,
 		"IN_COUNT": count, "IN_SHARDS": shards, "IN_ARCHES": "both", "IN_MEMLOCK": "8m",
 		"IN_RACE": race, "IN_TIMEOUT": timeout, "IN_EXTRA": extra,
+		"IN_TARGET": "github", "IN_MODE": "stress", "IN_TIMING": "",
 	}
 }
 
@@ -595,6 +1014,9 @@ func planSelfTest() (Plan, error) {
 		}
 		if d.CelerisRef != p.CelerisRef || len(d.Cases) != 1 {
 			return Plan{}, fmt.Errorf("self-test case %s planned %d case(s) of celeris %s", st.name, len(d.Cases), d.CelerisRef)
+		}
+		if d.IsCluster() || d.IsTiming() {
+			return Plan{}, fmt.Errorf("self-test case %s is a cluster or timing plan; a pull request never reaches the cluster", st.name)
 		}
 		c := d.Cases[0]
 		c.Name, c.Purpose, c.Expect = st.name, st.purpose, st.expect

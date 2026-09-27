@@ -2,18 +2,25 @@ self-hosted-runner:
   # `celeris-cluster` is the label our ephemeral cluster runners
   # register themselves with (see .github/actions/cluster-runner-up).
   # `msr1` pins matrix orchestration to that specific node (it is the
-  # benchmark conductor; see benchmark-tier.yml runs-on). Declaring both
-  # here silences actionlint's runner-label warning.
+  # benchmark conductor; see benchmark-tier.yml runs-on). The stress
+  # workflow's cluster target runs one job per arch on its own host, so
+  # `msa2-server` (x86) and `msr1` (arm64) are both host labels there.
+  # Declaring them here silences actionlint's runner-label warning.
   labels:
     - celeris-cluster
     - msr1
+    - msa2-server
 
 paths:
   # `cache-mode` is a GitHub Actions workflow and job key (docs: "Dependency
   # caching reference", cache-mode) that actionlint 1.7.12 does not know
-  # yet. The stress workflow needs it: it runs the code under test and must
-  # give that code's token no cache access. Only this one message, and only
-  # in this one file, is ignored; any other unknown key still fails.
+  # yet. The stress workflow and its cluster half need it: they run the code
+  # under test and must give that code's token no cache access. Only this
+  # one message, and only in these two files, is ignored; any other unknown
+  # key still fails.
+  .github/workflows/celeris-stress-cluster.yml:
+    ignore:
+      - 'unexpected key "cache-mode" for "(workflow|job)" section'
   .github/workflows/celeris-stress.yml:
     ignore:
       - 'unexpected key "cache-mode" for "(workflow|job)" section'
