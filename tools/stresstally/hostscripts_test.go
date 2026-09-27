@@ -823,14 +823,12 @@ func TestTimingHostJobPrebuildsAndTrimsPaths(t *testing.T) {
 // pmu=required on a host where perf cannot count refuses every observation
 // before go test runs: the log says why and go test never starts. (Coverage
 // for a refusal that existed before; it was only exercised on its passing
-// path.)
+// path.) The fake perf fails as perf does at perf_event_paranoid 4, so the
+// test runs the same on any runner.
 func TestTimingHostJobRefusesPMURequiredWithoutPerf(t *testing.T) {
 	h := newTimingHost(t, "A", "B")
 	h.env["STRESS_SEQUENCE"], h.env["STRESS_PMU"] = "A:1:11 B:1:11", "required"
-	h.env["PATH"] = h.bin + ":/usr/bin:/bin" // no perf, whatever the runner has
-	if p, err := exec.LookPath("perf"); err == nil && (strings.HasPrefix(p, "/usr/bin/") || strings.HasPrefix(p, "/bin/")) {
-		t.Skipf("this runner has %s; the test needs a host without perf", p)
-	}
+	writeExec(t, filepath.Join(h.bin, "perf"), "#!/usr/bin/env bash\necho 'Error: Access to performance monitoring and observability operations is limited.' >&2\nexit 255\n")
 	out, code := runBash(t, h.dir, h.env, `bash "$1"`, script(t, "cluster-host.sh"))
 	if code != 1 {
 		t.Errorf("exit %d, want 1 (every shard refused)\n%s", code, out)
@@ -845,7 +843,7 @@ func TestTimingHostJobRefusesPMURequiredWithoutPerf(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(string(log), "stress-refused: ") || !strings.Contains(string(log), "pmu required but perf is absent") ||
+		if !strings.Contains(string(log), "stress-refused: ") || !strings.Contains(string(log), "pmu required but perf is unusable:paranoid=") ||
 			!strings.HasSuffix(strings.TrimSpace(string(log)), "stress-trailer: exit=refused elapsed_s=0") {
 			t.Errorf("arm %s log does not refuse for want of perf:\n%s", arm, log)
 		}
