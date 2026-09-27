@@ -263,8 +263,11 @@ msa2-server, every arm64 shard on msr1, never msa2-client. What changes:
   the group (`stresstally guard`; the lists and the decision are the
   `stress-cluster-guard` artifact). If a tier holds the group, this run waits
   as the pending one, and a later tier dispatch cancels this run, never the
-  other way round. The first job inside the group reports, as an error, any
-  cluster run cancelled in the seconds between the guard's look and the entry.
+  other way round. The guard builds its tool before it looks, so its look
+  and its verdict are seconds apart. The first job inside the group reports,
+  as an error, any cluster run cancelled between the guard's look and two
+  minutes after the guard's job ended (when this run's cluster job entered
+  the group): each may be an eviction, or a cancel for another reason.
 - **Never re-run.** "Re-run failed jobs" re-runs a failed cluster job but
   reuses the verdict of a `cluster-guard` that succeeded, possibly hours
   ago, and would enter the group on it, cancelling whatever is pending there

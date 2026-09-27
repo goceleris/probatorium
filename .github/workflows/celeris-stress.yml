@@ -355,10 +355,13 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           GUARD_DIR: ${{ runner.temp }}/guard
+        # Built first, so the look (guard.sh) and the verdict are seconds
+        # apart, not a cold compile apart.
         run: |
           set -euo pipefail
+          go build -o "$RUNNER_TEMP/stresstally" ./tools/stresstally
           bash tools/stresstally/guard.sh
-          go run ./tools/stresstally guard -dir "$GUARD_DIR" -self "$RUN_ID"
+          "$RUNNER_TEMP/stresstally" guard -dir "$GUARD_DIR" -self "$RUN_ID"
       - name: Upload the guard's evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

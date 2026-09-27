@@ -415,7 +415,7 @@ func TestStressClusterGuardBuildsBeforeItLooks(t *testing.T) {
 	build := strings.Index(guard, `go build -o "$RUNNER_TEMP/stresstally" ./tools/stresstally`)
 	list := strings.Index(guard, "bash tools/stresstally/guard.sh")
 	judge := strings.Index(guard, `"$RUNNER_TEMP/stresstally" guard -dir "$GUARD_DIR" -self "$RUN_ID"`)
-	if build < 0 || list < 0 || judge < 0 || !(build < list && list < judge) {
+	if build < 0 || list < 0 || judge < 0 || build > list || list > judge {
 		t.Errorf("cluster-guard must build the tool, then list the runs, then judge them (positions %d %d %d):\n%s", build, list, judge, guard)
 	}
 }
