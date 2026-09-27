@@ -1045,99 +1045,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		})
 	}()
 
-	// alertedCounters tracks which sub-tally counters we've already
-	// emitted an Incident for, so the periodic callback fires AT MOST
-	// ONCE per counter per run. Without this, a steady-rate adversarial
-	// bug (server accepts every malformed request) would generate
-	// hundreds of incidents per second once the bug catches.
-	alertedCounters := make(map[string]bool)
-	faultInjected := strings.TrimSpace(os.Getenv(refappFaultEnv)) != ""
 	// In-stall capture (celeris#588), in a stall-capture run only: nil
 	// leaves Tier 1's walkers with no stall timer at all.
 	onWalkerStall := walkerStallHook(os.Getenv, violations, pid)
-	tallyCB := func(snap tier1TallySnapshot) {
-		// Publish the refapp's stderr tail for the dossier writer.
-		if tail := snap.RefappStderrTail; len(tail) > 0 {
-			o.stderrTail.Store(&tail)
-		}
-		// HIGH-severity sub-counters: anything non-zero is a bug.
-		// Mirror the canonical list from report.invariantCounters so
-		// the per-arch incident emission stays in sync with the
-		// cross-arch DiffValidation gate.
-		fireIncident := func(counter, msg string, ok, recordOnly bool) {
-			if !ok {
-				return
-			}
-			offerOnce(alertedCounters, violations, Incident{
-				Tier:        TierProperty,
-				PredicateID: counter,
-				Message:     msg,
-				ObservedAt:  time.Now().UTC(),
-				RefappPID:   pid(),
-				RecordOnly:  recordOnly,
-				SkipCore:    recordOnly,
-			})
-		}
-		fire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, false) }
-		// walkerFire is fire for the walker oracles. A fault-injected
-		// control run (PROBATORIUM_REFAPP_FAULT set, celeris#588) records
-		// them instead: the injected stall trips them by design (a held /ws
-		// also times out the 64 KiB echo walker), and a hard fail would end
-		// the cell before the capture it exists to judge had run. Liveness
-		// and hang stay hard in every run.
-		walkerFire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, faultInjected) }
-		// Record-only: dossier (no gcore) while the refapp is still up,
-		// and the cell runs on. The gate still fails on the total; this
-		// only adds evidence to it (celeris#588).
-		record := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, true) }
-		walkerFire(properties.IADVAccepted.ID,
-			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
-			snap.Adversarial.WrongAccepted > 0)
-		walkerFire(properties.IH2CCrashed.ID,
-			fmt.Sprintf("h2c churn returned non-HTTP babble (count=%d) — engine crash on upgrade", snap.H2CChurn.Crashed),
-			snap.H2CChurn.Crashed > 0)
-		walkerFire(properties.IWSAccepted.ID,
-			fmt.Sprintf("server accepted bad WebSocket frame (count=%d) — RFC 6455 violation", snap.WSTorture.AcceptedBadFrame),
-			snap.WSTorture.AcceptedBadFrame > 0)
-		walkerFire(properties.IWSHang.ID,
-			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
-			snap.WSTorture.HangNoClose > 0)
-		// The two gated walker totals that never had a reactive incident.
-		// Both carry the first slow-read record in the message so the
-		// incident.json alone names the instant, the error and the
-		// addresses; the full ring is in the tally snapshot beside it.
-		record(properties.IH2CHang.ID,
-			fmt.Sprintf("h2c upgrade request neither answered nor declined (count=%d: eof=%d timeout=%d reset=%d other=%d, max_elapsed=%dms)%s",
-				snap.H2CChurn.Hang, snap.H2CChurn.HangEOF, snap.H2CChurn.HangTimeout,
-				snap.H2CChurn.HangReset, snap.H2CChurn.HangOther, snap.H2CChurn.HangMaxElapsedMs,
-				report.FirstFailedSlowFire(snap.H2CChurn.SlowReads)),
-			snap.H2CChurn.Hang > 0)
-		record(properties.IWSHandshake.ID,
-			fmt.Sprintf("WebSocket upgrade handshake failed (count=%d: eof=%d timeout=%d reset=%d status=%d other=%d)%s",
-				snap.WSTorture.HandshakeFail, snap.WSTorture.HandshakeFailEOF, snap.WSTorture.HandshakeFailTimeout,
-				snap.WSTorture.HandshakeFailReset, snap.WSTorture.HandshakeFailStatus, snap.WSTorture.HandshakeFailOther,
-				report.FirstFailedSlowFire(snap.WSTorture.SlowReads)),
-			snap.WSTorture.HandshakeFail > 0)
-		// Large-echo wire oracle (celeris#587): any of the four failure
-		// classes is one incident; the message carries all four so the
-		// dossier says which.
-		e := snap.WSEcho
-		walkerFire(properties.IWSEcho.ID,
-			fmt.Sprintf("64 KiB WebSocket echoes not byte-intact and in order (corrupt=%d [egress_interleave=%d other=%d] reorder=%d missing=%d timeout=%d, ok=%d)",
-				e.Corrupt, e.EgressInterleave, e.OtherCorrupt, e.Reorder, e.Missing, e.Timeout, e.OK),
-			e.Corrupt+e.Reorder+e.Missing+e.Timeout > 0)
-		// Engine-agnostic crash oracle: the refapp process died mid-run. This
-		// is the catch-all that the per-protocol counters above can't see — a
-		// dead server just looks like connection-refused to every walker.
-		fire(properties.ILiveness.ID,
-			livenessDeathMessage(snap.Liveness),
-			snap.Liveness.Crashed)
-		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
-		// connection errors). Complements I-LIVENESS for the hang class.
-		fire(properties.IHang.ID,
-			fmt.Sprintf("refapp wedged mid-run: %s", snap.Liveness.Reason()),
-			snap.Liveness.Hung)
-	}
+	tallyCB := o.tallyIncidentCallback(ctx, violations, pid)
 
 	cfg := tier1Config{
 		Driver:      driver,
@@ -1461,6 +1372,103 @@ const stallDossiersPerKind = 4
 // container run had no h2c budget left when the / hold began. A later
 // episode of the same kind, seconds apart, still gets its own dossier.
 const stallDossierCooldown = 2 * time.Second
+
+// tallyIncidentCallback is Tier 1's TallyCallback for this run: each tick
+// it publishes the refapp's stderr tail for the dossier writer and turns the
+// tally snapshot into the property tier's reactive incidents on violations.
+// ctx is the run's context (rootCtx); pid reads the live refapp's PID.
+func (o *Orchestrator) tallyIncidentCallback(ctx context.Context, violations chan<- Incident, pid func() int) func(tier1TallySnapshot) {
+	// alertedCounters tracks which sub-tally counters we've already
+	// emitted an Incident for, so the periodic callback fires AT MOST
+	// ONCE per counter per run. Without this, a steady-rate adversarial
+	// bug (server accepts every malformed request) would generate
+	// hundreds of incidents per second once the bug catches.
+	alertedCounters := make(map[string]bool)
+	faultInjected := strings.TrimSpace(os.Getenv(refappFaultEnv)) != ""
+	return func(snap tier1TallySnapshot) {
+		// Publish the refapp's stderr tail for the dossier writer.
+		if tail := snap.RefappStderrTail; len(tail) > 0 {
+			o.stderrTail.Store(&tail)
+		}
+		// HIGH-severity sub-counters: anything non-zero is a bug.
+		// Mirror the canonical list from report.invariantCounters so
+		// the per-arch incident emission stays in sync with the
+		// cross-arch DiffValidation gate.
+		fireIncident := func(counter, msg string, ok, recordOnly bool) {
+			if !ok {
+				return
+			}
+			offerOnce(alertedCounters, violations, Incident{
+				Tier:        TierProperty,
+				PredicateID: counter,
+				Message:     msg,
+				ObservedAt:  time.Now().UTC(),
+				RefappPID:   pid(),
+				RecordOnly:  recordOnly,
+				SkipCore:    recordOnly,
+			})
+		}
+		fire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, false) }
+		// walkerFire is fire for the walker oracles. A fault-injected
+		// control run (PROBATORIUM_REFAPP_FAULT set, celeris#588) records
+		// them instead: the injected stall trips them by design (a held /ws
+		// also times out the 64 KiB echo walker), and a hard fail would end
+		// the cell before the capture it exists to judge had run. Liveness
+		// and hang stay hard in every run.
+		walkerFire := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, faultInjected) }
+		// Record-only: dossier (no gcore) while the refapp is still up,
+		// and the cell runs on. The gate still fails on the total; this
+		// only adds evidence to it (celeris#588).
+		record := func(counter, msg string, ok bool) { fireIncident(counter, msg, ok, true) }
+		walkerFire(properties.IADVAccepted.ID,
+			fmt.Sprintf("server accepted malformed adversarial bytes (count=%d) — RFC violation", snap.Adversarial.WrongAccepted),
+			snap.Adversarial.WrongAccepted > 0)
+		walkerFire(properties.IH2CCrashed.ID,
+			fmt.Sprintf("h2c churn returned non-HTTP babble (count=%d) — engine crash on upgrade", snap.H2CChurn.Crashed),
+			snap.H2CChurn.Crashed > 0)
+		walkerFire(properties.IWSAccepted.ID,
+			fmt.Sprintf("server accepted bad WebSocket frame (count=%d) — RFC 6455 violation", snap.WSTorture.AcceptedBadFrame),
+			snap.WSTorture.AcceptedBadFrame > 0)
+		walkerFire(properties.IWSHang.ID,
+			fmt.Sprintf("WebSocket connection hung past close timeout (count=%d) — likely goroutine wedge", snap.WSTorture.HangNoClose),
+			snap.WSTorture.HangNoClose > 0)
+		// The two gated walker totals that never had a reactive incident.
+		// Both carry the first slow-read record in the message so the
+		// incident.json alone names the instant, the error and the
+		// addresses; the full ring is in the tally snapshot beside it.
+		record(properties.IH2CHang.ID,
+			fmt.Sprintf("h2c upgrade request neither answered nor declined (count=%d: eof=%d timeout=%d reset=%d other=%d, max_elapsed=%dms)%s",
+				snap.H2CChurn.Hang, snap.H2CChurn.HangEOF, snap.H2CChurn.HangTimeout,
+				snap.H2CChurn.HangReset, snap.H2CChurn.HangOther, snap.H2CChurn.HangMaxElapsedMs,
+				report.FirstFailedSlowFire(snap.H2CChurn.SlowReads)),
+			snap.H2CChurn.Hang > 0)
+		record(properties.IWSHandshake.ID,
+			fmt.Sprintf("WebSocket upgrade handshake failed (count=%d: eof=%d timeout=%d reset=%d status=%d other=%d)%s",
+				snap.WSTorture.HandshakeFail, snap.WSTorture.HandshakeFailEOF, snap.WSTorture.HandshakeFailTimeout,
+				snap.WSTorture.HandshakeFailReset, snap.WSTorture.HandshakeFailStatus, snap.WSTorture.HandshakeFailOther,
+				report.FirstFailedSlowFire(snap.WSTorture.SlowReads)),
+			snap.WSTorture.HandshakeFail > 0)
+		// Large-echo wire oracle (celeris#587): any of the four failure
+		// classes is one incident; the message carries all four so the
+		// dossier says which.
+		e := snap.WSEcho
+		walkerFire(properties.IWSEcho.ID,
+			fmt.Sprintf("64 KiB WebSocket echoes not byte-intact and in order (corrupt=%d [egress_interleave=%d other=%d] reorder=%d missing=%d timeout=%d, ok=%d)",
+				e.Corrupt, e.EgressInterleave, e.OtherCorrupt, e.Reorder, e.Missing, e.Timeout, e.OK),
+			e.Corrupt+e.Reorder+e.Missing+e.Timeout > 0)
+		// Engine-agnostic crash oracle: the refapp process died mid-run. This
+		// is the catch-all that the per-protocol counters above can't see — a
+		// dead server just looks like connection-refused to every walker.
+		fire(properties.ILiveness.ID,
+			livenessDeathMessage(snap.Liveness),
+			snap.Liveness.Crashed)
+		// Deadlock oracle: alive but unresponsive (a wedge the walkers read as
+		// connection errors). Complements I-LIVENESS for the hang class.
+		fire(properties.IHang.ID,
+			fmt.Sprintf("refapp wedged mid-run: %s", snap.Liveness.Reason()),
+			snap.Liveness.Hung)
+	}
+}
 
 // offerOnce sends inc on ch unless inc.PredicateID already produced an
 // incident this run (alerted), and marks it only when the send happened.
