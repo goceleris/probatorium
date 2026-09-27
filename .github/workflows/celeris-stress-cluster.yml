@@ -168,7 +168,13 @@ jobs:
           STRESS_PMU: ${{ matrix.pmu }}
           STRESS_LOG_DIR: ${{ runner.temp }}/stress/logs
           STRESS_FACTS: ${{ runner.temp }}/stress/host/host-facts-${{ matrix.arch }}.txt
-        run: bash probatorium/tools/stresstally/cluster-host.sh
+        # exec: on a cancel or a timeout the runner signals the step's process
+        # alone (SIGINT, then SIGTERM, then SIGKILL), never its children. So
+        # that process must be cluster-host.sh, which then kills the running
+        # shard before the always() steps below run (the Go-state wipe among
+        # them). Without exec the signals reach only this shell, and go test
+        # outlives the job's last step.
+        run: exec bash probatorium/tools/stresstally/cluster-host.sh
       - name: Upload the logs
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -36,13 +36,19 @@
 # Exit status: 0 when every shard ran (the summary judges them), 1 when any
 # shard refused to run in the shape asked for.
 #
-# Each shard runs in its own session (setsid), and a watchdog kills that
-# session when the runner dir disappears (a lost runner's teardown); a cancel
-# is the runner's to handle, as on GitHub. It kills nothing else.
+# Each shard, and each prebuild, runs in a session of its own (setsid), and
+# none may outlive the host job's step: the job's always() steps, the Go-state
+# wipe among them, run as soon as the step has ended. On SIGINT, SIGTERM or
+# SIGHUP (a cancel or a timeout: the runner signals the step's process alone,
+# which is this script, because the workflow's host step execs it) it kills
+# that session before it exits (on_signal). A watchdog in a session of its own
+# kills it when this script is gone (SIGKILL runs no trap) or the runner dir
+# is (a lost runner's teardown) (watch_runner). It kills nothing else.
 #
-# Run, it runs main. Sourced (the tests do), it only defines its functions;
-# the tests point sysfs and procfs at fixtures (STRESS_SYSFS, STRESS_PROCFS)
-# and shorten the waits (STRESS_BUSY_SECONDS, STRESS_QUIET_SECONDS,
+# Run, it runs main; run as `cluster-host.sh watch SIDFILE PID`, the watchdog
+# main starts. Sourced (the tests do), it only defines its functions; the
+# tests point sysfs and procfs at fixtures (STRESS_SYSFS, STRESS_PROCFS) and
+# shorten or lengthen the waits (STRESS_BUSY_SECONDS, STRESS_QUIET_SECONDS,
 # STRESS_QUIET_POLL, STRESS_WATCHDOG_SECONDS). The workflow sets none of these.
 set -euo pipefail
 
@@ -51,6 +57,8 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$here/gostate.sh"
 sysfs=${STRESS_SYSFS:-/sys/devices/system/cpu}
 procfs=${STRESS_PROCFS:-/proc}
+# The running shard's session (see in_session), and the watchdog.
+shard_sidfile="" shard_pid="" watchdog_pid=""
 
 note() { printf '%s\n' "$*" | tee -a "$STRESS_FACTS"; }
 section() { printf '\n=== %s (%s)\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$STRESS_FACTS"; }
@@ -221,7 +229,9 @@ prebuild_arms() {
 		arm=${kv%%=*}
 		out="$TMPDIR/prebuild-$arm.test"
 		rc=0
-		(cd "celeris-$arm" && go test -c -o "$out" "${build[@]}" "${pkgs[@]}") >"$TMPDIR/prebuild-$arm.log" 2>&1 || rc=$?
+		# shellcheck disable=SC2016 # $1 and $@ are the inner shell's
+		in_session bash -c 'cd "$1" && shift && exec go test -c "$@"' _ "celeris-$arm" -o "$out" "${build[@]}" "${pkgs[@]}" \
+			>"$TMPDIR/prebuild-$arm.log" 2>&1 || rc=$?
 		if [ "$rc" = 0 ]; then
 			note "prebuild $arm: binary $(sha256sum "$out" | awk '{print $1}') (go test -c ${build[*]})"
 		else
@@ -232,27 +242,110 @@ prebuild_arms() {
 	done
 }
 
-# watch_runner PID SIDFILE: while PID (this script) lives, watch the runner
-# dir ($RUNNER_TEMP). A runner GitHub gave up on can keep running its job on
-# the host while the teardown kills the listener and deletes that dir;
-# nothing would then stop the running shard, which could run on into the
-# next cluster run for up to its -timeout (5h30m at most). Once the dir is
-# gone, kill the running shard's whole session (its id is in SIDFILE, which
-# lives in TMPDIR, outside the runner dir), then this script.
-watch_runner() {
-	local pid=$1 sidfile=$2 sid
-	while kill -0 "$pid" 2>/dev/null; do
-		if [ ! -d "$RUNNER_TEMP" ]; then
-			echo "::error::the runner dir $RUNNER_TEMP is gone (teardown ran while this job was still running): killing the shard" >&2
-			sid=$(cat "$sidfile" 2>/dev/null || true)
-			if [[ $sid =~ ^[0-9]+$ ]]; then
-				kill -KILL -- "-$sid" 2>/dev/null || true
-			fi
-			kill -TERM "$pid" 2>/dev/null || true
-			return
-		fi
-		sleep "${STRESS_WATCHDOG_SECONDS:-10}"
+# running PID: PID is a live process (a zombie is not). Always the real
+# /proc: a test's STRESS_PROCFS holds no processes.
+running() {
+	local st=""
+	read -r st 2>/dev/null <"/proc/$1/stat" || return 1
+	st=${st##*) }
+	[ "${st%% *}" != Z ]
+}
+
+# kill_session SIDFILE [PID]: SIGKILL every process of the session whose id
+# SIDFILE holds (else PID's: a child caught before it wrote SIDFILE), in
+# whatever process group, and wait until none of them runs, 2 s at most.
+# Fails when there was no session to kill.
+kill_session() {
+	local sid="" f st
+	local -a pids fld
+	read -r sid 2>/dev/null <"$1" || true
+	[[ $sid =~ ^[0-9]+$ ]] || sid=${2-}
+	[[ $sid =~ ^[0-9]+$ ]] || return 1
+	kill -KILL -- "-$sid" 2>/dev/null || kill -KILL "$sid" 2>/dev/null || true
+	for _ in {1..20}; do
+		pids=()
+		for f in /proc/[0-9]*/stat; do
+			read -r st 2>/dev/null <"$f" || continue
+			read -r -a fld <<<"${st##*) }" # state ppid pgrp session ...
+			if [ "${fld[0]}" != Z ] && [ "${fld[3]}" = "$sid" ]; then pids+=("${f//[!0-9]/}"); fi
+		done
+		[ "${#pids[@]}" -gt 0 ] || return 0
+		kill -KILL "${pids[@]}" 2>/dev/null || true
+		sleep 0.1
 	done
+}
+
+# in_session CMD...: run CMD to its end in a session of its own (setsid),
+# whose id is in $shard_sidfile while it runs, so that on_signal and the
+# watchdog can kill all of it: shard.sh, go, the test binary and anything
+# they start. It runs asynchronously and is waited for, because bash runs no
+# trap until a foreground command has ended, and a shard can run for hours.
+# Bash starts an asynchronous command with SIGINT and SIGQUIT ignored, and a
+# signal ignored across exec stays ignored; but the exec builtin first
+# restores the dispositions the shell was started with. So, run as
+# `(exec ...) &`, CMD starts with a foreground command's signal dispositions
+# (and stdin), as a shard does on GitHub.
+in_session() {
+	local rc=0
+	# shellcheck disable=SC2016 # $$, $1 and $@ are the inner shell's
+	(exec setsid bash -c 'printf %s "$$" >"$1" && shift && exec "$@"' _ "$shard_sidfile" "$@") <&0 &
+	shard_pid=$!
+	wait "$shard_pid" || rc=$?
+	shard_pid=""
+	rm -f "$shard_sidfile"
+	return "$rc"
+}
+
+stop_watchdog() {
+	[ -z "$watchdog_pid" ] || kill -TERM -- "-$watchdog_pid" 2>/dev/null || true
+	watchdog_pid=""
+}
+
+# on_signal SIG: a cancel or a timeout. The runner sends SIGINT to the step's
+# process alone (this script: the workflow's host step execs it), SIGTERM
+# 7.5 s later and SIGKILL 2.5 s after that, and then runs the job's always()
+# steps. So kill the running shard's session (or prebuild's) now, then the
+# watchdog, and exit as the signal would have.
+on_signal() {
+	trap '' INT TERM HUP
+	local what="no shard was running"
+	if kill_session "$shard_sidfile" "$shard_pid"; then what="killed the running shard's session"; fi
+	stop_watchdog
+	echo "::warning::cluster-host.sh got SIG$1 (a cancel or a timeout): $what" >&2 || true
+	printf '\n=== SIG%s (%s): %s\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$what" >>"$STRESS_FACTS" 2>/dev/null || true
+	exit $((128 + $(kill -l "$1")))
+}
+
+# watch_runner SIDFILE PID: the watchdog. main starts it in a session of its
+# own, so nothing sent to this script's process group reaches it. Every
+# STRESS_WATCHDOG_SECONDS (default 2) it checks that PID (this script) still
+# runs and that the runner dir ($RUNNER_TEMP) is still there. PID can die of
+# SIGKILL, which runs no trap (the runner's last word on a cancel, 10 s after
+# its SIGINT). A runner GitHub gave up on can keep running its job on the
+# host while the teardown kills the listener and deletes that dir. Either way
+# nothing else would stop the running shard, which could run on into the next
+# cluster run for up to its -timeout (5h30m at most). So once either is gone,
+# it kills the session in SIDFILE (which lives in TMPDIR, outside the runner
+# dir), then PID if it still runs, and exits.
+watch_runner() {
+	local sidfile=$1 pid=$2 why
+	while :; do
+		if ! running "$pid"; then
+			why="the host script (pid $pid) is gone"
+			break
+		fi
+		if [ ! -d "$RUNNER_TEMP" ]; then
+			why="the runner dir $RUNNER_TEMP is gone (teardown ran while this job was still running)"
+			break
+		fi
+		sleep "${STRESS_WATCHDOG_SECONDS:-2}"
+	done
+	if kill_session "$sidfile"; then
+		echo "::error::$why: killed the running shard's session" >&2 || true
+	fi
+	if running "$pid"; then
+		kill -TERM "$pid" 2>/dev/null || true
+	fi
 }
 
 main() {
@@ -261,6 +354,16 @@ main() {
 	gostate_init
 	mkdir -p "$STRESS_LOG_DIR" "$(dirname "$STRESS_FACTS")"
 	: >"$STRESS_FACTS"
+
+	# From here on nothing long-running this script starts may outlive it:
+	# see in_session, on_signal and watch_runner.
+	shard_sidfile="$TMPDIR/stress-shard.sid"
+	rm -f "$shard_sidfile"
+	trap 'on_signal INT' INT
+	trap 'on_signal TERM' TERM
+	trap 'on_signal HUP' HUP
+	setsid bash "$here/${BASH_SOURCE[0]##*/}" watch "$shard_sidfile" "$$" </dev/null &
+	watchdog_pid=$!
 
 	local -A sha_of ref_of
 	local kv
@@ -306,14 +409,6 @@ main() {
 	export STRESS_CPUSET="$cpuset" STRESS_PERF="$perf_state" STRESS_QUIET="$quiet" STRESS_PRE_REFUSE="$pre_refuse"
 	export STRESS_OBS_WRAPPER="$here/obs.sh"
 
-	# Each shard runs in the foreground (so its signal dispositions are the
-	# GitHub target's) in a session of its own (setsid), whose id it writes
-	# to sidfile first, so the watchdog can kill all of it: shard.sh, go test,
-	# the test binary and anything that started.
-	local sidfile="$TMPDIR/stress-shard.sid"
-	watch_runner "$$" "$sidfile" &
-	local watchdog=$!
-
 	local -a seq
 	local refused=0 i=0 tok c shard shuffle rc
 	read -r -a seq <<<"$STRESS_SEQUENCE"
@@ -321,21 +416,20 @@ main() {
 		i=$((i + 1))
 		if ! [[ $tok =~ ^([A-Za-z0-9]+):([0-9]+):(off|[0-9]+)$ ]]; then
 			note "sequence token $tok is not CASE:SHARD:SHUFFLE; refusing the host job"
+			stop_watchdog
 			exit 1
 		fi
 		c=${BASH_REMATCH[1]} shard=${BASH_REMATCH[2]} shuffle=${BASH_REMATCH[3]}
 		echo "=== [$i/${#seq[@]}] case $c shard $shard (-shuffle=$shuffle)"
 		rc=0
-		# shellcheck disable=SC2016 # $$, $1 and $2 are the inner shell's
 		STRESS_CASE=$c STRESS_SHARD=$shard STRESS_SHUFFLE=$shuffle STRESS_OBS_SEQ=$i \
 			STRESS_CELERIS_SHA=${sha_of[$c]:?no commit for case $c} STRESS_CELERIS_REF=${ref_of[$c]-} \
 			STRESS_CELERIS_DIR="celeris-$c" STRESS_LOG="$STRESS_LOG_DIR/${c}__${STRESS_ARCH}__${shard}.log" \
-			setsid bash -c 'printf %s "$$" >"$1" && exec bash "$2"' _ "$sidfile" "$here/shard.sh" || rc=$?
-		rm -f "$sidfile"
+			in_session bash "$here/shard.sh" || rc=$?
 		[ "$rc" = 0 ] || refused=$((refused + 1))
 		note "$(date -u +%H:%M:%SZ) [$i/${#seq[@]}] $c shard $shard: $(tail -n 1 "$STRESS_LOG_DIR/${c}__${STRESS_ARCH}__${shard}.log" 2>/dev/null || echo no log)"
 	done
-	kill "$watchdog" 2>/dev/null || true
+	stop_watchdog
 
 	snapshot "after the last shard"
 	if [ "$refused" -gt 0 ]; then
@@ -345,5 +439,10 @@ main() {
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-	main "$@"
+	if [ "${1-}" = watch ]; then
+		shift
+		watch_runner "$@"
+	else
+		main "$@"
+	fi
 fi

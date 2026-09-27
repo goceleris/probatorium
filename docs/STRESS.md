@@ -283,6 +283,10 @@ msa2-server, every arm64 shard on msr1, never msa2-client. What changes:
   setup, plus 10 for a timing's quiet wait and 3 per arm to build it, plus
   per shard one `timeout` per package and 1 more. The plan log prints the bound and how long the group
   can be held (bootstrap 25 + the bound + teardown 15). Teardown always runs.
+  A cancel or a timeout kills the running shard (its whole session: go
+  test, the test binary and what they started) before the host job's
+  always() steps run, the Go-state wipe among them, and so does the deletion
+  of the host job's runner dir under it (a lost runner's teardown).
   Two waits are not bounded: the wait to enter the group (as for every
   tier), and a host job's wait for its runner. Each host job can run only on
   its host's one runner, so the bootstrap fails (host jobs skipped, teardown
