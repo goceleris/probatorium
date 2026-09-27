@@ -267,7 +267,7 @@ var Registry = map[string]Adapter{
 	//     their binding constraint.
 	//
 	// gin / echo / chi / iris — net/http-based routers. Each carries an
-	// h1 and an h2c (h2c.NewHandler-wrapped) variant.
+	// h1 and an h2c variant; h2c is net/http's own (Server.Protocols).
 	"gin-h1": {
 		Name: "gin-h1", Category: "go-net-http", Language: "go", Framework: "gin", FrameworkVersion: "v1.12.0", Engine: "h1",
 		Bin:          GoBinary{ModuleDir: "servers/gin"},

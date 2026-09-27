@@ -1,6 +1,6 @@
 // Command gin serves the probatorium contract endpoints with the Gin
 // framework. Two engine modes via -engine: h1 (plain HTTP/1.1) and h2c
-// (h2c.NewHandler-wrapped Gin engine).
+// (net/http's own HTTP/2: Server.Protocols with UnencryptedHTTP2).
 //
 // Gin is set to ReleaseMode at startup so its debug logger is disabled
 // — the benchmark cost of zap-level structured logging would dominate

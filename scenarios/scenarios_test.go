@@ -176,6 +176,14 @@ func TestErrorBudgets(t *testing.T) {
 	if got := ErrorBudgetFor(&StaticScenario{name: "x"}); got != DefaultErrorBudget {
 		t.Errorf("zero-ErrBudget scenario = %v, want DefaultErrorBudget fallback", got)
 	}
+	// No registered scenario raises its budget, so the loop above cannot
+	// tell a working override from an ignored one. The override stays the
+	// fallback for churn-close if the first post-bump run shows genuine
+	// refused dials above 5% (probatorium#424), so a scenario that declares
+	// one must get it.
+	if got := ErrorBudgetFor(&StaticScenario{name: "x", ErrBudget: 0.2}); got != 0.2 {
+		t.Errorf("ErrBudget 0.2 scenario = %v, want its declared 0.2", got)
+	}
 }
 
 // TestChurnCloseErrorBudget checks churn-close's budget against measured

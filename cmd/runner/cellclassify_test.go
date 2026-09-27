@@ -210,6 +210,39 @@ func TestClassifyCompletedCell(t *testing.T) {
 			wantPrefix: "suspect:", wantHard: false, wantStatus: report.CellSuspect,
 		},
 		{
+			// A raised budget is honoured. No registered scenario sets
+			// one today, so every other row runs at the 5% default and
+			// cannot tell the cell's budget from the default. A scenario
+			// that declares 0.5 (ErrBudget, the fallback probatorium#424
+			// keeps for churn-close) must pass a 0.3 ratio.
+			name: "ratio under a raised budget is clean",
+			in: completedCell{
+				ScenarioName: "raised-budget", ServerName: "axum",
+				Category: "static", Requests: 700000, Errors: 300000,
+				Duration: 90 * time.Second, ServerAlive: true,
+				ErrorBudget: 0.5,
+			},
+			wantPrefix: "", wantHard: false, wantStatus: report.CellOK,
+		},
+		{
+			// Over a raised budget, the message and the overage
+			// attribution use that budget. At 0.5 the allowance is 1,500
+			// of 3,000 failed operations, so 600 connect errors cover the
+			// 500 past it; at the 5% default they would not (allowance
+			// 150, overage 1,850).
+			name: "over a raised budget the attribution uses that budget",
+			in: completedCell{
+				ScenarioName: "raised-budget", ServerName: "axum",
+				Category: "static", Requests: 1000, Errors: 2000,
+				ConnectErrors: 600,
+				Duration:      90 * time.Second, ServerAlive: true,
+				ErrorBudget: 0.5,
+			},
+			wantPrefix:   "suspect: error ratio 0.667 exceeds budget 0.50 ",
+			wantContains: "overage is connect-class (connect_errors=600)",
+			wantHard:     false, wantStatus: report.CellSuspect,
+		},
+		{
 			// Churn with a few failed dials (3.8% of attempts) stays
 			// clean under the churn-close budget.
 			name: "churn-close under budget is clean",

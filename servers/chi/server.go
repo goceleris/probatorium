@@ -1,5 +1,5 @@
 // Command chi serves the probatorium contract endpoints with the Chi
-// router. Two engine modes: h1 (plain) and h2c (h2c.NewHandler-wrapped).
+// router. Two engine modes: h1 (plain) and h2c (net/http's own HTTP/2).
 //
 // Chi expresses path params as "{id}" rather than the contract's
 // ":id" — registerRoutes does that translation locally.

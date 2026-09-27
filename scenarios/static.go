@@ -253,7 +253,8 @@ func init() {
 		// an error: Linux drops the SYN of a full accept queue and the
 		// client resends it after 1 s, so it lands in the latency of a
 		// recorded success (a mode at 1 s or more is backlog drops, not a
-		// server latency regression). Only a dial that fails counts.
+		// server latency regression). The expected close never counts; a
+		// failed dial, a reset, a truncated response or a timeout does.
 	})
 
 	// HTTP/2 prior-knowledge variants. Paired with the H1 versions on the
