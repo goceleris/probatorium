@@ -43,6 +43,7 @@ func TestParseSUTEnv(t *testing.T) {
 		{name: "trailing comma", in: "A=1,", errPart: "entry 2 is empty"},
 		{name: "PATH refused", in: "PATH=/x", errPart: "not allowed"},
 		{name: "LD_PRELOAD refused", in: "LD_PRELOAD=/x.so", errPart: "not allowed"},
+		{name: "harness debug addr refused", in: "PROBATORIUM_DEBUG_ADDR=127.0.0.1:18090", errPart: "not allowed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := parseSUTEnv(tc.in)
@@ -291,8 +292,8 @@ func TestAggregateWindowsScenarioResources(t *testing.T) {
 	if err := json.Unmarshal(docRaw, &doc); err != nil {
 		t.Fatalf("parse document: %v", err)
 	}
-	if doc.SchemaVersion != "5.16" {
-		t.Errorf("schema_version=%q want 5.16", doc.SchemaVersion)
+	if doc.SchemaVersion != "5.17" {
+		t.Errorf("schema_version=%q want 5.17", doc.SchemaVersion)
 	}
 	if doc.Environment.SUTEnv["CELERIS_IOURING_SEND_ZC"] != "off" {
 		t.Errorf("environment.sut_env=%v want the OFF arm", doc.Environment.SUTEnv)

@@ -102,14 +102,20 @@ var (
 )
 
 // sutEnvForbiddenKeys are the variables that change WHICH binary or
-// loader runs rather than how it behaves; a passthrough into a
-// root-launched SUT must not be able to set them.
+// loader runs rather than how it behaves, and the harness's own endpoints;
+// a passthrough into a root-launched SUT must not be able to set them.
+// PROBATORIUM_DEBUG_ADDR is where the bench server serves /debug/vars
+// (servers/celeris/debugvars.go): run_bench_cell.yml sets it from
+// bench_debug_port and points the observer at the same port, so an override
+// would move the listener away from the observer and leave the cell's
+// engine counters silently absent (CodeRabbit on probatorium#411).
 var sutEnvForbiddenKeys = map[string]bool{
-	"PATH":            true,
-	"LD_PRELOAD":      true,
-	"LD_LIBRARY_PATH": true,
-	"LD_AUDIT":        true,
-	"HOME":            true,
+	"PATH":                   true,
+	"LD_PRELOAD":             true,
+	"LD_LIBRARY_PATH":        true,
+	"LD_AUDIT":               true,
+	"HOME":                   true,
+	"PROBATORIUM_DEBUG_ADDR": true,
 }
 
 // parseSUTEnv parses the BENCH_SUT_ENV format "KEY=VALUE[,KEY=VALUE]".
@@ -147,6 +153,30 @@ func parseSUTEnv(s string) (map[string]string, error) {
 		out[key] = value
 	}
 	return out, nil
+}
+
+// validateSUTEnvMap applies parseSUTEnv's per-entry rules to an env given
+// as a map (a registry column's SUTEnv, celeris#585): the same key and
+// value charsets and the same forbidden keys, because the map reaches the
+// same root-launched process through the same playbook.
+func validateSUTEnvMap(env map[string]string) error {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if !sutEnvKeyRE.MatchString(k) {
+			return fmt.Errorf("key %q must match %s", k, sutEnvKeyRE)
+		}
+		if sutEnvForbiddenKeys[k] {
+			return fmt.Errorf("key %q is not allowed through the SUT env passthrough", k)
+		}
+		if v := env[k]; !sutEnvValueRE.MatchString(v) {
+			return fmt.Errorf("value of %s (%q) must match %s (no whitespace, quotes or shell metacharacters)", k, v, sutEnvValueRE)
+		}
+	}
+	return nil
 }
 
 // sutEnvExtraVars renders the override set as the JSON `--extra-vars`
