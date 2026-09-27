@@ -275,8 +275,8 @@ msa2-server, every arm64 shard on msr1, never msa2-client. What changes:
   teardown already removed. So the `cluster` job runs only when its guard
   ran in the same attempt, and each host job only on runners its own
   attempt's bootstrap registered. Otherwise they are skipped (teardown still
-  runs), and the summary fails with "a re-run never enters
-  matrix-tier-cluster on an old guard verdict". "Re-run all jobs" runs the
+  runs), and the summary fails with "a re-run never enters the cluster's
+  concurrency group on an old guard verdict". "Re-run all jobs" runs the
   guard again, but do not re-run a cluster run at all: dispatch a new one.
 - **Bounded.** The plan refuses a `...` pattern (the bound needs the package
   count) and any plan whose host job could run over 480 minutes: 15 for

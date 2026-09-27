@@ -424,7 +424,7 @@ jobs:
           ATTEMPT: ${{ github.run_attempt }}
           GUARD_ATTEMPT: ${{ needs.cluster-guard.outputs.attempt }}
         run: |
-          echo "::error::attempt $ATTEMPT re-runs a cluster run whose guard ran in attempt ${GUARD_ATTEMPT:-?}. The cluster job did not run: a re-run never enters matrix-tier-cluster on an old guard verdict, and its host jobs never wait for runners the first attempt's teardown removed. Nothing was measured again. Dispatch a new run."
+          echo "::error::attempt $ATTEMPT re-runs a cluster run whose guard ran in attempt ${GUARD_ATTEMPT:-?}. The cluster job did not run: a re-run never enters the cluster's concurrency group on an old guard verdict, and its host jobs never wait for runners the first attempt's teardown removed. Nothing was measured again. Dispatch a new run."
           exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
