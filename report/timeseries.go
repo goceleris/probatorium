@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -37,10 +38,60 @@ const TimeseriesSchemaVersion = "timeseries/1"
 
 // TimeseriesDoc is the top-level sidecar shape, serialised gzip-
 // compressed to timeseries.json.gz next to results.json.
+//
+// One doc describes ONE machine: every series in it was measured on the
+// bench target named by Arch. A BENCH_TARGET=both run therefore writes one
+// doc per arch, never a merged one (probatorium#422: the merged doc of
+// v1.5.8/20260829 carried every cell twice with nothing saying which copy
+// was which machine's, and was published to both arch dirs).
 type TimeseriesDoc struct {
-	GeneratedAt   time.Time        `json:"generated_at"`
-	SchemaVersion string           `json:"schema_version"`
-	Scenarios     []ScenarioSeries `json:"scenarios"`
+	GeneratedAt   time.Time `json:"generated_at"`
+	SchemaVersion string    `json:"schema_version"`
+	// Arch is the publish arch tag (x86_64 / arm64, the same vocabulary
+	// as env.json's arch and the docs tree's <arch> dir) of the machine
+	// every series here was measured on. The cluster merge always sets
+	// it; empty means an unlabelled single-machine doc (the in-process
+	// runner, or a sidecar written before probatorium#422). An optional
+	// field, so schema_version stays timeseries/1 and readers that do
+	// not know it are unaffected.
+	Arch      string           `json:"arch,omitempty"`
+	Scenarios []ScenarioSeries `json:"scenarios"`
+}
+
+// CheckTimeseriesForArch decodes a timeseries.json.gz sidecar and refuses
+// it for the docs tree of arch when it cannot be that one machine's series:
+//
+//   - it is labelled with a different arch, or
+//   - some (scenario, server) cell appears more than once, which is what a
+//     doc holding two machines' series looks like when nothing labels them
+//     (probatorium#422: 1,626 entries for 813 cells, published to x86_64
+//     and arm64 alike).
+//
+// [WriteTree] runs it before writing anything, so every publish path
+// (git, contents API, dry run) is covered.
+func CheckTimeseriesForArch(tsGz []byte, arch string) error {
+	var d TimeseriesDoc
+	if err := d.UnmarshalGzip(tsGz); err != nil {
+		return fmt.Errorf("decode %s: %w", TimeseriesFile, err)
+	}
+	if d.Arch != "" && d.Arch != arch {
+		return fmt.Errorf("%s is labelled arch %q, refusing to publish it under %q", TimeseriesFile, d.Arch, arch)
+	}
+	seen := make(map[[2]string]int, len(d.Scenarios))
+	var dups []string
+	for _, s := range d.Scenarios {
+		k := [2]string{s.Scenario, s.Server}
+		seen[k]++
+		if seen[k] == 2 {
+			dups = append(dups, s.Scenario+"/"+s.Server)
+		}
+	}
+	if len(dups) > 0 {
+		return fmt.Errorf("%s holds %d series for %d (scenario, server) cells: %d cells appear more than once (first: %s), "+
+			"so the doc mixes machines and no reader can tell whose series is whose",
+			TimeseriesFile, len(d.Scenarios), len(seen), len(dups), dups[0])
+	}
+	return nil
 }
 
 // ScenarioSeries is the per-(scenario, server) time-series block: each

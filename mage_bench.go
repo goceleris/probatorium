@@ -1085,9 +1085,11 @@ func aggregatePerCellResults(resultsDir string, warmup time.Duration) error {
 		}
 	}
 
-	if err := writeClusterTimeseries(resultsDir, hostCells); err != nil {
-		return fmt.Errorf("write timeseries sidecar: %w", err)
-	}
+	// The time-series sidecar is NOT written here: this walk sees every
+	// host at once, and a sidecar written from it holds both machines'
+	// series for a BENCH_TARGET=both run (probatorium#422). It is written
+	// by mergeBenchResultsFor, beside the Document it belongs to and from
+	// the same host-scoped cells.
 	return nil
 }
 
@@ -1097,12 +1099,18 @@ func aggregatePerCellResults(resultsDir string, warmup time.Duration) error {
 //
 // The cluster pipeline never builds report.CellResult, so we go through
 // report.BuildScenarioSeries on a []loadgen.Result assembled per
-// (host, competitor, scenario), in RunIndex order. The result is one
-// resultsDir/timeseries.json.gz alongside the per-host raw payloads.
+// (host, competitor, scenario), in RunIndex order. The result is written
+// to path, labelled with arch (the publish arch tag of the Document it
+// sits beside).
+//
+// hostCells must be scoped exactly like that Document: nothing in a
+// ScenarioSeries names its host, so two hosts' cells here become two
+// unlabelled series for one (scenario, server) (probatorium#422).
+// mergeBenchResultsFor is the only caller and passes its own scope.
 //
 // Per-cell unmarshal errors are skipped (mirroring the missing-result
 // skip in readRunnerCellResults) rather than failing the whole bench.
-func writeClusterTimeseries(resultsDir string, hostCells map[string][]cellRecord) error {
+func writeClusterTimeseries(path, arch string, hostCells map[string][]cellRecord) error {
 	type seriesKey struct {
 		Host, Competitor, Scenario string
 	}
@@ -1131,12 +1139,21 @@ func writeClusterTimeseries(resultsDir string, hostCells map[string][]cellRecord
 	doc := &report.TimeseriesDoc{
 		GeneratedAt:   time.Now().UTC(),
 		SchemaVersion: report.TimeseriesSchemaVersion,
+		Arch:          arch,
 	}
 	for _, k := range keys {
 		recs := grouped[k]
 		sort.Slice(recs, func(i, j int) bool { return recs[i].RunIndex < recs[j].RunIndex })
 		results := make([]loadgen.Result, 0, len(recs))
 		for _, r := range recs {
+			// A cell with no measurement carries no loadgen payload: nil
+			// in memory, and "null" once it has been through a raw/<host>.json
+			// payload (which is where mergeBenchResultsFor reads it from).
+			// Skip both, as the merge itself does, so a no-data run never
+			// becomes an empty run series.
+			if len(r.Loadgen) == 0 || string(r.Loadgen) == "null" {
+				continue
+			}
 			var res loadgen.Result
 			if err := json.Unmarshal(r.Loadgen, &res); err != nil {
 				continue
@@ -1159,7 +1176,22 @@ func writeClusterTimeseries(resultsDir string, hostCells map[string][]cellRecord
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(resultsDir, "timeseries.json.gz"), data, 0o644)
+	return os.WriteFile(path, data, 0o644)
+}
+
+// timeseriesSidecarName is the time-series sidecar that belongs to a merged
+// results file: results.json -> timeseries.json.gz, and a BENCH_TARGET=both
+// run's results-<arch>.json -> timeseries-<arch>.json.gz. The writer
+// (mergeBenchResultsFor) and the reader (loadPublishInputsFrom) both derive
+// the name here, so a Document and its sidecar cannot be paired wrongly.
+// Any other name keeps the canonical report.TimeseriesFile.
+func timeseriesSidecarName(resultsName string) string {
+	if a, ok := strings.CutPrefix(resultsName, "results-"); ok {
+		if a, ok := strings.CutSuffix(a, ".json"); ok && a != "" {
+			return "timeseries-" + a + ".json.gz"
+		}
+	}
+	return report.TimeseriesFile
 }
 
 // provenanceReconstructed is the cellRecord.Provenance value for cells
@@ -1694,6 +1726,9 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 		errMsg string
 	}
 	evidence := map[string][]runEvidence{}
+	// scoped holds this merge's raw cells per host: the time-series
+	// sidecar is built from exactly the cells the Document is.
+	scoped := map[string][]cellRecord{}
 	reconstructed := 0
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
@@ -1714,6 +1749,8 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 		if err := json.Unmarshal(data, &payload); err != nil {
 			return "", fmt.Errorf("parse %s: %w", e.Name(), err)
 		}
+		host := strings.TrimSuffix(e.Name(), ".json")
+		scoped[host] = append(scoped[host], payload.Cells...)
 		for _, cell := range payload.Cells {
 			// Effective status: honour the record's classification, else
 			// classify its error string with the SAME report.ClassifyCellError
@@ -1899,6 +1936,13 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 	}
 	if err := os.WriteFile(out, data, 0o644); err != nil {
 		return "", err
+	}
+	// The sidecar is labelled with the arch Publish will file this
+	// Document under (the same archTagFromHostArchPair of its
+	// HostArchPair), so report.WriteTree can refuse it under any other.
+	tsPath := filepath.Join(resultsDir, timeseriesSidecarName(outName))
+	if err := writeClusterTimeseries(tsPath, archTagFromHostArchPair(doc.HostArchPair), scoped); err != nil {
+		return "", fmt.Errorf("write timeseries sidecar %s: %w", tsPath, err)
 	}
 	return out, nil
 }

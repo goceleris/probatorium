@@ -12,6 +12,10 @@
       "description": "Sidecar schema tag, versioned independently of results.json.",
       "const": "timeseries/1"
     },
+    "arch": {
+      "type": "string",
+      "description": "Publish arch tag (x86_64 / arm64, as env.json and the docs tree's <arch> dir) of the ONE machine every series in this doc was measured on (probatorium#422). Set by the cluster merge; absent on unlabelled single-machine docs (the in-process runner, sidecars written before #422). Optional, so schema_version stays timeseries/1. Each (scenario, server) appears at most once."
+    },
     "scenarios": {
       "type": "array",
       "items": { "$ref": "#/$defs/scenarioSeries" }
