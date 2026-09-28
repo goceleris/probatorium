@@ -33,7 +33,7 @@ import (
 // Per-cell execution: a cell visits ONE (server, scenario) pair and
 // runs the saturation pass unconditionally. If the profile is rated and
 // the cell matches the profile's rated glob (budget.RatedGlob: every
-// budget.RatedScenarios scenario on every capable server, 388 cells), the
+// budget.RatedScenarios scenario on every capable server, 401 cells), the
 // same cell ALSO runs the rated sweep once its saturation pass is clean.
 // The cell's JSON carries both maps on the same row; the published
 // Document has a per-scenario SaturationModeRPS (every scenario) and a

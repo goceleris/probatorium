@@ -49,7 +49,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "full (DEFAULT, the weekly cadence): the whole grid at the exhaustive 90s/20s window — projected ~50h (it measured ~69h while every clean cell was rated, probatorium#418). This is what PUBLISHES. | headline: same grid at a shorter 40s/12s window, projected ~29h (it measured ~53h before probatorium#418). | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
+        description: "full (DEFAULT, the weekly cadence): the whole grid at the exhaustive 90s/20s window — projected ~51h (it measured ~69h while every clean cell was rated, probatorium#418). This is what PUBLISHES. | headline: same grid at a shorter 40s/12s window, projected ~30h (it measured ~53h before probatorium#418). | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
         required: false
         type: string
         default: headline
@@ -134,8 +134,8 @@ jobs:
     runs-on: [self-hosted, celeris-cluster, msr1]
     # Job ceiling, plus Deploy + Cleanup. Every full run up to v1.5.8 measured
     # ~69h single-pass because the runner rated every clean cell (~770 of 813,
-    # probatorium#418); with the rated sweep scoped to the model's 388 cells the
-    # full profile projects ~50h and headline ~29h. Well under GitHub's 5-day
+    # probatorium#418); with the rated sweep scoped to the model's 401 cells the
+    # full profile projects ~51h and headline ~30h. Well under GitHub's 5-day
     # self-hosted job hard limit. This is only a ceiling. BENCH_BUDGET (below)
     # is the real fail-loud projection gate.
     timeout-minutes: 6600
@@ -276,17 +276,17 @@ jobs:
           # sweep on the whole grid — many hours); both stay under the job
           # timeout-minutes above.
           # PROJECTED by budget.FitWithin for 2 parallel arches (probatorium#418):
-          #   headline 29h23m = 813 x 1m9s saturation + 388 rated cells x 2m8s
-          #   full     50h14m = 813 x 2m7s saturation + 388 rated cells x 3m20s
+          #   headline 29h50m = 813 x 1m9s saturation + 401 rated cells x 2m8s
+          #   full     50h58m = 813 x 2m7s saturation + 401 rated cells x 3m20s
           # (a rated cell adds 4 passes x (saturation warmup + rated window)).
           # The runs before #418 measured ~53h (headline) and ~69h (full)
           # against projections of 26h35m and 44h31m. Per-cell overhead was
-          # not the gap: the runner rated every clean cell (~770, not 388) at
-          # 30s passes, and each pass re-ran the saturation warmup, which the
-          # projection did not count. The saturation part over-counts if
+          # not the gap: the runner rated every clean cell (~770, not the 388
+          # the model then planned) at 30s passes, and each pass re-ran the
+          # saturation warmup, which the projection did not count. The saturation part over-counts if
           # anything (fast measures 11.34h against a 14.0h projection). The
-          # budgets leave ~20% over the projection, so a grid that grows past
-          # them fails before the run rather than overrunning it.
+          # budgets leave ~18-21% over the projection, so a grid that grows
+          # past them fails before the run rather than overrunning it.
           BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && '36h' || '60h') }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier

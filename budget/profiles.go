@@ -17,18 +17,58 @@ import "time"
 // coverage as the Full profile — only the per-cell window differs (a shorter
 // weekly window that still fits the 24h budget). There is therefore no
 // HeadlineServers / HeadlineScenarios list anymore; the SATURATION grid is
-// "everything". The RATED sweep stays curated (RatedServers x RatedScenarios)
-// because it is the expensive additive dimension — see RatedServers below.
+// "everything". The RATED sweep stays curated (RatedScenarios, on every
+// capable server) because it is the expensive additive dimension.
 
-// RatedScenarios is the rated/SLO subset (#156): the scenarios where
-// throughput-at-SLO (max sustained RPS while P99 <= N ms) carries signal that
-// saturation RPS alone misses. The v1.5.5 audit rebalanced this toward the
-// DRIVER rows — adapters pile up at identical store-bound saturation ceilings
-// there, so latency-at-load is the only thing that ranks them — plus the two
-// static headline rows and churn-close (latency under connection churn, the
-// v1.5.5 timer-cancel signal). The concurrency sweep is already a
-// latency-vs-load curve, and WS/SSE rate-vs-stream is ill-defined, so neither
-// is rated (saturation ranks them).
+// RatedScenarios is the rated/SLO subset (#156): the rows whose rated sweep
+// (four open-loop passes at 0.25-0.9 of the cell's saturation RPS) measures
+// the server and says something no other rated row says. The scope was
+// measured for probatorium#418 over the per-pass data of the published full
+// runs (x86 0716 and 0829, arm64 0829), and the maintainer chose it (option
+// B, 2026-09-28):
+//   - the driver rows: adapters pile up at the same store-bound saturation
+//     ceiling there, so latency at load is what ranks them;
+//   - get-json and post-4k, the static headline rows;
+//   - churn-close: latency under connection churn;
+//   - ws-echo: the only row that shows the celeris loop engines' WebSocket
+//     tail at light load (celeris#755: p99 2.5-10.4 ms at 25% load in
+//     v1.5.8, where celeris-std holds 0.13 ms at twice the rate), which
+//     saturation hides. No ws-echo pass reached 100 ms in any full run. It
+//     sends 7 B, not the 256 B the row declares (probatorium#444); the rated
+//     number is right for the payload actually sent.
+//
+// Not rated, with the measured reason:
+//   - get-simple-1c: one paced connection reads loadgen's ~1 ms timer
+//     quantum plus the RTT (loadgen#102), not the server.
+//   - get-simple, get-simple-128c, get-json-1k: the same client and handler
+//     shape as get-json, which they match within its own run-to-run noise
+//     (get-simple and get-simple-128c are one workload, probatorium#446).
+//   - get-simple-256c/512c/1024c: above ~0.5-0.6M req/s at these connection
+//     counts no server's pass held 10 ms, where the same servers saturate at
+//     1.0-1.4M. The fastest servers publish loadgen's backlog, and the rated
+//     ranking comes out inverted against saturation.
+//   - get-json-h2, post-4k-h2: no H2 pass at 0.4M req/s or more held 10 ms,
+//     on six H2 stacks. A second loadgen process restored the target in a
+//     laptop split test, but a celeris epoll H2 fault below that rate is not
+//     excluded (celeris#757), so the cause is not proven to be loadgen only.
+//   - ws-hub-broadcast-*, sse-fanout-*: not a latency. The server publishes
+//     on its own tick at every fraction and frames carry no timestamp, so the
+//     target only sets how fast loadgen reads.
+//   - ws-large-echo: a real, replicated signal (the loop engines' 64 KiB
+//     echo floor, celeris#756), but its high passes in the arch-parallel 0829
+//     run published 3-12 s backlog clocks (probatorium#442).
+//
+// The concurrency sweep (get-simple-*c) is NOT a latency-vs-load curve: every
+// sweep point is the server at 100% load (RPS x mean latency = connections,
+// within 0.3% at the median).
+//
+// Candidates to re-add once the runner records each pass's achieved rate and
+// refuses a pass that missed it (probatorium#441), the arches stop sharing
+// one loadgen host (probatorium#442) and loadgen paces each worker
+// (loadgen#102): ws-large-echo, get-json-h2 (post-4k-h2 only if it shows
+// something get-json-h2 does not) and get-simple-1024c (the only row at
+// partial load with a large keep-alive pool). The rated rows sit at the same
+// loadgen edge, less often, so #441 and #442 gate any rated publish.
 //
 // Every rated scenario runs on EVERY participating, capability-gated server
 // (see ratedGlobs) — not a curated column subset — so the rated table ranks
@@ -42,6 +82,7 @@ var RatedScenarios = []string{
 	"driver-redis-get", "driver-redis-set", "driver-redis-pipeline",
 	"driver-mc-get", "driver-mc-set", "driver-mc-multiget",
 	"driver-session-rw",
+	"ws-echo",
 }
 
 // Realized (capability-gated) cell counts for the headline weekly
@@ -56,12 +97,13 @@ var RatedScenarios = []string{
 // rated sweep stays curated, so HeadlineRatedRealizedCells is unchanged.
 const (
 	HeadlineRealizedCells = FullRealizedCells
-	// Rated now runs the meaningful scenarios on ALL participating servers
+	// Rated runs the RatedScenarios on ALL participating servers
 	// (capability-gated), not a curated column subset. Realized via
-	// `cmd/runner -dry-run -cells '<ratedGlobs()>' | grep -c '^run0'`:
-	// 3 static rows × 45 H1 cols + 11 driver rows × 23 driver-capable cols = 388.
-	// Re-pin when RatedScenarios or the registry changes.
-	HeadlineRatedRealizedCells = 388
+	// `cmd/runner -dry-run -runs 1 -cells '*/*' -rated -rated-cells '<RatedGlob>'`,
+	// whose stderr counts the rated cells: 3 static rows × 45 H1 cols +
+	// 11 driver rows × 23 driver-capable cols + ws-echo × 13 WS-capable
+	// cols = 401. Re-pin when RatedScenarios or the registry changes.
+	HeadlineRatedRealizedCells = 401
 
 	// Full profile: every server x every scenario, capability-gated. This is
 	// the SAME realized "*/*" grid Fast runs (FullRealizedCells ==
@@ -76,7 +118,7 @@ const (
 	// `cmd/runner -dry-run -cells '*/*' | grep -c '^run0'` when the registry
 	// changes; the grid is now 52 columns x 29 rows, capability-gated.
 	FullRealizedCells      = 813
-	FullRatedRealizedCells = 388 // same rated set as Headline (all participating servers)
+	FullRatedRealizedCells = 401 // same rated set as Headline (all participating servers)
 )
 
 // HeadlineWeekly is the config the benchmark-tier workflow runs on the
@@ -95,9 +137,9 @@ const (
 // artefact is keyed by bench_target (bench_run_dir AND the loadgen transport
 // tarball) and msa2-client is far from saturation while driving one arch.
 //
-// Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~13.8h
-// rated (388 rated cells x 4 x (12+20)s, each rated pass re-running the
-// saturation warmup) = ~29.4h bench — this NO LONGER fits 24h. (Until
+// Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~14.3h
+// rated (401 rated cells x 4 x (12+20)s, each rated pass re-running the
+// saturation warmup) = ~29.8h bench — this NO LONGER fits 24h. (Until
 // probatorium#418 the runner rated every clean cell, ~770, at 30s passes,
 // and the measured run was ~53h.) The v1.5.5 audit expanded rated to
 // run the meaningful scenarios (drivers + static headline + churn-close) on
@@ -168,8 +210,8 @@ func Fast() Profile {
 // dispatch that raises BENCH_BUDGET above 24h; FitWithin asserts the
 // single-pass config fits the (raised) budget and fails loudly otherwise.
 //
-// Budget: 813 cells x (20+90+5+12)s = ~28.7h saturation + 388 rated cells
-// x 4 x (20+30)s = ~21.6h rated = ~50.2h on one arch (the arches run in
+// Budget: 813 cells x (20+90+5+12)s = ~28.7h saturation + 401 rated cells
+// x 4 x (20+30)s = ~22.3h rated = ~51.0h on one arch (the arches run in
 // parallel). Until probatorium#418 every clean cell (~770) was rated and a
 // full run measured ~69h.
 func Full() Profile {

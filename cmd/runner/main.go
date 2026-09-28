@@ -153,7 +153,7 @@ type Config struct {
 	// Empty means every cell, which is what an ad-hoc -rated run always did.
 	// A rated BenchTier run passes budget.RatedGlob, so only the cells the
 	// budget model plans a rated sweep for get one (probatorium#418: with no
-	// scope the runner rated every clean cell, ~770 of 813 instead of 388).
+	// scope the runner rated every clean cell, ~770 of 813 instead of 401).
 	RatedCells string
 
 	// RatedFractions are the offered loads for the rated sweep, expressed as

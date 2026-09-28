@@ -177,8 +177,9 @@ func TestGlobsAreNonEmpty(t *testing.T) {
 // TestRatedGlobsConsistent guards the rated wiring. Rated now runs each
 // RatedScenario on every participating server ("<scenario>/*"), so the realized
 // count is capability-gated — NOT a clean product — and is pinned from a live
-// `cmd/runner -dry-run -cells '<ratedGlobs()>' | grep -c '^run0'` (388),
-// re-verified when RatedScenarios or the registry change. This test guards the
+// `cmd/runner -dry-run -runs 1 -cells '*/*' -rated -rated-cells '<RatedGlob>'`
+// (401), re-verified when RatedScenarios or the registry change
+// (cmd/runner's TestRatedSweepRunsOnlyOnTheModelsRatedCells checks the pin). This test guards the
 // cheap invariants the pin can't: exactly one glob per rated scenario, both
 // rated pins agree, and the pin covers at least one cell per scenario (a stale
 // scenario whose glob matched nothing would drag the realized count below this

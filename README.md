@@ -191,8 +191,8 @@ rated sweep runs.
 
 The workflow publishes only rated profiles, because saturation-only data would publish datasets with no
 `latency_at_slo`. `mage BenchTier` run by hand publishes unless `BENCH_PUBLISH=0`. The workflow sets
-`BENCH_BUDGET` per profile (24 h, 36 h and 60 h). The budget model projects about 29 h for headline and
-50 h for full. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
+`BENCH_BUDGET` per profile (24 h, 36 h and 60 h). The budget model projects about 30 h for headline and
+51 h for full. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
 and 69 h, because they rated every clean cell.
 
 ### Result: latency at SLO
@@ -201,11 +201,13 @@ In the rated sweep, each cell gets four constant-rate passes at 25, 50, 75 and 9
 saturation RPS, with loadgen's coordinated-omission correction. `latency_at_slo` maps each budget in
 `{10, 50, 100, 500, 1000}` ms to the highest pass target whose P99 (the median across runs) stayed within
 it. Bigger is better, and it ranks the field where saturation ceilings collapse together, such as the
-store-bound driver rows. Only the 388 cells of `budget.RatedScenarios` (every rated scenario on every
+store-bound driver rows. Only the 401 cells of `budget.RatedScenarios` (every rated scenario on every
 server that can serve it) get the sweep: `BenchTier` passes their glob to the runner's `-rated-cells`
-(`BENCH_RATED_CELLS`), with the profile's pass window in `BENCH_RATED_DURATION`. The other scenarios
-(`get-simple` and its concurrency sweep, `get-json-1k`, the H2 rows, WS and SSE) publish saturation data
-only. Datasets published before [#418](https://github.com/goceleris/probatorium/issues/418) also carry
+(`BENCH_RATED_CELLS`), with the profile's pass window in `BENCH_RATED_DURATION`. The rated rows are the
+driver rows, `get-json`, `post-4k`, `churn-close` and `ws-echo`. The other scenarios (`get-simple` and its
+concurrency sweep, `get-json-1k`, the H2 rows, `ws-large-echo`, and the WS hub and SSE fan-out rows)
+publish saturation data only; [`budget/profiles.go`](budget/profiles.go) gives the measured reason for
+each. Datasets published before [#418](https://github.com/goceleris/probatorium/issues/418) also carry
 rated data for those scenarios.
 
 ## Validation tier

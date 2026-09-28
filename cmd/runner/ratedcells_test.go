@@ -46,7 +46,7 @@ func ratedArgs(p budget.Profile) []string {
 }
 
 // TestRatedSweepRunsOnlyOnTheModelsRatedCells is probatorium#418: the budget
-// model plans the rated sweep on the RatedScenarios cells (388), but the runner
+// model plans the rated sweep on the RatedScenarios cells (401), but the runner
 // rated every cell whose saturation pass came back clean (~770 of 813 in every
 // published rated run), at 1.55-2x the projected wall clock. Given the flags a
 // rated BenchTier column receives, exactly the model's rated cells may get the
