@@ -91,11 +91,13 @@ type EngineCounter struct {
 // total, which the completeness guard found on its first run.
 //
 // The eighteen celeris#657 counters celeris 9f4d89b added (celeris#676, #681,
-// #687) joined in schema 5.16.
+// #687) joined in schema 5.16, and the two celeris#685 close-path counters
+// celeris 3e7abba added (engine_close_fd_deferred, engine_close_fd_forced) in
+// schema 5.18.
 //
 // Nothing here is gated. The counters celeris documents as must-stay-zero --
-// engine_transplant_stranded, and six of the celeris#657 counters --
-// qualify for [ZeroWitnessMeaning], but moving one there fails a cell on a
+// engine_transplant_stranded, six of the celeris#657 counters and
+// engine_close_fd_forced -- qualify for [ZeroWitnessMeaning], but moving one there fails a cell on a
 // nonzero value, and that is a gate decision, not a reporting one: a
 // diagnostic counter is not gated until a run has said what normal looks
 // like. Each carries its would-be meaning in [EngineCounter.MustStayZero]
@@ -153,7 +155,7 @@ var EngineCounters = map[string]EngineCounter{
 	},
 	"engine_stale_recv_data_closed": {
 		Kind:   CounterCumulative,
-		Counts: "io_uring recv completions that read bytes for a connection this engine had closed or hijacked, dropped as stale. Usually a client's bytes racing a server-side close, and that client sees its connection end; celeris documents it is not always benign -- after a Hijack, or when a recv resolves a reused descriptor number, a live client's request can land here",
+		Counts: "io_uring recv completions that read bytes for a connection this engine had closed or hijacked, dropped as stale: a closed connection's recv reading its own client's late bytes, and that client sees its connection end. Before celeris#685 (celeris 3e7abba) it was not always benign -- after a Hijack, or when a recv resolved a reused descriptor number, a live client's request landed here (celeris#715); since then the close paths keep the descriptor until no op can resolve it (engine_close_fd_deferred), so on an older pin read it with that caveat",
 		Series: false,
 		Why:    "it moves with ordinary close traffic rather than with switches, so its question is how large the close race was over the cell, which the total answers. The switch-time loss is engine_stale_recv_data_transplanted, which has a column",
 	},
@@ -219,6 +221,25 @@ var EngineCounters = map[string]EngineCounter{
 		Counts: "hand-off recv cancels not placed because the io_uring startup probe did not find the IORING_ASYNC_CANCEL flags (Linux 5.19) accepted; such a connection stays on io_uring until its recv completes on its own. Placement only, never a lost request, and zero wherever the probe finds the flags",
 		Series: false,
 		Why:    "a property of the host's kernel rather than of any second: a nonzero total says the arch ran a kernel without the flags, and the residue it leaves is engine_transplant_residual_pinned, which has a column",
+	},
+
+	// --- The same fd-lifetime rule on the io_uring CLOSE paths (celeris#685,
+	// celeris 3e7abba): a closed connection's descriptor number is released
+	// only once no op that names it can still be issued. io_uring only,
+	// cumulative; on the adaptive engine each is the sum over both
+	// sub-engines.
+	"engine_close_fd_deferred": {
+		Kind:   CounterCumulative,
+		Counts: "closes whose descriptor stayed open until the last op the kernel owed on it had completed, and was closed then (normally one loop iteration later). The mechanism working, not a fault: on an async-handler engine close to one per connection the server closes, on a sync-mode engine the server-side closes of connections with a recv armed (timeouts). A rate",
+		Series: false,
+		Why:    "a rate of the rule doing its job, read against engine_close_count as a ratio of totals; the instant of each close is already engine_close_count's column",
+	},
+	"engine_close_fd_forced": {
+		Kind:         CounterCumulative,
+		Counts:       "descriptors the io_uring release backstop closed with an op still owed on them, 5 s after the close that kept them open. The close path had shut the socket's read side, so an owed recv the kernel issues on that socket ends at once; one issued after the number is reused would not. celeris documents it MUST STAY ZERO",
+		Series:       true,
+		Why:          "as engine_transplant_stranded: a nonzero reading is a defect, and the backstop fires 5 s after the close it rescues, so the row, set against the steps of engine_close_count and adaptive_switches 5 s earlier, says which close burst left an op owed; the refapp log carries the backstop's WARN line with the descriptor at the same instant",
+		MustStayZero: "a closed io_uring connection's descriptor was released by the 5 s backstop while the kernel still owed an op on it, so a recv issued after the number was reused could read the request of whatever connection then held it -- the celeris#715 theft the celeris#685 fd-lifetime rule forbids",
 	},
 
 	// --- The celeris#687 post-switch sweep, on whichever engine is draining.

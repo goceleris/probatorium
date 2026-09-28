@@ -502,6 +502,19 @@ func (v *Vars) Document() map[string]any {
 			doc["celeris.engine_transplant_claim_deferred"] = int64(info.Metrics.TransplantClaimDeferred)
 			doc["celeris.engine_transplant_reap_failed"] = int64(info.Metrics.TransplantReapFailed)
 			doc["celeris.engine_transplant_reap_unsupported"] = int64(info.Metrics.TransplantReapUnsupported)
+			// The same fd-lifetime rule on the io_uring CLOSE paths
+			// (celeris#685): a closed connection's descriptor number is
+			// released only once no op that names it can still be issued,
+			// so a recv the kernel had not issued yet can no longer read
+			// the request of a new connection given the freed number.
+			// `close_fd_deferred` is a rate: closes whose descriptor
+			// stayed open until the last owed op completed (on an
+			// async-handler engine close to one per server-side close).
+			// `close_fd_forced` counts such descriptors the release
+			// backstop closed with an op still owed; celeris documents it
+			// MUST STAY ZERO.
+			doc["celeris.engine_close_fd_deferred"] = int64(info.Metrics.CloseFDDeferred)
+			doc["celeris.engine_close_fd_forced"] = int64(info.Metrics.CloseFDForced)
 			// The post-switch sweep (celeris#687). `sweep_passes` is a
 			// rate, the sweep's cost. The five `residual_*` are GAUGES,
 			// not totals: the connections a draining engine still holds,
