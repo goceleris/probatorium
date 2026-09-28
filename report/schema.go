@@ -248,7 +248,20 @@ import (
 //     tell "zero-copy costs nothing" from "zero-copy never ran". Additive;
 //     older readers ignore every field, mean_cpu_pct keeps its meaning,
 //     and nothing is gated.
-const SchemaVersion = "5.17"
+//   - 5.18 — the celeris#685 close-path counters (celeris 3e7abba, #793).
+//     celeris added two EngineMetrics fields for its io_uring fd-lifetime
+//     rule on the close paths: CloseFDDeferred (closes whose descriptor
+//     stayed open until the last op the kernel owed on it completed, a
+//     rate) and CloseFDForced (descriptors the 5 s release backstop closed
+//     with an op still owed; documented must-stay-zero). Adds both to
+//     Tier1Summary.EngineCounters and ONE per-cell series column,
+//     engine_close_fd_forced, appended. Nothing new is gated:
+//     engine_close_fd_forced carries its meaning in
+//     EngineCounter.MustStayZero, and moving it into ZeroWitnessMeaning is
+//     a gate change this version does not make (probatorium#416 holds that
+//     decision for the celeris#657 counters). Additive; older readers
+//     ignore every field.
+const SchemaVersion = "5.18"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
