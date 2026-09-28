@@ -195,6 +195,13 @@ The workflow publishes only rated profiles, because saturation-only data would p
 51 h for full. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
 and 69 h, because they rated every clean cell.
 
+**Rated data is not publishable yet.** [#441](https://github.com/goceleris/probatorium/issues/441) and
+[#442](https://github.com/goceleris/probatorium/issues/442) gate any rated publish, so dispatch headline
+and full with `publish=false` until both land. The runner keeps no achieved rate per pass, so no rated
+number can tell a slow server from load that loadgen never sent (#441). In the two-arch 0829 run, rated
+passes that overlapped the other arch's run of the same row, on the shared loadgen host, published
+backlog clocks far more often than the rest (#442).
+
 ### Result: latency at SLO
 
 In the rated sweep, each cell gets four constant-rate passes at 25, 50, 75 and 90 % of that cell's

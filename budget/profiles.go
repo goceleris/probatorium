@@ -20,55 +20,78 @@ import "time"
 // "everything". The RATED sweep stays curated (RatedScenarios, on every
 // capable server) because it is the expensive additive dimension.
 
-// RatedScenarios is the rated/SLO subset (#156): the rows whose rated sweep
-// (four open-loop passes at 0.25-0.9 of the cell's saturation RPS) measures
-// the server and says something no other rated row says. The scope was
-// measured for probatorium#418 over the per-pass data of the published full
-// runs (x86 0716 and 0829, arm64 0829), and the maintainer chose it (option
-// B, 2026-09-28):
-//   - the driver rows: adapters pile up at the same store-bound saturation
-//     ceiling there, so latency at load is what ranks them;
-//   - get-json and post-4k, the static headline rows;
-//   - churn-close: latency under connection churn;
-//   - ws-echo: the only row that shows the celeris loop engines' WebSocket
-//     tail at light load (celeris#755: p99 2.5-10.4 ms at 25% load in
-//     v1.5.8, where celeris-std holds 0.13 ms at twice the rate), which
-//     saturation hides. No ws-echo pass reached 100 ms in any full run. It
-//     sends 7 B, not the 256 B the row declares (probatorium#444); the rated
-//     number is right for the payload actually sent.
+// RatedScenarios is the rated/SLO subset (#156): the rows that get the rated
+// sweep (four open-loop passes at 0.25-0.9 of the cell's saturation RPS).
+// For probatorium#418 the maintainer chose option B (2026-09-28): the 14 rows
+// the v1.5.5 audit rated, plus ws-echo.
 //
-// Not rated, with the measured reason:
+// The 14 audit rows keep the v1.5.5 audit's reasons; #418 did NOT re-measure
+// them, it only counted their passes (below):
+//   - the driver rows: adapters pile up near a store-bound saturation ceiling,
+//     so latency at load is what ranks them (the audit's claim; in v1.5.8 the
+//     x86 saturation spread across adapters is still 1.2-1.75x per row);
+//   - get-json and post-4k, the static headline rows;
+//   - churn-close: latency under connection churn.
+//
+// ws-echo was added by #418, measured over the per-pass data of the published
+// full runs (x86 0716 and 0829, arm64 0829). It is the only rated row that
+// shows the celeris loop engines' light-load WebSocket tail (celeris#755),
+// which saturation hides; ws-large-echo shows their 64 KiB floor but is not
+// rated (below). The loop engines' 0.25 pass reads p99 2.5-10.4 ms on x86,
+// where celeris-std holds 0.13 ms at twice the rate, and 2.2-2.8 ms on
+// arm64, where celeris-std and axum hold 0.45-0.48 ms at more than twice the
+// rate. No ws-echo pass reached 100 ms in any full run. It sends 7 B, not
+// the 256 B the row declares (probatorium#444); the rated number is right
+// for the payload actually sent.
+//
+// Not rated, with the reason #418 measured over the same runs:
 //   - get-simple-1c: one paced connection reads loadgen's ~1 ms timer
 //     quantum plus the RTT (loadgen#102), not the server.
 //   - get-simple, get-simple-128c, get-json-1k: the same client and handler
-//     shape as get-json, which they match within its own run-to-run noise
-//     (get-simple and get-simple-128c are one workload, probatorium#446).
-//   - get-simple-256c/512c/1024c: above ~0.5-0.6M req/s at these connection
-//     counts no server's pass held 10 ms, where the same servers saturate at
-//     1.0-1.4M. The fastest servers publish loadgen's backlog, and the rated
-//     ranking comes out inverted against saturation.
-//   - get-json-h2, post-4k-h2: no H2 pass at 0.4M req/s or more held 10 ms,
-//     on six H2 stacks. A second loadgen process restored the target in a
-//     laptop split test, but a celeris epoll H2 fault below that rate is not
-//     excluded (celeris#757), so the cause is not proven to be loadgen only.
+//     shape as get-json. On x86 at 0.5-0.9 of saturation, get-json-1k's p99
+//     matches get-json's within get-json-1k's own run-to-run spread, and the
+//     two get-simple rows rank the servers as get-json does (Spearman
+//     0.83-0.95). At 0.25 (both arches) and at 0.9 on arm64 they agree less,
+//     so "adds too little to rate" is a judgment, not a proof. get-simple and
+//     get-simple-128c are one workload (probatorium#446).
+//   - get-simple-256c/512c/1024c: on x86, above ~0.5-0.6M req/s at these
+//     connection counts no server's pass held 10 ms, where the same servers
+//     saturate at 1.0-1.4M; the fastest servers publish loadgen's backlog,
+//     and the rated ranking comes out inverted against saturation. On arm64
+//     (targets below 0.4M) their latency_at_slo ranks the servers almost
+//     exactly as saturation does (Spearman 0.96-1.00 at 100 ms and 1 s).
+//   - get-json-h2, post-4k-h2: on x86, no H2 pass at 0.4M req/s or more held
+//     10 ms, on six H2 stacks. A second loadgen process restored the target
+//     in a laptop split test, but celeris-epoll and celeris-adaptive fail
+//     their 0.5 pass at 18-20% SUT CPU (celeris#757), so the cause is not
+//     proven to be loadgen only.
 //   - ws-hub-broadcast-*, sse-fanout-*: not a latency. The server publishes
 //     on its own tick at every fraction and frames carry no timestamp, so the
 //     target only sets how fast loadgen reads.
 //   - ws-large-echo: a real, replicated signal (the loop engines' 64 KiB
-//     echo floor, celeris#756), but its high passes in the arch-parallel 0829
-//     run published 3-12 s backlog clocks (probatorium#442).
+//     echo floor, celeris#756), but 5 of its x86 cells in the arch-parallel
+//     0829 run published 3-12 s backlog clocks at 0.75 and 0.9
+//     (probatorium#442).
 //
 // The concurrency sweep (get-simple-*c) is NOT a latency-vs-load curve: every
 // sweep point is the server at 100% load (RPS x mean latency = connections,
-// within 0.3% at the median).
+// within 0.3% at the median, over the 810 sweep cells of the three runs).
 //
 // Candidates to re-add once the runner records each pass's achieved rate and
-// refuses a pass that missed it (probatorium#441), the arches stop sharing
-// one loadgen host (probatorium#442) and loadgen paces each worker
-// (loadgen#102): ws-large-echo, get-json-h2 (post-4k-h2 only if it shows
-// something get-json-h2 does not) and get-simple-1024c (the only row at
-// partial load with a large keep-alive pool). The rated rows sit at the same
-// loadgen edge, less often, so #441 and #442 gate any rated publish.
+// refuses a pass that missed it (probatorium#441), overlapping arch runs of
+// the same heavy row are prevented (probatorium#442) and loadgen paces each
+// worker (loadgen#102): ws-large-echo, get-json-h2 (post-4k-h2 only if it
+// shows something get-json-h2 does not) and get-simple-1024c (the only row at
+// partial load with a large keep-alive pool).
+//
+// #441 and #442 gate any rated publish, the rated rows included: they sit at
+// the same loadgen edge, less often, and #418's pass census of them is not
+// clean (the counts are in #441). 17 of the 350 in-set cells x86 0829 rated
+// have a pass of 1 s or more. x86 0829 driver-pg-write rated 16 of 23 cells,
+// 15 of them missing passes. On arm64 the top pass of driver-redis-get, -set,
+// -pipeline and driver-session-rw reads above the cell's own saturation max
+// in 12-20 of 23 cells. churn-close was rated on 1 of 45 x86 cells, the rest
+// suspect at saturation (loadgen#87, probatorium#424).
 //
 // Every rated scenario runs on EVERY participating, capability-gated server
 // (see ratedGlobs) — not a curated column subset — so the rated table ranks
@@ -133,9 +156,13 @@ const (
 // BENCH_TARGET=both. ArchParallel is now true (#168 landed 2026-08-28): the
 // two arch passes run CONCURRENTLY against distinct SUT hosts, sharing only
 // the msa2-client loadgen, so two arches cost the same wall-clock as one and
-// FitWithin projects accordingly. The parallel path is safe because every
-// artefact is keyed by bench_target (bench_run_dir AND the loadgen transport
-// tarball) and msa2-client is far from saturation while driving one arch.
+// FitWithin projects accordingly. The parallel path is safe for artefacts:
+// every artefact is keyed by bench_target (bench_run_dir AND the loadgen
+// transport tarball). It is not shown safe for rated passes: msa2-client is
+// far from saturation while driving one arch, but both arches walk the same
+// cell order, and in the 0829 run x86 rated passes that overlapped the arm64
+// run of the same heavy row read 1 s or more far more often
+// (probatorium#442: ws-large-echo 6 of 10 overlapping passes, 0 of 42 others).
 //
 // Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~14.3h
 // rated (401 rated cells x 4 x (12+20)s, each rated pass re-running the
