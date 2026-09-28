@@ -1,19 +1,35 @@
 name: Celeris Stress
 
-# Runs celeris tests many times on GitHub-hosted runners, x86 and arm64, so a
-# flake and its rate can be measured in minutes instead of hours on a laptop.
-# A local timing is not the runner's timing: for a CI flake the runner is the
-# truth. celeris is public, so these runners (arm64 included) cost nothing.
+# Runs celeris tests many times, x86 and arm64, so a flake and its rate can be
+# measured in minutes instead of hours on a laptop. A local timing is not the
+# runner's timing: for a CI flake the runner is the truth.
 # How to dispatch it, with examples: docs/STRESS.md.
 #
-# GitHub-hosted runners ONLY. This workflow never names a self-hosted or
-# cluster label and never joins the matrix-tier-cluster concurrency group.
+# target github (the default): GitHub-hosted runners. celeris is public, so
+# these runners (arm64 included) cost nothing. Nothing in this file names a
+# self-hosted label, a cluster host or a cluster composite.
+#
+# target cluster: the bare-metal cluster, msa2-server (x86) and msr1 (arm64),
+# native io_uring, through ONE job (`cluster`) that calls
+# celeris-stress-cluster.yml and holds the matrix-tier-cluster concurrency
+# group while it runs, like every tier. That group keeps one running and one
+# pending run, and a run queued into it cancels the pending one, so
+# `cluster-guard` first lists every open run and refuses this one if anything
+# is pending there (tools/stresstally guard). Only a dispatch reaches the
+# cluster; the pull_request self-test never does. mode timing (cluster only)
+# runs pre-registered A/B timings: arms named in celeris_ref, one process per
+# observation, the arm order counterbalanced by the plan.
 #
 #   plan     validates every input (tools/stresstally plan) and resolves the
 #            celeris ref to ONE commit, so every shard tests the same code
 #            even if the branch moves during the run.
-#   shard    one job per shard per arch: go test -v -count=N -shuffle=<seed>
-#            in the requested memlock shape; the raw log is the artifact.
+#   shard    github: one job per shard per arch: go test -v -count=N
+#            -shuffle=<seed> in the requested memlock shape; the raw log is
+#            the artifact.
+#   cluster-guard, cluster
+#            cluster: the guard above, then bootstrap, one job per host
+#            running every shard of its arch in turn (one go test process
+#            each, the same log per shard), and a teardown that always runs.
 #   summary  tallies every log (tools/stresstally summarize): per test and
 #            arch, the per-process fail rate with an exact 95% interval and
 #            the PASS/FAIL/SKIP iteration counts, and a shard that did not
@@ -45,6 +61,15 @@ name: Celeris Stress
 # once. A pull request that touches celeris's driver paths adds drivers.yml's
 # 24 jobs and queues on its own, with or without a pair running.
 #
+# The cluster path adds, on top of the walls above: a pull ref (anyone's
+# fork) is refused for the cluster, and the plan job proves every commit a
+# cluster run tests is reachable from a goceleris/celeris branch or tag,
+# because a cluster shard runs on bare metal as a user with sudo; the four
+# secrets the cluster composites need are passed by name to the cluster
+# workflow, where only its hosted bootstrap and teardown jobs read them, never
+# the host job that runs the code under test; that job keeps cache-mode: none
+# and keeps Go's caches under its own RUNNER_TEMP.
+#
 # The pull_request trigger is the workflow's self-test. A pull request that
 # changes this file or the tool runs a fixed set of cases (selfTests in
 # tools/stresstally/plan.go), each written as dispatch inputs and planned by
@@ -53,11 +78,19 @@ name: Celeris Stress
 # matches nothing must each be reported as exactly that. The run is green
 # only when every case comes out as expected.
 
+# The run's title names the target and mode: the cluster guard reads it to
+# tell a github dispatch (which never joins matrix-tier-cluster) from one that
+# may (TestStressWorkflowRunNameIsWhatTheGuardReads).
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+  && format('Celeris Stress [{0}/{1}] {2}', inputs.target, inputs.mode, inputs.celeris_ref)
+  || format('Celeris Stress self-test #{0}', github.event.pull_request.number) }}
+
 on:
   workflow_dispatch:
     inputs:
       celeris_ref:
-        description: "celeris branch, tag, full commit sha or refs/pull/N/head"
+        description: "celeris branch, tag, full commit sha or refs/pull/N/head (github only); mode timing: 2-4 arms as NAME=REF NAME=REF"
         type: string
         default: main
       packages:
@@ -82,10 +115,10 @@ on:
         options: [both, x86, arm64]
         default: both
       memlock:
-        description: "RLIMIT_MEMLOCK for go test (8m is celeris CI's unit-job shape)"
+        description: "RLIMIT_MEMLOCK for go test; default = the target's shape: github 8m (celeris CI's unit job), cluster unlimited (native io_uring)"
         type: choice
-        options: [8m, 128m, unlimited]
-        default: 8m
+        options: [default, 8m, 128m, unlimited]
+        default: default
       race:
         description: "go test -race"
         type: boolean
@@ -98,10 +131,25 @@ on:
         description: "Allow-listed only: -short -failfast -cpu=N[,N] -parallel=N -skip=RE -tags=LIST -shuffle=off|N, and NAME=V for a variable celeris tests read (CELERIS_*, GOTEST_BACKPRESSURE, WS484_CONNS, ...)"
         type: string
         default: ""
+      target:
+        description: "github: GitHub-hosted runners. cluster: the bare-metal cluster, one host per arch, native io_uring (refused while another cluster run is pending)"
+        type: choice
+        options: [github, cluster]
+        default: github
+      mode:
+        description: "stress: repetitions and their fail rates. timing (cluster only): pre-registered A/B timing of the arms named in celeris_ref"
+        type: choice
+        options: [stress, timing]
+        default: stress
+      timing:
+        description: "mode timing only: cpus=N (CPUs each observation is pinned to, default 4) pmu=required|optional (default optional)"
+        type: string
+        default: ""
   pull_request:
     branches: [main]
     paths:
       - .github/workflows/celeris-stress.yml
+      - .github/workflows/celeris-stress-cluster.yml
       - tools/stresstally/**
 
 permissions:
@@ -126,6 +174,10 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       celeris_ref: ${{ steps.plan.outputs.celeris_ref }}
       celeris_sha: ${{ steps.resolve.outputs.celeris_sha }}
+      target: ${{ steps.plan.outputs.target }}
+      mode: ${{ steps.plan.outputs.mode }}
+      refs: ${{ steps.plan.outputs.refs }}
+      case_shas: ${{ steps.cases.outputs.case_shas }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -157,6 +209,9 @@ jobs:
           IN_RACE: ${{ inputs.race }}
           IN_TIMEOUT: ${{ inputs.timeout }}
           IN_EXTRA: ${{ inputs.extra }}
+          IN_TARGET: ${{ inputs.target }}
+          IN_MODE: ${{ inputs.mode }}
+          IN_TIMING: ${{ inputs.timing }}
         run: go run ./tools/stresstally plan
       # The ref was validated above (a branch, tag, full sha or pull ref that
       # cannot be read as an option). Fetching it here pins the run to one
@@ -178,13 +233,25 @@ jobs:
           fi
           echo "celeris $CELERIS_REF is $sha"
           echo "celeris_sha=$sha" >>"$GITHUB_OUTPUT"
+      # The cluster: every case's ref (one for stress, one per arm for a
+      # timing) pinned to one commit, and each commit proven reachable from a
+      # goceleris/celeris branch or tag, so bare metal runs only code a
+      # celeris maintainer pushed.
+      - name: Resolve every case's commit and prove where it came from (cluster)
+        id: cases
+        if: ${{ steps.plan.outputs.target == 'cluster' }}
+        shell: bash
+        env:
+          REFS: ${{ steps.plan.outputs.refs }}
+        run: bash tools/stresstally/resolve-cases.sh
 
   shard:
     name: ${{ matrix.case }} ${{ matrix.arch }} ${{ matrix.shard }}
     needs: plan
     # plan already refuses this; the job keeps the rule on its own, since it
-    # is the job that runs the celeris code under test.
-    if: ${{ github.event_name == 'pull_request' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+    # is the job that runs the celeris code under test. A cluster plan's
+    # matrix is its host jobs, which the cluster workflow runs.
+    if: ${{ needs.plan.outputs.target == 'github' && (github.event_name == 'pull_request' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch)) }}
     runs-on: ${{ matrix.runner }}
     # Stated again on the job that runs the code under test, so an edit of
     # the workflow-level key cannot give this job's token cache access.
@@ -252,15 +319,113 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  # Outside matrix-tier-cluster, just before entering it: refuse this run if
+  # any run is pending in the group, since entering would cancel it. Lists
+  # every open run (and the jobs of other stress runs) with this run's
+  # read-only token and judges them with tools/stresstally guard; the lists
+  # and the decision are the stress-cluster-guard artifact.
+  cluster-guard:
+    name: cluster-guard
+    needs: plan
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.target == 'cluster' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      checked_at: ${{ steps.guard.outputs.checked_at }}
+      # The attempt this verdict belongs to: the cluster job enters the group
+      # only on a verdict from its own attempt (see the cluster job).
+      attempt: ${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/stresstally
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Refuse if a run is pending in the cluster group
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          GUARD_DIR: ${{ runner.temp }}/guard
+        # Built first, so the look (guard.sh) and the verdict are seconds
+        # apart, not a cold compile apart.
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/stresstally" ./tools/stresstally
+          bash tools/stresstally/guard.sh
+          "$RUNNER_TEMP/stresstally" guard -dir "$GUARD_DIR" -self "$RUN_ID"
+      - name: Upload the guard's evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-cluster-guard
+          path: ${{ runner.temp }}/guard/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The cluster run, inside matrix-tier-cluster for its whole length
+  # (bootstrap, host jobs, teardown), as every tier is. The called workflow
+  # declares no group of its own: this job holds it.
+  #
+  # A re-run never re-enters the group on an old verdict. "Re-run failed
+  # jobs" re-runs this job (and its dependents) but reuses the result and
+  # outputs of a cluster-guard that succeeded, which may be hours old; this
+  # job would then cancel whatever is pending in the group now. So it runs
+  # only when cluster-guard ran in this same attempt; otherwise it is skipped
+  # and the summary says why. "Re-run all jobs" runs the guard again and is
+  # allowed. Never re-run a cluster run: dispatch a new one (docs/STRESS.md).
+  cluster:
+    name: cluster
+    needs: [plan, cluster-guard]
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.target == 'cluster' && needs.cluster-guard.result == 'success' && needs.cluster-guard.outputs.attempt == github.run_attempt && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+    concurrency:
+      group: matrix-tier-cluster
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/celeris-stress-cluster.yml
+    with:
+      matrix: ${{ needs.plan.outputs.matrix }}
+      case_shas: ${{ needs.plan.outputs.case_shas }}
+      refs: ${{ needs.plan.outputs.refs }}
+      guard_checked_at: ${{ needs.cluster-guard.outputs.checked_at }}
+    secrets:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+      RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+      CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+
   summary:
     name: summary
-    needs: [plan, shard]
+    needs: [plan, shard, cluster-guard, cluster]
     # Runs when shards failed too (their logs are the evidence), but not when
-    # the plan itself was refused or the run was cancelled.
-    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    # the plan itself was refused, the cluster guard refused the run, or the
+    # run was cancelled.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.target == 'github' || needs.cluster-guard.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      # A cluster job skipped although the guard allowed the run can only be
+      # a re-run on an earlier attempt's guard (see the cluster job): nothing
+      # ran on the cluster in this attempt, so there is nothing new to judge.
+      - name: Refuse a re-run that skipped the cluster
+        if: ${{ needs.plan.outputs.target == 'cluster' && needs.cluster.result == 'skipped' }}
+        shell: bash
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+          GUARD_ATTEMPT: ${{ needs.cluster-guard.outputs.attempt }}
+        run: |
+          echo "::error::attempt $ATTEMPT re-runs a cluster run whose guard ran in attempt ${GUARD_ATTEMPT:-?}. The cluster job did not run: a re-run never enters the cluster's concurrency group on an old guard verdict, and its host jobs never wait for runners the first attempt's teardown removed. Nothing was measured again. Dispatch a new run."
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -281,6 +446,8 @@ jobs:
         env:
           STRESS_PLAN: ${{ needs.plan.outputs.plan }}
           STRESS_CELERIS_SHA: ${{ needs.plan.outputs.celeris_sha }}
+          # The cluster's per-case commits (CASE=SHA), which its shards tested.
+          STRESS_CASE_SHAS: ${{ needs.plan.outputs.case_shas }}
           LOGS: ${{ runner.temp }}/logs
           OUT: ${{ runner.temp }}/summary
         run: |

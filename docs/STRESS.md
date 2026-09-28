@@ -1,4 +1,4 @@
-# Stress-testing celeris on GitHub-hosted runners
+# Stress-testing celeris on GitHub-hosted runners and on the cluster
 
 `.github/workflows/celeris-stress.yml` runs celeris tests many times, in
 parallel, on GitHub-hosted runners: x86 (`ubuntu-24.04`) and arm64
@@ -7,8 +7,12 @@ both cost nothing. Use it to measure a flake and its rate in minutes instead
 of hours on a laptop. A local timing is not the runner's timing: for a CI
 flake, the runner is the truth.
 
-It never touches the benchmark cluster: no self-hosted label, no share of the
-`matrix-tier-cluster` concurrency group.
+With `target: cluster` the same shards run on the bare-metal cluster instead:
+msa2-server (x86) and msr1 (arm64), native io_uring, no 8 MiB memlock cap, in
+the `matrix-tier-cluster` concurrency group like every tier; and
+`mode: timing` there runs pre-registered A/B timings. See
+[The cluster target](#the-cluster-target) and [Timing mode](#timing-mode).
+The default, `target: github`, never touches the cluster.
 
 ## What a run does
 
@@ -95,25 +99,29 @@ examples; an `Example` runs once per shard.
 
 ### Seeds
 
-Shard `n` of run `R` uses `-shuffle=R*100+n`. Every shard tests a different
-order; the same shard number on x86 and arm64 tests the same order, so an
-arch difference is not an order difference. To replay an order, pass the seed
+Shard `n` of run `R` uses `-shuffle=R*100+n` (on the cluster, which allows
+up to 200 shards, `R*1000+n`; a timing's block `n` gives every arm that
+seed). Every shard tests a different order; the same shard number on x86 and
+arm64 tests the same order, so an arch difference is not an order difference. To replay an order, pass the seed
 from the summary: `extra=-shuffle=<seed>`.
 
 ## Inputs
 
 | input | allowed | default |
 |---|---|---|
-| `celeris_ref` | branch, tag, full 40-hex commit sha, or `refs/pull/N/head` | `main` |
+| `celeris_ref` | branch, tag, full 40-hex commit sha, or `refs/pull/N/head` (github only); `mode: timing`: 2 to 4 arms, `NAME=REF NAME=REF ...` | `main` |
 | `packages` | up to 16 patterns under the celeris module: `.` (the root package), `./dir`, `./dir/...`, `./...` | `./engine/iouring` |
 | `run` | a Go regexp, printable ASCII without spaces, up to 2048 characters; empty runs every test | empty |
 | `count` | 1 to 1000: `-count`, the iterations inside each process | 10 |
-| `shards` | 1 to 20 per arch: one job, and one process per package, each | 5 |
+| `shards` | 1 to 20 per arch: one job, and one process per package, each (cluster: 1 to 200, run in turn; timing: blocks) | 5 |
 | `arches` | `both`, `x86`, `arm64` | `both` |
-| `memlock` | `8m` (celeris CI's unit-job shape), `128m`, `unlimited` | `8m` |
+| `memlock` | `default` (the target's shape: `8m` on github, celeris CI's unit job; `unlimited` on the cluster), `8m`, `128m`, `unlimited` | `default` |
 | `race` | `true`, `false` | `false` |
 | `timeout` | a go test `-timeout` from `1s` to `5h30m`; see below | `30m` |
 | `extra` | space-separated, each token one of: `-short`, `-failfast`, `-cpu=N[,N]`, `-parallel=N`, `-skip=REGEXP`, `-tags=LIST`, `-shuffle=off\|N`, or `NAME=VALUE` for a variable celeris's tests read (below) | empty |
+| `target` | `github`, `cluster` | `github` |
+| `mode` | `stress`, `timing` (cluster only) | `stress` |
+| `timing` | `mode: timing` only: `cpus=N` (1 to 16) and `pmu=required\|optional` | empty (`cpus=4 pmu=optional`) |
 
 Anything else is refused by name before any shard starts. `-run`, `-count`,
 `-timeout`, `-race` and `-v` have their own inputs (or are always set) and are
@@ -226,6 +234,163 @@ gh api -X PATCH repos/goceleris/probatorium/git/refs/heads/stress/runs \
 
 Do not re-run failed shard jobs to "fix" a run: retrying only the shards that
 failed selects for passes and biases the rate. Dispatch a new run instead.
+
+## The cluster target
+
+`target: cluster` runs the plan's shards on bare metal: every x86 shard on
+msa2-server, every arm64 shard on msr1, never msa2-client. What changes:
+
+- **Hosts, not VMs.** One runner per host takes one job at a time, so a
+  cluster plan is one job per arch that runs its shards one after another,
+  each a fresh `go test` process with its own seed and its own log (the
+  process independence the per-process rate rests on is kept; only the
+  per-job setup goes). The logs, the summary, `tally` and `compare` are the
+  GitHub target's. The log header adds the host, CPU model, governor, boost,
+  `perf_event_paranoid`, PMU devices and the load before the shard; a
+  `stress-after:` line adds the load after it. The summary adds a host-facts
+  table, and the `stress-host-<arch>` artifact holds the host's full record
+  (cores and their classes, frequencies, the busiest processes before and
+  after).
+- **Native io_uring.** `memlock: default` is the host's own unlimited there.
+  `8m` still applies celeris CI's shape when a dispatch asks for it; the
+  header's `memlock_in_force` shows what the shard ran with, and a shard that
+  could not get it refuses to run.
+- **The group.** The run holds `matrix-tier-cluster` for its whole length
+  (bootstrap, host jobs, teardown), like every tier, so it never shares the
+  cluster with a tier. That group keeps one running and one pending run, and
+  a run queued into it cancels the pending one. So a `cluster-guard` job
+  first lists every open run and refuses this one if anything is pending in
+  the group (`stresstally guard`; the lists and the decision are the
+  `stress-cluster-guard` artifact). If a tier holds the group, this run waits
+  as the pending one, and a later tier dispatch cancels this run, never the
+  other way round. The guard builds its tool before it looks, so its look
+  and its verdict are seconds apart. The first job inside the group reports,
+  as an error, any cluster run cancelled between the guard's look and two
+  minutes after the guard's job ended (when this run's cluster job entered
+  the group): each may be an eviction, or a cancel for another reason.
+- **Never re-run.** "Re-run failed jobs" re-runs a failed cluster job but
+  reuses the verdict of a `cluster-guard` that succeeded, possibly hours
+  ago, and would enter the group on it, cancelling whatever is pending there
+  now; a re-run host job would queue for a runner the first attempt's
+  teardown already removed. So the `cluster` job runs only when its guard
+  ran in the same attempt, and each host job only on runners its own
+  attempt's bootstrap registered. Otherwise they are skipped (teardown still
+  runs), and the summary fails with "a re-run never enters the cluster's
+  concurrency group on an old guard verdict". "Re-run all jobs" runs the
+  guard again, but do not re-run a cluster run at all: dispatch a new one.
+- **Bounded.** The plan refuses a `...` pattern (the bound needs the package
+  count) and any plan whose host job could run over 480 minutes: 15 for
+  setup, plus 10 for a timing's quiet wait and 3 per arm to build it, plus
+  per shard one `timeout` per package and 1 more. The plan log prints the bound and how long the group
+  can be held (bootstrap 25 + the bound + teardown 15). Teardown always runs.
+  A cancel or a timeout kills the running shard (its whole session: go
+  test, the test binary and what they started) before the host job's
+  always() steps run, the Go-state wipe among them, and so does the deletion
+  of the host job's runner dir under it (a lost runner's teardown).
+  Two waits are not bounded: the wait to enter the group (as for every
+  tier), and a host job's wait for its runner. Each host job can run only on
+  its host's one runner, so the bootstrap fails (host jobs skipped, teardown
+  run) unless every planned host's runner is online; a runner that drops
+  after that check still leaves its job queued, for up to the 24 h GitHub
+  keeps a self-hosted job queued.
+- **Only maintainers' code.** A cluster shard runs on bare metal as a user
+  with sudo. `refs/pull/*` is refused for the cluster, and the plan job
+  proves every commit is contained in a goceleris/celeris branch or tag (a
+  fork's commit can be fetched by sha through its pull ref). The four
+  secrets the cluster composites need are read only by the hosted bootstrap
+  and teardown jobs; the host job gets none, a read-only token,
+  `cache-mode: none`, and Go caches under its own `RUNNER_TEMP`, never the
+  host's shared `~/go` or `~/.cache/go-build`.
+
+```sh
+gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \
+  -f target=cluster -f celeris_ref=9f4d89b171db7838dbcc3ece2107191bc15b25f8 -f packages=./engine/iouring \
+  -f run='^TestListenCloses(ListenSocketsWhenEveryWorkerRingSetupFails|ListenSocketWhenOneWorkerRingSetupFails|ListenSocketRingAndEventfdWhenInitialSubmitFails)$' \
+  -f count=10 -f shards=5 -f arches=both -f timeout=10m -f extra='CELERIS_REQUIRE_IOURING_WORKERS=1'
+```
+
+Queue it: dispatch only when no cluster run is pending (the guard refuses
+otherwise), and add it to `evidence/_queue/cluster.tsv` with its ETA:
+
+    ETA = bootstrap (about 2 min; 12-15 on a cold runner-tarball cache)
+        + the slower host: setup (2-4 min; +2 with -race) + quiet wait (timing: 1-3, at most 10)
+                           + the sum of its shards' go test time
+        + teardown (about 3 min)
+
+A shard's go test time is its first compile (20 to 60 s) plus the test run;
+later shards of the same case only re-link. The bare-metal time per shard is
+measured by the first cluster runs; until then use the GitHub run's
+`elapsed_s` as an upper estimate.
+
+## Timing mode
+
+`mode: timing` (cluster only) measures two to four arms, each a celeris ref
+named in `celeris_ref` (`A=<ref> B=<ref>`), for a pre-registered A/B
+question. Two arms may name the same commit: an A/A control.
+
+- **One process per observation.** A timing runs exactly one package. Each
+  observation is one `go test` process of one arm; go test runs the test
+  binary through `-exec tools/stresstally/obs.sh`, which measures only the
+  binary (go test re-links it every time): wall time, user and system CPU,
+  the load before and after, the binary's sha256, and, when `perf` works on
+  the host, user-mode instructions, cycles and task clock (`perf stat`; on a
+  heterogeneous host such as msr1's big.LITTLE SoC, perf counts each core
+  type on its own PMU and the observation records the sum). It
+  writes one `stress-obs:` line into the shard's log; a shard with no such
+  line, two, or one without its wall time, binary or (under
+  `pmu=required`) instruction count is UNPARSED (reason `observation`), not
+  an observation. Every timing `go test`
+  builds with `-trimpath`, so each arm's checkout directory is not in its
+  binary and two arms of one commit build the same bytes.
+- **Counterbalanced.** A block runs every arm once, in a Williams order:
+  every arm comes first equally often and follows every other arm equally
+  often (two arms: AB, BA, AB, BA, ...). `shards` is the number of blocks and
+  must be a multiple of the order's period (2 for two arms, 6 for three, 4 for
+  four). All arms of a block share one `-shuffle` seed.
+- **Exclusive, pinned, quiet.** The group keeps every other cluster run off
+  the hosts. Before the first observation the host job builds every arm's
+  test binary once (so the build cache holds every compile and no
+  observation directly follows one), then waits up to 10 minutes
+  for a quiet host (busy CPU under 5 % over 5 s and a 1-minute load under
+  1.0); a host that never gets quiet refuses every observation, so no data is
+  taken, and none is ever dropped afterwards. Every observation is pinned
+  (`taskset`) to `cpus` primary SMT threads of the host's fastest core class,
+  never cpu0's core; their SMT siblings stay idle. GOMAXPROCS follows. A
+  class is one `cpu_capacity` and, on arm64 (where a kernel may report every
+  core of a big.LITTLE SoC at 1024), one core type and cluster frequency;
+  the host facts list every class found, and too few CPUs in the fastest
+  one refuses every observation. Governor, boost and `perf_event_paranoid`
+  are recorded, never changed. `pmu=required` refuses every observation when
+  `perf` cannot count (not installed, or `perf_event_paranoid` above 2). A
+  refused timing builds nothing and waits for nothing: each shard's log says
+  why, and go test never starts.
+- **Output.** Each arm is a case that must PASS, judged against its own
+  commit. The summary adds `observations.tsv` (one row per observation in run
+  order: arch, host, block, arm, its position in the block, commit, binary
+  sha256, exit, wall_ns, user_s, sys_s, loads, perf counts, CPU set, shard
+  status), `arms/<ARM>/` (a single-case summary per arm, so
+  `stresstally compare out/arms/A out/arms/B` compares the arms' failures),
+  and a descriptive table. The verdict on the A/B question is the
+  pre-registered analysis of `observations.tsv`, never that table.
+- **The binaries are checked.** On each host every observation of an arm
+  must have run one binary (else the arm fails with `binary-drift`), and two
+  arms of one commit the same binary as each other (else both fail with
+  `aa-binaries-differ`: the build was not reproducible, so a difference
+  between them need not be a code difference). An A/A control therefore
+  shows one sha256 per host, the same for both arms; the two hosts' differ,
+  being two architectures. The summary lists what it found.
+
+```sh
+gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \
+  -f target=cluster -f mode=timing \
+  -f celeris_ref='A=9f4d89b171db7838dbcc3ece2107191bc15b25f8 B=9f4d89b171db7838dbcc3ece2107191bc15b25f8' \
+  -f packages=./engine/iouring -f run='^(TestSockaddrString|TestParseSendZCResult|TestUseSendZC)$' \
+  -f count=50 -f shards=4 -f arches=both -f timeout=2m -f timing='cpus=4 pmu=optional'
+```
+
+This is an A/A run (one commit in both arms): both arms PASS, eight
+observations per arch in the order A B B A A B B A, and one binary sha256
+across all of them.
 
 ## Examples
 

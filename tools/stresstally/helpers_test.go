@@ -1,8 +1,10 @@
 package main
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -51,7 +53,9 @@ func headerFor(c Case, arch string, shard int, override map[string]string) strin
 		{"nproc", "4"}, {"image", "ubuntu24 20260907.300"}, {"go_version", "go version go1.27.0 linux/amd64"},
 	}
 	var b strings.Builder
+	known := map[string]bool{}
 	for _, p := range kv {
+		known[p[0]] = true
 		v := p[1]
 		if o, ok := override[p[0]]; ok {
 			if o == "<drop>" {
@@ -60,6 +64,12 @@ func headerFor(c Case, arch string, shard int, override map[string]string) strin
 			v = o
 		}
 		b.WriteString("stress-header: " + p[0] + "=" + v + "\n")
+	}
+	// Keys the base header lacks (the cluster's and a timing's) are added.
+	for _, k := range slices.Sorted(maps.Keys(override)) {
+		if !known[k] && override[k] != "<drop>" {
+			b.WriteString("stress-header: " + k + "=" + override[k] + "\n")
+		}
 	}
 	b.WriteString("stress-header-end\n")
 	return b.String()

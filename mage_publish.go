@@ -93,7 +93,8 @@ func archTagFromHostArchPair(hostArchPair string) string {
 //  1. Resolve version (PUBLISH_VERSION or go.mod), date (UTC yyyymmdd),
 //     arch (archTag of BENCH_GOARCH/runtime), run_id (run-1).
 //  2. Read the newest results/<...>-bench-<ver>/results.json and its
-//     sibling timeseries.json.gz.
+//     sibling timeseries.json.gz (for a both-arch run, PUBLISH_RESULTS
+//     names results-<arch>.json and the sidecar is timeseries-<arch>.json.gz).
 //  3. report.SplitDocument + report.WriteTree into the docs checkout's
 //     results/ dir, producing results/<ver>/<date>/<arch>/{4 files}.
 //  4. Commit + push the cell (git path) or PUT each file (contents path).
@@ -332,12 +333,25 @@ func loadPublishInputsFrom(resultsPath, version string) (report.SplitMeta, *repo
 		return report.SplitMeta{}, nil, nil, "", fmt.Errorf("parse %s: %w", resultsPath, err)
 	}
 
-	// timeseries.json.gz lives next to results.json (both emit paths
-	// write it there). Absent is fine — older runs predate the sidecar.
+	// The time-series sidecar lives next to its results file, under the
+	// name timeseriesSidecarName derives from it: timeseries.json.gz for
+	// results.json, timeseries-<arch>.json.gz for a BENCH_TARGET=both
+	// run's results-<arch>.json. Absent is fine — older runs predate the
+	// sidecar.
 	var tsGz []byte
-	tsPath := filepath.Join(filepath.Dir(resultsPath), report.TimeseriesFile)
+	tsName := timeseriesSidecarName(filepath.Base(resultsPath))
+	tsPath := filepath.Join(filepath.Dir(resultsPath), tsName)
 	if b, err := os.ReadFile(tsPath); err == nil {
 		tsGz = b
+	} else if tsName != report.TimeseriesFile {
+		// A both-arch run merged before probatorium#422 left ONE
+		// timeseries.json.gz holding both machines' series with nothing
+		// naming either. It is never a per-arch sidecar: publish without
+		// one rather than file another machine's series under this arch.
+		if _, statErr := os.Stat(filepath.Join(filepath.Dir(resultsPath), report.TimeseriesFile)); statErr == nil {
+			fmt.Printf("  WARN: %s has no %s; ignoring the run's combined %s (a both-arch sidecar from before probatorium#422 holds both machines' series) — publishing without a timeseries\n",
+				filepath.Base(resultsPath), tsName, report.TimeseriesFile)
+		}
 	}
 
 	now := time.Now().UTC()

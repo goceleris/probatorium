@@ -1,8 +1,12 @@
 // Command stresstally plans and judges the celeris stress workflow
 // (.github/workflows/celeris-stress.yml), which runs celeris tests many times
-// on GitHub-hosted x86 and arm64 runners to measure flakes and their rates.
+// on GitHub-hosted x86 and arm64 runners, or on the bare-metal cluster
+// (target cluster, .github/workflows/celeris-stress-cluster.yml), to measure
+// flakes and their rates, and on the cluster pre-registered A/B timings.
 //
 //	stresstally plan        validate the dispatch inputs and emit the matrix
+//	stresstally guard       refuse a cluster run that would cancel a pending
+//	                        run of the matrix-tier-cluster group
 //	stresstally summarize   judge every case of a run from its shard logs
 //	stresstally tally DIR   judge a directory of shard logs (local use)
 //	stresstally compare BASE BRANCH
@@ -15,9 +19,16 @@
 // (a dispatch on the default branch is refused), STRESS_PROBATORIUM_SHA (the
 // run's github.sha, recorded in the plan) and the dispatch inputs from
 // IN_CELERIS_REF, IN_PACKAGES, IN_RUN, IN_COUNT, IN_SHARDS, IN_ARCHES,
-// IN_MEMLOCK, IN_RACE, IN_TIMEOUT and IN_EXTRA, and writes the outputs
-// `plan`, `matrix` and `celeris_ref` to $GITHUB_OUTPUT. Inputs arrive through
-// the environment, never through the workflow's expression syntax.
+// IN_MEMLOCK, IN_RACE, IN_TIMEOUT, IN_EXTRA, IN_TARGET, IN_MODE and
+// IN_TIMING, and writes the outputs `plan`, `matrix`, `celeris_ref`,
+// `target`, `mode` and `refs` to $GITHUB_OUTPUT. The matrix is one entry per
+// shard per arch on GitHub, one entry per arch (HostEntry) on the cluster.
+// Inputs arrive through the environment, never through the workflow's
+// expression syntax.
+//
+// summarize takes a cluster run's per-case commits from STRESS_CASE_SHAS
+// (CASE=SHA ...): each case's shards must have tested its own commit (a
+// timing's arms may differ).
 //
 // summarize reads the plan from STRESS_PLAN and the celeris commit every
 // shard must have tested from STRESS_CELERIS_SHA, reads <case>__<arch>__<n>.log
@@ -59,6 +70,8 @@ func main() {
 		code = cmdPlan(os.Stdout, os.Getenv)
 	case "summarize":
 		code = cmdSummarize(os.Args[2:], os.Stdout, os.Getenv)
+	case "guard":
+		code = cmdGuard(os.Args[2:], os.Stdout)
 	case "tally":
 		code = cmdTally(os.Args[2:], os.Stdout)
 	case "compare":
@@ -70,7 +83,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: stresstally plan | summarize -logs DIR -out DIR | tally [-case NAME] DIR | compare BASE BRANCH")
+	fmt.Fprintln(os.Stderr, "usage: stresstally plan | guard -dir DIR -self RUN_ID | summarize -logs DIR -out DIR | tally [-case NAME] DIR | compare BASE BRANCH")
 	os.Exit(2)
 }
 
@@ -89,6 +102,9 @@ func inputsFrom(getenv func(string) string) Inputs {
 		Race:       getenv("IN_RACE"),
 		Timeout:    getenv("IN_TIMEOUT"),
 		Extra:      getenv("IN_EXTRA"),
+		Target:     getenv("IN_TARGET"),
+		Mode:       getenv("IN_MODE"),
+		Timing:     getenv("IN_TIMING"),
 	}
 }
 
@@ -143,29 +159,76 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 		}
 		runID = n
 	}
-	entries := plan.Entries(runID)
+	var (
+		matrix any
+		jobs   int
+	)
+	if plan.IsCluster() {
+		es := plan.HostEntries(runID)
+		matrix, jobs = map[string][]HostEntry{"include": es}, len(es)
+	} else {
+		es := plan.Entries(runID)
+		matrix, jobs = map[string][]Entry{"include": es}, len(es)
+	}
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
 		say(stdout, "::error::%v\n", err)
 		return 2
 	}
-	matrixJSON, err := json.Marshal(map[string][]Entry{"include": entries})
+	matrixJSON, err := json.Marshal(matrix)
 	if err != nil {
 		say(stdout, "::error::%v\n", err)
 		return 2
 	}
 
-	say(stdout, "event %s; probatorium commit %s; celeris ref %s; %d case(s), %d shard job(s)\n",
-		plan.Event, plan.ProbatoriumSHA, plan.CelerisRef, len(plan.Cases), len(entries))
+	target, mode := "github", "stress"
+	if plan.IsCluster() {
+		target = "cluster"
+	}
+	// celeris_ref is the one ref the plan job's resolve step pins (a timing's
+	// first arm); refs names every case's ref as CASE=REF, which the cluster
+	// resolves and checks for provenance case by case.
+	celerisRef, refs := plan.CelerisRef, "stress="+plan.CelerisRef
+	if plan.IsTiming() {
+		mode = "timing"
+		celerisRef = plan.Arms[0].Ref
+		var r []string
+		for _, a := range plan.Arms {
+			r = append(r, a.Name+"="+a.Ref)
+		}
+		refs = strings.Join(r, " ")
+	}
+	unit := "shard job(s)"
+	if plan.IsCluster() {
+		unit = "cluster host job(s)"
+	}
+	say(stdout, "event %s; probatorium commit %s; celeris ref %s; target %s; mode %s; %d case(s), %d %s\n",
+		plan.Event, plan.ProbatoriumSHA, plan.CelerisRef, target, mode, len(plan.Cases), jobs, unit)
 	for _, c := range plan.Cases {
+		limit := jobMinutes(c)
+		if plan.IsCluster() {
+			limit = hostJobMinutes(plan)
+		}
 		say(stdout, "  case %s: packages %q run %q count %d shards %d arches %v memlock %s race %t timeout %s per test binary (job limit %d min) flags %q env %q shuffle %q; expect %s\n",
-			c.Name, strings.Join(c.Packages, " "), c.Run, c.Count, c.Shards, c.Arches, c.Memlock, c.Race, c.Timeout, jobMinutes(c),
+			c.Name, strings.Join(c.Packages, " "), c.Run, c.Count, c.Shards, c.Arches, c.Memlock, c.Race, c.Timeout, limit,
 			strings.Join(c.Flags, " "), strings.Join(c.Env, " "), c.Shuffle, c.Expect.Verdict)
 	}
+	if plan.IsCluster() {
+		m := hostJobMinutes(plan)
+		say(stdout, "cluster: %d go test process(es) per host, hosts in parallel; host job limit %d min (%s); "+
+			"matrix-tier-cluster held at most %d min (bootstrap %d + host job %d + teardown %d)\n",
+			len(plan.Sequence(runID)), m, hostJobFormula(plan), clusterBootstrapMinutes+m+clusterTeardownMinutes,
+			clusterBootstrapMinutes, m, clusterTeardownMinutes)
+		if plan.IsTiming() {
+			say(stdout, "timing: %d arm(s), %d block(s), order %s; each observation pinned to %d CPU(s), pmu %s\n",
+				len(plan.Arms), plan.Cases[0].Shards, strings.Join(plan.Sequence(runID), " "), plan.Cases[0].CPUs, plan.Cases[0].PMU)
+		}
+	}
 
+	lines := fmt.Sprintf("plan=%s\nmatrix=%s\nceleris_ref=%s\ntarget=%s\nmode=%s\nrefs=%s\n", planJSON, matrixJSON, celerisRef, target, mode, refs)
 	out := getenv("GITHUB_OUTPUT")
 	if out == "" {
-		say(stdout, "plan=%s\nmatrix=%s\nceleris_ref=%s\n", planJSON, matrixJSON, plan.CelerisRef)
+		say(stdout, "%s", lines)
 		return 0
 	}
 	f, err := os.OpenFile(out, os.O_APPEND|os.O_WRONLY, 0)
@@ -174,8 +237,8 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 		return 2
 	}
 	// Single-line values only: JSON never contains a raw newline, and the
-	// validated ref cannot contain one.
-	_, err = fmt.Fprintf(f, "plan=%s\nmatrix=%s\nceleris_ref=%s\n", planJSON, matrixJSON, plan.CelerisRef)
+	// validated refs cannot contain one.
+	_, err = io.WriteString(f, lines)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -188,6 +251,28 @@ func cmdPlan(stdout io.Writer, getenv func(string) string) int {
 
 // commitRe is a full git commit sha, as github.sha is.
 var commitRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// parseCaseSHAs reads CASE=SHA tokens and checks they name exactly the
+// plan's cases, each with a full commit sha.
+func parseCaseSHAs(s string, plan Plan) (map[string]string, error) {
+	out := map[string]string{}
+	for _, tok := range strings.Fields(s) {
+		name, sha, ok := strings.Cut(tok, "=")
+		if !ok || !commitRe.MatchString(sha) {
+			return nil, fmt.Errorf("%q is not CASE=<full commit sha>", tok)
+		}
+		out[name] = sha
+	}
+	for _, c := range plan.Cases {
+		if out[c.Name] == "" {
+			return nil, fmt.Errorf("no commit for case %s", c.Name)
+		}
+	}
+	if len(out) != len(plan.Cases) {
+		return nil, fmt.Errorf("%d commit(s) for %d case(s)", len(out), len(plan.Cases))
+	}
+	return out, nil
+}
 
 // refuseDefaultBranch keeps the code under test out of every run on the
 // default branch. A shard runs whatever celeris commit it was given, and code
@@ -226,13 +311,45 @@ func cmdSummarize(args []string, stdout io.Writer, getenv func(string) string) i
 		return 2
 	}
 	sha := getenv("STRESS_CELERIS_SHA")
+	// On the cluster every case's commit comes from the plan job's
+	// provenance check (STRESS_CASE_SHAS, CASE=SHA): a timing's arms each
+	// test their own, and each arm's shards are held to it. A cluster plan
+	// without them fails closed.
+	caseSHA := map[string]string{}
+	if plan.IsCluster() {
+		m, err := parseCaseSHAs(getenv("STRESS_CASE_SHAS"), plan)
+		if err != nil {
+			say(stdout, "::error::STRESS_CASE_SHAS: %v\n", err)
+			return 2
+		}
+		caseSHA = m
+		if !plan.IsTiming() {
+			sha = m[plan.Cases[0].Name]
+		}
+	}
 	reports := make([]CaseReport, 0, len(plan.Cases))
 	for _, c := range plan.Cases {
-		reports = append(reports, judgeCase(c, *logs, sha))
+		s := sha
+		if x, ok := caseSHA[c.Name]; ok {
+			s = x
+		}
+		reports = append(reports, judgeCase(c, *logs, s))
+	}
+	// A timing's binaries can fail an arm, so they are checked before any
+	// report is written.
+	var binaries []string
+	if plan.IsTiming() {
+		binaries = checkBinaries(plan, reports)
 	}
 	if err := writeReports(*outDir, plan, sha, reports); err != nil {
 		say(stdout, "::error::%v\n", err)
 		return 2
+	}
+	if plan.IsTiming() {
+		if err := writeTiming(*outDir, plan, reports, binaries); err != nil {
+			say(stdout, "::error::%v\n", err)
+			return 2
+		}
 	}
 	return verdictText(stdout, plan, reports)
 }
@@ -346,7 +463,22 @@ func writeReports(dir string, plan Plan, sha string, reports []CaseReport) error
 		md.WriteString("This pull request run is the workflow's self-test: each case has a fixed configuration and a fixed expected outcome, " +
 			"including the cases that must FAIL. The run is green only when every case comes out exactly as expected.\n\n")
 	}
-	say(&md, "celeris ref `%s`, commit `%s`", inline(plan.CelerisRef), inline(sha))
+	if plan.IsTiming() {
+		var arms []string
+		for i, a := range plan.Arms {
+			c := ""
+			if i < len(reports) {
+				c = reports[i].CelerisSHA
+			}
+			arms = append(arms, fmt.Sprintf("%s `%s` commit `%s`", inline(a.Name), inline(a.Ref), inline(c)))
+		}
+		say(&md, "Timing of %d arm(s): %s", len(plan.Arms), strings.Join(arms, "; "))
+	} else {
+		say(&md, "celeris ref `%s`, commit `%s`", inline(plan.CelerisRef), inline(sha))
+	}
+	if plan.IsCluster() {
+		md.WriteString("; on the bare-metal cluster (x86 on msa2-server, arm64 on msr1)")
+	}
 	if plan.ProbatoriumSHA != "" {
 		say(&md, "; probatorium commit `%s`", inline(plan.ProbatoriumSHA))
 	}

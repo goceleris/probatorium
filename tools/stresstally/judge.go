@@ -73,6 +73,19 @@ type ShardReport struct {
 	Nproc      string   `json:"nproc"`
 	CelerisSHA string   `json:"celeris_sha"`
 	GoVersion  string   `json:"go_version"`
+	// Host facts, recorded by shard.sh on every target and shown for the
+	// cluster (on GitHub the runner is a fresh VM each time).
+	Host       string `json:"host,omitempty"`
+	CPUModel   string `json:"cpu_model,omitempty"`
+	Governor   string `json:"governor,omitempty"`
+	LoadBefore string `json:"loadavg_before,omitempty"`
+	LoadAfter  string `json:"loadavg_after,omitempty"`
+	CPUSet     string `json:"cpuset,omitempty"`
+	Perf       string `json:"perf,omitempty"`
+	// Observations is the number of stress-obs lines (timing: exactly one).
+	Observations int `json:"observations,omitempty"`
+	// obs are those lines, for observations.tsv; not part of report.json.
+	obs []map[string]string
 }
 
 // TestRow is one test (subtests included) on one arch.
@@ -178,7 +191,11 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 			sr.Exit, sr.Elapsed, sr.Races, sr.TimedOut, sr.Notes = sl.exit, sl.elapsed, sl.races, sl.timedOut, sl.notes
 			sr.Shuffle, sr.Kernel, sr.Image, sr.Memlock = h["shuffle"], h["kernel"], h["image"], h["memlock_in_force"]
 			sr.Nproc, sr.CelerisSHA, sr.GoVersion = h["nproc"], h["celeris_sha"], h["go_version"]
+			sr.Host, sr.CPUModel, sr.Governor, sr.LoadBefore = h["host"], h["cpu_model"], h["governor"], h["loadavg_before"]
+			sr.LoadAfter, sr.CPUSet, sr.Perf, sr.Observations, sr.obs = sl.after["loadavg"], h["cpuset"], h["perf"], len(sl.obs), sl.obs
+			obsReasons := observationReasons(c, sl)
 			sr.Reasons = append(sr.Reasons, sl.reasons...)
+			sr.Reasons = append(sr.Reasons, obsReasons...)
 			shape := checkShape(h, c, arch, shard, celerisSHA)
 			switch {
 			case sl.refused != "" || sl.exit == "refused" || (len(shape) > 0 && !sl.hasReason(reasonNoHeader)):
@@ -186,7 +203,7 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 				for _, m := range shape {
 					sr.Reasons = append(sr.Reasons, reasonShape+": "+m)
 				}
-			case len(sl.reasons) > 0:
+			case len(sl.reasons) > 0 || len(obsReasons) > 0:
 				sr.Status = statusUnparsed
 			default:
 				sr.Status = statusComplete
@@ -305,6 +322,36 @@ func judgeCaseFrom(c Case, locate func(name string) string, celerisSHA string) C
 	return rep
 }
 
+// reasonObservation marks a timing shard that is not one complete
+// observation: it is UNPARSED, whatever its tests did.
+const reasonObservation = "observation"
+
+// observationReasons says why a timing shard that ran (was not refused) is
+// not exactly one complete observation: one process per observation means
+// exactly one stress-obs line, and the pre-registered analysis reads its
+// wall time and binary, and under pmu=required its instruction count.
+func observationReasons(c Case, sl *shardLog) []string {
+	if c.Mode != "timing" || sl.refused != "" || sl.exit == "refused" {
+		return nil
+	}
+	if len(sl.obs) != 1 {
+		return []string{fmt.Sprintf("%s: %d stress-obs line(s), want exactly 1: the test binary did not run exactly once", reasonObservation, len(sl.obs))}
+	}
+	var out []string
+	o := sl.obs[0]
+	for _, k := range []string{"wall_ns", "binary_sha256", "exit"} {
+		if o[k] == "" {
+			out = append(out, fmt.Sprintf("%s: no %s", reasonObservation, k))
+		}
+	}
+	if c.PMU == "required" {
+		if _, err := strconv.ParseFloat(o["instructions_u"], 64); err != nil {
+			out = append(out, fmt.Sprintf("%s: pmu required but no instructions_u (perf=%s)", reasonObservation, o["perf"]))
+		}
+	}
+	return out
+}
+
 // archGaps lists every test (per package) that reached a PASS or FAIL verdict
 // on at least one arch of the case and on no process of another: skipped
 // there, run there only without a verdict, or never started there. With a
@@ -421,6 +468,18 @@ func checkShape(h map[string]string, c Case, arch string, shard int, celerisSHA 
 	}
 	if c.Shuffle != "" {
 		want("shuffle", c.Shuffle)
+	}
+	// The cluster: the right bare-metal host, and for a timing the asked-for
+	// pinning and PMU rule (shard.sh refuses an observation it cannot give
+	// them; this catches a log that claims another shape).
+	if c.Target == "cluster" {
+		want("target", "cluster")
+		want("host", clusterHosts[arch])
+	}
+	if c.Mode == "timing" {
+		want("mode", "timing")
+		want("cpus_asked", strconv.Itoa(c.CPUs))
+		want("pmu_asked", c.PMU)
 	}
 	return bad
 }
