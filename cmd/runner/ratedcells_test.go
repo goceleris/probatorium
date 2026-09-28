@@ -94,6 +94,87 @@ func TestRatedSweepRunsOnlyOnTheModelsRatedCells(t *testing.T) {
 	}
 }
 
+// ratedRows is the rated scope the maintainer chose for probatorium#418
+// (option B, 2026-09-28): the 14 rows first rated by the fix (the static
+// headline rows, churn-close and the 11 driver rows) plus ws-echo. It is
+// spelled out here, not read from budget.RatedScenarios, so that a change to
+// the rated scope fails a test that names the decision.
+var ratedRows = []string{
+	"get-json", "post-4k", "churn-close",
+	"driver-pg-read", "driver-pg-write", "driver-pg-update-tx", "driver-pg-read-range",
+	"driver-redis-get", "driver-redis-set", "driver-redis-pipeline",
+	"driver-mc-get", "driver-mc-set", "driver-mc-multiget",
+	"driver-session-rw",
+	"ws-echo",
+}
+
+// TestRatedScopeIsTheFourteenRowsAndWSEcho is option B of probatorium#418.
+// ws-echo is the one row outside the 14 whose rated number measures the
+// server, and no rated row repeats it: the celeris loop engines' WebSocket
+// echo tail at light load (celeris#755), which saturation hides. Given the
+// flags a rated BenchTier column receives, the runner must rate every cell of
+// the 15 rows in the '*/*' grid and no other cell. ws-echo must be
+// capability-gated exactly as in the saturation grid: rated on every column
+// that declares WebSocket over HTTP/1.1, and on no other column.
+func TestRatedScopeIsTheFourteenRowsAndWSEcho(t *testing.T) {
+	grid := realizedGrid(t)
+	var gridWS []string // the columns the saturation grid runs ws-echo on
+	for _, id := range grid {
+		if sc, srv, _ := strings.Cut(id, "/"); sc == "ws-echo" {
+			gridWS = append(gridWS, srv)
+		}
+	}
+	slices.Sort(gridWS)
+	var wsCols []string // the columns that declare WebSocket over HTTP/1.1
+	for _, a := range servers.AdaptersSorted() {
+		if fs := featureSetFor(a, false); a.Capabilities.WS && fs.HTTP1 {
+			wsCols = append(wsCols, a.Name)
+		}
+	}
+	slices.Sort(wsCols)
+	if len(gridWS) == 0 || !slices.Equal(gridWS, wsCols) {
+		t.Fatalf("the '*/*' grid runs ws-echo on %d columns %q; %d columns declare WebSocket over HTTP/1.1 %q",
+			len(gridWS), gridWS, len(wsCols), wsCols)
+	}
+
+	for _, p := range []budget.Profile{budget.HeadlineWeekly(), budget.Full()} {
+		cfg, err := ParseArgs(ratedArgs(p), io.Discard)
+		if err != nil {
+			t.Fatalf("%s: ParseArgs(%q): %v", p.Name, ratedArgs(p), err)
+		}
+		var ratedWS, missing, extra []string
+		want := 0
+		for _, id := range grid {
+			sc, srv, _ := strings.Cut(id, "/")
+			in := slices.Contains(ratedRows, sc)
+			if in {
+				want++
+			}
+			switch rated := cfg.ratesCell(id); {
+			case rated && !in:
+				extra = append(extra, id)
+			case !rated && in:
+				missing = append(missing, id)
+			case rated && sc == "ws-echo":
+				ratedWS = append(ratedWS, srv)
+			}
+		}
+		slices.Sort(ratedWS)
+		if !slices.Equal(ratedWS, gridWS) {
+			t.Errorf("%s: ws-echo is rated on %d of the %d columns that serve it: rated %q, want %q",
+				p.Name, len(ratedWS), len(gridWS), ratedWS, gridWS)
+		}
+		if len(missing) > 0 {
+			t.Errorf("%s: %d of the %d cells of the 14 rows and ws-echo get no rated sweep: %s",
+				p.Name, len(missing), want, strings.Join(missing, " "))
+		}
+		if len(extra) > 0 {
+			t.Errorf("%s: %d cells outside the 14 rows and ws-echo get the rated sweep: %s",
+				p.Name, len(extra), strings.Join(extra, " "))
+		}
+	}
+}
+
 // TestExecuteCellRatesOnlyTheRatedCells drives the real executeCell against a
 // loopback server, as a cluster column does (remote-target mode), with the
 // flags a rated BenchTier column receives. The in-scope cell (get-json) must
