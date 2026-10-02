@@ -108,6 +108,9 @@ func TestIMEM1Replay_soak36433207097ScatterCellsAreClean(t *testing.T) {
 // the #574 fix), which is clean by itself, plus a leak from the end of
 // warm-up at the true positive's own recorded trough slopes: 3.2 KB/s on
 // msa2, 2.2 KB/s on msr1. I-MEM-1 must still catch it on both hosts.
+// These carriers' troughs scatter by only 72-84 KB, so this control shows
+// that the bound keeps the old catch on a quiet cell, not what it costs on
+// a noisy one: see the next test.
 func TestIMEM1Replay_positiveControlStillFails(t *testing.T) {
 	for _, name := range []string{
 		"soak34616620237-amd64-auth_session_ratelimit-iouring",
@@ -124,5 +127,27 @@ func TestIMEM1Replay_positiveControlStillFails(t *testing.T) {
 				t.Errorf("%s: a %.0f B/s leak (the celeris#573 true positive's slope) no longer fails I-MEM-1", name, leak)
 			}
 		}
+	}
+}
+
+// The near-the-bar control, on the soak shape the gate judges today. The
+// 09-11 carriers above scatter about 20x less than these cells, so they
+// cannot see a bound that is too strict. This is celeris#573's own cell in
+// soak 36433207097 (arm64 auth_session_ratelimit/io_uring, 45 min, ws_echo
+// walker on), clean by itself under the bound, plus a 4 KB/s leak from the
+// end of warm-up: I-MEM-1 must still catch it. 4 KB/s is close to what
+// this cell can show. 3 KB/s is caught here by 226 evaluations, 2.5 KB/s
+// not at all, so celeris#573's 2.2 KB/s would go uncalled in this cell
+// (probatorium#478).
+func TestIMEM1Replay_soak36433207097NearTheBarStillFails(t *testing.T) {
+	const name = "soak36433207097-arm64-auth_session_ratelimit-iouring"
+	s := loadSeries(t, name)
+	if got := imem1Violations(properties.IMEM1, s, 0); got != 0 {
+		t.Fatalf("%s: the carrier alone fails I-MEM-1 %d times; it must be clean for the leak to be what is caught", name, got)
+	}
+	got := imem1Violations(properties.IMEM1, s, 4096)
+	t.Logf("%s + 4096 B/s: %d I-MEM-1 violations", name, got)
+	if got == 0 {
+		t.Errorf("%s: a 4 KB/s leak no longer fails I-MEM-1 in the soak's highest-scatter cell: the bound is stricter than its 99.9 %% quantile", name)
 	}
 }
