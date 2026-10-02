@@ -576,10 +576,17 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	if markovCount < 1 {
 		markovCount = 1
 	}
-	// launch starts one full walker fleet against ctx and returns its
-	// WaitGroup. salt is XORed into every seed: 0 is the walk every cell
-	// has always run, idleBurstSeedSalt the prelude's.
-	launch := func(ctx context.Context, salt uint64) *sync.WaitGroup {
+	// launch starts one full walker fleet and returns its WaitGroup. salt
+	// is XORed into every seed: 0 is the walk every cell has always run,
+	// idleBurstSeedSalt the prelude's.
+	//
+	// stop ends the fleet. Every slice but the Markov walkers runs on it,
+	// as all of them always have. The Markov walkers check it BETWEEN
+	// requests and send each request on reqCtx, so the request a walker
+	// has in flight when stop fires is answered instead of abandoned
+	// (runPhase). A caller with nothing to drain passes one context as
+	// both.
+	launch := func(reqCtx, stop context.Context, salt uint64) *sync.WaitGroup {
 		var wg sync.WaitGroup
 		seedBase := cfg.Seed ^ salt
 		for i := 0; i < markovCount; i++ {
@@ -587,7 +594,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			go func(walkerID int) {
 				defer wg.Done()
 				seed := seedBase ^ uint64(walkerID)*0x9e3779b97f4a7c15
-				runMarkovWalker(ctx, httpc, baseURL, cfg.Matrix, seed, tally)
+				runMarkovWalker(reqCtx, stop, httpc, baseURL, cfg.Matrix, seed, tally)
 			}(i)
 		}
 		for i := 0; i < advCount; i++ {
@@ -597,7 +604,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 				seed := seedBase ^ uint64(0xdead0000+walkerID)*0x9e3779b97f4a7c15
 				// Adversarial fires slower than Markov so it stays inside
 				// its budget share (~1/5 of the total request volume).
-				runAdversarialWalker(ctx, hostPort, seed, 50*time.Millisecond, advTally)
+				runAdversarialWalker(stop, hostPort, seed, 50*time.Millisecond, advTally)
 			}(i)
 		}
 		for i := 0; i < h2cCount; i++ {
@@ -611,7 +618,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 				// rate below the engine's own listener turnover so we're
 				// racing the engine's state machine, not just creating
 				// backlog.
-				runH2CChurnWalker(ctx, hostPort, seed, 100*time.Millisecond, h2cTallyPtr)
+				runH2CChurnWalker(stop, hostPort, seed, 100*time.Millisecond, h2cTallyPtr)
 			}(i)
 		}
 		for i := 0; i < wsCount; i++ {
@@ -623,7 +630,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 				// upgrade + read 101 + send torture frame + classify. At
 				// 150ms tick and 2s per-fire timeout the worst-case rate
 				// is ~6 fires/sec per walker.
-				runWSTortureWalker(ctx, hostPort, wsTorturePath, seed, 150*time.Millisecond, wsTallyPtr)
+				runWSTortureWalker(stop, hostPort, wsTorturePath, seed, 150*time.Millisecond, wsTallyPtr)
 			}(i)
 		}
 		for i := 0; i < sseCount; i++ {
@@ -636,7 +643,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 				// stream-kill per few hundred ms. The point is to keep
 				// fresh disconnect events flowing to the I-CONN-2 oracle,
 				// not to maximise throughput.
-				runSSEKillWalker(ctx, hostPort, sseKillPath, seed, 200*time.Millisecond, sseTallyPtr)
+				runSSEKillWalker(stop, hostPort, sseKillPath, seed, 200*time.Millisecond, sseTallyPtr)
 			}(i)
 		}
 		// Response-conformance slice (I-RFC-1, I-RFC-2). ONE connection at
@@ -658,7 +665,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			go func() {
 				defer wg.Done()
 				seed := seedBase ^ 0x8fc0_1e50_0000_0001
-				runRFCConformanceWalker(ctx, hostPort, "/", seed, rfcConformanceInterval, rfcTallyPtr)
+				runRFCConformanceWalker(stop, hostPort, "/", seed, rfcConformanceInterval, rfcTallyPtr)
 			}()
 		}
 		// WebSocket large-echo slice (celeris#587). ONE walker, off-budget
@@ -675,10 +682,31 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			go func() {
 				defer wg.Done()
 				seed := seedBase ^ 0xec40_0000_0000_0001
-				runWSLargeEchoWalker(ctx, hostPort, wsTorturePath, seed, wsEchoInterval, wsEchoTallyPtr)
+				runWSLargeEchoWalker(stop, hostPort, wsTorturePath, seed, wsEchoInterval, wsEchoTallyPtr)
 			}()
 		}
 		return &wg
+	}
+	// runPhase runs one fleet until stop is done, then ends it gracefully:
+	// no Markov walker starts another request, and the requests already in
+	// flight get up to cfg.RequestTimeout to be answered -- the most any of
+	// them has left before its own client timeout ends it -- before their
+	// context is cancelled (drainFleet).
+	//
+	// The phase used to end by cancelling the requests themselves, and on
+	// the observability refapp that broke I-PANIC (probatorium#465).
+	// celeris's recovery middleware counts a designed /api/error panic
+	// into panic_count before it looks at the request's context, while the
+	// walker counts requests_panic_expected only when the 500 arrives, so
+	// every walker inside /api/error at the burst cut or the load cut left
+	// the excess at +1 for the rest of the cell, and the idle windows that
+	// followed judged it (soak 36433207097: 3 arm64 cells).
+	runPhase := func(stop context.Context, salt uint64) {
+		reqCtx, cancelReq := context.WithCancel(runCtx)
+		defer cancelReq()
+		wg := launch(reqCtx, stop, salt)
+		<-stop.Done()
+		drainFleet(wg, cfg.RequestTimeout, cancelReq)
 	}
 
 	// Optional periodic tally-callback + snapshot-to-disk for reactive
@@ -731,26 +759,29 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	}
 	idleWindow.set(0) // the cell starts under load, window or no window
 	if cfg.IdleWindows {
-		burstCtx, cancelBurst := context.WithTimeout(runCtx, idleBurstDuration)
-		launch(burstCtx, idleBurstSeedSalt).Wait()
+		burstStop, cancelBurst := context.WithTimeout(runCtx, idleBurstDuration)
+		runPhase(burstStop, idleBurstSeedSalt)
 		cancelBurst()
 		holdIdle(runCtx, idleWindow, 1, idleWindowDuration)
 		// The main fleet stops idleTailDuration before the cell's deadline
 		// so the second window fits; with no deadline it runs to cancel.
-		var loadCtx context.Context
+		var loadStop context.Context
 		var cancelLoad context.CancelFunc
 		if deadline, ok := ctx.Deadline(); ok {
-			loadCtx, cancelLoad = context.WithDeadline(runCtx, deadline.Add(-idleTailDuration))
+			loadStop, cancelLoad = context.WithDeadline(runCtx, deadline.Add(-idleTailDuration))
 		} else {
-			loadCtx, cancelLoad = context.WithCancel(runCtx)
+			loadStop, cancelLoad = context.WithCancel(runCtx)
 		}
 		if runCtx.Err() == nil {
-			launch(loadCtx, 0).Wait()
+			runPhase(loadStop, 0)
 		}
 		cancelLoad()
 		holdIdle(runCtx, idleWindow, 2, 0)
 	} else {
-		launch(runCtx, 0).Wait()
+		// One fleet to the end of the cell. The refapp (probatorium#455)
+		// and the property loop end with it, so no sample judges what this
+		// cut leaves behind and there is no phase end to drain.
+		launch(runCtx, runCtx, 0).Wait()
 	}
 	// Every path above ends with runCtx done, so the periodic writer is
 	// on its way out; wait for it so nothing of this tier writes after
@@ -772,6 +803,27 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 		cfg.TallyCallback(snap)
 	}
 	return snap, nil
+}
+
+// drainFleet waits up to bound for the walkers in wg to return on their
+// own, then cancels their requests and waits for the rest. A fleet whose
+// walkers are already past their last request drains in the time that
+// request takes to be answered; bound only matters when one is not.
+func drainFleet(wg *sync.WaitGroup, bound time.Duration, cancelRequests context.CancelFunc) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+	}
+	cancelRequests()
+	<-done
 }
 
 // writeSnapshotAtomically marshals snap and lands it at path through a
@@ -941,9 +993,14 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 	}
 }
 
-// runMarkovWalker walks the Markov chain until ctx is cancelled,
+// runMarkovWalker walks the Markov chain until stop or ctx is done,
 // sending one HTTP request per state visit. The endpoint URL for each
 // state comes from the matrix's data-driven Requests map.
+//
+// stop is checked only BETWEEN requests and the requests run on ctx, so
+// a request in flight when stop fires is still answered and counted;
+// only ctx cuts one short (runPhase in driveTier1, probatorium#465).
+// Pass the same context as both to end the walk with a cut.
 //
 // Each walker gets its own [http.CookieJar] + [http.Client] so the
 // N concurrent walkers exercise N parallel session lifecycles
@@ -960,7 +1017,7 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 // realism; refapps WITH login at a non-/login path (auth_session_ratelimit
 // serves /login but some others serve /api/login) had silent
 // path-mismatch bugs.
-func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
+func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string,
 	m *markov.Matrix, seed uint64, tally *tier1Tally,
 ) {
 	// Per-walker cookie jar. nil error per cookiejar.New's contract
@@ -1025,7 +1082,7 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 	rng := rand.New(rand.NewPCG(seed, ^seed))
 	_ = rng // reserved for adversarial-slice follow-up
 	for {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || stop.Err() != nil {
 			return
 		}
 		state := chain.Current()
@@ -1042,7 +1099,7 @@ func runMarkovWalker(ctx context.Context, parent *http.Client, base string,
 				tally.walkerLogouts.Add(1)
 			}
 			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, req.ExpectPanic, tally)
-			if status == 401 && hasLogin {
+			if status == 401 && hasLogin && stop.Err() == nil {
 				// Session likely expired — re-login and keep walking.
 				// The next request will pick up the fresh cookie.
 				//
