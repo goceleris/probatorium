@@ -25,7 +25,7 @@ func loadSeries(t *testing.T, name string) []properties.Snapshot {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		t.Fatal(err)
