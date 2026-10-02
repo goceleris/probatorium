@@ -49,7 +49,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "full (DEFAULT, the weekly cadence): the whole grid at the exhaustive 90s/20s window — MEASURED ~69h, runs under a 90h budget. This is what PUBLISHES. | headline: same grid at a shorter 40s/12s window, MEASURED ~53h — only ~16h cheaper than full, which is why full is the weekly default. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
+        description: "headline (DEFAULT): the whole grid at a 40s/12s window plus the rated sweep on budget.RatedScenarios, projected ~30h (it measured ~53h before probatorium#418). | full: same grid at the exhaustive 90s/20s window, projected ~51h (it measured ~69h while every clean cell was rated, probatorium#418). headline and full PUBLISH unless publish=false, but probatorium#441 and #442 gate any rated publish: until both land, dispatch them with publish=false. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
         required: false
         type: string
         default: headline
@@ -70,7 +70,7 @@ on:
         type: string
         default: all
       publish:
-        description: "Push results to the docs repo (BENCH_PUBLISH). 'true' (DEFAULT) publishes; 'false' produces data only (no docs push, no integrity gate) — use for a subset re-run that you compose + publish manually. IGNORED when profile=fast: saturation-only data is never published."
+        description: "Push results to the docs repo (BENCH_PUBLISH). 'true' (DEFAULT) publishes; 'false' produces data only (no docs push, no integrity gate) — use for a subset re-run that you compose + publish manually. Until probatorium#441 (per-pass achieved rate) and #442 (arch overlap) land, set 'false': no rated number can yet tell a slow server from load that was never sent. IGNORED when profile=fast: saturation-only data is never published."
         required: false
         type: string
         default: "true"
@@ -132,13 +132,12 @@ jobs:
     # (measured ~40%/core of 32 and ~1.2 of 14 Gbit/s driving a single arch, so
     # far from the bottleneck that would contaminate either measurement).
     runs-on: [self-hosted, celeris-cluster, msr1]
-    # 80h ceiling: the full rated profile on one arch runs ~69h single-pass
-    # (the v1.5.5 full run measured 813 cells in ~69h), plus Deploy + Cleanup.
-    # Raised from 72h to 80h so the run has comfortable headroom and reaching
-    # the ceiling is not a concern. Well under GitHub's 5-day self-hosted job
-    # hard limit. This is only a ceiling — the headline profile (same grid,
-    # shorter 40s/12s window) projects ~26h35m. BENCH_BUDGET (below) is the real
-    # fail-loud projection gate.
+    # Job ceiling, plus Deploy + Cleanup. Every full run up to v1.5.8 measured
+    # ~69h single-pass because the runner rated every clean cell (~770 of 813,
+    # probatorium#418); with the rated sweep scoped to the model's 401 cells the
+    # full profile projects ~51h and headline ~30h. Well under GitHub's 5-day
+    # self-hosted job hard limit. This is only a ceiling. BENCH_BUDGET (below)
+    # is the real fail-loud projection gate.
     timeout-minutes: 6600
     env:
       BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
@@ -276,19 +275,20 @@ jobs:
           # rated "full" deep-dive needs the raised ceiling (it runs the rated
           # sweep on the whole grid — many hours); both stay under the job
           # timeout-minutes above.
-          # headline PROJECTS 26h35m (813 cells x 1m9s saturation + 388 rated
-          # cells x 1m42s), so the old 24h ceiling aborted it before a single
-          # cell ran. 30h leaves ~3h25m headroom. NOTE: the run then spans into
-          # the next day and one Nightly Validation will queue behind it on the
-          # matrix-tier-cluster concurrency group — it runs late, it is not lost.
-          # MEASURED, not projected. The estimator counts only the measurement
-          # window and ignores per-cell fixed overhead (server start, warmup,
-          # teardown), so it under-counts — worse for shorter windows:
-          #   full     projected 44h31m -> ACTUAL 69h15m  (1.56x, 2026-07-16)
-          #   headline projected 26h35m -> ACTUAL ~53h    (2.01x, 2026-08-26)
-          # Budgets below are set from the ACTUALS with headroom, not the
-          # projection. Fixing the estimator itself is a separate follow-up.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && '60h' || '80h') }}
+          # PROJECTED by budget.FitWithin for 2 parallel arches (probatorium#418):
+          #   headline 29h50m = 813 x 1m9s saturation + 401 rated cells x 2m8s
+          #   full     50h58m = 813 x 2m7s saturation + 401 rated cells x 3m20s
+          # (a rated cell adds 4 passes x (saturation warmup + rated window)).
+          # The runs before #418 measured ~53h (headline) and ~69h (full)
+          # against projections of 26h35m and 44h31m. Per-cell overhead was
+          # not the gap: the runner rated every clean cell (~770, not the 388
+          # the model then planned) at 30s passes, and each pass re-ran the
+          # saturation warmup, which the projection did not count. The
+          # saturation part over-counts if anything (fast measures 11.34h
+          # against a 14.0h projection). The budgets leave ~18-21% over the
+          # projection, so a grid that grows past them fails before the run
+          # rather than overrunning it.
+          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && '36h' || '60h') }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 

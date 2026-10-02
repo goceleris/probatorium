@@ -45,6 +45,12 @@
 #                         false; opt-in via BENCH_RATED=1 (budget issue #166).
 #   bench_rated_duration_seconds  measurement window per rated pass,
 #                         integer seconds (default: 30).
+#   bench_rated_cells     glob over "<scenario>/<competitor>" (the
+#                         bench_cells syntax) forwarded to runner
+#                         -rated-cells: only matching cells get the rated
+#                         sweep. mage Bench sets it from BENCH_RATED_CELLS
+#                         (default: the budget model's rated cells). Unset
+#                         = every cell (probatorium#418).
 #   bench_scenario_count  realized scenario count of the busiest column
 #                         (mage derives it from the runner's dry-run
 #                         schedule); sizes the per-cell budget fallback

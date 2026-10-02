@@ -177,8 +177,9 @@ func TestGlobsAreNonEmpty(t *testing.T) {
 // TestRatedGlobsConsistent guards the rated wiring. Rated now runs each
 // RatedScenario on every participating server ("<scenario>/*"), so the realized
 // count is capability-gated — NOT a clean product — and is pinned from a live
-// `cmd/runner -dry-run -cells '<ratedGlobs()>' | grep -c '^run0'` (388),
-// re-verified when RatedScenarios or the registry change. This test guards the
+// `cmd/runner -dry-run -runs 1 -cells '*/*' -rated -rated-cells '<RatedGlob>'`
+// (401), re-verified when RatedScenarios or the registry change
+// (cmd/runner's TestRatedSweepRunsOnlyOnTheModelsRatedCells checks the pin). This test guards the
 // cheap invariants the pin can't: exactly one glob per rated scenario, both
 // rated pins agree, and the pin covers at least one cell per scenario (a stale
 // scenario whose glob matched nothing would drag the realized count below this
@@ -249,5 +250,35 @@ func TestColumnWallClock(t *testing.T) {
 	if rated <= v38OldGuard {
 		t.Errorf("rated column projection %v must exceed the v3.8 guard %v that killed the run; "+
 			"a smaller projection means the data-loss bug is back", rated, v38OldGuard)
+	}
+}
+
+// TestRatedCostIsTheSweepTheRunnerRuns is probatorium#418: FitWithin and the
+// hang guard must price a rated cell the same way. The runner's rated sweep is
+// RatedPasses closed-loop passes, and each re-runs the saturation warmup
+// (runRatedSweep clones the saturation loadgen.Config), which is what
+// ColumnWallClock charges. FitWithin charged one RatedWarmup plus the passes,
+// so the projection of every rated profile came in short of what the runner
+// spends even on the model's own rated cells.
+func TestRatedCostIsTheSweepTheRunnerRuns(t *testing.T) {
+	for _, p := range []Profile{HeadlineWeekly(), Full()} {
+		p.Arches = 1
+		sweep := ColumnWallClock(1, p.RatedPasses, p.Warmup, p.Duration, p.RatedDuration) -
+			ColumnWallClock(1, 0, p.Warmup, p.Duration, p.RatedDuration)
+		if want := time.Duration(p.RatedCells) * sweep; p.Rated() != want {
+			t.Errorf("%s: Rated() = %v for %d rated cells, want %v (%d cells x %v, the sweep ColumnWallClock charges: %d x (warmup %v + rated %v))",
+				p.Name, p.Rated(), p.RatedCells, want, p.RatedCells, sweep, p.RatedPasses, p.Warmup, p.RatedDuration)
+		}
+	}
+}
+
+// TestRatedCellsGlobIsTheRatedProfilesGlob: mage Bench rates
+// RatedCellsGlob() when BENCH_RATED=1 comes without BENCH_RATED_CELLS, so it
+// must be the rated glob BenchTier forwards for either rated profile.
+func TestRatedCellsGlobIsTheRatedProfilesGlob(t *testing.T) {
+	for _, p := range []Profile{HeadlineWeekly(), Full()} {
+		if got := RatedGlob(p); got != RatedCellsGlob() {
+			t.Errorf("%s: RatedGlob = %q, RatedCellsGlob = %q", p.Name, got, RatedCellsGlob())
+		}
 	}
 }

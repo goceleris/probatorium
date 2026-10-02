@@ -539,6 +539,9 @@
   # The -cells server-half matches the competitor slug (the runner's
   # synthetic remote server is named via -server-name), so e.g.
   # BENCH_CELLS='get-*/*' or '*/celeris-*' both work.
+  # RATED SCOPE: -rated-cells takes bench_rated_cells (the rated glob mage
+  # Bench forwards, the same syntax). Only the matching cells get the rated
+  # sweep. Without it the runner rates every clean cell (probatorium#418).
   # HANG GUARD: a bound-but-wedged SUT (a competitor that accepts the
   # connection but never completes responses — e.g. an event-loop server that
   # deadlocks under concurrency) makes loadgen's workers block on socket reads
@@ -582,7 +585,7 @@
       -duration {{ bench_duration_seconds | default(30) }}s \
       -warmup {{ bench_warmup_seconds | default(5) }}s \
       -cells '{{ bench_cells | default("*") }}' \
-      {% if bench_rated | default(false) | bool %}-rated -rated-duration {{ bench_rated_duration_seconds | default(30) }}s {% endif %}\
+      {% if bench_rated | default(false) | bool %}-rated -rated-duration {{ bench_rated_duration_seconds | default(30) }}s {% if bench_rated_cells is defined and bench_rated_cells %}-rated-cells '{{ bench_rated_cells }}' {% endif %}{% endif %}\
       -services none \
       -out {{ cell_dir }} \
       2> {{ cell_dir }}/runner.stderr
