@@ -59,7 +59,7 @@ jobs:
       # left behind by a dead-code removal). Compile them here instead.
       - name: Install mage
         run: |
-          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" github.com/magefile/mage
+          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" tool
           "$(go env GOPATH)/bin/mage" -version
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: mage compiles

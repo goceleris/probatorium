@@ -1,8 +1,8 @@
 // Versions of the Go tools the workflows run, kept out of the probatorium
 // module so they add nothing to its dependency graph. Each is a `tool`
 // directive, pinned by go.sum and bumped by Dependabot (.github/dependabot.yml).
-// The workflows install mage from here with
-// `go install -modfile=$GITHUB_WORKSPACE/.github/tools/go.mod github.com/magefile/mage`
+// The workflows install mage (and actionlint) from here with
+// `go install -modfile=$GITHUB_WORKSPACE/.github/tools/go.mod tool`
 // and run actionlint with
 // `go tool -modfile=$GITHUB_WORKSPACE/.github/tools/go.mod actionlint`.
 // This module is never imported or released (probatorium#458).

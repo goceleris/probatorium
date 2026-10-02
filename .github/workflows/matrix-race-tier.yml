@@ -115,7 +115,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Install mage
         run: |
-          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" github.com/magefile/mage
+          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" tool
           "$(go env GOPATH)/bin/mage" -version
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: mage BuildRaceRefapps
@@ -151,9 +151,10 @@ jobs:
         # ahead of every mage invocation, at the version the CI tools
         # module names and its go.sum hashes (.github/tools; Dependabot
         # bumps it), so a mage release cannot change a tier run
-        # (probatorium#458).
+        # (probatorium#458). `tool` installs every tool that module
+        # lists (mage, actionlint).
         run: |
-          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" github.com/magefile/mage
+          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" tool
           "$(go env GOPATH)/bin/mage" -version
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
