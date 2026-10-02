@@ -33,6 +33,9 @@ updates:
       - /validation/refapp/kitchen_sink
       - /validation/refapp/observability
       - /validation/refapp/static_swagger_proxy
+      # The CI tools module (mage, actionlint; probatorium#458): its go.sum
+      # pins the versions the workflows run; this entry moves the pins.
+      - /.github/tools
     schedule:
       interval: daily
     groups:

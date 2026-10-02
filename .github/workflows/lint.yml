@@ -59,12 +59,14 @@ jobs:
       # left behind by a dead-code removal). Compile them here instead.
       - name: Install mage
         run: |
-          go install github.com/magefile/mage@latest
+          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" github.com/magefile/mage
+          "$(go env GOPATH)/bin/mage" -version
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: mage compiles
         run: mage -compile /tmp/mage-compile-check
 
+      # actionlint is a tool of the CI tools module too (probatorium#458).
       - name: actionlint
         run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@latest
-          actionlint -color
+          go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" actionlint -version
+          go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" actionlint -color

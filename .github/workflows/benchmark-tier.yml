@@ -194,11 +194,14 @@ jobs:
           cache: true
 
       - name: Install mage
-        # mage isn't in the root go.mod; install it into GOPATH/bin ahead
-        # of every mage invocation. Cheap (~5s) and avoids `go run` which
-        # needs mage in go.mod.
+        # mage isn't in the root go.mod; install it into GOPATH/bin
+        # ahead of every mage invocation, at the version the CI tools
+        # module names and its go.sum hashes (.github/tools; Dependabot
+        # bumps it), so a mage release cannot change a tier run
+        # (probatorium#458).
         run: |
-          go install github.com/magefile/mage@latest
+          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" github.com/magefile/mage
+          "$(go env GOPATH)/bin/mage" -version
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Use bootstrap-provisioned ansible
