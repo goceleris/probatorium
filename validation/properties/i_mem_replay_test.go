@@ -84,6 +84,7 @@ func imem1Violations(spec properties.Spec, series []properties.Snapshot, leakBps
 // recorded counts, which is what shows each fixture is the series the
 // gate judged.
 func TestIMEM1Replay_soak36433207097ScatterCellsAreClean(t *testing.T) {
+	t.Parallel()
 	for _, c := range []struct {
 		name     string
 		recorded int64
@@ -110,8 +111,12 @@ func TestIMEM1Replay_soak36433207097ScatterCellsAreClean(t *testing.T) {
 // msa2, 2.2 KB/s on msr1. I-MEM-1 must still catch it on both hosts.
 // These carriers' troughs scatter by only 72-84 KB, so this control shows
 // that the bound keeps the old catch on a quiet cell, not what it costs on
-// a noisy one: see the next test.
+// a noisy one: see the next test. The leak must be called for at least
+// half of the hour-long cell (1800 evaluations; 2326-2476 at this head),
+// not merely called: a bound 10x too strict still calls it, but only
+// 826-1576 times.
 func TestIMEM1Replay_positiveControlStillFails(t *testing.T) {
+	t.Parallel()
 	for _, name := range []string{
 		"soak34616620237-amd64-auth_session_ratelimit-iouring",
 		"soak34616620237-arm64-auth_session_ratelimit-iouring",
@@ -123,8 +128,8 @@ func TestIMEM1Replay_positiveControlStillFails(t *testing.T) {
 		for _, leak := range []float64{3277, 2253} {
 			got := imem1Violations(properties.IMEM1, s, leak)
 			t.Logf("%s + %.0f B/s: %d I-MEM-1 violations", name, leak, got)
-			if got == 0 {
-				t.Errorf("%s: a %.0f B/s leak (the celeris#573 true positive's slope) no longer fails I-MEM-1", name, leak)
+			if got < 1800 {
+				t.Errorf("%s: a %.0f B/s leak (the celeris#573 true positive's slope) fails I-MEM-1 only %d times, want at least 1800 (half the cell)", name, leak, got)
 			}
 		}
 	}
@@ -138,8 +143,11 @@ func TestIMEM1Replay_positiveControlStillFails(t *testing.T) {
 // end of warm-up: I-MEM-1 must still catch it. 4 KB/s is close to what
 // this cell can show. 3 KB/s is caught here by 226 evaluations, 2.5 KB/s
 // not at all, so celeris#573's 2.2 KB/s would go uncalled in this cell
-// (probatorium#478).
+// (probatorium#478). It must be called for at least one persistence period
+// (IMEM1.Persist, 150 evaluations; 376 at this head), so a bound 1.5x too
+// strict, which leaves 76, fails here too.
 func TestIMEM1Replay_soak36433207097NearTheBarStillFails(t *testing.T) {
+	t.Parallel()
 	const name = "soak36433207097-arm64-auth_session_ratelimit-iouring"
 	s := loadSeries(t, name)
 	if got := imem1Violations(properties.IMEM1, s, 0); got != 0 {
@@ -147,7 +155,7 @@ func TestIMEM1Replay_soak36433207097NearTheBarStillFails(t *testing.T) {
 	}
 	got := imem1Violations(properties.IMEM1, s, 4096)
 	t.Logf("%s + 4096 B/s: %d I-MEM-1 violations", name, got)
-	if got == 0 {
-		t.Errorf("%s: a 4 KB/s leak no longer fails I-MEM-1 in the soak's highest-scatter cell: the bound is stricter than its 99.9 %% quantile", name)
+	if got < int64(properties.IMEM1.Persist) {
+		t.Errorf("%s: a 4 KB/s leak fails I-MEM-1 only %d times in the soak's highest-scatter cell, want at least one persistence period (%d): the bound is stricter than its 99.9 %% quantile", name, got, properties.IMEM1.Persist)
 	}
 }
