@@ -689,9 +689,12 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	}
 	// runPhase runs one fleet until stop is done, then ends it gracefully:
 	// no Markov walker starts another request, and the requests already in
-	// flight get up to cfg.RequestTimeout to be answered -- the most any of
-	// them has left before its own client timeout ends it -- before their
-	// context is cancelled (drainFleet).
+	// flight get up to cfg.RequestTimeout to be answered before their
+	// context is cancelled (drainFleet). That is about the most any of them
+	// has left before its own client timeout ends it: a walker that passed
+	// its stop check just before stop fired can still start one request
+	// after drainFleet's timer started, and the cancel can then come up to
+	// that scheduling delay before the request's own timeout would have.
 	//
 	// The phase used to end by cancelling the requests themselves, and on
 	// the observability refapp that broke I-PANIC (probatorium#465).
