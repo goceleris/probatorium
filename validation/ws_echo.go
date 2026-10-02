@@ -86,7 +86,9 @@ import (
 // One walker, off-budget, exactly like the RFC conformance slice: one
 // connection at a time against the hundreds a cell already drives changes
 // no counter the gate reads, and taking a Markov slot would have changed
-// the load profile of every cell to buy nothing.
+// the load profile of every cell to buy nothing. The one exception is the
+// heap: a native engine holds each fire's echo backlog on it, which is why
+// the walker pauses where I-MEM-1 takes its troughs (ws_echo_quiet.go).
 
 // wsEchoFrameBytes is the payload size of every frame the slice sends,
 // matching the bench tier's ws-large-echo scenario (scenarios/streaming.go)
@@ -110,8 +112,9 @@ const wsEchoMaxInFlight = 64
 const wsEchoRcvBuf = 64 * 1024
 
 // wsEchoInterval paces fires. Each fire holds its connection for about
-// wsEchoStreamDuration plus the drain, so the walker is effectively one
-// connection back to back; the interval only bounds the gap between them.
+// wsEchoStreamDuration plus the drain, so outside its quiet gaps
+// (ws_echo_quiet.go) the walker is effectively one connection back to back;
+// the interval only bounds the gap between them.
 const wsEchoInterval = 250 * time.Millisecond
 
 // wsEchoReadPace is the pause after every frame the reader takes WHILE the
@@ -226,9 +229,9 @@ func summariseWSEcho(s wsEchoSnapshot) string {
 }
 
 // runWSLargeEchoWalker fires fireWSLargeEcho at hostPort + path per
-// tickInterval until ctx is done. seed is the per-walker PCG seed; the
-// frame masks are drawn from it, so the same seed puts the same bytes on
-// the wire.
+// tickInterval until ctx is done, holding no connection inside a quiet gap
+// (ws_echo_quiet.go). seed is the per-walker PCG seed; the frame masks are
+// drawn from it, so the same seed puts the same bytes on the wire.
 func runWSLargeEchoWalker(ctx context.Context, hostPort, path string,
 	seed uint64, tickInterval time.Duration, tally *wsEchoTally,
 ) {
@@ -246,6 +249,16 @@ func runWSLargeEchoWalker(ctx context.Context, hostPort, path string,
 		case <-ctx.Done():
 			return
 		case <-tick.C:
+			if wait := wsEchoQuietWait(time.Now()); wait > 0 {
+				quiet := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					quiet.Stop()
+					return
+				case <-quiet.C:
+				}
+				continue
+			}
 			fireWSLargeEcho(ctx, hostPort, path, rng, tally)
 		}
 	}
