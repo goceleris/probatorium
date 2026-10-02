@@ -610,7 +610,7 @@ var rssSlopeSpec = slopeSpec{
 // pinned celeris) are EXPECTED true positives here, not noise.
 var IMEM1 = Spec{
 	ID: "I-MEM-1",
-	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level, %gx sampling noise), and the slope's one-sided %s lower confidence bound > the budget",
+	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up; a slope over it is a violation only when the rise is ≥ max(%s, %.0f%% of level, %gx sampling noise) and the slope's one-sided %s lower confidence bound is over the budget too",
 		fmtBytes(heapSlopeMaxBytesPerSec), slopeWarmup, fmtBytes(heapSlopeMaxBytesPerSec*slopeMinSpan.Seconds()), heapRiseRelFloor*100, slopeNoiseK, slopeBoundLevel),
 	Tier:           "core",
 	Persist:        slopePersistSamples,

@@ -305,7 +305,10 @@ Judged in every cell:
 - `I-MEM-1`: the `heap_inuse` trough slope is at most 1 KB/s over the trailing min(1 h, elapsed), after a
   5-minute warm-up, from 10 minutes of samples. A violation also needs the slope's one-sided 99.9 % lower
   confidence bound, from the troughs' scatter about their own fit, to exceed the budget, so troughs that
-  wander by themselves (the ws_echo walker's WebSocket send backlogs, #466) cannot pass for a leak.
+  wander by themselves (the ws_echo walker's WebSocket send backlogs, #466) cannot pass for a leak. The
+  price is paid where the troughs scatter most. In the 45-minute auth_session_ratelimit io_uring cells of
+  soak 36433207097, a linear leak under about 3 KB/s is not called at all, celeris#573's 2.2 KB/s
+  included, and one under about 3.5 KB/s only by a single evaluation on amd64 (#478).
 - `I-MEM-3`: the goroutine-count trough slope is at most 0.2/s over the trailing 10 minutes after
   warm-up.
 - `I-MEM-4`: the RSS trough slope is at most 64 KB/s over the trailing min(1 h, elapsed) after warm-up
