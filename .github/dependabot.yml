@@ -7,7 +7,8 @@ updates:
   # collapse into ONE pull request per scheduled run — a daily x/net
   # bump produces a single PR touching every module instead of nine
   # racing PRs. Add a path here whenever a new go.mod lands in the
-  # tree (run `find . -name go.mod` to verify coverage).
+  # tree (run `find . -name go.mod` to verify coverage); the one
+  # exception is .github/tools, which has its own entry below.
   - package-ecosystem: gomod
     directories:
       - /
@@ -33,13 +34,44 @@ updates:
       - /validation/refapp/kitchen_sink
       - /validation/refapp/observability
       - /validation/refapp/static_swagger_proxy
-      # The CI tools module (mage, actionlint; probatorium#458): its go.sum
-      # pins the versions the workflows run; this entry moves the pins.
-      - /.github/tools
     schedule:
       interval: daily
     groups:
       all-go-deps:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps"
+
+  # ----- CI tools module -----
+  # .github/tools pins the mage and actionlint that the workflows run,
+  # through its go.sum (probatorium#458). Go records every requirement
+  # of a module that only holds `tool` directives as `// indirect`, the
+  # two tool modules included. Version updates cover direct dependencies
+  # only unless `allow` says otherwise, so without the rules below this
+  # entry would never move the pins. The rules name each tool's module
+  # with `dependency-type: all`. Dependabot then bumps it with `go get`,
+  # which raises the other requirements only as far as the new release
+  # itself requires. A bare `dependency-type: all` would also bump each
+  # tool's dependencies past what its release was built with: today it
+  # proposes go.yaml.in/yaml/v4 v4.0.0-rc.6, and actionlint v1.7.12 does
+  # not compile against it. A new `tool` directive needs its module added
+  # to this list. The rules are on this entry alone, so the modules above
+  # keep the direct-only default.
+  - package-ecosystem: gomod
+    directory: /.github/tools
+    allow:
+      - dependency-name: github.com/magefile/mage
+        dependency-type: all
+      - dependency-name: github.com/rhysd/actionlint
+        dependency-type: all
+    schedule:
+      interval: daily
+    groups:
+      ci-tools:
         patterns:
           - "*"
         update-types:
