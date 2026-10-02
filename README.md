@@ -303,7 +303,9 @@ Judged in every cell:
 - `I-CONN-2`: `accepted − closed − active == 0`, judged only when the drift keeps the same sign for 30
   samples.
 - `I-MEM-1`: the `heap_inuse` trough slope is at most 1 KB/s over the trailing min(1 h, elapsed), after a
-  5-minute warm-up, from 10 minutes of samples.
+  5-minute warm-up, from 10 minutes of samples. A violation also needs the slope's one-sided 99.9 % lower
+  confidence bound, from the troughs' scatter about their own fit, to exceed the budget, so troughs that
+  wander by themselves (the ws_echo walker's WebSocket send backlogs, #466) cannot pass for a leak.
 - `I-MEM-3`: the goroutine-count trough slope is at most 0.2/s over the trailing 10 minutes after
   warm-up.
 - `I-MEM-4`: the RSS trough slope is at most 64 KB/s over the trailing min(1 h, elapsed) after warm-up

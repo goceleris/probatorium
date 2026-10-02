@@ -96,6 +96,24 @@ const slopePersistSamples = int(slopeBucket / time.Second)
 // samples, one hour, 12 seeds each) must stay at zero violations.
 const slopeNoiseK = 8.0
 
+// slopeBoundT is the one-sided 99.9 % quantile of Student's t, indexed by
+// degrees of freedom (troughs - 2) from 1 to 30: the multiple of the
+// slope's standard error that the slope has to clear the budget by when a
+// slopeSpec sets boundSlope. Past 30 the 30-dof value is used. It is larger
+// than the true quantile there, so the bound only gets stricter. A one-hour
+// window holds at most 24 troughs, so I-MEM-1 never reaches that case.
+// i_mem_bound_test.go checks every entry against a numerical integration
+// of the t density.
+var slopeBoundT = [...]float64{
+	0, // no degrees of freedom: no bound (see slopeLowerBound)
+	318.309, 22.327, 10.215, 7.173, 5.893, 5.208, 4.785, 4.501, 4.297, 4.144,
+	4.025, 3.930, 3.852, 3.787, 3.733, 3.686, 3.646, 3.610, 3.579, 3.552,
+	3.527, 3.505, 3.485, 3.467, 3.450, 3.435, 3.421, 3.408, 3.396, 3.385,
+}
+
+// slopeBoundLevel names slopeBoundT's quantile in messages.
+const slopeBoundLevel = "99.9%"
+
 // heapSlopeWindow is the trailing window over which I-MEM-1 (and
 // I-MEM-4) fits a least-squares line: min(1h, elapsed since warm-up).
 // 1h matches the rolling-window cap in [Context.History]. A growing
@@ -357,6 +375,39 @@ func slope(points []point) float64 {
 	return (n*sxy - sx*sy) / denom
 }
 
+// slopeLowerBound returns the one-sided 99.9 % lower confidence bound of
+// the least-squares slope b of points, b - t x SE(b). SE(b) comes from the
+// residuals of the troughs about their own fitted line: sqrt(RSS / (n-2) /
+// Sxx). It also returns that SE, the degrees of freedom (n-2) and the t it
+// used. With fewer than three points there is no residual to estimate the
+// scatter from, so ok is false: no bound, and no verdict that needs one.
+func slopeLowerBound(points []point, b float64) (lower, se, t float64, dof int, ok bool) {
+	n := len(points)
+	dof = n - 2
+	if dof < 1 {
+		return 0, 0, 0, dof, false
+	}
+	var sx, sy float64
+	for _, p := range points {
+		sx += p.x
+		sy += p.y
+	}
+	mx, my := sx/float64(n), sy/float64(n)
+	var sxx, rss float64
+	for _, p := range points {
+		dx := p.x - mx
+		sxx += dx * dx
+		r := p.y - (my + b*dx)
+		rss += r * r
+	}
+	if sxx == 0 {
+		return 0, 0, 0, dof, false
+	}
+	se = math.Sqrt(rss / float64(dof) / sxx)
+	t = slopeBoundT[min(dof, len(slopeBoundT)-1)]
+	return b - t*se, se, t, dof, true
+}
+
 // troughLevel is the mean trough over the buckets: the "size" of the
 // series the relative floor scales with.
 func troughLevel(bs []bucket) float64 {
@@ -429,6 +480,21 @@ type slopeSpec struct {
 	y    func(*Snapshot) float64
 	keep func(*Snapshot) bool
 	fmtV func(float64) string // formats a series value
+	// boundSlope also requires the slope's one-sided 99.9 % lower
+	// confidence bound (slopeLowerBound) to exceed the budget, so the
+	// slope has to clear the budget by more than the troughs' own scatter
+	// about the fit can explain.
+	//
+	// The rise floor cannot see that scatter. Its noise term,
+	// samplingNoise, measures how far a bucket's minimum can sit above the
+	// true post-GC trough INSIDE one bucket. It says nothing about how far
+	// the trough itself moves from one bucket to the next. Since the
+	// ws_echo walker (#348), the auth_session cells on the native engines
+	// hold multi-MB WebSocket send backlogs on the Go heap, and their
+	// troughs scatter by 0.6-1.6 MB. In soak 36433207097 that alone failed
+	// the arm64 epoll cell 353 times and the io_uring cell once, from
+	// windows of 5 to 9 troughs (probatorium#466).
+	boundSlope bool
 }
 
 // skipWindow is the [Skip] reason while a slope window is not judgeable.
@@ -444,8 +510,11 @@ var skipWindow = fmt.Sprintf("slope window not judgeable yet (needs %s warm-up, 
 // so that (a) a single step smaller than the budgeted 10 min total,
 // (b) a step proportionate to the series' size, and (c) the sampling
 // noise of a GC sawtooth at this heap size can each not produce a
-// verdict on their own. The message carries every number so a triage
-// can see which floor was cleared and by how much.
+// verdict on their own. With boundSlope (I-MEM-1), (d) the troughs'
+// own scatter cannot either: the slope's one-sided 99.9 % lower
+// confidence bound must also exceed the budget. The message carries
+// every number so a triage can see which floor was cleared and by how
+// much.
 func (sp slopeSpec) judge(ctx Context) (bool, string) {
 	series, ok := slopeWindow(ctx, sp.window, sp.keep, sp.y)
 	if !ok {
@@ -476,12 +545,21 @@ func (sp slopeSpec) judge(ctx Context) (bool, string) {
 	if rise < floor {
 		return true, ""
 	}
+	bound := ""
+	if sp.boundSlope {
+		lower, se, t, dof, ok := slopeLowerBound(pts, s)
+		if !ok || lower <= sp.budget {
+			return true, ""
+		}
+		bound = fmt.Sprintf("; its %s lower bound %s/s = slope - %.3f x SE %s/s (t, %d dof) clears the budget too",
+			slopeBoundLevel, sp.fmtV(lower), t, sp.fmtV(se), dof)
+	}
 	return false, fmt.Sprintf(
-		"%s violated: %s trough slope %s/s exceeds %s/s budget; rise %s (fitted %s, trough-to-trough %s) over %s (%d troughs) clears the floor %s = max(budget x %s = %s, %.0f%% of level %s = %s, %gx sampling noise %s = %s); %s -> %s",
+		"%s violated: %s trough slope %s/s exceeds %s/s budget; rise %s (fitted %s, trough-to-trough %s) over %s (%d troughs) clears the floor %s = max(budget x %s = %s, %.0f%% of level %s = %s, %gx sampling noise %s = %s); %s -> %s%s",
 		sp.id, sp.what, sp.fmtV(s), sp.fmtV(sp.budget), sp.fmtV(rise), sp.fmtV(fitted), sp.fmtV(raw), windowSpan(series), len(bs),
 		sp.fmtV(floor), slopeMinSpan, sp.fmtV(floorBudget), sp.relFloor*100, sp.fmtV(level), sp.fmtV(floorRel),
 		slopeNoiseK, sp.fmtV(noise), sp.fmtV(floorNoise),
-		sp.fmtV(series[0].v), sp.fmtV(series[len(series)-1].v))
+		sp.fmtV(series[0].v), sp.fmtV(series[len(series)-1].v), bound)
 }
 
 // fmtBytes renders a byte quantity for messages.
@@ -504,6 +582,7 @@ var heapSlopeSpec = slopeSpec{
 	id: "I-MEM-1", what: "heap_inuse", window: heapSlopeWindow,
 	budget: heapSlopeMaxBytesPerSec, relFloor: heapRiseRelFloor,
 	y: func(s *Snapshot) float64 { return float64(s.HeapInuseBytes) }, fmtV: fmtBytes,
+	boundSlope: true,
 }
 
 var goroutineSlopeSpec = slopeSpec{
@@ -522,6 +601,8 @@ var rssSlopeSpec = slopeSpec{
 // IMEM1 asserts heap_inuse trough slope is bounded over the trailing
 // window min(1h, elapsed) excluding the first 5 minutes of warm-up,
 // and that the fitted rise clears the rise floor (see slopeSpec.judge).
+// A violation also needs the slope's 99.9 % lower confidence bound, from
+// the troughs' scatter about their fit, to exceed the budget (boundSlope).
 // Skips until 10 minutes of post-warm-up samples exist.
 //
 // Refapps whose in-memory TTL stores keep growing past warm-up (a
@@ -529,8 +610,8 @@ var rssSlopeSpec = slopeSpec{
 // pinned celeris) are EXPECTED true positives here, not noise.
 var IMEM1 = Spec{
 	ID: "I-MEM-1",
-	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level, %gx sampling noise)",
-		fmtBytes(heapSlopeMaxBytesPerSec), slopeWarmup, fmtBytes(heapSlopeMaxBytesPerSec*slopeMinSpan.Seconds()), heapRiseRelFloor*100, slopeNoiseK),
+	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level, %gx sampling noise), and the slope's one-sided %s lower confidence bound > the budget",
+		fmtBytes(heapSlopeMaxBytesPerSec), slopeWarmup, fmtBytes(heapSlopeMaxBytesPerSec*slopeMinSpan.Seconds()), heapRiseRelFloor*100, slopeNoiseK, slopeBoundLevel),
 	Tier:           "core",
 	Persist:        slopePersistSamples,
 	MinObservation: slopeMinObservation,
