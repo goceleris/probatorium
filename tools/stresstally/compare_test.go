@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -331,5 +332,43 @@ func TestCompareJoinsAPackageAcrossTheMove(t *testing.T) {
 	var out strings.Builder
 	if code := cmdCompare([]string{base, branch}, &out); code != 2 || !strings.Contains(out.String(), "packages: base [./engine/iouring], branch [./engine/epoll]") {
 		t.Errorf("exit %d, want 2 naming the packages:\n%s", code, out.String())
+	}
+}
+
+// An arm whose commit has both a package P and internal/P (none does yet) must
+// not merge the two packages' tests: rows then join by package as named, and
+// the comparison says so.
+func TestCompareKeepsApartTwoPackagesOfOneLayoutFreeName(t *testing.T) {
+	base := armReport(t, testSHA, "3", "4", map[string]int{"x86": 3}, nil)
+	branch := armReport(t, branchSHA, "3", "4", nil, nil)
+	r, err := readReport(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := r.Cases[0].Tests
+	for _, row := range slices.Clone(tests) {
+		row.Package = strings.Replace(row.Package, celerisModule, celerisModule+"internal/", 1)
+		row.FailedProcesses = 0
+		tests = append(tests, row)
+	}
+	r.Cases[0].Tests = tests
+	if err := writeReports(base, r.Plan, r.CelerisSHA, r.Cases); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if code := cmdCompare([]string{base, branch}, &out); code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out.String())
+	}
+	s := out.String()
+	for _, want := range []string{
+		"NOTE: base: packages engine/iouring and internal/engine/iouring share the name engine/iouring",
+		"not in this arm",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("comparison lacks %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "celeris#443's move); their tests are compared as one package") {
+		t.Errorf("two packages were joined as one:\n%s", s)
 	}
 }

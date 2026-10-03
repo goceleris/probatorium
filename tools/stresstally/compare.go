@@ -98,9 +98,11 @@ const celerisModule = "github.com/goceleris/celeris/"
 // driver/X/internal/protocol reads as driver/X/protocol. It takes an import
 // path (github.com/goceleris/celeris/internal/engine/iouring) or a pattern
 // (./internal/engine/iouring, ./internal/engine/...) and leaves anything else
-// as it is. No celeris commit has both a package P and internal/P, so no two
-// packages of one run share a layout-free name (pkgpaths.sh probes the same
-// candidates, the other way round).
+// as it is. Neither 28383e8 (before the move) nor ee8ae8b (the move) has both a
+// package P and internal/P, but nothing keeps a later commit from adding one,
+// so cmdCompare checks that no arm has two packages with one layout-free name
+// before it joins rows by it (pkgpaths.sh probes the same candidates, the
+// other way round).
 func layoutFree(p string) string {
 	var prefix string
 	switch {
@@ -119,6 +121,20 @@ func layoutFree(p string) string {
 }
 
 var driverInternalProtocolRe = regexp.MustCompile(`^driver/([^/]+)/internal/protocol(/.*)?$`)
+
+// layoutClash reports two different packages among tests that have one
+// layout-free name, in sorted order.
+func layoutClash(tests []TestRow) (string, string, bool) {
+	seen := map[string]string{}
+	for _, t := range tests {
+		lf := layoutFree(t.Package)
+		if q, ok := seen[lf]; ok && q != t.Package {
+			return min(q, t.Package), max(q, t.Package), true
+		}
+		seen[lf] = t.Package
+	}
+	return "", "", false
+}
 
 func layoutFreeAll(ps []string) []string {
 	out := make([]string, len(ps))
@@ -201,12 +217,27 @@ func compareReports(base, branch runReport) (Comparison, error) {
 
 	// Rows join by layout-free package: an arm at a commit after celeris#443's
 	// move runs internal/engine/iouring's tests, which are engine/iouring's.
+	// An arm with two packages of one layout-free name (a commit with both P
+	// and internal/P) would merge two packages' tests, so then rows join by
+	// package as named.
+	joinKey := layoutFree
+	for _, arm := range []struct {
+		name string
+		r    CaseReport
+	}{{"base", a}, {"branch", b}} {
+		if p, q, ok := layoutClash(arm.r.Tests); ok {
+			note("%s: packages %s and %s share the name %s once celeris#443's move is undone, so rows join by package as named: a package that moved between the arms is in one arm only",
+				arm.name, shortPkg(p), shortPkg(q), shortPkg(layoutFree(p)))
+			joinKey = func(p string) string { return p }
+			break
+		}
+	}
 	type key struct{ pkg, name, arch string }
 	rows := map[key]*CompareRow{}
 	var order []key
 	moved := map[string]string{}
 	add := func(t TestRow, isBase bool) {
-		k := key{layoutFree(t.Package), t.Name, t.Arch}
+		k := key{joinKey(t.Package), t.Name, t.Arch}
 		r := rows[k]
 		if r == nil {
 			r = &CompareRow{Package: t.Package, Name: t.Name, Arch: t.Arch}

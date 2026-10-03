@@ -15,9 +15,10 @@
 #   1. the pattern as written;
 #   2. ./P, where P is the pattern's layout-free name: a leading internal/ is
 #      dropped and driver/X/internal/protocol is read as driver/X/protocol;
-#   3. ./internal/P;
+#   3. ./internal/P (for P = driver/X/protocol, the move's
+#      ./internal/driver/X/protocol);
 #   4. for P = driver/X/protocol[/rest]: ./driver/X/internal/protocol[/rest],
-#      then ./internal/driver/X/protocol[/rest].
+#      the layout an earlier proposal had.
 # So ./engine/iouring runs ./engine/iouring before the move and
 # ./internal/engine/iouring after it, and a row that already names the new path
 # runs the old one at a commit before the move. A pattern none of them matches
@@ -62,7 +63,7 @@ resolve_pkg() {
 	local -a cand=("$rel" "$p" "internal/$p")
 	if [[ $p =~ ^driver/([^/]+)/protocol(/.*)?$ ]]; then
 		x=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]}
-		cand+=("driver/$x/internal/protocol$rest" "internal/driver/$x/protocol$rest")
+		cand+=("driver/$x/internal/protocol$rest")
 	fi
 	for c in "${cand[@]}"; do
 		if is_pkg "$dir" "$c" "$rec"; then
