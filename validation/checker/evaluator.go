@@ -619,6 +619,12 @@ func (e *Evaluator) recordEngineCounters(snap properties.Snapshot) {
 		// The celeris#685 close-path counters celeris 3e7abba added.
 		"engine_close_fd_deferred": snap.EngineCloseFDDeferred,
 		"engine_close_fd_forced":   snap.EngineCloseFDForced,
+		// The celeris#812 held SEND_ZC send buffers celeris e2508c7 added.
+		"engine_close_zc_notif_held":       snap.EngineCloseZCNotifHeld,
+		"engine_close_zc_notif_held_now":   snap.EngineCloseZCNotifHeldNow,
+		"engine_close_zc_notif_held_bytes": snap.EngineCloseZCNotifHeldBytes,
+		"engine_close_zc_notif_forced":     snap.EngineCloseZCNotifForced,
+		"engine_shutdown_zc_buf_retained":  snap.EngineShutdownZCBufRetained,
 	} {
 		held, seen := e.tally.EngineCounters[k]
 		e.tally.EngineCounters[k] = reduceEngineCounter(report.EngineCounters[k].Kind, held, seen, v)

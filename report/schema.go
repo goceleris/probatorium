@@ -213,10 +213,11 @@ import (
 //     key, and .Kind how readings may be combined (two are running maxima
 //     that must never be summed). celeris.engine_throughput is the one
 //     published key carried nowhere: no engine assigns it (celeris#653),
-//     so a carried 0 would read as a measured rate. Nothing new is gated:
-//     engine_transplant_stranded is documented must-stay-zero, but moving
-//     it into ZeroWitnessMeaning is a gate change this version does not
-//     make. Additive; older readers ignore every field.
+//     so a carried 0 would read as a measured rate (celeris removed the
+//     field before v1.6.0; 5.19 records the key's removal). Nothing new is
+//     gated: engine_transplant_stranded is documented must-stay-zero, but
+//     moving it into ZeroWitnessMeaning is a gate change this version does
+//     not make. Additive; older readers ignore every field.
 //   - 5.16 — the celeris#657 hand-off counters (probatorium#410). celeris
 //     9f4d89b (celeris#676, #681, #687) added eighteen EngineMetrics
 //     fields: the stale-recv loss witnesses, the fd-lifetime rule's holds,
@@ -261,7 +262,26 @@ import (
 //     a gate change this version does not make (probatorium#416 holds that
 //     decision for the celeris#657 counters). Additive; older readers
 //     ignore every field.
-const SchemaVersion = "5.18"
+//   - 5.19 — the celeris#812 held SEND_ZC send buffers (celeris e2508c7,
+//     #813). celeris added five EngineMetrics fields for the io_uring
+//     release backstop, which now holds a closed connection's send buffer
+//     past its 5 s until the SEND_ZC's notification instead of reusing it:
+//     CloseZCNotifHeld (holds started, a rate), the GAUGES
+//     CloseZCNotifHeldNow and CloseZCNotifHeldBytes (buffers held right
+//     now and their capacity, reduced by their highest sampled reading,
+//     report.CounterPeakGauge), CloseZCNotifForced (a buffer given up with
+//     a SEND_ZC still owed; documented must-stay-zero) and
+//     ShutdownZCBufRetained (buffers a worker shutdown kept for the life of
+//     the process). Adds all five to Tier1Summary.EngineCounters and THREE
+//     per-cell series columns, appended: engine_close_zc_notif_held_now,
+//     engine_close_zc_notif_held_bytes and engine_close_zc_notif_forced.
+//     Nothing new is gated: engine_close_zc_notif_forced carries its
+//     meaning in EngineCounter.MustStayZero, as engine_close_fd_forced does.
+//     The same celeris (celeris#830, #894) removed EngineMetrics.Throughput,
+//     so the refapps no longer publish celeris.engine_throughput, which no
+//     artifact carried (probatorium#480). Additive; older readers ignore
+//     every field.
+const SchemaVersion = "5.19"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is

@@ -670,7 +670,7 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 		}
 		if c.Tier1.EngineRequestsTotal*engineRequestCoverageFactor < c.Tier1.RequestsSent {
 			add(c, "tier_1.engine_requests_total", c.Tier1.EngineRequestsTotal,
-				fmt.Sprintf("the engine counted %d requests while the walker sent %d on the other side of the socket, a factor of %.0f. An engine that stops counting its own requests takes Throughput and the adaptive controller's bytes-per-request with it (celeris#626)",
+				fmt.Sprintf("the engine counted %d requests while the walker sent %d on the other side of the socket, a factor of %.0f. An engine that stops counting its own requests takes every request rate derived from it (the delta of engine_requests_total between series rows) and the adaptive controller's bytes-per-request with it (celeris#626)",
 					c.Tier1.EngineRequestsTotal, c.Tier1.RequestsSent,
 					float64(c.Tier1.RequestsSent)/float64(c.Tier1.EngineRequestsTotal)))
 		}

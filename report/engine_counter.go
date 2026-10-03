@@ -47,7 +47,10 @@ const (
 	// into a rate, and combine cells with max. The peak can be a transient --
 	// celeris#687's Busy is expected to be nonzero while a drain is in
 	// progress -- so a nonzero peak is read against the series, which is why
-	// every counter of this kind has a column.
+	// every counter of this kind has a column. celeris#812's held send-buffer
+	// gauges are the other case: their question is whether a hold stood at
+	// all and the most heap the holds kept alive, not whether the last
+	// sample caught one.
 	CounterPeakGauge EngineCounterKind = "peak_gauge"
 )
 
@@ -85,19 +88,24 @@ type EngineCounter struct {
 // [ZeroWitnessMeaning] and [ErrorClasses] use.
 //
 // Most of it is what probatorium#386 published and probatorium#391 found
-// reaching no artifact: nineteen of the twenty keys it added (the twentieth,
-// celeris.engine_throughput, is carried nowhere; checker.EngineKeysNotParsed
-// says why). The other four were already series columns with no end-of-cell
-// total, which the completeness guard found on its first run.
+// reaching no artifact: nineteen of the twenty keys it added. The twentieth,
+// celeris.engine_throughput, was carried nowhere, because no engine ever
+// assigned the field (celeris#653); celeris removed the field before v1.6.0
+// (celeris#830), and the refapps no longer publish the key (probatorium#480).
+// The other four were already series columns with no end-of-cell total, which
+// the completeness guard found on its first run.
 //
 // The eighteen celeris#657 counters celeris 9f4d89b added (celeris#676, #681,
 // #687) joined in schema 5.16, and the two celeris#685 close-path counters
 // celeris 3e7abba added (engine_close_fd_deferred, engine_close_fd_forced) in
-// schema 5.18.
+// schema 5.18, and the five celeris#812 held-send-buffer counters celeris
+// e2508c7 added (engine_close_zc_notif_held, _held_now, _held_bytes, _forced
+// and engine_shutdown_zc_buf_retained) in schema 5.19.
 //
 // Nothing here is gated. The counters celeris documents as must-stay-zero --
-// engine_transplant_stranded, six of the celeris#657 counters and
-// engine_close_fd_forced -- qualify for [ZeroWitnessMeaning], but moving one there fails a cell on a
+// engine_transplant_stranded, six of the celeris#657 counters,
+// engine_close_fd_forced and engine_close_zc_notif_forced -- qualify for
+// [ZeroWitnessMeaning], but moving one there fails a cell on a
 // nonzero value, and that is a gate decision, not a reporting one: a
 // diagnostic counter is not gated until a run has said what normal looks
 // like. Each carries its would-be meaning in [EngineCounter.MustStayZero]
@@ -240,6 +248,44 @@ var EngineCounters = map[string]EngineCounter{
 		Series:       true,
 		Why:          "as engine_transplant_stranded: a nonzero reading is a defect, and the backstop fires 5 s after the close it rescues, so the row, set against the steps of engine_close_count and adaptive_switches 5 s earlier, says which close burst left an op owed; the refapp log carries the backstop's WARN line with the descriptor at the same instant",
 		MustStayZero: "a closed io_uring connection's descriptor was released by the 5 s backstop while the kernel still owed an op on it, so a recv issued after the number was reused could read the request of whatever connection then held it -- the celeris#715 theft the celeris#685 fd-lifetime rule forbids",
+	},
+
+	// --- The SEND_ZC send buffer of a closed io_uring connection (celeris#812,
+	// celeris e2508c7). The kernel reads the buffer until the SEND_ZC's
+	// notification, which a peer that stopped reading mid-send holds off past
+	// the close, so the 5 s release backstop holds the buffer instead of
+	// reusing it. io_uring only; on the adaptive engine each is the sum over
+	// both sub-engines, which hold disjoint buffers.
+	"engine_close_zc_notif_held": {
+		Kind:   CounterCumulative,
+		Counts: "closed io_uring connections whose SEND_ZC send buffer the release backstop held past its 5 s, because the kernel had not yet posted the notification that says nothing reads it: a connection the server closed while its peer had stopped reading mid-send. Counted once per hold, when it starts. The mechanism working, not a fault: before celeris e2508c7 the backstop released such a buffer for reuse, and the peer, reading again, received another connection's bytes. A rate",
+		Series: false,
+		Why:    "a rate of closes on stalled peers, read against engine_close_count as a ratio of totals; when holds stood, and how much they kept, is engine_close_zc_notif_held_bytes' column",
+	},
+	"engine_close_zc_notif_held_now": {
+		Kind:   CounterPeakGauge,
+		Counts: "send buffers held past the backstop right now, summed over the io_uring workers. A gauge: each falls out when its SEND_ZC notification arrives, which only the peer decides -- one that keeps reading, however slowly, or stays at a zero window keeps it (celeris measured 5 min 36 s at a zero window). A worker that shuts down takes its share out",
+		Series: true,
+		Why:    "whether holds stood, and for how long, is a trajectory: a step 5 s after a step of engine_close_count is a close on a stalled peer, and a level still standing at the cell's end is a peer that never read again. The tally keeps the highest sampled count; zero means no sampled instant held one",
+	},
+	"engine_close_zc_notif_held_bytes": {
+		Kind:   CounterPeakGauge,
+		Counts: "the capacity in bytes of the send buffers counted in engine_close_zc_notif_held_now: Go heap the engine keeps alive for the kernel. A worker holding 16 MiB arms no new SEND_ZC and its sends copy until some are released; the cap is per worker, so a peak below 16 MiB says no worker reached it",
+		Series: true,
+		Why:    "held buffers are live heap, so a heap_inuse or rss rise in the same rows as a rise of this column is held send buffers rather than a leak, which is the question the slope oracles' series exists to answer. The tally keeps the peak: the most heap a cell's holds kept alive at a sampled instant",
+	},
+	"engine_close_zc_notif_forced": {
+		Kind:         CounterCumulative,
+		Counts:       "send buffers given up while a SEND_ZC was still owed on them, so the kernel could still send from an array whose next owner may write it. celeris documents it MUST STAY ZERO: the hold is decided on the connection's identity so that the backstop never gives one up, and this counter is the tripwire for a change that breaks that",
+		Series:       true,
+		Why:          "as engine_close_fd_forced: a nonzero reading is a defect, and the backstop acts 5 s after the close it handles, so the row, set against the steps of engine_close_count and adaptive_switches 5 s earlier, says which close burst left a SEND_ZC owed",
+		MustStayZero: "an io_uring send buffer was released for reuse while the kernel could still read it for a SEND_ZC, so the closed connection's peer could receive whatever the buffer's next owner wrote: another connection's bytes, the celeris#812 leak the hold exists to prevent",
+	},
+	"engine_shutdown_zc_buf_retained": {
+		Kind:   CounterCumulative,
+		Counts: "send buffers an io_uring worker's shutdown kept for the life of the process, because a SEND_ZC might still read them when the ring closed and no notification can then say when that ends. Moves only when a worker shuts down, i.e. at the engine's shutdown, so a cell's property loop, which samples a running engine, reads it nonzero only if a worker shut down while the loop was still sampling",
+		Series: false,
+		Why:    "a count of a shutdown, not of a second: the total says whether a worker ended with SEND_ZC buffers still owed, and nothing it could explain needs its instant",
 	},
 
 	// --- The celeris#687 post-switch sweep, on whichever engine is draining.

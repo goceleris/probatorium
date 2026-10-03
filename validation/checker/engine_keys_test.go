@@ -572,7 +572,6 @@ var engineFieldKinds = map[string]struct {
 	"DetachedConnections":       {report.CounterGauge, "a signed int64 celeris documents as the current number of connections handed to a detached middleware goroutine (celeris#584)"},
 	"Workers":                   {report.CounterGauge, "an int celeris documents as static after Listen, but the adaptive engine reports pm.Workers + sm.Workers and its lazy standby adds nothing until it is built, so on that engine it steps up mid-cell"},
 	"AsyncRoutes":               {report.CounterStatic, "an int derived from the router's per-route async flags and fixed after Listen"},
-	"Throughput":                {report.CounterGauge, "a float64 recent requests-per-second rate, which falls as well as rises"},
 	"RecvStallMaxNanos":         {report.CounterRunningMax, "a uint64 that is the longest single recv-stall episode, not a total"},
 	"RecvLinkedBlockedMaxNanos": {report.CounterRunningMax, "a uint64 that is the longest single linked-recv wait, not a total"},
 	// celeris#687's residual gauges are uint64 -- each loop publishes a delta
@@ -584,6 +583,11 @@ var engineFieldKinds = map[string]struct {
 	"TransplantResidualPinned":    {report.CounterPeakGauge, "a uint64 celeris#687 documents as a GAUGE: the connections a draining engine holds that cannot be handed over at all"},
 	"TransplantResidualUnstarted": {report.CounterPeakGauge, "a uint64 celeris#687 documents as a GAUGE: the accepted connections a draining engine holds that have sent nothing yet"},
 	"TransplantResidualBusy":      {report.CounterPeakGauge, "a uint64 celeris#687 documents as a GAUGE: the mid-request connections a draining engine holds, whose standing nonzero value after a switch settles is the placement bug"},
+	// celeris#812's held send-buffer gauges are uint64 too, clamped at zero
+	// by the engine, and celeris documents both as GAUGES; their question is
+	// whether a hold stood and how much it kept, hence peak_gauge.
+	"CloseZCNotifHeldNow":   {report.CounterPeakGauge, "a uint64 celeris#812 documents as a GAUGE: the send buffers held past the release backstop right now"},
+	"CloseZCNotifHeldBytes": {report.CounterPeakGauge, "a uint64 celeris#812 documents as a GAUGE: the capacity in bytes of the send buffers held right now"},
 }
 
 // TestEachEngineCounterKindFollowsItsEngineMetricsField ties each declared
@@ -595,11 +599,11 @@ var engineFieldKinds = map[string]struct {
 // The authority is the field's Go type, which the manifest carries from a
 // reflective walk of the pinned celeris: a uint64 is cumulative unless
 // engineFieldKinds names it a running maximum or a peak gauge (the
-// TransplantResidual* uint64 gauges fall); a field of
-// any other type has to be classified in engineFieldKinds; and a signed int64
-// exists to be decremented, so it can only be a gauge. The table holds the
-// decisions a type cannot make (Workers against AsyncRoutes, both int), each
-// with its reason.
+// TransplantResidual* and CloseZCNotifHeld{Now,Bytes} uint64 gauges fall); a
+// field of any other type has to be classified in engineFieldKinds; and a
+// signed int64 exists to be decremented, so it can only be a gauge. The table
+// holds the decisions a type cannot make (Workers against AsyncRoutes, both
+// int), each with its reason.
 func TestEachEngineCounterKindFollowsItsEngineMetricsField(t *testing.T) {
 	keys, err := enginekeys.All()
 	if err != nil {

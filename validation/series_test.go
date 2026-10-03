@@ -74,6 +74,9 @@ func TestSeriesWriterRecordsEveryColumn(t *testing.T) {
 		EngineTransplantResidualUnstarted: 151,
 		EngineTransplantResidualBusy:      157,
 		EngineCloseFDForced:               163,
+		EngineCloseZCNotifHeldNow:         167,
+		EngineCloseZCNotifHeldBytes:       173,
+		EngineCloseZCNotifForced:          179,
 	}
 	w.Record(snap)
 	w.Close()
@@ -143,6 +146,9 @@ func TestSeriesWriterRecordsEveryColumn(t *testing.T) {
 		"engine_transplant_residual_unstarted":  151,
 		"engine_transplant_residual_busy":       157,
 		"engine_close_fd_forced":                163,
+		"engine_close_zc_notif_held_now":        167,
+		"engine_close_zc_notif_held_bytes":      173,
+		"engine_close_zc_notif_forced":          179,
 	}
 	if len(want) != len(seriesColumns) {
 		t.Fatalf("test covers %d columns but the writer has %d — a new column needs a case here",

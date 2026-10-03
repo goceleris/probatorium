@@ -149,9 +149,10 @@ type Snapshot struct {
 	// predicate and gated by nothing; report.EngineCounters says what each
 	// counts, how its readings combine, and whether the per-cell series
 	// samples it. Named "Engine" + the EngineMetrics field, except
-	// EngineDetachedConns, which mirrors its debugvars key. The one
-	// published key with no field is celeris.engine_throughput, and
-	// checker.EngineKeysNotParsed says why.
+	// EngineDetachedConns, which mirrors its debugvars key. Every published
+	// key has a field: the one that had none, celeris.engine_throughput,
+	// went with celeris's removal of EngineMetrics.Throughput (celeris#830,
+	// probatorium#480), and checker.EngineKeysNotParsed is empty.
 	//
 	// The four hand-off outcomes celeris#647 added so its celeris#624 fix is
 	// falsifiable. Stranded must stay zero; the other three are recoveries.
@@ -220,6 +221,18 @@ type Snapshot struct {
 	// an op still owed, is documented must-stay-zero.
 	EngineCloseFDDeferred int64
 	EngineCloseFDForced   int64
+	// The SEND_ZC send buffer of a closed io_uring connection (celeris#812,
+	// celeris e2508c7), held past the 5 s release backstop until the
+	// kernel's notification says nothing reads it any more. ZCNotifHeld is
+	// a rate; HeldNow and HeldBytes are GAUGES (the buffers held right now
+	// and their capacity); ZCNotifForced, a buffer given up while a SEND_ZC
+	// was still owed, is documented must-stay-zero; ShutdownZCBufRetained
+	// counts buffers a worker shutdown kept for the life of the process.
+	EngineCloseZCNotifHeld      int64
+	EngineCloseZCNotifHeldNow   int64
+	EngineCloseZCNotifHeldBytes int64
+	EngineCloseZCNotifForced    int64
+	EngineShutdownZCBufRetained int64
 	// The post-switch sweep (celeris#687). SweepPasses is a rate; the five
 	// Residual fields are GAUGES -- the connections a draining engine still
 	// holds, by the reason the hand-off refused them -- so they fall as well
