@@ -40,10 +40,12 @@
 # none may outlive the host job's step: the job's always() steps, the Go-state
 # wipe among them, run as soon as the step has ended. On SIGINT, SIGTERM or
 # SIGHUP (a cancel or a timeout: the runner signals the step's process alone,
-# which is this script, because the workflow's host step execs it) it kills
-# that session before it exits (on_signal). A watchdog in a session of its own
-# kills it when this script is gone (SIGKILL runs no trap) or the runner dir
-# is (a lost runner's teardown) (watch_runner). It kills nothing else.
+# which is this script, because the workflow's host step execs it, through
+# env --default-signal, since the cluster's runner starts its steps with
+# SIGINT ignored and bash cannot trap that) it kills that session before it
+# exits (on_signal). A watchdog in a session of its own kills it when this
+# script is gone (SIGKILL runs no trap) or the runner dir is (a lost runner's
+# teardown) (watch_runner). It kills nothing else.
 #
 # Run, it runs main; run as `cluster-host.sh watch SIDFILE PID`, the watchdog
 # main starts. Sourced (the tests do), it only defines its functions; the
@@ -61,6 +63,15 @@ procfs=${STRESS_PROCFS:-/proc}
 shard_sidfile="" shard_pid="" watchdog_pid=""
 
 note() { printf '%s\n' "$*" | tee -a "$STRESS_FACTS"; }
+
+# sigmask PID FIELD: FIELD (SigIgn, SigBlk or SigCgt) of /proc/PID/status, a
+# hex mask whose bit N-1 is signal N (1 HUP, 2 INT, 4 QUIT, 4000 TERM), or
+# "-" when it cannot be read.
+sigmask() {
+	local m
+	m=$(awk -v f="$2:" '$1 == f {print $2}' "/proc/$1/status" 2>/dev/null) || true
+	echo "${m:--}"
+}
 section() { printf '\n=== %s (%s)\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$STRESS_FACTS"; }
 
 # busy prints host-wide busy CPU percent over 5 s (/proc/stat: everything
@@ -108,6 +119,10 @@ host_facts() {
 		echo "taskset: $(command -v taskset || echo absent)"
 		echo "memlock of this job: $(awk '/^Max locked memory/ {print $4 ":" $5}' /proc/self/limits)"
 		echo "io_uring_disabled: $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo n/a)"
+		# Whether a cancel's SIGINT can reach on_signal (see main), and what
+		# the runner's worker, this script's parent, was started with.
+		echo "signals of this script (pid $$): SigIgn $(sigmask $$ SigIgn) SigBlk $(sigmask $$ SigBlk) SigCgt $(sigmask $$ SigCgt)"
+		echo "signals of its parent (pid $PPID, $(cat "/proc/$PPID/comm" 2>/dev/null || echo '?')): SigIgn $(sigmask "$PPID" SigIgn) SigBlk $(sigmask "$PPID" SigBlk) SigCgt $(sigmask "$PPID" SigCgt)"
 		echo "cpu  capacity  siblings  governor  cur_khz  max_khz  cpuinfo_max_khz  midr"
 		local d
 		for d in "$sysfs"/cpu[0-9]*; do
@@ -281,14 +296,15 @@ kill_session() {
 # they start. It runs asynchronously and is waited for, because bash runs no
 # trap until a foreground command has ended, and a shard can run for hours.
 # Bash starts an asynchronous command with SIGINT and SIGQUIT ignored, and a
-# signal ignored across exec stays ignored; but the exec builtin first
-# restores the dispositions the shell was started with. So, run as
-# `(exec ...) &`, CMD starts with a foreground command's signal dispositions
-# (and stdin), as a shard does on GitHub.
+# signal ignored across exec stays ignored. Bash 5.2's exec builtin restored
+# the dispositions the shell was started with first; bash 5.3's (Ubuntu
+# 26.04, the cluster hosts) does not. So env resets the two, and CMD starts
+# with a foreground command's signal dispositions (and stdin), as a shard
+# does on GitHub.
 in_session() {
 	local rc=0
 	# shellcheck disable=SC2016 # $$, $1 and $@ are the inner shell's
-	(exec setsid bash -c 'printf %s "$$" >"$1" && shift && exec "$@"' _ "$shard_sidfile" "$@") <&0 &
+	(exec env --default-signal=INT,QUIT setsid bash -c 'printf %s "$$" >"$1" && shift && exec "$@"' _ "$shard_sidfile" "$@") <&0 &
 	shard_pid=$!
 	wait "$shard_pid" || rc=$?
 	shard_pid=""
@@ -362,6 +378,16 @@ main() {
 	trap 'on_signal INT' INT
 	trap 'on_signal TERM' TERM
 	trap 'on_signal HUP' HUP
+	# Bash cannot trap a signal that was ignored when it started: the INT trap
+	# above is then void, silently, and a cancel reaches on_signal only on the
+	# runner's SIGTERM, 7.5 s after its SIGINT. The cluster's runner starts
+	# every step with SIGINT ignored, so the workflow's host step resets it
+	# (env --default-signal); say so if that ever stops working.
+	local ign
+	ign=$(sigmask $$ SigIgn)
+	if [[ $ign =~ ^[0-9a-f]{1,16}$ ]] && ((16#$ign & 2)); then
+		echo "::warning::cluster-host.sh started with SIGINT ignored (SigIgn $ign): a cancel reaches it only on the runner's SIGTERM, 7.5 s after its SIGINT. Start it as the workflow's host step does: exec env --default-signal=INT,QUIT,HUP bash cluster-host.sh" >&2
+	fi
 	setsid bash "$here/${BASH_SOURCE[0]##*/}" watch "$shard_sidfile" "$$" </dev/null &
 	watchdog_pid=$!
 

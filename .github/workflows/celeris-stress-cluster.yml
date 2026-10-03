@@ -174,7 +174,19 @@ jobs:
         # shard before the always() steps below run (the Go-state wipe among
         # them). Without exec the signals reach only this shell, and go test
         # outlives the job's last step.
-        run: exec bash probatorium/tools/stresstally/cluster-host.sh
+        #
+        # env --default-signal: the cluster's runner hands every step SIGINT
+        # and SIGQUIT ignored (and SIGHUP, from nohup), because
+        # ansible/runner-setup.yml starts it as `nohup ./run.sh ... &` from a
+        # non-interactive shell. Bash cannot trap a signal that was ignored
+        # when it started, so without this the runner's SIGINT does nothing
+        # and the shard dies only on its SIGTERM, 7.5 s later (P6b, run
+        # 36338683576; probatorium#435). Reset here, the three start at their
+        # defaults, as on a GitHub-hosted runner, for cluster-host.sh and every
+        # shard it starts. env execs, so the step's process is still
+        # cluster-host.sh. (--default-signal: GNU coreutils >= 8.31, uutils
+        # >= 0.6.0; the hosts run Ubuntu 26.04, which ships uutils 0.8.0.)
+        run: exec env --default-signal=INT,QUIT,HUP bash probatorium/tools/stresstally/cluster-host.sh
       - name: Upload the logs
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
