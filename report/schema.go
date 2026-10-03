@@ -997,7 +997,8 @@ type Tier1Summary struct {
 	// is, and whether the per-cell series samples it). Each value reduces the
 	// samples whose document carried the engine block by that kind: the
 	// highest reading of a running maximum or of a peak gauge (the
-	// celeris#687 residual gauges, schema 5.16), and the last reading of
+	// celeris#687 residual gauges, schema 5.16, and the celeris#812 held
+	// send-buffer gauges, schema 5.19), and the last reading of
 	// everything else -- the cell's final total, gauge level or static count
 	// -- never a sum over samples (schema 5.15, probatorium#391).
 	//
