@@ -4,11 +4,12 @@
 
 ```sh
 go mod download
-go install -modfile=.github/tools/go.mod tool   # mage and actionlint, the versions CI runs
+GOWORK=off go install -modfile=.github/tools/go.mod tool   # mage and actionlint, the versions CI runs
 ```
 
 `.github/tools/go.mod` pins both (its go.sum, bumped by Dependabot), the same install the lint
-workflow runs, so a local `mage` cannot drift from CI's.
+workflow runs, so a local `mage` cannot drift from CI's. `GOWORK=off` is there because go refuses
+`-modfile` in workspace mode, which a local `go.work` (`.gitignore` lists it) turns on.
 
 Linux is required for any `mage Bench` / `mage Validate` / `mage Soak` since the cluster targets are Linux. macOS is fine for `go build` + `go test ./...`.
 
