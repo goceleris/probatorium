@@ -555,10 +555,12 @@ func (e *Evaluator) recordErrorClasses(snap properties.Snapshot) {
 // each sub-engine at most once and never replaces it), and max is what keeps
 // a running maximum right if that ever stops being true. For the gauges,
 // last is the reading that keeps a persistent drift visible in either
-// direction, where a peak would hide the negative one. The peak gauges --
-// celeris#687's residual gauges, which cannot go negative -- keep the peak
-// for the opposite reason: their question is whether any switch left residue
-// standing, and only a zero peak answers it for every switch the cell made.
+// direction, where a peak would hide the negative one. The peak gauges,
+// which cannot go negative, keep the peak for the opposite reason. For
+// celeris#687's residual gauges the question is whether any switch left
+// residue standing, and only a zero peak answers it for every switch the cell
+// made. For celeris#812's held send-buffer gauges it is whether a hold stood
+// at all, and the most heap the holds kept alive.
 //
 // A sample whose document carried no engine block (EngineName empty) is
 // skipped rather than recorded, since every engine key in it was absent and
@@ -619,6 +621,12 @@ func (e *Evaluator) recordEngineCounters(snap properties.Snapshot) {
 		// The celeris#685 close-path counters celeris 3e7abba added.
 		"engine_close_fd_deferred": snap.EngineCloseFDDeferred,
 		"engine_close_fd_forced":   snap.EngineCloseFDForced,
+		// The celeris#812 held SEND_ZC send buffers celeris e2508c7 added.
+		"engine_close_zc_notif_held":       snap.EngineCloseZCNotifHeld,
+		"engine_close_zc_notif_held_now":   snap.EngineCloseZCNotifHeldNow,
+		"engine_close_zc_notif_held_bytes": snap.EngineCloseZCNotifHeldBytes,
+		"engine_close_zc_notif_forced":     snap.EngineCloseZCNotifForced,
+		"engine_shutdown_zc_buf_retained":  snap.EngineShutdownZCBufRetained,
 	} {
 		held, seen := e.tally.EngineCounters[k]
 		e.tally.EngineCounters[k] = reduceEngineCounter(report.EngineCounters[k].Kind, held, seen, v)

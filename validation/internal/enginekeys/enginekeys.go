@@ -69,6 +69,8 @@ func All() ([]Key, error) {
 // into the wrong field -- or into two -- lands a wrong number somewhere
 // instead of the right number everywhere, and no alias map is needed to
 // excuse the historical names (ActiveConnections -> ActiveConns and the rest).
+// No manifest key has been a float since celeris#894 removed Throughput, so
+// the +0.5 branch is unused until celeris adds a float field.
 func Sentinel(i int, k Key) float64 {
 	v := float64(1_000_003 + i*7_919)
 	if k.IsFloat() {
