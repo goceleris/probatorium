@@ -87,9 +87,10 @@ func recordingEchoServer(t *testing.T, rec *connRecorder) *fakeWSServer {
 //
 // The schedule is scaled down: fires of 120 ms (shortEchoFire) under a
 // 400 ms hold, so a fire's bound is 2 x 400 ms + wsEchoCloseWait = 1.3 s; a
-// 3 s period with a 500 ms gap then leaves 1.2 s per period in which a fire
-// may start, more than the 1.8 s it must keep quiet minus the gap, so a
-// walker whose gaps sit off the epoch grid fires inside the test's gaps.
+// 3 s period with a 500 ms gap then leaves 3 - 0.5 - 1.3 = 1.2 s per period
+// in which a fire may start. That is more than half the period minus the gap
+// (1 s), so a walker whose gaps sit half a period off the epoch grid starts
+// fires inside the test's gaps.
 // The walker starts 50 ms into a gap, as a cell can, so its first look at
 // the schedule is from inside one. The run covers that gap, the period after
 // it and the next gap.
