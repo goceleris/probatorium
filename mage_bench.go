@@ -143,6 +143,48 @@ func maxDryRunCellsPerServer(dryRunOut string, colSlugs []string) int {
 	return maxCells
 }
 
+// ratedBench is the rated half of a Bench: whether the runner drives the
+// rated sweep, on which cells, and how long each rated pass measures.
+type ratedBench struct {
+	On          bool
+	DurationSec int
+	// Cells is the runner's -rated-cells glob over "<scenario>/<server>".
+	// Only a cell that matches it (and whose saturation pass is clean) gets
+	// the rated sweep.
+	Cells string
+}
+
+// resolveRatedBench reads the rated sweep's BENCH_* env. BENCH_RATED_CELLS
+// defaults to the budget model's rated cells (budget.RatedCellsGlob), so a
+// hand-run `mage Bench BENCH_RATED=1` rates what the model plans too; set
+// it to "*" to rate every cell.
+func resolveRatedBench() (ratedBench, error) {
+	on := os.Getenv("BENCH_RATED") == "1" || os.Getenv("BENCH_RATED") == "true"
+	d := envOrDefault("BENCH_RATED_DURATION", "30s")
+	sec, err := durationSeconds(d)
+	if err != nil {
+		return ratedBench{}, fmt.Errorf("BENCH_RATED_DURATION %q: %w", d, err)
+	}
+	cells := strings.TrimSpace(os.Getenv("BENCH_RATED_CELLS"))
+	if cells == "" {
+		cells = budget.RatedCellsGlob()
+	}
+	return ratedBench{On: on, DurationSec: sec, Cells: cells}, nil
+}
+
+// extraVars are the ansible extra-vars that turn the rated sweep on in
+// run_bench_cell.yml; none when rated mode is off.
+func (r ratedBench) extraVars() []string {
+	if !r.On {
+		return nil
+	}
+	return []string{
+		"--extra-vars", "bench_rated=1",
+		"--extra-vars", "bench_rated_duration_seconds=" + strconv.Itoa(r.DurationSec),
+		"--extra-vars", "bench_rated_cells=" + r.Cells,
+	}
+}
+
 // durationSeconds renders a BENCH_* Go duration string as the whole
 // integer seconds the playbooks consume. The old path forwarded the raw
 // string and had run_bench_cell.yml strip units with a regex — which
@@ -218,8 +260,11 @@ func Bench() error {
 	// per-cell wall-clock by the rated sweep, so the budget issue (#166)
 	// curates when it runs. "1"/"true" turns it on; forwarded to the runner
 	// via bench_rated so run_bench_cell.yml adds the -rated flag.
-	ratedOn := os.Getenv("BENCH_RATED") == "1" || os.Getenv("BENCH_RATED") == "true"
-	ratedDuration := envOrDefault("BENCH_RATED_DURATION", "30s")
+	rated, err := resolveRatedBench()
+	if err != nil {
+		return err
+	}
+	ratedOn := rated.On
 	version, err := celerisVersion()
 	if err != nil {
 		return err
@@ -319,7 +364,11 @@ func Bench() error {
 	fmt.Printf("  connections:  %s\n", conns)
 	fmt.Printf("  cells:        %s\n", cells)
 	fmt.Printf("  runs:         %s\n", runs)
-	fmt.Printf("  rated:        %v\n", ratedOn)
+	if ratedOn {
+		fmt.Printf("  rated:        true (%ds passes on %s)\n", rated.DurationSec, rated.Cells)
+	} else {
+		fmt.Printf("  rated:        false\n")
+	}
 	fmt.Printf("  celeris ver:  %s\n", version)
 	fmt.Printf("  results:      %s\n\n", resultsDir)
 
@@ -430,10 +479,7 @@ func Bench() error {
 	if err != nil {
 		return fmt.Errorf("BENCH_WARMUP %q: %w", warmup, err)
 	}
-	ratedDurationSec, err := durationSeconds(ratedDuration)
-	if err != nil {
-		return fmt.Errorf("BENCH_RATED_DURATION %q: %w", ratedDuration, err)
-	}
+	ratedDurationSec := rated.DurationSec
 	scenarioCount, err := benchMaxScenariosPerColumn(cells, colSlugs)
 	if err != nil {
 		return err
@@ -447,6 +493,9 @@ func Bench() error {
 		return fmt.Errorf("BENCH_CELLS %q schedules zero cells on every column "+
 			"(glob halves are <scenario>/<server> — e.g. '*/celeris-*', not 'celeris-*/*')", cells)
 	}
+	// The guard charges the rated sweep to every scenario of the busiest
+	// column, although only the cells matching rated.Cells run it: an upper
+	// bound, which is what a hang guard needs.
 	ratedPasses := 0
 	if ratedOn {
 		ratedPasses = budget.DefaultRatedPasses
@@ -500,11 +549,7 @@ func Bench() error {
 		if len(sutEnv) > 0 {
 			args = append(args, "--extra-vars", sutEnvExtraVars(sutEnv))
 		}
-		if ratedOn {
-			args = append(args,
-				"--extra-vars", "bench_rated=1",
-				"--extra-vars", "bench_rated_duration_seconds="+strconv.Itoa(ratedDurationSec))
-		}
+		args = append(args, rated.extraVars()...)
 		if os.Getenv("CLUSTER_USE_LAN") == "1" {
 			args = append(args, "--extra-vars", "use_lan=true")
 		}
