@@ -140,6 +140,8 @@ func TestParseDebugVarsReadsEveryPublishedEngineKey(t *testing.T) {
 			undocumented = append(undocumented, k.Key)
 		}
 		switch {
+		// Dormant while the manifest has no float key (none since celeris#894
+		// removed Throughput); it fires again once celeris adds a float field.
 		case len(holders) == 0 && k.IsFloat() && len(p.holders[math.Trunc(exact)]) > 0:
 			truncated = append(truncated, k.Key+" -> "+strings.Join(p.holders[math.Trunc(exact)], ","))
 			continue
