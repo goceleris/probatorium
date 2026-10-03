@@ -126,11 +126,13 @@ const wsEchoReadPace = 3 * time.Millisecond
 // the unit tests can run a whole fire in a fraction of a second.
 var wsEchoStreamDuration = 1 * time.Second
 
-// wsEchoMaxHold bounds one fire end to end: dial, handshake, stream,
-// drain, close. See wsMaxHold and TestStreamHoldsStayUnderTheConnCloseBound:
-// a detached stream is not stamped in the refapp's last-byte table, so this
-// must stay well under I-CONN-1's deadline. A var so the timeout class can
-// be unit-tested in well under a second.
+// wsEchoMaxHold bounds the dial, and then, from the end of the dial, the
+// handshake, stream and drain; the close handshake after them has its own
+// wsEchoCloseWait (wsEchoFireBound adds the three). See wsMaxHold and
+// TestStreamHoldsStayUnderTheConnCloseBound: a detached stream is not
+// stamped in the refapp's last-byte table, so this must stay well under
+// I-CONN-1's deadline. A var so the timeout class can be unit-tested in well
+// under a second.
 var wsEchoMaxHold = 2 * time.Second
 
 // wsEchoCloseWait bounds the close handshake after a drained fire.

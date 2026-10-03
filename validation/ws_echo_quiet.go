@@ -32,7 +32,7 @@ import "time"
 //   - The gap is a third of the period. Fewer clean samples per bucket make a
 //     noisier minimum: measured on the 09-11 soak's 32 native-engine cells, a
 //     trough taken from the gap samples alone scatters 1.43x as much as one
-//     taken from the whole bucket (median; 2.4x at a 10 s gap).
+//     taken from the whole bucket (median; 2.4x for a 10 s gap in 65 s).
 //
 // The cost is ws_echo coverage. A fire may only start when it is sure to be
 // closed before the next gap opens (wsEchoFireBound), so about 60 % of the
