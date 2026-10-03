@@ -257,11 +257,13 @@ jobs:
     # which is outside .github/, so a runner label it returned would put the
     # pull request's code on whatever runner that label names, the cluster
     # hosts' runners included, with no change under .github/ for a
-    # maintainer to see before "Approve and run". Only the two GitHub-hosted
-    # labels in this list are ever used (plan.go's runners map names the
-    # same two; change both together). Anything else runs on ubuntu-24.04
-    # and the first step fails the shard, naming what the plan asked for.
-    runs-on: ${{ contains(fromJSON('["ubuntu-24.04","ubuntu-24.04-arm"]'), matrix.runner) && matrix.runner || 'ubuntu-24.04' }}
+    # maintainer to see before "Approve and run". runs-on is always one of
+    # the two GitHub-hosted labels written here, never the plan's own text
+    # (== ignores case, as contains() does; plan.go's runners map names the
+    # same two labels, so change both together). Anything outside the list
+    # runs on ubuntu-24.04, and the first step fails the shard, naming what
+    # the plan asked for.
+    runs-on: ${{ matrix.runner == 'ubuntu-24.04-arm' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     # Stated again on the job that runs the code under test, so an edit of
     # the workflow-level key cannot give this job's token cache access.
     cache-mode: none

@@ -127,18 +127,19 @@ func TestStressWorkflowReachesTheClusterOnlyThroughItsGatedJob(t *testing.T) {
 // plan returned, a pull request that changed only plan.go could put its code
 // on any runner the repository has, the cluster hosts' included, and no
 // change under .github/ would show it before "Approve and run". So the
-// workflow names the two GitHub-hosted labels itself, falls back to
-// ubuntu-24.04 for anything else, and the first step fails such a shard.
+// workflow names the two GitHub-hosted labels itself and runs-on yields only
+// those literals, never the plan's text; anything else falls back to
+// ubuntu-24.04, and the first step fails such a shard.
 const (
 	shardAllowList = `fromJSON('["ubuntu-24.04","ubuntu-24.04-arm"]')`
-	shardRunsOn    = "${{ contains(" + shardAllowList + ", matrix.runner) && matrix.runner || 'ubuntu-24.04' }}"
+	shardRunsOn    = "${{ matrix.runner == 'ubuntu-24.04-arm' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}"
 	shardRefuseIf  = "${{ !contains(" + shardAllowList + ", matrix.runner) }}"
 )
 
 func TestStressShardRunnerIsChosenByTheWorkflow(t *testing.T) {
 	shard := jobBlock(t, withoutComments(readStressWorkflow(t)), "shard")
 	if !strings.Contains(shard, "\n    runs-on: "+shardRunsOn+"\n") {
-		t.Errorf("the shard job's runs-on must be the allow-list expression %s:\n%s", shardRunsOn, shard)
+		t.Errorf("the shard job's runs-on must be the expression %s, which yields only the two GitHub-hosted labels:\n%s", shardRunsOn, shard)
 	}
 	steps := regexp.MustCompile(`(?s)\n    steps:\n(.*)`).FindStringSubmatch(shard)
 	if steps == nil {
