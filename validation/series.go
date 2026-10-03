@@ -57,6 +57,15 @@ const seriesFlushEvery = 30
 // row joined to engine_close_count and adaptive_switches. The rate
 // engine_close_fd_deferred is a total, read against engine_close_count.
 //
+// Schema 5.19 applied it to the five celeris#812 held-send-buffer counters
+// celeris e2508c7 added and admitted THREE: the two gauges
+// engine_close_zc_notif_held_now and _held_bytes, whose question is whether a
+// hold stood and how much heap it kept -- rows joined to heap_inuse, rss and
+// engine_close_count -- and engine_close_zc_notif_forced, documented
+// must-stay-zero, whose question is which close burst left a SEND_ZC owed. The
+// rate engine_close_zc_notif_held and engine_shutdown_zc_buf_retained, which
+// moves only at a worker's shutdown, are totals.
+//
 // New columns are APPENDED, never inserted: the header names every column and
 // a reader should key off it, but an appended column cannot invalidate a
 // column index somebody already wrote down against a shipped artifact.
@@ -108,6 +117,9 @@ var seriesColumns = []string{
 	"engine_transplant_residual_unstarted",
 	"engine_transplant_residual_busy",
 	"engine_close_fd_forced",
+	"engine_close_zc_notif_held_now",
+	"engine_close_zc_notif_held_bytes",
+	"engine_close_zc_notif_forced",
 }
 
 // seriesWriter appends one row per property-loop sample to a CSV in the cell
@@ -215,6 +227,9 @@ func (s *seriesWriter) Record(snap properties.Snapshot) {
 		snap.EngineTransplantResidualUnstarted,
 		snap.EngineTransplantResidualBusy,
 		snap.EngineCloseFDForced,
+		snap.EngineCloseZCNotifHeldNow,
+		snap.EngineCloseZCNotifHeldBytes,
+		snap.EngineCloseZCNotifForced,
 	}
 	for i, x := range v {
 		s.row[i] = strconv.FormatInt(x, 10)

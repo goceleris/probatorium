@@ -237,7 +237,9 @@ small smoke runs don't pay for the expensive slices:
 
 From concurrency 4, two more walkers run outside that budget. One is an RFC conformance scraper that
 reads the wire (`I-RFC-1`, `I-RFC-2`). The other is a 64 KiB WebSocket echo (`I-WS-ECHO`), which runs
-where `/ws` is routed.
+where `/ws` is routed. The echo holds no connection for the first 18 s of every 54 s: a native engine
+keeps each echo's backlog on the Go heap, and these gaps give every `I-MEM-1` trough bucket samples
+without one ([`validation/ws_echo_quiet.go`](validation/ws_echo_quiet.go), probatorium#478).
 
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
