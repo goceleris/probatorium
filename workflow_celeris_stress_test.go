@@ -62,8 +62,8 @@ func TestStressWorkflowReachesTheClusterOnlyThroughItsGatedJob(t *testing.T) {
 		}
 	}
 	for _, m := range regexp.MustCompile(`(?m)^\s*runs-on:\s*(.+)$`).FindAllStringSubmatch(src, -1) {
-		if v := strings.TrimSpace(m[1]); v != "ubuntu-24.04" && v != "${{ matrix.runner }}" {
-			t.Errorf("runs-on %q: only ubuntu-24.04, or the planned GitHub-hosted label", v)
+		if v := strings.TrimSpace(m[1]); v != "ubuntu-24.04" && v != shardRunsOn {
+			t.Errorf("runs-on %q: only ubuntu-24.04, or the shard's allow-listed GitHub-hosted label", v)
 		}
 	}
 	if n := strings.Count(src, "matrix-tier-cluster"); n != 1 {
@@ -118,6 +118,50 @@ func TestStressWorkflowReachesTheClusterOnlyThroughItsGatedJob(t *testing.T) {
 	}
 	if gotHosts["x86"] != "msa2-server" || gotHosts["arm64"] != "msr1" || len(hosts) != 2 {
 		t.Errorf("planned cluster hosts %v; want x86 on msa2-server and arm64 on msr1, never the load generator", gotHosts)
+	}
+}
+
+// The shard job's runner, and the refusal that goes with it (celeris#864).
+// On pull_request the matrix is the pull request's own tools/stresstally
+// plan, which lives outside .github/: if the job ran on whatever label the
+// plan returned, a pull request that changed only plan.go could put its code
+// on any runner the repository has, the cluster hosts' included, and no
+// change under .github/ would show it before "Approve and run". So the
+// workflow names the two GitHub-hosted labels itself and runs-on yields only
+// those literals, never the plan's text; anything else falls back to
+// ubuntu-24.04, and the first step fails such a shard.
+const (
+	shardAllowList = `fromJSON('["ubuntu-24.04","ubuntu-24.04-arm"]')`
+	shardRunsOn    = "${{ matrix.runner == 'ubuntu-24.04-arm' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}"
+	shardRefuseIf  = "${{ !contains(" + shardAllowList + ", matrix.runner) }}"
+)
+
+func TestStressShardRunnerIsChosenByTheWorkflow(t *testing.T) {
+	shard := jobBlock(t, withoutComments(readStressWorkflow(t)), "shard")
+	if !strings.Contains(shard, "\n    runs-on: "+shardRunsOn+"\n") {
+		t.Errorf("the shard job's runs-on must be the expression %s, which yields only the two GitHub-hosted labels:\n%s", shardRunsOn, shard)
+	}
+	steps := regexp.MustCompile(`(?s)\n    steps:\n(.*)`).FindStringSubmatch(shard)
+	if steps == nil {
+		t.Fatalf("no steps in the shard job:\n%s", shard)
+	}
+	first := regexp.MustCompile(`(?s)^      - (.*?)(\n      - |\z)`).FindStringSubmatch(steps[1])
+	if first == nil || !strings.Contains(first[1], "name: Refuse a runner this workflow does not allow") ||
+		!strings.Contains(first[1], "if: "+shardRefuseIf+"\n") || !strings.Contains(first[1], "exit 1") {
+		t.Errorf("the shard job's FIRST step must refuse a runner outside the allow-list (if: %s, exit 1):\n%s", shardRefuseIf, steps[1])
+	}
+	// The allow-list and plan.go's runners map name the same labels.
+	plan, err := os.ReadFile("tools/stresstally/plan.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var planned []string
+	for _, l := range regexp.MustCompile(`"(?:x86|arm64)":\s*"(ubuntu[^"]+)"`).FindAllStringSubmatch(string(plan), -1) {
+		planned = append(planned, l[1])
+	}
+	slices.Sort(planned)
+	if want := []string{"ubuntu-24.04", "ubuntu-24.04-arm"}; !slices.Equal(planned, want) {
+		t.Errorf("plan.go's runners map names %v, the shard allow-list %v: change both together", planned, want)
 	}
 }
 

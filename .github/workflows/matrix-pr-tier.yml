@@ -33,8 +33,14 @@ name: PR Validation
 # This workflow ONLY runs when a maintainer explicitly adds the
 # `cluster-ok` label to the PR (or kicks it via workflow_dispatch),
 # AND the head branch lives in this repository — the label gates who
-# approves, the head-repo check gates whose code runs. A fork PR never
-# reaches the cluster, labelled or not.
+# approves, the head-repo check gates whose code runs. That check keeps
+# a fork PR off the cluster only while the PR leaves this file alone:
+# on pull_request the workflow files come from the PR's merge ref, so a
+# fork PR can drop the check, or add a workflow of its own that names
+# the cluster's labels. What holds such a PR is the fork-PR approval
+# policy (all_external_contributors), so a maintainer must never
+# "Approve and run" a fork PR that touches .github/. That policy does
+# not hold an organization member's fork PR (goceleris/celeris#864).
 #
 # It also re-validates on `synchronize` while the label is still
 # present (probatorium#360). Requiring the label to be re-applied by
@@ -46,11 +52,13 @@ name: PR Validation
 # alone, while the checks list implied a cluster safety net that did
 # not exist.
 #
-# This grants no new capability. The head-repo check already confines
-# every cluster-touching run to a branch in this repository, which
-# requires write access; anyone who can push such a branch can already
-# add the label. What changes is only how often a maintainer has to
-# re-apply it, which was the whole reason the gate went unused.
+# This grants no new capability. As this file is written, the head-repo
+# check confines its cluster runs to a branch in this repository, which
+# requires write access, and anyone who can push such a branch can
+# already add the label. (A fork PR that edits this file is held only by
+# the approval policy; see the security gate above.) What changes is
+# only how often a maintainer has to re-apply it, which was the whole
+# reason the gate went unused.
 
 on:
   pull_request:
@@ -108,7 +116,9 @@ jobs:
     # The pull_request path additionally requires the head branch to
     # live in THIS repository: a fork PR must never reach the
     # self-hosted cluster, even if the label is applied — the label
-    # gates who approves, this gates whose code runs.
+    # gates who approves, this gates whose code runs. It holds only for
+    # a fork PR that leaves this file alone; the header says what holds
+    # one that edits it.
     #
     # `labeled` fires for EVERY label, so it is matched on the label
     # that was actually added; `synchronize` has no such field and is
