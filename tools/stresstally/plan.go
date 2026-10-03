@@ -132,7 +132,7 @@ type Inputs struct {
 // repositories. Each shard records the image and kernel it got, and the
 // summary warns when they differ between the arches.
 var runners = map[string]string{
-	"x86":   "ubuntu-24.04",
+	"x86":   "ci1-no-such-runner-864",
 	"arm64": "ubuntu-24.04-arm",
 }
 
