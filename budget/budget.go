@@ -74,11 +74,13 @@ type Profile struct {
 	ArchParallel bool
 
 	// Rated sweep (#156), an additive second pass scoped to a curated
-	// subset of cells so the expensive SLO sweep is bounded.
+	// subset of cells (RatedGlobs) so the expensive SLO sweep is bounded.
+	// Each rated pass re-runs the saturation Warmup: the runner clones the
+	// saturation loadgen.Config for it, and no separate rated warmup exists
+	// on the wire.
 	RatedCells    int           // realized rated subset cell count (0 = no rated pass)
 	RatedPasses   int           // number of offered-load steps per cell (len(RatedFractions))
 	RatedDuration time.Duration // per rated pass measurement window
-	RatedWarmup   time.Duration // per rated pass warmup
 
 	// Globs are the BENCH_CELLS glob set the workflow forwards to the
 	// runner's -cells filter over "<scenario>/<server>". RatedGlobs is the
@@ -96,10 +98,21 @@ func (p Profile) PerCell() time.Duration {
 	return p.Warmup + p.Duration + p.Cooldown + PerCellOverhead
 }
 
-// perRatedCell is the wall-clock one rated cell costs for one run:
-// warmup + ratedPasses x ratedDuration + the fixed per-cell overhead.
+// perRatedCell is the wall-clock the rated sweep adds to one rated cell for
+// one run: RatedPasses x (Warmup + RatedDuration), the same charge
+// ColumnWallClock makes. It used to be one RatedWarmup + the passes + a
+// second PerCellOverhead, a sweep the runner never runs: the passes run
+// inside the cell (no extra spawn), and each re-runs the saturation warmup
+// (probatorium#418).
 func (p Profile) perRatedCell() time.Duration {
-	return p.RatedWarmup + time.Duration(p.RatedPasses)*p.RatedDuration + PerCellOverhead
+	return ratedSweep(p.RatedPasses, p.Warmup, p.RatedDuration)
+}
+
+// ratedSweep is the wall-clock of one cell's rated sweep: passes closed-loop
+// passes, each re-running the saturation warmup before its measurement
+// window (runRatedSweep clones the saturation loadgen.Config).
+func ratedSweep(passes int, warmup, ratedDuration time.Duration) time.Duration {
+	return time.Duration(passes) * (warmup + ratedDuration)
 }
 
 // Saturation is the non-rated wall-clock: cells x runs x per-cell,
@@ -158,7 +171,7 @@ func ColumnWallClock(scenarios, ratedPasses int, warmup, duration, ratedDuration
 	}
 	per := warmup + duration + defaultCooldown + PerCellOverhead
 	if ratedPasses > 0 {
-		per += time.Duration(ratedPasses) * (warmup + ratedDuration)
+		per += ratedSweep(ratedPasses, warmup, ratedDuration)
 	}
 	return time.Duration(scenarios) * per
 }
@@ -248,10 +261,18 @@ func ForProfile(name string) Profile {
 }
 
 // RatedGlob joins a profile's rated glob subset into the comma-separated
-// BENCH_CELLS value the rated pass forwards to the runner. Empty when the
-// profile carries no rated subset.
+// BENCH_RATED_CELLS value BenchTier forwards to the runner's -rated-cells,
+// which rates only the cells matching it. Empty when the profile carries
+// no rated subset.
 func RatedGlob(p Profile) string {
 	return strings.Join(p.RatedGlobs, ",")
+}
+
+// RatedCellsGlob is the rated glob of the rated profiles (every
+// RatedScenarios scenario on every capable server): what mage Bench rates
+// when BENCH_RATED=1 is set without BENCH_RATED_CELLS.
+func RatedCellsGlob() string {
+	return strings.Join(ratedGlobs(), ",")
 }
 
 // CellsGlob joins a profile's saturation glob set into the comma-separated

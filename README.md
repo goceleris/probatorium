@@ -191,8 +191,16 @@ rated sweep runs.
 
 The workflow publishes only rated profiles, because saturation-only data would publish datasets with no
 `latency_at_slo`. `mage BenchTier` run by hand publishes unless `BENCH_PUBLISH=0`. The workflow sets
-`BENCH_BUDGET` per profile (24 h, 60 h and 80 h), and its notes record measured wall-clock times of about
-53 h for headline and 69 h for full.
+`BENCH_BUDGET` per profile (24 h, 36 h and 60 h). The budget model projects about 30 h for headline and
+51 h for full. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
+and 69 h, because they rated every clean cell.
+
+**Rated data is not publishable yet.** [#441](https://github.com/goceleris/probatorium/issues/441) and
+[#442](https://github.com/goceleris/probatorium/issues/442) gate any rated publish, so dispatch headline
+and full with `publish=false` until both land. The runner keeps no achieved rate per pass, so no rated
+number can tell a slow server from load that loadgen never sent (#441). In the two-arch 0829 run, rated
+passes that overlapped the other arch's run of the same row, on the shared loadgen host, published
+backlog clocks far more often than the rest (#442).
 
 ### Result: latency at SLO
 
@@ -200,8 +208,14 @@ In the rated sweep, each cell gets four constant-rate passes at 25, 50, 75 and 9
 saturation RPS, with loadgen's coordinated-omission correction. `latency_at_slo` maps each budget in
 `{10, 50, 100, 500, 1000}` ms to the highest pass target whose P99 (the median across runs) stayed within
 it. Bigger is better, and it ranks the field where saturation ceilings collapse together, such as the
-store-bound driver rows. The budget model plans the sweep for the 388 rated cells in
-`budget.RatedScenarios`, but `BenchTier` currently turns it on for every cell of the run.
+store-bound driver rows. Only the 401 cells of `budget.RatedScenarios` (every rated scenario on every
+server that can serve it) get the sweep: `BenchTier` passes their glob to the runner's `-rated-cells`
+(`BENCH_RATED_CELLS`), with the profile's pass window in `BENCH_RATED_DURATION`. The rated rows are the
+driver rows, `get-json`, `post-4k`, `churn-close` and `ws-echo`. The other scenarios (`get-simple` and its
+concurrency sweep, `get-json-1k`, the H2 rows, `ws-large-echo`, and the WS hub and SSE fan-out rows)
+publish saturation data only; [`budget/profiles.go`](budget/profiles.go) gives the measured reason for
+each. Datasets published before [#418](https://github.com/goceleris/probatorium/issues/418) also carry
+rated data for those scenarios.
 
 ## Validation tier
 
@@ -370,7 +384,7 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `Status` | Cluster reachability and manifest state | |
 | `Deploy` | Cross-compile and stage every binary | `CLUSTER_USE_LAN`, `DEPLOY_COMPETITORS=all\|go-only\|none\|<list>`, `DEPLOY_NEEDS_DBSERVICES` |
 | `Cleanup` | Undo what a run installed, per the host manifests | `CLEANUP_HOSTS=all\|<list>` |
-| `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_SUT_ENV`, `CELERIS_VERSION` |
+| `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_RATED_CELLS` (default: the rated cells), `BENCH_SUT_ENV`, `CELERIS_VERSION` |
 | `BenchTier` | A profile-driven run over the whole grid; publishes it unless `BENCH_PUBLISH=0` | `BENCH_PROFILE=fast\|headline\|full`, `BENCH_BUDGET`, `BENCH_TARGET`, `BENCH_SKIP_RATED`, `BENCH_PUBLISH` |
 | `BenchSince` | Compare against a baseline version | `BASELINE_VERSION` (default `v1.4.2`), `REGRESSION_THRESHOLD` (default `0.05`) |
 | `Validate` | A validation run, one cell or the matrix | `VALIDATE_TARGET` (default `both`), `VALIDATE_DURATION` (default `6h`), `VALIDATE_MATRIX=1`, `VALIDATE_MATRIX_REFAPPS`, `VALIDATE_MATRIX_ENGINES`, `VALIDATE_PARALLEL=1`, `VALIDATE_DBSERVICES=1`, `VALIDATE_CONCURRENCY`, `VALIDATE_RESUME_FROM`, `CELERIS_VERSION`, `PROBATORIUM_VALIDATE_DRIVER=ssh` |

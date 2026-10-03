@@ -51,6 +51,12 @@ const seriesFlushEvery = 30
 // to adaptive_switches. The other six are totals: five rates of the hand-off mechanism and
 // engine_stale_recv_data_closed, which counts close races.
 //
+// Schema 5.18 applied it to the two celeris#685 close-path counters celeris
+// 3e7abba added and admitted ONE: engine_close_fd_forced, documented
+// must-stay-zero, whose question is which close burst left an op owed -- a
+// row joined to engine_close_count and adaptive_switches. The rate
+// engine_close_fd_deferred is a total, read against engine_close_count.
+//
 // New columns are APPENDED, never inserted: the header names every column and
 // a reader should key off it, but an appended column cannot invalidate a
 // column index somebody already wrote down against a shipped artifact.
@@ -101,6 +107,7 @@ var seriesColumns = []string{
 	"engine_transplant_residual_pinned",
 	"engine_transplant_residual_unstarted",
 	"engine_transplant_residual_busy",
+	"engine_close_fd_forced",
 }
 
 // seriesWriter appends one row per property-loop sample to a CSV in the cell
@@ -207,6 +214,7 @@ func (s *seriesWriter) Record(snap properties.Snapshot) {
 		snap.EngineTransplantResidualPinned,
 		snap.EngineTransplantResidualUnstarted,
 		snap.EngineTransplantResidualBusy,
+		snap.EngineCloseFDForced,
 	}
 	for i, x := range v {
 		s.row[i] = strconv.FormatInt(x, 10)

@@ -502,6 +502,19 @@ func (v *Vars) Document() map[string]any {
 			doc["celeris.engine_transplant_claim_deferred"] = int64(info.Metrics.TransplantClaimDeferred)
 			doc["celeris.engine_transplant_reap_failed"] = int64(info.Metrics.TransplantReapFailed)
 			doc["celeris.engine_transplant_reap_unsupported"] = int64(info.Metrics.TransplantReapUnsupported)
+			// The same fd-lifetime rule on the io_uring CLOSE paths
+			// (celeris#685): a closed connection's descriptor number is
+			// released only once no op that names it can still be issued,
+			// so a recv the kernel had not issued yet can no longer read
+			// the request of a new connection given the freed number.
+			// `close_fd_deferred` is a rate: closes whose descriptor
+			// stayed open until the last owed op completed (on an
+			// async-handler engine close to one per server-side close).
+			// `close_fd_forced` counts such descriptors the release
+			// backstop closed with an op still owed; celeris documents it
+			// MUST STAY ZERO.
+			doc["celeris.engine_close_fd_deferred"] = int64(info.Metrics.CloseFDDeferred)
+			doc["celeris.engine_close_fd_forced"] = int64(info.Metrics.CloseFDForced)
 			// The post-switch sweep (celeris#687). `sweep_passes` is a
 			// rate, the sweep's cost. The five `residual_*` are GAUGES,
 			// not totals: the connections a draining engine still holds,
@@ -551,15 +564,20 @@ func (v *Vars) Document() map[string]any {
 			// one that has them.
 			doc["celeris.engine_async_routes"] = int64(info.Metrics.AsyncRoutes)
 			// Published as a float, because it is the one non-integer
-			// field on EngineMetrics. No shipped engine assigns it --
-			// std, epoll and io_uring leave it at zero and the adaptive
-			// engine sums two zeros -- so it reads 0 everywhere today and
-			// a nonzero value means celeris started populating it. It is
-			// here anyway: a field that exists and is never published
-			// cannot be told apart from one that is published and never
-			// moves, and removing that ambiguity is what this document
-			// is for (probatorium#297).
-			doc["celeris.engine_throughput"] = info.Metrics.Throughput
+			// field on EngineMetrics. No engine has ever assigned it, and
+			// since celeris#695 (celeris#653) it is Deprecated and
+			// documented to always read 0: the adaptive engine stopped
+			// summing its sub-engines' zeros, and v2.0.0 removes the field
+			// (celeris#651). A nonzero value would mean celeris broke that
+			// contract. It is here anyway, because the projection is
+			// total while the field exists: a field that exists and is
+			// never published cannot be told apart from one that is
+			// published and never moves, and removing that ambiguity is
+			// what this document is for (probatorium#297). The removal
+			// stops this line compiling, so it cannot be missed; the
+			// manifest then drops the key (-update-engine-keys), and
+			// checker.EngineKeysNotParsed's entry for it fails as stale.
+			doc["celeris.engine_throughput"] = info.Metrics.Throughput //nolint:staticcheck // SA1019: published until celeris removes the field (celeris#651); see above
 		}
 	}
 	return doc

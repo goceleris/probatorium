@@ -148,6 +148,14 @@ type Config struct {
 	// offered load and converges faster.
 	RatedDuration time.Duration
 
+	// RatedCells scopes the rated sweep to the cells matching this glob over
+	// "<scenario>/<server>" (the -cells syntax, "!" exclusions included).
+	// Empty means every cell, which is what an ad-hoc -rated run always did.
+	// A rated BenchTier run passes budget.RatedGlob, so only the cells the
+	// budget model plans a rated sweep for get one (probatorium#418: with no
+	// scope the runner rated every clean cell, ~770 of 813 instead of 401).
+	RatedCells string
+
 	// RatedFractions are the offered loads for the rated sweep, expressed as
 	// fractions of the measured saturation RPS (adapter-relative so the
 	// targets stay comparable across servers of wildly different throughput).
@@ -237,6 +245,8 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.BoolVar(&c.RatedMode, "rated", c.RatedMode,
 		"run a Gil-Tene rated (closed-loop, CO-corrected) sweep after each saturation pass (opt-in; multiplies per-cell time)")
 	fs.DurationVar(&c.RatedDuration, "rated-duration", c.RatedDuration, "measurement window for each rated pass")
+	fs.StringVar(&c.RatedCells, "rated-cells", c.RatedCells,
+		`glob over "<scenario>/<server>" (the -cells syntax) scoping the rated sweep; empty = every cell`)
 	fs.StringVar(&c.TLSTerminator, "tls-terminator", c.TLSTerminator,
 		"https base URL of the shared TLS terminator fronting the adapters; empty disables all tls-* scenarios")
 	fs.StringVar(&c.SeedServices, "seed-services", c.SeedServices,
@@ -474,9 +484,16 @@ func run(cfg Config) error {
 	if v := os.Getenv("BENCH_RATED"); v == "1" || v == "true" {
 		cfg.RatedMode = true
 	}
+	if _, _, err := parseCellGlob(cfg.RatedCells); err != nil {
+		return fmt.Errorf("-rated-cells: %w", err)
+	}
 	if cfg.RatedMode {
-		fmt.Fprintf(os.Stderr, "probatorium-runner: rated mode ON (fractions=%v duration=%s)\n",
-			cfg.RatedFractions, cfg.RatedDuration)
+		scope := cfg.RatedCells
+		if scope == "" {
+			scope = "every cell"
+		}
+		fmt.Fprintf(os.Stderr, "probatorium-runner: rated mode ON (fractions=%v duration=%s cells=%s)\n",
+			cfg.RatedFractions, cfg.RatedDuration, scope)
 	}
 	fmt.Fprintf(os.Stderr, "probatorium-runner: seed=%d\n", cfg.Seed)
 
@@ -597,6 +614,20 @@ func run(cfg Config) error {
 		for _, cell := range schedule {
 			_, _ = fmt.Fprintf(os.Stdout, "run%d %s/%s\n",
 				cell.RunIdx, cell.Scenario.Name(), cell.Server.Name())
+		}
+		// The rated half goes to stderr: mage Bench parses stdout
+		// ("run<N> <scenario>/<server>") to size the hang guard, and its
+		// dry-run inherits BENCH_RATED=1 from a rated BenchTier.
+		if cfg.RatedMode {
+			rated := 0
+			for _, cell := range schedule {
+				if id := cell.Scenario.Name() + "/" + cell.Server.Name(); cfg.ratesCell(id) {
+					rated++
+					_, _ = fmt.Fprintf(os.Stderr, "rated run%d %s\n", cell.RunIdx, id)
+				}
+			}
+			_, _ = fmt.Fprintf(os.Stderr, "probatorium-runner: dry-run; the rated sweep runs on %d of the %d cells (-rated-cells %q) once each saturation pass is clean\n",
+				rated, len(schedule), cfg.RatedCells)
 		}
 		return nil
 	}
@@ -1256,7 +1287,7 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	// correction is applied by loadgen itself — never hand-roll a pacer here,
 	// which would defeat the correction. The saturation pass is reused as the
 	// scale anchor, so the targets stay adapter-relative.
-	if cfg.RatedMode && res != nil && res.RequestsPerSec > 0 {
+	if cfg.ratesCell(cell.Scenario.Name()+"/"+cell.Server.Name()) && res != nil && res.RequestsPerSec > 0 {
 		cellRes.SaturationModeRPS = res.RequestsPerSec
 		samples, passes := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
 		oc.RatedSamples = samples
@@ -1494,6 +1525,21 @@ func hostPortFromURL(raw string) (string, bool) {
 	return net.JoinHostPort(u.Hostname(), port), true
 }
 
+// ratesCell reports whether the cell "<scenario>/<server>" gets the rated
+// sweep once its saturation pass comes back clean: rated mode is on and the
+// cell matches -rated-cells. run() rejects a malformed -rated-cells before
+// any cell runs, so a parse error here cannot happen and rates nothing.
+func (c Config) ratesCell(id string) bool {
+	if !c.RatedMode {
+		return false
+	}
+	include, exclude, err := parseCellGlob(c.RatedCells)
+	if err != nil {
+		return false
+	}
+	return matchCellGlob(include, exclude, id)
+}
+
 // runRatedSweep drives one rated (closed-loop, CO-corrected) pass per
 // configured fraction of saturationRPS, returning the (target, P99) samples
 // for aggregation plus the on-disk pass records. A pass that errors or returns
@@ -1673,46 +1719,16 @@ func filterCells(scs []scenarios.Scenario, advs []servers.Adapter, glob string) 
 	if glob == "" || glob == "*" {
 		return scs, advs, nil
 	}
-	var include, exclude []string
-	for _, part := range strings.Split(glob, ",") {
-		p := strings.TrimSpace(part)
-		if p == "" {
-			continue
-		}
-		if strings.HasPrefix(p, "!") {
-			exclude = append(exclude, p[1:])
-		} else {
-			include = append(include, p)
-		}
-	}
-	if len(include) == 0 {
-		include = []string{"*"}
-	}
-	for _, g := range append(include, exclude...) {
-		if _, err := path.Match(g, "probe/probe"); err != nil {
-			return nil, nil, fmt.Errorf("invalid glob %q: %w", g, err)
-		}
-	}
-	matchAny := func(patterns []string, id string) bool {
-		for _, g := range patterns {
-			if g == "*" {
-				return true
-			}
-			if ok, _ := path.Match(g, id); ok {
-				return true
-			}
-		}
-		return false
+	include, exclude, err := parseCellGlob(glob)
+	if err != nil {
+		return nil, nil, err
 	}
 	scKeep := map[string]bool{}
 	advKeep := map[string]bool{}
 	for _, s := range scs {
 		for _, a := range advs {
 			id := s.Name() + "/" + a.Name
-			if !matchAny(include, id) {
-				continue
-			}
-			if matchAny(exclude, id) {
+			if !matchCellGlob(include, exclude, id) {
 				continue
 			}
 			scKeep[s.Name()] = true
@@ -1732,6 +1748,50 @@ func filterCells(scs []scenarios.Scenario, advs []servers.Adapter, glob string) 
 		}
 	}
 	return outS, outA, nil
+}
+
+// parseCellGlob splits a comma-separated cell glob into its include and
+// "!"-prefixed exclude patterns over "<scenario>/<server>", and rejects a
+// malformed pattern. No include pattern (a blank glob, or only exclusions)
+// includes every cell.
+func parseCellGlob(glob string) (include, exclude []string, err error) {
+	for _, part := range strings.Split(glob, ",") {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if strings.HasPrefix(p, "!") {
+			exclude = append(exclude, p[1:])
+		} else {
+			include = append(include, p)
+		}
+	}
+	if len(include) == 0 {
+		include = []string{"*"}
+	}
+	for _, g := range append(include, exclude...) {
+		if _, err := path.Match(g, "probe/probe"); err != nil {
+			return nil, nil, fmt.Errorf("invalid glob %q: %w", g, err)
+		}
+	}
+	return include, exclude, nil
+}
+
+// matchCellGlob reports whether the cell id matches an include pattern and
+// no exclude pattern of a parsed cell glob.
+func matchCellGlob(include, exclude []string, id string) bool {
+	matchAny := func(patterns []string) bool {
+		for _, g := range patterns {
+			if g == "*" {
+				return true
+			}
+			if ok, _ := path.Match(g, id); ok {
+				return true
+			}
+		}
+		return false
+	}
+	return matchAny(include) && !matchAny(exclude)
 }
 
 // requiredServiceKinds inspects the effective scenario set and returns
