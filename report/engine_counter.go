@@ -205,7 +205,7 @@ var EngineCounters = map[string]EngineCounter{
 	},
 	"engine_transplant_claim_deferred": {
 		Kind:   CounterCumulative,
-		Counts: "hand-off attempts on the worker's own path that found the connection's async dispatch goroutine had already claimed the hand-off, and left it to that claim. Ordering, not a fault: a completion of the connection landed between the goroutine's park and the worker's drain of the claim. A rate",
+		Counts: "hand-off attempts on the worker's own path that found the connection's async dispatch goroutine had already claimed the hand-off, and left it to that claim. Ordering, not a fault: a hand-off attempt (a completion of the connection, a reap retry or a reap landing) found the claim set between the goroutine's park and the worker's drain of it (celeris#758, #780). A rate",
 		Series: false,
 		Why:    "a rate of a benign ordering; the total says how often async hand-offs raced their own completions in the cell, and nothing it could explain needs its instant",
 	},
