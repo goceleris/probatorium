@@ -85,6 +85,11 @@ func main() {
     fmt.Println("slow-replay clean exit")
 }
 `)
+	// The ws_echo walker's quiet gaps (ws_echo_quiet.go) follow a 54 s
+	// production schedule, so a test that drives the walker for a second
+	// could sit in one for up to 22.5 s. They are off for the package; the
+	// tests in ws_echo_quiet_test.go set the schedule they exercise.
+	wsEchoQuietPeriod, wsEchoQuietGap = 0, 0
 	code := m.Run()
 	if cachedPassingReplayPath != "" {
 		_ = os.Remove(cachedPassingReplayPath)
