@@ -29,6 +29,7 @@ var documentedMustStayZero = map[string]string{
 	"engine_transplant_double_claim":      "engine.EngineMetrics.TransplantDoubleClaim: 'Must stay 0: a release gate can require it'",
 	"engine_transplant_reap_failed":       "engine.EngineMetrics.TransplantReapFailed: 'Must stay 0'",
 	"engine_close_fd_forced":              "celeris#685 (celeris 3e7abba), engine.EngineMetrics.CloseFDForced: 'such descriptors closed by the release backstop with an operation still owed. Must stay 0.'",
+	"engine_close_zc_notif_forced":        "celeris#812 (celeris e2508c7), engine.EngineMetrics.CloseZCNotifForced: 'send buffers given up while a SEND_ZC was still owed on them. Must stay 0.'",
 }
 
 // TestEveryDocumentedMustStayZeroCounterIsRecordedButNotGated holds the
@@ -70,6 +71,7 @@ func TestEveryDocumentedMustStayZeroCounterIsRecordedButNotGated(t *testing.T) {
 		"engine_transplant_double_claim":      &snap.EngineTransplantDoubleClaim,
 		"engine_transplant_reap_failed":       &snap.EngineTransplantReapFailed,
 		"engine_close_fd_forced":              &snap.EngineCloseFDForced,
+		"engine_close_zc_notif_forced":        &snap.EngineCloseZCNotifForced,
 	}
 	want := map[string]int64{}
 	for i, name := range documented {

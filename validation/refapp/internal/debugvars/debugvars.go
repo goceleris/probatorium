@@ -515,6 +515,24 @@ func (v *Vars) Document() map[string]any {
 			// MUST STAY ZERO.
 			doc["celeris.engine_close_fd_deferred"] = int64(info.Metrics.CloseFDDeferred)
 			doc["celeris.engine_close_fd_forced"] = int64(info.Metrics.CloseFDForced)
+			// The SEND_ZC send buffer of a closed io_uring connection
+			// (celeris#812, celeris e2508c7): the kernel reads it until the
+			// SEND_ZC's notification, which a peer that stopped reading
+			// mid-send can hold off long past the close, so the release
+			// backstop holds the buffer past its 5 s instead of reusing
+			// it. `held` is a rate: holds started, one per such close.
+			// `held_now` and `held_bytes` are GAUGES: the buffers held
+			// right now and their capacity (a worker holding 16 MiB arms
+			// no new SEND_ZC, and its sends copy until some are released).
+			// `forced` counts buffers given up while a SEND_ZC was still
+			// owed on them; celeris documents it MUST STAY ZERO.
+			// `shutdown_zc_buf_retained` counts buffers a worker shutdown
+			// kept for the life of the process.
+			doc["celeris.engine_close_zc_notif_held"] = int64(info.Metrics.CloseZCNotifHeld)
+			doc["celeris.engine_close_zc_notif_held_now"] = int64(info.Metrics.CloseZCNotifHeldNow)
+			doc["celeris.engine_close_zc_notif_held_bytes"] = int64(info.Metrics.CloseZCNotifHeldBytes)
+			doc["celeris.engine_close_zc_notif_forced"] = int64(info.Metrics.CloseZCNotifForced)
+			doc["celeris.engine_shutdown_zc_buf_retained"] = int64(info.Metrics.ShutdownZCBufRetained)
 			// The post-switch sweep (celeris#687). `sweep_passes` is a
 			// rate, the sweep's cost. The five `residual_*` are GAUGES,
 			// not totals: the connections a draining engine still holds,
@@ -563,21 +581,6 @@ func (v *Vars) Document() map[string]any {
 			// at all is a different reading from the same number against
 			// one that has them.
 			doc["celeris.engine_async_routes"] = int64(info.Metrics.AsyncRoutes)
-			// Published as a float, because it is the one non-integer
-			// field on EngineMetrics. No engine has ever assigned it, and
-			// since celeris#695 (celeris#653) it is Deprecated and
-			// documented to always read 0: the adaptive engine stopped
-			// summing its sub-engines' zeros, and v2.0.0 removes the field
-			// (celeris#651). A nonzero value would mean celeris broke that
-			// contract. It is here anyway, because the projection is
-			// total while the field exists: a field that exists and is
-			// never published cannot be told apart from one that is
-			// published and never moves, and removing that ambiguity is
-			// what this document is for (probatorium#297). The removal
-			// stops this line compiling, so it cannot be missed; the
-			// manifest then drops the key (-update-engine-keys), and
-			// checker.EngineKeysNotParsed's entry for it fails as stale.
-			doc["celeris.engine_throughput"] = info.Metrics.Throughput //nolint:staticcheck // SA1019: published until celeris removes the field (celeris#651); see above
 		}
 	}
 	return doc
