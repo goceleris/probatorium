@@ -476,6 +476,14 @@
       #
       # Both paths are symlinks into the host's version-keyed tool cache;
       # see "Point the legacy runner_root tool paths at the cache".
+      #
+      # Signals: the `&` below runs in a non-interactive shell, so the runner
+      # starts with SIGINT and SIGQUIT ignored (nohup adds SIGHUP), and every
+      # step it runs inherits that. A cancel's SIGINT is lost on a step that
+      # does not reset it, and a bash step cannot even trap it: the step then
+      # ends only on the runner's SIGTERM, 7.5 s later (probatorium#435, P6b
+      # run 36338683576). celeris-stress-cluster.yml's host step resets them
+      # with env --default-signal.
       ansible.builtin.shell: |
         cd {{ runner_root }}
         export PATH="{{ runner_root }}/ansible-venv/bin:$PATH"

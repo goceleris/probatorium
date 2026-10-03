@@ -213,6 +213,13 @@ type Snapshot struct {
 	EngineTransplantClaimDeferred   int64
 	EngineTransplantReapFailed      int64
 	EngineTransplantReapUnsupported int64
+	// The same rule on the io_uring close paths (celeris#685, celeris
+	// 3e7abba): a closed connection's descriptor number is released only
+	// once no op that names it can still be issued. CloseFDDeferred is a
+	// rate; CloseFDForced, the release backstop closing a descriptor with
+	// an op still owed, is documented must-stay-zero.
+	EngineCloseFDDeferred int64
+	EngineCloseFDForced   int64
 	// The post-switch sweep (celeris#687). SweepPasses is a rate; the five
 	// Residual fields are GAUGES -- the connections a draining engine still
 	// holds, by the reason the hand-off refused them -- so they fall as well

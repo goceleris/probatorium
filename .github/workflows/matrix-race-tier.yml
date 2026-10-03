@@ -115,7 +115,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Install mage
         run: |
-          go install github.com/magefile/mage@latest
+          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" tool
+          "$(go env GOPATH)/bin/mage" -version
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: mage BuildRaceRefapps
         env:
@@ -147,11 +148,14 @@ jobs:
 
       - name: Install mage
         # mage isn't in the root go.mod; install it into GOPATH/bin
-        # ahead of every mage invocation. Cheap (~5s) and avoids
-        # `go run github.com/magefile/mage` which needs mage in
-        # go.mod.
+        # ahead of every mage invocation, at the version the CI tools
+        # module names and its go.sum hashes (.github/tools; Dependabot
+        # bumps it), so a mage release cannot change a tier run
+        # (probatorium#458). `tool` installs every tool that module
+        # lists (mage, actionlint).
         run: |
-          go install github.com/magefile/mage@latest
+          go install -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" tool
+          "$(go env GOPATH)/bin/mage" -version
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Use bootstrap-provisioned ansible
