@@ -252,7 +252,16 @@ jobs:
     # is the job that runs the celeris code under test. A cluster plan's
     # matrix is its host jobs, which the cluster workflow runs.
     if: ${{ needs.plan.outputs.target == 'github' && (github.event_name == 'pull_request' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch)) }}
-    runs-on: ${{ matrix.runner }}
+    # The runner is chosen HERE, not by the plan (celeris#864). On
+    # pull_request the plan is the pull request's own tools/stresstally,
+    # which is outside .github/, so a runner label it returned would put the
+    # pull request's code on whatever runner that label names, the cluster
+    # hosts' runners included, with no change under .github/ for a
+    # maintainer to see before "Approve and run". Only the two GitHub-hosted
+    # labels in this list are ever used (plan.go's runners map names the
+    # same two; change both together). Anything else runs on ubuntu-24.04
+    # and the first step fails the shard, naming what the plan asked for.
+    runs-on: ${{ contains(fromJSON('["ubuntu-24.04","ubuntu-24.04-arm"]'), matrix.runner) && matrix.runner || 'ubuntu-24.04' }}
     # Stated again on the job that runs the code under test, so an edit of
     # the workflow-level key cannot give this job's token cache access.
     cache-mode: none
@@ -266,6 +275,14 @@ jobs:
       max-parallel: 4
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
+      - name: Refuse a runner this workflow does not allow
+        if: ${{ !contains(fromJSON('["ubuntu-24.04","ubuntu-24.04-arm"]'), matrix.runner) }}
+        shell: bash
+        env:
+          PLANNED_RUNNER: ${{ toJSON(matrix.runner) }}
+        run: |
+          echo "::error::the plan asked for runner $PLANNED_RUNNER; this workflow runs shards only on ubuntu-24.04 and ubuntu-24.04-arm (celeris#864)"
+          exit 1
       - name: Check out the shard script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
