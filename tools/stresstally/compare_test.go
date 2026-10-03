@@ -240,3 +240,96 @@ func TestReportsRecordTheProbatoriumCommit(t *testing.T) {
 		t.Errorf("summary.md lacks %q:\n%s", want, md)
 	}
 }
+
+// relayout rewrites an arm's report.json as if it had run at a celeris commit
+// after celeris#443's move: its packages asked as asked (nil keeps them) and
+// every test row's import path moved under internal/.
+func relayout(t *testing.T, dir string, asked []string) {
+	t.Helper()
+	r, err := readReport(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asked != nil {
+		r.Cases[0].Config.Packages = asked
+	}
+	for i := range r.Cases[0].Tests {
+		r.Cases[0].Tests[i].Package = strings.Replace(r.Cases[0].Tests[i].Package, celerisModule, celerisModule+"internal/", 1)
+	}
+	if err := writeReports(dir, r.Plan, r.CelerisSHA, r.Cases); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A package is the same package on both sides of celeris#443's move: the
+// layout-free name drops a leading internal/ and reads driver/X/internal/protocol
+// as driver/X/protocol, for import paths and patterns alike.
+func TestLayoutFreeUndoesTheMove(t *testing.T) {
+	for in, want := range map[string]string{
+		celerisModule + "internal/engine/iouring":           celerisModule + "engine/iouring",
+		celerisModule + "engine/iouring":                    celerisModule + "engine/iouring",
+		celerisModule + "internal/driver/postgres/protocol": celerisModule + "driver/postgres/protocol",
+		celerisModule + "driver/postgres/internal/protocol": celerisModule + "driver/postgres/protocol",
+		celerisModule + "internal/engine/internal/errclass": celerisModule + "engine/internal/errclass",
+		celerisModule + "middleware/websocket":              celerisModule + "middleware/websocket",
+		celerisModule[:len(celerisModule)-1]:                celerisModule[:len(celerisModule)-1],
+		"./internal/adaptive":                               "./adaptive",
+		"./internal/engine/...":                             "./engine/...",
+		"./driver/redis/internal/protocol":                  "./driver/redis/protocol",
+		"./internal/driver/redis/protocol":                  "./driver/redis/protocol",
+		".":                                                 ".",
+		"./...":                                             "./...",
+		"(no package result)":                               "(no package result)",
+		"example.com/other/internal/x":                      "example.com/other/internal/x",
+	} {
+		if got := layoutFree(in); got != want {
+			t.Errorf("layoutFree(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A base arm at a commit before celeris#443's move against a branch arm after
+// it is a comparison: the same row (./engine/iouring, or the new path) is the
+// same package, its tests join by name, and the move is noted, not refused.
+func TestCompareJoinsAPackageAcrossTheMove(t *testing.T) {
+	for name, asked := range map[string][]string{
+		"same pattern":   nil,
+		"new path asked": {"./internal/engine/iouring"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := armReport(t, testSHA, "3", "20", map[string]int{"x86": 5, "arm64": 4}, nil)
+			branch := armReport(t, branchSHA, "3", "20", nil, nil)
+			relayout(t, branch, asked)
+			var out strings.Builder
+			if code := cmdCompare([]string{base, branch}, &out); code != 0 {
+				t.Fatalf("exit %d:\n%s", code, out.String())
+			}
+			s := out.String()
+			for _, want := range []string{
+				"TestFlaky                                                    x86   5 / 20       0 / 20       0.04712 *",
+				"TestFlaky                                                    arm64 4 / 20       0 / 20       0.106 ",
+				"NOTE: package engine/iouring in the base arm is internal/engine/iouring in the branch arm (celeris#443's move)",
+				"2 test/arch row(s) compared",
+			} {
+				if !strings.Contains(s, want) {
+					t.Errorf("comparison lacks %q:\n%s", want, s)
+				}
+			}
+			if strings.Contains(s, "not in this arm") {
+				t.Errorf("a row did not join across the move:\n%s", s)
+			}
+			if got := strings.Contains(s, "name their packages differently"); got != (asked != nil) {
+				t.Errorf("note on differently named packages: %v, want %v:\n%s", got, asked != nil, s)
+			}
+		})
+	}
+	// A package that is not the same one under any layout is still a
+	// configuration difference.
+	base := armReport(t, testSHA, "3", "4", nil, nil)
+	branch := armReport(t, branchSHA, "3", "4", nil, nil)
+	relayout(t, branch, []string{"./internal/engine/epoll"})
+	var out strings.Builder
+	if code := cmdCompare([]string{base, branch}, &out); code != 2 || !strings.Contains(out.String(), "packages: base [./engine/iouring], branch [./engine/epoll]") {
+		t.Errorf("exit %d, want 2 naming the packages:\n%s", code, out.String())
+	}
+}

@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -72,7 +74,9 @@ func configDiffs(base, branch runReport) []string {
 	diff("mode", orDefault(a.Mode, "stress"), orDefault(b.Mode, "stress"))
 	diff("cpus", a.CPUs, b.CPUs)
 	diff("pmu", strconv.Quote(a.PMU), strconv.Quote(b.PMU))
-	diff("packages", a.Packages, b.Packages)
+	// By layout-free name: a pattern names the same package before and after
+	// celeris#443's move, and shard.sh runs it where each arm's commit keeps it.
+	diff("packages", layoutFreeAll(a.Packages), layoutFreeAll(b.Packages))
 	diff("run", strconv.Quote(a.Run), strconv.Quote(b.Run))
 	diff("count", a.Count, b.Count)
 	diff("shards", a.Shards, b.Shards)
@@ -84,6 +88,44 @@ func configDiffs(base, branch runReport) []string {
 	diff("env", a.Env, b.Env)
 	diff("shuffle", strconv.Quote(a.Shuffle), strconv.Quote(b.Shuffle))
 	return d
+}
+
+// celerisModule is the import path prefix of every celeris package.
+const celerisModule = "github.com/goceleris/celeris/"
+
+// layoutFree is a celeris package's name with celeris#443's move undone, so a
+// package keys alike on both sides of it: a leading internal/ is dropped, and
+// driver/X/internal/protocol reads as driver/X/protocol. It takes an import
+// path (github.com/goceleris/celeris/internal/engine/iouring) or a pattern
+// (./internal/engine/iouring, ./internal/engine/...) and leaves anything else
+// as it is. No celeris commit has both a package P and internal/P, so no two
+// packages of one run share a layout-free name (pkgpaths.sh probes the same
+// candidates, the other way round).
+func layoutFree(p string) string {
+	var prefix string
+	switch {
+	case strings.HasPrefix(p, celerisModule):
+		prefix = celerisModule
+	case strings.HasPrefix(p, "./"):
+		prefix = "./"
+	default:
+		return p
+	}
+	rest := strings.TrimPrefix(strings.TrimPrefix(p, prefix), "internal/")
+	if m := driverInternalProtocolRe.FindStringSubmatch(rest); m != nil {
+		rest = "driver/" + m[1] + "/protocol" + m[2]
+	}
+	return prefix + rest
+}
+
+var driverInternalProtocolRe = regexp.MustCompile(`^driver/([^/]+)/internal/protocol(/.*)?$`)
+
+func layoutFreeAll(ps []string) []string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = layoutFree(p)
+	}
+	return out
 }
 
 func orDefault(s, def string) string {
@@ -120,6 +162,9 @@ func compareReports(base, branch runReport) (Comparison, error) {
 	}
 	cmp := Comparison{BaseSHA: a.CelerisSHA, BranchSHA: b.CelerisSHA, ProbatoriumSHA: base.Plan.ProbatoriumSHA, Config: a.Config, Notes: []string{}}
 	note := func(format string, x ...any) { cmp.Notes = append(cmp.Notes, fmt.Sprintf(format, x...)) }
+	if pa, pb := strings.Join(a.Config.Packages, " "), strings.Join(b.Config.Packages, " "); pa != pb {
+		note("the arms name their packages differently (base %q, branch %q): the same packages under celeris#443's two layouts", pa, pb)
+	}
 	if a.CelerisSHA == b.CelerisSHA {
 		note("both arms tested celeris %s: this is an A/A comparison, a control, not base against branch", a.CelerisSHA)
 	}
@@ -154,11 +199,14 @@ func compareReports(base, branch runReport) (Comparison, error) {
 		}
 	}
 
+	// Rows join by layout-free package: an arm at a commit after celeris#443's
+	// move runs internal/engine/iouring's tests, which are engine/iouring's.
 	type key struct{ pkg, name, arch string }
 	rows := map[key]*CompareRow{}
 	var order []key
+	moved := map[string]string{}
 	add := func(t TestRow, isBase bool) {
-		k := key{t.Package, t.Name, t.Arch}
+		k := key{layoutFree(t.Package), t.Name, t.Arch}
 		r := rows[k]
 		if r == nil {
 			r = &CompareRow{Package: t.Package, Name: t.Name, Arch: t.Arch}
@@ -170,12 +218,19 @@ func compareReports(base, branch runReport) (Comparison, error) {
 		} else {
 			r.Branch, r.InBranch = t, true
 		}
+		if r.InBase && r.InBranch && r.Base.Package != r.Branch.Package {
+			moved[r.Base.Package] = r.Branch.Package
+		}
 	}
 	for _, t := range a.Tests {
 		add(t, true)
 	}
 	for _, t := range b.Tests {
 		add(t, false)
+	}
+	for _, p := range slices.Sorted(maps.Keys(moved)) {
+		note("package %s in the base arm is %s in the branch arm (celeris#443's move); their tests are compared as one package",
+			shortPkg(p), shortPkg(moved[p]))
 	}
 	slices.SortFunc(order, func(x, y key) int {
 		return cmpStrings(x.pkg, y.pkg, x.name, y.name, archOrder(x.arch), archOrder(y.arch))

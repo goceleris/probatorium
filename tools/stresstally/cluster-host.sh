@@ -57,6 +57,8 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=tools/stresstally/gostate.sh
 . "$here/gostate.sh"
+# shellcheck source=tools/stresstally/pkgpaths.sh
+. "$here/pkgpaths.sh"
 sysfs=${STRESS_SYSFS:-/sys/devices/system/cpu}
 procfs=${STRESS_PROCFS:-/proc}
 # The running shard's session (see in_session), and the watchdog.
@@ -232,17 +234,27 @@ quiet_wait() {
 # -trimpath, two arms of one commit share it). A failed build is recorded;
 # its observations then report the build failure themselves.
 prebuild_arms() {
-	local kv arm out rc f
-	local -a build=(-trimpath) flags=() pkgs=()
+	local kv arm out rc f p
+	local -a build=(-trimpath) flags=() asked=() pkgs=() moved=()
 	[ "${STRESS_RACE:-false}" != "true" ] || build+=(-race)
 	read -r -a flags <<<"${STRESS_FLAGS-}"
 	for f in ${flags[@]+"${flags[@]}"}; do
 		case "$f" in -tags=*) build+=("$f") ;; esac
 	done
-	read -r -a pkgs <<<"$STRESS_PACKAGES"
+	read -r -a asked <<<"$STRESS_PACKAGES"
 	for kv in $STRESS_CASE_SHAS; do
 		arm=${kv%%=*}
 		out="$TMPDIR/prebuild-$arm.test"
+		# Each arm builds the packages where its own commit keeps them
+		# (pkgpaths.sh), as its observations (shard.sh) will run them: the
+		# arms of a timing may straddle celeris#443's move.
+		pkgs=() moved=()
+		for p in "${asked[@]}"; do
+			resolve_pkg "celeris-$arm" "$p"
+			pkgs+=("$pkg_out")
+			[ "$pkg_out" = "$p" ] || moved+=("$p -> $pkg_out")
+		done
+		[ "${#moved[@]}" = 0 ] || note "prebuild $arm: package ${moved[*]} (not a package at this arm's commit as named)"
 		rc=0
 		# shellcheck disable=SC2016 # $1 and $@ are the inner shell's
 		in_session bash -c 'cd "$1" && shift && exec go test -c "$@"' _ "celeris-$arm" -o "$out" "${build[@]}" "${pkgs[@]}" \
