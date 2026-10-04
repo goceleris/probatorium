@@ -68,6 +68,11 @@
   ansible.builtin.shell: |
     set -euo pipefail
     idx="$(curl -fsSL https://ziglang.org/download/index.json)"
+    # zig_pin (default 0.16.0): Zig 0.17.0 (released ~2026-10-03) removed Build.args, which the
+    # pinned httpz/metrics zig-pkgs use, so httpzig no longer builds on the latest release.
+    # Set zig_pin='' to go back to always-latest.
+    pin="{{ zig_pin | default('0.16.0') }}"
+    if [ -n "$pin" ]; then ver="$pin"; else
     ver="$(printf '%s' "$idx" | python3 -c '
     import json,sys
     d=json.load(sys.stdin)
@@ -75,6 +80,7 @@
     # newest by semver tuple (major,minor,patch); dev/pre suffixes absent in releases
     cands.sort(key=lambda v: [int(x) for x in v.split(".")])
     print(cands[-1])')"
+    fi
     url="$(printf '%s' "$idx" | python3 -c "import json,sys; print(json.load(sys.stdin)['$ver']['{{ zig_dl_arch }}-linux']['tarball'])")"
     sha="$(printf '%s' "$idx" | python3 -c "import json,sys; print(json.load(sys.stdin)['$ver']['{{ zig_dl_arch }}-linux']['shasum'])")"
     printf '%s\t%s\t%s\n' "$ver" "$url" "$sha"
