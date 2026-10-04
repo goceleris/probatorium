@@ -30,6 +30,9 @@ STRESS_ENV=${STRESS_ENV-}
 target=${STRESS_TARGET:-github}
 mode=${STRESS_MODE:-stress}
 celeris_dir=${STRESS_CELERIS_DIR:-celeris}
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=tools/stresstally/pkgpaths.sh
+. "$here/pkgpaths.sh"
 
 mkdir -p "$(dirname "$STRESS_LOG")"
 : >"$STRESS_LOG"
@@ -117,7 +120,18 @@ if [ "$mode" = "timing" ]; then
 	export STRESS_OBS_FILE STRESS_OBS_SEQ="${STRESS_OBS_SEQ:-0}" STRESS_PERF="${STRESS_PERF:-off}"
 fi
 read -r -a flags <<<"$STRESS_FLAGS"
-read -r -a pkgs <<<"$STRESS_PACKAGES"
+read -r -a asked <<<"$STRESS_PACKAGES"
+# Each pattern runs where this celeris commit keeps the package (pkgpaths.sh):
+# celeris#443 moves packages under internal/, and one row must work for a
+# commit on either side of the move. The header keeps the patterns as asked
+# (the summary checks them against the plan) and records what ran in
+# packages_resolved.
+pkgs=()
+for p in "${asked[@]}"; do
+	resolve_pkg "$celeris_dir" "$p"
+	pkgs+=("$pkg_out")
+	[ "$pkg_out" = "$p" ] || echo "package $p runs as $pkg_out ($pkg_why)"
+done
 read -r -a envs <<<"$STRESS_ENV"
 args+=("${flags[@]}" "${pkgs[@]}")
 for kv in "${envs[@]}"; do
@@ -144,6 +158,7 @@ hdr timeout "$STRESS_TIMEOUT"
 hdr job_timeout_minutes "${STRESS_JOB_TIMEOUT-}"
 hdr run "$STRESS_RUN"
 hdr packages "$STRESS_PACKAGES"
+hdr packages_resolved "${pkgs[*]}"
 hdr flags "$STRESS_FLAGS"
 hdr env "$STRESS_ENV"
 hdr machine "$machine"

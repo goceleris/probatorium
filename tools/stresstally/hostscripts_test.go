@@ -261,7 +261,7 @@ func TestHostJobKillsItsShardWhenTheRunnerDirGoes(t *testing.T) {
 	linuxOnly(t)
 	root := t.TempDir()
 	tools := filepath.Join(root, "tools")
-	for _, f := range []string{"cluster-host.sh", "gostate.sh"} {
+	for _, f := range []string{"cluster-host.sh", "gostate.sh", "pkgpaths.sh"} {
 		b, err := os.ReadFile(script(t, f))
 		if err != nil {
 			t.Fatal(err)
@@ -514,7 +514,7 @@ func startCancelledHost(t *testing.T, start hostStart, watchdogSeconds string) *
 	}
 	root := t.TempDir()
 	tools := filepath.Join(root, "probatorium", "tools", "stresstally")
-	for _, f := range []string{"cluster-host.sh", "gostate.sh"} {
+	for _, f := range []string{"cluster-host.sh", "gostate.sh", "pkgpaths.sh"} {
 		b, err := os.ReadFile(script(t, f))
 		if err != nil {
 			t.Fatal(err)

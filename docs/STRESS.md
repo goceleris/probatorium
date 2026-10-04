@@ -136,6 +136,37 @@ a `...` pattern the number of packages is not known in advance and the limit
 is 360. A binary that overruns its timeout prints go test's goroutine dump and
 its shard is `UNPARSED` (`timeout`).
 
+**Packages across celeris#443's move.** celeris#443 moves `engine`,
+`engine/{epoll,iouring,std}`, `adaptive`, `probe`, `resource` and
+`protocol/...` under `internal/`, and each `driver/X/protocol` to
+`internal/driver/X/protocol` (an earlier proposal had
+`driver/X/internal/protocol`). One row works for a celeris commit on either
+side of the move: each pattern runs where the commit under test keeps the
+package (`tools/stresstally/pkgpaths.sh`, called by `shard.sh` for every
+shard and by `cluster-host.sh` for every arm's prebuild). The first of these
+that is a Go package in the checkout wins: the pattern as written, then `./P`,
+`./internal/P` (which for a driver is `./internal/driver/X/protocol`) and, for
+a driver, `./driver/X/internal/protocol`, where `P` is the pattern with a
+leading `internal/` dropped and `driver/X/internal/protocol` read as
+`driver/X/protocol`. So `./engine/iouring` runs `./engine/iouring` at a commit
+before the move and `./internal/engine/iouring` after it, and a row that
+names the new path still runs at an old commit. A pattern that is a package as
+written is never rewritten, `.` and `./...` never are, and a pattern that no
+candidate matches is passed to go test as written, which reports it as
+before. Each shard's log header keeps `packages` as asked (the summary checks
+it against the plan) and records what ran in `packages_resolved`; the job log
+prints each rewritten pattern, and a timing's host facts each arm's.
+`compare` matches packages by the same move-free name, so a base arm before
+the move and a branch arm after it join test by test; it notes the packages
+that moved, and that the arms named them differently, if they did (an arm
+whose commit has both `P` and `internal/P` joins by package as named, and the
+comparison says so). Timings compare arms within one run, so a timing whose
+arms straddle the move needs nothing more. A `...` pattern that matches a
+package as written is kept, so it can cover other packages on each side of the
+move (`./driver/...` loses the three protocol packages after it,
+`./internal/...` gains every moved one), and a comparison across the move
+shows those tests in one arm only.
+
 **Environment settings.** `NAME=VALUE` is accepted for the variables celeris's
 own tests read, and nothing else (`celerisTestEnv` in
 `tools/stresstally/plan.go`, built from
