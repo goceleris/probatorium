@@ -38,16 +38,12 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"net"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -68,6 +64,7 @@ import (
 	"github.com/goceleris/celeris/middleware/secure"
 	"github.com/goceleris/celeris/middleware/singleflight"
 	"github.com/goceleris/celeris/middleware/timeout"
+	"github.com/goceleris/probatorium/internal/exitguard"
 	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
@@ -255,22 +252,17 @@ func main() {
 		return c.JSON(200, map[string]any{"admin": true})
 	})
 
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-		<-sig
-		log.Printf("kitchen_sink: signal received, shutting down")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-	}()
+	// exitguard ends the process on SIGTERM/SIGINT even when the engine cannot
+	// end Listen (celeris#595; probatorium#473): Shutdown under a 10 s deadline,
+	// then a forced non-zero exit if Start has not returned.
+	guard := exitguard.Install(exitguard.Config{Name: "kitchen_sink"}, srv.Shutdown)
 
 	ln, err := net.Listen("tcp", *bind)
 	if err != nil {
 		log.Fatalf("kitchen_sink: listen: %v", err)
 	}
 	fmt.Printf("ready addr=%s\n", ln.Addr().String())
-	if err := srv.StartWithListener(ln); err != nil {
+	if err := guard.Serve(func() error { return srv.StartWithListener(ln) }); err != nil {
 		log.Fatalf("kitchen_sink: start: %v", err)
 	}
 }

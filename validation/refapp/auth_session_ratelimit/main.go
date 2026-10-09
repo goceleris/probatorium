@@ -15,7 +15,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,12 +23,10 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/signal"
 	"slices"
 	"sort"
 	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -38,6 +35,7 @@ import (
 	"github.com/goceleris/celeris/middleware/session"
 	"github.com/goceleris/celeris/middleware/sse"
 	"github.com/goceleris/celeris/middleware/websocket"
+	"github.com/goceleris/probatorium/internal/exitguard"
 	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
@@ -281,15 +279,10 @@ func main() {
 	// counter nothing ever writes to.
 	dv.Declare("I-MW-SESSION", "I-MW-RATELIMIT")
 
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-		<-sig
-		log.Printf("auth_session_ratelimit: signal received, shutting down")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-	}()
+	// exitguard ends the process on SIGTERM/SIGINT even when the engine cannot
+	// end Listen (celeris#595; probatorium#473): Shutdown under a 10 s deadline,
+	// then a forced non-zero exit if Start has not returned.
+	guard := exitguard.Install(exitguard.Config{Name: "auth_session_ratelimit"}, srv.Shutdown)
 
 	// Print the canonical ready line BEFORE Start (which blocks). The
 	// orchestrator parses this line to know when to start probing.
@@ -299,7 +292,7 @@ func main() {
 	}
 	fmt.Printf("ready addr=%s\n", ln.Addr().String())
 	debugvars.StartFaults(faults, time.Now(), os.Stderr)
-	if err := srv.StartWithListener(ln); err != nil {
+	if err := guard.Serve(func() error { return srv.StartWithListener(ln) }); err != nil {
 		log.Fatalf("auth_session_ratelimit: start: %v", err)
 	}
 }

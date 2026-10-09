@@ -32,9 +32,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -46,6 +44,7 @@ import (
 	"github.com/goceleris/celeris/middleware/secure"
 	"github.com/goceleris/celeris/middleware/session"
 	sessredis "github.com/goceleris/celeris/middleware/session/redisstore"
+	"github.com/goceleris/probatorium/internal/exitguard"
 	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
@@ -244,22 +243,17 @@ func main() {
 		return c.JSON(http.StatusOK, map[string]any{"key": k, "len": len(v)})
 	})
 
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-		<-sig
-		log.Printf("driver_redis: signal received, shutting down")
-		shCtx, shCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shCancel()
-		_ = srv.Shutdown(shCtx)
-	}()
+	// exitguard ends the process on SIGTERM/SIGINT even when the engine cannot
+	// end Listen (celeris#595; probatorium#473): Shutdown under a 10 s deadline,
+	// then a forced non-zero exit if Start has not returned.
+	guard := exitguard.Install(exitguard.Config{Name: "driver_redis"}, srv.Shutdown)
 
 	ln, err := net.Listen("tcp", *bind)
 	if err != nil {
 		log.Fatalf("driver_redis: listen: %v", err)
 	}
 	fmt.Printf("ready addr=%s\n", ln.Addr().String())
-	if err := srv.StartWithListener(ln); err != nil {
+	if err := guard.Serve(func() error { return srv.StartWithListener(ln) }); err != nil {
 		log.Fatalf("driver_redis: start: %v", err)
 	}
 }
