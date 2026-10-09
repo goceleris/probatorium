@@ -88,6 +88,12 @@ jobs:
       - name: go test (internal/debugvars)
         working-directory: validation/refapp/internal/debugvars
         run: go test -count=1 -race -timeout=5m ./...
+      # The shared SIGTERM/SIGINT exit helper (probatorium#473): the real-signal
+      # and source-scan tests live in its own module, which every refapp and
+      # servers/celeris link. It needs a Linux runner for the process tests.
+      - name: go test (internal/exitguard)
+        working-directory: internal/exitguard
+        run: go test -count=1 -race -timeout=5m ./...
       - name: go build + vet (every refapp)
         run: |
           for d in validation/refapp/*/; do
@@ -310,7 +316,7 @@ jobs:
         run: |
           fail=0
           n=0
-          for d in . servers/celeris validation/refapp/internal/debugvars validation/refapp/*/; do
+          for d in . servers/celeris internal/exitguard validation/refapp/internal/debugvars validation/refapp/*/; do
             case "$d" in */internal/) continue ;; esac
             test -f "$d/go.mod" || { echo "::error::$d has no go.mod"; fail=1; continue; }
             n=$((n + 1))

@@ -24,13 +24,11 @@ import (
 	"context"
 	"flag"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/goceleris/celeris"
 
+	"github.com/goceleris/probatorium/internal/exitguard"
 	"github.com/goceleris/probatorium/servers/common"
 )
 
@@ -138,21 +136,18 @@ func main() {
 	// The observer's /debug/vars, on a side listener (debugvars.go).
 	_, stopDebugVars := startDebugVars(srv)
 
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-		<-sig
-		log.Printf("celeris: signal received, shutting down")
+	// exitguard ends the process on SIGTERM/SIGINT even when the engine cannot
+	// end Listen (celeris#595; probatorium#473). The pre-shutdown closes run
+	// inside the guarded func, so a close that hangs is bounded too.
+	guard := exitguard.Install(exitguard.Config{Name: "celeris"}, func(ctx context.Context) error {
 		stopDebugVars()
 		cancelLifetime()
 		streaming.close()
 		clients.close()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-	}()
+		return srv.Shutdown(ctx)
+	})
 
-	if err := srv.Start(); err != nil {
+	if err := guard.Serve(srv.Start); err != nil {
 		log.Fatalf("celeris: start: %v", err)
 	}
 }

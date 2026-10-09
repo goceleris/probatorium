@@ -24,7 +24,6 @@
 package main
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -35,10 +34,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
-	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/goceleris/celeris"
@@ -48,6 +44,7 @@ import (
 	"github.com/goceleris/celeris/middleware/recovery"
 	"github.com/goceleris/celeris/middleware/requestid"
 	"github.com/goceleris/celeris/middleware/secure"
+	"github.com/goceleris/probatorium/internal/exitguard"
 	"github.com/goceleris/probatorium/validation/refapp/internal/debugvars"
 )
 
@@ -210,22 +207,17 @@ func main() {
 	// writes to (probatorium#297).
 	dv.Declare("I-MW-JWT")
 
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-		<-sig
-		log.Printf("auth_jwt_csrf: signal received, shutting down")
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
-	}()
+	// exitguard ends the process on SIGTERM/SIGINT even when the engine cannot
+	// end Listen (celeris#595; probatorium#473): Shutdown under a 10 s deadline,
+	// then a forced non-zero exit if Start has not returned.
+	guard := exitguard.Install(exitguard.Config{Name: "auth_jwt_csrf"}, srv.Shutdown)
 
 	ln, err := net.Listen("tcp", *bind)
 	if err != nil {
 		log.Fatalf("auth_jwt_csrf: listen: %v", err)
 	}
 	fmt.Printf("ready addr=%s\n", ln.Addr().String())
-	if err := srv.StartWithListener(ln); err != nil {
+	if err := guard.Serve(func() error { return srv.StartWithListener(ln) }); err != nil {
 		log.Fatalf("auth_jwt_csrf: start: %v", err)
 	}
 }
