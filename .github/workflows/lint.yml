@@ -39,7 +39,10 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.13
+          # v2.14 or newer: v2.13.x cannot read the export data of Go 1.27.2's
+          # standard library ("export data version 5 is greater than maximum
+          # supported version 4") and fails every package with a typecheck error.
+          version: v2.14
           args: --timeout=5m
       # gofmt -l prints offending files and emits no output on success.
       # Fail the job if anything appears on stdout — preserves the
