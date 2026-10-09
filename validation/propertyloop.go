@@ -106,7 +106,7 @@ func appendDeclared(list string, ids ...string) string {
 
 // isIOUringEngine reports whether a celeris.engine value names the io_uring
 // engine. celeris publishes engine.Type.String(), which is "io_uring" with
-// the underscore (engine/enginetype.go); the matrix, the cell names and
+// the underscore (internal/engine/enginetype.go); the matrix, the cell names and
 // the -refapp-engine flag spell it "iouring". The first checkptr tier run
 // compared against the slug and declared I-ENG-IOURING in 0 of 16 io_uring
 // cells; both spellings are accepted so neither side can silently drift.
