@@ -14,7 +14,6 @@ import (
 	"unicode"
 
 	"github.com/goceleris/celeris"
-	"github.com/goceleris/celeris/engine"
 	"github.com/goceleris/celeris/middleware/recovery"
 )
 
@@ -227,7 +226,7 @@ func TestDebugVars_PublishesEveryEngineErrorBucket(t *testing.T) {
 	doc := getVars(t, base)
 
 	var checked int
-	mt := reflect.TypeOf(engine.EngineMetrics{})
+	mt := reflect.TypeOf(celeris.EngineMetrics{})
 	for i := range mt.NumField() {
 		name := mt.Field(i).Name
 		if !strings.HasPrefix(name, "Error") {
