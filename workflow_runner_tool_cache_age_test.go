@@ -188,7 +188,7 @@ func TestAnsibleCoreCacheIsTrustedOnlyWhenEveryFileHashes(t *testing.T) {
 			manifest.WriteString(hex.EncodeToString(sum[:]) + "  " + p + "\n")
 		}
 		write(filepath.Join(f.venv, ".celeris-manifest"), manifest.String(), 0o644)
-		write(filepath.Join(f.venv, ".celeris-installed"), "ansible-core "+core+" python 3.13.15 uv 0.0.0 2026-10-09T00:00:00Z\n", 0o644)
+		write(filepath.Join(f.venv, ".celeris-installed"), "ansible-core "+core+" python 3.13.15 uv "+playbookPin(t, setup, "uv_version")+" 2026-10-09T00:00:00Z\n", 0o644)
 
 		f.script = ansibleCoreTaskScript(t, setup, map[string]string{
 			"ansible_venv_dir": f.venv, "ansible_core_version": core,
