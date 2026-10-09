@@ -106,7 +106,8 @@ func TestBootstrapPythonIsPinnedToAPatchAndRebuiltFromNothing(t *testing.T) {
 		"the python is installed as the exact pin without linking into ~/.local/bin":     "/D/uv python install --no-bin 3.13.15",
 		"the managed python is probed before a venv is built on it":                      "/D/uv python find --managed-python 3.13.15",
 		"every file is hashed against the manifest when the cache is trusted":            `sha256sum --check --quiet --strict "$manifest"`,
-		"the stamp is read, not stat'ed":                                                 `cat "$stamp"`,
+		"the stamp is read (and must name the pinned uv), not stat'ed":                   `grep -qF "uv 0.0.0 " "$stamp"`,
+		"a find error cannot leave a truncated manifest that is then trusted":            "set -o pipefail",
 		"the manifest is refused when it names too few files":                            `-lt 1000`,
 		"the venv is still created from the managed python only":                         "/D/uv venv --clear --managed-python --python 3.13.15 /V",
 		"the installed standalone build is compared with its pin":                        `[ "$build" != "20260901" ]`,
@@ -187,7 +188,7 @@ func TestAnsibleCoreCacheIsTrustedOnlyWhenEveryFileHashes(t *testing.T) {
 			manifest.WriteString(hex.EncodeToString(sum[:]) + "  " + p + "\n")
 		}
 		write(filepath.Join(f.venv, ".celeris-manifest"), manifest.String(), 0o644)
-		write(filepath.Join(f.venv, ".celeris-installed"), "ansible-core "+core+"\n", 0o644)
+		write(filepath.Join(f.venv, ".celeris-installed"), "ansible-core "+core+" python 3.13.15 uv 0.0.0 2026-10-09T00:00:00Z\n", 0o644)
 
 		f.script = ansibleCoreTaskScript(t, setup, map[string]string{
 			"ansible_venv_dir": f.venv, "ansible_core_version": core,

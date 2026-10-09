@@ -366,7 +366,7 @@
         manifest="{{ ansible_venv_dir }}/.celeris-manifest"
         cache_ok() {
           [ -s "$stamp" ] && [ -s "$manifest" ] || return 1
-          cat "$stamp" > /dev/null || return 1
+          grep -qF "uv {{ uv_version }} " "$stamp" || return 1
           sha256sum --check --quiet --strict "$manifest" > /dev/null 2>&1 || return 1
           "$venv/bin/ansible-playbook" --version 2>/dev/null | head -1 | grep -qF "[core {{ ansible_core_version }}]"
         }
@@ -393,8 +393,12 @@
         # be hashed, so only links to files are listed; a dangling one fails the
         # hashing here, as it would fail the check later.
         home="$("$venv/bin/python" -c 'import os, sys; print(os.path.realpath(sys.base_prefix))')"
+        # pipefail only around this pipeline: a find error (EACCES, a vanished
+        # directory) must not leave a truncated manifest that is then trusted.
+        set -o pipefail
         find "$venv" "$home/" \( -type f -o -type l \) ! -xtype d ! -path '*/__pycache__/*' ! -name '.celeris-*' \
           | LC_ALL=C sort | xargs -d '\n' sha256sum > "$manifest.new"
+        set +o pipefail
         entries="$(wc -l < "$manifest.new")"
         if [ "$entries" -lt 1000 ]; then
           echo "manifest of $venv and $home has only $entries entries: refusing to trust it" >&2
