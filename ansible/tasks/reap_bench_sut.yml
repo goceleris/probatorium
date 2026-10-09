@@ -1,0 +1,38 @@
+---
+# Stop leftover bench SUT processes by IDENTITY (ops/sut/reap-bench-sut), for
+# the case where the pid file, the bench directory, the SUT's argv and the
+# bench port are all useless -- the orphan the cancelled bench 37226284351 left
+# on msa2-server. A process is ours when its environment carries
+# PROBATORIUM_SUT_RUN (set by the launch in run_bench_cell.yml) or its working
+# directory / binary lies under bench_root (deleted or not).
+#
+# Shared by the per-cell stop (run_bench_cell.yml), cleanup.yml and the
+# teardown job's cancel-path playbook (stop-sut.yml). The includer decides
+# which hosts it runs on.
+#
+# reap_sut_match (default any): "tag" matches ONLY the run tag. The per-cell stop
+# runs mid-bench on the SUT host and asks for tag, so nothing that merely sits in
+# bench_root (a helper, a fixture) can be taken for a leftover; cleanup.yml and
+# stop-sut.yml run when everything should die and use both handles.
+#
+# reap_sut_strict (default false): when true the task FAILS if a process
+# survived SIGKILL. The per-cell stop must stay best-effort -- a failed
+# per-cell task drops the bench target from the play and zeros every later
+# column -- so only the cancel-path playbook turns it on.
+
+- name: "reap leftover bench SUT processes by identity (run tag, or cwd/exe under bench_root)"
+  become: true
+  ansible.builtin.script:
+    cmd: "{{ playbook_dir }}/../ops/sut/reap-bench-sut"
+    executable: /bin/bash
+  environment:
+    BENCH_ROOT: "{{ bench_root }}"
+    REAP_MATCH: "{{ reap_sut_match | default('any') }}"
+  register: reap_sut
+  changed_when: "reap_sut.stdout | default('') is search('reap: stopped [1-9]')"
+  failed_when: "(reap_sut.rc | default(0)) != 0 and (reap_sut_strict | default(false) | bool)"
+
+- name: "report what the identity reap stopped"
+  ansible.builtin.debug:
+    msg: "{{ (reap_sut.stdout_lines | default([])) + (reap_sut.stderr_lines | default([])) }}"
+  when: "reap_sut.stdout | default('') is search('reap: stopped [1-9]')"

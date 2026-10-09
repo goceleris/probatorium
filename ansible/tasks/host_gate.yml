@@ -1,0 +1,40 @@
+---
+# Collect one host's gate record and write it to the controller. Read-only on
+# the host; see hostgate/collect.sh. Needs hostgate_local_dir.
+#
+# The collected text is written whatever the script's exit status was: the
+# parser decides, and a truncated record fails there (no `end ok` line).
+
+- name: Require an output directory
+  ansible.builtin.assert:
+    that: hostgate_local_dir | length > 0
+    fail_msg: "hostgate_local_dir must be set to an absolute path"
+  delegate_to: localhost
+  become: false
+
+- name: Ensure the local output directory exists
+  ansible.builtin.file:
+    path: "{{ hostgate_local_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+
+- name: Capture host state for the gate (read-only)
+  ansible.builtin.script:
+    cmd: "{{ playbook_dir }}/../hostgate/collect.sh"
+    executable: /bin/bash
+  register: hostgate_capture
+  changed_when: false
+  failed_when: false
+
+- name: Write the host's gate record
+  ansible.builtin.copy:
+    content: "{{ hostgate_capture.stdout }}"
+    dest: "{{ hostgate_local_dir }}/{{ inventory_hostname }}.txt"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  # An unreachable host has no .stdout: write nothing, so the gate reports
+  # "no gate output" for it instead of reading a stale or empty record.
+  when: hostgate_capture.stdout is defined

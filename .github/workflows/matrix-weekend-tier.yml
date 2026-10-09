@@ -162,6 +162,19 @@ jobs:
           bash .github/scripts/refresh-cluster-known-hosts.sh \
             ansible/inventory.yml "${RUNNER_ROOT}/.ssh/known_hosts"
 
+      - name: mage HostGate (pre-tier host gate, read-only, fails fast on a leftover)
+        # probatorium#473: before ANYTHING of this tier is started, assert that
+        # every host it will use is clean: no listener on the SUT / debug /
+        # fixture ports, no process from a previous run (a harness binary, a
+        # /tmp/celeris-* directory, a binary deleted from /tmp), idle IO
+        # pressure below the threshold. It only REPORTS: it never kills what it
+        # finds (the msr1 rvtest was an agent smoke test nobody had asked
+        # about). It has to precede mage Deploy and the sampler, or the tier's own
+        # fixtures would be reported as leftovers. See README.md, "Host gate".
+        env:
+          HOSTGATE_TARGET: both
+        run: mage HostGate
+
       # A 24 h soak died at 20 h 05 m with "the self-hosted runner lost
       # communication with the server" and left nothing behind that could
       # tell memory pressure from a reboot from a network event
