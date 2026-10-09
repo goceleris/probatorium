@@ -9,7 +9,7 @@ require (
 )
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20261003135342-ed3b7fbcff33
+	github.com/goceleris/celeris v1.5.12-0.20261009135804-21d49ef80efc
 	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
 )
 

@@ -110,7 +110,7 @@ from the summary: `extra=-shuffle=<seed>`.
 | input | allowed | default |
 |---|---|---|
 | `celeris_ref` | branch, tag, full 40-hex commit sha, or `refs/pull/N/head` (github only); `mode: timing`: 2 to 4 arms, `NAME=REF NAME=REF ...` | `main` |
-| `packages` | up to 16 patterns under the celeris module: `.` (the root package), `./dir`, `./dir/...`, `./...` | `./engine/iouring` |
+| `packages` | up to 16 patterns under the celeris module: `.` (the root package), `./dir`, `./dir/...`, `./...` | `./internal/engine/iouring` |
 | `run` | a Go regexp, printable ASCII without spaces, up to 2048 characters; empty runs every test | empty |
 | `count` | 1 to 1000: `-count`, the iterations inside each process | 10 |
 | `shards` | 1 to 20 per arch: one job, and one process per package, each (cluster: 1 to 200, run in turn; timing: blocks) | 5 |
@@ -150,7 +150,10 @@ a driver, `./driver/X/internal/protocol`, where `P` is the pattern with a
 leading `internal/` dropped and `driver/X/internal/protocol` read as
 `driver/X/protocol`. So `./engine/iouring` runs `./engine/iouring` at a commit
 before the move and `./internal/engine/iouring` after it, and a row that
-names the new path still runs at an old commit. A pattern that is a package as
+names the new path still runs at an old commit. The `packages` default is the
+new path, `./internal/engine/iouring`, and the examples below name the new
+path for `main` or a branch; an example pinned to a full sha from before the
+move names the package as that commit has it. A pattern that is a package as
 written is never rewritten, `.` and `./...` never are, and a pattern that no
 candidate matches is passed to go test as written, which reports it as
 before. Each shard's log header keeps `packages` as asked (the summary checks
@@ -178,7 +181,7 @@ own tests read, and nothing else (`celerisTestEnv` in
   and `CELERIS_REQUIRE_UPSWITCH=1` turn an environment skip into a failure,
   the way celeris CI runs its skipping-forbidden steps.
 - By name: `GOTEST_BACKPRESSURE` (`=1` runs
-  `TestWriteBufBackpressureClosesSlowConsumer` in `./engine/epoll`, which
+  `TestWriteBufBackpressureClosesSlowConsumer` in `./internal/engine/epoll`, which
   otherwise skips as "non-deterministic on CI", so CI never runs it),
   `TESTING_STRICT_ALLOC_BUDGETS`, `DRAIN583_REPS`, the WebSocket rig knobs
   `WS482_*`, `WS484_*` and `WS583_*`, `SOAK_DURATION`, `SOAK_CLIENTS`,
@@ -459,7 +462,7 @@ The arms:
 - **One test**, by `-run`, that exists on both commits (the defect needs no
   other test). A test only one arm has shows as "not in this arm".
 - **CI's shape** for this package: `-race` at the runner's 8 MiB memlock, as
-  celeris CI's unit job runs `./engine/iouring`.
+  celeris CI's unit job runs `./internal/engine/iouring`.
 - **20 shards per arch**, the most there is: 20 processes per arch per arm.
 
 ```sh
@@ -467,7 +470,7 @@ branch=$(gh api repos/goceleris/celeris/pulls/696 --jq .head.sha)
 base=$(gh api "repos/goceleris/celeris/compare/main...$branch" --jq .merge_base_commit.sha)
 for ref in "$base" "$branch"; do
   gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \
-    -f celeris_ref="$ref" -f packages=./engine/iouring -f run='^TestDriverHTTPZeroOverhead$' \
+    -f celeris_ref="$ref" -f packages=./internal/engine/iouring -f run='^TestDriverHTTPZeroOverhead$' \
     -f count=20 -f shards=20 -f arches=both -f memlock=8m -f race=true -f timeout=10m
 done
 ```
@@ -527,7 +530,7 @@ skip. Raise memlock and forbid the skip:
 
 ```sh
 gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \
-  -f celeris_ref=main -f packages=./engine/iouring \
+  -f celeris_ref=main -f packages=./internal/engine/iouring \
   -f run='^TestListenCloses(ListenSocketsWhenEveryWorkerRingSetupFails|ListenSocketWhenOneWorkerRingSetupFails|ListenSocketRingAndEventfdWhenInitialSubmitFails)$' \
   -f count=50 -f shards=4 -f arches=both -f memlock=unlimited -f race=true -f timeout=20m \
   -f extra='CELERIS_REQUIRE_IOURING_WORKERS=1'
@@ -541,7 +544,7 @@ non-deterministic on CI"), so no CI job runs it. Its rate on the runners:
 
 ```sh
 gh workflow run celeris-stress.yml --repo goceleris/probatorium --ref stress/runs \
-  -f celeris_ref=main -f packages=./engine/epoll -f run='^TestWriteBufBackpressureClosesSlowConsumer$' \
+  -f celeris_ref=main -f packages=./internal/engine/epoll -f run='^TestWriteBufBackpressureClosesSlowConsumer$' \
   -f count=5 -f shards=20 -f arches=both -f memlock=8m -f race=false -f timeout=10m \
   -f extra='GOTEST_BACKPRESSURE=1'
 ```

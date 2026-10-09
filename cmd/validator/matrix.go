@@ -688,7 +688,7 @@ func seedServicesWithRetry(ctx context.Context, spec string) error {
 
 // The adaptive engine starts on epoll and promotes new connections to
 // io_uring only when the controller's conns-per-worker ratio crosses a
-// threshold (celeris adaptive/controller.go). An adaptive cell sized below
+// threshold (celeris internal/adaptive/controller.go). An adaptive cell sized below
 // that line validates epoll under another name, so the matrix sizes these
 // cells deliberately and the gate's ExpectAdaptiveSwitch proves it worked.
 //

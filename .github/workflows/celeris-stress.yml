@@ -94,9 +94,9 @@ on:
         type: string
         default: main
       packages:
-        description: "Package patterns under the celeris module, space-separated (. ./engine/iouring ./adaptive/...)"
+        description: "Package patterns under the celeris module, space-separated (. ./internal/engine/iouring ./internal/adaptive/...); a ref from before celeris#443 runs ./internal/P as ./P"
         type: string
-        default: ./engine/iouring
+        default: ./internal/engine/iouring
       run:
         description: "go test -run regexp (empty runs every test in the packages)"
         type: string
