@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,10 +92,14 @@ func TestBootstrapPythonIsPinnedToAPatchAndRebuiltFromNothing(t *testing.T) {
 			"which python-build-standalone build the hosts run", py)
 	}
 
+	if b := playbookPin(t, setup, "python_build"); !regexp.MustCompile(`^\d{8}$`).MatchString(b) {
+		t.Errorf("python_build %q is not a python-build-standalone release tag (YYYYMMDD)", b)
+	}
+
 	script := ansibleCoreTaskScript(t, setup, map[string]string{
 		"ansible_venv_dir": "/V", "ansible_core_version": "C", "uv_python_install_dir": "/P",
 		"uv_cache_dir": "/U", "uv_dir": "/D", "python_version": "3.13.15",
-		"ansible_deps_exclude_newer": "X", "uv_version": "0.0.0",
+		"ansible_deps_exclude_newer": "X", "uv_version": "0.0.0", "python_build": "20260901",
 	})
 	for what, want := range map[string]string{
 		"a miss wipes the venv, the whole managed python tree and the uv cache together": `rm -rf "$venv" "/P" "/U"`,
@@ -104,6 +109,7 @@ func TestBootstrapPythonIsPinnedToAPatchAndRebuiltFromNothing(t *testing.T) {
 		"the stamp is read, not stat'ed":                                                 `cat "$stamp"`,
 		"the manifest is refused when it names too few files":                            `-lt 1000`,
 		"the venv is still created from the managed python only":                         "/D/uv venv --clear --managed-python --python 3.13.15 /V",
+		"the installed standalone build is compared with its pin":                        `[ "$build" != "20260901" ]`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("ansible-core install: %s (want %q)", what, want)
@@ -188,6 +194,7 @@ func TestAnsibleCoreCacheIsTrustedOnlyWhenEveryFileHashes(t *testing.T) {
 			"uv_python_install_dir": f.py, "uv_cache_dir": f.cache, "uv_dir": filepath.Join(root, "uvbin"),
 			"python_version": playbookPin(t, setup, "python_version"), "uv_version": playbookPin(t, setup, "uv_version"),
 			"ansible_deps_exclude_newer": playbookPin(t, setup, "ansible_deps_exclude_newer"),
+			"python_build":               playbookPin(t, setup, "python_build"),
 		})
 		return f
 	}
@@ -198,8 +205,8 @@ func TestAnsibleCoreCacheIsTrustedOnlyWhenEveryFileHashes(t *testing.T) {
 		if err == nil {
 			return string(out), 0
 		}
-		ee, ok := err.(*exec.ExitError)
-		if !ok {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
 			t.Fatalf("run script: %v", err)
 		}
 		return string(out), ee.ExitCode()

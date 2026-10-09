@@ -67,16 +67,19 @@
     # reusing a stale copy. All four pins were field-proven by the
     # 2026-09-15 14:29Z bootstrap on all three hosts.
     uv_version: "0.12.15"
-    # An exact patch release, not "3.13". A bare minor lets uv pick whichever
-    # 3.13.x it knows about, and uv's idea of that moves with the uv pin AND
-    # with an already-installed managed python it will happily reuse. With the
-    # uv pin above, "3.13.15" resolves to exactly one python-build-standalone
-    # build, release 20260901, taken from uv's own embedded download table
-    # (https://releases.astral.sh/github/python-build-standalone/releases/
+    # An exact patch release, not "3.13", AND the python-build-standalone
+    # release it is built from. A bare minor lets uv take whichever 3.13.x it
+    # knows, or reuse one already on disk. The patch alone still leaves the
+    # build to the uv pin: a later uv can map 3.13.15 to a rebuilt standalone
+    # release, and no cache key would change. So the installed tree's BUILD
+    # file (the release tag, written by uv) is compared with python_build
+    # right after the install, and a mismatch fails the bootstrap.
+    # uv 0.12.15 resolves 3.13.15 to release 20260901:
+    # https://releases.astral.sh/github/python-build-standalone/releases/
     # download/20260901/cpython-3.13.15+20260901-<arch>-unknown-linux-gnu-
-    # install_only_stripped.tar.gz, which is also the BUILD file in the
-    # installed tree); nothing else decides which python this is.
+    # install_only_stripped.tar.gz
     python_version: "3.13.15"
+    python_build: "20260901"
     ansible_core_version: "2.21.4"
     ansible_posix_version: "2.2.2"
     tool_cache_dir: "{{ runner_cache_dir }}/tools"
@@ -344,8 +347,9 @@
       # uv's .temp included) and the uv cache, whose archive-v0 entries are
       # hardlinks to inodes aged the same way and would put a venv with
       # missing modules past an ansible-playbook probe. The python is the exact
-      # patch release pinned above and is probed (it must import the modules
-      # a broken tree loses, and report that version) before a venv is built on it.
+      # patch release and standalone build pinned above and is probed (it must
+      # import the modules a broken tree loses, report that version and carry
+      # that build) before a venv is built on it.
       #
       # --managed-python is what keeps that python inside the cache. Without it
       # uv prefers any matching python already on PATH over downloading into
@@ -374,6 +378,11 @@
         {{ uv_dir }}/uv python install --no-bin {{ python_version }}
         managed="$({{ uv_dir }}/uv python find --managed-python {{ python_version }})"
         "$managed" -I -c 'import encodings, sys, sysconfig, ssl, ctypes, sqlite3, venv, ensurepip; assert "%d.%d.%d" % sys.version_info[:3] == sys.argv[1], sys.version' {{ python_version }}
+        build="$(cat "$(dirname "$(dirname "$managed")")/BUILD")"
+        if [ "$build" != "{{ python_build }}" ]; then
+          echo "uv installed python-build-standalone release $build, not the pinned {{ python_build }}: bump python_build with uv_version, or pin uv" >&2
+          exit 1
+        fi
         {{ uv_dir }}/uv venv --clear --managed-python --python {{ python_version }} {{ ansible_venv_dir }}
         {{ uv_dir }}/uv pip install --python {{ ansible_venv_dir }}/bin/python --exclude-newer {{ ansible_deps_exclude_newer }} ansible-core=={{ ansible_core_version }}
         "$venv/bin/ansible-playbook" --version | head -1 | grep -qF "[core {{ ansible_core_version }}]"
