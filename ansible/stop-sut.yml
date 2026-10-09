@@ -1,0 +1,45 @@
+---
+# stop-sut.yml -- the CANCEL-PATH reap: stop any bench SUT left on a cluster
+# host, by identity, and nothing else.
+#
+#   ansible-playbook -i ansible/inventory.yml ansible/stop-sut.yml
+#
+# Driven by the off-cluster teardown job (.github/actions/cluster-runner-down,
+# `if: always()`, so it also runs when the workflow was cancelled or the matrix
+# runner died) BEFORE the results are purged and the runner is removed. The
+# in-band `mage Cleanup` cannot be relied on for this: it runs on the SUT
+# runner, and a cancelled job dies with it (bench 37226284351: the runner
+# cancelled itself when its link to GitHub broke, and the SUT it had started
+# 14 s later was still running three days after).
+#
+# It stops processes only: no rm, no docker, no sysctl, no package change, no
+# results purge. cleanup.yml does the full reclamation and now calls the same
+# reap first, so this play is the narrow, always-safe step that cannot be
+# skipped for another step's sake.
+#
+# BOUNDED: the SSH tuning is the short one forensics.yml uses, not the
+# inventory's patient one (that exists so a saturated LIVE host is not dropped;
+# here a dead host must cost seconds). An unreachable host is not an error of
+# this play (ignore_unreachable) -- the teardown job's verdict step reads the
+# output and fails loudly, naming the host.
+
+- name: Stop leftover bench SUT processes (cancel path)
+  hosts: cluster
+  gather_facts: false
+  ignore_unreachable: true
+  vars:
+    reap_sut_strict: true
+    ansible_ssh_common_args: >-
+      -o ControlMaster=no
+      -o ControlPath=none
+      -o ConnectTimeout=10
+      -o ServerAliveInterval=5
+      -o ServerAliveCountMax=3
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
+    ansible_connect_timeout: 10
+    ansible_command_timeout: 90
+    ansible_ssh_retries: 0
+  tasks:
+    - ansible.builtin.import_tasks: tasks/reap_bench_sut.yml

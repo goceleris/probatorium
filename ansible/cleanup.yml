@@ -46,6 +46,13 @@
         true
       changed_when: false
 
+    # ---------- stop the SUT by identity ----------
+    # The pkill above matches by name and argv; this matches by the run tag in
+    # the environment or a cwd/binary under bench_root, so it still finds a SUT
+    # whose directory and pid file are already gone (bench 37226284351). It
+    # runs before the rm -rf of bench_root below, while cwd/exe still resolve.
+    - ansible.builtin.import_tasks: tasks/reap_bench_sut.yml
+
     # ---------- read manifest ----------
     - name: Read dep manifest if present
       ansible.builtin.slurp:

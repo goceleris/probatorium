@@ -198,6 +198,17 @@
   changed_when: false
   when: inventory_hostname == bench_target
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | reap any leftover SUT by identity (tag or bench_root)"
+  # The stop task above finds its targets by pid file, argv and port. This one
+  # finds them by the run tag in their environment, so a SUT that none of those
+  # handles can see does not survive into this cell. Best-effort like the task above: see reap_bench_sut.yml.
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/reap_bench_sut.yml"
+  vars:
+    # Tag only: this runs MID-BENCH, where a helper that merely sits in
+    # bench_root must not be mistaken for a leftover SUT. See reap_bench_sut.yml.
+    reap_sut_match: tag
+  when: inventory_hostname == bench_target
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start competitor server in background"
   # Root ONLY for the celeris SUT — see the privilege-gate fact above.
   become: "{{ cell_needs_root | bool }}"
@@ -261,7 +272,14 @@
       # binary.
       PROBATORIUM_DEBUG_ADDR: "127.0.0.1:{{ bench_debug_port | default(18089) }}"
     cell_sut_env: "{{ sut_base_env | combine(bench_sut_env | default({})) | combine(cell_col_env | default({})) }}"
-  environment: "{{ cell_sut_env }}"
+    # The run identity of this SUT and its supervisor. NOT part of cell_sut_env
+    # on purpose: that mapping is echoed into server.log and recorded in
+    # results.json, and a per-run id there would make every run differ. Every
+    # process started below inherits it, so ops/sut/reap-bench-sut can find a
+    # SUT whose pid file, directory, argv and port are all gone. Outside CI
+    # (no GITHUB_RUN_ID on the controller) it is "local-0".
+    sut_run_tag: "{{ lookup('env', 'GITHUB_RUN_ID') | default('local', true) }}-{{ lookup('env', 'GITHUB_RUN_ATTEMPT') | default('0', true) }}"
+  environment: "{{ cell_sut_env | combine({'PROBATORIUM_SUT_RUN': sut_run_tag}) }}"
   ansible.builtin.shell:
     cmd: |
       cd {{ bench_root }}

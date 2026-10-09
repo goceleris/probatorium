@@ -137,6 +137,50 @@ Three hosts, defined in [`ansible/inventory.yml`](ansible/inventory.yml):
 The validator runs on the bench target itself, next to the reference app it drives
 ([`ansible/validate.yml`](ansible/validate.yml)); msa2-client holds no validation state.
 
+## Host gate
+
+Every cluster tier starts with `mage HostGate` (the step sits before `mage Deploy` in all six tier
+workflows). It checks, read-only, that each host the tier will use is clean, and fails the job in the
+first minute when it is not, instead of measuring on a dirty host and finding out from the numbers
+(probatorium#473: a leftover `rvtest` held IO pressure at 99 % on msr1 for 28 days and every arm64 CPU
+figure read about 100).
+
+For each host it asserts:
+
+| Check | Fails when | Default |
+| --- | --- | --- |
+| Listeners | something already listens on a port the harness will bind: the SUT port, its debug sidecar, the postgres, redis and memcached fixture ports | 8080, 18089, 54321, 63791, 21211 (`HOSTGATE_PORTS`) |
+| Leftover processes | a process older than the limit has a harness binary name (the list `ansible/cleanup.yml` kills), lives in or runs a binary from a `/tmp/celeris-*` directory (deleted or not), or runs a binary that was deleted from `/tmp` | 1 hour (`HOSTGATE_MAX_AGE_HOURS`) |
+| Idle IO pressure | `/proc/pressure/io` `some avg60` is at or above the limit | 25 % (`HOSTGATE_MAX_IO_PSI`; `0` disables; `HOSTGATE_REQUIRE_PSI=1` also fails a kernel without PSI) |
+| Readable | a host returns nothing, or output the gate cannot parse. A host it cannot see is not passed | |
+
+The GitHub runner's own `/tmp/actions-runner-*` directory is exempt: the runner replaces its binaries
+when it updates, so a live runner often shows a deleted executable.
+
+**The gate only reports.** It never kills, stops or removes anything: a process it names may be someone's
+(the `rvtest` was an agent's smoke test), and finding the owner comes first. On a violation it prints a
+`::error` annotation with the process list (pid, age, executable, working directory, the reason it
+matched), writes the same to the job summary and exits non-zero. Command lines are not copied whole: a SUT
+supervisor is `bash -c <script>` and the script embeds the fixture DSN, so a shell shows only its name and
+other processes have URL credentials masked.
+
+How it is built:
+
+- [`hostgate/collect.sh`](hostgate/collect.sh) runs on each host through
+  [`ansible/host-gate.yml`](ansible/host-gate.yml) (the task file is
+  [`ansible/tasks/host_gate.yml`](ansible/tasks/host_gate.yml)), as root so `/proc/<pid>/exe` and `ss -p`
+  see every user's processes. It reads `/proc`, `/proc/pressure/io` and `ss -ltnp`, and nothing else.
+- [`hostgate/`](hostgate/) parses that output and applies the thresholds; it is plain Go with no build tag
+  and is unit-tested on fixtures built from the real msr1 and msa2-server captures (the `ss` and pressure lines are verbatim).
+- `mage HostGate` ties them together. `HOSTGATE_TARGET` (falling back to `BENCH_TARGET` then
+  `VALIDATE_TARGET`) picks the hosts, as for `--limit`: the target plus the loadgen. `HOSTGATE_HOSTS=a,b`
+  overrides the list. `HOSTGATE_INPUT_DIR=<dir>` reads `<dir>/<host>.txt` instead of running ansible; the
+  tests feed fake host output this way, and so can you:
+  `HOSTGATE_INPUT_DIR=./captures mage HostGate`.
+
+It is not a substitute for the teardown below: the gate says a host is dirty, the teardown is what keeps
+it clean.
+
 ## Bench tier
 
 ### The field
@@ -394,6 +438,7 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `ValidateGate` | The absolute gate over the most recent run's `validate-results.json` on every host | `VALIDATE_GATE_EXPECT_CELLS`, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH` |
 | `ValidateDiff` | The cross-engine and cross-arch gate | `VALIDATE_DIFF_STRICT=1` (MEDIUM fails too), `VALIDATE_DIFF_HOSTS=a,b` |
 | `BuildRaceRefapps` | Cross-build the `-race` reference apps (the race runtime needs cgo) | |
+| `HostGate` | The pre-tier host gate: read-only, fails when a host has an unexpected listener, a leftover process or idle IO pressure (see [Host gate](#host-gate)) | `HOSTGATE_TARGET`, `HOSTGATE_HOSTS`, `HOSTGATE_MAX_IO_PSI`, `HOSTGATE_MAX_AGE_HOURS`, `HOSTGATE_PORTS`, `HOSTGATE_REQUIRE_PSI`, `HOSTGATE_INPUT_DIR` |
 | `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host | `SAMPLER_DURATION`, `SAMPLER_INTERVAL`, `SAMPLER_TAG` |
 | `Publish` | Write the newest bench run into goceleris/docs and fire the `benchmark-published` pointer | `PUBLISH_VERSION`, `PUBLISH_VIA=git\|contents`, `PUBLISH_DRYRUN=1`, `DOCS_REPO_DIR`, `DOCS_TOKEN`, `BENCH_PUBLISH_FORCE` |
 | `PublishValidate` | Kept for callers; it runs `Publish` | |
@@ -498,7 +543,21 @@ Cluster runners are provisioned per run and torn down at the end:
 - [`.github/actions/cluster-runner-down/`](.github/actions/cluster-runner-down/) collects forensics,
   rescues results to `/var/lib/celeris-rescue`, cleans the hosts, writes a "Resume candidates" job
   summary, mints a removal token, runs [`ansible/runner-teardown.yml`](ansible/runner-teardown.yml) and
-  sweeps orphaned registrations.
+  sweeps orphaned registrations. It runs on every outcome, including a cancelled workflow, and has three
+  properties worth knowing:
+  - **It waits for hosts.** The first step probes every host and retries with backoff for up to
+    `reachability-budget-seconds` (default 180). A healthy cluster answers the first probe and never waits.
+  - **It stops a leftover SUT by identity.** `ansible/stop-sut.yml` finds the bench SUT and its respawn
+    supervisor by the `PROBATORIUM_SUT_RUN=<run id>` the launch puts in their environment, or by a working
+    directory or binary under `/tmp/celeris-bench`, so it still finds them when the pid file and the bench
+    directory are gone. `ansible/cleanup.yml` and the per-cell stop task (by run tag only, since it runs mid-bench) run the same reap
+    ([`ops/sut/reap-bench-sut`](ops/sut/reap-bench-sut)).
+  - **It fails loudly.** The last step is a verdict. The reclamation plays use `ignore_unreachable` (one
+    dead host must not stop the others), so their exit status and recap say nothing about reachability;
+    bench 37226284351's teardown reported success with every host unreachable and three runners left
+    online. The verdict fails the job, with an `::error` annotation naming the hosts, if a host stayed
+    silent after the retry or dropped mid-teardown, if the SUT could not be stopped, if no removal token
+    could be minted, or if GitHub still lists an online runner with the `celeris-cluster` label.
 - Runners live under `/tmp/actions-runner-<host>/`, with no systemd unit and no package install.
 
 The one-time operator setup (four repository secrets and a Tailscale ACL rule) is documented in

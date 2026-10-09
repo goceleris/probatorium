@@ -1,0 +1,29 @@
+---
+# host-gate.yml -- the pre-tier host gate's collection play (probatorium#473).
+#
+#   ansible-playbook -i inventory.yml host-gate.yml \
+#       --extra-vars '{"hostgate_local_dir": "/abs/out"}'
+#
+# Driven by `mage HostGate`, which parses what lands in hostgate_local_dir and
+# decides. This play only COLLECTS: hostgate/collect.sh is read-only (it reads
+# /proc, /proc/pressure/io and `ss -ltnp`; no signal, no stop, no rm), and the
+# gate never kills what it finds -- a process it names may be somebody's.
+#
+# Run it BEFORE Deploy and before the weekend tier's sampler start, so the
+# tier's own fixtures and sampler are not mistaken for leftovers.
+#
+# An unreachable host is NOT an error of this play: it writes no file, and
+# `mage HostGate` fails that host as "no gate output". A gate that cannot see a
+# host must not pass it.
+
+- name: Pre-tier host gate (read-only collection)
+  hosts: cluster
+  gather_facts: false
+  ignore_unreachable: true
+  # root: /proc/<pid>/exe and `ss -p` are blank for other users' processes
+  # otherwise, and an orphan owned by another user is exactly the case.
+  become: true
+  vars:
+    hostgate_local_dir: ""
+  tasks:
+    - ansible.builtin.import_tasks: tasks/host_gate.yml

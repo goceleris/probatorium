@@ -11,7 +11,11 @@ description: >-
   ownership lock; (2)
   kills every Runner.Listener, de-registers from GitHub, and rm -rf's
   /tmp/actions-runner-<host>/; (3) sweeps orphan offline runner
-  registrations. Pristine.
+  registrations. Pristine. It then FAILS LOUDLY (a red job with an
+  annotation naming the hosts) if any host could not be reached, if no
+  runner could be de-registered, or if a cluster runner is still online:
+  an unreachable host used to be logged "ignoring" and the job reported
+  success (bench 37226284351).
 
   Pair with cluster-runner-up/. Designed to run as a teardown job
   with `if: always()` so cluster state is cleaned up even when the
@@ -19,7 +23,8 @@ description: >-
   with the host (the in-band `mage Cleanup` cannot run in that case —
   this off-cluster job is the host-failure-survivable reclamation
   path). Every reclamation step is `if: always()` so one failing step
-  does not skip the others.
+  does not skip the others, and the last step, the verdict, is
+  `if: always()` too.
 
 inputs:
   tailscale-oauth-client-id:
@@ -68,6 +73,16 @@ inputs:
       an escape hatch; there is no reason to use it on a tier run.
     required: false
     default: "true"
+  reachability-budget-seconds:
+    description: >-
+      How long the teardown waits, retrying with backoff, for hosts that do
+      not answer before it carries on without them (the verdict step then
+      fails the job naming them). A healthy cluster answers the first probe
+      and never waits. The caller's job timeout is the backstop: the worst
+      case, every host silent for the whole budget, adds this to the
+      roughly three minutes the reclamation steps cost against dead hosts.
+    required: false
+    default: "180"
   rescue-results:
     description: >-
       Set to "false" to skip the results rescue and purge results_root the
@@ -115,17 +130,47 @@ runs:
         chmod 600 ~/.ssh/id_ed25519
         ssh-keyscan -H msa2-server msa2-client msr1 >> ~/.ssh/known_hosts 2>/dev/null || true
 
+    # WAIT FOR THE CLUSTER, bounded. Every reclamation play below uses
+    # ignore_unreachable, so that one dead host cannot stop the others, and that
+    # makes ansible's exit status and recap useless as a signal (bench
+    # 37226284351: three hosts UNREACHABLE, recap `unreachable=0 ignored=6`, job
+    # green, three runners left online). So reachability is asked directly,
+    # first, and retried with backoff: a short outage then costs nothing but
+    # time, and a long one is named in the verdict at the end. A healthy
+    # cluster answers the first probe: one ping, no sleep.
+    - name: Wait for the cluster hosts to answer (bounded retry with backoff)
+      id: reach
+      if: always()
+      shell: bash
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: "False"
+        INVENTORY_PATH: ${{ inputs.inventory-path }}
+        PROBE_BUDGET_SECONDS: ${{ inputs.reachability-budget-seconds }}
+      run: bash .github/scripts/cluster-reachability.sh wait
+
     - name: Mint removal token
       id: remtoken
+      if: always()
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.gh-runner-pat }}
         REPO: ${{ inputs.repo-owner-and-name }}
       run: |
-        TOKEN=$(gh api -X POST "/repos/${REPO}/actions/runners/remove-token" --jq .token)
-        if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
-          echo "::warning::Failed to mint removal token; teardown will skip the de-register step"
+        # Retried: a transient API error here used to skip de-registration for
+        # the whole teardown. Three tries, 5 s then 10 s apart; a healthy API
+        # answers the first.
+        TOKEN=""
+        for delay in 0 5 10; do
+          [ "${delay}" -gt 0 ] && sleep "${delay}"
+          TOKEN=$(gh api -X POST "/repos/${REPO}/actions/runners/remove-token" --jq .token 2>/dev/null || true)
+          if [ -n "${TOKEN}" ] && [ "${TOKEN}" != "null" ]; then break; fi
           TOKEN=""
+        done
+        if [ -z "${TOKEN}" ]; then
+          echo "::warning::Failed to mint removal token after 3 tries; teardown will skip the de-register step, and the verdict step will fail the job"
+          echo "minted=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "minted=true" >> "$GITHUB_OUTPUT"
         fi
         echo "::add-mask::${TOKEN}"
         echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
@@ -293,6 +338,36 @@ runs:
         # displaces the real one.
         if-no-files-found: warn
 
+    # CANCEL PATH: stop the SUT by identity (probatorium#473). A cancelled or
+    # timed-out bench leaves its SUT and the respawn supervisor behind; the
+    # stop task inside the bench finds them through a pid file under bench_root,
+    # and in bench 37226284351 that directory (and the pid file) was gone. This
+    # step runs even when the workflow was cancelled and the matrix job died
+    # with its runner (`if: always()`), and finds the processes by the run tag
+    # in their environment, or a cwd/binary under bench_root. It stops
+    # processes and nothing else: no rm, no purge. It runs after the forensics
+    # and the rescue, which are reads of exactly what it ends, and before the
+    # purge. Its output is kept for the verdict step.
+    - name: Stop the remote SUT by identity (cancel path)
+      id: stopsut
+      if: always()
+      shell: bash
+      env:
+        ANSIBLE_HOST_KEY_CHECKING: "False"
+        INVENTORY_PATH: ${{ inputs.inventory-path }}
+      run: |
+        mkdir -p teardown-logs
+        set +e
+        timeout -k 30 300 ansible-playbook \
+          -i "${INVENTORY_PATH}" \
+          ansible/stop-sut.yml \
+          2>&1 | tee teardown-logs/stop-sut.log
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [ "${rc}" -ne 0 ]; then
+          echo "::warning::stop-sut.yml exited ${rc}: a bench SUT may still be running on a host. The verdict step reads teardown-logs/stop-sut.log."
+        fi
+
     # KEYSTONE (2026-07-11 incident): reclaim ALL cluster host state — docker
     # volumes, bench_root, results, and the manifest ownership lock — from this
     # OFF-CLUSTER, always-run teardown job. The in-band `mage Cleanup` step runs
@@ -317,11 +392,13 @@ runs:
         # old behaviour; a FAILED one leaves the partial run on the host.
         PURGE_RESULTS: ${{ (inputs.rescue-results == 'false' && 'true') || steps.rescue.outputs.purge_results }}
       run: |
+        mkdir -p teardown-logs
         ansible-playbook \
           -i ${{ inputs.inventory-path }} \
           ansible/cleanup.yml \
           --extra-vars "purge_results=${PURGE_RESULTS:-false}" \
-          || echo "::warning::off-cluster cleanup.yml returned non-zero (a host may be unreachable); continuing teardown"
+          2>&1 | tee teardown-logs/cleanup.log \
+          || echo "::warning::off-cluster cleanup.yml returned non-zero (a host may be unreachable); continuing teardown. The verdict step names unreachable hosts."
 
     - name: Run ansible runner-teardown
       if: always()
@@ -329,11 +406,16 @@ runs:
       env:
         ANSIBLE_HOST_KEY_CHECKING: "False"
       run: |
+        mkdir -p teardown-logs
+        # Teed, because this play is `ignore_unreachable` and its exit status
+        # cannot say whether a host was reached: the verdict step reads the
+        # log for `UNREACHABLE!`.
         ansible-playbook \
           -i ${{ inputs.inventory-path }} \
           ansible/runner-teardown.yml \
           --extra-vars "gh_repo_url=${{ inputs.repo-url }}" \
-          --extra-vars "gh_runner_remove_token=${{ steps.remtoken.outputs.token }}"
+          --extra-vars "gh_runner_remove_token=${{ steps.remtoken.outputs.token }}" \
+          2>&1 | tee teardown-logs/runner-teardown.log
 
     - name: Sweep any orphan runner registrations
       if: always()
@@ -352,3 +434,19 @@ runs:
               echo "Sweeping orphan runner id=${id}"
               gh api -X DELETE "/repos/${REPO}/actions/runners/${id}" || true
             done
+
+    # THE VERDICT. Last, and `if: always()`, so it also runs after a cancelled
+    # workflow and after any step above failed. It is what turns "every host
+    # was UNREACHABLE, the plays ignored it, the job passed" into a red job
+    # with an annotation that names the hosts (see the script header). A normal
+    # run passes it with one `gh api` call and no sleep.
+    - name: Teardown verdict (fails loudly if the cluster was not torn down)
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-runner-pat }}
+        REPO: ${{ inputs.repo-owner-and-name }}
+        UNREACHABLE_AT_START: ${{ steps.reach.outputs.unreachable }}
+        REMOVAL_TOKEN_MINTED: ${{ steps.remtoken.outputs.minted }}
+        LOG_DIR: teardown-logs
+      run: bash .github/scripts/cluster-teardown-verdict.sh
