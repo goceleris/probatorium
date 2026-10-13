@@ -1,6 +1,6 @@
 module github.com/goceleris/probatorium/servers/celeris
 
-go 1.27.0
+go 1.27.2
 
 require (
 	github.com/goceleris/celeris v1.5.12-0.20261013133423-7d9ff01dab67
@@ -8,9 +8,9 @@ require (
 )
 
 require (
-	golang.org/x/net v0.60.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 )
 
 replace github.com/goceleris/probatorium => ../..
