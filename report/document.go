@@ -12,7 +12,7 @@ import (
 // the in-process and cluster paths.
 //
 // The Go entry mirrors the canonical cross-compile path
-// (crossCompileGoBinary in mage_helpers.go): CGO_ENABLED=0, the
+// (crossCompileGoBinary in magefiles/mage_helpers.go): CGO_ENABLED=0, the
 // arch-tuning knob, -trimpath, and the -s -w ldflags. Native adapters
 // (rust / python / bun) are built by the ansible roles; their flags are
 // recorded here so the metadata is non-empty and grep-friendly.

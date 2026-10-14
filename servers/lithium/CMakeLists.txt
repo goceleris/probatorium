@@ -28,7 +28,7 @@ endif()
 #
 # (An earlier version of this comment claimed the cpp ansible role staged the
 # header via LITHIUM_HEADER_DIR. It never did — that variable is set nowhere in
-# ansible/ or mage_cluster.go — so branch 3 was what actually ran on every
+# ansible/ or magefiles/mage_cluster.go — so branch 3 was what actually ran on every
 # cluster deploy, downloading and compiling an unverified header each time.)
 #
 # LITHIUM_COMMIT pins the upstream revision so the build is reproducible —

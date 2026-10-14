@@ -63,7 +63,7 @@ type MatrixConfig struct {
 
 	// BinDir is where pre-built refapp binaries are looked up
 	// before falling back to `go build`. The cluster deploy flow
-	// stages binaries here (matches mage_cluster.go's
+	// stages binaries here (matches magefiles/mage_cluster.go's
 	// staging dir layout). Default: empty (always build).
 	BinDir string
 }
@@ -267,7 +267,7 @@ func discoverRefappBins(binDir string) ([]string, error) {
 			continue
 		}
 		// Pre-built refapp binaries are named after their slug (see
-		// mage_cluster.go's refapp staging — dest=refapps/<slug>).
+		// magefiles/mage_cluster.go's refapp staging — dest=refapps/<slug>).
 		// Skip hidden / dot files; everything else is treated as a
 		// candidate binary. Caller validates each one is executable
 		// before launch via findRefappBin.

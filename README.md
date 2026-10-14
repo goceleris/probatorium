@@ -56,7 +56,7 @@ attached to the run as an artifact.
 > [!NOTE]
 > **The tiers are dispatched by hand.** Their schedules have been paused since
 > [#380](https://github.com/goceleris/probatorium/pull/380) (2026-09-15) to keep the cluster free for
-> the v1.6.0 release validation; [`workflow_schedule_paused_test.go`](workflow_schedule_paused_test.go) pins that state. The run lists
+> the v1.6.0 release validation; [`workflow_schedule_paused_test.go`](tools/workflowguard/workflow_schedule_paused_test.go) pins that state. The run lists
 > below show the most recent manual runs, not a nightly or weekly cadence.
 
 | Tier (links to its runs) | What it runs | Result artifact on each run (kept for) |
@@ -167,7 +167,7 @@ The three `tls-*` scenarios need a TLS terminator that no run configures today.
 
 Count from the registry, not from adapter directories: a directory can exist without being registered.
 Adding a framework takes a registry entry and an adapter directory, plus a `nativeBuildSpecs` entry in
-[`mage_cluster.go`](mage_cluster.go) for a non-Go adapter.
+[`magefiles/mage_cluster.go`](magefiles/mage_cluster.go) for a non-Go adapter.
 
 ### Capability gating
 

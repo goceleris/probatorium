@@ -84,7 +84,7 @@
 #      branch tip was — unpinned upstream code compiled on the bench hosts.
 #   2. GATED on libreactor actually being in scope. The tasks below had NO
 #      `when:` guard, so they ran on every deploy even though libreactor is not
-#      in servers.Registry or mage_cluster.go's nativeBuildSpecs and appears in
+#      in servers.Registry or magefiles/mage_cluster.go's nativeBuildSpecs and appears in
 #      no published result — a dead adapter costing an unpinned fetch plus an
 #      autotools build every time. The source under servers/libreactor/ is kept
 #      so the adapter can be re-registered; it just no longer builds unasked.

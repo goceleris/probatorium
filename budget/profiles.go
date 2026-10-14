@@ -5,7 +5,7 @@ import "time"
 // Curated matrix definitions (#166). These are DATA: the concrete server
 // and scenario sets each profile expands into, plus the realized
 // (capability-gated) cell counts pinned as constants the budget test
-// asserts. A mage-tagged helper (mage_tier.go) recomputes the realized
+// asserts. A mage-tagged helper (magefiles/mage_tier.go) recomputes the realized
 // counts from the live scenarios + servers registries through the same
 // filter the runner uses; these constants are the pinned expectation that
 // helper's output must match, so a registry change that blows the budget

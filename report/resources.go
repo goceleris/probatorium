@@ -599,7 +599,7 @@ func ptrF64(v float64) *float64 { return &v }
 //
 // This is the single source of truth for the per-run reduction shared by
 // the report-side [Aggregate] (the typed Document path) and the cluster
-// per-host summary (mage_bench.go summarizeCells).
+// per-host summary (magefiles/mage_bench.go summarizeCells).
 func ReduceResources(runs []*ResourceStats) *ResourceStats {
 	present := make([]*ResourceStats, 0, len(runs))
 	for _, r := range runs {

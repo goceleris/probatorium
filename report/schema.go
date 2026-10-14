@@ -678,7 +678,7 @@ type ValidationResults struct {
 	// Single-cell runs leave this empty and populate Tier1/Tier3 at
 	// the top level instead.
 	//
-	// The cross-engine ValidateDiff in mage_diff.go walks this slice
+	// The cross-engine ValidateDiff in magefiles/mage_diff.go walks this slice
 	// to compute per-(refapp, arch) engine-divergence findings; the
 	// existing cross-arch diff continues to work from the top-level
 	// (or first Cells entry) snapshot.

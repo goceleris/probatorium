@@ -709,7 +709,7 @@ var Registry = map[string]Adapter{
 
 	// ---- wave-6 native competitors (h1 columns; -h2 siblings follow once
 	// the h1 grid is cluster-verified). Each rides an existing or new
-	// toolchain role; see ansible/roles/<lang> + mage_cluster.go specs. ----
+	// toolchain role; see ansible/roles/<lang> + magefiles/mage_cluster.go specs. ----
 
 	// actix — actix-web 4.x (rust role, unchanged). Worker-per-core, no TLS.
 	"actix": {

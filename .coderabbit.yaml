@@ -130,7 +130,7 @@ reviews:
           artifacts do not record, or aggregated in a way that cannot be
           recomputed from them.
         - A schema change must bump SchemaVersion and re-pin it in
-          report/schema_test.go, mage_bench_sutenv_test.go and
+          report/schema_test.go, magefiles/mage_bench_sutenv_test.go and
           validation/runner_test.go, and keep schema_v5.json in step with the
           Go structs.
         - The gate never passes what was not measured: a dead cell
@@ -139,7 +139,7 @@ reviews:
           never a PASS, and a zero is health only when the oracle ran.
         - Absent must stay distinguishable from zero. Flag omitempty or
           default values that make a missing counter read as a measured 0.
-    - path: "mage_*.go"
+    - path: "magefiles/**"
       instructions: |
         Magefiles carry //go:build mage: they are the bench driver, the
         release gate and the cluster orchestration, and `go test ./...`
@@ -167,7 +167,7 @@ reviews:
         - Never interpolate ${{ }} expressions inside run: scripts; pass them
           through env:. Keep workflows actionlint- and zizmor-clean, and
           declare any new self-hosted label in .github/actionlint.yaml.
-        - The workflow_*_test.go files at the repository root pin properties
+        - The workflow_*_test.go files in tools/workflowguard/ pin properties
           of these workflows; a change here may need one of them updated.
     - path: ".github/actions/**"
       instructions: |
@@ -232,7 +232,7 @@ reviews:
         mode: warning
         instructions: >-
           PASS if the pull request changes no file under validation/ or
-          report/, no mage_*.go file and no workflow_*_test.go file. Otherwise
+          report/, no file under magefiles/ and no workflow_*_test.go file. Otherwise
           PASS only if the description states how each added or changed
           check, gate, guard, predicate or oracle was shown to FAIL on bad
           input as well as to pass on good input. FAIL if such a file changed
