@@ -22,7 +22,7 @@ func loadFixtureHeap(t *testing.T) []int64 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var out []int64
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
