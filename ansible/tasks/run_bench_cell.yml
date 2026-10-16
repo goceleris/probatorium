@@ -454,8 +454,10 @@
     - inventory_hostname == bench_target
     - cell_bound | bool
 
-- name: "{{ cell.1 }} run={{ cell.0 }} | start kernel-counter sampler (server side, 1037 A/B)"
-  # Read-only. For the p99 A/B of celeris#1037: per-CPU softirq counters
+- name: "{{ cell.1 }} run={{ cell.0 }} | start kernel-counter sampler (server side, A/B)"
+  # Read-only. For the A/Bs of celeris#1036 and #1037, plus threads.log: every
+  # SUT thread (tid, last CPU psr, state, cumulative CPU time, comm) every 1 s.
+  # Also: per-CPU softirq counters
   # (NET_RX, NET_TX) every 5 s and the full /proc/interrupts every 30 s,
   # with epoch seconds, so the column-wide logs can be sliced per scenario
   # like cpu.log. Also once at cell start: the NIC irq affinities, the bond
@@ -479,6 +481,12 @@
       > $d/kcounters.log 2>&1 &
     disown
     echo $! > $d/kcounters.pid
+    if [ -n "$pid" ]; then
+      nohup bash -c "end=\$((\$(date +%s) + {{ cell_guard_seconds }})); while [ \$(date +%s) -lt \$end ]; do echo \"== \$(date +%s.%N)\"; ps -L -o tid=,psr=,stat=,time=,comm= -p $pid; sleep 1; done" \
+        > $d/threads.log 2>&1 &
+      disown
+      echo $! > $d/threads.pid
+    fi
   args:
     executable: /bin/bash
   changed_when: false
@@ -681,11 +689,14 @@
   changed_when: false
   when: inventory_hostname == bench_target
 
-- name: "{{ cell.1 }} run={{ cell.0 }} | stop kernel-counter sampler (server side, 1037 A/B)"
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop kernel-counter sampler (server side, A/B)"
   ansible.builtin.shell: |
     d={{ cell_dir }}
     if [ -f $d/kcounters.pid ]; then
       kill -TERM "$(cat $d/kcounters.pid)" 2>/dev/null
+    fi
+    if [ -f $d/threads.pid ]; then
+      kill -TERM "$(cat $d/threads.pid)" 2>/dev/null
     fi
     pid=$(cat $d/server.pid 2>/dev/null)
     if [ -n "$pid" ]; then
