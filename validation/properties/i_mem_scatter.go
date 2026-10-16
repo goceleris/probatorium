@@ -1,9 +1,12 @@
 package properties
 
-import "math"
+import (
+	"math"
+	"sort"
+)
 
 // heapScatterAlpha is the one-sided significance level of the slope's
-// t-test, applied to every judged window (I-MEM-1 only).
+// test, applied to every judged window (I-MEM-1 only).
 //
 // The rise floor's other terms measure size: a budgeted 10 minutes of
 // leak, a fraction of the level, the within-bucket sawtooth. None of
@@ -16,177 +19,129 @@ import "math"
 // a whole-cell slope of 0.42 KB/s.
 //
 // The scatter term asks that the fitted rise also be a clear signal
-// against the window's own residual scatter: the slope's t-statistic
-// must exceed the one-sided Student-t quantile at heapScatterAlpha with
-// n-2 degrees of freedom. It is a floor inside the existing max(), so
-// it can only remove violations, and where the troughs scatter little
-// it sits below the other terms and changes nothing.
+// against the cell's own trough scatter: the slope's test statistic,
+// b / (sigmaD / sqrt(Sxx)), must exceed the critical value heapScatterCrit
+// gives for the window's trough count, calibrated at heapScatterAlpha.
+// It is a floor inside the existing max(), so it can only remove
+// violations.
 //
-// The level is chosen, not fitted to a soak. A cell is judged on up to
-// a dozen distinct trough sets (4 to 15 troughs over a 45 min cell),
-// each a nested superset of the one before, with 2 to 13 degrees of
-// freedom. For troughs that are independent and normal, per-window
-// levels of 0.01 / 0.005 / 0.002 / 0.001 give a false-alarm rate per
-// cell of 6.3 % / 3.5 % / 1.6 % / 0.66 % (simulated, 30000 cells);
-// 0.001 is the largest of those that keeps it at or under 1 %, which
-// is the target probatorium#466 set for the oracle. Real troughs are
-// not exactly independent and normal: the stationary block-permutation
-// null in the PR that introduced this term measures the rate on the
-// soaks' own series.
+// What it costs, so nobody reads it as free:
+//   - In a cell whose troughs scatter by hundreds of KB it holds back
+//     the verdict on a leak the scatter could explain: a 1-2 KB/s leak
+//     is called later or not at all there, and a 3-6 KB/s leak is called
+//     minutes later.
+//   - Windows of 5-8 troughs need a leak large against the scatter
+//     (heapScatterCrit is 26 at 5 troughs, 11 at 6, 7.7 at 7), because
+//     the estimator is robust and so inefficient. In a cell that
+//     scatters little the other floors still bind, but a leak is called
+//     a trough or two later than without the term.
+//   - A leak that starts late or climbs in steps is called later than a
+//     straight one (it is the estimator's job to keep that to a few
+//     minutes, not to remove it).
 //
-// The t quantile, not a fixed multiple of the standard error, because
-// the earliest judged windows hold 4 or 5 troughs (2 or 3 degrees of
-// freedom), where the residual scatter itself is a poor estimate and a
-// fixed 3 sigma lets a chance-quiet window through.
+// The scatter estimate sigmaD comes from successive trough differences,
+// not from the residuals about the fitted line. A residual grows with
+// the span whenever the series bends, so a leak that starts late, or
+// climbs in steps, was counted as scatter and held back (the review of
+// the first version of this term). A difference sees a bend only at the
+// bend, and a step as one outlying difference, which the trimmed mean of
+// squares drops.
+//
+// alpha is the level, not a fitted constant: heapScatterCrit holds the
+// 1 - alpha quantile of the statistic for iid normal troughs at equal
+// spacing, by simulation (4,000,000 draws per trough count, seeds
+// 1000+n; the any-look false-alarm rate over windows of 4 to 15 troughs
+// is 0.75 % per cell, simulated). Real troughs are not exactly iid
+// normal; the stationary-bootstrap null in the PR that introduced this
+// term measures the rate on the soaks' own series.
 const heapScatterAlpha = 0.001
 
-// scatterFloor is the smallest fitted rise that is significant, at
-// alpha, against the residual scatter of pts about their least-squares
-// line: t(1-alpha, n-2) x SE(slope) x span, where
-// SE(slope) = sqrt(RSS / (n-2) / Sxx). With fewer than 3 points, or no
-// spread in x, the scatter cannot be estimated and the floor is +Inf
-// (no verdict).
-func scatterFloor(pts []point, alpha float64) float64 {
+// scatterTrim is the fraction of the squared centred differences kept
+// by the scale estimate. 0.75 keeps one outlying difference in 4
+// (breakdown point 25 %): more than the one or two steps a 45 minute
+// cell holds, less than a staircase with a step every 600 s.
+const scatterTrim = 0.75
+
+// heapScatterCrit[n] is the critical value of the slope statistic for a
+// window of n troughs, n = 4..30 (the window holds at most 24). Index 0-3
+// are unused. See heapScatterAlpha for how it was obtained.
+var heapScatterCrit = [...]float64{
+	4: 22.342, 5: 26.005, 6: 11.139, 7: 7.737, 8: 6.220, 9: 6.547,
+	10: 5.663, 11: 5.171, 12: 4.807, 13: 4.893, 14: 4.614, 15: 4.451,
+	16: 4.279, 17: 4.336, 18: 4.205, 19: 4.101, 20: 3.999, 21: 4.036,
+	22: 3.943, 23: 3.883, 24: 3.822, 25: 3.857, 26: 3.812, 27: 3.759,
+	28: 3.719, 29: 3.737, 30: 3.699,
+}
+
+// scatterFloor is the smallest fitted rise that is significant against
+// the cell's trough scatter: c(n) x sigmaD / sqrt(Sxx) x span, where
+// sigmaD is trimmedDiffScale of the troughs. With fewer than 4 points,
+// or no spread in x, the scatter cannot be estimated and the floor is
+// +Inf (no verdict).
+func scatterFloor(pts []point) float64 {
 	n := len(pts)
-	if n < 3 {
+	if n < 4 {
 		return math.Inf(1)
 	}
-	var sx, sy float64
+	var sx float64
 	for _, p := range pts {
 		sx += p.x
-		sy += p.y
 	}
-	fn := float64(n)
-	mx, my := sx/fn, sy/fn
-	var sxx, sxy float64
+	mx := sx / float64(n)
+	var sxx float64
 	for _, p := range pts {
 		dx := p.x - mx
 		sxx += dx * dx
-		sxy += dx * (p.y - my)
 	}
 	if sxx == 0 {
 		return math.Inf(1)
 	}
-	b := sxy / sxx
-	var rss float64
-	for _, p := range pts {
-		r := p.y - my - b*(p.x-mx)
-		rss += r * r
+	c := heapScatterCrit[len(heapScatterCrit)-1]
+	if n < len(heapScatterCrit) {
+		c = heapScatterCrit[n]
 	}
-	se := math.Sqrt(rss / float64(n-2) / sxx)
-	span := pts[n-1].x - pts[0].x
-	return studentTQuantile(1-alpha, n-2) * se * span
+	return c * trimmedDiffScale(pts) / math.Sqrt(sxx) * (pts[n-1].x - pts[0].x)
 }
 
-// studentTQuantile returns the p-quantile (0.5 < p < 1) of Student's t
-// distribution with dof degrees of freedom. Values for dof up to
-// tQuantileCacheMax at heapScatterAlpha are tabulated once at start-up,
-// because the judge asks every second; any other (p, dof) is computed
-// by bisection on the exact CDF.
-func studentTQuantile(p float64, dof int) float64 {
-	if dof < 1 {
-		return math.Inf(1)
+// trimmedDiffScale estimates the sd of independent trough scatter from
+// the successive differences of the troughs: the differences are centred
+// at their median (a linear trend adds a constant to every one), squared,
+// the smallest scatterTrim of them kept, their mean divided by the
+// Gaussian consistency factor of that truncation, and the square root
+// divided by sqrt(2) (a difference of two independent troughs has twice
+// the variance).
+func trimmedDiffScale(pts []point) float64 {
+	d := make([]float64, 0, len(pts)-1)
+	for i := 1; i < len(pts); i++ {
+		d = append(d, pts[i].y-pts[i-1].y)
 	}
-	if p == 1-heapScatterAlpha && dof <= tQuantileCacheMax {
-		return scatterTCache[dof]
+	sorted := append([]float64(nil), d...)
+	m := medianOf(sorted)
+	sq := make([]float64, len(d))
+	for i, v := range d {
+		sq[i] = (v - m) * (v - m)
 	}
-	return studentTQuantileExact(p, dof)
+	sort.Float64s(sq)
+	k := int(math.Ceil(scatterTrim * float64(len(sq))))
+	var s float64
+	for _, v := range sq[:k] {
+		s += v
+	}
+	f := 1.0
+	if k < len(sq) {
+		p := float64(k) / float64(len(sq)) // realised retained fraction
+		z := math.Sqrt2 * math.Erfinv(p)
+		f = 1 - 2*z*math.Exp(-z*z/2)/math.Sqrt(2*math.Pi)/p
+	}
+	return math.Sqrt(s/float64(k)/f) / math.Sqrt2
 }
 
-const tQuantileCacheMax = 128
-
-var scatterTCache = func() [tQuantileCacheMax + 1]float64 {
-	var c [tQuantileCacheMax + 1]float64
-	for d := 1; d <= tQuantileCacheMax; d++ {
-		c[d] = studentTQuantileExact(1-heapScatterAlpha, d)
+// medianOf sorts v in place and returns its median.
+func medianOf(v []float64) float64 {
+	sort.Float64s(v)
+	if n := len(v); n%2 == 1 {
+		return v[n/2]
+	} else {
+		return (v[n/2-1] + v[n/2]) / 2
 	}
-	return c
-}()
-
-// studentTQuantileExact inverts studentTCDF by bisection. The upper
-// bracket 1e7 covers every p >= 0.5 + 1e-12 at dof >= 1 (the Cauchy
-// tail: t ~ 1/(pi (1-p))).
-func studentTQuantileExact(p float64, dof int) float64 {
-	lo, hi := 0.0, 1e7
-	for i := 0; i < 200; i++ {
-		mid := (lo + hi) / 2
-		if studentTCDF(mid, float64(dof)) < p {
-			lo = mid
-		} else {
-			hi = mid
-		}
-	}
-	return (lo + hi) / 2
-}
-
-// studentTCDF is P(T <= t) for Student's t with v degrees of freedom,
-// through the regularized incomplete beta function.
-func studentTCDF(t, v float64) float64 {
-	x := v / (v + t*t)
-	tail := 0.5 * regIncBeta(v/2, 0.5, x)
-	if t > 0 {
-		return 1 - tail
-	}
-	return tail
-}
-
-// regIncBeta is the regularized incomplete beta function I_x(a, b), by
-// the continued fraction of Numerical Recipes (betacf), evaluated on
-// whichever side of the symmetry point converges faster.
-func regIncBeta(a, b, x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	if x >= 1 {
-		return 1
-	}
-	lg := func(z float64) float64 { v, _ := math.Lgamma(z); return v }
-	bt := math.Exp(lg(a+b) - lg(a) - lg(b) + a*math.Log(x) + b*math.Log(1-x))
-	if x < (a+1)/(a+b+2) {
-		return bt * betaCF(a, b, x) / a
-	}
-	return 1 - bt*betaCF(b, a, 1-x)/b
-}
-
-func betaCF(a, b, x float64) float64 {
-	const tiny = 1e-30
-	qab, qap, qam := a+b, a+1, a-1
-	c := 1.0
-	d := 1 - qab*x/qap
-	if math.Abs(d) < tiny {
-		d = tiny
-	}
-	d = 1 / d
-	h := d
-	for m := 1; m <= 300; m++ {
-		fm := float64(m)
-		m2 := 2 * fm
-		aa := fm * (b - fm) * x / ((qam + m2) * (a + m2))
-		d = 1 + aa*d
-		if math.Abs(d) < tiny {
-			d = tiny
-		}
-		c = 1 + aa/c
-		if math.Abs(c) < tiny {
-			c = tiny
-		}
-		d = 1 / d
-		h *= d * c
-		aa = -(a + fm) * (qab + fm) * x / ((a + m2) * (qap + m2))
-		d = 1 + aa*d
-		if math.Abs(d) < tiny {
-			d = tiny
-		}
-		c = 1 + aa/c
-		if math.Abs(c) < tiny {
-			c = tiny
-		}
-		d = 1 / d
-		del := d * c
-		h *= del
-		if math.Abs(del-1) < 1e-14 {
-			break
-		}
-	}
-	return h
 }

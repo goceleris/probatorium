@@ -425,8 +425,9 @@ type slopeSpec struct {
 	relFloor float64 // fraction of the trough level
 	// scatterAlpha, when > 0, adds the trough-scatter floor (see
 	// heapScatterAlpha): the fitted rise must also be significant, at
-	// this one-sided level, against the window's own residual scatter.
-	// 0 leaves the floor as budget / level / sampling noise.
+	// this one-sided level, against the scatter of the window's troughs
+	// (estimated from their successive differences). 0 leaves the floor
+	// as budget / level / sampling noise.
 	scatterAlpha float64
 	// y projects a sample onto the judged series; keep filters it (nil
 	// keeps everything). Both take a pointer to avoid copying the
@@ -449,7 +450,7 @@ var skipWindow = fmt.Sprintf("slope window not judgeable yet (needs %s warm-up, 
 // so that (a) a single step smaller than the budgeted 10 min total,
 // (b) a step proportionate to the series' size, (c) the sampling
 // noise of a GC sawtooth at this heap size, and (d) where the spec
-// asks for it (I-MEM-1), a rise the window's own trough scatter can
+// asks for it (I-MEM-1), a rise the troughs' own scatter can
 // explain (heapScatterAlpha) can each not produce a verdict on their
 // own. The message carries every number so a triage can see which
 // floor was cleared and by how much.
@@ -482,7 +483,7 @@ func (sp slopeSpec) judge(ctx Context) (bool, string) {
 	floor := math.Max(floorBudget, math.Max(floorRel, floorNoise))
 	floorScat := 0.0
 	if sp.scatterAlpha > 0 {
-		floorScat = scatterFloor(pts, sp.scatterAlpha)
+		floorScat = scatterFloor(pts)
 		floor = math.Max(floor, floorScat)
 	}
 	if rise < floor {
@@ -490,7 +491,7 @@ func (sp slopeSpec) judge(ctx Context) (bool, string) {
 	}
 	scat := ""
 	if sp.scatterAlpha > 0 {
-		scat = fmt.Sprintf(", trough scatter (t test at %g, %d dof) %s", sp.scatterAlpha, len(pts)-2, sp.fmtV(floorScat))
+		scat = fmt.Sprintf(", trough scatter (slope test at %g, %d troughs) %s", sp.scatterAlpha, len(pts), sp.fmtV(floorScat))
 	}
 	return false, fmt.Sprintf(
 		"%s violated: %s trough slope %s/s exceeds %s/s budget; rise %s (fitted %s, trough-to-trough %s) over %s (%d troughs) clears the floor %s = max(budget x %s = %s, %.0f%% of level %s = %s, %gx sampling noise %s = %s%s); %s -> %s",
@@ -545,7 +546,7 @@ var rssSlopeSpec = slopeSpec{
 // pinned celeris) are EXPECTED true positives here, not noise.
 var IMEM1 = Spec{
 	ID: "I-MEM-1",
-	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level, %gx sampling noise, the rise the window's own trough scatter explains at t-test level %g)",
+	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level, %gx sampling noise, the rise the cell's trough scatter explains at slope-test level %g)",
 		fmtBytes(heapSlopeMaxBytesPerSec), slopeWarmup, fmtBytes(heapSlopeMaxBytesPerSec*slopeMinSpan.Seconds()), heapRiseRelFloor*100, slopeNoiseK, heapScatterAlpha),
 	Tier:           "core",
 	Persist:        slopePersistSamples,

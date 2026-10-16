@@ -206,31 +206,52 @@ func TestIMEM1_scatterTermLeavesQuietCellsAlone(t *testing.T) {
 	}
 }
 
-func TestStudentTQuantile_matchesReference(t *testing.T) {
-	// Reference values: R qt() / standard tables.
-	for _, c := range []struct {
-		p    float64
-		dof  int
-		want float64
-	}{
-		{0.975, 10, 2.2281388519649385},
-		{0.999, 2, 22.327124770119874},
-		{0.999, 5, 5.893429532},
-		{0.999, 12, 3.929633},
-		{0.99, 30, 2.457262},
-		{1 - heapScatterAlpha, 1, 318.308839},
-		{0.95, 1000, 1.646379},
-	} {
-		got := studentTQuantile(c.p, c.dof)
-		if math.Abs(got-c.want) > 1e-5*c.want {
-			t.Errorf("t(%v, %d) = %.9g, want %.9g", c.p, c.dof, got, c.want)
-		}
+// scatterPts builds trough points (150 s apart) from the given values.
+func scatterPts(y ...float64) []point {
+	pts := make([]point, len(y))
+	for i, v := range y {
+		pts[i] = point{x: float64(i * 150), y: v}
 	}
-	// the cached path agrees with the exact one at the registered level.
-	for d := 1; d <= tQuantileCacheMax; d++ {
-		if g, w := studentTQuantile(1-heapScatterAlpha, d), studentTQuantileExact(1-heapScatterAlpha, d); g != w {
-			t.Fatalf("dof %d: cache %v != exact %v", d, g, w)
-		}
+	return pts
+}
+
+// The scatter estimate comes from successive differences, so a linear
+// trend does not move it, one step moves it little, and (the point of
+// the estimator) a bend does not scale it with the span.
+func TestTrimmedDiffScale(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	noise := make([]float64, 40)
+	for i := range noise {
+		noise[i] = rng.NormFloat64() * 5e5
+	}
+	flat := trimmedDiffScale(scatterPts(noise...))
+	if flat < 3.5e5 || flat > 6.5e5 {
+		t.Errorf("sd 500 KB iid troughs: estimate %.0f KB, want near 500", flat/1e3)
+	}
+	// a linear trend of 9 KB/s (1.35 MB per trough) changes nothing: the differences all shift together.
+	trend := append([]float64(nil), noise...)
+	for i := range trend {
+		trend[i] += 9000 * 150 * float64(i)
+	}
+	if got := trimmedDiffScale(scatterPts(trend...)); math.Abs(got-flat) > 1e-6*flat {
+		t.Errorf("a linear trend moved the estimate: %.0f -> %.0f", flat, got)
+	}
+	// one 5 MB step in 40 troughs is a single outlying difference: dropped by the trim.
+	step := append([]float64(nil), noise...)
+	for i := 20; i < len(step); i++ {
+		step[i] += 5e6
+	}
+	if got := trimmedDiffScale(scatterPts(step...)); got > 1.1*flat {
+		t.Errorf("one 5 MB step inflated the estimate %.0f -> %.0f KB", flat/1e3, got/1e3)
+	}
+	// a bend: flat, then 6 KB/s for the last 15 troughs. The residual about a line grows with the span here;
+	// the difference estimate sees 15 differences shifted by 0.9 MB and must stay at the noise.
+	bend := append([]float64(nil), noise[:30]...)
+	for i := 15; i < 30; i++ {
+		bend[i] += 6144 * 150 * float64(i-15)
+	}
+	if got := trimmedDiffScale(scatterPts(bend...)); got > 2.2*flat {
+		t.Errorf("a late bend inflated the estimate %.0f -> %.0f KB (the residual approach read it as ~2 MB)", flat/1e3, got/1e3)
 	}
 }
 
@@ -246,24 +267,127 @@ func TestScatterFloor(t *testing.T) {
 		}
 		return pts
 	}
-	if f := scatterFloor(line(8, 3000, 0), 0.001); f > 1e-6 {
+	if f := scatterFloor(line(8, 3000, 0)); f > 1e-6 {
 		t.Errorf("an exact line has no scatter: floor %v, want 0", f)
 	}
-	if f := scatterFloor(line(2, 3000, 0), 0.001); !math.IsInf(f, 1) {
-		t.Errorf("2 troughs: floor %v, want +Inf", f)
+	if f := scatterFloor(line(3, 3000, 0)); !math.IsInf(f, 1) {
+		t.Errorf("3 troughs: floor %v, want +Inf", f)
 	}
-	// alternating +-: residual scatter grows with the noise, linearly.
-	a, b := scatterFloor(line(8, 0, 1e5), 0.001), scatterFloor(line(8, 0, 2e5), 0.001)
+	// alternating +-: the floor scales linearly with the scatter.
+	a, b := scatterFloor(line(8, 0, 1e5)), scatterFloor(line(8, 0, 2e5))
 	if a <= 0 || math.Abs(b/a-2) > 1e-9 {
 		t.Errorf("floor should scale with the scatter: %v then %v", a, b)
 	}
 	// a leak's slope does not enter the floor.
-	if x, y := scatterFloor(line(8, 0, 1e5), 0.001), scatterFloor(line(8, 9000, 1e5), 0.001); math.Abs(x-y) > 1e-6*x {
+	if x, y := scatterFloor(line(8, 0, 1e5)), scatterFloor(line(8, 9000, 1e5)); math.Abs(x-y) > 1e-6*x {
 		t.Errorf("slope changed the scatter floor: %v vs %v", x, y)
 	}
-	// fewer troughs, fewer degrees of freedom: a larger multiple of the same scatter.
-	if scatterFloor(line(5, 0, 1e5), 0.001)/scatterFloor(line(14, 0, 1e5), 0.001) < 1.5 {
-		t.Error("a 5-trough window must demand more than a 14-trough one at equal scatter")
+	// fewer troughs, a larger multiple of the same scatter.
+	if scatterFloor(line(6, 0, 1e5))/scatterFloor(line(14, 0, 1e5)) < 2 {
+		t.Error("a 6-trough window must demand more than a 14-trough one at equal scatter")
+	}
+}
+
+// The critical-value table is the 1 - alpha quantile of the statistic
+// for iid normal troughs: spot-check three entries by a small
+// simulation (the full table: scripts in the PR body).
+func TestScatterCritCalibration(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	for _, n := range []int{7, 10, 15} {
+		const draws = 60000
+		over := 0
+		pts := make([]point, n)
+		for k := 0; k < draws; k++ {
+			for i := range pts {
+				pts[i] = point{x: float64(i * 150), y: rng.NormFloat64()}
+			}
+			var sxx float64
+			mx := float64((n-1)*150) / 2
+			for _, p := range pts {
+				sxx += (p.x - mx) * (p.x - mx)
+			}
+			if slope(pts)*math.Sqrt(sxx)/trimmedDiffScale(pts) > heapScatterCrit[n] {
+				over++
+			}
+		}
+		// expected 60 exceedances at alpha 0.001; allow a wide band (binomial sd ~ 8).
+		if over < 25 || over > 110 {
+			t.Errorf("n=%d: %d of %d null windows exceed the critical value %.2f, want about %d", n, over, draws, heapScatterCrit[n], int(draws*heapScatterAlpha))
+		}
+	}
+}
+
+// scatterLeak builds a 1 Hz heap series on troughSeries' grid with a leak
+// added by leak(t), t seconds after the end of warm-up.
+func scatterLeak(rng *rand.Rand, secs int, sigma float64, leak func(t float64) float64) []int64 {
+	h := troughSeries(rng, secs, 20e6, sigma, 0)
+	grid0 := fixtureLoadOffset + 300
+	for i := grid0; i < len(h); i++ {
+		h[i] += int64(leak(float64(i - grid0)))
+	}
+	return h
+}
+
+func lateRamp(rate, onset float64) func(float64) float64 {
+	return func(t float64) float64 {
+		if t <= onset {
+			return 0
+		}
+		return rate * (t - onset)
+	}
+}
+
+func stairs(rate, period float64) func(float64) float64 {
+	return func(t float64) float64 { return rate * period * math.Floor(t/period) }
+}
+
+// A leak that starts late, on troughs that scatter by 0.6 MB, must be
+// called nearly as often as the rule without the scatter term calls it
+// (the first version of the term counted the bend as scatter and lost a
+// third of them). 6 KB/s from load+1500 s, 45 min cells.
+func TestIMEM1_scatterTermKeepsLateStartingLeaks(t *testing.T) {
+	off := withoutScatter()
+	var nNew, nOff int
+	for s := 0; s < 40; s++ {
+		rng := rand.New(rand.NewSource(int64(5000 + s)))
+		h := scatterLeak(rng, 2700, 0.6e6, lateRamp(6*1024, 1200))
+		if _, n := persistedAt(IMEM1, h, fixtureLoadOffset); n > 0 {
+			nNew++
+		}
+		if _, n := persistedAt(off, h, fixtureLoadOffset); n > 0 {
+			nOff++
+		}
+	}
+	t.Logf("late-start 6 KB/s on 0.6 MB scatter, 40 cells: %d called with the scatter term, %d without", nNew, nOff)
+	if nOff < 20 {
+		t.Fatalf("control: the rule without the term called only %d/40; the scenario is not a leak the old rule sees", nOff)
+	}
+	if float64(nNew) < 0.85*float64(nOff) {
+		t.Fatalf("scatter term called %d of the %d late-start leaks the old rule calls (want >= 85%%)", nNew, nOff)
+	}
+}
+
+// A leak that climbs in steps (2.7 MB every 15 min, 3 KB/s on average) on
+// a quiet cell must be called within a few minutes of the old rule.
+func TestIMEM1_scatterTermKeepsSteppedLeaksOnQuietCells(t *testing.T) {
+	off := withoutScatter()
+	var worst int
+	for s := 0; s < 20; s++ {
+		rng := rand.New(rand.NewSource(int64(9000 + s)))
+		h := scatterLeak(rng, 2700, 0.1e6, stairs(3*1024, 900))
+		fNew, nNew := persistedAt(IMEM1, h, fixtureLoadOffset)
+		fOld, nOld := persistedAt(off, h, fixtureLoadOffset)
+		if nOld == 0 {
+			t.Fatalf("seed %d: control: the old rule never called the stepped leak", s)
+		}
+		if nNew == 0 {
+			t.Fatalf("seed %d: the stepped leak on a quiet cell is not called with the scatter term", s)
+		}
+		worst = max(worst, fNew-fOld)
+	}
+	t.Logf("stepped 3 KB/s on a 0.1 MB cell: worst first-violation delay vs the old rule %d s", worst)
+	if worst > 600 {
+		t.Fatalf("worst delay %d s, want <= 600 s (10 min)", worst)
 	}
 }
 
