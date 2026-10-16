@@ -330,7 +330,11 @@ The three slope oracles share a false-positive guard:
 - A slope above budget counts only if the rise across the window also clears a floor, so one legitimate
   step (a cache filling once, a standby engine spinning up) cannot fire it. The floor is the larger of
   budget × 10 minutes, a fraction of the series' level (3 % heap, 5 % goroutines and RSS) and, for the
-  heap, 8× its sampling noise.
+  heap, 8× its sampling noise and the rise the window's own trough scatter can explain: the fitted slope
+  must be significant, one-sided at 0.001 with n − 2 degrees of freedom, against the residual scatter of
+  the window's troughs about their line. In a cell whose troughs scatter by 0.5-1.4 MB (observability)
+  that costs time, and leaks near 1-2 KB/s; where the troughs scatter little it is below the other terms
+  and changes nothing.
 - A verdict must persist for 150 consecutive evaluations before it is declared.
 
 These oracles need cells of 15 minutes or more. They judge in the weekend soak's cells (about 45 minutes
