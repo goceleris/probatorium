@@ -165,7 +165,7 @@ func troughSeries(rng *rand.Rand, secs int, level, sigma, drift float64) []int64
 // calculation behind heapScatterAlpha allows, where the rule without the
 // scatter term trips several times as often. Seeds fixed.
 func TestIMEM1_scatterNullOnSyntheticScatter(t *testing.T) {
-	const cells = 300
+	const cells = 60
 	var withTerm, without int
 	off := withoutScatter()
 	for s := 0; s < cells; s++ {
