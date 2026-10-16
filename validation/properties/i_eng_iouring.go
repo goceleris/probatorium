@@ -5,7 +5,7 @@ import "fmt"
 // IENGIOURing is the io_uring engine invariant: a ring's SQ tail never moves
 // backward — the PR #36 send-queue corruption bug class. Torn SQE writes are
 // not judged; nothing publishes them. The assertion lives in celeris itself:
-// under -tags=validation, validateSQEWrite (engine/iouring/validation_check.go,
+// under -tags=validation, validateSQEWrite (internal/engine/iouring/validation_check.go,
 // called from the ring's SQE getter in ring.go) increments
 // validation.IouringSQECorruptions whenever a ring's SQ tail moves backward.
 // The refapp publishes the counter on /debug/vars and

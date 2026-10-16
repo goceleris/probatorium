@@ -251,7 +251,7 @@ var celerisTestEnv = []string{
 	"CHAOS_P99_CEILING_MS",         // test/conformance/memcached/cluster_failover_test.go
 	"DEBUG_TOKEN",                  // middleware/debug/example_test.go
 	"DRAIN583_REPS",                // internal/sockopts/drain_recv_tcp_linux_test.go
-	"GOTEST_BACKPRESSURE",          // engine/epoll/backpressure_test.go: =1 runs a test skipped on CI as nondeterministic
+	"GOTEST_BACKPRESSURE",          // internal/engine/epoll/backpressure_test.go: =1 runs a test skipped on CI as nondeterministic
 	"PPROF_TOKEN",                  // middleware/pprof/example_test.go
 	"SOAK_CLIENTS",                 // middleware/websocket/soak_test.go
 	"SOAK_DURATION",                // middleware/websocket/soak_test.go
@@ -359,7 +359,7 @@ func planDispatch(in Inputs) (Plan, error) {
 	pkgs := strings.Fields(in.Packages)
 	switch {
 	case len(pkgs) == 0:
-		bad("packages: name at least one package, e.g. ./engine/iouring")
+		bad("packages: name at least one package, e.g. ./internal/engine/iouring (a ref from before celeris#443 runs it as ./engine/iouring)")
 	case len(pkgs) > maxPackages:
 		bad("packages: %d patterns, at most %d", len(pkgs), maxPackages)
 	}
@@ -908,7 +908,7 @@ const selfTestSHA = "9f4d89b171db7838dbcc3ece2107191bc15b25f8"
 
 // The celeris#656 tests need two io_uring workers. At an 8 MiB memlock
 // RLIMIT_MEMLOCK funds one, so they skip, and CELERIS_REQUIRE_IOURING_WORKERS=1
-// turns that skip into a failure (engine/iouring/init_failure_leak_linux_test.go).
+// turns that skip into a failure (internal/engine/iouring/init_failure_leak_linux_test.go).
 // That makes them a deterministic SKIP and a deterministic FAIL on any runner.
 var celeris656 = []string{
 	"TestListenClosesListenSocketsWhenEveryWorkerRingSetupFails",

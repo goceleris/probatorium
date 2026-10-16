@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/goceleris/celeris/engine"
+	"github.com/goceleris/celeris"
 )
 
 // engineMetricsKeyAliases names the EngineMetrics fields whose document
@@ -76,7 +76,7 @@ func TestDebugVarsPublishesEveryEngineMetricsField(t *testing.T) {
 		t.Fatal("celeris.engine absent: the whole EngineMetrics projection was skipped, so this test cannot judge it")
 	}
 
-	mt := reflect.TypeOf(engine.EngineMetrics{})
+	mt := reflect.TypeOf(celeris.EngineMetrics{})
 	// Neither list may name a field that no longer exists. A stale entry
 	// in either one is an excuse that outlived its field, and the alias
 	// case is the dangerous one: it would send the walk looking for a key
@@ -196,7 +196,7 @@ const engineKeysManifestHeader = `# Every engine.EngineMetrics scalar field the 
 // renderEngineKeysManifest walks engine.EngineMetrics and renders the
 // manifest: one line per published scalar field, sorted by key.
 func renderEngineKeysManifest() (text string, lines int) {
-	mt := reflect.TypeOf(engine.EngineMetrics{})
+	mt := reflect.TypeOf(celeris.EngineMetrics{})
 	var rows []string
 	for i := range mt.NumField() {
 		f := mt.Field(i)

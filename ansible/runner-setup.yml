@@ -7,7 +7,14 @@
 #
 # One thing persists by design: the version-keyed tool cache under
 # /tmp/celeris-runner-tarballs -- the runner tarball, uv, a python build,
-# the ansible venv and ansible.posix. Teardown leaves it; a reboot clears it.
+# the ansible venv and ansible.posix. Teardown leaves it. A reboot clears it,
+# and so does AGE: systemd-tmpfiles-clean runs daily with `q /tmp ... 10d`
+# (the stock /usr/lib/tmpfiles.d/tmp.conf) and deletes, file by file, whatever
+# nothing has read, written or changed for ten days -- including from the
+# middle of a tree that is otherwise in daily use. A python's stdlib sources,
+# which the interpreter stats but never reads once its bytecode exists, are the
+# first to go. Every cached unit is therefore trusted only after READING all of
+# it (see the ansible-core task), and an unreadable one is rebuilt from nothing.
 #
 # This playbook follows the cluster-pristine rule: the runner ships
 # its own runtime tarball + supervises itself with `nohup ./run.sh`
@@ -60,7 +67,19 @@
     # reusing a stale copy. All four pins were field-proven by the
     # 2026-09-15 14:29Z bootstrap on all three hosts.
     uv_version: "0.12.15"
-    python_version: "3.13"
+    # An exact patch release, not "3.13", AND the python-build-standalone
+    # release it is built from. A bare minor lets uv take whichever 3.13.x it
+    # knows, or reuse one already on disk. The patch alone still leaves the
+    # build to the uv pin: a later uv can map 3.13.15 to a rebuilt standalone
+    # release, and no cache key would change. So the installed tree's BUILD
+    # file (the release tag, written by uv) is compared with python_build
+    # right after the install, and a mismatch fails the bootstrap.
+    # uv 0.12.15 resolves 3.13.15 to release 20260901:
+    # https://releases.astral.sh/github/python-build-standalone/releases/
+    # download/20260901/cpython-3.13.15+20260901-<arch>-unknown-linux-gnu-
+    # install_only_stripped.tar.gz
+    python_version: "3.13.15"
+    python_build: "20260901"
     ansible_core_version: "2.21.4"
     ansible_posix_version: "2.2.2"
     tool_cache_dir: "{{ runner_cache_dir }}/tools"
@@ -289,19 +308,48 @@
       # mage Deploy / Validate / Soak shell out to ansible-playbook, and the
       # cluster hosts have no system ansible (the pristine rule forbids it).
       #
-      # The venv and ansible-core are ONE cached unit, trusted only when a
-      # completion stamp written after a verified install exists AND
-      # ansible-playbook actually runs and reports the pinned core. A presence
-      # check is not enough, twice over (probatorium#393 review):
+      # The cached unit is the venv AND the managed python it runs on: bin/python
+      # is a symlink into uv-python/, so a venv is only as intact as that tree.
+      # It is trusted only when ALL of these hold (probatorium#393 review, and
+      # the 2026-10-09 bootstrap failure below):
+      #  - a completion stamp, written last, exists and is READ;
+      #  - every file of the venv and of its python matches the sha256 recorded
+      #    when the install was verified (.celeris-manifest);
+      #  - ansible-playbook actually runs and reports the pinned core.
+      # A presence check is not enough, three times over:
       #  - Ansible's `creates:` checks with glob.glob, which counts a DANGLING
       #    bin/python symlink as present, so a venv whose interpreter was
       #    deleted would be skipped and fail later inside a job.
       #  - uv writes a wheel's entry-point scripts before its package data,
       #    metadata and RECORD, so bin/ansible-playbook can exist over an
       #    install the bootstrap timeout killed half way.
-      # The probe executes the interpreter and imports ansible, which neither a
-      # dangling link nor a partial install can pass, and the stamp is written
-      # last. A miss rebuilds the whole venv from scratch.
+      #  - systemd-tmpfiles ages /tmp (see the header): on 2026-10-09 the first
+      #    bootstrap after the 2026-10-06 outage found the managed python of
+      #    2026-09-26 with only the 184 bytecode files and 4 sources that the
+      #    last run had touched left of its ~4,500. uv treats an existing
+      #    cpython-3.13.15-* directory as installed, so every `uv venv` died with
+      #    "Python installation is missing a `_sysconfigdata_` file" (msa2) or
+      #    "Failed to import encodings module" (msr1), five times, on all three
+      #    hosts (celeris-stress run 37934646717). A probe that runs
+      #    ansible-playbook cannot see a hole in a file nothing imports.
+      #
+      # The hash check is also what keeps the cache alive. The kernel stamps a
+      # file's access time when it is read, so reading every file of the venv
+      # and its python on each run resets the age clock on all of them
+      # (ansible.posix survived for the same reason: `collection verify` reads
+      # every file). Neither a stat nor running the interpreter does, since
+      # Python loads bytecode and merely stats the source beside it. The stamp
+      # is read with cat for the same reason; `test -f` left it to be aged out
+      # ten days after it was written even on a host that ran every day.
+      #
+      # A miss rebuilds from nothing: the venv, the whole uv-python tree (an
+      # existing but damaged cpython directory, its minor-version symlink and
+      # uv's .temp included) and the uv cache, whose archive-v0 entries are
+      # hardlinks to inodes aged the same way and would put a venv with
+      # missing modules past an ansible-playbook probe. The python is the exact
+      # patch release and standalone build pinned above and is probed (it must
+      # import the modules a broken tree loses, report that version and carry
+      # that build) before a venv is built on it.
       #
       # --managed-python is what keeps that python inside the cache. Without it
       # uv prefers any matching python already on PATH over downloading into
@@ -309,19 +357,55 @@
       # that lives somewhere else entirely. An end-to-end run caught exactly
       # that: the venv linked to the test controller's python, and a fresh
       # container could not execute it. The cluster only escapes today because
-      # its system python is 3.14.
+      # its system python is 3.14. `python install --no-bin` keeps uv from
+      # also linking python executables into ~/.local/bin.
       ansible.builtin.shell: |
         set -e
+        venv="{{ ansible_venv_dir }}"
         stamp="{{ ansible_venv_dir }}/.celeris-installed"
-        if [ -f "$stamp" ] && "{{ ansible_venv_dir }}/bin/ansible-playbook" --version 2>/dev/null | head -1 | grep -qF "[core {{ ansible_core_version }}]"; then
+        manifest="{{ ansible_venv_dir }}/.celeris-manifest"
+        cache_ok() {
+          [ -s "$stamp" ] && [ -s "$manifest" ] || return 1
+          grep -qF "uv {{ uv_version }} " "$stamp" || return 1
+          sha256sum --check --quiet --strict "$manifest" > /dev/null 2>&1 || return 1
+          "$venv/bin/ansible-playbook" --version 2>/dev/null | head -1 | grep -qF "[core {{ ansible_core_version }}]"
+        }
+        if cache_ok; then
           echo "ansible-core {{ ansible_core_version }} already cached"
           exit 0
         fi
-        rm -rf "{{ ansible_venv_dir }}"
+        rm -rf "$venv" "{{ uv_python_install_dir }}" "{{ uv_cache_dir }}"
+        {{ uv_dir }}/uv python install --no-bin {{ python_version }}
+        managed="$({{ uv_dir }}/uv python find --managed-python {{ python_version }})"
+        "$managed" -I -c 'import encodings, sys, sysconfig, ssl, ctypes, sqlite3, venv, ensurepip; assert "%d.%d.%d" % sys.version_info[:3] == sys.argv[1], sys.version' {{ python_version }}
+        build="$(cat "$(dirname "$(dirname "$managed")")/BUILD")"
+        if [ "$build" != "{{ python_build }}" ]; then
+          echo "uv installed python-build-standalone release $build, not the pinned {{ python_build }}: bump python_build with uv_version, or pin uv" >&2
+          exit 1
+        fi
         {{ uv_dir }}/uv venv --clear --managed-python --python {{ python_version }} {{ ansible_venv_dir }}
         {{ uv_dir }}/uv pip install --python {{ ansible_venv_dir }}/bin/python --exclude-newer {{ ansible_deps_exclude_newer }} ansible-core=={{ ansible_core_version }}
-        "{{ ansible_venv_dir }}/bin/ansible-playbook" --version | head -1 | grep -qF "[core {{ ansible_core_version }}]"
-        touch "$stamp"
+        "$venv/bin/ansible-playbook" --version | head -1 | grep -qF "[core {{ ansible_core_version }}]"
+        # Record what a complete install holds. realpath: base_prefix is the
+        # minor-version symlink, and find lists only the link itself if it is
+        # not told to descend. The count guards that: a manifest of a few
+        # entries would verify nothing. A symlink to a directory (lib64) cannot
+        # be hashed, so only links to files are listed; a dangling one fails the
+        # hashing here, as it would fail the check later.
+        home="$("$venv/bin/python" -c 'import os, sys; print(os.path.realpath(sys.base_prefix))')"
+        # pipefail only around this pipeline: a find error (EACCES, a vanished
+        # directory) must not leave a truncated manifest that is then trusted.
+        set -o pipefail
+        find "$venv" "$home/" \( -type f -o -type l \) ! -xtype d ! -path '*/__pycache__/*' ! -name '.celeris-*' \
+          | LC_ALL=C sort | xargs -d '\n' sha256sum > "$manifest.new"
+        set +o pipefail
+        entries="$(wc -l < "$manifest.new")"
+        if [ "$entries" -lt 1000 ]; then
+          echo "manifest of $venv and $home has only $entries entries: refusing to trust it" >&2
+          exit 1
+        fi
+        mv "$manifest.new" "$manifest"
+        echo "ansible-core {{ ansible_core_version }} python {{ python_version }} uv {{ uv_version }} $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$stamp"
       args:
         executable: /bin/bash
       environment:
@@ -359,7 +443,8 @@
         - name: Check the cached ansible.posix is complete and the pinned version
           ansible.builtin.shell: |
             set -e
-            test -f "{{ ansible_collections_dir }}/.celeris-installed-posix{{ ansible_posix_version }}"
+            # cat, not test -f: only a read resets the age of the stamp (see the ansible-core task).
+            cat "{{ ansible_collections_dir }}/.celeris-installed-posix{{ ansible_posix_version }}" > /dev/null
             # verify --offline hashes every file but not MANIFEST.json itself, so a
             # manifest whose version was altered passes it (measured end to end).
             "{{ ansible_venv_dir }}/bin/python" -c 'import json, sys; sys.exit(json.load(open(sys.argv[1]))["collection_info"]["version"] != sys.argv[2])' \

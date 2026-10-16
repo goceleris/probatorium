@@ -157,14 +157,32 @@ on every run made each tier depend on four internet services at once
   bump in `runner-setup.yml` installs fresh instead of reusing a stale copy.
   Old versions stay until a reboot; they are small (tens of MB each).
 - **Trusted only when verified, never on presence.** uv must report its
-  pinned version. The venv needs a completion stamp *and* a working
+  pinned version. The venv needs a completion stamp, every file of the venv
+  *and of the managed python under it* matching the sha256 recorded when it
+  was installed (`.celeris-manifest`), *and* a working
   `ansible-playbook --version` naming the pinned core. `ansible.posix` needs
   a completion stamp *and* `ansible-galaxy collection verify --offline`. Any
-  miss discards that tool and reinstalls it.
+  miss discards that tool and reinstalls it; for the venv that means the
+  venv, all of `uv-python/` and `uv-cache/` together, from an exact python
+  patch release (`python_version`, e.g. `3.13.15`), never a partial repair.
 - **Reached through symlinks.** Six cluster workflows hardcode
   `/tmp/actions-runner-<host>/ansible-venv` and `.../ansible-collections`;
   the bootstrap recreates those as links into the cache on every run.
   Teardown removes the links and leaves the cache.
-- **Cleared by a reboot**, because `/tmp` is RAM-backed on these hosts. To
-  purge it by hand, run `rm -rf /tmp/celeris-runner-tarballs` on each host
+- **Cleared by a reboot**, because `/tmp` is RAM-backed on these hosts.
+- **Eaten by age, file by file.** `systemd-tmpfiles-clean` runs daily with the
+  stock `q /tmp 1777 root root 10d` and deletes every file nothing has read,
+  written or changed for ten days, from the middle of a tree that is otherwise
+  in use. A python's stdlib sources are the first to go: the interpreter
+  stats a source file but reads only its bytecode. On 2026-10-09 that left the
+  managed python of 2026-09-26 with 188 of its ~4,500 files and failed the
+  first bootstrap after the 2026-10-06 outage on all three hosts
+  (`Python installation is missing a _sysconfigdata_ file`; celeris-stress run
+  37934646717). The bootstrap therefore *reads* every cached file it relies on
+  each run (the sha256 check above, `collection verify`, `cat` of the stamps,
+  executing uv), which resets their age, and rebuilds from nothing when it
+  finds a hole, so a host that sat idle for ten days costs one cold bootstrap
+  instead of a failed run. A cache older than that on a host nobody ran is
+  expected to be rebuilt, not trusted.
+- To purge it by hand, run `rm -rf /tmp/celeris-runner-tarballs` on each host
   while no cluster run is in progress; the next bootstrap repopulates it.

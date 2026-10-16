@@ -250,7 +250,7 @@ var Registry = map[string]Adapter{
 	// processes — a flow-control artifact, not merit. To keep the matrix a
 	// fair fight we equalize the advertised per-stream window to celeris's
 	// profile (1 MiB initial window + 100 max concurrent streams; see
-	// celeris resource/config.go, which also notes 1 MiB matches
+	// celeris internal/resource/config.go, which also notes 1 MiB matches
 	// golang.org/x/net/http2 and fasthttp2):
 	//   - Go columns (gin/echo/chi/iris/hertz/stdhttp) and the Rust
 	//     hyper-based columns (axum/hyper) already advertise a 1 MiB window
