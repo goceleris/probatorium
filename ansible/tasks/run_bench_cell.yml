@@ -454,6 +454,39 @@
     - inventory_hostname == bench_target
     - cell_bound | bool
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | start kernel-counter sampler (server side, 1037 A/B)"
+  # Read-only. For the p99 A/B of celeris#1037: per-CPU softirq counters
+  # (NET_RX, NET_TX) every 5 s and the full /proc/interrupts every 30 s,
+  # with epoch seconds, so the column-wide logs can be sliced per scenario
+  # like cpu.log. Also once at cell start: the NIC irq affinities, the bond
+  # and port carrier_changes, and every SUT thread with its allowed CPUs
+  # and the CPU it last ran on. Written next to cpu.log; it dies with the
+  # guard timeout like the mpstat sampler and is killed by the stop task.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    pid=$(cat $d/server.pid 2>/dev/null)
+    {
+      echo "== carrier_changes"; grep -H . /sys/class/net/*/carrier_changes 2>/dev/null
+      echo "== bond0"; head -40 /proc/net/bonding/bond0 2>/dev/null
+      echo "== irq smp_affinity_list"; grep -H . /proc/irq/*/smp_affinity_list 2>/dev/null
+    } > $d/host-net.pre 2>&1
+    if [ -n "$pid" ]; then
+      for t in /proc/$pid/task/*; do
+        echo "$(basename $t) $(awk "/Cpus_allowed_list/{print \$2}" $t/status 2>/dev/null) psr=$(awk "{print \$39}" $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
+      done > $d/sut-threads.pre 2>&1
+    fi
+    nohup bash -c "end=\$((\$(date +%s) + {{ cell_guard_seconds }})); n=0; while [ \$(date +%s) -lt \$end ]; do echo \"== \$(date +%s.%N)\"; grep -E \"CPU|NET_RX|NET_TX\" /proc/softirqs; if [ \$((n % 6)) -eq 0 ]; then echo \"== interrupts\"; cat /proc/interrupts; fi; n=\$((n+1)); sleep 5; done" \
+      > $d/kcounters.log 2>&1 &
+    disown
+    echo $! > $d/kcounters.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start observer sampler (server side)"
   # The observer sidecars the server during the cell and emits a 1Hz
   # SQLite time series of FD count, RSS, goroutine count, GC pause,
@@ -646,6 +679,26 @@
   args:
     executable: /bin/bash
   changed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop kernel-counter sampler (server side, 1037 A/B)"
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    if [ -f $d/kcounters.pid ]; then
+      kill -TERM "$(cat $d/kcounters.pid)" 2>/dev/null
+    fi
+    pid=$(cat $d/server.pid 2>/dev/null)
+    if [ -n "$pid" ]; then
+      for t in /proc/$pid/task/*; do
+        echo "$(basename $t) $(awk "/Cpus_allowed_list/{print \$2}" $t/status 2>/dev/null) psr=$(awk "{print \$39}" $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
+      done > $d/sut-threads.post 2>&1
+    fi
+    { echo "== carrier_changes"; grep -H . /sys/class/net/*/carrier_changes 2>/dev/null; } > $d/host-net.post 2>&1
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
   when: inventory_hostname == bench_target
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (server side)"
