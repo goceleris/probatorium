@@ -330,11 +330,14 @@ The three slope oracles share a false-positive guard:
 - A slope above budget counts only if the rise across the window also clears a floor, so one legitimate
   step (a cache filling once, a standby engine spinning up) cannot fire it. The floor is the larger of
   budget × 10 minutes, a fraction of the series' level (3 % heap, 5 % goroutines and RSS) and, for the
-  heap, 8× its sampling noise and the rise the window's own trough scatter can explain: the fitted slope
-  must be significant, one-sided at 0.001 with n − 2 degrees of freedom, against the residual scatter of
-  the window's troughs about their line. In a cell whose troughs scatter by 0.5-1.4 MB (observability)
-  that costs time, and leaks near 1-2 KB/s; where the troughs scatter little it is below the other terms
-  and changes nothing.
+  heap, 8× its sampling noise and the rise the cell's own trough scatter can explain: the fitted slope
+  must be significant (one-sided 0.001, a critical value per trough count) against the scatter of the
+  window's troughs, estimated from their successive differences. That is not free. Measured on the
+  weekend soaks' cells (45 min), against the rule without this term: in the noisy observability cells
+  (trough sd 0.34-1.4 MB) a 3 KB/s leak is called about 11 minutes later and a 1 KB/s leak in 9 of 25
+  cells instead of 24, and a leak that starts late (after 25 min) is called in fewer of them; in the
+  quiet cells a 3 KB/s leak is called about 3.7 minutes later, and the windows of 5 to 8 troughs judge
+  only a leak that is large against the scatter.
 - A verdict must persist for 150 consecutive evaluations before it is declared.
 
 These oracles need cells of 15 minutes or more. They judge in the weekend soak's cells (about 45 minutes

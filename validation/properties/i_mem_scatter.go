@@ -25,19 +25,20 @@ import (
 // It is a floor inside the existing max(), so it can only remove
 // violations.
 //
-// What it costs, so nobody reads it as free:
-//   - In a cell whose troughs scatter by hundreds of KB it holds back
-//     the verdict on a leak the scatter could explain: a 1-2 KB/s leak
-//     is called later or not at all there, and a 3-6 KB/s leak is called
-//     minutes later.
-//   - Windows of 5-8 troughs need a leak large against the scatter
-//     (heapScatterCrit is 26 at 5 troughs, 11 at 6, 7.7 at 7), because
-//     the estimator is robust and so inefficient. In a cell that
-//     scatters little the other floors still bind, but a leak is called
-//     a trough or two later than without the term.
-//   - A leak that starts late or climbs in steps is called later than a
-//     straight one (it is the estimator's job to keep that to a few
-//     minutes, not to remove it).
+// What it costs, so nobody reads it as free (45 minute cells of the weekend
+// soaks, against the rule without the term; probatorium PR, lane IMEM1):
+//   - In the noisy cells (trough sd 0.34-1.4 MB, the observability cells)
+//     a 3 KB/s leak from the end of warm-up is called about 11 minutes
+//     later (median 17.5 -> 28.7 min), a 2 KB/s leak in 24 of 25 cells
+//     (25 before), a 1 KB/s leak in 9 (24 before), and a leak that starts
+//     at minute 25 in fewer of them (3 KB/s: 12 of 21 that were called
+//     before).
+//   - In the quiet cells a 3 KB/s leak is called about 3.7 minutes later
+//     (median 17.5 -> 21.2 min), because windows of 5-8 troughs need a
+//     leak large against the scatter (heapScatterCrit is 26 at 5 troughs,
+//     11 at 6, 7.7 at 7; the estimator is robust and so inefficient).
+//   - A leak that climbs in steps every 15 or 30 minutes is called as
+//     early as without the term on the quiet cells.
 //
 // The scatter estimate sigmaD comes from successive trough differences,
 // not from the residuals about the fitted line. A residual grows with
