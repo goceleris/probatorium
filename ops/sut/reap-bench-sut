@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# reap-bench-sut -- stop leftover bench SUT processes by IDENTITY.
+#
+# WHY. The generic stop task finds the SUT supervisor through a pid file under
+# bench_root and the SUT through argv text ("competitors/") or the bench port.
+# After a cancelled bench all three can be gone at once: the cancelled bench
+# 37226284351 left a supervisor and a gin SUT on msa2-server with
+# /tmp/celeris-bench (and its .sut-supervisor.pid) deleted. A process is
+# matched here by what survives that:
+#
+#   1. its ENVIRONMENT carries PROBATORIUM_SUT_RUN (any value). The bench
+#      launch (ansible/tasks/run_bench_cell.yml) sets it, to the CI run id, on
+#      the supervisor and so on every SUT it spawns. It outlives the directory,
+#      the pid file, the SUT's argv and its listening port.
+#   2. its working directory or executable is under BENCH_ROOT, "(deleted)" or
+#      not. This is what finds a SUT started by a harness version that did not
+#      set the tag yet, such as the one that is orphaned today.
+#
+# REAP_MATCH=any (default) uses both handles. REAP_MATCH=tag uses only the run
+# tag: the per-cell stop runs MID-BENCH on the SUT host, where anything that
+# merely sits in bench_root (a helper, a fixture) must not be touched, so it
+# asks for tag only. cleanup.yml and stop-sut.yml run when everything should die.
+#
+# WHAT IT DOES. REAP_MODE=reap (default) freezes every match with SIGSTOP
+# first, so a respawn supervisor cannot relaunch the SUT between kills, then
+# SIGKILLs it, and repeats until nothing matches. REAP_MODE=list prints the
+# matches and signals nothing. Its own ancestors are never touched. It prints
+# one `reap:` line per process, and ends with `reap: stopped N process(es)`.
+# Exit 0 normally, 3 if something survived SIGKILL.
+#
+# Run as root (ansible `become`): /proc/<pid>/environ is unreadable for other
+# users' processes otherwise, and the SUT is launched under root.
+#
+# Used by the per-cell stop (run_bench_cell.yml), cleanup.yml, and the
+# teardown job's cancel-path step (ansible/stop-sut.yml). It is NOT part of the
+# pre-tier host gate, which only reports (hostgate/collect.sh).
+set -u
+LC_ALL=C
+export LC_ALL
+
+bench_root=${BENCH_ROOT:-/tmp/celeris-bench}
+mode=${REAP_MODE:-reap}
+match=${REAP_MATCH:-any}
+tag_var=PROBATORIUM_SUT_RUN
+
+case "$mode" in reap | list) ;; *)
+	echo "reap: REAP_MODE must be reap or list, got $mode" >&2
+	exit 2
+	;;
+esac
+
+case "$match" in any | tag) ;; *)
+	echo "reap: REAP_MATCH must be any or tag, got $match" >&2
+	exit 2
+	;;
+esac
+
+# Own ancestors, from our pid up: the shell ansible used, sshd, the test that
+# launched us. They may well have their cwd in the bench root.
+declare -A protect=()
+p=$$
+while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do
+	protect[$p]=1
+	line=$(cat "/proc/$p/stat" 2>/dev/null) || break
+	rest=${line##*) }
+	# shellcheck disable=SC2086
+	set -- $rest
+	p=${2:-}
+done
+
+under_root() { # $1 path as printed by readlink
+	local x=${1% (deleted)}
+	[ -n "$x" ] && { [ "$x" = "$bench_root" ] || [ "${x#"$bench_root"/}" != "$x" ]; }
+}
+
+# why PID -> prints the reason, returns 0 when the process is ours to reap
+why() {
+	local d=/proc/$1 v cwd exe
+	if v=$(tr '\0' '\n' <"$d/environ" 2>/dev/null | grep -m1 "^${tag_var}="); then
+		echo "tag run=${v#*=}"
+		return 0
+	fi
+	[ "$match" = tag ] && return 1
+	cwd=$(readlink "$d/cwd" 2>/dev/null) || cwd=
+	if under_root "$cwd"; then
+		echo "cwd ${cwd}"
+		return 0
+	fi
+	exe=$(readlink "$d/exe" 2>/dev/null) || exe=
+	if under_root "$exe"; then
+		echo "exe ${exe}"
+		return 0
+	fi
+	return 1
+}
+
+matches=()
+scan() {
+	matches=()
+	local d pid
+	for d in /proc/[0-9]*; do
+		pid=${d#/proc/}
+		[ -n "${protect[$pid]:-}" ] && continue
+		[ -d "$d" ] || continue
+		if r=$(why "$pid"); then
+			matches+=("$pid|$r")
+		fi
+	done
+}
+
+describe() { # pid reason
+	local pid=$1 r=$2 comm ppid cwd exe line rest
+	comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')
+	line=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+	rest=${line##*) }
+	# shellcheck disable=SC2086
+	set -- $rest
+	ppid=${2:-?}
+	cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo '?')
+	exe=$(readlink "/proc/$pid/exe" 2>/dev/null || echo '?')
+	echo "reap: pid=$pid ppid=$ppid comm=$comm why=[$r] cwd=$cwd exe=$exe"
+}
+
+scan
+if [ "$mode" = list ]; then
+	for m in "${matches[@]}"; do describe "${m%%|*}" "${m#*|}"; done
+	echo "reap: would stop ${#matches[@]} process(es)"
+	exit 0
+fi
+
+stopped=0
+declare -A seen=()
+pass=0
+while [ "${#matches[@]}" -gt 0 ] && [ "$pass" -lt 10 ]; do
+	pass=$((pass + 1))
+	for m in "${matches[@]}"; do
+		pid=${m%%|*}
+		kill -STOP "$pid" 2>/dev/null || true
+	done
+	for m in "${matches[@]}"; do
+		pid=${m%%|*}
+		if [ -z "${seen[$pid]:-}" ]; then
+			seen[$pid]=1
+			stopped=$((stopped + 1))
+			describe "$pid" "${m#*|}"
+		fi
+		kill -KILL "$pid" 2>/dev/null || true
+	done
+	sleep 0.2
+	scan
+done
+
+if [ "${#matches[@]}" -gt 0 ]; then
+	left=""
+	for m in "${matches[@]}"; do left="$left ${m%%|*}"; done
+	echo "reap: stopped $stopped process(es); STILL ALIVE after SIGKILL:$left" >&2
+	exit 3
+fi
+echo "reap: stopped $stopped process(es)"
+exit 0

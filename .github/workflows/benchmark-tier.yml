@@ -260,6 +260,17 @@ jobs:
           fi
           echo "docs publish token present — preflight OK"
 
+      - name: mage HostGate (pre-tier host gate, read-only, fails fast on a leftover)
+        # probatorium#473: before ANYTHING of this tier is started, assert that
+        # every host it will use is clean: no listener on the SUT / debug /
+        # fixture ports, no process from a previous run (a harness binary, a
+        # /tmp/celeris-* directory, a binary deleted from /tmp), idle IO
+        # pressure below the threshold. It only REPORTS: it never kills what it
+        # finds (the msr1 rvtest was an agent smoke test nobody had asked
+        # about). It has to precede mage Deploy, or the tier's own
+        # fixtures would be reported as leftovers. See README.md, "Host gate".
+        run: mage HostGate
+
       - name: mage Deploy (competitors + db services for the profile)
         env:
           # DEPLOY_COMPETITORS is set at the job level (above) so the BenchTier

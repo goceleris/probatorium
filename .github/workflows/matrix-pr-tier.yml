@@ -72,11 +72,14 @@ on:
       - 'mage_*.go'
       - 'magefile.go'
       - 'ansible/**'
+      - 'hostgate/**'
+      - 'ops/sut/**'
       - 'go.mod'
       - 'go.sum'
       - '.github/workflows/matrix-pr-tier.yml'
       - '.github/actions/cluster-runner-up/**'
       - '.github/actions/cluster-runner-down/**'
+      - '.github/scripts/cluster-*.sh'
   workflow_dispatch:
     inputs:
       duration:
@@ -245,6 +248,19 @@ jobs:
           # looks dead. See the script header.
           bash .github/scripts/refresh-cluster-known-hosts.sh \
             ansible/inventory.yml "${RUNNER_ROOT}/.ssh/known_hosts"
+
+      - name: mage HostGate (pre-tier host gate, read-only, fails fast on a leftover)
+        # probatorium#473: before ANYTHING of this tier is started, assert that
+        # every host it will use is clean: no listener on the SUT / debug /
+        # fixture ports, no process from a previous run (a harness binary, a
+        # /tmp/celeris-* directory, a binary deleted from /tmp), idle IO
+        # pressure below the threshold. It only REPORTS: it never kills what it
+        # finds (the msr1 rvtest was an agent smoke test nobody had asked
+        # about). It has to precede mage Deploy, or the tier's own
+        # fixtures would be reported as leftovers. See README.md, "Host gate".
+        env:
+          HOSTGATE_TARGET: msa2-server
+        run: mage HostGate
 
       - name: mage Deploy (stage refapps + validator)
         env:
