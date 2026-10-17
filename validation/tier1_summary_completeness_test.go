@@ -119,6 +119,7 @@ var tallyTier1Renames = map[string]string{
 	"violation_ids":  "property_violation_ids",
 	"poll_errors":    "property_poll_errors",
 	"skipped_reason": "property_loop_skipped",
+	"informational":  "property_informational",
 }
 
 // tallyNotInTier1Summary names the checker.Tally fields deliberately NOT
@@ -181,6 +182,11 @@ func TestTier1SummaryCarriesEveryPropertyTallyField(t *testing.T) {
 				fv.Set(reflect.ValueOf(map[string]int64{tag: n}))
 			case reflect.String:
 				fv.Set(reflect.ValueOf(map[string]string{tag: tag}))
+			case reflect.Struct:
+				// the informational twins (schema 5.20)
+				fv.Set(reflect.ValueOf(map[string]checker.ShadowTally{tag: {
+					Label: tag, Violations: n, AbsolvedEvaluations: n + 1, Absolved: true, FirstMessage: tag,
+				}}))
 			default:
 				t.Fatalf("Tally.%s is a %s; teach this guard its shape rather than skip it", f.Name, f.Type)
 			}
@@ -221,6 +227,15 @@ func TestTier1SummaryCarriesEveryPropertyTallyField(t *testing.T) {
 		}
 		want, err := json.Marshal(fv.Interface())
 		if err != nil {
+			t.Fatal(err)
+		}
+		// compare as decoded documents: a struct-valued map marshals its
+		// fields in declaration order, the decoded projection sorted.
+		var wantAny any
+		if err := json.Unmarshal(want, &wantAny); err != nil {
+			t.Fatal(err)
+		}
+		if want, err = json.Marshal(wantAny); err != nil {
 			t.Fatal(err)
 		}
 		gotRaw, err := json.Marshal(got)

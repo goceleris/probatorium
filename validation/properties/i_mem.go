@@ -523,6 +523,19 @@ var heapSlopeSpec = slopeSpec{
 	y: func(s *Snapshot) float64 { return float64(s.HeapInuseBytes) }, fmtV: fmtBytes,
 }
 
+// legacyHeapSlopeSpec is I-MEM-1 as it was before the scatter floor
+// (heapScatterAlpha): the same spec with the term switched off, so the
+// informational twin of I-MEM-1 runs through the very same judge and
+// cannot drift from it.
+var legacyHeapSlopeSpec = func() slopeSpec {
+	sp := heapSlopeSpec
+	sp.scatterAlpha = 0
+	return sp
+}()
+
+// IMEM1ShadowLabel names the rule IMEM1's Shadow runs.
+const IMEM1ShadowLabel = "I-MEM-1 (pre-scatter-floor rule, informational)"
+
 var goroutineSlopeSpec = slopeSpec{
 	id: "I-MEM-3", what: "goroutine count", window: goroutineSlopeWindow,
 	budget: goroutineSlopeMaxPerSec, relFloor: goroutineRiseRelFloor,
@@ -552,6 +565,13 @@ var IMEM1 = Spec{
 	Persist:        slopePersistSamples,
 	MinObservation: slopeMinObservation,
 	Predicate:      func(_ *Snapshot, ctx Context) (bool, string) { return heapSlopeSpec.judge(ctx) },
+	// The rule before the scatter floor, recorded and never gated: the
+	// floor absolves rises the cell's own trough scatter can explain, and
+	// a human reading a soak should see every one it absolved.
+	Shadow: &Shadow{
+		Label:     IMEM1ShadowLabel,
+		Predicate: func(_ *Snapshot, ctx Context) (bool, string) { return legacyHeapSlopeSpec.judge(ctx) },
+	},
 }
 
 // IMEM3 asserts the goroutine count trough slope is bounded over the

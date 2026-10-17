@@ -361,6 +361,14 @@ The three slope oracles share a false-positive guard:
     troughs. With the load phase cut to 20 minutes the quiet cells lose 99 of 162 at 3 KB/s, 75 at
     5 KB/s and 32 at 10 KB/s (noisy cells 22-25 of 25); at 25 minutes none are lost.
   - Windows of 5-8 troughs judge only a leak that is large against the scatter.
+  - Nothing the floor absolves is hidden. The validator runs I-MEM-1 as it was before the floor
+    beside the gated rule, on the same series, and records it per cell as `property_informational`
+    (schema 5.20) with its violation count, the evaluations the gated rule absolved and a flag for a
+    cell it absolved entirely. `mage ValidateGate` prints it on every run under "informational, NOT
+    gating (the pre-scatter-floor rule of I-MEM-1 ...)". The gate never reads it: the verdict is the
+    gated rule's alone. A reader of a soak sees every trip the floor absolved and can judge it.
+  - The maintainer accepted these costs on 2026-10-17 after five pre-registered attempts (probatorium#520;
+    the two later estimators that did not work, and why, are in its description).
 - A verdict must persist for 150 consecutive evaluations before it is declared.
 
 These oracles need cells of 15 minutes or more to judge at all, and I-MEM-1 needs about 25 minutes of

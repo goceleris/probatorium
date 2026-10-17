@@ -60,6 +60,14 @@ import (
 //   - Windows of 5-8 troughs judge only a leak that is large against the
 //     scatter (heapScatterCrit is 26 at 5 troughs, 11 at 6, 7.7 at 7).
 //
+// Nothing the floor absolves is hidden: IMEM1.Shadow runs the same judge with
+// the floor switched off (legacyHeapSlopeSpec) beside the gated rule, the
+// evaluator records it as an informational twin that is never gated, and
+// ValidateGate prints every cell where it tripped. The maintainer accepted
+// the costs above on 2026-10-17 after five pre-registered attempts (the
+// residual scatter, the successive differences, the half-bucket pairs, a
+// noisy-cell switch; probatorium#520 says why the last two did not work).
+//
 // The scatter estimate sigmaD comes from successive trough differences,
 // not from the residuals about the fitted line. A residual grows with
 // the span whenever the series bends, so a leak that starts late, or

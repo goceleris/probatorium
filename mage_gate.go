@@ -189,6 +189,9 @@ func ValidateGate() error {
 		len(cells), len(paths), opts.ExpectedCells, opts.RequireTier3, opts.RequireSoak, opts.RequireProperties, propertyAware, opts.RequireCoverage, coverageAware, upgradeRefapps, cellSoaks, len(soaks), propEvals, propViol)
 	printCoverage(report.Coverage(cells), coverageAware)
 	printInstrumentationCoverage(cells)
+	for _, l := range report.InformationalLines(cells) {
+		fmt.Println(l)
+	}
 	viol := report.Gate(cells, soaks, opts)
 	if len(viol) == 0 {
 		fmt.Println("ValidateGate: PASS -- every gated signal is zero in every cell.")
