@@ -666,7 +666,7 @@
     d={{ cell_dir }}
     cat > $d/stallcap.sh <<'EOSTALL'
     #!/bin/bash
-    # stallcap.sh ROLE DIR PORT WARM DUR GUARD TARGET_IP
+    # stallcap.sh ROLE DIR PORT WARM DUR GUARD TARGET_IP   (v2, after the X1 read)
     # Read-only captures for the 200 ms stall investigation (celeris#1036). ROLE is sut or lg.
     # Everything is bounded by GUARD seconds. Files go into DIR; the loadgen role adds the suffix .loadgen.
     role=$1; d=$2; port=$3; warm=$4; dur=$5; guard=$6; tip=$7
@@ -676,14 +676,16 @@
     now_us() { local t=${EPOCHREALTIME/./}; echo "$t"; }
     wait_until() { local t=$1 n; n=$(now_us); [ "$t" -gt "$n" ] || return 0; local dl=$((t - n)); sleep "$((dl / 1000000)).$(printf %06d $((dl % 1000000)))"; }
     endsec=$(( ${EPOCHREALTIME%.*} + guard ))
-    nics=""
+    nics=""; capnic=""
     if [ "$role" = sut ]; then
       nics="$(cat /sys/class/net/bond0/bonding/slaves 2>/dev/null)"
       [ -n "$nics" ] || nics="$(for n in /sys/class/net/*; do [ -e $n/device ] && basename $n; done)"
       nics="${STALL_NICS:-$nics}"   # test override only
+      capnic="${STALL_CAPNIC:-enp1s0}"
+      case " $nics " in *" $capnic "*) ;; *) capnic=$(echo $nics | cut -d" " -f1);; esac
     fi
     echo "$$" > stallcap$sfx.pid
-    echo "role=$role port=$port warm=$warm dur=$dur guard=$guard nics=$nics" > stallcap$sfx.meta
+    echo "v2 role=$role port=$port warm=$warm dur=$dur guard=$guard nics=$nics capnic=$capnic" > stallcap$sfx.meta
 
     # awk: one line per connection from ss -tinoH (two physical lines per socket)
     cat > ssc$sfx.awk <<"EOA"
@@ -702,28 +704,134 @@
     { rq = $1; sq = $2; loc = $3; peer = $4; timer = "timer:-"; for (i = 5; i <= NF; i++) if ($i ~ /^timer:/) timer = $i }
     EOA
 
-    # 20 Hz per-port packet counters and BQL (sut only), pure bash builtins
+    # 20 Hz sampler (sut only): a deadline-scheduled python helper; the old bash loop is the fallback when python3 is missing
     if [ "$role" = sut ]; then
-      ( while [ "${EPOCHREALTIME%.*}" -lt "$endsec" ]; do
-          line="$EPOCHREALTIME"
-          for n in $nics bond0; do
-            s=/sys/class/net/$n/statistics; q=/sys/class/net/$n/queues/tx-0/byte_queue_limits
-            tp=-; tb=-; rp=-; bi=-; bl=-
-            { read -r tp < $s/tx_packets; read -r tb < $s/tx_bytes; read -r rp < $s/rx_packets; } 2>/dev/null
-            { read -r bi < $q/inflight; read -r bl < $q/limit; } 2>/dev/null
-            line="$line $n $tp $tb $rp $bi $bl"
-          done
-          echo "$line" >> txprog.log
-          sleep 0.05
-        done ) &
+      if command -v python3 >/dev/null 2>&1; then
+        cat > sampler20.py <<"EOP"
+    #!/usr/bin/env python3
+    # sampler20.py DIR GUARD_SECONDS "NIC1 NIC2" [HZ]
+    # 20 Hz read-only sampler for the stall investigation (SUT only). Deadline-scheduled on CLOCK_MONOTONIC (no drift from the work of a tick),
+    # runs at nice -10 when started by root, reports the achieved rate and interval percentiles in sampler20.stats (rewritten every 5 s and on TERM).
+    #   txq20.log      one line per tick: epoch, then per NIC (and bond0) <nic>.<counter>=<value>: tx/rx packets and bytes, tx_dropped, tx_errors,
+    #                  BQL inflight/limit/hold_time/stall_cnt/stall_max/stall_thrs, tx-0 tx_timeout (the netdev watchdog counter), carrier_changes
+    #   softirq20.log  one line per tick: epoch TX <12 per-CPU counts> RX <12 per-CPU counts> (/proc/softirqs NET_TX, NET_RX)
+    #   tc20.log       per tick `== epoch` and the `tc -s qdisc show` lines of the NICs (backlog, requeues, drops), when tc exists
+    #   irq1.log       once per second `== epoch` and the NIC vector lines of /proc/interrupts (per-CPU counts)
+    import os, sys, time, signal, subprocess, shutil, statistics
+
+    d, guard, nics = sys.argv[1], int(sys.argv[2]), sys.argv[3].split()
+    hz = float(sys.argv[4]) if len(sys.argv) > 4 else 20.0
+    period = 1.0 / hz
+    os.chdir(d)
+    try: os.nice(-10)
+    except OSError: pass
+    S = '/sys/class/net/'
+    devs = nics + ['bond0']
+    attrs = []
+    for n in devs:
+        b = S + n
+        q = b + '/queues/tx-0/'
+        for k in ('tx_packets', 'tx_bytes', 'rx_packets', 'tx_dropped', 'tx_errors'):
+            attrs.append((n + '.' + k, b + '/statistics/' + k))
+        for k in ('inflight', 'limit', 'hold_time', 'stall_cnt', 'stall_max', 'stall_thrs'):
+            attrs.append((n + '.bql_' + k, q + 'byte_queue_limits/' + k))
+        attrs.append((n + '.tx_timeout', q + 'tx_timeout'))
+        attrs.append((n + '.carrier_changes', b + '/carrier_changes'))
+    fds = {}
+    def reopen():
+        for lab, p in attrs:
+            try: fds[lab] = os.open(p, os.O_RDONLY)
+            except OSError: fds[lab] = None
+    reopen()
+    def rd(lab):
+        fd = fds.get(lab)
+        if fd is None: return '-'
+        try:
+            os.lseek(fd, 0, 0); return os.read(fd, 64).strip().decode() or '-'
+        except OSError: return '-'
+    tcbin = shutil.which('tc')
+    f_txq = open('txq20.log', 'a', buffering=1 << 16); f_sirq = open('softirq20.log', 'a', buffering=1 << 16)
+    f_tc = open('tc20.log', 'a', buffering=1 << 16) if tcbin else None; f_irq = open('irq1.log', 'a', buffering=1 << 16)
+    f_softirqs = os.open('/proc/softirqs', os.O_RDONLY); f_ints = '/proc/interrupts'
+    stamps = []; stop = False; last_stats = 0.0; skipped = 0
+    def write_stats(final=False):
+        iv = [(b - a) * 1e3 for a, b in zip(stamps, stamps[1:])]
+        with open('sampler20.stats.tmp', 'w') as f:
+            if iv:
+                s = sorted(iv)
+                f.write('ticks=%d span_s=%.2f achieved_hz=%.2f target_hz=%.1f interval_ms median=%.1f p90=%.1f p99=%.1f max=%.1f skipped_deadlines=%d final=%s\n' % (
+                    len(stamps), stamps[-1] - stamps[0], (len(stamps) - 1) / max(stamps[-1] - stamps[0], 1e-9), hz, statistics.median(s),
+                    s[int(0.9 * (len(s) - 1))], s[int(0.99 * (len(s) - 1))], s[-1], skipped, final))
+            else: f.write('ticks=0\n')
+        os.replace('sampler20.stats.tmp', 'sampler20.stats')
+    def term(*_):
+        global stop; stop = True
+    signal.signal(signal.SIGTERM, term); signal.signal(signal.SIGINT, term)
+    labels = [l for l, _ in attrs]
+    f_txq.write('# fields: ' + ' '.join(labels) + '\n')
+    mono0 = time.monotonic(); real0 = time.time() - mono0
+    end = time.time() + guard; n = 0
+    while not stop and time.time() < end:
+        deadline = mono0 + n * period
+        now = time.monotonic()
+        if now < deadline: time.sleep(deadline - now)
+        elif now - deadline > 4 * period:      # fell behind (CPU contention): skip the missed deadlines, count them
+            missed = int((now - mono0) / period) - n; skipped += max(missed, 0); n += max(missed, 0)
+        t = time.monotonic() + real0; stamps.append(t)
+        f_txq.write('%.6f ' % t + ' '.join('%s=%s' % (lab, rd(lab)) for lab in labels) + '\n')
+        try:
+            os.lseek(f_softirqs, 0, 0); raw = os.read(f_softirqs, 8192).decode()
+            row = {}
+            for ln in raw.splitlines():
+                p = ln.split()
+                if p and p[0] in ('NET_TX:', 'NET_RX:'): row[p[0][:6]] = p[1:]
+            f_sirq.write('%.6f TX %s RX %s\n' % (t, ' '.join(row.get('NET_TX', [])), ' '.join(row.get('NET_RX', []))))
+        except OSError: pass
+        if tcbin:
+            try:
+                out = subprocess.run([tcbin, '-s', 'qdisc', 'show'], capture_output=True, timeout=1.0).stdout.decode(errors='replace')
+                keep = []; on = False
+                for ln in out.splitlines():
+                    if ln.startswith('qdisc'): on = any((' dev %s ' % dv) in (ln + ' ') for dv in devs)
+                    if on: keep.append(ln)
+                f_tc.write('== %.6f\n' % t + '\n'.join(keep) + '\n')
+            except (subprocess.SubprocessError, OSError): pass
+        if n % int(hz) == 0:
+            try:
+                with open(f_ints) as fi: lines = [l for l in fi if ('enp' in l or 'IPI0' in l or 'IPI1' in l)]
+                f_irq.write('== %.6f\n' % t + ''.join(lines))
+            except OSError: pass
+        n += 1
+        if time.time() - last_stats > 5:
+            last_stats = time.time(); write_stats()
+            for f in (f_txq, f_sirq, f_irq): f.flush()
+            if f_tc: f_tc.flush()
+    for f in (f_txq, f_sirq, f_irq): f.flush()
+    if f_tc: f_tc.flush()
+    write_stats(True)
+    EOP
+        nohup python3 sampler20.py "$d" "$guard" "$nics" 20 > sampler20.out 2>&1 &
+      else
+        echo "python3 missing: bash fallback at about 16 Hz" > sampler20.missing
+        ( while [ "${EPOCHREALTIME%.*}" -lt "$endsec" ]; do
+            line="$EPOCHREALTIME"
+            for n in $nics bond0; do
+              s=/sys/class/net/$n/statistics; q=/sys/class/net/$n/queues/tx-0/byte_queue_limits
+              tp=-; tb=-; rp=-; bi=-; bl=-
+              { read -r tp < $s/tx_packets; read -r tb < $s/tx_bytes; read -r rp < $s/rx_packets; } 2>/dev/null
+              { read -r bi < $q/inflight; read -r bl < $q/limit; } 2>/dev/null
+              line="$line $n.tx_packets=$tp $n.tx_bytes=$tb $n.rx_packets=$rp $n.bql_inflight=$bi $n.bql_limit=$bl"
+            done
+            echo "$line" >> txq20.log
+            sleep 0.05
+          done ) &
+      fi
     fi
 
-    # 1 Hz: qdisc, NIC vectors, per-connection TCP state
+    # 1 Hz: per-connection TCP state
     ( while [ "${EPOCHREALTIME%.*}" -lt "$endsec" ]; do
         ts="$EPOCHREALTIME"
         if [ "$role" = sut ]; then
-          if command -v tc >/dev/null 2>&1; then { echo "== $ts"; for n in $nics bond0; do tc -s qdisc show dev $n 2>&1; done; } >> tc.log; fi
-          { echo "== $ts"; grep -E "enp|IPI0|IPI1" /proc/interrupts; } >> irq1.log
           ss -tinoH state established "( sport = :$port )" 2>/dev/null | awk -v ts="$ts" -f ssc.awk >> ss.log
         else
           ss -tinoH state established "( dport = :$port )" 2>/dev/null | awk -v ts="$ts" -f ssc.loadgen.awk >> ss.loadgen.log
@@ -731,32 +839,36 @@
         sleep 1
       done ) &
 
+    # cell snapshots. Written to a temporary file and moved into place only when complete, then a .done marker; the stop task waits for the
+    # marker before it kills anything. Cheap reads first, the slow ethtool -S last, so a late kill still leaves the useful part in the .tmp.
     snap() {
-      local tag=$1
+      local tag=$1 out=cell.$1$sfx.txt
       {
         echo "== $EPOCHREALTIME"
-        if [ "$role" = sut ]; then
-          for n in $nics bond0; do echo "=== ethtool -S $n"; ethtool -S $n 2>&1; done
-          echo "== tc"; for n in $nics bond0; do tc -s qdisc show dev $n 2>&1; done
-          echo "== irq effective_affinity_list smp_affinity_list"
-          for i in $(awk "/enp/{sub(\":\",\"\",\$1);print \$1}" /proc/interrupts); do echo "$i $(cat /proc/irq/$i/effective_affinity_list 2>&1) $(cat /proc/irq/$i/smp_affinity_list 2>&1)"; done
-          echo "== irq"; grep -E "enp|IPI0|IPI1" /proc/interrupts
-        fi
         echo "== ip -s -s link"; ip -s -s link 2>&1
         echo "== /proc/net/dev"; cat /proc/net/dev
         echo "== cpuidle name usage time"; grep -H . /sys/devices/system/cpu/cpu*/cpuidle/state*/name /sys/devices/system/cpu/cpu*/cpuidle/state*/usage /sys/devices/system/cpu/cpu*/cpuidle/state*/time 2>/dev/null
-      } > cell.$tag$sfx.txt 2>&1
+        if [ "$role" = sut ]; then
+          echo "== irq"; grep -E "enp|IPI0|IPI1" /proc/interrupts
+          echo "== irq effective_affinity_list smp_affinity_list"
+          for i in $(awk "/enp/{sub(\":\",\"\",\$1);print \$1}" /proc/interrupts); do echo "$i $(cat /proc/irq/$i/effective_affinity_list 2>&1) $(cat /proc/irq/$i/smp_affinity_list 2>&1)"; done
+          echo "== tc"; for n in $nics bond0; do tc -s qdisc show dev $n 2>&1; done
+          echo "== tx queue sysfs"; grep -H . /sys/class/net/*/queues/tx-*/tx_timeout /sys/class/net/*/queues/tx-*/byte_queue_limits/* 2>/dev/null
+          for n in $nics bond0; do echo "=== ethtool -S $n"; ethtool -S $n 2>&1; done
+        fi
+        echo "== end of snapshot $tag $EPOCHREALTIME"
+      } > $out.tmp 2>&1
+      mv $out.tmp $out && : > cell.$tag$sfx.done
     }
 
     capture() {
       if ! command -v tcpdump >/dev/null 2>&1; then echo "tcpdump not installed" > tcpdump.missing$sfx; return; fi
+      # one connection in four (destination port multiple of 4 on both sides), header only, 5.6 s around the middle of the window
       if [ "$role" = sut ]; then
-        for n in $nics; do
-          ( timeout -s INT 0.7 tcpdump -i $n -Q out -nn -s 66 -c 120000 -w - "tcp src port $port" 2> cap.$n.err | gzip -1 > pcap.$n.out.gz ) &
-        done
+        ( timeout -s INT 5.6 tcpdump -i $capnic -Q out -nn -s 66 -c 600000 -w - "tcp src port $port and (tcp[2:2] & 3) = 0" 2> cap.$capnic.err | gzip -1 > pcap.$capnic.out.gz ) &
       else
         dev=$(ip route get "$tip" 2>/dev/null | grep -o "dev [^ ]*" | head -1 | cut -d" " -f2)
-        ( timeout -s INT 0.7 tcpdump -i "${dev:-any}" -Q in -nn -s 66 -c 240000 -w - "tcp src port $port" 2> cap.loadgen.err | gzip -1 > pcap.loadgen.in.gz ) &
+        ( timeout -s INT 5.6 tcpdump -i "${dev:-any}" -Q in -nn -s 66 -c 900000 -w - "tcp src port $port and (tcp[2:2] & 3) = 0" 2> cap.loadgen.err | gzip -1 > pcap.loadgen.in.gz ) &
       fi
       wait
     }
@@ -771,7 +883,8 @@
       done
       [ "$n" -ge 64 ] || exit 0
       tr=$(now_us); echo "$tr" > rendezvous$sfx.us
-      start=$((tr + warm * 1000000)); mid=$((start + dur * 500000 - 300000)); fin=$((start + dur * 1000000))
+      start=$((tr + warm * 1000000)); mid=$((start + dur * 500000 - 2800000)); fin=$((start + dur * 1000000 - 300000))
+      [ "$mid" -gt "$start" ] || mid=$start
       wait_until $start; snap start
       wait_until $mid; capture
       wait_until $fin; snap end
@@ -915,10 +1028,23 @@
 
 # ---------- teardown for this cell ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop stall captures (both hosts)"
+  # The window-end snapshot is written to a temporary file and moved into place when complete, then a .done marker is
+  # created. Wait for that marker (at most 45 s, only when the rendezvous happened) BEFORE anything is killed: X1 lost the end
+  # snapshot of every SUT cell because this task killed the writer mid-write.
   ansible.builtin.shell: |
     d={{ cell_dir }}
+    for sfx in "" ".loadgen"; do
+      if [ -f $d/rendezvous$sfx.us ]; then
+        i=0
+        while [ ! -f $d/cell.end$sfx.done ] && [ $i -lt 90 ] && [ -f $d/stallcap$sfx.pid ] && kill -0 "$(cat $d/stallcap$sfx.pid)" 2>/dev/null; do sleep 0.5; i=$((i + 1)); done
+      fi
+    done
     for f in $d/stallcap.pid $d/stallcap.loadgen.pid; do
       [ -f $f ] && kill -TERM -- -"$(cat $f)" 2>/dev/null
+    done
+    sleep 2
+    for f in $d/stallcap.pid $d/stallcap.loadgen.pid; do
+      [ -f $f ] && kill -KILL -- -"$(cat $f)" 2>/dev/null
     done
     true
   args:
