@@ -1,9 +1,9 @@
-module github.com/goceleris/probatorium/servers/pr1049_celeris
+module github.com/goceleris/probatorium/servers/x2knobs_celeris
 
 go 1.27.2
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20261017001135-655d8d68553c
+	github.com/goceleris/celeris v1.5.12-0.20261017151113-37575415d985
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 )
 
