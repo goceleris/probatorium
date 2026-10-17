@@ -672,6 +672,7 @@
     role=$1; d=$2; port=$3; warm=$4; dur=$5; guard=$6; tip=$7
     cd "$d" || exit 1
     sfx=""; [ "$role" = lg ] && sfx=".loadgen"
+    [ -n "$EPOCHREALTIME" ] || { echo "bash without EPOCHREALTIME (needs bash 5): no stall captures" > stallcap.error$sfx; exit 0; }
     now_us() { local t=${EPOCHREALTIME/./}; echo "$t"; }
     wait_until() { local t=$1 n; n=$(now_us); [ "$t" -gt "$n" ] || return 0; local dl=$((t - n)); sleep "$((dl / 1000000)).$(printf %06d $((dl % 1000000)))"; }
     endsec=$(( ${EPOCHREALTIME%.*} + guard ))
@@ -809,7 +810,7 @@
     wait
     EOSTALL
     cd $d
-    setsid nohup bash stallcap.sh {{ 'sut' if inventory_hostname == bench_target else 'lg' }} $d {{ bench_port | default(8080) }} {{ bench_warmup_seconds | default(5) }} {{ bench_duration_seconds | default(30) }} {{ cell_guard_seconds }} {{ target_ip }} > stallcap.out 2>&1 &
+    setsid nohup bash stallcap.sh {{ 'sut' if inventory_hostname == bench_target else 'lg' }} $d {{ bench_port | default(8080) }} {{ bench_warmup_seconds | default(5) }} {{ bench_duration_seconds | default(30) }} {{ cell_guard_seconds }} {{ hostvars[bench_target].lan_ip }} > stallcap.out 2>&1 &
     disown
     true
   args:
