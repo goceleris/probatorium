@@ -330,11 +330,51 @@ The three slope oracles share a false-positive guard:
 - A slope above budget counts only if the rise across the window also clears a floor, so one legitimate
   step (a cache filling once, a standby engine spinning up) cannot fire it. The floor is the larger of
   budget × 10 minutes, a fraction of the series' level (3 % heap, 5 % goroutines and RSS) and, for the
-  heap, 8× its sampling noise.
+  heap, 8× its sampling noise and the rise the cell's own trough scatter can explain: the fitted slope
+  must be significant (one-sided 0.001, a critical value per trough count) against the scatter of the
+  window's troughs, estimated from their successive differences. **That is not free.** Measured against
+  the rule without the term on the weekend soaks' 45 minute cells (25 noisy observability cells, trough
+  sd 0.34-1.4 MB; 162 quiet cells; detected/sustained counts; all tables and the case definitions are in
+  probatorium#520):
+  - Noisy cells, straight leak from the end of warm-up: 1 KB/s is called in 9 of 25 cells (24 without
+    the term), 2 KB/s in 24 (25), and a 3 KB/s leak about 11 minutes later (median 17.5 -> 28.7 min).
+  - Noisy cells, a leak that starts late: from minute 20, 3 KB/s 25/25 -> 22/19; from minute 25, 3 KB/s
+    21/10 -> 12/3, 4 KB/s 25/22 -> 21/10, 6 KB/s 25/25 -> 24/21.
+  - Noisy cells, a stepped leak of 3 KB/s on average: 11 minutes later with a step every 15 minutes
+    (median 23.7 -> 35.0), sustained 21 -> 9 with a step every 30.
+  - Quiet cells, straight leak: 3 KB/s is called 3.7 minutes later at the median and 6.2 at most;
+    1 KB/s in 146 of 162 cells instead of 150. Late-start and stepped leaks: up to 2.5-5 minutes later.
+  - **Quiet cells, a leak that stops.** A leak that starts at the end of warm-up, runs 7.5 minutes and
+    then plateaus is lost: 3 KB/s 154/153 -> 64/18 (90 quiet cells lost), 4 KB/s 162/156 -> 125/75,
+    6 KB/s 162/162 -> 156/153; 3 KB/s for 10 minutes 162/162 -> 157/149. The estimator, not a floor
+    that is too high, is the cause: an instant 2 MB step is still called in 156 cells, as without the
+    term. After the leak stops, the shifted successive differences sit in windows of 6-8 troughs where
+    the 75 % trim drops only one difference, which inflates the scatter estimate. The other floors do
+    not catch it.
+  - A single low trough (a 2-4 MB dip at minute 10-15) delays a 3-5 KB/s call by a median of 7.5-11.2
+    minutes (max 11.2-13.7) on quiet cells, beyond the 10 minute maximum the straight-leak tests allow.
+  - A single 1 MB step is called in 139 of 150 quiet cells that the rule without the term calls.
+  - Cells that scatter heavily though quiet (1-2 MB of added trough scatter): 3 KB/s is lost in 19
+    (1 MB) to 123 (2 MB) of 162 cells, and a 4 MB sawtooth loses 161. In the same cells with no leak
+    the rule without the term trips falsely in 59 of 162 and this rule in none.
+  - Short cells: the scatter term needs the load phase to last long enough for windows of 8 or more
+    troughs. With the load phase cut to 20 minutes the quiet cells lose 99 of 162 at 3 KB/s, 75 at
+    5 KB/s and 32 at 10 KB/s (noisy cells 22-25 of 25); at 25 minutes none are lost.
+  - Windows of 5-8 troughs judge only a leak that is large against the scatter.
+  - Nothing the floor absolves is hidden. The validator runs I-MEM-1 as it was before the floor
+    beside the gated rule, on the same series, and records it per cell as `property_informational`
+    (schema 5.20) with its violation count, the evaluations the gated rule absolved and a flag for a
+    cell it absolved entirely. `mage ValidateGate` prints it on every run under "informational, NOT
+    gating (the pre-scatter-floor rule of I-MEM-1 ...)". The gate never reads it: the verdict is the
+    gated rule's alone. A reader of a soak sees every trip the floor absolved and can judge it.
+  - The maintainer accepted these costs on 2026-10-17 after five pre-registered attempts (probatorium#520;
+    the two later estimators that did not work, and why, are in its description).
 - A verdict must persist for 150 consecutive evaluations before it is declared.
 
-These oracles need cells of 15 minutes or more. They judge in the weekend soak's cells (about 45 minutes
-each: 24 h over 32 cells per architecture), and are `not_judged` in the short nightly cells.
+These oracles need cells of 15 minutes or more to judge at all, and I-MEM-1 needs about 25 minutes of
+sustained load to keep its sensitivity: a shorter load phase loses leaks (see the cost list above). They
+judge in the weekend soak's cells (about 45 minutes each: 24 h over 32 cells per architecture, which is
+unaffected), and are `not_judged` in the short nightly cells.
 
 Judged only where their data source exists, and reported as `not_instrumented` everywhere else:
 

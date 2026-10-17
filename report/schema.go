@@ -281,7 +281,17 @@ import (
 //     so the refapps no longer publish celeris.engine_throughput, which no
 //     artifact carried (probatorium#480). Additive; older readers ignore
 //     every field.
-const SchemaVersion = "5.19"
+//   - 5.20 — the informational twin of I-MEM-1 (probatorium#466). The
+//     heap-slope predicate gained a scatter floor; the validator now also
+//     runs the rule as it was before the floor beside the gated one on
+//     the same series and records it, never gated. Adds
+//     Tier1Summary.PropertyInformational (property_informational), keyed
+//     by predicate ID, present only when the twin declared a violation
+//     in the cell: its label, its violation count, the count of
+//     evaluations the gated rule absolved, a flag for a cell it absolved
+//     entirely, and its first message. Gate() does not read it. Additive;
+//     older readers ignore the field.
+const SchemaVersion = "5.20"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -640,6 +650,23 @@ type ServerResult struct {
 	CellRunStatuses map[string][]string `json:"cell_run_statuses,omitempty"`
 }
 
+// PropertyInformational is what an informational twin of a gated
+// predicate recorded in one cell (schema 5.20). See
+// [Tier1Summary.PropertyInformational].
+type PropertyInformational struct {
+	// Label names the twin rule.
+	Label string `json:"label"`
+	// Violations: samples on which the twin declared a violation.
+	Violations int64 `json:"violations"`
+	// AbsolvedEvaluations: the part of Violations on which the gated
+	// predicate declared none.
+	AbsolvedEvaluations int64 `json:"absolved_evaluations"`
+	// Absolved: the twin tripped and the gated predicate never did.
+	Absolved bool `json:"absolved"`
+	// FirstMessage is the twin's first violation message.
+	FirstMessage string `json:"first_message,omitempty"`
+}
+
 // ValidationResults captures the fixture-graph property tests and the
 // RESTler-style stateful fuzzing summary. Fields kept loose (string
 // counters keyed by name) so the validator can grow new properties
@@ -923,6 +950,12 @@ type Tier1Summary struct {
 	// PropertyViolationIDs: distinct predicate IDs that failed at least
 	// once, sorted.
 	PropertyViolationIDs []string `json:"property_violation_ids,omitempty"`
+	// PropertyInformational is the informational twin of a gated
+	// predicate (schema 5.20), keyed by the predicate's ID, present only
+	// when the twin declared a violation in this cell. NOT gated: Gate
+	// never reads it. For I-MEM-1 it is the rule before the scatter floor,
+	// so a reader sees every trip the floor absolved.
+	PropertyInformational map[string]PropertyInformational `json:"property_informational,omitempty"`
 	// PropertyPollErrors: polls that yielded no sample (transport error,
 	// non-200, unparseable body). Informational.
 	PropertyPollErrors int64 `json:"property_poll_errors"`

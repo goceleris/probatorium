@@ -1862,6 +1862,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		PropertySkips:            s.Properties.Skips,
 		PropertyViolations:       s.Properties.Violations,
 		PropertyViolationIDs:     append([]string(nil), s.Properties.ViolationIDs...),
+		PropertyInformational:    informationalSummary(s.Properties.Informational),
 		PropertyPollErrors:       s.Properties.PollErrors,
 		PropertyLoopSkipped:      s.Properties.SkippedReason,
 		AdaptiveSwitches:         s.Properties.AdaptiveSwitches,
@@ -2235,4 +2236,20 @@ func resolveConcurrency(d time.Duration, envOverride string, floor int) int {
 		concurrency = floor
 	}
 	return concurrency
+}
+
+// informationalSummary projects the checker's informational twins onto the
+// report type. nil when no twin declared a violation.
+func informationalSummary(in map[string]checker.ShadowTally) map[string]report.PropertyInformational {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]report.PropertyInformational, len(in))
+	for id, t := range in {
+		out[id] = report.PropertyInformational{
+			Label: t.Label, Violations: t.Violations, AbsolvedEvaluations: t.AbsolvedEvaluations,
+			Absolved: t.Absolved, FirstMessage: t.FirstMessage,
+		}
+	}
+	return out
 }

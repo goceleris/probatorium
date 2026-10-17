@@ -489,6 +489,24 @@ type Spec struct {
 	// absolute zero-signal gate is not the same as zero signal
 	// (probatorium#299).
 	MinObservation time.Duration
+
+	// Shadow, when non-nil, is a second verdict on the same series that
+	// the evaluator records and never gates on: it runs through the same
+	// Persist streak, its violations are counted apart from the
+	// predicate's own, and the tally says when the shadow tripped on
+	// ticks the predicate did not (the predicate absolved them). It
+	// exists so a human reading a soak can see everything a rule change
+	// absolved, without that rule change being able to hide it.
+	Shadow *Shadow
+}
+
+// Shadow is the informational twin of a [Spec].
+type Shadow struct {
+	// Label names the shadow rule in the tally and the gate output.
+	Label string
+	// Predicate is the shadow evaluator. It must reach its verdict from
+	// the same inputs as [Spec.Predicate] and must not write through them.
+	Predicate Predicate
 }
 
 // Forever returns ctx.Now - ctx.RunStartedAt; convenience for predicates

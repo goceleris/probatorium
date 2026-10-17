@@ -423,6 +423,12 @@ type slopeSpec struct {
 	window   time.Duration
 	budget   float64 // units per second
 	relFloor float64 // fraction of the trough level
+	// scatterAlpha, when > 0, adds the trough-scatter floor (see
+	// heapScatterAlpha): the fitted rise must also be significant, at
+	// this one-sided level, against the scatter of the window's troughs
+	// (estimated from their successive differences). 0 leaves the floor
+	// as budget / level / sampling noise.
+	scatterAlpha float64
 	// y projects a sample onto the judged series; keep filters it (nil
 	// keeps everything). Both take a pointer to avoid copying the
 	// Snapshot and must not write through it.
@@ -439,13 +445,15 @@ var skipWindow = fmt.Sprintf("slope window not judgeable yet (needs %s warm-up, 
 // violation only when the trough slope exceeds the budget AND the
 // fitted rise over the window (slope x span) clears the floor
 //
-//	max(budget x slopeMinSpan, relFloor x trough level, slopeNoiseK x sampling noise)
+//	max(budget x slopeMinSpan, relFloor x trough level, slopeNoiseK x sampling noise, scatter)
 //
 // so that (a) a single step smaller than the budgeted 10 min total,
-// (b) a step proportionate to the series' size, and (c) the sampling
-// noise of a GC sawtooth at this heap size can each not produce a
-// verdict on their own. The message carries every number so a triage
-// can see which floor was cleared and by how much.
+// (b) a step proportionate to the series' size, (c) the sampling
+// noise of a GC sawtooth at this heap size, and (d) where the spec
+// asks for it (I-MEM-1), a rise the troughs' own scatter can
+// explain (heapScatterAlpha) can each not produce a verdict on their
+// own. The message carries every number so a triage can see which
+// floor was cleared and by how much.
 func (sp slopeSpec) judge(ctx Context) (bool, string) {
 	series, ok := slopeWindow(ctx, sp.window, sp.keep, sp.y)
 	if !ok {
@@ -473,14 +481,23 @@ func (sp slopeSpec) judge(ctx Context) (bool, string) {
 	floorRel := sp.relFloor * level
 	floorNoise := slopeNoiseK * noise
 	floor := math.Max(floorBudget, math.Max(floorRel, floorNoise))
+	floorScat := 0.0
+	if sp.scatterAlpha > 0 {
+		floorScat = scatterFloor(pts)
+		floor = math.Max(floor, floorScat)
+	}
 	if rise < floor {
 		return true, ""
 	}
+	scat := ""
+	if sp.scatterAlpha > 0 {
+		scat = fmt.Sprintf(", trough scatter (slope test at %g, %d troughs) %s", sp.scatterAlpha, len(pts), sp.fmtV(floorScat))
+	}
 	return false, fmt.Sprintf(
-		"%s violated: %s trough slope %s/s exceeds %s/s budget; rise %s (fitted %s, trough-to-trough %s) over %s (%d troughs) clears the floor %s = max(budget x %s = %s, %.0f%% of level %s = %s, %gx sampling noise %s = %s); %s -> %s",
+		"%s violated: %s trough slope %s/s exceeds %s/s budget; rise %s (fitted %s, trough-to-trough %s) over %s (%d troughs) clears the floor %s = max(budget x %s = %s, %.0f%% of level %s = %s, %gx sampling noise %s = %s%s); %s -> %s",
 		sp.id, sp.what, sp.fmtV(s), sp.fmtV(sp.budget), sp.fmtV(rise), sp.fmtV(fitted), sp.fmtV(raw), windowSpan(series), len(bs),
 		sp.fmtV(floor), slopeMinSpan, sp.fmtV(floorBudget), sp.relFloor*100, sp.fmtV(level), sp.fmtV(floorRel),
-		slopeNoiseK, sp.fmtV(noise), sp.fmtV(floorNoise),
+		slopeNoiseK, sp.fmtV(noise), sp.fmtV(floorNoise), scat,
 		sp.fmtV(series[0].v), sp.fmtV(series[len(series)-1].v))
 }
 
@@ -502,9 +519,22 @@ func fmtCount(v float64) string { return fmt.Sprintf("%.2f", v) }
 
 var heapSlopeSpec = slopeSpec{
 	id: "I-MEM-1", what: "heap_inuse", window: heapSlopeWindow,
-	budget: heapSlopeMaxBytesPerSec, relFloor: heapRiseRelFloor,
+	budget: heapSlopeMaxBytesPerSec, relFloor: heapRiseRelFloor, scatterAlpha: heapScatterAlpha,
 	y: func(s *Snapshot) float64 { return float64(s.HeapInuseBytes) }, fmtV: fmtBytes,
 }
+
+// legacyHeapSlopeSpec is I-MEM-1 as it was before the scatter floor
+// (heapScatterAlpha): the same spec with the term switched off, so the
+// informational twin of I-MEM-1 runs through the very same judge and
+// cannot drift from it.
+var legacyHeapSlopeSpec = func() slopeSpec {
+	sp := heapSlopeSpec
+	sp.scatterAlpha = 0
+	return sp
+}()
+
+// IMEM1ShadowLabel names the rule IMEM1's Shadow runs.
+const IMEM1ShadowLabel = "I-MEM-1 (pre-scatter-floor rule, informational)"
 
 var goroutineSlopeSpec = slopeSpec{
 	id: "I-MEM-3", what: "goroutine count", window: goroutineSlopeWindow,
@@ -529,12 +559,19 @@ var rssSlopeSpec = slopeSpec{
 // pinned celeris) are EXPECTED true positives here, not noise.
 var IMEM1 = Spec{
 	ID: "I-MEM-1",
-	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level, %gx sampling noise)",
-		fmtBytes(heapSlopeMaxBytesPerSec), slopeWarmup, fmtBytes(heapSlopeMaxBytesPerSec*slopeMinSpan.Seconds()), heapRiseRelFloor*100, slopeNoiseK),
+	Description: fmt.Sprintf("heap_inuse trough slope ≤ %s/s over trailing min(1h, elapsed) after %s warm-up, rise ≥ max(%s, %.0f%% of level, %gx sampling noise, the rise the cell's trough scatter explains at slope-test level %g)",
+		fmtBytes(heapSlopeMaxBytesPerSec), slopeWarmup, fmtBytes(heapSlopeMaxBytesPerSec*slopeMinSpan.Seconds()), heapRiseRelFloor*100, slopeNoiseK, heapScatterAlpha),
 	Tier:           "core",
 	Persist:        slopePersistSamples,
 	MinObservation: slopeMinObservation,
 	Predicate:      func(_ *Snapshot, ctx Context) (bool, string) { return heapSlopeSpec.judge(ctx) },
+	// The rule before the scatter floor, recorded and never gated: the
+	// floor absolves rises the cell's own trough scatter can explain, and
+	// a human reading a soak should see every one it absolved.
+	Shadow: &Shadow{
+		Label:     IMEM1ShadowLabel,
+		Predicate: func(_ *Snapshot, ctx Context) (bool, string) { return legacyHeapSlopeSpec.judge(ctx) },
+	},
 }
 
 // IMEM3 asserts the goroutine count trough slope is bounded over the

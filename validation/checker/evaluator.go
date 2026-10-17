@@ -231,6 +231,11 @@ type Tally struct {
 	FailureSummaries map[string]string `json:"failure_summaries,omitempty"`
 	// PerPredicate maps every evaluated ID to its violation count.
 	PerPredicate map[string]int64 `json:"per_predicate,omitempty"`
+	// Informational holds the informational twin of a predicate
+	// ([properties.Spec.Shadow]) that declared a violation at least once,
+	// keyed by the predicate's ID. NOT gated: nothing in Violations,
+	// ViolationIDs, PerPredicate, Passed or Failed reads it.
+	Informational map[string]ShadowTally `json:"informational,omitempty"`
 
 	// IdleWindows is the highest orchestrator idle window observed (0 when
 	// the cell never idled) and IdleBaselineGoroutines the goroutine count
@@ -245,6 +250,23 @@ type Tally struct {
 	LastHeapInuse      int64 `json:"last_heap_inuse_bytes"`
 	FirstRSS           int64 `json:"first_rss_bytes"`
 	LastRSS            int64 `json:"last_rss_bytes"`
+}
+
+// ShadowTally is what an informational twin recorded in one cell.
+type ShadowTally struct {
+	// Label names the shadow rule.
+	Label string `json:"label"`
+	// Violations is the number of samples on which the shadow declared a
+	// violation (after its Persist streak), counted like Tally.Violations.
+	Violations int64 `json:"violations"`
+	// AbsolvedEvaluations is the part of Violations on which the real
+	// predicate declared none: what the rule change absolved.
+	AbsolvedEvaluations int64 `json:"absolved_evaluations"`
+	// Absolved is true when the shadow tripped and the real predicate
+	// never did in this cell.
+	Absolved bool `json:"absolved"`
+	// FirstMessage is the shadow's first violation message.
+	FirstMessage string `json:"first_message,omitempty"`
 }
 
 // Passed is the number of instrumented predicates that reached a
@@ -283,10 +305,15 @@ type Evaluator struct {
 	specs  []properties.Spec
 	ctx    properties.Context
 	tally  Tally
-	per    map[string]int64  // declared violations per ID
-	judged map[string]int64  // verdict-reaching evaluations per ID
-	streak map[string]int    // consecutive failing evaluations per ID (Persist)
-	first  map[string]string // first violation message per ID
+	per    map[string]int64 // declared violations per ID
+	judged map[string]int64 // verdict-reaching evaluations per ID
+	streak map[string]int   // consecutive failing evaluations per ID (Persist)
+	// Informational twins (properties.Spec.Shadow): their own streaks and
+	// counts, never mixed into per, judged, tally.Violations or the
+	// gate's inputs.
+	shadowStreak map[string]int
+	shadow       map[string]*ShadowTally
+	first        map[string]string // first violation message per ID
 	// declared is the union of the refapp's celeris.instrumented_properties
 	// over every sample. A union and not the last sample's value because a
 	// poll that failed mid-run must not retract a declaration the refapp
@@ -309,12 +336,14 @@ type Evaluator struct {
 // SelectPredicates(tier)).
 func NewEvaluator(specs []properties.Spec) *Evaluator {
 	e := &Evaluator{
-		specs:    specs,
-		per:      map[string]int64{},
-		judged:   map[string]int64{},
-		streak:   map[string]int{},
-		first:    map[string]string{},
-		declared: map[string]bool{},
+		specs:        specs,
+		per:          map[string]int64{},
+		judged:       map[string]int64{},
+		streak:       map[string]int{},
+		shadowStreak: map[string]int{},
+		shadow:       map[string]*ShadowTally{},
+		first:        map[string]string{},
+		declared:     map[string]bool{},
 	}
 	for _, s := range specs {
 		e.per[s.ID] = 0
@@ -436,30 +465,70 @@ func (e *Evaluator) Observe(snap properties.Snapshot, now time.Time) []Violation
 
 	var out []Violation
 	for _, s := range e.specs {
-		ok, msg := s.Predicate(&snap, e.ctx)
-		if properties.IsSkip(ok, msg) {
-			e.tally.Skips++
-			continue
+		v, declared := e.evalSpec(s, &snap)
+		if declared {
+			out = append(out, v)
 		}
-		e.tally.Evaluations++
-		e.judged[s.ID]++
-		if ok {
-			e.streak[s.ID] = 0
-			continue
+		if s.Shadow != nil {
+			e.observeShadow(s, &snap, declared)
 		}
-		e.streak[s.ID]++
-		if e.streak[s.ID] < s.Persist {
-			continue
-		}
-		e.tally.Violations++
-		first := e.per[s.ID] == 0
-		e.per[s.ID]++
-		if first {
-			e.first[s.ID] = msg
-		}
-		out = append(out, Violation{ID: s.ID, Message: msg, Snapshot: snap, First: first})
 	}
 	return out
+}
+
+// evalSpec runs one predicate over the current context and reports the
+// violation it declares on this sample, if any.
+func (e *Evaluator) evalSpec(s properties.Spec, snap *properties.Snapshot) (Violation, bool) {
+	ok, msg := s.Predicate(snap, e.ctx)
+	if properties.IsSkip(ok, msg) {
+		e.tally.Skips++
+		return Violation{}, false
+	}
+	e.tally.Evaluations++
+	e.judged[s.ID]++
+	if ok {
+		e.streak[s.ID] = 0
+		return Violation{}, false
+	}
+	e.streak[s.ID]++
+	if e.streak[s.ID] < s.Persist {
+		return Violation{}, false
+	}
+	e.tally.Violations++
+	first := e.per[s.ID] == 0
+	e.per[s.ID]++
+	if first {
+		e.first[s.ID] = msg
+	}
+	return Violation{ID: s.ID, Message: msg, Snapshot: *snap, First: first}, true
+}
+
+// observeShadow runs the informational twin of s through its own Persist
+// streak. declared says whether s itself declared a violation on this
+// sample; a sample on which the shadow declares one and s does not is an
+// absolved evaluation. Nothing here reaches the gate.
+func (e *Evaluator) observeShadow(s properties.Spec, snap *properties.Snapshot, declared bool) {
+	ok, msg := s.Shadow.Predicate(snap, e.ctx)
+	if properties.IsSkip(ok, msg) {
+		return
+	}
+	if ok {
+		e.shadowStreak[s.ID] = 0
+		return
+	}
+	e.shadowStreak[s.ID]++
+	if e.shadowStreak[s.ID] < s.Persist {
+		return
+	}
+	t := e.shadow[s.ID]
+	if t == nil {
+		t = &ShadowTally{Label: s.Shadow.Label, FirstMessage: msg}
+		e.shadow[s.ID] = t
+	}
+	t.Violations++
+	if !declared {
+		t.AbsolvedEvaluations++
+	}
 }
 
 // Context returns a copy of the current [properties.Context] (History
@@ -696,6 +765,14 @@ func (e *Evaluator) Tally() Tally {
 			}
 			t.FailureSummaries[s.ID] = e.first[s.ID]
 		}
+	}
+	for id, sh := range e.shadow {
+		if t.Informational == nil {
+			t.Informational = map[string]ShadowTally{}
+		}
+		c := *sh
+		c.Absolved = e.per[id] == 0
+		t.Informational[id] = c
 	}
 	sort.Strings(t.Predicates)
 	sort.Strings(t.NotInstrumented)
