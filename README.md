@@ -168,7 +168,7 @@ vector to CPU 1 before every run on msr1, a standing part of the setup, not an e
 
 Tests: `bash ansible/tests/test_nic_irq_pin.sh` (the shell logic against a fake `/proc` and `/sys`; also
 runs in a plain container) and `bash ansible/tests/test_nic_irq_placement_play.sh` (the real tasks files
-under ansible); `go test` runs both.
+under ansible, run by the ansible CI job; `PROBATORIUM_ANSIBLE_TESTS=1 go test` runs it too). `go test` runs the first.
 
 ## Bench tier
 
