@@ -45,6 +45,7 @@
             "host": { "type": "string" },
             "interface": { "type": "string" },
             "vector": { "type": "string" },
+            "binding": { "type": "string", "enum": ["msi_irqs", "name"], "description": "Which check tied the vector to the interface: every IRQ listed under /sys/class/net/<iface>/device/msi_irqs, or the vector name starting with <iface>-." },
             "cpu": { "type": "integer", "minimum": 0 },
             "changed": { "type": "boolean" },
             "verified": { "type": "boolean" },

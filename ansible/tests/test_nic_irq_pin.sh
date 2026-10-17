@@ -77,7 +77,7 @@ check "pin: effective_affinity_list reads 1" test "$(irqfile "$R" 167 effective_
 check "pin: JSON says changed + verified" has '"changed":true,"verified":true'
 check "pin: JSON records the value found before (0-11)" has '"before":{"affinity":"0-11","effective":"0-11"}'
 check "pin: JSON records the value read back after" has '"after":{"affinity":"1","effective":"1"}'
-check "pin: JSON carries interface, vector, cpu" has '"interface":"enp1s0","vector":"enp1s0-8","cpu":1'
+check "pin: JSON carries interface, vector, binding, cpu" has '"interface":"enp1s0","vector":"enp1s0-8","binding":"msi_irqs","cpu":1'
 check "pin: resolved the IRQ by name (167)" has '"irq":167'
 check "pin: enp1s0-80 (name prefix) untouched" test "$(irqfile "$R" 168 smp_affinity_list)" = 0-11
 check "pin: enp49s0-8 untouched" test "$(irqfile "$R" 169 smp_affinity_list)" = 0-11
@@ -138,12 +138,12 @@ run "$R" pin enp1s0 enp1s0-8 1
 check "no effective_affinity_list (cannot verify): exit 2" test "$rc" = 2
 check "no effective_affinity_list: nothing written" test "$(irqfile "$R" 167 smp_affinity_list)" = 0-11
 
-# 6b. the vector must belong to the interface: another port's vector name is refused, nothing is written
+# 6b. the vector must be bound to the interface (msi_irqs OR name): when BOTH fail it is refused, nothing is written
 R=$work/bind
 mkroot "$R" follows
 run "$R" pin enp1s0 enp49s0-8 1
 check "bind: enp49s0-8 under enp1s0 is refused: exit 2" test "$rc" = 2
-check "bind: the refusal says whose vector it is not" errhas "not one of the MSI vectors of enp1s0"
+check "bind: the refusal says both checks failed" errhas "neither listed in /sys/class/net/enp1s0/device/msi_irqs nor named 'enp1s0-*'"
 check "bind: no JSON on a refusal" test -z "$out"
 check "bind: enp49s0-8 not written" test "$(irqfile "$R" 169 smp_affinity_list)" = 0-11
 run "$R" pin enp49s0 enp1s0-8 1
@@ -155,15 +155,34 @@ run "$R" pin enp49s0 enp49s0-8 1
 check "bind: the right pair still works: exit 0" test "$rc" = 0
 check "bind: enp49s0-8 pinned when asked for by name" test "$(irqfile "$R" 169 smp_affinity_list)" = 1
 
-# 6c. a host without device/msi_irqs falls back to the vector name starting with the interface name
+# 6c. msi_irqs OR name: either alone binds the vector (an out-of-tree driver may expose one differently)
 R=$work/nomsi
 mkroot "$R" follows
 rm -rf "$R/sys/class/net/enp1s0/device" "$R/sys/class/net/enp49s0/device"
 run "$R" pin enp1s0 enp49s0-8 1
-check "no msi_irqs: another port's vector name is refused: exit 2" test "$rc" = 2
-check "no msi_irqs: nothing written" test "$(irqfile "$R" 169 smp_affinity_list)" = 0-11
+check "no msi_irqs dir, other port's name: both fail: exit 2" test "$rc" = 2
+check "no msi_irqs dir, other port's name: nothing written" test "$(irqfile "$R" 169 smp_affinity_list)" = 0-11
 run "$R" pin enp1s0 enp1s0-8 1
-check "no msi_irqs: <iface>-<n> is accepted: exit 0" test "$rc" = 0
+check "no msi_irqs dir, name matches: accepted: exit 0" test "$rc" = 0
+check "no msi_irqs dir, name matches: binding=name" has '"binding":"name"'
+check "no msi_irqs dir, name matches: stderr says which check passed" errhas "the name starts with 'enp1s0-'"
+R=$work/lacks
+mkroot "$R" follows
+rm "$R/sys/class/net/enp1s0/device/msi_irqs/167"
+run "$R" pin enp1s0 enp1s0-8 1
+check "msi_irqs dir present but lacks the IRQ, name matches: accepted: exit 0" test "$rc" = 0
+check "msi_irqs lacks the IRQ: binding=name" has '"binding":"name"'
+check "msi_irqs lacks the IRQ: the vector was pinned" test "$(irqfile "$R" 167 smp_affinity_list)" = 1
+R=$work/lacks2
+mkroot "$R" follows
+# enp49s0-8's IRQ 169 is not in enp1s0's msi_irqs and the name does not start with enp1s0-
+run "$R" pin enp1s0 enp49s0-8 1
+check "msi_irqs dir present but lacks the IRQ, name differs: both fail: exit 2" test "$rc" = 2
+check "msi_irqs lacks the IRQ, name differs: nothing written" test "$(irqfile "$R" 169 smp_affinity_list)" = 0-11
+R=$work/viamsi
+mkroot "$R" follows
+run "$R" pin enp49s0 enp49s0-8 1
+check "listed in msi_irqs: binding=msi_irqs" has '"binding":"msi_irqs"'
 
 # 6d. a later IRQ of the same name without its affinity files: refused before ANY write (no half pin, no JSON)
 R=$work/late

@@ -163,14 +163,15 @@ hardware:
   `-e '{"nic_irq_placement": {}}'`. enp49s0's vector is not touched (the maintainer excluded it from the placement).
 - **How.** The vector is found by name in `/proc/interrupts`, an explicit single CPU is written to
   `/proc/irq/N/smp_affinity_list`, and both `smp_affinity_list` and `effective_affinity_list` are read
-  back. IFACE is bound to the vector: each IRQ found by that name must be listed under
-  `/sys/class/net/<iface>/device/msi_irqs/` (a host without that directory falls back to the name starting
-  with `<iface>-`), else the script refuses with exit 2 and writes nothing. A readback that differs from the
+  back. IFACE is bound to the vector: it is accepted when either (a) each IRQ found by that name is listed
+  under `/sys/class/net/<iface>/device/msi_irqs/` or (b) the vector name starts with `<iface>-`, and refused
+  (exit 2, nothing written) only when both fail; the record says which check passed (`binding`: `msi_irqs` or
+  `name`). Either alone suffices because an out-of-tree driver may expose one of them differently. A readback that differs from the
   CPU fails the play before the first cell. It is a pin, not a
   restore: writing the old mask (0-11) back does not return the vector to its previous CPU, the kernel
   picks one from the mask. Applying it again is a no-op. Nothing is undone at teardown.
 - **Record.** Every bench run on a host with the placement writes `nic-irq-placement.json` into its run
-  directory (interface, vector, irq, cpu, the affinity found before and read back after, and a second
+  directory (interface, vector, binding, irq, cpu, the affinity found before and read back after, and a second
   readback taken after the last cell) and prints the same in the log. `mage Bench` folds it into
   `environment.nic_irq_placement` of the results document and so into `env.json` (schema 5.21); a
   run without a placement has no such key.

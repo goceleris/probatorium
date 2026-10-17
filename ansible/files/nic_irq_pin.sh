@@ -8,7 +8,7 @@
 # Usage: nic_irq_pin.sh MODE IFACE VECTOR CPU
 #   MODE    "pin" writes the CPU and verifies; "verify" only reads back and checks (no write)
 #   IFACE   interface the vector belongs to (e.g. enp1s0); /sys/class/net/<iface> must exist, and every
-#           IRQ of the vector must belong to it (see "Binding" below), else exit 2 and nothing is written
+#           IRQ of the vector must be bound to it (see "Binding of VECTOR to IFACE" below), else exit 2
 #   VECTOR  interrupt NAME as /proc/interrupts prints it in its last column (e.g. enp1s0-8).
 #           Matched by exact equality, never as a pattern and never by IRQ number: the
 #           number changes across boots. Every line with that name is pinned.
@@ -18,9 +18,11 @@
 # Environment: NIC_IRQ_ROOT is a test override, a prefix for /proc and /sys. Empty on a host.
 #
 # Binding of VECTOR to IFACE: a vector name alone could belong to another port (enp49s0-8 is a valid name
-# on msr1), so each IRQ found by name must be listed under /sys/class/net/<iface>/device/msi_irqs/. A host
-# without that directory (not an MSI device) falls back to the vector name starting with "<iface>-".
-# Anything else is refused with exit 2 before a single write.
+# on msr1), so a vector is accepted when EITHER (a) each of its IRQs is listed under
+# /sys/class/net/<iface>/device/msi_irqs/ OR (b) its name starts with "<iface>-" as /proc/interrupts prints
+# it. It is refused (exit 2, before a single write) only when BOTH fail. Either alone suffices because an
+# out-of-tree driver may expose one of them differently. The JSON says which check passed: "binding" is
+# "msi_irqs" when every IRQ was listed there, else "name".
 #
 # Why an explicit pin and not a restore: writing a mask back (0-11) does not put the vector back on the CPU
 # it was on, the kernel picks one from the mask. So the CPU is written as a single-CPU list and the EFFECTIVE
@@ -55,12 +57,18 @@ irqs=$(awk -v n="$vector" '$NF == n { sub(":", "", $1); print $1 }' "$R/proc/int
 [ -n "$irqs" ] || die "no interrupt named '$vector' in /proc/interrupts"
 
 # Every IRQ of the vector must belong to IFACE, and must have its affinity files, before anything is written.
+binding=msi_irqs
 for irq in $irqs; do
-	if [ -d "$R/sys/class/net/$iface/device/msi_irqs" ]; then
-		[ -e "$R/sys/class/net/$iface/device/msi_irqs/$irq" ] ||
-			die "irq $irq ($vector) is not one of the MSI vectors of $iface (/sys/class/net/$iface/device/msi_irqs): refusing to pin another device's vector"
+	if [ -e "$R/sys/class/net/$iface/device/msi_irqs/$irq" ]; then
+		echo "nic_irq_pin: irq $irq ($vector) bound to $iface: listed in /sys/class/net/$iface/device/msi_irqs" >&2
 	else
-		case "$vector" in "$iface"-*) ;; *) die "$iface has no device/msi_irqs and '$vector' does not start with '$iface-': refusing to pin another device's vector" ;; esac
+		case "$vector" in
+		"$iface"-*)
+			binding=name
+			echo "nic_irq_pin: irq $irq ($vector) bound to $iface: not listed in device/msi_irqs, the name starts with '$iface-'" >&2
+			;;
+		*) die "irq $irq ($vector) is neither listed in /sys/class/net/$iface/device/msi_irqs nor named '$iface-*': refusing to pin another device's vector" ;;
+		esac
 	fi
 	[ -r "$R/proc/irq/$irq/smp_affinity_list" ] || die "irq $irq has no smp_affinity_list"
 	[ -r "$R/proc/irq/$irq/effective_affinity_list" ] || die "irq $irq has no effective_affinity_list: the pin cannot be verified"
@@ -105,7 +113,7 @@ for irq in $irqs; do
 	items="$items{\"irq\":$irq,\"before\":{\"affinity\":$(jstr "$b_aff"),\"effective\":$(jstr "$b_eff")},\"after\":{\"affinity\":$(jstr "$a_aff"),\"effective\":$(jstr "$a_eff")}}"
 done
 
-printf '{"interface":%s,"vector":%s,"cpu":%s,"changed":%s,"verified":%s,"irqs":[%s]}\n' \
-	"$(jstr "$iface")" "$(jstr "$vector")" "$cpu" "$changed" "$verified" "$items"
+printf '{"interface":%s,"vector":%s,"binding":%s,"cpu":%s,"changed":%s,"verified":%s,"irqs":[%s]}\n' \
+	"$(jstr "$iface")" "$(jstr "$vector")" "$(jstr "$binding")" "$cpu" "$changed" "$verified" "$items"
 [ "$verified" = true ] || exit 3
 exit 0

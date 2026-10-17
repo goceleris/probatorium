@@ -540,6 +540,11 @@ type NICIRQPlacement struct {
 	// Vector is the interrupt NAME in /proc/interrupts (e.g. enp1s0-8);
 	// the IRQ number is per boot, so the numbers live in IRQs.
 	Vector string `json:"vector"`
+	// Binding says which check tied the vector to Interface: "msi_irqs"
+	// (every IRQ is listed under /sys/class/net/<iface>/device/msi_irqs) or
+	// "name" (the vector name starts with "<iface>-"). Empty in records
+	// written before the field existed.
+	Binding string `json:"binding,omitempty"`
 	// CPU is the one CPU the vector was pinned to.
 	CPU int `json:"cpu"`
 	// Changed is true when this run wrote the pin, false when the vector

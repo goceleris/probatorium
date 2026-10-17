@@ -76,7 +76,7 @@ func TestNICIRQPinScriptRecordMatchesReportSchema(t *testing.T) {
 	if err := dec.Decode(&p); err != nil {
 		t.Fatalf("the script's record does not decode into report.NICIRQPlacement: %v", err)
 	}
-	if p.Interface != "enp1s0" || p.Vector != "enp1s0-8" || p.CPU != 1 || !p.Changed || !p.Verified || len(p.IRQs) != 1 {
+	if p.Interface != "enp1s0" || p.Vector != "enp1s0-8" || p.Binding != "msi_irqs" || p.CPU != 1 || !p.Changed || !p.Verified || len(p.IRQs) != 1 {
 		t.Fatalf("record = %+v", p)
 	}
 	if v := p.IRQs[0]; v.IRQ != 167 || v.Before.Affinity != "0-11" || v.After.Affinity != "1" || v.After.Effective != "1" {

@@ -23,7 +23,7 @@ func placementFixture() *NICIRQPlacement {
 		After:  NICIRQAffinity{Affinity: "1", Effective: "1"},
 	}
 	return &NICIRQPlacement{
-		Host: "msr1", Interface: "enp1s0", Vector: "enp1s0-8", CPU: 1,
+		Host: "msr1", Interface: "enp1s0", Vector: "enp1s0-8", Binding: "msi_irqs", CPU: 1,
 		Changed: true, Verified: true, IRQs: []NICIRQVector{vec},
 		AtEnd: &NICIRQPlacement{Interface: "enp1s0", Vector: "enp1s0-8", CPU: 1, Verified: true, IRQs: []NICIRQVector{end}},
 	}
