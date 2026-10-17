@@ -45,15 +45,16 @@
   args:
     executable: /bin/bash
   register: nic_irq_pin
-  # Exit 3 is a readback mismatch, 2 a bad input or an unknown vector. Both fail the play
-  # loudly: a run on an unplaced vector is not comparable with the runs on a placed one.
+  # Exit 3 is a readback mismatch, 2 a bad input or an unknown vector (stdout is then empty,
+  # hence default('{}', true) below: default() alone only covers an UNDEFINED value). Both fail
+  # the play loudly: a run on an unplaced vector is not comparable with the runs on a placed one.
   failed_when: nic_irq_pin.rc | default(0) != 0
-  changed_when: (nic_irq_pin.stdout | default('{}') | from_json).changed | default(false)
+  changed_when: (nic_irq_pin.stdout | default('{}', true) | from_json).changed | default(false)
 
 - name: NIC IRQ placement | record fact
   ansible.builtin.set_fact:
     nic_irq_record: >-
-      {{ (nic_irq_pin.stdout | default('{}') | from_json)
+      {{ (nic_irq_pin.stdout | default('{}', true) | from_json)
          | combine({'host': inventory_hostname}) }}
 
 - name: NIC IRQ placement | print before/after

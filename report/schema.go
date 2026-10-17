@@ -553,6 +553,9 @@ type NICIRQPlacement struct {
 	// were collected. Nil when the end-of-run readback did not happen. Its
 	// Verified is false when the vector had left its CPU during the run.
 	AtEnd *NICIRQPlacement `json:"at_end,omitempty"`
+	// AtEndError is the end-of-run readback's own message when it failed
+	// (the vector left its CPU, or is gone); empty when it passed.
+	AtEndError string `json:"at_end_error,omitempty"`
 }
 
 // NICIRQVector is one interrupt's affinity before and after the pin.

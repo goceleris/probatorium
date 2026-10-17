@@ -60,7 +60,8 @@
                 }
               }
             },
-            "at_end": { "type": "object", "description": "The same record, read back after the last cell (no write)." }
+            "at_end": { "type": "object", "description": "The same record, read back after the last cell (no write). verified=false when the vector left its CPU during the run." },
+            "at_end_error": { "type": "string", "description": "The end-of-run readback's message when it failed." }
           }
         }
       }

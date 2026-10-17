@@ -33,6 +33,11 @@ cat > "$work/pb/play.yml" << 'EOT'
       when:
         - inventory_hostname == bench_target
         - (nic_irq_placement | default({})) | length > 0
+    # test-only: the vector disappears between the pin and the end-of-run readback (a driver re-requested its IRQs)
+    - ansible.builtin.copy:
+        content: ""
+        dest: "{{ lookup('env', 'NIC_IRQ_ROOT') }}/proc/interrupts"
+      when: test_vector_vanishes | default(false) | bool
     - ansible.builtin.include_tasks: tasks/nic_irq_placement_end.yml
       when:
         - inventory_hostname == bench_target
@@ -60,10 +65,10 @@ mkroot() { # mkroot DIR follows|stale
 		echo 8 > "$r/proc/irq/169/effective_affinity_list"
 	fi
 }
-play() { # play ROOT RUNDIR EXTRA_VARS_JSON  -> $log, $rc
+play() { # play ROOT RUNDIR EXTRA_VARS_JSON [MORE_VARS_JSON] -> $log, $rc
 	log=$work/play.log
 	(cd "$work/pb" && PATH=$work/bin:$PATH NIC_IRQ_ROOT=$1 ANSIBLE_LOCALHOST_WARNING=False ANSIBLE_INVENTORY_UNPARSED_WARNING=False \
-		ANSIBLE_DEPRECATION_WARNINGS=False ansible-playbook -i localhost, play.yml -e "run_dir=$2" -e "$3") > "$log" 2>&1
+		ANSIBLE_DEPRECATION_WARNINGS=False ansible-playbook -i localhost, play.yml -e "run_dir=$2" -e "$3" -e "${4:-{\}}") > "$log" 2>&1
 	rc=$?
 }
 PLACEMENT='{"nic_irq_placement":{"iface":"enp1s0","vector":"enp1s0-8","cpu":1}}'
@@ -97,6 +102,20 @@ play "$R" "$work/run3" "$PLACEMENT"
 check "readback mismatch FAILS the play" test "$rc" != 0
 check "the failure names the mismatch" logged "MISMATCH irq 167"
 check "no record is written for an unverified pin" test ! -e "$work/run3/nic-irq-placement.json"
+
+R=$work/r4
+mkroot "$R" follows
+play "$R" "$work/run8" "$PLACEMENT" '{"test_vector_vanishes":true}'
+check "end-of-run exit 2 (vector gone): the play still succeeds" test "$rc" = 0
+check "end-of-run exit 2: the WARNING fires" logged "WARNING: NIC IRQ placement DRIFTED"
+check "end-of-run exit 2: the record is written, at_end.verified=false, with the message" bash -c "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d[\"verified\"] is True and d[\"at_end\"][\"verified\"] is False and \"no interrupt named\" in d[\"at_end_error\"]' '$work/run8/nic-irq-placement.json'"
+
+R=$work/r5
+mkroot "$R" follows
+play "$R" "$work/run9" '{"nic_irq_placement":{"iface":"enp1s0","vector":"enp1s0-9","cpu":1}}'
+check "unknown vector at pin time fails the play" test "$rc" != 0
+check "unknown vector: the log says no interrupt named" logged "no interrupt named"
+check "unknown vector: no record, vector untouched" bash -c "[ ! -e '$work/run9/nic-irq-placement.json' ] && [ \$(cat '$R/proc/irq/167/smp_affinity_list') = 0-11 ]"
 
 R=$work/r3
 mkroot "$R" follows

@@ -19,19 +19,31 @@
   failed_when: false
   changed_when: false
 
+- name: NIC IRQ placement | parse the end-of-run readback
+  # Exit 2 (the vector or interface is gone, e.g. a driver re-requested its IRQs) prints no JSON, only
+  # a message on stderr: that is a drift too, recorded as verified=false with the message, never a crash
+  # that would stop the artefacts from coming back.
+  ansible.builtin.set_fact:
+    nic_irq_end_json: "{{ nic_irq_end.stdout | default('{}', true) | from_json }}"
+    nic_irq_end_failed: "{{ (nic_irq_end.rc | default(0)) != 0 }}"
+
 - name: NIC IRQ placement | merge the end-of-run readback into the record
   ansible.builtin.set_fact:
     nic_irq_record: >-
-      {{ nic_irq_record | combine({'at_end': (nic_irq_end.stdout | default('{}') | from_json)}) }}
+      {{ nic_irq_record | combine({
+           'at_end': (nic_irq_end_json if nic_irq_end_json else {'verified': false}),
+           'at_end_error': ((nic_irq_end.stderr | default('', true) | trim) if nic_irq_end_failed | bool else '')
+         }) }}
 
 - name: NIC IRQ placement | warn when the vector left its CPU during the run
   ansible.builtin.debug:
     msg: >-
       WARNING: NIC IRQ placement DRIFTED during the run on {{ inventory_hostname }}:
-      {{ nic_irq_record.vector }} was pinned to CPU {{ nic_irq_record.cpu }} and now reads
+      {{ nic_irq_record.vector }} was pinned to CPU {{ nic_irq_record.cpu }} and the end-of-run readback
+      says: {{ nic_irq_record.at_end_error | default('') }}
       {{ nic_irq_record.at_end.irqs | default([]) | map(attribute='after') | list }}.
       The cells of this run are not comparable with a run that kept the placement.
-  when: not (nic_irq_record.at_end.verified | default(true))
+  when: nic_irq_end_failed | bool
 
 - name: NIC IRQ placement | rewrite the record with the end-of-run readback
   ansible.builtin.copy:

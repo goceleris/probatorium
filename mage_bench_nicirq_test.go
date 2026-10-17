@@ -108,23 +108,19 @@ func TestReadNICIRQPlacementRefusesWhatItCannotTrust(t *testing.T) {
 	if p, err := readNICIRQPlacement(t.TempDir(), "msa2-server"); p != nil || err != nil {
 		t.Errorf("no record: got %+v, %v; want nil, nil", p, err)
 	}
-	// Two runs for the host in one results dir: the newest record wins.
+	// Two runs for the host in one results dir: their cells cannot share one placement.
 	dir := t.TempDir()
 	for _, ts := range []string{"20261017T090000", "20261017T110000"} {
 		run := filepath.Join(dir, ts+"-bench-msr1")
 		if err := os.MkdirAll(run, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		cpu := "1"
-		if ts == "20261017T090000" {
-			cpu = "2"
-		}
-		body := `{"host":"msr1","interface":"enp1s0","vector":"enp1s0-8","cpu":` + cpu + `,"verified":true,"irqs":[{"irq":167}]}`
+		body := `{"host":"msr1","interface":"enp1s0","vector":"enp1s0-8","cpu":1,"verified":true,"irqs":[{"irq":167}]}`
 		if err := os.WriteFile(filepath.Join(run, nicIRQPlacementFile), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if p, err := readNICIRQPlacement(dir, "msr1"); err != nil || p == nil || p.CPU != 1 {
-		t.Errorf("newest record: got %+v, %v; want cpu 1", p, err)
+	if p, err := readNICIRQPlacement(dir, "msr1"); err == nil || p != nil || !strings.Contains(err.Error(), "2 NIC IRQ placement records") {
+		t.Errorf("two records: got %+v, %v; want an error", p, err)
 	}
 }

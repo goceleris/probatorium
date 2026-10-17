@@ -88,11 +88,16 @@ func TestNICIRQPinScriptRecordMatchesReportSchema(t *testing.T) {
 
 // TestNICIRQPlacementPlay runs the real tasks files on a local connection against the fake tree
 // (ansible/tests/test_nic_irq_placement_play.sh): record written, second run idempotent, mismatch fails the
-// play, an empty or unset variable is a no-op. It needs ansible-playbook, which the ansible CI job has.
+// play, an empty or unset variable is a no-op. Opt-in with PROBATORIUM_ANSIBLE_TESTS=1.
 func TestNICIRQPlacementPlay(t *testing.T) {
 	bash := needBash(t)
+	// Opt-in: the version of ansible on a developer box or a generic runner is not the one the cluster pins,
+	// so only the ansible CI job (which installs the pinned one and runs this script directly) counts.
+	if os.Getenv("PROBATORIUM_ANSIBLE_TESTS") != "1" {
+		t.Skip("set PROBATORIUM_ANSIBLE_TESTS=1 to run the play test (needs ansible-playbook); the ansible CI job runs it")
+	}
 	if _, err := exec.LookPath("ansible-playbook"); err != nil {
-		t.Skip("ansible-playbook not installed; the ansible CI job runs this script")
+		t.Fatal("PROBATORIUM_ANSIBLE_TESTS=1 but ansible-playbook is not installed")
 	}
 	out, err := exec.Command(bash, filepath.Join("ansible", "tests", "test_nic_irq_placement_play.sh")).CombinedOutput()
 	if err != nil {
