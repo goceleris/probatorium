@@ -286,12 +286,23 @@
         bench_schedule: >-
           {{ [0] | product(bench_competitors) | list }}
 
-    - name: Iterate bench cells
-      ansible.builtin.include_tasks: tasks/run_bench_cell.yml
-      loop: "{{ bench_schedule }}"
-      loop_control:
-        loop_var: cell
-        label: "run={{ cell.0 }} comp={{ cell.1 }}"
+    - name: Iterate bench cells (X3 block, so the host probes are restored whatever happens inside)
+      block:
+        - name: Iterate bench cells
+          ansible.builtin.include_tasks: tasks/run_bench_cell.yml
+          loop: "{{ bench_schedule }}"
+          loop_control:
+            loop_var: cell
+            label: "run={{ cell.0 }} comp={{ cell.1 }}"
+      always:
+        - name: X3 restore host probes (always; idempotent, a no-op when nothing was changed)
+          ansible.builtin.shell: |
+            [ -f /tmp/celeris-x3/x3_restore.sh ] && bash /tmp/celeris-x3/x3_restore.sh || true
+          args:
+            executable: /bin/bash
+          become: true
+          changed_when: false
+          when: inventory_hostname == bench_target
 
 - name: Collect bench artefacts
   hosts: cluster
