@@ -28,9 +28,9 @@
       - nic_irq_placement.iface is defined
       - nic_irq_placement.vector is defined
       - nic_irq_placement.cpu is defined
-      - nic_irq_placement.cpu | string is match('^[0-9]+$')
+      - nic_irq_placement.cpu | string is match('^(0|[1-9][0-9]*)$')
     fail_msg: >-
-      nic_irq_placement needs iface, vector and a single integer cpu
+      nic_irq_placement needs iface, vector and a single integer cpu without leading zeros
       (e.g. {iface: enp1s0, vector: enp1s0-8, cpu: 1}); got {{ nic_irq_placement }}.
       Set it to {} to apply no placement.
     quiet: true

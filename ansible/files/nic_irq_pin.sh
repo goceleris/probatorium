@@ -7,13 +7,20 @@
 #
 # Usage: nic_irq_pin.sh MODE IFACE VECTOR CPU
 #   MODE    "pin" writes the CPU and verifies; "verify" only reads back and checks (no write)
-#   IFACE   interface the vector belongs to (e.g. enp1s0); /sys/class/net/<iface> must exist
+#   IFACE   interface the vector belongs to (e.g. enp1s0); /sys/class/net/<iface> must exist, and every
+#           IRQ of the vector must belong to it (see "Binding" below), else exit 2 and nothing is written
 #   VECTOR  interrupt NAME as /proc/interrupts prints it in its last column (e.g. enp1s0-8).
 #           Matched by exact equality, never as a pattern and never by IRQ number: the
 #           number changes across boots. Every line with that name is pinned.
-#   CPU     the ONE CPU that must service the vector (a plain integer, not a list or a mask)
+#   CPU     the ONE CPU that must service the vector (a plain integer without leading zeros, not a
+#           list or a mask)
 # Arguments, not environment: ansible.builtin.script does not apply the task's `environment`.
 # Environment: NIC_IRQ_ROOT is a test override, a prefix for /proc and /sys. Empty on a host.
+#
+# Binding of VECTOR to IFACE: a vector name alone could belong to another port (enp49s0-8 is a valid name
+# on msr1), so each IRQ found by name must be listed under /sys/class/net/<iface>/device/msi_irqs/. A host
+# without that directory (not an MSI device) falls back to the vector name starting with "<iface>-".
+# Anything else is refused with exit 2 before a single write.
 #
 # Why an explicit pin and not a restore: writing a mask back (0-11) does not put the vector back on the CPU
 # it was on, the kernel picks one from the mask. So the CPU is written as a single-CPU list and the EFFECTIVE
@@ -22,8 +29,11 @@
 # Idempotent: when smp_affinity_list AND effective_affinity_list already equal the CPU nothing is written
 # and "changed" is false.
 #
-# stdout: one JSON object (also on failure, with "verified": false), stderr: human lines. Exit 0 only when
-# every matching vector is verified on the CPU; 2 on bad input or an unknown vector, 3 on a readback mismatch.
+# stdout: one JSON object once the checks of the inputs have passed (also on a failed write or readback, with
+# "verified": false), stderr: human lines. Every refusal (exit 2) happens BEFORE the first write and prints no
+# JSON: bad input, an unknown vector, a vector that is not the interface's, an IRQ without its affinity files.
+# Exit 0 only when every matching vector is verified on the CPU; 2 on a refusal, 3 on a write or readback
+# failure.
 set -u
 
 R=${NIC_IRQ_ROOT:-}
@@ -38,11 +48,23 @@ die() { echo "nic_irq_pin: $*" >&2; exit 2; }
 case "$mode" in pin | verify) ;; *) die "MODE must be pin or verify, got '$mode'" ;; esac
 [[ $iface =~ ^[A-Za-z0-9_.-]+$ ]] || die "IFACE '$iface' is empty or not an interface name"
 [[ $vector =~ ^[A-Za-z0-9_.:-]+$ ]] || die "VECTOR '$vector' is empty or not an interrupt name"
-[[ $cpu =~ ^[0-9]+$ ]] || die "CPU '$cpu' is not a single CPU number"
+[[ $cpu =~ ^(0|[1-9][0-9]*)$ ]] || die "CPU '$cpu' is not a single CPU number (digits only, no leading zero)"
 [ -d "$R/sys/class/net/$iface" ] || die "interface $iface does not exist on this host"
 
 irqs=$(awk -v n="$vector" '$NF == n { sub(":", "", $1); print $1 }' "$R/proc/interrupts" | sort -n)
 [ -n "$irqs" ] || die "no interrupt named '$vector' in /proc/interrupts"
+
+# Every IRQ of the vector must belong to IFACE, and must have its affinity files, before anything is written.
+for irq in $irqs; do
+	if [ -d "$R/sys/class/net/$iface/device/msi_irqs" ]; then
+		[ -e "$R/sys/class/net/$iface/device/msi_irqs/$irq" ] ||
+			die "irq $irq ($vector) is not one of the MSI vectors of $iface (/sys/class/net/$iface/device/msi_irqs): refusing to pin another device's vector"
+	else
+		case "$vector" in "$iface"-*) ;; *) die "$iface has no device/msi_irqs and '$vector' does not start with '$iface-': refusing to pin another device's vector" ;; esac
+	fi
+	[ -r "$R/proc/irq/$irq/smp_affinity_list" ] || die "irq $irq has no smp_affinity_list"
+	[ -r "$R/proc/irq/$irq/effective_affinity_list" ] || die "irq $irq has no effective_affinity_list: the pin cannot be verified"
+done
 
 trim() { tr -d '[:space:]' < "$1" 2> /dev/null; }
 aff() { trim "$R/proc/irq/$1/smp_affinity_list"; }
@@ -54,8 +76,6 @@ verified=true
 items=""
 for irq in $irqs; do
 	d=$R/proc/irq/$irq
-	[ -r "$d/smp_affinity_list" ] || die "irq $irq has no smp_affinity_list"
-	[ -r "$d/effective_affinity_list" ] || die "irq $irq has no effective_affinity_list: the pin cannot be verified"
 	b_aff=$(aff "$irq")
 	b_eff=$(eff "$irq")
 	if [ "$mode" = pin ] && { [ "$b_aff" != "$cpu" ] || [ "$b_eff" != "$cpu" ]; }; then

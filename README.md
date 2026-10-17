@@ -140,20 +140,33 @@ The validator runs on the bench target itself, next to the reference app it driv
 ### msr1 NIC interrupt placement
 
 msr1 has two bonded Realtek r8127 ports (enp1s0, enp49s0) with one RX and one TX queue each and no RSS.
-When the TX-completion vector of enp1s0 (interrupt name `enp1s0-8`; its IRQ number changes per boot) is
-serviced by a CPU that runs no celeris loop, the whole port stops transmitting for about 200 ms; serviced
-by CPU 1, which does run a loop, there was no stall and +35% rps
-([goceleris/celeris#1036](https://github.com/goceleris/celeris/issues/1036)). So the bench pins that
-vector to CPU 1 before every run on msr1, a standing part of the setup, not an experiment:
+The bench pins the TX-completion vector of enp1s0 (interrupt name `enp1s0-8`; its IRQ number changes per boot)
+to CPU 1 before every bench run on msr1. This is a host-tuning choice made by the maintainer on 2026-10-17
+([goceleris/celeris#1036](https://github.com/goceleris/celeris/issues/1036)), not a measured fact about the
+hardware:
+
+- **What the evidence is.** It is exploratory and post hoc. X2: an extra loop on CPU 4 (where the vector sat)
+  cleared a whole-port TX stall of about 200 ms in 8 of 8 runs. X3 (run 39060669852): 21 of 21 columns with the
+  vector on a loop CPU were clean and 3 of 3 with it on CPU 4 stalled. But the pre-registered gate of that X3
+  run failed and its row was INCONCLUSIVE, and the h-irq4to1 arm always ran last, so order is not separated
+  from placement. The mechanism (a TX-completion vector serviced by a CPU without a loop stalls the port) is
+  the working explanation, not an established one. A +35% rps seen with the vector on CPU 1 is relative to
+  CPU 8 and is unexplained; do not quote it as an effect of this placement.
+- **What CPU 1 is.** A loop CPU only in celeris's #1049 (C1) layout. The non-celeris columns have no loops
+  there, so for them CPU 1 is simply the CPU the vector was put on, and the placement does not mean the same
+  thing across engines.
 
 - **Where.** `nic_irq_placement` on the msr1 entry of [`ansible/inventory.yml`](ansible/inventory.yml)
   (`iface`, `vector`, `cpu`), applied by [`ansible/tasks/nic_irq_placement.yml`](ansible/tasks/nic_irq_placement.yml)
   through [`ansible/files/nic_irq_pin.sh`](ansible/files/nic_irq_pin.sh) in the stage play of `bench.yml`.
   Empty or unset means do nothing: msa2-server and msa2-client never have it. A one-off run without it:
-  `-e '{"nic_irq_placement": {}}'`. enp49s0's vector is not touched (CPU 8 hosts a loop).
+  `-e '{"nic_irq_placement": {}}'`. enp49s0's vector is not touched (the maintainer excluded it from the placement).
 - **How.** The vector is found by name in `/proc/interrupts`, an explicit single CPU is written to
   `/proc/irq/N/smp_affinity_list`, and both `smp_affinity_list` and `effective_affinity_list` are read
-  back. A readback that differs from the CPU fails the play before the first cell. It is a pin, not a
+  back. IFACE is bound to the vector: each IRQ found by that name must be listed under
+  `/sys/class/net/<iface>/device/msi_irqs/` (a host without that directory falls back to the name starting
+  with `<iface>-`), else the script refuses with exit 2 and writes nothing. A readback that differs from the
+  CPU fails the play before the first cell. It is a pin, not a
   restore: writing the old mask (0-11) back does not return the vector to its previous CPU, the kernel
   picks one from the mask. Applying it again is a no-op. Nothing is undone at teardown.
 - **Record.** Every bench run on a host with the placement writes `nic-irq-placement.json` into its run
@@ -161,9 +174,16 @@ vector to CPU 1 before every run on msr1, a standing part of the setup, not an e
   readback taken after the last cell) and prints the same in the log. `mage Bench` folds it into
   `environment.nic_irq_placement` of the results document and so into `env.json` (schema 5.21); a
   run without a placement has no such key.
+- **Where it applies.** Only `bench.yml` pins. `mage Validate` (PR, nightly and checkptr tiers) and the stress
+  playbooks do not, so on msr1 their vector placement depends on history: pinned if a bench ran since the
+  boot, else the boot default. It is not recorded for them. irqbalance is not handled: nothing stops or
+  configures it, so it can move the vector between the pin and the end of a run (the end-of-run readback
+  below only detects that).
 - **Invariant.** Every bench run records its placement, and a changed placement (another vector, another
-  CPU, none) changes comparability: runs are compared only across the same `nic_irq_placement`. An
-  end-of-run readback that differs from the pin (something moved the vector mid-run) is logged as
+  CPU, none) changes comparability: runs are compared only across the same `nic_irq_placement`. The docs
+  site does not flag `nic_irq_placement` changes, so the first arm64 publish after this change crosses a
+  placement change unflagged. An end-of-run readback that differs from the pin (something moved the vector
+  mid-run) or that could not run at all (a become or transport failure) is logged as
   `WARNING: NIC IRQ placement DRIFTED` and recorded as `at_end.verified: false`; treat that run as unplaced.
 
 Tests: `bash ansible/tests/test_nic_irq_pin.sh` (the shell logic against a fake `/proc` and `/sys`; also

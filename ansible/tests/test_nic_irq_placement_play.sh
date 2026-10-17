@@ -14,6 +14,8 @@ mkdir -p "$work/pb" "$work/bin"
 cp -R "$here/files" "$here/tasks" "$work/pb/"
 cat > "$work/bin/sudo" << 'EOT'
 #!/bin/bash
+# test-only: while the flag file exists, become fails the way a missing sudo password does (the script never runs)
+if [ -n "${SUDO_FAIL_FLAG:-}" ] && [ -e "$SUDO_FAIL_FLAG" ]; then echo "sudo: a password is required" >&2; exit 1; fi
 while [ $# -gt 0 ]; do case "$1" in -u|-p|-g|-C|-U) shift 2;; -*) shift;; *) break;; esac; done
 exec "$@"
 EOT
@@ -38,6 +40,11 @@ cat > "$work/pb/play.yml" << 'EOT'
         content: ""
         dest: "{{ lookup('env', 'NIC_IRQ_ROOT') }}/proc/interrupts"
       when: test_vector_vanishes | default(false) | bool
+    # test-only: become breaks between the pin and the end-of-run readback, so the script never runs there
+    - ansible.builtin.copy:
+        content: ""
+        dest: "{{ lookup('env', 'SUDO_FAIL_FLAG') }}"
+      when: test_become_fails | default(false) | bool
     - ansible.builtin.include_tasks: tasks/nic_irq_placement_end.yml
       when:
         - inventory_hostname == bench_target
@@ -53,7 +60,8 @@ check() { local n=$1; shift; if "$@"; then ok "$n"; else bad "$n"; fi; }
 
 mkroot() { # mkroot DIR follows|stale
 	local r=$1
-	mkdir -p "$r/sys/class/net/enp1s0" "$r/sys/class/net/enp49s0" "$r/proc/irq/167" "$r/proc/irq/169"
+	mkdir -p "$r/sys/class/net/enp1s0/device/msi_irqs" "$r/sys/class/net/enp49s0/device/msi_irqs" "$r/proc/irq/167" "$r/proc/irq/169"
+	touch "$r/sys/class/net/enp1s0/device/msi_irqs/167" "$r/sys/class/net/enp49s0/device/msi_irqs/169"
 	printf ' 167:  0  0  ITS-MSI 2 Edge      enp1s0-8\n 169:  0  0  ITS-MSI 4 Edge      enp49s0-8\n' > "$r/proc/interrupts"
 	echo 0-11 > "$r/proc/irq/167/smp_affinity_list"
 	echo 0-11 > "$r/proc/irq/169/smp_affinity_list"
@@ -67,7 +75,8 @@ mkroot() { # mkroot DIR follows|stale
 }
 play() { # play ROOT RUNDIR EXTRA_VARS_JSON [MORE_VARS_JSON] -> $log, $rc
 	log=$work/play.log
-	(cd "$work/pb" && PATH=$work/bin:$PATH NIC_IRQ_ROOT=$1 ANSIBLE_LOCALHOST_WARNING=False ANSIBLE_INVENTORY_UNPARSED_WARNING=False \
+	rm -f "$work/sudo-fail"
+	(cd "$work/pb" && PATH=$work/bin:$PATH SUDO_FAIL_FLAG=$work/sudo-fail NIC_IRQ_ROOT=$1 ANSIBLE_LOCALHOST_WARNING=False ANSIBLE_INVENTORY_UNPARSED_WARNING=False \
 		ANSIBLE_DEPRECATION_WARNINGS=False ansible-playbook -i localhost, play.yml -e "run_dir=$2" -e "$3" -e "${4:-{\}}") > "$log" 2>&1
 	rc=$?
 }
@@ -110,6 +119,13 @@ check "end-of-run exit 2 (vector gone): the play still succeeds" test "$rc" = 0
 check "end-of-run exit 2: the WARNING fires" logged "WARNING: NIC IRQ placement DRIFTED"
 check "end-of-run exit 2: the record is written, at_end.verified=false, with the message" bash -c "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d[\"verified\"] is True and d[\"at_end\"][\"verified\"] is False and \"no interrupt named\" in d[\"at_end_error\"]' '$work/run8/nic-irq-placement.json'"
 
+R=$work/r6
+mkroot "$R" follows
+play "$R" "$work/run10" "$PLACEMENT" '{"test_become_fails":true}'
+check "end-of-run become failure: the play still succeeds" test "$rc" = 0
+check "end-of-run become failure: the WARNING fires" logged "WARNING: NIC IRQ placement DRIFTED"
+check "end-of-run become failure: not read as success, at_end.verified=false and the error is recorded" bash -c "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d[\"verified\"] is True and d[\"at_end\"][\"verified\"] is False and \"password\" in d[\"at_end_error\"]' '$work/run10/nic-irq-placement.json'"
+
 R=$work/r5
 mkroot "$R" follows
 play "$R" "$work/run9" '{"nic_irq_placement":{"iface":"enp1s0","vector":"enp1s0-9","cpu":1}}'
@@ -128,6 +144,10 @@ check "unset variable: no-op, no record, vector untouched" bash -c "[ \$(cat '$R
 
 play "$R" "$work/run6" '{"nic_irq_placement":{"iface":"enp1s0","vector":"enp1s0-8","cpu":"0-3"}}'
 check "a CPU list in the variable fails the play" test "$rc" != 0
+play "$R" "$work/run11" '{"nic_irq_placement":{"iface":"enp1s0","vector":"enp1s0-8","cpu":"01"}}'
+check "a leading-zero CPU in the variable fails the play" test "$rc" != 0
+play "$R" "$work/run12" '{"nic_irq_placement":{"iface":"enp1s0","vector":"enp49s0-8","cpu":1}}'
+check "a vector of another interface fails the play, nothing written" bash -c "[ $rc != 0 ] && [ \$(cat '$R/proc/irq/169/smp_affinity_list') = 0-11 ]"
 play "$R" "$work/run7" '{"nic_irq_placement":{"iface":"enp1s0"}}'
 check "a malformed variable fails the play" test "$rc" != 0
 

@@ -26,10 +26,13 @@ check() { # $1 name, then a command run as the condition
 	if "$@"; then ok "$name"; else bad "$name"; fi
 }
 
-# mkroot DIR EFFECTIVE_MODE  - the msr1 shape: enp1s0-8 on irq 167 (CPU 4), enp49s0-8 on irq 169 (CPU 8)
+# mkroot DIR EFFECTIVE_MODE  - the msr1 shape: enp1s0-8 on irq 167, enp49s0-8 on irq 169, each in its port's msi_irqs
 mkroot() {
 	local r=$1 mode=$2
-	mkdir -p "$r/sys/class/net/enp1s0" "$r/sys/class/net/enp49s0" "$r/proc/irq/167" "$r/proc/irq/168" "$r/proc/irq/169"
+	mkdir -p "$r/sys/class/net/enp1s0/device/msi_irqs" "$r/sys/class/net/enp49s0/device/msi_irqs" "$r/proc/irq/167" "$r/proc/irq/168" "$r/proc/irq/169"
+	# the MSI vectors each port owns, as the kernel lists them (one empty file per IRQ number)
+	touch "$r/sys/class/net/enp1s0/device/msi_irqs/166" "$r/sys/class/net/enp1s0/device/msi_irqs/167" "$r/sys/class/net/enp1s0/device/msi_irqs/168"
+	touch "$r/sys/class/net/enp49s0/device/msi_irqs/169"
 	cat > "$r/proc/interrupts" << 'EOT'
            CPU0       CPU1       CPU2       CPU3       CPU4
  166:          0          0          0          0         12  ITS-MSI 1  Edge      enp1s0-0
@@ -134,6 +137,57 @@ rm "$R/proc/irq/167/effective_affinity_list"
 run "$R" pin enp1s0 enp1s0-8 1
 check "no effective_affinity_list (cannot verify): exit 2" test "$rc" = 2
 check "no effective_affinity_list: nothing written" test "$(irqfile "$R" 167 smp_affinity_list)" = 0-11
+
+# 6b. the vector must belong to the interface: another port's vector name is refused, nothing is written
+R=$work/bind
+mkroot "$R" follows
+run "$R" pin enp1s0 enp49s0-8 1
+check "bind: enp49s0-8 under enp1s0 is refused: exit 2" test "$rc" = 2
+check "bind: the refusal says whose vector it is not" errhas "not one of the MSI vectors of enp1s0"
+check "bind: no JSON on a refusal" test -z "$out"
+check "bind: enp49s0-8 not written" test "$(irqfile "$R" 169 smp_affinity_list)" = 0-11
+run "$R" pin enp49s0 enp1s0-8 1
+check "bind: enp1s0-8 under enp49s0 is refused: exit 2" test "$rc" = 2
+check "bind: enp1s0-8 not written" test "$(irqfile "$R" 167 smp_affinity_list)" = 0-11
+run "$R" verify enp1s0 enp49s0-8 1
+check "bind: verify mode refuses too: exit 2" test "$rc" = 2
+run "$R" pin enp49s0 enp49s0-8 1
+check "bind: the right pair still works: exit 0" test "$rc" = 0
+check "bind: enp49s0-8 pinned when asked for by name" test "$(irqfile "$R" 169 smp_affinity_list)" = 1
+
+# 6c. a host without device/msi_irqs falls back to the vector name starting with the interface name
+R=$work/nomsi
+mkroot "$R" follows
+rm -rf "$R/sys/class/net/enp1s0/device" "$R/sys/class/net/enp49s0/device"
+run "$R" pin enp1s0 enp49s0-8 1
+check "no msi_irqs: another port's vector name is refused: exit 2" test "$rc" = 2
+check "no msi_irqs: nothing written" test "$(irqfile "$R" 169 smp_affinity_list)" = 0-11
+run "$R" pin enp1s0 enp1s0-8 1
+check "no msi_irqs: <iface>-<n> is accepted: exit 0" test "$rc" = 0
+
+# 6d. a later IRQ of the same name without its affinity files: refused before ANY write (no half pin, no JSON)
+R=$work/late
+mkroot "$R" follows
+echo ' 170:          0          0          0          0          5  ITS-MSI 5  Edge      enp1s0-8' >> "$R/proc/interrupts"
+touch "$R/sys/class/net/enp1s0/device/msi_irqs/170"
+run "$R" pin enp1s0 enp1s0-8 1
+check "later irq dir missing: exit 2" test "$rc" = 2
+check "later irq dir missing: the first irq was not written either" test "$(irqfile "$R" 167 smp_affinity_list)" = 0-11
+check "later irq dir missing: stderr names irq 170" errhas "irq 170 has no smp_affinity_list"
+
+# 6e. the CPU is a plain integer: leading zeros are refused (0 itself is fine)
+R=$work/cpu
+mkroot "$R" follows
+for bad_cpu in 01 007 00 -1 1.5 ' 1' ''; do
+	run "$R" pin enp1s0 enp1s0-8 "$bad_cpu"
+	check "cpu '$bad_cpu' is refused: exit 2, no JSON" test "$rc" = 2 -a -z "$out"
+done
+check "refused cpus wrote nothing" test "$(irqfile "$R" 167 smp_affinity_list)" = 0-11
+run "$R" pin enp1s0 enp1s0-8 0
+check "cpu 0 is accepted: exit 0" test "$rc" = 0
+check "cpu 0 is written" test "$(irqfile "$R" 167 smp_affinity_list)" = 0
+run "$R" pin enp1s0 enp1s0-8 10
+check "cpu 10 is accepted: exit 0" test "$rc" = 0
 
 # 7. enp49s0 is only touched when asked for by name (the maintainer excluded it from the standing placement)
 R=$work/other

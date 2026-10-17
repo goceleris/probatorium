@@ -55,7 +55,8 @@ func TestNICIRQPinScriptRecordMatchesReportSchema(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	mk("sys/class/net/enp1s0/.keep", "")
+	mk("sys/class/net/enp1s0/device/msi_irqs/167", "")
+	mk("sys/class/net/enp49s0/device/msi_irqs/169", "")
 	mk("proc/interrupts", "  CPU0\n 167: 0 ITS-MSI 2 Edge      enp1s0-8\n 169: 0 ITS-MSI 4 Edge      enp49s0-8\n")
 	mk("proc/irq/167/smp_affinity_list", "0-11\n")
 	if err := os.Symlink("smp_affinity_list", filepath.Join(root, "proc/irq/167/effective_affinity_list")); err != nil {

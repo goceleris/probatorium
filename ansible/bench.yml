@@ -109,8 +109,8 @@
         state: directory
         mode: '0755'
 
-    # Standing NIC interrupt placement (msr1: the enp1s0 TX-completion vector on a
-    # CPU that runs a loop; goceleris/celeris#1036). Bench target only, and only
+    # Standing NIC interrupt placement (msr1: the enp1s0 TX-completion vector on
+    # CPU 1, a host-tuning choice; goceleris/celeris#1036, rationale in inventory.yml). Bench target only, and only
     # when nic_irq_placement is a non-empty dict (inventory.yml). A readback that
     # does not show the vector on the CPU fails the play before any cell runs.
     # Every run records it in nic-irq-placement.json -> environment.nic_irq_placement.

@@ -293,11 +293,12 @@ import (
 //     older readers ignore the field.
 //   - 5.21 — the NIC interrupt placement the bench ran under
 //     (goceleris/celeris#1036). msr1 has one RX and one TX queue per
-//     port and no RSS, and a ~200 ms whole-port TX stall appears when the
-//     TX-completion vector is serviced by a CPU without a loop. The bench
-//     now pins that vector to a loop CPU before every run (ansible
-//     nic_irq_placement) and records it. Adds Environment.NICIRQPlacement
-//     (nic_irq_placement): interface, vector name, CPU, and per IRQ the
+//     port and no RSS, and exploratory, post hoc runs saw a ~200 ms
+//     whole-port TX stall when the TX-completion vector was serviced by a
+//     CPU without a loop (a working explanation, not an established one).
+//     The bench now pins that vector to CPU 1 before every bench run, a
+//     host-tuning choice (ansible nic_irq_placement), and records it.
+//     Adds Environment.NICIRQPlacement (nic_irq_placement): interface, vector name, CPU, and per IRQ the
 //     smp_affinity_list / effective_affinity_list found before and read back
 //     after, plus the end-of-run readback. Omitted when the host applies no
 //     placement (every amd64 run). A changed placement changes
