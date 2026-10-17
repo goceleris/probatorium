@@ -290,7 +290,7 @@ func TestScatterFloor(t *testing.T) {
 
 // The critical-value table is the 1 - alpha quantile of the statistic
 // for iid normal troughs: spot-check three entries by a small
-// simulation (the full table: scripts in the PR body).
+// simulation (the full table: go run ./validation/properties/testdata/scatter_calib).
 func TestScatterCritCalibration(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
 	for _, n := range []int{7, 10, 15} {

@@ -26,19 +26,39 @@ import (
 // violations.
 //
 // What it costs, so nobody reads it as free (45 minute cells of the weekend
-// soaks, against the rule without the term; probatorium PR, lane IMEM1):
-//   - In the noisy cells (trough sd 0.34-1.4 MB, the observability cells)
-//     a 3 KB/s leak from the end of warm-up is called about 11 minutes
-//     later (median 17.5 -> 28.7 min), a 2 KB/s leak in 24 of 25 cells
-//     (25 before), a 1 KB/s leak in 9 (24 before), and a leak that starts
-//     at minute 25 in fewer of them (3 KB/s: 12 of 21 that were called
-//     before).
-//   - In the quiet cells a 3 KB/s leak is called about 3.7 minutes later
-//     (median 17.5 -> 21.2 min), because windows of 5-8 troughs need a
-//     leak large against the scatter (heapScatterCrit is 26 at 5 troughs,
-//     11 at 6, 7.7 at 7; the estimator is robust and so inefficient).
-//   - A leak that climbs in steps every 15 or 30 minutes is called as
-//     early as without the term on the quiet cells.
+// soaks: 25 noisy observability cells, trough sd 0.34-1.4 MB, and 162 quiet
+// cells; detected/sustained counts against the rule without the term; the
+// case definitions and all tables are in probatorium#520):
+//   - Noisy cells, straight leak from the end of warm-up: 1 KB/s is called
+//     in 9 of 25 (24 before), 2 KB/s in 24 (25), 3 KB/s about 11 minutes
+//     later (median 17.5 -> 28.7 min).
+//   - Noisy cells, a leak that starts late: from minute 20, 3 KB/s 25/25 ->
+//     22/19; from minute 25, 3 KB/s 21/10 -> 12/3, 4 KB/s 25/22 -> 21/10,
+//     6 KB/s 25/25 -> 24/21.
+//   - Noisy cells, a stepped leak (3 KB/s on average): 11 minutes later
+//     with a step every 15 minutes, sustained 21 -> 9 with a step every 30.
+//   - Quiet cells, straight leak: 3 KB/s about 3.7 minutes later at the
+//     median (6.2 at most), 1 KB/s in 146 of 162 (150 before); late-start
+//     and stepped leaks up to 2.5-5 minutes later.
+//   - Quiet cells, a leak that STOPS: starting at the end of warm-up and
+//     plateauing after 7.5 minutes, 3 KB/s is lost in 90 cells (154/153 ->
+//     64/18), 4 KB/s 162/156 -> 125/75, 6 KB/s 162/162 -> 156/153; 3 KB/s
+//     for 10 minutes 162/162 -> 157/149. An instant 2 MB step is still
+//     called in 156 cells, so the estimator is the cause: after the leak
+//     stops the shifted differences sit in windows of 6-8 troughs where the
+//     75 % trim drops only one, and the scatter estimate inflates. The
+//     other floors do not catch it.
+//   - A single low trough outlier (2-4 MB at minute 10-15) delays a 3-5
+//     KB/s call by a median of 7.5-11.2 minutes (max 11.2-13.7) on quiet
+//     cells; a single 1 MB step is called in 139 of 150.
+//   - Quiet cells with 1-2 MB of added trough scatter: 3 KB/s is lost in
+//     19-123 of 162, a 4 MB sawtooth loses 161; with no leak the rule
+//     without the term trips falsely in 59 of those 162 and this one in 0.
+//   - Short cells: with the load phase cut to 20 minutes, quiet cells lose
+//     99 of 162 at 3 KB/s, 75 at 5, 32 at 10 (noisy 22-25 of 25); at 25
+//     minutes none. The production 45 minute cells are unaffected.
+//   - Windows of 5-8 troughs judge only a leak that is large against the
+//     scatter (heapScatterCrit is 26 at 5 troughs, 11 at 6, 7.7 at 7).
 //
 // The scatter estimate sigmaD comes from successive trough differences,
 // not from the residuals about the fitted line. A residual grows with
@@ -51,8 +71,8 @@ import (
 // alpha is the level, not a fitted constant: heapScatterCrit holds the
 // 1 - alpha quantile of the statistic for iid normal troughs at equal
 // spacing, by simulation (4,000,000 draws per trough count, seeds
-// 1000+n; the any-look false-alarm rate over windows of 4 to 15 troughs
-// is 0.75 % per cell, simulated). Real troughs are not exactly iid
+// 1000+n, testdata/scatter_calib/main.go reproduces the table; the any-look
+// false-alarm rate over windows of 4 to 15 troughs is 0.75 % per cell). Real troughs are not exactly iid
 // normal; the stationary-bootstrap null in the PR that introduced this
 // term measures the rate on the soaks' own series.
 const heapScatterAlpha = 0.001
