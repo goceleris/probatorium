@@ -297,7 +297,7 @@
       always:
         - name: X3 restore host probes (always; idempotent, a no-op when nothing was changed)
           ansible.builtin.shell: |
-            [ -f /tmp/celeris-x3/x3_restore.sh ] && bash /tmp/celeris-x3/x3_restore.sh || true
+            [ -f /tmp/celeris-x3/x3_restore.sh ] && X3WHO=always bash /tmp/celeris-x3/x3_restore.sh || true
           args:
             executable: /bin/bash
           become: true

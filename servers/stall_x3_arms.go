@@ -9,11 +9,11 @@ package servers
 //	f-napi0     napi_defer_hard_irqs=0, gro_flush_timeout=0 on enp1s0 and enp49s0
 //	g-napi0one  the same on enp1s0 only
 //	h-irq4to1   the enp1s0-8 IRQ moved from CPU 4 to CPU 1 (a loop CPU)
-//	i-qdisc     enp1s0 root qdisc pfifo_fast instead of mq/fq_codel
+//	(the qdisc swap probe was declined by the maintainer and does not exist in this branch)
 func init() {
 	const ver = "v1.5.12-0.20261017151113-37575415d985"
 	arms := []struct{ suffix, probe string }{
-		{"a-c1", ""}, {"f-napi0", "napi0"}, {"g-napi0one", "napi0one"}, {"h-irq4to1", "irq4to1"}, {"i-qdisc", "qdisc"},
+		{"a-c1", ""}, {"f-napi0", "napi0"}, {"g-napi0one", "napi0one"}, {"h-irq4to1", "irq4to1"},
 	}
 	for _, n := range []string{"celeris-adaptive-h1-async", "celeris-iouring-h1-async"} {
 		a, ok := Registry[n]

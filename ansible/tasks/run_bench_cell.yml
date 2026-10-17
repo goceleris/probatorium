@@ -664,72 +664,93 @@
     #   napi0      napi_defer_hard_irqs=0 and gro_flush_timeout=0 on enp1s0 and enp49s0
     #   napi0one   the same on enp1s0 only
     #   irq4to1    IRQ of enp1s0-8 (CPU 4) moved to CPU 1, which hosts a loop (smp_affinity_list)
-    #   qdisc      enp1s0 root qdisc mq(fq_codel) replaced by pfifo_fast
+    # Any other name is refused (exit 2) before anything is read or written. (The qdisc swap was declined by the maintainer and is not in this script.)
     # The ORIGINAL values are recorded once in $X3DIR/saved.env before anything is changed; x3_restore.sh puts them back and is idempotent.
+    # X3RUNDIR (the bench run directory) receives the per-run record x3-probe.txt, which the reader uses to verify the restore.
     # X3ROOT is a test override (a fake /sys, /proc tree); empty on the host.
     set -u
     probe=$1
     R=${X3ROOT:-}
     X3DIR=${X3DIR:-/tmp/celeris-x3}
-    mkdir -p "$X3DIR"
+    RUNDIR=${X3RUNDIR:-$X3DIR}
+    case "$probe" in napi0|napi0one|irq4to1) ;; *) echo "unknown or declined probe $probe" >&2; exit 2;; esac
+    mkdir -p "$X3DIR" "$RUNDIR"
     SAVED=$X3DIR/saved.env
+    REC=$RUNDIR/x3-probe.txt
     port_attr() { echo "$R/sys/class/net/$1/$2"; }
     irq_of() { awk -v n="$1" '$NF == n {sub(":","",$1); print $1; exit}' "$R/proc/interrupts"; }
-    save() { # key value-from-file ; only the first save of a key counts, so a second apply cannot overwrite the originals
+    save() { # key value ; only the first save of a key counts, so a second apply cannot overwrite the originals
       grep -q "^$1=" "$SAVED" 2>/dev/null || printf '%s=%s\n' "$1" "$2" >> "$SAVED"
     }
-    # the watchdog: restore after $X3WATCH seconds even if the playbook and its always block are gone (job cancelled, host lost the controller)
+    save rundir "$RUNDIR"
+    # the watchdog: restore after $X3WATCH seconds even if the playbook and its always block are gone (job cancelled, controller lost)
     if [ -n "${X3WATCH:-}" ] && ! [ -f "$X3DIR/watchdog.pid" ]; then
       SETSID=$(command -v setsid || true)
-      $SETSID nohup bash -c "sleep $X3WATCH; X3ROOT='$R' X3DIR='$X3DIR' bash '$X3DIR/x3_restore.sh'" > "$X3DIR/watchdog.out" 2>&1 &
+      $SETSID nohup bash -c "sleep $X3WATCH; X3WHO=watchdog X3ROOT='$R' X3DIR='$X3DIR' bash '$X3DIR/x3_restore.sh'" > "$X3DIR/watchdog.out" 2>&1 &
       echo $! > "$X3DIR/watchdog.pid"
     fi
+    before="" ; after=""
     case "$probe" in
       napi0|napi0one)
         ports="enp1s0 enp49s0"; [ "$probe" = napi0one ] && ports="enp1s0"
         for p in $ports; do
           save "napi_defer_hard_irqs.$p" "$(cat "$(port_attr $p napi_defer_hard_irqs)")"
           save "gro_flush_timeout.$p" "$(cat "$(port_attr $p gro_flush_timeout)")"
+          before="$before $p:napi_defer_hard_irqs=$(cat "$(port_attr $p napi_defer_hard_irqs)") $p:gro_flush_timeout=$(cat "$(port_attr $p gro_flush_timeout)")"
         done
         for p in $ports; do
           echo 0 > "$(port_attr $p napi_defer_hard_irqs)" && echo 0 > "$(port_attr $p gro_flush_timeout)" || exit 1
+          after="$after $p:napi_defer_hard_irqs=$(cat "$(port_attr $p napi_defer_hard_irqs)") $p:gro_flush_timeout=$(cat "$(port_attr $p gro_flush_timeout)")"
         done ;;
       irq4to1)
         irq=$(irq_of enp1s0-8); [ -n "$irq" ] || { echo "no enp1s0-8 vector" >&2; exit 1; }
         save "irq" "$irq"
         save "irq.$irq.smp_affinity_list" "$(cat "$R/proc/irq/$irq/smp_affinity_list")"
-        echo 1 > "$R/proc/irq/$irq/smp_affinity_list" || exit 1 ;;
-      qdisc)
-        save "qdisc.enp1s0" "$(tc qdisc show dev enp1s0 | tr '\n' ';')"
-        tc qdisc replace dev enp1s0 root pfifo_fast || exit 1 ;;
-      *) echo "unknown probe $probe" >&2; exit 2 ;;
+        before="irq$irq:smp_affinity_list=$(cat "$R/proc/irq/$irq/smp_affinity_list") irq$irq:effective=$(cat "$R/proc/irq/$irq/effective_affinity_list" 2>/dev/null)"
+        echo 1 > "$R/proc/irq/$irq/smp_affinity_list" || exit 1
+        after="irq$irq:smp_affinity_list=$(cat "$R/proc/irq/$irq/smp_affinity_list") irq$irq:effective=$(cat "$R/proc/irq/$irq/effective_affinity_list" 2>/dev/null)" ;;
     esac
-    echo "applied $probe $(date +%s.%N)" >> "$X3DIR/log"
+    echo "APPLY $(date +%s.%N) probe=$probe before:$before after:$after" | tee -a "$X3DIR/log" >> "$REC"
     EOX3A
     cat > /tmp/celeris-x3/x3_restore.sh <<'EOX3R'
     #!/bin/bash
-    # x3_restore.sh: put back every value x3_apply.sh recorded in $X3DIR/saved.env. Idempotent; a no-op when nothing was saved.
-    # Exit status is non-zero if a value could not be restored, so the caller can fail loudly; it still tries every key.
+    # x3_restore.sh: put back every value x3_apply.sh recorded in $X3DIR/saved.env, read each one back, and append the result to the per-run
+    # record (x3-probe.txt in the run directory recorded at apply time) and to $X3DIR/log. Idempotent; a no-op when nothing was saved.
+    # X3WHO labels the caller (after-runner, always, watchdog, cleanup). Exit status is non-zero if a value could not be restored or read
+    # back different; the record is kept (saved.env stays) and every key is still tried.
     set -u
     R=${X3ROOT:-}
     X3DIR=${X3DIR:-/tmp/celeris-x3}
     SAVED=$X3DIR/saved.env
-    rc=0
+    who=${X3WHO:-unknown}
     [ -f "$SAVED" ] || { echo "nothing saved, nothing to restore"; exit 0; }
-    irq=$(sed -n 's/^irq=//p' "$SAVED")
+    RUNDIR=$(sed -n 's/^rundir=//p' "$SAVED"); RUNDIR=${RUNDIR:-$X3DIR}
+    mkdir -p "$RUNDIR" 2>/dev/null || RUNDIR=$X3DIR
+    REC=$RUNDIR/x3-probe.txt
+    rc=0; got=""; mism=""
+    chk() { # key restored-file expected
+      local now; now=$(cat "$2" 2>/dev/null)
+      got="$got $1=$now"
+      [ "$now" = "$3" ] || { mism="$mism $1(want $3 got $now)"; rc=1; }
+    }
     while IFS='=' read -r k v; do
       case "$k" in
-        napi_defer_hard_irqs.*) p=${k#*.}; echo "$v" > "$R/sys/class/net/$p/napi_defer_hard_irqs" || rc=1 ;;
-        gro_flush_timeout.*)    p=${k#*.}; echo "$v" > "$R/sys/class/net/$p/gro_flush_timeout" || rc=1 ;;
-        irq.*.smp_affinity_list) i=${k#irq.}; i=${i%%.*}; echo "$v" > "$R/proc/irq/$i/smp_affinity_list" || rc=1 ;;
-        qdisc.enp1s0) tc qdisc del dev enp1s0 root 2>/dev/null; tc qdisc replace dev enp1s0 root mq 2>/dev/null || tc qdisc add dev enp1s0 root mq || rc=1
-                      now=$(tc qdisc show dev enp1s0 | tr '\n' ';'); [ "$now" = "$v" ] || echo "WARN qdisc differs after restore: was [$v] now [$now]" >&2 ;;
+        napi_defer_hard_irqs.*) p=${k#*.}; echo "$v" > "$R/sys/class/net/$p/napi_defer_hard_irqs" 2>/dev/null; chk "$p:napi_defer_hard_irqs" "$R/sys/class/net/$p/napi_defer_hard_irqs" "$v" ;;
+        gro_flush_timeout.*)    p=${k#*.}; echo "$v" > "$R/sys/class/net/$p/gro_flush_timeout" 2>/dev/null; chk "$p:gro_flush_timeout" "$R/sys/class/net/$p/gro_flush_timeout" "$v" ;;
+        irq.*.smp_affinity_list) i=${k#irq.}; i=${i%%.*}; echo "$v" > "$R/proc/irq/$i/smp_affinity_list" 2>/dev/null; chk "irq$i:smp_affinity_list" "$R/proc/irq/$i/smp_affinity_list" "$v"
+                                 got="$got irq$i:effective=$(cat "$R/proc/irq/$i/effective_affinity_list" 2>/dev/null)" ;;
       esac
     done < "$SAVED"
-    if [ $rc -eq 0 ]; then mv "$SAVED" "$SAVED.restored.$(date +%s)"; echo "restored $(date +%s.%N)" >> "$X3DIR/log"; [ -f "$X3DIR/watchdog.pid" ] && { kill "$(cat "$X3DIR/watchdog.pid")" 2>/dev/null; rm -f "$X3DIR/watchdog.pid"; }; fi
+    verdict=VERIFIED; [ $rc -eq 0 ] || verdict="MISMATCH$mism"
+    line="RESTORE $(date +%s.%N) who=$who $verdict readback:$got"
+    echo "$line" | tee -a "$X3DIR/log" >> "$REC"
+    if [ $rc -eq 0 ]; then
+      mv "$SAVED" "$SAVED.restored.$(date +%s)"
+      [ -f "$X3DIR/watchdog.pid" ] && { kill "$(cat "$X3DIR/watchdog.pid")" 2>/dev/null; rm -f "$X3DIR/watchdog.pid"; }
+    fi
     exit $rc
     EOX3R
-    X3WATCH={{ (cell_guard_seconds | int) + 120 }} bash /tmp/celeris-x3/x3_apply.sh {{ cell_col_env.AB_HOST_PROBE }}
+    X3RUNDIR={{ bench_run_dir }} X3WATCH={{ (cell_guard_seconds | int) + 120 }} bash /tmp/celeris-x3/x3_apply.sh {{ cell_col_env.AB_HOST_PROBE }}
   args:
     executable: /bin/bash
   become: true
@@ -737,7 +758,7 @@
   when:
     - inventory_hostname == bench_target
     - cell_bound | bool
-    - (cell_col_env.AB_HOST_PROBE | default('')) != ''
+    - (cell_col_env.AB_HOST_PROBE | default('')) in ['napi0', 'napi0one', 'irq4to1']
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | start stall captures (both hosts, read-only, celeris#1036 investigation)"
   # Per-port packet counters at 20 Hz, qdisc, NIC vectors and per-connection TCP
@@ -1115,7 +1136,7 @@
 # ---------- teardown for this cell ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | X3 restore host probe (fails loudly if a value could not be put back)"
   ansible.builtin.shell: |
-    [ -f /tmp/celeris-x3/x3_restore.sh ] && bash /tmp/celeris-x3/x3_restore.sh || true
+    [ -f /tmp/celeris-x3/x3_restore.sh ] && X3WHO=after-runner bash /tmp/celeris-x3/x3_restore.sh || true
   args:
     executable: /bin/bash
   become: true
