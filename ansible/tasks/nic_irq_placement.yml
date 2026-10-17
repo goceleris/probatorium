@@ -1,0 +1,78 @@
+# Standing NIC interrupt placement for the bench target (goceleris/celeris#1036).
+#
+# Included from the "Stage bench-run state" play of bench.yml, on the bench target
+# only, and only when `nic_irq_placement` is a non-empty dict. msr1 carries it in
+# inventory.yml, where the comment explains WHY. Every other host, and msr1 with
+# the var emptied (-e '{"nic_irq_placement": {}}'), never reaches this file.
+#
+#   nic_irq_placement:
+#     iface:  enp1s0      interface the vector belongs to
+#     vector: enp1s0-8    interrupt NAME in /proc/interrupts (the IRQ number varies per boot)
+#     cpu:    1           the ONE CPU that must service it
+#
+# files/nic_irq_pin.sh writes the CPU to /proc/irq/N/smp_affinity_list and reads
+# smp_affinity_list AND effective_affinity_list back. A mismatch fails the play
+# here, before a single cell runs. The result (interface, irq, cpu, the value found
+# BEFORE and the value read back AFTER) is printed in the log and written to
+# <bench_run_dir>/nic-irq-placement.json, which the collect play fetches and
+# mage Bench folds into the run's results.json / env.json as
+# environment.nic_irq_placement.
+#
+# The placement is deliberately NOT restored at teardown: it is the standing
+# configuration of the benchmark, and restoring a mask would not put the vector
+# back on its previous CPU anyway (the kernel picks one from the mask).
+
+- name: NIC IRQ placement | validate the nic_irq_placement variable
+  ansible.builtin.assert:
+    that:
+      - nic_irq_placement.iface is defined
+      - nic_irq_placement.vector is defined
+      - nic_irq_placement.cpu is defined
+      - nic_irq_placement.cpu | string is match('^(0|[1-9][0-9]*)$')
+    fail_msg: >-
+      nic_irq_placement needs iface, vector and a single integer cpu without leading zeros
+      (e.g. {iface: enp1s0, vector: enp1s0-8, cpu: 1}); got {{ nic_irq_placement }}.
+      Set it to {} to apply no placement.
+    quiet: true
+
+- name: NIC IRQ placement | pin the vector to its CPU and verify by readback
+  become: true
+  ansible.builtin.script: >-
+    {{ playbook_dir }}/files/nic_irq_pin.sh pin
+    {{ nic_irq_placement.iface | string | quote }}
+    {{ nic_irq_placement.vector | string | quote }}
+    {{ nic_irq_placement.cpu | string | quote }}
+  args:
+    executable: /bin/bash
+  register: nic_irq_pin
+  # Exit 3 is a readback mismatch, 2 a bad input or an unknown vector (stdout is then empty,
+  # hence default('{}', true) below: default() alone only covers an UNDEFINED value). Both fail
+  # the play loudly: a run on an unplaced vector is not comparable with the runs on a placed one.
+  failed_when: nic_irq_pin.rc | default(0) != 0
+  changed_when: (nic_irq_pin.stdout | default('{}', true) | from_json).changed | default(false)
+
+- name: NIC IRQ placement | record fact
+  ansible.builtin.set_fact:
+    nic_irq_record: >-
+      {{ (nic_irq_pin.stdout | default('{}', true) | from_json)
+         | combine({'host': inventory_hostname}) }}
+
+- name: NIC IRQ placement | print before/after
+  ansible.builtin.debug:
+    msg: >-
+      NIC IRQ placement on {{ inventory_hostname }}:
+      {{ nic_irq_record.interface | default('(check mode, not applied)') }}
+      vector {{ nic_irq_record.vector | default('') }}
+      -> CPU {{ nic_irq_record.cpu | default('') }}
+      ({{ 'CHANGED' if nic_irq_record.changed | default(false) else 'already in place' }},
+      verified={{ nic_irq_record.verified | default(false) }});
+      {% for i in nic_irq_record.irqs | default([]) %}
+      irq {{ i.irq }}: smp_affinity_list {{ i.before.affinity }} -> {{ i.after.affinity }},
+      effective_affinity_list {{ i.before.effective }} -> {{ i.after.effective }};
+      {% endfor %}
+
+- name: NIC IRQ placement | record in the run dir (fetched with the run, folded into env.json)
+  ansible.builtin.copy:
+    dest: "{{ bench_run_dir }}/nic-irq-placement.json"
+    content: "{{ nic_irq_record | to_nice_json }}\n"
+    mode: '0644'

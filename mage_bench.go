@@ -2039,6 +2039,16 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 	if onlyHost != "" {
 		archTarget = onlyHost
 	}
+	// The NIC interrupt placement the SUT ran under (schema 5.21,
+	// goceleris/celeris#1036): one file per bench run, written by the
+	// playbook next to the cells. Absent (nil) on a host that applies none.
+	if archTarget != "both" {
+		nicp, err := readNICIRQPlacement(resultsDir, archTarget)
+		if err != nil {
+			return "", err
+		}
+		env.NICIRQPlacement = nicp
+	}
 	doc := report.BuildDocument(report.BuildInput{
 		HostArchPair:    "linux/" + benchTargetArch(archTarget),
 		Environment:     env,

@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -205,4 +206,44 @@ func sutEnvString(env map[string]string) string {
 		parts = append(parts, k+"="+env[k])
 	}
 	return strings.Join(parts, " ")
+}
+
+// nicIRQPlacementFile is the record ansible/tasks/nic_irq_placement.yml
+// writes into the bench run directory on a host that applies the standing
+// NIC interrupt placement (goceleris/celeris#1036).
+const nicIRQPlacementFile = "nic-irq-placement.json"
+
+// readNICIRQPlacement returns the NIC interrupt placement the bench ran
+// under on host, or nil when the host applied none (no file: every amd64 run,
+// msr1 with the placement variable emptied). The run directory is
+// resultsDir/<TS>-bench-<host>; the timestamp is taken per host by the
+// controller, so the directory is found by glob. Bench makes a fresh resultsDir per
+// invocation, so a host has one run dir in it; more than one would fold cells that ran
+// under different placements into one document, so that is an error. A file that exists but does
+// not parse, or that records an unverified pin, is an error: the artifact must
+// not silently claim a placement the run did not have.
+func readNICIRQPlacement(resultsDir, host string) (*report.NICIRQPlacement, error) {
+	// Glob fails only on a malformed pattern, which a host name cannot make; no match means no placement.
+	matches, _ := filepath.Glob(filepath.Join(resultsDir, "*-bench-"+host, nicIRQPlacementFile))
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("%d NIC IRQ placement records for %s in %s (%s): cells of different runs cannot share one placement",
+			len(matches), host, resultsDir, strings.Join(matches, ", "))
+	}
+	path := matches[0]
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var p report.NICIRQPlacement
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if !p.Verified || len(p.IRQs) == 0 {
+		return nil, fmt.Errorf("%s records a NIC IRQ placement that was not verified (verified=%t, %d irqs)",
+			path, p.Verified, len(p.IRQs))
+	}
+	return &p, nil
 }

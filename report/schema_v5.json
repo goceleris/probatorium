@@ -36,6 +36,34 @@
           "type": "object",
           "description": "KEY=VALUE environment overrides the bench merged into the SUT process (v5.9+, celeris#585), so an A/B arm is identifiable from this file alone. Omitted when none were passed.",
           "additionalProperties": { "type": "string" }
+        },
+        "nic_irq_placement": {
+          "type": "object",
+          "description": "The NIC interrupt placement the SUT host ran under (v5.21, goceleris/celeris#1036): the vector name, the one CPU it was pinned to, and per IRQ the smp_affinity_list / effective_affinity_list before and after. Omitted when the host applies none. A changed placement changes comparability.",
+          "required": ["host", "interface", "vector", "cpu", "verified", "irqs"],
+          "properties": {
+            "host": { "type": "string" },
+            "interface": { "type": "string" },
+            "vector": { "type": "string" },
+            "binding": { "type": "string", "enum": ["msi_irqs", "name"], "description": "Which check tied the vector to the interface: every IRQ listed under /sys/class/net/<iface>/device/msi_irqs, or the vector name starting with <iface>-." },
+            "cpu": { "type": "integer", "minimum": 0 },
+            "changed": { "type": "boolean" },
+            "verified": { "type": "boolean" },
+            "irqs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["irq", "before", "after"],
+                "properties": {
+                  "irq": { "type": "integer" },
+                  "before": { "$ref": "#/$defs/nic_irq_affinity" },
+                  "after": { "$ref": "#/$defs/nic_irq_affinity" }
+                }
+              }
+            },
+            "at_end": { "type": "object", "description": "The same record, read back after the last cell (no write). verified=false when the vector left its CPU during the run." },
+            "at_end_error": { "type": "string", "description": "The end-of-run readback's message when it failed." }
+          }
         }
       }
     },
@@ -72,6 +100,14 @@
     "soak_summary": { "$ref": "#/$defs/soakSummary" }
   },
   "$defs": {
+    "nic_irq_affinity": {
+      "type": "object",
+      "required": ["affinity", "effective"],
+      "properties": {
+        "affinity": { "type": "string", "description": "/proc/irq/N/smp_affinity_list" },
+        "effective": { "type": "string", "description": "/proc/irq/N/effective_affinity_list" }
+      }
+    },
     "serverResult": {
       "type": "object",
       "required": [

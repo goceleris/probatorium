@@ -395,8 +395,8 @@ func TestBuildDocument(t *testing.T) {
 	if doc.SchemaVersion != SchemaVersion {
 		t.Errorf("SchemaVersion: want %q got %q", SchemaVersion, doc.SchemaVersion)
 	}
-	if doc.SchemaVersion != "5.20" {
-		t.Errorf("SchemaVersion drift: want 5.20 got %q", doc.SchemaVersion)
+	if doc.SchemaVersion != "5.21" {
+		t.Errorf("SchemaVersion drift: want 5.21 got %q", doc.SchemaVersion)
 	}
 	if len(doc.Benchmarks) != 2 {
 		t.Fatalf("Benchmarks: want 2 got %d", len(doc.Benchmarks))

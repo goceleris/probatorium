@@ -1,0 +1,73 @@
+# End-of-run readback of the standing NIC interrupt placement (see
+# tasks/nic_irq_placement.yml). Included from the collect play of bench.yml, before the
+# run dir is tarred, on the bench target when the placement was applied. Something
+# else moving the vector mid-run (irqbalance, a driver reset) would otherwise change
+# comparability silently. It does NOT fail the play: the cells are already measured and
+# the artefacts must still come back. It records the verdict as `at_end` in
+# nic-irq-placement.json and prints a loud WARNING when the vector is off its CPU.
+
+- name: NIC IRQ placement | end-of-run readback (no write)
+  # A script that exits non-zero, a become failure or a lost transport must all end up as a recorded drift,
+  # never as a crash that stops the artefacts from coming back (the cells are already measured). failed_when
+  # only covers a script that ran; a become or connection failure is raised before the result is evaluated,
+  # so the block/rescue catches that and hands the failure on as the result.
+  block:
+    - name: NIC IRQ placement | run the readback
+      become: true
+      ansible.builtin.script: >-
+        {{ playbook_dir }}/files/nic_irq_pin.sh verify
+        {{ nic_irq_placement.iface | string | quote }}
+        {{ nic_irq_placement.vector | string | quote }}
+        {{ nic_irq_placement.cpu | string | quote }}
+      args:
+        executable: /bin/bash
+      register: nic_irq_end
+      failed_when: false
+      changed_when: false
+      ignore_unreachable: true
+  rescue:
+    - name: NIC IRQ placement | the readback could not run (become or transport failure)
+      ansible.builtin.set_fact:
+        nic_irq_end: "{{ ansible_failed_result | default({'failed': true, 'msg': 'end-of-run readback could not run'}) }}"
+
+- name: NIC IRQ placement | parse the end-of-run readback
+  # Exit 2 (the vector or interface is gone, e.g. a driver re-requested its IRQs) prints no JSON, only
+  # a message on stderr: that is a drift too, recorded as verified=false with the message, never a crash
+  # that would stop the artefacts from coming back. A become or transport failure never ran the script
+  # at all: the result then has no rc, so an undefined rc counts as a failure (default(1)), as does
+  # failed / unreachable, and the message stands in for the missing stderr. Only a script that ran,
+  # exited 0 and printed a verified JSON reads as success.
+  ansible.builtin.set_fact:
+    nic_irq_end_json: >-
+      {{ (nic_irq_end.stdout | default('{}', true) | from_json)
+         if (nic_irq_end.stdout | default('', true) | trim).startswith('{') else {} }}
+    nic_irq_end_failed: >-
+      {{ (nic_irq_end.rc | default(1)) != 0
+         or (nic_irq_end.failed | default(false) | bool)
+         or (nic_irq_end.unreachable | default(false) | bool) }}
+
+- name: NIC IRQ placement | merge the end-of-run readback into the record
+  ansible.builtin.set_fact:
+    nic_irq_record: >-
+      {{ nic_irq_record | combine({
+           'at_end': (nic_irq_end_json if nic_irq_end_json else {'verified': false}),
+           'at_end_error': ((nic_irq_end.stderr | default('', true) | trim
+                             or nic_irq_end.msg | default('end-of-run readback did not run (no rc)', true) | string | trim)
+                            if nic_irq_end_failed | bool else '')
+         }) }}
+
+- name: NIC IRQ placement | warn when the vector left its CPU during the run
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: NIC IRQ placement DRIFTED during the run on {{ inventory_hostname }}:
+      {{ nic_irq_record.vector }} was pinned to CPU {{ nic_irq_record.cpu }} and the end-of-run readback
+      says: {{ nic_irq_record.at_end_error | default('') }}
+      {{ nic_irq_record.at_end.irqs | default([]) | map(attribute='after') | list }}.
+      The cells of this run are not comparable with a run that kept the placement.
+  when: (nic_irq_end_failed | bool) or not (nic_irq_record.at_end.verified | default(false) | bool)
+
+- name: NIC IRQ placement | rewrite the record with the end-of-run readback
+  ansible.builtin.copy:
+    dest: "{{ bench_run_dir }}/nic-irq-placement.json"
+    content: "{{ nic_irq_record | to_nice_json }}\n"
+    mode: '0644'
