@@ -653,6 +653,173 @@
     - inventory_hostname == "msa2-client"
     - hostvars[bench_target].cell_bound | default(false) | bool
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | start stall captures (both hosts, read-only, celeris#1036 investigation)"
+  # Per-port packet counters at 20 Hz, qdisc, NIC vectors and per-connection TCP
+  # state at 1 Hz, per-cell ethtool, qdisc, cpuidle and IRQ affinity brackets
+  # taken at the saturation window start and end, and a 0.7 s header-only
+  # capture in the middle of the window on the SUT slaves and on the loadgen
+  # port. The script rendezvouses on the first 64 established connections, so
+  # both hosts time the window from the same event. Everything is bounded by the
+  # hang guard and read-only; a missing tool is noted in the output file. Needs
+  # root for ethtool and tcpdump; output redirections are opened by the shell.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    cat > $d/stallcap.sh <<'EOSTALL'
+    #!/bin/bash
+    # stallcap.sh ROLE DIR PORT WARM DUR GUARD TARGET_IP
+    # Read-only captures for the 200 ms stall investigation (celeris#1036). ROLE is sut or lg.
+    # Everything is bounded by GUARD seconds. Files go into DIR; the loadgen role adds the suffix .loadgen.
+    role=$1; d=$2; port=$3; warm=$4; dur=$5; guard=$6; tip=$7
+    cd "$d" || exit 1
+    sfx=""; [ "$role" = lg ] && sfx=".loadgen"
+    now_us() { local t=${EPOCHREALTIME/./}; echo "$t"; }
+    wait_until() { local t=$1 n; n=$(now_us); [ "$t" -gt "$n" ] || return 0; local dl=$((t - n)); sleep "$((dl / 1000000)).$(printf %06d $((dl % 1000000)))"; }
+    endsec=$(( ${EPOCHREALTIME%.*} + guard ))
+    nics=""
+    if [ "$role" = sut ]; then
+      nics="$(cat /sys/class/net/bond0/bonding/slaves 2>/dev/null)"
+      [ -n "$nics" ] || nics="$(for n in /sys/class/net/*; do [ -e $n/device ] && basename $n; done)"
+      nics="${STALL_NICS:-$nics}"   # test override only
+    fi
+    echo "$$" > stallcap$sfx.pid
+    echo "role=$role port=$port warm=$warm dur=$dur guard=$guard nics=$nics" > stallcap$sfx.meta
+
+    # awk: one line per connection from ss -tinoH (two physical lines per socket)
+    cat > ssc$sfx.awk <<"EOA"
+    /^[ \t]/ {
+      rto=""; rtt=""; un=""; re=""; ns=""; ba=""; so=""; ls=""; lr=""; la=""; cw=""; bo=""
+      for (i = 1; i <= NF; i++) {
+        k = $i; sub(/:.*/, "", k); v = substr($i, length(k) + 2)
+        if (k == "rto") rto = v; else if (k == "rtt") rtt = v; else if (k == "unacked") un = v
+        else if (k == "retrans") re = v; else if (k == "notsent") ns = v; else if (k == "bytes_acked") ba = v
+        else if (k == "segs_out") so = v; else if (k == "lastsnd") ls = v; else if (k == "lastrcv") lr = v
+        else if (k == "lastack") la = v; else if (k == "cwnd") cw = v; else if (k == "backoff") bo = v
+      }
+      print ts, loc, peer, "sq=" sq, "rq=" rq, timer, "rto=" rto, "rtt=" rtt, "unacked=" un, "retrans=" re, "notsent=" ns, "bytes_acked=" ba, "segs_out=" so, "lastsnd=" ls, "lastrcv=" lr, "lastack=" la, "cwnd=" cw, "backoff=" bo
+      next
+    }
+    { rq = $1; sq = $2; loc = $3; peer = $4; timer = "timer:-"; for (i = 5; i <= NF; i++) if ($i ~ /^timer:/) timer = $i }
+    EOA
+
+    # 20 Hz per-port packet counters and BQL (sut only), pure bash builtins
+    if [ "$role" = sut ]; then
+      ( while [ "${EPOCHREALTIME%.*}" -lt "$endsec" ]; do
+          line="$EPOCHREALTIME"
+          for n in $nics bond0; do
+            s=/sys/class/net/$n/statistics; q=/sys/class/net/$n/queues/tx-0/byte_queue_limits
+            tp=-; tb=-; rp=-; bi=-; bl=-
+            { read -r tp < $s/tx_packets; read -r tb < $s/tx_bytes; read -r rp < $s/rx_packets; } 2>/dev/null
+            { read -r bi < $q/inflight; read -r bl < $q/limit; } 2>/dev/null
+            line="$line $n $tp $tb $rp $bi $bl"
+          done
+          echo "$line" >> txprog.log
+          sleep 0.05
+        done ) &
+    fi
+
+    # 1 Hz: qdisc, NIC vectors, per-connection TCP state
+    ( while [ "${EPOCHREALTIME%.*}" -lt "$endsec" ]; do
+        ts="$EPOCHREALTIME"
+        if [ "$role" = sut ]; then
+          if command -v tc >/dev/null 2>&1; then { echo "== $ts"; for n in $nics bond0; do tc -s qdisc show dev $n 2>&1; done; } >> tc.log; fi
+          { echo "== $ts"; grep -E "enp|IPI0|IPI1" /proc/interrupts; } >> irq1.log
+          ss -tinoH state established "( sport = :$port )" 2>/dev/null | awk -v ts="$ts" -f ssc.awk >> ss.log
+        else
+          ss -tinoH state established "( dport = :$port )" 2>/dev/null | awk -v ts="$ts" -f ssc.loadgen.awk >> ss.loadgen.log
+        fi
+        sleep 1
+      done ) &
+
+    snap() {
+      local tag=$1
+      {
+        echo "== $EPOCHREALTIME"
+        if [ "$role" = sut ]; then
+          for n in $nics bond0; do echo "=== ethtool -S $n"; ethtool -S $n 2>&1; done
+          echo "== tc"; for n in $nics bond0; do tc -s qdisc show dev $n 2>&1; done
+          echo "== irq effective_affinity_list smp_affinity_list"
+          for i in $(awk "/enp/{sub(\":\",\"\",\$1);print \$1}" /proc/interrupts); do echo "$i $(cat /proc/irq/$i/effective_affinity_list 2>&1) $(cat /proc/irq/$i/smp_affinity_list 2>&1)"; done
+          echo "== irq"; grep -E "enp|IPI0|IPI1" /proc/interrupts
+        fi
+        echo "== ip -s -s link"; ip -s -s link 2>&1
+        echo "== /proc/net/dev"; cat /proc/net/dev
+        echo "== cpuidle name usage time"; grep -H . /sys/devices/system/cpu/cpu*/cpuidle/state*/name /sys/devices/system/cpu/cpu*/cpuidle/state*/usage /sys/devices/system/cpu/cpu*/cpuidle/state*/time 2>/dev/null
+      } > cell.$tag$sfx.txt 2>&1
+    }
+
+    capture() {
+      if ! command -v tcpdump >/dev/null 2>&1; then echo "tcpdump not installed" > tcpdump.missing$sfx; return; fi
+      if [ "$role" = sut ]; then
+        for n in $nics; do
+          ( timeout -s INT 0.7 tcpdump -i $n -Q out -nn -s 66 -c 120000 -w - "tcp src port $port" 2> cap.$n.err | gzip -1 > pcap.$n.out.gz ) &
+        done
+      else
+        dev=$(ip route get "$tip" 2>/dev/null | grep -o "dev [^ ]*" | head -1 | cut -d" " -f2)
+        ( timeout -s INT 0.7 tcpdump -i "${dev:-any}" -Q in -nn -s 66 -c 240000 -w - "tcp src port $port" 2> cap.loadgen.err | gzip -1 > pcap.loadgen.in.gz ) &
+      fi
+      wait
+    }
+
+    # rendezvous on the load: both hosts see the first >= 64 established connections within milliseconds
+    ( dirf=sport; [ "$role" = lg ] && dirf=dport
+      i=0; n=0
+      while [ $i -lt 900 ]; do
+        n=$(ss -tnH state established "( $dirf = :$port )" 2>/dev/null | wc -l)
+        [ "$n" -ge 64 ] && break
+        i=$((i + 1)); sleep 0.2
+      done
+      [ "$n" -ge 64 ] || exit 0
+      tr=$(now_us); echo "$tr" > rendezvous$sfx.us
+      start=$((tr + warm * 1000000)); mid=$((start + dur * 500000 - 300000)); fin=$((start + dur * 1000000))
+      wait_until $start; snap start
+      wait_until $mid; capture
+      wait_until $fin; snap end
+    ) &
+
+    # driver and host facts, once
+    {
+      echo "== uname"; uname -a
+      echo "== /proc/cmdline"; cat /proc/cmdline
+      echo "== cpuidle driver governor"; grep -H . /sys/devices/system/cpu/cpuidle/current_driver /sys/devices/system/cpu/cpuidle/current_governor 2>&1
+      echo "== sysctl"
+      for k in net.ipv4.tcp_autocorking net.ipv4.tcp_limit_output_bytes net.core.busy_read net.core.busy_poll net.core.dev_weight net.core.default_qdisc net.core.rps_sock_flow_entries; do echo "$k = $(sysctl -n $k 2>&1)"; done
+      if [ "$role" = sut ]; then
+        for n in $nics bond0; do
+          echo "=== $n"
+          for o in -i -l -g --show-priv-flags; do echo "--- ethtool $o"; ethtool $o $n 2>&1; done
+          echo "queues: $(ls /sys/class/net/$n/queues 2>&1 | tr "\n" " ")"
+          grep -H . /sys/class/net/$n/threaded /sys/class/net/$n/gro_flush_timeout /sys/class/net/$n/napi_defer_hard_irqs /sys/class/net/$n/tx_queue_len 2>&1
+        done
+        drv=$(ethtool -i $(echo $nics | cut -d" " -f1) 2>/dev/null | sed -n "s/^driver: //p")
+        echo "== modinfo $drv"; modinfo ${drv:-r8127} 2>&1 | head -30
+        echo "== /proc/net/bonding/bond0"; cat /proc/net/bonding/bond0 2>&1
+      else
+        dev=$(ip route get "$tip" 2>/dev/null | grep -o "dev [^ ]*" | head -1 | cut -d" " -f2)
+        echo "route dev: $dev"
+        for n in $dev $(cat /sys/class/net/$dev/bonding/slaves 2>/dev/null); do
+          echo "=== $n"
+          for o in -i -l; do echo "--- ethtool $o"; ethtool $o $n 2>&1; done
+        done
+        drv=$(ethtool -i $(echo $dev $(cat /sys/class/net/$dev/bonding/slaves 2>/dev/null) | awk "{print \$NF}") 2>/dev/null | sed -n "s/^driver: //p")
+        echo "== modinfo $drv"; modinfo ${drv:-bond} 2>&1 | head -30
+        echo "== irq placement of NIC vectors"; grep -E "eth|enp|eno|ens|mlx|ixgbe|i40e|ice" /proc/interrupts | head -80
+      fi
+    } > driverfacts$sfx.txt 2>&1
+
+    wait
+    EOSTALL
+    cd $d
+    setsid nohup bash stallcap.sh {{ 'sut' if inventory_hostname == bench_target else 'lg' }} $d {{ bench_port | default(8080) }} {{ bench_warmup_seconds | default(5) }} {{ bench_duration_seconds | default(30) }} {{ cell_guard_seconds }} {{ target_ip }} > stallcap.out 2>&1 &
+    disown
+    true
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  failed_when: false
+  when:
+    - (inventory_hostname == bench_target and (cell_bound | bool)) or (inventory_hostname == "msa2-client" and (hostvars[bench_target].cell_bound | default(false) | bool))
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | run runner against bench target"
   # Flag names must match the runner CLI in cmd/runner/main.go:
   #   -target / -server-name / -runs / -duration / -warmup /
@@ -746,6 +913,20 @@
     - (runner_run.rc | default(0)) != 0
 
 # ---------- teardown for this cell ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop stall captures (both hosts)"
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    for f in $d/stallcap.pid $d/stallcap.loadgen.pid; do
+      [ -f $f ] && kill -TERM -- -"$(cat $f)" 2>/dev/null
+    done
+    true
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == bench_target or inventory_hostname == "msa2-client"
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop net-counter sampler (loadgen side)"
   ansible.builtin.shell: |
     if [ -f {{ cell_dir }}/netctr.loadgen.pid ]; then

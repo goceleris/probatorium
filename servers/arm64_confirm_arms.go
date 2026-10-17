@@ -12,7 +12,7 @@ package servers
 //	(the D arm of the confirmation run, servers/pr1049wrap_celeris, is dropped on this branch)
 //
 // Column suffixes sort as r1 (b c d; A is the plain column), r2 (a b c d), r3 (a b c d), so each
-// engine runs A B C1 C3 A B C1 C3 A B C1 C3. -r2a and -r3a are the A binary again.
+// engine runs B C1 C3 B C1 C3 B C1 C3 (the glob selects only the -r* columns). -r2a and -r3a are the A binary again.
 func init() {
 	const (
 		verB  = "v1.5.12-0.20261017075218-659b3f8636a6"
@@ -34,11 +34,7 @@ func init() {
 			panic("arm64_confirm_arms: no celeris column " + n)
 		}
 		for _, r := range []string{"r1", "r2", "r3"} {
-			if r != "r1" {
-				twin := a // arm A again: same binary as the plain column
-				twin.Name = n + "-" + r + "a-tip"
-				Registry[twin.Name] = twin
-			}
+			// X1 (stall investigation): no arm A columns; the plain column <n> is not selected by the cells glob.
 			for _, x := range arms {
 				v := a
 				v.Name = n + "-" + r + x.suffix
