@@ -173,7 +173,7 @@ func TestNICIRQPlacementWiring(t *testing.T) {
 	run := strings.Index(bench, "- name: Run interleaved bench")
 	end := strings.Index(bench, "tasks/nic_irq_placement_end.yml")
 	tar := strings.Index(bench, "- name: Tar bench artefacts on remote")
-	if pin < 0 || run < 0 || end < 0 || tar < 0 || !(pin < run && run < end && end < tar) {
+	if pin < 0 || run < 0 || end < 0 || tar < 0 || pin >= run || run >= end || end >= tar {
 		t.Errorf("order in bench.yml: pin %d < run %d < end readback %d < tar %d does not hold", pin, run, end, tar)
 	}
 
