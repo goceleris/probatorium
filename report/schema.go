@@ -291,7 +291,19 @@ import (
 //     evaluations the gated rule absolved, a flag for a cell it absolved
 //     entirely, and its first message. Gate() does not read it. Additive;
 //     older readers ignore the field.
-const SchemaVersion = "5.20"
+//   - 5.21 — the NIC interrupt placement the bench ran under
+//     (goceleris/celeris#1036). msr1 has one RX and one TX queue per
+//     port and no RSS, and a ~200 ms whole-port TX stall appears when the
+//     TX-completion vector is serviced by a CPU without a loop. The bench
+//     now pins that vector to a loop CPU before every run (ansible
+//     nic_irq_placement) and records it. Adds Environment.NICIRQPlacement
+//     (nic_irq_placement): interface, vector name, CPU, and per IRQ the
+//     smp_affinity_list / effective_affinity_list found before and read back
+//     after, plus the end-of-run readback. Omitted when the host applies no
+//     placement (every amd64 run). A changed placement changes
+//     comparability. Nothing is gated. Additive; older readers ignore the
+//     field.
+const SchemaVersion = "5.21"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -504,6 +516,56 @@ type Environment struct {
 	// identifiable from results.json alone, next to the engine's own
 	// server.log arm line.
 	SUTEnv map[string]string `json:"sut_env,omitempty"`
+
+	// NICIRQPlacement records the standing NIC interrupt placement the
+	// SUT host ran under (schema 5.21, goceleris/celeris#1036): which
+	// vector was pinned to which CPU, what it was before, and what the
+	// kernel reported after. Nil when the host applies none (amd64 hosts,
+	// or msr1 with the placement variable emptied), so a run without one
+	// is distinguishable from a run with one.
+	NICIRQPlacement *NICIRQPlacement `json:"nic_irq_placement,omitempty"`
+}
+
+// NICIRQPlacement is the record ansible/files/nic_irq_pin.sh prints and
+// ansible/tasks/nic_irq_placement.yml writes next to the run
+// (nic-irq-placement.json). The pin is an explicit single-CPU write, verified
+// by reading effective_affinity_list back; a run whose readback differed
+// never gets this far, the play fails first.
+type NICIRQPlacement struct {
+	// Host is the SUT the placement was applied on (e.g. msr1).
+	Host string `json:"host"`
+	// Interface is the NIC the vector belongs to (e.g. enp1s0).
+	Interface string `json:"interface"`
+	// Vector is the interrupt NAME in /proc/interrupts (e.g. enp1s0-8);
+	// the IRQ number is per boot, so the numbers live in IRQs.
+	Vector string `json:"vector"`
+	// CPU is the one CPU the vector was pinned to.
+	CPU int `json:"cpu"`
+	// Changed is true when this run wrote the pin, false when the vector
+	// was already there.
+	Changed bool `json:"changed"`
+	// Verified is true when every IRQ read back on CPU, both the
+	// smp_affinity_list and the effective_affinity_list.
+	Verified bool `json:"verified"`
+	// IRQs holds one entry per /proc/interrupts line with that name.
+	IRQs []NICIRQVector `json:"irqs"`
+	// AtEnd is the readback taken after the last cell, before the artefacts
+	// were collected. Nil when the end-of-run readback did not happen. Its
+	// Verified is false when the vector had left its CPU during the run.
+	AtEnd *NICIRQPlacement `json:"at_end,omitempty"`
+}
+
+// NICIRQVector is one interrupt's affinity before and after the pin.
+type NICIRQVector struct {
+	IRQ    int            `json:"irq"`
+	Before NICIRQAffinity `json:"before"`
+	After  NICIRQAffinity `json:"after"`
+}
+
+// NICIRQAffinity is a smp_affinity_list / effective_affinity_list reading.
+type NICIRQAffinity struct {
+	Affinity  string `json:"affinity"`
+	Effective string `json:"effective"`
 }
 
 // BenchmarkConfig records the orchestrator flags + tunables that

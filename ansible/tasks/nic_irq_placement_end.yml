@@ -1,0 +1,40 @@
+# End-of-run readback of the standing NIC interrupt placement (see
+# tasks/nic_irq_placement.yml). Included from the collect play of bench.yml, before the
+# run dir is tarred, on the bench target when the placement was applied. Something
+# else moving the vector mid-run (irqbalance, a driver reset) would otherwise change
+# comparability silently. It does NOT fail the play: the cells are already measured and
+# the artefacts must still come back. It records the verdict as `at_end` in
+# nic-irq-placement.json and prints a loud WARNING when the vector is off its CPU.
+
+- name: NIC IRQ placement | end-of-run readback (no write)
+  become: true
+  ansible.builtin.script: >-
+    {{ playbook_dir }}/files/nic_irq_pin.sh verify
+    {{ nic_irq_placement.iface | string | quote }}
+    {{ nic_irq_placement.vector | string | quote }}
+    {{ nic_irq_placement.cpu | string | quote }}
+  args:
+    executable: /bin/bash
+  register: nic_irq_end
+  failed_when: false
+  changed_when: false
+
+- name: NIC IRQ placement | merge the end-of-run readback into the record
+  ansible.builtin.set_fact:
+    nic_irq_record: >-
+      {{ nic_irq_record | combine({'at_end': (nic_irq_end.stdout | default('{}') | from_json)}) }}
+
+- name: NIC IRQ placement | warn when the vector left its CPU during the run
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: NIC IRQ placement DRIFTED during the run on {{ inventory_hostname }}:
+      {{ nic_irq_record.vector }} was pinned to CPU {{ nic_irq_record.cpu }} and now reads
+      {{ nic_irq_record.at_end.irqs | default([]) | map(attribute='after') | list }}.
+      The cells of this run are not comparable with a run that kept the placement.
+  when: not (nic_irq_record.at_end.verified | default(true))
+
+- name: NIC IRQ placement | rewrite the record with the end-of-run readback
+  ansible.builtin.copy:
+    dest: "{{ bench_run_dir }}/nic-irq-placement.json"
+    content: "{{ nic_irq_record | to_nice_json }}\n"
+    mode: '0644'

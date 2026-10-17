@@ -120,6 +120,29 @@ all:
         msr1:
           lan_ip: 192.168.50.199
           arch: arm64
+          # Standing NIC interrupt placement for the benchmark (maintainer decision
+          # 2026-10-17, goceleris/celeris#1036). msr1 has two bonded Realtek r8127
+          # ports (enp1s0, enp49s0) with ONE RX and ONE TX queue each and no RSS.
+          # The TX-completion vector of enp1s0 (interrupt name enp1s0-8; its IRQ
+          # NUMBER changes per boot, so it is found by name in /proc/interrupts)
+          # must be serviced by a CPU that runs a celeris loop. When it is serviced
+          # by a CPU without a loop the whole port stalls TX for ~200 ms; on CPU 1
+          # (a loop CPU) there was no stall and +35% rps (A/B runs 39046543453,
+          # 39054303222, 39060669852 on goceleris/probatorium).
+          # It is an EXPLICIT single-CPU pin applied before every bench run and
+          # VERIFIED by reading effective_affinity_list back (the play fails on a
+          # mismatch): restoring the mask (0-11) does not return the vector to its
+          # previous CPU, the kernel picks one from the mask (it picked CPU 8).
+          # enp49s0's vector is NOT touched: CPU 8 hosts a loop.
+          # Every run records interface, irq, cpu and the before/after values in
+          # environment.nic_irq_placement (env.json / results.json). A changed
+          # placement changes comparability: do not compare runs across it.
+          # Empty ({}) applies nothing: hosts without this var are untouched, and
+          # a one-off run can unset it with -e '{"nic_irq_placement": {}}'.
+          nic_irq_placement:
+            iface: enp1s0
+            vector: enp1s0-8
+            cpu: 1
     loadgen:
       hosts:
         msa2-client:

@@ -137,6 +137,39 @@ Three hosts, defined in [`ansible/inventory.yml`](ansible/inventory.yml):
 The validator runs on the bench target itself, next to the reference app it drives
 ([`ansible/validate.yml`](ansible/validate.yml)); msa2-client holds no validation state.
 
+### msr1 NIC interrupt placement
+
+msr1 has two bonded Realtek r8127 ports (enp1s0, enp49s0) with one RX and one TX queue each and no RSS.
+When the TX-completion vector of enp1s0 (interrupt name `enp1s0-8`; its IRQ number changes per boot) is
+serviced by a CPU that runs no celeris loop, the whole port stops transmitting for about 200 ms; serviced
+by CPU 1, which does run a loop, there was no stall and +35% rps
+([goceleris/celeris#1036](https://github.com/goceleris/celeris/issues/1036)). So the bench pins that
+vector to CPU 1 before every run on msr1, a standing part of the setup, not an experiment:
+
+- **Where.** `nic_irq_placement` on the msr1 entry of [`ansible/inventory.yml`](ansible/inventory.yml)
+  (`iface`, `vector`, `cpu`), applied by [`ansible/tasks/nic_irq_placement.yml`](ansible/tasks/nic_irq_placement.yml)
+  through [`ansible/files/nic_irq_pin.sh`](ansible/files/nic_irq_pin.sh) in the stage play of `bench.yml`.
+  Empty or unset means do nothing: msa2-server and msa2-client never have it. A one-off run without it:
+  `-e '{"nic_irq_placement": {}}'`. enp49s0's vector is not touched (CPU 8 hosts a loop).
+- **How.** The vector is found by name in `/proc/interrupts`, an explicit single CPU is written to
+  `/proc/irq/N/smp_affinity_list`, and both `smp_affinity_list` and `effective_affinity_list` are read
+  back. A readback that differs from the CPU fails the play before the first cell. It is a pin, not a
+  restore: writing the old mask (0-11) back does not return the vector to its previous CPU, the kernel
+  picks one from the mask. Applying it again is a no-op. Nothing is undone at teardown.
+- **Record.** Every bench run on a host with the placement writes `nic-irq-placement.json` into its run
+  directory (interface, vector, irq, cpu, the affinity found before and read back after, and a second
+  readback taken after the last cell) and prints the same in the log. `mage Bench` folds it into
+  `environment.nic_irq_placement` of the results document and so into `env.json` (schema 5.21); a
+  run without a placement has no such key.
+- **Invariant.** Every bench run records its placement, and a changed placement (another vector, another
+  CPU, none) changes comparability: runs are compared only across the same `nic_irq_placement`. An
+  end-of-run readback that differs from the pin (something moved the vector mid-run) is logged as
+  `WARNING: NIC IRQ placement DRIFTED` and recorded as `at_end.verified: false`; treat that run as unplaced.
+
+Tests: `bash ansible/tests/test_nic_irq_pin.sh` (the shell logic against a fake `/proc` and `/sys`; also
+runs in a plain container) and `bash ansible/tests/test_nic_irq_placement_play.sh` (the real tasks files
+under ansible); `go test` runs both.
+
 ## Bench tier
 
 ### The field

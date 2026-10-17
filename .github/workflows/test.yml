@@ -364,6 +364,12 @@ jobs:
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
         run: bash ansible/load-check.sh
+      # The standing NIC interrupt placement (goceleris/celeris#1036): the real
+      # tasks files on a local connection against a fake /proc and /sys tree.
+      - name: ansible/tests/test_nic_irq_placement_play.sh
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: bash ansible/tests/test_nic_irq_placement_play.sh
 
   # Fan-in over every job above so branch protection can require ONE
   # stable check name ("ci-ok") instead of enumerating the adapter

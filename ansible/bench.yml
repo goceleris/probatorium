@@ -109,6 +109,17 @@
         state: directory
         mode: '0755'
 
+    # Standing NIC interrupt placement (msr1: the enp1s0 TX-completion vector on a
+    # CPU that runs a loop; goceleris/celeris#1036). Bench target only, and only
+    # when nic_irq_placement is a non-empty dict (inventory.yml). A readback that
+    # does not show the vector on the CPU fails the play before any cell runs.
+    # Every run records it in nic-irq-placement.json -> environment.nic_irq_placement.
+    - name: NIC IRQ placement | pin and verify the standing vector placement
+      ansible.builtin.include_tasks: tasks/nic_irq_placement.yml
+      when:
+        - inventory_hostname == bench_target
+        - (nic_irq_placement | default({})) | length > 0
+
     - name: Resolve bench target LAN IP from inventory (loadgen side only)
       # lan_ip is the DHCP-pinned 20G fabric address. Using a hostname
       # here would resolve via Tailscale MagicDNS to the tailnet IP and
@@ -391,6 +402,13 @@
       when:
         - inventory_hostname == bench_target
         - bench_needs_dbservices | default(false) | bool
+
+    - name: NIC IRQ placement | end-of-run readback (bench target, placement applied)
+      ansible.builtin.include_tasks: tasks/nic_irq_placement_end.yml
+      when:
+        - inventory_hostname == bench_target
+        - (nic_irq_placement | default({})) | length > 0
+        - nic_irq_record is defined
 
     - name: Wait for mpstat samplers to finish writing
       # Glob covers both sampler pid files: mpstat.pid (server side) and
