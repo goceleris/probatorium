@@ -118,7 +118,7 @@ async fn main() -> ExitCode {
             // server must accept up to ~2 MiB. Without raising this limit
             // post-1m returns 400 Payload Overflow and the cell is classified
             // not_applicable (the exact "post-1m body limit" capability gap
-            // mage_bench.go calls out for ntex). PayloadConfig applies to the
+            // magefiles/mage_bench.go calls out for ntex). PayloadConfig applies to the
             // built-in Bytes/String extractors and is registered via app_data.
             .app_data(web::PayloadConfig::new(2 * 1024 * 1024))
             .route("/", web::get().to(root))

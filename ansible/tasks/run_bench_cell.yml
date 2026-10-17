@@ -527,7 +527,7 @@
   # interleaving is preserved. -services none because the loadgen box has
   # no docker; driver/chain backends are wired on the SUT side. The
   # runner writes run0/<scenario>/<server>.json plus its own
-  # results.json/report.md under the cell dir; mage_bench.go ingests the
+  # results.json/report.md under the cell dir; magefiles/mage_bench.go ingests the
   # per-scenario JSON.
   #
   # NOTE: there is intentionally no -connections flag — connection count

@@ -35,7 +35,7 @@ func readRepoFile(t *testing.T, p string) string {
 }
 
 func TestStallCaptureKnobsReachTheClusterValidator(t *testing.T) {
-	mage := readRepoFile(t, "mage_validate.go")
+	mage := readRepoFile(t, "magefiles/mage_validate.go")
 	playbook := readRepoFile(t, "ansible/validate.yml")
 	validator := readRepoFile(t, "validation/liveness.go")
 	for _, h := range stallCaptureHops {

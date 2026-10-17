@@ -317,7 +317,7 @@
         # and refapps-checkptr (checkptr tier). pkill -f also matches the argv
         # of the shell running this block, so the block itself must never
         # spell a refapp path; the bracket keeps it from matching itself.
-        # workflow_validate_cleanup_test.go holds both rules.
+        # tools/workflowguard/workflow_validate_cleanup_test.go holds both rules.
         - name: Stop any leftover validator / refapp processes
           become: true
           ansible.builtin.shell: |

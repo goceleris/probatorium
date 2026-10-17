@@ -13,7 +13,7 @@ name: Coverage
 # Runners. GitHub-hosted only. This workflow never targets the self-hosted
 # bench cluster and never joins the matrix-tier-cluster concurrency group,
 # so it cannot queue behind a cluster run or displace one;
-# workflow_coverage_test.go holds it to that.
+# tools/workflowguard/workflow_coverage_test.go holds it to that.
 #
 # Authentication. OIDC, so no Codecov token is stored anywhere. Only the
 # upload job may mint an ID token (id-token: write), and it runs none of the

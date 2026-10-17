@@ -107,7 +107,7 @@ func TestMatrixCapReachesTheValidator(t *testing.T) {
 	// A text assertion, because the failure it guards is a deletion: with
 	// the call site gone, matrixCapExtraVars is still correct, still
 	// tested, still compiled -- and never invoked.
-	mage, err := os.ReadFile("mage_validate.go")
+	mage, err := os.ReadFile("magefiles/mage_validate.go")
 	if err != nil {
 		t.Fatalf("read mage_validate.go: %v", err)
 	}

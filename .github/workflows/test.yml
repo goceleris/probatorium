@@ -330,7 +330,7 @@ jobs:
   # here stayed green. The script imports each tasks file statically, so
   # ansible parses every task in it. ansible-core and ansible.posix are the
   # versions ansible/runner-setup.yml pins on the cluster
-  # (workflow_ansible_load_test.go keeps them equal).
+  # (tools/workflowguard/workflow_ansible_load_test.go keeps them equal).
   ansible:
     name: ansible loads every playbook and tasks file
     runs-on: ubuntu-latest

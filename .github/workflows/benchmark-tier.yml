@@ -163,7 +163,7 @@ jobs:
       # server process and echoes it into server.log.
       BENCH_SUT_ENV: ${{ github.event.inputs.sut_env || '' }}
       # Cell-glob restriction (celeris#585). Empty = the profile's own glob
-      # (mage_tier.go setBenchEnvFromProfile honours a non-blank preset the
+      # (magefiles/mage_tier.go setBenchEnvFromProfile honours a non-blank preset the
       # same way it honours BENCH_DURATION / BENCH_WARMUP).
       BENCH_CELLS: ${{ github.event.inputs.cells || '' }}
       # PUBLISH POLICY. Two rules, in order:

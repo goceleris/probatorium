@@ -706,7 +706,7 @@ func TestGuardControlReadSide(t *testing.T) {
 	probeDir := filepath.Dir(base.structFile)
 
 	// code goes in a new file of package properties; testCode in a new test
-	// file of it; mageCode in a new //go:build mage file of the root package.
+	// file of it; mageCode in a new //go:build mage file of the magefiles package.
 	cases := []struct {
 		name, code, testCode, mageCode string
 		reported                       bool
@@ -811,7 +811,7 @@ func fieldguardProbe() int64 {
 					[]byte("package properties\n" + c.testCode + "\n")
 			}
 			if c.mageCode != "" {
-				overlay[filepath.Join(root, "zz_fieldguard_probe_mage.go")] =
+				overlay[filepath.Join(root, "magefiles", "zz_fieldguard_probe_mage.go")] =
 					[]byte("//go:build mage\n\npackage main\n" + c.mageCode + "\n")
 			}
 			a := analyse(t, root, overlay)

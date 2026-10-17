@@ -22,6 +22,12 @@ go test ./...
 mage -compile /tmp/check  # confirm magefile compiles
 ```
 
+The mage targets live in `magefiles/` (mage's native layout: run `mage -l` from the repository root,
+no flag needed; targets run with the repository root as the working directory). They and their tests
+carry `//go:build mage`, so `go test ./...` skips them: run `go test -tags mage ./magefiles` for those.
+The tests that pin the shape of the GitHub workflow files are in `tools/workflowguard/` and run with
+a plain `go test ./...`.
+
 ## Cluster ops
 
 `mage Status` is read-only — safe to run anytime. Anything else (`Deploy` / `Bench` / `Validate` / `Soak` / `Fuzz` / `Cleanup`) drives ansible against the cluster. Inventory lives at `ansible/inventory.yml`.
