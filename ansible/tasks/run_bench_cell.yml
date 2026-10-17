@@ -454,6 +454,113 @@
     - inventory_hostname == bench_target
     - cell_bound | bool
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | start kernel-counter sampler (server side, A/B)"
+  # Read-only. For the A/Bs of celeris#1036 and #1037, plus threads.log: every
+  # SUT thread (tid, last CPU psr, state, cumulative CPU time, comm) every 1 s.
+  # Also: per-CPU softirq counters
+  # (NET_RX, NET_TX) every 5 s and the full /proc/interrupts every 30 s,
+  # with epoch seconds, so the column-wide logs can be sliced per scenario
+  # like cpu.log. Also once at cell start: the NIC irq affinities, the bond
+  # and port carrier_changes, and every SUT thread with its allowed CPUs
+  # and the CPU it last ran on. Written next to cpu.log; it dies with the
+  # guard timeout like the mpstat sampler and is killed by the stop task.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    pid=$(cat $d/server.pid 2>/dev/null)
+    {
+      echo "== carrier_changes"; grep -H . /sys/class/net/*/carrier_changes 2>/dev/null
+      echo "== bond0"; head -40 /proc/net/bonding/bond0 2>/dev/null
+      echo "== irq smp_affinity_list"; grep -H . /proc/irq/*/smp_affinity_list 2>/dev/null
+    } > $d/host-net.pre 2>&1
+    if [ -n "$pid" ]; then
+      for t in /proc/$pid/task/*; do
+        echo "$(basename $t) $(awk "/Cpus_allowed_list/{print \$2}" $t/status 2>/dev/null) psr=$(awk "{print \$39}" $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
+      done > $d/sut-threads.pre 2>&1
+    fi
+    nohup bash -c "end=\$((\$(date +%s) + {{ cell_guard_seconds }})); n=0; while [ \$(date +%s) -lt \$end ]; do echo \"== \$(date +%s.%N)\"; grep -E \"CPU|NET_RX|NET_TX\" /proc/softirqs; if [ \$((n % 6)) -eq 0 ]; then echo \"== interrupts\"; cat /proc/interrupts; fi; n=\$((n+1)); sleep 5; done" \
+      > $d/kcounters.log 2>&1 &
+    disown
+    echo $! > $d/kcounters.pid
+    if [ -n "$pid" ]; then
+      nohup bash -c "end=\$((\$(date +%s) + {{ cell_guard_seconds }})); while [ \$(date +%s) -lt \$end ]; do echo \"== \$(date +%s.%N)\"; ps -L -o tid=,psr=,stat=,time=,comm= -p $pid; sleep 1; done" \
+        > $d/threads.log 2>&1 &
+      disown
+      echo $! > $d/threads.pid
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | start net-counter sampler (server side, confirmation A/B)"
+  # Read-only. TCP retransmit and timeout counters (TcpExt TCPTimeouts,
+  # TcpRetransSegs ...) and softnet_stat per CPU every second, so a per-cell
+  # delta is read between the runner timestamps of the cell. Files net.log and
+  # softnet.log next to cpu.log; the sampler stops with the guard timeout and
+  # in the stop task below.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    cat > $d/netctr.sh <<"EOS"
+    #!/bin/bash
+    # usage: netctr.sh SECONDS SUFFIX. Appends, every second, the TCP and IP
+    # SNMP counters, the TcpExt and IpExt netstat counters (retransmits,
+    # timeouts) and the per-CPU softnet_stat, each block stamped with epoch.
+    end=$(( $(date +%s) + $1 ))
+    while [ $(date +%s) -lt $end ]; do
+      t=$(date +%s.%N)
+      { echo "== $t"; grep -E "^(Tcp|Ip):" /proc/net/snmp; grep -E "^(TcpExt|IpExt):" /proc/net/netstat; } >> net$2.log
+      { echo "== $t"; cat /proc/net/softnet_stat; } >> softnet$2.log
+      sleep 1
+    done
+    EOS
+    cd $d
+    nohup bash netctr.sh {{ cell_guard_seconds }} "" > /dev/null 2>&1 &
+    disown
+    echo $! > $d/netctr.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | NIC and steering state (server side, once per column)"
+  # Read-only. ethtool -i -k -n -l -x -c -g of every physical NIC and bond0,
+  # ethtool -S before the column (here) and after it (stop task), the RPS and
+  # XPS masks, rps_flow_cnt, rps_sock_flow_entries and a few TCP sysctls, ip
+  # -s link. ethtool needs root for some queries; become is used for this task
+  # only and nothing is written outside the cell dir.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    nics="$(for n in /sys/class/net/*; do [ -e $n/device ] && basename $n; done) bond0"
+    {
+      for n in $nics; do
+        echo "=== $n"
+        for o in -i -k -n -l -x -c -g; do echo "--- ethtool $o $n"; ethtool $o $n 2>&1; done
+        echo "--- ethtool -S $n"; ethtool -S $n 2>&1
+      done
+    } > $d/ethtool.pre 2>&1
+    {
+      echo "== rps_cpus, rps_flow_cnt, xps_cpus"
+      grep -H . /sys/class/net/*/queues/rx-*/rps_cpus /sys/class/net/*/queues/rx-*/rps_flow_cnt /sys/class/net/*/queues/tx-*/xps_cpus 2>/dev/null
+      echo "== sysctl"
+      for k in net.core.rps_sock_flow_entries net.core.netdev_budget net.core.netdev_max_backlog net.core.busy_poll net.core.somaxconn net.ipv4.tcp_congestion_control net.ipv4.tcp_syn_retries net.ipv4.tcp_retries2 net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do echo "$k = $(sysctl -n $k 2>&1)"; done
+      echo "== ip -s link"; ip -s link 2>&1
+    } > $d/steering.pre 2>&1
+    true
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start observer sampler (server side)"
   # The observer sidecars the server during the cell and emits a 1Hz
   # SQLite time series of FD count, RSS, goroutine count, GC pause,
@@ -495,6 +602,36 @@
     - cell_bound | bool
 
 # ---------- loadgen side: mpstat + runner ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | start net-counter sampler (loadgen side, confirmation A/B)"
+  # Same counters on the loadgen host (a request lost on the way in shows as a
+  # retransmit there), distinct file names for the reason given above.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    cat > $d/netctr.sh <<"EOS"
+    #!/bin/bash
+    # usage: netctr.sh SECONDS SUFFIX. Appends, every second, the TCP and IP
+    # SNMP counters, the TcpExt and IpExt netstat counters (retransmits,
+    # timeouts) and the per-CPU softnet_stat, each block stamped with epoch.
+    end=$(( $(date +%s) + $1 ))
+    while [ $(date +%s) -lt $end ]; do
+      t=$(date +%s.%N)
+      { echo "== $t"; grep -E "^(Tcp|Ip):" /proc/net/snmp; grep -E "^(TcpExt|IpExt):" /proc/net/netstat; } >> net$2.log
+      { echo "== $t"; cat /proc/net/softnet_stat; } >> softnet$2.log
+      sleep 1
+    done
+    EOS
+    cd $d
+    nohup bash netctr.sh {{ cell_guard_seconds }} ".loadgen" > /dev/null 2>&1 &
+    disown
+    echo $! > $d/netctr.loadgen.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (loadgen side)"
   # Distinct filenames from the server-side sampler ON PURPOSE. bench.yml
   # tars bench_run_dir on BOTH hosts and extracts both into the same
@@ -609,6 +746,18 @@
     - (runner_run.rc | default(0)) != 0
 
 # ---------- teardown for this cell ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop net-counter sampler (loadgen side)"
+  ansible.builtin.shell: |
+    if [ -f {{ cell_dir }}/netctr.loadgen.pid ]; then
+      kill -TERM "$(cat {{ cell_dir }}/netctr.loadgen.pid)" 2>/dev/null
+    fi
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == "msa2-client"
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (loadgen side)"
   # The sampler window is sized to the hang guard so it always outlives
   # the runner; without this kill a healthy (much shorter) cell would
@@ -646,6 +795,45 @@
   args:
     executable: /bin/bash
   changed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop kernel-counter sampler (server side, A/B)"
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    if [ -f $d/kcounters.pid ]; then
+      kill -TERM "$(cat $d/kcounters.pid)" 2>/dev/null
+    fi
+    if [ -f $d/threads.pid ]; then
+      kill -TERM "$(cat $d/threads.pid)" 2>/dev/null
+    fi
+    pid=$(cat $d/server.pid 2>/dev/null)
+    if [ -n "$pid" ]; then
+      for t in /proc/$pid/task/*; do
+        echo "$(basename $t) $(awk "/Cpus_allowed_list/{print \$2}" $t/status 2>/dev/null) psr=$(awk "{print \$39}" $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
+      done > $d/sut-threads.post 2>&1
+    fi
+    { echo "== carrier_changes"; grep -H . /sys/class/net/*/carrier_changes 2>/dev/null; } > $d/host-net.post 2>&1
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop net-counter sampler and NIC counters after (server side)"
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    if [ -f $d/netctr.pid ]; then
+      kill -TERM "$(cat $d/netctr.pid)" 2>/dev/null
+    fi
+    nics="$(for n in /sys/class/net/*; do [ -e $n/device ] && basename $n; done) bond0"
+    { for n in $nics; do echo "=== $n"; ethtool -S $n 2>&1; done; echo "== ip -s link"; ip -s link 2>&1; } > $d/ethtool.post 2>&1
+    true
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  failed_when: false
   when: inventory_hostname == bench_target
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (server side)"
