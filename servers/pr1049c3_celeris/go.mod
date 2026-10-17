@@ -1,9 +1,9 @@
-module github.com/goceleris/probatorium/servers/pr1049wrap_celeris
+module github.com/goceleris/probatorium/servers/pr1049c3_celeris
 
 go 1.27.2
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20261017001135-655d8d68553c
+	github.com/goceleris/celeris v1.5.12-0.20261017100904-79f6ce537951
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 )
 

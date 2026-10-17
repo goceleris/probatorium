@@ -104,19 +104,20 @@ func main() {
 	engineName := flag.String("engine", "iouring-h1-async", "runtime engine (see source for the canonical 4)")
 	flag.Parse()
 
+	// AB ARM C3 (throwaway diagnostic): no loop on CPU 8, a NIC IRQ CPU of msr1; read by the
+	// celeris plan code of ab/c3-7loops (internal/platform).
+	_ = os.Setenv("CELERIS_AB_EXCLUDE_CPU", "8")
+
 	spec, ok := engineSpecs[*engineName]
 	if !ok {
 		log.Fatalf("celeris: unknown -engine %q", *engineName)
 	}
 
 	srv := celeris.New(celeris.Config{
-		Addr:          *bind,
-		Engine:        spec.engineType,
-		Protocol:      spec.protocol,
-		AsyncHandlers: spec.async,
-		// AB ARM D (throwaway): an explicit worker count above the non-little CPUs of msr1
-		// (8), so the planner wraps the extra loops round-robin, pinned (celeris PR #1049).
-		Workers:         12,
+		Addr:            *bind,
+		Engine:          spec.engineType,
+		Protocol:        spec.protocol,
+		AsyncHandlers:   spec.async,
 		ReadTimeout:     30 * time.Second,
 		WriteTimeout:    30 * time.Second,
 		IdleTimeout:     120 * time.Second,
