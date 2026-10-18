@@ -15,8 +15,8 @@ func init() {
 	type arm struct{ module, framework, version string }
 	arms := map[string]arm{
 		"base": {"servers/ppbase_celeris", "celeris-pp-base", "v1.5.11"},
-		"main": {"servers/ppmain_celeris", "celeris-pp-main", "v1.5.12-0.20261018173213-44c6ff757d29"},
-		"pin":  {"servers/pppin_celeris", "celeris-pp-pin", "v1.5.12-0.20261018173929-126b4aa5d896"},
+		"main": {"servers/ppmain_celeris", "celeris-pp-main", "v1.5.12-0.20261018175708-1bfe685921a8"},
+		"pin":  {"servers/pppin_celeris", "celeris-pp-pin", "v1.5.12-0.20261018175806-13b77c78c5b2"},
 	}
 	add := func(seq, rep int, armKey, cell string) {
 		base, ok := Registry[map[string]string{
