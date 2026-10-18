@@ -3,7 +3,7 @@ module github.com/goceleris/probatorium/servers/pppin_celeris
 go 1.27.2
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20261018173929-126b4aa5d896
+	github.com/goceleris/celeris v1.5.12-0.20261018175806-13b77c78c5b2
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 )
 

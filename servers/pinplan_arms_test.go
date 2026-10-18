@@ -16,7 +16,7 @@ import (
 )
 
 // THROWAWAY (ab/pinplan-v2, ab/pinplan-v2-90s). Pins the layout of the PINPLAN2 run (PLAN-pinplan-v2.md): the exact (scenario, column) pairs each
-// dispatch glob selects, one cell per column, three arms (base = celeris tag v1.5.11, main = celeris 44c6ff75, pin = 126b4aa5 = main + #1049)
+// dispatch glob selects, one cell per column, three arms (base = celeris tag v1.5.11, main = celeris 1bfe6859, pin = 13b77c78 = main + #1049)
 // whose modules differ in the celeris pin only, the single vector position (the standing CPU 1), the position-balanced seeded schedule, and that
 // every column's registry pin equals the celeris require of its module.
 const (
@@ -27,8 +27,8 @@ const (
 	wantNine = 12 // 4 reps x 3 arms x io512
 
 	pinBase = "v1.5.11"
-	pinMain = "v1.5.12-0.20261018173213-44c6ff757d29"
-	pinPin  = "v1.5.12-0.20261018173929-126b4aa5d896"
+	pinMain = "v1.5.12-0.20261018175708-1bfe685921a8"
+	pinPin  = "v1.5.12-0.20261018175806-13b77c78c5b2"
 )
 
 var (
@@ -220,7 +220,7 @@ func TestPinplan2Layout(t *testing.T) {
 	}
 }
 
-// The three arms must differ in the celeris pin and nothing else: pin - main is then PR #1049 (git diff 44c6ff75 126b4aa5 is the PR's own 26 files
+// The three arms must differ in the celeris pin and nothing else: pin - main is then PR #1049 (git diff 1bfe6859 13b77c78 is the PR's own 26 files
 // and has no go.mod change); base is the release tag compiled by the same unchanged harness source.
 func TestPinplan2ArmModulesDifferOnlyInThePin(t *testing.T) {
 	ref := "ppmain_celeris"
