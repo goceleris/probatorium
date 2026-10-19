@@ -562,6 +562,14 @@
       for t in /proc/$pid/task/*; do
         echo "$(basename $t) $(awk "/Cpus_allowed_list/{print \$2}" $t/status 2>/dev/null) psr=$(awk "{print \$39}" $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
       done > $d/sut-threads.pre 2>&1
+      # PINPLAN4 supplementary capture (additive; separate files, sut-threads.* keeps its format): per-thread schedstat
+      # (tid run_ns run_delay_ns timeslices comm) and one snapshot of the /debug/vars side listener of the SUT (NumGC), taken here
+      # (server up, before the load) and in the stop task (after the load). Best effort: a missing /proc schedstat or a closed
+      # listener leaves an empty or error file and never fails the cell.
+      for t in /proc/$pid/task/*; do
+        echo "$(basename $t) $(cat $t/schedstat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
+      done > $d/sut-schedstat.pre 2>&1
+      { echo "== $(date +%s.%N)"; timeout 4 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{{ bench_debug_port | default(18089) }}; printf "GET /debug/vars HTTP/1.0\r\nHost: debug\r\n\r\n" >&3; cat <&3' 2>&1; } > $d/debugvars.pre 2>&1
     fi
     nohup bash -c "end=\$((\$(date +%s) + {{ cell_guard_seconds }})); n=0; while [ \$(date +%s) -lt \$end ]; do echo \"== \$(date +%s.%N)\"; grep -E \"CPU|NET_RX|NET_TX\" /proc/softirqs; if [ \$((n % 6)) -eq 0 ]; then echo \"== interrupts\"; cat /proc/interrupts; fi; n=\$((n+1)); sleep 5; done" \
       > $d/kcounters.log 2>&1 &
@@ -1218,6 +1226,10 @@
       for t in /proc/$pid/task/*; do
         echo "$(basename $t) $(awk "/Cpus_allowed_list/{print \$2}" $t/status 2>/dev/null) psr=$(awk "{print \$39}" $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
       done > $d/sut-threads.post 2>&1
+      for t in /proc/$pid/task/*; do
+        echo "$(basename $t) $(cat $t/schedstat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
+      done > $d/sut-schedstat.post 2>&1
+      { echo "== $(date +%s.%N)"; timeout 4 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{{ bench_debug_port | default(18089) }}; printf "GET /debug/vars HTTP/1.0\r\nHost: debug\r\n\r\n" >&3; cat <&3' 2>&1; } > $d/debugvars.post 2>&1
     fi
     { echo "== carrier_changes"; grep -H . /sys/class/net/*/carrier_changes 2>/dev/null; } > $d/host-net.post 2>&1
     true
