@@ -30,6 +30,9 @@ func realizedGrid(t *testing.T) []string {
 	}
 	srvs := make([]servers.Server, 0, len(advs))
 	for _, a := range advs {
+		if strings.HasPrefix(a.Name, "irqplace-") || strings.HasPrefix(a.Name, "pinplan4-") {
+			continue // THROWAWAY ab/irqplace-v1 and ab/pinplan-v4: the experiment's own columns are not part of the pinned full grid
+		}
 		srvs = append(srvs, &adapterServer{adapter: a, features: featureSetFor(a, false)})
 	}
 	var ids []string
@@ -127,6 +130,9 @@ func TestRatedScopeIsTheFourteenRowsAndWSEcho(t *testing.T) {
 	slices.Sort(gridWS)
 	var wsCols []string // the columns that declare WebSocket over HTTP/1.1
 	for _, a := range servers.AdaptersSorted() {
+		if strings.HasPrefix(a.Name, "irqplace-") || strings.HasPrefix(a.Name, "pinplan4-") {
+			continue // THROWAWAY ab/irqplace-v1: not part of the pinned full grid
+		}
 		if fs := featureSetFor(a, false); a.Capabilities.WS && fs.HTTP1 {
 			wsCols = append(wsCols, a.Name)
 		}
