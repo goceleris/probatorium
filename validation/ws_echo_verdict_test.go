@@ -143,6 +143,19 @@ func withCliRecvQ(i echoInstant, n int64) echoInstant {
 
 func withBytes(i echoInstant, n uint64) echoInstant { i.BytesIn += n; return i }
 
+// withDetail marks the socket as one whose -i detail line ss printed (cwnd and
+// rto are always on it), and drops counters that are zero, as iproute2 does.
+func withDetail(s *ssSock) *ssSock {
+	c := *s
+	c.Info = map[string]string{"cwnd": "10", "rto": "201"}
+	for k, v := range s.Info {
+		if v != "0" {
+			c.Info[k] = v
+		}
+	}
+	return &c
+}
+
 // without returns the socket with one Info key removed.
 func without(s *ssSock, key string) *ssSock {
 	c := *s
@@ -202,6 +215,12 @@ func TestWSEchoClassify(t *testing.T) {
 		{"indeterminate: bytes_acked absent at t0", inst(0, 1180, without(srvSock(433664, recv0), "bytes_acked")), inst(win, 1180, srvSock(433664, recv0)), "INDETERMINATE", "server_counters_missing"},
 		{"indeterminate: counters went backwards (another socket on the port)", inst(0, 1180, srvSock(433664, recv0)), inst(win, 1180, srvSockW(433664, recv0, 0, acked-1000)), "INDETERMINATE", "server_counters_inconsistent"},
 		{"indeterminate: bytes_received went backwards", inst(0, 1180, srvSock(433664, recv0)), inst(win, 1180, srvSock(433664, recv0-5000)), "INDETERMINATE", "server_counters_inconsistent"},
+		// iproute2 omits a counter that is zero: a server end that has never
+		// written prints no bytes_acked. With the detail line present that is
+		// a zero, not missing data (the live test records what the runner's ss prints).
+		{"wedge: a server that never wrote prints no bytes_acked at either instant", inst(0, 0, withDetail(srvSockW(433664, recv0, 0, 0))), inst(win, 0, withDetail(srvSockW(433664, recv0, 0, 0))), "WEDGE_CLASS", "no_app_read_no_app_write_recvq_pending"},
+		{"slow: the first write the server ever made", inst(0, 0, withDetail(srvSockW(433664, recv0, 0, 0))), withBytes(inst(win, 0, withDetail(srvSockW(433664, recv0, 0, 4096))), 4096), "SLOW_CLASS", "server_wrote"},
+		{"indeterminate: detail line present but bytes_received absent while the queue holds bytes", inst(0, 1180, without(withDetail(srvSock(433664, recv0)), "bytes_received")), inst(win, 1180, without(withDetail(srvSock(433664, recv0)), "bytes_received")), "INDETERMINATE", "server_counters_missing"},
 		{"indeterminate: Recv-Q zero at both instants", inst(0, 1180, srvSock(0, 10)), inst(win, 1180, srvSock(0, 10)), "INDETERMINATE", "recvq_zero_no_progress"},
 		{"indeterminate: Recv-Q appears only at t1", inst(0, 1180, srvSock(0, 10)), inst(win, 1180, srvSock(65536, 65546)), "INDETERMINATE", "recvq_zero_no_progress"},
 		{"indeterminate: window shorter than the minimum", inst(0, 1180, srvSock(433664, 1)), inst(500*time.Millisecond, 1180, srvSock(433664, 1)), "INDETERMINATE", "window_too_short"},
@@ -246,6 +265,29 @@ func TestWSEchoClassify_MissingDataNeverWedge(t *testing.T) {
 		"bytes_acked t0":     func(t0, _ *echoInstant) { t0.Server = without(t0.Server, "bytes_acked") },
 		"bytes_acked t1":     func(_, t1 *echoInstant) { t1.Server = without(t1.Server, "bytes_acked") },
 		"both counters both": func(t0, t1 *echoInstant) { t0.Server = &ssSock{RecvQ: 433664}; t1.Server = &ssSock{RecvQ: 433664} },
+	}
+	// The same on sockets with the detail line, where a zero counter is
+	// legitimately omitted: an ss that prints neither counter (too old) and
+	// a bytes_received missing under a pending queue are still missing data.
+	detailed := func() (echoInstant, echoInstant) {
+		t0, t1 := mk()
+		t0.Server, t1.Server = withDetail(t0.Server), withDetail(t1.Server)
+		return t0, t1
+	}
+	if t0, t1 := detailed(); wsEchoClassify(t0, t1).Class != verdictWedge {
+		t.Fatal("the detailed base capture is not a WEDGE")
+	}
+	for name, drop := range map[string]func(t0, t1 *echoInstant){
+		"detail: bytes_received t1": func(_, t1 *echoInstant) { t1.Server = without(t1.Server, "bytes_received") },
+		"detail: an ss with neither": func(t0, t1 *echoInstant) {
+			t0.Server, t1.Server = without(without(t0.Server, "bytes_received"), "bytes_acked"), without(without(t1.Server, "bytes_received"), "bytes_acked")
+		},
+	} {
+		t0, t1 := detailed()
+		drop(&t0, &t1)
+		if v := wsEchoClassify(t0, t1); v.Class != verdictIndeterminate {
+			t.Errorf("%s: %s/%s, want INDETERMINATE\n%s", name, v.Class, v.Reason, v.Line)
+		}
 	}
 	for name, drop := range drops {
 		t0, t1 := mk()
@@ -308,5 +350,31 @@ func TestWSEchoClassify_LinePrintsAppReadsAndWrites(t *testing.T) {
 	}
 	if v.Class != verdictSlow || v.Reason != "server_read_and_wrote" {
 		t.Errorf("class=%s reason=%s, want SLOW_CLASS/server_read_and_wrote", v.Class, v.Reason)
+	}
+}
+
+func TestSSSockCounter(t *testing.T) {
+	cases := []struct {
+		name   string
+		s      *ssSock
+		key    string
+		want   int64
+		wantOK bool
+	}{
+		{"present", withDetail(srvSock(10, 500)), "bytes_received", 500, true},
+		{"present without the detail marker", srvSock(10, 500), "bytes_acked", 4490877, true},
+		{"acked omitted as zero", withDetail(srvSockW(10, 500, 0, 0)), "bytes_acked", 0, true},
+		{"acked absent, detail line but no counters at all (an old ss): missing", &ssSock{RecvQ: 10, Info: map[string]string{"cwnd": "10"}}, "bytes_acked", 0, false},
+		{"acked absent, detail line, bytes_sent printed: zero", &ssSock{RecvQ: 10, Info: map[string]string{"cwnd": "10", "bytes_sent": "7"}}, "bytes_acked", 0, true},
+		{"acked absent and no detail line: missing", without(srvSock(10, 500), "bytes_acked"), "bytes_acked", 0, false},
+		{"received omitted as zero with an empty queue", withDetail(&ssSock{RecvQ: 0, Info: map[string]string{}}), "bytes_received", 0, true},
+		{"received absent with bytes queued: missing", without(withDetail(srvSock(10, 500)), "bytes_received"), "bytes_received", 0, false},
+		{"not a number: missing", &ssSock{Info: map[string]string{"cwnd": "10", "bytes_acked": "x"}}, "bytes_acked", 0, false},
+		{"nil socket", nil, "bytes_acked", 0, false},
+	}
+	for _, tc := range cases {
+		if got, ok := tc.s.Counter(tc.key); got != tc.want || ok != tc.wantOK {
+			t.Errorf("%s: Counter(%s) = %d, %v; want %d, %v", tc.name, tc.key, got, ok, tc.want, tc.wantOK)
+		}
 	}
 }

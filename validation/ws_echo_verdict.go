@@ -95,6 +95,47 @@ func (s *ssSock) Int(key string) (int64, bool) {
 	return n, err == nil
 }
 
+// hasDetail reports whether ss printed the -i detail line for the socket:
+// cwnd and rto are always printed there, whatever the counters are.
+func (s *ssSock) hasDetail() bool {
+	if s == nil {
+		return false
+	}
+	_, c := s.Info["cwnd"]
+	_, r := s.Info["rto"]
+	return c || r
+}
+
+// Counter returns one of the two byte counters the verdict rests on,
+// bytes_received and bytes_acked. iproute2 omits a counter that is zero
+// (bytes_acked on a server end that has never written, bytes_received on one
+// that has never received), so an absent key is zero when ss printed the
+// detail line of the socket AND this ss prints the counters at all (the
+// socket shows bytes_received or bytes_sent), and is "missing" otherwise: an ss
+// too old to print them would look the same, and a missing counter must never
+// be read as "the server did nothing". A bytes_received that is absent while
+// the receive queue holds bytes cannot be a zero and is missing.
+func (s *ssSock) Counter(key string) (int64, bool) {
+	if n, ok := s.Int(key); ok {
+		return n, true
+	}
+	if !s.hasDetail() {
+		return 0, false
+	}
+	if _, present := s.Info[key]; present { // printed, but not a number
+		return 0, false
+	}
+	_, rcv := s.Info["bytes_received"]
+	_, snd := s.Info["bytes_sent"]
+	switch key {
+	case "bytes_acked":
+		return 0, rcv || snd
+	case "bytes_received":
+		return 0, s.RecvQ == 0
+	}
+	return 0, false
+}
+
 // Skmem returns one field of the skmem tuple ("r", "rb", "t", "tb", "f",
 // "w", "o", "bl", "d").
 func (s *ssSock) Skmem(key string) (int64, bool) {
@@ -280,8 +321,8 @@ func wsEchoClassify(t0, t1 echoInstant) wsEchoVerdict {
 // of the receive queue (rcv_nxt - copied_seq) is the growth of copied_seq.
 // ok is false when either end lacks the socket or the counter.
 func srvReads(t0, t1 echoInstant) (int64, bool) {
-	r0, ok0 := t0.Server.Int("bytes_received")
-	r1, ok1 := t1.Server.Int("bytes_received")
+	r0, ok0 := t0.Server.Counter("bytes_received")
+	r1, ok1 := t1.Server.Counter("bytes_received")
 	if t0.Server == nil || t1.Server == nil || !ok0 || !ok1 {
 		return 0, false
 	}
@@ -292,8 +333,8 @@ func srvReads(t0, t1 echoInstant) (int64, bool) {
 // between the instants: bytes_acked plus the send queue is the total written,
 // so a queue draining into a reading client does not move it.
 func srvWrites(t0, t1 echoInstant) (int64, bool) {
-	a0, ok0 := t0.Server.Int("bytes_acked")
-	a1, ok1 := t1.Server.Int("bytes_acked")
+	a0, ok0 := t0.Server.Counter("bytes_acked")
+	a1, ok1 := t1.Server.Counter("bytes_acked")
 	if t0.Server == nil || t1.Server == nil || !ok0 || !ok1 {
 		return 0, false
 	}
@@ -348,9 +389,9 @@ func verdictLine(class, reason string, window time.Duration, t0, t1 echoInstant)
 		t := fmt.Sprintf("t%d", i)
 		kv("srv_recvq_"+t, recvQ(in.Server), in.Server != nil)
 		kv("srv_sendq_"+t, sendQ(in.Server), in.Server != nil)
-		n, ok := in.Server.Int("bytes_received")
+		n, ok := in.Server.Counter("bytes_received")
 		kv("srv_bytes_received_"+t, n, ok)
-		n, ok = in.Server.Int("bytes_acked")
+		n, ok = in.Server.Counter("bytes_acked")
 		kv("srv_bytes_acked_"+t, n, ok)
 		n, ok = in.Server.Skmem("r")
 		kv("srv_skmem_r_"+t, n, ok)
@@ -360,7 +401,7 @@ func verdictLine(class, reason string, window time.Duration, t0, t1 echoInstant)
 		kv("cli_recvq_"+t, recvQ(in.Client), in.Client != nil)
 		// Bytes the refapp has handed to the server socket in all (acked plus
 		// still queued): moves only when the application writes.
-		acked, ok := in.Server.Int("bytes_acked")
+		acked, ok := in.Server.Counter("bytes_acked")
 		kv("srv_written_"+t, acked+sendQ(in.Server), ok && in.Server != nil)
 	}
 	return b.String()

@@ -132,7 +132,9 @@ func TestFireWSLargeEcho_DiagWedge(t *testing.T) {
 
 // Negative control: a server that is only late. Frame 3 sits behind a delay
 // longer than the hold, then everything is echoed. The walker, still reading,
-// sees the echoes arrive in the window: SLOW_CLASS, whatever ss says.
+// sees the echoes arrive in the window, and the fake ss reports the server's
+// write counter moving: SLOW_CLASS, by the counters (bytes at the client alone
+// would not decide it).
 func TestFireWSLargeEcho_DiagSlow(t *testing.T) {
 	shortEchoFire(t, 400*time.Millisecond)
 	shortDiag(t, time.Second, 100*time.Millisecond)
