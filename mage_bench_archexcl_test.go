@@ -38,7 +38,7 @@ func TestResolveArchExclusion(t *testing.T) {
 }
 
 // TestArchExclusionExtraVars: only a both-arch run with the lock on gets the
-// lock vars, and only the arm64 pass under policy heavy gets the reversed order.
+// lock vars, and only the arm64 pass under a locking policy (heavy, all) gets the reversed order.
 func TestArchExclusionExtraVars(t *testing.T) {
 	join := func(v []string) string { return strings.Join(v, " ") }
 	x86 := join(archExclusionExtraVars("heavy", "msa2-server"))
@@ -51,8 +51,11 @@ func TestArchExclusionExtraVars(t *testing.T) {
 	if strings.Contains(x86, "bench_cell_order") || !strings.Contains(arm, "bench_cell_order=reverse") {
 		t.Errorf("only the arm64 pass reverses its cells:\n x86 %s\n arm %s", x86, arm)
 	}
-	if got := join(archExclusionExtraVars("all", "msr1")); strings.Contains(got, "reverse") || !strings.Contains(got, "policy=all") {
-		t.Errorf("policy all keeps both arches forward: %s", got)
+	if got := join(archExclusionExtraVars("all", "msr1")); !strings.Contains(got, "bench_cell_order=reverse") || !strings.Contains(got, "policy=all") {
+		t.Errorf("policy all reverses arm64 too (cell positions match run A): %s", got)
+	}
+	if got := join(archExclusionExtraVars("all", "msa2-server")); strings.Contains(got, "bench_cell_order") {
+		t.Errorf("x86 stays forward under all: %s", got)
 	}
 	if archExclusionExtraVars("off", "msr1") != nil || archExclusionExtraVars("", "msr1") != nil {
 		t.Error("policy off and a single-arch run must add nothing to the playbook command")

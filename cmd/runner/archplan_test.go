@@ -81,6 +81,9 @@ func planCases() []planCase {
 			return interleave.ArchPlan{Columns: c, ReverseCells: true, ReverseColumns: true}
 		}},
 		{"all lock, both forward (strict)", interleave.LockAll, fwd},
+		{"all lock, arm64 cells reversed (strict)", interleave.LockAll, func(c []interleave.PlanColumn) interleave.ArchPlan {
+			return interleave.ArchPlan{Columns: c, ReverseCells: true}
+		}},
 		// priced option, not a runner policy: heavy cells whole, every other
 		// cell's rated sweep under the lock too.
 		{"heavy+rated lock, arm64 cells reversed (option)", interleave.LockHeavyRated, func(c []interleave.PlanColumn) interleave.ArchPlan {
@@ -330,28 +333,39 @@ func TestValidationScopeGroupSizes(t *testing.T) {
 		if hh != 0 {
 			t.Errorf("%s: %d heavy+heavy overlaps", pc.name, hh)
 		}
-		// the heavy saturation-only probe row: how many of its 6 cells share
-		// the client with a peer light cell.
-		var probeShared, probeAlone int
-		for side := 0; side < 2; side++ {
-			for _, x := range r.Slots[side] {
-				if x.Scenario != "get-simple-256c" {
-					continue
-				}
-				shared := false
-				for _, y := range r.Slots[1-side] {
-					if !y.Heavy && y.Start < x.End && x.Start < y.End {
-						shared = true
+		// each heavy row: how many of its cells, per arch, have at least a quarter
+		// of their saturation window under a peer light cell (P6's "shared"). P6
+		// needs both arches covered, and the probe row that covers one arch may
+		// not cover the other, so the log says which.
+		for _, row := range []string{"get-simple-256c", "ws-large-echo", "post-4k"} {
+			var shared, total [2]int
+			for side := 0; side < 2; side++ {
+				for _, x := range r.Slots[side] {
+					if x.Scenario != row {
+						continue
+					}
+					total[side]++
+					satEnd := x.End
+					if x.RatedStart != 0 {
+						satEnd = x.RatedStart
+					}
+					var ov time.Duration
+					for _, y := range r.Slots[1-side] {
+						if y.Heavy {
+							continue
+						}
+						lo, hi := max(x.Start, y.Start), min(satEnd, y.End)
+						if hi > lo {
+							ov += hi - lo
+						}
+					}
+					if ov*4 >= satEnd-x.Start {
+						shared[side]++
 					}
 				}
-				if shared {
-					probeShared++
-				} else {
-					probeAlone++
-				}
 			}
+			t.Logf("%-44s %-16s cells with >= 1/4 of the saturation window under a peer light cell: x86 %d of %d, arm64 %d of %d", pc.name, row, shared[0], total[0], shared[1], total[1])
 		}
-		t.Logf("%-44s get-simple-256c cells (6): %d overlap a peer light cell, %d do not", pc.name, probeShared, probeAlone)
 		if pc.policy == interleave.LockAll && (heavy != 0 || light != 0 || alone != 48) {
 			t.Errorf("%s: alone %d heavy %d light %d, want every one of the 48 light-row passes alone", pc.name, alone, heavy, light)
 		}

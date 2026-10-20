@@ -52,19 +52,22 @@ columns, whose x86 passes read 3-12 s at the 0.75 and 0.9 passes in the 0829 run
   passes: its criterion below is then inconclusive, which is a result about churn-close and not about the lock.
 - **Cells.** 3 columns x 5 rows = 15 cells per arch.
 - **Windows (P1).** Per arch 3 x (5 + 5 + 1 + 5 + 5) = 63 (ws-large-echo, post-4k, get-simple-256c,
-  ws-hub-broadcast-128, churn-close: one saturation window, and 4 rated windows where rated); 51 if
-  churn-close is suspect on every column (it then has 1).
+  ws-hub-broadcast-128, churn-close: one saturation window, and 4 rated windows where rated); 4 fewer for each
+  churn-close cell that is suspect (it then has 1): 63, 59, 55 or 51.
 - **Duration, from the planner** (`go test ./cmd/runner -run ValidationScope -v`, output in the PR). A: 1.29 h
   of bench (1.5-2.5 h wall clock with the Deploy of axum, which is Rust, and celeris, and the runner
   bootstrap). B: 2.35 h (the arches take turns). C and D: 1.19 h each (one arch alone; the arches overlapping). A+B is
   about 3.6 h of bench.
 - **What the default leaves alone.** The same model says, for A, that of the 48 rated passes of the two light
   rows (2 rows x 3 columns x 2 arches x 4 passes), **0 run alone, 0 under a peer light cell and 48 run under
-  a peer heavy cell** (with both arches forward: 0 alone, 8 under light, 40 under heavy), and that 3 of the 6
-  get-simple-256c cells share the client with a peer light cell. So a within-run alone-versus-shared split
-  of the light rows has an empty `alone` group by construction; B supplies it (all 48 alone, 0 of the
-  get-simple-256c cells shared). Dispatch only with the cluster group empty and `EV/_locks/HOLD-CLUSTER`
-  absent, as for any cluster run.
+  a peer heavy cell** (with both arches forward: 0 alone, 8 under light, 40 under heavy). For P6 the model
+  counts cells with at least a quarter of their saturation window under a peer light cell: x86 get-simple-256c
+  3 of 3, **arm64 get-simple-256c 0 of 3** (arm64 runs it after a lock wait, while x86 is in its heavy rows),
+  post-4k and ws-large-echo 3 of 3 on both arches. So P6 judges x86 on get-simple-256c and arm64 on post-4k
+  and ws-large-echo, per arch. A within-run alone-versus-shared split of the light rows has an empty `alone`
+  group by construction; B supplies it (all 48 alone, no heavy cell shared).
+
+Dispatch only with the cluster group empty and `EV/_locks/HOLD-CLUSTER` absent, as for any cluster run.
 
 ## Pre-registered criteria
 
@@ -82,7 +85,8 @@ timestamps; both documents carry `environment.arch_exclusion` with `policy: heav
 `heavy_heavy_overlaps: 0`; `lock_wait_seconds` is greater than 0 on at least one arch and at least one cell
 carries a `client_lock_wait_s` greater than 0 (a lock that was free at the first attempt now reports exactly
 0, so this can fail); `heavy_light_overlaps` is greater than 0 (the run did put heavy cells under light
-load); the windows are all there (63, or 51 where churn-close is suspect, per arch).
+load); the windows are all there (per arch 63 minus 4 for every churn-close cell that is suspect at saturation and so
+has no rated sweep: 63, 59, 55 or 51).
 **P1b, run B:** `BENCH_ARCH_EXCLUSIVE=all mage BenchArchOverlap` exits 0, with `heavy_light_overlaps: 0` and
 `light_light_overlaps: 0` in both documents, `lock_wait_seconds` greater than 0, and no cell failed as
 `client-lock:` (the wait limit is a safety net; one firing in a healthy run is a bug to read first).
@@ -106,14 +110,24 @@ moves between two runs at the same fraction (saturation numbers of duplicate cel
 |log| p50 0.027, p90 0.158 on arm64), and the 1 s clause is what #442 is about. A fail means the light rows'
 rated passes were hurt by the peer's heavy cells.
 
-**P6, a heavy cell under a light peer, A against B** (get-simple-256c saturation requests/s per arch and
-column). A cell of A is *shared* when at least a quarter of its saturation window overlapped a window of the
-other arch's light cells. Holds when there are at least 3 shared cells, the median of rps(A) / rps(B) over
-them is at least 0.965 (the low end of the 3.5-6% the coefficient predicts for x86 under the arm64 light
-rows), and none is below 0.92. Fewer than 3 shared cells is inconclusive. The unshared cells of A against B
-are printed next to it as the noise reference (they should sit near 1.00). A fail, for either arch, means the
-light exemption costs a measurable share of a heavy cell. The arm64 side is the direction nobody has
-measured.
+**P6, a heavy cell under a light peer, A against B, per arch** (saturation requests/s). x86 is judged on
+get-simple-256c (the row of the 0.18-0.31 coefficient) and arm64 on post-4k and ws-large-echo, because the
+planner shows arm64's get-simple-256c cells do not share the client with an x86 light cell in the default
+order while its post-4k and ws-large-echo cells do; this is the direction nobody has measured. The other
+rows are printed, not judged (x86 post-4k and ws-large-echo sit on the #518 plateau, which makes them
+insensitive). A cell of A is *shared* when at least a quarter of its saturation window overlapped a window of
+the other arch's light cells. For each arch: holds when there are at least 3 shared cells, the median of
+rps(A) / rps(B) over them is at least 0.965 (the low end of the 3.5-6% the coefficient predicts for x86 under
+the arm64 light rows), and none is below 0.92. Fewer than 3 shared cells is inconclusive. P6 holds only if both
+arches hold, fails if either fails. The unshared judged cells of A against B are printed as the noise reference
+(they should sit near 1.00).
+
+**What A and B do and do not hold equal.** arm64 walks each column in reverse under both policies (`all`
+reverses it too, at no wall-clock cost), so a cell's position in its column, and its place on a freshly
+started SUT, is the same in A and B. What differs is what the arches shared, and the idle time: under `all`
+nearly every cell waits for the peer, under the default far fewer do. Arm C controls that idle only for x86,
+and only for the amount B waits; an effect of idling would show as a B that reads differently from C and
+would make A against B understate or overstate the sharing. It is read, not judged (P7).
 
 **P7, idle wait (only with arm C).** x86 saturation requests/s and rated p99 of C against B at the same cell,
 and against the A cells that waited 60 s or more. Reported, not judged: no threshold is pre-registered

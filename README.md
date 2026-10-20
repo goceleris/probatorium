@@ -355,6 +355,9 @@ bond carries both arches). A run made before the fix marks nothing of this.
   (`environment.arch_exclusion.cell_order`). It is a comparability change for arm64 only: its heavy rows now
   run first on a freshly started SUT and its light rows last, where every earlier arm64 run did the opposite.
   x86, the arch #442 contaminated and the one the single-arch references are for, keeps the registry order.
+  `all` reverses arm64 too: its wall-clock does not depend on the order (99.7 h either way in the model), and
+  it keeps every cell's position in its column the same under both policies, so a comparison of the two
+  (the validation's run A against run B) differs in what the arches shared, not in where a cell sat.
 - `BENCH_ARCH_EXCLUSIVE=heavy|all|off` (workflow input `arch_exclusive`) picks the policy. `heavy` is the
   default for `target=both`. `all` locks every cell, so the arches take turns. `off` is today's behaviour,
   kept as a control arm: the publish gate refuses its documents.

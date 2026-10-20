@@ -242,7 +242,7 @@ func TestLockErrorIsNotAnInterruption(t *testing.T) {
 
 // lockCell runs one get-json cell (heavy, rated) of a remote-target runner on
 // lock against srvURL and returns the executeCell result and its per-cell JSON.
-func lockCell(t *testing.T, srvURL string, lock *clientLock, extra ...string) (cellOutcome, error, cellResultFile) {
+func lockCell(t *testing.T, srvURL string, lock *clientLock, extra ...string) (cellOutcome, cellResultFile, error) {
 	t.Helper()
 	args := append([]string{"-target", srvURL, "-server-name", "e2e-remote", "-duration", "150ms", "-warmup", "50ms",
 		"-rated", "-rated-duration", "100ms", "-rated-fractions", "0.5", "-rated-cells", "*", "-out", t.TempDir()}, extra...)
@@ -261,7 +261,7 @@ func lockCell(t *testing.T, srvURL string, lock *clientLock, extra ...string) (c
 	if jerr := json.Unmarshal(raw, &cf); jerr != nil {
 		t.Fatal(jerr)
 	}
-	return oc, err, cf
+	return oc, cf, err
 }
 
 func okServer(t *testing.T) *httptest.Server {
@@ -275,7 +275,7 @@ func okServer(t *testing.T) *httptest.Server {
 // neither records client_lock_wait_s nor re-stamps started_at (probatorium#442).
 func TestUncontendedHeavyCellRecordsNoLockWait(t *testing.T) {
 	srv := okServer(t)
-	oc, err, cf := lockCell(t, srv.URL, testLock(t, filepath.Join(t.TempDir(), "client.lock"), ""))
+	oc, cf, err := lockCell(t, srv.URL, testLock(t, filepath.Join(t.TempDir(), "client.lock"), ""))
 	if err != nil || oc.Status != report.CellOK {
 		t.Fatalf("status %q err %v", oc.Status, err)
 	}
@@ -296,7 +296,7 @@ func TestWedgedHolderDoesNotStallThePeersCell(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	oc, err, cf := lockCell(t, srv.URL, testLock(t, path, ""))
+	oc, cf, err := lockCell(t, srv.URL, testLock(t, path, ""))
 	if err != nil || oc.Status != report.CellOK {
 		t.Fatalf("the peer's cell did not run behind a wedged holder: status %q err %v", oc.Status, err)
 	}
@@ -319,7 +319,7 @@ func TestPeerCellFailsAsClientLockAfterTheWaitLimit(t *testing.T) {
 	defer hold()
 	mine := testLock(t, path, "")
 	mine.maxWait = 200 * time.Millisecond
-	oc, err, cf := lockCell(t, srv.URL, mine)
+	oc, cf, err := lockCell(t, srv.URL, mine)
 	if err == nil || !errors.Is(err, errClientLockWait) {
 		t.Fatalf("err = %v, want errClientLockWait", err)
 	}
@@ -352,7 +352,7 @@ func TestSUTThatDiedDuringTheLockWaitIsNotMeasured(t *testing.T) {
 		srv.Close() // the SUT dies while the cell waits...
 		hold()      // ...and the peer lets go
 	}()
-	oc, err, cf := lockCell(t, srv.URL, testLock(t, path, ""))
+	oc, cf, err := lockCell(t, srv.URL, testLock(t, path, ""))
 	if err == nil || !strings.HasPrefix(oc.ErrorMsg, "server-down:") || !strings.Contains(oc.ErrorMsg, "client-lock wait") {
 		t.Fatalf("err %v error %q: want server-down from the probe after the lock wait", err, oc.ErrorMsg)
 	}

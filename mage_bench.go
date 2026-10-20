@@ -71,7 +71,8 @@ import (
 //	                               other (host-wide lock on msa2-client,
 //	                               arm64 walks each column in reverse);
 //	                               all: the arches never overlap (about
-//	                               twice the wall-clock); off: the pre-fix
+//	                               twice the wall-clock; arm64 reversed
+//	                               too); off: the pre-fix
 //	                               behaviour, which the publish gate refuses
 //	                               (probatorium#442)
 //	CELERIS_VERSION=               override go.mod auto-detect

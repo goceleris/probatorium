@@ -53,10 +53,15 @@ func resolveArchExclusion(target string) (string, error) {
 	return "", fmt.Errorf("BENCH_ARCH_EXCLUSIVE=%q: want heavy, all or off", v)
 }
 
-// archCellOrder is the order host's runner walks each column. Under policy heavy
-// the arm64 pass walks it in reverse; every other pass and policy is forward.
+// archCellOrder is the order host's runner walks each column. Under a policy
+// that locks (heavy, all) the arm64 pass walks it in reverse; every other pass
+// is forward, and so is policy off (the pre-fix control). Under all the order
+// does not change the wall-clock (the planner gives 99.7 h either way), but it
+// keeps every cell's position in its column the same as under heavy, so the
+// validation's run A against run B differs in what the arches shared and not in
+// where each cell sat on a freshly started SUT (probatorium#442).
 func archCellOrder(policy, host string) string {
-	if policy == report.ExclusionHeavy && host == "msr1" {
+	if (policy == report.ExclusionHeavy || policy == report.ExclusionAll) && host == "msr1" {
 		return "reverse"
 	}
 	return "forward"
