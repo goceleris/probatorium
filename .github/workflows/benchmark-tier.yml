@@ -153,7 +153,12 @@ jobs:
     # full profile projects ~51h and headline ~30h. Well under GitHub's 5-day
     # self-hosted job hard limit. This is only a ceiling. BENCH_BUDGET (below)
     # is the real fail-loud projection gate.
-    timeout-minutes: 6600
+    # arch_exclusive=all (the strict option of probatorium#442, the arches take
+    # turns) projects ~102h for full, which no 6600 min (110h) ceiling holds;
+    # that policy gets 7080 min (118h), under the 7200 min (5 day) limit.
+    # Keyed by the arch policy like BENCH_BUDGET (below); a single-arch target
+    # ignores the policy.
+    timeout-minutes: ${{ fromJSON('{"heavy":6600,"off":6600,"all":7080}')[(github.event.inputs.target || 'both') == 'both' && github.event.inputs.arch_exclusive || 'heavy'] }}
     env:
       BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
       # Job-level so BOTH `mage Deploy` and `mage BenchTier` see it. Deploy uses
@@ -309,6 +314,15 @@ jobs:
           # a target=both run adds the client lock of probatorium#442 on top
           # (budget.ArchLockOverheadHeavy, 14%): headline ~34h, full ~58h; the
           # budgets below are raised to keep the same 18-21% margin.
+          # BENCH_BUDGET is a table of profile x arch policy, because the policy
+          # moves the projection (workflow_arch_budget_test.go checks every
+          # entry against FitWithin and the job timeout above). `all` projects
+          # fast 28h, headline 59h41m, full 101h55m (twice one arch): budgets
+          # 34h / 72h keep the 20% margin; full gets 108h (6% over the model)
+          # because 122h would not fit under the 5 day job limit (7200 min).
+          # The model ran 7% HIGH against bench-full 38431303162, so ~95h is
+          # the expectation, but that is one run: an `all` full dispatch has
+          # the thinnest margin of any entry.
           # (a rated cell adds 4 passes x (saturation warmup + rated window)).
           # The runs before #418 measured ~53h (headline) and ~69h (full)
           # against projections of 26h35m and 44h31m. Per-cell overhead was
@@ -323,7 +337,7 @@ jobs:
           # (budget.BaselineRealizedCells), +14.5 h projected on full and
           # +8.5 h on headline: 29h50m -> 38h22m (48h), 50h58m -> 65h28m (80h).
           # fast stays under 24h (+3.8 h). budget_test.go pins these.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && (github.event.inputs.baseline == 'true' && '48h' || '40h') || (github.event.inputs.baseline == 'true' && '80h' || '69h')) }}
+          BENCH_BUDGET: ${{ fromJSON('{"fast":{"heavy":"24h","off":"24h","all":"34h"},"headline":{"heavy":"40h","off":"40h","all":"72h"},"full":{"heavy":"69h","off":"69h","all":"108h"}}')[github.event.inputs.profile || 'full'][(github.event.inputs.target || 'both') == 'both' && github.event.inputs.arch_exclusive || 'heavy'] }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 
