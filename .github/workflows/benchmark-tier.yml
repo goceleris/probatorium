@@ -166,6 +166,11 @@ jobs:
       # (mage_tier.go setBenchEnvFromProfile honours a non-blank preset the
       # same way it honours BENCH_DURATION / BENCH_WARMUP).
       BENCH_CELLS: ${{ github.event.inputs.cells || '' }}
+      # AB (throwaway branch ab/pinplan-v6-90s, not for merge): the 90 s / 20 s window of bench 38431303162, as a preset. mage_tier.go
+      # setBenchEnvFromProfile keeps a non-blank BENCH_DURATION / BENCH_WARMUP, and ansible sizes the hang guard from them. The workflow has
+      # no per-cell window: one value per run.
+      BENCH_DURATION: 90s
+      BENCH_WARMUP: 20s
       # PUBLISH POLICY. Two rules, in order:
       #
       #   1. profile=fast NEVER publishes — full stop, regardless of the
