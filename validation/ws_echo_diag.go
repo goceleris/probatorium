@@ -177,6 +177,12 @@ func wsEchoDiagDrain(ctx context.Context, conn net.Conn, br *bufio.Reader, until
 	buf := make([]byte, 32<<10)
 	for {
 		_ = conn.SetReadDeadline(until)
+		// The cancel watcher may have set an expired deadline just before the
+		// line above replaced it; checked after, a cancel that landed first is
+		// still seen, and one that lands later sets the deadline again.
+		if ctx.Err() != nil {
+			return "ctx_cancelled"
+		}
 		_, err := br.Read(buf)
 		switch {
 		case err == nil:
