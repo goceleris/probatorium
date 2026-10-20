@@ -16,7 +16,7 @@ import (
 )
 
 // THROWAWAY (ab/pinplan-v7). Pins the layout of the PINPLAN7 run (PLAN-pinplan7.md): the exact (scenario, column) pairs the dispatch glob selects, one cell (io256) per column, two arms on ONE
-// celeris commit family (rulend = celeris 7af74c6 = #1085's head, default Workers and NO knob, the loops planned by the rx-port rule; vnv = celeris 45a90edf = 7af74c6 + the EXPERIMENT-ONLY
+// celeris commit family (rulend = celeris 165be7d = #1085's head, default Workers and NO knob, the loops planned by the rx-port rule; vnv = celeris 734d4d31 = 165be7d + the EXPERIMENT-ONLY
 // CELERIS_AB_PLAN_CPUS knob with the CPU list 0-1,7,9-11 a CONSTANT of the module), the single vector position (the standing CPU 1), the position-balanced seeded schedule (8 reps, each arm leads 4),
 // and that every column's registry pin equals the celeris require of its module.
 const (
@@ -25,8 +25,8 @@ const (
 	wantFast = 16 // 8 reps x 2 arms x io256
 
 	pinPin  = "v1.5.12-0.20261019091132-a193acb4e610" // pppin8_celeris (kept as the byte-for-byte reference of the module sources): celeris a193acb4, not a column of this run
-	pinRule = "v1.5.12-0.20261020000038-7af74c614248" // rulend: celeris 7af74c6 = #1085 head (branch ab/rulend-20261020), no knob
-	pinVnv  = "v1.5.12-0.20261020071651-45a90edfe27f" // vnv: celeris 45a90edf (branch ab/vnv-on-7af74c6) = 7af74c6 + the EXPERIMENT-ONLY knob
+	pinRule = "v1.5.12-0.20261020081147-165be7db3e1b" // rulend: celeris 165be7d = #1085 head (branch ab/rulend-20261020b), no knob
+	pinVnv  = "v1.5.12-0.20261020082044-734d4d3123a3" // vnv: celeris 734d4d31 (branch ab/vnv-on-165be7d) = 165be7d + the EXPERIMENT-ONLY knob
 )
 
 var (
@@ -244,7 +244,7 @@ const knobEnv = "CELERIS_AB_PLAN_CPUS"
 
 // The loop CPUs of a variant are a constant of its module (arm.go: `const armPlanCPUs = "<list>"` and an init() that os.Setenv's the knob from it, so
 // a value the run's environment carries is overwritten and nothing can unset it); Config.Workers stays unset (armWorkers = 0) in every #1049-based
-// arm; rulend never mentions the knob (7af74c6 does not have it); no other file of any module mentions it or reads the
+// arm; rulend never mentions the knob (165be7d does not have it); no other file of any module mentions it or reads the
 // environment for a CPU list.
 func TestPinplan7PlanKnobIsAModuleConstant(t *testing.T) {
 	for _, arm := range arms {
@@ -331,9 +331,9 @@ func TestPinplan7VariantsDifferFromPin8OnlyInThePin(t *testing.T) {
 			t.Errorf("%s/go.sum must hold exactly the h1 lines of celeris %s", other, pin)
 		}
 	}
-	// vnv's pin is the knob commit on top of 7af74c6 (celeris branch ab/vnv-on-7af74c6): its short sha is the pseudo-version's suffix
-	if !strings.HasSuffix(pinVnv, "-45a90edfe27f") {
-		t.Errorf("the vnv pin %s is not celeris 45a90edfe27f (7af74c6 + the knob)", pinVnv)
+	// vnv's pin is the knob commit on top of 165be7d (celeris branch ab/vnv-on-165be7d): its short sha is the pseudo-version's suffix
+	if !strings.HasSuffix(pinVnv, "-734d4d3123a3") {
+		t.Errorf("the vnv pin %s is not celeris 734d4d3123a3 (165be7d + the knob)", pinVnv)
 	}
 	// the two arm modules are the same program: every file but arm.go, go.mod and go.sum is byte for byte equal
 	ents, _ := os.ReadDir("pprulend_celeris")
@@ -348,9 +348,9 @@ func TestPinplan7VariantsDifferFromPin8OnlyInThePin(t *testing.T) {
 			t.Errorf("ppvnv7_celeris/%s differs from pprulend_celeris/%s", e.Name(), e.Name())
 		}
 	}
-	// the rulend pin is the head of celeris PR #1085 (7af74c6142486bd049ed13db1e674d5b1bcb9c25, branch ab/rulend-20261020): its short sha is the pseudo-version's suffix
-	if !strings.HasSuffix(pinRule, "-7af74c614248") {
-		t.Errorf("the rulend pin %s is not celeris 7af74c614248 (#1085's head)", pinRule)
+	// the rulend pin is the head of celeris PR #1085 (165be7db3e1b77c5bed7afd8895886b3fe29f242, branch ab/rulend-20261020b): its short sha is the pseudo-version's suffix
+	if !strings.HasSuffix(pinRule, "-165be7db3e1b") {
+		t.Errorf("the rulend pin %s is not celeris 165be7db3e1b (#1085's head)", pinRule)
 	}
 	gm, _ := os.ReadFile(filepath.Join(ref, "go.mod"))
 	if !strings.Contains(string(gm), "github.com/goceleris/celeris "+pinPin+"\n") {

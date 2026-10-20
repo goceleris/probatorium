@@ -5,18 +5,18 @@ package servers
 import "fmt"
 
 // PINPLAN7: the two-arm, one-cell re-run (io256, 35 s) that settles the one noise breach of the v6 read of RULE D (celeris PR #1085, the rx-port loop rule): RULE-D (rulend: celeris branch
-// ab/rulend-20261020 7af74c6 = #1085's head, default Workers, NO knob: the loops are planned by the rule itself at Listen from /proc and /sys) against V-NV (vnv: celeris branch ab/vnv-on-7af74c6
-// 45a90edf = the SAME commit 7af74c6 + the EXPERIMENT-ONLY planner knob CELERIS_AB_PLAN_CPUS with the hard-coded list 0-1,7,9-11; with the knob set the rule is not consulted; never intended
+// ab/rulend-20261020b 165be7d = #1085's head, default Workers, NO knob: the loops are planned by the rule itself at Listen from /proc and /sys) against V-NV (vnv: celeris branch ab/vnv-on-165be7d
+// 734d4d31 = the SAME commit 165be7d + the EXPERIMENT-ONLY planner knob CELERIS_AB_PLAN_CPUS with the hard-coded list 0-1,7,9-11; with the knob set the rule is not consulted; never intended
 // to ship). The two arms differ in the knob code and in nothing else of celeris. Throwaway branch ab/pinplan-v7, not for merge; evidence/cluster-reads-20261016/ab-prep/PLAN-pinplan7.md.
-// servers/pprulend_celeris is the v6 module byte for byte; servers/ppvnv7_celeris is a copy of it with the knob constant and another celeris pin. One column per (execution slot, arm): the
+// servers/pprulend_celeris is the v6 module with the new celeris pin; servers/ppvnv7_celeris is a copy of it with the knob constant and another celeris pin. One column per (execution slot, arm): the
 // column name carries the schedule because columns run in sorted-name order. SUTEnv AB_IRQ_VECTOR_CPU=1 is read by run_bench_cell.yml (never by the server): the enp1s0-8 vector stays on its
 // standing CPU 1, which ansible verifies by effective_affinity_list readback before the server starts.
 
 func init() {
 	type arm struct{ module, framework, version string }
 	arms := map[string]arm{
-		"rulend": {"servers/pprulend_celeris", "celeris-pp-rulend", "v1.5.12-0.20261020000038-7af74c614248"},
-		"vnv":    {"servers/ppvnv7_celeris", "celeris-pp-vnv7", "v1.5.12-0.20261020071651-45a90edfe27f"},
+		"rulend": {"servers/pprulend_celeris", "celeris-pp-rulend", "v1.5.12-0.20261020081147-165be7db3e1b"},
+		"vnv":    {"servers/ppvnv7_celeris", "celeris-pp-vnv7", "v1.5.12-0.20261020082044-734d4d3123a3"},
 	}
 	add := func(seq, rep int, armKey string) {
 		base, ok := Registry["celeris-iouring-h1-async"]
