@@ -119,6 +119,11 @@ type tier1Config struct {
 	// (celeris#588). See wsStallThreshold / h2cStallThreshold.
 	OnWalkerStall func(kind string)
 
+	// WSEchoDiag, when non-nil, is the two-instant capture a timed-out
+	// ws_echo fire takes before the timeout is counted (ws_echo_diag.go,
+	// probatorium#481). Set in a stall-capture run only.
+	WSEchoDiag *wsEchoDiag
+
 	// TallyCallbackInterval is how often TallyCallback fires. Zero
 	// defaults to 2 seconds; only used when TallyCallback is non-nil.
 	TallyCallbackInterval time.Duration
@@ -507,6 +512,9 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	armWalkerCapture(runCtx, tally.readyAt.Load(), h2cTallyPtr, wsTallyPtr, cfg.OnWalkerStall)
 	wsEchoTallyPtr := &wsEchoTally{}
 	tally.wsEcho = wsEchoTallyPtr
+	if cfg.WSEchoDiag != nil {
+		wsEchoTallyPtr.diag.Store(cfg.WSEchoDiag)
+	}
 	if cfg.OnResponseCounters != nil {
 		cfg.OnResponseCounters(rfcTallyPtr.counters)
 	}

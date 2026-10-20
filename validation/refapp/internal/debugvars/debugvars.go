@@ -100,6 +100,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -173,6 +174,7 @@ func (v *Vars) NewServer(cfg celeris.Config) *celeris.Server {
 // Hook installs the connection counters on cfg, chaining any callbacks
 // already set. Must run before celeris.New(cfg).
 func (v *Vars) Hook(cfg *celeris.Config) {
+	applyWorkloadHint(cfg, os.Getenv)
 	prevConnect, prevDisconnect := cfg.OnConnect, cfg.OnDisconnect
 	cfg.OnConnect = func(addr string) {
 		v.accepted.Add(1)
@@ -288,12 +290,20 @@ func (v *Vars) Handler() celeris.HandlerFunc {
 
 // Document builds the current /debug/vars document.
 func (v *Vars) Document() map[string]any {
+	doc := v.document()
+	doc["memstats"] = v.MemStats()
+	return doc
+}
+
+// document is Document without memstats, whose runtime.ReadMemStats stops
+// the world: the side listener's /debug/sched reads the engine counters
+// through it so a diagnosis of a stalled process does not add a pause.
+func (v *Vars) document() map[string]any {
 	doc := map[string]any{
 		"goroutines":                  int64(runtime.NumGoroutine()),
 		"celeris.accepted_conn_total": v.accepted.Load(),
 		"celeris.closed_conn_total":   v.closed.Load(),
 		"celeris.panic_count":         v.PanicCount(),
-		"memstats":                    v.MemStats(),
 		// I-CONN-1's input. Always present, even at zero, so the document
 		// keeps a fixed shape and a missing key is distinguishable from a
 		// clean reading.

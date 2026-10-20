@@ -295,6 +295,20 @@ where `/ws` is routed. The echo holds no connection for the first 18 s of every 
 keeps each echo's backlog on the Go heap, and these gaps give every `I-MEM-1` trough bucket samples
 without one ([`validation/ws_echo_quiet.go`](validation/ws_echo_quiet.go), probatorium#478).
 
+In a stall-capture run (the `stall_capture` dispatch input), a 64 KiB echo fire that times out is held
+open: the sender stops, the walker keeps reading, and `ss -tmi` of both ends, the echo and byte
+counters, the refapp's per-thread CPU masks and states, its `GOMAXPROCS` and its engine counters are
+taken at t0 and t0 + 3 s. A record-only `I-WS-ECHO-STALL` dossier carries `ws-echo-diag.txt`, whose first
+line is `WS_ECHO_VERDICT=SLOW_CLASS` (the server application read bytes or wrote more than a control frame
+in the window, from the exact counters `bytes_received` less Recv-Q and `bytes_acked` plus Send-Q: slow),
+`WEDGE_CLASS` (neither moved while bytes sat unread in the server's receive queue) or `INDETERMINATE`
+(missing or contradictory data is never a wedge).
+The timeout is counted after the second instant. `mage` and the race tier also take two off-by-default
+experiment arms for msa2-server only, `refapp_cpus` (a `taskset -c` list of at least 2 CPUs) and
+`refapp_workload_hint` (`high` starts the adaptive engine on io_uring); each cell records the arm it
+actually ran under in `refapp_sched.txt` ([`validation/ws_echo_diag.go`](validation/ws_echo_diag.go),
+[`validation/refapparms`](validation/refapparms), probatorium#481).
+
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
 `auth_session_ratelimit` routes them today. The verdict is recorded per cell (`ws_route_probed` /

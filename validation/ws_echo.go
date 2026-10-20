@@ -171,6 +171,9 @@ type wsEchoTally struct {
 	// cutAtDeadline counts fires the run context ended mid-stream. Not a
 	// defect: the budget ran out.
 	cutAtDeadline atomic.Int64
+	// diag, when set, takes the two-instant capture of a timed-out fire
+	// (ws_echo_diag.go). Installed in a stall-capture run only.
+	diag atomic.Pointer[wsEchoDiag]
 }
 
 // wsEchoSnapshot is the value-typed projection emitted into the tally
@@ -297,7 +300,10 @@ func fireWSLargeEcho(ctx context.Context, hostPort, path string, rng *rand.Rand,
 		tally.handshakeFail.Add(1)
 		return
 	}
-	br := bufio.NewReaderSize(conn, wsEchoFrameBytes)
+	// bytesIn counts what the fire pulled off the socket; only the timeout
+	// diagnosis reads it (ws_echo_diag.go).
+	var bytesIn atomic.Uint64
+	br := bufio.NewReaderSize(countingConn{Conn: conn, n: &bytesIn}, wsEchoFrameBytes)
 	status, err := wsReadUpgradeResponse(br)
 	if err != nil {
 		tally.handshakeFail.Add(1)
@@ -368,6 +374,9 @@ func fireWSLargeEcho(ctx context.Context, hostPort, path string, rng *rand.Rand,
 	}()
 	v := newWSEchoVerifier()
 	drained := false
+	// diagnose is set when this fire timed out in a stall-capture run: the
+	// timeout is then counted after the capture (ws_echo_diag.go).
+	var diagnose *wsEchoDiag
 	connEnded := false // the peer closed, reset, or stopped speaking frames
 readLoop:
 	for {
@@ -380,7 +389,13 @@ readLoop:
 				tally.cutAtDeadline.Add(1)
 				connEnded = true
 			case errors.Is(err, os.ErrDeadlineExceeded):
-				tally.timeout.Add(1)
+				if diag := tally.diag.Load(); diag.claim() {
+					// Counted after the two-instant capture below, not now:
+					// the tally tick ends the cell on a timeout.
+					diagnose = diag
+				} else {
+					tally.timeout.Add(1)
+				}
 				connEnded = true
 			case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
 				errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
@@ -438,6 +453,21 @@ readLoop:
 	close(stop)
 	_ = conn.SetWriteDeadline(time.Now())
 	<-sendDone
+	if diagnose != nil {
+		// The sender is joined, the connection still open: take the two
+		// instants, hand the record over, and only then book the timeout.
+		rep := diagnose.run(ctx, conn, br, &received, &sent, &bytesIn)
+		// Nothing more is needed from the connection, and Deliver may wait a
+		// long time for the orchestrator's slot (an in-stall dossier of the
+		// same stall can be holding it). A detached stream that stays open
+		// keeps ageing in the refapp's last-byte table, where I-CONN-1 would
+		// add a second violation to the cell.
+		_ = conn.Close()
+		if diagnose.Deliver != nil {
+			diagnose.Deliver(ctx, rep)
+		}
+		tally.timeout.Add(1)
+	}
 	if connEnded {
 		return
 	}

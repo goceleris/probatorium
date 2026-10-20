@@ -48,7 +48,7 @@ func (v *Vars) startDebugListenerFromEnv() {
 	if addr == "" {
 		return
 	}
-	a, err := StartDebugListener(addr, debugBannerOut)
+	a, err := startDebugListener(addr, debugBannerOut, map[string]http.Handler{"/debug/sched": http.HandlerFunc(v.serveSched)})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "debugvars: %s=%s: %v (the dossier's pprof leg falls back to the engine)\n", DebugAddrEnv, addr, err)
 		return
@@ -70,6 +70,11 @@ func (v *Vars) DebugAddr() string {
 // returns once the listener is bound; serving runs on its own goroutine for
 // the life of the process.
 func StartDebugListener(addr string, w io.Writer) (net.Addr, error) {
+	return startDebugListener(addr, w, nil)
+}
+
+// startDebugListener is StartDebugListener plus extra handlers by exact path.
+func startDebugListener(addr string, w io.Writer, extra map[string]http.Handler) (net.Addr, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -80,6 +85,9 @@ func StartDebugListener(addr string, w io.Writer) (net.Addr, error) {
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	for path, h := range extra {
+		mux.Handle(path, h)
+	}
 	srv := &http.Server{
 		Handler: http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 			if !isLoopback(r.RemoteAddr) {
