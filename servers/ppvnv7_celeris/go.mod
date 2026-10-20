@@ -1,9 +1,9 @@
-module github.com/goceleris/probatorium/servers/ppvnv_celeris
+module github.com/goceleris/probatorium/servers/ppvnv7_celeris
 
 go 1.27.2
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20261019135026-3d0ddb0a8f6b
+	github.com/goceleris/celeris v1.5.12-0.20261020071651-45a90edfe27f
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 )
 
