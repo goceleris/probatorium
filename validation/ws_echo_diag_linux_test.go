@@ -58,17 +58,18 @@ func TestDefaultSS_LiveLoopbackShowsTheUnreadBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	port := cli.LocalAddr().(*net.TCPAddr).Port
+	srvPort := ln.Addr().(*net.TCPAddr).Port
 
 	var sockSrv *ssSock
 	var out string
 	for i := 0; i < 50; i++ { // the bytes are queued synchronously on loopback; the poll only covers ss start-up
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		out, err = defaultSS(ctx, port)
+		out, err = defaultSS(ctx, port, srvPort)
 		cancel()
 		if err != nil {
 			t.Fatalf("defaultSS: %v\n%s", err, out)
 		}
-		sockSrv, _ = findEchoSocks(parseSS(out), port)
+		sockSrv, _ = findEchoSocks(parseSS(out), port, srvPort)
 		if sockSrv != nil && sockSrv.RecvQ >= unread {
 			break
 		}
@@ -83,12 +84,12 @@ func TestDefaultSS_LiveLoopbackShowsTheUnreadBytes(t *testing.T) {
 	if _, ok := sockSrv.Int("rcv_space"); !ok {
 		t.Errorf("ss -i printed no rcv_space for the server end:\n%s", sockSrv.Raw)
 	}
-	if _, cliSock := findEchoSocks(parseSS(out), port); cliSock == nil {
+	if _, cliSock := findEchoSocks(parseSS(out), port, srvPort); cliSock == nil {
 		t.Errorf("client end not seen:\n%s", out)
 	}
 	// The filter names this connection only.
 	for _, s := range parseSS(out) {
-		if portOf(s.Local) != port && portOf(s.Peer) != port {
+		if !(portOf(s.Local) == port && portOf(s.Peer) == srvPort) && !(portOf(s.Local) == srvPort && portOf(s.Peer) == port) {
 			t.Errorf("ss returned a socket of another connection: %s", s.Raw)
 		}
 	}

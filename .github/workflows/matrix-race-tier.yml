@@ -72,10 +72,16 @@ on:
         description: >-
           Experiment arm B (probatorium#481), off by default: the refapps set
           celeris.Config.WorkloadHint on msa2-server. high starts the adaptive
-          engine on io_uring instead of epoll-then-switch, low keeps it on
-          epoll. Empty runs as today. With a value set the gate no longer
-          expects each adaptive cell to switch (a cell started on io_uring has
-          no switch to count).
+          engine on io_uring instead of epoll-then-switch. low is identical to
+          empty at the pinned celeris sha (both start on epoll), so it is a
+          no-op, not an arm. high is silently ignored when io_uring is not
+          viable, for H2C and when CELERIS_ADAPTIVE_START is set, so the
+          effect is read back per cell (REFAPP_IOURING in refapp_sched.txt:
+          the refapp holds an io_uring instance at ready), not from this
+          input. Empty runs as today. Under high the gate no longer expects
+          each adaptive cell to switch (a cell started on io_uring has no
+          switch to count), for the whole run including the msr1 control
+          cells; under low or empty it still does.
         required: false
         default: ""
         type: string
@@ -111,7 +117,8 @@ jobs:
             *) echo "refapp_workload_hint must be high, low or empty, got: $REFAPP_WORKLOAD_HINT" >&2; exit 1 ;;
           esac
           if [ -n "$REFAPP_CPUS" ]; then
-            if ! printf '%s' "$REFAPP_CPUS" | grep -Eq '^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$'; then
+            # grep matches line by line: refuse a multi-line value outright.
+            if [ "$(printf '%s' "$REFAPP_CPUS" | wc -l)" -ne 0 ] || ! printf '%s' "$REFAPP_CPUS" | grep -Eq '^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$'; then
               echo "refapp_cpus must be a taskset -c list such as 2-5 or 0,2,4, got: $REFAPP_CPUS" >&2
               exit 1
             fi
@@ -351,9 +358,11 @@ jobs:
           # Every adaptive cell must promote epoll -> io_uring at least once;
           # the matrix sizes those cells so the controller's threshold is
           # reachable, and this proves it was (celeris#580).
-          # Not under arm B (refapp_workload_hint set): a cell started on
-          # io_uring has no epoll -> io_uring switch to count.
-          VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH: ${{ inputs.refapp_workload_hint == '' && '1' || '' }}
+          # Not under arm B (refapp_workload_hint high): a cell started on
+          # io_uring has no epoll -> io_uring switch to count. low starts on
+          # epoll like empty and still switches, so it keeps the check. The
+          # check is run-wide, so under high the msr1 control cells lose it too.
+          VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH: ${{ inputs.refapp_workload_hint != 'high' && '1' || '' }}
           # Every cell of this tier is a -race build and must have declared
           # I-RACE; a refapp that silently lost the detector would otherwise
           # hide behind the waiver.

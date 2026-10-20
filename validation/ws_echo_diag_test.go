@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,24 +22,36 @@ func shortDiag(t *testing.T, window, minWindow time.Duration) {
 	t.Cleanup(func() { wsEchoDiagWindow, wsEchoMinWindow = savedW, savedM })
 }
 
-// fakeSS answers with the server end of the connection at the given
-// Recv-Q (per call) and the client end with a deep Send-Q. A negative queue
-// leaves the server socket out of the output.
-func fakeSS(recvq func(call int) int64) (func(context.Context, int) (string, error), *int) {
+// fakeSrv is the server end of the connection as a fake ss prints it: the
+// queues and the two counters the verdict rests on. A negative RecvQ leaves
+// the server socket out of the output.
+type fakeSrv struct{ RecvQ, Recv, Acked, SendQ int64 }
+
+// flatSrv is the incident's server socket with nothing moving.
+var flatSrv = fakeSrv{RecvQ: 433664, Recv: 2951836, Acked: 4490877}
+
+// fakeSS answers with the server end of the connection as fakeSrv says (per
+// call) and the client end with a deep Send-Q.
+func fakeSS(srv func(call int) fakeSrv) (func(context.Context, int, int) (string, error), *int) {
 	calls := new(int)
 	var mu sync.Mutex
-	return func(_ context.Context, port int) (string, error) {
+	return func(_ context.Context, port, srvPort int) (string, error) {
 		mu.Lock()
 		*calls++
-		q := recvq(*calls)
+		q := srv(*calls)
 		mu.Unlock()
 		out := "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
-		if q >= 0 {
-			out += fmt.Sprintf("ESTAB %d 0 127.0.0.1:30833 127.0.0.1:%d\n\t skmem:(r%d,rb460800,t0,tb2626560,f0,w0,o0,bl0,d0) cubic bytes_received:%d lastrcv:60 rcv_wnd:17408\n", q, port, q, 2951836+q)
+		if q.RecvQ >= 0 {
+			out += fmt.Sprintf("ESTAB %d %d 127.0.0.1:%d 127.0.0.1:%d\n\t skmem:(r%d,rb460800,t0,tb2626560,f0,w0,o0,bl0,d0) cubic bytes_acked:%d bytes_received:%d lastrcv:60 rcv_wnd:17408\n", q.RecvQ, q.SendQ, srvPort, port, q.RecvQ, q.Acked, q.Recv)
 		}
-		out += fmt.Sprintf("ESTAB 0 3071716 127.0.0.1:%d 127.0.0.1:30833\n\t cubic notsent:3071716\n", port)
+		out += fmt.Sprintf("ESTAB 0 3071716 127.0.0.1:%d 127.0.0.1:%d\n\t cubic notsent:3071716\n", port, srvPort)
 		return out, nil
 	}, calls
+}
+
+// flatSS is fakeSS with the server socket unchanged at every call.
+func flatSS() (func(context.Context, int, int) (string, error), *int) {
+	return fakeSS(func(int) fakeSrv { return flatSrv })
 }
 
 type diagRecorder struct {
@@ -83,7 +97,7 @@ func swallowAfterTwo() func(n int, _ bool, _ byte, p []byte) ([]byte, bool) {
 func TestFireWSLargeEcho_DiagWedge(t *testing.T) {
 	shortEchoFire(t, 400*time.Millisecond)
 	shortDiag(t, 300*time.Millisecond, 100*time.Millisecond)
-	ss, calls := fakeSS(func(int) int64 { return 433664 })
+	ss, calls := flatSS()
 	rec := &diagRecorder{}
 	proc := procFixture(t)
 	d := &wsEchoDiag{SS: ss, Refapp: func(context.Context) string { return threadTable(proc, 100) }}
@@ -93,8 +107,8 @@ func TestFireWSLargeEcho_DiagWedge(t *testing.T) {
 		t.Fatalf("%d reports, want 1", len(rec.reps))
 	}
 	rep := rec.reps[0]
-	if rep.Verdict.Class != verdictWedge || rep.Verdict.Reason != "recvq_flat_no_progress" {
-		t.Fatalf("verdict %s/%s, want WEDGE_CLASS/recvq_flat_no_progress\n%s", rep.Verdict.Class, rep.Verdict.Reason, rep.Text)
+	if rep.Verdict.Class != verdictWedge || rep.Verdict.Reason != "no_app_read_no_app_write_recvq_pending" {
+		t.Fatalf("verdict %s/%s, want WEDGE_CLASS/no_app_read_no_app_write_recvq_pending\n%s", rep.Verdict.Class, rep.Verdict.Reason, rep.Text)
 	}
 	t.Logf("record as written to ws-echo-diag.txt:\n%s", rep.Text)
 	if rec.timeoutAtDeliver[0] != 0 {
@@ -122,7 +136,15 @@ func TestFireWSLargeEcho_DiagWedge(t *testing.T) {
 func TestFireWSLargeEcho_DiagSlow(t *testing.T) {
 	shortEchoFire(t, 400*time.Millisecond)
 	shortDiag(t, time.Second, 100*time.Millisecond)
-	ss, _ := fakeSS(func(int) int64 { return 433664 }) // flat: ss alone would say WEDGE
+	// Recv-Q and bytes_received flat, but the application's write counter
+	// moves between the two instants: the echoes it wrote are what arrive.
+	ss, _ := fakeSS(func(call int) fakeSrv {
+		q := flatSrv
+		if call > 1 {
+			q.Acked += 3 * 65546
+		}
+		return q
+	})
 	rec := &diagRecorder{}
 	d := &wsEchoDiag{SS: ss}
 	late := echoServer(t, func(n int, _ bool, _ byte, p []byte) ([]byte, bool) {
@@ -135,8 +157,8 @@ func TestFireWSLargeEcho_DiagSlow(t *testing.T) {
 	if len(rec.reps) != 1 {
 		t.Fatalf("%d reports, want 1", len(rec.reps))
 	}
-	if v := rec.reps[0].Verdict; v.Class != verdictSlow || v.Reason != "bytes_arrived" {
-		t.Fatalf("verdict %s/%s, want SLOW_CLASS/bytes_arrived\n%s", v.Class, v.Reason, rec.reps[0].Text)
+	if v := rec.reps[0].Verdict; v.Class != verdictSlow || v.Reason != "server_wrote" {
+		t.Fatalf("verdict %s/%s, want SLOW_CLASS/server_wrote\n%s", v.Class, v.Reason, rec.reps[0].Text)
 	}
 	if s.Timeout != 1 {
 		t.Errorf("timeout=%d, want 1: the fire still reached its hold with echoes outstanding", s.Timeout)
@@ -147,10 +169,10 @@ func TestFireWSLargeEcho_DiagSlow(t *testing.T) {
 func TestFireWSLargeEcho_DiagMissingDataIsIndeterminate(t *testing.T) {
 	shortEchoFire(t, 400*time.Millisecond)
 	shortDiag(t, 300*time.Millisecond, 100*time.Millisecond)
-	for name, ss := range map[string]func(context.Context, int) (string, error){
-		"ss fails": func(context.Context, int) (string, error) { return "", fmt.Errorf("exec: ss: not found") },
-		"socket absent": func() func(context.Context, int) (string, error) {
-			f, _ := fakeSS(func(int) int64 { return -1 })
+	for name, ss := range map[string]func(context.Context, int, int) (string, error){
+		"ss fails": func(context.Context, int, int) (string, error) { return "", fmt.Errorf("exec: ss: not found") },
+		"socket absent": func() func(context.Context, int, int) (string, error) {
+			f, _ := fakeSS(func(int) fakeSrv { return fakeSrv{RecvQ: -1} })
 			return f
 		}(),
 	} {
@@ -174,7 +196,7 @@ func TestFireWSLargeEcho_DiagCancelledWindowStillCountsTheTimeout(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tally := &wsEchoTally{}
-	d := &wsEchoDiag{SS: func(context.Context, int) (string, error) {
+	d := &wsEchoDiag{SS: func(context.Context, int, int) (string, error) {
 		cancel() // the cell's budget ends during the first instant
 		return "", fmt.Errorf("cancelled")
 	}}
@@ -229,9 +251,9 @@ func TestFireWSLargeEcho_DiagSlowRefappLegDoesNotEatTheWindow(t *testing.T) {
 	shortEchoFire(t, 400*time.Millisecond)
 	shortDiag(t, 600*time.Millisecond, 400*time.Millisecond)
 	savedB := wsEchoDiagRefappBudget
-	wsEchoDiagRefappBudget = 100 * time.Millisecond
+	wsEchoDiagRefappBudget = 400 * time.Millisecond
 	t.Cleanup(func() { wsEchoDiagRefappBudget = savedB })
-	ss, _ := fakeSS(func(int) int64 { return 433664 })
+	ss, _ := flatSS()
 	rec := &diagRecorder{}
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
@@ -248,16 +270,71 @@ func TestFireWSLargeEcho_DiagSlowRefappLegDoesNotEatTheWindow(t *testing.T) {
 	if v := rep.Verdict; v.Class != verdictWedge {
 		t.Errorf("verdict %s/%s, want WEDGE_CLASS: the window was a full reading window, so the flat queue counts\n%s", v.Class, v.Reason, rep.Text)
 	}
-	// The window on the line is the time spent reading: the whole configured
-	// window, not what was left after the refapp leg.
-	if !strings.Contains(rep.Verdict.Line, "window_ms=6") && !strings.Contains(rep.Verdict.Line, "window_ms=7") {
-		t.Errorf("window on the line is not about the configured 600 ms:\n%s", rep.Verdict.Line)
+	// The window on the line is the time spent reading: the configured 600 ms,
+	// not that plus the refapp leg's 400 ms budget (which is what a window
+	// measured from the start of the first capture would show, about 1000 ms).
+	// Without the anchor after the first capture this fails.
+	m := regexp.MustCompile(`window_ms=(\d+)`).FindStringSubmatch(rep.Verdict.Line)
+	if m == nil {
+		t.Fatalf("no window_ms on the line:\n%s", rep.Verdict.Line)
+	}
+	if ms, _ := strconv.Atoi(m[1]); ms < 580 || ms > 800 {
+		t.Errorf("window_ms=%d, want about the configured 600 (580..800): the first capture's refapp leg ate into or stretched it\n%s", ms, rep.Verdict.Line)
 	}
 	if el := time.Since(start); el > 3*time.Second {
 		t.Errorf("fire took %v: the slow refapp leg stalled it", el)
 	}
 	if s.Timeout != 1 {
 		t.Errorf("timeout=%d, want 1", s.Timeout)
+	}
+}
+
+// The reading window is anchored after the first capture: the walker reads
+// for the configured window from the moment the first capture's host calls are
+// done, not from when they started. A slow first capture (here the refapp leg
+// takes its whole 600 ms budget) would otherwise leave a reading window of
+// nothing; the window_ms on the line cannot show it (it is t1-t0 either way),
+// so the test makes the server's echoes arrive between the two possible window
+// ends: the late echoes land after the end of an unanchored window (about the
+// timeout plus 600 ms) and before the end of the anchored one (about the
+// timeout plus 600 ms refapp leg plus 600 ms), and the line must show them in
+// bytes_new.
+func TestFireWSLargeEcho_DiagWindowIsAnchoredAfterTheFirstCapture(t *testing.T) {
+	shortEchoFire(t, 400*time.Millisecond)
+	shortDiag(t, 600*time.Millisecond, 400*time.Millisecond)
+	savedB := wsEchoDiagRefappBudget
+	wsEchoDiagRefappBudget = 600 * time.Millisecond
+	t.Cleanup(func() { wsEchoDiagRefappBudget = savedB })
+	// Recv-Q and bytes_received flat, the write counter moving: the echoes the
+	// server sends are explained, so the class is not what this test is about.
+	ss, _ := fakeSS(func(call int) fakeSrv {
+		q := flatSrv
+		if call > 1 {
+			q.Acked += 3 * 65546
+		}
+		return q
+	})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	rec := &diagRecorder{}
+	d := &wsEchoDiag{SS: ss, Refapp: func(context.Context) string { <-release; return "late" }}
+	late := echoServer(t, func(n int, _ bool, _ byte, p []byte) ([]byte, bool) {
+		if n == 3 {
+			time.Sleep(1350 * time.Millisecond)
+		}
+		return p, false
+	})
+	fireDiagnosed(t, late, d, rec)
+	if len(rec.reps) != 1 {
+		t.Fatalf("%d reports, want 1", len(rec.reps))
+	}
+	line := rec.reps[0].Verdict.Line
+	m := regexp.MustCompile(`bytes_new=(-?\d+)`).FindStringSubmatch(line)
+	if m == nil {
+		t.Fatalf("no bytes_new on the line:\n%s", line)
+	}
+	if n, _ := strconv.Atoi(m[1]); n <= 0 {
+		t.Errorf("bytes_new=%d: the echoes that arrive after the first capture's slow refapp leg were not read, so the window was not anchored after it\n%s", n, rec.reps[0].Text)
 	}
 }
 
@@ -286,7 +363,7 @@ func TestFireWSLargeEcho_DiagClosesTheConnectionBeforeDeliver(t *testing.T) {
 			}
 		}
 	})
-	ss, _ := fakeSS(func(int) int64 { return 433664 })
+	ss, _ := flatSS()
 	closedAtDeliver := false
 	tally := &wsEchoTally{}
 	tally.diag.Store(&wsEchoDiag{SS: ss, Deliver: func(context.Context, wsEchoDiagReport) {

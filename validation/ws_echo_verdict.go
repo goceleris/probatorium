@@ -15,18 +15,33 @@ import (
 // kernel and the handler waits for the rest of a frame. Two readings fit one
 // snapshot of that: the refapp is SLOW (a race-instrumented process that has
 // not got to the socket yet), or it is WEDGED (the bytes will never be read).
-// One ss snapshot cannot tell them apart; two a few seconds apart, with the
-// walker still draining the echoes in between, can:
+// One ss snapshot cannot tell them apart; two a few seconds apart can, but
+// not from queue LEVELS: the client's kernel Send-Q (3 MB in the incident)
+// keeps refilling the server's Recv-Q every time the server reads and its
+// window reopens, and the server's own Send-Q keeps draining into a reading
+// client. A flat Recv-Q therefore proves nothing about the handler, and bytes
+// reaching the client prove nothing about it either. What the application did
+// is in two exact counters that ss prints for the server socket:
 //
-//	SLOW_CLASS   the server read bytes (Recv-Q fell) or new bytes reached the
-//	             client between the two instants: it is delivering, only late.
-//	             Bytes the client's own kernel queue already held at t0 do not
-//	             count: the client reads them whatever the server does.
-//	WEDGE_CLASS  bytes sit unread (Recv-Q above zero at both instants and not
-//	             falling) and no echo arrived: it delivers nothing.
+//	app reads   = delta(bytes_received) - delta(Recv-Q)   (Recv-Q is rcv_nxt-copied_seq)
+//	app writes  = delta(bytes_acked + Send-Q)             (every byte the app handed over)
+//
+// and the verdict is drawn from those:
+//
+//	SLOW_CLASS   the server application read bytes, or wrote more than a
+//	             ping or a close frame could account for (wsEchoMinWrite):
+//	             it is working, only late.
+//	WEDGE_CLASS  neither counter moved, Recv-Q is above zero at both
+//	             instants, and every byte that reached the client is
+//	             accounted for by what the client and server kernels already
+//	             queued at t0: the application did nothing with bytes that
+//	             were there for it.
 //	INDETERMINATE  anything else, above all missing data. A socket that
-//	             could not be found, an ss that failed, or an empty queue is
-//	             not evidence of a wedge and is never booked as one.
+//	             could not be found, an ss that failed, a counter that is
+//	             absent (bytes_received, bytes_acked), counters that went
+//	             backwards, bytes at the client that no queue explains, or an
+//	             empty queue is not evidence of a wedge and is never booked
+//	             as one.
 //
 // The classifier and the parser are plain Go with no build tag, so they run
 // on any host; only the capture that feeds them (ws_echo_diag.go) is a host
@@ -45,6 +60,13 @@ const (
 // nothing about progress. A var so the walker's unit tests can run a whole
 // diagnosis in a fraction of a second.
 var wsEchoMinWindow = 2 * time.Second
+
+// wsEchoMinWrite is the least the server application must have written in the
+// window for the write counter to count as progress. A WebSocket control frame
+// from the server (ping, pong, close) is at most 2+125 bytes, so anything
+// below this can be a keepalive or a close frame from a wedged server, not an
+// echo.
+const wsEchoMinWrite = 256
 
 // ssSock is one socket of `ss -tmi` output.
 type ssSock struct {
@@ -158,21 +180,26 @@ func parseSS(text string) []ssSock {
 }
 
 // findEchoSocks picks the two ends of the echo connection out of socks, given
-// the client's ephemeral port: the client end is the socket whose LOCAL port
-// is it, the server end the one whose PEER port is it (and whose local port
-// is not). Either is nil when absent. The client and the refapp share a host
-// (the validator drives a loopback refapp), so both ends are in one ss.
-func findEchoSocks(socks []ssSock, clientPort int) (srv, cli *ssSock) {
-	if clientPort <= 0 {
+// the client's ephemeral port and the refapp's listening port (the remote port
+// of the walker's connection): the client end is the socket whose LOCAL port
+// is clientPort and whose peer port is serverPort, the server end the one whose
+// local port is serverPort and whose PEER port is clientPort. Either is nil
+// when absent. Matching the port PAIR matters: Linux reuses an ephemeral port
+// number for connections to different destinations (the validator's polls of
+// the refapp's side listener, for one), and the number alone would pick the
+// wrong socket. The client and the refapp share a host (the validator drives a
+// loopback refapp), so both ends are in one ss.
+func findEchoSocks(socks []ssSock, clientPort, serverPort int) (srv, cli *ssSock) {
+	if clientPort <= 0 || serverPort <= 0 {
 		return nil, nil
 	}
 	for i := range socks {
 		s := &socks[i]
 		lp, pp := portOf(s.Local), portOf(s.Peer)
 		switch {
-		case lp == clientPort && pp != clientPort && cli == nil:
+		case lp == clientPort && pp == serverPort && cli == nil:
 			cli = s
-		case pp == clientPort && lp != clientPort && srv == nil:
+		case lp == serverPort && pp == clientPort && srv == nil:
 			srv = s
 		}
 	}
@@ -207,40 +234,92 @@ type wsEchoVerdict struct {
 // At of t0 is when the client resumed reading and At of t1 when it stopped, so
 // the window is the time the walker spent reading.
 //
-// Order matters. New bytes at the client are the walker's own counter and need
-// no ss, so they decide first: bytes that arrived in the window and were not
-// already in the client's kernel queue at t0 (its Recv-Q, which the client
-// reads whatever the server does) are a server that delivers. Next the data
-// must exist (both server sockets found). Then Recv-Q: a fall is a server that
-// reads; a queue above zero at both instants that did not fall, with nothing
-// new at the client, is one that does not. Everything else is INDETERMINATE.
+// Both server sockets must be found and carry bytes_received and bytes_acked:
+// the verdict rests on the application's own read and write counters (see the
+// header), never on queue levels. Any of those missing is INDETERMINATE, as is
+// a counter that went backwards (a different socket on the same port). Reads
+// above zero or writes of at least wsEchoMinWrite are SLOW. With neither, a
+// server Recv-Q above zero at both instants is a handler that did not read
+// bytes that were there for it, and only then is it WEDGE, and only when the
+// bytes the walker took off the socket are explained by queues that existed
+// at t0 (a contradiction between the walker's counter and ss is not a wedge).
 func wsEchoClassify(t0, t1 echoInstant) wsEchoVerdict {
 	window := t1.At.Sub(t0.At)
 	class, reason := verdictIndeterminate, ""
+	reads, haveReads := srvReads(t0, t1)
+	writes, haveWrites := srvWrites(t0, t1)
 	switch {
 	case window < wsEchoMinWindow:
 		reason = "window_too_short"
-	case bytesNew(t0, t1) > 0:
-		class, reason = verdictSlow, "bytes_arrived"
 	case t0.Server == nil:
 		reason = "server_socket_missing_t0"
 	case t1.Server == nil:
 		reason = "server_socket_missing_t1"
-	case t1.Server.RecvQ < t0.Server.RecvQ:
-		class, reason = verdictSlow, "recvq_drained"
-	case t0.Server.RecvQ > 0 && t1.Server.RecvQ == t0.Server.RecvQ:
-		class, reason = verdictWedge, "recvq_flat_no_progress"
-	case t0.Server.RecvQ > 0:
-		class, reason = verdictWedge, "recvq_grew_no_progress"
-	default:
+	case !haveReads || !haveWrites:
+		reason = "server_counters_missing"
+	case reads < 0 || writes < 0:
+		reason = "server_counters_inconsistent"
+	case reads > 0 && writes >= wsEchoMinWrite:
+		class, reason = verdictSlow, "server_read_and_wrote"
+	case reads > 0:
+		class, reason = verdictSlow, "server_read"
+	case writes >= wsEchoMinWrite:
+		class, reason = verdictSlow, "server_wrote"
+	case t0.Server.RecvQ == 0 || t1.Server.RecvQ == 0:
 		reason = "recvq_zero_no_progress"
+	case clientBytesUnexplained(t0, t1, writes):
+		reason = "client_bytes_unexplained"
+	default:
+		class, reason = verdictWedge, "no_app_read_no_app_write_recvq_pending"
 	}
 	return wsEchoVerdict{Class: class, Reason: reason, Line: verdictLine(class, reason, window, t0, t1)}
 }
 
+// srvReads is how many bytes the server application took off its socket
+// between the instants: the growth of bytes_received (rcv_nxt) less the growth
+// of the receive queue (rcv_nxt - copied_seq) is the growth of copied_seq.
+// ok is false when either end lacks the socket or the counter.
+func srvReads(t0, t1 echoInstant) (int64, bool) {
+	r0, ok0 := t0.Server.Int("bytes_received")
+	r1, ok1 := t1.Server.Int("bytes_received")
+	if t0.Server == nil || t1.Server == nil || !ok0 || !ok1 {
+		return 0, false
+	}
+	return (r1 - r0) - (t1.Server.RecvQ - t0.Server.RecvQ), true
+}
+
+// srvWrites is how many bytes the server application handed to its socket
+// between the instants: bytes_acked plus the send queue is the total written,
+// so a queue draining into a reading client does not move it.
+func srvWrites(t0, t1 echoInstant) (int64, bool) {
+	a0, ok0 := t0.Server.Int("bytes_acked")
+	a1, ok1 := t1.Server.Int("bytes_acked")
+	if t0.Server == nil || t1.Server == nil || !ok0 || !ok1 {
+		return 0, false
+	}
+	return (a1 + t1.Server.SendQ) - (a0 + t0.Server.SendQ), true
+}
+
+// clientBytesUnexplained reports whether the walker took more bytes off the
+// socket in the window than the kernels could have supplied: what the
+// client's receive queue and the server's send queue held at t0, plus what the
+// server application wrote. Such a contradiction between the walker's counter
+// and ss means one of them is not about the connection it should be, and no
+// class may rest on it. A client socket missing at t0 supplies nothing to
+// subtract, so the surplus then counts in full.
+func clientBytesUnexplained(t0, t1 echoInstant, writes int64) bool {
+	arrived := int64(t1.BytesIn) - int64(t0.BytesIn)
+	supply := t0.Server.SendQ + writes
+	if t0.Client != nil {
+		supply += t0.Client.RecvQ
+	}
+	return arrived > supply
+}
+
 // bytesNew is the bytes the walker took off the socket between the instants
 // beyond what its own kernel queue already held at t0. With no client socket
-// in the t0 ss output nothing is subtracted.
+// in the t0 ss output nothing is subtracted. It is on the verdict line for
+// audit and decides nothing: bytes can also come from the server's Send-Q.
 func bytesNew(t0, t1 echoInstant) int64 {
 	n := int64(t1.BytesIn) - int64(t0.BytesIn)
 	if t0.Client != nil {
@@ -261,12 +340,18 @@ func verdictLine(class, reason string, window time.Duration, t0, t1 echoInstant)
 			fmt.Fprintf(&b, " %s=na", name)
 		}
 	}
+	reads, haveReads := srvReads(t0, t1)
+	kv("srv_app_reads", reads, haveReads)
+	writes, haveWrites := srvWrites(t0, t1)
+	kv("srv_app_writes", writes, haveWrites)
 	for i, in := range []echoInstant{t0, t1} {
 		t := fmt.Sprintf("t%d", i)
 		kv("srv_recvq_"+t, recvQ(in.Server), in.Server != nil)
 		kv("srv_sendq_"+t, sendQ(in.Server), in.Server != nil)
 		n, ok := in.Server.Int("bytes_received")
 		kv("srv_bytes_received_"+t, n, ok)
+		n, ok = in.Server.Int("bytes_acked")
+		kv("srv_bytes_acked_"+t, n, ok)
 		n, ok = in.Server.Skmem("r")
 		kv("srv_skmem_r_"+t, n, ok)
 		n, ok = in.Server.Int("rcv_wnd")

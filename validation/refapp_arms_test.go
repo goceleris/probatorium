@@ -109,3 +109,47 @@ func TestNewDriverLocalHonoursArmA(t *testing.T) {
 		t.Fatalf("ssh driver with arm A: err=%v, want a refusal naming the ssh driver", err)
 	}
 }
+
+// Arm B's effect is read back from the process, not echoed from the input:
+// the io_uring instances the refapp holds open say which engine it started on.
+func TestIoUringFDs_ReadsTheRefappsRings(t *testing.T) {
+	root := t.TempDir()
+	fd := filepath.Join(root, "100", "fd")
+	if err := os.MkdirAll(fd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{
+		"3": "anon_inode:[io_uring]", "4": "socket:[1234]", "5": "anon_inode:[io_uring]", "6": "anon_inode:[eventpoll]",
+	} {
+		if err := os.Symlink(target, filepath.Join(fd, name)); err != nil {
+			t.Skipf("no symlinks here: %v", err)
+		}
+	}
+	if got := ioUringFDs(root, 100); got != "REFAPP_IOURING fds=2 unreadable=0\n" {
+		t.Errorf("two rings and two other fds: %q", got)
+	}
+	// An epoll-started refapp holds none: the line says zero, not "absent".
+	epoll := filepath.Join(root, "200", "fd")
+	if err := os.MkdirAll(epoll, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("anon_inode:[eventpoll]", filepath.Join(epoll, "3")); err != nil {
+		t.Fatal(err)
+	}
+	if got := ioUringFDs(root, 200); got != "REFAPP_IOURING fds=0 unreadable=0\n" {
+		t.Errorf("epoll-only refapp: %q", got)
+	}
+	// No such process or no permission: unavailable, never a zero that reads
+	// as "started on epoll".
+	if got := ioUringFDs(root, 300); !strings.HasPrefix(got, "REFAPP_IOURING unavailable: ") {
+		t.Errorf("missing fd dir: %q", got)
+	}
+	dir := t.TempDir()
+	if err := writeRefappReadback(context.Background(), dir, envMap(map[string]string{refapparms.WorkloadHintEnv: "high"}), root, 100, ""); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, refappReadbackFile))
+	if !strings.Contains(string(b), "\nREFAPP_IOURING fds=2 unreadable=0\n") {
+		t.Errorf("the readback lacks the io_uring line:\n%s", b)
+	}
+}

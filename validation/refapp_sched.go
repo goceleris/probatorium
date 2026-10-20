@@ -39,6 +39,7 @@ func refappSchedText(ctx context.Context, procRoot string, pid int, debugAddr st
 		b.WriteString("REFAPP_THREADS unavailable: no refapp pid\n")
 	} else {
 		b.WriteString(threadTable(procRoot, pid))
+		b.WriteString(ioUringFDs(procRoot, pid))
 	}
 	if debugAddr == "" {
 		b.WriteString("REFAPP_SCHED unavailable: no side listener\n")
@@ -48,6 +49,37 @@ func refappSchedText(ctx context.Context, procRoot string, pid int, debugAddr st
 		fmt.Fprintf(&b, "REFAPP_SCHED %s\n", strings.TrimSpace(body))
 	}
 	return b.String()
+}
+
+// ioUringFDLink is what /proc/<pid>/fd/N reads as for an io_uring instance.
+const ioUringFDLink = "anon_inode:[io_uring]"
+
+// ioUringFDs is one line, REFAPP_IOURING fds=N: how many io_uring instances the
+// refapp holds open. The adaptive engine builds only its start engine at the
+// pinned celeris sha (the other is built lazily on the first switch), so in the
+// readback taken when the refapp is ready N above zero says the engine STARTED
+// on io_uring (arm B in effect) and zero says it started on epoll, which no
+// input the validator echoes could show: /debug/sched reports the engine as
+// "adaptive" either way, and an ignored hint (io_uring not viable, H2C,
+// CELERIS_ADAPTIVE_START) is silent. In a timeout's dossier, taken later, N is
+// above zero in any arm that has switched.
+func ioUringFDs(procRoot string, pid int) string {
+	dir := filepath.Join(procRoot, strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Sprintf("REFAPP_IOURING unavailable: %v\n", err)
+	}
+	n, unreadable := 0, 0
+	for _, e := range entries {
+		l, err := os.Readlink(filepath.Join(dir, e.Name()))
+		switch {
+		case err != nil:
+			unreadable++
+		case l == ioUringFDLink:
+			n++
+		}
+	}
+	return fmt.Sprintf("REFAPP_IOURING fds=%d unreadable=%d\n", n, unreadable)
 }
 
 // procStatusField returns the value of one "Key:\tvalue" line of a

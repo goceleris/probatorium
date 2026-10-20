@@ -49,7 +49,7 @@ func TestRaceTierArmEnvReachesTheValidateStepAndTheGate(t *testing.T) {
 	// Arm B starts adaptive on io_uring: there is no switch for the gate to
 	// expect, and the default run still expects it.
 	gate := stepRunning(src, "mage ValidateGate")
-	if !strings.Contains(gate, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH: ${{ inputs.refapp_workload_hint == '' && '1' || '' }}`) {
+	if !strings.Contains(gate, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH: ${{ inputs.refapp_workload_hint != 'high' && '1' || '' }}`) {
 		t.Errorf("the gate's switch expectation is not conditional on arm B:\n%s", gate)
 	}
 }
@@ -127,6 +127,8 @@ func TestEarlyArmCheckMatchesTheValidator(t *testing.T) {
 	for _, tc := range []struct{ cpus, hint string }{
 		{"3", ""}, {"3-3", ""}, {"5-2", ""}, {"2-", ""}, {"a,b", ""}, {"2;id", ""}, {"1,,2", ""},
 		{"", "HIGH"}, {"", "iouring"}, {"2-3", "x"},
+		// grep matches line by line: a first line that is valid must not carry a second.
+		{"2-3\nfoo;bar", ""}, {"0-1\n2-3", ""},
 	} {
 		if out, err := earlyArmCheck(t, tc.cpus, tc.hint); err == nil {
 			t.Errorf("cpus=%q hint=%q accepted:\n%s", tc.cpus, tc.hint, out)

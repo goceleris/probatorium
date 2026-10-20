@@ -19,11 +19,14 @@ import (
 //
 // A stall-capture run only. When a fire reaches wsEchoMaxHold with echoes
 // outstanding, the walker does not close the connection and count the
-// timeout at once. It stops the sender, so nothing new enters the server's
-// receive queue, and keeps READING for wsEchoDiagWindow: a client that stops
-// reading would fill the server's send queue and park the handler in a write,
-// and the receive queue would then sit flat for a reason that has nothing to
-// do with the server being slow. At the start and at the end of that window
+// timeout at once. It stops the sender and keeps READING for
+// wsEchoDiagWindow: a client that stops reading would fill the server's send
+// queue and park the handler in a write, for a reason that has nothing to do
+// with the server being slow. Stopping the sender does NOT stop bytes entering
+// the server's receive queue: the client's kernel Send-Q (3 MB in the
+// incident) refills it whenever the server reads and its window reopens, which
+// is why the verdict is drawn from the server's own read and write counters,
+// not from queue levels. At the start and at the end of that window
 // it takes the host's view of the connection (ss -tmi of both ends, the
 // walker's echo counters, the refapp's thread table and engine counters),
 // classifies the pair (ws_echo_verdict.go) and hands the record to the
@@ -59,9 +62,9 @@ const wsEchoDiagPerCell = 3
 // wsEchoDiag is what a stall-capture run gives the ws_echo walker. A nil
 // *wsEchoDiag (every other run) leaves fireWSLargeEcho exactly as it was.
 type wsEchoDiag struct {
-	// SS returns `ss -tmi` text for the connection whose client port is
-	// given (both ends). nil runs the host's ss.
-	SS func(ctx context.Context, clientPort int) (string, error)
+	// SS returns `ss -tmi` text for the connection between the client port and
+	// the server (refapp) port (both ends). nil runs the host's ss.
+	SS func(ctx context.Context, clientPort, serverPort int) (string, error)
 	// Refapp returns the refapp's state at this instant as text (thread
 	// masks and states, GOMAXPROCS, engine counters); nil adds nothing.
 	Refapp func(ctx context.Context) string
@@ -92,11 +95,11 @@ func (d *wsEchoDiag) claim() bool {
 }
 
 // defaultSS runs the host's ss for the two ends of one loopback connection.
-func defaultSS(ctx context.Context, clientPort int) (string, error) {
+func defaultSS(ctx context.Context, clientPort, serverPort int) (string, error) {
 	if !hasBinary("ss") {
 		return "", errors.New("ss not available on this host")
 	}
-	expr := fmt.Sprintf("( sport = :%d or dport = :%d )", clientPort, clientPort)
+	expr := fmt.Sprintf("( ( sport = :%d and dport = :%d ) or ( sport = :%d and dport = :%d ) )", clientPort, serverPort, serverPort, clientPort)
 	out, err := exec.CommandContext(ctx, "ss", "-tmin", expr).CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("ss -tmin: %w", err)
@@ -106,7 +109,7 @@ func defaultSS(ctx context.Context, clientPort int) (string, error) {
 
 // instant takes one instant's view: the counters first, then ss, then the
 // refapp. The text is what goes into the dossier for it.
-func (d *wsEchoDiag) instant(ctx context.Context, label string, clientPort int, received, sent, bytesIn *atomic.Uint64) (echoInstant, string) {
+func (d *wsEchoDiag) instant(ctx context.Context, label string, clientPort, serverPort int, received, sent, bytesIn *atomic.Uint64) (echoInstant, string) {
 	in := echoInstant{At: time.Now(), Echoes: received.Load(), Sent: sent.Load(), BytesIn: bytesIn.Load()}
 	var b strings.Builder
 	fmt.Fprintf(&b, "### %s %s echoes=%d bytes_in=%d sent=%d client_port=%d\n", label, in.At.UTC().Format(time.RFC3339Nano), in.Echoes, in.BytesIn, in.Sent, clientPort)
@@ -115,7 +118,7 @@ func (d *wsEchoDiag) instant(ctx context.Context, label string, clientPort int, 
 		ss = defaultSS
 	}
 	sctx, cancel := context.WithTimeout(ctx, wsEchoDiagSSBudget)
-	text, err := ss(sctx, clientPort)
+	text, err := ss(sctx, clientPort, serverPort)
 	cancel()
 	if err != nil {
 		in.SSErr = err.Error()
@@ -125,9 +128,9 @@ func (d *wsEchoDiag) instant(ctx context.Context, label string, clientPort int, 
 	if !strings.HasSuffix(text, "\n") {
 		b.WriteString("\n")
 	}
-	in.Server, in.Client = findEchoSocks(parseSS(text), clientPort)
+	in.Server, in.Client = findEchoSocks(parseSS(text), clientPort, serverPort)
 	if in.Server == nil && in.SSErr == "" {
-		fmt.Fprintf(&b, "note: no server-end socket with peer port %d in the ss output\n", clientPort)
+		fmt.Fprintf(&b, "note: no server-end socket %d <-> %d in the ss output\n", serverPort, clientPort)
 	}
 	if d.Refapp != nil {
 		state, ok := callWithin(ctx, wsEchoDiagRefappBudget, d.Refapp)
@@ -165,16 +168,19 @@ func callWithin(ctx context.Context, d time.Duration, fn func(context.Context) s
 // reader has taken, sent is the highest sequence written, bytesIn the bytes
 // pulled off the socket (see countingConn).
 func (d *wsEchoDiag) run(ctx context.Context, conn net.Conn, br *bufio.Reader, received, sent, bytesIn *atomic.Uint64) wsEchoDiagReport {
-	clientPort := 0
+	clientPort, serverPort := 0, 0
 	if a, ok := conn.LocalAddr().(*net.TCPAddr); ok {
 		clientPort = a.Port
 	}
-	t0, text0 := d.instant(ctx, "t0", clientPort, received, sent, bytesIn)
+	if a, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		serverPort = a.Port
+	}
+	t0, text0 := d.instant(ctx, "t0", clientPort, serverPort, received, sent, bytesIn)
 	// The window starts when the client starts reading again, after the first
 	// instant's host calls, so a slow call cannot eat it.
 	t0.At = time.Now()
 	end := wsEchoDiagDrain(ctx, conn, br, t0.At.Add(wsEchoDiagWindow))
-	t1, text1 := d.instant(ctx, "t1", clientPort, received, sent, bytesIn)
+	t1, text1 := d.instant(ctx, "t1", clientPort, serverPort, received, sent, bytesIn)
 	v := wsEchoClassify(t0, t1)
 	v.Line += " window_end=" + end
 	var b strings.Builder

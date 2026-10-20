@@ -299,8 +299,10 @@ In a stall-capture run (the `stall_capture` dispatch input), a 64 KiB echo fire 
 open: the sender stops, the walker keeps reading, and `ss -tmi` of both ends, the echo and byte
 counters, the refapp's per-thread CPU masks and states, its `GOMAXPROCS` and its engine counters are
 taken at t0 and t0 + 3 s. A record-only `I-WS-ECHO-STALL` dossier carries `ws-echo-diag.txt`, whose first
-line is `WS_ECHO_VERDICT=SLOW_CLASS` (the server read bytes or echoes arrived in the window: slow),
-`WEDGE_CLASS` (bytes sit unread and nothing moved) or `INDETERMINATE` (missing data is never a wedge).
+line is `WS_ECHO_VERDICT=SLOW_CLASS` (the server application read bytes or wrote more than a control frame
+in the window, from the exact counters `bytes_received` less Recv-Q and `bytes_acked` plus Send-Q: slow),
+`WEDGE_CLASS` (neither moved while bytes sat unread in the server's receive queue) or `INDETERMINATE`
+(missing or contradictory data is never a wedge).
 The timeout is counted after the second instant. `mage` and the race tier also take two off-by-default
 experiment arms for msa2-server only, `refapp_cpus` (a `taskset -c` list of at least 2 CPUs) and
 `refapp_workload_hint` (`high` starts the adaptive engine on io_uring); each cell records the arm it
