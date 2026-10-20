@@ -107,14 +107,17 @@ func (s *ssSock) hasDetail() bool {
 }
 
 // Counter returns one of the two byte counters the verdict rests on,
-// bytes_received and bytes_acked. iproute2 omits a counter that is zero
-// (bytes_acked on a server end that has never written, bytes_received on one
-// that has never received), so an absent key is zero when ss printed the
-// detail line of the socket AND this ss prints the counters at all (the
-// socket shows bytes_received or bytes_sent), and is "missing" otherwise: an ss
-// too old to print them would look the same, and a missing counter must never
-// be read as "the server did nothing". A bytes_received that is absent while
-// the receive queue holds bytes cannot be a zero and is missing.
+// bytes_received and bytes_acked. iproute2 omits a counter that is zero: a
+// connection with no payload yet prints neither (measured on the CI runner's
+// ss, see realIdleServerSock), a server end that has only received prints no
+// bytes_acked. So an absent key is zero when ss printed the detail line of the
+// socket (cwnd and rto are always on it), and is "missing" when it did not.
+// bytes_received is the exception under a pending queue: a queue that holds
+// bytes cannot sit under a zero bytes_received, so an absent one there means an
+// ss that does not print the counters, and is missing. That is also what keeps
+// an old ss from reading as "the server did nothing": a WEDGE needs a pending
+// queue at both instants, hence bytes_received printed, hence an ss that
+// prints bytes_acked whenever it is nonzero.
 func (s *ssSock) Counter(key string) (int64, bool) {
 	if n, ok := s.Int(key); ok {
 		return n, true
@@ -125,11 +128,9 @@ func (s *ssSock) Counter(key string) (int64, bool) {
 	if _, present := s.Info[key]; present { // printed, but not a number
 		return 0, false
 	}
-	_, rcv := s.Info["bytes_received"]
-	_, snd := s.Info["bytes_sent"]
 	switch key {
 	case "bytes_acked":
-		return 0, rcv || snd
+		return 0, true
 	case "bytes_received":
 		return 0, s.RecvQ == 0
 	}

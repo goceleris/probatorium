@@ -353,6 +353,30 @@ func TestWSEchoClassify_LinePrintsAppReadsAndWrites(t *testing.T) {
 	}
 }
 
+// realIdleServerSock is the server end of a loopback connection with no payload
+// yet, as the ss on the CI runner (ubuntu-24.04, run 39456205109, job
+// root module, TestDefaultSS_LiveLoopbackAppCounters) printed it: neither
+// bytes_sent, bytes_acked nor bytes_received, because iproute2 omits a zero.
+const realIdleServerSock = `ESTAB 0      0          127.0.0.1:34267    127.0.0.1:38948
+	 skmem:(r0,rb131072,t0,tb2626560,f0,w0,o0,bl0,d0) cubic wscale:10,10 rto:201 rtt:0.019/0.009 mss:32768 pmtu:65535 rcvmss:536 advmss:65483 cwnd:10 segs_in:2 send 137970526316bps lastsnd:4 lastrcv:4 lastack:4 pacing_rate 275941052624bps delivered:1 app_limited rcv_space:65483 rcv_ssthresh:65483 minrtt:0.019 snd_wnd:65536
+`
+
+func TestSSSockCounter_RealZeroTrafficServerEnd(t *testing.T) {
+	socks := parseSS(ssText(realIdleServerSock))
+	if len(socks) != 1 {
+		t.Fatalf("parsed %d sockets, want 1", len(socks))
+	}
+	s := &socks[0]
+	for _, key := range []string{"bytes_acked", "bytes_received"} {
+		if n, ok := s.Counter(key); !ok || n != 0 {
+			t.Errorf("Counter(%s) = %d, %v on the runner's idle server end; want 0, true (iproute2 omits a zero)", key, n, ok)
+		}
+	}
+	if _, ok := s.Int("bytes_acked"); ok {
+		t.Error("the fixture is meant to carry no bytes_acked")
+	}
+}
+
 func TestSSSockCounter(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -364,8 +388,7 @@ func TestSSSockCounter(t *testing.T) {
 		{"present", withDetail(srvSock(10, 500)), "bytes_received", 500, true},
 		{"present without the detail marker", srvSock(10, 500), "bytes_acked", 4490877, true},
 		{"acked omitted as zero", withDetail(srvSockW(10, 500, 0, 0)), "bytes_acked", 0, true},
-		{"acked absent, detail line but no counters at all (an old ss): missing", &ssSock{RecvQ: 10, Info: map[string]string{"cwnd": "10"}}, "bytes_acked", 0, false},
-		{"acked absent, detail line, bytes_sent printed: zero", &ssSock{RecvQ: 10, Info: map[string]string{"cwnd": "10", "bytes_sent": "7"}}, "bytes_acked", 0, true},
+		{"acked absent with a pending queue and no bytes_received (an old ss): zero acked, but received is missing", &ssSock{RecvQ: 10, Info: map[string]string{"cwnd": "10"}}, "bytes_received", 0, false},
 		{"acked absent and no detail line: missing", without(srvSock(10, 500), "bytes_acked"), "bytes_acked", 0, false},
 		{"received omitted as zero with an empty queue", withDetail(&ssSock{RecvQ: 0, Info: map[string]string{}}), "bytes_received", 0, true},
 		{"received absent with bytes queued: missing", without(withDetail(srvSock(10, 500)), "bytes_received"), "bytes_received", 0, false},
