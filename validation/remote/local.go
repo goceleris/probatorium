@@ -18,6 +18,10 @@ import (
 // stay framework-agnostic.
 type Local struct {
 	binary string
+	// prefix, when set, is a command that execs the binary: Start runs
+	// prefix[0] prefix[1:]... binary args... (taskset -c LIST, which execs its
+	// target, so the process Start returns is the binary's own).
+	prefix []string
 	// kill sends every signal the driver's processes get (syscall.Kill when
 	// nil). Tests record through it.
 	kill func(pid int, sig syscall.Signal) error
@@ -31,11 +35,26 @@ func NewLocal(binary string) *Local {
 	return &Local{binary: binary}
 }
 
+// WithPrefix returns a copy of l that starts the binary behind the given
+// command, e.g. WithPrefix("taskset", "-c", "2-5"). The prefix command must
+// exec the binary rather than fork it: the PID, the process group and every
+// signal the driver sends stay the binary's.
+func (l *Local) WithPrefix(prefix ...string) *Local {
+	c := *l
+	c.prefix = append([]string(nil), prefix...)
+	return &c
+}
+
 // Start forks the binary with args. The returned Process tracks the
 // underlying exec.Cmd; Wait drains stdout/stderr pipes before
 // returning so the caller can read Stderr() afterwards.
 func (l *Local) Start(ctx context.Context, args []string) (Process, error) {
-	cmd := exec.CommandContext(ctx, l.binary, args...)
+	name, argv := l.binary, args
+	if len(l.prefix) > 0 {
+		name = l.prefix[0]
+		argv = append(append(append([]string(nil), l.prefix[1:]...), l.binary), args...)
+	}
+	cmd := exec.CommandContext(ctx, name, argv...)
 	// Own the pipes instead of using cmd.StdoutPipe/StderrPipe. exec closes
 	// those read ends the moment cmd.Wait reaps the process, discarding any
 	// bytes still buffered in the kernel -- the crash banner a refapp prints

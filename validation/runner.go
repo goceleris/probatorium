@@ -20,6 +20,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -35,6 +36,7 @@ import (
 	"github.com/goceleris/probatorium/validation/fault"
 	"github.com/goceleris/probatorium/validation/markov"
 	"github.com/goceleris/probatorium/validation/properties"
+	"github.com/goceleris/probatorium/validation/refapparms"
 	"github.com/goceleris/probatorium/validation/remote"
 )
 
@@ -342,6 +344,8 @@ func New(cfg Config) (*Orchestrator, error) {
 	if cfg.DriverMode != "ssh" && stallCaptureEnabled(os.Getenv) && os.Getenv(refappDebugAddrEnv) == "" {
 		_ = os.Setenv(refappDebugAddrEnv, "127.0.0.1:0")
 	}
+
+	logArm(os.Getenv)
 
 	if cfg.MarkovPath != "" {
 		m, err := markov.LoadMatrixFile(cfg.MarkovPath)
@@ -870,8 +874,23 @@ func (o *Orchestrator) newDriver() (remote.Driver, error) {
 	}
 	switch mode {
 	case "local":
-		return remote.NewLocal(o.cfg.CelerisBin), nil
+		d := remote.NewLocal(o.cfg.CelerisBin)
+		prefix, err := refappCPUsPrefix(os.Getenv, exec.LookPath)
+		if err != nil {
+			return nil, err
+		}
+		if prefix != nil {
+			// Arm A of probatorium#481: the refapp is confined to a CPU list.
+			return d.WithPrefix(prefix...), nil
+		}
+		return d, nil
 	case "ssh":
+		if strings.TrimSpace(os.Getenv(refapparms.CPUsEnv)) != "" {
+			// The refapp starts on the remote host, where a taskset prefix
+			// built here confines nothing: refuse rather than run unconfined
+			// and be read as arm A.
+			return nil, fmt.Errorf("%s is not supported with the ssh driver", refapparms.CPUsEnv)
+		}
 		if o.cfg.DriverSSHUser == "" || o.cfg.DriverSSHHost == "" {
 			return nil, fmt.Errorf("ssh driver requires DriverSSHUser + DriverSSHHost")
 		}
@@ -997,6 +1016,19 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		case <-loopCtx.Done():
 		}
 		refappPID.Store(int64(p))
+		if armsActive(os.Getenv) && p > 0 {
+			// The arm as the refapp lived it, for the analysis to read back
+			// (refapp_arms.go). Off the property loop's path.
+			go func() {
+				addr := ""
+				if f := o.debugAddr.Load(); f != nil {
+					addr = (*f)()
+				}
+				if err := writeRefappReadback(loopCtx, o.cfg.OutDir, os.Getenv, "/proc", p, addr); err != nil {
+					fmt.Fprintf(os.Stderr, "validation: refapp readback: %v\n", err)
+				}
+			}()
+		}
 		if loopSkipped != "" {
 			propDone <- checker.Tally{SkippedReason: loopSkipped}
 			return

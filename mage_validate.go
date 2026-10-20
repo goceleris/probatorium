@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/goceleris/probatorium/validation/refapparms"
 )
 
 // titleCase upper-cases the first rune of s. Replaces strings.Title
@@ -118,6 +120,13 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 	durationSec, err := durationSeconds(duration)
 	if err != nil {
 		return fmt.Errorf("%s duration %q: %w", kind, duration, err)
+	}
+
+	// The race tier's experiment arms (probatorium#481), validated before any
+	// host is touched. Unset adds nothing.
+	armArgs, err := refappArmExtraVars(os.Getenv)
+	if err != nil {
+		return fmt.Errorf("%s: %w", kind, err)
 	}
 
 	var targets []string
@@ -247,6 +256,11 @@ func runValidatePlaybook(duration, target, version string, soakMode bool) error 
 		// the capture's own no-fault control). Same three hops; unset in
 		// every routine tier, which leaves the capture off.
 		args = append(args, stallCaptureExtraVars(os.Getenv)...)
+		// The experiment arms reach msa2-server only (refappArmTarget): the
+		// timeouts are amd64's, and msr1 running as today is the control.
+		if t == refappArmTarget {
+			args = append(args, armArgs...)
+		}
 		// VALIDATE_DBSERVICES=1 starts the postgres/redis/memcached
 		// containers (assumed pre-pulled by deploy.yml's dbservices
 		// role) so the driver_* refapps in matrix-mode validate can
@@ -367,6 +381,39 @@ func stallCaptureExtraVars(getenv func(string) string) []string {
 		panic(fmt.Sprintf("marshal probatorium_stall_capture: %v", err))
 	}
 	return []string{"--extra-vars", string(b)}
+}
+
+// refappArmTarget is the one bench target the experiment arms apply to.
+const refappArmTarget = "msa2-server"
+
+// refappArmExtraVars carries the two experiment arms of the race tier's
+// adaptive/amd64 ws_echo investigation (probatorium#481) to the remote
+// validator as JSON extra-vars, like stallCaptureExtraVars: workflow env ->
+// mage extra-var -> validate.yml environment -> validator. A value the
+// validator would refuse is refused here, before Deploy's hosts are
+// touched. Unset or blank adds nothing: the defaults are today's behaviour.
+func refappArmExtraVars(getenv func(string) string) ([]string, error) {
+	vars := map[string]string{}
+	if v := strings.TrimSpace(getenv(refapparms.CPUsEnv)); v != "" {
+		if _, err := refapparms.ParseCPUs(v); err != nil {
+			return nil, err
+		}
+		vars["probatorium_refapp_cpus"] = v
+	}
+	if v := strings.TrimSpace(getenv(refapparms.WorkloadHintEnv)); v != "" {
+		if err := refapparms.ValidateWorkloadHint(v); err != nil {
+			return nil, err
+		}
+		vars["probatorium_refapp_workload_hint"] = v
+	}
+	if len(vars) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(vars)
+	if err != nil {
+		panic(fmt.Sprintf("marshal refapp arm extra-vars: %v", err))
+	}
+	return []string{"--extra-vars", string(b)}, nil
 }
 
 // runValidateTargets drives run for every target in sequence and reports

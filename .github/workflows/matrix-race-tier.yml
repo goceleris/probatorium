@@ -47,10 +47,38 @@ on:
           side-listener goroutine dump). Off (default) on routine and
           scheduled runs; the release soak is dispatched with it on
           (celeris#588's release criterion). The dossiers are not gated:
-          the gates judge the run as usual.
+          the gates judge the run as usual. With it on, a ws_echo fire that
+          times out is held open, its sender stopped, and the walker keeps
+          reading while ss -tmi of both ends, the echo counters, the refapp's
+          per-thread CPU masks and its GOMAXPROCS and engine counters are
+          taken at t0 and t0+3 s: an I-WS-ECHO-STALL dossier whose
+          ws-echo-diag.txt starts with a WS_ECHO_VERDICT= line
+          (SLOW_CLASS, WEDGE_CLASS or INDETERMINATE; probatorium#481).
         required: false
         default: false
         type: boolean
+      refapp_cpus:
+        description: >-
+          Experiment arm A (probatorium#481), off by default: confine every
+          refapp on msa2-server (amd64) to this CPU list, taskset -c syntax
+          (for example 2-5), at least 2 CPUs. msr1 is not touched and stays
+          the control. Empty runs the refapp unconfined, as today. The arm is
+          read back per cell from refapp_sched.txt (thread masks, GOMAXPROCS),
+          not from this input.
+        required: false
+        default: ""
+        type: string
+      refapp_workload_hint:
+        description: >-
+          Experiment arm B (probatorium#481), off by default: the refapps set
+          celeris.Config.WorkloadHint on msa2-server. high starts the adaptive
+          engine on io_uring instead of epoll-then-switch, low keeps it on
+          epoll. Empty runs as today. With a value set the gate no longer
+          expects each adaptive cell to switch (a cell started on io_uring has
+          no switch to count).
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -70,6 +98,37 @@ jobs:
     # every later run; this is the headroom for the first one.
     timeout-minutes: 25
     steps:
+      - name: Refuse a malformed experiment arm before any host is touched
+        # probatorium#481. mage Validate refuses the same values later; this
+        # is the cheap early copy, so a typo costs seconds, not a bootstrap.
+        env:
+          REFAPP_CPUS: ${{ inputs.refapp_cpus }}
+          REFAPP_WORKLOAD_HINT: ${{ inputs.refapp_workload_hint }}
+        run: |
+          set -eu
+          case "$REFAPP_WORKLOAD_HINT" in
+            ""|high|low) ;;
+            *) echo "refapp_workload_hint must be high, low or empty, got: $REFAPP_WORKLOAD_HINT" >&2; exit 1 ;;
+          esac
+          if [ -n "$REFAPP_CPUS" ]; then
+            if ! printf '%s' "$REFAPP_CPUS" | grep -Eq '^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$'; then
+              echo "refapp_cpus must be a taskset -c list such as 2-5 or 0,2,4, got: $REFAPP_CPUS" >&2
+              exit 1
+            fi
+            n=0
+            for tok in $(printf '%s' "$REFAPP_CPUS" | tr ',' ' '); do
+              case "$tok" in
+                *-*) lo=${tok%-*}; hi=${tok#*-}
+                     if [ "$hi" -lt "$lo" ]; then echo "descending range $tok in refapp_cpus" >&2; exit 1; fi
+                     n=$((n + hi - lo + 1)) ;;
+                *) n=$((n + 1)) ;;
+              esac
+            done
+            if [ "$n" -lt 2 ]; then
+              echo "refapp_cpus must name at least 2 CPUs, got: $REFAPP_CPUS" >&2
+              exit 1
+            fi
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -263,6 +322,11 @@ jobs:
           # celeris#588 stall capture (dispatch input stall_capture); empty
           # on a scheduled run and on a routine dispatch.
           PROBATORIUM_STALL_CAPTURE: ${{ inputs.stall_capture && '1' || '' }}
+          # probatorium#481 experiment arms (dispatch inputs refapp_cpus and
+          # refapp_workload_hint); empty on a scheduled run and a routine
+          # dispatch. mage carries them to msa2-server only.
+          PROBATORIUM_REFAPP_CPUS: ${{ inputs.refapp_cpus }}
+          PROBATORIUM_REFAPP_WORKLOAD_HINT: ${{ inputs.refapp_workload_hint }}
         run: mage Validate
 
       - name: mage ValidateGate (absolute zero-signal gate)
@@ -287,7 +351,9 @@ jobs:
           # Every adaptive cell must promote epoll -> io_uring at least once;
           # the matrix sizes those cells so the controller's threshold is
           # reachable, and this proves it was (celeris#580).
-          VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH: "1"
+          # Not under arm B (refapp_workload_hint set): a cell started on
+          # io_uring has no epoll -> io_uring switch to count.
+          VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH: ${{ inputs.refapp_workload_hint == '' && '1' || '' }}
           # Every cell of this tier is a -race build and must have declared
           # I-RACE; a refapp that silently lost the detector would otherwise
           # hide behind the waiver.

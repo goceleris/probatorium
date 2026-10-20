@@ -100,6 +100,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -173,6 +174,7 @@ func (v *Vars) NewServer(cfg celeris.Config) *celeris.Server {
 // Hook installs the connection counters on cfg, chaining any callbacks
 // already set. Must run before celeris.New(cfg).
 func (v *Vars) Hook(cfg *celeris.Config) {
+	applyWorkloadHint(cfg, os.Getenv)
 	prevConnect, prevDisconnect := cfg.OnConnect, cfg.OnDisconnect
 	cfg.OnConnect = func(addr string) {
 		v.accepted.Add(1)
