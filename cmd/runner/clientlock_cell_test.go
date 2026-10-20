@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -128,6 +129,14 @@ func TestTwoArchRunnersNeverOverlapOnAHeavyCell(t *testing.T) {
 	if second.ClientLockWaitS <= 0 {
 		t.Errorf("the second cell reports no lock wait (client_lock_wait_s = %v)", second.ClientLockWaitS)
 	}
+	// the first took a free lock: no wait. (An uncontended acquire once
+	// reported a positive wait, which made the check above vacuous.)
+	if first.ClientLockWaitS != 0 {
+		t.Errorf("the first cell took a free lock but reports client_lock_wait_s = %v", first.ClientLockWaitS)
+	}
+	if second.ClientLockWaitS < 0.1 {
+		t.Errorf("the second cell waited %v s for a cell that ran at least 0.4 s", second.ClientLockWaitS)
+	}
 	if second.StartedAt.Before(first.CompletedAt) {
 		t.Errorf("second cell started_at %v precedes the first cell's completed_at %v: the wait is inside the cell window",
 			second.StartedAt, first.CompletedAt)
@@ -228,5 +237,126 @@ func TestLockErrorIsNotAnInterruption(t *testing.T) {
 	oc, err = executeCell(ctx, cfg, interleave.Cell{Scenario: scenarioByName(t, "get-json"), Server: server})
 	if err == nil || !strings.HasPrefix(oc.ErrorMsg, "interrupted:") {
 		t.Fatalf("cancelled wait: err %v error %q, want interrupted:", err, oc.ErrorMsg)
+	}
+}
+
+// lockCell runs one get-json cell (heavy, rated) of a remote-target runner on
+// lock against srvURL and returns the executeCell result and its per-cell JSON.
+func lockCell(t *testing.T, srvURL string, lock *clientLock, extra ...string) (cellOutcome, error, cellResultFile) {
+	t.Helper()
+	args := append([]string{"-target", srvURL, "-server-name", "e2e-remote", "-duration", "150ms", "-warmup", "50ms",
+		"-rated", "-rated-duration", "100ms", "-rated-fractions", "0.5", "-rated-cells", "*", "-out", t.TempDir()}, extra...)
+	cfg, err := ParseArgs(args, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.lock = lock
+	server := &adapterServer{adapter: servers.Adapter{Name: "e2e-remote", Category: "remote"}, features: remoteFeatureSet()}
+	oc, err := executeCell(context.Background(), cfg, interleave.Cell{Scenario: scenarioByName(t, "get-json"), Server: server})
+	var cf cellResultFile
+	raw, rerr := os.ReadFile(filepath.Join(cfg.Out, "run0", "get-json", "e2e-remote.json"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if jerr := json.Unmarshal(raw, &cf); jerr != nil {
+		t.Fatal(jerr)
+	}
+	return oc, err, cf
+}
+
+func okServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"message":"ok"}`)) }))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestUncontendedHeavyCellRecordsNoLockWait: with the lock free, a heavy cell
+// neither records client_lock_wait_s nor re-stamps started_at (probatorium#442).
+func TestUncontendedHeavyCellRecordsNoLockWait(t *testing.T) {
+	srv := okServer(t)
+	oc, err, cf := lockCell(t, srv.URL, testLock(t, filepath.Join(t.TempDir(), "client.lock"), ""))
+	if err != nil || oc.Status != report.CellOK {
+		t.Fatalf("status %q err %v", oc.Status, err)
+	}
+	if cf.ClientLockWaitS != 0 {
+		t.Fatalf("client_lock_wait_s = %v on a free lock, want 0 (omitted)", cf.ClientLockWaitS)
+	}
+}
+
+// TestWedgedHolderDoesNotStallThePeersCell: the other arch's runner took the
+// lock and its cell never returns. Its hold limit frees the lock, and this
+// arch's heavy cell runs, instead of waiting out the holder's hang guard.
+func TestWedgedHolderDoesNotStallThePeersCell(t *testing.T) {
+	srv := okServer(t)
+	path := filepath.Join(t.TempDir(), "client.lock")
+	holder := testLock(t, path, "")
+	holder.maxHold = 300 * time.Millisecond
+	if _, _, err := holder.acquire(context.Background(), "get-json"); err != nil { // never released
+		t.Fatal(err)
+	}
+	start := time.Now()
+	oc, err, cf := lockCell(t, srv.URL, testLock(t, path, ""))
+	if err != nil || oc.Status != report.CellOK {
+		t.Fatalf("the peer's cell did not run behind a wedged holder: status %q err %v", oc.Status, err)
+	}
+	if cf.ClientLockWaitS < 0.2 || time.Since(start) > 10*time.Second {
+		t.Fatalf("wait %v s, total %v: want a wait of about the 0.3 s hold limit", cf.ClientLockWaitS, time.Since(start))
+	}
+}
+
+// TestPeerCellFailsAsClientLockAfterTheWaitLimit: a holder that is not a runner
+// of this harness and never lets go costs this arch one cell per wait limit,
+// each recorded as a client-lock failure with its wait, not an interruption
+// and not a column lost to the hang guard.
+func TestPeerCellFailsAsClientLockAfterTheWaitLimit(t *testing.T) {
+	srv := okServer(t)
+	path := filepath.Join(t.TempDir(), "client.lock")
+	hold, _, err := testLock(t, path, "").acquire(context.Background(), "get-json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold()
+	mine := testLock(t, path, "")
+	mine.maxWait = 200 * time.Millisecond
+	oc, err, cf := lockCell(t, srv.URL, mine)
+	if err == nil || !errors.Is(err, errClientLockWait) {
+		t.Fatalf("err = %v, want errClientLockWait", err)
+	}
+	if !strings.HasPrefix(oc.ErrorMsg, "client-lock:") || strings.HasPrefix(oc.ErrorMsg, "interrupted:") {
+		t.Fatalf("error %q: want a client-lock failure", oc.ErrorMsg)
+	}
+	if cf.ClientLockWaitS < 0.2 {
+		t.Fatalf("the failed wait was not recorded: client_lock_wait_s = %v", cf.ClientLockWaitS)
+	}
+	if len(cf.PassWindows) != 0 {
+		t.Fatalf("a cell that never ran recorded %d pass windows", len(cf.PassWindows))
+	}
+}
+
+// TestSUTThatDiedDuringTheLockWaitIsNotMeasured: the SUT probe before the wait
+// passed; the SUT died while the cell queued. The cell must be marked
+// server-down instead of burning its window on a dead port with the lock held.
+func TestSUTThatDiedDuringTheLockWaitIsNotMeasured(t *testing.T) {
+	old := reprobeAfterLockWait
+	reprobeAfterLockWait = 50 * time.Millisecond
+	t.Cleanup(func() { reprobeAfterLockWait = old })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	path := filepath.Join(t.TempDir(), "client.lock")
+	hold, _, err := testLock(t, path, "").acquire(context.Background(), "get-json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		srv.Close() // the SUT dies while the cell waits...
+		hold()      // ...and the peer lets go
+	}()
+	oc, err, cf := lockCell(t, srv.URL, testLock(t, path, ""))
+	if err == nil || !strings.HasPrefix(oc.ErrorMsg, "server-down:") || !strings.Contains(oc.ErrorMsg, "client-lock wait") {
+		t.Fatalf("err %v error %q: want server-down from the probe after the lock wait", err, oc.ErrorMsg)
+	}
+	if len(cf.PassWindows) != 0 {
+		t.Fatalf("a dead SUT was driven: %d pass windows", len(cf.PassWindows))
 	}
 }

@@ -648,6 +648,7 @@ func run(cfg Config) error {
 	if cfg.ClientLock != "" && cfg.Target == "" {
 		return errors.New("-client-lock applies to remote-target mode only (-target)")
 	}
+	lock.maxHold, lock.maxWait = cfg.clientLockLimits()
 	cfg.lock = lock
 
 	if cfg.ResumeFrom != "" {
@@ -1280,12 +1281,22 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 			prefix = "interrupted: "
 		}
 		cellRes.Error = prefix + lerr.Error()
+		cellRes.ClientLockWaitS = waited.Seconds() // what a refused or cancelled wait cost
 		return cellOutcome{}, lerr
 	}
 	defer releaseLock()
 	if waited > 0 {
 		cellRes.ClientLockWaitS = waited.Seconds()
 		cellRes.StartedAt = time.Now().UTC()
+		// The SUT was probed before the wait. After minutes of idle it may
+		// have died, and the cell would burn its window against a dead port
+		// while holding the lock, the failure the probe exists to prevent.
+		if waited >= reprobeAfterLockWait && probeAddr != "" {
+			if perr := probeSUT(parent, probeAddr); perr != nil {
+				cellRes.Error = "server-down: probe after the client-lock wait: " + perr.Error()
+				return cellOutcome{}, errors.New(cellRes.Error)
+			}
+		}
 	}
 
 	lgCfg := buildCellConfig(cell, lgURL, cfg)
