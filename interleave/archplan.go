@@ -21,6 +21,12 @@ const (
 	LockHeavy LockPolicy = "heavy"
 	// LockAll locks every cell: the arches never run at the same time.
 	LockAll LockPolicy = "all"
+	// LockHeavyRated is not a runner policy; it prices an option the
+	// maintainer decision names: heavy cells hold the lock whole, and every
+	// other cell holds it for its rated sweep only (its saturation pass runs
+	// free), so no rated pass of either class overlaps a peer's heavy cell or
+	// a peer's rated sweep.
+	LockHeavyRated LockPolicy = "heavy+rated"
 )
 
 // PlanCell is one cell of a column: the scenario, whether it is heavy
@@ -30,6 +36,9 @@ type PlanCell struct {
 	Scenario string
 	Heavy    bool
 	Dur      time.Duration
+	// Rated is the part of Dur that is the rated sweep, the tail of the cell
+	// (0 = no rated sweep).
+	Rated time.Duration
 }
 
 // PlanColumn is one column (one SUT) with its cells in registry order.
@@ -69,6 +78,9 @@ type Slot struct {
 	Heavy            bool
 	Start, End       time.Duration
 	Waited           time.Duration
+	// RatedStart is when the rated sweep began (zero when the cell has none);
+	// the sweep runs [RatedStart, End).
+	RatedStart time.Duration
 }
 
 // PlanResult is the outcome of SimulateArchPlan.
@@ -131,19 +143,33 @@ func SimulateArchPlan(a, b ArchPlan, p PlanParams) PlanResult {
 			t += setup[pick]
 		}
 		start := t
-		needsLock := p.Policy == LockAll || (p.Policy == LockHeavy && wc.cell.Heavy)
+		needsLock := p.Policy == LockAll || ((p.Policy == LockHeavy || p.Policy == LockHeavyRated) && wc.cell.Heavy)
 		if needsLock && lockFree > start {
 			start = lockFree
 		}
 		end := start + wc.cell.Dur
+		var ratedStart time.Duration
+		if wc.cell.Rated > 0 {
+			ratedStart = end - wc.cell.Rated
+		}
+		waited := start - t
 		if needsLock {
+			lockFree = end
+		} else if p.Policy == LockHeavyRated && wc.cell.Rated > 0 {
+			// a light cell: the saturation pass runs free, the rated sweep
+			// waits for the lock.
+			if lockFree > ratedStart {
+				waited += lockFree - ratedStart
+				ratedStart = lockFree
+				end = ratedStart + wc.cell.Rated
+			}
 			lockFree = end
 		}
 		r.Slots[pick] = append(r.Slots[pick], Slot{
 			Column: wc.col, Scenario: wc.cell.Scenario, Heavy: wc.cell.Heavy,
-			Start: start, End: end, Waited: start - t,
+			Start: start, End: end, Waited: waited, RatedStart: ratedStart,
 		})
-		r.LockWait[pick] += start - t
+		r.LockWait[pick] += waited
 		x.ready = end
 		if !wc.last {
 			x.ready += p.Cooldown
@@ -199,4 +225,74 @@ func (r PlanResult) Overlaps() (heavyHeavy, heavyLight, lightLight int) {
 		}
 	}
 	return
+}
+
+// RatedUnderHeavy counts the rated sweeps of light cells (the cells the heavy
+// policy lets run unlocked) that ran while a heavy cell of the other arch was
+// running: the cells, the (sweep, heavy cell) pairs, and the total overlapped
+// time. A light row's rated passes are ranked by latency at load, so this is
+// what the default policy leaves exposed to the peer's heavy load.
+func (r PlanResult) RatedUnderHeavy() (cells, pairs int, overlapped time.Duration) {
+	for side := 0; side < 2; side++ {
+		for _, x := range r.Slots[side] {
+			if x.Heavy || x.RatedStart == 0 {
+				continue
+			}
+			hit := false
+			for _, y := range r.Slots[1-side] {
+				if !y.Heavy || y.Start >= x.End || x.RatedStart >= y.End {
+					continue
+				}
+				lo, hi := max(x.RatedStart, y.Start), min(x.End, y.End)
+				if hi <= lo {
+					continue
+				}
+				hit = true
+				pairs++
+				overlapped += hi - lo
+			}
+			if hit {
+				cells++
+			}
+		}
+	}
+	return cells, pairs, overlapped
+}
+
+// RatedPassSharing classifies the rated passes of the light cells that kept
+// RatedStart: passes of passDur each, back to back from RatedStart, n per cell.
+// A pass is "alone" when no slot of the other arch touches it, "heavy" when a
+// heavy cell of the other arch does, "light" when only light cells do.
+func (r PlanResult) RatedPassSharing(n int, passDur time.Duration) (alone, heavy, light int) {
+	for side := 0; side < 2; side++ {
+		for _, x := range r.Slots[side] {
+			if x.Heavy || x.RatedStart == 0 {
+				continue
+			}
+			for k := 0; k < n; k++ {
+				ps := x.RatedStart + time.Duration(k)*passDur
+				pe := ps + passDur
+				var sawHeavy, sawLight bool
+				for _, y := range r.Slots[1-side] {
+					if y.Start >= pe || ps >= y.End {
+						continue
+					}
+					if y.Heavy {
+						sawHeavy = true
+					} else {
+						sawLight = true
+					}
+				}
+				switch {
+				case sawHeavy:
+					heavy++
+				case sawLight:
+					light++
+				default:
+					alone++
+				}
+			}
+		}
+	}
+	return alone, heavy, light
 }

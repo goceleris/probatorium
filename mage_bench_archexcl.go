@@ -82,7 +82,11 @@ func archExclusionExtraVars(policy, host string) []string {
 // lockWaitAllowance is the time a column's hang guard must add for the waits the
 // client lock can cause: in the worst case every cell that takes the lock waits
 // out one cell of the other arch. A wedged runner is still killed; it only takes
-// that much longer to be noticed.
+// that much longer to be noticed. It is the allowance for ordinary queueing. A
+// wedged peer does not make a healthy runner wait for it: the holder releases
+// the lock itself after one cell's longest run and a waiter gives up a little
+// later (cmd/runner clientLockLimits), so the peer costs at most that once, not
+// the holder's guard.
 func lockWaitAllowance(policy string, ratedPasses int, warmup, duration, ratedDuration time.Duration) time.Duration {
 	var n int
 	switch policy {

@@ -35,11 +35,29 @@ const (
 //
 // The link channel (probatorium#442, own + other arch traffic = 19.1-20.1
 // Gbit/s on the 20 Gbit/s bond) can only bind on the bandwidth rows. The
-// client channel was measured on static rows up to 256 connections, where an
-// amd64 cell lost 0.18-0.31 requests/s for each concurrent arm64 request:
-// extrapolated to the light rows' arm64 demand (at most 30k requests/s) that
-// is about 1% of a 650k requests/s heavy cell. It is an extrapolation, not a
-// measurement on these rows.
+// client channel was measured on static rows of 128 and 256 connections
+// (goceleris/probatorium#442 comment on run 36441790519; evidence/bench-
+// 36441790519/rank/skeptic/out_s18_cpu_contention2.txt: slope -0.31 at 128c,
+// -0.18 at 256c, partial r -0.92 to -0.97, over arm64 demand of 174-321k
+// requests/s), where an x86 cell lost 0.18-0.31 requests/s per concurrent
+// arm64 request. Nothing in this table was measured on the light rows.
+//
+// What the light class leaves unprotected, by that coefficient and the demand
+// figures below (it is an extrapolation, not a measurement on these rows):
+//   - an x86 heavy cell sharing the client with the arm64 light rows: two of
+//     them reach 122-126k (ws-hub-broadcast-128 frames/s, sse-fanout-128
+//     events/s), which is 22-39k requests/s lost from a 650k requests/s cell,
+//     3.5-6%; the others stay at or below 30k, under 1.5%;
+//   - an arm64 heavy cell (about 400k requests/s) sharing it with the x86
+//     light rows, which reach 120-140k: the coefficient was never measured in
+//     this direction; if it were symmetric, 25-43k, 6-11%;
+//   - the light rows' OWN measurements under the other arch's heavy cells:
+//     12 of the 15 rated rows are light (budget.RatedScenarios), and the
+//     default order puts 173 rated light cells per arch under a peer heavy
+//     cell (cmd/runner TestFullGridArchPlan).
+//
+// docs/ARCH-EXCLUSION-VALIDATION.md is built to measure all three, and
+// BENCH_ARCH_EXCLUSIVE=all removes them.
 var clientLoadTable = map[string]ClientLoad{
 	// bandwidth rows: 14-18 Gbit/s on x86, 7-10 on arm64.
 	"post-4k":       LoadHeavy, // 548k | 226k rps, 18.0 | 7.4 Gbit/s

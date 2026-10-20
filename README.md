@@ -327,10 +327,27 @@ bond carries both arches). A run made before the fix marks nothing of this.
   cell, saturation pass, rated sweep and warmups included ([`cmd/runner/clientlock.go`](cmd/runner/clientlock.go)).
   A heavy cell of one arch therefore waits for the other arch's heavy cell. The wait polls once a second,
   ends with the run context, and the kernel drops the lock when a runner dies, so a runner killed by its hang
-  guard frees the other. `started_at` is stamped after the wait, so the idle wait never lands in the
-  per-scenario CPU window (`scenario_resources`); the wait is recorded as `client_lock_wait_s`. The column's
-  hang guard grows by `lockWaitAllowance` so a queued but healthy runner is not killed. The column-wide
-  `resources` mean (every scenario of the column, not the window) does include the waits.
+  guard frees the other. Neither arch can stall the other for more than a cell: the holder releases the lock
+  itself after the longest a cell can run when its own contexts work (its saturation pass plus every rated pass
+  at their timeouts, plus a minute: a wedged cell, loadgen workers blocked in reads, has driven nothing since
+  its context fired), and a waiter gives up after that plus two minutes and fails the cell as
+  `client-lock: ...` (a DNF with its wait recorded, not an "interrupted" cell). The checker still reads the
+  passes' own timestamps, so a cell that did overlap its peer is reported. `started_at` is stamped after a
+  wait, so the idle wait never lands in the per-scenario CPU window (`scenario_resources`); the wait is
+  recorded as `client_lock_wait_s` and is exactly 0 for a lock that was free at the first attempt. After a wait
+  of 5 s or more the runner probes the SUT again before it drives load. The column's hang guard grows by
+  `lockWaitAllowance` so a queued but healthy runner is not killed. The lock file is opened without following
+  symlinks, its times are refreshed at every acquire (a host that age-cleans `/tmp` must not unlink it
+  mid-run), and a lock taken on an inode the path no longer names is dropped and retaken.
+  Two things the wait does to a measurement. The SUT idles through it (minutes, 6.7 h in total per arch in the
+  model) where the only gap between cells used to be the 5 s cooldown; whether the first cell after a long
+  wait reads differently (CPU frequency, an adaptive engine's settled state) is not measured, and the
+  validation run has an item for it. And the column-wide `resources` mean (every scenario of the column,
+  not the window) now includes that idle time, diluting it by an amount that differs per column: read
+  `scenario_resources` for per-cell CPU. The lock is released when a cell's load ends, before the 5 s
+  cooldown, so the peer's heavy cell can start while the previous cell's sockets drain on the client; they
+  are connections to the other arch's SUT, so they share no 4-tuple with the next cell's, and the planner
+  models the release at the same point.
 - The arm64 pass walks each column's cells **in reverse** (`-cell-order reverse`). The registry order runs
   churn-close and the driver rows (light) first and the static, h2 and WebSocket/SSE rows (mostly heavy)
   after them; reversed on one arch, the two arches' heavy cells fall in different halves of a column and
@@ -357,6 +374,7 @@ lockstep case, not every past run.
 | **lock on heavy cells, arm64 cells reversed (the default)** | **57.6 h** | **+13%** | 0 |
 | lock on heavy cells, arm64 columns reversed | 58.6 h | +15% | 0 |
 | lock on every cell (`all`) | 99.7 h | +96% | 0 |
+| option, not implemented: heavy cells and every rated sweep, arm64 cells reversed | 75.2 h | +48% | 0 |
 
 The lock's cost depends on how far apart the arches run. The drift sweep moves the arm64 start by 0 to 3 h
 and the column set-up time of each arch by 0-120 s (20 points):
@@ -373,16 +391,42 @@ falls hours behind the other. A `full` target=both run goes from the measured 47
 model's 1.14 mean times 47.6 h), 53-60 h across the sweep; `budget.FitWithin` projects 58 h
 (`ArchLockOverheadHeavy` = 14%, pinned to the lockstep planner by a test) and the workflow budgets
 (40 h headline, 69 h full) cover the sweep's 1.30 worst case. `headline` goes from about 30 h to about 34 h.
-`all` is about twice. These are a model of fixed window lengths and the lock's first-come order, not a
+`all` is about twice, and the workflow budgets it separately (the budget and the job timeout are tables of
+profile and policy, `workflow_arch_budget_test.go`): 34 h fast, 72 h headline, 108 h full under a 7080 min
+(118 h) job timeout, which sits under GitHub's 5-day (7200 min) limit. A `full` dispatch with
+`arch_exclusive=all` projects 101.9 h, so its budget has a 6% margin where every other entry has 18% or more;
+the model ran 7% high against the one measured run, so about 95 h is the expectation, but it is the thinnest
+margin of any dispatch. These are a model of fixed window lengths and the lock's first-come order, not a
 cluster run: how often the lock really queues a runner is the first thing the validation run measures
 (`lock_wait_seconds`).
 
-**What it does not do.** Under `heavy`, a heavy cell still shares the client with the other arch's light
-cells (793 cell pairs in the model, `heavy_light_overlaps` in the record). The residual is small by the
-numbers that chose the rule but it is an extrapolation: the client-side effect was measured on static rows
-up to 256 connections, where an x86 cell lost 0.18-0.31 requests/s per concurrent arm64 request, and the
-light rows' arm64 demand is at most 30k requests/s, about 1% of a 650k requests/s heavy cell. Nobody has
-measured it on driver traffic. `BENCH_ARCH_EXCLUSIVE=all` removes it at about twice the wall-clock.
+**What it does not do.** Under `heavy` a heavy cell still shares the client with the other arch's light
+cells, and a light cell's own measurement runs under the other arch's heavy cells. Neither is measured.
+
+- *Heavy under light, x86 side.* The coefficient that chose the rule (an x86 cell lost 0.18-0.31 requests/s per
+  concurrent arm64 request, partial r -0.92 to -0.97, on static rows of 128 and 256 connections over arm64
+  demand of 174-321k requests/s; from run 36441790519, `evidence/bench-36441790519/rank/skeptic/
+  out_s18_cpu_contention2.txt`) was never measured on the light rows. At the arm64 light rows' demand
+  (p90 over columns, `out/demand_by_row.out` of the lane evidence): ws-hub-broadcast-128 122.5k frames/s and
+  sse-fanout-128 125.7k events/s cost an x86 heavy cell 22-39k requests/s, 3.5-6.0% of a 650k requests/s cell
+  (2.3-3.9% of a 1M one); every other light row stays at or below 30k, under 1.5%.
+- *Heavy under light, arm64 side.* The x86 light rows reach 120-140k (churn-close 140k, driver-mc-set 130k,
+  ws-hub-broadcast-128 127k). The coefficient was measured only as x86 loss per arm64 request. If it were
+  symmetric an arm64 heavy cell of about 400k requests/s would lose 25-43k, 6-11%. This direction is
+  unquantified.
+- *Light under heavy.* 12 of the 15 `RatedScenarios` rows are light (churn-close and the 11 driver rows,
+  ranked by latency at load). In the default order, 173 of each arch's rated light cells run their rated sweep
+  while a heavy cell of the other arch does (346 cells in the model, 15.7 h in total;
+  `go test ./cmd/runner -run FullGridArchPlan -v`). That is #442's own mechanism (rated passes under the other
+  arch's heavy load) on most of the rated rows. It is exposure, not measured contamination.
+
+`BENCH_ARCH_EXCLUSIVE=all` removes all three at about twice the wall-clock (99.7 h in the model, against
+57.6 h). A third option, not implemented, locks every rated sweep as well as every heavy cell: the planner
+prices it at 75.2 h (+48%) and it removes the third exposure only. The default order itself is a trade: with
+both arches forward there are 230 heavy+light cell overlaps at 65.9 h; reversing arm64 makes it 793 at 57.6 h.
+`all` removes that trade too. The validation run measures all three
+([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md)); its pre-registered rule says to
+move the default to `all` if they are not small.
 
 **The check on a finished run.** Every saturation and every rated pass records the interval it drove load
 in, on msa2-client's own clock (the same clock for both arches), kept or skipped
@@ -411,12 +455,14 @@ excluded. Such a run is recognisable by its two arch documents carrying the same
 (Bench stamps one start for both; checked on the results of runs 33256654220 and 37091941051, where
 `started_at` is identical to the nanosecond and `finished_at` differs by under 3 s) and by the workflow's
 dispatch input `target`. The runs this applies to
-include 33256654220 (0829), 36441790519 and 38431303162 (bench-full). A post-fix both-arch document always
+include 33256654220 (0829), 36441790519, 37091941051 (schema 5.18, identical `started_at`, checked) and
+38431303162 (bench-full). A post-fix both-arch document always
 carries `arch_exclusion`, whatever the policy, so absence can no longer be read two ways. The docs site
 does not flag it yet; that is for goceleris/docs.
 
-**Validation owed.** Nothing above has run on the cluster. The scoped both-arch run that checks it (about
-1 h, pre-registered) is in [`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md).
+**Validation owed.** Nothing above has run on the cluster. The two scoped both-arch runs that check it (the
+default policy and `all`, about 3.6 h of bench together, criteria pre-registered, including the three
+exposures above) are in [`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md).
 
 ### Result: latency at SLO
 

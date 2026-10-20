@@ -5,8 +5,9 @@
 // except for [Document.LoadWindows] (schema 5.22), which stays in the run's
 // results-<arch>.json and is not part of the published tree.
 //
-// Why split at all: a full Document is ~650 KB, dominated by the
-// per-server base64 HDR histograms. The dashboard's landing page only
+// Why split at all: a full Document is large (the schema 5.18 results-<arch>.json
+// of run 37091941051 is 27.8 MB), dominated by the per-server base64 HDR
+// histograms. The dashboard's landing page only
 // needs the scalar headline numbers, so the heavy HDR blobs move to a
 // gzipped sidecar fetched lazily. The four pieces are:
 //
@@ -130,8 +131,9 @@ type SplitMeta struct {
 // The split is reversible: MergeSplit(summary, hist) == doc under JSON.
 func SplitDocument(doc *Document, meta SplitMeta) (summary *Document, hist *HistogramDoc, env *EnvDoc) {
 	summary = cloneDocument(doc)
-	// The load windows are the raw material of the cross-arch overlap check,
-	// a few hundred KB per arch; the published summary carries the verdict
+	// The load windows are the raw material of the cross-arch overlap check
+	// (about 210 bytes each, so ~0.5 MB for the ~2,400 windows of a full run, small
+	// next to the rest of the document); the published summary carries the verdict
 	// (env.json: environment.arch_exclusion), not the windows. They stay in
 	// results-<arch>.json (probatorium#442).
 	summary.LoadWindows = nil

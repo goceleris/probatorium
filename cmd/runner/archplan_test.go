@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -35,10 +36,12 @@ func fullGridPlan(t *testing.T, p budget.Profile) []interleave.PlanColumn {
 			order = append(order, srv)
 		}
 		d := p.Warmup + p.Duration + budget.PerCellOverhead
+		var rated time.Duration
 		if cfg.ratesCell(id) {
-			d += time.Duration(p.RatedPasses) * (p.Warmup + p.RatedDuration)
+			rated = time.Duration(p.RatedPasses) * (p.Warmup + p.RatedDuration)
+			d += rated
 		}
-		c.Cells = append(c.Cells, interleave.PlanCell{Scenario: scn, Heavy: scenarios.ClientLoadOf(scn) == scenarios.LoadHeavy, Dur: d})
+		c.Cells = append(c.Cells, interleave.PlanCell{Scenario: scn, Heavy: scenarios.ClientLoadOf(scn) == scenarios.LoadHeavy, Dur: d, Rated: rated})
 	}
 	out := make([]interleave.PlanColumn, 0, len(order))
 	for _, s := range order {
@@ -78,6 +81,11 @@ func planCases() []planCase {
 			return interleave.ArchPlan{Columns: c, ReverseCells: true, ReverseColumns: true}
 		}},
 		{"all lock, both forward (strict)", interleave.LockAll, fwd},
+		// priced option, not a runner policy: heavy cells whole, every other
+		// cell's rated sweep under the lock too.
+		{"heavy+rated lock, arm64 cells reversed (option)", interleave.LockHeavyRated, func(c []interleave.PlanColumn) interleave.ArchPlan {
+			return interleave.ArchPlan{Columns: c, ReverseCells: true}
+		}},
 	}
 }
 
@@ -122,8 +130,21 @@ func TestFullGridArchPlan(t *testing.T) {
 		r, rep := runPlanCase(cols, pc)
 		res[pc.name] = r
 		hh, hl, ll := r.Overlaps()
-		t.Logf("%-46s makespan %6.1f h (%+5.1f%% vs one arch)  lock wait x86 %5.1f h arm64 %5.1f h  overlaps heavy+heavy %3d heavy+light %4d light+light %4d  forbidden %d",
-			pc.name, r.Makespan.Hours(), 100*(r.Makespan.Hours()/single.Hours()-1), r.LockWait[0].Hours(), r.LockWait[1].Hours(), hh, hl, ll, rep.Total)
+		rc, rp, ro := r.RatedUnderHeavy()
+		t.Logf("%-46s makespan %6.1f h (%+5.1f%% vs one arch)  lock wait x86 %5.1f h arm64 %5.1f h  overlaps heavy+heavy %3d heavy+light %4d light+light %4d  forbidden %d  | light rated sweeps under a peer heavy cell: %d cells, %d pairs, %.1f h",
+			pc.name, r.Makespan.Hours(), 100*(r.Makespan.Hours()/single.Hours()-1), r.LockWait[0].Hours(), r.LockWait[1].Hours(), hh, hl, ll, rep.Total, rc, rp, ro.Hours())
+		switch pc.policy {
+		case interleave.LockHeavy:
+			// the exposure the maintainer decision names: the default does not
+			// protect the rated sweeps of the light rows.
+			if rc == 0 && pc.name != "heavy lock, both forward" {
+				t.Errorf("%s: no light rated sweep under a peer heavy cell; the decision text says there are many", pc.name)
+			}
+		case interleave.LockAll, interleave.LockHeavyRated:
+			if rc != 0 {
+				t.Errorf("%s: %d light rated sweeps under a peer heavy cell, want 0", pc.name, rc)
+			}
+		}
 		if pc.policy == interleave.LockOff {
 			if hh == 0 {
 				t.Errorf("%s: no heavy+heavy overlap, but today's schedule overlaps heavily (probatorium#442)", pc.name)
@@ -216,6 +237,123 @@ func TestArchPlanDriftSweep(t *testing.T) {
 		t.Logf("%-40s makespan / one arch alone: min %.3f mean %.3f max %.3f over %d drift points", k, b.lo, b.sum/float64(b.n), b.hi, b.n)
 		if b.hi > 1.30 {
 			t.Errorf("%s: worst case %.3f exceeds the +30%% the workflow budgets cover", k, b.hi)
+		}
+	}
+}
+
+// validationScope is the dispatch of docs/ARCH-EXCLUSION-VALIDATION.md.
+var (
+	validationColumns = []string{"axum", "celeris-adaptive-auto+upg-async", "celeris-iouring-auto+upg-async"}
+	validationRows    = []string{"churn-close", "get-simple-256c", "post-4k", "ws-hub-broadcast-128", "ws-large-echo"}
+)
+
+// validationPlan returns the three columns of the validation dispatch at the
+// `full` window with the rated sweep on ratedRows, in the order the runner
+// walks them.
+func validationPlan(t *testing.T, ratedRows ...string) []interleave.PlanColumn {
+	t.Helper()
+	p := budget.Full()
+	var glob []string
+	for _, r := range ratedRows {
+		glob = append(glob, r+"/*")
+	}
+	cfg, err := ParseArgs([]string{"-rated", "-rated-duration", p.RatedDuration.String(), "-rated-cells", strings.Join(glob, ",")}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols := map[string]*interleave.PlanColumn{}
+	for _, id := range realizedGrid(t) {
+		scn, srv, _ := strings.Cut(id, "/")
+		if !slices.Contains(validationColumns, srv) || !slices.Contains(validationRows, scn) {
+			continue
+		}
+		c := cols[srv]
+		if c == nil {
+			c = &interleave.PlanColumn{Name: srv}
+			cols[srv] = c
+		}
+		d := p.Warmup + p.Duration + budget.PerCellOverhead
+		var rated time.Duration
+		if cfg.ratesCell(id) {
+			rated = time.Duration(p.RatedPasses) * (p.Warmup + p.RatedDuration)
+			d += rated
+		}
+		c.Cells = append(c.Cells, interleave.PlanCell{Scenario: scn, Heavy: scenarios.ClientLoadOf(scn) == scenarios.LoadHeavy, Dur: d, Rated: rated})
+	}
+	var out []interleave.PlanColumn
+	for _, n := range validationColumns {
+		if c := cols[n]; c != nil {
+			out = append(out, *c)
+		}
+	}
+	return out
+}
+
+// TestValidationScopeGroupSizes predicts, for the validation dispatch, how many
+// rated passes of its light rows land alone, under a peer's light cell or under
+// a peer's heavy cell. The pre-registered light-row criterion
+// (docs/ARCH-EXCLUSION-VALIDATION.md) compares those groups, so they must be
+// large enough: with the arm64 pass walking each column in reverse, the light
+// cells of one arch fall under the heavy cells of the other, and the `alone`
+// group is the one at risk of being empty. The log is the table in the doc.
+func TestValidationScopeGroupSizes(t *testing.T) {
+	cols := validationPlan(t, "ws-large-echo", "post-4k", "ws-hub-broadcast-128", "churn-close")
+	if len(cols) != 3 {
+		t.Fatalf("the validation scope found %d of its 3 columns", len(cols))
+	}
+	var order []string
+	for _, c := range cols[0].Cells {
+		order = append(order, c.Scenario)
+	}
+	t.Logf("cells per column in walk order: %v", order)
+	const passes, passDur = 4, 50 * time.Second
+	one := interleave.SimulateArchPlan(interleave.ArchPlan{Columns: cols}, interleave.ArchPlan{}, interleave.PlanParams{Policy: interleave.LockOff, Cooldown: 5 * time.Second})
+	off := interleave.SimulateArchPlan(interleave.ArchPlan{Columns: cols}, interleave.ArchPlan{Columns: cols, ReverseCells: true}, interleave.PlanParams{Policy: interleave.LockOff, Cooldown: 5 * time.Second})
+	t.Logf("arm C (target=amd64, one arch alone): %.2f h; arm D (arch_exclusive=off): %.2f h", one.Makespan.Hours(), off.Makespan.Hours())
+	for _, pc := range []struct {
+		name   string
+		policy interleave.LockPolicy
+		b      func([]interleave.PlanColumn) interleave.ArchPlan
+	}{
+		{"heavy lock, arm64 cells reversed (default)", interleave.LockHeavy, func(c []interleave.PlanColumn) interleave.ArchPlan {
+			return interleave.ArchPlan{Columns: c, ReverseCells: true}
+		}},
+		{"heavy lock, both forward", interleave.LockHeavy, func(c []interleave.PlanColumn) interleave.ArchPlan { return interleave.ArchPlan{Columns: c} }},
+		{"all lock (arch_exclusive=all)", interleave.LockAll, func(c []interleave.PlanColumn) interleave.ArchPlan { return interleave.ArchPlan{Columns: c} }},
+	} {
+		r := interleave.SimulateArchPlan(interleave.ArchPlan{Columns: cols}, pc.b(cols),
+			interleave.PlanParams{Policy: pc.policy, Cooldown: 5 * time.Second})
+		alone, heavy, light := r.RatedPassSharing(passes, passDur)
+		hh, hl, ll := r.Overlaps()
+		t.Logf("%-44s makespan %5.2f h; light-row rated passes alone %2d, under a peer light cell %2d, under a peer heavy cell %2d; overlaps heavy+heavy %d heavy+light %d light+light %d",
+			pc.name, r.Makespan.Hours(), alone, light, heavy, hh, hl, ll)
+		if hh != 0 {
+			t.Errorf("%s: %d heavy+heavy overlaps", pc.name, hh)
+		}
+		// the heavy saturation-only probe row: how many of its 6 cells share
+		// the client with a peer light cell.
+		var probeShared, probeAlone int
+		for side := 0; side < 2; side++ {
+			for _, x := range r.Slots[side] {
+				if x.Scenario != "get-simple-256c" {
+					continue
+				}
+				shared := false
+				for _, y := range r.Slots[1-side] {
+					if !y.Heavy && y.Start < x.End && x.Start < y.End {
+						shared = true
+					}
+				}
+				if shared {
+					probeShared++
+				} else {
+					probeAlone++
+				}
+			}
+		}
+		t.Logf("%-44s get-simple-256c cells (6): %d overlap a peer light cell, %d do not", pc.name, probeShared, probeAlone)
+		if pc.policy == interleave.LockAll && (heavy != 0 || light != 0 || alone != 48) {
+			t.Errorf("%s: alone %d heavy %d light %d, want every one of the 48 light-row passes alone", pc.name, alone, heavy, light)
 		}
 	}
 }
