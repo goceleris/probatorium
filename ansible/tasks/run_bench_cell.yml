@@ -284,6 +284,42 @@
     - inventory_hostname == bench_target
     - irq_probe_cpu != ''
 
+# ---------- PINPLAN6 (THROWAWAY ab/pinplan-v6): the inputs of celeris' rx-port loop rule, recorded BEFORE the server starts ----------
+# Read-only, additive (its own file, rule-inputs.pre), best effort (never fails the column). The rule of celeris #1085 plans its loops once, at
+# Listen, from sysfs and /proc; the cell.start.txt snapshot is taken about 18 s AFTER Listen and from /proc/net/dev, not from the sysfs counters the
+# rule reads. This is the same machine state a moment before the server is launched: the rx_packets of every interface (sysfs statistics, the
+# rule's own source), the bond's lower_* links, the MSI vectors of the physical ports, the /proc/interrupts rows of the NIC vectors (IRQ 127 and
+# 135 of enp49s0, 159 and 167 of enp1s0 and the idle ones) and their effective / smp affinity lists, plus the boot id. With these the analyzer can
+# say WHY a RULE-D column planned what it planned (the rule's Debug line is not in server.log).
+- name: "{{ cell.1 }} run={{ cell.0 }} | record the inputs of the rx-port loop rule (read-only, before the server starts)"
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    {
+      echo "== rule-inputs.pre $(date +%s.%N)"
+      echo "== boot_id"; cat /proc/sys/kernel/random/boot_id 2>&1
+      echo "== rx_packets (sysfs statistics: the rule's source)"
+      for n in /sys/class/net/*; do [ -d "$n" ] || continue; echo "$(basename $n) $(cat $n/statistics/rx_packets 2>&1) physical=$([ -e $n/device ] && echo yes || echo no)"; done
+      echo "== lower links"
+      ls /sys/class/net/ 2>&1 | tr '\n' ' '; echo
+      for n in /sys/class/net/*; do for l in $n/lower_*; do [ -e "$l" ] && echo "$(basename $n) -> $(basename $l)"; done; done
+      echo "== msi_irqs of the physical ports"
+      for n in /sys/class/net/*; do [ -e $n/device ] && echo "$(basename $n): $(ls $n/device/msi_irqs 2>&1 | tr '\n' ' ')"; done
+      echo "== interrupts: header and the NIC rows"
+      head -1 /proc/interrupts
+      grep -E 'enp1s0|enp49s0' /proc/interrupts
+      echo "== irq effective_affinity_list smp_affinity_list of the NIC rows"
+      for i in $(grep -E 'enp1s0|enp49s0' /proc/interrupts | awk -F: '{gsub(/ /,"",$1); print $1}'); do
+        echo "$i $(cat /proc/irq/$i/effective_affinity_list 2>&1) $(cat /proc/irq/$i/smp_affinity_list 2>&1)"
+      done
+      echo "== end of rule-inputs.pre"
+    } > $d/rule-inputs.pre 2>&1
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == bench_target
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start competitor server in background"
   # Root ONLY for the celeris SUT — see the privilege-gate fact above.
   become: "{{ cell_needs_root | bool }}"
