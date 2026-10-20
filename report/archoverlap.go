@@ -242,8 +242,15 @@ func ArchExclusionFor(policy, peerArch, order string, own, peer []LoadWindow, lo
 
 // Problem returns why the record is not a clean verdict, or "" when it is:
 // a forbidden overlap, windows that could not be checked, nothing compared at
-// all (an arch with no windows reads clean to a naive count), or a run whose
+// all (a run with no windows reads clean to a naive count), or a run whose
 // policy was off.
+//
+// An arch whose peer drove no load (its host down, every cell a DNF before
+// loadgen started) is not refused for it: a peer that recorded no pass cannot
+// have loaded the client, and a peer that measured something but recorded no
+// window is already counted as a window without timestamps (MissingTimestamps,
+// loadWindowsFromRaw), which is refused. The record keeps PeerChecked = 0, so
+// the document says what the verdict rests on.
 func (e *ArchExclusion) Problem() string {
 	if e == nil {
 		return ""
@@ -253,8 +260,8 @@ func (e *ArchExclusion) Problem() string {
 		return fmt.Sprintf("arch exclusion (policy %s) violated: %d overlapping window pair(s) of the two arches (probatorium#442)", e.Policy, e.Violations)
 	case e.MissingTimestamps > 0:
 		return fmt.Sprintf("arch exclusion (policy %s) not verified: %d window(s) have no usable timestamps", e.Policy, e.MissingTimestamps)
-	case e.Policy != ExclusionOff && (e.Checked == 0 || e.PeerChecked == 0):
-		return fmt.Sprintf("arch exclusion (policy %s) not verified: %d window(s) of this arch and %d of the other were compared, so no overlap could have been seen", e.Policy, e.Checked, e.PeerChecked)
+	case e.Policy != ExclusionOff && e.Checked == 0 && e.PeerChecked == 0:
+		return fmt.Sprintf("arch exclusion (policy %s) not verified: no window of either arch was compared, so no overlap could have been seen", e.Policy)
 	case e.Policy == ExclusionOff:
 		return "arch exclusion policy is off: the two arches ran concurrently (probatorium#442)"
 	}

@@ -180,21 +180,38 @@ func TestSingleArchDocumentHasNeitherField(t *testing.T) {
 	}
 }
 
-// TestArchExclusionNothingCheckedIsNotClean: an arch with no windows at all
-// shows no overlap to a naive count. The verdict must say it checked nothing,
-// and the gate must read that as a problem (policy off aside, which is its own).
+// TestArchExclusionNothingCheckedIsNotClean: a run with no windows at all shows
+// no overlap to a naive count. The verdict must say it checked nothing, and the
+// gate must read that as a problem (policy off aside, which is its own).
 func TestArchExclusionNothingCheckedIsNotClean(t *testing.T) {
+	rec := ArchExclusionFor(ExclusionAll, "arm64", "forward", nil, nil, 0)
+	if rec.Violations != 0 {
+		t.Fatalf("%d violations from nothing", rec.Violations)
+	}
+	if p := rec.Problem(); !strings.Contains(p, "not verified") {
+		t.Errorf("Problem() = %q, want a not-verified problem", p)
+	}
+}
+
+// TestArchExclusionPeerThatDroveNoLoadDoesNotRefuseTheSurvivor: the peer's host
+// was down, so it recorded no pass. Its windows are empty, and the surviving arch
+// is verified clean against nothing, not refused. A peer that DID measure but
+// has no windows is the mage-side missing-timestamps case
+// (TestCellsWithoutPassWindowsAreNotVerifiedClean).
+func TestArchExclusionPeerThatDroveNoLoadDoesNotRefuseTheSurvivor(t *testing.T) {
 	x86, _ := cleanRun()
 	for name, rec := range map[string]*ArchExclusion{
-		"peer has no windows": ArchExclusionFor(ExclusionHeavy, "arm64", "forward", x86, nil, 0),
-		"own has no windows":  ArchExclusionFor(ExclusionHeavy, "arm64", "forward", nil, x86, 0),
-		"neither":             ArchExclusionFor(ExclusionAll, "arm64", "forward", nil, nil, 0),
+		"peer drove no load": ArchExclusionFor(ExclusionHeavy, "arm64", "forward", x86, nil, 0),
+		"own drove no load":  ArchExclusionFor(ExclusionHeavy, "arm64", "forward", nil, x86, 0),
 	} {
-		if rec.Violations != 0 {
-			t.Fatalf("%s: %d violations from nothing", name, rec.Violations)
+		if p := rec.Problem(); p != "" {
+			t.Errorf("%s: Problem() = %q, want none", name, p)
 		}
-		if p := rec.Problem(); !strings.Contains(p, "not verified") {
-			t.Errorf("%s: Problem() = %q, want a not-verified problem", name, p)
-		}
+	}
+	// a peer window without timestamps is still refused
+	rec := ArchExclusionFor(ExclusionHeavy, "arm64", "forward", x86,
+		[]LoadWindow{{Competitor: "c", Scenario: "post-4k", Kind: LoadKindSaturation, Class: "heavy"}}, 0)
+	if p := rec.Problem(); !strings.Contains(p, "not verified") {
+		t.Errorf("a peer window with no timestamps: Problem() = %q, want not verified", p)
 	}
 }

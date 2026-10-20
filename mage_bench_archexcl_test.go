@@ -267,3 +267,29 @@ func TestCellsWithoutPassWindowsAreNotVerifiedClean(t *testing.T) {
 		t.Fatalf("checkArchOverlapDir must not call it clean: %v\n%s", err, rep)
 	}
 }
+
+// TestSurvivingArchIsNotRefusedForAPeerThatDroveNoLoad: the arm64 host was down
+// for the whole run, so its only cell is a server-down DNF with no loadgen
+// pass. The x86 document still publishes: a peer that drove no load cannot have
+// contaminated it (probatorium#442).
+func TestSurvivingArchIsNotRefusedForAPeerThatDroveNoLoad(t *testing.T) {
+	dir := t.TempDir()
+	x86 := filepath.Join(dir, "20261020T120000-bench-msa2-server", "00-celeris-epoll-h1-sync")
+	writeWindowedCell(t, x86, "ws-large-echo", "celeris-epoll-h1-sync", "heavy", 0,
+		[]passWindowWire{pw("saturation", 0, 110), pw("rated", 110, 160)})
+	arm := filepath.Join(dir, "20261020T120000-bench-msr1", "00-celeris-epoll-h1-sync")
+	writeRunnerCell(t, arm, "ws-large-echo", "celeris-epoll-h1-sync", "dnf", "server-down: pre-cell probe: connection refused", nil)
+	if err := os.WriteFile(filepath.Join(arm, "results.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mergeBoth(t, dir, "heavy")
+
+	amd := readDoc(t, filepath.Join(dir, "results-amd64.json"))
+	ae := amd.Environment.ArchExclusion
+	if ae == nil || ae.Checked != 2 || ae.PeerChecked != 0 || ae.Problem() != "" {
+		t.Fatalf("amd64 verdict = %+v, want 2 own windows, 0 peer windows, no problem", ae)
+	}
+	if err := checkDataCompleteness(&amd); err != nil && strings.Contains(err.Error(), "arch exclusion") {
+		t.Fatalf("the surviving arch is refused for its peer's absence: %v", err)
+	}
+}
