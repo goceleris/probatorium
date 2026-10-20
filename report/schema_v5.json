@@ -64,6 +64,24 @@
             "at_end": { "type": "object", "description": "The same record, read back after the last cell (no write). verified=false when the vector left its CPU during the run." },
             "at_end_error": { "type": "string", "description": "The end-of-run readback's message when it failed." }
           }
+        },
+        "arch_exclusion": {
+          "type": "object",
+          "description": "Arch-exclusion verdict of a BENCH_TARGET=both run (v5.22, probatorium#442), stamped into both arches' documents at merge time. Omitted on single-arch runs; on a document from a both-arch run, absent means the arches ran concurrently with nothing excluded (written before 5.22).",
+          "required": ["policy", "peer_arch", "cell_order", "checked", "peer_checked", "heavy_heavy_overlaps", "heavy_light_overlaps", "light_light_overlaps", "violations", "missing_timestamps", "lock_wait_seconds"],
+          "properties": {
+            "policy": { "type": "string", "enum": ["heavy", "all", "off"], "description": "heavy: no heavy cell of one arch overlaps a heavy cell of the other. all: no cells overlap. off: nothing excluded." },
+            "peer_arch": { "type": "string" },
+            "cell_order": { "type": "string", "enum": ["forward", "reverse"], "description": "The order this arch walked each column's cells." },
+            "checked": { "type": "integer", "minimum": 0 },
+            "peer_checked": { "type": "integer", "minimum": 0 },
+            "heavy_heavy_overlaps": { "type": "integer", "minimum": 0 },
+            "heavy_light_overlaps": { "type": "integer", "minimum": 0, "description": "Pairs where exactly one window is heavy: the shared load a heavy pass ran under." },
+            "light_light_overlaps": { "type": "integer", "minimum": 0 },
+            "violations": { "type": "integer", "minimum": 0, "description": "Window pairs the policy forbids that intersect. Must be 0 for the document to publish." },
+            "missing_timestamps": { "type": "integer", "minimum": 0 },
+            "lock_wait_seconds": { "type": "number", "minimum": 0 }
+          }
         }
       }
     },
@@ -97,7 +115,24 @@
       "items": { "$ref": "#/$defs/serverResult" }
     },
     "validation_results": { "$ref": "#/$defs/validationResults" },
-    "soak_summary": { "$ref": "#/$defs/soakSummary" }
+    "soak_summary": { "$ref": "#/$defs/soakSummary" },
+    "load_windows": {
+      "type": "array",
+      "description": "Every interval this arch's runner drove load through the loadgen host, one per saturation pass and rated pass (v5.22, probatorium#442). Times are the runner's clock on the loadgen host. Not part of the published summary.json.",
+      "items": {
+        "type": "object",
+        "required": ["competitor", "scenario", "kind", "class", "start", "end"],
+        "properties": {
+          "competitor": { "type": "string" },
+          "scenario": { "type": "string" },
+          "kind": { "type": "string", "enum": ["saturation", "rated"] },
+          "target_rps": { "type": "number" },
+          "class": { "type": "string", "enum": ["heavy", "light"] },
+          "start": { "type": "string", "format": "date-time" },
+          "end": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
   },
   "$defs": {
     "nic_irq_affinity": {

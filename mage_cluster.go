@@ -995,12 +995,17 @@ func runHostsParallel(hosts []string, fn func(host string) error) error {
 
 // ── arm64 loadgen federation seam (#168) ────────────────────────────
 //
-// Today the bench fabric drives BOTH arch targets from a single amd64
-// loadgen host (msa2-client): the amd64 server (msa2-server) is driven
-// natively, but the arm64 server (msr1) is also driven by that amd64
-// client over the 20G fabric, and the two arch passes run SERIALLY
-// (BENCH_TARGET=both = two bench.yml passes back-to-back). That
-// serialization is the ~2× wall-clock the 24h budget (#166) fights.
+// The bench fabric drives BOTH arch targets from a single amd64 loadgen
+// host (msa2-client): the amd64 server (msa2-server) is driven natively,
+// but the arm64 server (msr1) is also driven by that amd64 client over the
+// 20G fabric. NOTE (probatorium#442): the two arch passes of
+// BENCH_TARGET=both do NOT run serially any more. Bench starts the two
+// bench.yml passes at the same time (the #168 wall-clock win landed on
+// 2026-08-28 without this seam; loadgenFederation below is not on that
+// path), and a host-wide lock in the runner keeps their heavy cells from
+// loading msa2-client together (BENCH_ARCH_EXCLUSIVE, mage_bench_archexcl.go).
+// The text below is the original #168 design for an arm64-native loadgen,
+// where the passes would no longer share a client.
 //
 // The fix is to stand up a SECOND, arm64-native loadgen instance so
 // each arch is driven by a same-arch client, and to run the two passes
@@ -1034,9 +1039,8 @@ func runHostsParallel(hosts []string, fn func(host string) error) error {
 //      below (mirrors the VALIDATE_PARALLEL fan-out precedent).
 //   4. Reuse report.mergeHistograms UNCHANGED for across-run merge.
 //
-// Flipping budget.Profile.ArchParallel=true (the #168 wall-clock win)
-// is GATED on this seam being live — until loadgen ships linux/arm64,
-// the budget calculator must run with ArchParallel=false (serial).
+// budget.Profile.ArchParallel=true (the #168 wall-clock win) is what the
+// profiles ship today, without this seam: see the NOTE above.
 
 // arm64LoadgenEnabled reports whether the arm64-native loadgen
 // federation seam is active. It is OFF by default so deploy/bench keep

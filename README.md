@@ -300,12 +300,123 @@ The workflow publishes only rated profiles, because saturation-only data would p
 51 h for full. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
 and 69 h, because they rated every clean cell.
 
-**Rated data is not publishable yet.** [#441](https://github.com/goceleris/probatorium/issues/441) and
-[#442](https://github.com/goceleris/probatorium/issues/442) gate any rated publish, so dispatch headline
-and full with `publish=false` until both land. The runner keeps no achieved rate per pass, so no rated
-number can tell a slow server from load that loadgen never sent (#441). In the two-arch 0829 run, rated
-passes that overlapped the other arch's run of the same row, on the shared loadgen host, published
-backlog clocks far more often than the rest (#442).
+**Rated data is not publishable yet.** [#441](https://github.com/goceleris/probatorium/issues/441) gates
+any rated publish, and [#442](https://github.com/goceleris/probatorium/issues/442) does until its
+validation run has shown the arch lock below holds on the cluster, so dispatch headline and full with
+`publish=false` until both are settled. The runner keeps no achieved rate per pass, so no rated number
+can tell a slow server from load that loadgen never sent (#441).
+
+### A both-arch run: the two arches share one client (#442)
+
+`BENCH_TARGET=both` (the default) runs the x86 pass and the arm64 pass at the same time, and both are
+driven from the one loadgen host, msa2-client (#168 asked for a loadgen per arch; as landed they share
+it). One arch alone leaves msa2-client far from saturation, but two arches loading it together did not
+leave the heavy rows alone: in the 0829 run, x86 ws-large-echo passes that overlapped the arm64 run of
+the same row read a backlog clock of 1 s or more in 6 of 10 passes, against 0 of 42 for the rest, and in
+run 36441790519 the saturation numbers of the bandwidth rows moved with the other arch's load (the 2x10G
+bond carries both arches). A run made before the fix marks nothing of this.
+
+**What the harness does now.**
+
+- Every scenario has a client-load class, `heavy` or `light` ([`scenarios/clientload.go`](scenarios/clientload.go),
+  the table, its demand figures and the rule). Light is a row whose p90 stays at or below 150k requests/s
+  and 4 Gbit/s on both arches in the published 0829 run: the 11 driver rows, churn-close, get-simple-1c,
+  ws-hub-broadcast-128 and sse-fanout-128 (369 of the 813 cells). Everything else, and any scenario the
+  table does not name, is heavy (a test fails until a new scenario is classified).
+- The runner holds a host-wide `flock` on msa2-client (`/tmp/probatorium-client.lock`) around every heavy
+  cell, saturation pass, rated sweep and warmups included ([`cmd/runner/clientlock.go`](cmd/runner/clientlock.go)).
+  A heavy cell of one arch therefore waits for the other arch's heavy cell. The wait polls once a second,
+  ends with the run context, and the kernel drops the lock when a runner dies, so a runner killed by its hang
+  guard frees the other. `started_at` is stamped after the wait, so the idle wait never lands in the
+  per-scenario CPU window (`scenario_resources`); the wait is recorded as `client_lock_wait_s`. The column's
+  hang guard grows by `lockWaitAllowance` so a queued but healthy runner is not killed. The column-wide
+  `resources` mean (every scenario of the column, not the window) does include the waits.
+- The arm64 pass walks each column's cells **in reverse** (`-cell-order reverse`). The registry order runs
+  churn-close and the driver rows (light) first and the static, h2 and WebSocket/SSE rows (mostly heavy)
+  after them; reversed on one arch, the two arches' heavy cells fall in different halves of a column and
+  the lock rarely makes one wait (it matters: 57.6 h against 65.9 h in the model below). The order is recorded
+  (`environment.arch_exclusion.cell_order`). It is a comparability change for arm64 only: its heavy rows now
+  run first on a freshly started SUT and its light rows last, where every earlier arm64 run did the opposite.
+  x86, the arch #442 contaminated and the one the single-arch references are for, keeps the registry order.
+- `BENCH_ARCH_EXCLUSIVE=heavy|all|off` (workflow input `arch_exclusive`) picks the policy. `heavy` is the
+  default for `target=both`. `all` locks every cell, so the arches take turns. `off` is today's behaviour,
+  kept as a control arm: the publish gate refuses its documents.
+
+**What it costs.** `interleave.SimulateArchPlan` replays the two passes on the real 813-cell, 52-column
+grid at the `full` profile's window (`go test ./cmd/runner -run 'FullGridArchPlan|DriftSweep' -v`; the output
+of this change is in the PR). One arch alone is 50.9 h in the model (bench-full 38431303162 measured 47.6 h
+with both arches, so the model runs about 7% high). The first table starts both arches together with equal
+column set-up and walks the same order, which is the lockstep 36441790519 showed (the same cell +61 s apart);
+38431303162 was not in lockstep (median -247 s, same-row overlap fraction 0.06, #518), so "444 of 444" is the
+lockstep case, not every past run.
+
+| both-arch schedule (lockstep model) | model | vs one arch | heavy cells overlapping a heavy cell of the other arch |
+| --- | --- | --- | --- |
+| today: no lock | 50.9 h | +0% | 444 of 444 |
+| lock on heavy cells, both arches forward | 65.9 h | +30% | 0 |
+| **lock on heavy cells, arm64 cells reversed (the default)** | **57.6 h** | **+13%** | 0 |
+| lock on heavy cells, arm64 columns reversed | 58.6 h | +15% | 0 |
+| lock on every cell (`all`) | 99.7 h | +96% | 0 |
+
+The lock's cost depends on how far apart the arches run. The drift sweep moves the arm64 start by 0 to 3 h
+and the column set-up time of each arch by 0-120 s (20 points):
+
+| makespan / one arch alone | min | mean | max |
+| --- | --- | --- | --- |
+| arm64 reversed, arches within 10 min (both full runs) | 1.12 | 1.14 | 1.17 |
+| arm64 reversed, arm64 1-3 h later | 1.16 | 1.22 | 1.25 |
+| both forward, arches within 10 min | 1.15 | 1.24 | 1.30 |
+| both forward, arm64 1-3 h later | 1.11 | 1.14 | 1.21 |
+
+So the reversal pays while the arches stay together, as in both full runs, and costs a few points if one
+falls hours behind the other. A `full` target=both run goes from the measured 47.6 h to about 54 h (the
+model's 1.14 mean times 47.6 h), 53-60 h across the sweep; `budget.FitWithin` projects 58 h
+(`ArchLockOverheadHeavy` = 14%, pinned to the lockstep planner by a test) and the workflow budgets
+(40 h headline, 69 h full) cover the sweep's 1.30 worst case. `headline` goes from about 30 h to about 34 h.
+`all` is about twice. These are a model of fixed window lengths and the lock's first-come order, not a
+cluster run: how often the lock really queues a runner is the first thing the validation run measures
+(`lock_wait_seconds`).
+
+**What it does not do.** Under `heavy`, a heavy cell still shares the client with the other arch's light
+cells (793 cell pairs in the model, `heavy_light_overlaps` in the record). The residual is small by the
+numbers that chose the rule but it is an extrapolation: the client-side effect was measured on static rows
+up to 256 connections, where an x86 cell lost 0.18-0.31 requests/s per concurrent arm64 request, and the
+light rows' arm64 demand is at most 30k requests/s, about 1% of a 650k requests/s heavy cell. Nobody has
+measured it on driver traffic. `BENCH_ARCH_EXCLUSIVE=all` removes it at about twice the wall-clock.
+
+**The check on a finished run.** Every saturation and every rated pass records the interval it drove load
+in, on msa2-client's own clock (the same clock for both arches), kept or skipped
+(`cell.pass_windows` in `raw/<host>.json`). `Bench` folds them into `load_windows` of each
+`results-<arch>.json` and, since each arch is published alone, stamps the cross-arch verdict into both:
+`environment.arch_exclusion` (policy, peer arch, cell order, windows checked, `heavy_heavy_overlaps`,
+`heavy_light_overlaps`, `light_light_overlaps`, `violations`, `missing_timestamps`, `lock_wait_seconds`;
+schema 5.22). `report.CheckArchOverlap` is the check, with a fixture self-test (a clean pair, a pair with
+one overlapping heavy pass, the policies, windows with no usable timestamps). It runs three times:
+
+- in `Bench`, which prints the report after the merge;
+- in the publish gate (`checkDataCompleteness`): a document whose verdict shows a violation, a window that
+  could not be checked, or policy `off` is refused (`BENCH_PUBLISH_FORCE=1` overrides, as for the other
+  completeness checks);
+- on demand, `mage BenchArchOverlap` (`BENCH_RESULTS_DIR`, default the latest run; `BENCH_ARCH_EXCLUSIVE`
+  to check against another policy), which reads the two `results-<arch>.json` and fails on a forbidden
+  overlap, a window without timestamps, or documents with no `load_windows` at all.
+
+`load_windows` stays in `results-<arch>.json` (the run artifact); the published `summary.json` drops it,
+and `env.json` keeps the verdict.
+
+**Results from before the fix.** No earlier field says a document came from a both-arch run, so the mark is
+a rule, not a flag. A `results-<arch>.json` or published cell with **no `environment.arch_exclusion` and
+`schema_version` below 5.22** that came from a `target=both` run ran the arches concurrently with nothing
+excluded. Such a run is recognisable by its two arch documents carrying the same `benchmark_config.started_at`
+(Bench stamps one start for both; checked on the results of runs 33256654220 and 37091941051, where
+`started_at` is identical to the nanosecond and `finished_at` differs by under 3 s) and by the workflow's
+dispatch input `target`. The runs this applies to
+include 33256654220 (0829), 36441790519 and 38431303162 (bench-full). A post-fix both-arch document always
+carries `arch_exclusion`, whatever the policy, so absence can no longer be read two ways. The docs site
+does not flag it yet; that is for goceleris/docs.
+
+**Validation owed.** Nothing above has run on the cluster. The scoped both-arch run that checks it (about
+1 h, pre-registered) is in [`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md).
 
 ### Result: latency at SLO
 
@@ -577,8 +688,9 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `Status` | Cluster reachability and manifest state | |
 | `Deploy` | Cross-compile and stage every binary | `CLUSTER_USE_LAN`, `DEPLOY_COMPETITORS=all\|go-only\|none\|<list>`, `DEPLOY_NEEDS_DBSERVICES` |
 | `Cleanup` | Undo what a run installed, per the host manifests | `CLEANUP_HOSTS=all\|<list>` |
-| `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_RATED_CELLS` (default: the rated cells), `BENCH_SUT_ENV`, `CELERIS_VERSION` |
+| `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_ARCH_EXCLUSIVE` (`both` only: `heavy` default, `all`, `off`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_RATED_CELLS` (default: the rated cells), `BENCH_SUT_ENV`, `CELERIS_VERSION` |
 | `BenchTier` | A profile-driven run over the whole grid; publishes it unless `BENCH_PUBLISH=0` | `BENCH_PROFILE=fast\|headline\|full`, `BENCH_BUDGET`, `BENCH_TARGET`, `BENCH_SKIP_RATED`, `BENCH_PUBLISH`, `BENCH_BASELINE=1` (see [Same-run celeris baseline](#same-run-celeris-baseline)) |
+| `BenchArchOverlap` | Check a finished both-arch run for overlap between the arches' load windows (#442); fails on a forbidden overlap | `BENCH_RESULTS_DIR` (default the latest run), `BENCH_ARCH_EXCLUSIVE` |
 | `BenchSince` | Compare against a baseline version | `BASELINE_VERSION` (default `v1.4.2`), `REGRESSION_THRESHOLD` (default `0.05`) |
 | `Validate` | A validation run, one cell or the matrix | `VALIDATE_TARGET` (default `both`), `VALIDATE_DURATION` (default `6h`), `VALIDATE_MATRIX=1`, `VALIDATE_MATRIX_REFAPPS`, `VALIDATE_MATRIX_ENGINES`, `VALIDATE_PARALLEL=1`, `VALIDATE_DBSERVICES=1`, `VALIDATE_CONCURRENCY`, `VALIDATE_RESUME_FROM`, `CELERIS_VERSION`, `PROBATORIUM_VALIDATE_DRIVER=ssh` |
 | `Soak` | A long validation run | `SOAK_DURATION` (default `24h`), plus the `Validate` knobs |

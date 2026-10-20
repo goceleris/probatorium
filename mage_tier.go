@@ -68,6 +68,7 @@ import (
 //	                           for the exhaustive sweep (~30h on one arch,
 //	                           needs a raised BENCH_BUDGET). Default: full.
 //	BENCH_TARGET=both          msa2-server | msr1 | both (both = 2 arches)
+//	BENCH_ARCH_EXCLUSIVE=      both only: heavy (default) | all | off, see Bench
 //	BENCH_SKIP_RATED=          "1" runs saturation passes only. Every
 //	                           cell still runs the saturation pass; the
 //	                           rated sweep is skipped per-cell.
@@ -84,13 +85,20 @@ func BenchTier() error {
 	p := budget.ForProfile(os.Getenv("BENCH_PROFILE"))
 	// The bench ALWAYS runs exactly one pass; profiles ship Runs=1.
 	p.Runs = 1
-	// Arch count drives the cost model: BENCH_TARGET=both is two arches
-	// (serial today — #168 ArchParallel is blocked on loadgen arm64).
-	if envOrDefault("BENCH_TARGET", defaultClusterTarget) == "both" {
+	// Arch count drives the cost model: BENCH_TARGET=both is two arches, run
+	// concurrently from the one msa2-client (#168), under the cross-arch client
+	// lock (BENCH_ARCH_EXCLUSIVE, probatorium#442), which costs wall-clock.
+	target := envOrDefault("BENCH_TARGET", defaultClusterTarget)
+	if target == "both" {
 		p.Arches = 2
 	} else {
 		p.Arches = 1
 	}
+	archPolicy, err := resolveArchExclusion(target)
+	if err != nil {
+		return err
+	}
+	p.ArchExclusion = archPolicy
 
 	// The fit budget defaults to the 24h weekly cluster invariant
 	// (budget.Budget) but can be raised per-invocation via BENCH_BUDGET for

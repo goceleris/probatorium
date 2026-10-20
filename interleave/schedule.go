@@ -54,3 +54,23 @@ func Schedule(runs int, ss []scenarios.Scenario, sv []servers.Server) []Cell {
 	}
 	return out
 }
+
+// ReverseWithinRuns returns cells with the order inside every run reversed and
+// the runs themselves kept in order: run 0's cells last to first, then run 1's.
+// A BENCH_TARGET=both run walks its arm64 half this way so the heavy cells of
+// the two arches fall in different halves of a column (probatorium#442). The
+// input is not modified.
+func ReverseWithinRuns(cells []Cell) []Cell {
+	out := make([]Cell, 0, len(cells))
+	for lo := 0; lo < len(cells); {
+		hi := lo
+		for hi < len(cells) && cells[hi].RunIdx == cells[lo].RunIdx {
+			hi++
+		}
+		for i := hi - 1; i >= lo; i-- {
+			out = append(out, cells[i])
+		}
+		lo = hi
+	}
+	return out
+}

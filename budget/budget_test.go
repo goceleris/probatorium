@@ -328,3 +328,30 @@ func TestBaselineProjection(t *testing.T) {
 		}
 	}
 }
+
+// TestArchExclusionPricesTheClientLock: a both-arch run under the client lock
+// (probatorium#442) costs one arch's wall-clock plus the lock overhead; with the
+// lock on every cell the arches take turns (about two arches' worth); with no
+// lock it is the plain parallel wall-clock.
+func TestArchExclusionPricesTheClientLock(t *testing.T) {
+	mk := func(excl string) Profile {
+		p := Full()
+		p.Arches, p.ArchParallel, p.ArchExclusion = 2, true, excl
+		return p
+	}
+	one := Full()
+	oneArch := one.WallClock()
+	if got := mk("").WallClock(); got != oneArch {
+		t.Fatalf("no lock: %v, want one arch's %v", got, oneArch)
+	}
+	heavy := mk("heavy").WallClock()
+	if want := time.Duration(float64(oneArch) * (1 + ArchLockOverheadHeavy)); heavy < want-time.Millisecond || heavy > want+time.Millisecond {
+		t.Fatalf("heavy lock: %v, want %v", heavy, want)
+	}
+	if all := mk("all").WallClock(); all < 2*oneArch-time.Minute || all > 2*oneArch+time.Minute {
+		t.Fatalf("lock on every cell: %v, want about two arches' %v", all, 2*oneArch)
+	}
+	if oneArch >= heavy || heavy >= mk("all").WallClock() {
+		t.Fatal("policies must cost off < heavy < all")
+	}
+}

@@ -66,6 +66,9 @@ type BuildInput struct {
 	Agg             map[string]CellAggregate
 	Validation      *ValidationResults
 	Soak            *SoakSummary
+	// LoadWindows are the arch's pass intervals (schema 5.22); copied to the
+	// Document unchanged, in the order given.
+	LoadWindows []LoadWindow
 }
 
 // BuildDocument folds a per-cell aggregate map into the canonical v5.1
@@ -224,6 +227,7 @@ func BuildDocument(in BuildInput) *Document {
 		BenchmarkConfig: in.BenchmarkConfig,
 		Validation:      in.Validation,
 		Soak:            in.Soak,
+		LoadWindows:     in.LoadWindows,
 	}
 	names := make([]string, 0, len(byAdapter))
 	for k := range byAdapter {

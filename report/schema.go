@@ -304,7 +304,24 @@ import (
 //     placement (every amd64 run). A changed placement changes
 //     comparability. Nothing is gated. Additive; older readers ignore the
 //     field.
-const SchemaVersion = "5.21"
+//   - 5.22 — arch exclusion on a BENCH_TARGET=both run (probatorium#442).
+//     Both arches are driven from msa2-client at the same time, and a
+//     heavy cell of one arch that overlapped the other arch's heavy cell
+//     read backlog clocks (ws-large-echo 6 of 10 overlapping x86 passes at
+//     1 s or more, 0 of 42 others, run 33256654220). The runner now holds
+//     a host-wide lock around every heavy cell and records the interval of
+//     every saturation and rated pass. Adds Document.LoadWindows
+//     (load_windows: competitor, scenario, kind, class, start, end, and the
+//     target of a rated pass) and Environment.ArchExclusion
+//     (arch_exclusion: the policy, this arch's cell order, the peer arch,
+//     the overlap counts of the finished run and the lock wait). Both are
+//     omitted on single-arch runs. A document from a both-arch run that
+//     lacks arch_exclusion predates the fix: the arches ran concurrently
+//     with nothing excluded. load_windows stays in results-<arch>.json; the
+//     published summary.json drops it (SplitDocument) and env.json keeps
+//     the verdict. The publish gate refuses a document whose verdict shows
+//     a forbidden overlap. Additive; older readers ignore both fields.
+const SchemaVersion = "5.22"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -482,6 +499,14 @@ type Document struct {
 	// Soak, when non-nil, attaches the long-running soak summary
 	// produced by the validator-replay harness. Optional.
 	Soak *SoakSummary `json:"soak_summary,omitempty"`
+
+	// LoadWindows is every interval this arch's runner drove load through
+	// the loadgen host: one per saturation pass and one per rated pass
+	// (schema 5.22, probatorium#442). The cross-arch overlap check
+	// (CheckArchOverlap) reads it. Omitted when the run recorded none
+	// (single-arch runs, pre-5.22 runner output). It stays in the results
+	// file and is not part of the published summary.json.
+	LoadWindows []LoadWindow `json:"load_windows,omitempty"`
 }
 
 // Environment captures the host fabric and the kernel/sysctl knobs the
@@ -525,6 +550,14 @@ type Environment struct {
 	// or msr1 with the placement variable emptied), so a run without one
 	// is distinguishable from a run with one.
 	NICIRQPlacement *NICIRQPlacement `json:"nic_irq_placement,omitempty"`
+
+	// ArchExclusion is the arch-exclusion verdict of a BENCH_TARGET=both run
+	// (schema 5.22, probatorium#442), computed at merge time from both
+	// arches' load windows and stamped into both documents. Nil on a
+	// single-arch run and on every document written before 5.22; on a
+	// both-arch document nil means the arches ran concurrently with
+	// nothing excluded.
+	ArchExclusion *ArchExclusion `json:"arch_exclusion,omitempty"`
 }
 
 // NICIRQPlacement is the record ansible/files/nic_irq_pin.sh prints and

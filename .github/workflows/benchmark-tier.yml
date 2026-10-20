@@ -54,7 +54,7 @@ on:
         type: string
         default: headline
       target:
-        description: "Bench SUT (BENCH_TARGET): 'both' (DEFAULT — msa2-server amd64 AND msr1 arm64, driven IN PARALLEL by the oversized msa2-client loadgen) | 'msa2-server' | 'msr1'."
+        description: "Bench SUT (BENCH_TARGET): 'both' (DEFAULT — msa2-server amd64 AND msr1 arm64, driven IN PARALLEL by the one msa2-client loadgen, with a host-wide lock so a heavy cell of one arch never overlaps a heavy cell of the other, probatorium#442) | 'msa2-server' | 'msr1'."
         required: false
         type: string
         default: both
@@ -86,6 +86,16 @@ on:
         default: ""
       cells:
         description: "Cell glob(s) to bench (BENCH_CELLS) over '<scenario>/<competitor>', comma-separated, '!' prefix excludes — e.g. 'ws-large-echo/*,ws-echo/*,get-json/*' runs only those three scenarios on the columns `competitors` selects. Default '' = the profile's own full glob. NOTE: the budget projection still counts the profile's full grid (a scoped run passes it trivially), and one column pass still runs ONE mpstat/observer for all matched scenarios — read benchmarks[].scenario_resources (per-scenario window) rather than resources (column-wide mean) for per-cell CPU."
+        required: false
+        type: string
+        default: ""
+      rated_cells:
+        description: "Cells that get the rated sweep (BENCH_RATED_CELLS): a glob over '<scenario>/<competitor>', comma-separated, '!' prefix excludes — e.g. 'ws-large-echo/*,post-4k/*'. Default '' = the budget model's rated cells (budget.RatedScenarios). Only matters when the profile rates (headline, full). Lets a scoped run rate a row the model does not, such as ws-large-echo for the probatorium#442 validation, without a throwaway branch."
+        required: false
+        type: string
+        default: ""
+      arch_exclusive:
+        description: "Arch exclusion on target=both (BENCH_ARCH_EXCLUSIVE, probatorium#442): 'heavy' (DEFAULT when empty) = a heavy cell of one arch never overlaps a heavy cell of the other (about +14% wall-clock) | 'all' = the arches never overlap (about twice the wall-clock) | 'off' = the pre-fix concurrency, a control arm only: the publish gate refuses its documents. Ignored for a single-arch target."
         required: false
         type: string
         default: ""
@@ -153,6 +163,10 @@ jobs:
       BENCH_TARGET: ${{ github.event.inputs.target || 'both' }}
       # Column subset to BENCH for a targeted re-run; 'all' on schedule/default.
       BENCH_COMPETITORS: ${{ github.event.inputs.competitors || 'all' }}
+      # Rated scope and arch exclusion (probatorium#442). Empty = the defaults
+      # (the model's rated cells; heavy). Job-level like BENCH_TARGET.
+      BENCH_RATED_CELLS: ${{ github.event.inputs.rated_cells || '' }}
+      BENCH_ARCH_EXCLUSIVE: ${{ github.event.inputs.arch_exclusive || '' }}
       # Binary/module set to BUILD+DEPLOY. MUST be job-level (not just the
       # Deploy step): BenchTier runs an internal auto-deploy when no manifest
       # is present (always true right after the prior run's Cleanup), and that
@@ -292,6 +306,9 @@ jobs:
           # PROJECTED by budget.FitWithin for 2 parallel arches (probatorium#418):
           #   headline 29h50m = 813 x 1m9s saturation + 401 rated cells x 2m8s
           #   full     50h58m = 813 x 2m7s saturation + 401 rated cells x 3m20s
+          # a target=both run adds the client lock of probatorium#442 on top
+          # (budget.ArchLockOverheadHeavy, 14%): headline ~34h, full ~58h; the
+          # budgets below are raised to keep the same 18-21% margin.
           # (a rated cell adds 4 passes x (saturation warmup + rated window)).
           # The runs before #418 measured ~53h (headline) and ~69h (full)
           # against projections of 26h35m and 44h31m. Per-cell overhead was
@@ -306,7 +323,7 @@ jobs:
           # (budget.BaselineRealizedCells), +14.5 h projected on full and
           # +8.5 h on headline: 29h50m -> 38h22m (48h), 50h58m -> 65h28m (80h).
           # fast stays under 24h (+3.8 h). budget_test.go pins these.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && (github.event.inputs.baseline == 'true' && '48h' || '36h') || (github.event.inputs.baseline == 'true' && '80h' || '60h')) }}
+          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && (github.event.inputs.baseline == 'true' && '48h' || '40h') || (github.event.inputs.baseline == 'true' && '80h' || '69h')) }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 

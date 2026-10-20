@@ -194,6 +194,24 @@ type Config struct {
 	// match mirrors the per-cell ids the bench actually schedules. Empty =
 	// full local adapter registry.
 	Competitors string
+
+	// ClientLock is the path of the host-wide lock file that keeps the two
+	// arch runners of a BENCH_TARGET=both run from driving the shared loadgen
+	// host with heavy cells at the same time (probatorium#442,
+	// clientlock.go). Empty = no lock (single-arch runs). Remote-target mode
+	// only.
+	ClientLock string
+	// ClientLockPolicy is which cells take the lock: heavy (default when
+	// ClientLock is set), all, or off.
+	ClientLockPolicy string
+	// CellOrder is the order the runner walks its schedule: forward (the
+	// registry order, default) or reverse. A BENCH_TARGET=both run walks the
+	// arm64 column reversed so the two arches' heavy cells fall in different
+	// halves of a column and the lock rarely has to make one wait.
+	CellOrder string
+
+	// lock is built from ClientLock / ClientLockPolicy by run().
+	lock *clientLock
 }
 
 // defaultRatedFractions is the saturation-relative sweep used when none is
@@ -255,6 +273,12 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 		"resolve -cells (scoped by -competitors) and print the docker service kinds the bench needs, one per line, then exit")
 	fs.StringVar(&c.Competitors, "competitors", c.Competitors,
 		"comma list of competitor column slugs scoping -print-required-services; empty = full adapter registry")
+	fs.StringVar(&c.ClientLock, "client-lock", c.ClientLock,
+		"path of the host-wide lock file shared by both arch runners of a BENCH_TARGET=both run; a heavy cell holds it so the arches never load the client together (probatorium#442); empty = no lock")
+	fs.StringVar(&c.ClientLockPolicy, "client-lock-policy", c.ClientLockPolicy,
+		"which cells take the -client-lock: heavy (default), all, or off")
+	fs.StringVar(&c.CellOrder, "cell-order", c.CellOrder,
+		"order the schedule is walked: forward (default) or reverse")
 	fs.Func("rated-fractions",
 		"comma-separated saturation fractions for the rated sweep (default 0.25,0.5,0.75,0.9)",
 		func(s string) error {
@@ -335,6 +359,27 @@ type cellResultFile struct {
 	// each carrying the target RPS and the CO-corrected P99 at that load.
 	// Empty unless rated mode ran.
 	RatedPasses []ratedPassFile `json:"rated_passes,omitempty"`
+
+	// LoadClass is the scenario's client-load class, heavy or light
+	// (scenarios.ClientLoadOf). Recorded on every cell that drove load.
+	LoadClass string `json:"load_class,omitempty"`
+	// ClientLockWaitS is how long the cell waited for the cross-arch client
+	// lock before it started (probatorium#442). started_at is stamped after
+	// the wait, so the per-scenario CPU window never includes it.
+	ClientLockWaitS float64 `json:"client_lock_wait_s,omitempty"`
+	// PassWindows is every interval the cell drove load: the saturation pass
+	// and each rated pass attempted, kept or skipped. The cross-arch overlap
+	// check reads them (report.CheckArchOverlap).
+	PassWindows []passWindowFile `json:"pass_windows,omitempty"`
+}
+
+// passWindowFile is one load pass's interval on the loadgen host's clock: from
+// just before loadgen starts (its warmup is inside) to just after it returns.
+type passWindowFile struct {
+	Kind      string    `json:"kind"` // report.LoadKindSaturation | report.LoadKindRated
+	TargetRPS float64   `json:"target_rps,omitempty"`
+	Start     time.Time `json:"start"`
+	End       time.Time `json:"end"`
 }
 
 // ratedPassFile is one rated pass recorded in the per-cell JSON.
@@ -592,6 +637,18 @@ func run(cfg Config) error {
 	}
 
 	schedule := interleave.Schedule(cfg.Runs, effSc, srvs)
+	schedule, err = orderSchedule(schedule, cfg.CellOrder)
+	if err != nil {
+		return err
+	}
+	lock, err := newClientLock(cfg.ClientLock, cfg.ClientLockPolicy, os.Stderr)
+	if err != nil {
+		return err
+	}
+	if cfg.ClientLock != "" && cfg.Target == "" {
+		return errors.New("-client-lock applies to remote-target mode only (-target)")
+	}
+	cfg.lock = lock
 
 	if cfg.ResumeFrom != "" {
 		full := len(schedule)
@@ -1207,6 +1264,30 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 		probeAddr = bindAddr
 	}
 
+	// The cross-arch client lock (probatorium#442): a heavy cell holds it from
+	// here to the end of its rated sweep, so no heavy cell of the other arch
+	// loads the shared loadgen host meanwhile. The wait is not part of the
+	// cell: started_at is stamped after it, which keeps the idle wait out of
+	// the per-scenario CPU window (started_at + warmup .. completed_at).
+	cellRes.LoadClass = string(scenarios.ClientLoadOf(cell.Scenario.Name()))
+	releaseLock, waited, lerr := cfg.lock.acquire(parent, cell.Scenario.Name())
+	if lerr != nil {
+		// Only a cancelled wait is a harness-side interruption; any other lock
+		// error (open, flock) is a failure of this cell and must not be
+		// merged as one.
+		prefix := "client-lock: "
+		if errors.Is(lerr, context.Canceled) || errors.Is(lerr, context.DeadlineExceeded) {
+			prefix = "interrupted: "
+		}
+		cellRes.Error = prefix + lerr.Error()
+		return cellOutcome{}, lerr
+	}
+	defer releaseLock()
+	if waited > 0 {
+		cellRes.ClientLockWaitS = waited.Seconds()
+		cellRes.StartedAt = time.Now().UTC()
+	}
+
 	lgCfg := buildCellConfig(cell, lgURL, cfg)
 
 	timeout := 5*cfg.Warmup + 2*cfg.Duration + 60*time.Second
@@ -1218,7 +1299,10 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 		cellRes.Error = "loadgen.New: " + err.Error()
 		return cellOutcome{}, err
 	}
+	satStart := time.Now().UTC()
 	res, err := bm.Run(cellCtx)
+	cellRes.PassWindows = append(cellRes.PassWindows, passWindowFile{
+		Kind: report.LoadKindSaturation, Start: satStart, End: time.Now().UTC()})
 	if err != nil {
 		cellRes.Error = loadgenRunCellError(parent, err, probeAddr)
 		return cellOutcome{}, errors.New(cellRes.Error)
@@ -1289,11 +1373,24 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	// scale anchor, so the targets stay adapter-relative.
 	if cfg.ratesCell(cell.Scenario.Name()+"/"+cell.Server.Name()) && res != nil && res.RequestsPerSec > 0 {
 		cellRes.SaturationModeRPS = res.RequestsPerSec
-		samples, passes := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
+		samples, passes, windows := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
 		oc.RatedSamples = samples
 		cellRes.RatedPasses = passes
+		cellRes.PassWindows = append(cellRes.PassWindows, windows...)
 	}
 	return oc, nil
+}
+
+// orderSchedule applies -cell-order to the schedule: forward (or empty) keeps
+// the registry order, reverse walks each run last to first (probatorium#442).
+func orderSchedule(schedule []interleave.Cell, order string) ([]interleave.Cell, error) {
+	switch order {
+	case "", "forward":
+		return schedule, nil
+	case "reverse":
+		return interleave.ReverseWithinRuns(schedule), nil
+	}
+	return nil, fmt.Errorf("-cell-order %q: want forward or reverse", order)
 }
 
 // completedCell carries the facts classifyCompletedCell folds into a
@@ -1545,9 +1642,10 @@ func (c Config) ratesCell(id string) bool {
 // for aggregation plus the on-disk pass records. A pass that errors or returns
 // zero requests is skipped rather than failing the cell — a partial sweep is
 // still useful, and the saturation pass already succeeded.
-func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, saturationRPS float64) ([]report.RatedSample, []ratedPassFile) {
+func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, saturationRPS float64) ([]report.RatedSample, []ratedPassFile, []passWindowFile) {
 	var samples []report.RatedSample
 	var passes []ratedPassFile
+	var windows []passWindowFile
 	for _, frac := range cfg.RatedFractions {
 		target := saturationRPS * frac
 		if target <= 0 {
@@ -1565,8 +1663,11 @@ func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, satu
 			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: loadgen.New: %v\n", target, err)
 			continue
 		}
+		passStart := time.Now().UTC()
 		rres, err := bm.Run(ctx)
 		cancel()
+		windows = append(windows, passWindowFile{
+			Kind: report.LoadKindRated, TargetRPS: target, Start: passStart, End: time.Now().UTC()})
 		if err != nil || rres == nil || rres.Requests == 0 {
 			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: skipped (err=%v)\n", target, err)
 			continue
@@ -1574,7 +1675,7 @@ func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, satu
 		samples = append(samples, report.RatedSample{TargetRPS: target, P99: rres.Latency.P99})
 		passes = append(passes, ratedPassFile{TargetRPS: target, P99: rres.Latency.P99})
 	}
-	return samples, passes
+	return samples, passes, windows
 }
 
 // adapterServer adapts an [servers.Adapter] to the in-process
