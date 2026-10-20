@@ -18,8 +18,10 @@ import (
 // One ss snapshot cannot tell them apart; two a few seconds apart, with the
 // walker still draining the echoes in between, can:
 //
-//	SLOW_CLASS   the server read bytes (Recv-Q fell) or echoes arrived
-//	             between the two instants: it is delivering, only late.
+//	SLOW_CLASS   the server read bytes (Recv-Q fell) or new bytes reached the
+//	             client between the two instants: it is delivering, only late.
+//	             Bytes the client's own kernel queue already held at t0 do not
+//	             count: the client reads them whatever the server does.
 //	WEDGE_CLASS  bytes sit unread (Recv-Q above zero at both instants and not
 //	             falling) and no echo arrived: it delivers nothing.
 //	INDETERMINATE  anything else, above all missing data. A socket that
@@ -183,8 +185,8 @@ type echoInstant struct {
 	At time.Time
 	// Echoes is the number of echo frames the walker had read back, Sent the
 	// highest sequence it had written, BytesIn the bytes it had pulled off the
-	// socket in all. BytesIn is the progress counter that survives a read cut
-	// in the middle of a frame; Echoes only moves on whole frames.
+	// socket in all. BytesIn is the progress counter: it survives a read cut in
+	// the middle of a frame, which Echoes does not.
 	Echoes, Sent, BytesIn uint64
 	// SSErr says why no ss output exists ("" when it ran).
 	SSErr string
@@ -201,22 +203,25 @@ type wsEchoVerdict struct {
 	Line string
 }
 
-// wsEchoClassify draws the verdict from the two instants. t0 is the earlier.
+// wsEchoClassify draws the verdict from the two instants. t0 is the earlier;
+// At of t0 is when the client resumed reading and At of t1 when it stopped, so
+// the window is the time the walker spent reading.
 //
-// Order matters. Echo progress (a whole echo, or any byte at all) is the
-// walker's own counter and needs no ss, so it decides first: bytes that
-// arrived in the window are a server that delivers. Next the data must exist (both server sockets found) and the
-// window must be long enough. Then Recv-Q: a fall is a server that reads; a
-// queue above zero at both instants that did not fall, with no echo, is one
-// that does not. Everything else is INDETERMINATE.
+// Order matters. New bytes at the client are the walker's own counter and need
+// no ss, so they decide first: bytes that arrived in the window and were not
+// already in the client's kernel queue at t0 (its Recv-Q, which the client
+// reads whatever the server does) are a server that delivers. Next the data
+// must exist (both server sockets found). Then Recv-Q: a fall is a server that
+// reads; a queue above zero at both instants that did not fall, with nothing
+// new at the client, is one that does not. Everything else is INDETERMINATE.
 func wsEchoClassify(t0, t1 echoInstant) wsEchoVerdict {
 	window := t1.At.Sub(t0.At)
 	class, reason := verdictIndeterminate, ""
 	switch {
 	case window < wsEchoMinWindow:
 		reason = "window_too_short"
-	case t1.Echoes > t0.Echoes || t1.BytesIn > t0.BytesIn:
-		class, reason = verdictSlow, "echo_progress"
+	case bytesNew(t0, t1) > 0:
+		class, reason = verdictSlow, "bytes_arrived"
 	case t0.Server == nil:
 		reason = "server_socket_missing_t0"
 	case t1.Server == nil:
@@ -233,11 +238,22 @@ func wsEchoClassify(t0, t1 echoInstant) wsEchoVerdict {
 	return wsEchoVerdict{Class: class, Reason: reason, Line: verdictLine(class, reason, window, t0, t1)}
 }
 
+// bytesNew is the bytes the walker took off the socket between the instants
+// beyond what its own kernel queue already held at t0. With no client socket
+// in the t0 ss output nothing is subtracted.
+func bytesNew(t0, t1 echoInstant) int64 {
+	n := int64(t1.BytesIn) - int64(t0.BytesIn)
+	if t0.Client != nil {
+		n -= t0.Client.RecvQ
+	}
+	return n
+}
+
 // verdictLine formats the record. An absent number is "na", never zero.
 func verdictLine(class, reason string, window time.Duration, t0, t1 echoInstant) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "WS_ECHO_VERDICT=%s reason=%s window_ms=%d echoes_t0=%d echoes_t1=%d bytes_in_t0=%d bytes_in_t1=%d sent=%d",
-		class, reason, window.Milliseconds(), t0.Echoes, t1.Echoes, t0.BytesIn, t1.BytesIn, max(t0.Sent, t1.Sent))
+	fmt.Fprintf(&b, "WS_ECHO_VERDICT=%s reason=%s window_ms=%d echoes_t0=%d echoes_t1=%d bytes_in_t0=%d bytes_in_t1=%d bytes_new=%d sent=%d",
+		class, reason, window.Milliseconds(), t0.Echoes, t1.Echoes, t0.BytesIn, t1.BytesIn, bytesNew(t0, t1), max(t0.Sent, t1.Sent))
 	kv := func(name string, v int64, ok bool) {
 		if ok {
 			fmt.Fprintf(&b, " %s=%d", name, v)
@@ -256,6 +272,11 @@ func verdictLine(class, reason string, window time.Duration, t0, t1 echoInstant)
 		n, ok = in.Server.Int("rcv_wnd")
 		kv("srv_rcv_wnd_"+t, n, ok)
 		kv("cli_sendq_"+t, sendQ(in.Client), in.Client != nil)
+		kv("cli_recvq_"+t, recvQ(in.Client), in.Client != nil)
+		// Bytes the refapp has handed to the server socket in all (acked plus
+		// still queued): moves only when the application writes.
+		acked, ok := in.Server.Int("bytes_acked")
+		kv("srv_written_"+t, acked+sendQ(in.Server), ok && in.Server != nil)
 	}
 	return b.String()
 }

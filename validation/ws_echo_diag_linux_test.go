@@ -18,12 +18,20 @@ import (
 // parser text; this one is where a changed ss spelling, a filter the ss of a
 // runner rejects, or a /proc layout surprise would show.
 func TestDefaultSS_LiveLoopbackShowsTheUnreadBytes(t *testing.T) {
+	// In CI the test must run: a skip there would leave "Linux evidence" that
+	// is only an absence.
+	skipOrFail := func(why string) {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("CI is set and the live ss leg cannot run: %s", why)
+		}
+		t.Skip(why)
+	}
 	if !hasBinary("ss") {
-		t.Skip("ss (iproute2) is not installed")
+		skipOrFail("ss (iproute2) is not installed")
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Skip("no loopback listener")
+		skipOrFail("no loopback listener")
 	}
 	defer func() { _ = ln.Close() }()
 	accepted := make(chan net.Conn, 1)

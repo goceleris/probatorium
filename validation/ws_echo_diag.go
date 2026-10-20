@@ -41,9 +41,15 @@ import (
 // wsEchoDiagWindow is the gap between the two instants.
 var wsEchoDiagWindow = 3 * time.Second
 
-// wsEchoDiagCaptureBudget bounds one instant's host calls (ss, the refapp's
-// side listener); the window is measured around them, not including them.
-var wsEchoDiagCaptureBudget = 4 * time.Second
+// The two host calls of one instant are capped separately, and the window is
+// measured AFTER the first instant's calls and BEFORE the second's, so a slow
+// call can neither eat the window nor stretch it. The refapp leg is the one
+// that can be slow: it is served by a goroutine of the very process whose
+// scheduling is in question.
+var (
+	wsEchoDiagSSBudget     = 2 * time.Second
+	wsEchoDiagRefappBudget = 1500 * time.Millisecond
+)
 
 // wsEchoDiagPerCell bounds the diagnosed fires per cell: each holds the
 // walker for the window, and a second one in a cell that is already ending
@@ -101,8 +107,6 @@ func defaultSS(ctx context.Context, clientPort int) (string, error) {
 // instant takes one instant's view: the counters first, then ss, then the
 // refapp. The text is what goes into the dossier for it.
 func (d *wsEchoDiag) instant(ctx context.Context, label string, clientPort int, received, sent, bytesIn *atomic.Uint64) (echoInstant, string) {
-	cctx, cancel := context.WithTimeout(ctx, wsEchoDiagCaptureBudget)
-	defer cancel()
 	in := echoInstant{At: time.Now(), Echoes: received.Load(), Sent: sent.Load(), BytesIn: bytesIn.Load()}
 	var b strings.Builder
 	fmt.Fprintf(&b, "### %s %s echoes=%d bytes_in=%d sent=%d client_port=%d\n", label, in.At.UTC().Format(time.RFC3339Nano), in.Echoes, in.BytesIn, in.Sent, clientPort)
@@ -110,7 +114,9 @@ func (d *wsEchoDiag) instant(ctx context.Context, label string, clientPort int, 
 	if ss == nil {
 		ss = defaultSS
 	}
-	text, err := ss(cctx, clientPort)
+	sctx, cancel := context.WithTimeout(ctx, wsEchoDiagSSBudget)
+	text, err := ss(sctx, clientPort)
+	cancel()
 	if err != nil {
 		in.SSErr = err.Error()
 		fmt.Fprintf(&b, "ss error: %v\n", err)
@@ -124,9 +130,34 @@ func (d *wsEchoDiag) instant(ctx context.Context, label string, clientPort int, 
 		fmt.Fprintf(&b, "note: no server-end socket with peer port %d in the ss output\n", clientPort)
 	}
 	if d.Refapp != nil {
-		fmt.Fprintf(&b, "--- refapp state at %s\n%s\n", label, strings.TrimRight(d.Refapp(cctx), "\n"))
+		state, ok := callWithin(ctx, wsEchoDiagRefappBudget, d.Refapp)
+		if !ok {
+			state = fmt.Sprintf("refapp state not read within %s (the refapp's own listener did not answer; this is a finding)", wsEchoDiagRefappBudget)
+		}
+		fmt.Fprintf(&b, "--- refapp state at %s\n%s\n", label, strings.TrimRight(state, "\n"))
 	}
 	return in, b.String()
+}
+
+// callWithin runs fn with a context that ends after d, and gives up waiting
+// for it then: ok is false when fn had not returned. fn may keep running in the
+// background until it notices its context; the caller must not need it.
+func callWithin(ctx context.Context, d time.Duration, fn func(context.Context) string) (string, bool) {
+	cctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	done := make(chan string, 1)
+	go func() { done <- fn(cctx) }()
+	select {
+	case s := <-done:
+		return s, true
+	case <-cctx.Done():
+		select {
+		case s := <-done:
+			return s, true
+		default:
+			return "", false
+		}
+	}
 }
 
 // run is the diagnosis of one timed-out fire: conn is still open and the
@@ -139,13 +170,16 @@ func (d *wsEchoDiag) run(ctx context.Context, conn net.Conn, br *bufio.Reader, r
 		clientPort = a.Port
 	}
 	t0, text0 := d.instant(ctx, "t0", clientPort, received, sent, bytesIn)
+	// The window starts when the client starts reading again, after the first
+	// instant's host calls, so a slow call cannot eat it.
+	t0.At = time.Now()
 	end := wsEchoDiagDrain(ctx, conn, br, t0.At.Add(wsEchoDiagWindow))
 	t1, text1 := d.instant(ctx, "t1", clientPort, received, sent, bytesIn)
 	v := wsEchoClassify(t0, t1)
 	v.Line += " window_end=" + end
 	var b strings.Builder
 	b.WriteString(v.Line + "\n")
-	fmt.Fprintf(&b, "# window %s configured %s; the sender was stopped and the walker kept reading echoes between the instants\n",
+	fmt.Fprintf(&b, "# window %s read, configured %s; the sender was stopped and the walker kept reading between the instants\n",
 		t1.At.Sub(t0.At).Round(time.Millisecond), wsEchoDiagWindow)
 	b.WriteString(text0)
 	b.WriteString(text1)

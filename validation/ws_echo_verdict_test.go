@@ -104,8 +104,17 @@ func srvSock(recvq int64, bytesRecv int64) *ssSock {
 
 var verdictBase = time.Date(2026, 10, 13, 15, 40, 0, 0, time.UTC)
 
+// inst builds an instant; each echo is about 64 KiB on the wire, so BytesIn
+// follows Echoes the way it does in a real fire.
 func inst(at time.Duration, echoes uint64, srv *ssSock) echoInstant {
-	return echoInstant{At: verdictBase.Add(at), Echoes: echoes, Sent: 1244, Server: srv, Client: &ssSock{State: "ESTAB", SendQ: 3071716}}
+	return echoInstant{At: verdictBase.Add(at), Echoes: echoes, BytesIn: echoes * 65546, Sent: 1244, Server: srv, Client: &ssSock{State: "ESTAB", SendQ: 3071716}}
+}
+
+func withCliRecvQ(i echoInstant, n int64) echoInstant {
+	c := *i.Client
+	c.RecvQ = n
+	i.Client = &c
+	return i
 }
 
 func withBytes(i echoInstant, n uint64) echoInstant { i.BytesIn += n; return i }
@@ -123,14 +132,18 @@ func TestWSEchoClassify(t *testing.T) {
 		{"wedge: Recv-Q grows, no echo, handler not reading", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1180, srvSock(500000, 3018172)), "WEDGE_CLASS", "recvq_grew_no_progress"},
 		// Slow: the server is moving.
 		{"slow: Recv-Q drains", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1180, srvSock(65536, 2951836)), "SLOW_CLASS", "recvq_drained"},
-		{"slow: echoes progress though Recv-Q is flat", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1183, srvSock(433664, 2951836)), "SLOW_CLASS", "echo_progress"},
-		{"slow: bytes arrive mid-frame, no whole echo yet", inst(0, 1180, srvSock(433664, 2951836)), withBytes(inst(win, 1180, srvSock(433664, 2951836)), 4096), "SLOW_CLASS", "echo_progress"},
-		{"slow: echoes progress and Recv-Q drains", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1190, srvSock(0, 2951836)), "SLOW_CLASS", "echo_progress"},
-		{"slow: echoes progress with no ss at all", echoInstant{At: verdictBase, Echoes: 5, SSErr: "ss not available"}, echoInstant{At: verdictBase.Add(win), Echoes: 9, SSErr: "ss not available"}, "SLOW_CLASS", "echo_progress"},
+		{"slow: echoes progress though Recv-Q is flat", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1183, srvSock(433664, 2951836)), "SLOW_CLASS", "bytes_arrived"},
+		{"slow: bytes arrive mid-frame, no whole echo yet", inst(0, 1180, srvSock(433664, 2951836)), withBytes(inst(win, 1180, srvSock(433664, 2951836)), 4096), "SLOW_CLASS", "bytes_arrived"},
+		{"slow: echoes progress and Recv-Q drains", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1190, srvSock(0, 2951836)), "SLOW_CLASS", "bytes_arrived"},
+		{"slow: bytes arrive with no ss at all", echoInstant{At: verdictBase, Echoes: 5, BytesIn: 100, SSErr: "ss not available"}, echoInstant{At: verdictBase.Add(win), Echoes: 9, BytesIn: 262284, SSErr: "ss not available"}, "SLOW_CLASS", "bytes_arrived"},
+		// Negative controls for the confound: the client's own kernel queue.
+		{"wedge: the only bytes read were already in the client's queue at t0", withCliRecvQ(inst(0, 1180, srvSock(433664, 1)), 40000), withBytes(inst(win, 1180, srvSock(433664, 1)), 40000), "WEDGE_CLASS", "recvq_flat_no_progress"},
+		{"slow: more than the client's queue held arrived", withCliRecvQ(inst(0, 1180, srvSock(433664, 1)), 40000), withBytes(inst(win, 1180, srvSock(433664, 1)), 45000), "SLOW_CLASS", "bytes_arrived"},
+		{"indeterminate: the client's queue explains every byte and the server socket is gone", withCliRecvQ(inst(0, 1180, srvSock(433664, 1)), 40000), withBytes(echoInstant{At: verdictBase.Add(win), Echoes: 1180, BytesIn: 1180 * 65546}, 40000), "INDETERMINATE", "server_socket_missing_t1"},
 		// Negative controls: missing or empty data must never become a class.
 		{"indeterminate: server socket gone at t1", inst(0, 1180, srvSock(433664, 1)), echoInstant{At: verdictBase.Add(win), Echoes: 1180}, "INDETERMINATE", "server_socket_missing_t1"},
-		{"indeterminate: server socket missing at t0", echoInstant{At: verdictBase, Echoes: 1180}, inst(win, 1180, srvSock(433664, 1)), "INDETERMINATE", "server_socket_missing_t0"},
-		{"indeterminate: ss failed at t0, no progress", echoInstant{At: verdictBase, Echoes: 1180, SSErr: "exec: ss: not found"}, inst(win, 1180, srvSock(433664, 1)), "INDETERMINATE", "server_socket_missing_t0"},
+		{"indeterminate: server socket missing at t0", echoInstant{At: verdictBase, Echoes: 1180, BytesIn: 1180 * 65546}, inst(win, 1180, srvSock(433664, 1)), "INDETERMINATE", "server_socket_missing_t0"},
+		{"indeterminate: ss failed at t0, no progress", echoInstant{At: verdictBase, Echoes: 1180, BytesIn: 1180 * 65546, SSErr: "exec: ss: not found"}, inst(win, 1180, srvSock(433664, 1)), "INDETERMINATE", "server_socket_missing_t0"},
 		{"indeterminate: Recv-Q zero at both instants", inst(0, 1180, srvSock(0, 10)), inst(win, 1180, srvSock(0, 10)), "INDETERMINATE", "recvq_zero_no_progress"},
 		{"indeterminate: Recv-Q appears only at t1", inst(0, 1180, srvSock(0, 10)), inst(win, 1180, srvSock(65536, 65546)), "INDETERMINATE", "recvq_zero_no_progress"},
 		{"indeterminate: window shorter than the minimum", inst(0, 1180, srvSock(433664, 1)), inst(500*time.Millisecond, 1180, srvSock(433664, 1)), "INDETERMINATE", "window_too_short"},
@@ -176,17 +189,17 @@ func TestWSEchoClassify_LineCarriesTheRawNumbers(t *testing.T) {
 	win := 3 * time.Second
 	v := wsEchoClassify(inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1180, srvSock(433664, 2951836)))
 	for _, want := range []string{
-		"window_ms=3000", "echoes_t0=1180", "echoes_t1=1180", "bytes_in_t0=0", "sent=1244",
+		"window_ms=3000", "echoes_t0=1180", "echoes_t1=1180", "bytes_new=0", "sent=1244",
 		"srv_recvq_t0=433664", "srv_recvq_t1=433664",
 		"srv_bytes_received_t0=2951836", "srv_bytes_received_t1=2951836",
-		"cli_sendq_t0=3071716", "cli_sendq_t1=3071716",
+		"cli_sendq_t0=3071716", "cli_sendq_t1=3071716", "cli_recvq_t0=0",
 	} {
 		if !strings.Contains(v.Line, want) {
 			t.Errorf("line lacks %q:\n%s", want, v.Line)
 		}
 	}
 	gone := wsEchoClassify(echoInstant{At: verdictBase, Echoes: 1}, echoInstant{At: verdictBase.Add(win), Echoes: 1})
-	for _, want := range []string{"srv_recvq_t0=na", "srv_recvq_t1=na", "srv_bytes_received_t0=na", "cli_sendq_t0=na"} {
+	for _, want := range []string{"srv_recvq_t0=na", "srv_recvq_t1=na", "srv_bytes_received_t0=na", "cli_sendq_t0=na", "cli_recvq_t0=na", "srv_written_t0=na"} {
 		if !strings.Contains(gone.Line, want) {
 			t.Errorf("a missing socket must print %q, line:\n%s", want, gone.Line)
 		}

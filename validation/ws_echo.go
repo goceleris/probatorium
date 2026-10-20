@@ -457,6 +457,12 @@ readLoop:
 		// The sender is joined, the connection still open: take the two
 		// instants, hand the record over, and only then book the timeout.
 		rep := diagnose.run(ctx, conn, br, &received, &sent, &bytesIn)
+		// Nothing more is needed from the connection, and Deliver may wait a
+		// long time for the orchestrator's slot (an in-stall dossier of the
+		// same stall can be holding it). A detached stream that stays open
+		// keeps ageing in the refapp's last-byte table, where I-CONN-1 would
+		// add a second violation to the cell.
+		_ = conn.Close()
 		if diagnose.Deliver != nil {
 			diagnose.Deliver(ctx, rep)
 		}

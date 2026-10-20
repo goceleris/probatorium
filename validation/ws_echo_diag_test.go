@@ -1,9 +1,11 @@
 package validation
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -83,7 +85,8 @@ func TestFireWSLargeEcho_DiagWedge(t *testing.T) {
 	shortDiag(t, 300*time.Millisecond, 100*time.Millisecond)
 	ss, calls := fakeSS(func(int) int64 { return 433664 })
 	rec := &diagRecorder{}
-	d := &wsEchoDiag{SS: ss, Refapp: func(context.Context) string { return "REFAPP_CPUS leader=0" }}
+	proc := procFixture(t)
+	d := &wsEchoDiag{SS: ss, Refapp: func(context.Context) string { return threadTable(proc, 100) }}
 	_, s := fireDiagnosed(t, echoServer(t, swallowAfterTwo()), d, rec)
 
 	if len(rec.reps) != 1 {
@@ -103,7 +106,7 @@ func TestFireWSLargeEcho_DiagWedge(t *testing.T) {
 	if *calls != 2 {
 		t.Errorf("ss ran %d times, want 2 (t0 and t1)", *calls)
 	}
-	for _, want := range []string{"### t0 ", "### t1 ", "--- refapp state at t0", "--- refapp state at t1", "REFAPP_CPUS leader=0", "window_end=deadline", "srv_recvq_t0=433664"} {
+	for _, want := range []string{"### t0 ", "### t1 ", "--- refapp state at t0", "--- refapp state at t1", "REFAPP_THREADS n=5 leader_cpus_allowed_list=0", "window_end=deadline", "srv_recvq_t0=433664"} {
 		if !strings.Contains(rep.Text, want) {
 			t.Errorf("record lacks %q:\n%s", want, rep.Text)
 		}
@@ -132,8 +135,8 @@ func TestFireWSLargeEcho_DiagSlow(t *testing.T) {
 	if len(rec.reps) != 1 {
 		t.Fatalf("%d reports, want 1", len(rec.reps))
 	}
-	if v := rec.reps[0].Verdict; v.Class != verdictSlow || v.Reason != "echo_progress" {
-		t.Fatalf("verdict %s/%s, want SLOW_CLASS/echo_progress\n%s", v.Class, v.Reason, rec.reps[0].Text)
+	if v := rec.reps[0].Verdict; v.Class != verdictSlow || v.Reason != "bytes_arrived" {
+		t.Fatalf("verdict %s/%s, want SLOW_CLASS/bytes_arrived\n%s", v.Class, v.Reason, rec.reps[0].Text)
 	}
 	if s.Timeout != 1 {
 		t.Errorf("timeout=%d, want 1: the fire still reached its hold with echoes outstanding", s.Timeout)
@@ -215,5 +218,89 @@ func TestWSEchoDiag_ClaimIsBounded(t *testing.T) {
 	}
 	if (*wsEchoDiag)(nil).claim() {
 		t.Errorf("a nil diagnosis granted a claim")
+	}
+}
+
+// A slow refapp leg (it is served by a goroutine of the very process whose
+// scheduling is in question) must neither eat the reading window nor stall the
+// fire: the call is capped, its absence is written down, and the window
+// measured is the time the walker really read.
+func TestFireWSLargeEcho_DiagSlowRefappLegDoesNotEatTheWindow(t *testing.T) {
+	shortEchoFire(t, 400*time.Millisecond)
+	shortDiag(t, 600*time.Millisecond, 400*time.Millisecond)
+	savedB := wsEchoDiagRefappBudget
+	wsEchoDiagRefappBudget = 100 * time.Millisecond
+	t.Cleanup(func() { wsEchoDiagRefappBudget = savedB })
+	ss, _ := fakeSS(func(int) int64 { return 433664 })
+	rec := &diagRecorder{}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d := &wsEchoDiag{SS: ss, Refapp: func(context.Context) string { <-release; return "late" }}
+	start := time.Now()
+	_, s := fireDiagnosed(t, echoServer(t, swallowAfterTwo()), d, rec)
+	if len(rec.reps) != 1 {
+		t.Fatalf("%d reports, want 1", len(rec.reps))
+	}
+	rep := rec.reps[0]
+	if !strings.Contains(rep.Text, "refapp state not read within") {
+		t.Errorf("a refapp leg that did not answer must be written down:\n%s", rep.Text)
+	}
+	if v := rep.Verdict; v.Class != verdictWedge {
+		t.Errorf("verdict %s/%s, want WEDGE_CLASS: the window was a full reading window, so the flat queue counts\n%s", v.Class, v.Reason, rep.Text)
+	}
+	// The window on the line is the time spent reading: the whole configured
+	// window, not what was left after the refapp leg.
+	if !strings.Contains(rep.Verdict.Line, "window_ms=6") && !strings.Contains(rep.Verdict.Line, "window_ms=7") {
+		t.Errorf("window on the line is not about the configured 600 ms:\n%s", rep.Verdict.Line)
+	}
+	if el := time.Since(start); el > 3*time.Second {
+		t.Errorf("fire took %v: the slow refapp leg stalled it", el)
+	}
+	if s.Timeout != 1 {
+		t.Errorf("timeout=%d, want 1", s.Timeout)
+	}
+}
+
+// The connection is closed before the record is handed over: Deliver can wait
+// a long time for the orchestrator's slot, and an open detached stream keeps
+// ageing in the refapp's last-byte table (I-CONN-1).
+func TestFireWSLargeEcho_DiagClosesTheConnectionBeforeDeliver(t *testing.T) {
+	shortEchoFire(t, 400*time.Millisecond)
+	shortDiag(t, 300*time.Millisecond, 100*time.Millisecond)
+	serverSawClose := make(chan struct{})
+	var once sync.Once
+	srv := newFakeWSServer(t, false, func(c net.Conn) {
+		br := bufio.NewReaderSize(c, wsEchoFrameBytes)
+		n := 0
+		for {
+			fin, op, payload, err := wsReadFrame(br, wsEchoFrameBytes)
+			if err != nil {
+				once.Do(func() { close(serverSawClose) })
+				return
+			}
+			if op == 0x8 {
+				return
+			}
+			if n++; n <= 2 {
+				_, _ = c.Write(wsAppendFrame(nil, fin, op, payload, nil))
+			}
+		}
+	})
+	ss, _ := fakeSS(func(int) int64 { return 433664 })
+	closedAtDeliver := false
+	tally := &wsEchoTally{}
+	tally.diag.Store(&wsEchoDiag{SS: ss, Deliver: func(context.Context, wsEchoDiagReport) {
+		select {
+		case <-serverSawClose:
+			closedAtDeliver = true
+		case <-time.After(2 * time.Second):
+		}
+	}})
+	fireWSLargeEcho(context.Background(), srv.HostPort(), "/ws", rand.New(rand.NewPCG(1, 2)), tally)
+	if !closedAtDeliver {
+		t.Error("the server had not seen the connection close when Deliver ran")
+	}
+	if tally.timeout.Load() != 1 {
+		t.Errorf("timeout=%d, want 1", tally.timeout.Load())
 	}
 }
