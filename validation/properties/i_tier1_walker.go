@@ -86,6 +86,17 @@ var (
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}
+	// IWSEchoStall is not a violation either: it labels the RECORD-ONLY
+	// dossier a stall-capture run takes when a 64 KiB echo fire timed out,
+	// carrying the two-instant discrimination (WS_ECHO_VERDICT: SLOW_CLASS,
+	// WEDGE_CLASS or INDETERMINATE; validation/ws_echo_verdict.go). The gated
+	// counter stays ws_echo_timeout under I-WS-ECHO (probatorium#481).
+	IWSEchoStall = Spec{
+		ID:          "I-WS-ECHO-STALL",
+		Description: "in-stall capture: a 64 KiB echo fire timed out; two ss snapshots a few seconds apart say slow or wedged (record-only dossier, not a violation)",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
 	// IWSEcho is the wire-level oracle for large detached sends
 	// (celeris#587): 64 KiB WebSocket frames streamed through the refapp's
 	// /ws echo must come back byte-intact, in order, and all of them. Fires

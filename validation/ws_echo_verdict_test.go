@@ -108,6 +108,8 @@ func inst(at time.Duration, echoes uint64, srv *ssSock) echoInstant {
 	return echoInstant{At: verdictBase.Add(at), Echoes: echoes, Sent: 1244, Server: srv, Client: &ssSock{State: "ESTAB", SendQ: 3071716}}
 }
 
+func withBytes(i echoInstant, n uint64) echoInstant { i.BytesIn += n; return i }
+
 func TestWSEchoClassify(t *testing.T) {
 	win := 3 * time.Second
 	cases := []struct {
@@ -122,6 +124,7 @@ func TestWSEchoClassify(t *testing.T) {
 		// Slow: the server is moving.
 		{"slow: Recv-Q drains", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1180, srvSock(65536, 2951836)), "SLOW_CLASS", "recvq_drained"},
 		{"slow: echoes progress though Recv-Q is flat", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1183, srvSock(433664, 2951836)), "SLOW_CLASS", "echo_progress"},
+		{"slow: bytes arrive mid-frame, no whole echo yet", inst(0, 1180, srvSock(433664, 2951836)), withBytes(inst(win, 1180, srvSock(433664, 2951836)), 4096), "SLOW_CLASS", "echo_progress"},
 		{"slow: echoes progress and Recv-Q drains", inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1190, srvSock(0, 2951836)), "SLOW_CLASS", "echo_progress"},
 		{"slow: echoes progress with no ss at all", echoInstant{At: verdictBase, Echoes: 5, SSErr: "ss not available"}, echoInstant{At: verdictBase.Add(win), Echoes: 9, SSErr: "ss not available"}, "SLOW_CLASS", "echo_progress"},
 		// Negative controls: missing or empty data must never become a class.
@@ -173,7 +176,7 @@ func TestWSEchoClassify_LineCarriesTheRawNumbers(t *testing.T) {
 	win := 3 * time.Second
 	v := wsEchoClassify(inst(0, 1180, srvSock(433664, 2951836)), inst(win, 1180, srvSock(433664, 2951836)))
 	for _, want := range []string{
-		"window_ms=3000", "echoes_t0=1180", "echoes_t1=1180", "sent=1244",
+		"window_ms=3000", "echoes_t0=1180", "echoes_t1=1180", "bytes_in_t0=0", "sent=1244",
 		"srv_recvq_t0=433664", "srv_recvq_t1=433664",
 		"srv_bytes_received_t0=2951836", "srv_bytes_received_t1=2951836",
 		"cli_sendq_t0=3071716", "cli_sendq_t1=3071716",

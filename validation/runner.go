@@ -834,6 +834,12 @@ type Incident struct {
 	// cell that keeps running. The cheap legs (pprof, /proc, dmesg) are
 	// still taken.
 	SkipCore bool
+	// Attachments are files the dossier writer puts in the incident
+	// directory beside incident.json: a name (no path) and its text. The
+	// ws_echo timeout diagnosis (I-WS-ECHO-STALL) carries its two-instant
+	// record this way, because its second instant is taken by the walker and
+	// the forensics capture only runs after it.
+	Attachments map[string]string
 }
 
 // buildDriver constructs the remote.Driver per the orchestrator's
@@ -1049,6 +1055,13 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// In-stall capture (celeris#588), in a stall-capture run only: nil
 	// leaves Tier 1's walkers with no stall timer at all.
 	onWalkerStall := walkerStallHook(os.Getenv, violations, pid)
+	// The ws_echo timeout's two-instant capture (probatorium#481), same gate.
+	wsEchoDiag := wsEchoDiagHook(os.Getenv, violations, pid, func() string {
+		if f := o.debugAddr.Load(); f != nil {
+			return (*f)()
+		}
+		return ""
+	}, "/proc")
 	tallyCB := o.tallyIncidentCallback(ctx, violations, pid)
 
 	cfg := tier1Config{
@@ -1067,6 +1080,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		AddrChan:           addrCh,
 		TallyCallback:      tallyCB,
 		OnWalkerStall:      onWalkerStall,
+		WSEchoDiag:         wsEchoDiag,
 		OnLiveTally:        func(f func() int64) { expectedPanicsFn.Store(&f) },
 		OnResponseCounters: func(f func() ResponseCounters) { responseCountersFn.Store(&f) },
 		OnCrashReports:     func(f func() int64) { crashReportsFn.Store(&f) },
@@ -1647,6 +1661,51 @@ func walkerStallHook(getenv func(string) string, violations chan<- Incident, pid
 	return newStallDossierHook(violations, pid, stallDossiersPerKind)
 }
 
+// wsEchoDiagDeliverWait bounds the wait for the orchestrator's incident slot when
+// a diagnosed fire hands its record over. The orchestrator may be inside one
+// synchronous capture (forensicsBudget) with another incident queued ahead.
+var wsEchoDiagDeliverWait = 2*forensicsBudget + 10*time.Second
+
+// wsEchoDiagHook is tier1Config.WSEchoDiag for this run: the two-instant
+// capture of a timed-out ws_echo fire (probatorium#481) in a stall-capture
+// run, nil -- the walker's fire exactly as before -- in every other run. The
+// record goes to the orchestrator as a record-only I-WS-ECHO-STALL incident
+// carrying ws-echo-diag.txt; the gated counter and its hard incident are
+// unchanged. procRoot is /proc; debugAddr reads the refapp's side listener.
+func wsEchoDiagHook(getenv func(string) string, violations chan<- Incident, pid func() int, debugAddr func() string, procRoot string) *wsEchoDiag {
+	if !stallCaptureEnabled(getenv) {
+		return nil
+	}
+	return &wsEchoDiag{
+		Refapp: func(ctx context.Context) string {
+			addr := ""
+			if debugAddr != nil {
+				addr = debugAddr()
+			}
+			return refappSchedText(ctx, procRoot, pid(), addr)
+		},
+		Deliver: func(ctx context.Context, rep wsEchoDiagReport) {
+			inc := Incident{
+				Tier:        TierProperty,
+				PredicateID: properties.IWSEchoStall.ID,
+				Message:     rep.Verdict.Line,
+				ObservedAt:  time.Now().UTC(),
+				RefappPID:   pid(),
+				RecordOnly:  true,
+				SkipCore:    true,
+				Attachments: map[string]string{"ws-echo-diag.txt": rep.Text},
+			}
+			t := time.NewTimer(wsEchoDiagDeliverWait)
+			defer t.Stop()
+			select {
+			case violations <- inc:
+			case <-ctx.Done():
+			case <-t.C:
+			}
+		},
+	}
+}
+
 // newStallDossierHook is tier1Config.OnWalkerStall for a stall-capture run
 // (celeris#588): a walker read that has waited past its stall threshold
 // with no byte back takes a record-only dossier NOW, while the stall is
@@ -1746,6 +1805,16 @@ func (o *Orchestrator) writeIncidentDossier(inc Incident) (string, error) {
 		tail = *p
 	}
 	_ = writeStderrTail(filepath.Join(dir, "refapp_stderr_tail.txt"), tail, nil)
+	for name, text := range inc.Attachments {
+		// A bare file name only: an attachment must not name a path outside
+		// the dossier.
+		if name == "" || name != filepath.Base(name) || name == "." || name == ".." {
+			continue
+		}
+		if err := writePlainText(filepath.Join(dir, name), text); err != nil {
+			fmt.Fprintf(os.Stderr, "validation: incident attachment %s: %v\n", name, err)
+		}
+	}
 	return dir, nil
 }
 

@@ -40,8 +40,9 @@ const (
 
 // wsEchoMinWindow is the shortest gap between the two instants a verdict is
 // drawn from. A shorter one (a cancelled run, a clock that stepped) proves
-// nothing about progress.
-const wsEchoMinWindow = 2 * time.Second
+// nothing about progress. A var so the walker's unit tests can run a whole
+// diagnosis in a fraction of a second.
+var wsEchoMinWindow = 2 * time.Second
 
 // ssSock is one socket of `ss -tmi` output.
 type ssSock struct {
@@ -181,8 +182,10 @@ func findEchoSocks(socks []ssSock, clientPort int) (srv, cli *ssSock) {
 type echoInstant struct {
 	At time.Time
 	// Echoes is the number of echo frames the walker had read back, Sent the
-	// highest sequence it had written.
-	Echoes, Sent uint64
+	// highest sequence it had written, BytesIn the bytes it had pulled off the
+	// socket in all. BytesIn is the progress counter that survives a read cut
+	// in the middle of a frame; Echoes only moves on whole frames.
+	Echoes, Sent, BytesIn uint64
 	// SSErr says why no ss output exists ("" when it ran).
 	SSErr string
 	// Server and Client are nil when the socket was not in the output.
@@ -200,9 +203,9 @@ type wsEchoVerdict struct {
 
 // wsEchoClassify draws the verdict from the two instants. t0 is the earlier.
 //
-// Order matters. Echo progress is the walker's own counter and needs no ss,
-// so it decides first: an echo that arrived in the window is a server that
-// delivers. Next the data must exist (both server sockets found) and the
+// Order matters. Echo progress (a whole echo, or any byte at all) is the
+// walker's own counter and needs no ss, so it decides first: bytes that
+// arrived in the window are a server that delivers. Next the data must exist (both server sockets found) and the
 // window must be long enough. Then Recv-Q: a fall is a server that reads; a
 // queue above zero at both instants that did not fall, with no echo, is one
 // that does not. Everything else is INDETERMINATE.
@@ -212,7 +215,7 @@ func wsEchoClassify(t0, t1 echoInstant) wsEchoVerdict {
 	switch {
 	case window < wsEchoMinWindow:
 		reason = "window_too_short"
-	case t1.Echoes > t0.Echoes:
+	case t1.Echoes > t0.Echoes || t1.BytesIn > t0.BytesIn:
 		class, reason = verdictSlow, "echo_progress"
 	case t0.Server == nil:
 		reason = "server_socket_missing_t0"
@@ -233,8 +236,8 @@ func wsEchoClassify(t0, t1 echoInstant) wsEchoVerdict {
 // verdictLine formats the record. An absent number is "na", never zero.
 func verdictLine(class, reason string, window time.Duration, t0, t1 echoInstant) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "WS_ECHO_VERDICT=%s reason=%s window_ms=%d echoes_t0=%d echoes_t1=%d sent=%d",
-		class, reason, window.Milliseconds(), t0.Echoes, t1.Echoes, max(t0.Sent, t1.Sent))
+	fmt.Fprintf(&b, "WS_ECHO_VERDICT=%s reason=%s window_ms=%d echoes_t0=%d echoes_t1=%d bytes_in_t0=%d bytes_in_t1=%d sent=%d",
+		class, reason, window.Milliseconds(), t0.Echoes, t1.Echoes, t0.BytesIn, t1.BytesIn, max(t0.Sent, t1.Sent))
 	kv := func(name string, v int64, ok bool) {
 		if ok {
 			fmt.Fprintf(&b, " %s=%d", name, v)

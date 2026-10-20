@@ -45,6 +45,10 @@ func TestStreamHoldsStayUnderTheConnCloseBound(t *testing.T) {
 	}{
 		{"WebSocket torture fire", wsMaxHold},
 		{"WebSocket large-echo fire", wsEchoMaxHold},
+		// A stall-capture run holds a timed-out fire open for the two-instant
+		// capture (ws_echo_diag.go): the whole fire, the window, and both
+		// instants' host calls at their budget.
+		{"WebSocket large-echo fire with the timeout diagnosis", wsEchoFireBound() + wsEchoDiagWindow + 2*wsEchoDiagCaptureBudget},
 		{"SSE kill fire", sseMaxHold},
 	} {
 		// Half the bound, not the bound itself: a hold that merely fits
