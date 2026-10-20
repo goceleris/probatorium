@@ -198,6 +198,92 @@
   changed_when: false
   when: inventory_hostname == bench_target
 
+# ---------- IRQPLACE (THROWAWAY ab/irqplace-v1, celeris#1036; needs the maintainer approval of 2026-10-18) ----------
+# A column whose SUTEnv carries AB_IRQ_VECTOR_CPU moves the standing-pinned enp1s0-8 TX-completion vector to that CPU
+# BEFORE the server starts (celeris plans its loops once, at Listen, from the vector CPU it reads then) and puts it back on the
+# explicit standing CPU after the server stops. Only the CPUs 4 (probe) and 1 (standing) are allowed, only on msr1. Every move goes through
+# files/nic_irq_pin.sh and is verified by the effective_affinity_list readback; a mismatch fails the column loudly. Restore layers:
+# the cell restore at the end of this file, the always block around the cell loop in bench.yml, the cleanup.yml task (cancelled run), and
+# a per-apply watchdog started by irqplace.sh apply.
+- name: "{{ cell.1 }} run={{ cell.0 }} | IRQPLACE column probe CPU (empty = not an IRQPLACE column)"
+  ansible.builtin.set_fact:
+    irq_probe_cpu: "{{ (cell_col_env.AB_IRQ_VECTOR_CPU | default('')) | string }}"
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | IRQPLACE refuse anything but msr1, CPUs 4 and 1, and the standing CPU 1"
+  ansible.builtin.assert:
+    that:
+      - bench_target == 'msr1'
+      - irq_probe_cpu in ['1', '4']
+      - nic_irq_placement is defined
+      - nic_irq_placement.iface is defined
+      - nic_irq_placement.vector is defined
+      - nic_irq_placement.cpu | string == '1'
+    fail_msg: >-
+      IRQPLACE needs bench_target msr1, AB_IRQ_VECTOR_CPU 1 or 4 and the standing placement nic_irq_placement (cpu 1)
+      from inventory.yml; got target={{ bench_target }} cpu={{ irq_probe_cpu }}.
+    quiet: true
+  when:
+    - inventory_hostname == bench_target
+    - irq_probe_cpu != ''
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | IRQPLACE stage the pin helpers on the bench target"
+  become: true
+  ansible.builtin.file:
+    path: /tmp/celeris-irqplace
+    state: directory
+    mode: '0755'
+  when:
+    - inventory_hostname == bench_target
+    - irq_probe_cpu != ''
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | IRQPLACE copy nic_irq_pin.sh and irqplace.sh"
+  become: true
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/files/{{ item }}"
+    dest: "/tmp/celeris-irqplace/{{ item }}"
+    mode: '0755'
+  loop:
+    - nic_irq_pin.sh
+    - irqplace.sh
+  when:
+    - inventory_hostname == bench_target
+    - irq_probe_cpu != ''
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | IRQPLACE record whether irqbalance is active"
+  ansible.builtin.shell: |
+    {
+      echo "irqbalance is-active: $(systemctl is-active irqbalance 2>&1 | head -1)"
+      echo "irqbalance is-enabled: $(systemctl is-enabled irqbalance 2>&1 | head -1)"
+      if pgrep -x irqbalance > /dev/null 2>&1; then echo "irqbalance process: running"; else echo "irqbalance process: none"; fi
+    } > {{ cell_dir }}/irqbalance.txt 2>&1
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - irq_probe_cpu != ''
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | IRQPLACE pin the vector to {{ irq_probe_cpu | default('') }} and verify by readback (before the server starts)"
+  become: true
+  ansible.builtin.shell: >-
+    bash /tmp/celeris-irqplace/irqplace.sh apply
+    {{ nic_irq_placement.iface | string | quote }}
+    {{ nic_irq_placement.vector | string | quote }}
+    {{ irq_probe_cpu | quote }}
+    {{ nic_irq_placement.cpu | string | quote }}
+    {{ (cell_guard_seconds | int) + 300 }}
+    {{ cell_dir | quote }}
+  args:
+    executable: /bin/bash
+  register: irq_apply
+  changed_when: false
+  failed_when: irq_apply.rc | default(0) != 0
+  when:
+    - inventory_hostname == bench_target
+    - irq_probe_cpu != ''
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start competitor server in background"
   # Root ONLY for the celeris SUT — see the privilege-gate fact above.
   become: "{{ cell_needs_root | bool }}"
@@ -454,6 +540,113 @@
     - inventory_hostname == bench_target
     - cell_bound | bool
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | start kernel-counter sampler (server side, A/B)"
+  # Read-only. For the A/Bs of celeris#1036 and #1037, plus threads.log: every
+  # SUT thread (tid, last CPU psr, state, cumulative CPU time, comm) every 1 s.
+  # Also: per-CPU softirq counters
+  # (NET_RX, NET_TX) every 5 s and the full /proc/interrupts every 30 s,
+  # with epoch seconds, so the column-wide logs can be sliced per scenario
+  # like cpu.log. Also once at cell start: the NIC irq affinities, the bond
+  # and port carrier_changes, and every SUT thread with its allowed CPUs
+  # and the CPU it last ran on. Written next to cpu.log; it dies with the
+  # guard timeout like the mpstat sampler and is killed by the stop task.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    pid=$(cat $d/server.pid 2>/dev/null)
+    {
+      echo "== carrier_changes"; grep -H . /sys/class/net/*/carrier_changes 2>/dev/null
+      echo "== bond0"; head -40 /proc/net/bonding/bond0 2>/dev/null
+      echo "== irq smp_affinity_list"; grep -H . /proc/irq/*/smp_affinity_list 2>/dev/null
+    } > $d/host-net.pre 2>&1
+    if [ -n "$pid" ]; then
+      for t in /proc/$pid/task/*; do
+        echo "$(basename $t) $(awk "/Cpus_allowed_list/{print \$2}" $t/status 2>/dev/null) psr=$(awk "{print \$39}" $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
+      done > $d/sut-threads.pre 2>&1
+    fi
+    nohup bash -c "end=\$((\$(date +%s) + {{ cell_guard_seconds }})); n=0; while [ \$(date +%s) -lt \$end ]; do echo \"== \$(date +%s.%N)\"; grep -E \"CPU|NET_RX|NET_TX\" /proc/softirqs; if [ \$((n % 6)) -eq 0 ]; then echo \"== interrupts\"; cat /proc/interrupts; fi; n=\$((n+1)); sleep 5; done" \
+      > $d/kcounters.log 2>&1 &
+    disown
+    echo $! > $d/kcounters.pid
+    if [ -n "$pid" ]; then
+      nohup bash -c "end=\$((\$(date +%s) + {{ cell_guard_seconds }})); while [ \$(date +%s) -lt \$end ]; do echo \"== \$(date +%s.%N)\"; ps -L -o tid=,psr=,stat=,time=,comm= -p $pid; sleep 1; done" \
+        > $d/threads.log 2>&1 &
+      disown
+      echo $! > $d/threads.pid
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | start net-counter sampler (server side, confirmation A/B)"
+  # Read-only. TCP retransmit and timeout counters (TcpExt TCPTimeouts,
+  # TcpRetransSegs ...) and softnet_stat per CPU every second, so a per-cell
+  # delta is read between the runner timestamps of the cell. Files net.log and
+  # softnet.log next to cpu.log; the sampler stops with the guard timeout and
+  # in the stop task below.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    cat > $d/netctr.sh <<"EOS"
+    #!/bin/bash
+    # usage: netctr.sh SECONDS SUFFIX. Appends, every second, the TCP and IP
+    # SNMP counters, the TcpExt and IpExt netstat counters (retransmits,
+    # timeouts) and the per-CPU softnet_stat, each block stamped with epoch.
+    end=$(( $(date +%s) + $1 ))
+    while [ $(date +%s) -lt $end ]; do
+      t=$(date +%s.%N)
+      { echo "== $t"; grep -E "^(Tcp|Ip):" /proc/net/snmp; grep -E "^(TcpExt|IpExt):" /proc/net/netstat; } >> net$2.log
+      { echo "== $t"; cat /proc/net/softnet_stat; } >> softnet$2.log
+      sleep 1
+    done
+    EOS
+    cd $d
+    nohup bash netctr.sh {{ cell_guard_seconds }} "" > /dev/null 2>&1 &
+    disown
+    echo $! > $d/netctr.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | NIC and steering state (server side, once per column)"
+  # Read-only. ethtool -i -k -n -l -x -c -g of every physical NIC and bond0,
+  # ethtool -S before the column (here) and after it (stop task), the RPS and
+  # XPS masks, rps_flow_cnt, rps_sock_flow_entries and a few TCP sysctls, ip
+  # -s link. ethtool needs root for some queries; become is used for this task
+  # only and nothing is written outside the cell dir.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    nics="$(for n in /sys/class/net/*; do [ -e $n/device ] && basename $n; done) bond0"
+    {
+      for n in $nics; do
+        echo "=== $n"
+        for o in -i -k -n -l -x -c -g; do echo "--- ethtool $o $n"; ethtool $o $n 2>&1; done
+        echo "--- ethtool -S $n"; ethtool -S $n 2>&1
+      done
+    } > $d/ethtool.pre 2>&1
+    {
+      echo "== rps_cpus, rps_flow_cnt, xps_cpus"
+      grep -H . /sys/class/net/*/queues/rx-*/rps_cpus /sys/class/net/*/queues/rx-*/rps_flow_cnt /sys/class/net/*/queues/tx-*/xps_cpus 2>/dev/null
+      echo "== sysctl"
+      for k in net.core.rps_sock_flow_entries net.core.netdev_budget net.core.netdev_max_backlog net.core.busy_poll net.core.somaxconn net.ipv4.tcp_congestion_control net.ipv4.tcp_syn_retries net.ipv4.tcp_retries2 net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do echo "$k = $(sysctl -n $k 2>&1)"; done
+      echo "== ip -s link"; ip -s link 2>&1
+    } > $d/steering.pre 2>&1
+    true
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start observer sampler (server side)"
   # The observer sidecars the server during the cell and emits a 1Hz
   # SQLite time series of FD count, RSS, goroutine count, GC pause,
@@ -495,6 +688,36 @@
     - cell_bound | bool
 
 # ---------- loadgen side: mpstat + runner ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | start net-counter sampler (loadgen side, confirmation A/B)"
+  # Same counters on the loadgen host (a request lost on the way in shows as a
+  # retransmit there), distinct file names for the reason given above.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    cat > $d/netctr.sh <<"EOS"
+    #!/bin/bash
+    # usage: netctr.sh SECONDS SUFFIX. Appends, every second, the TCP and IP
+    # SNMP counters, the TcpExt and IpExt netstat counters (retransmits,
+    # timeouts) and the per-CPU softnet_stat, each block stamped with epoch.
+    end=$(( $(date +%s) + $1 ))
+    while [ $(date +%s) -lt $end ]; do
+      t=$(date +%s.%N)
+      { echo "== $t"; grep -E "^(Tcp|Ip):" /proc/net/snmp; grep -E "^(TcpExt|IpExt):" /proc/net/netstat; } >> net$2.log
+      { echo "== $t"; cat /proc/net/softnet_stat; } >> softnet$2.log
+      sleep 1
+    done
+    EOS
+    cd $d
+    nohup bash netctr.sh {{ cell_guard_seconds }} ".loadgen" > /dev/null 2>&1 &
+    disown
+    echo $! > $d/netctr.loadgen.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (loadgen side)"
   # Distinct filenames from the server-side sampler ON PURPOSE. bench.yml
   # tars bench_run_dir on BOTH hosts and extracts both into the same
@@ -515,6 +738,287 @@
   when:
     - inventory_hostname == "msa2-client"
     - hostvars[bench_target].cell_bound | default(false) | bool
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | start stall captures (both hosts, read-only, celeris#1036 investigation)"
+  # Per-port packet counters at 20 Hz, qdisc, NIC vectors and per-connection TCP
+  # state at 1 Hz, per-cell ethtool, qdisc, cpuidle and IRQ affinity brackets
+  # taken at the saturation window start and end, and a 0.7 s header-only
+  # capture in the middle of the window on the SUT slaves and on the loadgen
+  # port. The script rendezvouses on the first 64 established connections, so
+  # both hosts time the window from the same event. Everything is bounded by the
+  # hang guard and read-only; a missing tool is noted in the output file. Needs
+  # root for ethtool and tcpdump; output redirections are opened by the shell.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    cat > $d/stallcap.sh <<'EOSTALL'
+    #!/bin/bash
+    # stallcap.sh ROLE DIR PORT WARM DUR GUARD TARGET_IP   (v2, after the X1 read)
+    # Read-only captures for the 200 ms stall investigation (celeris#1036). ROLE is sut or lg.
+    # Everything is bounded by GUARD seconds. Files go into DIR; the loadgen role adds the suffix .loadgen.
+    role=$1; d=$2; port=$3; warm=$4; dur=$5; guard=$6; tip=$7
+    cd "$d" || exit 1
+    sfx=""; [ "$role" = lg ] && sfx=".loadgen"
+    [ -n "$EPOCHREALTIME" ] || { echo "bash without EPOCHREALTIME (needs bash 5): no stall captures" > stallcap.error$sfx; exit 0; }
+    now_us() { local t=${EPOCHREALTIME/./}; echo "$t"; }
+    wait_until() { local t=$1 n; n=$(now_us); [ "$t" -gt "$n" ] || return 0; local dl=$((t - n)); sleep "$((dl / 1000000)).$(printf %06d $((dl % 1000000)))"; }
+    endsec=$(( ${EPOCHREALTIME%.*} + guard ))
+    nics=""; capnic=""
+    if [ "$role" = sut ]; then
+      nics="$(cat /sys/class/net/bond0/bonding/slaves 2>/dev/null)"
+      [ -n "$nics" ] || nics="$(for n in /sys/class/net/*; do [ -e $n/device ] && basename $n; done)"
+      nics="${STALL_NICS:-$nics}"   # test override only
+      capnic="${STALL_CAPNIC:-enp1s0}"
+      case " $nics " in *" $capnic "*) ;; *) capnic=$(echo $nics | cut -d" " -f1);; esac
+    fi
+    echo "$$" > stallcap$sfx.pid
+    echo "v2 role=$role port=$port warm=$warm dur=$dur guard=$guard nics=$nics capnic=$capnic" > stallcap$sfx.meta
+
+    # awk: one line per connection from ss -tinoH (two physical lines per socket)
+    cat > ssc$sfx.awk <<"EOA"
+    /^[ \t]/ {
+      rto=""; rtt=""; un=""; re=""; ns=""; ba=""; so=""; ls=""; lr=""; la=""; cw=""; bo=""
+      for (i = 1; i <= NF; i++) {
+        k = $i; sub(/:.*/, "", k); v = substr($i, length(k) + 2)
+        if (k == "rto") rto = v; else if (k == "rtt") rtt = v; else if (k == "unacked") un = v
+        else if (k == "retrans") re = v; else if (k == "notsent") ns = v; else if (k == "bytes_acked") ba = v
+        else if (k == "segs_out") so = v; else if (k == "lastsnd") ls = v; else if (k == "lastrcv") lr = v
+        else if (k == "lastack") la = v; else if (k == "cwnd") cw = v; else if (k == "backoff") bo = v
+      }
+      print ts, loc, peer, "sq=" sq, "rq=" rq, timer, "rto=" rto, "rtt=" rtt, "unacked=" un, "retrans=" re, "notsent=" ns, "bytes_acked=" ba, "segs_out=" so, "lastsnd=" ls, "lastrcv=" lr, "lastack=" la, "cwnd=" cw, "backoff=" bo
+      next
+    }
+    { rq = $1; sq = $2; loc = $3; peer = $4; timer = "timer:-"; for (i = 5; i <= NF; i++) if ($i ~ /^timer:/) timer = $i }
+    EOA
+
+    # 20 Hz sampler (sut only): a deadline-scheduled python helper; the old bash loop is the fallback when python3 is missing
+    if [ "$role" = sut ]; then
+      if command -v python3 >/dev/null 2>&1; then
+        cat > sampler20.py <<"EOP"
+    #!/usr/bin/env python3
+    # sampler20.py DIR GUARD_SECONDS "NIC1 NIC2" [HZ]
+    # 20 Hz read-only sampler for the stall investigation (SUT only). Deadline-scheduled on CLOCK_MONOTONIC (no drift from the work of a tick),
+    # runs at nice -10 when started by root, reports the achieved rate and interval percentiles in sampler20.stats (rewritten every 5 s and on TERM).
+    #   txq20.log      one line per tick: epoch, then per NIC (and bond0) <nic>.<counter>=<value>: tx/rx packets and bytes, tx_dropped, tx_errors,
+    #                  BQL inflight/limit/hold_time/stall_cnt/stall_max/stall_thrs, tx-0 tx_timeout (the netdev watchdog counter), carrier_changes
+    #   softirq20.log  one line per tick: epoch TX <12 per-CPU counts> RX <12 per-CPU counts> (/proc/softirqs NET_TX, NET_RX)
+    #   tc20.log       per tick `== epoch` and the `tc -s qdisc show` lines of the NICs (backlog, requeues, drops), when tc exists
+    #   irq1.log       once per second `== epoch` and the NIC vector lines of /proc/interrupts (per-CPU counts)
+    import os, sys, time, signal, subprocess, shutil, statistics
+
+    d, guard, nics = sys.argv[1], int(sys.argv[2]), sys.argv[3].split()
+    hz = float(sys.argv[4]) if len(sys.argv) > 4 else 20.0
+    period = 1.0 / hz
+    os.chdir(d)
+    try: os.nice(-10)
+    except OSError: pass
+    S = '/sys/class/net/'
+    devs = nics + ['bond0']
+    attrs = []
+    for n in devs:
+        b = S + n
+        q = b + '/queues/tx-0/'
+        for k in ('tx_packets', 'tx_bytes', 'rx_packets', 'tx_dropped', 'tx_errors'):
+            attrs.append((n + '.' + k, b + '/statistics/' + k))
+        for k in ('inflight', 'limit', 'hold_time', 'stall_cnt', 'stall_max', 'stall_thrs'):
+            attrs.append((n + '.bql_' + k, q + 'byte_queue_limits/' + k))
+        attrs.append((n + '.tx_timeout', q + 'tx_timeout'))
+        attrs.append((n + '.carrier_changes', b + '/carrier_changes'))
+    fds = {}
+    def reopen():
+        for lab, p in attrs:
+            try: fds[lab] = os.open(p, os.O_RDONLY)
+            except OSError: fds[lab] = None
+    reopen()
+    def rd(lab):
+        fd = fds.get(lab)
+        if fd is None: return '-'
+        try:
+            os.lseek(fd, 0, 0); return os.read(fd, 64).strip().decode() or '-'
+        except OSError: return '-'
+    tcbin = shutil.which('tc')
+    f_txq = open('txq20.log', 'a', buffering=1 << 16); f_sirq = open('softirq20.log', 'a', buffering=1 << 16)
+    f_tc = open('tc20.log', 'a', buffering=1 << 16) if tcbin else None; f_irq = open('irq1.log', 'a', buffering=1 << 16)
+    f_softirqs = os.open('/proc/softirqs', os.O_RDONLY); f_ints = '/proc/interrupts'
+    stamps = []; stop = False; last_stats = 0.0; skipped = 0
+    def write_stats(final=False):
+        iv = [(b - a) * 1e3 for a, b in zip(stamps, stamps[1:])]
+        with open('sampler20.stats.tmp', 'w') as f:
+            if iv:
+                s = sorted(iv)
+                f.write('ticks=%d span_s=%.2f achieved_hz=%.2f target_hz=%.1f interval_ms median=%.1f p90=%.1f p99=%.1f max=%.1f skipped_deadlines=%d final=%s\n' % (
+                    len(stamps), stamps[-1] - stamps[0], (len(stamps) - 1) / max(stamps[-1] - stamps[0], 1e-9), hz, statistics.median(s),
+                    s[int(0.9 * (len(s) - 1))], s[int(0.99 * (len(s) - 1))], s[-1], skipped, final))
+            else: f.write('ticks=0\n')
+        os.replace('sampler20.stats.tmp', 'sampler20.stats')
+    def term(*_):
+        global stop; stop = True
+    signal.signal(signal.SIGTERM, term); signal.signal(signal.SIGINT, term)
+    labels = [l for l, _ in attrs]
+    f_txq.write('# fields: ' + ' '.join(labels) + '\n')
+    mono0 = time.monotonic(); real0 = time.time() - mono0
+    end = time.time() + guard; n = 0
+    while not stop and time.time() < end:
+        deadline = mono0 + n * period
+        now = time.monotonic()
+        if now < deadline: time.sleep(deadline - now)
+        elif now - deadline > 4 * period:      # fell behind (CPU contention): skip the missed deadlines, count them
+            missed = int((now - mono0) / period) - n; skipped += max(missed, 0); n += max(missed, 0)
+        t = time.monotonic() + real0; stamps.append(t)
+        f_txq.write('%.6f ' % t + ' '.join('%s=%s' % (lab, rd(lab)) for lab in labels) + '\n')
+        try:
+            os.lseek(f_softirqs, 0, 0); raw = os.read(f_softirqs, 8192).decode()
+            row = {}
+            for ln in raw.splitlines():
+                p = ln.split()
+                if p and p[0] in ('NET_TX:', 'NET_RX:'): row[p[0][:6]] = p[1:]
+            f_sirq.write('%.6f TX %s RX %s\n' % (t, ' '.join(row.get('NET_TX', [])), ' '.join(row.get('NET_RX', []))))
+        except OSError: pass
+        if tcbin:
+            try:
+                out = subprocess.run([tcbin, '-s', 'qdisc', 'show'], capture_output=True, timeout=1.0).stdout.decode(errors='replace')
+                keep = []; on = False
+                for ln in out.splitlines():
+                    if ln.startswith('qdisc'): on = any((' dev %s ' % dv) in (ln + ' ') for dv in devs)
+                    if on: keep.append(ln)
+                f_tc.write('== %.6f\n' % t + '\n'.join(keep) + '\n')
+            except (subprocess.SubprocessError, OSError): pass
+        if n % int(hz) == 0:
+            try:
+                with open(f_ints) as fi: lines = [l for l in fi if ('enp' in l or 'IPI0' in l or 'IPI1' in l)]
+                f_irq.write('== %.6f\n' % t + ''.join(lines))
+            except OSError: pass
+        n += 1
+        if time.time() - last_stats > 5:
+            last_stats = time.time(); write_stats()
+            for f in (f_txq, f_sirq, f_irq): f.flush()
+            if f_tc: f_tc.flush()
+    for f in (f_txq, f_sirq, f_irq): f.flush()
+    if f_tc: f_tc.flush()
+    write_stats(True)
+    EOP
+        nohup python3 sampler20.py "$d" "$guard" "$nics" 20 > sampler20.out 2>&1 &
+      else
+        echo "python3 missing: bash fallback at about 16 Hz" > sampler20.missing
+        ( while [ "${EPOCHREALTIME%.*}" -lt "$endsec" ]; do
+            line="$EPOCHREALTIME"
+            for n in $nics bond0; do
+              s=/sys/class/net/$n/statistics; q=/sys/class/net/$n/queues/tx-0/byte_queue_limits
+              tp=-; tb=-; rp=-; bi=-; bl=-
+              { read -r tp < $s/tx_packets; read -r tb < $s/tx_bytes; read -r rp < $s/rx_packets; } 2>/dev/null
+              { read -r bi < $q/inflight; read -r bl < $q/limit; } 2>/dev/null
+              line="$line $n.tx_packets=$tp $n.tx_bytes=$tb $n.rx_packets=$rp $n.bql_inflight=$bi $n.bql_limit=$bl"
+            done
+            echo "$line" >> txq20.log
+            sleep 0.05
+          done ) &
+      fi
+    fi
+
+    # 1 Hz: per-connection TCP state
+    ( while [ "${EPOCHREALTIME%.*}" -lt "$endsec" ]; do
+        ts="$EPOCHREALTIME"
+        if [ "$role" = sut ]; then
+          ss -tinoH state established "( sport = :$port )" 2>/dev/null | awk -v ts="$ts" -f ssc.awk >> ss.log
+        else
+          ss -tinoH state established "( dport = :$port )" 2>/dev/null | awk -v ts="$ts" -f ssc.loadgen.awk >> ss.loadgen.log
+        fi
+        sleep 1
+      done ) &
+
+    # cell snapshots. Written to a temporary file and moved into place only when complete, then a .done marker; the stop task waits for the
+    # marker before it kills anything. Cheap reads first, the slow ethtool -S last, so a late kill still leaves the useful part in the .tmp.
+    snap() {
+      local tag=$1 out=cell.$1$sfx.txt
+      {
+        echo "== $EPOCHREALTIME"
+        echo "== ip -s -s link"; ip -s -s link 2>&1
+        echo "== /proc/net/dev"; cat /proc/net/dev
+        echo "== cpuidle name usage time"; grep -H . /sys/devices/system/cpu/cpu*/cpuidle/state*/name /sys/devices/system/cpu/cpu*/cpuidle/state*/usage /sys/devices/system/cpu/cpu*/cpuidle/state*/time 2>/dev/null
+        if [ "$role" = sut ]; then
+          echo "== irq"; grep -E "enp|IPI0|IPI1" /proc/interrupts
+          echo "== irq effective_affinity_list smp_affinity_list"
+          for i in $(awk "/enp/{sub(\":\",\"\",\$1);print \$1}" /proc/interrupts); do echo "$i $(cat /proc/irq/$i/effective_affinity_list 2>&1) $(cat /proc/irq/$i/smp_affinity_list 2>&1)"; done
+          echo "== tc"; for n in $nics bond0; do tc -s qdisc show dev $n 2>&1; done
+          echo "== tx queue sysfs"; grep -H . /sys/class/net/*/queues/tx-*/tx_timeout /sys/class/net/*/queues/tx-*/byte_queue_limits/* 2>/dev/null
+          for n in $nics bond0; do echo "=== ethtool -S $n"; ethtool -S $n 2>&1; done
+        fi
+        echo "== end of snapshot $tag $EPOCHREALTIME"
+      } > $out.tmp 2>&1
+      mv $out.tmp $out && : > cell.$tag$sfx.done
+    }
+
+    capture() {
+      if ! command -v tcpdump >/dev/null 2>&1; then echo "tcpdump not installed" > tcpdump.missing$sfx; return; fi
+      # one connection in four (destination port multiple of 4 on both sides), header only, 5.6 s around the middle of the window
+      if [ "$role" = sut ]; then
+        ( timeout -s INT 5.6 tcpdump -i $capnic -Q out -nn -s 66 -c 600000 -w - "tcp src port $port and (tcp[2:2] & 3) = 0" 2> cap.$capnic.err | gzip -1 > pcap.$capnic.out.gz ) &
+      else
+        dev=$(ip route get "$tip" 2>/dev/null | grep -o "dev [^ ]*" | head -1 | cut -d" " -f2)
+        ( timeout -s INT 5.6 tcpdump -i "${dev:-any}" -Q in -nn -s 66 -c 900000 -w - "tcp src port $port and (tcp[2:2] & 3) = 0" 2> cap.loadgen.err | gzip -1 > pcap.loadgen.in.gz ) &
+      fi
+      wait
+    }
+
+    # rendezvous on the load: both hosts see the first >= 64 established connections within milliseconds
+    ( dirf=sport; [ "$role" = lg ] && dirf=dport
+      i=0; n=0
+      while [ $i -lt 900 ]; do
+        n=$(ss -tnH state established "( $dirf = :$port )" 2>/dev/null | wc -l)
+        [ "$n" -ge 64 ] && break
+        i=$((i + 1)); sleep 0.2
+      done
+      [ "$n" -ge 64 ] || exit 0
+      tr=$(now_us); echo "$tr" > rendezvous$sfx.us
+      start=$((tr + warm * 1000000)); mid=$((start + dur * 500000 - 2800000)); fin=$((start + dur * 1000000 - 300000))
+      [ "$mid" -gt "$start" ] || mid=$start
+      wait_until $start; snap start
+      wait_until $mid; capture
+      wait_until $fin; snap end
+    ) &
+
+    # driver and host facts, once
+    {
+      echo "== uname"; uname -a
+      echo "== /proc/cmdline"; cat /proc/cmdline
+      echo "== cpuidle driver governor"; grep -H . /sys/devices/system/cpu/cpuidle/current_driver /sys/devices/system/cpu/cpuidle/current_governor 2>&1
+      echo "== sysctl"
+      for k in net.ipv4.tcp_autocorking net.ipv4.tcp_limit_output_bytes net.core.busy_read net.core.busy_poll net.core.dev_weight net.core.default_qdisc net.core.rps_sock_flow_entries; do echo "$k = $(sysctl -n $k 2>&1)"; done
+      if [ "$role" = sut ]; then
+        for n in $nics bond0; do
+          echo "=== $n"
+          for o in -i -l -g --show-priv-flags; do echo "--- ethtool $o"; ethtool $o $n 2>&1; done
+          echo "queues: $(ls /sys/class/net/$n/queues 2>&1 | tr "\n" " ")"
+          grep -H . /sys/class/net/$n/threaded /sys/class/net/$n/gro_flush_timeout /sys/class/net/$n/napi_defer_hard_irqs /sys/class/net/$n/tx_queue_len 2>&1
+        done
+        drv=$(ethtool -i $(echo $nics | cut -d" " -f1) 2>/dev/null | sed -n "s/^driver: //p")
+        echo "== modinfo $drv"; modinfo ${drv:-r8127} 2>&1 | head -30
+        echo "== /proc/net/bonding/bond0"; cat /proc/net/bonding/bond0 2>&1
+      else
+        dev=$(ip route get "$tip" 2>/dev/null | grep -o "dev [^ ]*" | head -1 | cut -d" " -f2)
+        echo "route dev: $dev"
+        for n in $dev $(cat /sys/class/net/$dev/bonding/slaves 2>/dev/null); do
+          echo "=== $n"
+          for o in -i -l; do echo "--- ethtool $o"; ethtool $o $n 2>&1; done
+        done
+        drv=$(ethtool -i $(echo $dev $(cat /sys/class/net/$dev/bonding/slaves 2>/dev/null) | awk "{print \$NF}") 2>/dev/null | sed -n "s/^driver: //p")
+        echo "== modinfo $drv"; modinfo ${drv:-bond} 2>&1 | head -30
+        echo "== irq placement of NIC vectors"; grep -E "eth|enp|eno|ens|mlx|ixgbe|i40e|ice" /proc/interrupts | head -80
+      fi
+    } > driverfacts$sfx.txt 2>&1
+
+    wait
+    EOSTALL
+    cd $d
+    setsid nohup bash stallcap.sh {{ 'sut' if inventory_hostname == bench_target else 'lg' }} $d {{ bench_port | default(8080) }} {{ bench_warmup_seconds | default(5) }} {{ bench_duration_seconds | default(30) }} {{ cell_guard_seconds }} {{ hostvars[bench_target].lan_ip }} > stallcap.out 2>&1 &
+    disown
+    true
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  failed_when: false
+  when:
+    - (inventory_hostname == bench_target and (cell_bound | bool)) or (inventory_hostname == "msa2-client" and (hostvars[bench_target].cell_bound | default(false) | bool))
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | run runner against bench target"
   # Flag names must match the runner CLI in cmd/runner/main.go:
@@ -609,6 +1113,45 @@
     - (runner_run.rc | default(0)) != 0
 
 # ---------- teardown for this cell ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop stall captures (both hosts)"
+  # The window-end snapshot is written to a temporary file and moved into place when complete, then a .done marker is
+  # created. Wait for that marker (at most 45 s, only when the rendezvous happened) BEFORE anything is killed: X1 lost the end
+  # snapshot of every SUT cell because this task killed the writer mid-write.
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    for sfx in "" ".loadgen"; do
+      if [ -f $d/rendezvous$sfx.us ]; then
+        i=0
+        while [ ! -f $d/cell.end$sfx.done ] && [ $i -lt 90 ] && [ -f $d/stallcap$sfx.pid ] && kill -0 "$(cat $d/stallcap$sfx.pid)" 2>/dev/null; do sleep 0.5; i=$((i + 1)); done
+      fi
+    done
+    for f in $d/stallcap.pid $d/stallcap.loadgen.pid; do
+      [ -f $f ] && kill -TERM -- -"$(cat $f)" 2>/dev/null
+    done
+    sleep 2
+    for f in $d/stallcap.pid $d/stallcap.loadgen.pid; do
+      [ -f $f ] && kill -KILL -- -"$(cat $f)" 2>/dev/null
+    done
+    true
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == bench_target or inventory_hostname == "msa2-client"
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop net-counter sampler (loadgen side)"
+  ansible.builtin.shell: |
+    if [ -f {{ cell_dir }}/netctr.loadgen.pid ]; then
+      kill -TERM "$(cat {{ cell_dir }}/netctr.loadgen.pid)" 2>/dev/null
+    fi
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == "msa2-client"
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (loadgen side)"
   # The sampler window is sized to the hang guard so it always outlives
   # the runner; without this kill a healthy (much shorter) cell would
@@ -646,6 +1189,45 @@
   args:
     executable: /bin/bash
   changed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop kernel-counter sampler (server side, A/B)"
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    if [ -f $d/kcounters.pid ]; then
+      kill -TERM "$(cat $d/kcounters.pid)" 2>/dev/null
+    fi
+    if [ -f $d/threads.pid ]; then
+      kill -TERM "$(cat $d/threads.pid)" 2>/dev/null
+    fi
+    pid=$(cat $d/server.pid 2>/dev/null)
+    if [ -n "$pid" ]; then
+      for t in /proc/$pid/task/*; do
+        echo "$(basename $t) $(awk "/Cpus_allowed_list/{print \$2}" $t/status 2>/dev/null) psr=$(awk "{print \$39}" $t/stat 2>/dev/null) $(cat $t/comm 2>/dev/null)"
+      done > $d/sut-threads.post 2>&1
+    fi
+    { echo "== carrier_changes"; grep -H . /sys/class/net/*/carrier_changes 2>/dev/null; } > $d/host-net.post 2>&1
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == bench_target
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop net-counter sampler and NIC counters after (server side)"
+  ansible.builtin.shell: |
+    d={{ cell_dir }}
+    if [ -f $d/netctr.pid ]; then
+      kill -TERM "$(cat $d/netctr.pid)" 2>/dev/null
+    fi
+    nics="$(for n in /sys/class/net/*; do [ -e $n/device ] && basename $n; done) bond0"
+    { for n in $nics; do echo "=== $n"; ethtool -S $n 2>&1; done; echo "== ip -s link"; ip -s link 2>&1; } > $d/ethtool.post 2>&1
+    true
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+  failed_when: false
   when: inventory_hostname == bench_target
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (server side)"
@@ -729,3 +1311,33 @@
   # "stop any prior server" + bind-failure isolation handle any leftover.
   failed_when: false
   when: inventory_hostname == bench_target
+
+# ---------- IRQPLACE restore (layer 1 of 4): the explicit standing CPU, verified, after the server has stopped ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | IRQPLACE restore the explicit standing CPU and verify by readback (fails the run loudly)"
+  become: true
+  ansible.builtin.shell: >-
+    bash /tmp/celeris-irqplace/irqplace.sh restore cell
+    {{ nic_irq_placement.iface | string | quote }}
+    {{ nic_irq_placement.vector | string | quote }}
+    {{ nic_irq_placement.cpu | string | quote }}
+    0
+    {{ cell_dir | quote }}
+  args:
+    executable: /bin/bash
+  register: irq_restore
+  changed_when: false
+  failed_when: irq_restore.rc | default(0) != 0
+  when:
+    - inventory_hostname == bench_target
+    - irq_probe_cpu | default('') != ''
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | IRQPLACE keep the celeris plan line, the loop count and the NIC vector warning of this column (also the amd64 columns)"
+  ansible.builtin.shell: |
+    grep -hiE "capability-aware CPU pinning|NIC interrupt vectors are serviced|loops could not pin|listening" {{ cell_dir }}/server.log > {{ cell_dir }}/plan-line.txt 2>&1
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bin is match('^irq')
