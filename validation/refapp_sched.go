@@ -128,12 +128,13 @@ func threadTable(procRoot string, pid int) string {
 			t.tid, t.comm, t.state, t.cpus, t.vol, t.nonvol, t.utime, t.stime, role)
 	}
 	fmt.Fprintf(&b, "REFAPP_THREADS n=%d leader_cpus_allowed_list=%s masks=%s states=%s\n",
-		len(ts), leader, counts(masks), counts(states))
+		len(ts), leader, counts(masks, ";"), counts(states, ","))
 	return b.String()
 }
 
-// counts renders a tally as "k:n,k:n" sorted by key.
-func counts(m map[string]int) string {
+// counts renders a tally as "k:n<sep>k:n" sorted by key. The masks use ";"
+// because a mask is itself a comma list ("0-3,8").
+func counts(m map[string]int, sep string) string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
@@ -143,7 +144,7 @@ func counts(m map[string]int) string {
 	for i, k := range keys {
 		parts[i] = k + ":" + strconv.Itoa(m[k])
 	}
-	return strings.Join(parts, ",")
+	return strings.Join(parts, sep)
 }
 
 // fetchSched GETs the refapp's /debug/sched from its side listener.

@@ -93,6 +93,7 @@ func TestFireWSLargeEcho_DiagWedge(t *testing.T) {
 	if rep.Verdict.Class != verdictWedge || rep.Verdict.Reason != "recvq_flat_no_progress" {
 		t.Fatalf("verdict %s/%s, want WEDGE_CLASS/recvq_flat_no_progress\n%s", rep.Verdict.Class, rep.Verdict.Reason, rep.Text)
 	}
+	t.Logf("record as written to ws-echo-diag.txt:\n%s", rep.Text)
 	if rec.timeoutAtDeliver[0] != 0 {
 		t.Errorf("timeout was already counted (%d) when the report was delivered: the tally tick would end the cell before the second instant", rec.timeoutAtDeliver[0])
 	}

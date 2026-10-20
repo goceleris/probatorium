@@ -42,7 +42,9 @@ func procFixture(t *testing.T) string {
 	write("100/task/102/status", status("auth_session_ra", "S (sleeping)", "0-15", 5, 5))
 	write("100/task/102/stat", stat(102, "auth_session_ra", 1, 1))
 	write("100/task/103/status", status("auth_session_ra", "S (sleeping)", "1", 7000, 12))
+	write("100/task/104/status", status("auth_session_ra", "S (sleeping)", "2-3,8", 1, 1))
 	write("100/task/103/stat", stat(103, "auth (odd) name", 3, 4)) // a ")" inside comm must not shift the fields
+	write("100/task/104/stat", stat(104, "auth_session_ra", 1, 1))
 	return root
 }
 
@@ -56,7 +58,7 @@ func TestThreadTable_LeaderMaskIsNotTheProcessMask(t *testing.T) {
 		"thread tid=103 comm=auth_session_ra state=S cpus_allowed_list=1 vol=7000 nonvol=12 utime=3 stime=4",
 		// The summary groups masks and states: the leader's mask of 0 is one
 		// of three, and two threads run free on 0-15.
-		"REFAPP_THREADS n=4 leader_cpus_allowed_list=0 masks=0:1,0-15:2,1:1 states=R:1,S:3",
+		"REFAPP_THREADS n=5 leader_cpus_allowed_list=0 masks=0:1;0-15:2;1:1;2-3,8:1 states=R:1,S:4",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("table lacks %q:\n%s", want, got)
@@ -85,7 +87,7 @@ func TestRefappSchedText_SideListenerAndMissingLegs(t *testing.T) {
 	t.Cleanup(func() { _ = srv.Close() })
 
 	got := refappSchedText(context.Background(), root, 100, ln.Addr().String())
-	for _, want := range []string{"VALIDATOR_CPUS ", "cpus_allowed_list=0-15", "REFAPP_THREADS n=4", `REFAPP_SCHED {"gomaxprocs":16,"numcpu":16}`} {
+	for _, want := range []string{"VALIDATOR_CPUS ", "cpus_allowed_list=0-15", "REFAPP_THREADS n=5", `REFAPP_SCHED {"gomaxprocs":16,"numcpu":16}`} {
 		if !strings.Contains(got, want) {
 			t.Errorf("text lacks %q:\n%s", want, got)
 		}

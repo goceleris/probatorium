@@ -75,7 +75,8 @@ func TestWriteRefappReadback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"ARM refapp_cpus=2-3 workload_hint=none ", "REFAPP_THREADS n=4 leader_cpus_allowed_list=0", "VALIDATOR_CPUS "} {
+	t.Logf("refapp_sched.txt:\n%s", b)
+	for _, want := range []string{"ARM refapp_cpus=2-3 workload_hint=none ", "REFAPP_THREADS n=5 leader_cpus_allowed_list=0", "VALIDATOR_CPUS "} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("readback lacks %q:\n%s", want, b)
 		}
