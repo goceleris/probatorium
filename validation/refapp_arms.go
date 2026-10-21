@@ -56,6 +56,14 @@ const refappReadbackFile = "refapp_sched.txt"
 // input that did not reach the refapp would otherwise be read as a null
 // result. Best effort: an unreadable leg says so in the file.
 func writeRefappReadback(ctx context.Context, dir string, getenv func(string) string, procRoot string, pid int, debugAddr string) error {
+	_, err := writeRefappReadbackText(ctx, dir, getenv, procRoot, pid, debugAddr)
+	return err
+}
+
+// writeRefappReadbackText is writeRefappReadback that also returns the text it
+// wrote, so the cell document can take the refapp's GOMAXPROCS from the same
+// /debug/sched answer instead of asking the refapp twice.
+func writeRefappReadbackText(ctx context.Context, dir string, getenv func(string) string, procRoot string, pid int, debugAddr string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	cpus := strings.TrimSpace(getenv(refapparms.CPUsEnv))
@@ -68,7 +76,7 @@ func writeRefappReadback(ctx context.Context, dir string, getenv func(string) st
 	}
 	text := fmt.Sprintf("ARM refapp_cpus=%s workload_hint=%s at=%s\n%s",
 		cpus, hint, time.Now().UTC().Format(time.RFC3339Nano), refappSchedText(cctx, procRoot, pid, debugAddr))
-	return writePlainText(filepath.Join(dir, refappReadbackFile), text)
+	return text, writePlainText(filepath.Join(dir, refappReadbackFile), text)
 }
 
 // logArm says on stderr that an arm is on, once per cell (one line in the

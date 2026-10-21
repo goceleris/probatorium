@@ -321,7 +321,22 @@ import (
 //     published summary.json drops it (SplitDocument) and env.json keeps
 //     the verdict. The publish gate refuses a document whose verdict shows
 //     a forbidden overlap. Additive; older readers ignore both fields.
-const SchemaVersion = "5.22"
+//   - 5.23 — race tier observability (probatorium#481, celeris#871). A
+//     failed race run (39560945814) could not say when its h2c_hang and
+//     ws_handshake_fail events happened (the slow ring keeps only reads over
+//     one second; those closed in 12 ms), what the refapp ran under, or how
+//     many ws_echo fires were SLOW. Adds Tier1Summary.H2CHangSpan
+//     (h2c_hang_span) and WSHandshakeFailSpan (ws_handshake_fail_span): the
+//     first and last event of the kind with UTC instant, since_ready_ms,
+//     cause, error and addresses; and Tier1Summary.RefappSched
+//     (refapp_sched): the refapp's per-thread Cpus_allowed_list read from
+//     /proc at ready, in every run, plus GOMAXPROCS when the stall-capture
+//     side listener answered. Adds two ws_echo keys, ws_echo_slow_over_n and
+//     ws_echo_slow_no_clean_fire: the SLOW_CLASS fires the race tier's guard
+//     refused, a subset of ws_echo_timeout (which still fails and is still
+//     the only one gated). Nothing new is gated. Additive; older readers
+//     ignore every field.
+const SchemaVersion = "5.23"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -1158,6 +1173,8 @@ type Tier1Summary struct {
 	//                  ws_echo_timeout_slow is the race tier's recorded latency: timed-out fires whose
 	//                  two-instant capture said SLOW_CLASS. Not in ws_echo_timeout, not in the cross-arch
 	//                  diff, tolerated by Gate only with GateOptions.ToleratesWSEchoSlow (probatorium#481).
+	//                  ws_echo_slow_over_n / ws_echo_slow_no_clean_fire (schema 5.23) split, by guard
+	//                  reason, the SLOW_CLASS fires the guard refused; a subset of ws_echo_timeout, not gated.
 	Adversarial map[string]int64 `json:"adversarial,omitempty"`
 	H2CChurn    map[string]int64 `json:"h2c_churn,omitempty"`
 	WSTorture   map[string]int64 `json:"ws_torture,omitempty"`

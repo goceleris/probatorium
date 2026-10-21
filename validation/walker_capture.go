@@ -281,6 +281,29 @@ func (c *fireCapture) record(conn net.Conn, dial, write, read time.Duration,
 	c.slow.add(f)
 }
 
+// stamp builds the EventStamp of a failed fire that ended at at: the instant
+// (UTC), the time since the refapp was ready, the walker's cause and the
+// verbatim error and addresses. The slow ring keeps only reads over one
+// second; this is for the failures that closed in a few milliseconds.
+func (c *fireCapture) stamp(at time.Time, cause string, err error, conn net.Conn) report.EventStamp {
+	st := report.EventStamp{TS: at.UTC().Format(time.RFC3339Nano), Cause: cause}
+	if err != nil {
+		st.Err = err.Error()
+	}
+	if r := c.readyAt.Load(); r != 0 {
+		st.SinceReadyMs = at.Sub(time.Unix(0, r)).Milliseconds()
+	}
+	if conn != nil {
+		if a := conn.LocalAddr(); a != nil {
+			st.LocalAddr = a.String()
+		}
+		if a := conn.RemoteAddr(); a != nil {
+			st.RemoteAddr = a.String()
+		}
+	}
+	return st
+}
+
 // recordNoRead files a fire that by design has no read leg (the h2c
 // rst-before-read mode): dial and write only.
 func (c *fireCapture) recordNoRead(dial, write time.Duration) {

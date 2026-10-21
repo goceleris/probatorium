@@ -581,6 +581,29 @@ weekend, checkptr and PR runs have neither switch, so a `SLOW_CLASS` ws_echo tim
 the first timeout ended its cell, so "one per run" was a censored count; the per-cell rate is now
 measured by the race tier itself.
 
+What a race run records about itself (schema 5.23, record only, nothing new is gated):
+
+- **Every SLOW fire is counted.** A `SLOW_CLASS` fire the guard refuses is still the failing
+  `ws_echo_timeout`; it is also counted by reason in `ws_echo_slow_over_n` and
+  `ws_echo_slow_no_clean_fire` (subsets of `ws_echo_timeout`). `mage ValidateGate` prints each cell's total
+  (tolerated plus refused) and lists the refused ones in a block of their own, marked FAILING, so the
+  failure reads as slow-class latency past N and not as a wedge. A document without these keys prints as
+  before.
+- **`h2c_hang` and `ws_handshake_fail` have an instant.** `tier_1.h2c_hang_span` and
+  `tier_1.ws_handshake_fail_span` hold the first and last event of the cell: UTC `ts`, `since_ready_ms`,
+  `cause` (eof, reset, timeout, status, other), the verbatim `err` and the addresses. The slow ring keeps
+  only reads over one second, so a hang that closed in milliseconds had no timestamp anywhere. `ts` is UTC,
+  like `ready_at`, the slow ring and the epoch seconds of `properties_series.csv` (whose
+  `adaptive_switches` column steps at the switch), so the four join on one timeline; the refapp's own
+  stderr lines carry host-local time with no zone and join through `since_ready_ms`.
+- **The refapp's CPU placement is in the cell document in every run:** `tier_1.refapp_sched` has the
+  per-thread `Cpus_allowed_list` counts (`thread_masks`) read from `/proc` at ready, and the leader's mask
+  separately, which is not the process's mask. `gomaxprocs` is recorded only when the stall-capture side
+  listener answered; otherwise it is 0 with a note. Recording it in every run needs the refapp to publish
+  it (`validation/refapp/internal/debugvars`), a change to the refapp build that is not made here.
+- **The race tier runs the host sampler** (`HostSamplerStart` / `HostSamplerStop`, tag
+  `race-<run id>`), as the weekend soak does.
+
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
 `auth_session_ratelimit` routes them today. The verdict is recorded per cell (`ws_route_probed` /

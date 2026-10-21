@@ -990,6 +990,10 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	loopCtx, cancelLoop := context.WithCancel(ctx)
 	defer cancelLoop()
 	propDone := make(chan checker.Tally, 1)
+	// schedRec is the refapp's CPU placement (refapp_sched_record.go), set
+	// once by a goroutine schedWG joins before the tally is read.
+	var schedRec atomic.Pointer[report.RefappSched]
+	var schedWG sync.WaitGroup
 	// expectedPanicsFn is published by driveTier1 (OnLiveTally) once its tally
 	// exists; the property loop reads it on every snapshot so I-PANIC nets
 	// designed panics out.
@@ -1022,17 +1026,19 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		case <-loopCtx.Done():
 		}
 		refappPID.Store(int64(p))
-		if armsActive(os.Getenv) && p > 0 {
-			// The arm as the refapp lived it, for the analysis to read back
-			// (refapp_arms.go). Off the property loop's path.
+		if p > 0 {
+			// The refapp's CPU placement for the cell document, read in every
+			// run; the arm / stall-capture readback file is written inside it
+			// when one is on (refapp_sched_record.go). Off the property loop's
+			// path, joined below.
+			schedWG.Add(1)
 			go func() {
+				defer schedWG.Done()
 				addr := ""
 				if f := o.debugAddr.Load(); f != nil {
 					addr = (*f)()
 				}
-				if err := writeRefappReadback(loopCtx, o.cfg.OutDir, os.Getenv, "/proc", p, addr); err != nil {
-					fmt.Fprintf(os.Stderr, "validation: refapp readback: %v\n", err)
-				}
+				schedRec.Store(collectRefappSched(loopCtx, os.Getenv, o.cfg.DriverMode, "/proc", p, o.cfg.OutDir, addr))
 			}()
 		}
 		if loopSkipped != "" {
@@ -1153,6 +1159,8 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// the goroutine never outlives the tier.
 	cancelLoop()
 	tally.Properties = <-propDone
+	schedWG.Wait()
+	tally.RefappSched = schedRec.Load()
 	if err != nil && ctx.Err() == nil {
 		// The cell produced nothing measurable, so this file is the only
 		// place a reader can learn why -- and until probatorium#359 it
@@ -2066,12 +2074,16 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		// Per-fire capture (celeris#588). The histograms are pointers so
 		// a cell whose slice never ran omits them rather than shipping
 		// twenty-four zeros; the rings are omitted when empty.
-		H2CLatency:       walkerLatencyIfRan(s.H2CChurn.Sent, s.H2CChurn.Latency),
-		WSLatency:        walkerLatencyIfRan(s.WSTorture.Sent, s.WSTorture.Latency),
-		H2CSlowReads:     append([]report.SlowFire(nil), s.H2CChurn.SlowReads...),
-		WSSlowReads:      append([]report.SlowFire(nil), s.WSTorture.SlowReads...),
-		ReadyAt:          s.ReadyAt,
-		RefappStderrTail: append([]string(nil), s.RefappStderrTail...),
+		H2CLatency:   walkerLatencyIfRan(s.H2CChurn.Sent, s.H2CChurn.Latency),
+		WSLatency:    walkerLatencyIfRan(s.WSTorture.Sent, s.WSTorture.Latency),
+		H2CSlowReads: append([]report.SlowFire(nil), s.H2CChurn.SlowReads...),
+		WSSlowReads:  append([]report.SlowFire(nil), s.WSTorture.SlowReads...),
+		ReadyAt:      s.ReadyAt,
+
+		H2CHangSpan:         s.H2CChurn.HangSpan,
+		WSHandshakeFailSpan: s.WSTorture.HandshakeFailSpan,
+		RefappSched:         cloneRefappSched(s.RefappSched),
+		RefappStderrTail:    append([]string(nil), s.RefappStderrTail...),
 		WSEcho: map[string]int64{
 			"ws_echo_route_probed":    b2i(s.WSEcho.RouteProbed),
 			"ws_echo_route_present":   b2i(s.WSEcho.RoutePresent),
@@ -2090,9 +2102,13 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"ws_echo_missing":           s.WSEcho.Missing,
 			"ws_echo_timeout":           s.WSEcho.Timeout,
 			"ws_echo_timeout_slow":      s.WSEcho.TimeoutSlow,
-			"ws_echo_frame_err":         s.WSEcho.FrameErr,
-			"ws_echo_close_ok":          s.WSEcho.CloseOK,
-			"ws_echo_cut_at_deadline":   s.WSEcho.CutAtDeadline,
+			// Subset of ws_echo_timeout: SLOW_CLASS fires the race tier's
+			// guard refused (attribution, not a signal of its own).
+			"ws_echo_slow_over_n":        s.WSEcho.TimeoutSlowOverN,
+			"ws_echo_slow_no_clean_fire": s.WSEcho.TimeoutSlowNoClean,
+			"ws_echo_frame_err":          s.WSEcho.FrameErr,
+			"ws_echo_close_ok":           s.WSEcho.CloseOK,
+			"ws_echo_cut_at_deadline":    s.WSEcho.CutAtDeadline,
 		},
 	}
 	m := out.H2CChurn

@@ -44,6 +44,13 @@ const (
 	dispositionFail      = "FAIL"
 )
 
+// The guard's refusal reasons, in WS_ECHO_DISPOSITION and in
+// wsEchoDiagReport.GuardReason.
+const (
+	guardOverN   = "over_n"
+	guardNoClean = "no_clean_fire_since_first_slow"
+)
+
 // wsEchoSlowGuard is the per-cell state of the two guard rules.
 type wsEchoSlowGuard struct {
 	mu   sync.Mutex
@@ -63,11 +70,11 @@ func (g *wsEchoSlowGuard) admit(n int, cleanNow int64) (ok bool, reason string, 
 	count = g.slow + 1
 	switch {
 	case count > n:
-		return false, "over_n", count
+		return false, guardOverN, count
 	case count == 1:
 		g.cleanAtFirst = cleanNow
 	case cleanNow == g.cleanAtFirst:
-		return false, "no_clean_fire_since_first_slow", count
+		return false, guardNoClean, count
 	}
 	g.slow = count
 	return true, "", count
@@ -92,6 +99,7 @@ func (d *wsEchoDiag) book(rep *wsEchoDiagReport, cleanNow int64) bool {
 			rep.Tolerated = true
 			line = fmt.Sprintf("WS_ECHO_DISPOSITION=%s ws_echo_timeout_slow=%d n=%d finding=I-WS-ECHO-SLOW tier=race", dispositionTolerated, count, d.SlowTolerance)
 		} else {
+			rep.GuardReason = reason
 			line = fmt.Sprintf("WS_ECHO_DISPOSITION=%s reason=%s slow_count=%d n=%d tier=race", dispositionFail, reason, count, d.SlowTolerance)
 		}
 	}

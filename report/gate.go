@@ -426,6 +426,30 @@ func causeSuffix(m map[string]int64, key string) string {
 	return " (" + strings.Join(parts, ", ") + ")"
 }
 
+// slowRefusedSuffix says, on the ws_echo_timeout violation, how many of its
+// timeouts were SLOW_CLASS fires the race tier's guard refused to tolerate
+// (ws_echo_slow_over_n, ws_echo_slow_no_clean_fire), so a failure that is
+// latency over the tolerance does not read as a wedge. Empty for any other
+// key and when none were refused, which includes every document written
+// before the counters existed.
+func slowRefusedSuffix(m map[string]int64, key string) string {
+	if key != "ws_echo_timeout" {
+		return ""
+	}
+	over, noClean := m[WSEchoSlowOverNKey], m[WSEchoSlowNoCleanKey]
+	refused := over + noClean
+	if refused == 0 {
+		return ""
+	}
+	total := m[key]
+	if refused >= total {
+		return fmt.Sprintf(" -- SLOW_CLASS latency over the race tier's tolerance, not a wedge (%s=%d, %s=%d)",
+			WSEchoSlowOverNKey, over, WSEchoSlowNoCleanKey, noClean)
+	}
+	return fmt.Sprintf(" -- %d of %d were SLOW_CLASS fires over the race tier's tolerance (%s=%d, %s=%d); the others were WEDGE_CLASS, INDETERMINATE or had no capture",
+		refused, total, WSEchoSlowOverNKey, over, WSEchoSlowNoCleanKey, noClean)
+}
+
 // slowFireDetail maps a gated total to the slow-fire ring that carries its
 // per-event records.
 func slowFireDetail(t *Tier1Summary, key string) []SlowFire {
@@ -616,7 +640,7 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 				}
 				if v := m[g.key]; v > 0 {
 					add(c, "tier_1."+g.slice+"."+g.key, v,
-						g.why+causeSuffix(m, g.key)+FirstFailedSlowFire(slowFireDetail(t, g.key)))
+						g.why+causeSuffix(m, g.key)+slowRefusedSuffix(m, g.key)+FirstFailedSlowFire(slowFireDetail(t, g.key)))
 				}
 			}
 			// The race tier's recorded latency (not in gatedTier1Keys: it is

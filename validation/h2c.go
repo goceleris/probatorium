@@ -347,6 +347,8 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 		// the slow-read ring, so the next one is attributable from the
 		// artifact alone (celeris#588).
 		cause := tally.recordHang(err, readD)
+		at := readStart.Add(readD)
+		tally.hangSpan.mark(at, tally.capture.stamp(at, cause, err, conn))
 		tally.capture.record(conn, dialD, writeD, readD, err, "hang-"+cause, "", n, readStart)
 		return
 	}

@@ -3,26 +3,60 @@ package report
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // WSEchoSlowLines renders, for ValidateGate's output, every cell that booked a
-// SLOW_CLASS ws_echo timeout (ws_echo_timeout_slow): the latency the race tier
-// records instead of failing on (probatorium#481, celeris#871). It reads cells
-// and writes nothing; [Gate] judges the same counter on its own.
+// SLOW_CLASS ws_echo fire: the ones the race tier tolerates
+// (ws_echo_timeout_slow) and the ones its guard refused (ws_echo_slow_over_n,
+// ws_echo_slow_no_clean_fire; the latter fail as ws_echo_timeout). It records
+// the latency the race tier does not fail on (probatorium#481, celeris#871).
+// It reads cells and writes nothing; [Gate] judges the counters on its own.
 //
 // tolerated is whether this gate run is the race tier. Then it always returns
 // a header, so a run that recorded none says so. Otherwise it returns nothing
-// unless a cell carries the counter, and says that the gate fails on it.
+// unless a cell carries ws_echo_timeout_slow, and says that the gate fails on
+// it.
+//
+// A cell's row counts every SLOW fire it had. A cell with no refused fire
+// prints exactly the row it always did; a cell with one says how many were
+// tolerated and how many were refused, and is repeated in a second block of
+// its own for the refused ones, which fail the gate.
 func WSEchoSlowLines(cells []ValidationCellResult, tolerated bool) []string {
-	var rows []string
+	var rows, refusedRows []string
 	for _, c := range cells {
-		if c.Tier1 == nil || c.Tier1.WSEcho[WSEchoSlowKey] == 0 {
+		if c.Tier1 == nil {
 			continue
 		}
-		rows = append(rows, fmt.Sprintf("  %-24s %-8s %-12s %d SLOW_CLASS ws_echo timeout(s) in %d fire(s) (%d echoes ok)",
-			c.Refapp, c.Engine, c.Arch, c.Tier1.WSEcho[WSEchoSlowKey], c.Tier1.WSEcho["ws_echo_fires"], c.Tier1.WSEcho["ws_echo_ok"]))
+		slow := c.Tier1.WSEcho[WSEchoSlowKey]
+		var over, noClean int64
+		if tolerated {
+			over, noClean = c.Tier1.WSEcho[WSEchoSlowOverNKey], c.Tier1.WSEcho[WSEchoSlowNoCleanKey]
+		}
+		if slow+over+noClean == 0 {
+			continue
+		}
+		who := fmt.Sprintf("  %-24s %-8s %-12s", c.Refapp, c.Engine, c.Arch)
+		fires, ok := c.Tier1.WSEcho["ws_echo_fires"], c.Tier1.WSEcho["ws_echo_ok"]
+		if over+noClean == 0 {
+			rows = append(rows, fmt.Sprintf("%s %d SLOW_CLASS ws_echo timeout(s) in %d fire(s) (%d echoes ok)", who, slow, fires, ok))
+			continue
+		}
+		var failing []string
+		if over > 0 {
+			failing = append(failing, fmt.Sprintf("%d over N=%d (%s)", over, WSEchoSlowTolerance, WSEchoSlowOverNKey))
+		}
+		if noClean > 0 {
+			failing = append(failing, fmt.Sprintf("%d with no clean fire since the first (%s)", noClean, WSEchoSlowNoCleanKey))
+		}
+		detail := strings.Join(failing, ", ")
+		rows = append(rows, fmt.Sprintf("%s %d SLOW_CLASS ws_echo fire(s) in %d fire(s) (%d echoes ok): %d tolerated (%s), %d FAILING: %s",
+			who, slow+over+noClean, fires, ok, slow, WSEchoSlowKey, over+noClean, detail))
+		refusedRows = append(refusedRows, fmt.Sprintf("%s %s; counted in ws_echo_timeout=%d",
+			who, detail, c.Tier1.WSEcho["ws_echo_timeout"]))
 	}
 	sort.Strings(rows)
+	sort.Strings(refusedRows)
 	if len(rows) == 0 {
 		if !tolerated {
 			return nil
@@ -35,5 +69,11 @@ func WSEchoSlowLines(cells []ValidationCellResult, tolerated bool) []string {
 	} else {
 		head = fmt.Sprintf("ws_echo_timeout_slow in %d cell(s) of a tier that does not tolerate it (the gate fails on these):", len(rows))
 	}
-	return append([]string{head}, rows...)
+	out := append([]string{head}, rows...)
+	if len(refusedRows) > 0 {
+		out = append(out, fmt.Sprintf("ws_echo SLOW_CLASS fires over the tolerance (%s, %s; race tier): %d cell(s), FAILING as ws_echo_timeout -- slow-class latency past N=%d per cell, not a wedge (the server read and wrote in the window):",
+			WSEchoSlowOverNKey, WSEchoSlowNoCleanKey, len(refusedRows), WSEchoSlowTolerance))
+		out = append(out, refusedRows...)
+	}
+	return out
 }

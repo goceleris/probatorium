@@ -209,12 +209,9 @@ func TestSchema523SpansAndSchedRoundTrip(t *testing.T) {
 	c.Tier1.RefappSched = &RefappSched{At: "2026-10-21T09:36:03Z", Threads: 5, LeaderCPUsAllowedList: "0",
 		ThreadMasks: map[string]int{"0": 1, "0-15": 4}, GOMAXPROCSNote: "no side listener"}
 	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
-	doc := Document{
-		SchemaVersion: SchemaVersion,
-		HostArchPair:  "linux_amd64",
-		Validation: &ValidationResults{StartedAt: now, FinishedAt: now.Add(time.Minute),
-			Cells: []ValidationCellResult{c}},
-	}
+	doc := minimalDoc(t)
+	doc.Validation = &ValidationResults{StartedAt: now, FinishedAt: now.Add(time.Minute),
+		Cells: []ValidationCellResult{c}}
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		t.Fatal(err)
@@ -231,8 +228,10 @@ func TestSchema523SpansAndSchedRoundTrip(t *testing.T) {
 	}
 	// An older document, without any of them, still parses and validates.
 	plain := cleanCell("a", "std", "amd64")
-	rawPlain, _ := json.Marshal(Document{SchemaVersion: "5.22", HostArchPair: "linux_amd64",
-		Validation: &ValidationResults{StartedAt: now, FinishedAt: now, Cells: []ValidationCellResult{plain}}})
+	olderDoc := minimalDoc(t)
+	olderDoc.SchemaVersion = "5.22"
+	olderDoc.Validation = &ValidationResults{StartedAt: now, FinishedAt: now, Cells: []ValidationCellResult{plain}}
+	rawPlain, _ := json.Marshal(olderDoc)
 	for _, k := range []string{"h2c_hang_span", "ws_handshake_fail_span", "refapp_sched"} {
 		if strings.Contains(string(rawPlain), k) {
 			t.Errorf("%s is serialised for a cell without it", k)

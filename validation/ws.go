@@ -314,6 +314,8 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 	nRead := 0
 	fail := func(err error, status string) {
 		cause := tally.recordHandshakeFail(err, status)
+		at := time.Now()
+		tally.handshakeFailSpan.mark(at, tally.capture.stamp(at, cause, err, conn))
 		tally.capture.record(conn, dialD, writeD, time.Since(readStart), err,
 			"handshake-fail-"+cause, status, nRead, readStart)
 	}

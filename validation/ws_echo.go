@@ -497,6 +497,15 @@ readLoop:
 			tally.timeoutSlow.Add(1)
 		} else {
 			tally.timeout.Add(1)
+			// A SLOW_CLASS fire the guard refused is still the failing
+			// ws_echo_timeout; it is also counted by reason so the failure
+			// reads as latency over the tolerance and not as a wedge.
+			switch rep.GuardReason {
+			case guardOverN:
+				tally.timeoutSlowOverN.Add(1)
+			case guardNoClean:
+				tally.timeoutSlowNoClean.Add(1)
+			}
 		}
 	}
 	if connEnded {
