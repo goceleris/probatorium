@@ -15,7 +15,7 @@
 # Inputs, set by the play: os_host (the target), os_bench_targets, os_loadgen_hosts (inventory group members),
 # os_surveys (every host's preflight survey, by host name), pre_target (the target's reboot_snapshot.sh record
 # before), pre_survey (its survey before), allow_results_loss, results_root, os_min_* (disk), and, as the play
-# produces them: sim (simulate), dkms_check, target_kernel, post_raw / post_survey / toolcheck (after the reboot),
+# produces them: sim (simulate), dkms_check, target_kernel, pre_toolcheck, post_raw / post_survey / toolcheck (after the reboot),
 # placement_vector, lan_ip, fabric_peer, ansible_user, os_counter_ceiling.
 
 os_min_root_free_kib: 6291456
@@ -52,6 +52,9 @@ refusals_str: >-
   {% if s.boot.savedefault %}{% set _ = p.append('GRUB_SAVEDEFAULT=true: booting the one-shot entry would make it the saved default') %}{% endif %}
   {% if s.boot.boot_stack | length > 0 %}{% set _ = p.append('/boot/grub is on ' ~ s.boot.boot_stack ~ ': grub cannot write its environment block there, so the boot is never one-shot') %}{% endif %}
   {% if s.boot.running_entry_id | length == 0 %}{% set _ = p.append('grub.cfg has no menu entry for the running kernel ' ~ s.kernel ~ ': it cannot be made the fallback') %}{% endif %}
+  {% if s.boot.next_entry | length > 0 %}{% set _ = p.append('grub has a one-shot entry pending (next_entry=' ~ s.boot.next_entry ~ '): an earlier run armed it and the host has not booted it; settle that first') %}{% endif %}
+  {% if s.boot.dropin_present and s.boot.default_kernel | length > 0 and s.boot.default_kernel != s.kernel %}{% set _ = p.append('an earlier OS upgrade left grub saved default ' ~ s.boot.default_kernel ~ ' while the host runs ' ~ s.kernel ~ ': a new run would pin the running kernel and move the fallback to a kernel that was not verified. Reboot the host back to ' ~ s.boot.default_kernel ~ ' first (the cluster-reboot workflow does that and ends red with "kernel changed", by design)') %}{% endif %}
+  {% if (blacklist_r8169 | bool) and (s.nics | selectattr('driver', 'equalto', 'r8169') | list | length > 0) %}{% set _ = p.append('blacklist_r8169=true, but a NIC is bound to r8169 (' ~ (s.nics | selectattr('driver', 'equalto', 'r8169') | map(attribute='iface') | join(', ')) ~ '): the blacklist would remove it under every kernel, the old one included') %}{% endif %}
   {% if os_host in os_loadgen_hosts %}
   {% for h in os_bench_targets %}
   {% set m = (os_surveys[h].marker | default({})) %}
@@ -99,6 +102,7 @@ post_problems_str: >-
   {% set s = pre_survey %}
   {% set bs = post_survey | default({}) %}
   {% set tc = toolcheck | default({}) %}
+  {% set ptc = pre_toolcheck | default({}) %}
   {% set p = [] %}
   {% if b | length == 0 %}{% set _ = p.append('no readable snapshot after the reboot') %}{% else %}
   {% if b.boot_id == a.boot_id %}{% set _ = p.append('boot_id did not change (' ~ a.boot_id ~ '): the host did not reboot') %}{% endif %}
@@ -127,8 +131,8 @@ post_problems_str: >-
   {% if s.time_sync.ntp_synchronized and not bs.time_sync.ntp_synchronized %}{% set _ = p.append('the clock is not synchronized after the reboot (it was before)') %}{% endif %}
   {% endif %}
   {% if tc | length == 0 %}{% set _ = p.append('the toolchain bootstrap check did not run') %}{% else %}
-  {% if not tc.cc_ok %}{% set _ = p.append('the system C compiler cannot build and run a program') %}{% endif %}
-  {% if not tc.https_ok %}{% set _ = p.append('TLS to github.com (the runner tarball) does not verify') %}{% endif %}
+  {% if (ptc.cc_ok | default(false)) and not tc.cc_ok %}{% set _ = p.append('the system C compiler built and ran a program before the upgrade and cannot now') %}{% endif %}
+  {% if (ptc.https_ok | default(false)) and not tc.https_ok %}{% set _ = p.append('TLS to github.com (the runner tarball) verified before the upgrade and does not now') %}{% endif %}
   {% endif %}
   {% endif %}
   {{ p | join(' ;; ') }}

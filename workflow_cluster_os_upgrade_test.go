@@ -280,9 +280,9 @@ func TestClusterOSUpgradeWorkflowHygiene(t *testing.T) {
 		t.Errorf("reboot_timeout_seconds = %d: the bound is 15 minutes", boot)
 	}
 	const dkmsBuild = 1800 // dkms autoinstall's own timeout in os_upgrade.py
-	need := poll*10 + dkmsBuild + boot + 36*5 + 24*5 + 600
+	need := poll*(30+1) + dkmsBuild + boot + 36*5 + 24*5 + 600
 	if play < need {
-		t.Errorf("ansible-playbook is bounded at %d s but apt (%d s) + a DKMS build (%d s) + the reboot (%d s) + settling + the checks need %d s", play, poll*10, dkmsBuild, boot, need)
+		t.Errorf("ansible-playbook is bounded at %d s but apt (%d s, 30 s per poll) + a DKMS build (%d s) + the reboot (%d s) + settling + the checks need %d s", play, poll*31, dkmsBuild, boot, need)
 	}
 	if jobMin*60 < play+600 {
 		t.Errorf("the job's %d-minute timeout does not cover the %d s playbook bound and the setup", jobMin, play)
@@ -329,7 +329,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 
 	// the subcommands the playbook may run on a host
 	allowed := []string{"apt-update", "survey", "simulate", "dump", "pin-grub", "upgrade-start", "upgrade-status", "upgrade-log",
-		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck"}
+		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup"}
 	for _, m := range regexp.MustCompile(`\{\{ osu \}\} ([a-z0-9-]+)`).FindAllStringSubmatch(src, -1) {
 		if !slices.Contains(allowed, m[1]) {
 			t.Errorf("the playbook runs the subcommand %q, which is not on the reviewed list %v", m[1], allowed)
@@ -432,7 +432,7 @@ func TestClusterOSUpgradeJudgementCoversTheRequirements(t *testing.T) {
 		"no PCI aliases", "Secure Boot is enabled", "lists the same PCI id as r8127", "boot_id did not change", "the one-shot entry for",
 		"new crash dump(s)", "prerequisite regressed", "is not owned by", "is not in /proc/interrupts", "is not configured on the host",
 		"over the fabric", "bond lost a slave", "the counters were not reset", "new failed unit(s)", "link speed", "is bound to", "the clock is not synchronized",
-		"the system C compiler", "TLS to github.com", "no readable snapshot",
+		"the system C compiler built and ran a program before", "verified before the upgrade", "one-shot entry pending", "an earlier OS upgrade left grub", "blacklist_r8169=true, but a NIC is bound to r8169", "no readable snapshot",
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("the judgement lost %q", want)

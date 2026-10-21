@@ -133,15 +133,18 @@ permanent)
 	echo "- Power-cycle: **not needed**. $host runs the new kernel, which is now grub's saved default; the old kernel is still installed (nothing was auto-removed) and is the fallback to pick by hand in grub or by \`grub-set-default\` through a later change."
 	;;
 verified)
-	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED (see the log). grub's saved default is still the OLD kernel, so a reboot returns to it. Dispatch the upgrade of $host again: the pin, the (empty) upgrade and the one-shot repeat, then the new kernel is made the default."
+	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED (see the log). grub's saved default is still the OLD kernel, so a reboot returns to it. Either accept the new kernel as the default by a reviewed change that runs grub-set-default for it, or reboot back with the cluster-reboot workflow (red with 'kernel changed', expected) and dispatch the upgrade again. The upgrade REFUSES to run while the host runs a kernel other than grub's saved default."
 	;;
 returned)
-	echo "- Power-cycle: **not needed**. $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. A reboot (the cluster-reboot workflow) returns to the old kernel. Do not run measurements on $host until this is understood."
+	echo "- Power-cycle: **not needed**. $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. Reboot it back with the cluster-reboot workflow: it returns to the old kernel and ends red with 'kernel changed', which is expected here. Do NOT dispatch the upgrade again before that: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
 	;;
 rebooting)
 	echo "- Power-cycle: **YES, if and only if $host does not answer.** The reboot was issued and the host did not answer over the tailnet within the timeout (15 minutes). It may be down (msr1 has a documented shutdown panic in the r8127 driver, ops/power/quiesce-r8127.shutdown, that needs a PHYSICAL power-cycle), hung, or UP without a NIC (the new kernel's r8127 did not load). **Ask the maintainer to power-cycle $host physically** (not a soft reboot). The next boot takes grub's saved default, the OLD kernel (the one-shot was consumed by the first boot of the new kernel, or never used). Then dispatch a survey to see which kernel it runs. Do not dispatch anything else on $host until it answers."
 	;;
-none* | preflight-ok | pinned | upgrading | upgraded | dkms-ok)
+upgrading)
+	echo "- Power-cycle: **not needed**. Nothing was rebooted (upgrading). The apt run is DETACHED on the host: if this run lost its poll, apt may still be running. Dispatch a survey and wait until its \`package_processes\` is empty before anything else. The old kernel is still running and is grub's saved default."
+	;;
+none* | preflight-ok | pinned | upgraded | dkms-ok)
 	echo "- Power-cycle: **not needed**. Nothing was rebooted ($phase). The old kernel is still running and is still grub's default (from phase \`pinned\` on, it is pinned as the saved default)."
 	;;
 esac

@@ -28,7 +28,7 @@ ID_38 = "gnulinux-advanced-%s>gnulinux-7.0.0-38-generic-advanced-%s" % (UUID, UU
 ID_40 = "gnulinux-advanced-%s>gnulinux-7.0.0-40-generic-advanced-%s" % (UUID, UUID)
 
 # commands a survey may run: nothing that changes a host
-MUTATING = ("grub-set-default", "grub-reboot", "update-grub", "update-initramfs", "dkms autoinstall", "apt-mark manual", "apt-get update",
+MUTATING = ("grub-set-default", "grub-reboot", "update-grub", "update-initramfs", "dkms autoinstall", "apt-mark manual", "apt-get -o DPkg::Lock::Timeout=600 update",
             "apt-get -y")
 
 
@@ -143,6 +143,8 @@ class Survey(Base):
         self.assertEqual(s["firmware"]["linux_firmware"], "20260301.git1")
         self.assertEqual(s["host_toolchain"]["packages"]["build-essential"], "12.12")
         self.assertEqual(s["marker"], {})
+        self.assertFalse(b["dropin_present"])
+        self.assertEqual(b["next_entry"], "")
 
     def test_nics_and_the_r8127_report(self):
         s = self.run_ok("survey")
@@ -348,6 +350,55 @@ class Upgrade(Base):
         self.assertNotIn("autoremove", " ".join(self.h.calls()))
         self.assertEqual(self.h.load()["packages"]["libc6"]["version"], "2.43-0ubuntu2")
 
+    def test_the_detached_run_survives_the_deletion_of_the_script_copy_ansible_ran(self):
+        # ansible.builtin.script runs a temporary copy and deletes it when the task returns
+        tmpdir = tempfile.mkdtemp(prefix="osu-copy-")
+        copy = os.path.join(tmpdir, "os_upgrade.py")
+        shutil.copy(osu_fakehost.SCRIPT, copy)
+        self.h.state["upgrade_sleep"] = 1.0
+        self.h.save()
+        import subprocess
+        r = subprocess.run([sys.executable, copy, "upgrade-start", "--run-id", "42"], capture_output=True, text=True, env=self.h.env(), cwd=tmpdir)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        shutil.rmtree(tmpdir)
+        st = self.wait_done()
+        self.assertEqual(st["rc"], 0)
+        self.assertTrue(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/42/os_upgrade.py"))
+
+    def test_a_died_run_is_reported_and_its_policy_rc_d_cleaned_up(self):
+        import signal
+        self.h.state["upgrade_sleep"] = 30
+        self.h.save()
+        started = self.j(self.h.run("upgrade-start", "--run-id", "42"))
+        time.sleep(0.5)
+        self.assertEqual(self.j(self.h.run("upgrade-status", "--run-id", "42"))["state"], "running")
+        self.assertTrue(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+        os.kill(started["pid"], signal.SIGKILL)
+        end = time.time() + 10
+        st = {}
+        while time.time() < end:
+            st = self.j(self.h.run("upgrade-status", "--run-id", "42"))
+            if st["state"] == "died":
+                break
+            time.sleep(0.2)
+        self.assertEqual(st["state"], "died")
+        self.assertEqual(self.j(self.h.run("upgrade-cleanup"))["removed"], True)
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+        # a policy-rc.d that is not ours is never removed
+        self.h.w("/usr/sbin/policy-rc.d", "#!/bin/sh\nexit 0\n", 0o755)
+        self.assertEqual(self.j(self.h.run("upgrade-cleanup"))["removed"], False)
+        self.assertTrue(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+        subprocess_kill = [c for c in self.h.calls() if c.startswith("apt-get")]
+        self.assertTrue(subprocess_kill)
+
+    def test_status_can_wait_on_the_host(self):
+        self.h.save()
+        self.j(self.h.run("upgrade-start", "--run-id", "42"))
+        t0 = time.time()
+        st = self.j(self.h.run("upgrade-status", "--run-id", "42", "--wait", "20"))
+        self.assertEqual(st["state"], "done")
+        self.assertLess(time.time() - t0, 15)
+
     def test_a_failing_apt_is_reported_and_policy_rc_d_removed(self):
         self.h.state["upgrade_rc"] = 100
         self.h.save()
@@ -367,7 +418,7 @@ class Upgrade(Base):
         self.h.save()
         r = self.h.run("apt-update")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("apt-get update", self.h.calls())
+        self.assertIn("apt-get -o DPkg::Lock::Timeout=600 update", self.h.calls())
 
 
 class DkmsCheck(Base):

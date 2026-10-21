@@ -170,8 +170,8 @@
   vars:
     osu: "{{ playbook_dir }}/files/os_upgrade.py"
     reboot_timeout_seconds: 900
-    # `apt-get full-upgrade` of three hosts' worth of packages and a DKMS build, polled every 10 seconds
-    upgrade_poll_retries: 360
+    # `apt-get full-upgrade` and its DKMS builds: each poll waits up to 30 s on the host, so 120 polls are an hour
+    upgrade_poll_retries: 120
     allow_results_loss: false
     blacklist_r8169: false
     placement_vector: "{{ (nic_irq_placement | default({})).vector | default('-') }}"
@@ -238,6 +238,17 @@
         pre_target: "{{ pre_raw.stdout | from_json }}"
         pre_survey: "{{ pre_survey_raw.stdout | from_json }}"
 
+    - name: Target | the toolchain bootstrap prerequisites before (a host without a C compiler is not blamed for it afterwards)
+      ansible.builtin.script:
+        cmd: "{{ osu }} toolcheck"
+      become: true
+      register: pre_toolcheck_raw
+      changed_when: false
+
+    - name: Target | parse the toolchain check
+      ansible.builtin.set_fact:
+        pre_toolcheck: "{{ pre_toolcheck_raw.stdout | from_json }}"
+
     - name: Target | keep the records
       ansible.builtin.copy:
         content: "{{ item.content | to_nice_json }}\n"
@@ -247,6 +258,7 @@
       loop:
         - { name: pre-snapshot.json, content: "{{ pre_target }}" }
         - { name: pre-survey.json, content: "{{ pre_survey }}" }
+        - { name: toolcheck-before.json, content: "{{ pre_toolcheck }}" }
       loop_control:
         label: "{{ item.name }}"
 
@@ -360,17 +372,25 @@
         cmd: "{{ osu }} upgrade-start --run-id {{ os_run_id }}"
       become: true
 
+    # Each poll waits up to 30 s on the host. If ansible ends the wait early because one poll was unreachable (it may not
+    # retry an unreachable result), the failure below says apt may still be running; nothing is rebooted either way.
     - name: Apt | wait for it (polled; a dropped ssh connection does not stop apt)
       ansible.builtin.script:
-        cmd: "{{ osu }} upgrade-status --run-id {{ os_run_id }}"
+        cmd: "{{ osu }} upgrade-status --run-id {{ os_run_id }} --wait 30"
       become: true
       register: upgrade_status_raw
       changed_when: false
       failed_when: false
       ignore_unreachable: true
-      until: (upgrade_status_raw.stdout | default('') | length > 0) and ((upgrade_status_raw.stdout | from_json).state == 'done')
+      until: (upgrade_status_raw.stdout | default('') | length > 0) and ((upgrade_status_raw.stdout | from_json).state in ['done', 'died'])
       retries: "{{ upgrade_poll_retries }}"
-      delay: 10
+      delay: 1
+
+    - name: Apt | take our policy-rc.d away if a run that died left it
+      ansible.builtin.script:
+        cmd: "{{ osu }} upgrade-cleanup"
+      become: true
+      changed_when: false
 
     - name: Apt | fetch the log
       ansible.builtin.script:
@@ -391,8 +411,9 @@
         msg: >-
           apt-get full-upgrade did not succeed (state {{ (upgrade_status_raw.stdout | default('{}', true) | from_json).state | default('unknown') }},
           exit {{ (upgrade_status_raw.stdout | default('{}', true) | from_json).rc | default('none') }}): packages may be
-          half-configured (dpkg --configure -a by a person). NOTHING was rebooted, and the OLD kernel
-          {{ pre_survey.kernel }} is still grub's default. See apt-upgrade.log.
+          half-configured (dpkg --configure -a by a person), or apt may STILL BE RUNNING detached on the host (a lost poll,
+          or "running" after the wait ran out): dispatch a survey before anything else. NOTHING was rebooted, and the OLD
+          kernel {{ pre_survey.kernel }} is still grub's default. See apt-upgrade.log.
       when: ((upgrade_status_raw.stdout | default('{}', true) | from_json).state | default('')) != 'done' or ((upgrade_status_raw.stdout | default('{}', true) | from_json).rc | default(1)) != 0
 
     - name: Target | record the phase

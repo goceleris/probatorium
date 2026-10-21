@@ -289,7 +289,9 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   too little disk on `/`, `/boot` and `/boot/efi`, dpkg or apt busy (an unattended upgrade) or half-configured
   packages, held kernel/boot/DKMS packages, an existing `policy-rc.d`, no usable GRUB, `GRUB_SAVEDEFAULT=true`, a
   `/boot/grub` on btrfs/zfs/lvm/mdraid (grub cannot make the boot one-shot there), no grub entry for the running kernel,
-  a wrong confirmation, and the order rule. Each is a message in `vars/os_upgrade_judge.yml` with a test case.
+  a one-shot grub entry still pending, a saved default that differs from the running kernel after an earlier
+  run (a second dispatch would move the fallback to an unverified kernel), `blacklist_r8169` with a NIC bound to
+  `r8169`, a wrong confirmation, and the order rule. Each is a message in `vars/os_upgrade_judge.yml` with a test case.
 - **Then, in this order.** (1) The *running* kernel becomes grub's saved default (`GRUB_DEFAULT=saved` in a drop-in, the
   old `/etc/default/grub` backed up, `update-grub`, `grub-set-default`) and its packages are marked manual, BEFORE a new
   kernel is installed: from then on a power-cycle at any moment boots the old kernel. (2) `apt-get update`, a simulation,
@@ -313,8 +315,11 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
 - **If the host does not return.** The summary names the phase and says exactly whether to do a **physical power-cycle**:
   only when the run is red in phase `rebooting` (the host did not answer within 15 minutes). The next boot takes
   grub's saved default, the old kernel, because the one-shot was consumed by the first boot of the new one. Every other
-  phase says "not needed". A host that came back but failed verification is up and keeps the old kernel as its default;
-  a reboot (the cluster-reboot workflow) returns it to that kernel.
+  phase says "not needed". A host that came back but failed verification is up and keeps the old kernel as its default:
+  reboot it back with the cluster-reboot workflow, which ends red with "kernel changed" by design (and refuses
+  outright when the OLD kernel runs with a newer one installed, which needs no recovery). The upgrade itself refuses to
+  run again while the host runs a kernel other than grub's saved default. The apt run is detached: if a poll is lost, the
+  run fails with apt possibly still running; survey before anything else.
 - **What this does not prove.** The tests run the real playbook and script against stub `grub`, `apt`, `dkms` and
   `modinfo` commands and a fake `/proc`/`/sys`: they prove the order, the refusals and the verdicts, not that a real GRUB
   on msr1 honours `grub-reboot`, that r8127 builds for a real kernel, or that the NIC comes up. The first real

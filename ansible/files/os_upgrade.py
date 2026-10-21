@@ -314,6 +314,7 @@ def boot_info():
         "cfg_recordfail_timeout": cfg_recordfail_timeout(cfg),
         "saved_entry": saved,
         "next_entry": env.get("next_entry", ""),
+        "dropin_present": os.path.exists(p(DROPIN)),
         "default_kernel": default_kernel,
         "entries": [{"kernel": e["kernel"], "id": e["full_id"], "title": e["title"]} for e in entries if e["kernel"] and not e["recovery"]],
         "boot_fs": fstype.strip(),
@@ -791,7 +792,7 @@ POLICY = "#!/bin/sh\n# Managed by probatorium ansible/os-upgrade.yml: no service
 
 
 def cmd_apt_update(a):
-    rc, out, err = run(["apt-get", "update"], env=APT_ENV, timeout=900)
+    rc, out, err = run(["apt-get", "-o", "DPkg::Lock::Timeout=600", "update"], env=APT_ENV, timeout=1500)
     sys.stdout.write(out + err)
     sys.exit(0 if rc == 0 else 1)
 
@@ -808,11 +809,18 @@ def cmd_upgrade_start(a):
     if os.path.exists(p(rcf)):
         fail("an upgrade of run %s was started already" % a.run_id)
     os.makedirs(p(d), exist_ok=True)
+    # ansible.builtin.script runs a temporary copy of this file and deletes it when the task returns: the detached
+    # half runs from a copy of its own, in a directory that stays
+    keep = "%s/%s/os_upgrade.py" % (STATE_DIR, a.run_id)
+    os.makedirs(os.path.dirname(p(keep)), exist_ok=True)
+    shutil.copyfile(os.path.abspath(__file__), p(keep))
+    os.chmod(p(keep), 0o700)
     out = open(p(log), "w")
-    child = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_upgrade-run", "--run-id", a.run_id],
+    child = subprocess.Popen([sys.executable, p(keep), "_upgrade-run", "--run-id", a.run_id],
                              stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
-                             env=dict(os.environ))
-    emit({"ok": True, "pid": child.pid, "log": log})
+                             cwd="/", env=dict(os.environ))
+    write(d + "/apt-upgrade.pid", "%d\n" % child.pid)
+    emit({"ok": True, "pid": child.pid, "log": log, "script": keep})
 
 
 def cmd_upgrade_run(a):
@@ -822,7 +830,7 @@ def cmd_upgrade_run(a):
     try:
         write(POLICY_RC_D, POLICY, 0o755)
         argv = ["apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold",
-                "-o", "Dpkg::Use-Pty=0", "full-upgrade"]
+                "-o", "Dpkg::Use-Pty=0", "-o", "DPkg::Lock::Timeout=600", "full-upgrade"]
         sys.stdout.write("+ " + " ".join(argv) + "\n")
         sys.stdout.flush()
         r = subprocess.run(argv, env=dict(os.environ, **APT_ENV, LC_ALL="C"), stdout=sys.stdout, stderr=subprocess.STDOUT)
@@ -835,14 +843,45 @@ def cmd_upgrade_run(a):
         write(rcf, "%d\n" % rc)
 
 
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # a zombie (a finished child nobody waited for) is not running
+    st = rd("/proc/%d/stat" % pid) if not ROOT else ""
+    return not (st.split(") ")[-1:] or [""])[0].startswith("Z")
+
+
 def cmd_upgrade_status(a):
     d, log, rcf = upgrade_paths(a.run_id)
-    if os.path.exists(p(rcf)):
-        emit({"state": "done", "rc": int(rd(rcf) or "1")})
-    elif os.path.exists(p(log)):
-        emit({"state": "running", "rc": None})
+    deadline = time.time() + max(0, a.wait)
+    while True:
+        if os.path.exists(p(rcf)):
+            emit({"state": "done", "rc": int(rd(rcf) or "1")})
+            return
+        if not os.path.exists(p(log)):
+            emit({"state": "none", "rc": None})
+            return
+        pid = int(rd(d + "/apt-upgrade.pid") or "0")
+        if pid and not pid_alive(pid):
+            emit({"state": "died", "rc": None})
+            return
+        if time.time() >= deadline:
+            emit({"state": "running", "rc": None})
+            return
+        time.sleep(1)
+
+
+def cmd_upgrade_cleanup(a):
+    """Removes OUR policy-rc.d if the detached run died before it could (never one that is not ours)."""
+    if rd(POLICY_RC_D) == POLICY.strip():
+        os.remove(p(POLICY_RC_D))
+        emit({"removed": True})
     else:
-        emit({"state": "none", "rc": None})
+        emit({"removed": False})
 
 
 def cmd_upgrade_log(a):
@@ -966,7 +1005,9 @@ def main():
     add("marker", lambda a: emit(marker()))
     s = add("dump", cmd_dump)
     s.add_argument("what", choices=["packages", "policy", "sysctl", "cmdline", "grub"])
-    add("upgrade-status", cmd_upgrade_status, "run-id")
+    st = add("upgrade-status", cmd_upgrade_status, "run-id")
+    st.add_argument("--wait", type=int, default=0)
+    add("upgrade-cleanup", cmd_upgrade_cleanup)
     add("upgrade-log", cmd_upgrade_log, "run-id")
     add("apt-update", cmd_apt_update)
     add("pin-grub", cmd_pin_grub, "running", "run-id")

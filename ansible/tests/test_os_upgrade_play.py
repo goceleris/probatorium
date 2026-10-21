@@ -71,7 +71,7 @@ def patch_playbook(src, work):
     old = "{{ manifest_path | quote }} {{ results_root | quote }} - - -"
     assert old in s
     s = s.replace(old, old + " {{ inventory_hostname }}")
-    for a, b in (("retries: 36", "retries: 2"), ("retries: 24", "retries: 2"), ("delay: 5", "delay: 0"), ("delay: 10", "delay: 0")):
+    for a, b in (("retries: 36", "retries: 2"), ("retries: 24", "retries: 2"), ("delay: 5", "delay: 0")):
         assert a in s, a
         s = s.replace(a, b)
     return s
@@ -198,7 +198,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         self.assertEqual(self.phase(), "permanent")
         c = self.calls()
         # the order that makes a power-cycle at any moment boot the old kernel, and the new one only after verifying
-        order = [self.idx("grub-set-default " + ID_31), self.idx("apt-get update"), self.idx("apt-get -y"), self.idx("dkms autoinstall"),
+        order = [self.idx("grub-set-default " + ID_31), self.idx("apt-get -o DPkg::Lock::Timeout=600 update"), self.idx("apt-get -y"), self.idx("dkms autoinstall"),
                  self.idx("grub-reboot " + ID_40), self.idx("FAKE-REBOOT"), self.idx("grub-set-default " + ID_40)]
         self.assertEqual(order, sorted(order), order)
         self.assertEqual(len(set(order)), len(order))
@@ -232,7 +232,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         self.play(name, extra, env)
         self.assertNotEqual(self.rc, 0, self.log[-1500:])
         self.assertIn(text, self.log)
-        for pre in ("grub-set-default", "grub-reboot", "update-grub", "apt-get update", "apt-get -y", "apt-mark manual", "dkms autoinstall", "FAKE-REBOOT"):
+        for pre in ("grub-set-default", "grub-reboot", "update-grub", "apt-get -o DPkg::Lock::Timeout=600 update", "apt-get -y", "apt-mark manual", "dkms autoinstall", "FAKE-REBOOT"):
             self.no_call(pre)
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], "")
 
@@ -410,6 +410,14 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         self.assertIn("no answer from 192.168.50.195 over the fabric", self.log)
         self.no_call("grub-set-default " + ID_40)
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+        # the host now RUNS the unverified new kernel while grub's default is still the old one: a second dispatch must
+        # not pin the running (unverified) kernel as the fallback
+        before = len(self.calls())
+        self.play("noping_again", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("an earlier OS upgrade left grub saved default 7.0.0-31-generic while the host runs 7.0.0-40-generic", self.log)
+        self.assertEqual([c for c in self.calls()[before:] if c.startswith(("grub-set-default", "grub-reboot", "apt-get -y", "apt-get -o", "apt-mark manual", "update-grub", "FAKE-REBOOT"))], [])
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
 
     # ---------------------------------------------------------------------------------------- survey mode
     def test_survey_changes_nothing_and_records_every_host(self):
@@ -433,7 +441,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
             self.assertIn(want, md)
         self.assertEqual(before, self.h.snapshot(), "the survey changed the host")
         for c in self.calls():
-            for bad in ("grub-set-default", "grub-reboot", "update-grub", "dkms autoinstall", "apt-mark manual", "FAKE-REBOOT", "apt-get update", "update-initramfs"):
+            for bad in ("grub-set-default", "grub-reboot", "update-grub", "dkms autoinstall", "apt-mark manual", "FAKE-REBOOT", "apt-get -o DPkg::Lock::Timeout=600 update", "update-initramfs"):
                 self.assertFalse(c.startswith(bad), c)
             if c.startswith("apt-get"):
                 self.assertIn(" -s ", c)
@@ -457,7 +465,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         self.fresh()
         self.play("refresh", {"os_mode": "survey", "os_host": "-", "os_confirm": "", "refresh_lists": True})
         self.assertEqual(self.rc, 0, self.log[-2500:])
-        self.assertTrue([c for c in self.calls() if c == "apt-get update"])
+        self.assertTrue([c for c in self.calls() if c == "apt-get -o DPkg::Lock::Timeout=600 update"])
         self.no_call("grub-set-default")
 
 

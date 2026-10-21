@@ -101,6 +101,8 @@ def base_case(survey, sim, dk):
         "post_raw": {"stdout": json.dumps(snapshot("bbbb", "7.0.0-40-generic", 1200))},
         "post_survey": post_survey,
         "toolcheck": {"cc_ok": True, "https_ok": True, "endpoints": {}, "warnings": []},
+        "pre_toolcheck": {"cc_ok": True, "https_ok": True, "endpoints": {}, "warnings": []},
+        "blacklist_r8169": False,
     }
 
 
@@ -127,6 +129,8 @@ PLAY = """
         label: "{{{{ item.key }}}}"
       vars:
         os_host: "{{{{ item.value.os_host }}}}"
+        blacklist_r8169: "{{{{ item.value.blacklist_r8169 | default(false) }}}}"
+        pre_toolcheck: "{{{{ item.value.pre_toolcheck }}}}"
         allow_results_loss: "{{{{ item.value.allow_results_loss }}}}"
         pre_target: "{{{{ item.value.pre_target }}}}"
         pre_survey: "{{{{ item.value.pre_survey }}}}"
@@ -235,6 +239,19 @@ class Judge(unittest.TestCase):
         case("client_after_a_server_drifted", {"refusals": "order: msa2-server has not been upgraded and verified yet (or runs another kernel than its record says: 6.14.0-37-generic vs 6.14.0-44-generic)"}, drifted)
         case("a_server_needs_no_marker", {}, lambda c: c.update(os_host="msa2-server", os_surveys={"msa2-server": {"kernel": "x", "marker": {}}, "msr1": {"kernel": "x", "marker": {}}, "msa2-client": {"kernel": "x", "marker": {}}}))
 
+        case("next_entry_pending", {"refusals": "grub has a one-shot entry pending (next_entry=gnulinux-x)"},
+             lambda c: c["pre_survey"]["boot"].update(next_entry="gnulinux-x"))
+        case("earlier_run_left_an_unverified_default", {"refusals": "an earlier OS upgrade left grub saved default 7.0.0-31-generic while the host runs 7.0.0-40-generic"},
+             lambda c: (c["pre_survey"].update(kernel="7.0.0-40-generic"), c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic")))
+        case("default_differs_but_no_earlier_run", {}, lambda c: c["pre_survey"]["boot"].update(dropin_present=False, default_kernel="7.0.0-38-generic"))
+        case("fell_back_default_is_the_running_kernel", {}, lambda c: c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic"))
+
+        def r8169_nic(c):
+            c.update(blacklist_r8169=True)
+            c["pre_survey"]["nics"][0]["driver"] = "r8169"
+        case("blacklist_with_an_r8169_nic", {"refusals": "blacklist_r8169=true, but a NIC is bound to r8169 (enp1s0)"}, r8169_nic)
+        case("blacklist_without_an_r8169_nic", {}, lambda c: c.update(blacklist_r8169=True))
+
         # ---- the plan
         case("plan_removes_a_kernel", {"plan": "would REMOVE protected package(s): linux-image-7.0.0-31-generic"},
              lambda c: c["sim"].update(remv=["linux-image-7.0.0-31-generic", "libfoo"]))
@@ -302,8 +319,10 @@ class Judge(unittest.TestCase):
         case("post_time_sync_was_never_on", {}, lambda c: (c["pre_survey"]["time_sync"].update(ntp_synchronized=False),
                                                            c["post_survey"]["time_sync"].update(ntp_synchronized=False)))
         case("post_no_survey", {"post": "no readable survey after the reboot"}, lambda c: c.update(post_survey={}))
-        case("post_cc", {"post": "the system C compiler cannot build and run a program"}, lambda c: c["toolcheck"].update(cc_ok=False))
-        case("post_tls", {"post": "TLS to github.com"}, lambda c: c["toolcheck"].update(https_ok=False))
+        case("post_cc", {"post": "the system C compiler built and ran a program before the upgrade and cannot now"}, lambda c: c["toolcheck"].update(cc_ok=False))
+        case("post_tls", {"post": "TLS to github.com (the runner tarball) verified before the upgrade and does not now"}, lambda c: c["toolcheck"].update(https_ok=False))
+        case("post_no_compiler_before_or_after", {}, lambda c: (c["pre_toolcheck"].update(cc_ok=False), c["toolcheck"].update(cc_ok=False)))
+        case("post_no_tls_before_or_after", {}, lambda c: (c["pre_toolcheck"].update(https_ok=False), c["toolcheck"].update(https_ok=False)))
         case("post_toolcheck_missing", {"post": "the toolchain bootstrap check did not run"}, lambda c: c.update(toolcheck={}))
 
         cls.out = judge_all({n: c for n, (c, _) in cls.cases.items()})
@@ -351,7 +370,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 59, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 62, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:
