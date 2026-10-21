@@ -755,9 +755,11 @@ func wsEchoSlowTolerance(raceTier bool) int {
 // the victims, not the load: the Markov fleet is the one slice with no pause.
 //
 // WHAT IT BUYS AND WHAT IT MUST NOT COST. The race cell carried ~17.8k requests
-// a second on 2 loops (the pure engines ~3.6k a loop). A closed-loop walker
-// answered in ~3.8 ms there, so 4 ms of think time puts the fleet near 9 to 11k
-// a second whatever the latency does. The floor matters as much as the ceiling:
+// a second on 2 loops (the pure engines ~3.6k a loop), measured from run
+// 39560945814. A closed-loop walker answered in ~3.8 ms there, so 4 ms of think
+// time PREDICTS a fleet near 8.6 to 11k a second (4.3 to 5.7k a loop). That figure
+// is arithmetic, not a measurement: the acceptance read decides it
+// (RACESHAPE/PREREG.md). The floor matters as much as the ceiling:
 // the controller refuses to promote while a tick's bytes per request is at or
 // above 8192, and a healthy ws_echo streams ~50 MB a second through the engine
 // without counting a request, so the fleet must keep offering at least ~7k

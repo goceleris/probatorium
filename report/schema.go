@@ -336,19 +336,7 @@ import (
 //     refused, a subset of ws_echo_timeout (which still fails and is still
 //     the only one gated). Nothing new is gated. Additive; older readers
 //     ignore every field.
-//   - 5.24 — load shaping in the race tier (probatorium#481, celeris#871).
-//     The race-built adaptive cell (2 workers x 110 walkers, sized so the
-//     controller promotes) saturated its two engine loops under the
-//     detector's slowdown and failed the race gate in every run; its Markov
-//     walkers now pause after each request, in that cell only. Adds
-//     Tier1Summary.LoadShaping (load_shaping): the reason, the walker count
-//     the cell ran with, how many of them were Markov walkers and the pause
-//     in ms. Omitted when nothing was shaped, i.e. in every other cell; a
-//     document from before 5.24 carries none and its cells ran closed-loop.
-//     Gated only as a consistency check: a shaped cell must show a -race
-//     build (I-RACE). Additive; older readers ignore the field. The bump also
-//     stamps bench documents with 5.24, as 5.21 to 5.23 did.
-const SchemaVersion = "5.24"
+const SchemaVersion = "5.23"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -1231,8 +1219,13 @@ type Tier1Summary struct {
 	// seen. See RefappSched for what it can and cannot say.
 	RefappSched *RefappSched `json:"refapp_sched,omitempty"`
 	// LoadShaping records that the cell's walkers were paced below their
-	// closed-loop rate, and by how much. Omitted when nothing was shaped, which
-	// is every cell outside the race tier's adaptive cell. See LoadShaping.
+	// closed-loop rate, and by how much (probatorium#481, celeris#871). Omitted
+	// when nothing was shaped, which is every cell outside the race tier's
+	// adaptive cell. Additive WITHOUT a schema bump, on purpose: the bump would
+	// re-stamp schema_version in every nightly, checkptr, weekend and bench
+	// document, which this change is meant to leave byte-identical; the field's
+	// presence is what tells a shaped cell from an unshaped one, in any 5.23
+	// document. See LoadShaping.
 	LoadShaping *LoadShaping `json:"load_shaping,omitempty"`
 	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
 	// bound address, i.e. the origin of every SlowFire.SinceReadyMs and
