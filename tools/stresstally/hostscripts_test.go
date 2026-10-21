@@ -812,6 +812,7 @@ func TestEvictionAuditReportsOnlyTheEntryWindow(t *testing.T) {
 		run(5, ".github/workflows/celeris-stress.yml", "2026-09-27T10:02:10Z"),      // a stress run at the entry: reported
 		run(77, ".github/workflows/celeris-stress.yml", "2026-09-27T10:00:30Z"),     // this run
 		run(6, ".github/workflows/matrix-weekend-tier.yml", "2026-09-27T10:03:30Z"), // after the window: not
+		run(8, ".github/workflows/cluster-reboot.yml", "2026-09-27T10:01:30Z"),      // a host reboot at the entry: reported
 	}, ",")+`]}`)
 	jobs := filepath.Join(t.TempDir(), "jobs.json")
 	writeFile(t, jobs, `{"jobs":[{"name":"plan","status":"completed","completed_at":"2026-09-27T09:59:40Z"},`+
@@ -826,8 +827,8 @@ func TestEvictionAuditReportsOnlyTheEntryWindow(t *testing.T) {
 	for _, m := range regexp.MustCompile(`::error::run (\d+) `).FindAllStringSubmatch(out, -1) {
 		reported[m[1]] = true
 	}
-	if !reported["1"] || !reported["5"] || len(reported) != 2 {
-		t.Errorf("reported runs %v, want exactly 1 and 5 (cancelled between the guard's look and the entry):\n%s", reported, out)
+	if !reported["1"] || !reported["5"] || !reported["8"] || len(reported) != 3 {
+		t.Errorf("reported runs %v, want exactly 1, 5 and 8 (cancelled between the guard's look and the entry):\n%s", reported, out)
 	}
 	if !strings.Contains(out, "may have") {
 		t.Errorf("a cancel in the window is not proof of an eviction; the report must say it may be one:\n%s", out)

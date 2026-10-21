@@ -1,0 +1,299 @@
+name: Cluster Reboot
+
+# Reboot ONE cluster host (msr1 or msa2-server), audited, and prove it came back. The only sanctioned path:
+# nothing else in this repository reboots a host, and a person does not ssh in (the tailnet policy denies
+# it). Maintainer approval (durable, 2026-10-20): "You are free to reboot whenever needed". Why: msr1's
+# since-boot interrupt counters feed celeris's rule D and IRQ 135's 32-bit counter is near its wrap; the
+# reboot also clears leftover tmpfs state. Runbook: README.md, "Rebooting a cluster host".
+#
+# Dispatch (from main only):
+#   gh workflow run cluster-reboot.yml --repo goceleris/probatorium --ref main \
+#     -f host=msr1 -f confirm=REBOOT-msr1 -f reason="rule D counters before the final-sha bench-full"
+#
+# Job graph: plan -> cluster-guard -> reboot -> verdict.
+#   plan           refuses a wrong host, a wrong confirmation (REBOOT-<host>), a bad reason, and any ref but main.
+#   cluster-guard  outside the group: lists every open run and refuses unless the cluster is IDLE
+#                  (tools/stresstally guard -idle: a holder refuses too, not only a pending run).
+#   reboot         inside matrix-tier-cluster for its whole length (ansible/reboot.yml). The group keeps one
+#                  running and one pending run, and a run queued into it cancels the pending one; the guard
+#                  above refuses rather than queue, and this job refuses a verdict older than ten minutes (a
+#                  job admitted late waited behind a holder, so the cluster was not idle when it was
+#                  dispatched). It needs no runner: it runs on a GitHub-hosted machine that joins the tailnet
+#                  like cluster-runner-down does, so there is nothing on the rebooted host to strand.
+#   verdict        red unless the reboot job succeeded: a skipped job (a re-run on an old guard verdict) must
+#                  not read as a reboot that happened.
+#
+# It never runs on a schedule, and never reboots msa2-client (it drives both targets).
+#
+# HOLD-CLUSTER: the orchestrator's marker file lives outside this repository and this workflow cannot see
+# it. Whoever dispatches honours it.
+
+run-name: Cluster reboot [${{ inputs.host }}]
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "Host to reboot. msa2-client is not offered: it drives both targets."
+        type: choice
+        options: [msr1, msa2-server]
+        required: true
+      confirm:
+        description: "Type REBOOT-<host> (REBOOT-msr1 or REBOOT-msa2-server) to confirm."
+        type: string
+        required: true
+      reason:
+        description: "Why (one line, up to 200 characters). Recorded in the step summary and the artifact."
+        type: string
+        required: true
+      allow_results_loss:
+        description: "Reboot even though results_root on the host holds entries (tmpfs: the reboot destroys them). Default: refuse."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Refuse a malformed request before any host is touched
+        # The inputs reach the script only through env:, never through ${{ }} in run:.
+        env:
+          IN_HOST: ${{ inputs.host }}
+          IN_CONFIRM: ${{ inputs.confirm }}
+          IN_REASON: ${{ inputs.reason }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eu
+          if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::dispatch from $DEFAULT_BRANCH only (got $REF): a host reboot runs reviewed code"
+            exit 1
+          fi
+          case "$IN_HOST" in
+            msr1|msa2-server) ;;
+            *) echo "::error::host must be msr1 or msa2-server, got: $IN_HOST"; exit 1 ;;
+          esac
+          if [ "$IN_CONFIRM" != "REBOOT-$IN_HOST" ]; then
+            echo "::error::confirm must be exactly REBOOT-$IN_HOST"
+            exit 1
+          fi
+          if [ -z "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ]; then
+            echo "::error::reason is empty"
+            exit 1
+          fi
+          if [ "${#IN_REASON}" -gt 200 ]; then
+            echo "::error::reason is longer than 200 characters"
+            exit 1
+          fi
+          if printf '%s' "$IN_REASON" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            echo "::error::reason must be one line without control characters"
+            exit 1
+          fi
+          echo "request accepted: reboot $IN_HOST"
+
+  # Outside matrix-tier-cluster, just before entering it. The tool is built first so the look (guard.sh) and
+  # the verdict are seconds apart, as in celeris-stress.yml.
+  cluster-guard:
+    name: cluster-guard
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      checked_at: ${{ steps.guard.outputs.checked_at }}
+      # The attempt this verdict belongs to: the reboot job runs only on a verdict from its own attempt.
+      attempt: ${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/stresstally
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Refuse unless the cluster is idle
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          GUARD_DIR: ${{ runner.temp }}/guard
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/stresstally" ./tools/stresstally
+          bash tools/stresstally/guard.sh
+          "$RUNNER_TEMP/stresstally" guard -idle -dir "$GUARD_DIR" -self "$RUN_ID"
+      - name: Upload the guard's evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reboot-cluster-guard
+          path: ${{ runner.temp }}/guard/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The reboot, inside matrix-tier-cluster for its whole length. Job-level concurrency only: a workflow-level
+  # group would enter at dispatch, before the guard looked.
+  reboot:
+    name: reboot ${{ inputs.host }}
+    needs: [plan, cluster-guard]
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.cluster-guard.result == 'success' && needs.cluster-guard.outputs.attempt == github.run_attempt && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    concurrency:
+      group: matrix-tier-cluster
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    # Setup, a reboot bounded at 15 minutes, up to 3 minutes of settling, and the summary.
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    env:
+      REBOOT_HOST: ${{ inputs.host }}
+      REBOOT_OUT: ${{ github.workspace }}/reboot-evidence
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report any cluster run cancelled since the guard looked
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          CHECKED_AT: ${{ needs.cluster-guard.outputs.checked_at }}
+        run: bash tools/stresstally/eviction-audit.sh
+      - name: Refuse a stale idle verdict
+        shell: bash
+        env:
+          CHECKED_AT: ${{ needs.cluster-guard.outputs.checked_at }}
+        run: |
+          set -eu
+          if ! printf '%s' "$CHECKED_AT" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+            echo "::error::the guard's look is unknown ('$CHECKED_AT'): refusing"
+            exit 1
+          fi
+          age=$(( $(date -u +%s) - $(date -u -d "$CHECKED_AT" +%s) ))
+          echo "the cluster was idle $age s ago (looked at $CHECKED_AT)"
+          if [ "$age" -gt 600 ]; then
+            echo "::error::the idle verdict is $age s old (limit 600 s): this job waited in matrix-tier-cluster behind a run that started after the guard looked, so the cluster was not idle when this was dispatched. Nothing was rebooted. Dispatch again when the cluster is idle."
+            exit 1
+          fi
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: latest
+      - name: Install ansible-core (the cluster's pin)
+        shell: bash
+        run: |
+          set -eu
+          core=$(sed -n 's/^[[:space:]]*ansible_core_version:[[:space:]]*"\([^"]*\)".*/\1/p' ansible/runner-setup.yml | head -n 1)
+          [ -n "$core" ] || { echo "::error::no ansible_core_version pin in ansible/runner-setup.yml"; exit 1; }
+          python3 -m venv "$RUNNER_TEMP/ansible"
+          "$RUNNER_TEMP/ansible/bin/pip" install --quiet "ansible-core==$core"
+          echo "$RUNNER_TEMP/ansible/bin" >> "$GITHUB_PATH"
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        run: |
+          set -eu
+          if [ -z "$SSH_KEY" ]; then
+            echo "::error::the CLUSTER_SSH_KEY secret is empty"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Names over the tailnet (MagicDNS), as the composites do. CLUSTER_USE_LAN stays UNSET: the
+          # reconnect after the reboot then goes over the tailnet, so it also proves tailscale came back.
+          ssh-keyscan -H msa2-server msa2-client msr1 >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: Write the request for ansible
+        shell: bash
+        env:
+          IN_CONFIRM: ${{ inputs.confirm }}
+          IN_REASON: ${{ inputs.reason }}
+          IN_ALLOW: ${{ inputs.allow_results_loss }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          mkdir -p "$REBOOT_OUT"
+          # A JSON file, not key=value: --extra-vars k=v splits on whitespace and the reason is free text.
+          python3 - <<'PY'
+          import json, os
+          json.dump({
+              "reboot_host": os.environ["REBOOT_HOST"],
+              "reboot_confirm": os.environ["IN_CONFIRM"],
+              "reboot_reason": os.environ["IN_REASON"],
+              "reboot_run_id": os.environ["RUN_ID"],
+              "reboot_out_dir": os.environ["REBOOT_OUT"],
+              "allow_results_loss": os.environ["IN_ALLOW"] == "true",
+          }, open(os.path.join(os.environ["REBOOT_OUT"], "extra-vars.json"), "w"), indent=2)
+          PY
+      - name: Preflight, reboot and verify (ansible/reboot.yml)
+        shell: bash
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_PRIVATE_KEY_FILE: ~/.ssh/id_ed25519
+        run: |
+          set -u
+          set +e
+          timeout -k 30 2400 ansible-playbook \
+            -i ansible/inventory.yml \
+            ansible/reboot.yml \
+            --extra-vars "@${REBOOT_OUT}/extra-vars.json" 2>&1 | tee "${REBOOT_OUT}/ansible.log"
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > "${REBOOT_OUT}/ansible.rc"
+          exit "$rc"
+      - name: Post-reboot verification (step summary)
+        if: ${{ always() }}
+        shell: bash
+        env:
+          IN_REASON: ${{ inputs.reason }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          rc=$(cat "${REBOOT_OUT}/ansible.rc" 2>/dev/null || echo 99)
+          mkdir -p "$REBOOT_OUT"
+          bash .github/scripts/reboot-summary.sh "$REBOOT_OUT" "$REBOOT_HOST" "$rc" "$IN_REASON" "$RUN_ID" | tee "$REBOOT_OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-reboot-${{ inputs.host }}-${{ github.run_id }}
+          path: reboot-evidence/
+          if-no-files-found: warn
+          retention-days: 90
+
+  verdict:
+    name: verdict
+    needs: [plan, cluster-guard, reboot]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Red unless the host was rebooted and verified
+        env:
+          PLAN: ${{ needs.plan.result }}
+          GUARD: ${{ needs.cluster-guard.result }}
+          REBOOT: ${{ needs.reboot.result }}
+          ATTEMPT: ${{ github.run_attempt }}
+          GUARD_ATTEMPT: ${{ needs.cluster-guard.outputs.attempt }}
+        run: |
+          echo "plan=$PLAN cluster-guard=$GUARD reboot=$REBOOT"
+          if [ "$REBOOT" != success ]; then
+            echo "::error::nothing was rebooted and verified (plan $PLAN, cluster-guard $GUARD, reboot $REBOOT; attempt $ATTEMPT, guard attempt ${GUARD_ATTEMPT:-none}). A re-run never reuses an old idle verdict: dispatch a new run."
+            exit 1
+          fi

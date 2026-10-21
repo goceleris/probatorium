@@ -371,6 +371,19 @@ jobs:
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
         run: bash ansible/tests/test_nic_irq_placement_play.sh
+      # The judgement of the sanctioned host reboot (ansible/reboot.yml): the
+      # real Jinja of ansible/vars/reboot_judge.yml against snapshots of fake
+      # hosts, under the cluster's ansible pin.
+      - name: ansible/tests/test_reboot_judge.sh
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: bash ansible/tests/test_reboot_judge.sh
+      # ... and the whole playbook end to end on local connections, with only
+      # the restart (a flag file) and the host's snapshot (a fake host) replaced.
+      - name: ansible/tests/test_reboot_play.sh
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: bash ansible/tests/test_reboot_play.sh
 
   # Fan-in over every job above so branch protection can require ONE
   # stable check name ("ci-ok") instead of enumerating the adapter

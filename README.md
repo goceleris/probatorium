@@ -191,6 +191,57 @@ Tests: `bash ansible/tests/test_nic_irq_pin.sh` (the shell logic against a fake 
 runs in a plain container) and `bash ansible/tests/test_nic_irq_placement_play.sh` (the real tasks files
 under ansible, run by the ansible CI job; `PROBATORIUM_ANSIBLE_TESTS=1 go test` runs it too). `go test` runs the first.
 
+### Rebooting a cluster host
+
+A host is rebooted by one sanctioned path and no other: the [`Cluster Reboot`](.github/workflows/cluster-reboot.yml)
+workflow, which runs [`ansible/reboot.yml`](ansible/reboot.yml) from a GitHub-hosted machine on the tailnet (no
+runner on the host, so none to strand). Nobody ssh-es in. Why you would: the since-boot interrupt counters (celeris's
+rule D reads them; msr1's IRQ 135 is a 32-bit counter near its wrap) and leftover `/tmp` state. The maintainer's
+standing approval (2026-10-20) covers reboots of msr1 needed for validation; report each one.
+
+```
+gh workflow run cluster-reboot.yml --repo goceleris/probatorium --ref main \
+  -f host=msr1 -f confirm=REBOOT-msr1 -f reason="rule D counters before the final-sha bench-full"
+```
+
+- **Inputs.** `host` is `msr1` or `msa2-server` (`msa2-client` is not offered: it drives both targets), `confirm`
+  must be exactly `REBOOT-<host>`, `reason` is one line recorded in the summary, and `allow_results_loss` (default
+  false) lets a reboot go ahead although `results_root` holds entries. Dispatch from `main` only; it never runs on a schedule.
+- **It refuses rather than queues.** A `cluster-guard` job outside the group runs `stresstally guard -idle`: anything
+  running or waiting in `matrix-tier-cluster` (a tier, a stress run, another reboot) refuses the run, and the
+  reboot job, which holds the group, also refuses an idle verdict older than ten minutes. The group keeps one running
+  and one pending run and a run queued into it cancels the pending one, so a reboot must never wait there. The
+  orchestrator's `HOLD-CLUSTER` marker lives outside this repository: the workflow cannot see it, so whoever
+  dispatches honours it. Add `cluster-reboot.yml` to any dispatcher's list of cluster workflows.
+- **It refuses, on the host, before touching anything:** any of the three hosts unreachable; a bench manifest on any
+  of them; on the target a runner job executing, a power-loss resume pending, entries in `results_root` (tmpfs: the
+  reboot destroys them), an r8127 NIC without the shutdown quiesce hook or without the module for the running
+  kernel, tailscaled running but not enabled at boot (the host would come back off the tailnet), or a newer kernel
+  installed than the one running (a decision for the maintainer: it changes comparability). The reasons are in the step
+  summary.
+- **It records, then reboots, then verifies.** Before: boot id, boot time, kernel, the NIC vectors found by name with
+  their since-boot totals and IRQ affinity, bonds, crash dumps. Then `ansible.builtin.reboot` (bounded at 15 minutes),
+  then a snapshot polled for up to 3 minutes. It FAILS unless the boot id changed, the kernel is the same, no new
+  crash dump appeared, each power-guard prerequisite that held before holds again, the fabric address is configured
+  and the loadgen answers over it, the bond has not lost a slave, `enp1s0-8` (what `bench.yml` pins) exists and the
+  since-boot totals are small. The reconnect goes over the tailnet, so it also proves tailscale came back. The step
+  summary and the `cluster-reboot-<host>-<run id>` artifact hold the before/after tables; the run is red unless the
+  host was rebooted and verified.
+- **What it does not do.** It restores nothing by hand: the IRQ affinity is recorded as the kernel left it. Only
+  `bench.yml` re-applies the msr1 `nic_irq_placement` (enp1s0-8 to CPU 1) per run and reads it back; a soak, race or
+  stress run on msr1 right after the reboot sees the kernel's placement. Runners are ephemeral and registered per
+  run, so none is stranded, and the power guard is persistent (checked, not re-applied). The `/tmp` tool cache is
+  gone: the next bootstrap is cold (the 25-minute timeout covers it).
+- **If the host does not return.** msr1 has a documented shutdown panic in the out-of-tree r8127 driver
+  ([`ops/power/quiesce-r8127.shutdown`](ops/power/quiesce-r8127.shutdown) works around it and is required before a
+  reboot); a host that hangs needs a physical power-cycle. The run fails after 15 minutes with the phase reached
+  (`rebooting`) in the summary. Do not dispatch anything on that host until it is back.
+
+Tests: `go test -run 'ClusterReboot|RebootSnapshot|RebootJudge|RebootSummary|RebootIsDocumented'` (the workflow's safety
+properties as text, the snapshot script against a fake `/proc`/`/sys`, the summary), `go test ./tools/stresstally`
+(the idle guard), and `bash ansible/tests/test_reboot_judge.sh` (the real Jinja judgement under ansible) and `bash ansible/tests/test_reboot_play.sh` (the whole playbook on local
+connections with only the restart faked), both run by the ansible CI job.
+
 ## Bench tier
 
 ### The field
