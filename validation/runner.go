@@ -200,6 +200,11 @@ type Config struct {
 	// that line validates the start engine, not the adaptive one. See
 	// adaptiveCellConcurrencyFloor in cmd/validator/matrix.go.
 	ConcurrencyFloor int
+
+	// WSEchoSlowTolerance is N of the race tier's SLOW_CLASS tolerance
+	// (ws_echo_slow.go); 0, the default and every other tier, tolerates
+	// nothing. STUB.
+	WSEchoSlowTolerance int
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -1088,7 +1093,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// leaves Tier 1's walkers with no stall timer at all.
 	onWalkerStall := walkerStallHook(os.Getenv, violations, pid)
 	// The ws_echo timeout's two-instant capture (probatorium#481), same gate.
-	wsEchoDiag := wsEchoDiagHook(os.Getenv, violations, pid, func() string {
+	wsEchoDiag := wsEchoDiagHook(os.Getenv, o.cfg.WSEchoSlowTolerance, violations, pid, func() string {
 		if f := o.debugAddr.Load(); f != nil {
 			return (*f)()
 		}
@@ -1704,7 +1709,7 @@ var wsEchoDiagDeliverWait = 2*forensicsBudget + 10*time.Second
 // record goes to the orchestrator as a record-only I-WS-ECHO-STALL incident
 // carrying ws-echo-diag.txt; the gated counter and its hard incident are
 // unchanged. procRoot is /proc; debugAddr reads the refapp's side listener.
-func wsEchoDiagHook(getenv func(string) string, violations chan<- Incident, pid func() int, debugAddr func() string, procRoot string) *wsEchoDiag {
+func wsEchoDiagHook(getenv func(string) string, slowTolerance int, violations chan<- Incident, pid func() int, debugAddr func() string, procRoot string) *wsEchoDiag {
 	if !stallCaptureEnabled(getenv) {
 		return nil
 	}
@@ -2069,6 +2074,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"ws_echo_reorder":           s.WSEcho.Reorder,
 			"ws_echo_missing":           s.WSEcho.Missing,
 			"ws_echo_timeout":           s.WSEcho.Timeout,
+			"ws_echo_timeout_slow":      s.WSEcho.TimeoutSlow,
 			"ws_echo_frame_err":         s.WSEcho.FrameErr,
 			"ws_echo_close_ok":          s.WSEcho.CloseOK,
 			"ws_echo_cut_at_deadline":   s.WSEcho.CutAtDeadline,

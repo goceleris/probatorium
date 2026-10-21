@@ -161,6 +161,11 @@ type wsEchoTally struct {
 	// Per-fire outcomes.
 	missing atomic.Int64
 	timeout atomic.Int64
+	// timeoutSlow counts timed-out fires that the race tier booked as a
+	// non-failing finding (ws_echo_slow.go). STUB: nothing books it yet.
+	timeoutSlow atomic.Int64
+	// cleanFires counts fires that drained: every echo came back.
+	cleanFires atomic.Int64
 	// frameErr counts fires whose server stream stopped parsing as RFC 6455
 	// frames (a length beyond the cap, a header mid-payload). Diagnostic
 	// detail for a missing fire, not a separate signal.
@@ -193,6 +198,7 @@ type wsEchoSnapshot struct {
 	Reorder          int64 `json:"ws_echo_reorder"`
 	Missing          int64 `json:"ws_echo_missing"`
 	Timeout          int64 `json:"ws_echo_timeout"`
+	TimeoutSlow      int64 `json:"ws_echo_timeout_slow"`
 	FrameErr         int64 `json:"ws_echo_frame_err"`
 	CloseOK          int64 `json:"ws_echo_close_ok"`
 	CutAtDeadline    int64 `json:"ws_echo_cut_at_deadline"`
@@ -221,6 +227,7 @@ func (t *wsEchoTally) snapshot() wsEchoSnapshot {
 		Reorder:          t.reorder.Load(),
 		Missing:          t.missing.Load(),
 		Timeout:          t.timeout.Load(),
+		TimeoutSlow:      t.timeoutSlow.Load(),
 		FrameErr:         t.frameErr.Load(),
 		CloseOK:          t.closeOK.Load(),
 		CutAtDeadline:    t.cutAtDeadline.Load(),

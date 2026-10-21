@@ -22,8 +22,15 @@ func (v Violation) String() string {
 	return fmt.Sprintf("%s/%s/%s %s=%d (%s)", v.Refapp, v.Engine, v.Arch, v.Field, v.Value, v.Why)
 }
 
+// WSEchoSlowTolerance is N of the race tier's ws_echo SLOW_CLASS tolerance:
+// at most this many timed-out 64 KiB echo fires per cell may be booked as a
+// non-failing finding (probatorium#481). STUB.
+const WSEchoSlowTolerance = 3
+
 // GateOptions tunes the absolute gate.
 type GateOptions struct {
+	// ToleratesWSEchoSlow: STUB.
+	ToleratesWSEchoSlow bool
 	// ExpectedCells > 0 fails the gate when fewer cells are present: a cell
 	// that crashed, was skipped, or never reported is a failure, not a pass.
 	ExpectedCells int

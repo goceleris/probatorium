@@ -97,6 +97,13 @@ var (
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}
+	// IWSEchoSlow: STUB.
+	IWSEchoSlow = Spec{
+		ID:          "I-WS-ECHO-SLOW",
+		Description: "stub",
+		Tier:        "tier-1-walker",
+		Predicate:   alwaysOK,
+	}
 	// IWSEcho is the wire-level oracle for large detached sends
 	// (celeris#587): 64 KiB WebSocket frames streamed through the refapp's
 	// /ws echo must come back byte-intact, in order, and all of them. Fires

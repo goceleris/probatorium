@@ -88,6 +88,9 @@ type Config struct {
 	// celeris requires >= 2 when set.
 	RefappWorkers int
 
+	// RaceTier: STUB.
+	RaceTier bool
+
 	// HeapDumpDir, when non-empty, names a directory the validator
 	// writes a heap profile to every HeapDumpInterval (default 1h —
 	// relaxed from 60s post-#115 because the validator RSS leak
@@ -175,6 +178,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.RefappEngine, "refapp-engine", c.RefappEngine, "celeris engine to pin for the refapp (iouring|epoll|std|adaptive); empty leaves refapp default")
 	fs.StringVar(&c.RefappAsyncHandlers, "refapp-async-handlers", c.RefappAsyncHandlers, "pass -async-handlers=<v> to the refapp (true|false); empty leaves refapp default")
 	fs.IntVar(&c.RefappWorkers, "refapp-workers", c.RefappWorkers, "cap io_uring refapp worker count (celeris Workers); 0 leaves GOMAXPROCS default, must be >=2 if set")
+	fs.BoolVar(&c.RaceTier, "race-tier", c.RaceTier, "stub")
 	fs.StringVar(&c.HeapDumpDir, "heap-dump-dir", c.HeapDumpDir, "directory to write periodic heap profiles to; empty disables")
 	// Default cadence relaxed to 1h after the validator RSS leak that
 	// motivated this diagnostic (probatorium#102) was fixed. Active
@@ -256,6 +260,7 @@ func run(cfg Config) error {
 		RefappEngine:        cfg.RefappEngine,
 		RefappAsyncHandlers: cfg.RefappAsyncHandlers,
 		RefappWorkers:       cfg.RefappWorkers,
+		WSEchoSlowTolerance: wsEchoSlowTolerance(cfg.RaceTier),
 		DriverMode:          cfg.DriverMode,
 		DriverSSHUser:       cfg.DriverSSHUser,
 		DriverSSHHost:       cfg.DriverSSHHost,

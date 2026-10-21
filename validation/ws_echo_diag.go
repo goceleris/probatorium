@@ -70,6 +70,9 @@ type wsEchoDiag struct {
 	Refapp func(ctx context.Context) string
 	// Deliver receives the finished record; nil drops it.
 	Deliver func(ctx context.Context, rep wsEchoDiagReport)
+	// SlowTolerance is N of the race tier's SLOW_CLASS tolerance; 0 (every
+	// other tier) books every timeout as a failure. STUB.
+	SlowTolerance int
 
 	taken atomic.Int32
 }
@@ -80,6 +83,9 @@ type wsEchoDiagReport struct {
 	// Text is the whole record: the verdict line, then both instants.
 	Text string
 	At   time.Time
+	// Tolerated is true when the timeout was booked as a non-failing
+	// SLOW_CLASS finding. STUB.
+	Tolerated bool
 }
 
 // claim reserves one of the cell's diagnoses; false when spent.
