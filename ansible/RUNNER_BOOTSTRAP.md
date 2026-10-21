@@ -169,7 +169,8 @@ on every run made each tier depend on four internet services at once
   `/tmp/actions-runner-<host>/ansible-venv` and `.../ansible-collections`;
   the bootstrap recreates those as links into the cache on every run.
   Teardown removes the links and leaves the cache.
-- **Cleared by a reboot**, because `/tmp` is RAM-backed on these hosts.
+- **Cleared by a reboot**, because `/tmp` is RAM-backed on these hosts, so the first bootstrap after one is cold.
+  A host is rebooted only through `.github/workflows/cluster-reboot.yml` (README, "Rebooting a cluster host").
 - **Eaten by age, file by file.** `systemd-tmpfiles-clean` runs daily with the
   stock `q /tmp 1777 root root 10d` and deletes every file nothing has read,
   written or changed for ten days, from the middle of a tree that is otherwise

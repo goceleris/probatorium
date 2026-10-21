@@ -6,7 +6,9 @@
 //
 //	stresstally plan        validate the dispatch inputs and emit the matrix
 //	stresstally guard       refuse a cluster run that would cancel a pending
-//	                        run of the matrix-tier-cluster group
+//	                        run of the matrix-tier-cluster group; with -idle,
+//	                        refuse unless nothing holds or waits in it (the
+//	                        host reboot, cluster-reboot.yml)
 //	stresstally summarize   judge every case of a run from its shard logs
 //	stresstally tally DIR   judge a directory of shard logs (local use)
 //	stresstally compare BASE BRANCH
@@ -83,7 +85,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: stresstally plan | guard -dir DIR -self RUN_ID | summarize -logs DIR -out DIR | tally [-case NAME] DIR | compare BASE BRANCH")
+	fmt.Fprintln(os.Stderr, "usage: stresstally plan | guard -dir DIR -self RUN_ID [-idle] | summarize -logs DIR -out DIR | tally [-case NAME] DIR | compare BASE BRANCH")
 	os.Exit(2)
 }
 

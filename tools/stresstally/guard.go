@@ -43,12 +43,14 @@ import (
 
 // clusterGroupWorkflows are the workflow files that declare the
 // matrix-tier-cluster group themselves (matrix-pr-tier only for a labelled
-// same-repository pull request; counted anyway). celeris-stress.yml is not
+// same-repository pull request; counted anyway; cluster-reboot.yml declares it
+// on its reboot job, and its own guard runs `guard -idle`). celeris-stress.yml is not
 // listed: its runs join from a job and are classified by their jobs.
 // TestStressClusterGuardKnowsEveryClusterWorkflow keeps this list equal to
 // the files that name the group.
 var clusterGroupWorkflows = []string{
 	".github/workflows/benchmark-tier.yml",
+	".github/workflows/cluster-reboot.yml",
 	".github/workflows/matrix-checkptr-tier.yml",
 	".github/workflows/matrix-nightly-tier.yml",
 	".github/workflows/matrix-pr-tier.yml",
@@ -175,6 +177,26 @@ func guardDecision(classes []runClass) (bool, string) {
 	return true, "allowed: matrix-tier-cluster is empty"
 }
 
+// idleDecision is the stricter verdict a host reboot needs (cluster-reboot.yml,
+// `guard -idle`): the cluster must be IDLE, not merely free of a pending run.
+// A reboot that waited in the group behind a holder would run when that holder
+// ended, hours after the maintainer looked, and a reboot that queued behind
+// nothing could still be evicted by a later dispatch. So any holder and any
+// pending run refuse it; it never queues.
+func idleDecision(classes []runClass) (bool, string) {
+	var busy []string
+	for _, c := range classes {
+		if c.Class == classPending || c.Class == classHolder {
+			busy = append(busy, fmt.Sprintf("run %d (%s, %s, %s)", c.Run.ID, c.Run.Name, c.Run.Status, c.Class))
+		}
+	}
+	if len(busy) > 0 {
+		return false, fmt.Sprintf("refusing: the cluster is not idle: %s. A host reboot never waits in matrix-tier-cluster; "+
+			"dispatch again once nothing runs or waits there", strings.Join(busy, ", "))
+	}
+	return true, "allowed: the cluster is idle (no run holds or waits in matrix-tier-cluster)"
+}
+
 // readJSONL reads one JSON object per line (what `gh api --jq '.x[]'` prints).
 func readJSONL[T any](path string) ([]T, error) {
 	f, err := os.Open(path)
@@ -200,11 +222,12 @@ func readJSONL[T any](path string) ([]T, error) {
 }
 
 // cmdGuard reads runs-*.jsonl and jobs-<id>.jsonl from -dir and decides.
-// Exit 0 allows, 1 refuses, 2 cannot tell (which refuses too: fail closed).
+// With -idle only an idle cluster allows. Exit 0 allows, 1 refuses, 2 cannot tell (which refuses too: fail closed).
 func cmdGuard(args []string, stdout io.Writer) int {
 	fs := flag.NewFlagSet("guard", flag.ContinueOnError)
 	dir := fs.String("dir", "guard", "directory holding runs-*.jsonl and jobs-<run id>.jsonl")
 	self := fs.Int64("self", 0, "this run's id")
+	idle := fs.Bool("idle", false, "refuse unless the cluster is idle: a holder refuses too, not only a pending run (a host reboot)")
 	if err := fs.Parse(args); err != nil || *self <= 0 {
 		say(stdout, "::error::usage: stresstally guard -dir DIR -self RUN_ID\n")
 		return 2
@@ -238,9 +261,13 @@ func cmdGuard(args []string, stdout io.Writer) int {
 		jobs[id] = js
 	}
 	classes := classifyRuns(runs, jobs, *self)
-	ok, msg := guardDecision(classes)
+	decide := guardDecision
+	if *idle {
+		decide = idleDecision
+	}
+	ok, msg := decide(classes)
 	var b strings.Builder
-	say(&b, "matrix-tier-cluster guard for run %d: %d open run(s) listed\n", *self, len(runs))
+	say(&b, "matrix-tier-cluster guard for run %d (idle required: %v): %d open run(s) listed\n", *self, *idle, len(runs))
 	for _, c := range classes {
 		say(&b, "  %-8s run %d %s [%s, created %s] %q: %s\n", c.Class, c.Run.ID, c.Run.Path, c.Run.Status, c.Run.CreatedAt, c.Run.DisplayTitle, c.Why)
 	}

@@ -1,0 +1,258 @@
+---
+# reboot.yml - reboot ONE cluster host, audited, and prove it came back. Driven by
+# .github/workflows/cluster-reboot.yml (the only sanctioned path; README.md, "Rebooting a cluster host").
+#
+#   ansible-playbook -i ansible/inventory.yml ansible/reboot.yml --extra-vars @extra-vars.json
+#
+# extra-vars.json carries reboot_host, reboot_confirm, reboot_reason, reboot_run_id, reboot_out_dir and
+# optionally allow_results_loss. It is a FILE, never key=value on the command line: that form is split on
+# whitespace and the reason is free text.
+#
+# WHY A HOST IS REBOOTED AT ALL
+#
+# The since-boot interrupt counters are read by celeris's rule D, and msr1's IRQ 135 (enp49s0-8) counts toward
+# its 32-bit wrap; /tmp is tmpfs, so a reboot also clears leftover run state. Maintainer approval (durable,
+# 2026-10-20): "You are free to reboot whenever needed". Every reboot is reported by the workflow summary.
+#
+# WHAT IT REFUSES, BEFORE ANYTHING IS TOUCHED (each prevents a host only a person can recover, or a lost run)
+#
+#   * a host other than msr1 or msa2-server (msa2-client drives both and is never rebooted here), a wrong
+#     confirmation (REBOOT-<host>), an empty or multi-line reason;
+#   * ANY of the three hosts unreachable, or a bench/validate manifest present on any of them (msa2-client
+#     drives both SUTs, so its manifest counts);
+#   * on the target: a runner job executing, a power-loss resume pending, entries in results_root (tmpfs: a
+#     reboot destroys what was not rescued; allow_results_loss=true is the explicit override), an r8127 NIC
+#     without the shutdown quiesce hook (msr1 panics in the r8127 driver at power-off and then needs a
+#     physical power-cycle, see ops/power/quiesce-r8127.shutdown), an r8127 module not available for the
+#     running kernel, or a newer kernel already installed than the one running (the reboot would boot it:
+#     unplanned, and the out-of-tree driver may not be built for it, leaving no NIC and no way back).
+#
+# WHAT IT DOES
+#
+# Reads, reboots with ansible.builtin.reboot (bounded by reboot_timeout_seconds, default 900), reads again
+# until the host has settled (3 minutes), and FAILS unless the boot id changed, the kernel is the same, no
+# new crash dump appeared, every power-guard prerequisite that held before holds again, the fabric address
+# is configured and a peer answers over it, the bond has not lost a slave, the NIC vector bench.yml pins
+# exists by name, and the since-boot interrupt totals are small. It stops nothing but what systemd stops at
+# shutdown. It restores NOTHING by hand: the IRQ affinity is recorded as the kernel left it, and bench.yml
+# applies the msr1 placement per run (tasks/nic_irq_placement.yml). Runners are ephemeral and registered per
+# run, so a reboot between runs strands none; the /tmp tool cache is wiped, so the next bootstrap is cold.
+#
+# Evidence: reboot_out_dir/<host>/{preflight,pre,post}-snapshot.json, phase.txt, result.json. The workflow
+# renders them into the step summary and uploads the directory.
+
+- name: Reboot | refuse anything but a confirmed, allowed host
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.import_tasks: tasks/reboot_request.yml
+
+- name: Reboot | preflight on every host (read-only; one that does not answer refuses the reboot)
+  hosts: cluster
+  gather_facts: false
+  # An unreachable or failed host must stop the run for every host: the target would otherwise go on to
+  # reboot while a peer's state is unknown.
+  any_errors_fatal: true
+  vars:
+    ansible_ssh_common_args: >-
+      -o ControlMaster=no
+      -o ControlPath=none
+      -o ConnectTimeout=20
+      -o ServerAliveInterval=5
+      -o ServerAliveCountMax=6
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
+  tasks:
+    # The same checks again, here: a failed play does not by itself stop the plays after it.
+    - ansible.builtin.import_tasks: tasks/reboot_request.yml
+
+    - name: Preflight | the evidence directory of this host
+      ansible.builtin.file:
+        path: "{{ reboot_out_dir }}/{{ inventory_hostname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+
+    - name: Preflight | snapshot (read-only)
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/files/reboot_snapshot.sh
+          {{ manifest_path | quote }} {{ results_root | quote }} - - -
+      become: true
+      register: preflight_raw
+      changed_when: false
+
+    - name: Preflight | parse
+      ansible.builtin.set_fact:
+        preflight_snap: "{{ preflight_raw.stdout | from_json }}"
+
+    - name: Preflight | keep the record
+      ansible.builtin.copy:
+        content: "{{ preflight_snap | to_nice_json }}\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/preflight-snapshot.json"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Preflight | no run owns this host
+      ansible.builtin.assert:
+        that: not preflight_snap.manifest_present
+        fail_msg: >-
+          refused: {{ manifest_path }} exists on {{ inventory_hostname }}: a bench or validation owns the
+          cluster (a manual mage run?). Nothing was rebooted.
+        quiet: true
+
+- name: Reboot | the target
+  # Never an empty match that "succeeds" without doing anything: the request was validated twice above, and the
+  # last play fails unless this one verified the host. The default only lets `--syntax-check` load the file.
+  hosts: "{{ reboot_host | default('none') }}"
+  gather_facts: false
+  any_errors_fatal: true
+  become: false
+  vars_files:
+    - vars/reboot_judge.yml
+  vars:
+    reboot_timeout_seconds: 900
+    # A host that has just booted has counted for minutes at most; the counters this reboot exists to reset were
+    # near 4.3e9. A total at or above this ceiling after a reboot means nothing was reset.
+    reboot_counter_ceiling: 1000000000
+    allow_results_loss: false
+    placement_vector: "{{ (nic_irq_placement | default({})).vector | default('-') }}"
+    fabric_peer: "{{ hostvars[groups['loadgen'] | first].lan_ip }}"
+    # The inventory's SSH tuning is patient on purpose (a host under bench load); here the opposite is wanted, and
+    # no multiplexed socket may outlive the reboot.
+    ansible_ssh_common_args: >-
+      -o ControlMaster=no
+      -o ControlPath=none
+      -o ConnectTimeout=20
+      -o ServerAliveInterval=5
+      -o ServerAliveCountMax=6
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
+    snapshot_cmd: >-
+      {{ playbook_dir }}/files/reboot_snapshot.sh
+      {{ manifest_path | quote }} {{ results_root | quote }} {{ placement_vector | quote }}
+      {{ lan_ip | quote }} {{ fabric_peer | quote }}
+  tasks:
+    - name: Target | record the request and the phase
+      ansible.builtin.copy:
+        content: "preflight-ok\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/phase.txt"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Target | snapshot before the reboot (read-only)
+      ansible.builtin.script:
+        cmd: "{{ snapshot_cmd }}"
+      become: true
+      register: pre_raw
+      changed_when: false
+
+    - name: Target | parse
+      ansible.builtin.set_fact:
+        pre_target: "{{ pre_raw.stdout | from_json }}"
+
+    - name: Target | keep the record
+      ansible.builtin.copy:
+        content: "{{ pre_target | to_nice_json }}\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/pre-snapshot.json"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Target | refuse when vars/reboot_judge.yml says so (refusals_str)
+      ansible.builtin.fail:
+        msg: "refused, nothing was rebooted: {{ refusals_str | trim | replace(' ;; ', '; ') }}"
+      when: refusals_str | trim | length > 0
+
+    - name: Target | record the phase
+      ansible.builtin.copy:
+        content: "rebooting\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/phase.txt"
+        mode: "0644"
+      delegate_to: localhost
+
+    # The message is FIXED text plus a validated run id: the reboot module puts it inside double quotes in a root
+    # shell command, so the free-text reason never goes near it.
+    - name: Reboot | issue the reboot and wait for the host to answer again
+      ansible.builtin.reboot:
+        msg: "cluster-reboot workflow run {{ reboot_run_id }}"
+        reboot_timeout: "{{ reboot_timeout_seconds | int }}"
+        connect_timeout: 20
+        post_reboot_delay: 30
+      become: true
+      register: reboot_result
+
+    - name: Reboot | record the phase
+      ansible.builtin.copy:
+        content: "returned\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/phase.txt"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Post | snapshot until the host has settled (the fabric and the daemons need a moment)
+      ansible.builtin.script:
+        cmd: "{{ snapshot_cmd }}"
+      become: true
+      register: post_raw
+      changed_when: false
+      failed_when: false
+      until: (post_raw.stdout | default('') | length > 0) and (post_problems_str | trim | length == 0)
+      retries: 36
+      delay: 5
+
+    - name: Post | keep the record (before judging it)
+      ansible.builtin.copy:
+        content: "{{ post_snap | to_nice_json }}\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/post-snapshot.json"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Post | keep the verdict
+      ansible.builtin.copy:
+        content: "{{ result | to_nice_json }}\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/result.json"
+        mode: "0644"
+      delegate_to: localhost
+      vars:
+        result:
+          host: "{{ inventory_hostname }}"
+          run_id: "{{ reboot_run_id }}"
+          reason: "{{ reboot_reason }}"
+          elapsed_seconds: "{{ reboot_result.elapsed | default(0) }}"
+          boot_id_before: "{{ pre_target.boot_id }}"
+          boot_id_after: "{{ post_snap.boot_id | default('') }}"
+          kernel_before: "{{ pre_target.kernel }}"
+          kernel_after: "{{ post_snap.kernel | default('') }}"
+          problems: "{{ (post_problems_str | trim).split(' ;; ') if (post_problems_str | trim | length > 0) else [] }}"
+
+    - name: Post | judge
+      ansible.builtin.fail:
+        msg: "the host rebooted but is NOT verified: {{ post_problems_str | trim | replace(' ;; ', '; ') }}"
+      when: post_problems_str | trim | length > 0
+
+    - name: Post | record the phase
+      ansible.builtin.copy:
+        content: "verified\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/phase.txt"
+        mode: "0644"
+      delegate_to: localhost
+
+    # Last, so the last play can prove this one ran.
+    - name: Post | the host is verified
+      ansible.builtin.set_fact:
+        reboot_verified: true
+
+- name: Reboot | the target was rebooted and verified
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Verified | the target play ran to its end
+      ansible.builtin.assert:
+        that: hostvars[reboot_host].reboot_verified | default(false)
+        fail_msg: "{{ reboot_host }} was not rebooted and verified (the target play did not run to its end)"
+        quiet: true

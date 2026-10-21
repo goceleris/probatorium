@@ -496,6 +496,92 @@ func TestGuardClassifiesTheGroup(t *testing.T) {
 	}
 }
 
+// The host reboot (cluster-reboot.yml) needs the cluster IDLE: the ordinary
+// verdict lets a run queue behind a holder, which for a reboot would mean a
+// host restarting hours after the maintainer looked, so -idle refuses on a
+// holder too. Everything that is not a cluster run never counts.
+func TestIdleGuardRefusesEverythingOpen(t *testing.T) {
+	const self = 100
+	nightly := ".github/workflows/matrix-nightly-tier.yml"
+	reboot := ".github/workflows/cluster-reboot.yml"
+	cases := map[string]struct {
+		runs  []ghRun
+		jobs  map[int64][]ghJob
+		allow bool
+	}{
+		"empty":                   {nil, nil, true},
+		"self only":               {[]ghRun{guardRun(self, reboot, "in_progress", "workflow_dispatch", "Cluster reboot")}, nil, true},
+		"tier running":            {[]ghRun{guardRun(1, nightly, "in_progress", "workflow_dispatch", "Nightly Validation")}, nil, false},
+		"tier pending":            {[]ghRun{guardRun(1, nightly, "pending", "workflow_dispatch", "Nightly Validation")}, nil, false},
+		"tier queued":             {[]ghRun{guardRun(1, nightly, "queued", "workflow_dispatch", "Nightly Validation")}, nil, false},
+		"another reboot":          {[]ghRun{guardRun(1, reboot, "in_progress", "workflow_dispatch", "Cluster reboot")}, nil, false},
+		"another reboot queued":   {[]ghRun{guardRun(1, reboot, "queued", "workflow_dispatch", "Cluster reboot")}, nil, false},
+		"tier completed":          {[]ghRun{guardRun(1, nightly, "completed", "workflow_dispatch", "Nightly Validation")}, nil, true},
+		"unrelated workflow":      {[]ghRun{guardRun(1, ".github/workflows/test.yml", "in_progress", "push", "Test")}, nil, true},
+		"stress self-test":        {[]ghRun{guardRun(1, stressWorkflowPath, "in_progress", "pull_request", "Celeris Stress self-test #1")}, nil, true},
+		"stress github":           {[]ghRun{guardRun(1, stressWorkflowPath, "in_progress", "workflow_dispatch", "Celeris Stress [github/stress] main")}, nil, true},
+		"stress before its guard": {[]ghRun{guardRun(1, stressWorkflowPath, "in_progress", "workflow_dispatch", "Celeris Stress [cluster/stress] main")}, map[int64][]ghJob{1: {{Name: "plan", Status: "in_progress"}}}, false},
+		"stress holding": {[]ghRun{guardRun(1, stressWorkflowPath, "in_progress", "workflow_dispatch", "Celeris Stress [cluster/stress] main")},
+			map[int64][]ghJob{1: {{Name: "cluster-guard", Status: "completed", Conclusion: "success"}, {Name: "cluster / host arm64 (msr1)", Status: "in_progress"}}}, false},
+		"stress refused by its guard": {[]ghRun{guardRun(1, stressWorkflowPath, "in_progress", "workflow_dispatch", "Celeris Stress [cluster/stress] main")},
+			map[int64][]ghJob{1: {{Name: "cluster-guard", Status: "completed", Conclusion: "failure"}}}, true},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			classes := classifyRuns(c.runs, c.jobs, self)
+			ok, msg := idleDecision(classes)
+			if ok != c.allow {
+				t.Errorf("idle verdict %v, want %v: %s", ok, c.allow, msg)
+			}
+			if !ok && !strings.Contains(msg, "run 1 ") {
+				t.Errorf("the refusal does not name the open run: %s", msg)
+			}
+			// The ordinary verdict is looser, which is why a reboot cannot use it:
+			// a holder alone is allowed there.
+			if name == "tier running" || name == "another reboot" || name == "stress holding" {
+				if okOrd, _ := guardDecision(classes); !okOrd {
+					t.Errorf("%s: the ordinary guard now refuses a holder too; the idle mode no longer differs", name)
+				}
+			}
+		})
+	}
+}
+
+// guard -idle end to end: the same listing is allowed by the ordinary guard
+// (a holder, nothing pending) and refused by -idle, with the verdict in
+// decision.txt for the artifact.
+func TestCmdGuardIdle(t *testing.T) {
+	dir := t.TempDir()
+	line, _ := json.Marshal(guardRun(8, ".github/workflows/matrix-race-tier.yml", "in_progress", "workflow_dispatch", "Race Validation"))
+	if err := os.WriteFile(filepath.Join(dir, "runs-in_progress.jsonl"), append(line, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	if code := cmdGuard([]string{"-dir", dir, "-self", "7"}, &out); code != 0 {
+		t.Fatalf("ordinary guard: exit %d, want 0 (a holder with nothing pending)\n%s", code, out.String())
+	}
+	out.Reset()
+	if code := cmdGuard([]string{"-dir", dir, "-self", "7", "-idle"}, &out); code != 1 || !strings.Contains(out.String(), "::error::refusing: the cluster is not idle: run 8") {
+		t.Errorf("-idle with a holder: exit %d, want 1\n%s", code, out.String())
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "decision.txt")); err != nil || !strings.Contains(string(b), "idle required: true") {
+		t.Errorf("decision.txt does not record the idle mode: %v %s", err, b)
+	}
+	empty := t.TempDir()
+	if err := os.WriteFile(filepath.Join(empty, "runs-in_progress.jsonl"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := cmdGuard([]string{"-dir", empty, "-self", "7", "-idle"}, &out); code != 0 || !strings.Contains(out.String(), "the cluster is idle") {
+		t.Errorf("-idle on an empty listing: exit %d, want 0\n%s", code, out.String())
+	}
+	// no listing at all still fails closed in the idle mode
+	out.Reset()
+	if code := cmdGuard([]string{"-dir", t.TempDir(), "-self", "7", "-idle"}, &out); code != 2 {
+		t.Errorf("-idle with no listing: exit %d, want 2", code)
+	}
+}
+
 // cmdGuard fails closed: no listing, no decision.
 func TestCmdGuard(t *testing.T) {
 	var out strings.Builder

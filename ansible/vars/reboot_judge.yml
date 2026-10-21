@@ -1,0 +1,48 @@
+---
+# The judgement of ansible/reboot.yml, as lazily evaluated variables, in a file of their own so that
+# ansible/tests/test_reboot_judge.sh can load the very same text with fixture snapshots and check every
+# verdict (a Jinja template that only runs on a rebooted cluster host is a template nobody has run).
+#
+# Inputs, set by the play: pre_target (the target's snapshot before the reboot), post_raw (the registered result
+# of the post-boot snapshot task), placement_vector, lan_ip, fabric_peer, ansible_user, results_root,
+# allow_results_loss, reboot_counter_ceiling. Outputs: refusals_str and post_problems_str, strings of messages
+# joined by " ;; " (a plain string survives every ansible-core version's templating; a JSON list in a string
+# is turned into a list by some versions and not by others). Empty means nothing to report.
+
+post_snap: >-
+  {{ (post_raw.stdout | from_json) if (post_raw.stdout | default('') | length > 0) else {} }}
+
+# Reasons NOT to reboot, judged on the snapshot taken just before it.
+refusals_str: >-
+  {% set a = pre_target %}
+  {% set p = [] %}
+  {% if a.results_entries | int > 0 and not (allow_results_loss | bool) %}{% set _ = p.append('results_root ' ~ results_root ~ ' holds ' ~ a.results_entries ~ ' entr(ies) a reboot destroys (' ~ (a.results_list | join(', ')) ~ '): rescue or fetch them, or dispatch with allow_results_loss=true') %}{% endif %}
+  {% if a.resume_pending %}{% set _ = p.append('/var/lib/celeris-power/resume-pending.json exists: a power-loss resume is pending (cluster-power-restore --list)') %}{% endif %}
+  {% if a.runner_workers | int > 0 %}{% set _ = p.append(a.runner_workers ~ ' runner job(s) are executing on the host') %}{% endif %}
+  {% if a.r8127 and not a.prereq.quiesce_hook %}{% set _ = p.append('the host has an r8127 NIC and no shutdown quiesce hook: msr1 panics at power-off and then needs a physical power-cycle; run ansible/power-guard.yml') %}{% endif %}
+  {% if a.r8127 and a.modinfo_r8127 != true %}{% set _ = p.append('the r8127 module is not available for the running kernel ' ~ a.kernel ~ ': the NIC would not come back') %}{% endif %}
+  {% if a.newest_installed_kernel | length > 0 and a.newest_installed_kernel != a.kernel %}{% set _ = p.append('kernel ' ~ a.newest_installed_kernel ~ ' is installed and ' ~ a.kernel ~ ' is running: the reboot would boot another kernel') %}{% endif %}
+  {{ p | join(' ;; ') }}
+
+# What is wrong with the host after the reboot (empty: verified).
+post_problems_str: >-
+  {% set a = pre_target %}
+  {% set b = post_snap %}
+  {% set p = [] %}
+  {% if b | length == 0 %}{% set _ = p.append('no readable snapshot after the reboot') %}{% else %}
+  {% if b.boot_id == a.boot_id %}{% set _ = p.append('boot_id did not change (' ~ a.boot_id ~ '): the host did not reboot') %}{% endif %}
+  {% if b.kernel != a.kernel %}{% set _ = p.append('kernel changed: ' ~ a.kernel ~ ' -> ' ~ b.kernel) %}{% endif %}
+  {% if (b.crash | difference(a.crash)) | length > 0 %}{% set _ = p.append('new crash dump(s) in /var/crash: ' ~ (b.crash | difference(a.crash) | join(', '))) %}{% endif %}
+  {% for k in ['tailscaled_active', 'apcupsd_active', 'resume_check_enabled', 'power_event_installed', 'tmpfiles_conf', 'quiesce_hook'] %}
+  {% if a.prereq[k] and not b.prereq[k] %}{% set _ = p.append('prerequisite regressed: ' ~ k ~ ' held before the reboot and does not now') %}{% endif %}
+  {% endfor %}
+  {% if a.prereq.run_celeris_owner == ansible_user and b.prereq.run_celeris_owner != ansible_user %}{% set _ = p.append('/run/celeris is not owned by ' ~ ansible_user ~ ' (' ~ b.prereq.run_celeris_owner ~ '): the tmpfiles.d entry of power-guard.yml did not apply') %}{% endif %}
+  {% if placement_vector != '-' and not b.placement_vector_present %}{% set _ = p.append('NIC vector ' ~ placement_vector ~ ' (bench.yml pins it) is not in /proc/interrupts') %}{% endif %}
+  {% if b.lan_ip_present != true %}{% set _ = p.append('fabric address ' ~ lan_ip ~ ' is not configured on the host') %}{% endif %}
+  {% if b.peer_ping_ok != true %}{% set _ = p.append('no answer from ' ~ fabric_peer ~ ' over the fabric') %}{% endif %}
+  {% set up_a = a.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
+  {% set up_b = b.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
+  {% if up_b < up_a %}{% set _ = p.append('bond lost a slave: ' ~ up_a ~ ' up before, ' ~ up_b ~ ' up now') %}{% endif %}
+  {% if b.max_vector_total >= reboot_counter_ceiling %}{% set _ = p.append('a NIC vector counts ' ~ b.max_vector_total ~ ' since boot: the counters were not reset') %}{% endif %}
+  {% endif %}
+  {{ p | join(' ;; ') }}
