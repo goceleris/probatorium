@@ -319,7 +319,7 @@ func TestValidationScopeGroupSizes(t *testing.T) {
 		policy interleave.LockPolicy
 		b      func([]interleave.PlanColumn) interleave.ArchPlan
 	}{
-		{"heavy lock, arm64 cells reversed (default)", interleave.LockHeavy, func(c []interleave.PlanColumn) interleave.ArchPlan {
+		{"heavy lock, arm64 cells reversed (run A)", interleave.LockHeavy, func(c []interleave.PlanColumn) interleave.ArchPlan {
 			return interleave.ArchPlan{Columns: c, ReverseCells: true}
 		}},
 		{"heavy lock, both forward", interleave.LockHeavy, func(c []interleave.PlanColumn) interleave.ArchPlan { return interleave.ArchPlan{Columns: c} }},

@@ -296,14 +296,18 @@ rated sweep runs.
 
 The workflow publishes only rated profiles, because saturation-only data would publish datasets with no
 `latency_at_slo`. `mage BenchTier` run by hand publishes unless `BENCH_PUBLISH=0`. The workflow sets
-`BENCH_BUDGET` per profile (24 h, 36 h and 60 h). The budget model projects about 30 h for headline and
-51 h for full. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
+`BENCH_BUDGET` from a table of profile, baseline switch and arch policy (single arch, no baseline: 24 h, 36 h
+and 60 h; the policies of a both-arch run and the baseline columns have their own entries, see below). The
+budget model projects about 30 h for headline and 51 h for full on one arch. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
 and 69 h, because they rated every clean cell.
 
 **Rated data is not publishable yet.** [#441](https://github.com/goceleris/probatorium/issues/441) gates
-any rated publish, and [#442](https://github.com/goceleris/probatorium/issues/442) does until its
-validation run has shown the arch lock below holds on the cluster, so dispatch headline and full with
-`publish=false` until both are settled. The runner keeps no achieved rate per pass, so no rated number
+any rated publish, and [#442](https://github.com/goceleris/probatorium/issues/442) does until it is settled.
+The validation run of 2026-10-21 showed the arch lock holds on the scoped rows (P1b, P2, P3, P5) and that the
+exemption of light cells did not (P6 fails on arm64), so the default policy is now `all`
+([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md), "Verdict"). #442 stays open for the
+three rows only a full both-arch run reads (get-simple-1024c, get-json-h2, post-4k-h2), so dispatch headline and
+full with `publish=false` until both are settled. The runner keeps no achieved rate per pass, so no rated number
 can tell a slow server from load that loadgen never sent (#441).
 
 ### A both-arch run: the two arches share one client (#442)
@@ -316,7 +320,10 @@ the same row read a backlog clock of 1 s or more in 6 of 10 passes, against 0 of
 run 36441790519 the saturation numbers of the bandwidth rows moved with the other arch's load (the 2x10G
 bond carries both arches). A run made before the fix marks nothing of this.
 
-**What the harness does now.**
+**What the harness does now.** The default policy is `all` (since the validation read of 2026-10-21): the
+arches take turns on the client and no pass of one arch overlaps any load of the other. The bullets below
+describe the lock; under `all` every cell takes it, under `heavy` (the previous default, still selectable)
+only the heavy ones.
 
 - Every scenario has a client-load class, `heavy` or `light` ([`scenarios/clientload.go`](scenarios/clientload.go),
   the table, its demand figures and the rule). Light is a row whose p90 stays at or below 150k requests/s
@@ -358,9 +365,11 @@ bond carries both arches). A run made before the fix marks nothing of this.
   `all` reverses arm64 too: its wall-clock does not depend on the order (99.7 h either way in the model), and
   it keeps every cell's position in its column the same under both policies, so a comparison of the two
   (the validation's run A against run B) differs in what the arches shared, not in where a cell sat.
-- `BENCH_ARCH_EXCLUSIVE=heavy|all|off` (workflow input `arch_exclusive`) picks the policy. `heavy` is the
-  default for `target=both`. `all` locks every cell, so the arches take turns. `off` is today's behaviour,
-  kept as a control arm: the publish gate refuses its documents.
+- `BENCH_ARCH_EXCLUSIVE=all|heavy|off` (workflow input `arch_exclusive`) picks the policy. `all` is the
+  default for `target=both`: it locks every cell, so the arches take turns (about twice one arch's
+  wall-clock). `heavy` locks the heavy cells only (+14%, the previous default). `off` is the pre-fix
+  behaviour, kept as a control arm: the publish gate refuses its documents. A single-arch target has no
+  peer and ignores the knob.
 
 **What it costs.** `interleave.SimulateArchPlan` replays the two passes on the real 813-cell, 52-column
 grid at the `full` profile's window (`go test ./cmd/runner -run 'FullGridArchPlan|DriftSweep' -v`; the output
@@ -374,9 +383,9 @@ lockstep case, not every past run.
 | --- | --- | --- | --- |
 | today: no lock | 50.9 h | +0% | 444 of 444 |
 | lock on heavy cells, both arches forward | 65.9 h | +30% | 0 |
-| **lock on heavy cells, arm64 cells reversed (the default)** | **57.6 h** | **+13%** | 0 |
+| lock on heavy cells, arm64 cells reversed (`heavy`, the previous default) | 57.6 h | +13% | 0 |
 | lock on heavy cells, arm64 columns reversed | 58.6 h | +15% | 0 |
-| lock on every cell (`all`) | 99.7 h | +96% | 0 |
+| **lock on every cell (`all`, the default)** | **99.7 h** | **+96%** | 0 |
 | option, not implemented: heavy cells and every rated sweep, arm64 cells reversed | 75.2 h | +48% | 0 |
 
 The lock's cost depends on how far apart the arches run. The drift sweep moves the arm64 start by 0 to 3 h
@@ -394,16 +403,30 @@ falls hours behind the other. A `full` target=both run goes from the measured 47
 model's 1.14 mean times 47.6 h), 53-60 h across the sweep; `budget.FitWithin` projects 58 h
 (`ArchLockOverheadHeavy` = 14%, pinned to the lockstep planner by a test) and the workflow budgets
 (40 h headline, 69 h full) cover the sweep's 1.30 worst case. `headline` goes from about 30 h to about 34 h.
-`all` is about twice, and the workflow budgets it separately (the budget and the job timeout are tables of
-profile and policy, `workflow_arch_budget_test.go`): 34 h fast, 72 h headline, 108 h full under a 7080 min
-(118 h) job timeout, which sits under GitHub's 5-day (7200 min) limit. A `full` dispatch with
-`arch_exclusive=all` projects 101.9 h, so its budget has a 6% margin where every other entry has 18% or more;
-the model ran 7% high against the one measured run, so about 95 h is the expectation, but it is the thinnest
-margin of any dispatch. These are a model of fixed window lengths and the lock's first-come order, not a
+`all`, the default, is about twice, and the workflow budgets it separately (the budget is a table of profile,
+baseline switch and policy and the job timeout a table of policy, `workflow_arch_budget_test.go`): 34 h fast,
+72 h headline, 108 h full under a 7080 min (118 h) job timeout, which sits under the 5-day (7200 min) limit. A
+default `full` dispatch therefore projects 101.9 h, so its budget has a 6% margin where every other entry has
+18% or more; the model ran 7% high against the one measured run, so about 95 h is the expectation, but it is
+the thinnest margin of any dispatch, and the weekly headline run, when its schedule is restored, projects 59.7 h
+under the default instead of 34 h. Projected hours of `profile=full` with the opt-in baseline columns
+(`baseline=true`, +222 saturation and +120 rated cells per arch), from the budget model and from the planner
+(`go test ./budget ./cmd/runner -run 'FullBaselineUnderAll|BaselineGridArchPlan' -v`):
+
+| `profile=full`, `baseline=true` | model | planner | job limit 120 h |
+| --- | --- | --- | --- |
+| one arch (`target=msa2-server` or `msr1`) | 65.5 h | 65.4 h | fits |
+| both arches, `heavy` | 74.6 h | 72.1 h | fits (budget 90 h) |
+| both arches, `all` (the default) | **130.9 h** | **128.0 h** | **does not fit** |
+
+`full` + `baseline=true` + `target=both` under `all` cannot be held by any job: the workflow refuses it at the
+start of the bench job, before Deploy (the first step of the matrix job, which still follows `setup` and the cluster
+concurrency queue; guarded by exactly that dispatch, tested against the model). Dispatch it
+as two single-arch runs or with `arch_exclusive=heavy`. These are a model of fixed window lengths and the lock's first-come order, not a
 cluster run: how often the lock really queues a runner is the first thing the validation run measures
 (`lock_wait_seconds`).
 
-**What it does not do.** Under `heavy` a heavy cell still shares the client with the other arch's light
+**What `heavy` does not do** (the reason the default moved). Under `heavy` a heavy cell still shares the client with the other arch's light
 cells, and a light cell's own measurement runs under the other arch's heavy cells. Neither is measured.
 
 - *Heavy under light, x86 side.* The coefficient that chose the rule (an x86 cell lost 0.18-0.31 requests/s per
@@ -427,9 +450,10 @@ cells, and a light cell's own measurement runs under the other arch's heavy cell
 57.6 h). A third option, not implemented, locks every rated sweep as well as every heavy cell: the planner
 prices it at 75.2 h (+48%) and it removes the third exposure only. The default order itself is a trade: with
 both arches forward there are 230 heavy+light cell overlaps at 65.9 h; reversing arm64 makes it 793 at 57.6 h.
-`all` removes that trade too. The validation run measures all three
-([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md)); its pre-registered rule says to
-move the default to `all` if they are not small.
+`all` removes that trade too. The validation run measured them
+([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md), "Verdict"): P5 held (light rows'
+rated p99, A against B) and P6 failed on arm64 (a heavy cell under the x86 light rows, celeris-iouring post-4k,
+minimum rps ratio 0.827 against a 0.92 floor, median 1.001), so by the pre-registered rule the default is `all`.
 
 **The check on a finished run.** Every saturation and every rated pass records the interval it drove load
 in, on msa2-client's own clock (the same clock for both arches), kept or skipped
@@ -737,7 +761,7 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `Status` | Cluster reachability and manifest state | |
 | `Deploy` | Cross-compile and stage every binary | `CLUSTER_USE_LAN`, `DEPLOY_COMPETITORS=all\|go-only\|none\|<list>`, `DEPLOY_NEEDS_DBSERVICES` |
 | `Cleanup` | Undo what a run installed, per the host manifests | `CLEANUP_HOSTS=all\|<list>` |
-| `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_ARCH_EXCLUSIVE` (`both` only: `heavy` default, `all`, `off`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_RATED_CELLS` (default: the rated cells), `BENCH_SUT_ENV`, `CELERIS_VERSION` |
+| `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_ARCH_EXCLUSIVE` (`both` only: `all` default, `heavy`, `off`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_RATED_CELLS` (default: the rated cells), `BENCH_SUT_ENV`, `CELERIS_VERSION` |
 | `BenchTier` | A profile-driven run over the whole grid; publishes it unless `BENCH_PUBLISH=0` | `BENCH_PROFILE=fast\|headline\|full`, `BENCH_BUDGET`, `BENCH_TARGET`, `BENCH_SKIP_RATED`, `BENCH_PUBLISH`, `BENCH_BASELINE=1` (see [Same-run celeris baseline](#same-run-celeris-baseline)) |
 | `BenchArchOverlap` | Check a finished both-arch run for overlap between the arches' load windows (#442); fails on a forbidden overlap | `BENCH_RESULTS_DIR` (default the latest run), `BENCH_ARCH_EXCLUSIVE` |
 | `BenchSince` | Compare against a baseline version | `BASELINE_VERSION` (default `v1.4.2`), `REGRESSION_THRESHOLD` (default `0.05`) |
@@ -849,7 +873,10 @@ holds the same-run interleaved comparison against the v1.5.x release. They are l
 expansion (the `*/*` grid, the default competitor set, `DEPLOY_COMPETITORS=all`, the budget pins) unless
 `BENCH_BASELINE=1`, which `benchmark-tier.yml` sets from its `baseline` input (default `false`). Switched on it adds
 222 saturation and 120 rated cells per architecture (about +14.5 h projected on `full`, +8.5 h on
-`headline`) and the workflow raises `BENCH_BUDGET` for it. Columns run as blocks in list order, so
+`headline`) and the workflow raises `BENCH_BUDGET` for it, for every arch policy. With `target=both` under the default
+policy `all`, `profile=full` with the baseline projects 130.9 h and is refused at the start of the job (above the
+7200 min job limit; see "A both-arch run"): dispatch it as two single-arch runs (65.5 h each) or with
+`arch_exclusive=heavy` (74.6 h). Columns run as blocks in list order, so
 `servers.InterleaveBaseline` places each baseline column directly beside its `celeris-*` twin (about 1.8 h
 apart, alternating which runs first) instead of the sorted `baseline-*` block fifteen hours earlier. Rows publish with framework `celeris-baseline`,
 framework_version `v1.5.11`. The module is a frozen fork of `servers/celeris` (go.mod pinned, not in

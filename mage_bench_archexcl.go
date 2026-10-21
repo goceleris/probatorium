@@ -30,10 +30,15 @@ import (
 const benchClientLockPath = "/tmp/probatorium-client.lock"
 
 // resolveArchExclusion reads BENCH_ARCH_EXCLUSIVE for a run of target.
-// The default for BENCH_TARGET=both is heavy; a single-arch run has no peer, so
-// the knob is ignored and it returns "" (no lock). Values: heavy, all (the strict option: the arches
-// never load the client together, about twice the wall-clock), off (the
+// The default for BENCH_TARGET=both is all (the validation read of 2026-10-21,
+// docs/ARCH-EXCLUSION-VALIDATION.md: the heavy exemption of the light rows did
+// not hold on arm64); a single-arch run has no peer, so the knob is ignored and
+// it returns "" (no lock). Values: all (the arches never load the client
+// together, about twice the wall-clock), heavy (a heavy cell of one arch never
+// overlaps a heavy cell of the other, +14%: the previous default), off (the
 // pre-fix behaviour, overlap allowed; the publish gate refuses such a run).
+// The default is also the two fallbacks of the workflow's budget and timeout
+// tables; TestWorkflowDefaultPolicyIsTheMageDefault keeps them in step.
 func resolveArchExclusion(target string) (string, error) {
 	v := strings.TrimSpace(os.Getenv("BENCH_ARCH_EXCLUSIVE"))
 	if target != "both" {
@@ -46,7 +51,7 @@ func resolveArchExclusion(target string) (string, error) {
 	}
 	switch v {
 	case "":
-		return report.ExclusionHeavy, nil
+		return report.ExclusionAll, nil
 	case report.ExclusionHeavy, report.ExclusionAll, report.ExclusionOff:
 		return v, nil
 	}

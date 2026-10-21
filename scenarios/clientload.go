@@ -53,11 +53,11 @@ const (
 //     this direction; if it were symmetric, 25-43k, 6-11%;
 //   - the light rows' OWN measurements under the other arch's heavy cells:
 //     12 of the 15 rated rows are light (budget.RatedScenarios), and the
-//     default order puts 173 rated light cells per arch under a peer heavy
+//     order under policy heavy puts 173 rated light cells per arch under a peer heavy
 //     cell (cmd/runner TestFullGridArchPlan).
 //
 // docs/ARCH-EXCLUSION-VALIDATION.md is built to measure all three, and
-// BENCH_ARCH_EXCLUSIVE=all removes them.
+// BENCH_ARCH_EXCLUSIVE=all (the default) removes them.
 var clientLoadTable = map[string]ClientLoad{
 	// bandwidth rows: 14-18 Gbit/s on x86, 7-10 on arm64.
 	"post-4k":       LoadHeavy, // 548k | 226k rps, 18.0 | 7.4 Gbit/s

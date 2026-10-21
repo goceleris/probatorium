@@ -65,14 +65,14 @@ import (
 //	                               as the first line of each cell's
 //	                               server.log and recorded in the merged
 //	                               Document's environment.sut_env
-//	BENCH_ARCH_EXCLUSIVE=          BENCH_TARGET=both only: heavy (default) |
-//	                               all | off. heavy: a heavy cell of one
+//	BENCH_ARCH_EXCLUSIVE=          BENCH_TARGET=both only: all (default) |
+//	                               heavy | off. all: the arches never
+//	                               overlap (about twice the wall-clock;
+//	                               arm64 walks each column in reverse);
+//	                               heavy: a heavy cell of one
 //	                               arch never overlaps a heavy cell of the
 //	                               other (host-wide lock on msa2-client,
-//	                               arm64 walks each column in reverse);
-//	                               all: the arches never overlap (about
-//	                               twice the wall-clock; arm64 reversed
-//	                               too); off: the pre-fix
+//	                               +14%); off: the pre-fix
 //	                               behaviour, which the publish gate refuses
 //	                               (probatorium#442)
 //	CELERIS_VERSION=               override go.mod auto-detect

@@ -81,7 +81,8 @@ import "time"
 // Candidates to re-add once the runner records each pass's achieved rate and
 // refuses a pass that missed it (probatorium#441), overlapping arch runs of
 // the same heavy row are shown prevented on the cluster (the client lock of
-// probatorium#442 is in; its validation run is not) and loadgen paces each
+// probatorium#442 is in and its scoped validation run has read, see
+// docs/ARCH-EXCLUSION-VALIDATION.md) and loadgen paces each
 // worker (loadgen#102): ws-large-echo, get-json-h2 (post-4k-h2 only if it
 // shows something get-json-h2 does not) and get-simple-1024c (the only row at
 // partial load with a large keep-alive pool).
@@ -178,8 +179,10 @@ const (
 // run of the same heavy row read 1 s or more far more often (ws-large-echo 6 of
 // 10 overlapping passes, 0 of 42 others, probatorium#442), and run 36441790519
 // showed it in saturation too. Since #442 the runner holds a host-wide lock
-// around every heavy cell (Profile.ArchExclusion, BENCH_ARCH_EXCLUSIVE), which
-// costs ArchLockOverheadHeavy of one arch's wall-clock on top.
+// around every heavy cell (policy heavy) or every cell (policy all, the default
+// since the validation read of 2026-10-21) (Profile.ArchExclusion,
+// BENCH_ARCH_EXCLUSIVE), which costs ArchLockOverheadHeavy or
+// ArchLockOverheadAll of one arch's wall-clock on top.
 //
 // Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~14.3h
 // rated (401 rated cells x 4 x (12+20)s, each rated pass re-running the

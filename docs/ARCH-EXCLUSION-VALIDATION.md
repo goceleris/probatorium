@@ -1,10 +1,47 @@
 # Arch exclusion: validation runs (probatorium#442)
 
-Nothing in the arch lock has run on the cluster. These are the scoped both-arch runs that check it, with
-their criteria fixed before they run. They do not close #442 by themselves: #442's own close criteria are
-quoted at the end.
+This page was written before the runs: nothing in the arch lock had run on the cluster. These are the scoped
+both-arch runs that check it, with their criteria fixed before they run. They have run; the verdict is the next
+section, and the rest of the page (the runs, the pre-registered criteria, what the verdicts do) is kept as
+written. They do not close #442 by themselves: #442's own close criteria are quoted at the end.
 
-The default policy, `heavy`, keeps heavy cells of the two arches apart and leaves three exposures
+## Verdict (read 2026-10-21): the default arch policy is now `all`
+
+Runs A (the then-default `heavy`, benchmark-tier 39532394806, head 58f85c4) and B (`arch_exclusive=all`,
+39543338699) were read once, strictly by the criteria below (`read_validation.py`, one reader for both). Both
+used the celeris pin of 2026-10-13, i.e. before celeris#1049 and #1085. Arms C and D (the idle-wait and off
+controls) were not part of this read, so P7 was not evaluated.
+
+| criterion | verdict | numbers |
+| --- | --- | --- |
+| P1, run A mechanism | holds | `mage BenchArchOverlap` rc 0: 63 x 63 windows, 0 forbidden overlaps, heavy+heavy 0, heavy+light 102, 0+0 windows without timestamps; `lock_wait_seconds` 321.3 (amd64) and 319.3 (arm64) |
+| P1b, run B mechanism | holds | `BENCH_ARCH_EXCLUSIVE=all mage BenchArchOverlap` rc 0: 63 x 63 windows, heavy+heavy, heavy+light and light+light all 0, no window without timestamps |
+| P2, x86 ws-large-echo clocks gone | holds | A and B: 0 of 12 passes at or above 1 s; largest p99 21.9 ms (A), 21.1 ms (B) |
+| P3, x86 post-4k 0.9 pass at or below 2 ms | holds | celeris adaptive 0.33 / 0.32 ms (A / B), iouring 0.20 / 0.21 ms |
+| P5, light rows' rated p99, A against B | holds | 48 pairs, median p99(A)/p99(B) 1.00 (max 16.75), 0 passes at or above 1 s in A with B under 1 s |
+| P6, heavy cell under a light peer, A against B | **fails** | x86 holds (3 shared cells, median 0.983, min 0.969); **arm64 fails**: 6 shared cells, median 1.001, minimum **0.827** on celeris-iouring post-4k (A 142625 requests/s, B 172518) against the 0.92 floor |
+
+P6 holds only if both arches hold, so P6 fails. The rule in "What the verdicts do" is applied as written ("P5 or
+P6 fails: the exemption does not hold; the default becomes `all`"), with the thresholds unedited: the default is
+now `all` (`resolveArchExclusion`'s empty case and the two fallbacks of the workflow's budget and timeout
+tables, which `TestWorkflowDefaultPolicyIsTheMageDefault` keeps in step). `heavy` stays selectable with
+`-f arch_exclusive=heavy`. The one cell that fails P6 is also a volatile cell (below); it is not a reason to
+keep `heavy`, because the thresholds were fixed before the run.
+
+What this does not say. (1) arm64 celeris-iouring post-4k at the 0.9 pass read p99 224.7 ms in A (shared with
+light cells) and **2512.4 ms in B, where nothing overlapped it** (arm64 adaptive 0.90 ms, x86 same cell 0.21 ms),
+so that tail is not the arch overlap: it is a finding for celeris, to be re-read at the final sha (the pin is
+the pre-#1049/#1085 build). (2) #442 stays open: get-simple-1024c, get-json-h2 and post-4k-h2 are not in this
+scope and only a full both-arch run reads them. (3) One A against one B, no A/A twin: the 0.827 is one cell of
+one run. (4) The scope is three columns and five rows; the driver rows are not covered.
+
+Cost of the new default, from the planner and the budget model (`go test ./budget ./cmd/runner -run
+'FullBaselineUnderAll|BaselineGridArchPlan' -v`): `profile=full target=both` projects 101.9 h under `all`
+(58.1 h under `heavy`); with `baseline=true` it projects 130.9 h under `all` (the planner says 128.0 h), above the
+7200 minute (120 h) job limit, so the workflow refuses that dispatch at the start of the job: run it as two
+single-arch dispatches (65.5 h each) or with `arch_exclusive=heavy` (74.6 h).
+
+The default policy when this page was written, `heavy`, keeps heavy cells of the two arches apart and leaves three exposures
 unmeasured (README, "What it does not do"): an x86 heavy cell sharing the client with the arm64 light rows
 (3.5-6% by the one coefficient we have, which was never measured on those rows), an arm64 heavy cell sharing
 it with the x86 light rows (unquantified, 6-11% if the coefficient were symmetric), and the light rows' own

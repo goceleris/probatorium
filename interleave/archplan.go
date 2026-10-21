@@ -231,7 +231,7 @@ func (r PlanResult) Overlaps() (heavyHeavy, heavyLight, lightLight int) {
 // policy lets run unlocked) that ran while a heavy cell of the other arch was
 // running: the cells, the (sweep, heavy cell) pairs, and the total overlapped
 // time. A light row's rated passes are ranked by latency at load, so this is
-// what the default policy leaves exposed to the peer's heavy load.
+// what the heavy policy leaves exposed to the peer's heavy load.
 func (r PlanResult) RatedUnderHeavy() (cells, pairs int, overlapped time.Duration) {
 	for side := 0; side < 2; side++ {
 		for _, x := range r.Slots[side] {

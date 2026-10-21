@@ -162,7 +162,7 @@ func TestWorkflowTablesAreIndexedByTheRightKeys(t *testing.T) {
 // timeout-minutes holds that budget plus Deploy and Cleanup, or the run cannot
 // be held by any job (projection + Deploy/Cleanup over the timeout of its
 // policy), in which case the table says so by an entry that FitWithin refuses
-// and the workflow refuses the dispatch at minute 0
+// and the workflow refuses the dispatch at the start of the bench job
 // (TestWorkflowRefusesAGridTheJobCannotHold). The set of refused dispatches is
 // pinned: a combination entering or leaving it is a deliberate edit.
 func TestWorkflowBudgetAdmitsEveryArchPolicy(t *testing.T) {
@@ -251,7 +251,7 @@ func TestWorkflowBudgetAdmitsEveryArchPolicy(t *testing.T) {
 // policy all projects 130h55m, above the 7200 minute job limit, so no
 // BENCH_BUDGET admits it. FitWithin would refuse it, but only after mage
 // Deploy has built the baseline module: a step before Deploy refuses it at
-// minute 0, for exactly the dispatches the table pins as unholdable.
+// the start of the bench job, for exactly the dispatches the table pins as unholdable.
 func TestWorkflowRefusesAGridTheJobCannotHold(t *testing.T) {
 	src := readWorkflow(t, "benchmark-tier.yml")
 	const cond = `if: ${{ (github.event.inputs.target || 'both') == 'both' && (github.event.inputs.arch_exclusive || 'all') == 'all' && github.event.inputs.baseline == 'true' && (github.event.inputs.profile || 'full') == 'full' }}`

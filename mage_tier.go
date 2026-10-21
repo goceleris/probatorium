@@ -68,7 +68,7 @@ import (
 //	                           for the exhaustive sweep (~30h on one arch,
 //	                           needs a raised BENCH_BUDGET). Default: full.
 //	BENCH_TARGET=both          msa2-server | msr1 | both (both = 2 arches)
-//	BENCH_ARCH_EXCLUSIVE=      both only: heavy (default) | all | off, see Bench
+//	BENCH_ARCH_EXCLUSIVE=      both only: all (default) | heavy | off, see Bench
 //	BENCH_SKIP_RATED=          "1" runs saturation passes only. Every
 //	                           cell still runs the saturation pass; the
 //	                           rated sweep is skipped per-cell.
