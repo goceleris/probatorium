@@ -607,15 +607,18 @@ What a race run records about itself (schema 5.23, record only, nothing new is g
 **The race tier shapes the load of its adaptive cells (no schema bump).** The adaptive cell is sized 2 workers x
 110 walkers so the controller's promotion fires, and under the race detector's slowdown a closed-loop walker
 fleet saturated its two engine loops (a fourth `SLOW_CLASS` echo, now and then a reset-type counter). With
-`-race-tier`, and for the adaptive cells only (all 16: eight refapps on both arches, not just the one that
-failed), each Markov walker now pauses 4 ms after every request
-(`raceAdaptiveMarkovThink` in `cmd/validator/matrix.go`). The worker, walker and connection counts are
-unchanged, no threshold, N or timeout moves, and every other cell (any tier, any other engine) is
-closed-loop exactly as before. The cell says so: `tier_1.load_shaping` has the reason, `walkers`,
-`markov_walkers` and `markov_think_ms`, and is omitted everywhere else. The field is additive in schema
-5.23 and does not bump it, so the documents of every other tier are byte-identical to before. Promotion is still gated in every
-default race run (`VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`); a shaped cell that misses it says it was
-shaped, and a shaped cell without a `-race` build (`I-RACE`) fails the gate.
+`-race-tier`, and for the adaptive cells only, each Markov walker now starts a request at most once every
+6.5 ms (`raceAdaptiveMarkovMinPeriod` in `cmd/validator/matrix.go`): open loop, so the fleet offers at most
+67 / 6.5 ms = ~10.3k requests a second whatever the response time, against the ~16.6k the same walkers sent
+when the cell saturated. The worker, walker and connection counts are unchanged, no threshold, N or timeout
+moves, and every other cell (any tier, any other engine) is closed-loop exactly as before. The shaping is
+uniform: all 16 race-tier adaptive cells (eight refapps, both arches) get it, including the 15 that were
+green, which now run under `-race` at about 60% of their Markov request volume; pure engines and every
+non-race tier keep their full load. The cell says so: `tier_1.load_shaping` has the reason, `walkers`,
+`markov_walkers` and `markov_min_period_us`, and is omitted everywhere else. The field is additive in schema
+5.23 and does not bump it, so the documents of every other tier are byte-identical to before. Promotion is
+still gated in every default race run (`VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`); a shaped cell that misses it
+says it was shaped, and a shaped cell without a `-race` build (`I-RACE`) fails the gate.
 
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only

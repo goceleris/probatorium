@@ -1303,12 +1303,16 @@ type EventSpan struct {
 // Walkers is the whole fleet's count (Config.ConcurrencyFloor applied) and
 // MarkovWalkers the part of it that was paced; both are the counts the cell ran
 // with, so a shaped cell can be compared walker for walker with an unshaped one.
-// MarkovThinkMs is the pause each Markov walker takes after every request.
+// MarkovMinPeriodUs is the pacing, in microseconds: the least time between the
+// STARTS of two requests of one Markov walker (open loop: a slow response does
+// not make the next start earlier, and nothing is caught up afterwards). The
+// fleet therefore offers at most MarkovWalkers / MarkovMinPeriodUs requests per
+// microsecond, whatever the response time.
 type LoadShaping struct {
-	Reason        string `json:"reason"`
-	Walkers       int    `json:"walkers"`
-	MarkovWalkers int    `json:"markov_walkers"`
-	MarkovThinkMs int64  `json:"markov_think_ms"`
+	Reason            string `json:"reason"`
+	Walkers           int    `json:"walkers"`
+	MarkovWalkers     int    `json:"markov_walkers"`
+	MarkovMinPeriodUs int64  `json:"markov_min_period_us"`
 }
 
 // RefappSched is what the validator read of the refapp's CPU placement.
