@@ -65,8 +65,10 @@ func requestsIn(t *testing.T, window, think time.Duration) int64 {
 // Without a think time the walker is the closed loop it always was: against a
 // loopback server it sends as fast as the server answers.
 func TestMarkovWalkerWithoutThinkTimeIsClosedLoop(t *testing.T) {
-	if got := requestsIn(t, 500*time.Millisecond, 0); got < 150 {
-		t.Fatalf("a closed-loop walker sent %d requests in 500ms against a loopback server, want >= 150: the walker is paced when it must not be", got)
+	// ~17k on an idle laptop, a few thousand under -race; even a 1 ms pause
+	// would cap it at 500.
+	if got := requestsIn(t, 500*time.Millisecond, 0); got < 700 {
+		t.Fatalf("a closed-loop walker sent %d requests in 500ms against a loopback server, want >= 700: the walker is paced when it must not be", got)
 	}
 }
 

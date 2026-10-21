@@ -604,6 +604,17 @@ What a race run records about itself (schema 5.23, record only, nothing new is g
 - **The race tier runs the host sampler** (`HostSamplerStart` / `HostSamplerStop`, tag
   `race-<run id>`, lifetime fixed at 150m inside the job's 180 minute limit, each step bounded to 5 minutes), as the weekend soak does.
 
+**The race tier shapes the load of its adaptive cell (schema 5.24).** The adaptive cell is sized 2 workers x
+110 walkers so the controller's promotion fires, and under the race detector's slowdown a closed-loop walker
+fleet saturated its two engine loops (a fourth `SLOW_CLASS` echo, now and then a reset-type counter). With
+`-race-tier`, and for the adaptive cell only, each Markov walker now pauses 4 ms after every request
+(`raceAdaptiveMarkovThink` in `cmd/validator/matrix.go`). The worker, walker and connection counts are
+unchanged, no threshold, N or timeout moves, and every other cell (any tier, any other engine) is
+closed-loop exactly as before. The cell says so: `tier_1.load_shaping` has the reason, `walkers`,
+`markov_walkers` and `markov_think_ms`, and is omitted everywhere else. Promotion is still gated in every
+default race run (`VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`); a shaped cell that misses it says it was
+shaped, and a shaped cell without a `-race` build (`I-RACE`) fails the gate.
+
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
 `auth_session_ratelimit` routes them today. The verdict is recorded per cell (`ws_route_probed` /

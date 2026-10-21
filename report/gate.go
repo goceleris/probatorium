@@ -709,7 +709,20 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			}
 			add(c, "tier_1.adaptive_switches", 0,
 				fmt.Sprintf("this tier expects every adaptive cell to promote at least once (VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH) and the engine never left its start engine; the cell validated epoll, not the adaptive path. Offered load, as the property loop measured it: peak %.1f conns/worker, mean %.0f bytes/req -- the controller's own two signals, so a peak below its conns/worker threshold is a sizing bug here and a bytes/req above its large-payload threshold is a deliberate suppression, not a defect",
-					c.Tier1.PeakConnsPerWorker, c.Tier1.MeanBytesPerReq))
+					c.Tier1.PeakConnsPerWorker, c.Tier1.MeanBytesPerReq)+loadShapingSuffix(c.Tier1.LoadShaping))
+		}
+	}
+	// A paced cell is the race tier's (probatorium#481): the pause exists for
+	// the detector's slowdown, and a cell that was paced without one is a
+	// nightly validated at a fraction of its load. Same test as the SLOW
+	// tolerance: I-RACE declared by a property loop that ran.
+	for _, c := range cells {
+		if c.Tier1 == nil || c.Tier1.LoadShaping == nil {
+			continue
+		}
+		if !ranPropertyLoop(c) || slices.Contains(c.PropertiesNotInstrumented, "I-RACE") {
+			add(c, "tier_1.load_shaping", int64(c.Tier1.LoadShaping.MarkovThinkMs),
+				"this cell's Markov walkers were paced (load shaping, a race-tier measure for the detector's slowdown) but the cell does not show a -race build (I-RACE declared by a property loop that ran): it was validated at a fraction of the load it is gated for")
 		}
 	}
 	// Must-stay-zero engine witnesses. No option guards these: each counts
@@ -811,4 +824,15 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 		return a.Field < b.Field
 	})
 	return out
+}
+
+// loadShapingSuffix is what a missed promotion of a paced cell adds to the
+// ExpectAdaptiveSwitch row: empty for an unpaced cell, so every other row reads
+// exactly as it did.
+func loadShapingSuffix(l *LoadShaping) string {
+	if l == nil {
+		return ""
+	}
+	return fmt.Sprintf(". This cell's load was shaped (load shaping, tier_1.load_shaping): %d of its %d walkers paused %d ms after every request while the walker, worker and connection counts were unchanged, so look at that pause first -- the controller also refuses to promote when a tick's bytes/req is large, and a fleet paced below the echo's bytes gives it that",
+		l.MarkovWalkers, l.Walkers, l.MarkovThinkMs)
 }

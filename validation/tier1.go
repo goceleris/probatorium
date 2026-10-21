@@ -279,6 +279,10 @@ type tier1Tally struct {
 	// address: the origin of the walkers' since_ready_ms (celeris#588).
 	readyAt atomic.Int64
 
+	// loadShaping is the pacing the Markov walkers run under, set once before
+	// the fleet starts and nil when they run closed-loop.
+	loadShaping atomic.Pointer[report.LoadShaping]
+
 	// wsEcho is the WebSocket large-echo slice (ws_echo.go, celeris#587):
 	// one off-budget walker, like rfc, gated on the /ws route like ws.
 	wsEcho *wsEchoTally
@@ -589,6 +593,17 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	markovCount := cfg.Concurrency - advCount - h2cCount - wsCount - sseCount
 	if markovCount < 1 {
 		markovCount = 1
+	}
+	// A paced fleet says so in its cell document, with the counts it kept.
+	// Nothing is recorded for a closed-loop one, so every other cell's
+	// document is what it was.
+	if cfg.MarkovThinkTime > 0 {
+		tally.loadShaping.Store(&report.LoadShaping{
+			Reason:        loadShapingReason,
+			Walkers:       cfg.Concurrency,
+			MarkovWalkers: markovCount,
+			MarkovThinkMs: cfg.MarkovThinkTime.Milliseconds(),
+		})
 	}
 	// launch starts one full walker fleet and returns its WaitGroup. salt
 	// is XORed into every seed: 0 is the walk every cell has always run,
@@ -1019,6 +1034,10 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 // only ctx cuts one short (runPhase in driveTier1, probatorium#465).
 // Pass the same context as both to end the walk with a cut.
 //
+// think is the pause after each request (Config.MarkovThinkTime): zero is the
+// closed loop, a positive value is the race tier's adaptive cell's load shape.
+// The pause ends with stop or ctx, so it never lengthens a phase's drain.
+//
 // Each walker gets its own [http.CookieJar] + [http.Client] so the
 // N concurrent walkers exercise N parallel session lifecycles
 // against the refapp's session middleware. If the matrix declares a
@@ -1037,7 +1056,7 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string,
 	m *markov.Matrix, seed uint64, think time.Duration, tally *tier1Tally,
 ) {
-	_ = think // stub: not wired yet
+
 	// Per-walker cookie jar. nil error per cookiejar.New's contract
 	// when options is nil.
 	jar, _ := cookiejar.New(nil)
@@ -1134,6 +1153,26 @@ func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string
 			// unbounded.
 			chain.Reset()
 		}
+		// Load shaping (Config.MarkovThinkTime): zero, the closed loop every
+		// cell has always run, skips this entirely.
+		if think > 0 {
+			thinkPause(ctx, stop, think)
+		}
+	}
+}
+
+// loadShapingReason is the sentence tier_1.load_shaping carries.
+const loadShapingReason = "the refapp is a -race build, which costs every request several times the CPU and saturated the adaptive cell's two engine loops (probatorium#481, celeris#871): the walker, worker and connection counts are unchanged and each Markov walker pauses after every request"
+
+// thinkPause waits d, or less when the request context or the phase ends first,
+// so a pause never lengthens the drain at the end of a phase (runPhase).
+func thinkPause(ctx, stop context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	case <-stop.Done():
 	}
 }
 
@@ -1260,6 +1299,7 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 		RequestsPanicExpected: t.requestsPanicExpected.Load(),
 		InvariantHits:         t.invariantHits.Load(),
 		RequestsCutAtDeadline: t.requestsCutAtDeadline.Load(),
+		LoadShaping:           t.loadShaping.Load(),
 	}
 	if t.adv != nil {
 		s.Adversarial = t.adv.snapshot()
