@@ -31,7 +31,11 @@ on:
   # (every tier shares the matrix-tier-cluster concurrency group, which
   # keeps only ONE pending run). workflow_dispatch is deliberately left
   # working so the release sequence can still drive each tier by hand.
-  # RESTORE by uncommenting the schedule block below.
+  # RESTORE by uncommenting the schedule block below. NOTE: a scheduled run has
+  # no inputs, so every fallback applies: BENCH_PROFILE falls back to `full`
+  # (not the `headline` the comment below describes), target=both, and the
+  # default arch policy `all`: restoring the schedule would start a ~102h full
+  # run every week. Set the profile for the schedule explicitly when restoring.
   #schedule:
   #  # Weekly RATED bench (the "headline" profile: full grid WITH the rated/SLO
   #  # sweep, 40s/12s → ~16.7h, fits the 24h cluster slot). Wednesday 04:00 UTC
@@ -49,12 +53,12 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "headline (DEFAULT): the whole grid at a 40s/12s window plus the rated sweep on budget.RatedScenarios, projected ~30h (it measured ~53h before probatorium#418). | full: same grid at the exhaustive 90s/20s window, projected ~51h (it measured ~69h while every clean cell was rated, probatorium#418). headline and full PUBLISH unless publish=false, but probatorium#441 and #442 gate any rated publish: until both land, dispatch them with publish=false. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
+        description: "headline (DEFAULT): the whole grid at a 40s/12s window plus the rated sweep on budget.RatedScenarios, projected ~30h on one arch (it measured ~53h before probatorium#418); on target=both under the default arch policy 'all' the arches take turns and it projects ~60h. | full: same grid at the exhaustive 90s/20s window, projected ~51h on one arch (it measured ~69h while every clean cell was rated, probatorium#418); on target=both under the default 'all' it projects ~102h. headline and full PUBLISH unless publish=false, but probatorium#441 and #442 gate any rated publish: until both land, dispatch them with publish=false. | fast: saturation-ONLY (rated OFF), 35s/10s — DEVELOPMENT / PR use only, NEVER publishes (forced BENCH_PUBLISH=0 regardless of the publish input)."
         required: false
         type: string
         default: headline
       target:
-        description: "Bench SUT (BENCH_TARGET): 'both' (DEFAULT — msa2-server amd64 AND msr1 arm64, driven IN PARALLEL by the oversized msa2-client loadgen) | 'msa2-server' | 'msr1'."
+        description: "Bench SUT (BENCH_TARGET): 'both' (DEFAULT — msa2-server amd64 AND msr1 arm64, driven IN PARALLEL by the one msa2-client loadgen, under the arch lock of probatorium#442: by default the two arches take turns on the client, see arch_exclusive) | 'msa2-server' | 'msr1'."
         required: false
         type: string
         default: both
@@ -75,7 +79,7 @@ on:
         type: string
         default: "true"
       baseline:
-        description: "Also BENCH the celeris v1.5.11 RELEASE as same-run baseline columns (BENCH_BASELINE). 'false' (DEFAULT): the grid, the budget and the published set are exactly what they were. 'true': adds 8 columns baseline-celeris-v1511-<engine> for the engines epoll-h1-sync, epoll-h1-async, epoll-auto+upg-async, iouring-h1-sync, iouring-h1-async, iouring-auto+upg-async, adaptive-h1-async, adaptive-auto+upg-async (servers/celeris_v1511, celeris pinned at v1.5.11, same engine variants and capabilities as the celeris-* twins; no std-h1): +222 saturation cells and +120 rated cells per arch, about +14.5 h projected (+8.5 h headline), and the BENCH_BUDGET gate is raised (headline 48h, full 80h). With competitors=all the columns join the sweep, each one run directly beside its celeris-* twin (one column block, about 1.8 h, apart; the pair order alternates) rather than in the sorted block of names; with a CSV competitors/deploy_competitors, name the columns and the module celeris_v1511. Published rows carry framework 'celeris-baseline' / framework_version 'v1.5.11'."
+        description: "Also BENCH the celeris v1.5.11 RELEASE as same-run baseline columns (BENCH_BASELINE). 'false' (DEFAULT): the grid, the budget and the published set are exactly what they were. 'true': adds 8 columns baseline-celeris-v1511-<engine> for the engines epoll-h1-sync, epoll-h1-async, epoll-auto+upg-async, iouring-h1-sync, iouring-h1-async, iouring-auto+upg-async, adaptive-h1-async, adaptive-auto+upg-async (servers/celeris_v1511, celeris pinned at v1.5.11, same engine variants and capabilities as the celeris-* twins; no std-h1): +222 saturation cells and +120 rated cells per arch, about +14.5 h projected (+8.5 h headline), and the BENCH_BUDGET gate is raised (one arch: headline 48h, full 80h; under the arch policies the job's budget table has its own entries, and full with the baseline on both arches under 'all' is refused: 130h55m). With competitors=all the columns join the sweep, each one run directly beside its celeris-* twin (one column block, about 1.8 h, apart; the pair order alternates) rather than in the sorted block of names; with a CSV competitors/deploy_competitors, name the columns and the module celeris_v1511. Published rows carry framework 'celeris-baseline' / framework_version 'v1.5.11'."
         required: false
         type: string
         default: "false"
@@ -86,6 +90,16 @@ on:
         default: ""
       cells:
         description: "Cell glob(s) to bench (BENCH_CELLS) over '<scenario>/<competitor>', comma-separated, '!' prefix excludes — e.g. 'ws-large-echo/*,ws-echo/*,get-json/*' runs only those three scenarios on the columns `competitors` selects. Default '' = the profile's own full glob. NOTE: the budget projection still counts the profile's full grid (a scoped run passes it trivially), and one column pass still runs ONE mpstat/observer for all matched scenarios — read benchmarks[].scenario_resources (per-scenario window) rather than resources (column-wide mean) for per-cell CPU."
+        required: false
+        type: string
+        default: ""
+      rated_cells:
+        description: "Cells that get the rated sweep (BENCH_RATED_CELLS): a glob over '<scenario>/<competitor>', comma-separated, '!' prefix excludes — e.g. 'ws-large-echo/*,post-4k/*'. Default '' = the budget model's rated cells (budget.RatedScenarios). Only matters when the profile rates (headline, full). Lets a scoped run rate a row the model does not, such as ws-large-echo for the probatorium#442 validation, without a throwaway branch."
+        required: false
+        type: string
+        default: ""
+      arch_exclusive:
+        description: "Arch exclusion on target=both (BENCH_ARCH_EXCLUSIVE, probatorium#442): 'all' (DEFAULT when empty) = the arches never overlap (about twice the wall-clock: profile=full projects 101h55m, headline 59h41m; the validation read of 2026-10-21 found the heavy exemption of the light rows did not hold on arm64, docs/ARCH-EXCLUSION-VALIDATION.md; full with baseline=true projects 130h55m, above the 7200 minute job limit, and is refused by the setup job: run it as two single-arch dispatches, target=msa2-server and then target=msr1) | 'heavy' = a heavy cell of one arch never overlaps a heavy cell of the other (about +14% wall-clock; the previous default, which failed P6 on arm64: its documents are refused for publication, so it needs publish=false) | 'off' = the pre-fix concurrency, a control arm only: the publish gate refuses its documents. Ignored for a single-arch target."
         required: false
         type: string
         default: ""
@@ -108,6 +122,64 @@ jobs:
     # every later run; this is the headroom for the first one.
     timeout-minutes: 25
     steps:
+      - name: Validate dispatch inputs (before any runner is provisioned)
+        # The budget and timeout tables below are indexed by these inputs; an
+        # unknown or padded value (' all', 'Full', target=amd64) indexes nothing,
+        # which GitHub renders as an empty timeout and BENCH_BUDGET, and would
+        # also step around the refusal that follows. mage trims whitespace, the
+        # tables do not, so a value must be exactly one of the allowed ones.
+        # A policy heavy or off document is refused at publish (heavy: the validation
+        # read of 2026-10-21, P6 failed on arm64; off: the arches overlap), so a
+        # dispatch that would publish one fails here, not after the run: they need
+        # publish=false (or a fast
+        # profile, which never publishes, or a single-arch target, which ignores
+        # the policy). workflow_arch_budget_test.go runs this script.
+        env:
+          IN_PROFILE: ${{ github.event.inputs.profile }}
+          IN_TARGET: ${{ github.event.inputs.target }}
+          IN_ARCH: ${{ github.event.inputs.arch_exclusive }}
+          IN_BASELINE: ${{ github.event.inputs.baseline }}
+          IN_PUBLISH: ${{ github.event.inputs.publish }}
+        run: |
+          fail=0
+          check() {
+            name=$1; val=$2; shift 2
+            [ -z "$val" ] && return 0
+            for ok in "$@"; do [ "$val" = "$ok" ] && return 0; done
+            echo "::error::input $name=\"$val\" is not one of: $*"
+            fail=1
+          }
+          check profile "$IN_PROFILE" fast headline full
+          check target "$IN_TARGET" both msa2-server msr1
+          check arch_exclusive "$IN_ARCH" all heavy off
+          check baseline "$IN_BASELINE" true false
+          publishes=1
+          [ "${IN_PROFILE:-full}" = fast ] && publishes=0
+          [ "$IN_PUBLISH" = false ] && publishes=0
+          if { [ "$IN_ARCH" = heavy ] || [ "$IN_ARCH" = off ]; } && [ "${IN_TARGET:-both}" = both ] && [ "$publishes" = 1 ]; then
+            echo "::error::arch_exclusive=$IN_ARCH on target=both would publish documents the publish gate refuses (policy heavy failed P6 on arm64, policy off lets the arches overlap; docs/ARCH-EXCLUSION-VALIDATION.md). Dispatch with publish=false, or use the default policy."
+            fail=1
+          fi
+          [ "$fail" = 0 ] || exit 1
+
+      - name: Refuse a grid the job cannot hold (full + baseline + both arches + policy all)
+        # 130h55m projected (budget.FitWithin; the planner says 128.0h), above the
+        # 7200 minute (5 day) job limit before Deploy and Cleanup: no BENCH_BUDGET
+        # admits it and the job would be killed near the end of the run. FitWithin
+        # refuses it too, but only after mage Deploy has built the baseline module.
+        # This step is in the setup job, so it fails before any runner is
+        # provisioned (the run itself has already entered the workflow's
+        # matrix-tier-cluster concurrency group, so it may have queued behind a
+        # running one). workflow_arch_budget_test.go keeps this condition equal
+        # to the set the table cannot hold. Run it as two single-arch dispatches
+        # (target=msa2-server, then target=msr1; 65h27m each). arch_exclusive=heavy
+        # (74h37m) is not an alternative for a published run: heavy documents are
+        # refused at publish.
+        if: ${{ (github.event.inputs.target || 'both') == 'both' && (github.event.inputs.arch_exclusive || 'all') == 'all' && github.event.inputs.baseline == 'true' && (github.event.inputs.profile || 'full') == 'full' }}
+        run: |
+          echo "::error::profile=full with baseline=true on target=both under arch_exclusive=all projects 130h55m, above the 7200 minute job limit. Dispatch it as two single-arch runs: target=msa2-server, then target=msr1 (65h27m each)."
+          exit 1
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -143,7 +215,12 @@ jobs:
     # full profile projects ~51h and headline ~30h. Well under GitHub's 5-day
     # self-hosted job hard limit. This is only a ceiling. BENCH_BUDGET (below)
     # is the real fail-loud projection gate.
-    timeout-minutes: 6600
+    # The default arch policy is `all` (probatorium#442, the arches take turns):
+    # profile=full projects ~102h, which no 6600 min (110h) ceiling holds, so
+    # `all` gets 7080 min (118h), under the 7200 min (5 day) limit. Keyed by the
+    # policy like BENCH_BUDGET (below); a single-arch target takes no lock and
+    # indexes `single`, never a policy (workflow_arch_budget_test.go).
+    timeout-minutes: ${{ fromJSON('{"heavy":6600,"off":6600,"single":6600,"all":7080}')[(github.event.inputs.target || 'both') != 'both' && 'single' || github.event.inputs.arch_exclusive || 'all'] }}
     env:
       BENCH_PROFILE: ${{ github.event.inputs.profile || 'full' }}
       # Job-level so BOTH `mage Deploy` and `mage BenchTier` see it. Deploy uses
@@ -153,6 +230,10 @@ jobs:
       BENCH_TARGET: ${{ github.event.inputs.target || 'both' }}
       # Column subset to BENCH for a targeted re-run; 'all' on schedule/default.
       BENCH_COMPETITORS: ${{ github.event.inputs.competitors || 'all' }}
+      # Rated scope and arch exclusion (probatorium#442). Empty = the defaults
+      # (the model's rated cells; the default policy all). Job-level like BENCH_TARGET.
+      BENCH_RATED_CELLS: ${{ github.event.inputs.rated_cells || '' }}
+      BENCH_ARCH_EXCLUSIVE: ${{ github.event.inputs.arch_exclusive || '' }}
       # Binary/module set to BUILD+DEPLOY. MUST be job-level (not just the
       # Deploy step): BenchTier runs an internal auto-deploy when no manifest
       # is present (always true right after the prior run's Cleanup), and that
@@ -292,6 +373,32 @@ jobs:
           # PROJECTED by budget.FitWithin for 2 parallel arches (probatorium#418):
           #   headline 29h50m = 813 x 1m9s saturation + 401 rated cells x 2m8s
           #   full     50h58m = 813 x 2m7s saturation + 401 rated cells x 3m20s
+          # a target=both run adds the client lock of probatorium#442 on top
+          # (budget.ArchLockOverheadHeavy, 14%): headline ~34h, full ~58h; the
+          # budgets below are raised to keep the same 18-21% margin.
+          # BENCH_BUDGET is a table of profile x baseline x arch policy, because
+          # both move the projection (workflow_arch_budget_test.go checks every
+          # entry against FitWithin and the job timeout above). The policy key
+          # is `single` for a single-arch target (no lock), else the input
+          # (default `all`); the baseline key is BENCH_BASELINE's predicate.
+          # Projected for target=both without the baseline columns:
+          #   `all`: fast 28h, headline 59h41m, full 101h55m (twice one arch):
+          #   budgets 34h / 72h keep the 20% margin; full gets 108h (6% over the
+          #   model) because 122h would not fit under the 5 day job limit (7200
+          #   min). The model ran 7% HIGH against bench-full 38431303162, so
+          #   ~95h is the expectation, but that is one run: a default full
+          #   dispatch has the thinnest margin of any entry.
+          #   `heavy`: fast 15h58m, headline 34h01m, full 58h06m (24h / 40h / 69h).
+          # With baseline=true the grid gains 222 saturation + 120 rated cells
+          # (budget.BaselineRealizedCells, +14.5 h on full, +8.5 h on headline):
+          #   one arch / off: fast 17h50m, headline 38h22m (48h), full 65h27m (80h)
+          #   heavy:          fast 20h19m (24h), headline 43h44m (52h), full 74h37m (90h)
+          #   all:            fast 35h39m (43h), headline 76h43m (92h), full 130h55m
+          # full + baseline + all (130h55m, the planner says 128.0h) is above the
+          # 7200 min job limit even before Deploy: no budget admits it. Its entry is
+          # the most the job could hold (112h) and the step "Refuse a grid the job
+          # cannot hold" stops the dispatch in the setup job, before Deploy builds the
+          # baseline module. Run it as two single-arch dispatches (65h27m each).
           # (a rated cell adds 4 passes x (saturation warmup + rated window)).
           # The runs before #418 measured ~53h (headline) and ~69h (full)
           # against projections of 26h35m and 44h31m. Per-cell overhead was
@@ -302,11 +409,7 @@ jobs:
           # against a 14.0h projection). The budgets leave ~18-21% over the
           # projection, so a grid that grows past them fails before the run
           # rather than overrunning it.
-          # With baseline=true the grid gains 222 saturation + 120 rated cells
-          # (budget.BaselineRealizedCells), +14.5 h projected on full and
-          # +8.5 h on headline: 29h50m -> 38h22m (48h), 50h58m -> 65h28m (80h).
-          # fast stays under 24h (+3.8 h). budget_test.go pins these.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && (github.event.inputs.baseline == 'true' && '48h' || '36h') || (github.event.inputs.baseline == 'true' && '80h' || '60h')) }}
+          BENCH_BUDGET: ${{ fromJSON('{"fast":{"false":{"heavy":"24h","off":"24h","single":"24h","all":"34h"},"true":{"heavy":"24h","off":"24h","single":"24h","all":"43h"}},"headline":{"false":{"heavy":"40h","off":"36h","single":"36h","all":"72h"},"true":{"heavy":"52h","off":"48h","single":"48h","all":"92h"}},"full":{"false":{"heavy":"69h","off":"60h","single":"60h","all":"108h"},"true":{"heavy":"90h","off":"80h","single":"80h","all":"112h"}}}')[github.event.inputs.profile || 'full'][github.event.inputs.baseline == 'true' && 'true' || 'false'][(github.event.inputs.target || 'both') != 'both' && 'single' || github.event.inputs.arch_exclusive || 'all'] }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 

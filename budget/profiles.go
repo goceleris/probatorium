@@ -71,7 +71,8 @@ import "time"
 //   - ws-large-echo: a real, replicated signal (the loop engines' 64 KiB
 //     echo floor, celeris#756), but 5 of its x86 cells in the arch-parallel
 //     0829 run published 3-12 s backlog clocks at 0.75 and 0.9
-//     (probatorium#442).
+//     (probatorium#442; the arches no longer overlap on heavy cells, a
+//     single-arch or locked both-arch rerun is what could re-add it).
 //
 // The concurrency sweep (get-simple-*c) is NOT a latency-vs-load curve: every
 // sweep point is the server at 100% load (RPS x mean latency = connections,
@@ -79,12 +80,15 @@ import "time"
 //
 // Candidates to re-add once the runner records each pass's achieved rate and
 // refuses a pass that missed it (probatorium#441), overlapping arch runs of
-// the same heavy row are prevented (probatorium#442) and loadgen paces each
+// the same heavy row are shown prevented on the cluster (the client lock of
+// probatorium#442 is in and its scoped validation run has read, see
+// docs/ARCH-EXCLUSION-VALIDATION.md) and loadgen paces each
 // worker (loadgen#102): ws-large-echo, get-json-h2 (post-4k-h2 only if it
 // shows something get-json-h2 does not) and get-simple-1024c (the only row at
 // partial load with a large keep-alive pool).
 //
-// #441 and #442 gate any rated publish, the rated rows included: they sit at
+// #441 gates any rated publish, and so does #442 until its validation run has
+// shown the lock holds, the rated rows included: they sit at
 // the same loadgen edge, less often, and #418's pass census of them is not
 // clean (the counts are in #441). 17 of the 350 in-set cells x86 0829 rated
 // have a pass of 1 s or more. x86 0829 driver-pg-write rated 16 of 23 cells,
@@ -168,16 +172,17 @@ const (
 // the 24h budget. The bench ALWAYS runs exactly one pass (Runs=1).
 //
 // Arches is 1 as the static default; BenchTier sets Arches=2 at runtime for
-// BENCH_TARGET=both. ArchParallel is now true (#168 landed 2026-08-28): the
-// two arch passes run CONCURRENTLY against distinct SUT hosts, sharing only
-// the msa2-client loadgen, so two arches cost the same wall-clock as one and
-// FitWithin projects accordingly. The parallel path is safe for artefacts:
-// every artefact is keyed by bench_target (bench_run_dir AND the loadgen
-// transport tarball). It is not shown safe for rated passes: msa2-client is
-// far from saturation while driving one arch, but both arches walk the same
-// cell order, and in the 0829 run x86 rated passes that overlapped the arm64
-// run of the same heavy row read 1 s or more far more often
-// (probatorium#442: ws-large-echo 6 of 10 overlapping passes, 0 of 42 others).
+// BENCH_TARGET=both. ArchParallel is true (#168 landed 2026-08-28): the two
+// arch passes run CONCURRENTLY against distinct SUT hosts, both driven from the
+// one msa2-client loadgen, so two arches cost about the wall-clock of one. That
+// concurrency was not free: in the 0829 run x86 passes that overlapped the arm64
+// run of the same heavy row read 1 s or more far more often (ws-large-echo 6 of
+// 10 overlapping passes, 0 of 42 others, probatorium#442), and run 36441790519
+// showed it in saturation too. Since #442 the runner holds a host-wide lock
+// around every heavy cell (policy heavy) or every cell (policy all, the default
+// since the validation read of 2026-10-21) (Profile.ArchExclusion,
+// BENCH_ARCH_EXCLUSIVE), which costs ArchLockOverheadHeavy or
+// ArchLockOverheadAll of one arch's wall-clock on top.
 //
 // Budget: ~813 cells x (12+40+5+12)s x 1 arch = ~15.6h saturation + ~14.3h
 // rated (401 rated cells x 4 x (12+20)s, each rated pass re-running the

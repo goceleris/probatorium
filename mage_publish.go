@@ -216,6 +216,18 @@ func checkDataCompleteness(doc *report.Document) error {
 		problems = append(problems, "benchmark_config.finished_at precedes started_at")
 	}
 
+	// A both-arch run whose arches overlapped (or whose passes could not be
+	// checked) is the contamination of probatorium#442: refuse it. Documents
+	// written before schema 5.22 carry no verdict and are not refused here.
+	if p := doc.Environment.ArchExclusion.Problem(); p != "" {
+		problems = append(problems, p)
+	}
+	// The policy heavy exemption of the light rows did not hold (P6, arm64): a
+	// heavy document is data only. BENCH_PUBLISH_FORCE=1 overrides.
+	if p := doc.Environment.ArchExclusion.PublishProblem(); p != "" {
+		problems = append(problems, p)
+	}
+
 	celerisSeen := false
 	for _, b := range doc.Benchmarks {
 		// Every cell, every framework: identity + the headline metric must

@@ -567,6 +567,16 @@
   # 30s left no margin over a slow in-flight cell unwind. A timed-out cell
   # (exit 124) is recorded + skipped via failed_when:false below; the grid
   # continues.
+  # ARCH EXCLUSION (probatorium#442): on a BENCH_TARGET=both run the two arch
+  # passes run this task at the same time on msa2-client. mage Bench then passes
+  # bench_client_lock (a lock file both runners open) and bench_client_lock_policy:
+  # a heavy cell of one arch waits for the other arch's heavy cell instead of
+  # loading the shared client with it. bench_cell_order=reverse (arm64 only)
+  # makes the runner walk the column last to first, so the two arches' heavy
+  # cells fall in different halves of a column and the lock rarely makes one
+  # wait. Both are absent on a single-arch run: the command line is then what it
+  # always was. The lock wait counts against the hang guard (mage adds an
+  # allowance, lockWaitAllowance).
   # QUOTING: ansible's free-form arg splitter counts every single/double
   # quote across the WHOLE block below — shell comments included — and
   # refuses to load the task on odd parity ("unbalanced jinja2 block or
@@ -588,6 +598,7 @@
       -warmup {{ bench_warmup_seconds | default(5) }}s \
       -cells '{{ bench_cells | default("*") }}' \
       {% if bench_rated | default(false) | bool %}-rated -rated-duration {{ bench_rated_duration_seconds | default(30) }}s {% if bench_rated_cells is defined and bench_rated_cells %}-rated-cells '{{ bench_rated_cells }}' {% endif %}{% endif %}\
+      {% if bench_client_lock is defined and bench_client_lock %}-client-lock '{{ bench_client_lock }}' -client-lock-policy {{ bench_client_lock_policy | default("all") }} {% endif %}{% if (bench_cell_order | default("forward")) == "reverse" %}-cell-order reverse {% endif %}\
       -services none \
       -out {{ cell_dir }} \
       2> {{ cell_dir }}/runner.stderr

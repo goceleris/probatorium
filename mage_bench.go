@@ -65,6 +65,16 @@ import (
 //	                               as the first line of each cell's
 //	                               server.log and recorded in the merged
 //	                               Document's environment.sut_env
+//	BENCH_ARCH_EXCLUSIVE=          BENCH_TARGET=both only: all (default) |
+//	                               heavy | off. all: the arches never
+//	                               overlap (about twice the wall-clock;
+//	                               arm64 walks each column in reverse);
+//	                               heavy: a heavy cell of one
+//	                               arch never overlaps a heavy cell of the
+//	                               other (host-wide lock on msa2-client,
+//	                               +14%); off: the pre-fix
+//	                               behaviour, which the publish gate refuses
+//	                               (probatorium#442)
 //	CELERIS_VERSION=               override go.mod auto-detect
 //	CLUSTER_USE_LAN=1              LAN fabric instead of Tailscale
 //
@@ -265,6 +275,12 @@ func Bench() error {
 		return err
 	}
 	ratedOn := rated.On
+	// Arch exclusion for BENCH_TARGET=both (probatorium#442): validated here so
+	// a bad value fails the dispatch in seconds, never after Deploy.
+	archPolicy, err := resolveArchExclusion(target)
+	if err != nil {
+		return err
+	}
 	version, err := celerisVersion()
 	if err != nil {
 		return err
@@ -364,6 +380,10 @@ func Bench() error {
 	fmt.Printf("  connections:  %s\n", conns)
 	fmt.Printf("  cells:        %s\n", cells)
 	fmt.Printf("  runs:         %s\n", runs)
+	if archPolicy != "" {
+		fmt.Printf("  arch lock:    %s (arm64 cell order: %s; lock file %s on msa2-client)\n",
+			archPolicy, archCellOrder(archPolicy, "msr1"), benchClientLockPath)
+	}
 	if ratedOn {
 		fmt.Printf("  rated:        true (%ds passes on %s)\n", rated.DurationSec, rated.Cells)
 	} else {
@@ -504,6 +524,12 @@ func Bench() error {
 		time.Duration(warmupSec)*time.Second,
 		time.Duration(durationSec)*time.Second,
 		time.Duration(ratedDurationSec)*time.Second)
+	// A heavy cell can wait for the other arch's heavy cell (the client lock):
+	// let the guard allow for it, so a healthy but queued runner is not killed.
+	cellBudget += lockWaitAllowance(archPolicy, ratedPasses,
+		time.Duration(warmupSec)*time.Second,
+		time.Duration(durationSec)*time.Second,
+		time.Duration(ratedDurationSec)*time.Second)
 	cellBudgetSec := int(cellBudget / time.Second)
 	fmt.Printf("  cell budget:  %s (%d scenarios/column max, rated passes %d)\n",
 		cellBudget, scenarioCount, ratedPasses)
@@ -550,6 +576,7 @@ func Bench() error {
 			args = append(args, "--extra-vars", sutEnvExtraVars(sutEnv))
 		}
 		args = append(args, rated.extraVars()...)
+		args = append(args, archExclusionExtraVars(archPolicy, pt)...)
 		if os.Getenv("CLUSTER_USE_LAN") == "1" {
 			args = append(args, "--extra-vars", "use_lan=true")
 		}
@@ -580,10 +607,16 @@ func Bench() error {
 	} else {
 		// PARALLEL arch passes (#168). The two SUTs are distinct hosts and the
 		// playbook keys every artefact by bench_target (bench_run_dir and the
-		// loadgen transport tarball), so the passes share only msa2-client —
-		// which is deliberately oversized and measured at ~40%/core and
-		// ~1.2 of 14 Gbit/s while driving one arch, i.e. far from the
-		// bottleneck that would contaminate either measurement.
+		// loadgen transport tarball), so the passes share only msa2-client.
+		// One arch alone leaves msa2-client far from saturation (~40%/core,
+		// ~1.2 of 14 Gbit/s), but BOTH arches loading it with heavy cells at
+		// the same time contaminated the 0829 and 36441790519 runs
+		// (probatorium#442: the 2x10G bond carries both arches, and the
+		// client's CPU and latency path is shared). The runner therefore holds
+		// a host-wide lock around every heavy cell (cmd/runner/clientlock.go,
+		// BENCH_ARCH_EXCLUSIVE) and the arm64 pass walks its cells in reverse
+		// (archExclusionExtraVars); the finished run is checked from the
+		// passes' own timestamps below.
 		//
 		// Output from both ansible processes is line-prefixed and serialised
 		// through one mutex so the interleaved logs stay readable.
@@ -637,14 +670,9 @@ func Bench() error {
 	// into a single "linux/multi" row describing neither. Publish picks the
 	// per-arch file up via PUBLISH_RESULTS (see mage_tier.go).
 	if target == "both" {
-		var outs []string
-		for _, h := range playbookTargets {
-			out, err := mergeBenchResultsFor(resultsDir, target, bp, h,
-				"results-"+benchTargetArch(h)+".json")
-			if err != nil {
-				return fmt.Errorf("merge results (%s): %w", h, err)
-			}
-			outs = append(outs, out)
+		outs, err := mergeBothArchs(resultsDir, target, archPolicy, bp, [2]string{playbookTargets[0], playbookTargets[1]})
+		if err != nil {
+			return err
 		}
 		fmt.Printf("\n=== Bench complete (per-arch documents) ===\n")
 		for _, o := range outs {
@@ -1354,6 +1382,22 @@ type runnerCellFile struct {
 	// resource sidecar per scenario (schema v5.9, celeris#585).
 	StartedAt   time.Time `json:"started_at"`
 	CompletedAt time.Time `json:"completed_at"`
+
+	// LoadClass, ClientLockWaitS and PassWindows are the arch-exclusion
+	// evidence of schema 5.22 (probatorium#442): the scenario's client-load
+	// class, the time the cell waited for the cross-arch client lock, and
+	// every interval it drove load. Empty on pre-5.22 runner output.
+	LoadClass       string           `json:"load_class,omitempty"`
+	ClientLockWaitS float64          `json:"client_lock_wait_s,omitempty"`
+	PassWindows     []passWindowWire `json:"pass_windows,omitempty"`
+}
+
+// passWindowWire mirrors cmd/runner's passWindowFile.
+type passWindowWire struct {
+	Kind      string    `json:"kind"`
+	TargetRPS float64   `json:"target_rps,omitempty"`
+	Start     time.Time `json:"start"`
+	End       time.Time `json:"end"`
 }
 
 // ratedPassWire mirrors cmd/runner's ratedPassFile: one rated pass's offered
@@ -1453,6 +1497,7 @@ func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cel
 				// surfaced by v3.2 review).
 				rec.SaturationModeRPS = cf.SaturationModeRPS
 				rec.StartedAt, rec.CompletedAt = cf.StartedAt, cf.CompletedAt
+				rec.LoadClass, rec.ClientLockWaitS, rec.PassWindows = cf.LoadClass, cf.ClientLockWaitS, cf.PassWindows
 				if len(cf.RatedPasses) > 0 {
 					rec.RatedPasses = append(rec.RatedPasses, cf.RatedPasses...)
 				}
@@ -1529,6 +1574,14 @@ type cellRecord struct {
 	// ingested from pre-v5.9 runner output.
 	StartedAt   time.Time `json:"started_at,omitzero"`
 	CompletedAt time.Time `json:"completed_at,omitzero"`
+
+	// LoadClass, ClientLockWaitS and PassWindows carry the runner's
+	// arch-exclusion evidence (schema 5.22, probatorium#442) through the raw
+	// payload: mergeBenchResultsFor turns them into the Document's
+	// load_windows and the run's lock wait, Bench into environment.arch_exclusion.
+	LoadClass       string           `json:"load_class,omitempty"`
+	ClientLockWaitS float64          `json:"client_lock_wait_s,omitempty"`
+	PassWindows     []passWindowWire `json:"pass_windows,omitempty"`
 
 	// ScenarioResources is the SAME sidecar sliced to this scenario's own
 	// window (StartedAt + warmup .. CompletedAt) — the per-cell view a CPU
@@ -1789,6 +1842,11 @@ type benchParams struct {
 	// recorded on the merged Document's environment.sut_env so an A/B arm
 	// is identifiable from results.json alone. Nil/empty when none.
 	SUTEnv map[string]string
+	// LoadWindows and ArchExclusion are this arch's pass windows and the
+	// arch-exclusion verdict of a BENCH_TARGET=both run (schema 5.22,
+	// probatorium#442), set per arch by Bench. Nil on single-arch runs.
+	LoadWindows   []report.LoadWindow
+	ArchExclusion *report.ArchExclusion
 }
 
 // clusterScenarioName is the legacy single-scenario fallback. Since
@@ -2040,6 +2098,9 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 		// The SUT env overrides this run was dispatched with (celeris#585),
 		// so the arm is readable from results.json without server.log.
 		SUTEnv: p.SUTEnv,
+		// The arch-exclusion verdict (schema 5.22, probatorium#442); nil unless
+		// this is one arch of a BENCH_TARGET=both run.
+		ArchExclusion: p.ArchExclusion,
 	}
 
 	archTarget := target
@@ -2062,6 +2123,7 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 		BenchmarkConfig: bench,
 		Servers:         clusterServerMeta(collected, p.CelerisVer, benchTargetArch(archTarget)),
 		Agg:             agg,
+		LoadWindows:     p.LoadWindows,
 	})
 
 	data, err := json.MarshalIndent(doc, "", "  ")

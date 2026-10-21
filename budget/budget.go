@@ -13,7 +13,7 @@
 //
 //   - headline: the weekly cadence — the FULL grid (every server x every
 //     scenario, capability-gated) at a shorter per-cell window so it fits
-//     24h single-arch (amd64-only today; ArchParallel is blocked on #168).
+//     24h single-arch.
 //   - full: the same full grid at a longer window, the occasional
 //     exhaustive sweep run as a manual dispatch with a raised budget.
 //
@@ -65,13 +65,18 @@ type Profile struct {
 	Warmup   time.Duration // per-cell warmup (BENCH_WARMUP)
 	Cooldown time.Duration // inter-cell TIME_WAIT drain (runner default 5s)
 	Runs     int           // per-cell repetitions; ALWAYS 1 (single-pass bench)
-	Arches   int           // 1 (single target) or 2 (both, serial today)
+	Arches   int           // 1 (single target) or 2 (both; the arch passes run concurrently, see ArchParallel)
 
-	// ArchParallel, when true, means the two arches' bench passes overlap
-	// on the wire (independent loadgen instances, #168) so the arch
-	// dimension stops multiplying wall-clock. Blocked on the loadgen repo
-	// shipping linux/arm64; until then every profile keeps this false.
+	// ArchParallel, when true, means the two arches' bench passes run
+	// concurrently (#168, landed 2026-08-28; both are driven from the one
+	// msa2-client) so the arch dimension stops multiplying wall-clock. The
+	// concurrency is not free: see ArchExclusion.
 	ArchParallel bool
+
+	// ArchExclusion is the cross-arch client-lock policy of a both-arch run
+	// (probatorium#442): "heavy", "all" or ""/"off". It prices what the lock
+	// costs in wall-clock on top of one arch's: see ArchLockOverheadHeavy.
+	ArchExclusion string
 
 	// Rated sweep (#156), an additive second pass scoped to a curated
 	// subset of cells (RatedGlobs) so the expensive SLO sweep is bounded.
@@ -131,16 +136,41 @@ func (p Profile) Rated() time.Duration {
 	return time.Duration(p.RatedCells) * time.Duration(p.Runs) * p.perRatedCell() * time.Duration(p.arches())
 }
 
+// The wall-clock a both-arch run adds to one arch's when the two arch passes
+// share msa2-client under the client lock (probatorium#442), as a fraction of
+// one arch's time. Both are modelled by interleave.SimulateArchPlan on the real
+// full grid, and pinned to it by cmd/runner TestArchLockOverheadMatchesPlanner:
+// with the lock on heavy cells and the arm64 pass walking each column in
+// reverse the model gives +13.2% (the heavy cells of one column need about 2x
+// their time, which the other half of the column cannot always hide); with the
+// lock on every cell the arches take turns, +95.8%. The constants round up.
+const (
+	ArchLockOverheadHeavy = 0.14
+	ArchLockOverheadAll   = 1.00
+)
+
+// archLockOverhead is the extra fraction of one arch's wall-clock the policy costs.
+func archLockOverhead(policy string) float64 {
+	switch policy {
+	case "heavy":
+		return ArchLockOverheadHeavy
+	case "all":
+		return ArchLockOverheadAll
+	}
+	return 0
+}
+
 // WallClock is the total run cost. When ArchParallel is true AND both
 // arches run, the arch dimension overlaps on the wire (the #168 win) so
 // the doubled Saturation/Rated cost is halved back to a single arch's
-// wall-clock.
+// wall-clock, plus what the client lock costs (ArchExclusion).
 func (p Profile) WallClock() time.Duration {
 	total := p.Saturation() + p.Rated()
 	if p.ArchParallel && p.Arches == 2 {
 		// Saturation/Rated already counted x2 via arches(); the parallel
 		// overlap removes one arch's wall-clock.
 		total /= 2
+		total += time.Duration(float64(total) * archLockOverhead(p.ArchExclusion))
 	}
 	return total
 }
@@ -207,8 +237,8 @@ func (p Profile) arches() int {
 // exactly why the config fit (or why it did not).
 func (p Profile) FitWithin(budget time.Duration) (log string, ok bool) {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "budget fit for profile %q (%d cells, %d rated cells, %d arch%s, parallel=%v):\n",
-		p.Name, p.Cells, p.RatedCells, p.arches(), plural(p.arches()), p.ArchParallel)
+	fmt.Fprintf(&sb, "budget fit for profile %q (%d cells, %d rated cells, %d arch%s, parallel=%v, arch lock=%q):\n",
+		p.Name, p.Cells, p.RatedCells, p.arches(), plural(p.arches()), p.ArchParallel, p.ArchExclusion)
 	fmt.Fprintf(&sb, "  per-cell=%s rated-per-cell=%s budget=%s\n",
 		p.PerCell().Round(time.Second), p.perRatedCell().Round(time.Second), budget)
 

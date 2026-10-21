@@ -63,6 +63,13 @@
 #                         it. When absent (direct playbook invocation)
 #                         the cell task recomputes the same formula from
 #                         the *_seconds vars above.
+#   bench_client_lock     path of the host-wide lock file on msa2-client both
+#                         arch runners of a BENCH_TARGET=both run open; a
+#                         heavy cell holds it so the arches never load the
+#                         client together (probatorium#442). mage Bench sets
+#                         it (bench_client_lock_policy: heavy | all) for both
+#                         passes, and bench_cell_order=reverse for the arm64
+#                         one. Unset = no lock, forward order.
 #   results_local_dir     where to fetch outputs back to on the Mac
 #
 # Single-pass: the bench runs exactly ONE pass over the competitor set

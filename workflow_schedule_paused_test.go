@@ -46,3 +46,21 @@ func TestClusterSchedulesArePausedButDispatchStillWorks(t *testing.T) {
 		}
 	}
 }
+
+// TestCommentedScheduleWarnsThatRestoringItStartsAFullRun: a scheduled run has no
+// inputs, so the profile falls back to `full` and the arch policy to `all`
+// (about 102h every week), not the headline the cron's own comment describes.
+func TestCommentedScheduleWarnsThatRestoringItStartsAFullRun(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(".github", "workflows", "benchmark-tier.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := strings.Index(string(b), "#schedule:")
+	if i < 0 {
+		t.Skip("the schedule is restored: delete this test")
+	}
+	head := string(b)[:i]
+	if !strings.Contains(head, "no inputs") || !strings.Contains(head, "`full`") || !strings.Contains(head, "~102h") {
+		t.Errorf("the note above the commented-out schedule does not say that restoring it starts a ~102h full run:\n%s", head[max(0, len(head)-700):])
+	}
+}

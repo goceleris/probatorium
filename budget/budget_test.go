@@ -328,3 +328,77 @@ func TestBaselineProjection(t *testing.T) {
 		}
 	}
 }
+
+// TestArchExclusionPricesTheClientLock: a both-arch run under the client lock
+// (probatorium#442) costs one arch's wall-clock plus the lock overhead; with the
+// lock on every cell the arches take turns (about two arches' worth); with no
+// lock it is the plain parallel wall-clock.
+func TestArchExclusionPricesTheClientLock(t *testing.T) {
+	mk := func(excl string) Profile {
+		p := Full()
+		p.Arches, p.ArchParallel, p.ArchExclusion = 2, true, excl
+		return p
+	}
+	one := Full()
+	oneArch := one.WallClock()
+	if got := mk("").WallClock(); got != oneArch {
+		t.Fatalf("no lock: %v, want one arch's %v", got, oneArch)
+	}
+	heavy := mk("heavy").WallClock()
+	if want := time.Duration(float64(oneArch) * (1 + ArchLockOverheadHeavy)); heavy < want-time.Millisecond || heavy > want+time.Millisecond {
+		t.Fatalf("heavy lock: %v, want %v", heavy, want)
+	}
+	if all := mk("all").WallClock(); all < 2*oneArch-time.Minute || all > 2*oneArch+time.Minute {
+		t.Fatalf("lock on every cell: %v, want about two arches' %v", all, 2*oneArch)
+	}
+	if oneArch >= heavy || heavy >= mk("all").WallClock() {
+		t.Fatal("policies must cost off < heavy < all")
+	}
+}
+
+// TestFullBaselineUnderAllCannotFitTheJob pins the fit verdict of the default
+// arch policy (`all`, probatorium#442) on the grids that carry the opt-in
+// baseline columns, and logs the projections it rests on. profile=full on both
+// arches with the baseline columns under `all` is twice the one-arch grid:
+// about 131 h, above the 7200 minute (120 h) job limit before Deploy and
+// Cleanup are counted, and still above it with the model's 7% over-projection
+// taken off. No BENCH_BUDGET can admit it; the workflow refuses it.
+func TestFullBaselineUnderAllCannotFitTheJob(t *testing.T) {
+	const jobLimit = 7200 * time.Minute
+	proj := func(p Profile, arches int, policy string, baseline bool) time.Duration {
+		p.Runs, p.Arches, p.ArchExclusion = 1, arches, policy
+		if baseline {
+			p = p.WithBaseline()
+		}
+		return p.WallClock()
+	}
+	hours := func(d time.Duration) float64 { return d.Hours() }
+	full := Full()
+	allBase := proj(full, 2, "all", true)
+	heavyBase := proj(full, 2, "heavy", true)
+	oneBase := proj(full, 1, "", true)
+	t.Logf("profile=full baseline=true: target=both all %.2f h (%s), target=both heavy %.2f h (%s), single arch (amd64 or arm64) %.2f h (%s)",
+		hours(allBase), allBase.Round(time.Minute), hours(heavyBase), heavyBase.Round(time.Minute), hours(oneBase), oneBase.Round(time.Minute))
+	t.Logf("profile=full baseline=false: target=both all %.2f h, heavy %.2f h, single arch %.2f h",
+		hours(proj(full, 2, "all", false)), hours(proj(full, 2, "heavy", false)), hours(proj(full, 1, "", false)))
+	t.Logf("profile=headline baseline=true: all %.2f h, heavy %.2f h, single %.2f h; fast baseline=true: all %.2f h, heavy %.2f h, single %.2f h",
+		hours(proj(HeadlineWeekly(), 2, "all", true)), hours(proj(HeadlineWeekly(), 2, "heavy", true)), hours(proj(HeadlineWeekly(), 1, "", true)),
+		hours(proj(Fast(), 2, "all", true)), hours(proj(Fast(), 2, "heavy", true)), hours(proj(Fast(), 1, "", true)))
+
+	if allBase <= jobLimit {
+		t.Fatalf("full+baseline under all projects %s, which now fits the %s job limit: the workflow's refusal of it (and its test) are stale", allBase, jobLimit)
+	}
+	if low := time.Duration(float64(allBase) / 1.07); low <= jobLimit {
+		t.Errorf("even %s (the projection less the model's 7%% over-projection) fits the %s limit; the refusal rests on the model", low, jobLimit)
+	}
+	// What does fit: the same grid on one arch, or under the weaker lock.
+	for name, d := range map[string]time.Duration{"heavy": heavyBase, "single arch": oneBase} {
+		if d+6*time.Hour > jobLimit {
+			t.Errorf("full+baseline %s projects %s, which with Deploy and Cleanup does not fit the %s limit", name, d, jobLimit)
+		}
+	}
+	// And without the baseline, `all` fits only thinly (the dispatch the default now is).
+	if d := proj(full, 2, "all", false); d+6*time.Hour > jobLimit || d < 100*time.Hour {
+		t.Errorf("full under all projects %s: want 100-114 h", d)
+	}
+}

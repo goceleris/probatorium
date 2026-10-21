@@ -1,6 +1,8 @@
 package interleave
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/goceleris/loadgen"
@@ -129,5 +131,26 @@ func TestScheduleSkipsInapplicablePairs(t *testing.T) {
 		if c.Scenario.Name() == "X" && c.Server.Name() == "h1only" {
 			t.Fatalf("inapplicable pair (X, h1only) must not appear")
 		}
+	}
+}
+
+func TestReverseWithinRuns(t *testing.T) {
+	mk := func(run int, name string) Cell {
+		return Cell{RunIdx: run, Scenario: &fakeScenario{name: name}, Server: &fakeServer{name: "s"}}
+	}
+	in := []Cell{mk(0, "a"), mk(0, "b"), mk(0, "c"), mk(1, "a"), mk(1, "b")}
+	got := ReverseWithinRuns(in)
+	var names []string
+	for _, c := range got {
+		names = append(names, fmt.Sprintf("%d%s", c.RunIdx, c.Scenario.Name()))
+	}
+	if want := "0c 0b 0a 1b 1a"; strings.Join(names, " ") != want {
+		t.Fatalf("ReverseWithinRuns = %v, want %s", names, want)
+	}
+	if in[0].Scenario.Name() != "a" {
+		t.Fatal("ReverseWithinRuns modified its input")
+	}
+	if len(ReverseWithinRuns(nil)) != 0 {
+		t.Fatal("ReverseWithinRuns(nil) must be empty")
 	}
 }
