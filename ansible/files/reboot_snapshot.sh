@@ -165,7 +165,11 @@ power_event=$(jbool test -x "$R/usr/local/sbin/cluster-power-event")
 tmpfiles_conf=$(jbool test -f "$R/etc/tmpfiles.d/celeris-power.conf")
 svc_active() { command -v systemctl > /dev/null 2>&1 && [ "$(systemctl is-active "$1" 2> /dev/null)" = active ] && printf true || printf false; }
 svc_enabled() { command -v systemctl > /dev/null 2>&1 && [ "$(systemctl is-enabled "$1" 2> /dev/null)" = enabled ] && printf true || printf false; }
+# the unit-file state as systemctl prints it (enabled, enabled-runtime, disabled, static, ...): "enabled-runtime"
+# lasts only until the next boot, which is exactly the state in which a reboot loses the tailnet
+svc_enabled_state() { command -v systemctl > /dev/null 2>&1 && systemctl is-enabled "$1" 2> /dev/null | head -n 1; }
 tailscaled=$(svc_active tailscaled)
+tailscaled_enabled=$(svc_enabled_state tailscaled)
 apcupsd=$(svc_active apcupsd)
 resume_check=$(svc_enabled celeris-resume-check.service)
 system_state=""
@@ -184,6 +188,6 @@ printf '"lan_ip":%s,"lan_ip_present":%s,"peer_ip":%s,"peer_ping_ok":%s,' \
 printf '"manifest_present":%s,"results_entries":%s,"results_list":%s,"resume_pending":%s,"runner_dirs":%s,"runner_listeners":%s,"runner_workers":%s,' \
 	"$manifest_present" "$results_entries" "$results_list" "$resume_pending" "$runner_dirs" "$listeners" "$workers"
 printf '"crash":%s,"r8127":%s,"modinfo_r8127":%s,' "$crash" "$r8127" "$modinfo_r8127"
-printf '"prereq":{"tailscaled_active":%s,"apcupsd_active":%s,"resume_check_enabled":%s,"power_event_installed":%s,"tmpfiles_conf":%s,"quiesce_hook":%s,"run_celeris_owner":%s},' \
-	"$tailscaled" "$apcupsd" "$resume_check" "$power_event" "$tmpfiles_conf" "$quiesce_hook" "$(js "$run_celeris_owner")"
+printf '"prereq":{"tailscaled_active":%s,"tailscaled_enabled":%s,"apcupsd_active":%s,"resume_check_enabled":%s,"power_event_installed":%s,"tmpfiles_conf":%s,"quiesce_hook":%s,"run_celeris_owner":%s},' \
+	"$tailscaled" "$(js "$tailscaled_enabled")" "$apcupsd" "$resume_check" "$power_event" "$tmpfiles_conf" "$quiesce_hook" "$(js "$run_celeris_owner")"
 printf '"system_state":%s,"failed_units":%s}\n' "$(js "$system_state")" "$failed_units"

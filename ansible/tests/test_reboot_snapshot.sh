@@ -170,6 +170,22 @@ else
 	echo "SKIP fabric address checks: no ip(8)"
 fi
 
+# the unit-file state of tailscaled is reported as systemctl prints it (a stand-in systemctl on PATH)
+mkdir -p "$work/stub"
+cat > "$work/stub/systemctl" << 'EOT'
+#!/bin/bash
+case "$1 $2" in
+"is-enabled tailscaled") echo enabled-runtime; exit 1 ;;
+"is-active tailscaled") echo active ;;
+"is-system-running "*) echo running ;;
+*) exit 3 ;;
+esac
+EOT
+chmod +x "$work/stub/systemctl"
+out=$(PATH=$work/stub:$PATH HOST_SNAPSHOT_ROOT=$R bash "$snap" /tmp/m /tmp/r - - - 2>&1)
+check "tailscaled active and its unit-file state" '"tailscaled_active":true,"tailscaled_enabled":"enabled-runtime"'
+out=$(HOST_SNAPSHOT_ROOT=$R PATH=/usr/bin:/bin bash "$snap" /tmp/m /tmp/r - - - 2>&1)
+
 # usage
 out=$(bash "$snap" a b 2>&1)
 rc=$?

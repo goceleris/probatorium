@@ -84,7 +84,7 @@ printf '#!/bin/bash\n[ -e "${STUB_FLAGS:?}/addr" ] && echo "2: bond0    inet 192
 printf '#!/bin/bash\n[ -e "${STUB_FLAGS:?}/ping" ]\n' > "$work/stub/ping"
 printf '#!/bin/bash\n[ -e "${STUB_FLAGS:?}/modinfo" ]\n' > "$work/stub/modinfo"
 chmod +x "$work/stub/"*
-touch "$work/flags/active-tailscaled" "$work/flags/active-apcupsd" "$work/flags/enabled-celeris-resume-check.service" "$work/flags/addr" "$work/flags/ping" "$work/flags/modinfo"
+touch "$work/flags/active-tailscaled" "$work/flags/enabled-tailscaled" "$work/flags/active-apcupsd" "$work/flags/enabled-celeris-resume-check.service" "$work/flags/addr" "$work/flags/ping" "$work/flags/modinfo"
 
 mktree() { # mktree DIR BOOT_ID TOTAL
 	local r=$1
@@ -177,6 +177,7 @@ play results "$GOOD"
 check "entries in results_root refuse the reboot" test "$rc" != 0
 check "the refusal says nothing was rebooted and names the entries" logged "refused, nothing was rebooted: results_root /tmp/celeris-results holds 1 entr(ies) a reboot destroys (old)"
 check "a refused reboot does not reboot" bash -c "! [ -e '$work/state/rebooted' ]"
+check "the refusal is written for the step summary" bash -c "grep -q 'results_root /tmp/celeris-results holds 1 entr' '$out/msr1/refusal.txt'"
 play results_ok '{"reboot_host":"msr1","reboot_confirm":"REBOOT-msr1","allow_results_loss":true}'
 check "allow_results_loss=true goes ahead" test "$rc" = 0
 rm -rf "$work/before/tmp"
@@ -187,6 +188,7 @@ mkdir -p "$work/before/tmp" && touch "$work/before/tmp/celeris-bench-manifest.js
 play manifest "$GOOD"
 check "a bench manifest refuses" test "$rc" != 0
 check "the refusal names the manifest" logged "exists on"
+check "the manifest refusal is written for the step summary" bash -c "grep -q 'celeris-bench-manifest.json exists on' '$out/msr1/refusal.txt'"
 check "nothing is rebooted with a manifest present" bash -c "! [ -e '$work/state/rebooted' ]"
 rm -rf "$work/before/tmp" "$work/before/tmp.manifest-marker"
 

@@ -27,7 +27,7 @@ cat > "$work/stub/systemctl" << 'EOT'
 S=${STUB_FLAGS:?}
 case "$1" in
 is-active) [ -e "$S/active-$2" ] && echo active || echo inactive ;;
-is-enabled) [ -e "$S/enabled-$2" ] && echo enabled || echo disabled ;;
+is-enabled) if [ -e "$S/enabled-$2" ]; then echo enabled; elif [ -e "$S/enabled-runtime-$2" ]; then echo enabled-runtime; else echo disabled; fi ;;
 is-system-running) echo running ;;
 --failed) : ;;
 esac
@@ -73,7 +73,7 @@ mktree() {
 }
 flags_good() { # flags_good DIR - everything a healthy host shows
 	mkdir -p "$1"
-	touch "$1/active-tailscaled" "$1/active-apcupsd" "$1/enabled-celeris-resume-check.service" "$1/addr" "$1/ping" "$1/modinfo"
+	touch "$1/active-tailscaled" "$1/enabled-tailscaled" "$1/active-apcupsd" "$1/enabled-celeris-resume-check.service" "$1/addr" "$1/ping" "$1/modinfo"
 }
 snap() { # snap ROOT FLAGSDIR -> stdout
 	PATH=$work/stub:$PATH STUB_FLAGS=$2 HOST_SNAPSHOT_ROOT=$1 bash "$here/files/reboot_snapshot.sh" /tmp/celeris-bench-manifest.json /tmp/celeris-results enp1s0-8 192.168.50.199 192.168.50.195 2> /dev/null
@@ -193,6 +193,13 @@ judge "$(mut "$work/pre.json" 's/"modinfo_r8127":true/"modinfo_r8127":false/')" 
 expect "an r8127 module missing for the running kernel refuses" "$refusals" "r8127 module is not available for the running kernel 7.0.0-14-generic"
 judge "$(mut "$work/pre.json" 's/"newest_installed_kernel":"7.0.0-14-generic"/"newest_installed_kernel":"7.0.0-20-generic"/')" "$work/post.json"
 expect "a newer kernel installed than the running one refuses" "$refusals" "kernel 7.0.0-20-generic is installed and 7.0.0-14-generic is running"
+# tailscaled running but not enabled at boot: the host would come back off the tailnet, unreachable to CI
+for st in disabled enabled-runtime; do
+	judge "$(mut "$work/pre.json" "s/\"tailscaled_enabled\":\"enabled\"/\"tailscaled_enabled\":\"$st\"/")" "$work/post.json"
+	expect "tailscaled running but '$st' at boot refuses" "$refusals" "tailscaled is running but systemctl is-enabled says \"$st\""
+done
+judge "$(mut "$work/pre.json" 's/"tailscaled_active":true,"tailscaled_enabled":"enabled"/"tailscaled_active":false,"tailscaled_enabled":"disabled"/')" "$work/post.json"
+expect "tailscaled not running at all is not the unit-file case (the host is then reached some other way)" "$refusals" ""
 # a host without r8127 is not held to the r8127 rules
 judge "$(mut "$work/pre.json" 's/"r8127":true,"modinfo_r8127":true/"r8127":false,"modinfo_r8127":null/; s/"quiesce_hook":true/"quiesce_hook":false/')" "$work/post.json"
 expect "a host without r8127 needs neither the hook nor the module" "$refusals" ""

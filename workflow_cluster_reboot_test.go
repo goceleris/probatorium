@@ -347,6 +347,7 @@ func TestClusterRebootJudgementCoversTheRequirements(t *testing.T) {
 		"resume-pending.json",
 		"runner job(s) are executing",
 		"no shutdown quiesce hook",
+		"tailscaled is running but systemctl is-enabled says",
 		"r8127 module is not available",
 		"the reboot would boot another kernel",
 	} {
@@ -406,6 +407,7 @@ type snapshotRecord struct {
 	ModinfoR8127    *bool    `json:"modinfo_r8127"`
 	Prereq          struct {
 		TailscaledActive    bool   `json:"tailscaled_active"`
+		TailscaledEnabled   string `json:"tailscaled_enabled"`
 		ApcupsdActive       bool   `json:"apcupsd_active"`
 		ResumeCheckEnabled  bool   `json:"resume_check_enabled"`
 		PowerEventInstalled bool   `json:"power_event_installed"`
@@ -602,7 +604,7 @@ func TestRebootSummary(t *testing.T) {
 			`"nic_vectors":[{"iface":"enp49s0","irq":135,"name":"enp49s0-8","total":` + strconv.FormatInt(total, 10) + `,"affinity":"0-11","effective":"8"}],"max_vector_total":` + strconv.FormatInt(total, 10) + `,` +
 			`"placement_vector":"enp1s0-8","placement_vector_present":true,"bonds":[{"bond":"bond0","mode":"802.3ad","slaves":["enp1s0=up","enp49s0=up"]}],"lan_ip":"x","lan_ip_present":true,"peer_ip":"y","peer_ping_ok":true,` +
 			`"manifest_present":false,"results_entries":0,"results_list":[],"resume_pending":false,"runner_dirs":[],"runner_listeners":0,"runner_workers":0,"crash":[],"r8127":true,"modinfo_r8127":true,` +
-			`"prereq":{"tailscaled_active":true,"apcupsd_active":true,"resume_check_enabled":true,"power_event_installed":true,"tmpfiles_conf":true,"quiesce_hook":true,"run_celeris_owner":"mini"},"system_state":"running","failed_units":[]}`
+			`"prereq":{"tailscaled_active":true,"tailscaled_enabled":"enabled","apcupsd_active":true,"resume_check_enabled":true,"power_event_installed":true,"tmpfiles_conf":true,"quiesce_hook":true,"run_celeris_owner":"mini"},"system_state":"running","failed_units":[]}`
 	}
 	run := func(rc, reason string) string {
 		t.Helper()
@@ -643,6 +645,12 @@ func TestRebootSummary(t *testing.T) {
 	write("phase.txt", "returned\n")
 	if got = run("0", "x"); !strings.Contains(got, "NOT VERIFIED") {
 		t.Errorf("rc 0 with phase returned must not read as verified:\n%s", got)
+	}
+
+	// a refusal's reasons are printed
+	write("refusal.txt", "results_root /tmp/celeris-results holds 3 entr(ies)\n")
+	if got = run("2", "x"); !strings.Contains(got, "### Refused: msr1") || !strings.Contains(got, "results_root /tmp/celeris-results holds 3 entr(ies)") {
+		t.Errorf("a refusal's reasons are not in the summary:\n%s", got)
 	}
 
 	// the play never started

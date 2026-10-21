@@ -30,7 +30,7 @@ else
 	case "$phase" in
 	rebooting)
 		echo
-		echo "> The reboot was issued and the host did not answer within the timeout. Check the host's console and power; msr1 has a documented shutdown panic in the r8127 driver (ops/power/quiesce-r8127.shutdown) that needs a PHYSICAL power-cycle. Do not dispatch anything that uses this host until it is back and verified."
+		echo "> The reboot was issued and the host did not answer over the tailnet within the timeout. It may be down (msr1 has a documented shutdown panic in the r8127 driver, ops/power/quiesce-r8127.shutdown, that needs a PHYSICAL power-cycle) or UP but off the tailnet (tailscaled did not start at boot, or the NIC/bond did not come back): look at the console, or reach it over the LAN, before power-cycling. Do not dispatch anything that uses this host until it is back and verified."
 		;;
 	returned)
 		echo
@@ -42,6 +42,17 @@ else
 		;;
 	esac
 fi
+
+# a refusal (the reasons, written before the play failed) is the likeliest outcome of a first dispatch
+for r in "$out"/*/refusal.txt; do
+	[ -s "$r" ] || continue
+	echo
+	echo "### Refused: $(basename "$(dirname "$r")")"
+	echo
+	echo '```'
+	cat "$r"
+	echo '```'
+done
 
 if ! command -v jq > /dev/null 2>&1; then
 	echo
@@ -66,7 +77,7 @@ if [ -s "$pre" ]; then
 		a=$(if [ -s "$post" ]; then jq -r ".$f" "$post"; else echo "(no snapshot)"; fi)
 		echo "| $f | \`$b\` | \`$a\` |"
 	done
-	for f in tailscaled_active apcupsd_active resume_check_enabled power_event_installed tmpfiles_conf quiesce_hook run_celeris_owner; do
+	for f in tailscaled_active tailscaled_enabled apcupsd_active resume_check_enabled power_event_installed tmpfiles_conf quiesce_hook run_celeris_owner; do
 		b=$(jq -r ".prereq.$f" "$pre")
 		a=$(if [ -s "$post" ]; then jq -r ".prereq.$f" "$post"; else echo "(no snapshot)"; fi)
 		echo "| prerequisite $f | $b | $a |"

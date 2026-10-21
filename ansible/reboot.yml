@@ -97,6 +97,14 @@
       delegate_to: localhost
       become: false
 
+    - name: Preflight | record a refusal (the step summary prints it)
+      ansible.builtin.copy:
+        content: "{{ manifest_path }} exists on {{ inventory_hostname }}: a bench or validation owns the cluster (a manual mage run?)\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/refusal.txt"
+        mode: "0644"
+      delegate_to: localhost
+      when: preflight_snap.manifest_present
+
     - name: Preflight | no run owns this host
       ansible.builtin.assert:
         that: not preflight_snap.manifest_present
@@ -162,6 +170,14 @@
         dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/pre-snapshot.json"
         mode: "0644"
       delegate_to: localhost
+
+    - name: Target | record the refusals (the step summary prints them)
+      ansible.builtin.copy:
+        content: "{{ refusals_str | trim | replace(' ;; ', '; ') }}\n"
+        dest: "{{ reboot_out_dir }}/{{ inventory_hostname }}/refusal.txt"
+        mode: "0644"
+      delegate_to: localhost
+      when: refusals_str | trim | length > 0
 
     - name: Target | refuse when vars/reboot_judge.yml says so (refusals_str)
       ansible.builtin.fail:
