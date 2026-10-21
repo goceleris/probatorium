@@ -127,12 +127,12 @@ func TestSlowTimeoutStillFailsOutsideTheRaceTier(t *testing.T) {
 func TestWedgeAndIndeterminateStillFailInTheRaceTier(t *testing.T) {
 	flat, _ := flatSS()
 	cases := map[string]struct {
-		ss   func(context.Context, int, int) (string, error)
-		want string
+		ss        func(context.Context, int, int) (string, error)
+		want, why string
 	}{
-		"wedge": {flat, verdictWedge},
+		"wedge": {flat, verdictWedge, "reason=verdict_wedge"},
 		"indeterminate": {func(context.Context, int, int) (string, error) { return "", fmt.Errorf("exec: ss: not found") },
-			verdictIndeterminate},
+			verdictIndeterminate, "reason=verdict_indeterminate"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -148,6 +148,9 @@ func TestWedgeAndIndeterminateStillFailInTheRaceTier(t *testing.T) {
 			}
 			if rec.reps[0].Tolerated {
 				t.Errorf("a %s report was marked tolerated", c.want)
+			}
+			if got := secondLine(rec.reps[0].Text); !strings.HasPrefix(got, "WS_ECHO_DISPOSITION=FAIL ") || !strings.Contains(got, c.why) {
+				t.Errorf("disposition %q, want FAIL %s", got, c.why)
 			}
 		})
 	}
