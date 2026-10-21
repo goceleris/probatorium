@@ -47,7 +47,10 @@ on:
           side-listener goroutine dump). Off (default) on routine and
           scheduled runs; the release soak is dispatched with it on
           (celeris#588's release criterion). The dossiers are not gated:
-          the gates judge the run as usual. With it on, a ws_echo fire that
+          the gates judge the run as usual. The race tier does not need it for
+          its ws_echo tolerance: the validator's -race-tier arms the ws_echo
+          capture by itself (a SLOW_CLASS timeout is recorded, not failed).
+          With it on, a ws_echo fire that
           times out is held open, its sender stopped, and the walker keeps
           reading while ss -tmi of both ends, the echo counters, the refapp's
           per-thread CPU masks and its GOMAXPROCS and engine counters are
@@ -367,6 +370,17 @@ jobs:
           # I-RACE; a refapp that silently lost the detector would otherwise
           # hide behind the waiver.
           VALIDATE_GATE_EXPECT_INSTRUMENTED: "I-RACE"
+          # The race tier judges liveness and records latency
+          # (probatorium#481, celeris#871): a ws_echo timeout whose two-instant
+          # capture said SLOW_CLASS (the server read and wrote in the window,
+          # only late) is booked as ws_echo_timeout_slow and does not fail the
+          # gate, up to 3 per cell and only in a cell that shows a -race build.
+          # WEDGE_CLASS, INDETERMINATE (a fire with no capture included) and
+          # every other violation still fail. No other tier sets this, so
+          # nightly, soak, weekend and checkptr keep failing on a ws_echo
+          # timeout. The validator's side is -race-tier (ansible/validate.yml,
+          # on validate_race).
+          VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW: "1"
         run: mage ValidateGate
 
       - name: mage ValidateDiff (cross-engine + cross-arch gate)

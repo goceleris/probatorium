@@ -169,6 +169,10 @@ func ValidateGate() error {
 		H2CUpgradeRefapps:    gateEnvRefapps("VALIDATE_GATE_H2C_UPGRADE_REFAPPS"),
 		ExpectInstrumented:   gateEnvRefapps("VALIDATE_GATE_EXPECT_INSTRUMENTED"),
 		ExpectAdaptiveSwitch: os.Getenv("VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH") == "1",
+		// The race tier judges liveness and records latency: a SLOW_CLASS
+		// ws_echo timeout is a finding there, a violation everywhere else
+		// (probatorium#481). Only the race workflow sets this.
+		ToleratesWSEchoSlow: os.Getenv("VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW") == "1",
 	}
 	cellSoaks := 0
 	var propEvals, propViol int64
@@ -190,6 +194,9 @@ func ValidateGate() error {
 	printCoverage(report.Coverage(cells), coverageAware)
 	printInstrumentationCoverage(cells)
 	for _, l := range report.InformationalLines(cells) {
+		fmt.Println(l)
+	}
+	for _, l := range report.WSEchoSlowLines(cells, opts.ToleratesWSEchoSlow) {
 		fmt.Println(l)
 	}
 	viol := report.Gate(cells, soaks, opts)

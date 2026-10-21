@@ -97,10 +97,16 @@ var (
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}
-	// IWSEchoSlow: STUB.
+	// IWSEchoSlow is the finding a race-tier run books for a 64 KiB echo
+	// fire that timed out when the two-instant capture says SLOW_CLASS (the
+	// server application read or wrote in the window; the echoes were only
+	// late). It is not a violation: the counter is ws_echo_timeout_slow, which
+	// the gate does not fail on up to N=3 per cell, in the race tier only; its
+	// record-only dossier carries the same ws-echo-diag.txt as I-WS-ECHO-STALL
+	// (probatorium#481, celeris#871).
 	IWSEchoSlow = Spec{
 		ID:          "I-WS-ECHO-SLOW",
-		Description: "stub",
+		Description: "race tier: a 64 KiB echo fire timed out and the two-instant capture says SLOW_CLASS (the server read or wrote in the window, only late); recorded as ws_echo_timeout_slow, not a violation",
 		Tier:        "tier-1-walker",
 		Predicate:   alwaysOK,
 	}

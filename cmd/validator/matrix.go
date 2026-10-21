@@ -727,8 +727,14 @@ func cellRefappWorkers(engine string, capFromFlag int) int {
 	return adaptiveCellWorkers
 }
 
-// wsEchoSlowTolerance: STUB.
-func wsEchoSlowTolerance(raceTier bool) int { return 0 }
+// wsEchoSlowTolerance is the ws_echo SLOW_CLASS tolerance a run takes: N in
+// the race tier (-race-tier), 0 everywhere else (validation/ws_echo_slow.go).
+func wsEchoSlowTolerance(raceTier bool) int {
+	if raceTier {
+		return report.WSEchoSlowTolerance
+	}
+	return 0
+}
 
 func cellConcurrencyFloor(engine string) int {
 	if engine != "adaptive" {

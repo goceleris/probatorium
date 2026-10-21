@@ -44,6 +44,7 @@ func All() []Spec {
 		IH2CStall,
 		IWSStall,
 		IWSEchoStall,
+		IWSEchoSlow,
 		IWSEcho,
 		ILiveness,
 		IHang,

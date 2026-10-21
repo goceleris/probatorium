@@ -251,7 +251,7 @@ func TestSlowToleranceRaisesTheCaptureBudgetToNPlusOne(t *testing.T) {
 	}
 }
 
-// Counted and printed: the run summary line carries the new counter, and the
+// Counted and exported: the summary helper carries the new counter, and the
 // results export carries it as a key.
 func TestSlowTimeoutIsSummarisedAndExported(t *testing.T) {
 	line := summariseWSEcho(wsEchoSnapshot{Fires: 9, Timeout: 0, TimeoutSlow: 2})

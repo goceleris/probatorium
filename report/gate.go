@@ -24,12 +24,30 @@ func (v Violation) String() string {
 
 // WSEchoSlowTolerance is N of the race tier's ws_echo SLOW_CLASS tolerance:
 // at most this many timed-out 64 KiB echo fires per cell may be booked as a
-// non-failing finding (probatorium#481). STUB.
+// non-failing finding, ws_echo_timeout_slow (probatorium#481, celeris#871).
+// Pre-registered at 3: the race tier's adaptive/amd64 cell timed out once per
+// run in 12 of 12 baseline, switch-free and relocated runs, and every run's
+// first timeout ended its cell, so one per run is a right-censored count, not
+// a rate; three leaves room above it, and a fourth is a different regime. The
+// validator (-race-tier) and the gate use this one constant.
 const WSEchoSlowTolerance = 3
+
+// WSEchoSlowKey is the Tier1Summary.WSEcho key of the race tier's recorded
+// SLOW_CLASS ws_echo timeouts.
+const WSEchoSlowKey = "ws_echo_timeout_slow"
 
 // GateOptions tunes the absolute gate.
 type GateOptions struct {
-	// ToleratesWSEchoSlow: STUB.
+	// ToleratesWSEchoSlow is the race tier's semantics for the ws_echo SLOW
+	// class: the gate fails on liveness defects and records latency, so a
+	// cell's ws_echo_timeout_slow (a timed-out 64 KiB echo fire whose
+	// two-instant capture said SLOW_CLASS) does not fail it, up to
+	// WSEchoSlowTolerance per cell and only in a cell that shows a -race
+	// build. Everything else, ws_echo_timeout (WEDGE_CLASS, INDETERMINATE, a
+	// tripped guard) included, fails as before. Off in every other tier: a
+	// ws_echo_timeout_slow there is a violation, because the key can only be
+	// non-zero in a run the validator took for the race tier. Set by
+	// VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW=1, which the race workflow alone sets.
 	ToleratesWSEchoSlow bool
 	// ExpectedCells > 0 fails the gate when fewer cells are present: a cell
 	// that crashed, was skipped, or never reported is a failure, not a pass.
@@ -590,6 +608,21 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 				if v := m[g.key]; v > 0 {
 					add(c, "tier_1."+g.slice+"."+g.key, v,
 						g.why+causeSuffix(m, g.key)+FirstFailedSlowFire(slowFireDetail(t, g.key)))
+				}
+			}
+			// The race tier's recorded latency (not in gatedTier1Keys: it is
+			// judged here, against the tier it ran in).
+			if v := t.WSEcho[WSEchoSlowKey]; v > 0 {
+				switch {
+				case !opts.ToleratesWSEchoSlow:
+					add(c, "tier_1.ws_echo."+WSEchoSlowKey, v, fmt.Sprintf(
+						"%d timed-out 64 KiB WebSocket echo fire(s) classified SLOW_CLASS, in a tier that does not tolerate them: only the race tier records these (VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW) and every other tier's timing budget is real", v))
+				case !ranPropertyLoop(c) || slices.Contains(c.PropertiesNotInstrumented, "I-RACE"):
+					add(c, "tier_1.ws_echo."+WSEchoSlowKey, v,
+						"SLOW_CLASS ws_echo timeouts are tolerated only in a cell that shows a -race build (I-RACE declared by a property loop that ran); this cell does not")
+				case v > WSEchoSlowTolerance:
+					add(c, "tier_1.ws_echo."+WSEchoSlowKey, v, fmt.Sprintf(
+						"more than %d SLOW_CLASS 64 KiB WebSocket echo timeouts in one cell: the server is not just late now and then", WSEchoSlowTolerance))
 				}
 			}
 		}
