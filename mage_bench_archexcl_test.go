@@ -21,7 +21,8 @@ func TestResolveArchExclusion(t *testing.T) {
 		target, env, want string
 		wantErr           bool
 	}{
-		{"both", "", "heavy", false},
+		{"both", "", "all", false}, // the default since the validation read of 2026-10-21
+		{"both", "heavy", "heavy", false},
 		{"both", "all", "all", false},
 		{"both", "off", "off", false},
 		{"both", "sometimes", "", true},

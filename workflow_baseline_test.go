@@ -55,29 +55,35 @@ func TestBenchmarkTierBaselineInputIsOptIn(t *testing.T) {
 	}
 }
 
-// TestBenchmarkTierBudgetCoversTheBaselineGrid ties the workflow's
-// BENCH_BUDGET expression to the budget model: the budgets of a dispatch
-// without the baseline are unchanged (24h fast, 36h headline, 60h full),
-// and a baseline dispatch uses budgets that fit the grid it will run
-// (budget.WithBaseline) and that the baseline-less ones do not.
+// TestBenchmarkTierBudgetCoversTheBaselineGrid ties the workflow's BENCH_BUDGET
+// table to the budget model for the baseline switch. The budgets of a no-lock
+// run (a single-arch target, or policy off) are the ones the baseline columns
+// were added with: 24h fast, 36h headline, 60h full without the baseline, and
+// 24h / 48h / 80h with it; a baseline dispatch uses budgets that fit the grid
+// it will run (budget.WithBaseline) and that the baseline-less ones do not. The
+// budgets of the arch policies are checked by TestWorkflowBudgetAdmitsEveryArchPolicy.
 func TestBenchmarkTierBudgetCoversTheBaselineGrid(t *testing.T) {
-	src := readWorkflow(t, "benchmark-tier.yml")
-	line := regexp.MustCompile(`(?m)^\s+BENCH_BUDGET: \$\{\{ (.*) \}\}$`).FindStringSubmatch(src)
-	if line == nil {
-		t.Fatal("no BENCH_BUDGET expression in benchmark-tier.yml")
+	budgets, timeouts := readWorkflowTables(t)
+	for _, key := range []string{"single", "off"} {
+		for profile, want := range map[string][2]string{
+			"fast":     {"24h", "24h"},
+			"headline": {"36h", "48h"},
+			"full":     {"60h", "80h"},
+		} {
+			for k, bl := range []string{"false", "true"} {
+				if got := budgets[profile][bl][key]; got != want[k] {
+					t.Errorf("%s baseline=%s policy %s: budget %s, want %s", profile, bl, key, got, want[k])
+				}
+			}
+		}
 	}
-	const want = `github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && (github.event.inputs.baseline == 'true' && '48h' || '36h') || (github.event.inputs.baseline == 'true' && '80h' || '60h'))`
-	if line[1] != want {
-		t.Fatalf("BENCH_BUDGET expression changed:\n got %s\nwant %s\n(update this test with the new budgets, after checking them against budget.WithBaseline)", line[1], want)
-	}
-	hl, full := budget.HeadlineWeekly(), budget.Full()
 	for _, c := range []struct {
 		name        string
 		p           budget.Profile
 		plain, with time.Duration
 	}{
-		{"headline", hl, 36 * time.Hour, 48 * time.Hour},
-		{"full", full, 60 * time.Hour, 80 * time.Hour},
+		{"headline", budget.HeadlineWeekly(), 36 * time.Hour, 48 * time.Hour},
+		{"full", budget.Full(), 60 * time.Hour, 80 * time.Hour},
 	} {
 		if log, ok := c.p.FitWithin(c.plain); !ok {
 			t.Errorf("%s no longer fits the %v of a dispatch without the baseline:\n%s", c.name, c.plain, log)
@@ -92,14 +98,12 @@ func TestBenchmarkTierBudgetCoversTheBaselineGrid(t *testing.T) {
 	if _, ok := budget.Fast().WithBaseline().FitWithin(24 * time.Hour); !ok {
 		t.Error("fast with the baseline no longer fits 24h")
 	}
-	// The matrix job's ceiling (timeout-minutes) must leave room for the
-	// raised full budget plus Deploy and Cleanup.
-	var ceiling time.Duration
-	for _, x := range regexp.MustCompile(`(?m)^    timeout-minutes: (\d+)$`).FindAllStringSubmatch(src, -1) {
-		d, _ := time.ParseDuration(x[1] + "m")
-		ceiling = max(ceiling, d)
-	}
-	if ceiling <= 80*time.Hour {
-		t.Errorf("job timeout %v does not leave room above the 80h baseline budget", ceiling)
+	// The job's ceiling (timeout-minutes) must leave room for the raised full
+	// budget plus Deploy and Cleanup: the no-lock one for a no-lock run.
+	for _, key := range []string{"single", "off", "heavy"} {
+		ceiling := time.Duration(timeouts[key]) * time.Minute
+		if ceiling < 80*time.Hour+jobOverhead {
+			t.Errorf("policy %s: job timeout %v does not leave room above the 80h baseline budget", key, ceiling)
+		}
 	}
 }

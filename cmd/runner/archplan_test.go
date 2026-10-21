@@ -12,6 +12,7 @@ import (
 	"github.com/goceleris/probatorium/interleave"
 	"github.com/goceleris/probatorium/report"
 	"github.com/goceleris/probatorium/scenarios"
+	"github.com/goceleris/probatorium/servers"
 )
 
 // fullGridPlan returns the columns of the real '*/*' grid (the same cells a
@@ -369,5 +370,52 @@ func TestValidationScopeGroupSizes(t *testing.T) {
 		if pc.policy == interleave.LockAll && (heavy != 0 || light != 0 || alone != 48) {
 			t.Errorf("%s: alone %d heavy %d light %d, want every one of the 48 light-row passes alone", pc.name, alone, heavy, light)
 		}
+	}
+}
+
+// TestBaselineGridArchPlan prices the default policy (`all`) on the grid that
+// carries the opt-in baseline columns (BENCH_BASELINE=1: 8 more columns, +222
+// saturation and +120 rated cells per arch), from the planner and not from the
+// budget model, and logs the numbers: one arch alone, both arches with no lock,
+// the heavy lock (arm64 reversed) and the strict lock. The budget constants must
+// cover the planner on this grid too, and the strict lock must not fit the
+// 7200 minute job limit on profile full: the planner and the model agree that
+// no budget can admit that dispatch.
+func TestBaselineGridArchPlan(t *testing.T) {
+	t.Setenv(servers.BaselineEnvVar, "1")
+	p := budget.Full()
+	cols := fullGridPlan(t, p)
+	cells := 0
+	for _, c := range cols {
+		cells += len(c.Cells)
+	}
+	if want := budget.FullRealizedCells + budget.BaselineRealizedCells; cells != want {
+		t.Fatalf("plan has %d cells, want %d", cells, want)
+	}
+	sim := func(policy interleave.LockPolicy, b interleave.ArchPlan) time.Duration {
+		return interleave.SimulateArchPlan(interleave.ArchPlan{Columns: cols}, b,
+			interleave.PlanParams{Policy: policy, Cooldown: 5 * time.Second}).Makespan
+	}
+	one := sim(interleave.LockOff, interleave.ArchPlan{})
+	heavy := sim(interleave.LockHeavy, interleave.ArchPlan{Columns: cols, ReverseCells: true})
+	all := sim(interleave.LockAll, interleave.ArchPlan{Columns: cols, ReverseCells: true})
+	t.Logf("planner, profile=full with the baseline columns (%d cells per arch): one arch alone %.1f h; heavy lock, arm64 reversed %.1f h (%+.1f%%); all lock, arm64 reversed %.1f h (%+.1f%%)",
+		cells, one.Hours(), heavy.Hours(), 100*(float64(heavy)/float64(one)-1), all.Hours(), 100*(float64(all)/float64(one)-1))
+	p.Runs, p.Arches, p.ArchParallel = 1, 2, true
+	for pol, planner := range map[string]time.Duration{"heavy": heavy, "all": all} {
+		q := p
+		q.ArchExclusion = pol
+		model := q.WithBaseline().WallClock()
+		t.Logf("budget model, same grid, policy %s: %.1f h (planner %.1f h)", pol, model.Hours(), planner.Hours())
+		if model < planner {
+			t.Errorf("policy %s: the budget model (%s) is below the planner (%s) on the baseline grid: FitWithin would under-count", pol, model, planner)
+		}
+	}
+	const jobLimit = 7200 * time.Minute
+	if all+6*time.Hour <= jobLimit {
+		t.Errorf("the planner fits full+baseline under all in %s: the workflow's refusal of that dispatch is stale", all)
+	}
+	if heavy+6*time.Hour > jobLimit {
+		t.Errorf("full+baseline under heavy plans %s, which does not fit the job limit", heavy)
 	}
 }
