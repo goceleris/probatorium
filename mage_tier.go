@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -170,6 +171,9 @@ func BenchTier() error {
 	// token was unresolvable on the runner. Skipped for data-only runs.
 	skipPublish := os.Getenv("BENCH_PUBLISH") == "0" || os.Getenv("BENCH_PUBLISH") == "false"
 	if !skipPublish {
+		if err := publishPolicyGate(archPolicy); err != nil {
+			return err
+		}
 		if err := publishPreflight(); err != nil {
 			return fmt.Errorf("publish preflight failed — aborting before the bench to avoid wasting cluster time (set BENCH_PUBLISH=0 for a data-only run): %w", err)
 		}
@@ -264,11 +268,21 @@ var realizedCounts = func(cells, ratedCells string) (int, int, error) {
 func scopedProjection(p budget.Profile) (budget.Profile, bool, error) {
 	cells := strings.TrimSpace(os.Getenv("BENCH_CELLS"))
 	rated := strings.TrimSpace(os.Getenv("BENCH_RATED_CELLS"))
-	if cells == "" && (rated == "" || p.RatedPasses == 0) {
+	comps := strings.TrimSpace(os.Getenv("BENCH_COMPETITORS"))
+	if comps == "all" {
+		comps = ""
+	}
+	if cells == "" && comps == "" && (rated == "" || p.RatedPasses == 0) {
 		return p, false, nil
 	}
 	if cells == "" {
 		cells = budget.CellsGlob(p)
+	}
+	if comps != "" {
+		// the runner's dry run schedules every column the cells glob matches;
+		// BENCH_COMPETITORS narrows the columns the bench runs, so narrow the
+		// glob the same way.
+		cells = narrowCellsToColumns(cells, splitTrimNonEmpty(comps))
 	}
 	if rated == "" {
 		rated = budget.RatedGlob(p)
@@ -297,6 +311,53 @@ func tierProjection(p budget.Profile) (budget.Profile, error) {
 		p = baselineProjection(p)
 	}
 	return p, nil
+}
+
+// publishPolicyGate refuses, before the multi-hour bench, a run that would
+// publish documents the publish gate will refuse: policy heavy (the exemption of
+// the light rows failed P6 on arm64) and policy off (the arches overlapped).
+// Run data-only with BENCH_PUBLISH=0, or override with BENCH_PUBLISH_FORCE=1 as
+// at the publish gate. A single-arch run has no policy ("") and is not affected.
+// The workflow's setup job refuses the same dispatches.
+func publishPolicyGate(policy string) error {
+	if (policy == "heavy" || policy == "off") && os.Getenv("BENCH_PUBLISH_FORCE") != "1" {
+		return fmt.Errorf("BENCH_ARCH_EXCLUSIVE=%s would publish documents the publish gate refuses (policy heavy failed P6 on arm64, policy off lets the arches overlap; docs/ARCH-EXCLUSION-VALIDATION.md): set BENCH_PUBLISH=0 for a data-only run, use the default policy (all), or BENCH_PUBLISH_FORCE=1 to override", policy)
+	}
+	return nil
+}
+
+// narrowCellsToColumns restricts a cell glob list ("<scenario>/<server>",
+// "!<exclude>") to the named columns: every include glob keeps the scenario
+// half and keeps the columns its server half matches, spelt out; excludes stay.
+// The result has no include glob when no named column matches (a scope that
+// schedules nothing, which the bench itself refuses).
+func narrowCellsToColumns(cells string, cols []string) string {
+	var out []string
+	hasInclude := false
+	for _, part := range strings.Split(cells, ",") {
+		g := strings.TrimSpace(part)
+		if g == "" {
+			continue
+		}
+		if strings.HasPrefix(g, "!") {
+			out = append(out, g)
+			continue
+		}
+		sc, srv, ok := strings.Cut(g, "/")
+		if !ok { // "*" alone matches every cell
+			sc, srv = "*", "*"
+		}
+		for _, c := range cols {
+			if m, _ := path.Match(srv, c); m {
+				out = append(out, sc+"/"+c)
+				hasInclude = true
+			}
+		}
+	}
+	if !hasInclude {
+		return "!*/*"
+	}
+	return strings.Join(out, ",")
 }
 
 // baselineProjection adds the opt-in baseline columns to p's cell counts when
@@ -353,8 +414,8 @@ func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 	setCells := func(profileGlob string) {
 		glob, overridden := resolveBenchCells(os.Getenv("BENCH_CELLS"), profileGlob)
 		if overridden {
-			fmt.Printf("  BENCH_CELLS preset %q overrides the %s profile glob %q (the budget projection counted the profile's %d cells; this scoped run is strictly smaller)\n",
-				glob, p.Name, profileGlob, p.Cells)
+			fmt.Printf("  BENCH_CELLS preset %q overrides the %s profile glob %q (the budget was projected from the scope's realized %d cells / %d rated)\n",
+				glob, p.Name, profileGlob, p.Cells, p.RatedCells)
 		}
 		_ = os.Setenv("BENCH_CELLS", glob)
 	}

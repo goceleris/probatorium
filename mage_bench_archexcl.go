@@ -185,7 +185,8 @@ func archExclusionParams(resultsDir, policy string, hosts [2]string) (map[string
 // intersects, or any window has no usable timestamps (probatorium#442). It reads
 // results-amd64.json and results-arm64.json from BENCH_RESULTS_DIR (default: the
 // latest bench run). The policy is BENCH_ARCH_EXCLUSIVE when set, else the one
-// recorded in the documents, else heavy. A document with no load_windows (written
+// recorded in the documents; a document that records none is an error, not a
+// guess. A document with no load_windows (written
 // before schema 5.22) cannot be checked, which is an error, not a pass.
 func BenchArchOverlap() error {
 	dir := os.Getenv("BENCH_RESULTS_DIR")

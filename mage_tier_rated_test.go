@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -221,10 +222,20 @@ func TestRealizedCountsMatchThePins(t *testing.T) {
 	}{
 		{"pins", "", budget.RatedGlob(full), budget.FullRealizedCells, budget.FullRatedRealizedCells},
 		{"every cell rated", "", "*", budget.FullRealizedCells, budget.FullRealizedCells},
+		{"one column, every cell rated", "", "*", -1, -1},
 		{"pins with the baseline", "1", budget.RatedGlob(full), budget.FullRealizedCells + budget.BaselineRealizedCells, budget.FullRatedRealizedCells + budget.BaselineRatedRealizedCells},
 	} {
 		t.Setenv(servers.BaselineEnvVar, c.baseline)
-		n, r, err := realizedCounts(budget.CellsGlob(full), c.rated)
+		cells := budget.CellsGlob(full)
+		if c.cells == -1 { // BENCH_COMPETITORS=celeris-epoll-h1-sync, as scopedProjection narrows it
+			cells = narrowCellsToColumns(cells, []string{"celeris-epoll-h1-sync"})
+			n, r, err := realizedCounts(cells, c.rated)
+			if err != nil || n < 20 || n > 40 || r != n {
+				t.Errorf("%s: %q realizes %d cells %d rated (err %v), want one column's 20-40 cells, all rated", c.name, cells, n, r, err)
+			}
+			continue
+		}
+		n, r, err := realizedCounts(cells, c.rated)
 		if err != nil || n != c.cells || r != c.ratedN {
 			t.Errorf("%s: got %d cells %d rated (err %v), want %d / %d", c.name, n, r, err, c.cells, c.ratedN)
 		}
@@ -249,5 +260,102 @@ func TestTierProjectionDoesNotCountTheBaselineTwice(t *testing.T) {
 	p, err = tierProjection(budget.Full())
 	if want := budget.Full().WithBaseline(); err != nil || p.Cells != want.Cells || p.RatedCells != want.RatedCells {
 		t.Errorf("unscoped with the baseline: cells=%d rated=%d err=%v, want %d / %d", p.Cells, p.RatedCells, err, want.Cells, want.RatedCells)
+	}
+}
+
+// TestScopedProjectionHonoursCompetitors: BENCH_COMPETITORS narrows the columns
+// the bench runs, so a rated_cells='*' dispatch of one column is priced as that
+// column's cells, not the whole grid's 813 (review round 2).
+func TestScopedProjectionHonoursCompetitors(t *testing.T) {
+	old := realizedCounts
+	defer func() { realizedCounts = old }()
+	var gotCells, gotRated string
+	realizedCounts = func(c, r string) (int, int, error) { gotCells, gotRated = c, r; return 27, 27, nil }
+	t.Setenv("BENCH_CELLS", "")
+	t.Setenv("BENCH_RATED_CELLS", "*")
+	t.Setenv("BENCH_COMPETITORS", "celeris-epoll-h1-sync")
+	p := budget.Full()
+	p.Runs, p.Arches, p.ArchExclusion = 1, 2, "all"
+	q, scoped, err := scopedProjection(p)
+	if err != nil || !scoped || q.Cells != 27 {
+		t.Fatalf("scoped=%v cells=%d err=%v", scoped, q.Cells, err)
+	}
+	if gotCells != "*/celeris-epoll-h1-sync" || gotRated != "*" {
+		t.Errorf("the dry run was asked for cells %q rated %q, want the one column", gotCells, gotRated)
+	}
+	if _, ok := q.FitWithin(108 * time.Hour); !ok {
+		t.Error("one column of the full profile must fit 108h")
+	}
+	// competitors=all (the workflow's default) and an unset profile scope change nothing.
+	t.Setenv("BENCH_COMPETITORS", "all")
+	t.Setenv("BENCH_RATED_CELLS", "")
+	if _, scoped, _ := scopedProjection(p); scoped {
+		t.Error("competitors=all with no scope must stay the profile's pins")
+	}
+	// a competitor list alone (no cells, no rated glob) is a scope too.
+	t.Setenv("BENCH_COMPETITORS", "axum")
+	if _, scoped, _ := scopedProjection(p); !scoped {
+		t.Error("an explicit competitors list must be projected from the dry run")
+	}
+}
+
+func TestNarrowCellsToColumns(t *testing.T) {
+	for _, c := range []struct{ cells, want string }{
+		{"*/*", "*/a,*/b"},
+		{"*", "*/a,*/b"},
+		{"get-*/celeris-*", "get-*/celeris-a"},
+		{"post-4k/*,churn-close/b", "post-4k/a,post-4k/b,churn-close/b"},
+		{"*/*,!ws-large-echo/*", "*/a,*/b,!ws-large-echo/*"},
+		{"post-4k/zzz", "!*/*"},
+	} {
+		cols := []string{"a", "b"}
+		if c.cells == "get-*/celeris-*" {
+			cols = []string{"celeris-a", "axum"}
+		}
+		if got := narrowCellsToColumns(c.cells, cols); got != c.want {
+			t.Errorf("narrow(%q, %v) = %q, want %q", c.cells, cols, got, c.want)
+		}
+	}
+}
+
+// TestPublishPolicyGate: a mage BenchTier outside the workflow refuses, before
+// the bench, a policy heavy or off run that would publish.
+func TestPublishPolicyGate(t *testing.T) {
+	t.Setenv("BENCH_PUBLISH_FORCE", "")
+	for _, c := range []struct {
+		policy string
+		ok     bool
+	}{{"all", true}, {"", true}, {"heavy", false}, {"off", false}} {
+		if err := publishPolicyGate(c.policy); (err == nil) != c.ok {
+			t.Errorf("policy %q: err %v, want ok=%v", c.policy, err, c.ok)
+		}
+	}
+	t.Setenv("BENCH_PUBLISH_FORCE", "1")
+	if err := publishPolicyGate("heavy"); err != nil {
+		t.Errorf("BENCH_PUBLISH_FORCE=1 must override: %v", err)
+	}
+	// wired before publishPreflight, and only when the run publishes.
+	b, _ := os.ReadFile("mage_tier.go")
+	src := string(b)
+	i, j := strings.Index(src, "publishPolicyGate(archPolicy)"), strings.Index(src, "publishPreflight(); err")
+	if i < 0 || j < 0 || i > j || !strings.Contains(src[:i], "if !skipPublish {") {
+		t.Error("BenchTier must call publishPolicyGate(archPolicy) under !skipPublish, before publishPreflight")
+	}
+}
+
+// TestScopedLogLineSaysWhatTheProjectionCounted: the BENCH_CELLS preset log no
+// longer claims the profile's pins were counted or that the run is strictly smaller.
+func TestScopedLogLineSaysWhatTheProjectionCounted(t *testing.T) {
+	b, _ := os.ReadFile("mage_tier.go")
+	src := string(b)
+	if strings.Contains(src, "strictly smaller") || strings.Contains(src, "projection counted the profile's") {
+		t.Error("the BENCH_CELLS preset log line still describes the old projection")
+	}
+	if !strings.Contains(src, "projected from the scope's realized %d cells / %d rated") {
+		t.Error("the BENCH_CELLS preset log line must say the budget was projected from the scope's realized counts")
+	}
+	a, _ := os.ReadFile("mage_bench_archexcl.go")
+	if strings.Contains(string(a), "else heavy") {
+		t.Error("BenchArchOverlap's doc comment still says the policy falls back to heavy")
 	}
 }

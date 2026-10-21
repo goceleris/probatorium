@@ -128,9 +128,10 @@ jobs:
         # which GitHub renders as an empty timeout and BENCH_BUDGET, and would
         # also step around the refusal that follows. mage trims whitespace, the
         # tables do not, so a value must be exactly one of the allowed ones.
-        # A policy heavy document is refused at publish (the validation read of
-        # 2026-10-21: P6 failed on arm64), so a dispatch that would publish one
-        # fails here, not after the run: heavy needs publish=false (or a fast
+        # A policy heavy or off document is refused at publish (heavy: the validation
+        # read of 2026-10-21, P6 failed on arm64; off: the arches overlap), so a
+        # dispatch that would publish one fails here, not after the run: they need
+        # publish=false (or a fast
         # profile, which never publishes, or a single-arch target, which ignores
         # the policy). workflow_arch_budget_test.go runs this script.
         env:
@@ -155,8 +156,8 @@ jobs:
           publishes=1
           [ "${IN_PROFILE:-full}" = fast ] && publishes=0
           [ "$IN_PUBLISH" = false ] && publishes=0
-          if [ "$IN_ARCH" = heavy ] && [ "${IN_TARGET:-both}" = both ] && [ "$publishes" = 1 ]; then
-            echo "::error::arch_exclusive=heavy on target=both would publish documents the publish gate refuses (policy heavy failed P6 on arm64, docs/ARCH-EXCLUSION-VALIDATION.md). Dispatch with publish=false, or use the default policy."
+          if { [ "$IN_ARCH" = heavy ] || [ "$IN_ARCH" = off ]; } && [ "${IN_TARGET:-both}" = both ] && [ "$publishes" = 1 ]; then
+            echo "::error::arch_exclusive=$IN_ARCH on target=both would publish documents the publish gate refuses (policy heavy failed P6 on arm64, policy off lets the arches overlap; docs/ARCH-EXCLUSION-VALIDATION.md). Dispatch with publish=false, or use the default policy."
             fail=1
           fi
           [ "$fail" = 0 ] || exit 1
