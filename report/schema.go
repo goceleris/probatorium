@@ -1256,8 +1256,13 @@ type Tier1Summary struct {
 	// seen. See RefappSched for what it can and cannot say.
 	RefappSched *RefappSched `json:"refapp_sched,omitempty"`
 	// LoadShaping records that the cell's walkers were paced below their
-	// closed-loop rate, and by how much. Omitted when nothing was shaped, which
-	// is every cell outside the race tier's adaptive cell. See LoadShaping.
+	// closed-loop rate, and by how much (probatorium#481, celeris#871). Omitted
+	// when nothing was shaped, which is every cell outside the race tier's
+	// adaptive cell. Additive WITHOUT a schema bump, on purpose: the bump would
+	// re-stamp schema_version in every nightly, checkptr, weekend and bench
+	// document, which this change is meant to leave byte-identical; the field's
+	// presence is what tells a shaped cell from an unshaped one, in any 5.24
+	// document. See LoadShaping.
 	LoadShaping *LoadShaping `json:"load_shaping,omitempty"`
 	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
 	// bound address, i.e. the origin of every SlowFire.SinceReadyMs and
