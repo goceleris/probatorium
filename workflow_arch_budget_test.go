@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -162,7 +163,7 @@ func TestWorkflowTablesAreIndexedByTheRightKeys(t *testing.T) {
 // timeout-minutes holds that budget plus Deploy and Cleanup, or the run cannot
 // be held by any job (projection + Deploy/Cleanup over the timeout of its
 // policy), in which case the table says so by an entry that FitWithin refuses
-// and the workflow refuses the dispatch at the start of the bench job
+// and the workflow refuses the dispatch in the setup job, before any runner is provisioned
 // (TestWorkflowRefusesAGridTheJobCannotHold). The set of refused dispatches is
 // pinned: a combination entering or leaving it is a deliberate edit.
 func TestWorkflowBudgetAdmitsEveryArchPolicy(t *testing.T) {
@@ -249,27 +250,147 @@ func TestWorkflowBudgetAdmitsEveryArchPolicy(t *testing.T) {
 
 // TestWorkflowRefusesAGridTheJobCannotHold: full + baseline + target=both +
 // policy all projects 130h55m, above the 7200 minute job limit, so no
-// BENCH_BUDGET admits it. FitWithin would refuse it, but only after mage
-// Deploy has built the baseline module: a step before Deploy refuses it at
-// the start of the bench job, for exactly the dispatches the table pins as unholdable.
+// BENCH_BUDGET admits it. FitWithin would refuse it, but only after mage Deploy
+// has built the baseline module: a step in the setup job (before any runner is
+// provisioned, and before the matrix job's Deploy) refuses it, for exactly the
+// dispatches the table pins as unholdable. The condition is built from the
+// default policy, so changing the default cannot leave it stale, and the
+// message sends the maintainer to the two single-arch dispatches only: a heavy
+// document is refused at publish.
 func TestWorkflowRefusesAGridTheJobCannotHold(t *testing.T) {
 	src := readWorkflow(t, "benchmark-tier.yml")
-	const cond = `if: ${{ (github.event.inputs.target || 'both') == 'both' && (github.event.inputs.arch_exclusive || 'all') == 'all' && github.event.inputs.baseline == 'true' && (github.event.inputs.profile || 'full') == 'full' }}`
+	cond := `if: ${{ (github.event.inputs.target || 'both') == 'both' && (github.event.inputs.arch_exclusive || '` + wantDefaultPolicy + `') == 'all' && github.event.inputs.baseline == 'true' && (github.event.inputs.profile || 'full') == 'full' }}`
 	i := strings.Index(src, cond)
 	if i < 0 {
 		t.Fatalf("no step guarded by\n%s", cond)
+	}
+	setup := strings.Index(src, "\n  setup:\n")
+	matrix := strings.Index(src, "\n  matrix:\n")
+	if setup < 0 || matrix < setup || i < setup || i > matrix {
+		t.Error("the refusal step must be in the setup job (before the matrix job and before any runner is provisioned)")
+	}
+	if co := strings.Index(src, "- uses: ./.github/actions/cluster-runner-up"); co < 0 || i > co {
+		t.Error("the refusal step must come before the cluster-runner-up step")
 	}
 	d := strings.Index(src, "- name: mage Deploy")
 	if d < 0 || i > d {
 		t.Error("the refusal step must come before mage Deploy (which builds the baseline module)")
 	}
 	rest := src[i:]
-	if j := strings.Index(rest, "\n      - name:"); j > 0 {
+	if j := strings.Index(rest, "\n      - "); j > 0 {
 		rest = rest[:j]
 	}
-	for _, want := range []string{"::error::", "exit 1", "130h55m"} {
+	for _, want := range []string{"::error::", "exit 1", "130h55m", "target=msa2-server", "target=msr1"} {
 		if !strings.Contains(rest, want) {
 			t.Errorf("the refusal step lacks %q:\n%s", want, rest)
+		}
+	}
+	// the texts that name the way out must not offer heavy for this grid: a
+	// heavy document is refused at publish.
+	for _, f := range []string{"README.md", filepath.Join("docs", "ARCH-EXCLUSION-VALIDATION.md"), filepath.Join(".github", "workflows", "benchmark-tier.yml")} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := strings.Join(strings.Fields(strings.ReplaceAll(string(b), "# ", " ")), " ")
+		for _, bad := range []string{"or with `arch_exclusive=heavy`", "or with arch_exclusive=heavy", "or with 'heavy'"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s offers heavy as a way out of the grid the job cannot hold (%q): a heavy document is refused at publish", f, bad)
+			}
+		}
+	}
+}
+
+// validateStep extracts the shell script of the setup job's "Validate dispatch
+// inputs" step.
+func validateStep(t *testing.T) string {
+	t.Helper()
+	src := readWorkflow(t, "benchmark-tier.yml")
+	i := strings.Index(src, "- name: Validate dispatch inputs")
+	if i < 0 {
+		t.Fatal("no `Validate dispatch inputs` step in the setup job")
+	}
+	setup, matrix := strings.Index(src, "\n  setup:\n"), strings.Index(src, "\n  matrix:\n")
+	if i < setup || i > matrix {
+		t.Fatal("the validate step must be in the setup job")
+	}
+	if co := strings.Index(src, "- uses: ./.github/actions/cluster-runner-up"); i > co {
+		t.Fatal("the validate step must come before the cluster-runner-up step")
+	}
+	r := strings.Index(src[i:], "        run: |\n")
+	if r < 0 {
+		t.Fatal("the validate step has no run block")
+	}
+	var lines []string
+	for _, ln := range strings.Split(src[i+r+len("        run: |\n"):], "\n") {
+		if ln != "" && !strings.HasPrefix(ln, "          ") {
+			break
+		}
+		lines = append(lines, strings.TrimPrefix(ln, "          "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TestWorkflowValidatesItsInputsBeforeProvisioning runs the validate step's
+// script: an unknown or padded value of an input the tables are indexed by
+// (' all' would skip the refusal and index nothing; target=amd64 is not a
+// target) fails, and so does a dispatch that would publish a policy heavy
+// document. Heavy with publish=false, on a fast profile or on a single-arch
+// target stays allowed.
+func TestWorkflowValidatesItsInputsBeforeProvisioning(t *testing.T) {
+	script := validateStep(t)
+	run := func(env ...string) error {
+		cmd := exec.Command("bash", "-e", "-c", script)
+		cmd.Env = append([]string{"PATH=" + os.Getenv("PATH")}, env...)
+		out, err := cmd.CombinedOutput()
+		t.Logf("%v -> %v\n%s", env, err, out)
+		return err
+	}
+	for _, c := range []struct {
+		name string
+		env  []string
+		ok   bool
+	}{
+		{"all empty (schedule or defaults)", nil, true},
+		{"defaults of a dispatch", []string{"IN_PROFILE=headline", "IN_TARGET=both", "IN_PUBLISH=false"}, true},
+		{"explicit all", []string{"IN_PROFILE=full", "IN_ARCH=all", "IN_BASELINE=true", "IN_PUBLISH=false"}, true},
+		{"padded policy", []string{"IN_ARCH= all"}, false},
+		{"capitalised profile", []string{"IN_PROFILE=Full"}, false},
+		{"unknown profile", []string{"IN_PROFILE=nightly"}, false},
+		{"amd64 is not a target", []string{"IN_TARGET=amd64"}, false},
+		{"unknown policy", []string{"IN_ARCH=sometimes"}, false},
+		{"unknown baseline", []string{"IN_BASELINE=yes"}, false},
+		{"heavy would publish", []string{"IN_PROFILE=headline", "IN_ARCH=heavy"}, false},
+		{"heavy would publish, default target", []string{"IN_PROFILE=full", "IN_TARGET=both", "IN_ARCH=heavy", "IN_PUBLISH=true"}, false},
+		{"heavy with publish=false", []string{"IN_PROFILE=full", "IN_ARCH=heavy", "IN_PUBLISH=false"}, true},
+		{"heavy on fast never publishes", []string{"IN_PROFILE=fast", "IN_ARCH=heavy"}, true},
+		{"heavy on a single arch is ignored", []string{"IN_PROFILE=full", "IN_TARGET=msr1", "IN_ARCH=heavy"}, true},
+		{"padded publish=false still publishes", []string{"IN_PROFILE=full", "IN_ARCH=heavy", "IN_PUBLISH= false"}, false},
+	} {
+		if got := run(c.env...) == nil; got != c.ok {
+			t.Errorf("%s: accepted=%v, want %v", c.name, got, c.ok)
+		}
+	}
+}
+
+// TestWorkflowTextsStateTheDefaultCost: the profile input's own text states what
+// the default arch policy costs on target=both (about 60h headline and 102h
+// full, not the one-arch 30h and 51h alone), and no comment still calls heavy
+// the default.
+func TestWorkflowTextsStateTheDefaultCost(t *testing.T) {
+	src := readWorkflow(t, "benchmark-tier.yml")
+	in := regexp.MustCompile(`(?m)^      profile:\n        description: "([^"]*)"`).FindStringSubmatch(src)
+	if in == nil {
+		t.Fatal("no profile input description")
+	}
+	for _, want := range []string{"~60h", "~102h", "default arch policy 'all'", "~30h on one arch", "~51h on one arch"} {
+		if !strings.Contains(in[1], want) {
+			t.Errorf("the profile input text lacks %q:\n%s", want, in[1])
+		}
+	}
+	for _, stale := range []string{"the model's rated cells; heavy)", "(DEFAULT when empty) = a heavy cell", "'heavy' (DEFAULT"} {
+		if strings.Contains(src, stale) {
+			t.Errorf("benchmark-tier.yml still names heavy as the default: %q", stale)
 		}
 	}
 }

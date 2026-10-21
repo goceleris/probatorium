@@ -89,7 +89,8 @@ type clientLock struct {
 var errClientLockWait = errors.New("client lock wait limit exceeded")
 
 // newClientLock validates the flags. An empty path means no lock (a single-arch
-// run); a policy is required only with a path and defaults to heavy.
+// run); a policy is required only with a path and defaults to all (the
+// default policy of a both-arch run, probatorium#442).
 func newClientLock(path, policy string, log io.Writer) (*clientLock, error) {
 	if path == "" {
 		if policy != "" && policy != report.ExclusionOff {
@@ -99,7 +100,7 @@ func newClientLock(path, policy string, log io.Writer) (*clientLock, error) {
 	}
 	switch policy {
 	case "":
-		policy = report.ExclusionHeavy
+		policy = report.ExclusionAll
 	case report.ExclusionHeavy, report.ExclusionAll, report.ExclusionOff:
 	default:
 		return nil, fmt.Errorf("-client-lock-policy %q: want heavy, all or off", policy)

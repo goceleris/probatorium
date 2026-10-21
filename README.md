@@ -298,7 +298,10 @@ The workflow publishes only rated profiles, because saturation-only data would p
 `latency_at_slo`. `mage BenchTier` run by hand publishes unless `BENCH_PUBLISH=0`. The workflow sets
 `BENCH_BUDGET` from a table of profile, baseline switch and arch policy (single arch, no baseline: 24 h, 36 h
 and 60 h; the policies of a both-arch run and the baseline columns have their own entries, see below). The
-budget model projects about 30 h for headline and 51 h for full on one arch. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
+budget model projects about 30 h for headline and 51 h for full on one arch. A preset `cells` or `rated_cells`
+scope is projected from the runner's own dry run (the realized cell and rated cell counts, baseline columns
+included), not from those pins: `rated_cells='*'` rates every cell, about twice the model's 401, and a full
+both-arch dispatch with it no longer passes the gate at 101.9 h. A scope the dry run cannot resolve is refused. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
 and 69 h, because they rated every clean cell.
 
 **Rated data is not publishable yet.** [#441](https://github.com/goceleris/probatorium/issues/441) gates
@@ -420,9 +423,12 @@ under the default instead of 34 h. Projected hours of `profile=full` with the op
 | both arches, `all` (the default) | **130.9 h** | **128.0 h** | **does not fit** |
 
 `full` + `baseline=true` + `target=both` under `all` cannot be held by any job: the workflow refuses it at the
-start of the bench job, before Deploy (the first step of the matrix job, which still follows `setup` and the cluster
-concurrency queue; guarded by exactly that dispatch, tested against the model). Dispatch it
-as two single-arch runs or with `arch_exclusive=heavy`. These are a model of fixed window lengths and the lock's first-come order, not a
+start of the `setup` job, before any runner is provisioned and before Deploy (the run has already entered the
+workflow's cluster concurrency group, so it may have queued behind a running one; the step is guarded by exactly
+that dispatch and tested against the model). Dispatch it as two single-arch runs, `target=msa2-server` and then
+`target=msr1`. `arch_exclusive=heavy` is not an alternative for a published run: its documents are refused at
+publish (policy `heavy` failed P6), and the `setup` job refuses a `heavy` dispatch that would publish; `heavy` stays
+available with `publish=false`. These are a model of fixed window lengths and the lock's first-come order, not a
 cluster run: how often the lock really queues a runner is the first thing the validation run measures
 (`lock_wait_seconds`).
 
@@ -874,9 +880,9 @@ expansion (the `*/*` grid, the default competitor set, `DEPLOY_COMPETITORS=all`,
 `BENCH_BASELINE=1`, which `benchmark-tier.yml` sets from its `baseline` input (default `false`). Switched on it adds
 222 saturation and 120 rated cells per architecture (about +14.5 h projected on `full`, +8.5 h on
 `headline`) and the workflow raises `BENCH_BUDGET` for it, for every arch policy. With `target=both` under the default
-policy `all`, `profile=full` with the baseline projects 130.9 h and is refused at the start of the job (above the
-7200 min job limit; see "A both-arch run"): dispatch it as two single-arch runs (65.5 h each) or with
-`arch_exclusive=heavy` (74.6 h). Columns run as blocks in list order, so
+policy `all`, `profile=full` with the baseline projects 130.9 h and is refused by the `setup` job (above the
+7200 min job limit; see "A both-arch run"): dispatch it as two single-arch runs (`target=msa2-server`, then
+`target=msr1`; 65.5 h each). Columns run as blocks in list order, so
 `servers.InterleaveBaseline` places each baseline column directly beside its `celeris-*` twin (about 1.8 h
 apart, alternating which runs first) instead of the sorted `baseline-*` block fifteen hours earlier. Rows publish with framework `celeris-baseline`,
 framework_version `v1.5.11`. The module is a frozen fork of `servers/celeris` (go.mod pinned, not in

@@ -3,9 +3,13 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,7 +124,14 @@ func BenchTier() error {
 	// extra cells the profile's pins do not count: project the grid that will
 	// run, so the gate cannot pass a baseline dispatch on the baseline-less
 	// numbers. The workflow raises BENCH_BUDGET for a baseline dispatch.
-	p = baselineProjection(p)
+	// A preset scope (the workflow's `cells` and `rated_cells` inputs) changes
+	// which cells run and how many are rated: project that, not the profile's
+	// pins. rated_cells='*' on the full profile rates all 813 cells (about twice
+	// the model's 401) and used to pass this gate on the pins' numbers.
+	p, err = tierProjection(p)
+	if err != nil {
+		return err
+	}
 
 	log, ok := p.FitWithin(fitBudget)
 	fmt.Println(log)
@@ -212,6 +223,82 @@ func BenchTier() error {
 	return nil
 }
 
+// dryRunSummary is the runner's dry-run line for a rated run:
+// "the rated sweep runs on <rated> of the <cells> cells".
+var dryRunSummary = regexp.MustCompile(`the rated sweep runs on (\d+) of the (\d+) cells`)
+
+// parseDryRunSummary reads the cell count and the rated cell count out of a
+// rated `cmd/runner -dry-run`'s stderr. Pure, so it is unit-testable.
+func parseDryRunSummary(stderr string) (cells, rated int, err error) {
+	m := dryRunSummary.FindStringSubmatch(stderr)
+	if m == nil {
+		return 0, 0, fmt.Errorf("the runner's dry run printed no rated-sweep summary:\n%s", strings.TrimSpace(stderr))
+	}
+	rated, _ = strconv.Atoi(m[1])
+	cells, _ = strconv.Atoi(m[2])
+	return cells, rated, nil
+}
+
+// realizedCounts asks the runner itself which cells a scope schedules and how
+// many get the rated sweep: the registry, the capability gating and
+// BENCH_BASELINE all apply, as they will in the run. A variable so a test can
+// stand in for the exec.
+var realizedCounts = func(cells, ratedCells string) (int, int, error) {
+	cmd := exec.Command("go", "run", "./cmd/runner", "-dry-run", "-runs", "1",
+		"-cells", cells, "-rated", "-rated-cells", ratedCells)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if _, err := cmd.Output(); err != nil {
+		return 0, 0, fmt.Errorf("resolve the cell counts of -cells %q -rated-cells %q: %w\n%s", cells, ratedCells, err, strings.TrimSpace(stderr.String()))
+	}
+	return parseDryRunSummary(stderr.String())
+}
+
+// scopedProjection returns the profile to gate. With neither BENCH_CELLS nor
+// BENCH_RATED_CELLS preset it is p itself (the pins are the grid). Otherwise
+// the cell and rated cell counts are the runner's realized counts for the
+// scope that will run (baseline columns included, since the dry run reads
+// BENCH_BASELINE), so a wider rated scope is priced and a narrower one is not
+// over-charged. scoped reports that the counts already include the baseline
+// columns. A profile without a rated sweep rates nothing whatever the glob.
+func scopedProjection(p budget.Profile) (budget.Profile, bool, error) {
+	cells := strings.TrimSpace(os.Getenv("BENCH_CELLS"))
+	rated := strings.TrimSpace(os.Getenv("BENCH_RATED_CELLS"))
+	if cells == "" && (rated == "" || p.RatedPasses == 0) {
+		return p, false, nil
+	}
+	if cells == "" {
+		cells = budget.CellsGlob(p)
+	}
+	if rated == "" {
+		rated = budget.RatedGlob(p)
+	}
+	n, r, err := realizedCounts(cells, rated)
+	if err != nil {
+		return p, false, fmt.Errorf("cannot project the scoped run, refusing rather than gating the profile's pins: %w", err)
+	}
+	if p.RatedPasses == 0 {
+		r = 0
+	}
+	fmt.Printf("scoped run: BENCH_CELLS=%q BENCH_RATED_CELLS=%q realize %d cells, %d rated (the profile's pins: %d, %d)\n", cells, rated, n, r, p.Cells, p.RatedCells)
+	p.Cells, p.RatedCells = n, r
+	return p, true, nil
+}
+
+// tierProjection is the profile BenchTier gates: the scoped counts when a scope
+// is preset (they already include the baseline columns), else the pins plus the
+// baseline columns when BENCH_BASELINE is on.
+func tierProjection(p budget.Profile) (budget.Profile, error) {
+	p, scoped, err := scopedProjection(p)
+	if err != nil {
+		return p, err
+	}
+	if !scoped {
+		p = baselineProjection(p)
+	}
+	return p, nil
+}
+
 // baselineProjection adds the opt-in baseline columns to p's cell counts when
 // BENCH_BASELINE is on (servers.BaselineEnabled) and returns p unchanged
 // otherwise.
@@ -258,8 +345,10 @@ func benchTierEnv(p budget.Profile) {
 // (benchmark-tier.yml's `cells` input) scopes the run to those globs
 // instead of the profile's, so a 3-scenario A/B does not pay for the
 // column's whole catalogue. The budget projection (FitWithin, run before
-// this) still counts the profile's full grid, which a scoped run passes
-// trivially — logged, not hidden.
+// this) counts the scope that will run: scopedProjection asks the runner's dry
+// run for the realized cell and rated cell counts of a preset BENCH_CELLS /
+// BENCH_RATED_CELLS, so neither a scoped run nor a widened rated scope slips
+// past the gate on the profile's pins.
 func setBenchEnvFromProfile(p budget.Profile, rated bool) {
 	setCells := func(profileGlob string) {
 		glob, overridden := resolveBenchCells(os.Getenv("BENCH_CELLS"), profileGlob)

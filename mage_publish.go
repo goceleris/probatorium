@@ -222,6 +222,11 @@ func checkDataCompleteness(doc *report.Document) error {
 	if p := doc.Environment.ArchExclusion.Problem(); p != "" {
 		problems = append(problems, p)
 	}
+	// The policy heavy exemption of the light rows did not hold (P6, arm64): a
+	// heavy document is data only. BENCH_PUBLISH_FORCE=1 overrides.
+	if p := doc.Environment.ArchExclusion.PublishProblem(); p != "" {
+		problems = append(problems, p)
+	}
 
 	celerisSeen := false
 	for _, b := range doc.Benchmarks {

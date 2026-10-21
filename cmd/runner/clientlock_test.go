@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,11 @@ import (
 
 func testLock(t *testing.T, path, policy string) *clientLock {
 	t.Helper()
+	if policy == "" && path != "" {
+		// these tests exercise the heavy-cells-only semantics; the flag's own
+		// default (all) is TestClientLockPolicyDefaultsToAll.
+		policy = report.ExclusionHeavy
+	}
 	l, err := newClientLock(path, policy, io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -334,5 +341,26 @@ func TestClientLockLimitsCoverTheCell(t *testing.T) {
 	cfg.RatedMode = false
 	if h, _ := cfg.clientLockLimits(); h != (340+60)*time.Second {
 		t.Fatalf("hold limit without rated: %v", h)
+	}
+}
+
+// TestClientLockPolicyDefaultsToAll: a lock path with no policy is the strict
+// policy, the default of a both-arch run (probatorium#442): a light cell takes
+// the lock, and the flag's help text says so.
+func TestClientLockPolicyDefaultsToAll(t *testing.T) {
+	l, err := newClientLock(filepath.Join(t.TempDir(), "x.lock"), "", io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.policy != report.ExclusionAll {
+		t.Errorf("empty policy resolved to %q, want %q", l.policy, report.ExclusionAll)
+	}
+	if !l.needs("churn-close") {
+		t.Error("under the default policy a light cell must take the lock")
+	}
+	var out bytes.Buffer
+	_, _ = ParseArgs([]string{"-h"}, &out) // flag.ErrHelp: the usage goes to out
+	if !strings.Contains(out.String(), "all (default), heavy, or off") {
+		t.Errorf("the -client-lock-policy help text does not name all as the default:\n%s", out.String())
 	}
 }

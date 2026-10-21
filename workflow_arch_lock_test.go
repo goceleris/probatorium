@@ -31,7 +31,7 @@ func TestRunBenchCellPassesTheArchLockToTheRunner(t *testing.T) {
 	for _, want := range []string{
 		`{% if bench_client_lock is defined and bench_client_lock %}`,
 		`-client-lock '{{ bench_client_lock }}'`,
-		`-client-lock-policy {{ bench_client_lock_policy | default("heavy") }}`,
+		`-client-lock-policy {{ bench_client_lock_policy | default("all") }}`,
 		`-cell-order reverse`,
 	} {
 		if !strings.Contains(line, want) {

@@ -267,3 +267,19 @@ func (e *ArchExclusion) Problem() string {
 	}
 	return ""
 }
+
+// PublishProblem is why a document with this verdict is not published although
+// Problem is empty: the client-lock policy heavy lets a heavy cell share the
+// client with the other arch's light cells and a light cell's rated passes run
+// under its heavy cells, and the validation read of 2026-10-21 found that
+// exemption does not hold (P6 failed on arm64, docs/ARCH-EXCLUSION-VALIDATION.md).
+// A heavy document is data, not a publishable result; the default policy (all)
+// and a single-arch run are not affected. BENCH_PUBLISH_FORCE=1 overrides it
+// like the other publish checks. The text avoids the words Problem uses so a
+// caller can tell the two apart.
+func (e *ArchExclusion) PublishProblem() string {
+	if e != nil && e.Policy == ExclusionHeavy {
+		return "client-lock policy heavy: not publishable since the validation read of 2026-10-21 (P6 failed on arm64: a heavy cell under the other arch's light rows lost up to 17%); rerun with the default policy (all), or dispatch with publish=false for data only"
+	}
+	return ""
+}

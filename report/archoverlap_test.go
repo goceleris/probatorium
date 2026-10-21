@@ -215,3 +215,23 @@ func TestArchExclusionPeerThatDroveNoLoadDoesNotRefuseTheSurvivor(t *testing.T) 
 		t.Errorf("a peer window with no timestamps: Problem() = %q, want not verified", p)
 	}
 }
+
+// TestPublishProblemRefusesPolicyHeavyOnly: a document of the heavy policy is
+// data only since the validation read of 2026-10-21 (P6 failed on arm64); the
+// default policy, the control and an absent record are not refused by it.
+func TestPublishProblemRefusesPolicyHeavyOnly(t *testing.T) {
+	heavy := &ArchExclusion{Policy: ExclusionHeavy, Checked: 3, PeerChecked: 3}
+	if heavy.Problem() != "" {
+		t.Fatalf("the heavy record is clean for Problem: %q", heavy.Problem())
+	}
+	if p := heavy.PublishProblem(); !strings.Contains(p, "policy heavy") || !strings.Contains(p, "publish=false") {
+		t.Errorf("PublishProblem(heavy) = %q, want the refusal with the way out", p)
+	}
+	for name, e := range map[string]*ArchExclusion{
+		"all": {Policy: ExclusionAll, Checked: 3, PeerChecked: 3}, "off": {Policy: ExclusionOff}, "nil": nil,
+	} {
+		if p := e.PublishProblem(); p != "" {
+			t.Errorf("%s: PublishProblem = %q, want none", name, p)
+		}
+	}
+}

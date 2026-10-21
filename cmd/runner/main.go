@@ -201,8 +201,8 @@ type Config struct {
 	// clientlock.go). Empty = no lock (single-arch runs). Remote-target mode
 	// only.
 	ClientLock string
-	// ClientLockPolicy is which cells take the lock: heavy (default when
-	// ClientLock is set), all, or off.
+	// ClientLockPolicy is which cells take the lock: all (default when
+	// ClientLock is set), heavy, or off.
 	ClientLockPolicy string
 	// CellOrder is the order the runner walks its schedule: forward (the
 	// registry order, default) or reverse. A BENCH_TARGET=both run walks the
@@ -276,7 +276,7 @@ func (c *Config) Bind(fs *flag.FlagSet) {
 	fs.StringVar(&c.ClientLock, "client-lock", c.ClientLock,
 		"path of the host-wide lock file shared by both arch runners of a BENCH_TARGET=both run; a heavy cell holds it so the arches never load the client together (probatorium#442); empty = no lock")
 	fs.StringVar(&c.ClientLockPolicy, "client-lock-policy", c.ClientLockPolicy,
-		"which cells take the -client-lock: heavy (default), all, or off")
+		"which cells take the -client-lock: all (default), heavy, or off")
 	fs.StringVar(&c.CellOrder, "cell-order", c.CellOrder,
 		"order the schedule is walked: forward (default) or reverse")
 	fs.Func("rated-fractions",

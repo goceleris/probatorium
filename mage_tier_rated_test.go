@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"slices"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goceleris/probatorium/budget"
+	"github.com/goceleris/probatorium/servers"
 )
 
 // benchEnvKeys are the BENCH_* variables BenchTier's env resolution reads or
@@ -118,4 +120,134 @@ func TestBenchTierRatedScopeEdges(t *testing.T) {
 			t.Errorf("BENCH_RATED=1 without BENCH_RATED_CELLS rates %q, want the model's %q", r.Cells, budget.RatedCellsGlob())
 		}
 	})
+}
+
+// TestScopedProjectionPricesTheRatedScope is the gate of the workflow's
+// `rated_cells` input: profile=full target=both (policy all) with
+// rated_cells='*' rates every cell, about twice the model's 401, and used to
+// pass FitWithin on the profile's pins at 101.9 h against the 108 h budget.
+// The realized counts price it (the counter is stubbed here; the real dry run is
+// TestRealizedCountsMatchThePins).
+func TestScopedProjectionPricesTheRatedScope(t *testing.T) {
+	stub := func(cells, rated string) (int, int, error) {
+		switch {
+		case rated == "*" && cells == budget.CellsGlob(budget.Full()):
+			return budget.FullRealizedCells, budget.FullRealizedCells, nil // every cell rated
+		case cells == "post-4k/*" && rated == "*":
+			return 52, 52, nil
+		}
+		return 0, 0, fmt.Errorf("unexpected scope %q %q", cells, rated)
+	}
+	old := realizedCounts
+	realizedCounts = stub
+	defer func() { realizedCounts = old }()
+
+	both := func() budget.Profile {
+		p := budget.Full()
+		p.Runs, p.Arches, p.ArchExclusion = 1, 2, "all"
+		return p
+	}
+	const bud = 108 * time.Hour // the workflow's full / all budget
+
+	// no preset: the pins, which fit.
+	t.Setenv("BENCH_CELLS", "")
+	t.Setenv("BENCH_RATED_CELLS", "")
+	p, scoped, err := scopedProjection(both())
+	if err != nil || scoped {
+		t.Fatalf("no preset: scoped=%v err=%v, want the profile unchanged", scoped, err)
+	}
+	if _, ok := p.FitWithin(bud); !ok {
+		t.Fatal("the model's own full / all projection must fit 108h")
+	}
+
+	// rated_cells='*' on the whole grid: priced, and refused.
+	t.Setenv("BENCH_RATED_CELLS", "*")
+	p, scoped, err = scopedProjection(both())
+	if err != nil || !scoped || p.RatedCells != budget.FullRealizedCells {
+		t.Fatalf("rated_cells=*: scoped=%v rated=%d err=%v, want every cell rated", scoped, p.RatedCells, err)
+	}
+	t.Logf("full / both / all with rated_cells='*': %s projected (the pins say %s) against the %s budget", p.WallClock().Round(time.Minute), both().WallClock().Round(time.Minute), bud)
+	if log, ok := p.FitWithin(bud); ok {
+		t.Errorf("rated_cells='*' on full / both / all fits 108h: the gate still ignores the rated scope\n%s", log)
+	}
+
+	// a scoped run is priced by its own cells: it fits.
+	t.Setenv("BENCH_CELLS", "post-4k/*")
+	p, scoped, err = scopedProjection(both())
+	if err != nil || !scoped || p.Cells != 52 {
+		t.Fatalf("scoped: scoped=%v cells=%d err=%v", scoped, p.Cells, err)
+	}
+	if log, ok := p.FitWithin(bud); !ok {
+		t.Errorf("a 52-cell scope must fit:\n%s", log)
+	}
+
+	// a profile without a rated sweep rates nothing whatever the glob.
+	fast := budget.Fast()
+	fast.Runs, fast.Arches = 1, 2
+	if p, _, err := scopedProjection(fast); err != nil || p.RatedCells != 0 {
+		t.Errorf("fast with a rated glob: rated=%d err=%v, want 0", p.RatedCells, err)
+	}
+
+	// the dry run failing is a refusal, not a silent fall back to the pins.
+	realizedCounts = func(string, string) (int, int, error) { return 0, 0, fmt.Errorf("go: no") }
+	if _, _, err := scopedProjection(both()); err == nil {
+		t.Error("a failing dry run must refuse the projection")
+	}
+}
+
+func TestParseDryRunSummary(t *testing.T) {
+	in := "probatorium-runner: rated mode ON\nprobatorium-runner: dry-run; the rated sweep runs on 401 of the 813 cells (-rated-cells \"x\") once each saturation pass is clean\n"
+	cells, rated, err := parseDryRunSummary(in)
+	if err != nil || cells != 813 || rated != 401 {
+		t.Errorf("got cells=%d rated=%d err=%v", cells, rated, err)
+	}
+	if _, _, err := parseDryRunSummary("nothing here"); err == nil {
+		t.Error("a dry run with no summary must be an error")
+	}
+}
+
+// TestRealizedCountsMatchThePins runs the real dry run: the counts the gate
+// uses for a preset scope agree with the pins the unscoped gate uses, widen
+// with rated_cells='*', and follow BENCH_BASELINE (so the scoped projection
+// must not add the baseline columns a second time).
+func TestRealizedCountsMatchThePins(t *testing.T) {
+	if testing.Short() {
+		t.Skip("execs go run ./cmd/runner")
+	}
+	full := budget.Full()
+	for _, c := range []struct {
+		name, baseline, rated string
+		cells, ratedN         int
+	}{
+		{"pins", "", budget.RatedGlob(full), budget.FullRealizedCells, budget.FullRatedRealizedCells},
+		{"every cell rated", "", "*", budget.FullRealizedCells, budget.FullRealizedCells},
+		{"pins with the baseline", "1", budget.RatedGlob(full), budget.FullRealizedCells + budget.BaselineRealizedCells, budget.FullRatedRealizedCells + budget.BaselineRatedRealizedCells},
+	} {
+		t.Setenv(servers.BaselineEnvVar, c.baseline)
+		n, r, err := realizedCounts(budget.CellsGlob(full), c.rated)
+		if err != nil || n != c.cells || r != c.ratedN {
+			t.Errorf("%s: got %d cells %d rated (err %v), want %d / %d", c.name, n, r, err, c.cells, c.ratedN)
+		}
+	}
+}
+
+// TestTierProjectionDoesNotCountTheBaselineTwice: a preset scope's realized
+// counts already include the baseline columns (the dry run reads
+// BENCH_BASELINE), so only the unscoped projection adds them.
+func TestTierProjectionDoesNotCountTheBaselineTwice(t *testing.T) {
+	old := realizedCounts
+	defer func() { realizedCounts = old }()
+	realizedCounts = func(string, string) (int, int, error) { return 100, 50, nil } // as the runner counts them, baseline on
+	t.Setenv(servers.BaselineEnvVar, "1")
+	t.Setenv("BENCH_CELLS", "post-4k/*")
+	t.Setenv("BENCH_RATED_CELLS", "")
+	p, err := tierProjection(budget.Full())
+	if err != nil || p.Cells != 100 || p.RatedCells != 50 {
+		t.Errorf("scoped with the baseline: cells=%d rated=%d err=%v, want the runner's 100 / 50", p.Cells, p.RatedCells, err)
+	}
+	t.Setenv("BENCH_CELLS", "")
+	p, err = tierProjection(budget.Full())
+	if want := budget.Full().WithBaseline(); err != nil || p.Cells != want.Cells || p.RatedCells != want.RatedCells {
+		t.Errorf("unscoped with the baseline: cells=%d rated=%d err=%v, want %d / %d", p.Cells, p.RatedCells, err, want.Cells, want.RatedCells)
+	}
 }

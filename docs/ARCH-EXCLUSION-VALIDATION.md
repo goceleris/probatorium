@@ -3,11 +3,13 @@
 This page was written before the runs: nothing in the arch lock had run on the cluster. These are the scoped
 both-arch runs that check it, with their criteria fixed before they run. They have run; the verdict is the next
 section, and the rest of the page (the runs, the pre-registered criteria, what the verdicts do) is kept as
-written. They do not close #442 by themselves: #442's own close criteria are quoted at the end.
+written; the only edit is to the opening words of its first paragraph, which named `heavy` as the default and now
+say it was (one sentence of "The runs" has since become untrue, noted in the verdict). They do not close #442 by themselves: #442's own close criteria are quoted at the end.
 
 ## Verdict (read 2026-10-21): the default arch policy is now `all`
 
-Runs A (the then-default `heavy`, benchmark-tier 39532394806, head 58f85c4) and B (`arch_exclusive=all`,
+Runs A (the then-default `heavy`, benchmark-tier 39532394806, head 58f85c4, which after the rebase onto main is the
+patch-identical 58eb73a: `git range-diff` shows them equal) and B (`arch_exclusive=all`,
 39543338699) were read once, strictly by the criteria below (`read_validation.py`, one reader for both). Both
 used the celeris pin of 2026-10-13, i.e. before celeris#1049 and #1085. Arms C and D (the idle-wait and off
 controls) were not part of this read, so P7 was not evaluated.
@@ -35,11 +37,18 @@ the pre-#1049/#1085 build). (2) #442 stays open: get-simple-1024c, get-json-h2 a
 scope and only a full both-arch run reads them. (3) One A against one B, no A/A twin: the 0.827 is one cell of
 one run. (4) The scope is three columns and five rows; the driver rows are not covered.
 
+One sentence of "The runs" below is kept as written and no longer holds: a scoped run does not pass the budget gate trivially. Since this
+revision `mage BenchTier` projects a preset `cells` / `rated_cells` scope from the runner's dry run (its realized
+cell and rated cell counts), so the validation runs, which are scoped to 15 cells per arch, are priced as such.
+
 Cost of the new default, from the planner and the budget model (`go test ./budget ./cmd/runner -run
 'FullBaselineUnderAll|BaselineGridArchPlan' -v`): `profile=full target=both` projects 101.9 h under `all`
 (58.1 h under `heavy`); with `baseline=true` it projects 130.9 h under `all` (the planner says 128.0 h), above the
-7200 minute (120 h) job limit, so the workflow refuses that dispatch at the start of the job: run it as two
-single-arch dispatches (65.5 h each) or with `arch_exclusive=heavy` (74.6 h).
+7200 minute (120 h) job limit, so the setup job refuses that dispatch before any runner is provisioned: run it as
+two single-arch dispatches (`target=msa2-server`, then `target=msr1`; 65.5 h each). `arch_exclusive=heavy`
+(74.6 h) is not an alternative for a published run: policy `heavy` failed P6, so its documents are refused at
+publish (`BENCH_PUBLISH_FORCE=1` overrides) and the workflow refuses a `heavy` dispatch that would publish; it
+stays available with `publish=false` for data-only runs.
 
 The default policy when this page was written, `heavy`, keeps heavy cells of the two arches apart and leaves three exposures
 unmeasured (README, "What it does not do"): an x86 heavy cell sharing the client with the arm64 light rows

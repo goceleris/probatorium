@@ -178,6 +178,57 @@ func TestBothArchRunStampsVerdictIntoBothDocuments(t *testing.T) {
 	}
 }
 
+// TestPublishGateRefusesAHeavyDocument: a clean policy heavy run is data only
+// (P6 failed on arm64, docs/ARCH-EXCLUSION-VALIDATION.md): the publish gate
+// refuses it with the way out, BENCH_PUBLISH_FORCE=1 overrides, and the same
+// run under the default policy is not refused for its policy.
+func TestPublishGateRefusesAHeavyDocument(t *testing.T) {
+	dir := t.TempDir()
+	writeArchRun(t, dir, 160)
+	mergeBoth(t, dir, "heavy")
+	amd := readDoc(t, filepath.Join(dir, "results-amd64.json"))
+	err := checkDataCompleteness(&amd)
+	if err == nil || !strings.Contains(err.Error(), "client-lock policy heavy") {
+		t.Fatalf("a heavy document must be refused for publication, got %v", err)
+	}
+	t.Setenv("BENCH_PUBLISH_FORCE", "1")
+	if err := checkDataCompleteness(&amd); err != nil && strings.Contains(err.Error(), "client-lock policy heavy") {
+		t.Errorf("BENCH_PUBLISH_FORCE=1 must bypass: %v", err)
+	}
+	t.Setenv("BENCH_PUBLISH_FORCE", "")
+	amd.Environment.ArchExclusion.Policy = "all"
+	if err := checkDataCompleteness(&amd); err != nil && strings.Contains(err.Error(), "client-lock policy") {
+		t.Errorf("a policy all document is refused for its policy: %v", err)
+	}
+}
+
+// TestCheckArchOverlapDirDoesNotGuessAPolicy: a document that records no policy
+// is checked against none unless the caller names one; the old fallback was
+// heavy, which is weaker than the default.
+func TestCheckArchOverlapDirDoesNotGuessAPolicy(t *testing.T) {
+	dir := t.TempDir()
+	writeArchRun(t, dir, 160)
+	mergeBoth(t, dir, "heavy")
+	for _, a := range []string{"amd64", "arm64"} {
+		f := filepath.Join(dir, "results-"+a+".json")
+		d := readDoc(t, f)
+		d.Environment.ArchExclusion = nil
+		raw, err := json.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := checkArchOverlapDir(dir, ""); err == nil || !strings.Contains(err.Error(), "records no arch_exclusion policy") {
+		t.Fatalf("err = %v, want the no-recorded-policy refusal", err)
+	}
+	if rep, err := checkArchOverlapDir(dir, "all"); err != nil || rep.Policy != "all" || !rep.Clean() {
+		t.Errorf("a caller-named policy must be used: %v\n%s", err, rep)
+	}
+}
+
 // TestBothArchRunThatOverlappedIsRefused: the arm64 heavy cell starts 100 s
 // into the x86 one. The verdict records it, the finished-run check fails, and
 // the publish gate refuses the document (BENCH_PUBLISH_FORCE overrides).

@@ -214,16 +214,20 @@ func checkArchOverlapDir(dir, policy string) (report.OverlapReport, error) {
 			return report.OverlapReport{}, fmt.Errorf("parse results-%s.json: %w", arch, err)
 		}
 	}
+	if len(docs[0].LoadWindows) == 0 || len(docs[1].LoadWindows) == 0 {
+		return report.OverlapReport{Policy: policy}, fmt.Errorf(
+			"%s has no load_windows (a run before schema 5.22, or a single-arch run): its arch overlap cannot be checked, and a both-arch run of that age ran the arches concurrently (probatorium#442)", dir)
+	}
 	if policy == "" {
 		if ae := docs[0].Environment.ArchExclusion; ae != nil && ae.Policy != "" {
 			policy = ae.Policy
 		} else {
-			policy = report.ExclusionHeavy
+			// No recorded policy (a document written before schema 5.22, or by
+			// hand): do not guess a weaker one than the default. The caller names
+			// it with BENCH_ARCH_EXCLUSIVE.
+			return report.OverlapReport{}, fmt.Errorf(
+				"%s records no arch_exclusion policy: set BENCH_ARCH_EXCLUSIVE=all|heavy|off to check it against one", dir)
 		}
-	}
-	if len(docs[0].LoadWindows) == 0 || len(docs[1].LoadWindows) == 0 {
-		return report.OverlapReport{Policy: policy}, fmt.Errorf(
-			"%s has no load_windows (a run before schema 5.22, or a single-arch run): its arch overlap cannot be checked, and a both-arch run of that age ran the arches concurrently (probatorium#442)", dir)
 	}
 	rep := report.CheckArchOverlap(docs[0].LoadWindows, docs[1].LoadWindows, policy)
 	if !rep.Clean() {
