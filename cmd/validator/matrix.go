@@ -551,6 +551,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		RefappWorkers:       cellRefappWorkers(mc.Engine, cfg.RefappWorkers),
 		ConcurrencyFloor:    cellConcurrencyFloor(mc.Engine),
 		WSEchoSlowTolerance: wsEchoSlowTolerance(cfg.RaceTier),
+		MarkovThinkTime:     cellMarkovThinkTime(mc.Engine, cfg.RaceTier),
 		DriverMode:          cfg.DriverMode,
 		DriverSSHUser:       cfg.DriverSSHUser,
 		DriverSSHHost:       cfg.DriverSSHHost,
@@ -736,13 +737,46 @@ func wsEchoSlowTolerance(raceTier bool) int {
 	return 0
 }
 
-// raceAdaptiveMarkovThink is the pause each Markov walker of the race tier's
-// adaptive cell takes after every request.
+// raceAdaptiveMarkovThink is the pause each Markov walker of the RACE TIER's
+// ADAPTIVE cell takes after every request. Nothing else is paced: the worker
+// count (2), the walker count (110) and the connections they hold are exactly
+// the sizing above, because the controller promotes on conns per worker.
+//
+// WHY. That sizing is closed-loop: 67 Markov walkers each send the next request
+// the instant the last one is answered. Without the detector that is a rate the
+// two engine loops carry (nightly 39599497495: the same cell, same sizing, every
+// gated signal zero). Under -race every request costs several times the CPU, and
+// the cell saturates its loops: auth_session_ratelimit/adaptive/amd64 failed the
+// race gate in every run since 39560945814, with a fourth SLOW_CLASS ws_echo
+// timeout over the tolerated N = 3 and, now and then, a reset-type counter
+// (h2c_hang, ws_handshake_fail, sse_handshake_fail, ws_echo_missing), always
+// with the loops busy and the refapp alive. The same race build as a pure engine
+// (4 to 16 loops, 10 walkers) passes. The echo and the connection churners are
+// the victims, not the load: the Markov fleet is the one slice with no pause.
+//
+// WHAT IT BUYS AND WHAT IT MUST NOT COST. The race cell carried ~17.8k requests
+// a second on 2 loops (the pure engines ~3.6k a loop). A closed-loop walker
+// answered in ~3.8 ms there, so 4 ms of think time puts the fleet near 9 to 11k
+// a second whatever the latency does. The floor matters as much as the ceiling:
+// the controller refuses to promote while a tick's bytes per request is at or
+// above 8192, and a healthy ws_echo streams ~50 MB a second through the engine
+// without counting a request, so the fleet must keep offering at least ~7k
+// requests a second or a healthy echo itself suppresses the switch. Promotion is
+// still checked by the gate in every default race run (ExpectAdaptiveSwitch), and
+// a shaped cell that misses it says it was shaped.
+//
+// This is a load shape, not a threshold: no tolerance, no N, no timeout and no
+// oracle moves (probatorium#481).
 const raceAdaptiveMarkovThink = 4 * time.Millisecond
 
-// cellMarkovThinkTime is the Markov walkers' pause for a cell. Stub: nothing is
-// shaped yet.
+// cellMarkovThinkTime is the Markov walkers' pause for a cell: the race tier's
+// adaptive cell only (-race-tier is passed by the playbook for the -race refapp
+// set only, like WSEchoSlowTolerance), zero for every other cell, which keeps
+// every other cell's walkers closed-loop exactly as they have always run.
 func cellMarkovThinkTime(engine string, raceTier bool) time.Duration {
+	if raceTier && engine == "adaptive" {
+		return raceAdaptiveMarkovThink
+	}
 	return 0
 }
 
