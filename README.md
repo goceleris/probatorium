@@ -216,7 +216,9 @@ gh workflow run cluster-reboot.yml --repo goceleris/probatorium --ref main \
 - **It refuses, on the host, before touching anything:** any of the three hosts unreachable; a bench manifest on any
   of them; on the target a runner job executing, a power-loss resume pending, entries in `results_root` (tmpfs: the
   reboot destroys them), an r8127 NIC without the shutdown quiesce hook or without the module for the running
-  kernel, or a newer kernel installed than the one running.
+  kernel, tailscaled running but not enabled at boot (the host would come back off the tailnet), or a newer kernel
+  installed than the one running (a decision for the maintainer: it changes comparability). The reasons are in the step
+  summary.
 - **It records, then reboots, then verifies.** Before: boot id, boot time, kernel, the NIC vectors found by name with
   their since-boot totals and IRQ affinity, bonds, crash dumps. Then `ansible.builtin.reboot` (bounded at 15 minutes),
   then a snapshot polled for up to 3 minutes. It FAILS unless the boot id changed, the kernel is the same, no new
