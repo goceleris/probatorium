@@ -67,7 +67,7 @@ func TestRunMarkovWalker_NoReloginAfterStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), tier1TestBudget)
 	defer cancel()
 	var tally tier1Tally
-	runMarkovWalker(ctx, stop, &http.Client{Timeout: time.Second}, srv.URL, minimalMatrix(t), 0xa11ce, &tally)
+	runMarkovWalker(ctx, stop, &http.Client{Timeout: time.Second}, srv.URL, minimalMatrix(t), 0xa11ce, 0, &tally)
 	// The 401 after stop must have happened, or the test proves nothing.
 	if w := walks.Load(); w != 1 {
 		t.Fatalf("%d walk requests, want exactly the one in flight when the phase ended", w)
