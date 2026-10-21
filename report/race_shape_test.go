@@ -9,7 +9,7 @@ import (
 
 func shapedCell() ValidationCellResult {
 	c := cleanCell("auth_session_ratelimit", "adaptive", "amd64")
-	c.Tier1.LoadShaping = &LoadShaping{Reason: "race build", Walkers: 110, MarkovWalkers: 67, MarkovThinkMs: 4}
+	c.Tier1.LoadShaping = &LoadShaping{Reason: "race build", Walkers: 110, MarkovWalkers: 67, MarkovMinPeriodUs: 6500}
 	return c
 }
 
@@ -36,7 +36,7 @@ func TestLoadShapingRoundTripsAndIsOmittedWhenAbsent(t *testing.T) {
 		t.Fatal(err)
 	}
 	ls := back.Validation.Cells[0].Tier1.LoadShaping
-	if ls == nil || ls.Walkers != 110 || ls.MarkovWalkers != 67 || ls.MarkovThinkMs != 4 || ls.Reason != "race build" {
+	if ls == nil || ls.Walkers != 110 || ls.MarkovWalkers != 67 || ls.MarkovMinPeriodUs != 6500 || ls.Reason != "race build" {
 		t.Errorf("round trip lost the record: %+v", ls)
 	}
 	if back.Validation.Cells[1].Tier1.LoadShaping != nil {
@@ -50,14 +50,40 @@ func TestLoadShapingRoundTripsAndIsOmittedWhenAbsent(t *testing.T) {
 
 // A shaped cell must be a race-built cell: shaping is the race tier's, and a
 // cell that was paced without the detector would be a nightly validated at a
-// fraction of its load. The same I-RACE test the SLOW tolerance uses.
+// fraction of its load. The same I-RACE test the SLOW tolerance uses. The two
+// ways to fail it have different causes and say so, word for word.
 func TestGateFailsAShapedCellThatShowsNoRaceBuild(t *testing.T) {
+	// The property loop ran and did not declare I-RACE: not a -race build.
 	c := shapedCell()
 	c.PropertiesNotInstrumented = []string{"I-RACE"}
 	v := Gate([]ValidationCellResult{c}, nil, raceOpts())
-	if len(v) != 1 || v[0].Field != "tier_1.load_shaping" || !strings.Contains(v[0].Why, "-race build") {
-		t.Fatalf("want exactly the tier_1.load_shaping violation, got %v", v)
+	if len(v) != 1 || v[0].Field != "tier_1.load_shaping" || v[0].Value != 6500 || v[0].Why != loadShapingNoRaceWhy {
+		t.Fatalf("want exactly the tier_1.load_shaping violation with value 6500 and the no-race-build reason, got %v", v)
 	}
+	if want := "this cell's Markov walkers were paced (load shaping, a race-tier measure for the detector's slowdown) but the cell does not show a -race build (I-RACE not declared by its property loop): it was validated at a fraction of the load it is gated for"; v[0].Why != want {
+		t.Errorf("no-race-build reason changed:\n got %q\nwant %q", v[0].Why, want)
+	}
+
+	// The property loop never ran (the refapp died, /debug/vars unreachable):
+	// that is not a refapp without the detector, and must not say so.
+	n := shapedCell()
+	n.Tier1.PropertyEvaluations, n.Tier1.PropertySkips = 0, 0
+	var rows []Violation
+	for _, x := range Gate([]ValidationCellResult{n}, nil, raceOpts()) {
+		if x.Field == "tier_1.load_shaping" {
+			rows = append(rows, x)
+		}
+	}
+	if len(rows) != 1 || rows[0].Value != 6500 || rows[0].Why != loadShapingNoLoopWhy {
+		t.Fatalf("want exactly one tier_1.load_shaping row with the property-loop reason, got %v", rows)
+	}
+	if want := "this cell's Markov walkers were paced (load shaping, a race-tier measure for the detector's slowdown) but its property loop did not run, so I-RACE could not be declared and the cell cannot be shown to be a -race build"; rows[0].Why != want {
+		t.Errorf("property-loop reason changed:\n got %q\nwant %q", rows[0].Why, want)
+	}
+	if strings.Contains(rows[0].Why, "does not show a -race build") {
+		t.Error("a cell whose property loop did not run is accused of lacking the detector")
+	}
+
 	// Declared I-RACE: clean, and an unshaped cell without I-RACE is not this rule's business.
 	if v := Gate([]ValidationCellResult{shapedCell()}, nil, raceOpts()); len(v) != 0 {
 		t.Errorf("a shaped race cell with I-RACE declared must pass, got %v", v)
@@ -71,11 +97,11 @@ func TestGateFailsAShapedCellThatShowsNoRaceBuild(t *testing.T) {
 	}
 }
 
-// If the pause stopped a cell from promoting, the cell says so: the gate already
+// If the pacing stopped a cell from promoting, the cell says so: the gate already
 // fails a missed promotion (VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH, on in every
 // default race run); a shaped cell adds that its walkers were paced, so the
 // reader's first suspect is the right one. An unshaped cell's wording is the
-// literal it was.
+// literal it was, and the shaped one is that literal plus an exact sentence.
 func TestMissedPromotionOfAShapedCellNamesTheShaping(t *testing.T) {
 	opts := GateOptions{RequireTier3: true, RequireProperties: true, ExpectAdaptiveSwitch: true}
 	plain := cleanCell("auth_session_ratelimit", "adaptive", "amd64")
@@ -90,13 +116,23 @@ func TestMissedPromotionOfAShapedCellNamesTheShaping(t *testing.T) {
 	if pv[0].Why != wantPlain {
 		t.Errorf("the unshaped wording changed:\n got %q\nwant %q", pv[0].Why, wantPlain)
 	}
-	shaped := plain
-	shaped.Tier1.LoadShaping = &LoadShaping{Reason: "race build", Walkers: 110, MarkovWalkers: 67, MarkovThinkMs: 4}
-	sv := Gate([]ValidationCellResult{shaped}, nil, opts)
-	if len(sv) != 1 || sv[0].Field != "tier_1.adaptive_switches" {
-		t.Fatalf("a shaped cell that never promoted must fail on adaptive_switches, got %v", sv)
-	}
-	if !strings.HasPrefix(sv[0].Why, wantPlain) || !strings.Contains(sv[0].Why, "4 ms") || !strings.Contains(sv[0].Why, "load shaping") {
-		t.Errorf("a shaped cell's failure must name the shaping after the unchanged text: %q", sv[0].Why)
+	for _, tc := range []struct {
+		us   int64
+		want string
+	}{
+		{6500, ". This cell's load was shaped (load shaping, tier_1.load_shaping): 67 of its 110 walkers started a request at most once every 6.5 ms while the walker, worker and connection counts were unchanged, so look at that pacing first -- the controller also refuses to promote when a tick's bytes/req is large, and a fleet paced below the echo's bytes gives it that"},
+		{7000, ". This cell's load was shaped (load shaping, tier_1.load_shaping): 67 of its 110 walkers started a request at most once every 7 ms while the walker, worker and connection counts were unchanged, so look at that pacing first -- the controller also refuses to promote when a tick's bytes/req is large, and a fleet paced below the echo's bytes gives it that"},
+	} {
+		shaped := plain
+		t1 := *plain.Tier1
+		t1.LoadShaping = &LoadShaping{Reason: "race build", Walkers: 110, MarkovWalkers: 67, MarkovMinPeriodUs: tc.us}
+		shaped.Tier1 = &t1
+		sv := Gate([]ValidationCellResult{shaped}, nil, opts)
+		if len(sv) != 1 || sv[0].Field != "tier_1.adaptive_switches" {
+			t.Fatalf("a shaped cell that never promoted must fail on adaptive_switches, got %v", sv)
+		}
+		if sv[0].Why != wantPlain+tc.want {
+			t.Errorf("period %d us: the shaped failure is not the unchanged text plus the exact sentence:\n got %q\nwant %q", tc.us, sv[0].Why, wantPlain+tc.want)
+		}
 	}
 }

@@ -207,12 +207,13 @@ type Config struct {
 	// -race-tier, which the playbook passes in the race tier only.
 	WSEchoSlowTolerance int
 
-	// MarkovThinkTime, when > 0, is the pause every Markov walker takes after
-	// each request. Zero, the default and every cell but the race tier's
-	// adaptive one, leaves the walkers closed-loop exactly as they always ran.
-	// cmd/validator sets it (raceAdaptiveMarkovThink) and Tier 1 records it in
-	// the cell document (tier_1.load_shaping).
-	MarkovThinkTime time.Duration
+	// MarkovMinPeriod, when > 0, is the least time between the STARTS of two
+	// requests of one Markov walker (open loop; see runMarkovWalker). Zero, the
+	// default and every cell but the race tier's adaptive one, leaves the
+	// walkers closed-loop exactly as they always ran. cmd/validator sets it
+	// (raceAdaptiveMarkovMinPeriod) and Tier 1 records it in the cell document
+	// (tier_1.load_shaping).
+	MarkovMinPeriod time.Duration
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -1123,7 +1124,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
 		Concurrency: concurrency,
 		// Zero for every cell but the race tier's adaptive one.
-		MarkovThinkTime: o.cfg.MarkovThinkTime,
+		MarkovMinPeriod: o.cfg.MarkovMinPeriod,
 		// Driver.Start happens inside driveTier1 so the PID isn't
 		// available until after waitForReady. The PIDChan callback
 		// fires once the refapp is bound; the orchestrator stashes
