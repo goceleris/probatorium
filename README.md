@@ -217,9 +217,8 @@ gh workflow run cluster-reboot.yml --repo goceleris/probatorium --ref main \
   of them; on the target a runner job executing, a power-loss resume pending, entries in `results_root` (tmpfs: the
   reboot destroys them), an r8127 NIC without the shutdown quiesce hook or without the module for the running
   kernel, tailscaled running but not enabled at boot (the host would come back off the tailnet), or a newer kernel
-  installed than the one running (a decision for the maintainer: it changes comparability) unless the OS-upgrade pin proves the
-  saved default is the running kernel (the drop-in and a valid rehearsal record, see "Upgrading a cluster host's OS"). The
-  reasons are in the step summary.
+  installed than the one running (a decision for the maintainer: it changes comparability). The reasons are in the step
+  summary.
 - **It records, then reboots, then verifies.** Before: boot id, boot time, kernel, the NIC vectors found by name with
   their since-boot totals and IRQ affinity, bonds, crash dumps. Then `ansible.builtin.reboot` (bounded at 15 minutes),
   then a snapshot polled for up to 3 minutes. It FAILS unless the boot id changed, the kernel is the same, no new
@@ -242,222 +241,6 @@ Tests: `go test -run 'ClusterReboot|RebootSnapshot|RebootJudge|RebootSummary|Reb
 properties as text, the snapshot script against a fake `/proc`/`/sys`, the summary), `go test ./tools/stresstally`
 (the idle guard), and `bash ansible/tests/test_reboot_judge.sh` (the real Jinja judgement under ansible) and `bash ansible/tests/test_reboot_play.sh` (the whole playbook on local
 connections with only the restart faked), both run by the ansible CI job.
-
-### Upgrading a cluster host's OS
-
-The kernel, the OS packages and the firmware of a cluster host are changed by one sanctioned path and no other: the
-[`Cluster OS Upgrade`](.github/workflows/cluster-os-upgrade.yml) workflow, which runs
-[`ansible/os-upgrade.yml`](ansible/os-upgrade.yml) from a GitHub-hosted machine on the tailnet. Every command on a host
-is a subcommand of [`ansible/files/os_upgrade.py`](ansible/files/os_upgrade.py) (the playbook has no shell task); its
-header lists them. Nobody ssh-es in. Decision (maintainer, 2026-10-21): bring all three hosts to the latest versions
-before the final release evidence; comparability with older releases does not matter.
-
-```
-# 1. read-only, all three hosts, no confirmation
-gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
-  -f mode=survey -f reason="platform survey before the OS upgrade"
-# 2. ONE host per dispatch, servers first, the load generator last
-gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
-  -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
-```
-
-- **Inputs.** `mode` is `survey`, `rehearse`, `upgrade`, `disarm`, `repair`, `freeze` or `thaw`; an upgrade names ONE `host` and `confirm` must be exactly
-  `UPGRADE-<host>` (`DISARM-<host>` for `mode=disarm`, which only clears a pending grub one-shot; `FREEZE-<host>`, `THAW-<host>`); `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
-  `results_root` holds entries (the reboot destroys the tmpfs). `refresh_lists` (survey only, default false) runs
-  `apt-get update` first so the simulation is not stale: it WRITES `/var/lib/apt/lists` and the apt caches
-  (`/var/cache/apt/*.bin`) and runs the apt update post-invoke hooks, so it is the one thing a survey changes, and only when asked. `blacklist_r8169`
-  (upgrade only, default false) is explained below. Dispatch from `main` only; it never runs on a schedule.
-- **Seven modes.** `survey` (read-only, all hosts; its summary opens with a checklist of every fact to read before a host-changing
-  dispatch, each with a PASS / FAIL / NOTE mark and the decision it informs); `rehearse` (ONE host, `REHEARSE-<host>`: pins the
-  running kernel, arms a one-shot to a boot of the SAME kernel, reboots, and requires a new boot id, the same kernel, an EMPTY
-  `next_entry` (GRUB read and cleared the environment block Linux writes) and the usual verification; no package or kernel changes;
-  an `upgrade` is refused until the host carries a rehearsal record for the kernel it runs. **It is not free of kernel risk**: if
-  GRUB does not read the environment block, the host boots GRUB's FIRST menu entry, on that boot and every power-cycle after it;
-  that is the running kernel only when nothing newer is installed (msr1 today: -38 is installed and is entry 0, running is -31).
-  The survey shows `boot.entry0_kernel`, and a rehearsal is refused while it differs from the running kernel unless the
-  confirmation is the console attestation of a person at the rack, below); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
-  clears a pending grub one-shot, nothing else; the playbook also does it by itself on any failure between arming and the new
-  kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure`,
-  `abort-new-kernel` or `release-holds`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the
-  `linux-headers` postinst, so `apt-get` exits non-zero and leaves dpkg half-configured, and every later dispatch refuses on
-  `dpkg --audit`. `configure` runs `dpkg --configure -a` (detached, same `policy-rc.d` discipline as the upgrade).
-  `abort-new-kernel` first purges the kernel versions newer than the running one that the failed upgrade left half-installed
-  (a kernel that was installed and working before is never removed), so the host stays on the old kernel. A repair never reboots
-  and never touches grub's saved default, and refuses while a one-shot is pending. `abort-new-kernel` simulates first (`apt-get -s`):
-  it stops on anything beyond the kernel metapackages, and when apt removes them with the image it says so (later full-upgrades
-  install no kernel until they are installed again). It also removes a kernel that installed cleanly but that an earlier run armed
-  and never verified (below); it forgets that record only when the purge exited 0 and dpkg shows the version gone (a failed purge keeps
-  the record, so `retry_kernel` stays required). `release-holds` releases the access-path holds that a dead run left (below) and
-  nothing else. `freeze` and `thaw` (ONE host, `FREEZE-<host>` / `THAW-<host>`) keep the platform fixed during the evidence campaign (next bullet).
-- **Freeze and thaw: the platform stays FIXED during the evidence campaign.** The hosts update themselves (`unattended-upgrades` and `needrestart`
-  are active: they installed the kernel -38 on their own), and a 131-hour benchmark must not see a package or a service change under it.
-  `mode=freeze` (`FREEZE-<host>`, one host per dispatch, behind the same `OS_UPGRADE_ALLOWED_HOSTS` gate, the `cluster-host-change` approval and the
-  idle cluster) refuses while apt or dpkg is busy, while a power-loss resume is pending (a thaw would re-enable timers on a host about to resume), while the host is already frozen, or while `Unattended-Upgrade::InstallOnShutdown` is true (the shutdown listener it stops would install at power-off, and what stopping it does then is not known), writes its record BEFORE it changes anything
-  (`/var/lib/celeris-os-upgrade/freeze.json`: the timestamp, every unit's previous `active`/`enabled` state, what it changed, whether it wrote a
-  needrestart drop-in, tailscale's previous auto-update and snapd's previous refresh hold), stops and disables `apt-daily.timer`, `apt-daily-upgrade.timer` and `unattended-upgrades.service`, sets `needrestart` to
-  list-only (`/etc/needrestart/conf.d/zzz-celeris-freeze.conf`, only when it is installed and not list-only already), turns tailscale's own auto-update off
-  (`tailscale set --auto-update=false`, only when it is on) and holds all of snapd's automatic refreshes (`snap refresh --hold=forever`: the config `refresh.hold`
-  that snapd 2.58+ accepts as `forever`, which `snap refresh --time` prints as `hold: forever`; a manual `snap refresh` still works; the old documented 90-day cap of `snap set system refresh.hold=<time>` does not apply to `forever`), checks the states, and records
-  the platform: the evidence holds `freeze.json` (with the kernel, the OS, the package count, a SHA-256 of every installed package and version, and
-  the holds), `dpkg-l.txt` (`dpkg -l`), `apt-held.txt` (`apt-mark showhold`), `kernel.txt` and the survey after, so the release results can name the
-  exact platform. The survey shows the freeze and whether it still holds (`freeze.drifted`; checklist row "platform frozen against apt self-updates":
-  NOTE not frozen, PASS frozen, FAIL drifted or incomplete). `mode=thaw` (`THAW-<host>`) restores ONLY what the record says the freeze changed
-  (enable what it disabled, start what it stopped, remove its needrestart file: a unit that was already off stays off; `tailscale set --auto-update=true` only if it was on and the freeze turned it off; the snap hold back to the recorded one, removed if there was none) and archives the record; the
-  apt timers are persistent, so they may run within minutes of a thaw. A freeze that failed half way, or was killed even between a change and its record, is undone by `mode=thaw` (the record is written durably before and after every change, with the change about to be made marked `pending`; a thaw undoes only what is not already as it was, so it can be repeated; a unit masked by hand is named; a needrestart file an earlier freeze left is adopted). It does not stop
-  the apt run `mode=upgrade` starts itself (which is why an upgrade is refused on a frozen host) and it covers nothing but these units, needrestart, tailscale's auto-update and snapd's automatic refreshes: motd-news, firmware updates (fwupd), ubuntu-pro-client and
-  other self-updaters are not touched. The survey records the two a freeze turns off (`self_updaters`: `tailscale debug prefs` AutoUpdate, which runs apt-get by itself, `snap refresh --time` and the `refresh.hold` of `snap get system`), `freeze.drifted` names either one that came back (one that does not answer is `freeze.not_measured`, not drift, and a thaw proof says so: `not_measured_at_thaw`; a freeze is refused, with nothing changed, when an installed tailscale or snapd does not answer), and the checklist row says what the freeze held (a record from before this cover says that tailscale and snapd were NOT stopped by it) and names what it does not cover (fwupd, motd-news, ubuntu-pro-client). **The survey recomputes the recorded platform**: the running kernel, the package list (SHA-256), the holds and grub's saved default
-  kernel; any difference is `freeze.drifted` and the checklist row FAILs (an upgrade, tailscale's own updater, a manual apt, a reboot onto
-  another kernel). `mode=upgrade` is therefore REFUSED on a frozen host (its record would name a platform that no longer exists), and a freeze
-  is refused while grub's saved default kernel is not the running kernel (a reboot would boot the other one). The order is: rehearse all three
-  hosts, upgrade them (`msa2-server`, `msr1`, `msa2-client`), a final survey, then freeze the three, the evidence campaign, then thaw. The thaw's
-  summary shows the drift found AT THAW TIME ("did not move", or what moved): the end-of-campaign proof for the release results. The drift is
-  read ONCE, by the first thaw attempt, before it changes anything, and stored in the record with the run and the time of that check
-  (`drift_checked_by_run`, `drift_checked_utc`): a retry after a failure or a kill reports that check, not its own restores. A thaw that did not
-  complete says "NOT ESTABLISHED" (and "not measured" if even the check did not run). `restored` in the archive `freeze-<run>-thawed.json`
-  lists what EVERY attempt restored, and an archive a killed thaw had already written is kept as it is by the retry. A thaw with no record to
-  thaw names the newest archived thaw; if that thaw run ended red it was killed after it had finished, and the answer is to read the archive,
-  not to thaw again. A freeze needed before an upgrade is `thaw`, upgrade, freeze again.
-- **Rehearsal at a console.** While grub's first menu entry is not the running kernel (survey row "kernel a GRUB that ignores the grubenv would
-  boot": FAIL, today on all three hosts: -38 is installed and is entry 0, -31 runs), a rehearsal is refused, because if GRUB does not read the
-  environment block it boots that other kernel on every power-cycle. Only a person at the rack of THAT host with a console (HDMI and keyboard:
-  the GRUB menu is hidden, Esc or Shift at power-on) may run it, and that person's dispatch types `REHEARSE-<host>-CONSOLE` in `confirm`
-  (instead of `REHEARSE-<host>`), which is an attestation that they are there. No refusal, error or input description spells that string out
-  (an automated dispatcher that read a refusal could re-send it): it is described here and in the PLAN only. The `run-name` and the job name
-  (what the environment's approver sees: "Cluster OS rehearse [msr1] CONSOLE-ATTESTED ...", or "(no console attested)"), the `plan` job's
-  notice, the step summary and `result.json` (`confirm_kind`) all say which kind it was, so the approver approves only a console-attested run
-  when they know somebody is there. An `upgrade` never accepts it (`UPGRADE-<host>-CONSOLE` and `REHEARSE-<host>-CONSOLE` as an upgrade's
-  confirmation are refused by the `plan` job and again by the playbook).
-- **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
-  job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's
-  `HOLD-CLUSTER` marker lives outside this repository, so whoever dispatches honours it. The survey goes through the
-  same gate: it runs commands on the hosts.
-- **A kernel that stranded a host is not armed twice.** `arm-oneshot` leaves `/var/lib/celeris-os-upgrade/armed-<kernel>.json`; a
-  verified boot removes it. After msr1's documented failure (the new kernel without a NIC, a power-cycle back to the old kernel) the
-  record is still there: the next `upgrade` refuses to arm that kernel again unless dispatched with `retry_kernel=<kernel>`, and
-  `repair` with `abort-new-kernel` accepts it for removal. A disarm that finds the host on the same boot (the reboot was never
-  issued) drops the record, because that kernel never booted. `cluster-reboot` no longer refuses a host forever for "a newer kernel is
-  installed", but accepts it only with proof: the drop-in exists, a rehearsal record exists for the running kernel with the grub and
-  shim versions installed now, grub.cfg says `set default="${saved_entry}"`, the saved entry is the running kernel's normal (not
-  recovery) Advanced entry and exists in grub.cfg, and no one-shot is pending. A host that was never rehearsed stays refused.
-- **The access path can be held.** `hold_access_packages` (`auto`, `on`, `off`; `auto` = on for a host with an r8127 NIC) holds
-  `grub-*`, `shim*`, `openssh-server` and `tailscale*` BEFORE the plan is simulated (so the protected-removal judgement describes the plan that runs) and for the length of the apt run,
-  and releases only the holds this run put (a refusal releases them at once). A hold counts as released only when `apt-mark showhold` no longer lists it (`apt-mark unhold` can fail while unattended-upgrades has the dpkg lock): one that stays keeps its record, the run says so (the step summary prints `holds-left.txt`) and, after the apt run, fails before any reboot. If the run dies with the holds on, the survey lists them
-  (`packages.tool_holds`), every upgrade refuses naming the repair, and `mode=repair repair_action=release-holds` releases them (and fails, keeping the record, if a hold stays: dispatch it again). Both
-  kernels share those packages, so no fallback helps if one breaks: upgrade them in a separate dispatch (`hold_access_packages=off`)
-  with a person at the rack and a console.
-- **Order: servers first, the load generator last.** `msa2-client` is refused until `msa2-server` and `msr1` each carry
-  a record of a verified upgrade (`/var/lib/celeris-os-upgrade/last-upgrade.json`, written only after verification)
-  that still matches the kernel they run. Why: every server is verified against the client (fabric ping), so the
-  client stays on the known-good platform while the servers are proven; the client's own verification then uses the
-  upgraded servers. The two servers have no order between them; `msa2-server` (no out-of-tree driver) is the rehearsal
-  to do before `msr1`. **The rule is for `mode=upgrade` only**: a rehearsal of any host may run in any order (the judge checks the order only
-  in an upgrade, and a test replays the three real hosts' records to show a client rehearsal with neither server upgraded has no refusal), so
-  one rack session can rehearse all three hosts first (each needs the console attestation while grub's first menu entry is not its running
-  kernel) and the upgrades then follow in order: `msa2-server`, `msr1`, `msa2-client`. A rehearsal record goes stale when grub or shim change
-  on THAT host (an unattended upgrade, or an upgrade run with `hold_access_packages=off`): hold the access path (`hold_access_packages=on`) in
-  every upgrade that follows a rehearsal, or the upgrade's own reboot uses a GRUB nobody rehearsed.
-- **Survey** (read-only; its commands are on an allow-list the process enforces) records per host: os-release, running
-  and installed kernels, which kernel grub boots after a power-cycle, `GRUB_DEFAULT`, EFI and Secure Boot, what
-  `apt-get -s full-upgrade` would install, remove and keep back, phased updates, held packages, third-party
-  repositories and pins, unattended-upgrades, reboot-required, `dkms status`, the NIC drivers, PCI ids and link speeds,
-  linux-firmware, disk, time sync, crash dumps, the run state, and the packages of the compilers and services. For the
-  r8127 NIC it also records the out-of-tree module (version, where it came from), and, per installed kernel, whether the
-  in-tree `r8169` lists the NIC's PCI id, so the summary shows whether the in-tree driver is already an option. A
-  separate step compares the toolchains the roles install (pinned or floating) with upstream.
-- **It refuses, on the host, before touching anything:** any of the three hosts unreachable; a bench manifest on any of
-  them; on the target a runner job executing, a power-loss resume pending, entries in `results_root`, the r8127
-  shutdown quiesce hook missing, the r8127 module not available for the running kernel, tailscaled not enabled at boot,
-  too little disk on `/`, `/boot` and `/boot/efi`, dpkg or apt busy (a real `apt`, `apt-get`, `dpkg`, `unattended-upgrade` ... process, read from `/proc/<pid>/cmdline`, or one of the four dpkg/apt lock
-  files held; the idle `unattended-upgrade-shutdown --wait-for-signal` listener and an idle `packagekitd` that every Ubuntu host runs do not count: both read
-  as `unattended-upgr` and `packagekitd` in `/proc/<pid>/comm`, a 15-character name, which is how the first real survey wrongly refused all three hosts) or half-configured
-  packages, held kernel/boot/DKMS packages, an existing `policy-rc.d`, no usable GRUB, GRUB not PROVEN to have booted the host (`BOOT_IMAGE=` on the kernel command line naming the running kernel; on EFI the firmware's `BootCurrent` loader is `shim`/`grub` under `\EFI\<vendor>`; the ESP stub's `search`/`prefix` names the filesystem of `/boot/grub`; `grubenv` is a 1024-byte file: anything unknown counts as not proven), `GRUB_SAVEDEFAULT=true`, a
-  `/boot/grub` on btrfs/zfs/lvm/mdraid (grub cannot make the boot one-shot there), no grub entry for the running kernel,
-  a one-shot grub entry still pending, a saved default that differs from the running kernel after an earlier
-  run (a second dispatch would move the fallback to an unverified kernel), `blacklist_r8169` with a NIC bound to
-  `r8169`, a wrong confirmation, and the order rule. Each is a message in `vars/os_upgrade_judge.yml` with a test case.
-- **Then, in this order.** (1) The *running* kernel becomes grub's saved default (`GRUB_DEFAULT=saved` in a drop-in, the
-  old `/etc/default/grub` backed up, `update-grub`, `grub-set-default`) and its packages are marked manual, BEFORE a new
-  kernel is installed: from then on a power-cycle at any moment boots the old kernel. (2) `apt-get update`, a simulation,
-  and a refusal if apt would remove the kernel, the boot chain, DKMS, ssh, tailscale, the power guard or docker.
-  (3) `apt-get full-upgrade`, detached (a dropped ssh connection cannot half-configure dpkg), non-interactive,
-  `--force-confold`, with a temporary `policy-rc.d` so no service is restarted behind the run and `needrestart` in
-  list-only mode; **never `autoremove`**, so the old kernel stays installed. (4) The DKMS modules are built for the new
-  kernel (`dkms autoinstall -k`, make log kept) and checked: headers, initrd, grub entry, the r8127 module found by
-  `modinfo -k`, its PCI aliases, its signature when Secure Boot is on, the shutdown hook, the fallback still intact.
-  **If anything fails here the host is not rebooted**: the old kernel is the default and still runs. (5)
-  `grub-reboot <new kernel>` (the next boot only; `saved_entry` stays the old kernel), `ansible.builtin.reboot` bounded
-  at 15 minutes. (6) Verification, like the reboot plus: running kernel == the intended one (a fall-back to the old one is
-  reported as such), each NIC's driver and link speed, time sync, no new failed unit, a C compiler that builds and runs,
-  TLS to github.com. (7) **Only then** `grub-set-default <new kernel>` and the record. On any failure the new kernel is
-  NOT made the default.
-- **r8127 and the in-tree driver.** The upgrade keeps the out-of-tree r8127 behaviour. If the new kernel's `r8169` lists the
-  same PCI id as r8127 and `r8169` is not blacklisted (in the new kernel's initramfs too: it must have been rebuilt after the blacklist), which driver binds the NIC would be a race, and the run refuses
-  to reboot (whatever the running kernel's `r8169` lists). `blacklist_r8169=true` writes `/etc/modprobe.d/celeris-r8127.conf` (`blacklist r8169`) and rebuilds the
-  initramfs of the new kernel, then goes on. Moving to the in-tree driver is a separate decision (PLAN.md of the
-  upgrade lane lists what to test first); this workflow never makes it.
-- **If the host does not return.** The summary names the phase and says whether to do a **physical power-cycle**: only when the
-  run is red in phase `rebooting` and the host stays silent. What the power-cycle boots depends on why it is silent: (1) the
-  NEW kernel booted without a NIC: grub already consumed the one-shot, so it boots the saved default, the OLD kernel; (2) the OLD
-  kernel hung or panicked while shutting down (msr1's documented r8127 power-off panic) or the reboot was never issued: the
-  one-shot is **still armed**, so the next boot is the NEW kernel, once, and a second power-cycle is what returns to the old
-  one; (3) the host is only slow (a run killed by its timeout reads the same): survey first. `mode=disarm` clears a one-shot
-  that is still armed. If the host still answers, the playbook disarms by itself on any failure between arming and the new
-  kernel's boot. **A power-cycle restores the choice of kernel only**: if the upgrade broke something both kernels share
-  (bootloader, ssh, tailscale, netplan, systemd, firmware), it restores nothing and the host needs its console. Every other phase
-  says "not needed". A host that came back but failed verification keeps the old kernel as its default: reboot it back with the
-  cluster-reboot workflow, which ends red with "kernel changed" by design (and refuses outright when the OLD kernel runs with a
-  newer one installed, which needs no recovery) -- but only when GRUB consumed its one-shot. If a problem says a one-shot is still
-  pending, GRUB does not read the environment block Linux writes: the saved default (`boot.default_kernel`) is NOT what boots, GRUB's FIRST
-  menu entry (`boot.entry0_kernel`, the NEW kernel after an upgrade) is, on every boot, and cluster-reboot boots it again; only the console
-  (Esc or Shift at power-on) or a reviewed change brings the old kernel back. `result.json` carries it as `first_entry_kernel`. The upgrade itself refuses to run again while the host runs a kernel other than
-  grub's saved default, or while a one-shot is pending. The apt run is detached: if a poll is lost, the run fails with apt possibly
-  still running; survey before anything else.
-- **What this does not prove.** The tests run the real playbook and script against stub `grub`, `apt`, `dkms` and
-  `modinfo` commands and a fake `/proc`/`/sys`: they prove the order, the refusals and the verdicts, not that a real GRUB
-  on msr1 honours `grub-reboot`, that r8127 builds for a real kernel, or that the NIC comes up. The first real
-  evidence is the survey, then `msa2-server`.
-
-#### Enabling a host change
-
-No host-changing mode (`upgrade`, `disarm`, `repair`) can be dispatched until the maintainer enables it. The code enforces one control
-and supports a second; this repository does not create either (that is settings, not code).
-
-Be plain about what these controls are: settings that a person with the maintainer's token can also change (`gh variable set`,
-approving a pending deployment). They stop accidents and anyone without that token; they do not stop an agent that holds it.
-Rules of use: (a) empty the variable the moment a window ends; a "Re-run all jobs" of an old host-changing run re-executes it with
-its old typed confirmation for as long as the host is listed; (b) **approve within ten minutes of the dispatch**: the idle verdict
-of the cluster guard is refused after ten minutes, and the approval wait counts against it (the run then says so and must be
-dispatched again).
-
-1. **The switch (enforced by the `plan` job).** Settings, Secrets and variables, Actions, Variables: create the repository variable
-   `OS_UPGRADE_ALLOWED_HOSTS`, a comma or space separated list of hosts, for the window: `msa2-server` for the first step. Add `msr1`
-   only after the survey has answered the questions of the lane PLAN (d.2 does it boot through GRUB, d.3 the in-tree r8169, d.7 Secure
-   Boot) and a person is at the rack; `msa2-client` last. Empty or missing (the default) means every host-changing dispatch is refused
-   in `plan`, before any approval is asked and before any host is touched. The `plan` job also reads the environment of step 2 through the API and
-   refuses unless it exists WITH a required reviewer and a deployment branch policy (if the workflow token may not read environments, it
-   refuses and says so: give it a token with Environments: read in the secret `ENVIRONMENTS_READ_TOKEN`). Empty the variable when the campaign is over.
-2. **The approval (GitHub environment `cluster-host-change`, used by host-changing modes only; a survey runs in `cluster-read` and
-   never waits).** Settings, Environments, New environment `cluster-host-change`: Required reviewers = the maintainer (leave
-   "Prevent self-review" off if the maintainer both dispatches and approves, or add a second reviewer); Deployment branches and
-   tags = Selected branches and tags: `main` only. The `plan` job refuses a host-changing mode until this environment exists with a reviewer (GitHub would otherwise create it unprotected on first use).
-3. **The secrets.** Environment secrets shadow repository secrets of the same name for a job in that environment. In
-   `cluster-host-change` (and in `cluster-read`, which needs the same access for the survey) create `CLUSTER_SSH_KEY`,
-   `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_SECRET`; their values cannot be read back from the repository, so re-enter them from where the
-   maintainer keeps them (a separate, less privileged key for `cluster-read` is better). **Be aware:** copying them does not remove
-   the repository-level secrets, and the tier workflows, `cluster-reboot` and the runner bootstrap read those. Deleting them would
-   break those workflows unless they adopt environments too. So until that separate decision, a workflow pushed on a branch by
-   someone with write access can still read the repository secrets; the variable and the reviewer protect this workflow, not the key.
-4. **Verify.** (a) With the variable empty, `gh workflow run cluster-os-upgrade.yml --ref main -f mode=disarm -f host=msr1
-   -f confirm=DISARM-msr1 -f reason=test` fails in the `plan` job with "not in the repository variable OS_UPGRADE_ALLOWED_HOSTS" and
-   touches nothing. (b) `gh variable list` shows the list; `gh api repos/goceleris/probatorium/environments/cluster-host-change
-   --jq '.protection_rules, .deployment_branch_policy'` shows the required reviewer and the `main`-only policy. (c) With
-   `msa2-server` listed, an upgrade of `msa2-server` stops at the `os-upgrade` job with a "Waiting for review" state until approved,
-   while a survey does not wait. If (c) does not wait, the environment has no reviewer yet.
-
-Tests: `go test -run 'ClusterOSUpgrade|OSUpgrade|FreeText'`, and `python3 -I ansible/tests/test_os_upgrade.py` (the script against a fake
-host), `python3 -I ansible/tests/test_os_upgrade_judge.py` (the real Jinja judgement under ansible, every refusal) and
-`python3 -I ansible/tests/test_os_upgrade_play.py` (the whole playbook on local connections, Linux only); the last two run
-in the ansible CI job.
 
 ## Bench tier
 
@@ -527,12 +310,8 @@ The validation run of 2026-10-21 showed the arch lock holds on the scoped rows (
 exemption of light cells did not (P6 fails on arm64), so the default policy is now `all`
 ([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md), "Verdict"). #442 stays open for the
 three rows only a full both-arch run reads (get-simple-1024c, get-json-h2, post-4k-h2), so dispatch headline and
-full with `publish=false` until both are settled. Since schema 5.24 the artifact keeps the achieved rate, the
-errors and a status for every rated pass ([#441](https://github.com/goceleris/probatorium/issues/441),
-see "Result: latency at SLO"), so a rated number can be read against the load loadgen actually sent. #441
-stays open for the rest: no pass is yet marked invalid for a shortfall, `latency_at_slo` still counts every
-kept pass whatever it achieved, and loadgen does not export its end-of-window schedule lag (loadgen#102).
-Until those land, read `achieved_ratio` before you read a rated p99 as the server's.
+full with `publish=false` until both are settled. The runner keeps no achieved rate per pass, so no rated number
+can tell a slow server from load that loadgen never sent (#441).
 
 ### A both-arch run: the two arches share one client (#442)
 
@@ -718,80 +497,6 @@ does not flag it yet; that is for goceleris/docs.
 default policy and `all`, about 3.6 h of bench together, criteria pre-registered, including the three
 exposures above) are in [`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md).
 
-### The host sampler beside a bench
-
-`Benchmark Tier` brackets `mage BenchTier` with `mage HostSamplerStart` / `HostSamplerStop`, as the race and weekend
-tiers do (the nightly tier runs `mage Validate`, not the bench, and has the race tier's path). Before this a bench
-ran no host sampler at all, so it had no series of its own: the forensics artifact fetched whatever the last weekend soak had left on the hosts, and
-a 60 s cadence could not see the 1-3 s stalls of the io512 cell (celeris#1036). Two read-only processes run on
-each host of the run (`BENCH_TARGET` limits the playbook to the target and the loadgen, as `Deploy` does):
-
-- the 60 s shell sampler (`ops/host-sampler/celeris-host-sampler`, the script unchanged; this tier starts it for the
-  first time): memory, load, the OOM and link-flap counters, the boot id, the kernel log;
-- the **fine series** (`ops/host-sampler/celeris-host-sampler-fine`, python3, no subprocess), at the `sampler_interval`
-  dispatch input: `1` s (the default, also on a schedule), `0.5`, `0.2`, `0.1` or `0.05` s (20 Hz). One text line per
-  tick: the per-CPU deltas of user+system, irq, softirq and steal, the NET_RX softirq runs and the `ksoftirqd`
-  run time of every CPU that did anything, the CPU pressure total, the run queue and the load; plus the two
-  whole-run files below. `fine.stats` has the achieved rate, the interval percentiles and the sampler's own CPU.
-
-**Not in the measurement path.** `BenchTier`, `bench.yml` and `run_bench_cell.yml` are not touched, no BenchTier
-variable is added, and the SUT is not told. Placement: both processes run under `SCHED_IDLE` (the fine one sets it
-itself (after `nice 10`), falling back to `SCHED_BATCH` at nice 19 if refused, and says which took in `fine-run.txt`;
-the 60 s shell sampler is launched `nice -n 19 chrt -i 0` by the bench tier only, and its children inherit it; the
-race and weekend starts are unchanged). A `SCHED_IDLE` task never preempts a normal one on wake-up and its CPU counts
-as idle to the load balancer. It is not pinned to a CPU set: on msr1 every CPU hosts a loop. The price is visible, not
-silent: a starved sampler shows as a gap in its own series (`gap` events, interval p99 and max in `fine.stats`). On a
-container with 8 spinning loops on 2 CPUs of quota it got 0.94 Hz of a 1 Hz target (max interval 3.6 s) and 2.6 Hz
-of 20: if a scoped io512 run shows many `gap` lines inside the cell's window, switch the class to `SCHED_BATCH` + nice 19
-(one line in `lower_priority`) and judge the cell, not the whole run.
-
-**Load.** Reads four `/proc` files and each `ksoftirqd` thread's `schedstat` per tick (4 + nCPU `pread`s, a 64 KiB
-buffer reused, no fork). The 60 s sampler finds its three pids by reading `/proc/*/comm`, not with `pgrep` (which opens every process's
-`cmdline`, taking its `mmap_lock`: under `SCHED_IDLE` it can be preempted holding it and stall the SUT for hundreds of
-ms); a test forbids `pgrep`, `ps`, `cmdline`, `maps` and the like in both samplers. Measured by the review with `ksoftirqd` visible, on 8 CPUs, contended: **0.051 % of one CPU at
-1 s and 0.711 % at 20 Hz**; expect about 0.1-0.2 % and 1.5-2 % on a 32-CPU host. (The first figures, 0.03 % and
-0.35 %, came from a container that could not see `ksoftirqd`.) `self_cpu_pct` in each host's `fine/fine.stats` is the
-figure of the real run. The 60 s shell sampler costs about 24 ms per sample (25-30 fork/execs; 0.04 % of a CPU) and
-this tier starts it for the first time.
-
-**Retention.** A tick is about 45 bytes plus 18-23 per CPU that did anything (every CPU, on msr1 with RPS on all 12 and
-on the loadgen). The open generation is plain text on tmpfs (`/run/celeris/fine`); at 16 MiB it is closed into
-`fine.<seq>.log.z` (zlib level 1, about 50 ms of CPU per generation, logged as a `generation_closed` event so its pause
-is not read as starvation). **The compression ratio is 2-5x, depending on how much the counters vary:** 5x on a quiet
-host, 2.1-2.4x with bench-like counters (NET_RX runs in the tens of thousands, user and system in the tens of percent).
-Compressed generations are kept up to 256 MiB, the oldest dropped *and counted* (`generations_dropped`, a
-`generation_dropped` event); the newest is never dropped. At 1 s, 234,000 ticks for a 65 h bench:
-
-| host | bytes a tick | text, 65 h | compressed, 65 h | 111 h (the `all` deadline) |
-|---|---|---|---|---|
-| msr1 (12 CPUs) | 261-321 | 61-75 MB | 13-35 MB | 23-60 MB |
-| 32 CPUs (msa2-server, msa2-client) | 621-791 | 145-185 MB | 33-87 MB | 55-148 MB |
-
-All of it fits in 256 MiB, so the whole run is kept at 1 s (at the pessimistic ratio a 111 h run on 32 CPUs is 148 MB; with
-half this cap it would have dropped its oldest generations). The artifact of a 65 h single-arch run is about
-50-175 MB for the two hosts (already compressed). The tmpfs worst case is 256 MiB + 16 MiB + the minute and event logs,
-about 0.6 % of msa2-client's RAM. At 0.05 s the ticks are 20 times as many and the cap holds the last 23-55 h on msr1 and
-9-23 h on a 32-CPU host: use 0.05 s for a scoped run (`cells=...`). Whatever the cadence, two files are never rotated:
-`fine-minute.log` (per CPU and minute: the highest softirq percent of a tick, the lowest user+system percent, the minute's
-softirq percent, the longest tick interval; about 1-2 MB for 65 h) and `fine-events.log` (starvation episodes as a
-begin/end pair, the sampler's own gaps, generations closed and dropped; 4 MiB with a drop counter). A 1 to 2 s stall is
-seen by a tick only part of the time at 1 s (a stall that straddles a tick boundary reads about 70 % on two ticks), which
-is why the full series is kept at 1 s and the minute record is a coarse index into it, not a substitute: it is meant to be
-re-cut offline with any criterion.
-
-**Lifetime and the artifact.** `SAMPLER_DURATION` is keyed like the job's `timeout-minutes` (the largest budget the key
-admits plus 3 h, inside the ceiling). The stop step (`if: always()`, `continue-on-error`, 10 minutes: the compressed
-series goes through ansible's `fetch`, in memory under `become`) ends both processes with a sentinel file and fetches into
-`results/host-sampler/<host>/` (fine files in `fine/`) before the upload. The fine files are fetched only if the host's
-`fine-run.txt` carries this run's tag (`bench-<run id>`), so a Deploy that failed before the start step cannot hand over the
-previous bench's series (the tag carries the run attempt, `bench-<run id>-<attempt>`, so a re-run does not take its
-first attempt's), and the race and weekend stops fetch no fine file; a new start deletes the files of the previous
-run in its directory. If the runner dies and the stop step never runs, the fine sampler ends 60 s after its
-`Runner.Listener` is gone, any later `HostSamplerStart` / `Stop` (the race and weekend tiers) retires it too, and the
-forensics play fetches its events, minute record, stats and run file, and, if nobody stopped the sampler, its newest 24
-per-tick generations (at most about 150 MB a host). A host without python3 gets the 60 s sampler only,
-with a warning.
-
 ### Result: latency at SLO
 
 In the rated sweep, each cell gets four constant-rate passes at 25, 50, 75 and 90 % of that cell's
@@ -806,61 +511,6 @@ concurrency sweep, `get-json-1k`, the H2 rows, `ws-large-echo`, and the WS hub a
 publish saturation data only; [`budget/profiles.go`](budget/profiles.go) gives the measured reason for
 each. Datasets published before [#418](https://github.com/goceleris/probatorium/issues/418) also carry
 rated data for those scenarios.
-
-#### What the artifact records per rated pass (schema 5.24, #441)
-
-Every fraction the sweep plans leaves exactly one record, whatever became of it. `benchmarks[].rated_passes`
-maps a scenario to the list of its passes, one entry per pass per run. `run` counts the runs of the cell that carried rated
-data, from 0: it is not the cell's run index (a DNF run takes no number), so it does not join to `cell_run_statuses`:
-
-| field | meaning |
-| --- | --- |
-| `fraction`, `target_rps` | the offered load: the fraction of the cell's saturation rate, and the rate |
-| `achieved_rps`, `achieved_ratio` | requests per second loadgen delivered over the measured window, and that over the target. Below 1 is load loadgen never sent: the p99 of that pass is its backlog (about 0.99 x window x (1 - ratio)), not the server's latency. The ratio reads slightly low: `requests` counts successes only and loadgen's elapsed time includes teardown, so set any validity line (the 0.98 of #441) knowing that |
-| `requests`, `errors`, `connect_errors`, `dial_retries`, `close_aborts` | loadgen's counts. `requests` are successes, `errors` failed requests, `connect_errors` the dial/handshake failures (TCP connect, TLS, WS/SSE upgrade, H1 reconnect dials). In loadgen v1.4.14 each also fails the request and is counted in `errors`, so `connect_errors` sits inside `errors`, give or take a few attempts cut off at phase boundaries (loadgen's own description: counted at the driver, it can differ from the matching `errors` increments by a few); `errors` close to `connect_errors` means the server was unreachable, not misbehaving |
-| `shortfall_requests` | target x duration - requests - errors: the slots of the schedule loadgen did not fill |
-| `p99` (ns), `p50`, `p99_9`, `max`, `duration`, `start`, `end`, `loadgen_version` | the pass's latency, window and loadgen build (`start`/`end` are on the loadgen host's clock, warmup included, the same clock as `load_windows`) |
-| `status` | `ok`: counted in `latency_at_slo` and the headline. `skipped`: the pass ran and produced nothing usable. `not_run`: it never started |
-| `reason`, `detail` | for a pass that is not `ok` (and `interrupted` on a cut-short `ok` one): `loadgen_new` (loadgen would not build), `run_error`, `nil_result`, `zero_requests`, `interrupted` (the run was cancelled: any pass after the cancel, and also an `ok` pass cut short, which loadgen returns as a short, error-free result and which stays `ok` and kept, as it always was, with the measured window in `detail`), `cell_flagged` (the cell's saturation pass was flagged suspect, so no sweep ran), `no_saturation_rate`, `non_positive_target`; and the error text |
-
-`rated_headline_target_rps` names the target `rated_mode_p99_at_target_rps` was read at: the highest target
-among the `ok` passes. When the 0.9 pass was lost it is the 0.75 pass's (or lower), and this says so; compare
-it with the `fraction` of the cell's passes. A cell with no `ok` pass has records and no
-`latency_at_slo`, headline or `rated_headline_target_rps`.
-
-`mage Publish` prints a rated line in its integrity summary (passes by status, `ok` passes below 98 % of their
-target, and the cells whose headline is not their top planned pass). It is informational: nothing is refused
-for it, because the validity rule is still open on #441. `summary.json` carries `rated_passes`: a full record is about 0.7 KB
-indented, so about 1.1 MB per arch for a full rated run (about 6 % of the 18 MB `summary.json` of 38431303162).
-
-**Records from runs that predate 5.24.** A pass record without `status` was written by a runner before 5.24:
-only `target_rps` and `p99`, kept, and the merge does not fill the status in. Such a run never recorded a pass it
-dropped, so a document merged from it (a re-merge of bench 38431303162, whose stderr shows 41 skipped passes)
-says nothing about lost passes. `mage Publish` counts those records as `legacy=N`, prints a `RATED LEGACY`
-line, and its `skipped=0` is not a statement that none was lost.
-
-**For a reader that predates 5.24.** Nothing it reads changes. `latency_at_slo` and
-`rated_mode_p99_at_target_rps` are built from the `ok` passes exactly as they were built from the kept passes;
-`saturation_mode_rps` and every other key are untouched; the two new keys are ignored. In the runner's per-cell
-JSON and `raw/<host>.json`, `rated_passes` still holds only the passes the runner kept (each now with the added
-keys, `target_rps` and `p99` as before); the passes it did not keep are a separate array,
-`rated_passes_not_kept`, so a script that reads `target_rps` and `p99` out of `rated_passes` never counts a
-pass that sent nothing as a pass with a p99 of zero. A script that wants the full picture reads both arrays.
-A cell in the rated scope whose saturation pass was flagged now has `rated_passes_not_kept` with `not_run`
-records where it used to have no rated key at all. A cell that failed before its saturation pass finished
-(`dnf`, `not_applicable`) has no rated record: its status in `cell_statuses` is the explicit record.
-
-**Two single-arch artifacts and `mage Publish`.** `Publish` takes ONE results file per call (`PUBLISH_RESULTS`,
-or the newest `results/*-bench-*/results.json`; the arch tag comes from the document's own `host_arch_pair`) and
-writes `results/<version>/<date>/<arch>/`. It merges nothing: two single-arch artifacts (a `target=msa2-server`
-run and a `target=msr1` run, each with `publish=false`) are two calls, each with its artifact unpacked under
-`results/<ts>-bench-<version>/` and `PUBLISH_VERSION` set, and they land in two arch directories of the same
-version. Set `BENCH_START_DATE` to the same day on both calls if you want them in the same date directory;
-the date only names the directory. The docs build ([goceleris/docs](https://github.com/goceleris/docs),
-`scripts/build-data.ts`, `src/lib/results/aggregate.ts`) groups the cells by (version, arch) over every date
-and run and AVERAGES them, so the two arches compose into one release dataset by version, and a second publish
-of the same version and arch, on any date, is averaged with the first, not a replacement for it. (Checked by
-`PUBLISH_DRYRUN=1` on both arch files of run 37091941051, and by reading the docs build.)
 
 ## Validation tier
 
@@ -953,20 +603,22 @@ What a race run records about itself (schema 5.23, record only, nothing new is g
   it (`validation/refapp/internal/debugvars`), a change to the refapp build that is not made here.
 - **The race tier runs the host sampler** (`HostSamplerStart` / `HostSamplerStop`, tag
   `race-<run id>`, lifetime fixed at 150m inside the job's 180 minute limit, each step bounded to 5 minutes), as the weekend soak does.
-  The bench tier runs it too, with a 1 s fine series by default (tag `bench-<run id>`; [details](#the-host-sampler-beside-a-bench)).
 
 **The race tier shapes the load of its adaptive cells (no schema bump).** The adaptive cell is sized 2 workers x
 110 walkers so the controller's promotion fires, and under the race detector's slowdown a closed-loop walker
 fleet saturated its two engine loops (a fourth `SLOW_CLASS` echo, now and then a reset-type counter). With
-`-race-tier`, and for the adaptive cells only (all 16: eight refapps on both arches, not just the one that
-failed), each Markov walker now pauses 4 ms after every request
-(`raceAdaptiveMarkovThink` in `cmd/validator/matrix.go`). The worker, walker and connection counts are
-unchanged, no threshold, N or timeout moves, and every other cell (any tier, any other engine) is
-closed-loop exactly as before. The cell says so: `tier_1.load_shaping` has the reason, `walkers`,
-`markov_walkers` and `markov_think_ms`, and is omitted everywhere else. The field is additive in schema
-5.24 and does not bump it, so the documents of every other tier are byte-identical to before. Promotion is still gated in every
-default race run (`VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`); a shaped cell that misses it says it was
-shaped, and a shaped cell without a `-race` build (`I-RACE`) fails the gate.
+`-race-tier`, and for the adaptive cells only, each Markov walker now starts a request at most once every
+6.5 ms (`raceAdaptiveMarkovMinPeriod` in `cmd/validator/matrix.go`): open loop, so the fleet offers at most
+67 / 6.5 ms = ~10.3k requests a second whatever the response time, against the ~16.6k the same walkers sent
+when the cell saturated. The worker, walker and connection counts are unchanged, no threshold, N or timeout
+moves, and every other cell (any tier, any other engine) is closed-loop exactly as before. The shaping is
+uniform: all 16 race-tier adaptive cells (eight refapps, both arches) get it, including the 15 that were
+green, which now run under `-race` at about 60% of their Markov request volume; pure engines and every
+non-race tier keep their full load. The cell says so: `tier_1.load_shaping` has the reason, `walkers`,
+`markov_walkers` and `markov_min_period_us`, and is omitted everywhere else. The field is additive in schema
+5.24 and does not bump it, so the documents of every other tier are byte-identical to before. Promotion is
+still gated in every default race run (`VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`); a shaped cell that misses it
+says it was shaped, and a shaped cell without a `-race` build (`I-RACE`) fails the gate.
 
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
@@ -1163,7 +815,7 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `ValidateGate` | The absolute gate over the most recent run's `validate-results.json` on every host | `VALIDATE_GATE_EXPECT_CELLS`, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`, `VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW` (race tier only) |
 | `ValidateDiff` | The cross-engine and cross-arch gate | `VALIDATE_DIFF_STRICT=1` (MEDIUM fails too), `VALIDATE_DIFF_HOSTS=a,b` |
 | `BuildRaceRefapps` | Cross-build the `-race` reference apps (the race runtime needs cgo) | |
-| `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host (or, with `BENCH_TARGET=msr1\|msa2-server`, the target and the loadgen) | `SAMPLER_DURATION`, `SAMPLER_INTERVAL` (full sample, integer 1-3600 s, default 60), `SAMPLER_FINE_INTERVAL` (fine series, 0.05-10 s, unset = none; [details](#the-host-sampler-beside-a-bench)), `SAMPLER_TAG` |
+| `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host | `SAMPLER_DURATION`, `SAMPLER_INTERVAL`, `SAMPLER_TAG` |
 | `Publish` | Write the newest bench run into goceleris/docs and fire the `benchmark-published` pointer | `PUBLISH_VERSION`, `PUBLISH_VIA=git\|contents`, `PUBLISH_DRYRUN=1`, `DOCS_REPO_DIR`, `DOCS_TOKEN`, `BENCH_PUBLISH_FORCE` |
 | `PublishValidate` | Kept for callers; it runs `Publish` | |
 | `BenchAndValidate` | `Validate` → `ValidateDiff` (when `VALIDATE_TARGET=both`) → `Bench` → `Publish` | the knobs of each |
