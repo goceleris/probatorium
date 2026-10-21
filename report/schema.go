@@ -1218,6 +1218,10 @@ type Tier1Summary struct {
 	// run and not only a stall-capture one. Omitted when no refapp pid was
 	// seen. See RefappSched for what it can and cannot say.
 	RefappSched *RefappSched `json:"refapp_sched,omitempty"`
+	// LoadShaping records that the cell's walkers were paced below their
+	// closed-loop rate, and by how much. Omitted when nothing was shaped, which
+	// is every cell outside the race tier's adaptive cell. See LoadShaping.
+	LoadShaping *LoadShaping `json:"load_shaping,omitempty"`
 	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
 	// bound address, i.e. the origin of every SlowFire.SinceReadyMs and
 	// of the mod-60 phase histogram the design computes offline.
@@ -1285,6 +1289,21 @@ type EventSpan struct {
 	Count int64      `json:"count"`
 	First EventStamp `json:"first"`
 	Last  EventStamp `json:"last"`
+}
+
+// LoadShaping is the pacing a cell's Markov walkers ran under. It exists so a
+// reader of a race-tier cell can see that its load was shaped, and by how much,
+// without reading the validator's source.
+//
+// Walkers is the whole fleet's count (Config.ConcurrencyFloor applied) and
+// MarkovWalkers the part of it that was paced; both are the counts the cell ran
+// with, so a shaped cell can be compared walker for walker with an unshaped one.
+// MarkovThinkMs is the pause each Markov walker takes after every request.
+type LoadShaping struct {
+	Reason        string `json:"reason"`
+	Walkers       int    `json:"walkers"`
+	MarkovWalkers int    `json:"markov_walkers"`
+	MarkovThinkMs int64  `json:"markov_think_ms"`
 }
 
 // RefappSched is what the validator read of the refapp's CPU placement.

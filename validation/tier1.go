@@ -125,6 +125,11 @@ type tier1Config struct {
 	// probatorium#481). Set in a stall-capture run only.
 	WSEchoDiag *wsEchoDiag
 
+	// MarkovThinkTime is the pause a Markov walker takes after each request;
+	// zero is the closed loop every cell has always run. See
+	// Config.MarkovThinkTime.
+	MarkovThinkTime time.Duration
+
 	// TallyCallbackInterval is how often TallyCallback fires. Zero
 	// defaults to 2 seconds; only used when TallyCallback is non-nil.
 	TallyCallbackInterval time.Duration
@@ -603,7 +608,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			go func(walkerID int) {
 				defer wg.Done()
 				seed := seedBase ^ uint64(walkerID)*0x9e3779b97f4a7c15
-				runMarkovWalker(reqCtx, stop, httpc, baseURL, cfg.Matrix, seed, tally)
+				runMarkovWalker(reqCtx, stop, httpc, baseURL, cfg.Matrix, seed, cfg.MarkovThinkTime, tally)
 			}(i)
 		}
 		for i := 0; i < advCount; i++ {
@@ -1030,8 +1035,9 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 // serves /login but some others serve /api/login) had silent
 // path-mismatch bugs.
 func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string,
-	m *markov.Matrix, seed uint64, tally *tier1Tally,
+	m *markov.Matrix, seed uint64, think time.Duration, tally *tier1Tally,
 ) {
+	_ = think // stub: not wired yet
 	// Per-walker cookie jar. nil error per cookiejar.New's contract
 	// when options is nil.
 	jar, _ := cookiejar.New(nil)
@@ -1317,6 +1323,9 @@ type tier1TallySnapshot struct {
 	// RefappSched is the refapp's CPU view read from /proc at ready
 	// (refapp_sched_record.go), attached by the orchestrator like Properties.
 	RefappSched *report.RefappSched `json:"refapp_sched,omitempty"`
+	// LoadShaping is the pacing the cell's Markov walkers ran under; nil when
+	// they ran closed-loop (every cell but the race tier's adaptive one).
+	LoadShaping *report.LoadShaping `json:"load_shaping,omitempty"`
 	// Properties is the in-process property loop's tally
 	// (validation/propertyloop.go), attached by the orchestrator once
 	// driveTier1 returns -- the loop runs beside the walkers, not inside

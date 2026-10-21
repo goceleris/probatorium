@@ -206,6 +206,11 @@ type Config struct {
 	// nothing. cmd/validator sets report.WSEchoSlowTolerance under
 	// -race-tier, which the playbook passes in the race tier only.
 	WSEchoSlowTolerance int
+
+	// MarkovThinkTime, when > 0, is the pause every Markov walker takes after
+	// each request. Zero, the default and every cell but the race tier's
+	// adaptive one, leaves the walkers closed-loop exactly as they always ran.
+	MarkovThinkTime time.Duration
 }
 
 // Default returns Config defaults; CLI flag binders use these as the

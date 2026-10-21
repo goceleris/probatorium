@@ -736,6 +736,16 @@ func wsEchoSlowTolerance(raceTier bool) int {
 	return 0
 }
 
+// raceAdaptiveMarkovThink is the pause each Markov walker of the race tier's
+// adaptive cell takes after every request.
+const raceAdaptiveMarkovThink = 4 * time.Millisecond
+
+// cellMarkovThinkTime is the Markov walkers' pause for a cell. Stub: nothing is
+// shaped yet.
+func cellMarkovThinkTime(engine string, raceTier bool) time.Duration {
+	return 0
+}
+
 func cellConcurrencyFloor(engine string) int {
 	if engine != "adaptive" {
 		return 0
