@@ -1,0 +1,134 @@
+---
+# The judgement of ansible/os-upgrade.yml, as lazily evaluated variables, in a file of their own so that
+# ansible/tests/test_os_upgrade_judge.sh can load the very same text with fixture records and check every
+# verdict (a Jinja template that only runs on a cluster host being upgraded is a template nobody has run).
+#
+# Four verdicts, each a string of messages joined by " ;; " (a plain string survives every ansible-core
+# version's templating); empty means nothing to report:
+#
+#   refusals_str           BEFORE anything is touched: the host is not in a state to be upgraded
+#   plan_refusals_str      after `apt-get update` and BEFORE `apt-get full-upgrade`: what apt would do is unacceptable
+#   pre_reboot_problems_str  after the upgrade, BEFORE the reboot: the new kernel is not safe to boot (the old one stays
+#                          the default and nothing is rebooted)
+#   post_problems_str      after the reboot: the host is not verified (the new kernel is NOT made the default)
+#
+# Inputs, set by the play: os_host (the target), os_bench_targets, os_loadgen_hosts (inventory group members),
+# os_surveys (every host's preflight survey, by host name), pre_target (the target's reboot_snapshot.sh record
+# before), pre_survey (its survey before), allow_results_loss, results_root, os_min_* (disk), and, as the play
+# produces them: sim (simulate), dkms_check, target_kernel, post_raw / post_survey / toolcheck (after the reboot),
+# placement_vector, lan_ip, fabric_peer, ansible_user, os_counter_ceiling.
+
+os_min_root_free_kib: 6291456
+os_min_boot_free_kib: 524288
+os_min_efi_free_kib: 32768
+os_counter_ceiling: 1000000000
+# what apt must never remove on a cluster host: the kernel and boot chain, DKMS and the NIC driver, and the ways
+# in (ssh, tailscale) and out (power guard, docker for the db fixtures)
+os_protected_regex: '^(linux-|grub|shim|dkms|openssh|tailscale|apcupsd|docker|containerd|runc|netplan|systemd|ifenslave|r8127|network)'
+
+post_snap: >-
+  {{ (post_raw.stdout | from_json) if (post_raw.stdout | default('') | length > 0) else {} }}
+
+# Reasons NOT to start, judged on the snapshot and the survey taken just before.
+refusals_str: >-
+  {% set a = pre_target %}
+  {% set s = pre_survey %}
+  {% set p = [] %}
+  {% if a.manifest_present %}{% set _ = p.append('a bench or validation manifest exists on the target') %}{% endif %}
+  {% if a.results_entries | int > 0 and not (allow_results_loss | bool) %}{% set _ = p.append('results_root ' ~ results_root ~ ' holds ' ~ a.results_entries ~ ' entr(ies) the reboot destroys (' ~ (a.results_list | join(', ')) ~ '): rescue or fetch them, or dispatch with allow_results_loss=true') %}{% endif %}
+  {% if a.resume_pending %}{% set _ = p.append('/var/lib/celeris-power/resume-pending.json exists: a power-loss resume is pending (cluster-power-restore --list)') %}{% endif %}
+  {% if a.runner_workers | int > 0 %}{% set _ = p.append(a.runner_workers ~ ' runner job(s) are executing on the host') %}{% endif %}
+  {% if a.r8127 and not a.prereq.quiesce_hook %}{% set _ = p.append('the host has an r8127 NIC and no shutdown quiesce hook: msr1 panics at power-off and then needs a physical power-cycle; run ansible/power-guard.yml') %}{% endif %}
+  {% if a.r8127 and a.modinfo_r8127 != true %}{% set _ = p.append('the r8127 module is not available for the running kernel ' ~ a.kernel ~ ': the NIC would not come back') %}{% endif %}
+  {% if a.prereq.tailscaled_active and a.prereq.tailscaled_enabled != 'enabled' %}{% set _ = p.append('tailscaled is running but systemctl is-enabled says "' ~ a.prereq.tailscaled_enabled ~ '": it would not start at boot and the host would be off the tailnet, unreachable to CI (enable it first)') %}{% endif %}
+  {% if s.disk['/'] is none or s.disk['/'].free_kib < os_min_root_free_kib %}{% set _ = p.append('not enough free disk on /: ' ~ (s.disk['/'].free_kib if s.disk['/'] is not none else 'unreadable') ~ ' KiB free, ' ~ os_min_root_free_kib ~ ' needed') %}{% endif %}
+  {% if s.disk['/boot'] is none or s.disk['/boot'].free_kib < os_min_boot_free_kib %}{% set _ = p.append('not enough free disk on /boot: ' ~ (s.disk['/boot'].free_kib if s.disk['/boot'] is not none else 'unreadable') ~ ' KiB free, ' ~ os_min_boot_free_kib ~ ' needed (three kernels and their initrds)') %}{% endif %}
+  {% if s.disk['/boot/efi'] is not none and s.disk['/boot/efi'].free_kib < os_min_efi_free_kib %}{% set _ = p.append('not enough free disk on /boot/efi: ' ~ s.disk['/boot/efi'].free_kib ~ ' KiB free, ' ~ os_min_efi_free_kib ~ ' needed') %}{% endif %}
+  {% if s.packages.dpkg_lock_held or s.packages.package_processes | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (s.packages.package_processes | join(', ') if s.packages.package_processes | length > 0 else 'a dpkg lock is held') ~ '): an unattended upgrade or another package run is in progress') %}{% endif %}
+  {% if s.packages.dpkg_audit | length > 0 %}{% set _ = p.append('dpkg --audit reports half-configured or broken packages: ' ~ (s.packages.dpkg_audit | join(' / '))) %}{% endif %}
+  {% if s.packages.held_kernel | length > 0 %}{% set _ = p.append('held kernel, boot or DKMS packages: ' ~ (s.packages.held_kernel | join(', ')) ~ ' (apt-mark unhold them deliberately, or leave the host)') %}{% endif %}
+  {% if s.packages.policy_rc_d_present %}{% set _ = p.append('/usr/sbin/policy-rc.d exists already: the upgrade installs its own for the length of the apt run and will not overwrite one') %}{% endif %}
+  {% if not (s.boot.grub_cfg_present and s.boot.grub_reboot and s.boot.grub_set_default and s.boot.grub_editenv and s.boot.update_grub) %}{% set _ = p.append('no usable GRUB (grub.cfg, grub-reboot, grub-set-default, grub-editenv and update-grub are all needed): the boot cannot be made one-shot, so a failed boot would not fall back to the old kernel') %}{% endif %}
+  {% if s.boot.savedefault %}{% set _ = p.append('GRUB_SAVEDEFAULT=true: booting the one-shot entry would make it the saved default') %}{% endif %}
+  {% if s.boot.boot_stack | length > 0 %}{% set _ = p.append('/boot/grub is on ' ~ s.boot.boot_stack ~ ': grub cannot write its environment block there, so the boot is never one-shot') %}{% endif %}
+  {% if s.boot.running_entry_id | length == 0 %}{% set _ = p.append('grub.cfg has no menu entry for the running kernel ' ~ s.kernel ~ ': it cannot be made the fallback') %}{% endif %}
+  {% if os_host in os_loadgen_hosts %}
+  {% for h in os_bench_targets %}
+  {% set m = (os_surveys[h].marker | default({})) %}
+  {% if not (m.permanent | default(false)) or (m.kernel_after | default('')) != os_surveys[h].kernel %}{% set _ = p.append('order: ' ~ h ~ ' has not been upgraded and verified yet (or runs another kernel than its record says: ' ~ os_surveys[h].kernel ~ ' vs ' ~ (m.kernel_after | default('no record')) ~ '): the servers go first and the load generator last, because the servers are verified against it') %}{% endif %}
+  {% endfor %}
+  {% endif %}
+  {{ p | join(' ;; ') }}
+
+# What apt WOULD do (simulation on freshly updated lists): refuse before it does anything.
+plan_refusals_str: >-
+  {% set p = [] %}
+  {% if sim.rc != 0 %}{% set _ = p.append('apt-get -s full-upgrade failed: ' ~ sim.error) %}{% endif %}
+  {% set gone = sim.remv | select('match', os_protected_regex) | list %}
+  {% if gone | length > 0 %}{% set _ = p.append('the upgrade would REMOVE protected package(s): ' ~ (gone | join(', '))) %}{% endif %}
+  {{ p | join(' ;; ') }}
+
+# Is the new kernel safe to boot? Judged after the upgrade, before anything reboots.
+pre_reboot_problems_str: >-
+  {% set a = pre_target %}
+  {% set d = dkms_check %}
+  {% set p = [] %}
+  {% if target_kernel | length == 0 %}{% set _ = p.append('no kernel of the running flavor is installed') %}{% endif %}
+  {% if not d.vmlinuz_present %}{% set _ = p.append('/boot/vmlinuz-' ~ target_kernel ~ ' is missing') %}{% endif %}
+  {% if not d.initrd_present %}{% set _ = p.append('/boot/initrd.img-' ~ target_kernel ~ ' is missing') %}{% endif %}
+  {% if d.target_entry_id | length == 0 %}{% set _ = p.append('grub.cfg has no menu entry for ' ~ target_kernel) %}{% endif %}
+  {% if d.saved_resolves_to != d.running %}{% set _ = p.append('the grub default would NOT boot the old kernel ' ~ d.running ~ ' (saved_entry resolves to "' ~ d.saved_resolves_to ~ '"): the fallback is not intact') %}{% endif %}
+  {% if not d.cfg_uses_saved %}{% set _ = p.append('grub.cfg does not use the saved entry') %}{% endif %}
+  {% if d.grub_savedefault %}{% set _ = p.append('GRUB_SAVEDEFAULT=true') %}{% endif %}
+  {% if d.recordfail_timeout == '-1' %}{% set _ = p.append('grub waits at the menu for ever after a failed boot (recordfail timeout -1)') %}{% endif %}
+  {% if d.dkms_needed | length > 0 and not d.headers_present %}{% set _ = p.append('linux-headers for ' ~ target_kernel ~ ' are not installed: DKMS cannot build ' ~ (d.dkms_needed | join(', '))) %}{% endif %}
+  {% if d.missing_modules | length > 0 %}{% set _ = p.append('DKMS module(s) ' ~ (d.missing_modules | join(', ')) ~ ' are installed for the running kernel and not for ' ~ target_kernel) %}{% endif %}
+  {% if d.build_rc is not none and d.build_rc != 0 %}{% set _ = p.append('dkms autoinstall -k ' ~ target_kernel ~ ' failed (exit ' ~ d.build_rc ~ '): see dkms.json for the make log') %}{% endif %}
+  {% if d.nic_drivers_missing | length > 0 %}{% set _ = p.append('the driver(s) of the NICs in use are not available for ' ~ target_kernel ~ ': ' ~ (d.nic_drivers_missing | join(', '))) %}{% endif %}
+  {% if a.r8127 and not d.r8127.found %}{% set _ = p.append('r8127 is NOT built for ' ~ target_kernel ~ ' (modinfo -k): the NIC would not come back') %}{% endif %}
+  {% if a.r8127 and d.r8127.found and not d.r8127_aliases %}{% set _ = p.append('the r8127 module of ' ~ target_kernel ~ ' has no PCI aliases: it would never be loaded for the NIC') %}{% endif %}
+  {% if a.r8127 and d.r8127.found and d.secure_boot == 'enabled' and d.r8127.signer | length == 0 %}{% set _ = p.append('Secure Boot is enabled and the r8127 module of ' ~ target_kernel ~ ' is not signed: the kernel would refuse to load it') %}{% endif %}
+  {% if a.r8127 and not d.quiesce_hook %}{% set _ = p.append('the shutdown quiesce hook of the r8127 NIC is missing') %}{% endif %}
+  {% if a.r8127 and d.intree_lists_id and not d.intree_lists_id_running and not d.r8169_blacklisted %}{% set _ = p.append('the in-tree r8169 of ' ~ target_kernel ~ ' lists the same PCI id as r8127 (the running kernel does not) and r8169 is not blacklisted: which driver binds the NIC would be a race (the bench pins the r8127 vector name). Dispatch with blacklist_r8169=true, or decide to move to the in-tree driver in a separate change') %}{% endif %}
+  {{ p | join(' ;; ') }}
+
+# What is wrong with the host after the reboot (empty: verified).
+post_problems_str: >-
+  {% set a = pre_target %}
+  {% set b = post_snap %}
+  {% set s = pre_survey %}
+  {% set bs = post_survey | default({}) %}
+  {% set tc = toolcheck | default({}) %}
+  {% set p = [] %}
+  {% if b | length == 0 %}{% set _ = p.append('no readable snapshot after the reboot') %}{% else %}
+  {% if b.boot_id == a.boot_id %}{% set _ = p.append('boot_id did not change (' ~ a.boot_id ~ '): the host did not reboot') %}{% endif %}
+  {% if b.kernel != target_kernel %}{% if b.kernel == s.kernel %}{% set _ = p.append('the host booted the OLD kernel ' ~ b.kernel ~ ' again: the one-shot entry for ' ~ target_kernel ~ ' fell back (it failed early or grub did not honour next_entry)') %}{% else %}{% set _ = p.append('the host runs ' ~ b.kernel ~ ', not the intended ' ~ target_kernel) %}{% endif %}{% endif %}
+  {% if (b.crash | difference(a.crash)) | length > 0 %}{% set _ = p.append('new crash dump(s) in /var/crash: ' ~ (b.crash | difference(a.crash) | join(', '))) %}{% endif %}
+  {% for k in ['tailscaled_active', 'apcupsd_active', 'resume_check_enabled', 'power_event_installed', 'tmpfiles_conf', 'quiesce_hook'] %}
+  {% if a.prereq[k] and not b.prereq[k] %}{% set _ = p.append('prerequisite regressed: ' ~ k ~ ' held before the upgrade and does not now') %}{% endif %}
+  {% endfor %}
+  {% if a.prereq.run_celeris_owner == ansible_user and b.prereq.run_celeris_owner != ansible_user %}{% set _ = p.append('/run/celeris is not owned by ' ~ ansible_user ~ ' (' ~ b.prereq.run_celeris_owner ~ '): the tmpfiles.d entry of power-guard.yml did not apply') %}{% endif %}
+  {% if placement_vector != '-' and not b.placement_vector_present %}{% set _ = p.append('NIC vector ' ~ placement_vector ~ ' (bench.yml pins it) is not in /proc/interrupts') %}{% endif %}
+  {% if b.lan_ip_present != true %}{% set _ = p.append('fabric address ' ~ lan_ip ~ ' is not configured on the host') %}{% endif %}
+  {% if b.peer_ping_ok != true %}{% set _ = p.append('no answer from ' ~ fabric_peer ~ ' over the fabric') %}{% endif %}
+  {% set up_a = a.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
+  {% set up_b = b.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
+  {% if up_b < up_a %}{% set _ = p.append('bond lost a slave: ' ~ up_a ~ ' up before, ' ~ up_b ~ ' up now') %}{% endif %}
+  {% if b.max_vector_total >= os_counter_ceiling %}{% set _ = p.append('a NIC vector counts ' ~ b.max_vector_total ~ ' since boot: the counters were not reset') %}{% endif %}
+  {% if (b.failed_units | difference(a.failed_units)) | length > 0 %}{% set _ = p.append('new failed unit(s): ' ~ (b.failed_units | difference(a.failed_units) | join(', '))) %}{% endif %}
+  {% if bs | length == 0 %}{% set _ = p.append('no readable survey after the reboot') %}{% else %}
+  {% for n in s.nics %}
+  {% set m = bs.nics | selectattr('iface', 'equalto', n.iface) | list %}
+  {% if m | length == 0 %}{% set _ = p.append('NIC ' ~ n.iface ~ ' (' ~ n.driver ~ ') is gone') %}{% else %}
+  {% if m[0].driver != n.driver %}{% set _ = p.append('NIC ' ~ n.iface ~ ' is bound to ' ~ m[0].driver ~ ', was ' ~ n.driver) %}{% endif %}
+  {% if n.speed_mbps is not none and m[0].speed_mbps != n.speed_mbps %}{% set _ = p.append('NIC ' ~ n.iface ~ ' link speed ' ~ m[0].speed_mbps ~ ' Mb/s, was ' ~ n.speed_mbps) %}{% endif %}
+  {% endif %}
+  {% endfor %}
+  {% if s.time_sync.ntp_synchronized and not bs.time_sync.ntp_synchronized %}{% set _ = p.append('the clock is not synchronized after the reboot (it was before)') %}{% endif %}
+  {% endif %}
+  {% if tc | length == 0 %}{% set _ = p.append('the toolchain bootstrap check did not run') %}{% else %}
+  {% if not tc.cc_ok %}{% set _ = p.append('the system C compiler cannot build and run a program') %}{% endif %}
+  {% if not tc.https_ok %}{% set _ = p.append('TLS to github.com (the runner tarball) does not verify') %}{% endif %}
+  {% endif %}
+  {% endif %}
+  {{ p | join(' ;; ') }}

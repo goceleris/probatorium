@@ -1,0 +1,32 @@
+---
+# The request of ansible/os-upgrade.yml, validated. Imported by the first two plays: a failed play does not by itself
+# stop the plays after it, and the host pattern of the target play is the very variable checked here.
+- name: OS upgrade | the request is well formed
+  ansible.builtin.assert:
+    that:
+      - os_mode is defined
+      - os_mode in ['survey', 'upgrade']
+      - os_host is defined
+      - (os_mode == 'upgrade') or (os_host == '-')
+      - (os_mode == 'survey') or (os_host in ['msa2-server', 'msr1', 'msa2-client'])
+      - os_confirm is defined
+      - (os_mode == 'survey') or (os_confirm == 'UPGRADE-' ~ os_host)
+      - os_reason is defined
+      - os_reason | trim | length > 0
+      - os_reason | length <= 200
+      - "'\n' not in os_reason"
+      - os_run_id is defined
+      - os_run_id | string is match('^[0-9]+$')
+      - os_out_dir is defined
+      - os_out_dir is match('^/')
+    fail_msg: >-
+      refused: os_mode must be survey or upgrade; an upgrade names ONE host (msa2-server, msr1 or msa2-client) and
+      os_confirm must be exactly UPGRADE-<host>; a survey names no host ("-"); os_reason is one line of 1-200
+      characters; os_run_id digits; os_out_dir absolute.
+    quiet: true
+
+- name: OS upgrade | the host is a host of the inventory
+  ansible.builtin.assert:
+    that: (os_mode == 'survey') or (os_host in groups['cluster'])
+    fail_msg: "refused: {{ os_host }} is not a host of the inventory's cluster group"
+    quiet: true

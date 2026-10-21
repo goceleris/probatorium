@@ -1,0 +1,645 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// The sanctioned OS survey and upgrade (.github/workflows/cluster-os-upgrade.yml, ansible/os-upgrade.yml,
+// ansible/files/os_upgrade.py). A kernel change is the one cluster action that can leave a host without a NIC and
+// recoverable only physically (msr1 has an out-of-tree r8127 driver and panics at power-off). These tests pin what
+// makes it safe, as text and as behaviour: the workflow's gates, the playbook's order of steps, the subcommands the
+// playbook may run on a host, and that the python and ansible tests run in CI. The judgement (every refusal) is
+// run for real by ansible/tests/test_os_upgrade_judge.py, the host-changing subcommands by test_os_upgrade.py, the
+// whole playbook by test_os_upgrade_play.py.
+
+const (
+	osWorkflow = "cluster-os-upgrade.yml"
+	osPlaybook = "ansible/os-upgrade.yml"
+	osScript   = "ansible/files/os_upgrade.py"
+	osJudge    = "ansible/vars/os_upgrade_judge.yml"
+	osRequest  = "ansible/tasks/os_upgrade_request.yml"
+)
+
+func osUpgradeHosts() []string { return []string{"msa2-server", "msr1", "msa2-client"} }
+
+func TestClusterOSUpgradeOnlyRunsWhenDispatched(t *testing.T) {
+	src := withoutComments(readWorkflow(t, osWorkflow))
+	on := regexp.MustCompile(`(?ms)^on:\n(.*?)^\S`).FindStringSubmatch(src + "\nX")
+	if on == nil {
+		t.Fatal("no on: block")
+	}
+	var triggers []string
+	for _, m := range regexp.MustCompile(`(?m)^  ([a-z_]+):`).FindAllStringSubmatch(on[1], -1) {
+		triggers = append(triggers, m[1])
+	}
+	if !slices.Equal(triggers, []string{"workflow_dispatch"}) {
+		t.Errorf("triggers = %v, want only workflow_dispatch: an OS upgrade must never start by itself", triggers)
+	}
+	if regexp.MustCompile(`(?m)^\s*-?\s*cron:`).MatchString(src) || strings.Contains(src, "schedule:") {
+		t.Error("the workflow has a schedule")
+	}
+}
+
+// The inputs: a survey (no host) or an upgrade of ONE named host with a typed confirmation; the playbook accepts
+// exactly the hosts the workflow offers.
+func TestClusterOSUpgradeInputs(t *testing.T) {
+	src := withoutComments(readWorkflow(t, osWorkflow))
+	choice := func(name, next string) []string {
+		m := regexp.MustCompile(`(?ms)^      ` + name + `:\n(.*?)^      ` + next + `:`).FindStringSubmatch(src)
+		if m == nil {
+			t.Fatalf("no input %s before %s", name, next)
+		}
+		if !strings.Contains(m[1], "type: choice") {
+			t.Fatalf("input %s is not a choice", name)
+		}
+		o := regexp.MustCompile(`options: \[([^\]]*)\]`).FindStringSubmatch(m[1])
+		if o == nil {
+			t.Fatalf("input %s has no options", name)
+		}
+		var out []string
+		for _, x := range strings.Split(o[1], ",") {
+			out = append(out, strings.Trim(strings.TrimSpace(x), `"'`))
+		}
+		return out
+	}
+	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "upgrade"}) {
+		t.Errorf("modes = %v", got)
+	}
+	offered := choice("host", "confirm")
+	if !slices.Equal(offered, append([]string{"-"}, osUpgradeHosts()...)) {
+		t.Errorf("hosts offered = %v, want '-' and the three hosts", offered)
+	}
+	for _, in := range []string{"mode", "reason"} {
+		m := regexp.MustCompile(`(?ms)^      ` + in + `:\n(.*?)^      [a-z_0-9]+:`).FindStringSubmatch(src)
+		if m == nil || !strings.Contains(m[1], "required: true") {
+			t.Errorf("input %s is not required", in)
+		}
+	}
+	for _, in := range []string{"allow_results_loss", "refresh_lists", "blacklist_r8169"} {
+		m := regexp.MustCompile(`(?ms)^      ` + in + `:\n(.*?)(?:^      [a-z_0-9]+:|^permissions:)`).FindStringSubmatch(src)
+		if m == nil || !strings.Contains(m[1], "default: false") {
+			t.Errorf("input %s does not default to false", in)
+		}
+	}
+
+	req := mustRead(t, osRequest)
+	allowed := regexp.MustCompile(`os_host in \[([^\]]*)\]`).FindStringSubmatch(req)
+	if allowed == nil {
+		t.Fatal("the playbook does not check os_host against a list")
+	}
+	var accepted []string
+	for _, o := range strings.Split(allowed[1], ",") {
+		accepted = append(accepted, strings.Trim(strings.TrimSpace(o), "'"))
+	}
+	if !slices.Equal(accepted, osUpgradeHosts()) {
+		t.Errorf("the playbook accepts %v, want %v", accepted, osUpgradeHosts())
+	}
+	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "(os_mode == 'upgrade') or (os_host == '-')", "os_mode in ['survey', 'upgrade']"} {
+		if !strings.Contains(req, want) {
+			t.Errorf("the playbook's request check lacks %s", want)
+		}
+	}
+	if n := strings.Count(stripComments(mustRead(t, osPlaybook)), "import_tasks: tasks/os_upgrade_request.yml"); n != 2 {
+		t.Errorf("%d plays validate the request, want 2 (localhost, then the preflight on every host)", n)
+	}
+}
+
+func TestClusterOSUpgradePlanRefuses(t *testing.T) {
+	plan := jobSection(t, withoutComments(readWorkflow(t, osWorkflow)), "plan")
+	for _, want := range []string{
+		`"$IN_CONFIRM" != "UPGRADE-$IN_HOST"`,
+		`"$REF" != "refs/heads/$DEFAULT_BRANCH"`,
+		`msa2-server|msr1|msa2-client) ;;`,
+		`"$IN_HOST" != "-"`,
+		`-gt 200`,
+		`mode must be survey or upgrade`,
+	} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("the plan job no longer checks %s", want)
+		}
+	}
+}
+
+// Serial group, no cancelling, behind the idle guard, on a fresh verdict. Same rules as the reboot.
+func TestClusterOSUpgradeJoinsTheGroupWithoutCancellingAnything(t *testing.T) {
+	src := withoutComments(readWorkflow(t, osWorkflow))
+	if regexp.MustCompile(`(?m)^concurrency:`).MatchString(src) {
+		t.Error("workflow-level concurrency: the run would enter matrix-tier-cluster at dispatch, before the guard looked")
+	}
+	if strings.Contains(src, "cancel-in-progress: true") {
+		t.Error("cancel-in-progress: true")
+	}
+	if n := strings.Count(src, "group: matrix-tier-cluster"); n != 1 {
+		t.Errorf("%d concurrency groups named matrix-tier-cluster, want exactly 1 (the os-upgrade job)", n)
+	}
+	job := jobSection(t, src, "os-upgrade")
+	if !regexp.MustCompile(`(?m)^    concurrency:\n      group: matrix-tier-cluster\n      cancel-in-progress: false\n`).MatchString(job) {
+		t.Error("the os-upgrade job does not hold matrix-tier-cluster with cancel-in-progress: false")
+	}
+	for _, other := range []string{"plan", "cluster-guard", "verdict"} {
+		if strings.Contains(jobSection(t, src, other), "concurrency:") {
+			t.Errorf("job %s declares concurrency: only the os-upgrade job may hold the group", other)
+		}
+	}
+	if !regexp.MustCompile(`needs: \[plan, cluster-guard\]`).MatchString(job) {
+		t.Error("the os-upgrade job does not need the guard")
+	}
+	for _, want := range []string{
+		"needs.cluster-guard.result == 'success'",
+		"needs.cluster-guard.outputs.attempt == github.run_attempt",
+		"github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+	} {
+		if !strings.Contains(job, want) {
+			t.Errorf("the os-upgrade job's if: lacks %s", want)
+		}
+	}
+	guard := jobSection(t, src, "cluster-guard")
+	if !strings.Contains(guard, `guard -idle -dir "$GUARD_DIR" -self "$RUN_ID"`) {
+		t.Error("the guard job does not run `stresstally guard -idle`: the ordinary verdict lets a change queue behind a holder")
+	}
+	if !strings.Contains(guard, "bash tools/stresstally/guard.sh") {
+		t.Error("the guard job does not list the open runs first (guard.sh)")
+	}
+	iAudit := mustIndex(t, job, "eviction-audit.sh", "the eviction audit")
+	iStale := mustIndex(t, job, "Refuse a stale idle verdict", "the stale-verdict step")
+	iLimit := mustIndex(t, job, `"$age" -gt 600`, "the ten-minute limit")
+	iJoin := mustIndex(t, job, "Join tailnet", "the tailnet join")
+	iPlay := mustIndex(t, job, "ansible/os-upgrade.yml", "the playbook run")
+	if iAudit >= iStale || iStale >= iLimit || iLimit >= iJoin || iJoin >= iPlay {
+		t.Error("order must be: eviction audit, stale-verdict refusal, tailnet join, playbook")
+	}
+	// the other workflows' guards must see this one as a holder
+	g := mustRead(t, filepath.Join("tools", "stresstally", "guard.go"))
+	if !strings.Contains(g, `".github/workflows/cluster-os-upgrade.yml"`) {
+		t.Error("tools/stresstally/guard.go does not list cluster-os-upgrade.yml in clusterGroupWorkflows: a tier's guard would not see an OS upgrade holding the cluster")
+	}
+	if !strings.Contains(mustRead(t, filepath.Join("tools", "stresstally", "eviction-audit.sh")), "cluster-os-upgrade") {
+		t.Error("eviction-audit.sh does not report a cancelled OS upgrade")
+	}
+}
+
+func TestClusterOSUpgradeVerdictIsRedUnlessDone(t *testing.T) {
+	v := jobSection(t, withoutComments(readWorkflow(t, osWorkflow)), "verdict")
+	if !strings.Contains(v, `needs: [plan, cluster-guard, os-upgrade]`) || !strings.Contains(v, `"$RUN" != success`) {
+		t.Error("the verdict job does not fail unless the os-upgrade job succeeded")
+	}
+	if !strings.Contains(v, "!cancelled()") {
+		t.Error("the verdict job must run when the os-upgrade job was skipped")
+	}
+}
+
+func TestClusterOSUpgradeWorkflowHygiene(t *testing.T) {
+	src := withoutComments(readWorkflow(t, osWorkflow))
+	lines := strings.Split(src, "\n")
+	for i, l := range lines {
+		if strings.Contains(l, "${{ inputs.") && !regexp.MustCompile(`^\s*(name|run-name|[A-Z][A-Z_]*):`).MatchString(l) {
+			t.Errorf("line %d: an input outside env:, run-name or a name: %s", i+1, l)
+		}
+		if strings.Contains(l, "${{ secrets.") && !regexp.MustCompile(`^\s*(oauth-client-id|oauth-secret|[A-Z][A-Z_]*):`).MatchString(l) {
+			t.Errorf("line %d: a secret outside env: or the tailscale step's with: %s", i+1, l)
+		}
+	}
+	for i := 0; i < len(lines); i++ {
+		m := regexp.MustCompile(`^(\s*)(?:- )?run:\s*(.*)$`).FindStringSubmatch(lines[i])
+		if m == nil {
+			continue
+		}
+		if strings.Contains(m[2], "${{") {
+			t.Errorf("line %d: an expression in a run: script", i+1)
+		}
+		if strings.TrimSpace(m[2]) != "|" {
+			continue
+		}
+		for j := i + 1; j < len(lines); j++ {
+			l := lines[j]
+			if strings.TrimSpace(l) != "" && len(l)-len(strings.TrimLeft(l, " ")) <= len(m[1]) {
+				break
+			}
+			if strings.Contains(l, "${{") {
+				t.Errorf("line %d: an expression in a run: script: %s", j+1, l)
+			}
+		}
+	}
+	pinned := regexp.MustCompile(`^[\w.-]+/[\w.-]+@[0-9a-f]{40}$`)
+	for _, u := range regexp.MustCompile(`(?m)^\s*(?:- )?uses:\s*(\S+)(.*)$`).FindAllStringSubmatch(src, -1) {
+		if !pinned.MatchString(u[1]) || !regexp.MustCompile(`^\s+# v\d`).MatchString(u[2]) {
+			t.Errorf("uses %s%s: pin by full commit sha with a # vX comment", u[1], u[2])
+		}
+	}
+	if strings.Count(src, "secrets.CLUSTER_SSH_KEY") != 1 {
+		t.Errorf("the cluster key must be given to exactly one step, found %d uses", strings.Count(src, "secrets.CLUSTER_SSH_KEY"))
+	}
+	if strings.Contains(src, "self-hosted") || strings.Contains(src, "celeris-cluster") {
+		t.Error("a job names a cluster runner label: the upgrade must not depend on, or leave, a runner on a cluster host")
+	}
+	if strings.Contains(src, "CLUSTER_USE_LAN") {
+		t.Error("CLUSTER_USE_LAN: the reconnect after the reboot must go over the tailnet, which proves tailscale came back")
+	}
+	if strings.Contains(src, "pull_request_target") {
+		t.Error("pull_request_target")
+	}
+	perms := regexp.MustCompile(`(?m)^permissions:\n((?:[ ]+.*\n)+)`).FindStringSubmatch(src)
+	if perms == nil || strings.TrimSpace(perms[1]) != "contents: read" {
+		t.Errorf("top-level permissions must be exactly contents: read, got %q", perms)
+	}
+	if !strings.Contains(jobSection(t, src, "cluster-guard"), "actions: read") {
+		t.Error("the guard cannot list runs without actions: read")
+	}
+	if !strings.Contains(src, "ansible_core_version") || !strings.Contains(src, "ansible/runner-setup.yml") {
+		t.Error("the job does not install the ansible-core pin of ansible/runner-setup.yml")
+	}
+	// the survey step that talks to the internet runs only in survey mode and cannot fail the run
+	if !strings.Contains(src, "if: ${{ env.OS_MODE == 'survey' }}") || !strings.Contains(src, "|| echo") {
+		t.Error("the toolchain comparison is not survey-only and best-effort")
+	}
+
+	// the job outlives apt, a DKMS build, the reboot and the settling, and the ansible timeout fits inside the job
+	job := jobSection(t, src, "os-upgrade")
+	m := regexp.MustCompile(`timeout-minutes: (\d+)`).FindStringSubmatch(job)
+	pb := mustRead(t, osPlaybook)
+	rt := regexp.MustCompile(`reboot_timeout_seconds: (\d+)`).FindStringSubmatch(pb)
+	retries := regexp.MustCompile(`upgrade_poll_retries: (\d+)`).FindStringSubmatch(pb)
+	at := regexp.MustCompile(`timeout -k 30 (\d+) ansible-playbook`).FindStringSubmatch(job)
+	if m == nil || rt == nil || retries == nil || at == nil {
+		t.Fatal("no timeout-minutes on the job, reboot_timeout_seconds / upgrade_poll_retries in the playbook, or timeout on ansible-playbook")
+	}
+	jobMin, _ := strconv.Atoi(m[1])
+	boot, _ := strconv.Atoi(rt[1])
+	poll, _ := strconv.Atoi(retries[1])
+	play, _ := strconv.Atoi(at[1])
+	if boot > 900 {
+		t.Errorf("reboot_timeout_seconds = %d: the bound is 15 minutes", boot)
+	}
+	const dkmsBuild = 1800 // dkms autoinstall's own timeout in os_upgrade.py
+	need := poll*10 + dkmsBuild + boot + 36*5 + 24*5 + 600
+	if play < need {
+		t.Errorf("ansible-playbook is bounded at %d s but apt (%d s) + a DKMS build (%d s) + the reboot (%d s) + settling + the checks need %d s", play, poll*10, dkmsBuild, boot, need)
+	}
+	if jobMin*60 < play+600 {
+		t.Errorf("the job's %d-minute timeout does not cover the %d s playbook bound and the setup", jobMin, play)
+	}
+	if !strings.Contains(mustRead(t, osScript), "timeout=1800") {
+		t.Error("os_upgrade.py no longer bounds the DKMS build at 1800 s: the timeout arithmetic above is stale")
+	}
+}
+
+// The playbook: no shell/command task, every host command is a subcommand of os_upgrade.py and only the ones listed,
+// they run in the order that makes a failed boot fall back to the old kernel, the new kernel becomes the default
+// only after the verification, the reboot is the only one and carries no free text.
+func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
+	raw := mustRead(t, osPlaybook)
+	src := stripComments(raw)
+	if n := strings.Count(src, "ansible.builtin.reboot:"); n != 1 {
+		t.Errorf("%d reboot tasks, want exactly 1", n)
+	}
+	if n := strings.Count(src, "any_errors_fatal: true"); n < 3 {
+		t.Errorf("%d plays with any_errors_fatal, want the request check, the preflight and the target: a peer that does not answer must stop the run", n)
+	}
+	if !strings.Contains(src, "hostvars[os_host].os_upgrade_verified | default(false)") || !strings.Contains(src, "os_upgrade_verified: true") {
+		t.Error("no last play proves the target play ran to its end: a host pattern that matched nothing would read as success")
+	}
+	task := regexp.MustCompile(`(?s)ansible\.builtin\.reboot:\n(.*?)\n    - name:`).FindStringSubmatch(src)
+	if task == nil {
+		t.Fatal("cannot find the reboot task")
+	}
+	if strings.Contains(task[1], "os_reason") || !strings.Contains(task[1], `msg: "cluster-os-upgrade workflow run {{ os_run_id }}"`) {
+		t.Errorf("the reboot message must be fixed text and the validated run id: the module puts it inside double quotes in a root shell command, so free text there is a shell injection:\n%s", task[1])
+	}
+	if !strings.Contains(task[1], `reboot_timeout: "{{ reboot_timeout_seconds | int }}"`) {
+		t.Error("the reboot wait is not bounded by reboot_timeout_seconds")
+	}
+	for _, banned := range []string{"ansible.builtin.shell:", "ansible.builtin.command:", "ansible.builtin.raw:", "ansible.builtin.service:", "ansible.builtin.systemd:",
+		"ansible.builtin.apt:", "ansible.builtin.package:", "ansible.builtin.lineinfile:", "ansible.builtin.replace:", "state: absent", "state: restarted", "state: stopped", "docker", "autoremove"} {
+		if strings.Contains(src, banned) {
+			t.Errorf("the playbook uses %s: a host is touched only through the subcommands of os_upgrade.py and the reboot", banned)
+		}
+	}
+	if !strings.Contains(src, `hosts: "{{ os_host if (os_mode | default('survey') == 'upgrade') else 'none' }}"`) {
+		t.Error("the target play does not run on os_host in upgrade mode only")
+	}
+
+	// the subcommands the playbook may run on a host
+	allowed := []string{"apt-update", "survey", "simulate", "dump", "pin-grub", "upgrade-start", "upgrade-status", "upgrade-log",
+		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck"}
+	for _, m := range regexp.MustCompile(`\{\{ osu \}\} ([a-z0-9-]+)`).FindAllStringSubmatch(src, -1) {
+		if !slices.Contains(allowed, m[1]) {
+			t.Errorf("the playbook runs the subcommand %q, which is not on the reviewed list %v", m[1], allowed)
+		}
+	}
+	// the reboot_snapshot.sh record is read, never changed: it is a script with no write verb (its own tests)
+
+	// the order
+	idx := func(needle string) int { return mustIndex(t, src, needle, needle) }
+	order := []string{
+		"Target | refuse when vars/os_upgrade_judge.yml says so",
+		"osu }} pin-grub",
+		"Apt | update the package lists",
+		"Apt | refuse when the plan is unacceptable",
+		"osu }} upgrade-start",
+		"osu }} upgrade-status",
+		"Apt | the full-upgrade must have finished with exit 0",
+		"osu }} dkms-check --build",
+		"Dkms | REFUSE TO REBOOT",
+		"osu }} arm-oneshot",
+		"ansible.builtin.reboot:",
+		"Post | judge",
+		"osu }} make-permanent",
+	}
+	last := -1
+	for _, o := range order {
+		i := idx(o)
+		if i <= last {
+			t.Errorf("order must be: %s; %q is out of place", strings.Join(order, " -> "), o)
+		}
+		last = i
+	}
+	for _, once := range []string{"osu }} pin-grub", "osu }} arm-oneshot", "osu }} make-permanent", "osu }} upgrade-start"} {
+		if n := strings.Count(src, once); n != 1 {
+			t.Errorf("%q appears %d times, want exactly 1", once, n)
+		}
+	}
+	// the pin happens before the first package change (the upgrade is also before the dkms-check)
+	if idx("osu }} pin-grub") > idx("Apt | update the package lists") {
+		t.Error("the old kernel is not pinned before apt runs")
+	}
+	// the judgement gates each step
+	for _, want := range []string{"when: refusals_str | trim | length > 0", "when: plan_refusals_str | trim | length > 0",
+		"when: pre_reboot_problems_str | trim | length > 0", "when: post_problems_str | trim | length > 0"} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the playbook does not act on the judgement: %q is missing", want)
+		}
+	}
+	if !strings.Contains(src, "ControlMaster=no") || !strings.Contains(src, "ControlPath=none") {
+		t.Error("a multiplexed ssh socket may outlive the reboot: switch ControlMaster off for the plays")
+	}
+	// the survey's preflight takes no confirmation and changes nothing but, when asked, the apt lists
+	pre := regexp.MustCompile(`(?s)preflight and survey on every host.*?- name: OS upgrade \| the target`).FindString(src)
+	for _, banned := range []string{"pin-grub", "upgrade-start", "arm-oneshot", "make-permanent", "ansible.builtin.reboot"} {
+		if strings.Contains(pre, banned) {
+			t.Errorf("the preflight/survey play contains %s", banned)
+		}
+	}
+}
+
+// The script: autoremove never runs, the read-only subcommands run in READ_ONLY mode, nothing else reaches a host.
+func TestOSUpgradeScriptCannotAutoremoveAndGuardsItsReads(t *testing.T) {
+	raw := mustRead(t, osScript)
+	code := regexp.MustCompile(`(?s)""".*?"""`).ReplaceAllString(raw, "")
+	code = stripComments(code)
+	for _, banned := range []string{"autoremove", `"purge"`, `"remove"`, "--purge", "rm -rf", `"reboot"`, `"shutdown"`, `"poweroff"`, "systemctl\", \"restart", "kexec"} {
+		if strings.Contains(code, banned) {
+			t.Errorf("os_upgrade.py contains %s", banned)
+		}
+	}
+	if !strings.Contains(code, `a.cmd in ("survey", "simulate", "dump", "upgrade-status", "upgrade-log", "marker")`) {
+		t.Error("the read-only subcommands are no longer run in READ_ONLY mode")
+	}
+	for _, want := range []string{"--force-confold", "--force-confdef", `"NEEDRESTART_MODE": "l"`, `"DEBIAN_FRONTEND": "noninteractive"`, "exit 101", "full-upgrade", "start_new_session=True"} {
+		if !strings.Contains(code, want) {
+			t.Errorf("os_upgrade.py lost %s", want)
+		}
+	}
+	// grub-set-default is called in exactly these places: pinning the OLD kernel, re-asserting it when arming, and the permanent step
+	if n := strings.Count(code, `run(["grub-set-default"`); n != 3 {
+		t.Errorf("%d grub-set-default calls, want 3 (pin-grub, arm-oneshot, make-permanent)", n)
+	}
+	if n := strings.Count(code, `run(["grub-reboot"`); n != 1 {
+		t.Errorf("%d grub-reboot calls, want 1 (arm-oneshot)", n)
+	}
+}
+
+// The judgement keeps every refusal the maintainer asked for. These are the sentences the step summary and the
+// failure print; the Jinja is exercised for real by test_os_upgrade_judge.py.
+func TestClusterOSUpgradeJudgementCoversTheRequirements(t *testing.T) {
+	src := mustRead(t, osJudge)
+	for _, want := range []string{
+		"a bench or validation manifest", "runner job(s) are executing", "resume-pending.json", "results_root", "no shutdown quiesce hook",
+		"r8127 module is not available for the running kernel", "tailscaled is running but", "not enough free disk on /:", "not enough free disk on /boot:",
+		"dpkg or apt is busy", "dpkg --audit", "held kernel, boot or DKMS packages", "policy-rc.d", "no usable GRUB", "GRUB_SAVEDEFAULT=true",
+		"grub cannot write its environment block", "no menu entry for the running kernel", "order: ",
+		"would REMOVE protected package(s)", "apt-get -s full-upgrade failed",
+		"vmlinuz-", "initrd.img-", "has no menu entry for", "the fallback is not intact", "waits at the menu for ever", "linux-headers for",
+		"are installed for the running kernel and not for", "dkms autoinstall -k", "the driver(s) of the NICs in use", "is NOT built for",
+		"no PCI aliases", "Secure Boot is enabled", "lists the same PCI id as r8127", "boot_id did not change", "the one-shot entry for",
+		"new crash dump(s)", "prerequisite regressed", "is not owned by", "is not in /proc/interrupts", "is not configured on the host",
+		"over the fabric", "bond lost a slave", "the counters were not reset", "new failed unit(s)", "link speed", "is bound to", "the clock is not synchronized",
+		"the system C compiler", "TLS to github.com", "no readable snapshot",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the judgement lost %q", want)
+		}
+	}
+	for _, k := range []string{"tailscaled_active", "apcupsd_active", "resume_check_enabled", "power_event_installed", "tmpfiles_conf", "quiesce_hook"} {
+		if !strings.Contains(src, "'"+k+"'") {
+			t.Errorf("the judgement no longer compares prerequisite %s before and after", k)
+		}
+	}
+}
+
+func pythonOrSkip(t *testing.T) string {
+	t.Helper()
+	p, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not installed")
+	}
+	return p
+}
+
+// TestOSUpgradeScript runs ansible/tests/test_os_upgrade.py: the grub menu parser, the survey (read-only: nothing
+// written, no changing command run), and each host-changing subcommand against a fake host with stub commands.
+func TestOSUpgradeScript(t *testing.T) {
+	py := pythonOrSkip(t)
+	out, err := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade.py")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("test_os_upgrade.py failed: %v\n%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("OK")) {
+		t.Fatalf("test_os_upgrade.py did not report OK:\n%s", out)
+	}
+}
+
+// TestOSUpgradeJudgePlay runs the real judgement under ansible (test_os_upgrade_judge.py). Opt-in like the other
+// play tests: the ansible CI job installs the cluster's pin and runs the script directly.
+func TestOSUpgradeJudgePlay(t *testing.T) {
+	py := pythonOrSkip(t)
+	if os.Getenv("PROBATORIUM_ANSIBLE_TESTS") != "1" {
+		t.Skip("set PROBATORIUM_ANSIBLE_TESTS=1 to run the judgement under ansible (needs ansible-playbook); the ansible CI job runs it")
+	}
+	if _, err := exec.LookPath("ansible-playbook"); err != nil {
+		t.Fatal("PROBATORIUM_ANSIBLE_TESTS=1 but ansible-playbook is not installed")
+	}
+	out, err := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade_judge.py")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("test_os_upgrade_judge.py failed: %v\n%s", err, out)
+	}
+}
+
+// TestOSUpgradePlay runs the real playbook end to end on local connections (test_os_upgrade_play.py), with only the
+// restart, the host's commands and sudo replaced.
+func TestOSUpgradePlay(t *testing.T) {
+	py := linuxPython(t)
+	if os.Getenv("PROBATORIUM_ANSIBLE_TESTS") != "1" {
+		t.Skip("set PROBATORIUM_ANSIBLE_TESTS=1 to run the playbook (needs ansible-playbook); the ansible CI job runs it")
+	}
+	if _, err := exec.LookPath("ansible-playbook"); err != nil {
+		t.Fatal("PROBATORIUM_ANSIBLE_TESTS=1 but ansible-playbook is not installed")
+	}
+	out, err := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade_play.py")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("test_os_upgrade_play.py failed: %v\n%s", err, out)
+	}
+}
+
+func linuxPython(t *testing.T) string {
+	t.Helper()
+	_ = linuxBash(t) // skips off Linux: the play reads /proc with GNU tools
+	return pythonOrSkip(t)
+}
+
+// The ansible CI job runs the three python tests under the cluster's ansible pin.
+func TestAnsibleJobRunsTheOSUpgradeTests(t *testing.T) {
+	wf := mustRead(t, filepath.Join(".github", "workflows", "test.yml"))
+	for _, s := range []string{"test_os_upgrade", "test_os_upgrade_judge", "test_os_upgrade_play"} {
+		if !regexp.MustCompile(`(?m)^\s*run: python3 -I ansible/tests/` + s + `\.py\s*$`).MatchString(wf) {
+			t.Errorf("test.yml's ansible job does not run `python3 -I ansible/tests/%s.py`", s)
+		}
+	}
+}
+
+// The toolchain comparison reads the pins of the roles themselves: every role has a row, and the pins are the
+// repository's.
+func TestOSUpgradeToolchainPins(t *testing.T) {
+	bash := needBash(t)
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
+	out, err := exec.Command(bash, filepath.Join(".github", "scripts", "os-upgrade-toolchains.sh"), "--pins-only").Output()
+	if err != nil {
+		t.Fatalf("--pins-only: %v", err)
+	}
+	var rows []struct{ Name, Kind, Pin, Where string }
+	if err := json.Unmarshal(out, &rows); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	pin := map[string]string{}
+	for _, r := range rows {
+		pin[r.Name] = r.Pin
+		if r.Pin == "" || r.Where == "" || (r.Kind != "pinned" && r.Kind != "floating") {
+			t.Errorf("incomplete row %+v", r)
+		}
+	}
+	gomod := mustRead(t, "go.mod")
+	goVer := regexp.MustCompile(`(?m)^go (\S+)$`).FindStringSubmatch(gomod)[1]
+	if !strings.Contains(pin["go (the module and the CI)"], goVer) {
+		t.Errorf("go pin %q does not carry go.mod's %s", pin["go (the module and the CI)"], goVer)
+	}
+	for name, file := range map[string]string{
+		"dotnet sdk":         "ansible/roles/dotnet/defaults/main.yml",
+		"drogon (libdrogon)": "ansible/roles/cpp/defaults/main.yml",
+		"uv":                 "ansible/runner-setup.yml",
+		"ansible-core":       "ansible/runner-setup.yml",
+		"actions runner":     ".github/actions/cluster-runner-up/action.yml",
+		"postgres image":     "ansible/roles/dbservices/tasks/main.yml",
+	} {
+		if !strings.Contains(mustRead(t, file), pin[name]) || pin[name] == "" {
+			t.Errorf("row %q: pin %q is not in %s", name, pin[name], file)
+		}
+	}
+	// every role that installs something has a row
+	roles, _ := filepath.Glob("ansible/roles/*")
+	want := map[string]string{"bun": "bun", "c": "h2o", "cpp": "drogon", "dbservices": "postgres", "dotnet": "dotnet", "java": "java", "node": "node", "python": "python", "rust": "rust", "zig": "zig"}
+	for _, r := range roles {
+		base := filepath.Base(r)
+		key, ok := want[base]
+		if !ok {
+			t.Errorf("ansible/roles/%s has no entry in this test's table: add its toolchain to os-upgrade-toolchains.sh", base)
+			continue
+		}
+		found := false
+		for n := range pin {
+			if strings.HasPrefix(n, key) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no toolchain row for role %s", base)
+		}
+	}
+}
+
+// The step summary of a survey with no record at all still renders (a run that failed before the hosts answered).
+func TestOSUpgradeSummaryWithNothingRecorded(t *testing.T) {
+	bash := needBash(t)
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
+	script := filepath.Join(".github", "scripts", "os-upgrade-summary.sh")
+	dir := t.TempDir()
+	b, err := exec.Command(bash, script, dir, "survey", "-", "2", "r `x`", "9").CombinedOutput()
+	if err != nil {
+		t.Fatalf("survey summary: %v\n%s", err, b)
+	}
+	if !strings.Contains(string(b), "SURVEY FAILED") || !strings.Contains(string(b), "no survey record") || !strings.Contains(string(b), "r 'x'") {
+		t.Errorf("survey summary:\n%s", b)
+	}
+	b, err = exec.Command(bash, script, dir, "upgrade", "msr1", "2", "x", "9").CombinedOutput()
+	if err != nil {
+		t.Fatalf("upgrade summary: %v\n%s", err, b)
+	}
+	if !strings.Contains(string(b), "Nothing was rebooted") || !strings.Contains(string(b), "NOT COMPLETE") {
+		t.Errorf("upgrade summary:\n%s", b)
+	}
+}
+
+// The upgrade is documented where an operator looks: the exact dispatches, the order rule, the refusals, the
+// one-shot, the recovery, the r8127 caveat and the risks.
+func TestOSUpgradeIsDocumented(t *testing.T) {
+	readme := mustRead(t, "README.md")
+	i := strings.Index(readme, "### Upgrading a cluster host's OS")
+	if i < 0 {
+		t.Fatal("README.md has no \"Upgrading a cluster host's OS\" section")
+	}
+	sec := readme[i:]
+	if j := strings.Index(sec[4:], "\n## "); j >= 0 {
+		sec = sec[:j+4]
+	}
+	for _, want := range []string{
+		"gh workflow run cluster-os-upgrade.yml",
+		"mode=survey",
+		"mode=upgrade",
+		"confirm=UPGRADE-",
+		"servers first",
+		"msa2-client",
+		"idle",
+		"matrix-tier-cluster",
+		"grub-reboot",
+		"saved default",
+		"physical power-cycle",
+		"r8127",
+		"r8169",
+		"policy-rc.d",
+		"autoremove",
+		"HOLD-CLUSTER",
+		"ansible/os-upgrade.yml",
+		"allow_results_loss",
+		"blacklist_r8169",
+		"refresh_lists",
+		"stub",
+	} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("the README section lacks %q", want)
+		}
+	}
+	if !strings.Contains(mustRead(t, filepath.Join("ansible", "RUNNER_BOOTSTRAP.md")), "cluster-os-upgrade.yml") {
+		t.Error("RUNNER_BOOTSTRAP.md does not point at the sanctioned OS upgrade path")
+	}
+}

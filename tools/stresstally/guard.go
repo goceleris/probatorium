@@ -43,13 +43,14 @@ import (
 
 // clusterGroupWorkflows are the workflow files that declare the
 // matrix-tier-cluster group themselves (matrix-pr-tier only for a labelled
-// same-repository pull request; counted anyway; cluster-reboot.yml declares it
-// on its reboot job, and its own guard runs `guard -idle`). celeris-stress.yml is not
+// same-repository pull request; counted anyway; cluster-reboot.yml and cluster-os-upgrade.yml declare it
+// on their one job, and their own guard runs `guard -idle`). celeris-stress.yml is not
 // listed: its runs join from a job and are classified by their jobs.
 // TestStressClusterGuardKnowsEveryClusterWorkflow keeps this list equal to
 // the files that name the group.
 var clusterGroupWorkflows = []string{
 	".github/workflows/benchmark-tier.yml",
+	".github/workflows/cluster-os-upgrade.yml",
 	".github/workflows/cluster-reboot.yml",
 	".github/workflows/matrix-checkptr-tier.yml",
 	".github/workflows/matrix-nightly-tier.yml",

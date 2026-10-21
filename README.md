@@ -242,6 +242,89 @@ properties as text, the snapshot script against a fake `/proc`/`/sys`, the summa
 (the idle guard), and `bash ansible/tests/test_reboot_judge.sh` (the real Jinja judgement under ansible) and `bash ansible/tests/test_reboot_play.sh` (the whole playbook on local
 connections with only the restart faked), both run by the ansible CI job.
 
+### Upgrading a cluster host's OS
+
+The kernel, the OS packages and the firmware of a cluster host are changed by one sanctioned path and no other: the
+[`Cluster OS Upgrade`](.github/workflows/cluster-os-upgrade.yml) workflow, which runs
+[`ansible/os-upgrade.yml`](ansible/os-upgrade.yml) from a GitHub-hosted machine on the tailnet. Every command on a host
+is a subcommand of [`ansible/files/os_upgrade.py`](ansible/files/os_upgrade.py) (the playbook has no shell task); its
+header lists them. Nobody ssh-es in. Decision (maintainer, 2026-10-21): bring all three hosts to the latest versions
+before the final release evidence; comparability with older releases does not matter.
+
+```
+# 1. read-only, all three hosts, no confirmation
+gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
+  -f mode=survey -f reason="platform survey before the OS upgrade"
+# 2. ONE host per dispatch, servers first, the load generator last
+gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
+  -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
+```
+
+- **Inputs.** `mode` is `survey` or `upgrade`; an upgrade names ONE `host` and `confirm` must be exactly
+  `UPGRADE-<host>`; `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
+  `results_root` holds entries (the reboot destroys the tmpfs). `refresh_lists` (survey only, default false) runs
+  `apt-get update` first so the simulation is not stale (it touches `/var/lib/apt/lists` only). `blacklist_r8169`
+  (upgrade only, default false) is explained below. Dispatch from `main` only; it never runs on a schedule.
+- **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
+  job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's
+  `HOLD-CLUSTER` marker lives outside this repository, so whoever dispatches honours it. The survey goes through the
+  same gate: it runs commands on the hosts.
+- **Order: servers first, the load generator last.** `msa2-client` is refused until `msa2-server` and `msr1` each carry
+  a record of a verified upgrade (`/var/lib/celeris-os-upgrade/last-upgrade.json`, written only after verification)
+  that still matches the kernel they run. Why: every server is verified against the client (fabric ping), so the
+  client stays on the known-good platform while the servers are proven; the client's own verification then uses the
+  upgraded servers. The two servers have no order between them; `msa2-server` (no out-of-tree driver) is the rehearsal
+  to do before `msr1`.
+- **Survey** (read-only; its commands are on an allow-list the process enforces) records per host: os-release, running
+  and installed kernels, which kernel grub boots after a power-cycle, `GRUB_DEFAULT`, EFI and Secure Boot, what
+  `apt-get -s full-upgrade` would install, remove and keep back, phased updates, held packages, third-party
+  repositories and pins, unattended-upgrades, reboot-required, `dkms status`, the NIC drivers, PCI ids and link speeds,
+  linux-firmware, disk, time sync, crash dumps, the run state, and the packages of the compilers and services. For the
+  r8127 NIC it also records the out-of-tree module (version, where it came from), and, per installed kernel, whether the
+  in-tree `r8169` lists the NIC's PCI id, so the summary shows whether the in-tree driver is already an option. A
+  separate step compares the toolchains the roles install (pinned or floating) with upstream.
+- **It refuses, on the host, before touching anything:** any of the three hosts unreachable; a bench manifest on any of
+  them; on the target a runner job executing, a power-loss resume pending, entries in `results_root`, the r8127
+  shutdown quiesce hook missing, the r8127 module not available for the running kernel, tailscaled not enabled at boot,
+  too little disk on `/`, `/boot` and `/boot/efi`, dpkg or apt busy (an unattended upgrade) or half-configured
+  packages, held kernel/boot/DKMS packages, an existing `policy-rc.d`, no usable GRUB, `GRUB_SAVEDEFAULT=true`, a
+  `/boot/grub` on btrfs/zfs/lvm/mdraid (grub cannot make the boot one-shot there), no grub entry for the running kernel,
+  a wrong confirmation, and the order rule. Each is a message in `vars/os_upgrade_judge.yml` with a test case.
+- **Then, in this order.** (1) The *running* kernel becomes grub's saved default (`GRUB_DEFAULT=saved` in a drop-in, the
+  old `/etc/default/grub` backed up, `update-grub`, `grub-set-default`) and its packages are marked manual, BEFORE a new
+  kernel is installed: from then on a power-cycle at any moment boots the old kernel. (2) `apt-get update`, a simulation,
+  and a refusal if apt would remove the kernel, the boot chain, DKMS, ssh, tailscale, the power guard or docker.
+  (3) `apt-get full-upgrade`, detached (a dropped ssh connection cannot half-configure dpkg), non-interactive,
+  `--force-confold`, with a temporary `policy-rc.d` so no service is restarted behind the run and `needrestart` in
+  list-only mode; **never `autoremove`**, so the old kernel stays installed. (4) The DKMS modules are built for the new
+  kernel (`dkms autoinstall -k`, make log kept) and checked: headers, initrd, grub entry, the r8127 module found by
+  `modinfo -k`, its PCI aliases, its signature when Secure Boot is on, the shutdown hook, the fallback still intact.
+  **If anything fails here the host is not rebooted**: the old kernel is the default and still runs. (5)
+  `grub-reboot <new kernel>` (the next boot only; `saved_entry` stays the old kernel), `ansible.builtin.reboot` bounded
+  at 15 minutes. (6) Verification, like the reboot plus: running kernel == the intended one (a fall-back to the old one is
+  reported as such), each NIC's driver and link speed, time sync, no new failed unit, a C compiler that builds and runs,
+  TLS to github.com. (7) **Only then** `grub-set-default <new kernel>` and the record. On any failure the new kernel is
+  NOT made the default.
+- **r8127 and the in-tree driver.** The upgrade keeps the out-of-tree r8127 behaviour. If the new kernel's `r8169` lists the
+  same PCI id as r8127 while the running kernel's does not, and `r8169` is not blacklisted, which driver binds the NIC would be a race, and the run refuses
+  to reboot. `blacklist_r8169=true` writes `/etc/modprobe.d/celeris-r8127.conf` (`blacklist r8169`) and rebuilds the
+  initramfs of the new kernel, then goes on. Moving to the in-tree driver is a separate decision (PLAN.md of the
+  upgrade lane lists what to test first); this workflow never makes it.
+- **If the host does not return.** The summary names the phase and says exactly whether to do a **physical power-cycle**:
+  only when the run is red in phase `rebooting` (the host did not answer within 15 minutes). The next boot takes
+  grub's saved default, the old kernel, because the one-shot was consumed by the first boot of the new one. Every other
+  phase says "not needed". A host that came back but failed verification is up and keeps the old kernel as its default;
+  a reboot (the cluster-reboot workflow) returns it to that kernel.
+- **What this does not prove.** The tests run the real playbook and script against stub `grub`, `apt`, `dkms` and
+  `modinfo` commands and a fake `/proc`/`/sys`: they prove the order, the refusals and the verdicts, not that a real GRUB
+  on msr1 honours `grub-reboot`, that r8127 builds for a real kernel, or that the NIC comes up. The first real
+  evidence is the survey, then `msa2-server`.
+
+Tests: `go test -run 'ClusterOSUpgrade|OSUpgrade'`, and `python3 -I ansible/tests/test_os_upgrade.py` (the script against a fake
+host), `python3 -I ansible/tests/test_os_upgrade_judge.py` (the real Jinja judgement under ansible, every refusal) and
+`python3 -I ansible/tests/test_os_upgrade_play.py` (the whole playbook on local connections, Linux only); the last two run
+in the ansible CI job.
+
 ## Bench tier
 
 ### The field

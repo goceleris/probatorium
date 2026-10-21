@@ -1,0 +1,989 @@
+#!/usr/bin/env python3
+"""os_upgrade.py - every command ansible/os-upgrade.yml runs ON a cluster host, in one auditable file.
+
+Run by ansible.builtin.script as root (python 3 standard library only). The playbook has no shell or command
+task: a host is read, changed and rebooted only through the named subcommands below, so this table is the whole
+list of what the sanctioned OS upgrade can do to a machine (README.md, "Upgrading a cluster host's OS").
+
+READ-ONLY subcommands (the survey mode of the workflow uses only these; READ_ONLY below makes the process
+refuse to start any command that is not on the read-only allow-list, and the tests run it against a fake root and
+check that nothing was written):
+    survey            one JSON object: os-release, kernels, grub, packages, dkms, NICs, r8127 vs in-tree, disk, time
+    simulate          the JSON of `apt-get -s full-upgrade` (installs, removals, kept back) on the lists as they are
+    dkms-check        (without --build) is the NEW kernel ready: modules, initrd, grub entry, signature, fallback
+    dump WHAT         packages | policy | sysctl | cmdline | grub : plain text, for the evidence
+    upgrade-status    state of the detached apt run (running | done | none) and its exit code
+    upgrade-log       the log of the detached apt run
+    marker            the record of the last verified OS upgrade of this host ({} when none)
+
+HOST-CHANGING subcommands (the upgrade mode only, in this order; each one is the only thing its task does):
+    apt-update                  apt-get update (touches /var/lib/apt/lists only; the survey mode may also use it)
+    pin-grub                    GRUB_DEFAULT=saved in a drop-in, update-grub, grub-set-default <RUNNING kernel>, and the
+                                running kernel's packages marked manual: BEFORE a new kernel is installed, so that a
+                                power-cycle at any later point boots the old kernel
+    upgrade-start               detached `apt-get full-upgrade` (non-interactive, --force-confold, no service restarts
+                                behind a run, no needrestart restart); never autoremove
+    blacklist-r8169             (only when asked) /etc/modprobe.d/celeris-r8127.conf: the in-tree r8169 must not race the
+                                out-of-tree r8127 for the same PCI id on the new kernel
+    dkms-check --build          the check above, building the DKMS modules for the new kernel first when they are missing
+    arm-oneshot                 grub-reboot <new kernel>: the next boot only; saved default stays the old kernel
+    make-permanent              grub-set-default <new kernel> and the marker: ONLY after the verification passed
+
+Environment: OSU_ROOT is a test override, a prefix for every path read or written. Empty on a host.
+Exit 0 whatever a read found (a finding is data); 1 when a host-changing step could not do what it says.
+"""
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.environ.get("OSU_ROOT", "")
+STATE_DIR = "/var/lib/celeris-os-upgrade"
+LOG_DIR = "/var/log/celeris-os-upgrade"
+DROPIN = "/etc/default/grub.d/99-celeris-os-upgrade.cfg"
+POLICY_RC_D = "/usr/sbin/policy-rc.d"
+MODPROBE_CONF = "/etc/modprobe.d/celeris-r8127.conf"
+READ_ONLY = False
+
+PCI_REALTEK = "10ec"
+
+
+def p(path):
+    return ROOT + path
+
+
+def rd(path, default=""):
+    try:
+        with open(p(path), "r", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+# ---------------------------------------------------------------------------------------------- commands
+def ro_allowed(a):
+    """True when argv is a command that cannot change the host."""
+    n = os.path.basename(a[0])
+    rest = a[1:]
+    if n in ("dpkg-query", "modinfo", "findmnt", "df", "apt-config", "apt-cache", "uname"):
+        return True
+    if n == "dpkg":
+        return bool(rest) and rest[0] in ("--audit", "-S", "-L", "-s")
+    if n == "apt-get":
+        return any(x in ("-s", "--simulate", "--just-print", "--dry-run") for x in rest)
+    if n == "apt-mark":
+        return rest[:1] == ["showhold"]
+    if n == "dkms":
+        return rest[:1] == ["status"]
+    if n == "grub-editenv":
+        return rest[-1:] == ["list"]
+    if n == "systemctl":
+        return rest[:1] in (["is-active"], ["is-enabled"], ["is-system-running"], ["show"])
+    if n == "timedatectl":
+        return rest[:1] == ["show"]
+    if n == "mokutil":
+        return rest == ["--sb-state"]
+    if n == "sysctl":
+        return rest == ["-a"]
+    if n in ("gcc", "g++", "clang", "cmake", "make", "python3", "docker", "tailscale", "cc"):
+        return rest == ["--version"]
+    return False
+
+
+def run(argv, timeout=600, env=None, check_ro=True):
+    """(rc, stdout, stderr). A missing command is rc 127, never an exception."""
+    if READ_ONLY and check_ro and not ro_allowed(argv):
+        raise SystemExit("read-only violation: refusing to run " + " ".join(shlex.quote(x) for x in argv))
+    e = dict(os.environ)
+    e["LC_ALL"] = "C"
+    if env:
+        e.update(env)
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout, env=e)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 127, "", argv[0] + ": not found"
+    except subprocess.TimeoutExpired as x:
+        return 124, (x.stdout or "") if isinstance(x.stdout, str) else "", "timeout after %ss" % timeout
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def write(path, content, mode=0o644):
+    if READ_ONLY:
+        raise SystemExit("read-only violation: refusing to write " + path)
+    full = p(path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    tmp = full + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    os.replace(tmp, full)
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, indent=1, sort_keys=True) + "\n")
+
+
+# ---------------------------------------------------------------------------------------------- kernels
+KVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)-(\d+)-(\S+)$")
+
+
+def kver_key(v):
+    m = KVER.match(v)
+    return tuple(int(x) for x in m.groups()[:4]) if m else (0, 0, 0, 0)
+
+
+def flavor(v):
+    m = KVER.match(v)
+    return m.group(5) if m else ""
+
+
+def running_kernel():
+    return rd("/proc/sys/kernel/osrelease") if ROOT else os.uname().release
+
+
+def installed_kernels():
+    rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n", "linux-image-*"])
+    found = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[-1] != "installed":
+            continue
+        m = re.match(r"^linux-image-(?:unsigned-)?(\d+\.\d+\.\d+-\d+-\S+)$", parts[0])
+        if m:
+            found.add(m.group(1))
+    return sorted(found, key=kver_key)
+
+
+def vmlinuz_versions():
+    return sorted((os.path.basename(x)[len("vmlinuz-"):] for x in glob.glob(p("/boot/vmlinuz-*"))), key=kver_key)
+
+
+# ---------------------------------------------------------------------------------------------- grub
+MENU = re.compile(r"""^\s*(menuentry|submenu)\s+(?:'([^']*)'|"([^"]*)")(.*?)\{\s*$""")
+ENTRY_ID = re.compile(r"""(?:\$menuentry_id_option|--id)\s+'([^']+)'""")
+LINUX = re.compile(r"^\s*linux(?:efi|16)?\s+\S*/vmlinuz-(\S+)")
+
+
+def parse_grub_cfg(text):
+    """Menu entries of a generated grub.cfg: [{title, id, full_id, parent, kernel, recovery}]."""
+    entries, stack = [], []
+    for line in text.splitlines():
+        m = MENU.match(line)
+        if m:
+            kind, title, rest = m.group(1), m.group(2) if m.group(2) is not None else m.group(3), m.group(4)
+            i = ENTRY_ID.search(rest)
+            node = {"kind": kind, "title": title, "id": i.group(1) if i else "", "kernel": "", "parent": ""}
+            for s in reversed(stack):
+                if s["kind"] == "submenu":
+                    node["parent"] = s["id"]
+                    break
+            stack.append(node)
+            continue
+        if line.strip() == "}":
+            if stack:
+                node = stack.pop()
+                if node["kind"] == "menuentry":
+                    node["recovery"] = "recovery" in node["id"] or "recovery mode" in node["title"]
+                    node["full_id"] = (node["parent"] + ">" + node["id"]) if node["parent"] else node["id"]
+                    entries.append(node)
+            continue
+        if line.rstrip().endswith("{"):
+            stack.append({"kind": "other", "id": "", "title": "", "kernel": "", "parent": ""})
+            continue
+        if stack and stack[-1]["kind"] == "menuentry" and not stack[-1]["kernel"]:
+            lm = LINUX.match(line)
+            if lm:
+                stack[-1]["kernel"] = lm.group(1)
+    return entries
+
+
+def grub_entries():
+    return parse_grub_cfg(rd("/boot/grub/grub.cfg"))
+
+
+def entry_id_for(entries, kernel):
+    """The id to give grub-set-default / grub-reboot for KERNEL: its non-recovery entry in the Advanced submenu,
+    else the top-level one. '' when the menu has none."""
+    cand = [e for e in entries if e["kernel"] == kernel and not e["recovery"]]
+    for e in cand:
+        if e["parent"]:
+            return e["full_id"]
+    return cand[0]["full_id"] if cand else ""
+
+
+def kernel_of_entry(entries, ref):
+    """The kernel a grub entry reference (a full id, an id or a title) names, '' when unknown."""
+    for e in entries:
+        if ref in (e["full_id"], e["id"], e["title"]) and e["kernel"]:
+            return e["kernel"]
+    return ""
+
+
+def grub_settings():
+    """Effective GRUB_* assignments: /etc/default/grub, then /etc/default/grub.d/*.cfg in order (later wins)."""
+    files = [p("/etc/default/grub")] + sorted(glob.glob(p("/etc/default/grub.d/*.cfg")))
+    out, used = {}, []
+    for f in files:
+        try:
+            text = open(f, errors="replace").read()
+        except OSError:
+            continue
+        used.append(f[len(ROOT):] if ROOT else f)
+        for line in text.splitlines():
+            m = re.match(r"^\s*(GRUB_[A-Z_0-9]+)=(.*)$", line)
+            if m:
+                out[m.group(1)] = m.group(2).strip().strip("'\"")
+    return out, used
+
+
+def grub_editenv():
+    rc, out, _ = run(["grub-editenv", "list"])
+    env = {}
+    if rc == 0:
+        for line in out.splitlines():
+            k, _, v = line.partition("=")
+            if k:
+                env[k] = v
+    return env
+
+
+def cfg_recordfail_timeout(text):
+    m = re.search(r'recordfail\}?"\s*=\s*1\s*\]\s*;\s*then\s*\n\s*set timeout=(-?\d+)', text)
+    return m.group(1) if m else ""
+
+
+def boot_info():
+    cfg = rd("/boot/grub/grub.cfg")
+    settings, files = grub_settings()
+    entries = parse_grub_cfg(cfg)
+    env = grub_editenv()
+    saved = env.get("saved_entry", "")
+    uses_saved = 'set default="${saved_entry}"' in cfg
+    if uses_saved:
+        default_kernel = kernel_of_entry(entries, saved) if saved else ""
+    else:
+        top = [e for e in entries if not e["parent"] and e["kernel"]]
+        default_kernel = top[0]["kernel"] if top and settings.get("GRUB_DEFAULT", "0") == "0" else ""
+    rc, fstype, _ = run(["findmnt", "-n", "-o", "FSTYPE", "-T", p("/boot/grub")])
+    rc2, src, _ = run(["findmnt", "-n", "-o", "SOURCE", "-T", p("/boot/grub")])
+    src = src.strip()
+    stack = ""
+    if src.startswith("/dev/mapper/") or src.startswith("/dev/md") or src.startswith("/dev/dm-"):
+        stack = "lvm-or-mdraid"
+    if fstype.strip() in ("btrfs", "zfs"):
+        stack = fstype.strip()
+    efi = os.path.isdir(p("/sys/firmware/efi"))
+    sb = "not-efi"
+    if efi:
+        sb = "unknown"
+        for f in glob.glob(p("/sys/firmware/efi/efivars/SecureBoot-*")):
+            try:
+                b = open(f, "rb").read()
+                sb = "enabled" if b and b[-1] == 1 else "disabled"
+            except OSError:
+                pass
+        if sb == "unknown" and have("mokutil"):
+            rc3, o, _ = run(["mokutil", "--sb-state"])
+            sb = "enabled" if "enabled" in o.lower() else ("disabled" if "disabled" in o.lower() else "unknown")
+    return {
+        "efi": efi,
+        "secure_boot": sb,
+        "grub_cfg_present": bool(cfg),
+        "grub_reboot": have("grub-reboot"),
+        "grub_set_default": have("grub-set-default"),
+        "grub_editenv": have("grub-editenv"),
+        "update_grub": have("update-grub"),
+        "settings": {k: v for k, v in settings.items() if k in (
+            "GRUB_DEFAULT", "GRUB_SAVEDEFAULT", "GRUB_TIMEOUT", "GRUB_TIMEOUT_STYLE", "GRUB_RECORDFAIL_TIMEOUT",
+            "GRUB_DISABLE_RECOVERY", "GRUB_CMDLINE_LINUX", "GRUB_CMDLINE_LINUX_DEFAULT")},
+        "settings_files": files,
+        "savedefault": settings.get("GRUB_SAVEDEFAULT", "") == "true",
+        "cfg_uses_saved": uses_saved,
+        "cfg_recordfail_timeout": cfg_recordfail_timeout(cfg),
+        "saved_entry": saved,
+        "next_entry": env.get("next_entry", ""),
+        "default_kernel": default_kernel,
+        "entries": [{"kernel": e["kernel"], "id": e["full_id"], "title": e["title"]} for e in entries if e["kernel"] and not e["recovery"]],
+        "boot_fs": fstype.strip(),
+        "boot_source": src,
+        "boot_stack": stack,
+    }
+
+
+# ---------------------------------------------------------------------------------------------- dkms
+DKMS = re.compile(r"^([^/,\s]+)[/,]\s*([^,\s:]+),\s*([^,\s:]+)(?:,\s*([^:\s]+))?:\s*(\S+)")
+
+
+def dkms_modules():
+    rc, out, _ = run(["dkms", "status"])
+    mods = []
+    if rc != 0:
+        return mods
+    for line in out.splitlines():
+        m = DKMS.match(line.strip())
+        if m:
+            mods.append({"name": m.group(1), "version": m.group(2), "kernel": m.group(3), "arch": m.group(4) or "", "state": m.group(5)})
+    return mods
+
+
+def dkms_installed_for(kernel):
+    return sorted({m["name"] for m in dkms_modules() if m["kernel"] == kernel and m["state"] in ("installed", "built")})
+
+
+def modinfo(kernel, module):
+    """What modinfo -k KERNEL says of MODULE: found, version, filename, signer."""
+    rc, fn, _ = run(["modinfo", "-k", kernel, "-F", "filename", module])
+    fn = fn.strip()
+    info = {"found": rc == 0 and bool(fn), "filename": fn, "version": "", "signer": ""}
+    if info["found"]:
+        info["version"] = run(["modinfo", "-k", kernel, "-F", "version", module])[1].strip()
+        info["signer"] = run(["modinfo", "-k", kernel, "-F", "signer", module])[1].strip()
+    return info
+
+
+def builtin_module(kernel, module):
+    b = rd("/lib/modules/%s/modules.builtin" % kernel)
+    return bool(re.search(r"/%s\.ko(?:\.\w+)?$" % re.escape(module), b, re.M))
+
+
+def pci_claims(kernel, pci_id):
+    """Modules whose aliases in KERNEL's modules.alias match the PCI id vendor:device."""
+    v, d = pci_id.split(":")
+    pat = re.compile(r"^alias pci:v0000%sd0000%s\S*\s+(\S+)\s*$" % (v.upper(), d.upper()), re.M)
+    return sorted(set(pat.findall(rd("/lib/modules/%s/modules.alias" % kernel))))
+
+
+# ---------------------------------------------------------------------------------------------- NICs
+def nics():
+    out = []
+    for d in sorted(glob.glob(p("/sys/class/net/*"))):
+        dev = os.path.join(d, "device")
+        if not os.path.exists(dev):
+            continue
+        iface = os.path.basename(d)
+        drv = ""
+        if os.path.islink(os.path.join(dev, "driver")):
+            drv = os.path.basename(os.readlink(os.path.join(dev, "driver")))
+        vendor = rd(dev[len(ROOT):] + "/vendor").replace("0x", "")
+        device = rd(dev[len(ROOT):] + "/device").replace("0x", "")
+        speed = rd(d[len(ROOT):] + "/speed")
+        out.append({
+            "iface": iface,
+            "driver": drv,
+            "driver_version": rd("/sys/module/%s/version" % drv) if drv else "",
+            "pci_id": ("%s:%s" % (vendor, device)) if vendor and device else "",
+            "pci_slot": os.path.basename(os.path.realpath(dev)),
+            "speed_mbps": int(speed) if re.match(r"^-?\d+$", speed) else None,
+            "operstate": rd(d[len(ROOT):] + "/operstate"),
+        })
+    return out
+
+
+def r8127_report(kernels, running, nic_list):
+    ids = sorted({n["pci_id"] for n in nic_list if n["driver"] == "r8127" and n["pci_id"]}) or [PCI_REALTEK + ":8127"]
+    mods = [m for m in dkms_modules() if m["name"] == "r8127"]
+    src_dirs = sorted(glob.glob(p("/usr/src/r8127-*")))
+    pkg = ""
+    for d in src_dirs:
+        rc, out, _ = run(["dpkg", "-S", d[len(ROOT):] if ROOT else d])
+        if rc == 0 and ":" in out:
+            pkg = out.split(":")[0].strip()
+            break
+    if not pkg:
+        rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package}\n", "r8127*"])
+        pkg = out.split()[0] if rc == 0 and out.split() else ""
+    cur = modinfo(running, "r8127") if running else {"found": False}
+    if pkg:
+        source = "package:" + pkg
+    elif mods or src_dirs:
+        source = "dkms-source-without-package"
+    elif cur.get("found"):
+        source = "manual-build"
+    else:
+        source = "none"
+    per_kernel = {}
+    for k in kernels:
+        r = modinfo(k, "r8127")
+        r["dkms_state"] = sorted({m["state"] for m in mods if m["kernel"] == k})
+        per_kernel[k] = {
+            "r8127": r,
+            "r8169": {"found": modinfo(k, "r8169")["found"], "builtin": builtin_module(k, "r8169")},
+            "claims": {i: pci_claims(k, i) for i in ids},
+            "intree_lists_id": {i: "r8169" in pci_claims(k, i) for i in ids},
+        }
+    fw = sorted(os.path.basename(f) for f in glob.glob(p("/lib/firmware/rtl_nic/*8127*")))
+    allfw = glob.glob(p("/lib/firmware/rtl_nic/*"))
+    bl = []
+    for f in sorted(glob.glob(p("/etc/modprobe.d/*.conf"))):
+        for line in open(f, errors="replace").read().splitlines():
+            if re.search(r"\b(r8169|r8127)\b", line) and not line.strip().startswith("#"):
+                bl.append(os.path.basename(f) + ": " + line.strip())
+    return {
+        "present": any(n["driver"] == "r8127" for n in nic_list) or bool(mods) or bool(src_dirs),
+        "pci_ids": ids,
+        "loaded_version": rd("/sys/module/r8127/version"),
+        "source": source,
+        "dkms": mods,
+        "dkms_source_dirs": [d[len(ROOT):] for d in src_dirs],
+        "bound": {n["iface"]: n["driver"] for n in nic_list if n["pci_id"].startswith(PCI_REALTEK + ":")},
+        "per_kernel": per_kernel,
+        "r8169_blacklisted": any(re.search(r"^\s*(blacklist|install)\s+r8169\b", x.split(": ", 1)[1]) for x in bl),
+        "modprobe_lines": bl,
+        "firmware_rtl_nic_files": len(allfw),
+        "firmware_rtl8127_files": fw,
+        "linux_firmware": dpkg_version("linux-firmware"),
+    }
+
+
+# ---------------------------------------------------------------------------------------------- packages
+def dpkg_version(pkg):
+    rc, out, _ = run(["dpkg-query", "-W", "-f", "${Version}", pkg])
+    return out.strip() if rc == 0 else ""
+
+
+INST = re.compile(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) ")
+REMV = re.compile(r"^Remv (\S+)")
+
+
+def simulate(include_phased=False):
+    argv = ["apt-get", "-s", "-o", "Debug::NoLocking=true", "-o", "APT::Get::Assume-Yes=false"]
+    if include_phased:
+        argv += ["-o", "APT::Get::Always-Include-Phased-Updates=true"]
+    rc, out, err = run(argv + ["full-upgrade"], env={"DEBIAN_FRONTEND": "noninteractive"})
+    inst, remv, kept = [], [], []
+    keeping = False
+    for line in out.splitlines():
+        m = INST.match(line)
+        if m:
+            inst.append({"name": m.group(1), "old": m.group(2) or "", "new": m.group(3)})
+            continue
+        m = REMV.match(line)
+        if m:
+            remv.append(m.group(1))
+            continue
+        if line.startswith("The following packages have been kept back"):
+            keeping = True
+            continue
+        if keeping:
+            if line.startswith(" "):
+                kept += line.split()
+            else:
+                keeping = False
+    return {"rc": rc, "inst": inst, "remv": remv, "kept_back": kept,
+            "kernel_inst": [i["name"] for i in inst if re.match(r"^linux-(image|modules|headers)", i["name"])],
+            "error": "" if rc == 0 else (err.strip() or out.strip())[-400:]}
+
+
+def sources():
+    repos = []
+    files = [p("/etc/apt/sources.list")] + sorted(glob.glob(p("/etc/apt/sources.list.d/*")))
+    for f in files:
+        try:
+            text = open(f, errors="replace").read()
+        except OSError:
+            continue
+        for u in re.findall(r"^\s*deb(?:-src)?\s+(?:\[[^\]]*\]\s+)?(\S+)", text, re.M) + re.findall(r"^URIs:\s*(.+)$", text, re.M):
+            for uri in u.split():
+                host = re.sub(r"^\w+://", "", uri).split("/")[0]
+                official = bool(re.search(r"(^|\.)(ubuntu\.com|debian\.org|canonical\.com)$", host))
+                repos.append({"file": os.path.basename(f), "uri": uri, "official": official})
+    return repos
+
+
+def lists_age_hours():
+    newest = 0
+    for f in glob.glob(p("/var/lib/apt/lists/*")):
+        try:
+            if os.path.isfile(f):
+                newest = max(newest, os.path.getmtime(f))
+        except OSError:
+            pass
+    return round((time.time() - newest) / 3600, 1) if newest else None
+
+
+PKG_PROCS = {"apt", "apt-get", "dpkg", "unattended-upgr", "apt.systemd.dai", "packagekitd", "aptd", "dkms", "update-grub", "grub-mkconfig", "update-initramfs"}
+
+
+def package_processes():
+    found = []
+    for c in glob.glob(p("/proc/[0-9]*/comm")):
+        try:
+            name = open(c).read().strip()
+        except OSError:
+            continue
+        if name in PKG_PROCS:
+            found.append(name)
+    return sorted(found)
+
+
+def dpkg_lock_held():
+    for lock in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"):
+        try:
+            with open(p(lock), "rb") as f:
+                try:
+                    fcntl.lockf(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except OSError:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def apt_config():
+    rc, out, _ = run(["apt-config", "dump"])
+    cfg = {}
+    for line in out.splitlines():
+        m = re.match(r'^(\S+)\s+"([^"]*)";', line)
+        if m:
+            cfg[m.group(1)] = m.group(2)
+    return cfg
+
+
+def svc(unit):
+    a = run(["systemctl", "is-active", unit])[1].strip()
+    e = run(["systemctl", "is-enabled", unit])[1].strip()
+    return {"active": a, "enabled": e}
+
+
+def df(path):
+    rc, out, _ = run(["df", "-Pk", p(path)])
+    lines = out.strip().splitlines()
+    if rc != 0 or len(lines) < 2:
+        return None
+    f = lines[-1].split()
+    try:
+        return {"total_kib": int(f[1]), "free_kib": int(f[3]), "mount": f[-1]}
+    except (IndexError, ValueError):
+        return None
+
+
+HOST_PKGS = ["linux-generic", "linux-image-generic", "linux-headers-generic", "linux-firmware", "build-essential", "gcc", "g++", "clang",
+             "cmake", "make", "python3", "docker.io", "containerd", "runc", "tailscale", "apcupsd", "dkms", "needrestart",
+             "unattended-upgrades", "grub-efi-arm64", "grub-efi-amd64", "grub-efi-arm64-signed", "grub-efi-amd64-signed", "shim-signed",
+             "libc6", "openssh-server", "systemd", "curl", "ca-certificates", "git", "r8127-dkms"]
+
+
+def host_toolchain():
+    pk = {x: dpkg_version(x) for x in HOST_PKGS}
+    bins = {}
+    for b in ("gcc", "g++", "clang", "cmake", "make", "python3", "docker", "tailscale"):
+        if have(b):
+            bins[b] = (run([b, "--version"])[1].splitlines() or [""])[0].strip()
+    return {"packages": {k: v for k, v in pk.items() if v}, "binaries": bins}
+
+
+def marker():
+    try:
+        return json.loads(rd(STATE_DIR + "/last-upgrade.json") or "{}")
+    except ValueError:
+        return {}
+
+
+# ---------------------------------------------------------------------------------------------- survey
+def survey():
+    running = running_kernel()
+    kernels = installed_kernels()
+    vm = vmlinuz_versions()
+    same = [k for k in kernels if flavor(k) == flavor(running)] or [k for k in vm if flavor(k) == flavor(running)]
+    boot = boot_info()
+    nic_list = nics()
+    held = [x for x in run(["apt-mark", "showhold"])[1].split() if x]
+    sim = simulate()
+    sim_phased = simulate(include_phased=True)
+    phased_held = sorted({i["name"] for i in sim_phased["inst"]} - {i["name"] for i in sim["inst"]})
+    cfg = apt_config()
+    rr = rd("/var/run/reboot-required")
+    osr = {}
+    for line in rd("/etc/os-release").splitlines():
+        k, _, v = line.partition("=")
+        if k in ("ID", "VERSION_ID", "VERSION_CODENAME", "PRETTY_NAME", "NAME"):
+            osr[k] = v.strip('"')
+    ent = boot["entries"]
+    boot["running_entry_id"] = entry_id_for(parse_grub_cfg(rd("/boot/grub/grub.cfg")), running)
+    ntp = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])[1].strip()
+    d = {
+        "schema": 1,
+        "host": rd("/etc/hostname"),
+        "os_release": osr,
+        "kernel": running,
+        "arch": os.uname().machine,
+        "kernel_flavor": flavor(running),
+        "installed_kernels": kernels,
+        "vmlinuz_versions": vm,
+        "newest_same_flavor": same[-1] if same else "",
+        "boot": boot,
+        "packages": {
+            "simulation": sim,
+            "kept_back": sim["kept_back"],
+            "phased_held_back": phased_held,
+            "held": held,
+            "held_kernel": [h for h in held if h.startswith(("linux-", "grub", "dkms"))],
+            "lists_age_hours": lists_age_hours(),
+            "repos": sources(),
+            "third_party_repos": sorted({r["uri"] for r in sources() if not r["official"]}),
+            "pin_files": sorted(os.path.basename(x) for x in glob.glob(p("/etc/apt/preferences.d/*")) + glob.glob(p("/etc/apt/preferences"))),
+            "dpkg_audit": [x for x in run(["dpkg", "--audit"])[1].splitlines() if x.strip()],
+            "package_processes": package_processes(),
+            "dpkg_lock_held": dpkg_lock_held(),
+            "policy_rc_d_present": os.path.exists(p(POLICY_RC_D)),
+        },
+        "unattended_upgrades": {
+            "installed": bool(dpkg_version("unattended-upgrades")),
+            "update_package_lists": cfg.get("APT::Periodic::Update-Package-Lists", ""),
+            "unattended_upgrade": cfg.get("APT::Periodic::Unattended-Upgrade", ""),
+            "remove_unused_kernel_packages": cfg.get("Unattended-Upgrade::Remove-Unused-Kernel-Packages", ""),
+            "automatic_reboot": cfg.get("Unattended-Upgrade::Automatic-Reboot", ""),
+            "units": {u: svc(u) for u in ("unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer")},
+            "needrestart_installed": bool(dpkg_version("needrestart")),
+        },
+        "reboot_required": bool(rr),
+        "reboot_required_pkgs": rd("/var/run/reboot-required.pkgs").split(),
+        "dkms": {"status": dkms_modules(), "installed_for_running": dkms_installed_for(running)},
+        "nics": nic_list,
+        "r8127": r8127_report(sorted(set(kernels + ([running] if running else [])), key=kver_key), running, nic_list),
+        "firmware": {"linux_firmware": dpkg_version("linux-firmware")},
+        "disk": {"/": df("/"), "/boot": df("/boot"), "/boot/efi": df("/boot/efi"), "/var": df("/var")},
+        "time_sync": {"ntp_synchronized": ntp == "yes", "raw": ntp},
+        "crash": sorted(os.listdir(p("/var/crash"))) if os.path.isdir(p("/var/crash")) else [],
+        "host_toolchain": host_toolchain(),
+        "marker": marker(),
+    }
+    return d
+
+
+# ---------------------------------------------------------------------------------------------- dkms-check
+def dkms_check(running, target, build):
+    built_now, rc_build, make_logs = False, None, {}
+    needed = dkms_installed_for(running)
+
+    def missing():
+        have_t = set(dkms_installed_for(target))
+        return [m for m in needed if m not in have_t]
+
+    if build and missing() and have("dkms"):
+        rc_build, out, err = run(["dkms", "autoinstall", "-k", target], timeout=1800)
+        built_now = True
+        make_logs["dkms_autoinstall_tail"] = (out + err).splitlines()[-60:]
+        for f in glob.glob(p("/var/lib/dkms/*/*/build/make.log")):
+            make_logs[f[len(ROOT):]] = open(f, errors="replace").read().splitlines()[-60:]
+    nic_list = nics()
+    drivers = sorted({n["driver"] for n in nic_list if n["driver"]})
+    drv_missing = [d for d in drivers if not modinfo(target, d)["found"] and not builtin_module(target, d)]
+    entries = parse_grub_cfg(rd("/boot/grub/grub.cfg"))
+    env = grub_editenv()
+    ids = sorted({n["pci_id"] for n in nic_list if n["driver"] == "r8127" and n["pci_id"]}) or [PCI_REALTEK + ":8127"]
+    r = modinfo(target, "r8127")
+    claims = {i: pci_claims(target, i) for i in ids}
+    settings, _ = grub_settings()
+    boot_sb = boot_info()["secure_boot"]
+    return {
+        "target": target,
+        "running": running,
+        "dkms_needed": needed,
+        "missing_modules": missing(),
+        "built_now": built_now,
+        "build_rc": rc_build,
+        "make_logs": make_logs,
+        "headers_present": os.path.isdir(p("/lib/modules/%s/build" % target)),
+        "vmlinuz_present": os.path.exists(p("/boot/vmlinuz-%s" % target)),
+        "initrd_present": os.path.exists(p("/boot/initrd.img-%s" % target)),
+        "nic_drivers": drivers,
+        "nic_drivers_missing": drv_missing,
+        "r8127": r,
+        "r8127_aliases": bool(run(["modinfo", "-k", target, "-F", "alias", "r8127"])[1].strip()) if r["found"] else False,
+        "intree_claims": claims,
+        "intree_lists_id": any("r8169" in v for v in claims.values()),
+        # does the RUNNING kernel's r8169 list it too? Then the race (if any) exists today and works out as r8127
+        "intree_lists_id_running": any("r8169" in pci_claims(running, i) for i in ids),
+        "r8169_blacklisted": r8127_blacklisted(),
+        "secure_boot": boot_sb,
+        "quiesce_hook": os.access(p("/usr/lib/systemd/system-shutdown/quiesce-r8127.shutdown"), os.X_OK),
+        "target_entry_id": entry_id_for(entries, target),
+        "running_entry_id": entry_id_for(entries, running),
+        "saved_entry": env.get("saved_entry", ""),
+        "saved_resolves_to": kernel_of_entry(entries, env.get("saved_entry", "")),
+        "cfg_uses_saved": 'set default="${saved_entry}"' in rd("/boot/grub/grub.cfg"),
+        "grub_savedefault": settings.get("GRUB_SAVEDEFAULT", "") == "true",
+        "recordfail_timeout": cfg_recordfail_timeout(rd("/boot/grub/grub.cfg")),
+    }
+
+
+def r8127_blacklisted():
+    for f in sorted(glob.glob(p("/etc/modprobe.d/*.conf"))):
+        for line in open(f, errors="replace").read().splitlines():
+            if re.match(r"^\s*(blacklist|install)\s+r8169\b", line):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------------------------- changing steps
+def fail(msg):
+    sys.stderr.write("os_upgrade.py: " + msg + "\n")
+    emit({"ok": False, "error": msg})
+    sys.exit(1)
+
+
+def kernel_packages(kernel):
+    names = ["linux-image-%s" % kernel, "linux-image-unsigned-%s" % kernel, "linux-modules-%s" % kernel,
+             "linux-modules-extra-%s" % kernel, "linux-headers-%s" % kernel, "linux-tools-%s" % kernel]
+    rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n"] + names)
+    return [l.split()[0] for l in out.splitlines() if l.endswith(" installed")]
+
+
+def cmd_pin_grub(a):
+    running = a.running
+    if not running:
+        fail("--running is required")
+    # the evidence of what was there
+    d = "%s/%s" % (STATE_DIR, a.run_id)
+    cur = rd("/etc/default/grub")
+    write(d + "/etc-default-grub.bak", cur + "\n")
+    # GRUB_RECORDFAIL_TIMEOUT: after a failed boot a headless host must still come up on the saved (old) kernel
+    # after a power-cycle, not wait at a menu for ever
+    write(DROPIN, "# Managed by probatorium ansible/os-upgrade.yml (run %s): the saved entry is the boot default.\n"
+          "GRUB_DEFAULT=saved\nGRUB_RECORDFAIL_TIMEOUT=5\n" % a.run_id)
+    settings, _ = grub_settings()
+    if settings.get("GRUB_SAVEDEFAULT", "") == "true":
+        fail("GRUB_SAVEDEFAULT=true: booting a one-shot entry would make it the saved default")
+    rc, out, err = run(["update-grub"], timeout=600)
+    if rc != 0:
+        fail("update-grub failed: " + (out + err)[-300:])
+    entries = parse_grub_cfg(rd("/boot/grub/grub.cfg"))
+    cfg = rd("/boot/grub/grub.cfg")
+    if 'set default="${saved_entry}"' not in cfg:
+        fail("the generated grub.cfg does not use the saved entry (a GRUB_DEFAULT elsewhere overrides the drop-in)")
+    rt = cfg_recordfail_timeout(cfg)
+    if rt == "-1":
+        fail("the generated grub.cfg waits at the menu for ever after a failed boot (recordfail timeout -1)")
+    eid = entry_id_for(entries, running)
+    if not eid:
+        fail("no grub menu entry for the running kernel %s" % running)
+    rc, out, err = run(["grub-set-default", eid])
+    if rc != 0:
+        fail("grub-set-default failed: " + (out + err)[-300:])
+    saved = grub_editenv().get("saved_entry", "")
+    if saved != eid:
+        fail("grub-editenv says saved_entry=%r, expected %r" % (saved, eid))
+    pk = kernel_packages(running)
+    if pk:
+        rc, out, err = run(["apt-mark", "manual"] + pk)
+        if rc != 0:
+            fail("apt-mark manual failed: " + (out + err)[-300:])
+    emit({"ok": True, "running": running, "entry_id": eid, "saved_entry": saved, "marked_manual": pk,
+          "backup": d + "/etc-default-grub.bak", "recordfail_timeout": rt})
+
+
+APT_ENV = {"DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "l", "NEEDRESTART_SUSPEND": "1",
+           "UCF_FORCE_CONFFOLD": "1", "APT_LISTCHANGES_FRONTEND": "none"}
+POLICY = "#!/bin/sh\n# Managed by probatorium ansible/os-upgrade.yml: no service is started or restarted behind a run.\nexit 101\n"
+
+
+def cmd_apt_update(a):
+    rc, out, err = run(["apt-get", "update"], env=APT_ENV, timeout=900)
+    sys.stdout.write(out + err)
+    sys.exit(0 if rc == 0 else 1)
+
+
+def upgrade_paths(run_id):
+    d = "%s/%s" % (LOG_DIR, run_id)
+    return d, d + "/apt-upgrade.log", d + "/apt-upgrade.rc"
+
+
+def cmd_upgrade_start(a):
+    d, log, rcf = upgrade_paths(a.run_id)
+    if os.path.exists(p(POLICY_RC_D)):
+        fail("%s exists already: not touching it" % POLICY_RC_D)
+    if os.path.exists(p(rcf)):
+        fail("an upgrade of run %s was started already" % a.run_id)
+    os.makedirs(p(d), exist_ok=True)
+    out = open(p(log), "w")
+    child = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_upgrade-run", "--run-id", a.run_id],
+                             stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
+                             env=dict(os.environ))
+    emit({"ok": True, "pid": child.pid, "log": log})
+
+
+def cmd_upgrade_run(a):
+    """The detached half: runs apt-get with the policy-rc.d in place and removes it whatever happens."""
+    d, log, rcf = upgrade_paths(a.run_id)
+    rc = 1
+    try:
+        write(POLICY_RC_D, POLICY, 0o755)
+        argv = ["apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold",
+                "-o", "Dpkg::Use-Pty=0", "full-upgrade"]
+        sys.stdout.write("+ " + " ".join(argv) + "\n")
+        sys.stdout.flush()
+        r = subprocess.run(argv, env=dict(os.environ, **APT_ENV, LC_ALL="C"), stdout=sys.stdout, stderr=subprocess.STDOUT)
+        rc = r.returncode
+    finally:
+        try:
+            os.remove(p(POLICY_RC_D))
+        except OSError:
+            pass
+        write(rcf, "%d\n" % rc)
+
+
+def cmd_upgrade_status(a):
+    d, log, rcf = upgrade_paths(a.run_id)
+    if os.path.exists(p(rcf)):
+        emit({"state": "done", "rc": int(rd(rcf) or "1")})
+    elif os.path.exists(p(log)):
+        emit({"state": "running", "rc": None})
+    else:
+        emit({"state": "none", "rc": None})
+
+
+def cmd_upgrade_log(a):
+    d, log, rcf = upgrade_paths(a.run_id)
+    sys.stdout.write(rd(log) + "\n")
+
+
+def cmd_blacklist(a):
+    write(MODPROBE_CONF, "# Managed by probatorium ansible/os-upgrade.yml (run %s): keep the out-of-tree r8127 bound to the "
+          "RTL8127; the in-tree r8169 of newer kernels lists the same PCI id.\nblacklist r8169\n" % a.run_id)
+    rc, out, err = run(["update-initramfs", "-u", "-k", a.target], timeout=900)
+    if rc != 0:
+        fail("update-initramfs -u -k %s failed: %s" % (a.target, (out + err)[-300:]))
+    emit({"ok": True, "file": MODPROBE_CONF})
+
+
+def cmd_dkms_check(a):
+    emit(dkms_check(a.running, a.target, a.build))
+
+
+def cmd_arm(a):
+    rc, out, err = run(["update-grub"], timeout=600)
+    if rc != 0:
+        fail("update-grub failed: " + (out + err)[-300:])
+    entries = grub_entries()
+    old, new = entry_id_for(entries, a.running), entry_id_for(entries, a.target)
+    if not old or not new:
+        fail("no grub entry for %s (%r) or %s (%r)" % (a.running, old, a.target, new))
+    rc, out, err = run(["grub-set-default", old])
+    if rc != 0:
+        fail("grub-set-default failed: " + (out + err)[-300:])
+    rc, out, err = run(["grub-reboot", new])
+    if rc != 0:
+        fail("grub-reboot failed: " + (out + err)[-300:])
+    env = grub_editenv()
+    if env.get("saved_entry") != old or env.get("next_entry") != new:
+        fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and %r" % (env.get("saved_entry"), env.get("next_entry"), old, new))
+    emit({"ok": True, "saved_entry": old, "next_entry": new, "running": a.running, "target": a.target})
+
+
+def cmd_make_permanent(a):
+    entries = grub_entries()
+    eid = entry_id_for(entries, a.target)
+    if not eid:
+        fail("no grub entry for %s" % a.target)
+    rc, out, err = run(["grub-set-default", eid])
+    if rc != 0:
+        fail("grub-set-default failed: " + (out + err)[-300:])
+    env = grub_editenv()
+    if env.get("saved_entry") != eid or env.get("next_entry"):
+        fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and no next_entry" % (env.get("saved_entry"), env.get("next_entry"), eid))
+    rec = {"run_id": a.run_id, "host": rd("/etc/hostname"), "kernel_before": a.running, "kernel_after": a.target,
+           "entry_id": eid, "permanent": True, "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    write(STATE_DIR + "/last-upgrade.json", json.dumps(rec, indent=1, sort_keys=True) + "\n")
+    emit({"ok": True, **rec})
+
+
+def cmd_toolcheck(a):
+    """A cheap look at whether the bootstrap's prerequisites work on the upgraded host: the system C compiler builds and
+    runs a program, TLS to GitHub (the runner tarball) verifies, and the other download hosts of the roles answer."""
+    res = {"cc_ok": False, "https_ok": False, "endpoints": {}, "warnings": []}
+    cc = shutil.which("cc") or shutil.which("gcc")
+    t = tempfile.mkdtemp(prefix="osu-toolcheck-")
+    try:
+        if cc:
+            src = os.path.join(t, "t.c")
+            open(src, "w").write("#include <stdio.h>\nint main(void){puts(\"ok\");return 0;}\n")
+            rc, _, _ = run([cc, src, "-o", os.path.join(t, "t")], timeout=120, check_ro=False)
+            rc2, out, _ = run([os.path.join(t, "t")], check_ro=False) if rc == 0 else (1, "", "")
+            res["cc_ok"] = rc == 0 and rc2 == 0 and out.strip() == "ok"
+        else:
+            res["warnings"].append("no cc or gcc on the host")
+        for host, hard in (("github.com", True), ("nodejs.org", False), ("static.rust-lang.org", False), ("astral.sh", False),
+                           ("api.adoptium.net", False), ("ziglang.org", False)):
+            rc, _, _ = run(["curl", "-fsSI", "--max-time", "20", "-o", "/dev/null", "https://" + host], timeout=40, check_ro=False)
+            res["endpoints"][host] = rc == 0
+            if hard:
+                res["https_ok"] = rc == 0
+            elif rc != 0:
+                res["warnings"].append("https://%s did not answer (curl rc %d)" % (host, rc))
+    finally:
+        shutil.rmtree(t, ignore_errors=True)
+    emit(res)
+
+
+def cmd_dump(a):
+    if a.what == "packages":
+        rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package}\t${Version}\t${Architecture}\t${db:Status-Abbrev}\n"])
+        sys.stdout.write("".join(sorted(out.splitlines(True))))
+    elif a.what == "policy":
+        sys.stdout.write(run(["apt-cache", "policy"])[1])
+        sys.stdout.write("\n# held: %s\n" % " ".join(run(["apt-mark", "showhold"])[1].split()))
+    elif a.what == "sysctl":
+        sys.stdout.write("".join(sorted(run(["sysctl", "-a"])[1].splitlines(True))))
+    elif a.what == "cmdline":
+        sys.stdout.write(rd("/proc/cmdline") + "\n")
+    elif a.what == "grub":
+        env = grub_editenv()
+        sys.stdout.write("saved_entry=%s\nnext_entry=%s\n" % (env.get("saved_entry", ""), env.get("next_entry", "")))
+        for e in grub_entries():
+            sys.stdout.write("%s\t%s\t%s\n" % (e["kernel"], e["full_id"], "recovery" if e["recovery"] else ""))
+
+
+# ---------------------------------------------------------------------------------------------- main
+def main():
+    global READ_ONLY
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, *args, flags=()):
+        s = sub.add_parser(name)
+        for x in args:
+            s.add_argument("--" + x, default="")
+        for x in flags:
+            s.add_argument("--" + x, action="store_true")
+        s.set_defaults(fn=fn)
+        return s
+
+    add("survey", lambda a: emit(survey()))
+    add("simulate", lambda a: emit(simulate()))
+    add("marker", lambda a: emit(marker()))
+    s = add("dump", cmd_dump)
+    s.add_argument("what", choices=["packages", "policy", "sysctl", "cmdline", "grub"])
+    add("upgrade-status", cmd_upgrade_status, "run-id")
+    add("upgrade-log", cmd_upgrade_log, "run-id")
+    add("apt-update", cmd_apt_update)
+    add("pin-grub", cmd_pin_grub, "running", "run-id")
+    add("upgrade-start", cmd_upgrade_start, "run-id")
+    add("_upgrade-run", cmd_upgrade_run, "run-id")
+    add("blacklist-r8169", cmd_blacklist, "run-id", "target")
+    add("dkms-check", cmd_dkms_check, "running", "target", flags=("build",))
+    add("arm-oneshot", cmd_arm, "running", "target")
+    add("make-permanent", cmd_make_permanent, "running", "target", "run-id")
+    add("toolcheck", cmd_toolcheck)
+    a = ap.parse_args()
+    # survey, simulate, dump, marker and the status reads: nothing may be written or changed. dkms-check without
+    # --build is a read too (with it, it runs `dkms autoinstall`).
+    if a.cmd in ("survey", "simulate", "dump", "upgrade-status", "upgrade-log", "marker") or (a.cmd == "dkms-check" and not a.build):
+        READ_ONLY = True
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
