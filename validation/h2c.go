@@ -118,6 +118,8 @@ type h2cTally struct {
 	// the validator heartbeat (walker_capture.go, celeris#588). Every
 	// fire is filed; every read over slowReadThreshold is kept verbatim.
 	capture fireCapture
+	// hangSpan is the first and last h2c_hang with their instants.
+	hangSpan eventSpan
 }
 
 // h2cSnapshot is the value-typed projection emitted into the tally
@@ -143,6 +145,8 @@ type h2cSnapshot struct {
 	SlowReadsTotal int64                `json:"h2c_slow_reads_total"`
 	Latency        report.WalkerLatency `json:"h2c_latency"`
 	SlowReads      []report.SlowFire    `json:"h2c_slow_reads,omitempty"`
+	// HangSpan is the first and last h2c_hang (nil when none).
+	HangSpan *report.EventSpan `json:"h2c_hang_span,omitempty"`
 }
 
 func (t *h2cTally) snapshot() h2cSnapshot {
@@ -165,6 +169,7 @@ func (t *h2cTally) snapshot() h2cSnapshot {
 		SlowReadsTotal: t.capture.slow.total.Load(),
 		Latency:        t.capture.latency.snapshot(),
 		SlowReads:      t.capture.slow.snapshot(),
+		HangSpan:       t.hangSpan.snapshot(),
 	}
 }
 
@@ -342,6 +347,8 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 		// the slow-read ring, so the next one is attributable from the
 		// artifact alone (celeris#588).
 		cause := tally.recordHang(err, readD)
+		at := readStart.Add(readD)
+		tally.hangSpan.mark(at, tally.capture.stamp(at, cause, err, conn))
 		tally.capture.record(conn, dialD, writeD, readD, err, "hang-"+cause, "", n, readStart)
 		return
 	}

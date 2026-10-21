@@ -91,6 +91,9 @@ type wsEchoDiagReport struct {
 	Tolerated bool
 	// Disposition is the WS_ECHO_DISPOSITION line, the second line of Text.
 	Disposition string
+	// GuardReason is why the SLOW guard refused to tolerate a SLOW_CLASS
+	// timeout (guardOverN or guardNoClean); empty for every other outcome.
+	GuardReason string
 }
 
 // claim reserves one of the cell's diagnoses; false when spent. Under a SLOW

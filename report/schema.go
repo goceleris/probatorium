@@ -321,7 +321,22 @@ import (
 //     published summary.json drops it (SplitDocument) and env.json keeps
 //     the verdict. The publish gate refuses a document whose verdict shows
 //     a forbidden overlap. Additive; older readers ignore both fields.
-const SchemaVersion = "5.22"
+//   - 5.23 — race tier observability (probatorium#481, celeris#871). A
+//     failed race run (39560945814) could not say when its h2c_hang and
+//     ws_handshake_fail events happened (the slow ring keeps only reads over
+//     one second; those closed in 12 ms), what the refapp ran under, or how
+//     many ws_echo fires were SLOW. Adds Tier1Summary.H2CHangSpan
+//     (h2c_hang_span) and WSHandshakeFailSpan (ws_handshake_fail_span): the
+//     first and last event of the kind with UTC instant, since_ready_ms,
+//     cause, error and addresses; and Tier1Summary.RefappSched
+//     (refapp_sched): the refapp's per-thread Cpus_allowed_list read from
+//     /proc at ready, in every run, plus GOMAXPROCS when the stall-capture
+//     side listener answered. Adds two ws_echo keys, ws_echo_slow_over_n and
+//     ws_echo_slow_no_clean_fire: the SLOW_CLASS fires the race tier's guard
+//     refused, a subset of ws_echo_timeout (which still fails and is still
+//     the only one gated). Nothing new is gated. Additive; older readers
+//     ignore every field.
+const SchemaVersion = "5.23"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -1158,6 +1173,8 @@ type Tier1Summary struct {
 	//                  ws_echo_timeout_slow is the race tier's recorded latency: timed-out fires whose
 	//                  two-instant capture said SLOW_CLASS. Not in ws_echo_timeout, not in the cross-arch
 	//                  diff, tolerated by Gate only with GateOptions.ToleratesWSEchoSlow (probatorium#481).
+	//                  ws_echo_slow_over_n / ws_echo_slow_no_clean_fire (schema 5.23) split, by guard
+	//                  reason, the SLOW_CLASS fires the guard refused; a subset of ws_echo_timeout, not gated.
 	Adversarial map[string]int64 `json:"adversarial,omitempty"`
 	H2CChurn    map[string]int64 `json:"h2c_churn,omitempty"`
 	WSTorture   map[string]int64 `json:"ws_torture,omitempty"`
@@ -1188,6 +1205,19 @@ type Tier1Summary struct {
 	// hold. Omitted on a cell with no slow fire.
 	H2CSlowReads []SlowFire `json:"h2c_slow_reads,omitempty"`
 	WSSlowReads  []SlowFire `json:"ws_slow_reads,omitempty"`
+	// H2CHangSpan / WSHandshakeFailSpan place the cell's h2c_hang and
+	// ws_handshake_fail events in time (schema 5.23, probatorium#481): the
+	// first and the last one, with their cause and verbatim error. The slow
+	// ring above keeps only reads over one second, so a hang that closed in
+	// 12 ms (the shape of race run 39560945814) had no instant anywhere.
+	// Record only; Gate() does not read them. Omitted when the cell had none.
+	H2CHangSpan         *EventSpan `json:"h2c_hang_span,omitempty"`
+	WSHandshakeFailSpan *EventSpan `json:"ws_handshake_fail_span,omitempty"`
+	// RefappSched is the refapp's CPU view, read by the validator from
+	// /proc when the refapp is ready (schema 5.23, probatorium#481), in every
+	// run and not only a stall-capture one. Omitted when no refapp pid was
+	// seen. See RefappSched for what it can and cannot say.
+	RefappSched *RefappSched `json:"refapp_sched,omitempty"`
 	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
 	// bound address, i.e. the origin of every SlowFire.SinceReadyMs and
 	// of the mod-60 phase histogram the design computes offline.
@@ -1227,6 +1257,56 @@ type WalkerLatency struct {
 	Dial  LatencyBuckets `json:"dial"`
 	Write LatencyBuckets `json:"write"`
 	Read  LatencyBuckets `json:"read"`
+}
+
+// EventStamp is one event of a rare kind (an h2c_hang, a ws_handshake_fail)
+// with the instant it happened. TS is UTC (RFC3339Nano), the same clock as
+// SlowFire.TS, Tier1Summary.ReadyAt and the epoch seconds of the per-cell
+// properties_series.csv, so it joins with all three.
+type EventStamp struct {
+	TS string `json:"ts"`
+	// SinceReadyMs is TS minus the refapp's ready instant; 0 when the
+	// walker ran without one.
+	SinceReadyMs int64 `json:"since_ready_ms,omitempty"`
+	// Cause is the walker's classification: eof, reset, timeout, status or
+	// other (the same words as the ws_handshake_fail_* and h2c_hang_*
+	// counters).
+	Cause string `json:"cause"`
+	// Err is the verbatim error that ended the read; empty for a non-101
+	// status or a zero-length read.
+	Err        string `json:"err,omitempty"`
+	LocalAddr  string `json:"local_addr,omitempty"`
+	RemoteAddr string `json:"remote_addr,omitempty"`
+}
+
+// EventSpan is the earliest and the latest event of one kind in a cell, and
+// how many were stamped. Count equals the counter it sits beside.
+type EventSpan struct {
+	Count int64      `json:"count"`
+	First EventStamp `json:"first"`
+	Last  EventStamp `json:"last"`
+}
+
+// RefappSched is what the validator read of the refapp's CPU placement.
+//
+// ThreadMasks counts the refapp's threads by their own Cpus_allowed_list.
+// LeaderCPUsAllowedList is the thread-group leader's alone, which is NOT the
+// process's mask: celeris pins each engine loop's thread to one CPU and the
+// main thread can be one of them (race run 38410499633 read "0" and was taken
+// for a one-CPU confinement). Read ThreadMasks.
+//
+// GOMAXPROCS is in no /proc file. It is recorded only when the refapp's own
+// /debug/sched answered (a stall-capture run, which starts the side
+// listener); otherwise it is 0 and GOMAXPROCSNote says why. Unavailable, when
+// set, is why nothing could be read at all.
+type RefappSched struct {
+	At                    string         `json:"at,omitempty"`
+	Unavailable           string         `json:"unavailable,omitempty"`
+	Threads               int            `json:"threads,omitempty"`
+	LeaderCPUsAllowedList string         `json:"leader_cpus_allowed_list,omitempty"`
+	ThreadMasks           map[string]int `json:"thread_masks,omitempty"`
+	GOMAXPROCS            int            `json:"gomaxprocs,omitempty"`
+	GOMAXPROCSNote        string         `json:"gomaxprocs_note,omitempty"`
 }
 
 // SlowFire is one walker fire whose read leg exceeded one second.

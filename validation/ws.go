@@ -157,6 +157,8 @@ type wsTally struct {
 	// leg is the handshake: from the end of the upgrade write to the blank
 	// line that ends the response headers.
 	capture fireCapture
+	// handshakeFailSpan is the first and last ws_handshake_fail.
+	handshakeFailSpan eventSpan
 }
 
 // wsSnapshot is the value-typed projection emitted into the tally
@@ -185,6 +187,8 @@ type wsSnapshot struct {
 	SlowReadsTotal int64                `json:"ws_slow_reads_total"`
 	Latency        report.WalkerLatency `json:"ws_latency"`
 	SlowReads      []report.SlowFire    `json:"ws_slow_reads,omitempty"`
+	// HandshakeFailSpan is the first and last ws_handshake_fail (nil when none).
+	HandshakeFailSpan *report.EventSpan `json:"ws_handshake_fail_span,omitempty"`
 }
 
 // recordRoute stores the pre-flight verdict for this cell.
@@ -215,6 +219,8 @@ func (t *wsTally) snapshot() wsSnapshot {
 		SlowReadsTotal: t.capture.slow.total.Load(),
 		Latency:        t.capture.latency.snapshot(),
 		SlowReads:      t.capture.slow.snapshot(),
+
+		HandshakeFailSpan: t.handshakeFailSpan.snapshot(),
 	}
 }
 
@@ -308,6 +314,8 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 	nRead := 0
 	fail := func(err error, status string) {
 		cause := tally.recordHandshakeFail(err, status)
+		at := time.Now()
+		tally.handshakeFailSpan.mark(at, tally.capture.stamp(at, cause, err, conn))
 		tally.capture.record(conn, dialD, writeD, time.Since(readStart), err,
 			"handshake-fail-"+cause, status, nRead, readStart)
 	}

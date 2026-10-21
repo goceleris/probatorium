@@ -2,6 +2,7 @@ package validation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -106,46 +107,10 @@ func statusField(status, key string) string {
 // masks and the states. A mask shared by many threads is the process mask; a
 // mask of one CPU on a few threads is a pinned loop.
 func threadTable(procRoot string, pid int) string {
-	taskDir := filepath.Join(procRoot, strconv.Itoa(pid), "task")
-	entries, err := os.ReadDir(taskDir)
+	ts, err := readThreads(procRoot, pid)
 	if err != nil {
 		return fmt.Sprintf("REFAPP_THREADS unavailable: %v\n", err)
 	}
-	type thread struct {
-		tid                       int
-		comm, state, cpus         string
-		vol, nonvol, utime, stime string
-	}
-	var ts []thread
-	for _, e := range entries {
-		tid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(taskDir, e.Name(), "status"))
-		if err != nil {
-			continue // the thread exited between the listing and the read
-		}
-		st := string(raw)
-		t := thread{tid: tid, comm: statusField(st, "Name"), cpus: statusField(st, "Cpus_allowed_list"),
-			vol: statusField(st, "voluntary_ctxt_switches"), nonvol: statusField(st, "nonvoluntary_ctxt_switches")}
-		t.state, _, _ = strings.Cut(statusField(st, "State"), " ")
-		t.utime, t.stime = "na", "na"
-		if sb, err := os.ReadFile(filepath.Join(taskDir, e.Name(), "stat")); err == nil {
-			// Fields after the ")" that closes the command name: state is the
-			// first, utime and stime the 12th and 13th.
-			if i := strings.LastIndexByte(string(sb), ')'); i >= 0 {
-				if f := strings.Fields(string(sb)[i+1:]); len(f) > 13 {
-					t.utime, t.stime = f[11], f[12]
-				}
-			}
-		}
-		ts = append(ts, t)
-	}
-	if len(ts) == 0 {
-		return "REFAPP_THREADS unavailable: no thread readable\n"
-	}
-	sort.Slice(ts, func(i, j int) bool { return ts[i].tid < ts[j].tid })
 	var b strings.Builder
 	masks, states := map[string]int{}, map[string]int{}
 	leader := "absent"
@@ -162,6 +127,54 @@ func threadTable(procRoot string, pid int) string {
 	fmt.Fprintf(&b, "REFAPP_THREADS n=%d leader_cpus_allowed_list=%s masks=%s states=%s\n",
 		len(ts), leader, counts(masks, ";"), counts(states, ","))
 	return b.String()
+}
+
+// procThread is one row of a refapp's thread table.
+type procThread struct {
+	tid                       int
+	comm, state, cpus         string
+	vol, nonvol, utime, stime string
+}
+
+// readThreads lists every thread of pid from procRoot/<pid>/task, sorted by
+// tid. The error says why none could be read.
+func readThreads(procRoot string, pid int) ([]procThread, error) {
+	taskDir := filepath.Join(procRoot, strconv.Itoa(pid), "task")
+	entries, err := os.ReadDir(taskDir)
+	if err != nil {
+		return nil, err
+	}
+	var ts []procThread
+	for _, e := range entries {
+		tid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(taskDir, e.Name(), "status"))
+		if err != nil {
+			continue // the thread exited between the listing and the read
+		}
+		st := string(raw)
+		t := procThread{tid: tid, comm: statusField(st, "Name"), cpus: statusField(st, "Cpus_allowed_list"),
+			vol: statusField(st, "voluntary_ctxt_switches"), nonvol: statusField(st, "nonvoluntary_ctxt_switches")}
+		t.state, _, _ = strings.Cut(statusField(st, "State"), " ")
+		t.utime, t.stime = "na", "na"
+		if sb, err := os.ReadFile(filepath.Join(taskDir, e.Name(), "stat")); err == nil {
+			// Fields after the ")" that closes the command name: state is the
+			// first, utime and stime the 12th and 13th.
+			if i := strings.LastIndexByte(string(sb), ')'); i >= 0 {
+				if f := strings.Fields(string(sb)[i+1:]); len(f) > 13 {
+					t.utime, t.stime = f[11], f[12]
+				}
+			}
+		}
+		ts = append(ts, t)
+	}
+	if len(ts) == 0 {
+		return nil, errors.New("no thread readable")
+	}
+	sort.Slice(ts, func(i, j int) bool { return ts[i].tid < ts[j].tid })
+	return ts, nil
 }
 
 // counts renders a tally as "k:n<sep>k:n" sorted by key. The masks use ";"
