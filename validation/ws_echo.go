@@ -161,6 +161,14 @@ type wsEchoTally struct {
 	// Per-fire outcomes.
 	missing atomic.Int64
 	timeout atomic.Int64
+	// timeoutSlow counts timed-out fires that the race tier booked as a
+	// non-failing SLOW_CLASS finding instead of timeout (ws_echo_slow.go).
+	// Not gated; the gate tolerates up to N per cell in the race tier only.
+	timeoutSlow atomic.Int64
+	// cleanFires counts fires that drained: every echo came back. The
+	// SLOW guard reads it to tell a late server from one that delivers
+	// nothing.
+	cleanFires atomic.Int64
 	// frameErr counts fires whose server stream stopped parsing as RFC 6455
 	// frames (a length beyond the cap, a header mid-payload). Diagnostic
 	// detail for a missing fire, not a separate signal.
@@ -193,6 +201,7 @@ type wsEchoSnapshot struct {
 	Reorder          int64 `json:"ws_echo_reorder"`
 	Missing          int64 `json:"ws_echo_missing"`
 	Timeout          int64 `json:"ws_echo_timeout"`
+	TimeoutSlow      int64 `json:"ws_echo_timeout_slow"`
 	FrameErr         int64 `json:"ws_echo_frame_err"`
 	CloseOK          int64 `json:"ws_echo_close_ok"`
 	CutAtDeadline    int64 `json:"ws_echo_cut_at_deadline"`
@@ -221,6 +230,7 @@ func (t *wsEchoTally) snapshot() wsEchoSnapshot {
 		Reorder:          t.reorder.Load(),
 		Missing:          t.missing.Load(),
 		Timeout:          t.timeout.Load(),
+		TimeoutSlow:      t.timeoutSlow.Load(),
 		FrameErr:         t.frameErr.Load(),
 		CloseOK:          t.closeOK.Load(),
 		CutAtDeadline:    t.cutAtDeadline.Load(),
@@ -229,8 +239,8 @@ func (t *wsEchoTally) snapshot() wsEchoSnapshot {
 
 // summariseWSEcho formats a snapshot for the run summary log line.
 func summariseWSEcho(s wsEchoSnapshot) string {
-	return fmt.Sprintf("ws_echo_fires=%d ws_echo_sent=%d ws_echo_ok=%d ws_echo_corrupt=%d ws_echo_reorder=%d ws_echo_missing=%d ws_echo_timeout=%d",
-		s.Fires, s.Sent, s.OK, s.Corrupt, s.Reorder, s.Missing, s.Timeout)
+	return fmt.Sprintf("ws_echo_fires=%d ws_echo_sent=%d ws_echo_ok=%d ws_echo_corrupt=%d ws_echo_reorder=%d ws_echo_missing=%d ws_echo_timeout=%d ws_echo_timeout_slow=%d",
+		s.Fires, s.Sent, s.OK, s.Corrupt, s.Reorder, s.Missing, s.Timeout, s.TimeoutSlow)
 }
 
 // runWSLargeEchoWalker fires fireWSLargeEcho at hostPort + path per
@@ -453,10 +463,15 @@ readLoop:
 	close(stop)
 	_ = conn.SetWriteDeadline(time.Now())
 	<-sendDone
+	if drained {
+		tally.cleanFires.Add(1)
+	}
 	if diagnose != nil {
 		// The sender is joined, the connection still open: take the two
-		// instants, hand the record over, and only then book the timeout.
+		// instants, decide what the timeout is (ws_echo_slow.go), hand the
+		// record over, and only then book it.
 		rep := diagnose.run(ctx, conn, br, &received, &sent, &bytesIn)
+		tolerated := diagnose.book(&rep, tally.cleanFires.Load())
 		// Nothing more is needed from the connection, and Deliver may wait a
 		// long time for the orchestrator's slot (an in-stall dossier of the
 		// same stall can be holding it). A detached stream that stays open
@@ -466,7 +481,11 @@ readLoop:
 		if diagnose.Deliver != nil {
 			diagnose.Deliver(ctx, rep)
 		}
-		tally.timeout.Add(1)
+		if tolerated {
+			tally.timeoutSlow.Add(1)
+		} else {
+			tally.timeout.Add(1)
+		}
 	}
 	if connEnded {
 		return

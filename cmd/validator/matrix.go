@@ -544,15 +544,16 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		// MetricsURL deliberately empty: addr is ":0" here, so the only
 		// usable /debug/vars URL is the one the orchestrator derives
 		// from the refapp's ready banner.
-		PropertyTier:     cfg.PropertyTier,
-		PropertyHardFail: cfg.PropertyHardFail,
-		ReplayBin:        cfg.ReplayBin,
-		RefappEngine:     mc.Engine,
-		RefappWorkers:    cellRefappWorkers(mc.Engine, cfg.RefappWorkers),
-		ConcurrencyFloor: cellConcurrencyFloor(mc.Engine),
-		DriverMode:       cfg.DriverMode,
-		DriverSSHUser:    cfg.DriverSSHUser,
-		DriverSSHHost:    cfg.DriverSSHHost,
+		PropertyTier:        cfg.PropertyTier,
+		PropertyHardFail:    cfg.PropertyHardFail,
+		ReplayBin:           cfg.ReplayBin,
+		RefappEngine:        mc.Engine,
+		RefappWorkers:       cellRefappWorkers(mc.Engine, cfg.RefappWorkers),
+		ConcurrencyFloor:    cellConcurrencyFloor(mc.Engine),
+		WSEchoSlowTolerance: wsEchoSlowTolerance(cfg.RaceTier),
+		DriverMode:          cfg.DriverMode,
+		DriverSSHUser:       cfg.DriverSSHUser,
+		DriverSSHHost:       cfg.DriverSSHHost,
 	}
 	o, err := validation.New(cellCfg)
 	if err != nil {
@@ -724,6 +725,15 @@ func cellRefappWorkers(engine string, capFromFlag int) int {
 		return capFromFlag
 	}
 	return adaptiveCellWorkers
+}
+
+// wsEchoSlowTolerance is the ws_echo SLOW_CLASS tolerance a run takes: N in
+// the race tier (-race-tier), 0 everywhere else (validation/ws_echo_slow.go).
+func wsEchoSlowTolerance(raceTier bool) int {
+	if raceTier {
+		return report.WSEchoSlowTolerance
+	}
+	return 0
 }
 
 func cellConcurrencyFloor(engine string) int {

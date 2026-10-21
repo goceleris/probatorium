@@ -63,7 +63,7 @@ attached to the run as an artifact.
 | --- | --- | --- |
 | [Nightly Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml) | The full 64-cell matrix on both architectures | `matrix-nightly-results-<run id>` (30 days) |
 | [Weekend Soak](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml) | The same matrix over 24 h, long enough to judge slow leaks | `matrix-weekend-results-<run id>` (90 days) |
-| [Race Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-race-tier.yml) | The matrix with `-race` reference apps | `matrix-race-results-<run id>` (30 days) |
+| [Race Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-race-tier.yml) | The matrix with `-race` reference apps; it gates liveness and records the latency of a slow 64 KiB echo ([tier semantics](#race-tier-semantics-liveness-is-gated-latency-is-recorded)) | `matrix-race-results-<run id>` (30 days) |
 | [Checkptr Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-checkptr-tier.yml) | The matrix with pointer-checker reference apps | `matrix-checkptr-results-<run id>` (30 days) |
 | [PR Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-pr-tier.yml) | A 10-minute matrix on the amd64 host, for pull requests a maintainer labels `cluster-ok` | `matrix-pr-results-<run id>` (7 days) |
 | [Benchmark Tier](https://github.com/goceleris/probatorium/actions/workflows/benchmark-tier.yml) | `mage BenchTier` over the whole grid | `benchmark-tier-results-<run id>` (90 days); rated runs are also published to the [benchmark dashboard](https://goceleris.dev/benchmarks/) |
@@ -309,6 +309,37 @@ experiment arms for msa2-server only, `refapp_cpus` (a `taskset -c` list of at l
 actually ran under in `refapp_sched.txt` ([`validation/ws_echo_diag.go`](validation/ws_echo_diag.go),
 [`validation/refapparms`](validation/refapparms), probatorium#481).
 
+#### Race tier semantics: liveness is gated, latency is recorded
+
+The race tier's adaptive cell is deliberately small (`adaptiveCellWorkers` = 2 workers, a floor of
+`adaptiveCellConcurrencyFloor` = 110 walkers, to force the epoll-to-io_uring promotion) and runs under
+`-race` instrumentation, so a late 64 KiB echo there is a capacity and latency effect before it is a
+liveness defect. Its amd64 adaptive cell timed out in every run, and every timeout the two-instant
+capture classified was `SLOW_CLASS`: the server read and wrote, the echoes were only slower than the
+fire's deadline. The race tier therefore judges liveness and records latency:
+
+| In the race tier | Result |
+| --- | --- |
+| A `ws_echo` timeout classed `SLOW_CLASS` | not a failure: counted in `ws_echo_timeout_slow` (exported in `validate-results.json` under `tier_1.ws_echo`, printed by `mage ValidateGate`, which lists every cell that recorded one), and a record-only `I-WS-ECHO-SLOW` dossier whose `ws-echo-diag.txt` keeps `WS_ECHO_VERDICT` as its first line and adds `WS_ECHO_DISPOSITION=TOLERATED_SLOW` as its second |
+| `WEDGE_CLASS`, `INDETERMINATE` (no capture included) | `ws_echo_timeout` as before: hard `I-WS-ECHO`, the cell stops, the gate fails |
+| More than N = 3 `SLOW_CLASS` timeouts in one cell | the 4th is `ws_echo_timeout` (`WS_ECHO_DISPOSITION=FAIL reason=over_n`) |
+| A `SLOW_CLASS` timeout after the first with no fire in the cell having drained cleanly since the first | `ws_echo_timeout` (`reason=no_clean_fire_since_first_slow`): every fire after the first timed out, which is a server delivering nothing, not one that is late now and then |
+| Every other violation | unchanged |
+
+The tolerance is explicit and scoped to this tier. The validator takes `-race-tier`, which
+`ansible/validate.yml` passes only when `validate_race` is `1` (the `-race` refapp set), and
+`mage ValidateGate` takes `VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW=1`, which only `matrix-race-tier.yml`
+sets. The gate repeats the rule on the results: it tolerates `ws_echo_timeout_slow` only with that
+variable, only in a cell that declared `I-RACE` (a `-race` build), and only up to 3. Nightly, soak,
+weekend, checkptr and PR runs have neither switch, so a `SLOW_CLASS` ws_echo timeout in them stays
+`ws_echo_timeout` and fails: their timing budget is real. In the race tier the capture is armed by
+`-race-tier` itself, so `stall_capture` is not needed for the tolerance. `ValidateDiff` does not list
+`ws_echo_timeout_slow`, so an amd64-only slow echo is not a cross-arch divergence.
+
+`ws_echo_timeout_slow` is a measurement, not an exemption: watch its count per run. Before this change
+the first timeout ended its cell, so "one per run" was a censored count; the per-cell rate is now
+measured by the race tier itself.
+
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
 `auth_session_ratelimit` routes them today. The verdict is recorded per cell (`ws_route_probed` /
@@ -324,7 +355,8 @@ The first time one of these signals appears, the orchestrator acts on it mid-run
 | h2c crashed > 0 | `I-H2C-CRASHED` | The engine answered an upgrade with non-HTTP bytes | hard fail: forensics first, then the cell stops |
 | WS accepted bad frame > 0 | `I-WS-ACCEPTED` | The server accepted an RFC 6455 violation | hard fail: forensics first, then the cell stops |
 | WS hang (no close) > 0 | `I-WS-HANG` | A WebSocket connection hung past the close timeout | hard fail: forensics first, then the cell stops |
-| 64 KiB echo corrupt / reordered / missing / timed out | `I-WS-ECHO` | WebSocket echoes were not byte-intact and in order | hard fail: forensics first, then the cell stops |
+| 64 KiB echo corrupt / reordered / missing / timed out | `I-WS-ECHO` | WebSocket echoes were not byte-intact and in order | hard fail: forensics first, then the cell stops. In the race tier only, a timeout that the two-instant capture classed `SLOW_CLASS` is not this row: see the next one |
+| 64 KiB echo timed out, `SLOW_CLASS` (race tier only) | `I-WS-ECHO-SLOW` | The server read and wrote in the window; the echoes were only later than the fire's deadline | record-only dossier, counted in `ws_echo_timeout_slow`, the cell runs on; the gate fails past 3 per cell |
 | process died | `I-LIVENESS` | The reference app crashed mid-run | hard fail: forensics first, then the cell stops |
 | process alive but wedged | `I-HANG` | The reference app stopped responding | hard fail: forensics first, then the cell stops |
 | h2c hang > 0 | `I-H2C-HANG` | An upgrade was neither answered nor declined within 20 s | dossier without a core dump; the cell runs on |
@@ -499,7 +531,7 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `BenchSince` | Compare against a baseline version | `BASELINE_VERSION` (default `v1.4.2`), `REGRESSION_THRESHOLD` (default `0.05`) |
 | `Validate` | A validation run, one cell or the matrix | `VALIDATE_TARGET` (default `both`), `VALIDATE_DURATION` (default `6h`), `VALIDATE_MATRIX=1`, `VALIDATE_MATRIX_REFAPPS`, `VALIDATE_MATRIX_ENGINES`, `VALIDATE_PARALLEL=1`, `VALIDATE_DBSERVICES=1`, `VALIDATE_CONCURRENCY`, `VALIDATE_RESUME_FROM`, `CELERIS_VERSION`, `PROBATORIUM_VALIDATE_DRIVER=ssh` |
 | `Soak` | A long validation run | `SOAK_DURATION` (default `24h`), plus the `Validate` knobs |
-| `ValidateGate` | The absolute gate over the most recent run's `validate-results.json` on every host | `VALIDATE_GATE_EXPECT_CELLS`, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH` |
+| `ValidateGate` | The absolute gate over the most recent run's `validate-results.json` on every host | `VALIDATE_GATE_EXPECT_CELLS`, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`, `VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW` (race tier only) |
 | `ValidateDiff` | The cross-engine and cross-arch gate | `VALIDATE_DIFF_STRICT=1` (MEDIUM fails too), `VALIDATE_DIFF_HOSTS=a,b` |
 | `BuildRaceRefapps` | Cross-build the `-race` reference apps (the race runtime needs cgo) | |
 | `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host | `SAMPLER_DURATION`, `SAMPLER_INTERVAL`, `SAMPLER_TAG` |

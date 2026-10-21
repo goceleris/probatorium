@@ -70,8 +70,13 @@ type wsEchoDiag struct {
 	Refapp func(ctx context.Context) string
 	// Deliver receives the finished record; nil drops it.
 	Deliver func(ctx context.Context, rep wsEchoDiagReport)
+	// SlowTolerance is N of the race tier's SLOW_CLASS tolerance
+	// (ws_echo_slow.go); 0, every other tier, books every timeout as a
+	// failure.
+	SlowTolerance int
 
 	taken atomic.Int32
+	guard wsEchoSlowGuard
 }
 
 // wsEchoDiagReport is one diagnosed fire.
@@ -80,14 +85,23 @@ type wsEchoDiagReport struct {
 	// Text is the whole record: the verdict line, then both instants.
 	Text string
 	At   time.Time
+	// Tolerated is true when the timeout was booked as a non-failing
+	// SLOW_CLASS finding (ws_echo_timeout_slow); false when it is the
+	// failing ws_echo_timeout.
+	Tolerated bool
+	// Disposition is the WS_ECHO_DISPOSITION line, the second line of Text.
+	Disposition string
 }
 
-// claim reserves one of the cell's diagnoses; false when spent.
+// claim reserves one of the cell's diagnoses; false when spent. Under a SLOW
+// tolerance of N the budget is N+1, so the (N+1)th SLOW_CLASS timeout, the one
+// the guard fails, is diagnosed and its dossier says why it failed; the guard
+// itself does not depend on the budget (ws_echo_slow.go).
 func (d *wsEchoDiag) claim() bool {
 	if d == nil {
 		return false
 	}
-	if d.taken.Add(1) > wsEchoDiagPerCell {
+	if d.taken.Add(1) > int32(max(wsEchoDiagPerCell, d.SlowTolerance+1)) {
 		d.taken.Add(-1)
 		return false
 	}

@@ -14,14 +14,14 @@ import (
 func TestWSEchoDiagHookIsNilOutsideAStallCaptureRun(t *testing.T) {
 	ch := make(chan Incident, 1)
 	pid := func() int { return 7 }
-	if h := wsEchoDiagHook(func(string) string { return "" }, ch, pid, nil, "/proc"); h != nil {
+	if h := wsEchoDiagHook(func(string) string { return "" }, 0, ch, pid, nil, "/proc"); h != nil {
 		t.Fatal("routine run: the ws_echo diagnosis is armed")
 	}
 	for name, env := range map[string]map[string]string{
 		"fault run": {refappFaultEnv: "/ws:8s@30s"},
 		"knob":      {stallCaptureEnv: "1"},
 	} {
-		if h := wsEchoDiagHook(func(k string) string { return env[k] }, ch, pid, nil, "/proc"); h == nil {
+		if h := wsEchoDiagHook(func(k string) string { return env[k] }, 0, ch, pid, nil, "/proc"); h == nil {
 			t.Fatalf("%s: the ws_echo diagnosis is not armed", name)
 		}
 	}
@@ -32,7 +32,7 @@ func TestWSEchoDiagHookIsNilOutsideAStallCaptureRun(t *testing.T) {
 // its message, so incident.json alone names the class.
 func TestWSEchoDiagDeliverSendsARecordOnlyIncident(t *testing.T) {
 	ch := make(chan Incident, 1)
-	h := wsEchoDiagHook(func(k string) string { return map[string]string{stallCaptureEnv: "1"}[k] }, ch, func() int { return 42 }, nil, "/proc")
+	h := wsEchoDiagHook(func(k string) string { return map[string]string{stallCaptureEnv: "1"}[k] }, 0, ch, func() int { return 42 }, nil, "/proc")
 	rep := wsEchoDiagReport{Verdict: wsEchoVerdict{Class: verdictWedge, Line: "WS_ECHO_VERDICT=WEDGE_CLASS reason=x"}, Text: "WS_ECHO_VERDICT=WEDGE_CLASS reason=x\n### t0\n"}
 	h.Deliver(context.Background(), rep)
 	inc := <-ch
@@ -52,7 +52,7 @@ func TestWSEchoDiagDeliverSendsARecordOnlyIncident(t *testing.T) {
 func TestWSEchoDiagDeliverWaitsForTheSlotAndHonoursCancel(t *testing.T) {
 	ch := make(chan Incident, 1)
 	ch <- Incident{PredicateID: "busy"}
-	h := wsEchoDiagHook(func(k string) string { return map[string]string{stallCaptureEnv: "1"}[k] }, ch, func() int { return 1 }, nil, "/proc")
+	h := wsEchoDiagHook(func(k string) string { return map[string]string{stallCaptureEnv: "1"}[k] }, 0, ch, func() int { return 1 }, nil, "/proc")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

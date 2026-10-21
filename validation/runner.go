@@ -200,6 +200,12 @@ type Config struct {
 	// that line validates the start engine, not the adaptive one. See
 	// adaptiveCellConcurrencyFloor in cmd/validator/matrix.go.
 	ConcurrencyFloor int
+
+	// WSEchoSlowTolerance is N of the race tier's SLOW_CLASS tolerance
+	// (ws_echo_slow.go); 0, the default and every other tier, tolerates
+	// nothing. cmd/validator sets report.WSEchoSlowTolerance under
+	// -race-tier, which the playbook passes in the race tier only.
+	WSEchoSlowTolerance int
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -1088,7 +1094,7 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 	// leaves Tier 1's walkers with no stall timer at all.
 	onWalkerStall := walkerStallHook(os.Getenv, violations, pid)
 	// The ws_echo timeout's two-instant capture (probatorium#481), same gate.
-	wsEchoDiag := wsEchoDiagHook(os.Getenv, violations, pid, func() string {
+	wsEchoDiag := wsEchoDiagHook(os.Getenv, o.cfg.WSEchoSlowTolerance, violations, pid, func() string {
 		if f := o.debugAddr.Load(); f != nil {
 			return (*f)()
 		}
@@ -1701,14 +1707,21 @@ var wsEchoDiagDeliverWait = 2*forensicsBudget + 10*time.Second
 // wsEchoDiagHook is tier1Config.WSEchoDiag for this run: the two-instant
 // capture of a timed-out ws_echo fire (probatorium#481) in a stall-capture
 // run, nil -- the walker's fire exactly as before -- in every other run. The
-// record goes to the orchestrator as a record-only I-WS-ECHO-STALL incident
-// carrying ws-echo-diag.txt; the gated counter and its hard incident are
-// unchanged. procRoot is /proc; debugAddr reads the refapp's side listener.
-func wsEchoDiagHook(getenv func(string) string, violations chan<- Incident, pid func() int, debugAddr func() string, procRoot string) *wsEchoDiag {
-	if !stallCaptureEnabled(getenv) {
+// race tier arms it too (slowTolerance > 0, validator -race-tier) without the
+// rest of the stall capture: the tolerance needs a verdict, and a timeout with
+// no capture is INDETERMINATE and fails. The record goes to the orchestrator
+// as a record-only incident carrying ws-echo-diag.txt: I-WS-ECHO-SLOW when the
+// timeout was booked as a tolerated SLOW_CLASS finding (ws_echo_slow.go),
+// I-WS-ECHO-STALL otherwise; the gated counter and its hard incident are
+// unchanged for everything that is not tolerated. procRoot is /proc;
+// debugAddr reads the refapp's side listener (absent without stall capture,
+// which the record says).
+func wsEchoDiagHook(getenv func(string) string, slowTolerance int, violations chan<- Incident, pid func() int, debugAddr func() string, procRoot string) *wsEchoDiag {
+	if !stallCaptureEnabled(getenv) && slowTolerance <= 0 {
 		return nil
 	}
 	return &wsEchoDiag{
+		SlowTolerance: max(slowTolerance, 0),
 		Refapp: func(ctx context.Context) string {
 			addr := ""
 			if debugAddr != nil {
@@ -1717,10 +1730,17 @@ func wsEchoDiagHook(getenv func(string) string, violations chan<- Incident, pid 
 			return refappSchedText(ctx, procRoot, pid(), addr)
 		},
 		Deliver: func(ctx context.Context, rep wsEchoDiagReport) {
+			id, msg := properties.IWSEchoStall.ID, rep.Verdict.Line
+			if rep.Tolerated {
+				id = properties.IWSEchoSlow.ID
+			}
+			if rep.Disposition != "" {
+				msg += " " + rep.Disposition
+			}
 			inc := Incident{
 				Tier:        TierProperty,
-				PredicateID: properties.IWSEchoStall.ID,
-				Message:     rep.Verdict.Line,
+				PredicateID: id,
+				Message:     msg,
 				ObservedAt:  time.Now().UTC(),
 				RefappPID:   pid(),
 				RecordOnly:  true,
@@ -2069,6 +2089,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 			"ws_echo_reorder":           s.WSEcho.Reorder,
 			"ws_echo_missing":           s.WSEcho.Missing,
 			"ws_echo_timeout":           s.WSEcho.Timeout,
+			"ws_echo_timeout_slow":      s.WSEcho.TimeoutSlow,
 			"ws_echo_frame_err":         s.WSEcho.FrameErr,
 			"ws_echo_close_ok":          s.WSEcho.CloseOK,
 			"ws_echo_cut_at_deadline":   s.WSEcho.CutAtDeadline,
