@@ -36,6 +36,15 @@ const WSEchoSlowTolerance = 3
 // SLOW_CLASS ws_echo timeouts.
 const WSEchoSlowKey = "ws_echo_timeout_slow"
 
+// WSEchoSlowOverNKey and WSEchoSlowNoCleanKey count, by the guard's reason,
+// the SLOW_CLASS timeouts the race tier did not tolerate. Both are a subset of
+// ws_echo_timeout (which fails and is the only one gated): attribution that
+// says the failing timeout was latency over the tolerance, not a wedge.
+const (
+	WSEchoSlowOverNKey   = "ws_echo_slow_over_n"
+	WSEchoSlowNoCleanKey = "ws_echo_slow_no_clean_fire"
+)
+
 // GateOptions tunes the absolute gate.
 type GateOptions struct {
 	// ToleratesWSEchoSlow is the race tier's semantics for the ws_echo SLOW

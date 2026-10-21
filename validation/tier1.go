@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goceleris/probatorium/report"
 	"github.com/goceleris/probatorium/validation/checker"
 	"github.com/goceleris/probatorium/validation/markov"
 	"github.com/goceleris/probatorium/validation/remote"
@@ -1313,6 +1314,9 @@ type tier1TallySnapshot struct {
 	// (celeris#588).
 	ReadyAt          string   `json:"ready_at,omitempty"`
 	RefappStderrTail []string `json:"refapp_stderr_tail,omitempty"`
+	// RefappSched is the refapp's CPU view read from /proc at ready
+	// (refapp_sched_record.go), attached by the orchestrator like Properties.
+	RefappSched *report.RefappSched `json:"refapp_sched,omitempty"`
 	// Properties is the in-process property loop's tally
 	// (validation/propertyloop.go), attached by the orchestrator once
 	// driveTier1 returns -- the loop runs beside the walkers, not inside

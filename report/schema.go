@@ -1188,6 +1188,19 @@ type Tier1Summary struct {
 	// hold. Omitted on a cell with no slow fire.
 	H2CSlowReads []SlowFire `json:"h2c_slow_reads,omitempty"`
 	WSSlowReads  []SlowFire `json:"ws_slow_reads,omitempty"`
+	// H2CHangSpan / WSHandshakeFailSpan place the cell's h2c_hang and
+	// ws_handshake_fail events in time (schema 5.23, probatorium#481): the
+	// first and the last one, with their cause and verbatim error. The slow
+	// ring above keeps only reads over one second, so a hang that closed in
+	// 12 ms (the shape of race run 39560945814) had no instant anywhere.
+	// Record only; Gate() does not read them. Omitted when the cell had none.
+	H2CHangSpan         *EventSpan `json:"h2c_hang_span,omitempty"`
+	WSHandshakeFailSpan *EventSpan `json:"ws_handshake_fail_span,omitempty"`
+	// RefappSched is the refapp's CPU view, read by the validator from
+	// /proc when the refapp is ready (schema 5.23, probatorium#481), in every
+	// run and not only a stall-capture one. Omitted when no refapp pid was
+	// seen. See RefappSched for what it can and cannot say.
+	RefappSched *RefappSched `json:"refapp_sched,omitempty"`
 	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
 	// bound address, i.e. the origin of every SlowFire.SinceReadyMs and
 	// of the mod-60 phase histogram the design computes offline.
@@ -1227,6 +1240,56 @@ type WalkerLatency struct {
 	Dial  LatencyBuckets `json:"dial"`
 	Write LatencyBuckets `json:"write"`
 	Read  LatencyBuckets `json:"read"`
+}
+
+// EventStamp is one event of a rare kind (an h2c_hang, a ws_handshake_fail)
+// with the instant it happened. TS is UTC (RFC3339Nano), the same clock as
+// SlowFire.TS, Tier1Summary.ReadyAt and the epoch seconds of the per-cell
+// properties_series.csv, so it joins with all three.
+type EventStamp struct {
+	TS string `json:"ts"`
+	// SinceReadyMs is TS minus the refapp's ready instant; 0 when the
+	// walker ran without one.
+	SinceReadyMs int64 `json:"since_ready_ms,omitempty"`
+	// Cause is the walker's classification: eof, reset, timeout, status or
+	// other (the same words as the ws_handshake_fail_* and h2c_hang_*
+	// counters).
+	Cause string `json:"cause"`
+	// Err is the verbatim error that ended the read; empty for a non-101
+	// status or a zero-length read.
+	Err        string `json:"err,omitempty"`
+	LocalAddr  string `json:"local_addr,omitempty"`
+	RemoteAddr string `json:"remote_addr,omitempty"`
+}
+
+// EventSpan is the earliest and the latest event of one kind in a cell, and
+// how many were stamped. Count equals the counter it sits beside.
+type EventSpan struct {
+	Count int64      `json:"count"`
+	First EventStamp `json:"first"`
+	Last  EventStamp `json:"last"`
+}
+
+// RefappSched is what the validator read of the refapp's CPU placement.
+//
+// ThreadMasks counts the refapp's threads by their own Cpus_allowed_list.
+// LeaderCPUsAllowedList is the thread-group leader's alone, which is NOT the
+// process's mask: celeris pins each engine loop's thread to one CPU and the
+// main thread can be one of them (race run 38410499633 read "0" and was taken
+// for a one-CPU confinement). Read ThreadMasks.
+//
+// GOMAXPROCS is in no /proc file. It is recorded only when the refapp's own
+// /debug/sched answered (a stall-capture run, which starts the side
+// listener); otherwise it is 0 and GOMAXPROCSNote says why. Unavailable, when
+// set, is why nothing could be read at all.
+type RefappSched struct {
+	At                    string         `json:"at,omitempty"`
+	Unavailable           string         `json:"unavailable,omitempty"`
+	Threads               int            `json:"threads,omitempty"`
+	LeaderCPUsAllowedList string         `json:"leader_cpus_allowed_list,omitempty"`
+	ThreadMasks           map[string]int `json:"thread_masks,omitempty"`
+	GOMAXPROCS            int            `json:"gomaxprocs,omitempty"`
+	GOMAXPROCSNote        string         `json:"gomaxprocs_note,omitempty"`
 }
 
 // SlowFire is one walker fire whose read leg exceeded one second.

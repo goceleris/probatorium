@@ -165,6 +165,12 @@ type wsEchoTally struct {
 	// non-failing SLOW_CLASS finding instead of timeout (ws_echo_slow.go).
 	// Not gated; the gate tolerates up to N per cell in the race tier only.
 	timeoutSlow atomic.Int64
+	// timeoutSlowOverN / timeoutSlowNoClean split, by guard reason, the
+	// SLOW_CLASS fires the race tier refused to tolerate. They are a subset of
+	// timeout (those fires are counted there and fail), kept apart so the
+	// failure reads as latency over the tolerance and not as a wedge.
+	timeoutSlowOverN   atomic.Int64
+	timeoutSlowNoClean atomic.Int64
 	// cleanFires counts fires that drained: every echo came back. The
 	// SLOW guard reads it to tell a late server from one that delivers
 	// nothing.
@@ -202,9 +208,12 @@ type wsEchoSnapshot struct {
 	Missing          int64 `json:"ws_echo_missing"`
 	Timeout          int64 `json:"ws_echo_timeout"`
 	TimeoutSlow      int64 `json:"ws_echo_timeout_slow"`
-	FrameErr         int64 `json:"ws_echo_frame_err"`
-	CloseOK          int64 `json:"ws_echo_close_ok"`
-	CutAtDeadline    int64 `json:"ws_echo_cut_at_deadline"`
+	// Subset of ws_echo_timeout: SLOW_CLASS fires over the tolerance.
+	TimeoutSlowOverN   int64 `json:"ws_echo_slow_over_n"`
+	TimeoutSlowNoClean int64 `json:"ws_echo_slow_no_clean_fire"`
+	FrameErr           int64 `json:"ws_echo_frame_err"`
+	CloseOK            int64 `json:"ws_echo_close_ok"`
+	CutAtDeadline      int64 `json:"ws_echo_cut_at_deadline"`
 }
 
 // recordRoute stores the pre-flight verdict for this cell (the same probe
@@ -231,9 +240,12 @@ func (t *wsEchoTally) snapshot() wsEchoSnapshot {
 		Missing:          t.missing.Load(),
 		Timeout:          t.timeout.Load(),
 		TimeoutSlow:      t.timeoutSlow.Load(),
-		FrameErr:         t.frameErr.Load(),
-		CloseOK:          t.closeOK.Load(),
-		CutAtDeadline:    t.cutAtDeadline.Load(),
+
+		TimeoutSlowOverN:   t.timeoutSlowOverN.Load(),
+		TimeoutSlowNoClean: t.timeoutSlowNoClean.Load(),
+		FrameErr:           t.frameErr.Load(),
+		CloseOK:            t.closeOK.Load(),
+		CutAtDeadline:      t.cutAtDeadline.Load(),
 	}
 }
 
