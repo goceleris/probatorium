@@ -24,6 +24,7 @@ import (
 // its own for the refused ones, which fail the gate.
 func WSEchoSlowLines(cells []ValidationCellResult, tolerated bool) []string {
 	var rows, refusedRows []string
+	var anyOver, anyNoClean bool
 	for _, c := range cells {
 		if c.Tier1 == nil {
 			continue
@@ -42,6 +43,7 @@ func WSEchoSlowLines(cells []ValidationCellResult, tolerated bool) []string {
 			rows = append(rows, fmt.Sprintf("%s %d SLOW_CLASS ws_echo timeout(s) in %d fire(s) (%d echoes ok)", who, slow, fires, ok))
 			continue
 		}
+		anyOver, anyNoClean = anyOver || over > 0, anyNoClean || noClean > 0
 		var failing []string
 		if over > 0 {
 			failing = append(failing, fmt.Sprintf("%d over N=%d (%s)", over, WSEchoSlowTolerance, WSEchoSlowOverNKey))
@@ -71,8 +73,15 @@ func WSEchoSlowLines(cells []ValidationCellResult, tolerated bool) []string {
 	}
 	out := append([]string{head}, rows...)
 	if len(refusedRows) > 0 {
-		out = append(out, fmt.Sprintf("ws_echo SLOW_CLASS fires over the tolerance (%s, %s; race tier): %d cell(s), FAILING as ws_echo_timeout -- slow-class latency past N=%d per cell, not a wedge (the server read and wrote in the window):",
-			WSEchoSlowOverNKey, WSEchoSlowNoCleanKey, len(refusedRows), WSEchoSlowTolerance))
+		var reasons []string
+		if anyOver {
+			reasons = append(reasons, fmt.Sprintf("%s: slow-class latency over the tolerance of N=%d per cell, not a wedge", WSEchoSlowOverNKey, WSEchoSlowTolerance))
+		}
+		if anyNoClean {
+			reasons = append(reasons, fmt.Sprintf("%s: every fire after the first SLOW one timed out, none drained cleanly", WSEchoSlowNoCleanKey))
+		}
+		out = append(out, fmt.Sprintf("ws_echo SLOW_CLASS fires the race tier's guard refused (%s) -- %d cell(s), FAILING as ws_echo_timeout; the server read and wrote in the window:",
+			strings.Join(reasons, "; "), len(refusedRows)))
 		out = append(out, refusedRows...)
 	}
 	return out

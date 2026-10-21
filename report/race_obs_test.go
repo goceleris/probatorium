@@ -106,8 +106,19 @@ func TestWSEchoSlowLines_NoCleanFireReasonIsCounted(t *testing.T) {
 			t.Errorf("output lacks %q:\n%s", want, all)
 		}
 	}
-	if strings.Contains(all, "over N=3") {
-		t.Errorf("a no-clean-fire refusal is not an over-N one:\n%s", all)
+	// Only over-N is "latency past the tolerance, not a wedge": the persistence
+	// rule can refuse the 2nd SLOW fire and says a server that delivers nothing.
+	for _, bad := range []string{"over N=3", "past N=", "not a wedge", "ws_echo_slow_over_n:"} {
+		if strings.Contains(all, bad) {
+			t.Errorf("a no-clean-fire refusal must not say %q:\n%s", bad, all)
+		}
+	}
+	if !strings.Contains(all, "none drained cleanly") {
+		t.Errorf("a no-clean-fire refusal must say why:\n%s", all)
+	}
+	v := Gate([]ValidationCellResult{c}, nil, raceOpts())
+	if len(v) != 1 || strings.Contains(v[0].Why, "not a wedge") || !strings.Contains(v[0].Why, "no fire drained cleanly") {
+		t.Errorf("violation wording for a no-clean-fire refusal: %+v", v)
 	}
 }
 
@@ -150,13 +161,13 @@ func TestGate_OtherTimeoutsKeepTheirWording(t *testing.T) {
 	if len(v) != 1 || v[0].Why != "a WebSocket echo connection stopped delivering before its hold expired" {
 		t.Fatalf("violations %+v, want the unchanged wording", v)
 	}
-	// Mixed: one of two timeouts was a refused SLOW fire. It must not read as
-	// "not a wedge" for the other.
+	// Mixed: one of two timeouts was a refused SLOW fire. The wording is about
+	// that fire only and says the others were not SLOW.
 	c.Tier1.WSEcho["ws_echo_timeout"] = 2
 	c.Tier1.WSEcho["ws_echo_slow_over_n"] = 1
 	v = Gate([]ValidationCellResult{c}, nil, raceOpts())
-	if len(v) != 1 || !strings.Contains(v[0].Why, "1 of 2") || strings.Contains(v[0].Why, "not a wedge") {
-		t.Fatalf("mixed timeouts: %+v, want '1 of 2' and no 'not a wedge'", v)
+	if len(v) != 1 || !strings.Contains(v[0].Why, "1 of 2") || !strings.Contains(v[0].Why, "the others were WEDGE_CLASS") {
+		t.Fatalf("mixed timeouts: %+v, want '1 of 2' and the others named as not SLOW", v)
 	}
 }
 
@@ -238,4 +249,21 @@ func TestSchema523SpansAndSchedRoundTrip(t *testing.T) {
 		}
 	}
 	validateAny(t, sch, rawPlain)
+}
+
+// A cell with both reasons says both.
+func TestWSEchoSlowLines_BothReasonsInOneCell(t *testing.T) {
+	c := runCell()
+	c.Tier1.WSEcho["ws_echo_slow_no_clean_fire"] = 1
+	c.Tier1.WSEcho["ws_echo_timeout"] = 2
+	all := strings.Join(WSEchoSlowLines([]ValidationCellResult{c}, true), "\n")
+	for _, want := range []string{"5 SLOW_CLASS", "2 FAILING", "not a wedge", "none drained cleanly"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("output lacks %q:\n%s", want, all)
+		}
+	}
+	v := Gate([]ValidationCellResult{c}, nil, raceOpts())
+	if len(v) != 1 || !strings.Contains(v[0].Why, "not a wedge") || !strings.Contains(v[0].Why, "no fire drained cleanly") {
+		t.Errorf("both reasons should be in the violation: %+v", v)
+	}
 }

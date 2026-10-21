@@ -442,12 +442,19 @@ func slowRefusedSuffix(m map[string]int64, key string) string {
 		return ""
 	}
 	total := m[key]
-	if refused >= total {
-		return fmt.Sprintf(" -- SLOW_CLASS latency over the race tier's tolerance, not a wedge (%s=%d, %s=%d)",
-			WSEchoSlowOverNKey, over, WSEchoSlowNoCleanKey, noClean)
+	var why []string
+	if over > 0 {
+		why = append(why, fmt.Sprintf("%d SLOW_CLASS fire(s): latency over the race tier's tolerance, not a wedge", over))
 	}
-	return fmt.Sprintf(" -- %d of %d were SLOW_CLASS fires over the race tier's tolerance (%s=%d, %s=%d); the others were WEDGE_CLASS, INDETERMINATE or had no capture",
-		refused, total, WSEchoSlowOverNKey, over, WSEchoSlowNoCleanKey, noClean)
+	if noClean > 0 {
+		why = append(why, fmt.Sprintf("%d SLOW_CLASS fire(s) refused because no fire drained cleanly since the first SLOW one", noClean))
+	}
+	counters := fmt.Sprintf("%s=%d, %s=%d", WSEchoSlowOverNKey, over, WSEchoSlowNoCleanKey, noClean)
+	if refused >= total {
+		return fmt.Sprintf(" -- %s (%s)", strings.Join(why, "; "), counters)
+	}
+	return fmt.Sprintf(" -- %d of %d were SLOW_CLASS fires the race tier refused: %s (%s); the others were WEDGE_CLASS, INDETERMINATE or had no capture",
+		refused, total, strings.Join(why, "; "), counters)
 }
 
 // slowFireDetail maps a gated total to the slow-fire ring that carries its
