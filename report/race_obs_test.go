@@ -67,9 +67,20 @@ func TestWSEchoSlowLines_ReportsEverySlowFireAndNamesTheOverNOne(t *testing.T) {
 			break
 		}
 	}
-	for _, want := range []string{"4 SLOW_CLASS", "in 11 fire(s)", "807 echoes ok", "3 tolerated", "1 over N=3", "FAILING"} {
+	for _, want := range []string{"4 diagnosed SLOW_CLASS", "in 11 fire(s)", "807 echoes ok", "3 tolerated", "1 over N=3", "FAILING"} {
 		if !strings.Contains(row, want) {
 			t.Errorf("row lacks %q:\n%s", want, row)
+		}
+	}
+	// The header must not say "NOT failing" over a cell that is failing, and
+	// must say only diagnosed fires are counted (a later timeout is in
+	// ws_echo_timeout alone).
+	if lines[0] == mainHeader || strings.Contains(lines[0], "recorded latency, NOT failing up to") {
+		t.Errorf("the header still says the cells are not failing:\n%s", lines[0])
+	}
+	for _, want := range []string{"FAILING", "diagnosed", "ws_echo_timeout alone"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("header lacks %q:\n%s", want, lines[0])
 		}
 	}
 	// A line of its own for the failing ones, named by the field.
@@ -101,7 +112,7 @@ func TestWSEchoSlowLines_NoCleanFireReasonIsCounted(t *testing.T) {
 	c.Tier1.WSEcho["ws_echo_timeout"] = 1
 	c.Tier1.WSEcho["ws_echo_slow_no_clean_fire"] = 1
 	all := strings.Join(WSEchoSlowLines([]ValidationCellResult{c}, true), "\n")
-	for _, want := range []string{"2 SLOW_CLASS", "1 tolerated", "ws_echo_slow_no_clean_fire", "FAILING"} {
+	for _, want := range []string{"2 diagnosed SLOW_CLASS", "1 tolerated", "ws_echo_slow_no_clean_fire", "FAILING"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("output lacks %q:\n%s", want, all)
 		}
@@ -257,7 +268,7 @@ func TestWSEchoSlowLines_BothReasonsInOneCell(t *testing.T) {
 	c.Tier1.WSEcho["ws_echo_slow_no_clean_fire"] = 1
 	c.Tier1.WSEcho["ws_echo_timeout"] = 2
 	all := strings.Join(WSEchoSlowLines([]ValidationCellResult{c}, true), "\n")
-	for _, want := range []string{"5 SLOW_CLASS", "2 FAILING", "not a wedge", "none drained cleanly"} {
+	for _, want := range []string{"5 diagnosed SLOW_CLASS", "2 FAILING", "not a wedge", "none drained cleanly"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("output lacks %q:\n%s", want, all)
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -56,11 +57,18 @@ func collectRefappSched(ctx context.Context, getenv func(string) string, driverM
 		}
 	}
 	rec.GOMAXPROCSNote = gomaxprocsNoSideListener
-	if pid > 0 && armsActive(getenv) {
+	switch {
+	case driverMode == "ssh":
+		// The local /proc and the local readback say nothing about a refapp
+		// that runs on another host; a record that is Unavailable must not
+		// also carry a GOMAXPROCS read from them.
+		rec.GOMAXPROCSNote = "not recorded: ssh driver, the refapp runs on another host"
+	case pid > 0 && armsActive(getenv):
 		// The arm / stall-capture readback, as before; its /debug/sched
 		// answer is where GOMAXPROCS comes from.
 		text, err := writeRefappReadbackText(ctx, outDir, getenv, procRoot, pid, debugAddr)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "validation: refapp readback: %v\n", err)
 			rec.GOMAXPROCSNote = fmt.Sprintf("not recorded: the readback could not be written: %v", err)
 		} else if g := gomaxprocsFromSchedText(text); g > 0 {
 			rec.GOMAXPROCS, rec.GOMAXPROCSNote = g, ""

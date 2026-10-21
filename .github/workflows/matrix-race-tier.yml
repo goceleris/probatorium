@@ -279,14 +279,22 @@ jobs:
       # read tag=weekend-38441116109, long past its deadline, and the
       # per-minute memory / load / OOM / link-flap record of the run itself
       # did not exist. Same read-only, self-terminating sampler, bracketing
-      # this run; VALIDATE_DURATION sizes its lifetime (without it the default
-      # is 24 h plus the margin, into the next tier) and the tag cuts the
-      # series into this run. About 24 ms of CPU a minute per host, also on
-      # msa2-server. Best-effort: it cannot fail the run.
+      # this run; the tag cuts the series into this run. About 24 ms of CPU a
+      # minute per host, also on msa2-server. Best-effort: it cannot fail the
+      # run, and each step is bounded to 5 minutes.
+      #
+      # Its lifetime is set outright. Left to VALIDATE_DURATION it would be
+      # that plus a 2 h margin (about 200 min for the default 80m), longer
+      # than this job's 180 minute limit, so a killed job would leave a
+      # sampler writing on the hosts into the next tier. 150m ends it inside
+      # the job limit whatever happens; the normal path stops it earlier, in
+      # the stop step below. A dispatch with a duration over about 2h20m
+      # loses the tail of the series, not the run.
       - name: Start the host sampler (read-only, 1/min)
         continue-on-error: true
+        timeout-minutes: 5
         env:
-          VALIDATE_DURATION: ${{ inputs.duration || '80m' }}
+          SAMPLER_DURATION: 150m
           SAMPLER_TAG: race-${{ github.run_id }}
         run: mage HostSamplerStart
 
@@ -424,6 +432,7 @@ jobs:
       - name: Stop the host sampler and collect its series
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         run: mage HostSamplerStop
 
       - name: Upload results

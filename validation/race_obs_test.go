@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -445,5 +447,112 @@ func TestTier1SummaryCarriesTheRefappSched(t *testing.T) {
 	snap.RefappSched.ThreadMasks["0-15"] = 99
 	if sum.RefappSched.ThreadMasks["0-15"] != 4 {
 		t.Error("the projected record aliases the snapshot's map")
+	}
+}
+
+// ---------------------------------------------------------- orchestrator
+
+// fakeRefappBin is a stand-in refapp: it announces ready on the address the
+// walkers will find nothing at, and stays up. The point is its pid, which the
+// orchestrator hands to the readback goroutine.
+func fakeRefappBin(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "fakerefapp")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\necho 'ready addr=127.0.0.1:1'\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// The placement record is in the cell document when the orchestrator runs a
+// whole Tier 1 against a refapp: the goroutine that reads it is started, joined
+// and its result attached. (Mutants: the attach removed; the goroutine not
+// started.) Off Linux there is no /proc, and the record says so instead of
+// being absent.
+func TestRunTierPropertyAttachesTheRefappSchedToTheCellDocument(t *testing.T) {
+	cfg := Default()
+	cfg.Duration = 2 * time.Second
+	cfg.OutDir = t.TempDir()
+	cfg.CelerisBin = fakeRefappBin(t)
+	cfg.MarkovPath = "markov/auth_session_ratelimit.yaml"
+	o, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	violations := make(chan Incident, 64)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	o.runTierProperty(ctx, violations)
+	if !o.tier1Ran {
+		t.Fatalf("premise: Tier 1 did not complete (%d incident(s) queued)", len(violations))
+	}
+	rec := o.tier1Snapshot.RefappSched
+	if rec == nil {
+		t.Fatal("the cell's tally carries no refapp_sched: the record was read but not attached")
+	}
+	if runtime.GOOS == "linux" {
+		if rec.Unavailable != "" || rec.Threads < 1 || len(rec.ThreadMasks) == 0 {
+			t.Errorf("on Linux the refapp's threads must be read: %+v", rec)
+		}
+	} else if rec.Unavailable == "" {
+		t.Errorf("without /proc the record must say it is unavailable: %+v", rec)
+	}
+	if sum := o.tier1Snapshot.Tier1Summary(); sum.RefappSched == nil {
+		t.Error("the record does not reach the document's Tier1Summary")
+	}
+}
+
+// Under the ssh driver the local /proc and the local readback say nothing
+// about the refapp, so a record that is Unavailable carries nothing read from
+// them, GOMAXPROCS included, even when an arm or the stall capture is on (the
+// readback used to run there against the wrong host's /proc).
+func TestCollectRefappSchedUnderSSHIsConsistent(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skip("no loopback listener")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/sched", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"gomaxprocs":8}` + "\n"))
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	dir := t.TempDir()
+	rec := collectRefappSched(context.Background(), envMap(map[string]string{stallCaptureEnv: "1"}), "ssh", procFixture(t), 100, dir, ln.Addr().String())
+	if rec == nil || rec.Unavailable == "" {
+		t.Fatalf("record %+v, want unavailable under ssh", rec)
+	}
+	if rec.GOMAXPROCS != 0 || rec.Threads != 0 || rec.ThreadMasks != nil || !strings.Contains(rec.GOMAXPROCSNote, "ssh") {
+		t.Errorf("an unavailable record carries local data: %+v", rec)
+	}
+	if _, err := os.Stat(filepath.Join(dir, refappReadbackFile)); err == nil {
+		t.Errorf("the local readback file was written for a refapp on another host")
+	}
+}
+
+// A readback that cannot be written still prints the stderr line the validator
+// log has always carried, as well as the note in the record.
+func TestCollectRefappSchedKeepsTheReadbackStderrLine(t *testing.T) {
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Skip("no pipe")
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+	// A regular file where the directory should be: nothing can be created under it.
+	missingDir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(missingDir, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := collectRefappSched(context.Background(), envMap(map[string]string{stallCaptureEnv: "1"}), "local", procFixture(t), 100, missingDir, "")
+	_ = w.Close()
+	b, _ := io.ReadAll(r)
+	if !strings.Contains(string(b), "validation: refapp readback: ") {
+		t.Errorf("stderr %q lacks the readback line", b)
+	}
+	if rec == nil || !strings.Contains(rec.GOMAXPROCSNote, "readback could not be written") {
+		t.Errorf("record %+v lacks the note", rec)
 	}
 }

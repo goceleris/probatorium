@@ -1,6 +1,8 @@
 package main
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -48,18 +50,54 @@ func TestRaceSamplerStepsCannotFailTheRun(t *testing.T) {
 	}
 }
 
-// Without VALIDATE_DURATION the sampler's lifetime defaults to 24 h plus the
-// margin (samplerDurationSeconds), and it would run on into the next tier.
-// The tag is what cuts a series that outlives a run into the run that made it.
-func TestRaceSamplerIsSizedAndTaggedForThisRun(t *testing.T) {
-	blk := stepRunning(mustRead(t, raceTier), "mage HostSamplerStart")
-	if !strings.Contains(blk, "VALIDATE_DURATION: ${{ inputs.duration || '80m' }}") {
-		t.Errorf("the start step does not size the sampler to the run's duration:\n%s", blk)
+// The sampler's lifetime is explicit and ends inside the job. Left to
+// VALIDATE_DURATION it is that plus a 2 h margin (mage_sampler.go), about
+// 200 minutes for the default 80m run, longer than the matrix job's limit: a
+// killed job would leave a sampler writing into the next tier. The tag cuts a
+// series that outlives a run into the run that made it.
+func TestRaceSamplerIsBoundedByTheJobAndTaggedForThisRun(t *testing.T) {
+	src := mustRead(t, raceTier)
+	blk := stepRunning(src, "mage HostSamplerStart")
+	m := regexp.MustCompile(`SAMPLER_DURATION: (\d+)m\n`).FindStringSubmatch(blk)
+	if m == nil {
+		t.Fatalf("the start step does not set SAMPLER_DURATION in minutes:\n%s", blk)
+	}
+	sampler, _ := strconv.Atoi(m[1])
+	job := raceJobTimeoutMinutes(t, src, "name: matrix validate (race tier)")
+	if sampler+10 > job {
+		t.Errorf("SAMPLER_DURATION %dm leaves under 10 minutes inside the job's %dm limit: a sampler started a few minutes into the job would outlive it", sampler, job)
+	}
+	if sampler < 90 {
+		t.Errorf("SAMPLER_DURATION %dm does not cover the default 80m run plus its deploy", sampler)
 	}
 	if !strings.Contains(blk, "SAMPLER_TAG: race-${{ github.run_id }}") {
 		t.Errorf("the start step does not tag the series with this run:\n%s", blk)
 	}
 	if strings.Contains(blk, "weekend-") {
 		t.Errorf("the race sampler carries the weekend's tag:\n%s", blk)
+	}
+}
+
+func raceJobTimeoutMinutes(t *testing.T, src, jobName string) int {
+	t.Helper()
+	i := strings.Index(src, jobName)
+	if i < 0 {
+		t.Fatalf("no job %q", jobName)
+	}
+	m := regexp.MustCompile(`timeout-minutes: (\d+)`).FindStringSubmatch(src[i:])
+	if m == nil {
+		t.Fatalf("job %q has no timeout-minutes", jobName)
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
+// A stuck ansible call must not hold the job: both steps are bounded.
+func TestRaceSamplerStepsAreTimeBounded(t *testing.T) {
+	src := mustRead(t, raceTier)
+	for _, run := range []string{"mage HostSamplerStart", "mage HostSamplerStop"} {
+		if blk := stepRunning(src, run); !strings.Contains(blk, "timeout-minutes: 5\n") {
+			t.Errorf("%s has no timeout-minutes: 5:\n%s", run, blk)
+		}
 	}
 }
