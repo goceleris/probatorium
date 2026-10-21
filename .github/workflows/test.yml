@@ -46,6 +46,7 @@ jobs:
       matrix:
         adapter:
           - celeris
+          - celeris_v1511
           - chi
           - echo
           - fasthttp
@@ -310,7 +311,7 @@ jobs:
         run: |
           fail=0
           n=0
-          for d in . servers/celeris validation/refapp/internal/debugvars validation/refapp/*/; do
+          for d in . servers/celeris servers/celeris_v1511 validation/refapp/internal/debugvars validation/refapp/*/; do
             case "$d" in */internal/) continue ;; esac
             test -f "$d/go.mod" || { echo "::error::$d has no go.mod"; fail=1; continue; }
             n=$((n + 1))

@@ -15,6 +15,7 @@
 
 /validation/refapp/auth_session_ratelimit/auth_session_ratelimit
 /servers/celeris/celeris
+/servers/celeris_v1511/celeris_v1511
 /servers/chi/chi
 /servers/echo/echo
 /servers/fasthttp/fasthttp

@@ -242,11 +242,15 @@ func ListByCategory(cat string) []Adapter {
 }
 
 // AdaptersSorted returns every registered Adapter, sorted by Name.
-// Convenience for callers (cmd/conformance) that walk the full set.
+// Convenience for callers (cmd/conformance) that walk the full set. The
+// opt-in baseline columns (Adapter.Baseline) are left out unless
+// BENCH_BASELINE is on.
 func AdaptersSorted() []Adapter {
 	out := make([]Adapter, 0, len(Registry))
 	for _, a := range Registry {
-		out = append(out, a)
+		if a.visible() {
+			out = append(out, a)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out

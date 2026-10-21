@@ -176,6 +176,18 @@ func ColumnWallClock(scenarios, ratedPasses int, warmup, duration, ratedDuration
 	return time.Duration(scenarios) * per
 }
 
+// WithBaseline returns p with the opt-in baseline columns (BENCH_BASELINE=1,
+// servers/baseline.go) added to its cell counts, so FitWithin projects the
+// run that will actually be dispatched. The profile's own pins describe the
+// grid with the switch off.
+func (p Profile) WithBaseline() Profile {
+	p.Cells += BaselineRealizedCells
+	if p.RatedCells > 0 {
+		p.RatedCells += BaselineRatedRealizedCells
+	}
+	return p
+}
+
 // arches clamps Arches to at least 1 so a zero-valued Profile never
 // collapses wall-clock to zero (which would silently "fit" any budget).
 func (p Profile) arches() int {
