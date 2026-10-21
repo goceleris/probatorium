@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goceleris/probatorium/budget"
+	"github.com/goceleris/probatorium/servers"
 )
 
 // Benchmark-tier orchestration (probatorium#172/#166/#167). BenchTier
@@ -107,6 +108,12 @@ func BenchTier() error {
 		fitBudget = d
 	}
 
+	// The opt-in baseline columns (BENCH_BASELINE=1, servers/baseline.go) are
+	// extra cells the profile's pins do not count: project the grid that will
+	// run, so the gate cannot pass a baseline dispatch on the baseline-less
+	// numbers. The workflow raises BENCH_BUDGET for a baseline dispatch.
+	p = baselineProjection(p)
+
 	log, ok := p.FitWithin(fitBudget)
 	fmt.Println(log)
 	if !ok {
@@ -195,6 +202,18 @@ func BenchTier() error {
 	_ = os.Unsetenv("BENCH_START_DATE")
 	fmt.Printf("\n=== BenchTier complete (single pass) ===\n")
 	return nil
+}
+
+// baselineProjection adds the opt-in baseline columns to p's cell counts when
+// BENCH_BASELINE is on (servers.BaselineEnabled) and returns p unchanged
+// otherwise.
+func baselineProjection(p budget.Profile) budget.Profile {
+	if !servers.BaselineEnabled() {
+		return p
+	}
+	fmt.Printf("baseline columns ON (%s): +%d saturation cells, +%d rated cells projected\n",
+		servers.BaselineEnvVar, budget.BaselineRealizedCells, budget.BaselineRatedRealizedCells)
+	return p.WithBaseline()
 }
 
 // benchTierEnv resolves the BENCH_* env the one Bench of a BenchTier run of

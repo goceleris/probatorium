@@ -74,6 +74,11 @@ on:
         required: false
         type: string
         default: "true"
+      baseline:
+        description: "Also BENCH the celeris v1.5.11 RELEASE as same-run baseline columns (BENCH_BASELINE). 'false' (DEFAULT): the grid, the budget and the published set are exactly what they were. 'true': adds 8 columns baseline-celeris-v1511-<engine> for the engines epoll-h1-sync, epoll-h1-async, epoll-auto+upg-async, iouring-h1-sync, iouring-h1-async, iouring-auto+upg-async, adaptive-h1-async, adaptive-auto+upg-async (servers/celeris_v1511, celeris pinned at v1.5.11, same engine variants and capabilities as the celeris-* twins; no std-h1): +222 saturation cells and +120 rated cells per arch, about +14.5 h projected (+8.5 h headline), and the BENCH_BUDGET gate is raised (headline 48h, full 80h). With competitors=all the columns join the sweep, each one run directly beside its celeris-* twin (one column block, about 1.8 h, apart; the pair order alternates) rather than in the sorted block of names; with a CSV competitors/deploy_competitors, name the columns and the module celeris_v1511. Published rows carry framework 'celeris-baseline' / framework_version 'v1.5.11'."
+        required: false
+        type: string
+        default: "false"
       sut_env:
         description: "SUT process environment overrides (BENCH_SUT_ENV): KEY=VALUE[,KEY=VALUE], e.g. 'CELERIS_IOURING_SEND_ZC=off' for a celeris#585 A/B arm. Merged OVER the harness's own PROBATORIUM_*/DOTNET_* vars on the bench target, echoed as the first line of every cell's server.log ('[sut-env] {...}') and recorded in results.json environment.sut_env. Keys [A-Za-z_][A-Za-z0-9_]*, values [A-Za-z0-9_./:@+=-]* (no quotes/whitespace); PATH and LD_* are refused. Default '' = no overrides."
         required: false
@@ -157,6 +162,11 @@ jobs:
       # use them. h2 columns reuse their h1 sibling's binary, so this set
       # differs from BENCH_COMPETITORS.
       DEPLOY_COMPETITORS: ${{ github.event.inputs.deploy_competitors || 'all' }}
+      # Opt-in same-run baseline: the celeris v1.5.11 release as extra columns
+      # (servers/baseline.go). Job-level so BOTH `mage Deploy` (builds the
+      # celeris_v1511 module only when on) and `mage BenchTier` (column set and
+      # budget projection) see it. Empty = off = the routine grid.
+      BENCH_BASELINE: ${{ github.event.inputs.baseline == 'true' && '1' || '' }}
       # SUT environment overrides for an A/B arm (celeris#585). Empty on
       # schedule and by default; mage Bench validates the format and forwards
       # it to ansible as bench_sut_env, run_bench_cell.yml merges it into the
@@ -292,7 +302,11 @@ jobs:
           # against a 14.0h projection). The budgets leave ~18-21% over the
           # projection, so a grid that grows past them fails before the run
           # rather than overrunning it.
-          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && '36h' || '60h') }}
+          # With baseline=true the grid gains 222 saturation + 120 rated cells
+          # (budget.BaselineRealizedCells), +14.5 h projected on full and
+          # +8.5 h on headline: 29h50m -> 38h22m (48h), 50h58m -> 65h28m (80h).
+          # fast stays under 24h (+3.8 h). budget_test.go pins these.
+          BENCH_BUDGET: ${{ github.event.inputs.profile == 'fast' && '24h' || (github.event.inputs.profile == 'headline' && (github.event.inputs.baseline == 'true' && '48h' || '36h') || (github.event.inputs.baseline == 'true' && '80h' || '60h')) }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
 

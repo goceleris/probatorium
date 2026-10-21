@@ -527,7 +527,7 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `Deploy` | Cross-compile and stage every binary | `CLUSTER_USE_LAN`, `DEPLOY_COMPETITORS=all\|go-only\|none\|<list>`, `DEPLOY_NEEDS_DBSERVICES` |
 | `Cleanup` | Undo what a run installed, per the host manifests | `CLEANUP_HOSTS=all\|<list>` |
 | `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_RATED_CELLS` (default: the rated cells), `BENCH_SUT_ENV`, `CELERIS_VERSION` |
-| `BenchTier` | A profile-driven run over the whole grid; publishes it unless `BENCH_PUBLISH=0` | `BENCH_PROFILE=fast\|headline\|full`, `BENCH_BUDGET`, `BENCH_TARGET`, `BENCH_SKIP_RATED`, `BENCH_PUBLISH` |
+| `BenchTier` | A profile-driven run over the whole grid; publishes it unless `BENCH_PUBLISH=0` | `BENCH_PROFILE=fast\|headline\|full`, `BENCH_BUDGET`, `BENCH_TARGET`, `BENCH_SKIP_RATED`, `BENCH_PUBLISH`, `BENCH_BASELINE=1` (see [Same-run celeris baseline](#same-run-celeris-baseline)) |
 | `BenchSince` | Compare against a baseline version | `BASELINE_VERSION` (default `v1.4.2`), `REGRESSION_THRESHOLD` (default `0.05`) |
 | `Validate` | A validation run, one cell or the matrix | `VALIDATE_TARGET` (default `both`), `VALIDATE_DURATION` (default `6h`), `VALIDATE_MATRIX=1`, `VALIDATE_MATRIX_REFAPPS`, `VALIDATE_MATRIX_ENGINES`, `VALIDATE_PARALLEL=1`, `VALIDATE_DBSERVICES=1`, `VALIDATE_CONCURRENCY`, `VALIDATE_RESUME_FROM`, `CELERIS_VERSION`, `PROBATORIUM_VALIDATE_DRIVER=ssh` |
 | `Soak` | A long validation run | `SOAK_DURATION` (default `24h`), plus the `Validate` knobs |
@@ -627,6 +627,22 @@ single-cell run leaves `Cells[]` empty and fills `tier_1` / `tier_3` at the top 
 The cluster tiers share `concurrency: matrix-tier-cluster` with `cancel-in-progress: false`, so they never
 overlap on the cluster. The group keeps only one pending run, so a newer queued run replaces an older
 one. Each tier provisions runners, runs on the cluster, then tears the runners down.
+
+### Same-run celeris baseline
+
+`servers/celeris_v1511` is the bench server built against the released celeris v1.5.11 instead of the
+pinned main, registered as eight opt-in columns `baseline-celeris-v1511-<engine>` (epoll, iouring and adaptive in
+every protocol flavour the `celeris-*` columns have, without `celeris-std-h1`). They exist so one dispatch
+holds the same-run interleaved comparison against the v1.5.x release. They are left out of every "all"
+expansion (the `*/*` grid, the default competitor set, `DEPLOY_COMPETITORS=all`, the budget pins) unless
+`BENCH_BASELINE=1`, which `benchmark-tier.yml` sets from its `baseline` input (default `false`). Switched on it adds
+222 saturation and 120 rated cells per architecture (about +14.5 h projected on `full`, +8.5 h on
+`headline`) and the workflow raises `BENCH_BUDGET` for it. Columns run as blocks in list order, so
+`servers.InterleaveBaseline` places each baseline column directly beside its `celeris-*` twin (about 1.8 h
+apart, alternating which runs first) instead of the sorted `baseline-*` block fifteen hours earlier. Rows publish with framework `celeris-baseline`,
+framework_version `v1.5.11`. The module is a frozen fork of `servers/celeris` (go.mod pinned, not in
+Dependabot); `servers/baseline_test.go` fails when the two drift. Dry-run the extra cells with
+`BENCH_BASELINE=1 go run ./cmd/runner -dry-run -runs 1 -cells '*/*'`.
 
 ### Self-hosted runner bootstrap
 

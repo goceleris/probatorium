@@ -282,3 +282,49 @@ func TestRatedCellsGlobIsTheRatedProfilesGlob(t *testing.T) {
 		}
 	}
 }
+
+// TestBaselineProjection pins what the opt-in baseline columns cost and
+// which workflow budgets cover them (benchmark-tier.yml `baseline` input):
+// the routine fast profile still fits 24h with them, headline and full
+// do not fit the budgets they have without them and need the raised ones.
+func TestBaselineProjection(t *testing.T) {
+	for _, p := range []Profile{Fast(), HeadlineWeekly(), Full()} {
+		with := p.WithBaseline()
+		if with.Cells != p.Cells+BaselineRealizedCells {
+			t.Errorf("%s: WithBaseline cells = %d, want %d", p.Name, with.Cells, p.Cells+BaselineRealizedCells)
+		}
+		if p.RatedCells == 0 && with.RatedCells != 0 {
+			t.Errorf("%s: a saturation-only profile gained %d rated cells", p.Name, with.RatedCells)
+		}
+		if p.RatedCells > 0 && with.RatedCells != p.RatedCells+BaselineRatedRealizedCells {
+			t.Errorf("%s: WithBaseline rated cells = %d, want %d", p.Name, with.RatedCells, p.RatedCells+BaselineRatedRealizedCells)
+		}
+		if with.WallClock() <= p.WallClock() {
+			t.Errorf("%s: the baseline columns must add wall-clock (%v -> %v)", p.Name, p.WallClock(), with.WallClock())
+		}
+	}
+	if _, ok := Fast().WithBaseline().FitWithin(Budget); !ok {
+		t.Error("fast with the baseline columns must still fit 24h")
+	}
+	// The workflow budgets of a baseline dispatch (headline 48h, full 80h):
+	// they fit, and the budgets of the baseline-less dispatch (36h / 60h) do
+	// not, so a baseline dispatch cannot run on the old gate by accident.
+	for _, c := range []struct {
+		p        Profile
+		old, new time.Duration
+	}{
+		{HeadlineWeekly(), 36 * time.Hour, 48 * time.Hour},
+		{Full(), 60 * time.Hour, 80 * time.Hour},
+	} {
+		if _, ok := c.p.FitWithin(c.old); !ok {
+			t.Errorf("%s must fit its baseline-less budget %v", c.p.Name, c.old)
+		}
+		w := c.p.WithBaseline()
+		if _, ok := w.FitWithin(c.old); ok {
+			t.Errorf("%s with the baseline fits %v: the old budget would hide the extra cost", c.p.Name, c.old)
+		}
+		if log, ok := w.FitWithin(c.new); !ok {
+			t.Errorf("%s with the baseline must fit %v:\n%s", c.p.Name, c.new, log)
+		}
+	}
+}

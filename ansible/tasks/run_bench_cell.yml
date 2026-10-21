@@ -100,7 +100,7 @@
 # Set `--extra-vars celeris_needs_root=true` to put the SUT back on root.
 - name: "{{ cell.1 }} run={{ cell.0 }} | resolve privilege for this column"
   ansible.builtin.set_fact:
-    cell_needs_root: "{{ cell_bin == 'celeris' and (celeris_needs_root | default(false) | bool) }}"
+    cell_needs_root: "{{ cell_bin in ['celeris', 'celeris_v1511'] and (celeris_needs_root | default(false) | bool) }}"
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
   ansible.builtin.file:
@@ -466,7 +466,9 @@
   # listener on PROBATORIUM_DEBUG_ADDR (see the start task), NOT the
   # bench port. The bench-cell playbook only knows the competitor slug
   # (cell.1), not the adapter language, so we gate the metrics URL on
-  # the celeris-* name prefix, and every non-celeris cell keeps an empty
+  # the celeris-* name prefix (and the baseline-celeris-* columns of the
+  # opt-in v1.5.11 baseline, servers/baseline.go, which are observed exactly
+  # like their celeris-* twins), and every other cell keeps an empty
   # -metrics-url so no non-Go competitor is asked for Go expvar it
   # doesn't serve. The observer refuses a document whose "pid" is not
   # the -pid it samples.
@@ -481,7 +483,7 @@
     cd {{ bench_root }}
     nohup ./observer \
       -pid $(cat {{ cell_dir }}/server.pid) \
-      -metrics-url '{{ ("http://127.0.0.1:" ~ (bench_debug_port | default(18089)) ~ "/debug/vars") if (cell.1 | regex_search("^celeris")) else "" }}' \
+      -metrics-url '{{ ("http://127.0.0.1:" ~ (bench_debug_port | default(18089)) ~ "/debug/vars") if (cell.1 | regex_search("^(baseline-)?celeris")) else "" }}' \
       -out {{ cell_dir }}/observer.sqlite \
       -interval 1s \
       > {{ cell_dir }}/observer.log 2>&1 &

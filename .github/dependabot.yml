@@ -7,8 +7,10 @@ updates:
   # collapse into ONE pull request per scheduled run — a daily x/net
   # bump produces a single PR touching every module instead of nine
   # racing PRs. Add a path here whenever a new go.mod lands in the
-  # tree (run `find . -name go.mod` to verify coverage); the one
-  # exception is .github/tools, which has its own entry below.
+  # tree (run `find . -name go.mod` to verify coverage); the exceptions
+  # are .github/tools, which has its own entry below, and
+  # /servers/celeris_v1511, the frozen baseline pinned at celeris v1.5.11
+  # (servers/baseline.go), which Dependabot must never move.
   - package-ecosystem: gomod
     directories:
       - /

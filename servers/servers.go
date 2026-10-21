@@ -160,6 +160,12 @@ type Adapter struct {
 	// facets (HTTP1 / HTTP2C / …) stay engine-derived and are NOT part of
 	// this manifest.
 	Capabilities Capabilities
+
+	// Baseline marks an OPT-IN comparator column (the celeris release the
+	// run is compared against, servers/baseline.go). A Baseline adapter is
+	// a Registry member but is left out of Names and AdaptersSorted, so out
+	// of every "all" / "*/*" expansion, unless BENCH_BASELINE is on.
+	Baseline bool
 }
 
 // Capabilities is an adapter's declared Phase-2 capability manifest. Each
@@ -825,10 +831,15 @@ var Registry = map[string]Adapter{
 
 // Names returns every registered adapter name in stable sorted order.
 // The returned slice is freshly allocated and safe to mutate.
+//
+// Opt-in baseline columns (Adapter.Baseline) are left out unless
+// BENCH_BASELINE is on; Registry itself always holds them.
 func Names() []string {
 	out := make([]string, 0, len(Registry))
-	for k := range Registry {
-		out = append(out, k)
+	for k, a := range Registry {
+		if a.visible() {
+			out = append(out, k)
+		}
 	}
 	sort.Strings(out)
 	return out

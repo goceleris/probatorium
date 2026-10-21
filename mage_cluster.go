@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/goceleris/probatorium/servers"
 )
 
 // Cluster orchestration targets. Mirrors celeris's mage_cluster.go but
@@ -652,7 +654,7 @@ func selectGoCompetitors(spec string) ([]string, error) {
 	}
 	switch spec {
 	case "", "all", "go-only":
-		return all, nil
+		return withoutOptInBaseline(all), nil
 	case "none":
 		return nil, nil
 	}
@@ -672,6 +674,29 @@ func selectGoCompetitors(spec string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// withoutOptInBaseline drops the opt-in baseline modules (servers.BaselineModules:
+// the frozen celeris v1.5.11 server) from an "all" build set unless the
+// baseline switch is on (BENCH_BASELINE=1, benchmark-tier.yml baseline=true).
+// A routine deploy therefore builds, and can fail on, exactly what it did
+// before the baseline module existed. A CSV that names the module is
+// explicit and is not filtered.
+func withoutOptInBaseline(all []string) []string {
+	if servers.BaselineEnabled() {
+		return all
+	}
+	skip := map[string]bool{}
+	for _, m := range servers.BaselineModules() {
+		skip[m] = true
+	}
+	out := make([]string, 0, len(all))
+	for _, n := range all {
+		if !skip[n] {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // scanGoCompetitors lists every immediate child of servers/ that has

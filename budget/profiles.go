@@ -142,6 +142,21 @@ const (
 	// changes; the grid is now 52 columns x 29 rows, capability-gated.
 	FullRealizedCells      = 813
 	FullRatedRealizedCells = 401 // same rated set as Headline (all participating servers)
+
+	// Opt-in baseline columns (servers/baseline.go: the celeris v1.5.11
+	// release benched in the same run, BENCH_BASELINE=1). They are NOT in
+	// the pins above: with the switch off the grid is exactly the 813 / 401
+	// it was. With it on the grid gains 8 columns (epoll x3, iouring x3,
+	// adaptive x2 protocol flavours) that realize the same cells as their
+	// main celeris twins: 5 h1 columns x 27 + 3 auto+upg columns x 29 = 222
+	// saturation cells, each of which has 15 rated cells (get-json, post-4k,
+	// churn-close, 10 driver rows, ws-echo) = 8 x 15 = 120 rated cells.
+	// Realized via
+	//   BENCH_BASELINE=1 cmd/runner -dry-run -runs 1 -cells '*/*' -rated -rated-cells '<RatedGlob>'
+	// (1035 saturation, 521 rated) minus the switch-off run (813, 401);
+	// TestBaselineGridPins in cmd/runner re-checks it against the registry.
+	BaselineRealizedCells      = 222
+	BaselineRatedRealizedCells = 120
 )
 
 // HeadlineWeekly is the config the benchmark-tier workflow runs on the

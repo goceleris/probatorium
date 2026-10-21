@@ -710,6 +710,9 @@ func resolveBenchColumns(arg string) ([]benchColumn, error) {
 				continue
 			}
 			if !known[n] {
+				if a, ok := servers.Registry[n]; ok && a.Baseline {
+					return nil, fmt.Errorf("BENCH_COMPETITORS: %q is an opt-in baseline column: set %s=1 (benchmark-tier.yml input baseline=true) to bench it", n, servers.BaselineEnvVar)
+				}
 				return nil, fmt.Errorf("BENCH_COMPETITORS: %q is not a registered adapter column (see servers.Registry)", n)
 			}
 			want[n] = true
@@ -721,6 +724,10 @@ func resolveBenchColumns(arg string) ([]benchColumn, error) {
 			}
 		}
 	}
+	// A baseline column runs beside its twin, not in the sorted block of
+	// names starting with "baseline-" (servers.InterleaveBaseline). A no-op
+	// without baseline columns, so every routine run keeps its sorted order.
+	names = servers.InterleaveBaseline(names)
 	cols := make([]benchColumn, 0, len(names))
 	for _, n := range names {
 		a := servers.Registry[n]
