@@ -322,7 +322,12 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   that still matches the kernel they run. Why: every server is verified against the client (fabric ping), so the
   client stays on the known-good platform while the servers are proven; the client's own verification then uses the
   upgraded servers. The two servers have no order between them; `msa2-server` (no out-of-tree driver) is the rehearsal
-  to do before `msr1`.
+  to do before `msr1`. **The rule is for `mode=upgrade` only**: a rehearsal of any host may run in any order (the judge checks the order only
+  in an upgrade, and a test replays the three real hosts' records to show a client rehearsal with neither server upgraded has no refusal), so
+  one rack session can rehearse all three hosts first (each needs the console attestation while grub's first menu entry is not its running
+  kernel) and the upgrades then follow in order: `msa2-server`, `msr1`, `msa2-client`. A rehearsal record goes stale when grub or shim change
+  on THAT host (an unattended upgrade, or an upgrade run with `hold_access_packages=off`): hold the access path (`hold_access_packages=on`) in
+  every upgrade that follows a rehearsal, or the upgrade's own reboot uses a GRUB nobody rehearsed.
 - **Survey** (read-only; its commands are on an allow-list the process enforces) records per host: os-release, running
   and installed kernels, which kernel grub boots after a power-cycle, `GRUB_DEFAULT`, EFI and Secure Boot, what
   `apt-get -s full-upgrade` would install, remove and keep back, phased updates, held packages, third-party
