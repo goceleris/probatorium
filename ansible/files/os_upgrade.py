@@ -1722,7 +1722,7 @@ def platform_identity():
         k, _, v = line.partition("=")
         if k in ("PRETTY_NAME", "VERSION_ID"):
             osr[k] = v.strip('"')
-    return {"kernel": running_kernel(), "os": osr.get("PRETTY_NAME", ""), "packages": len(lines),
+    return {"kernel": running_kernel(), "boot_default_kernel": boot_info()["default_kernel"], "os": osr.get("PRETTY_NAME", ""), "packages": len(lines),
             "dpkg_sha256": hashlib.sha256("\n".join(lines).encode()).hexdigest(),
             "held": sorted(x for x in run(["apt-mark", "showhold"])[1].split() if x)}
 
@@ -1747,6 +1747,16 @@ def freeze_state():
         now = unit_state(u)  # every unit of the freeze, whether it changed it or found it off already: none may run
         if now["active"] == "active" or now["enabled"] == "enabled":
             drifted.append("%s=%s/%s" % (u, now["active"], now["enabled"]))
+    # the PLATFORM the freeze recorded, recomputed: a frozen host whose kernel, package list, holds or boot default moved is not the platform the
+    # release results cite, whatever the units say (an upgrade, tailscale's own updater, a manual apt, a reboot onto the saved default ...)
+    plat = rec.get("platform") or {}
+    if plat:
+        now = platform_identity()
+        for k, label in (("kernel", "running kernel"), ("boot_default_kernel", "grub saved default kernel"), ("dpkg_sha256", "package list (sha256)")):
+            if k in plat and plat[k] != now.get(k):
+                drifted.append("%s changed: recorded %s, now %s" % (label, plat[k], now.get(k)))
+        if "held" in plat and sorted(plat["held"]) != now["held"]:
+            drifted.append("holds changed: recorded %s, now %s" % (",".join(sorted(plat["held"])) or "none", ",".join(now["held"]) or "none"))
     nr = rec.get("needrestart", {})
     if nr.get("dropin_written") and needrestart_mode() != "l":
         drifted.append("needrestart restart mode is %r, not 'l'" % needrestart_mode())

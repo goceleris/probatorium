@@ -1649,7 +1649,7 @@ class FreezeThaw(Base):
         self.assertRegex(p["dpkg_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(p["packages"], len(self.h.load()["packages"]))
         # no package, no kernel, no grub: a freeze changes timers and one needrestart file
-        self.assertFalse([c for c in self.h.calls() if c.startswith(("apt-get -y", "grub-", "update-grub", "dpkg --configure", "apt-mark hold", "apt-mark unhold"))])
+        self.assertFalse([c for c in self.h.calls() if c.startswith(("apt-get -y", "grub-set-default", "grub-reboot", "update-grub", "dpkg --configure", "apt-mark hold", "apt-mark unhold"))])
 
     def test_the_platform_identity_names_the_packages_and_changes_with_them(self):
         a = self.freeze("7")
@@ -1879,6 +1879,45 @@ class FreezeThaw(Base):
         os.remove(self.h.root + NR_DROPIN)
         d = self.run_ok("survey")["freeze"]["drifted"]
         self.assertEqual(d, ["apt-daily.timer=active/enabled", "needrestart restart mode is '', not 'l'"])
+
+    def frozen_survey(self):
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], [])
+
+    def test_a_package_that_moves_under_a_freeze_is_drift(self):
+        self.frozen_survey()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"  # tailscale's own updater, a manual apt ...
+        d = self.run_ok("survey")["freeze"]["drifted"]
+        self.assertEqual(len(d), 1)
+        self.assertRegex(d[0], r"^package list \(sha256\) changed: recorded [0-9a-f]{64}, now [0-9a-f]{64}$")
+
+    def test_a_kernel_that_changes_under_a_freeze_is_drift(self):
+        self.frozen_survey()
+        self.h.w("/proc/sys/kernel/osrelease", "7.0.0-38-generic\n")  # a reboot onto the saved default
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], ["running kernel changed: recorded 7.0.0-31-generic, now 7.0.0-38-generic"])
+
+    def test_a_hold_that_appears_under_a_freeze_is_drift(self):
+        self.frozen_survey()
+        self.h.state["held"] = ["tailscale"]
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], ["holds changed: recorded none, now tailscale"])
+
+    def test_a_grub_default_that_changes_under_a_freeze_is_drift(self):
+        self.frozen_survey()
+        self.h.state["next_grub_cfg"] = os.path.join(FIXTURES, "grub-arm64-efi.cfg")  # what update-grub generates once pinned
+        self.h.save()
+        self.assertEqual(self.h.run("pin-grub", "--running", "7.0.0-31-generic", "--run-id", "5").returncode, 0)  # the saved default was -38 (entry 0)
+        self.h.load()
+        d = self.run_ok("survey")["freeze"]["drifted"]
+        self.assertIn("grub saved default kernel changed: recorded 7.0.0-38-generic, now 7.0.0-31-generic", d)
+
+    def test_an_old_record_without_a_platform_is_not_compared(self):
+        self.frozen_survey()
+        rec = self.record()
+        del rec["platform"]
+        self.h.w(FREEZE_RECORD, json.dumps(rec))
+        self.h.state["packages"]["linux-firmware"]["version"] = "x"
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], [])
 
     def test_a_unit_the_freeze_found_off_and_left_alone_is_drift_too_when_it_comes_back(self):
         self.set_svc("apt-daily-upgrade.timer", "inactive", "disabled")  # a person had switched it off: the freeze leaves it

@@ -362,6 +362,9 @@ class Judge(unittest.TestCase):
              lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
         case("freeze_with_install_on_shutdown_off_is_fine", {}, lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="false")))
         case("thaw_ignores_install_on_shutdown", {}, lambda c: (c.update(os_mode="thaw"), c["pre_survey"].update(freeze=dict(FROZEN)), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
+        case("upgrade_of_a_frozen_host", {"refusals": "this host is frozen (run 41, 2026-10-23T10:00:00Z): an upgrade changes the platform the freeze recorded"},
+             lambda c: c["pre_survey"].update(freeze=copy.deepcopy(FROZEN)))
+        case("rehearse_of_a_frozen_host_is_fine", {}, lambda c: (c.update(os_mode="rehearse", os_confirm="REHEARSE-msr1-CONSOLE"), c["pre_survey"].update(freeze=copy.deepcopy(FROZEN), rehearsal={})))
         case("freeze_twice", {"maint": "this host is already frozen (run 41, 2026-10-23T10:00:00Z, status frozen): dispatch mode=thaw first. The record of what the first freeze changed is kept"}, fz("freeze", FROZEN))
         case("freeze_over_a_failed_freeze", {"maint": "status freezing-failed): dispatch mode=thaw first"}, fz("freeze", dict(FROZEN, status="freezing-failed")))
         case("thaw_ok", {}, fz("thaw", FROZEN))
@@ -520,7 +523,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 86, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 87, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:

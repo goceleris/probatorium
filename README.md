@@ -303,8 +303,12 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   (enable what it disabled, start what it stopped, remove its needrestart file: a unit that was already off stays off) and archives the record; the
   apt timers are persistent, so they may run within minutes of a thaw. A freeze that failed half way is undone by `mode=thaw`. It does not stop
   `mode=upgrade` (which runs apt itself) and it covers nothing but these units and needrestart: snapd refreshes, motd-news, firmware updates and
-  other self-updaters are not touched. Freeze before the rehearsals (an unattended grub or shim upgrade makes a rehearsal record stale), thaw
-  after the evidence.
+  other self-updaters are not touched. **The survey recomputes the recorded platform**: the running kernel, the package list (SHA-256), the holds and grub's saved default
+  kernel; any difference is `freeze.drifted` and the checklist row FAILs (an upgrade, tailscale's own updater, a manual apt, a reboot onto
+  another kernel). `mode=upgrade` is therefore REFUSED on a frozen host (its record would name a platform that no longer exists): the order is
+  rehearse (a frozen host may be rehearsed), thaw, upgrade, and freeze again once every host is upgraded and verified, then the evidence
+  campaign, then thaw. Freezing before the rehearsals keeps an unattended grub or shim upgrade from making a rehearsal record stale, at the price
+  of a thaw before each upgrade.
 - **Rehearsal at a console.** While grub's first menu entry is not the running kernel (survey row "kernel a GRUB that ignores the grubenv would
   boot": FAIL, today on all three hosts: -38 is installed and is entry 0, -31 runs), a rehearsal is refused, because if GRUB does not read the
   environment block it boots that other kernel on every power-cycle. Only a person at the rack of THAT host with a console (HDMI and keyboard:

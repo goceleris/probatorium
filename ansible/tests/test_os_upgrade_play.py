@@ -724,6 +724,24 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("fz_idle", self.FZ)  # the fake host runs unattended-upgrade-shutdown and packagekitd, as every real host does
         self.assertEqual(self.rc, 0, self.log[-2000:])
 
+    def test_an_upgrade_is_refused_on_a_frozen_host_and_goes_ahead_after_the_thaw(self):
+        self.fresh()
+        self.play("fz_up0", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.play("fz_up1", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("this host is frozen (run", self.log)
+        self.no_call("apt-get -y")
+        self.no_call("grub-set-default")
+        self.play("fz_up2", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.play("fz_up3", self.UP)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.phase(), "permanent")
+        self.play("fz_up4", self.FZ)  # and the host is frozen again, on the platform it has now
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.assertEqual(self.j("msr1", "result.json")["freeze"]["platform"]["kernel"], "7.0.0-40-generic")
+
     def test_a_freeze_and_a_thaw_are_refused_while_a_power_loss_resume_is_pending(self):
         self.fresh()
         self.h.w("/var/lib/celeris-power/resume-pending.json", "{}")
