@@ -276,8 +276,8 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   The survey shows `boot.entry0_kernel`, and a rehearsal is refused while it differs from the running kernel unless the
   confirmation is `REHEARSE-<host>-CONSOLE`, which says someone is at the rack with a console); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
   clears a pending grub one-shot, nothing else; the playbook also does it by itself on any failure between arming and the new
-  kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure` or
-  `abort-new-kernel`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the
+  kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure`,
+  `abort-new-kernel` or `release-holds`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the
   `linux-headers` postinst, so `apt-get` exits non-zero and leaves dpkg half-configured, and every later dispatch refuses on
   `dpkg --audit`. `configure` runs `dpkg --configure -a` (detached, same `policy-rc.d` discipline as the upgrade).
   `abort-new-kernel` first purges the kernel versions newer than the running one that the failed upgrade left half-installed
@@ -285,7 +285,9 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   and never touches grub's saved default, and refuses while a one-shot is pending. `abort-new-kernel` simulates first (`apt-get -s`):
   it stops on anything beyond the kernel metapackages, and when apt removes them with the image it says so (later full-upgrades
   install no kernel until they are installed again). It also removes a kernel that installed cleanly but that an earlier run armed
-  and never verified (below).
+  and never verified (below); it forgets that record only when the purge exited 0 and dpkg shows the version gone (a failed purge keeps
+  the record, so `retry_kernel` stays required). `release-holds` releases the access-path holds that a dead run left (below) and
+  nothing else.
 - **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
   job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's
   `HOLD-CLUSTER` marker lives outside this repository, so whoever dispatches honours it. The survey goes through the
@@ -293,10 +295,15 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
 - **A kernel that stranded a host is not armed twice.** `arm-oneshot` leaves `/var/lib/celeris-os-upgrade/armed-<kernel>.json`; a
   verified boot removes it. After msr1's documented failure (the new kernel without a NIC, a power-cycle back to the old kernel) the
   record is still there: the next `upgrade` refuses to arm that kernel again unless dispatched with `retry_kernel=<kernel>`, and
-  `repair` with `abort-new-kernel` accepts it for removal. `cluster-reboot` no longer refuses a host forever for "a newer kernel is
-  installed": it accepts that when the OS-upgrade pin makes the running kernel grub's saved default and no one-shot is pending.
+  `repair` with `abort-new-kernel` accepts it for removal. A disarm that finds the host on the same boot (the reboot was never
+  issued) drops the record, because that kernel never booted. `cluster-reboot` no longer refuses a host forever for "a newer kernel is
+  installed", but accepts it only with proof: the drop-in exists, a rehearsal record exists for the running kernel with the grub and
+  shim versions installed now, grub.cfg says `set default="${saved_entry}"`, the saved entry is the running kernel's normal (not
+  recovery) Advanced entry and exists in grub.cfg, and no one-shot is pending. A host that was never rehearsed stays refused.
 - **The access path can be held.** `hold_access_packages` (`auto`, `on`, `off`; `auto` = on for a host with an r8127 NIC) holds
-  `grub-*`, `shim*`, `openssh-server` and `tailscale*` for the length of the apt run and releases only the holds this run put. Both
+  `grub-*`, `shim*`, `openssh-server` and `tailscale*` BEFORE the plan is simulated (so the protected-removal judgement describes the plan that runs) and for the length of the apt run,
+  and releases only the holds this run put (a refusal releases them at once). If the run dies with the holds on, the survey lists them
+  (`packages.tool_holds`), every upgrade refuses naming the repair, and `mode=repair repair_action=release-holds` releases them. Both
   kernels share those packages, so no fallback helps if one breaks: upgrade them in a separate dispatch (`hold_access_packages=off`)
   with a person at the rack and a console.
 - **Order: servers first, the load generator last.** `msa2-client` is refused until `msa2-server` and `msr1` each carry
