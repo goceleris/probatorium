@@ -125,6 +125,11 @@ type tier1Config struct {
 	// probatorium#481). Set in a stall-capture run only.
 	WSEchoDiag *wsEchoDiag
 
+	// MarkovMinPeriod is the least time between the starts of two requests of
+	// one Markov walker; zero is the closed loop every cell has always run. See
+	// Config.MarkovMinPeriod.
+	MarkovMinPeriod time.Duration
+
 	// TallyCallbackInterval is how often TallyCallback fires. Zero
 	// defaults to 2 seconds; only used when TallyCallback is non-nil.
 	TallyCallbackInterval time.Duration
@@ -273,6 +278,10 @@ type tier1Tally struct {
 	// readyAt is the unix-nano instant the refapp announced its bound
 	// address: the origin of the walkers' since_ready_ms (celeris#588).
 	readyAt atomic.Int64
+
+	// loadShaping is the pacing the Markov walkers run under, set once before
+	// the fleet starts and nil when they run closed-loop.
+	loadShaping atomic.Pointer[report.LoadShaping]
 
 	// wsEcho is the WebSocket large-echo slice (ws_echo.go, celeris#587):
 	// one off-budget walker, like rfc, gated on the /ws route like ws.
@@ -585,6 +594,17 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 	if markovCount < 1 {
 		markovCount = 1
 	}
+	// A paced fleet says so in its cell document, with the counts it kept.
+	// Nothing is recorded for a closed-loop one, so every other cell's
+	// document is what it was.
+	if cfg.MarkovMinPeriod > 0 {
+		tally.loadShaping.Store(&report.LoadShaping{
+			Reason:            loadShapingReason,
+			Walkers:           cfg.Concurrency,
+			MarkovWalkers:     markovCount,
+			MarkovMinPeriodUs: cfg.MarkovMinPeriod.Microseconds(),
+		})
+	}
 	// launch starts one full walker fleet and returns its WaitGroup. salt
 	// is XORed into every seed: 0 is the walk every cell has always run,
 	// idleBurstSeedSalt the prelude's.
@@ -603,7 +623,7 @@ func driveTier1(ctx context.Context, cfg tier1Config) (tier1TallySnapshot, error
 			go func(walkerID int) {
 				defer wg.Done()
 				seed := seedBase ^ uint64(walkerID)*0x9e3779b97f4a7c15
-				runMarkovWalker(reqCtx, stop, httpc, baseURL, cfg.Matrix, seed, tally)
+				runMarkovWalker(reqCtx, stop, httpc, baseURL, cfg.Matrix, seed, cfg.MarkovMinPeriod, tally)
 			}(i)
 		}
 		for i := 0; i < advCount; i++ {
@@ -1014,6 +1034,15 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 // only ctx cuts one short (runPhase in driveTier1, probatorium#465).
 // Pass the same context as both to end the walk with a cut.
 //
+// period is the least time between the STARTS of two requests (Config.MarkovMinPeriod):
+// zero is the closed loop, a positive value is the race tier's adaptive cell's
+// load shape. It is open loop: the next start is period after the last ACTUAL
+// start, so a slow response makes the walker start the next request at once but
+// never earlier than that, and nothing is caught up afterwards (no burst). The
+// first start is offset by a seed-derived share of period, so the fleet does not
+// start in lockstep. The wait ends with stop or ctx, so it never lengthens a
+// phase's drain. A re-login after a 401 is a request start like any other.
+//
 // Each walker gets its own [http.CookieJar] + [http.Client] so the
 // N concurrent walkers exercise N parallel session lifecycles
 // against the refapp's session middleware. If the matrix declares a
@@ -1030,7 +1059,7 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 // serves /login but some others serve /api/login) had silent
 // path-mismatch bugs.
 func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string,
-	m *markov.Matrix, seed uint64, tally *tier1Tally,
+	m *markov.Matrix, seed uint64, period time.Duration, tally *tier1Tally,
 ) {
 	// Per-walker cookie jar. nil error per cookiejar.New's contract
 	// when options is nil.
@@ -1092,7 +1121,10 @@ func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string
 
 	chain := markov.New(m, seed)
 	rng := rand.New(rand.NewPCG(seed, ^seed))
-	_ = rng // reserved for adversarial-slice follow-up
+	var pace startPacer
+	if period > 0 {
+		pace = newStartPacer(period, rng, time.Now())
+	}
 	for {
 		if ctx.Err() != nil || stop.Err() != nil {
 			return
@@ -1104,9 +1136,13 @@ func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string
 		// `request: METHOD path`; states without an entry are silent.
 		// See validation/markov/<refapp>.yaml.
 		if req, ok := m.Requests[state]; ok {
+			if !pace.wait(ctx, stop) {
+				return
+			}
 			// A matrix-declared logout destroys the session on purpose;
 			// the 401 it causes on the next request is expected, so count
-			// it to keep the re-login budget honest.
+			// it to keep the re-login budget honest. Counted once the
+			// request is going out, not while it waits for its start.
 			if m.Logout.Method != "" && req.Method == m.Logout.Method && req.Path == m.Logout.Path {
 				tally.walkerLogouts.Add(1)
 			}
@@ -1119,6 +1155,9 @@ func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string
 				// deliberate logout, so this climbing with request
 				// count means the server is not honouring the session
 				// at all (probatorium#292).
+				if !pace.wait(ctx, stop) {
+					return
+				}
 				tally.walkerRelogins.Add(1)
 				_ = walkerLogin(ctx, hc, base, m.Login, username, password)
 			}
@@ -1129,6 +1168,54 @@ func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string
 			chain.Reset()
 		}
 	}
+}
+
+// loadShapingReason is the sentence tier_1.load_shaping carries.
+const loadShapingReason = "the refapp is a -race build, which costs every request several times the CPU and saturated the adaptive cell's two engine loops (probatorium#481, celeris#871): the walker, worker and connection counts are unchanged and each Markov walker starts a request at most once per period"
+
+// startPacer spaces the starts of one walker's requests (open loop). The zero
+// value paces nothing, so an unshaped walker takes no timer and no select.
+type startPacer struct {
+	period time.Duration
+	next   time.Time
+	timer  *time.Timer // reused across waits; allocated on the first
+}
+
+// newStartPacer books the walker's first start a share of period after now,
+// drawn from the walker's own generator: walkers (each with its own seed) do not
+// start in lockstep, and none waits a whole period. period must be > 0.
+func newStartPacer(period time.Duration, rng *rand.Rand, now time.Time) startPacer {
+	return startPacer{period: period, next: now.Add(time.Duration(rng.Int64N(int64(period))))}
+}
+
+// wait blocks until a request may start, then books the next start period after
+// this one, measured from the moment it actually starts: a late start is not
+// made up for, and a response that is slow (or fast) does not move the booking.
+// It returns false when the request context or the phase ended first, in which
+// case no request may be sent (so the wait never lengthens a phase's drain,
+// runPhase).
+func (p *startPacer) wait(ctx, stop context.Context) bool {
+	if p.period <= 0 {
+		return true
+	}
+	if d := time.Until(p.next); d > 0 {
+		if p.timer == nil {
+			p.timer = time.NewTimer(d)
+		} else {
+			p.timer.Reset(d)
+		}
+		select {
+		case <-p.timer.C:
+		case <-ctx.Done():
+		case <-stop.Done():
+		}
+		p.timer.Stop()
+	}
+	if ctx.Err() != nil || stop.Err() != nil {
+		return false
+	}
+	p.next = time.Now().Add(p.period)
+	return true
 }
 
 // walkerLogin fires the matrix's configured login request with the
@@ -1254,6 +1341,7 @@ func (t *tier1Tally) snapshot() tier1TallySnapshot {
 		RequestsPanicExpected: t.requestsPanicExpected.Load(),
 		InvariantHits:         t.invariantHits.Load(),
 		RequestsCutAtDeadline: t.requestsCutAtDeadline.Load(),
+		LoadShaping:           t.loadShaping.Load(),
 	}
 	if t.adv != nil {
 		s.Adversarial = t.adv.snapshot()
@@ -1317,6 +1405,9 @@ type tier1TallySnapshot struct {
 	// RefappSched is the refapp's CPU view read from /proc at ready
 	// (refapp_sched_record.go), attached by the orchestrator like Properties.
 	RefappSched *report.RefappSched `json:"refapp_sched,omitempty"`
+	// LoadShaping is the pacing the cell's Markov walkers ran under; nil when
+	// they ran closed-loop (every cell but the race tier's adaptive one).
+	LoadShaping *report.LoadShaping `json:"load_shaping,omitempty"`
 	// Properties is the in-process property loop's tally
 	// (validation/propertyloop.go), attached by the orchestrator once
 	// driveTier1 returns -- the loop runs beside the walkers, not inside

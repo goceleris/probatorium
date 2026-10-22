@@ -772,6 +772,24 @@ What a race run records about itself (schema 5.23, record only, nothing new is g
 - **The race tier runs the host sampler** (`HostSamplerStart` / `HostSamplerStop`, tag
   `race-<run id>`, lifetime fixed at 150m inside the job's 180 minute limit, each step bounded to 5 minutes), as the weekend soak does.
 
+**The race tier shapes the load of ONE cell (no schema bump).** The adaptive cell is sized 2 workers x
+110 walkers so the controller's promotion fires, and under the race detector's slowdown the closed-loop
+walker fleet of the `auth_session_ratelimit` adaptive cell saturated its two engine loops (a fourth
+`SLOW_CLASS` echo, now and then a reset-type counter). With `-race-tier`, in that cell only (both arches),
+each Markov walker now starts a request at most once every 6.5 ms (`raceAdaptiveMarkovMinPeriod` in
+`cmd/validator/matrix.go`): open loop, so the fleet offers at most 67 / 6.5 ms = ~10.3k requests a second
+whatever the response time, against the ~16.6k the same walkers sent when the cell saturated. The worker,
+walker and connection counts are unchanged, no threshold, N or timeout moves, and every other cell is
+closed-loop exactly as before: the other seven refapps' adaptive cells (green at full load; they run 77 Markov
+walkers, and a 6.5 ms period would have kept only 21-46% of their request volume on amd64), every pure engine
+and every non-race tier. Shaping costs race-detector coverage, so another refapp's adaptive cell joins only if
+a run shows a SLOW or reset-type counter in that cell with the loops busy, never pre-emptively. The cell
+says so: `tier_1.load_shaping` has the reason, `walkers`, `markov_walkers` and `markov_min_period_us`, and is
+omitted everywhere else. The field is additive in schema 5.23 and does not bump it, so the documents of
+every other tier are byte-identical to before. Promotion is still gated in every default race run
+(`VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`); a shaped cell that misses it says it was shaped, and a shaped cell
+without a `-race` build (`I-RACE`) fails the gate.
+
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
 `auth_session_ratelimit` routes them today. The verdict is recorded per cell (`ws_route_probed` /
