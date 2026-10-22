@@ -5,8 +5,8 @@
 #
 #   ansible-playbook -i ansible/inventory.yml ansible/os-upgrade.yml --extra-vars @extra-vars.json
 #
-# extra-vars.json carries os_mode (survey | upgrade | disarm | repair), os_host ("-" for a survey), os_confirm, os_reason, os_run_id,
-# os_out_dir and optionally allow_results_loss, refresh_lists, blacklist_r8169. It is a FILE, never key=value on the
+# extra-vars.json carries os_mode (survey | rehearse | upgrade | disarm | repair), os_host ("-" for a survey), os_confirm, os_reason, os_run_id,
+# os_out_dir and optionally allow_results_loss, refresh_lists, blacklist_r8169, repair_action, retry_kernel, hold_access_packages. It is a FILE, never key=value on the
 # command line: that form is split on whitespace and the reason is free text.
 #
 # Every command on a host is a subcommand of ansible/files/os_upgrade.py: this playbook has no shell or command task.

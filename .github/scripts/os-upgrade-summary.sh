@@ -4,7 +4,7 @@
 # the play managed to write, so a run that failed half way still gets a summary.
 #
 # usage: os-upgrade-summary.sh OUT_DIR MODE HOST ANSIBLE_RC "REASON" RUN_ID
-#   MODE survey | upgrade | disarm | repair; HOST is "-" for a survey
+#   MODE survey | rehearse | upgrade | disarm | repair; HOST is "-" for a survey
 set -u
 out=${1:?out dir}
 mode=${2:?mode}
@@ -79,7 +79,7 @@ efi_min=32768
 checklist() {
 	echo "### Checklist: what to read before any host-changing dispatch"
 	echo
-	echo "PASS = fine. FAIL = the upgrade or the rehearsal will be refused, or would be unsafe: fix or decide first. NOTE = a person reads it and decides."
+	echo "PASS = fine. FAIL = the upgrade or the rehearsal will be refused, or would be unsafe: fix or decide first. NOTE = a person reads it and decides, or a step that has not been done yet (the rehearsal)."
 	echo
 	echo "| host | check | value | mark | decision it informs |"
 	echo "|---|---|---|---|---|"
@@ -113,7 +113,7 @@ checklist() {
 			row("a new kernel is on offer"; ($kimg | join(", ") | if . == "" then (if $nsf != $krun then "none offered by apt, but `\($nsf)` is ALREADY INSTALLED and newer than the running `\($krun)`: it is the target of an upgrade (the upgrade reboots into it, once)" else "none (a rehearsal-only window; the upgrade would reboot into the same kernel)" end) else . end); (if ($kimg | length) == 1 then "PASS" else "NOTE" end); "exactly one new ABI expected; the target is the newest installed kernel of the running flavor"),
 			row("the kernel version parses (X.Y.Z-N-flavor)"; .kernel; (if (.kernel | test("^[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+-[a-z0-9-]+$")) then "PASS" else "FAIL" end); "if FAIL, the ordering of kernels is unreliable (a vendor kernel name)"),
 			row("DKMS modules installed for the running kernel"; (.dkms.installed_for_running | join(", ") | if . == "" then "none" else . end); (if .r8127.present then (if (.dkms.installed_for_running | index("r8127")) != null then "PASS" else "FAIL" end) else (if (.dkms.installed_for_running | length) == 0 then "PASS" else "NOTE" end) end); "an r8127 host must show r8127 here; a server with an in-tree NIC should show none"),
-			row("one-shot rehearsal done on the running kernel"; (.rehearsal | if . == {} then "none" else "\(.kernel) by run \(.run_id) at \(.utc)" end); (if .rehearsal.kernel == .kernel then "PASS" else "NOTE" end); "REQUIRED before an upgrade (mode=rehearse proves GRUB reads and clears the grubenv Linux writes)"),
+			row("one-shot rehearsal done on the running kernel"; (.rehearsal | if . == {} then "none" else "\(.kernel) by run \(.run_id) at \(.utc)" + (if (.valid // false) then "" else "; STALE: \(.stale // "unknown")" end) end); (if (.rehearsal.valid // false) and .rehearsal.kernel == .kernel then "PASS" else "NOTE" end); "REQUIRED before an upgrade (the upgrade is refused without a valid one). mode=rehearse tests that GRUB reads and clears the grubenv Linux writes; it goes stale when grub or shim change"),
 			row("kernels armed earlier and never verified"; ([.armed_kernels[] | "\(.kernel) (run \(.run_id))"] | join(", ") | if . == "" then "none" else . end); (if (.armed_kernels | length) == 0 then "PASS" else "FAIL" end); "if FAIL, the host may have been stranded by it; retry_kernel=<it> to try again, or mode=repair abort-new-kernel"),
 			row("run state"; "manifest \($sn.manifest_present // "?"); runner jobs \($sn.runner_workers // "?"); power-loss resume \($sn.resume_pending // "?"); crash dumps \(.crash | length)"; (if ($sn | length) == 0 then "NOTE" elif ($sn.manifest_present // false) or (($sn.runner_workers // 0) > 0) or ($sn.resume_pending // false) then "FAIL" else "PASS" end); "NOTE: no preflight snapshot of this host, so nothing is known about a run on it. If FAIL, the upgrade refuses beside a run"),
 			row("access-path packages and third-party moves the full-upgrade brings"; ($access | if . == "" then "none" else . end) + "; third-party repos: " + ($pk.third_party_repos | join(", ") | if . == "" then "none" else . end); "NOTE"; "read the major jumps (docker, containerd, tailscale, openssh, grub, shim, netplan, systemd, linux-firmware): a full-upgrade has no checkpoint, and none of them is undone by a power-cycle"),

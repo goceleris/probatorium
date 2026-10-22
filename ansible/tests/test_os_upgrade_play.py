@@ -1120,6 +1120,19 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("linux-image-7.0.0-40-generic", row)
         self.assertIn("**PASS**", row)
 
+    def test_the_checklist_shows_a_stale_rehearsal_as_not_done(self):
+        self.fresh()
+        self.play("survey_rehearsed", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        row = [l for l in self.summary("survey", "-").splitlines() if "| msr1 | one-shot rehearsal done" in l][0]
+        self.assertIn("**PASS**", row)
+        st = self.h.load()
+        st["packages"]["shim-signed"]["version"] = "1.61"  # shim upgraded since the rehearsal
+        self.h.save()
+        self.play("survey_stale", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        row = [l for l in self.summary("survey", "-").splitlines() if "| msr1 | one-shot rehearsal done" in l][0]
+        self.assertIn("STALE: grub or shim changed since the rehearsal", row)
+        self.assertIn("**NOTE**", row)
+
     def test_the_survey_summary_marks_a_broken_way_in(self):
         self.fresh(sshd_rc=255)
         self.play("survey_ssh", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
