@@ -266,7 +266,11 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   `apt-get update` first so the simulation is not stale: it WRITES `/var/lib/apt/lists` and the apt caches
   (`/var/cache/apt/*.bin`) and runs the apt update post-invoke hooks, so it is the one thing a survey changes, and only when asked. `blacklist_r8169`
   (upgrade only, default false) is explained below. Dispatch from `main` only; it never runs on a schedule.
-- **Four modes.** `survey` (read-only, all hosts); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
+- **Five modes.** `survey` (read-only, all hosts; its summary opens with a checklist of every fact to read before a host-changing
+  dispatch, each with a PASS / FAIL / NOTE mark and the decision it informs); `rehearse` (ONE host, `REHEARSE-<host>`: pins the
+  running kernel, arms a one-shot to a boot of the SAME kernel, reboots, and requires a new boot id, the same kernel, an EMPTY
+  `next_entry` (GRUB read and cleared the environment block Linux writes) and the usual verification; no package or kernel changes;
+  an `upgrade` is refused until the host carries a rehearsal record for the kernel it runs); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
   clears a pending grub one-shot, nothing else; the playbook also does it by itself on any failure between arming and the new
   kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure` or
   `abort-new-kernel`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the
@@ -274,11 +278,23 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   `dpkg --audit`. `configure` runs `dpkg --configure -a` (detached, same `policy-rc.d` discipline as the upgrade).
   `abort-new-kernel` first purges the kernel versions newer than the running one that the failed upgrade left half-installed
   (a kernel that was installed and working before is never removed), so the host stays on the old kernel. A repair never reboots
-  and never touches grub's saved default, and refuses while a one-shot is pending.
+  and never touches grub's saved default, and refuses while a one-shot is pending. `abort-new-kernel` simulates first (`apt-get -s`):
+  it stops on anything beyond the kernel metapackages, and when apt removes them with the image it says so (later full-upgrades
+  install no kernel until they are installed again). It also removes a kernel that installed cleanly but that an earlier run armed
+  and never verified (below).
 - **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
   job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's
   `HOLD-CLUSTER` marker lives outside this repository, so whoever dispatches honours it. The survey goes through the
   same gate: it runs commands on the hosts.
+- **A kernel that stranded a host is not armed twice.** `arm-oneshot` leaves `/var/lib/celeris-os-upgrade/armed-<kernel>.json`; a
+  verified boot removes it. After msr1's documented failure (the new kernel without a NIC, a power-cycle back to the old kernel) the
+  record is still there: the next `upgrade` refuses to arm that kernel again unless dispatched with `retry_kernel=<kernel>`, and
+  `repair` with `abort-new-kernel` accepts it for removal. `cluster-reboot` no longer refuses a host forever for "a newer kernel is
+  installed": it accepts that when the OS-upgrade pin makes the running kernel grub's saved default and no one-shot is pending.
+- **The access path can be held.** `hold_access_packages` (`auto`, `on`, `off`; `auto` = on for a host with an r8127 NIC) holds
+  `grub-*`, `shim*`, `openssh-server` and `tailscale*` for the length of the apt run and releases only the holds this run put. Both
+  kernels share those packages, so no fallback helps if one breaks: upgrade them in a separate dispatch (`hold_access_packages=off`)
+  with a person at the rack and a console.
 - **Order: servers first, the load generator last.** `msa2-client` is refused until `msa2-server` and `msr1` each carry
   a record of a verified upgrade (`/var/lib/celeris-os-upgrade/last-upgrade.json`, written only after verification)
   that still matches the kernel they run. Why: every server is verified against the client (fabric ping), so the

@@ -13,7 +13,7 @@ name: Cluster OS Upgrade
 #     -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
 #
 # Job graph: plan -> cluster-guard -> os-upgrade -> verdict.
-#   plan           refuses a malformed request: a wrong mode, a survey that names a host or carries a confirm, an upgrade or
+#   plan           refuses a malformed request: a wrong mode (survey, rehearse, upgrade, disarm, repair), a survey that names a host or carries a confirm, an upgrade or
 #                  disarm without ONE host and its typed confirmation (UPGRADE-<host>, DISARM-<host>), a bad reason,
 #                  and any ref but main.
 #   cluster-guard  outside the group: lists every open run and refuses unless the cluster is IDLE
@@ -42,18 +42,18 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "survey: read-only, all three hosts, no confirmation. upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host."
+        description: "survey: read-only, all three hosts, no confirmation. rehearse: ONE host reboots into its OWN running kernel through a grub one-shot (proves the fallback mechanism; changes no package). upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host."
         type: choice
-        options: [survey, upgrade, disarm, repair]
+        options: [survey, rehearse, upgrade, disarm, repair]
         required: true
       host:
-        description: "upgrade, disarm or repair: the host. Leave '-' for a survey."
+        description: "rehearse, upgrade, disarm or repair: the host. Leave '-' for a survey."
         type: choice
         options: ["-", msa2-server, msr1, msa2-client]
         required: false
         default: "-"
       confirm:
-        description: "upgrade: type UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. A survey takes none."
+        description: "rehearse: type REHEARSE-<host>. upgrade: UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. A survey takes none."
         type: string
         required: false
         default: ""
@@ -77,6 +77,17 @@ on:
         options: [configure, abort-new-kernel]
         required: false
         default: configure
+      retry_kernel:
+        description: "upgrade only: a kernel version (7.0.0-40-generic) that an earlier run armed and that never ended verified; leave empty to have the upgrade refuse to arm it again."
+        type: string
+        required: false
+        default: ""
+      hold_access_packages:
+        description: "upgrade only: hold grub*, shim*, openssh-server and tailscale* for the run (both kernels share them, so a power-cycle cannot undo a regression in them). auto = on for a host with an r8127 NIC (msr1), off otherwise."
+        type: choice
+        options: [auto, "on", "off"]
+        required: false
+        default: auto
       blacklist_r8169:
         description: "upgrade only: blacklist the in-tree r8169 when the new kernel's r8169 lists the r8127 PCI id (msr1). Default: refuse to reboot."
         type: boolean
@@ -100,6 +111,8 @@ jobs:
           IN_CONFIRM: ${{ inputs.confirm }}
           IN_REASON: ${{ inputs.reason }}
           IN_REPAIR_ACTION: ${{ inputs.repair_action }}
+          IN_RETRY_KERNEL: ${{ inputs.retry_kernel }}
+          IN_HOLD: ${{ inputs.hold_access_packages }}
           # the maintainer's switch: hosts a host-changing mode may touch (comma or space separated). Empty by default.
           ALLOWED_HOSTS: ${{ vars.OS_UPGRADE_ALLOWED_HOSTS }}
           # reads the environment's protection rules; GITHUB_TOKEN may not be allowed to, then a token with Environments: read
@@ -124,10 +137,10 @@ jobs:
                 exit 1
               fi
               ;;
-            upgrade | disarm | repair)
+            upgrade | rehearse | disarm | repair)
               case "$IN_HOST" in
                 msa2-server|msr1|msa2-client) ;;
-                *) echo "::error::an upgrade, a disarm or a repair names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
+                *) echo "::error::an upgrade, a rehearsal, a disarm or a repair names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
               esac
               # the extra control: a host-changing mode is impossible until the maintainer lists the host for the window
               # (repository variable OS_UPGRADE_ALLOWED_HOSTS; README, "Enabling a host change")
@@ -149,6 +162,14 @@ jobs:
                 echo "::error::the environment cluster-host-change has no deployment branch policy: restrict it to main"
                 exit 1
               fi
+              if ! [[ "$IN_RETRY_KERNEL" =~ ^([0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z0-9-]+)?$ ]]; then
+                echo "::error::retry_kernel must be empty or a kernel version such as 7.0.0-40-generic"
+                exit 1
+              fi
+              case "$IN_HOLD" in
+                auto | on | off) ;;
+                *) echo "::error::hold_access_packages must be auto, on or off"; exit 1 ;;
+              esac
               if [ "$IN_MODE" = repair ]; then
                 case "$IN_REPAIR_ACTION" in
                   configure | abort-new-kernel) ;;
@@ -157,6 +178,10 @@ jobs:
               fi
               if [ "$IN_MODE" = upgrade ] && [ "$IN_CONFIRM" != "UPGRADE-$IN_HOST" ]; then
                 echo "::error::confirm must be exactly UPGRADE-$IN_HOST"
+                exit 1
+              fi
+              if [ "$IN_MODE" = rehearse ] && [ "$IN_CONFIRM" != "REHEARSE-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly REHEARSE-$IN_HOST"
                 exit 1
               fi
               if [ "$IN_MODE" = disarm ] && [ "$IN_CONFIRM" != "DISARM-$IN_HOST" ]; then
@@ -168,7 +193,7 @@ jobs:
                 exit 1
               fi
               ;;
-            *) echo "::error::mode must be survey, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
+            *) echo "::error::mode must be survey, rehearse, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
           esac
           if [ -z "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ]; then
             echo "::error::reason is empty"
@@ -342,6 +367,8 @@ jobs:
           IN_REFRESH: ${{ inputs.refresh_lists }}
           IN_BLACKLIST: ${{ inputs.blacklist_r8169 }}
           IN_REPAIR_ACTION: ${{ inputs.repair_action }}
+          IN_RETRY_KERNEL: ${{ inputs.retry_kernel }}
+          IN_HOLD: ${{ inputs.hold_access_packages }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -eu
@@ -362,6 +389,8 @@ jobs:
               "refresh_lists": os.environ["IN_REFRESH"] == "true",
               "blacklist_r8169": os.environ["IN_BLACKLIST"] == "true",
               "repair_action": os.environ["IN_REPAIR_ACTION"],
+              "retry_kernel": {"__ansible_unsafe": os.environ["IN_RETRY_KERNEL"]},
+              "hold_access_packages": os.environ["IN_HOLD"],
           }, open(os.path.join(os.environ["OS_OUT"], "extra-vars.json"), "w"), indent=2)
           PY
       - name: Survey or upgrade (ansible/os-upgrade.yml)

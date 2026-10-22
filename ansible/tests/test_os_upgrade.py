@@ -663,7 +663,7 @@ class DkmsCheck(Base):
 class OneShotAndPermanent(DkmsCheck):
     def arm(self):
         self.h.save()
-        return self.h.run("arm-oneshot", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic")
+        return self.h.run("arm-oneshot", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic", "--run-id", "42")
 
     def test_the_old_kernel_stays_the_default_and_only_the_next_boot_is_the_new_one(self):
         self.after_upgrade()
@@ -725,8 +725,11 @@ class OneShotAndPermanent(DkmsCheck):
         self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
         self.j(self.arm())
         self.h.load()
+        self.h.w("/proc/sys/kernel/osrelease", "7.0.0-40-generic\n")  # the host booted the new kernel and GRUB left the one-shot pending
         r = self.h.run("make-permanent", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic", "--run-id", "42")
         self.assertEqual(r.returncode, 1)
+        self.assertIn("a one-shot is still pending", r.stdout + r.stderr)
+        self.assertEqual(self.h.load()["grubenv"]["saved_entry"], ID_31, "make-permanent changed the saved default before refusing")
         self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/last-upgrade.json"))
 
     def test_make_permanent_sets_the_new_default_and_writes_the_marker(self):
@@ -885,6 +888,150 @@ class RepairCascade(Repair):
         self.assertFalse([c for c in self.h.calls() if c.startswith("apt-get -y") and "remove" in c])
         self.assertIn("linux-image-7.0.0-40-generic", self.h.load()["packages"])
         self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+
+
+class ArmedRecords(DkmsCheck):
+    def test_arming_leaves_a_record_and_a_verified_boot_removes_it(self):
+        self.after_upgrade()
+        self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
+        self.j(self.arm_for_record())
+        rec = json.loads(open(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json").read())
+        self.assertEqual((rec["kernel"], rec["running"], rec["run_id"]), ("7.0.0-40-generic", "7.0.0-31-generic", "42"))
+        self.assertEqual([r["kernel"] for r in self.run_ok("survey")["armed_kernels"]], ["7.0.0-40-generic"])
+        d = self.check()
+        self.assertEqual([r["kernel"] for r in d["target_armed_before"]], ["7.0.0-40-generic"])
+        # the boot consumed the one-shot and the host runs the kernel: verified, then made permanent
+        st = self.h.load()
+        st["grubenv"]["next_entry"] = ""
+        self.h.save()
+        self.h.w("/proc/sys/kernel/osrelease", "7.0.0-40-generic\n")
+        self.j(self.h.run("make-permanent", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic", "--run-id", "42"))
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"))
+
+    def arm_for_record(self):
+        self.h.save()
+        return self.h.run("arm-oneshot", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic", "--run-id", "42")
+
+    def test_an_armed_kernel_that_installs_cleanly_is_still_a_candidate_for_the_abort(self):
+        # the dead end after a NIC-less boot: the kernel is installed cleanly, the host runs the old one, nothing is half-installed
+        self.after_upgrade()
+        for pk in ("linux-image-7.0.0-40-generic", "linux-modules-7.0.0-40-generic"):
+            self.h.state["packages"][pk] = {"version": "7.0.0-40", "status": "installed"}
+        self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
+        self.assertEqual(self.run_ok("survey")["packages"]["broken_kernel_pkgs"], [])
+        self.j(self.arm_for_record())
+        self.h.load()
+        self.h.state["grubenv"]["next_entry"] = ""  # consumed by the NIC-less boot, then a power-cycle back to the old kernel
+        self.h.state["configure_ok"] = True
+        self.h.save()
+        s = self.run_ok("survey")
+        self.assertEqual(s["packages"]["broken_kernel_pkgs"], ["linux-image-7.0.0-40-generic", "linux-modules-7.0.0-40-generic"])
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "abort-new-kernel"))
+        end = time.time() + 20
+        while time.time() < end and self.j(self.h.run("upgrade-status", "--run-id", "9"))["state"] != "done":
+            time.sleep(0.1)
+        self.assertNotIn("linux-image-7.0.0-40-generic", self.h.load()["packages"])
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"), "the abort left the suspicion behind")
+
+
+class Rehearsal(Base):
+    def pinned(self):
+        self.h.save()
+        self.j(self.h.run("pin-grub", "--running", "7.0.0-31-generic", "--run-id", "5"))
+        self.h.load()
+
+    def test_it_arms_the_running_kernel_and_records_nothing_until_the_boot_proved_it(self):
+        self.pinned()
+        r = self.j(self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic"))
+        # -38 is newer, so the top-level entry boots -38: the running kernel's own Advanced entry is the safe one
+        self.assertEqual((r["via"], r["next_entry"], r["saved_entry"]), ("advanced entry", ID_31, ID_31))
+        self.assertEqual(self.h.load()["grubenv"]["next_entry"], ID_31)
+        # GRUB did not consume it: no record
+        bad = self.h.run("record-rehearsal", "--kernel", "7.0.0-31-generic", "--run-id", "5")
+        self.assertEqual(bad.returncode, 1)
+        self.assertEqual(self.run_ok("survey")["rehearsal"], {})
+        # GRUB consumed it and the same kernel runs: the record
+        self.h.state["grubenv"]["next_entry"] = ""
+        self.h.save()
+        rec = self.j(self.h.run("record-rehearsal", "--kernel", "7.0.0-31-generic", "--run-id", "5"))
+        self.assertEqual(self.run_ok("survey")["rehearsal"]["kernel"], "7.0.0-31-generic")
+        self.assertTrue(rec["ok"])
+
+    def test_it_uses_the_top_level_entry_when_the_running_kernel_is_the_newest(self):
+        os.remove(self.h.root + "/boot/vmlinuz-7.0.0-38-generic")
+        self.h.state["packages"].pop("linux-image-7.0.0-38-generic")
+        self.h.state["grub_template"] = os.path.join(FIXTURES, "grub-arm64-efi.cfg")
+        self.h.state["next_grub_cfg"] = None
+        self.pinned()
+        r = self.j(self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic"))
+        self.assertEqual(r["via"], "top-level entry")
+        self.assertTrue(r["next_entry"].startswith("gnulinux-simple-"))
+        self.assertNotEqual(r["next_entry"], r["saved_entry"])
+
+    def test_it_refuses_when_the_running_kernel_is_not_the_saved_default(self):
+        self.h.save()
+        r = self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("pin it first", r.stdout + r.stderr)
+        self.assertFalse(any(c.startswith("grub-reboot") for c in self.h.calls()))
+
+    def test_it_refuses_into_a_running_package_run_and_disarms_what_it_cannot_verify(self):
+        self.pinned()
+        self.h.w("/proc/4242/comm", "dpkg\n")
+        self.assertEqual(self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic").returncode, 1)
+        os.remove(self.h.root + "/proc/4242/comm")
+        self.h.state["reboot_sets_wrong"] = True
+        self.h.save()
+        r = self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("one-shot disarmed: True", r.stdout + r.stderr)
+        self.assertEqual(self.h.load()["grubenv"]["next_entry"], "")
+
+    def test_a_record_for_another_kernel_than_the_running_one_is_refused(self):
+        self.h.save()
+        self.assertEqual(self.h.run("record-rehearsal", "--kernel", "7.0.0-38-generic", "--run-id", "5").returncode, 1)
+
+
+class HoldAccessPackages(Base):
+    def wait(self, run_id="42"):
+        end = time.time() + 20
+        while time.time() < end:
+            st = self.j(self.h.run("upgrade-status", "--run-id", run_id))
+            if st["state"] == "done":
+                return st
+            time.sleep(0.1)
+        self.fail("the upgrade did not finish")
+
+    def test_the_access_path_is_held_for_the_length_of_the_run_and_released_after(self):
+        self.h.state["held"] = ["vim", "shim-signed"]  # holds somebody else put, one of them on an access-path package
+        self.h.save()
+        out = self.j(self.h.run("upgrade-start", "--run-id", "42", "--hold"))
+        self.assertEqual(out["access_packages_held"], ["grub-common", "grub-efi-arm64-bin", "openssh-server", "tailscale"])
+        self.assertEqual(self.wait()["rc"], 0)
+        log = self.h.run("upgrade-log", "--run-id", "42").stdout
+        self.assertIn("apt-mark hold grub-common grub-efi-arm64-bin openssh-server tailscale", log)
+        self.assertIn("held: grub-common grub-efi-arm64-bin openssh-server shim-signed tailscale vim", log)  # held while apt ran
+        self.assertEqual(self.h.load()["held"], ["shim-signed", "vim"])  # released after; the two that were held before are not ours
+
+    def test_without_the_flag_nothing_is_held(self):
+        self.h.save()
+        out = self.j(self.h.run("upgrade-start", "--run-id", "42"))
+        self.assertEqual(out["access_packages_held"], [])
+        self.wait()
+        self.assertNotIn("apt-mark hold", self.h.run("upgrade-log", "--run-id", "42").stdout)
+
+    def test_a_run_that_died_with_the_holds_on_is_released_by_the_cleanup(self):
+        import signal
+        self.h.state["upgrade_sleep"] = 30
+        self.h.save()
+        started = self.j(self.h.run("upgrade-start", "--run-id", "42", "--hold"))
+        time.sleep(0.7)
+        self.assertIn("tailscale", self.h.load()["held"])
+        os.kill(started["pid"], signal.SIGKILL)
+        time.sleep(0.7)
+        c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+        self.assertIn("tailscale", c["unheld"])
+        self.assertEqual(self.h.load()["held"], [])
 
 
 class Toolcheck(Base):

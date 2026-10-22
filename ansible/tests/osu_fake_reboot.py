@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stands in for the machine restarting in the tests of ansible/os-upgrade.yml: what grub would boot (the one-shot
 entry if next_entry is set, which grub then clears; else the saved entry) becomes the running kernel, the boot id
-changes and the interrupt counters reset. BOOT_MODE: not-issued (the reboot never happens, the host stays up) | ok | ignore-next (the new kernel fails early: grub falls back
+changes and the interrupt counters reset. BOOT_MODE: keep-next (GRUB boots the saved entry and never clears next_entry: it reads another environment block) | not-issued (the reboot never happens, the host stays up) | ok | ignore-next (the new kernel fails early: grub falls back
 to the saved entry) | no-nic (the new kernel boots without enp1s0) | hang (the host never answers: exit 1).
 
     osu_fake_reboot.py ROOT STATE_DIR
@@ -42,9 +42,10 @@ with open(root + "/boot/grub/grub.cfg") as f:
     entries = osu.parse_grub_cfg(f.read())
 env = st["grubenv"]
 ref = env.get("saved_entry", "")
-if env.get("next_entry") and mode != "ignore-next":
+if env.get("next_entry") and mode not in ("ignore-next", "keep-next"):
     ref = env["next_entry"]
-env["next_entry"] = ""  # grub clears it as it boots it, whatever happens next
+if mode != "keep-next":
+    env["next_entry"] = ""  # grub clears it as it boots it, whatever happens next (keep-next: it reads another environment block)
 kernel = osu.kernel_of_entry(entries, ref) or "unknown"
 with open(root + "/proc/sys/kernel/osrelease", "w") as f:
     f.write(kernel + "\n")

@@ -157,6 +157,18 @@ if [ "$r8127" = true ]; then
 	fi
 fi
 
+# ---- the OS-upgrade pin: a newer kernel installed does not matter to a reboot when grub's saved default IS the running kernel and
+# no one-shot is pending (ansible/os-upgrade.yml writes the drop-in and sets the saved entry before it installs anything)
+pinned=false
+if [ -e "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg" ] && [ -n "$kernel" ] && command -v grub-editenv > /dev/null 2>&1; then
+	genv=$(grub-editenv list 2> /dev/null)
+	saved=$(printf '%s\n' "$genv" | sed -n 's/^saved_entry=//p')
+	pending=$(printf '%s\n' "$genv" | sed -n 's/^next_entry=//p')
+	case "$saved" in
+	*"gnulinux-$kernel-advanced-"*) [ -z "$pending" ] && pinned=true ;;
+	esac
+fi
+
 # ---- the persistent prerequisites a reboot must leave in place (ansible/power-guard.yml) --------
 run_celeris_owner=""
 [ -d "$R/run/celeris" ] && run_celeris_owner=$(stat -c %U "$R/run/celeris" 2> /dev/null)
@@ -187,7 +199,7 @@ printf '"lan_ip":%s,"lan_ip_present":%s,"peer_ip":%s,"peer_ping_ok":%s,' \
 	"$(js "$lan_ip")" "$lan_present" "$(js "$peer_ip")" "$peer_ping"
 printf '"manifest_present":%s,"results_entries":%s,"results_list":%s,"resume_pending":%s,"runner_dirs":%s,"runner_listeners":%s,"runner_workers":%s,' \
 	"$manifest_present" "$results_entries" "$results_list" "$resume_pending" "$runner_dirs" "$listeners" "$workers"
-printf '"crash":%s,"r8127":%s,"modinfo_r8127":%s,' "$crash" "$r8127" "$modinfo_r8127"
+printf '"crash":%s,"r8127":%s,"modinfo_r8127":%s,"grub_pinned_to_running":%s,' "$crash" "$r8127" "$modinfo_r8127" "$pinned"
 printf '"prereq":{"tailscaled_active":%s,"tailscaled_enabled":%s,"apcupsd_active":%s,"resume_check_enabled":%s,"power_event_installed":%s,"tmpfiles_conf":%s,"quiesce_hook":%s,"run_celeris_owner":%s},' \
 	"$tailscaled" "$(js "$tailscaled_enabled")" "$apcupsd" "$resume_check" "$power_event" "$tmpfiles_conf" "$quiesce_hook" "$(js "$run_celeris_owner")"
 printf '"system_state":%s,"failed_units":%s}\n' "$(js "$system_state")" "$failed_units"

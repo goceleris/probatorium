@@ -84,6 +84,7 @@ SERVER_MARKER = {"permanent": True, "kernel_after": "6.14.0-44-generic", "run_id
 
 def base_case(survey, sim, dk):
     pre_survey = copy.deepcopy(survey)
+    pre_survey["rehearsal"] = {"kernel": survey["kernel"], "run_id": "11", "ok": True}  # an upgrade needs a rehearsal on the running kernel
     post_survey = copy.deepcopy(survey)
     post_survey["kernel"] = "7.0.0-40-generic"
     servers = {"msa2-server": {"kernel": "6.14.0-44-generic", "marker": copy.deepcopy(SERVER_MARKER)},
@@ -130,6 +131,7 @@ PLAY = """
       vars:
         os_host: "{{{{ item.value.os_host }}}}"
         os_mode: "{{{{ item.value.os_mode | default('upgrade') }}}}"
+        retry_kernel: "{{{{ item.value.retry_kernel | default('') }}}}"
         repair_action: "{{{{ item.value.repair_action | default('configure') }}}}"
         blacklist_r8169: "{{{{ item.value.blacklist_r8169 | default(false) }}}}"
         pre_toolcheck: "{{{{ item.value.pre_toolcheck }}}}"
@@ -208,6 +210,13 @@ class Judge(unittest.TestCase):
              lambda c: c["pre_survey"]["packages"].update(dpkg_audit=["foo"]))
         case("held_kernel", {"refusals": "held kernel, boot or DKMS packages: linux-image-generic"},
              lambda c: c["pre_survey"]["packages"].update(held_kernel=["linux-image-generic"]))
+        case("no_rehearsal", {"refusals": "no successful one-shot rehearsal of this host on the running kernel 7.0.0-31-generic (record: none)"},
+             lambda c: c["pre_survey"].update(rehearsal={}))
+        case("a_rehearsal_of_another_kernel", {"refusals": "(record: 7.0.0-25-generic)"},
+             lambda c: c["pre_survey"].update(rehearsal={"kernel": "7.0.0-25-generic"}))
+        case("a_rehearsal_needs_no_rehearsal", {}, lambda c: (c.update(os_mode="rehearse"), c["pre_survey"].update(rehearsal={})))
+        case("a_rehearsal_has_no_order_rule", {}, lambda c: (c.update(os_mode="rehearse", os_host="msa2-client"), c["pre_survey"].update(rehearsal={}),
+                                                              c.update(os_surveys={"msa2-server": {"kernel": "x", "marker": {}}, "msr1": {"kernel": "x", "marker": {}}, "msa2-client": {"kernel": "x", "marker": {}}})))
         case("the_way_in_is_already_broken", {"refusals": "the way in is ALREADY not intact on the current userland (sshd -t fails: x)"},
              lambda c: c["pre_survey"].update(access_problems=["sshd -t fails: x"]))
         case("policy_rc_d", {"refusals": "policy-rc.d exists already"}, lambda c: c["pre_survey"]["packages"].update(policy_rc_d_present=True))
@@ -328,6 +337,12 @@ class Judge(unittest.TestCase):
         case("intree_does_not_list_the_id", {}, lambda c: c["dkms_check"].update(intree_lists_id=False))
         case("access_broken", {"prereboot": "the way in is not intact on the upgraded userland (both kernels share it, a power-cycle would not undo it): sshd -t fails: x / netplan generate fails"},
              lambda c: c["dkms_check"].update(access_problems=["sshd -t fails: x", "netplan generate fails"]))
+        case("target_was_armed_before", {"prereboot": "was armed as a one-shot by run 77 and no run ever verified the host on it"},
+             lambda c: c["dkms_check"].update(target_armed_before=[{"kernel": "7.0.0-40-generic", "run_id": "77"}]))
+        case("target_was_armed_before_and_a_retry_is_asked", {},
+             lambda c: (c["dkms_check"].update(target_armed_before=[{"kernel": "7.0.0-40-generic", "run_id": "77"}]), c.update(retry_kernel="7.0.0-40-generic")))
+        case("a_retry_of_another_kernel_does_not_count", {"prereboot": "was armed as a one-shot by run 77"},
+             lambda c: (c["dkms_check"].update(target_armed_before=[{"kernel": "7.0.0-40-generic", "run_id": "77"}]), c.update(retry_kernel="7.0.0-38-generic")))
         case("target_older_than_running", {"prereboot": "is older than the running one"}, lambda c: c["dkms_check"].update(target_older_than_running=True))
         case("secure_boot_other_key", {"prereboot": "not signed by the key the running module is signed with"},
              lambda c: c["dkms_check"].update(secure_boot="enabled", running_r8127_signer="Albert MOK") or c["dkms_check"]["r8127"].update(signer="Someone Else"))
@@ -359,6 +374,8 @@ class Judge(unittest.TestCase):
              lambda c: post(c, bonds=[{"bond": "bond0", "mode": "802.3ad", "slaves": ["enp1s0=up", "enp49s0=down"]}]))
         case("post_counters", {"post": "the counters were not reset"}, lambda c: post(c, max_vector_total=4050000000))
         case("post_failed_unit", {"post": "new failed unit(s): foo.service"}, lambda c: post(c, failed_units=["foo.service"]))
+        case("post_one_shot_not_consumed", {"post": "a one-shot is still pending (gnulinux-x) after the host booted: GRUB did not consume it"},
+             lambda c: c["post_survey"]["boot"].update(next_entry="gnulinux-x"))
         case("post_no_snapshot", {"post": "no readable snapshot after the reboot"}, lambda c: c["post_raw"].update(stdout=""))
         case("post_nic_driver_changed", {"post": "NIC enp1s0 is bound to r8169, was r8127"},
              lambda c: c["post_survey"]["nics"][0].update(driver="r8169"))
@@ -381,7 +398,7 @@ class Judge(unittest.TestCase):
         for name, (_, expect) in self.cases.items():
             got = self.out[name]
             if not expect:
-                if self.cases[name][0].get("os_mode", "upgrade") != "upgrade":
+                if self.cases[name][0].get("os_mode", "upgrade") in ("repair", "disarm"):
                     got = {"maint": got["maint"]}  # a maintenance mode is judged by maint_refusals_str alone
                 if any(got.values()):
                     failures.append("%s: expected nothing, got %r" % (name, got))
@@ -421,7 +438,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 74, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 77, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:

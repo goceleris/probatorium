@@ -71,7 +71,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 		}
 		return out
 	}
-	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "upgrade", "disarm", "repair"}) {
+	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "rehearse", "upgrade", "disarm", "repair"}) {
 		t.Errorf("modes = %v", got)
 	}
 	offered := choice("host", "confirm")
@@ -84,7 +84,10 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 			t.Errorf("input %s is not required", in)
 		}
 	}
-	if got := choice("repair_action", "blacklist_r8169"); !slices.Equal(got, []string{"configure", "abort-new-kernel"}) {
+	if got := choice("hold_access_packages", "blacklist_r8169"); !slices.Equal(got, []string{"auto", "on", "off"}) {
+		t.Errorf("hold_access_packages = %v", got)
+	}
+	if got := choice("repair_action", "retry_kernel"); !slices.Equal(got, []string{"configure", "abort-new-kernel"}) {
 		t.Errorf("repair actions = %v", got)
 	}
 	for _, in := range []string{"allow_results_loss", "refresh_lists"} {
@@ -106,7 +109,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 	if !slices.Equal(accepted, osUpgradeHosts()) {
 		t.Errorf("the playbook accepts %v, want %v", accepted, osUpgradeHosts())
 	}
-	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'disarm', 'repair']", "os_confirm == 'REPAIR-' ~ os_host"} {
+	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_confirm == 'REHEARSE-' ~ os_host", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'rehearse', 'disarm', 'repair']", "os_confirm == 'REPAIR-' ~ os_host"} {
 		if !strings.Contains(req, want) {
 			t.Errorf("the playbook's request check lacks %s", want)
 		}
@@ -121,13 +124,14 @@ func TestClusterOSUpgradePlanRefuses(t *testing.T) {
 	for _, want := range []string{
 		`"$IN_CONFIRM" != "UPGRADE-$IN_HOST"`,
 		`"$IN_CONFIRM" != "DISARM-$IN_HOST"`,
+		`"$IN_CONFIRM" != "REHEARSE-$IN_HOST"`,
 		`"$IN_CONFIRM" != "REPAIR-$IN_HOST"`,
 		`OS_UPGRADE_ALLOWED_HOSTS`,
 		`"$REF" != "refs/heads/$DEFAULT_BRANCH"`,
 		`msa2-server|msr1|msa2-client) ;;`,
 		`"$IN_HOST" != "-"`,
 		`-gt 200`,
-		`mode must be survey, upgrade, disarm or repair`,
+		`mode must be survey, rehearse, upgrade, disarm or repair`,
 		`a survey takes no confirmation`,
 		`reason must not contain braces`,
 	} {
@@ -350,13 +354,13 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 			t.Errorf("the playbook uses %s: a host is touched only through the subcommands of os_upgrade.py and the reboot", banned)
 		}
 	}
-	if !strings.Contains(src, `hosts: "{{ os_host if (os_mode | default('survey') == 'upgrade') else 'none' }}"`) {
+	if !strings.Contains(src, `hosts: "{{ os_host if ((os_mode | default('survey')) in ['upgrade', 'rehearse']) else 'none' }}"`) {
 		t.Error("the target play does not run on os_host in upgrade mode only")
 	}
 
 	// the subcommands the playbook may run on a host
 	allowed := []string{"apt-update", "survey", "simulate", "dump", "pin-grub", "upgrade-start", "upgrade-status", "upgrade-log",
-		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start"}
+		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start", "arm-rehearsal", "record-rehearsal"}
 	all := src
 	tasks, _ := filepath.Glob("ansible/tasks/os_upgrade_*.yml")
 	for _, tf := range tasks {
@@ -381,7 +385,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 		"Apt | the full-upgrade must have finished with exit 0",
 		"osu }} dkms-check --build",
 		"Dkms | REFUSE TO REBOOT",
-		"osu }} arm-oneshot",
+		"'arm-oneshot' if (os_mode == 'upgrade') else 'arm-rehearsal'",
 		"ansible.builtin.reboot:",
 		"Post | judge",
 		"osu }} make-permanent",
@@ -394,7 +398,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 		}
 		last = i
 	}
-	for _, once := range []string{"osu }} pin-grub", "osu }} arm-oneshot", "osu }} make-permanent", "osu }} upgrade-start"} {
+	for _, once := range []string{"osu }} pin-grub", "'arm-oneshot' if (os_mode == 'upgrade') else 'arm-rehearsal'", "osu }} make-permanent", "osu }} upgrade-start"} {
 		if n := strings.Count(src, once); n != 1 {
 			t.Errorf("%q appears %d times, want exactly 1", once, n)
 		}
@@ -402,6 +406,13 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 	// the pin happens before the first package change (the upgrade is also before the dkms-check)
 	if idx("osu }} pin-grub") > idx("Apt | update the package lists") {
 		t.Error("the old kernel is not pinned before apt runs")
+	}
+	// mode=rehearse reuses the target play but skips every package step; make-permanent lives only in the upgrade block
+	for _, n := range []string{"- name: Upgrade | the packages, DKMS and the checks of the new kernel\n      when: os_mode == 'upgrade'",
+		"- name: Permanent | the new kernel becomes the default\n      when: os_mode == 'upgrade'", "- name: Rehearse | the kernel under test is the running one"} {
+		if !strings.Contains(src, n) {
+			t.Errorf("the playbook lost %q", n)
+		}
 	}
 	// the blacklist is written on an r8127 host only, and the playbook wires the cleanup of a dead run's policy-rc.d
 	if !strings.Contains(src, "when: (blacklist_r8169 | bool) and pre_target.r8127") {
@@ -411,7 +422,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 		t.Error("the playbook does not clean up the policy-rc.d of a run that died")
 	}
 	// the two tasks that can leave the host armed must reach the rescue even when the host is UNREACHABLE (ansible does not rescue those)
-	for _, n := range []string{"osu }} arm-oneshot", "ansible.builtin.reboot:"} {
+	for _, n := range []string{"'arm-oneshot' if (os_mode == 'upgrade') else 'arm-rehearsal'", "ansible.builtin.reboot:"} {
 		i := idx(n)
 		j := strings.Index(src[i:], "- name:")
 		if j < 0 {
@@ -427,7 +438,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 		}
 	}
 	// a failure between the arming and the host's return disarms the one-shot: arm and reboot sit in a block whose rescue disarms
-	iArm := idx("osu }} arm-oneshot")
+	iArm := idx("'arm-oneshot' if (os_mode == 'upgrade') else 'arm-rehearsal'")
 	iRescue := idx("      rescue:")
 	iDisarm := strings.Index(src[iRescue:], "osu }} disarm")
 	if iArm >= iRescue || iDisarm < 0 || iRescue+iDisarm >= idx("Post | judge") || idx("ansible.builtin.reboot:") >= iRescue {
@@ -480,8 +491,8 @@ func TestOSUpgradeScriptCannotAutoremoveAndGuardsItsReads(t *testing.T) {
 	if n := strings.Count(code, `run(["grub-set-default"`); n != 3 {
 		t.Errorf("%d grub-set-default calls, want 3 (pin-grub, arm-oneshot, make-permanent)", n)
 	}
-	if n := strings.Count(code, `run(["grub-reboot"`); n != 1 {
-		t.Errorf("%d grub-reboot calls, want 1 (arm-oneshot)", n)
+	if n := strings.Count(code, `run(["grub-reboot"`); n != 2 {
+		t.Errorf("%d grub-reboot calls, want 2 (arm-oneshot, arm-rehearsal)", n)
 	}
 }
 
@@ -495,7 +506,7 @@ func TestClusterOSUpgradeJudgementCoversTheRequirements(t *testing.T) {
 		"dpkg or apt is busy", "dpkg --audit", "held kernel, boot or DKMS packages", "policy-rc.d", "no usable GRUB", "GRUB is not proven to have booted this host", "GRUB_SAVEDEFAULT=true",
 		"grub cannot write its environment block", "no menu entry for the running kernel", "order: ",
 		"would REMOVE protected package(s)", "apt-get -s full-upgrade failed",
-		"vmlinuz-", "initrd.img-", "has no menu entry for", "the fallback is not intact", "waits at the menu for ever", "linux-headers for",
+		"no successful one-shot rehearsal", "was armed as a one-shot by run", "a one-shot is still pending (", "vmlinuz-", "initrd.img-", "has no menu entry for", "the fallback is not intact", "waits at the menu for ever", "linux-headers for",
 		"are installed for the running kernel and not for", "dkms autoinstall -k", "the driver(s) of the NICs in use", "is NOT built for",
 		"no PCI aliases", "Secure Boot is ", "lists the same PCI id as r8127", "boot_id did not change", "the one-shot entry for",
 		"new crash dump(s)", "prerequisite regressed", "is not owned by", "is not in /proc/interrupts", "is not configured on the host",
@@ -804,6 +815,7 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 	type env = map[string]string
 	base := func(over env) env {
 		e := env{"IN_MODE": "survey", "IN_HOST": "-", "IN_CONFIRM": "", "IN_REASON": "platform survey", "IN_REPAIR_ACTION": "configure",
+			"IN_RETRY_KERNEL": "", "IN_HOLD": "auto",
 			"ALLOWED_HOSTS": "", "REF": "refs/heads/main", "DEFAULT_BRANCH": "main", "REPO": "goceleris/probatorium",
 			"GH_FIXTURE": filepath.Join(bin, "good.json"), "GH_RC": "0"}
 		for k, v := range over {
@@ -852,6 +864,18 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"a disarm is gated too", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1"}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
 		{"a listed disarm", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
 		{"a disarm confirmed in lower case", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "disarm-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly DISARM-msr1"},
+		{"a rehearsal with its confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
+		{"a rehearsal is gated too", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1"}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
+		{"a rehearsal confirmed as an upgrade", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "UPGRADE-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
+		{"a rehearsal confirmed in lower case", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "rehearse-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
+		{"a rehearsal needs the environment too", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1", "ALLOWED_HOSTS": "msr1", "GH_FIXTURE": filepath.Join(bin, "noreviewer.json")}), false, "no required reviewer"},
+		{"an upgrade retrying a kernel", up("msr1", env{"IN_RETRY_KERNEL": "7.0.0-40-generic"}), true, ""},
+		{"a retry kernel that is not a kernel", up("msr1", env{"IN_RETRY_KERNEL": "latest"}), false, "retry_kernel must be"},
+		{"a retry kernel with a second line", up("msr1", env{"IN_RETRY_KERNEL": "7.0.0-40-generic\nrm -rf"}), false, "retry_kernel must be"},
+		{"a retry kernel with a template", up("msr1", env{"IN_RETRY_KERNEL": "{{ x }}"}), false, "retry_kernel must be"},
+		{"hold on", up("msr1", env{"IN_HOLD": "on"}), true, ""},
+		{"hold off", up("msr1", env{"IN_HOLD": "off"}), true, ""},
+		{"hold with an unknown value", up("msr1", env{"IN_HOLD": "maybe"}), false, "hold_access_packages must be"},
 		{"a repair with its confirmation", rep(nil), true, ""},
 		{"a repair is gated too", rep(env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
 		{"a repair of a host that is not listed", rep(env{"ALLOWED_HOSTS": "msa2-server"}), false, "is not in the repository variable"},
@@ -892,5 +916,24 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 				t.Errorf("%s: refused for another reason than %q: %s", c.name, c.msg, out)
 			}
 		}
+	}
+}
+
+// The summary's checklist and the script's list of protected packages are built from the judge's own numbers and text: a threshold
+// or a package that moved in one place only would show PASS where the upgrade refuses.
+func TestOSUpgradeConstantsAgree(t *testing.T) {
+	judge := mustRead(t, osJudge)
+	sum := mustRead(t, filepath.Join(".github", "scripts", "os-upgrade-summary.sh"))
+	for _, c := range [][2]string{{"root_min", "os_min_root_free_kib"}, {"boot_min", "os_min_boot_free_kib"}, {"efi_min", "os_min_efi_free_kib"}} {
+		a := regexp.MustCompile(`(?m)^` + c[0] + `=(\d+)$`).FindStringSubmatch(sum)
+		b := regexp.MustCompile(`(?m)^` + c[1] + `: (\d+)$`).FindStringSubmatch(judge)
+		if a == nil || b == nil || a[1] != b[1] {
+			t.Errorf("%s in the summary (%v) and %s in the judge (%v) differ", c[0], a, c[1], b)
+		}
+	}
+	rj := regexp.MustCompile(`(?m)^os_protected_regex: '(.*)'$`).FindStringSubmatch(judge)
+	rs := regexp.MustCompile(`(?m)^PROTECTED_RE = re\.compile\(r"(.*)"\)$`).FindStringSubmatch(mustRead(t, osScript))
+	if rj == nil || rs == nil || rj[1] != rs[1] {
+		t.Errorf("os_protected_regex (%v) and PROTECTED_RE (%v) differ", rj, rs)
 	}
 }

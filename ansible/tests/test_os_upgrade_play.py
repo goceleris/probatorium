@@ -153,7 +153,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         shutil.rmtree(cls.work, ignore_errors=True)
 
     # ---- a host that is ready to be upgraded, fresh for each scenario
-    def fresh(self, **state):
+    def fresh(self, rehearsed=True, **state):
         h = self.h
         for stale in ("down", "stale_count"):
             if os.path.exists(h.state_dir + "/" + stale):
@@ -166,6 +166,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         h.state["upgrade_sleep"] = 0.2
         h.state.update(state)
         h.w("/boot/grub/grub.cfg", "")
+        if rehearsed:  # an upgrade needs a one-shot rehearsal on the running kernel
+            h.w("/var/lib/celeris-os-upgrade/rehearsal.json", json.dumps({"kernel": "7.0.0-31-generic", "run_id": "1", "ok": True, "utc": "2026-10-22T00:00:00Z"}))
         h.save()
         subprocess.run([h.bin + "/update-grub"], env=h.env(), check=True)  # the cfg of a host with GRUB_DEFAULT=0
         h.load()
@@ -187,7 +189,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         code = textwrap.dedent(m.group(1))
         env = dict(os.environ, IN_MODE=base["os_mode"], IN_HOST=base["os_host"], IN_CONFIRM=base.get("os_confirm", ""), IN_REASON=base["os_reason"],
                    IN_ALLOW=str(bool(base.get("allow_results_loss", False))).lower(), IN_REFRESH=str(bool(base.get("refresh_lists", False))).lower(),
-                   IN_BLACKLIST=str(bool(base.get("blacklist_r8169", False))).lower(), IN_REPAIR_ACTION=base.get("repair_action", "configure"), RUN_ID=base["os_run_id"], OS_OUT=out)
+                   IN_BLACKLIST=str(bool(base.get("blacklist_r8169", False))).lower(), IN_REPAIR_ACTION=base.get("repair_action", "configure"), IN_RETRY_KERNEL=base.get("retry_kernel", ""), IN_HOLD=base.get("hold_access_packages", "auto"), RUN_ID=base["os_run_id"], OS_OUT=out)
         subprocess.run([sys.executable, "-c", code], env=env, check=True)
         return os.path.join(out, "extra-vars.json")
 
@@ -251,6 +253,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertFalse([c for c in self.calls() if c.startswith(prefix)], "unexpected call " + prefix)
 
     UP = {"os_mode": "upgrade", "os_host": "msr1", "os_confirm": "UPGRADE-msr1"}
+    RH = {"os_mode": "rehearse", "os_host": "msr1", "os_confirm": "REHEARSE-msr1"}
 
     # ---------------------------------------------------------------------------------------- the good path
     def test_a_healthy_upgrade_of_msr1(self):
@@ -681,6 +684,116 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.rc, 0, self.log[-2500:])
         self.assertEqual(self.phase(), "permanent")
 
+    # ---------------------------------------------------------------------------------------- the one-shot rehearsal
+    def test_a_rehearsal_proves_the_one_shot_with_no_other_kernel_in_play(self):
+        self.fresh(rehearsed=False)
+        self.play("rehearse", self.RH)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.phase(), "rehearsed")
+        c = self.calls()
+        self.assertTrue(any(x.startswith("OSU arm-rehearsal") for x in c))
+        self.assertFalse(any(x.startswith(("apt-get -y", "apt-get -o", "dkms autoinstall", "update-initramfs", "grub-set-default " + ID_40)) for x in c))
+        self.assertLess(self.idx("grub-set-default"), self.idx("grub-reboot"))  # pinned first
+        self.assertLess(self.idx("grub-reboot"), self.idx("FAKE-REBOOT"))
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+        rec = json.loads(open(self.h.root + "/var/lib/celeris-os-upgrade/rehearsal.json").read())
+        self.assertEqual(rec["kernel"], "7.0.0-31-generic")
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["kernel_before"], r["kernel_after"]), ("rehearsed", "7.0.0-31-generic", "7.0.0-31-generic"))
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/last-upgrade.json"), "a rehearsal is not an upgrade: no marker for the order rule")
+        self.assertIn("REHEARSED", self.summary("rehearse", "msr1"))
+        # ... and now an upgrade is allowed
+        self.play("after_rehearsal", self.UP)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+
+    def test_an_upgrade_is_refused_without_a_rehearsal(self):
+        self.fresh(rehearsed=False)
+        self.refused("norehearsal", self.UP, "no successful one-shot rehearsal of this host on the running kernel")
+
+    def test_a_rehearsal_where_grub_never_consumed_the_one_shot_records_nothing(self):
+        self.fresh(rehearsed=False)
+        self.play("keepnext", self.RH, env={"BOOT_MODE": "keep-next"})
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("a one-shot is still pending", self.log)
+        self.assertIn("the fallback is NOT proven", self.log)
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/rehearsal.json"))
+        self.assertEqual(self.phase(), "returned")
+
+    def test_a_rehearsal_refuses_what_an_upgrade_refuses(self):
+        self.fresh(rehearsed=False)
+        self.h.state["boot_fs"] = "btrfs"
+        self.h.save()
+        self.refused("rehearse_btrfs", self.RH, "/boot/grub is on btrfs")
+
+    # ---------------------------------------------------------------------------------------- after a stranded boot
+    def stranded(self):
+        """msr1's documented failure: the new kernel is armed, the host never answers, a person power-cycles it: the old kernel runs
+        again, next_entry was consumed, the new kernel is installed cleanly."""
+        self.fresh()
+        self.play("strand", self.UP, env={"BOOT_MODE": "hang"})
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.j("msr1", "result.json")["status"], "failed-unknown-armed")
+        os.remove(self.h.state_dir + "/down")  # the power-cycle
+        self.h.load()
+        self.h.state["grubenv"]["next_entry"] = ""  # consumed by the NIC-less boot
+        self.h.save()
+
+    def test_after_a_stranding_the_next_upgrade_does_not_arm_the_same_kernel_again(self):
+        self.stranded()
+        self.assertTrue(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"))
+        before = len(self.calls())
+        self.play("rearm", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("was armed as a one-shot by run", self.log)
+        self.assertEqual([c for c in self.calls()[before:] if c.startswith(("grub-reboot", "FAKE-REBOOT"))], [], "the stranding kernel was armed a second time")
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
+
+    def test_after_a_stranding_a_deliberate_retry_is_possible(self):
+        self.stranded()
+        self.play("retry", dict(self.UP, retry_kernel="7.0.0-40-generic"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.phase(), "permanent")
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"))
+
+    def test_after_a_stranding_the_sanctioned_way_out_removes_the_kernel(self):
+        self.stranded()
+        self.h.load()
+        self.h.state["configure_ok"] = True
+        self.h.save()
+        self.play("strand_abort", dict(self.R, repair_action="abort-new-kernel"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertNotIn("linux-image-7.0.0-40-generic", self.h.state["packages"])
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"))
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+
+    # ---------------------------------------------------------------------------------------- holding the access path
+    def test_the_access_path_is_held_during_the_upgrade_of_an_r8127_host_by_default(self):
+        self.fresh()
+        self.play("hold_auto", self.UP)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        with open(os.path.join(self.out, "msr1", "apt-upgrade.log")) as f:
+            log = f.read()
+        self.assertIn("apt-mark hold grub-common grub-efi-arm64-bin openssh-server shim-signed tailscale", log)
+        self.assertIn("held: grub-common grub-efi-arm64-bin openssh-server shim-signed tailscale", log)
+        self.assertEqual(self.h.state["held"], [], "the holds outlived the run")
+        self.assertEqual(self.j("msr1", "result.json")["access_packages_held"], ["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed", "tailscale"])
+
+    def test_the_hold_can_be_switched_off(self):
+        self.fresh()
+        self.play("hold_off", dict(self.UP, hold_access_packages="off"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        with open(os.path.join(self.out, "msr1", "apt-upgrade.log")) as f:
+            self.assertNotIn("apt-mark hold", f.read())
+        self.assertEqual(self.j("msr1", "result.json")["access_packages_held"], [])
+
+    def test_the_hold_can_be_forced_on(self):
+        self.fresh()
+        self.h.state["upgrade_sleep"] = 0.2
+        self.play("hold_on", dict(self.UP, hold_access_packages="on"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertTrue(self.j("msr1", "result.json")["access_packages_held"])
+
     def test_a_nic_that_did_not_come_back_is_not_verified(self):
         self.fresh()
         self.play("nonic", self.UP, env={"BOOT_MODE": "no-nic"})
@@ -722,6 +835,11 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         with open(os.path.join(self.out, "toolchains.json"), "w") as f:
             json.dump([{"name": "dotnet sdk", "kind": "pinned", "pin": "10.0.400", "where": "x", "upstream": "10.0.402", "upstream_source": "y", "upstream_ahead": "true"}], f)
         md = self.summary("survey", "-")
+        self.assertIn("### Checklist: what to read before any host-changing dispatch", md)
+        self.assertLess(md.index("### Checklist"), md.index("| host | OS |"), "the checklist is at the top")
+        for want in ("GRUB booted this host and reads the grubenv Linux writes", "one-shot rehearsal done on the running kernel", "the r8169 decision",
+                     "the way in is intact today"):
+            self.assertIn(want, md)
         for want in ("SURVEYED", "| msr1 |", "| msa2-server |", "| msa2-client |", "r8127 (out-of-tree) against the in-tree r8169", "dotnet sdk", "10.0.402",
                      "in-tree driver as an option on `7.0.0-31-generic`: NO"):
             self.assertIn(want, md)
@@ -746,6 +864,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertTrue(self.j("msr1", "survey.json")["r8127"]["per_kernel"][k]["intree_lists_id"]["10ec:8127"])
         md = self.summary("survey", "-")
         self.assertIn("in-tree driver as an option on `7.0.0-38-generic`: the in-tree r8169 of that kernel LISTS the PCI id", md)
+        self.assertIn("| **ACTION** | ACTION: dispatch the first upgrade with blacklist_r8169=true", md)  # the checklist says what to decide beforehand
 
     def test_the_survey_summary_shows_a_pending_one_shot_and_the_pin(self):
         self.fresh()
@@ -758,13 +877,24 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("one-shot: " + ID_40, md)
         self.assertIn("dispatch mode=disarm", md)
         self.assertIn("upgrade drop-in present: false", md)
+        self.assertIn("| no one-shot pending (next_entry) |", md)
+        self.assertRegex(md, r"no one-shot pending \(next_entry\) \| gnulinux[^|]* \| \*\*FAIL\*\*")
         self.assertIn("kernel packages newer than the running kernel:", md)
+
+    def test_the_checklist_marks_a_host_whose_boot_is_not_proven(self):
+        self.fresh()
+        self.h.w("/proc/cmdline", "root=/dev/nvme0n1p2 ro\n")
+        self.play("survey_noproof", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertEqual(self.rc, 0, self.log[-1500:])
+        md = self.summary("survey", "-")
+        self.assertRegex(md, r"GRUB booted this host and reads the grubenv Linux writes \| /proc/cmdline has no BOOT_IMAGE=[^|]*\| \*\*FAIL\*\*")
 
     def test_the_survey_summary_marks_a_broken_way_in(self):
         self.fresh(sshd_rc=255)
         self.play("survey_ssh", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
         self.assertEqual(self.rc, 0, self.log[-1500:])
         self.assertIn("sshd -t fails", self.j("msr1", "survey.json")["access_problems"][0])
+        self.assertRegex(self.summary("survey", "-"), r"the way in is intact today[^\n]*sshd -t fails[^|]*\| \*\*FAIL\*\*")
 
     def test_survey_can_refresh_the_apt_lists_when_asked(self):
         self.fresh()

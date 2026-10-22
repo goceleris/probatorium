@@ -193,6 +193,8 @@ judge "$(mut "$work/pre.json" 's/"modinfo_r8127":true/"modinfo_r8127":false/')" 
 expect "an r8127 module missing for the running kernel refuses" "$refusals" "r8127 module is not available for the running kernel 7.0.0-14-generic"
 judge "$(mut "$work/pre.json" 's/"newest_installed_kernel":"7.0.0-14-generic"/"newest_installed_kernel":"7.0.0-20-generic"/')" "$work/post.json"
 expect "a newer kernel installed than the running one refuses" "$refusals" "kernel 7.0.0-20-generic is installed and 7.0.0-14-generic is running"
+judge "$(mut "$work/pre.json" 's/"newest_installed_kernel":"7.0.0-14-generic"/"newest_installed_kernel":"7.0.0-20-generic"/; s/"grub_pinned_to_running":false/"grub_pinned_to_running":true/')" "$work/post.json"
+expect "a newer kernel installed is no reason to refuse when the OS-upgrade pin makes the running kernel grub's default" "$refusals" ""
 # tailscaled running but not enabled at boot: the host would come back off the tailnet, unreachable to CI
 for st in disabled enabled-runtime; do
 	judge "$(mut "$work/pre.json" "s/\"tailscaled_enabled\":\"enabled\"/\"tailscaled_enabled\":\"$st\"/")" "$work/post.json"

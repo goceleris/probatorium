@@ -125,6 +125,7 @@ if name == "apt-get":
         save(); sys.exit(0)
     if "full-upgrade" in args:
         out("policy-rc.d present: %s\n" % os.path.exists(root + "/usr/sbin/policy-rc.d"))
+        out("held: %s\n" % " ".join(st.get("held", [])))
         out("env: %s %s %s\n" % (os.environ.get("DEBIAN_FRONTEND"), os.environ.get("NEEDRESTART_MODE"), os.environ.get("UCF_FORCE_CONFFOLD")))
         out("args: %s\n" % " ".join(args))
         time.sleep(float(st.get("upgrade_sleep", 0.3)))
@@ -154,6 +155,10 @@ if name == "apt-get":
 if name == "apt-mark":
     if args[:1] == ["showhold"]:
         out("\n".join(st.get("held", [])) + "\n"); sys.exit(0)
+    if args[:1] == ["hold"]:
+        st["held"] = sorted(set(st.get("held", [])) | set(args[1:])); save(); sys.exit(0)
+    if args[:1] == ["unhold"]:
+        st["held"] = [h for h in st.get("held", []) if h not in args[1:]]; save(); sys.exit(0)
     sys.exit(st.get("apt_mark_rc", 0))
 if name == "apt-config":
     out("\n".join('%s "%s";' % kv for kv in st.get("apt_config", {}).items()) + "\n"); sys.exit(0)
@@ -343,7 +348,9 @@ class FakeHost:
                    "linux-firmware": {"version": "20260301.git1", "status": "installed"},
                    "unattended-upgrades": {"version": "2.12", "status": "installed"},
                    "build-essential": {"version": "12.12", "status": "installed"},
-                   "tailscale": {"version": "1.90.0", "status": "installed"}})
+                   "tailscale": {"version": "1.90.0", "status": "installed"},
+                   "grub-efi-arm64-bin": {"version": "2.14", "status": "installed"}, "grub-common": {"version": "2.14", "status": "installed"},
+                   "shim-signed": {"version": "1.60", "status": "installed"}, "openssh-server": {"version": "10.0", "status": "installed"}})
         modinfo = {}
         for k in self.kernels:
             modinfo[k + "/r8169"] = {"filename": "/lib/modules/%s/kernel/drivers/net/ethernet/realtek/r8169.ko.zst" % k}

@@ -357,7 +357,8 @@ def boot_proof(running, efi, boot_uuid):
             problems.append("/boot/grub/grubenv is %d bytes, not 1024" % st.st_size)
     except OSError:
         problems.append("/boot/grub/grubenv does not exist")
-    return {"ok": not problems, "problems": problems, "boot_image": image, "efi_loader": loader, "prefix": prefix, "stub_uuid": stub_uuid}
+    return {"ok": not problems, "problems": problems, "boot_image": image, "efi_loader": loader, "prefix": prefix, "stub_uuid": stub_uuid,
+            "boot_uuid": boot_uuid.lower()}
 
 
 def boot_info():
@@ -557,6 +558,10 @@ INST = re.compile(r"^Inst (\S+)(?: \[([^\]]+)\])? \((\S+) ")
 REMV = re.compile(r"^Remv (\S+)")
 
 
+# what apt must never remove on a cluster host; the SAME text as os_protected_regex in vars/os_upgrade_judge.yml (a test compares them)
+PROTECTED_RE = re.compile(r"^(linux-|grub|shim|dkms|openssh|tailscale|apcupsd|docker|containerd|runc|netplan|systemd|ifenslave|r8127|network|sudo|python3|udev|kmod|initramfs-tools|iproute2|libc6|ca-certificates|efibootmgr|apt$|dpkg$|libapt|openssl|libssl|mokutil|ethtool|curl$)")
+
+
 def simulate(include_phased=False):
     argv = ["apt-get", "-s", "-o", "Debug::NoLocking=true", "-o", "APT::Get::Assume-Yes=false"]
     if include_phased:
@@ -581,7 +586,7 @@ def simulate(include_phased=False):
                 kept += line.split()
             else:
                 keeping = False
-    return {"rc": rc, "inst": inst, "remv": remv, "kept_back": kept,
+    return {"rc": rc, "inst": inst, "remv": remv, "kept_back": kept, "protected_removals": [r for r in remv if PROTECTED_RE.match(r)],
             "kernel_inst": [i["name"] for i in inst if re.match(r"^linux-(image|modules|headers)", i["name"])],
             "error": "" if rc == 0 else (err.strip() or out.strip())[-400:]}
 
@@ -685,6 +690,25 @@ def host_toolchain():
     return {"packages": {k: v for k, v in pk.items() if v}, "binaries": bins}
 
 
+def armed_records():
+    """Kernels a run armed as a one-shot and that no run made permanent: the host may have been stranded by them."""
+    out = []
+    for f in sorted(glob.glob(p(STATE_DIR + "/armed-*.json"))):
+        try:
+            with open(f) as fh:
+                out.append(json.load(fh))
+        except (OSError, ValueError):
+            out.append({"kernel": os.path.basename(f)[len("armed-"):-len(".json")], "run_id": "unreadable"})
+    return out
+
+
+def rehearsal_record():
+    try:
+        return json.loads(rd(STATE_DIR + "/rehearsal.json") or "{}")
+    except ValueError:
+        return {}
+
+
 def marker():
     try:
         return json.loads(rd(STATE_DIR + "/last-upgrade.json") or "{}")
@@ -702,6 +726,7 @@ def new_kernel_pkgs(running, broken_only=False):
     packages: a kernel that was installed before and works is not ours to remove."""
     rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n", "linux-image-*", "linux-modules-*", "linux-headers-*", "linux-tools-*"])
     by_version = {}
+    armed = {re.sub(r"-[a-z0-9]+$", "", r.get("kernel", "")) for r in armed_records()}  # "7.0.0-40" of "7.0.0-40-generic"
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 4 or parts[-1] in ("not-installed", "config-files"):
@@ -711,7 +736,7 @@ def new_kernel_pkgs(running, broken_only=False):
             by_version.setdefault(m.group(1), []).append((parts[0], parts[-1]))
     names = []
     for ver, pk in by_version.items():
-        if broken_only and all(st == "installed" for _, st in pk):
+        if broken_only and all(st == "installed" for _, st in pk) and ver not in armed:
             continue
         names += [n for n, _ in pk]
     return sorted(set(names))
@@ -828,6 +853,8 @@ def survey():
         "crash": sorted(os.listdir(p("/var/crash"))) if os.path.isdir(p("/var/crash")) else [],
         "host_toolchain": host_toolchain(),
         "marker": marker(),
+        "armed_kernels": armed_records(),
+        "rehearsal": rehearsal_record(),
     }
     return d
 
@@ -883,6 +910,7 @@ def dkms_check(running, target, build):
             for f in blacklist_files()),
         "running_r8127_signer": modinfo(running, "r8127")["signer"],
         "target_older_than_running": kver_key(target) < kver_key(running),
+        "target_armed_before": [r for r in armed_records() if r.get("kernel") == target],
         "access_problems": access_problems(),
         "secure_boot": boot_sb,
         "quiesce_hook": os.access(p("/usr/lib/systemd/system-shutdown/quiesce-r8127.shutdown"), os.X_OK),
@@ -993,7 +1021,7 @@ def upgrade_paths(run_id):
     return d, d + "/apt-upgrade.log", d + "/apt-upgrade.rc"
 
 
-def start_detached(run_id, subcmd, extra):
+def start_detached(run_id, subcmd, extra, held=()):
     d, log, rcf = upgrade_paths(run_id)
     if os.path.exists(p(POLICY_RC_D)) and rd(POLICY_RC_D) != POLICY.strip():
         fail("%s exists already and is not ours: not touching it" % POLICY_RC_D)
@@ -1011,13 +1039,13 @@ def start_detached(run_id, subcmd, extra):
                              stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
                              cwd="/", env=dict(os.environ))
     write(d + "/apt-upgrade.pid", "%d\n" % child.pid)
-    emit({"ok": True, "pid": child.pid, "log": log, "script": keep})
+    emit({"ok": True, "pid": child.pid, "log": log, "script": keep, "access_packages_held": sorted(held)})
 
 
 def cmd_upgrade_start(a):
     if os.path.exists(p(POLICY_RC_D)):
         fail("%s exists already: not touching it" % POLICY_RC_D)
-    start_detached(a.run_id, "_upgrade-run", [])
+    start_detached(a.run_id, "_upgrade-run", ["--hold"] if a.hold else [], held=access_to_hold() if a.hold else [])
 
 
 def cmd_repair_start(a):
@@ -1058,6 +1086,7 @@ def cmd_repair_run(a):
         if rc == 3:
             return
         steps.append(["dpkg", "--force-confold", "--configure", "-a"])
+        purged_versions = {NEW_KERNEL_PKG.match(n).group(1) for n in (pk if a.action == "abort-new-kernel" else []) if NEW_KERNEL_PKG.match(n)}
         rc = 0
         for argv in steps:
             sys.stdout.write("+ " + " ".join(argv) + "\n")
@@ -1065,6 +1094,12 @@ def cmd_repair_run(a):
             r = subprocess.run(argv, env=dict(os.environ, **APT_ENV, LC_ALL="C"), stdout=sys.stdout, stderr=subprocess.STDOUT)
             if r.returncode != 0:
                 rc = r.returncode
+        for rec in armed_records():  # an explicit decision resets the suspicion of a kernel that is gone
+            if re.sub(r"-[a-z0-9]+$", "", rec.get("kernel", "")) in purged_versions:
+                try:
+                    os.remove(p("%s/armed-%s.json" % (STATE_DIR, rec["kernel"])))
+                except OSError:
+                    pass
     finally:
         try:
             os.remove(p(POLICY_RC_D))
@@ -1073,11 +1108,45 @@ def cmd_repair_run(a):
         write(rcf, "%d\n" % rc)
 
 
+ACCESS_GLOBS = ["grub-*", "grub2-common", "shim*", "openssh-server", "tailscale*"]
+
+
+def access_packages():
+    """Installed packages of the way in and of the bootloader: both kernels share them, so no fallback helps if they break."""
+    rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n"] + ACCESS_GLOBS)
+    return sorted({l.split()[0] for l in out.splitlines() if l.endswith(" installed")})
+
+
+def access_to_hold():
+    """The access-path packages THIS run would hold: not the ones somebody held before."""
+    held_before = set(run(["apt-mark", "showhold"])[1].split())
+    return [n for n in access_packages() if n not in held_before]
+
+
+def unhold_ours(run_id):
+    """Releases the holds THIS run put (never one that was there before)."""
+    d, log, rcf = upgrade_paths(run_id)
+    names = [x for x in rd(d + "/held.txt").split() if x]
+    if names:
+        run(["apt-mark", "unhold"] + names)
+        try:
+            os.remove(p(d + "/held.txt"))
+        except OSError:
+            pass
+    return names
+
+
 def cmd_upgrade_run(a):
     """The detached half: runs apt-get with the policy-rc.d in place and removes it whatever happens."""
     d, log, rcf = upgrade_paths(a.run_id)
     rc = 1
     try:
+        if a.hold:
+            ours = access_to_hold()
+            write(d + "/held.txt", " ".join(ours) + "\n")
+            if ours:
+                sys.stdout.write("+ apt-mark hold %s\n" % " ".join(ours))
+                run(["apt-mark", "hold"] + ours)
         write(POLICY_RC_D, POLICY, 0o755)
         argv = ["apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold",
                 "-o", "Dpkg::Use-Pty=0", "-o", "DPkg::Lock::Timeout=600", "full-upgrade"]
@@ -1090,6 +1159,7 @@ def cmd_upgrade_run(a):
             os.remove(p(POLICY_RC_D))
         except OSError:
             pass
+        unhold_ours(a.run_id)
         write(rcf, "%d\n" % rc)
 
 
@@ -1137,11 +1207,12 @@ def cmd_upgrade_cleanup(a):
     if package_processes() or dpkg_lock_held():
         emit({"removed": False, "reason": "dpkg or apt is still running (%s)" % (", ".join(package_processes()) or "a dpkg lock is held")})
         return
+    unheld = unhold_ours(a.run_id)  # a run that died with its holds on
     if rd(POLICY_RC_D) == POLICY.strip():
         os.remove(p(POLICY_RC_D))
-        emit({"removed": True})
+        emit({"removed": True, "unheld": unheld})
     else:
-        emit({"removed": False, "reason": "no policy-rc.d of ours"})
+        emit({"removed": False, "reason": "no policy-rc.d of ours", "unheld": unheld})
 
 
 def cmd_upgrade_log(a):
@@ -1181,6 +1252,8 @@ def cmd_disarm(a):
 
 
 def cmd_arm(a):
+    if not a.run_id:
+        fail("--run-id is required")
     # an unattended upgrade that started since the check would be cut by the reboot
     if package_processes() or dpkg_lock_held():
         fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % (", ".join(package_processes()) or "a dpkg lock is held"))
@@ -1202,7 +1275,49 @@ def cmd_arm(a):
         d = disarm()  # never leave an unverified one-shot behind
         fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and %r; one-shot disarmed: %s" % (
             env.get("saved_entry"), env.get("next_entry"), old, new, d["ok"]))
+    write("%s/armed-%s.json" % (STATE_DIR, a.target), json.dumps({"kernel": a.target, "running": a.running, "run_id": a.run_id,
+          "armed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, sort_keys=True) + "\n")
     emit({"ok": True, "saved_entry": old, "next_entry": new, "running": a.running, "target": a.target})
+
+
+def cmd_arm_rehearsal(a):
+    """Arms next_entry to a boot of the RUNNING kernel (its top-level menu entry when that is the running kernel, else its Advanced
+    entry, which is also the saved default). It proves that GRUB reads the environment block Linux writes (next_entry is empty after
+    the boot) with no other kernel in play. If GRUB read another block it would boot entry 0, what any power cut gives today."""
+    if package_processes() or dpkg_lock_held():
+        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % (", ".join(package_processes()) or "a dpkg lock is held"))
+    rc, out, err = run(["update-grub"], timeout=600)
+    if rc != 0:
+        fail("update-grub failed: " + (out + err)[-300:])
+    entries = grub_entries()
+    saved_id = entry_id_for(entries, a.running)
+    if not saved_id:
+        fail("no grub entry for %s" % a.running)
+    env = grub_editenv()
+    if env.get("saved_entry") != saved_id:
+        fail("the saved default is %r, not the running kernel's entry %r: pin it first" % (env.get("saved_entry"), saved_id))
+    top = [e for e in entries if not e["parent"] and e["kernel"] == a.running and not e["recovery"]]
+    new = top[0]["full_id"] if top else saved_id
+    rc, out, err = run(["grub-reboot", new])
+    if rc != 0:
+        fail("grub-reboot failed: " + (out + err)[-300:])
+    env = grub_editenv()
+    if env.get("saved_entry") != saved_id or env.get("next_entry") != new:
+        d = disarm()
+        fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and %r; one-shot disarmed: %s" % (
+            env.get("saved_entry"), env.get("next_entry"), saved_id, new, d["ok"]))
+    emit({"ok": True, "saved_entry": saved_id, "next_entry": new, "running": a.running, "target": a.running,
+          "via": "top-level entry" if top else "advanced entry"})
+
+
+def cmd_record_rehearsal(a):
+    if running_kernel() != a.kernel:
+        fail("the host runs %s, not %s" % (running_kernel(), a.kernel))
+    if grub_editenv().get("next_entry"):
+        fail("a one-shot is still pending: GRUB did not consume it")
+    rec = {"kernel": a.kernel, "run_id": a.run_id, "ok": True, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    write(STATE_DIR + "/rehearsal.json", json.dumps(rec, sort_keys=True) + "\n")
+    emit(rec)
 
 
 def cmd_make_permanent(a):
@@ -1212,6 +1327,10 @@ def cmd_make_permanent(a):
     eid = entry_id_for(entries, a.target)
     if not eid:
         fail("no grub entry for %s" % a.target)
+    pending = grub_editenv().get("next_entry", "")
+    if pending:
+        # GRUB booted the one-shot and did not consume it: it reads another environment block than the one Linux writes
+        fail("a one-shot is still pending (%r) after the new kernel booted: GRUB did not consume it, so the fallback is not proven; nothing was changed" % pending)
     rc, out, err = run(["grub-set-default", eid])
     if rc != 0:
         fail("grub-set-default failed: " + (out + err)[-300:])
@@ -1222,6 +1341,10 @@ def cmd_make_permanent(a):
     rec = {"run_id": a.run_id, "host": rd("/etc/hostname"), "kernel_before": a.running, "kernel_after": a.target,
            "entry_id": eid, "permanent": True, "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     write(STATE_DIR + "/last-upgrade.json", json.dumps(rec, indent=1, sort_keys=True) + "\n")
+    try:
+        os.remove(p("%s/armed-%s.json" % (STATE_DIR, a.target)))  # verified: no longer a suspect
+    except OSError:
+        pass
     emit({"ok": True, **rec})
 
 
@@ -1301,11 +1424,13 @@ def main():
     add("upgrade-log", cmd_upgrade_log, "run-id")
     add("apt-update", cmd_apt_update)
     add("pin-grub", cmd_pin_grub, "running", "run-id")
-    add("upgrade-start", cmd_upgrade_start, "run-id")
-    add("_upgrade-run", cmd_upgrade_run, "run-id")
+    add("upgrade-start", cmd_upgrade_start, "run-id", flags=("hold",))
+    add("_upgrade-run", cmd_upgrade_run, "run-id", flags=("hold",))
     add("blacklist-r8169", cmd_blacklist, "run-id", "target")
     add("dkms-check", cmd_dkms_check, "running", "target", flags=("build",))
-    add("arm-oneshot", cmd_arm, "running", "target")
+    add("arm-oneshot", cmd_arm, "running", "target", "run-id")
+    add("arm-rehearsal", cmd_arm_rehearsal, "running", "target", "run-id")
+    add("record-rehearsal", cmd_record_rehearsal, "kernel", "run-id")
     add("disarm", cmd_disarm)
     add("make-permanent", cmd_make_permanent, "running", "target", "run-id")
     add("toolcheck", cmd_toolcheck)

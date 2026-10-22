@@ -186,6 +186,28 @@ out=$(PATH=$work/stub:$PATH HOST_SNAPSHOT_ROOT=$R bash "$snap" /tmp/m /tmp/r - -
 check "tailscaled active and its unit-file state" '"tailscaled_active":true,"tailscaled_enabled":"enabled-runtime"'
 out=$(HOST_SNAPSHOT_ROOT=$R PATH=/usr/bin:/bin bash "$snap" /tmp/m /tmp/r - - - 2>&1)
 
+# the OS-upgrade pin: a newer kernel installed is harmless to a reboot when grub's saved default IS the running kernel
+check "no drop-in of the OS upgrade: not pinned" '"grub_pinned_to_running":false'
+mkdir -p "$R/etc/default/grub.d" "$work/stubg"
+touch "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg"
+printf '#!/bin/bash\ncat "${STUB_ENV:?}"\n' > "$work/stubg/grub-editenv"
+chmod +x "$work/stubg/grub-editenv"
+pin() { # pin ENV-FILE-CONTENT
+	printf '%b' "$1" > "$work/grubenv"
+	out=$(PATH=$work/stubg:$PATH STUB_ENV=$work/grubenv HOST_SNAPSHOT_ROOT=$R bash "$snap" /tmp/m /tmp/r - - - 2>&1)
+}
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-14-generic-advanced-U\nnext_entry=\n'
+check "the saved default is the running kernel's entry, no one-shot: pinned" '"grub_pinned_to_running":true'
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-14-generic-advanced-U\nnext_entry=gnulinux-advanced-U>gnulinux-7.0.0-20-generic-advanced-U\n'
+check "a one-shot pending: not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-20-generic-advanced-U\n'
+check "the saved default is another kernel: not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-140-generic-advanced-U\n'
+check "a kernel whose name merely contains the running one: not pinned" '"grub_pinned_to_running":false'
+rm "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg"
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-14-generic-advanced-U\n'
+check "no drop-in even with a matching saved entry: not pinned" '"grub_pinned_to_running":false'
+
 # usage
 out=$(bash "$snap" a b 2>&1)
 rc=$?

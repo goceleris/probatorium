@@ -71,6 +71,62 @@ survey_section() {
 	echo
 }
 
+# The checklist: every fact a person must read BEFORE a host-changing dispatch, with a mark and the decision it informs.
+# Thresholds are the judge's (ansible/vars/os_upgrade_judge.yml; a test compares them). PASS / FAIL / NOTE (a human reads it).
+root_min=6291456
+boot_min=524288
+efi_min=32768
+checklist() {
+	echo "### Checklist: what to read before any host-changing dispatch"
+	echo
+	echo "PASS = fine. FAIL = the upgrade or the rehearsal will be refused, or would be unsafe: fix or decide first. NOTE = a person reads it and decides."
+	echo
+	echo "| host | check | value | mark | decision it informs |"
+	echo "|---|---|---|---|---|"
+	for h in $hosts; do
+		local sv=$out/$h/survey.json ps=$out/$h/preflight-snapshot.json
+		if [ ! -s "$sv" ]; then echo "| $h | survey record | none | FAIL | nothing can be decided for this host |"; continue; fi
+		[ -s "$ps" ] || ps=/dev/null
+		jq -r --arg h "$h" --argjson rootmin "$root_min" --argjson bootmin "$boot_min" --argjson efimin "$efi_min" --slurpfile snap <(if [ -s "$ps" ]; then cat "$ps"; else echo '{}'; fi) '
+			def row($c; $v; $m; $d): "| \($h) | \($c) | \($v | tostring | gsub("\\|"; "/")) | **\($m)** | \($d) |";
+			def gib($k): (((.disk[$k].free_kib // 0) / 1048576 * 10) | floor / 10);
+			($snap[0] // {}) as $sn
+			| (.boot.proof) as $pf
+			| .packages as $pk
+			| (.packages.simulation.inst | map(select(.name | test("^(docker|containerd|runc|tailscale|openssh-server|grub|shim|netplan|systemd$|linux-firmware)"))) | map("\(.name) \(.old) -> \(.new)") | join("; ")) as $access
+			| (.r8127.per_kernel[.newest_same_flavor] // null) as $nk
+			| (.packages.simulation.kernel_inst | map(select(test("^linux-image-"))) ) as $kimg
+			| (
+			row("GRUB booted this host and reads the grubenv Linux writes"; (if $pf.ok then "BOOT_IMAGE \($pf.boot_image); loader \($pf.efi_loader); prefix \($pf.prefix); stub fs \($pf.stub_uuid) = /boot/grub fs \($pf.boot_uuid)" else ($pf.problems | join(" / ")) end); (if $pf.ok then "PASS" else "FAIL" end); "if FAIL, every rehearsal and upgrade is refused; a one-shot cannot be trusted"),
+			row("no one-shot pending (next_entry)"; (if .boot.next_entry == "" then "none" else .boot.next_entry end); (if .boot.next_entry == "" then "PASS" else "FAIL" end); "if FAIL, mode=disarm first (an upgrade refuses)"),
+			row("upgrade pin vs the running kernel"; "drop-in \(.boot.dropin_present); saved default \(.boot.default_kernel | if . == "" then "unset" else . end); running \(.kernel)"; (if (.boot.dropin_present | not) then "NOTE" elif .boot.default_kernel == .kernel then "PASS" else "FAIL" end); "NOTE: not pinned yet, the first step pins. FAIL: the host runs a kernel other than its saved default: reboot it back (cluster-reboot) first"),
+			row("boot filesystem of /boot/grub"; "\(.boot.boot_fs) on \(.boot.boot_source) \(.boot.boot_stack)"; (if .boot.boot_stack == "" and (.boot.boot_fs | IN("ext4","vfat","xfs","ext3","ext2")) then "PASS" else "FAIL" end); "if FAIL, grub cannot write its environment block there, so no one-shot"),
+			row("GRUB_DEFAULT and the recordfail timeout"; "GRUB_DEFAULT=\(.boot.settings.GRUB_DEFAULT // "unset"); menu timeout after a failed boot \(.boot.cfg_recordfail_timeout | if . == "" then "n/a" else . end) s"; (if .boot.cfg_recordfail_timeout == "-1" then "FAIL" else "PASS" end); "-1 = a failed boot waits at the menu for ever (the pin sets 5 s)"),
+			row("apt would remove nothing protected"; ($pk.simulation.remv | join(", ") | if . == "" then "no removals" else . end) + (if ($pk.simulation.protected_removals | length) > 0 then "; PROTECTED: " + ($pk.simulation.protected_removals | join(", ")) else "" end); (if ($pk.simulation.protected_removals | length) == 0 and $pk.simulation.rc == 0 then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses before it changes a package"),
+			row("dpkg clean, nothing held, apt idle, no policy-rc.d"; "audit \($pk.dpkg_audit | length); held kernel/boot \($pk.held_kernel | join(",")); procs \($pk.package_processes | join(",")); lock \($pk.dpkg_lock_held); policy-rc.d \($pk.policy_rc_d_present)"; (if ($pk.dpkg_audit | length) == 0 and ($pk.held_kernel | length) == 0 and ($pk.package_processes | length) == 0 and ($pk.dpkg_lock_held | not) and ($pk.policy_rc_d_present | not) then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses (a broken dpkg: mode=repair)"),
+			row("the way in is intact today (sshd -t, ssh/tailscaled enabled, netplan generate)"; (.access_problems | join(" / ") | if . == "" then "ok" else . end); (if (.access_problems | length) == 0 then "PASS" else "FAIL" end); "if FAIL, an upgrade would change every package and then refuse to reboot, for ever"),
+			row("disk free"; "/ \(gib("/")) GiB (min \($rootmin / 1048576)); /boot \(gib("/boot")) GiB (min \($bootmin / 1048576 * 1000 | floor / 1000)); /boot/efi \(.disk["/boot/efi"].free_kib // "n/a") KiB (min \($efimin))"; (if ((.disk["/"].free_kib // 0) >= $rootmin) and ((.disk["/boot"].free_kib // 0) >= $bootmin) and ((.disk["/boot/efi"] == null) or (.disk["/boot/efi"].free_kib >= $efimin)) then "PASS" else "FAIL" end); "if FAIL, three kernels and their initrds do not fit: the upgrade refuses"),
+			row("clock synchronized"; .time_sync.raw; (if .time_sync.ntp_synchronized then "PASS" else "NOTE" end); "the verification compares it before and after"),
+			row("a new kernel is on offer"; ($kimg | join(", ") | if . == "" then "none (a rehearsal-only window; the upgrade would reboot into the same kernel)" else . end); (if ($kimg | length) == 1 then "PASS" elif ($kimg | length) == 0 then "NOTE" else "NOTE" end); "exactly one new ABI expected; the target is the newest of the running flavor"),
+			row("the kernel version parses (X.Y.Z-N-flavor)"; .kernel; (if (.kernel | test("^[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+-[a-z0-9-]+$")) then "PASS" else "FAIL" end); "if FAIL, the ordering of kernels is unreliable (a vendor kernel name)"),
+			row("DKMS modules installed for the running kernel"; (.dkms.installed_for_running | join(", ") | if . == "" then "none" else . end); (if .r8127.present then (if (.dkms.installed_for_running | index("r8127")) != null then "PASS" else "FAIL" end) else (if (.dkms.installed_for_running | length) == 0 then "PASS" else "NOTE" end) end); "an r8127 host must show r8127 here; a server with an in-tree NIC should show none"),
+			row("one-shot rehearsal done on the running kernel"; (.rehearsal | if . == {} then "none" else "\(.kernel) by run \(.run_id) at \(.utc)" end); (if .rehearsal.kernel == .kernel then "PASS" else "NOTE" end); "REQUIRED before an upgrade (mode=rehearse proves GRUB reads and clears the grubenv Linux writes)"),
+			row("kernels armed earlier and never verified"; ([.armed_kernels[] | "\(.kernel) (run \(.run_id))"] | join(", ") | if . == "" then "none" else . end); (if (.armed_kernels | length) == 0 then "PASS" else "FAIL" end); "if FAIL, the host may have been stranded by it; retry_kernel=<it> to try again, or mode=repair abort-new-kernel"),
+			row("run state"; "manifest \($sn.manifest_present // "?"); runner jobs \($sn.runner_workers // "?"); power-loss resume \($sn.resume_pending // "?"); crash dumps \(.crash | length)"; (if ($sn.manifest_present // false) or (($sn.runner_workers // 0) > 0) or ($sn.resume_pending // false) then "FAIL" else "PASS" end); "if FAIL, the upgrade refuses beside a run"),
+			row("access-path packages and third-party moves the full-upgrade brings"; ($access | if . == "" then "none" else . end) + "; third-party repos: " + ($pk.third_party_repos | join(", ") | if . == "" then "none" else . end); "NOTE"; "read the major jumps (docker, containerd, tailscale, openssh, grub, shim, netplan, systemd, linux-firmware): a full-upgrade has no checkpoint, and none of them is undone by a power-cycle"),
+			row("unattended-upgrades and phasing"; "periodic \(.unattended_upgrades.unattended_upgrade); removes unused kernels \(.unattended_upgrades.remove_unused_kernel_packages); phased and held back: \($pk.phased_held_back | join(", ") | if . == "" then "none" else . end)"; "NOTE"; "the pin keeps the old kernel from unattended removal; phased packages are not forced (PLAN d.4, d.5)")
+			),
+			(if .r8127.present then (
+			row("r8127: where the module comes from"; "\(.r8127.source); loaded \(.r8127.loaded_version); dkms \(.r8127.dkms | map("\(.version) \(.kernel) \(.state)") | join("; "))"; (if (.r8127.source | startswith("package:")) or .r8127.source == "dkms-source-without-package" then "PASS" else "FAIL" end); "manual-build or none: apt runs and the reboot is then refused (nothing to rebuild for the new kernel)"),
+			row("r8127: firmware blob rtl8127a-1.fw"; (.r8127.firmware_rtl8127_files | join(", ") | if . == "" then "absent" else . end); (if (.r8127.firmware_rtl8127_files | length) > 0 then "PASS" else "NOTE" end); "absent: the in-tree driver (if it binds) would run without PHY fixes"),
+			row("r8127: Secure Boot and the signer of the running module"; "Secure Boot \(.boot.secure_boot); signer `\(.r8127.per_kernel[.kernel].r8127.signer // "")`"; (if .boot.secure_boot == "enabled" and ((.r8127.per_kernel[.kernel].r8127.signer // "") == "") then "FAIL" else "NOTE" end); "enabled with an unsigned running module is impossible to reproduce: the new build must be signed by the same key"),
+			row("r8127: the r8169 decision (does the newest kernel'"'"'s in-tree driver list 10ec:8127?)"; (if $nk == null then "no record for the newest kernel" else "newest `\(.newest_same_flavor)`: lists the id \($nk.intree_lists_id | to_entries | map("\(.key)=\(.value)") | join(",")); r8169 blacklisted \(.r8127.r8169_blacklisted); running kernel lists it \(.r8127.per_kernel[.kernel].intree_lists_id | to_entries | map(.value) | any)" end); (if $nk == null then "NOTE" elif ($nk.intree_lists_id | to_entries | map(.value) | any) and (.r8127.r8169_blacklisted | not) then "ACTION" else "PASS" end); "ACTION: dispatch the first upgrade with blacklist_r8169=true (decided beforehand), or the reboot is refused and the window wasted")
+			) else empty end)
+		' "$sv"
+	done
+	echo
+}
+
 host_table() {
 	echo "| host | OS | running kernel | NEXT BOOT | newest same flavor | upgrades / removals / kept back | reboot-required | disk free / and /boot (GiB) | NTP | crash dumps |"
 	echo "|---|---|---|---|---|---|---|---|---|---|"
@@ -89,6 +145,7 @@ echo "- workflow run: $run_id"
 if [ "$mode" = survey ]; then
 	if [ "$rc" -eq 0 ]; then echo "- **result: SURVEYED** (read-only; nothing on any host was changed, except, when refresh_lists was set, what apt-get update writes: /var/lib/apt/lists, /var/cache/apt/*.bin and its post-invoke hooks)"; else echo "- **result: SURVEY FAILED** (ansible-playbook exit $rc): the hosts that answered have a record below"; fi
 	echo
+	checklist
 	host_table
 	echo
 	for h in $hosts; do survey_section "$h"; done
@@ -174,8 +231,10 @@ pre=$d/pre-snapshot.json
 post=$d/post-snapshot.json
 phase=$(cat "$d/phase.txt" 2> /dev/null || echo "none (the play never started on the host)")
 phase=${phase//$'\n'/}
-echo "- last phase reached: \`$phase\` (preflight-ok, pinned, upgrading, upgraded, dkms-ok, rebooting, returned, verified, permanent)"
-if [ "$rc" -eq 0 ] && [ "$phase" = permanent ]; then
+echo "- last phase reached: \`$phase\` (preflight-ok, pinned, upgrading, upgraded, dkms-ok, arming, rebooting, returned, verified, permanent, rehearsed)"
+if [ "$mode" = rehearse ] && [ "$rc" -eq 0 ] && [ "$phase" = rehearsed ]; then
+	echo "- **result: REHEARSED**: GRUB took the one-shot, cleared it (next_entry is empty), and $host runs the same kernel again. The one-shot mechanism works on this host; nothing else was changed (no package, no kernel)."
+elif [ "$rc" -eq 0 ] && [ "$phase" = permanent ]; then
 	if [ "$(jq -r '.kernel_before == .kernel_after' "$d/result.json" 2> /dev/null)" = true ]; then
 		echo "- **result: UPGRADED AND VERIFIED; no new kernel was installed, the running kernel stays the default**"
 	else
@@ -198,8 +257,11 @@ case "$phase" in
 permanent)
 	echo "- Power-cycle: **not needed**. $host runs the new kernel, which is now grub's saved default; the old kernel is still installed (nothing was auto-removed) and is the fallback to pick by hand in grub or by \`grub-set-default\` through a later change."
 	;;
+rehearsed)
+	echo "- Power-cycle: **not needed**. The host booted the one-shot and runs its kernel normally."
+	;;
 verified)
-	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED (see the log). grub's saved default is still the OLD kernel, so a reboot returns to it. Either accept the new kernel as the default by a reviewed change that runs grub-set-default for it, or reboot back with the cluster-reboot workflow (red with 'kernel changed', expected) and dispatch the upgrade again. The upgrade REFUSES to run while the host runs a kernel other than grub's saved default."
+	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED or was refused (see the log; the step may have changed grub's saved default before failing: dispatch a survey and read \`boot.saved_entry\` and \`boot.next_entry\`; a one-shot still pending after the boot means GRUB did not consume it). Either accept the new kernel as the default by a reviewed change that runs grub-set-default for it, or reboot back with the cluster-reboot workflow (red with 'kernel changed', expected) and dispatch the upgrade again. The upgrade REFUSES to run while the host runs a kernel other than grub's saved default."
 	;;
 returned)
 	echo "- Power-cycle: **not needed while $host answers** (if it stops answering later, read the 'rebooting' case: the one-shot is consumed by now, so a power-cycle boots the OLD kernel). $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. Reboot it back with the cluster-reboot workflow: it returns to the old kernel and ends red with 'kernel changed', which is expected here. Do NOT dispatch the upgrade again before that: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."

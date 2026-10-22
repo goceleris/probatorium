@@ -16,7 +16,7 @@
 # Inputs, set by the play: os_host (the target), os_bench_targets, os_loadgen_hosts (inventory group members),
 # os_surveys (every host's preflight survey, by host name), pre_target (the target's reboot_snapshot.sh record
 # before), pre_survey (its survey before), allow_results_loss, results_root, os_min_* (disk), and, as the play
-# produces them: sim (simulate), dkms_check, target_kernel, pre_toolcheck, post_raw / post_survey / toolcheck (after the reboot),
+# produces them: os_mode, retry_kernel, sim (simulate), dkms_check, target_kernel, pre_toolcheck, post_raw / post_survey / toolcheck (after the reboot),
 # placement_vector, lan_ip, fabric_peer, ansible_user, os_counter_ceiling.
 
 os_min_root_free_kib: 6291456
@@ -58,7 +58,8 @@ refusals_str: >-
   {% if s.boot.next_entry | length > 0 %}{% set _ = p.append('grub has a one-shot entry pending (next_entry=' ~ s.boot.next_entry ~ '): an earlier run armed it and the host has not booted it; settle that first') %}{% endif %}
   {% if s.boot.dropin_present and s.boot.default_kernel | length > 0 and s.boot.default_kernel != s.kernel %}{% set _ = p.append('an earlier OS upgrade left grub saved default ' ~ s.boot.default_kernel ~ ' while the host runs ' ~ s.kernel ~ ': a new run would pin the running kernel and move the fallback to a kernel that was not verified. Reboot the host back to ' ~ s.boot.default_kernel ~ ' first (the cluster-reboot workflow does that and ends red with "kernel changed", by design)') %}{% endif %}
   {% if (blacklist_r8169 | bool) and (s.nics | selectattr('driver', 'equalto', 'r8169') | list | length > 0) %}{% set _ = p.append('blacklist_r8169=true, but a NIC is bound to r8169 (' ~ (s.nics | selectattr('driver', 'equalto', 'r8169') | map(attribute='iface') | join(', ')) ~ '): the blacklist would remove it under every kernel, the old one included') %}{% endif %}
-  {% if os_host in os_loadgen_hosts %}
+  {% if os_mode == 'upgrade' and (s.rehearsal.kernel | default('')) != s.kernel %}{% set _ = p.append('no successful one-shot rehearsal of this host on the running kernel ' ~ s.kernel ~ ' (record: ' ~ (s.rehearsal.kernel | default('none')) ~ '): dispatch mode=rehearse first. It proves, with no other kernel in play, that GRUB reads and clears the environment block Linux writes, which every fallback of the upgrade depends on') %}{% endif %}
+  {% if os_mode == 'upgrade' and os_host in os_loadgen_hosts %}
   {% for h in os_bench_targets %}
   {% set m = (os_surveys[h].marker | default({})) %}
   {% if not (m.permanent | default(false)) or (m.kernel_after | default('')) != os_surveys[h].kernel %}{% set _ = p.append('order: ' ~ h ~ ' has not been upgraded and verified yet (or runs another kernel than its record says: ' ~ os_surveys[h].kernel ~ ' vs ' ~ (m.kernel_after | default('no record')) ~ '): the servers go first and the load generator last, because the servers are verified against it') %}{% endif %}
@@ -112,6 +113,7 @@ pre_reboot_problems_str: >-
   {% if a.r8127 and d.r8127.found and not d.r8127_aliases %}{% set _ = p.append('the r8127 module of ' ~ target_kernel ~ ' has no PCI aliases: it would never be loaded for the NIC') %}{% endif %}
   {% if a.r8127 and d.r8127.found and d.secure_boot != 'disabled' and (d.r8127.signer | length == 0 or (d.running_r8127_signer | length > 0 and d.r8127.signer != d.running_r8127_signer)) %}{% set _ = p.append('Secure Boot is ' ~ d.secure_boot ~ ' and the r8127 module of ' ~ target_kernel ~ ' is not signed by the key the running module is signed with (' ~ d.r8127.signer ~ ' vs ' ~ d.running_r8127_signer ~ '): the kernel may refuse to load it') %}{% endif %}
   {% if d.access_problems | length > 0 %}{% set _ = p.append('the way in is not intact on the upgraded userland (both kernels share it, a power-cycle would not undo it): ' ~ (d.access_problems | join(' / '))) %}{% endif %}
+  {% if d.target_armed_before | length > 0 and (retry_kernel | default('')) != target_kernel %}{% set _ = p.append('the kernel ' ~ target_kernel ~ ' was armed as a one-shot by run ' ~ (d.target_armed_before[0].run_id | default('?')) ~ ' and no run ever verified the host on it: if that boot stranded the host (a power-cycle brought it back on the old kernel), arming it again strands it again. Decide: dispatch with retry_kernel=' ~ target_kernel ~ ' to try it once more, or mode=repair abort-new-kernel to remove it') %}{% endif %}
   {% if d.target_older_than_running %}{% set _ = p.append('the intended kernel ' ~ target_kernel ~ ' is older than the running one ' ~ d.running) %}{% endif %}
   {% if a.r8127 and not d.quiesce_hook %}{% set _ = p.append('the shutdown quiesce hook of the r8127 NIC is missing') %}{% endif %}
   {% if a.r8127 and d.intree_lists_id and not (d.r8169_blacklisted and d.r8169_blacklist_in_initrd) %}{% set _ = p.append('the in-tree r8169 of ' ~ target_kernel ~ ' lists the same PCI id as r8127 and r8169 is not blacklisted in the new kernel initramfs as well (blacklisted: ' ~ d.r8169_blacklisted ~ ', in the initramfs: ' ~ d.r8169_blacklist_in_initrd ~ '): which driver binds the NIC would be a race that the bench (it pins the r8127 vector name) would lose. DECIDE: dispatch with blacklist_r8169=true to keep r8127 (it writes /etc/modprobe.d/celeris-r8127.conf and rebuilds the initramfs), or move to the in-tree driver in a separate reviewed change') %}{% endif %}
@@ -141,6 +143,7 @@ post_problems_str: >-
   {% set up_b = b.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
   {% if up_b < up_a %}{% set _ = p.append('bond lost a slave: ' ~ up_a ~ ' up before, ' ~ up_b ~ ' up now') %}{% endif %}
   {% if b.max_vector_total >= os_counter_ceiling %}{% set _ = p.append('a NIC vector counts ' ~ b.max_vector_total ~ ' since boot: the counters were not reset') %}{% endif %}
+  {% if bs | length > 0 and bs.boot.next_entry | length > 0 %}{% set _ = p.append('a one-shot is still pending (' ~ bs.boot.next_entry ~ ') after the host booted: GRUB did not consume it, so it reads or writes another environment block than the one Linux uses, and the fallback is NOT proven') %}{% endif %}
   {% if (b.failed_units | difference(a.failed_units)) | length > 0 %}{% set _ = p.append('new failed unit(s): ' ~ (b.failed_units | difference(a.failed_units) | join(', '))) %}{% endif %}
   {% if bs | length == 0 %}{% set _ = p.append('no readable survey after the reboot') %}{% else %}
   {% for n in s.nics %}
