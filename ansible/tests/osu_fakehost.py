@@ -302,6 +302,15 @@ class FakeHost:
         if mode:
             os.chmod(full, mode)
 
+    def proc(self, pid, *argv, comm=None):
+        """A running process: /proc/<pid>/cmdline (NUL separated, as the kernel prints it) and /proc/<pid>/comm (the first 15
+        characters of the program or script name, as the kernel keeps them)."""
+        self.w("/proc/%d/cmdline" % pid)
+        with open("%s/proc/%d/cmdline" % (self.root, pid), "wb") as f:
+            f.write(b"".join(a.encode() + b"\0" for a in argv))
+        base = os.path.basename(argv[1] if len(argv) > 1 and os.path.basename(argv[0]).startswith(("python", "perl", "sh", "bash", "dash")) else argv[0])
+        self.w("/proc/%d/comm" % pid, (comm if comm is not None else base[:15]) + "\n")
+
     def build(self, hostname, arm64):
         self.w("/etc/hostname", hostname + "\n")
         self.w("/etc/os-release", 'PRETTY_NAME="Ubuntu 26.04 LTS"\nNAME="Ubuntu"\nVERSION_ID="26.04"\nID=ubuntu\nVERSION_CODENAME=resolute\n')
@@ -342,6 +351,11 @@ class FakeHost:
         self.w("/var/lib/apt/lists/ports.ubuntu.com_InRelease")
         self.w("/var/lib/dpkg/lock-frontend")
         self.w("/var/lib/dpkg/lock")
+        self.w("/var/cache/apt/archives/lock")
+        self.w("/var/lib/apt/lists/lock")
+        # what an idle Ubuntu host always runs: neither is a package run (their comm is "unattended-upgr" and "packagekitd")
+        self.proc(900, "/usr/bin/python3", "/usr/share/unattended-upgrades/unattended-upgrade-shutdown", "--wait-for-signal")
+        self.proc(901, "/usr/libexec/packagekitd")
         self.w("/proc/1/comm", "systemd\n")
         self.w("/proc/stat", "btime 1\n")
         self.w("/etc/modprobe.d/blacklist.conf", "# nothing\n")

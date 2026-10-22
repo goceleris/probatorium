@@ -27,6 +27,18 @@ os_counter_ceiling: 1000000000
 # in (ssh, tailscale) and out (power guard, docker for the db fixtures)
 os_protected_regex: '^(linux-|grub|shim|dkms|openssh|tailscale|apcupsd|docker|containerd|runc|netplan|systemd|ifenslave|r8127|network|sudo|python3|udev|kmod|initramfs-tools|iproute2|libc6|ca-certificates|efibootmgr|apt$|dpkg$|libapt|openssl|libssl|mokutil|ethtool|curl$)'
 
+# The package-manager programs the tool reports as running (os_upgrade.py PKG_RUN_NAMES, read from /proc/<pid>/cmdline; a test compares the
+# two lists). Only these count here too: the first survey of release 1.6.0 (run 39814880117) recorded the kernel's 15-character comm names, among them
+# the idle daemons `unattended-upgr` (unattended-upgrade-shutdown --wait-for-signal) and `packagekitd`, which are not package runs.
+os_busy_process_names: 'apt apt-get aptitude dpkg unattended-upgrade apt.systemd.daily dkms update-grub grub-mkconfig update-initramfs'
+
+# Is a package run going on on the target (pre_survey)? "" when not; else the programs running, or the lock files held.
+apt_busy_str: >-
+  {% set pk = pre_survey.packages %}
+  {% set procs = pk.package_processes | select('in', os_busy_process_names.split()) | list %}
+  {% set locks = pk.locks_held | default([]) %}
+  {% if procs | length > 0 %}{{ procs | join(', ') }}{% elif pk.dpkg_lock_held or locks | length > 0 %}an apt or dpkg lock is held{{ (' (' ~ (locks | join(', ')) ~ ')') if locks | length > 0 else '' }}{% endif %}
+
 post_snap: >-
   {{ (post_raw.stdout | from_json) if (post_raw.stdout | default('') | length > 0) else {} }}
 
@@ -45,7 +57,7 @@ refusals_str: >-
   {% if s.disk['/'] is none or s.disk['/'].free_kib < os_min_root_free_kib %}{% set _ = p.append('not enough free disk on /: ' ~ (s.disk['/'].free_kib if s.disk['/'] is not none else 'unreadable') ~ ' KiB free, ' ~ os_min_root_free_kib ~ ' needed') %}{% endif %}
   {% if s.disk['/boot'] is none or s.disk['/boot'].free_kib < os_min_boot_free_kib %}{% set _ = p.append('not enough free disk on /boot: ' ~ (s.disk['/boot'].free_kib if s.disk['/boot'] is not none else 'unreadable') ~ ' KiB free, ' ~ os_min_boot_free_kib ~ ' needed (three kernels and their initrds)') %}{% endif %}
   {% if s.disk['/boot/efi'] is not none and s.disk['/boot/efi'].free_kib < os_min_efi_free_kib %}{% set _ = p.append('not enough free disk on /boot/efi: ' ~ s.disk['/boot/efi'].free_kib ~ ' KiB free, ' ~ os_min_efi_free_kib ~ ' needed') %}{% endif %}
-  {% if s.packages.dpkg_lock_held or s.packages.package_processes | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (s.packages.package_processes | join(', ') if s.packages.package_processes | length > 0 else 'a dpkg lock is held') ~ '): an unattended upgrade or another package run is in progress') %}{% endif %}
+  {% if (apt_busy_str | trim) | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (apt_busy_str | trim) ~ '): an unattended upgrade or another package run is in progress') %}{% endif %}
   {% if s.packages.dpkg_audit | length > 0 %}{% set _ = p.append('dpkg --audit reports half-configured or broken packages: ' ~ (s.packages.dpkg_audit | join(' / '))) %}{% endif %}
   {% if s.packages.held_kernel | length > 0 %}{% set _ = p.append('held kernel, boot or DKMS packages: ' ~ (s.packages.held_kernel | join(', ')) ~ ' (apt-mark unhold them deliberately, or leave the host)' ~ (('. Of these, THIS TOOL put the holds of ' ~ (s.packages.tool_holds | map(attribute='run_id') | join(', ')) ~ ' (' ~ (s.packages.tool_holds | map(attribute='packages') | map('join', ' ') | join(' / ')) ~ ') and a run that died left them: dispatch mode=repair with repair_action=release-holds, which releases only holds this tool recorded') if (s.packages.tool_holds | default([])) | length > 0 else '')) %}{% endif %}
   {% if s.access_problems | length > 0 %}{% set _ = p.append('the way in is ALREADY not intact on the current userland (' ~ (s.access_problems | join(' / ')) ~ '): an upgrade would change every package and then refuse to reboot, for ever. Fix it first') %}{% endif %}
@@ -76,7 +88,7 @@ maint_refusals_str: >-
   {% if os_mode == 'repair' %}
   {% if a.manifest_present %}{% set _ = p.append('a bench or validation manifest exists on the target') %}{% endif %}
   {% if a.runner_workers | int > 0 %}{% set _ = p.append(a.runner_workers ~ ' runner job(s) are executing on the host') %}{% endif %}
-  {% if s.packages.dpkg_lock_held or s.packages.package_processes | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (s.packages.package_processes | join(', ') if s.packages.package_processes | length > 0 else 'a dpkg lock is held') ~ '): a repair would race it') %}{% endif %}
+  {% if (apt_busy_str | trim) | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (apt_busy_str | trim) ~ '): a repair would race it') %}{% endif %}
   {% if s.boot.next_entry | length > 0 %}{% set _ = p.append('grub has a one-shot entry pending (next_entry=' ~ s.boot.next_entry ~ '): dispatch mode=disarm first') %}{% endif %}
   {% if s.packages.policy_rc_d_present and not s.packages.policy_rc_d_ours %}{% set _ = p.append('/usr/sbin/policy-rc.d exists and is not the one this workflow writes') %}{% endif %}
   {% if repair_action == 'configure' and s.packages.dpkg_audit | length == 0 %}{% set _ = p.append('nothing to repair: dpkg --audit is clean' ~ (' (this tool left holds in place: use repair_action=release-holds)' if (s.packages.tool_holds | default([])) | length > 0 else '')) %}{% endif %}

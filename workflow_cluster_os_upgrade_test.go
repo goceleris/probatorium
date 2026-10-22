@@ -585,6 +585,22 @@ func TestOSUpgradePlay(t *testing.T) {
 	}
 }
 
+// TestOSUpgradeRealHosts replays the three real hosts' records (the first real survey, run 39814880117) through the summary's
+// checklist and the judgement (test_os_upgrade_real_hosts.py): the row that read FAIL on every host because of two idle daemons is PASS.
+func TestOSUpgradeRealHosts(t *testing.T) {
+	py := pythonOrSkip(t)
+	if os.Getenv("PROBATORIUM_ANSIBLE_TESTS") != "1" {
+		t.Skip("set PROBATORIUM_ANSIBLE_TESTS=1 to replay the real hosts' records (needs jq and ansible-playbook); the ansible CI job runs it")
+	}
+	if _, err := exec.LookPath("ansible-playbook"); err != nil {
+		t.Fatal("PROBATORIUM_ANSIBLE_TESTS=1 but ansible-playbook is not installed")
+	}
+	out, err := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade_real_hosts.py")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("test_os_upgrade_real_hosts.py failed: %v\n%s", err, out)
+	}
+}
+
 func linuxPython(t *testing.T) string {
 	t.Helper()
 	_ = linuxBash(t) // skips off Linux: the play reads /proc with GNU tools
@@ -594,7 +610,7 @@ func linuxPython(t *testing.T) string {
 // The ansible CI job runs the three python tests under the cluster's ansible pin.
 func TestAnsibleJobRunsTheOSUpgradeTests(t *testing.T) {
 	wf := mustRead(t, filepath.Join(".github", "workflows", "test.yml"))
-	for _, s := range []string{"test_os_upgrade", "test_os_upgrade_judge", "test_os_upgrade_play"} {
+	for _, s := range []string{"test_os_upgrade", "test_os_upgrade_judge", "test_os_upgrade_play", "test_os_upgrade_real_hosts"} {
 		if !regexp.MustCompile(`(?m)^\s*run: python3 -I ansible/tests/` + s + `\.py\s*$`).MatchString(wf) {
 			t.Errorf("test.yml's ansible job does not run `python3 -I ansible/tests/%s.py`", s)
 		}
@@ -955,6 +971,19 @@ func TestOSUpgradeConstantsAgree(t *testing.T) {
 		b := regexp.MustCompile(`(?m)^` + c[1] + `: (\d+)$`).FindStringSubmatch(judge)
 		if a == nil || b == nil || a[1] != b[1] {
 			t.Errorf("%s in the summary (%v) and %s in the judge (%v) differ", c[0], a, c[1], b)
+		}
+	}
+	// the package-manager programs that count as a package run: the tool's list, the judge's and the summary's are one list
+	words := func(s string) string { f := strings.Fields(s); slices.Sort(f); return strings.Join(f, " ") }
+	bs := regexp.MustCompile(`(?m)^PKG_RUN_NAMES = frozenset\("([^"]+)"\.split\(\)\)$`).FindStringSubmatch(mustRead(t, osScript))
+	bj := regexp.MustCompile(`(?m)^os_busy_process_names: '([^']+)'$`).FindStringSubmatch(judge)
+	bm := regexp.MustCompile(`(?m)^busy_names="([^"]+)"$`).FindStringSubmatch(sum)
+	if bs == nil || bj == nil || bm == nil || words(bs[1]) != words(bj[1]) || words(bs[1]) != words(bm[1]) {
+		t.Errorf("the busy program lists differ: script %v, judge %v, summary %v", bs, bj, bm)
+	}
+	for _, idle := range []string{"unattended-upgr", "packagekitd", "unattended-upgrade-shutdown"} {
+		if strings.Contains(" "+words(bs[1])+" ", " "+idle+" ") {
+			t.Errorf("%s is an idle daemon, not a package run: it must not be in the list", idle)
 		}
 	}
 	rj := regexp.MustCompile(`(?m)^os_protected_regex: '(.*)'$`).FindStringSubmatch(judge)

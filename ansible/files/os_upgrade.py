@@ -627,32 +627,73 @@ def lists_age_hours():
     return round((time.time() - newest) / 3600, 1) if newest else None
 
 
-PKG_PROCS = {"apt", "apt-get", "dpkg", "unattended-upgr", "apt.systemd.dai", "packagekitd", "aptd", "dkms", "update-grub", "grub-mkconfig", "update-initramfs"}
+# What counts as a package run: a process that EXECUTES one of these programs (or a script of that name). The name is read from
+# /proc/<pid>/cmdline and NEVER decided from /proc/<pid>/comm: the kernel keeps 15 characters of a name, and "unattended-upgr" is
+# exactly 15, so the idle daemon Ubuntu always runs (`unattended-upgrade-shutdown --wait-for-signal`, waiting for a shutdown signal) and
+# a real `unattended-upgrade` run read alike. packagekitd idles when nobody uses it. Neither is a package run: when either one is
+# working it holds the dpkg or apt locks, which are checked next. (Release 1.6.0's first survey judged both by comm and
+# refused every host forever: probatorium run 39814880117.) The same words are in vars/os_upgrade_judge.yml (os_busy_process_names)
+# and .github/scripts/os-upgrade-summary.sh (busy_names): a test compares them.
+PKG_RUN_NAMES = frozenset("apt apt-get aptitude dpkg unattended-upgrade apt.systemd.daily dkms update-grub grub-mkconfig update-initramfs".split())
+SCRIPT_RUNNERS = re.compile(r"^(python[0-9.]*|perl|sh|bash|dash)$")
+APT_LOCKS = ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock", "/var/lib/apt/lists/lock", "/var/cache/apt/archives/lock")
+
+
+def process_program(argv):
+    """The program a process runs: argv[0]'s base name, or, for a script started through its interpreter (python3
+    /usr/bin/unattended-upgrade, /bin/sh /usr/lib/apt/apt.systemd.daily), the script's. "" for no argv (a kernel thread, a zombie)."""
+    if not argv:
+        return ""
+    name = os.path.basename(argv[0])
+    if SCRIPT_RUNNERS.match(name):
+        for a in argv[1:]:
+            if a == "-c":
+                return name  # sh -c "...": a command string, not a script
+            if a.startswith("-"):
+                continue
+            return os.path.basename(a)
+    return name
 
 
 def package_processes():
+    """The package-manager programs running now, by name, sorted: real apt, apt-get, dpkg, unattended-upgrade ... processes, read from
+    /proc/<pid>/cmdline. The idle unattended-upgrade-shutdown listener and an idle packagekitd are not among them."""
     found = []
-    for c in glob.glob(p("/proc/[0-9]*/comm")):
+    for c in glob.glob(p("/proc/[0-9]*/cmdline")):
         try:
-            name = open(c).read().strip()
+            with open(c, "rb") as f:
+                raw = f.read()
         except OSError:
             continue
-        if name in PKG_PROCS:
+        name = process_program([x.decode("utf-8", "replace") for x in raw.split(b"\0") if x])
+        if name in PKG_RUN_NAMES:
             found.append(name)
     return sorted(found)
 
 
-def dpkg_lock_held():
-    for lock in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"):
+def locks_held():
+    """The dpkg and apt lock files another process holds right now (apt, dpkg, unattended-upgrade and PackageKit all take them while they
+    work, and not while they idle). A shared lock is asked for without waiting: a refusal means somebody holds it exclusively."""
+    held = []
+    for lock in APT_LOCKS:
         try:
             with open(p(lock), "rb") as f:
                 try:
                     fcntl.lockf(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 except OSError:
-                    return True
+                    held.append(lock)
         except OSError:
             continue
-    return False
+    return held
+
+
+def package_run_busy():
+    """"" when no package run is going on, else the words for a refusal: the programs running, or the locks held."""
+    procs = package_processes()
+    if procs:
+        return ", ".join(procs)
+    held = locks_held()
+    return ("an apt or dpkg lock is held (%s)" % ", ".join(held)) if held else ""
 
 
 def apt_config():
@@ -853,6 +894,7 @@ def survey():
     ent = boot["entries"]
     boot["running_entry_id"] = entry_id_for(parse_grub_cfg(rd("/boot/grub/grub.cfg")), running)
     ntp = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])[1].strip()
+    lock_files = locks_held()
     d = {
         "schema": 1,
         "host": rd("/etc/hostname"),
@@ -877,7 +919,8 @@ def survey():
             "pin_files": sorted(os.path.basename(x) for x in glob.glob(p("/etc/apt/preferences.d/*")) + glob.glob(p("/etc/apt/preferences"))),
             "dpkg_audit": [x for x in run(["dpkg", "--audit"])[1].splitlines() if x.strip()],
             "package_processes": package_processes(),
-            "dpkg_lock_held": dpkg_lock_held(),
+            "locks_held": lock_files,
+            "dpkg_lock_held": bool(lock_files),
             "policy_rc_d_present": os.path.exists(p(POLICY_RC_D)),
             "policy_rc_d_ours": rd(POLICY_RC_D) == POLICY.strip(),
             "new_kernel_pkgs": new_kernel_pkgs(running),
@@ -1335,8 +1378,9 @@ def cmd_upgrade_cleanup(a):
         emit({"removed": False, "reason": "the apt run is still alive"})
         return
     # the detached wrapper can die (the OOM killer) while its apt-get child, reparented to init, still runs
-    if package_processes() or dpkg_lock_held():
-        emit({"removed": False, "reason": "dpkg or apt is still running (%s)" % (", ".join(package_processes()) or "a dpkg lock is held")})
+    busy = package_run_busy()
+    if busy:
+        emit({"removed": False, "reason": "dpkg or apt is still running (%s)" % busy})
         return
     unheld = unhold_ours(a.run_id)  # a run that died with its holds on
     if rd(POLICY_RC_D) == POLICY.strip():
@@ -1411,8 +1455,9 @@ def cmd_arm(a):
     if not a.run_id:
         fail("--run-id is required")
     # an unattended upgrade that started since the check would be cut by the reboot
-    if package_processes() or dpkg_lock_held():
-        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % (", ".join(package_processes()) or "a dpkg lock is held"))
+    busy = package_run_busy()
+    if busy:
+        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % busy)
     rc, out, err = run(["update-grub"], timeout=600)
     if rc != 0:
         fail("update-grub failed: " + (out + err)[-300:])
@@ -1442,8 +1487,9 @@ def cmd_arm_rehearsal(a):
     and the reboot would be booted). It proves that GRUB reads the environment block Linux writes (next_entry is empty after the
     boot). NOT a zero-kernel-risk test: if GRUB ignores the block it boots its first menu entry (see boot.entry0_kernel), which is
     another kernel while a newer one is installed; the judge refuses that unless the maintainer confirmed a console."""
-    if package_processes() or dpkg_lock_held():
-        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % (", ".join(package_processes()) or "a dpkg lock is held"))
+    busy = package_run_busy()
+    if busy:
+        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % busy)
     rc, out, err = run(["update-grub"], timeout=600)
     if rc != 0:
         fail("update-grub failed: " + (out + err)[-300:])

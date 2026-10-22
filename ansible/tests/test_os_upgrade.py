@@ -186,11 +186,11 @@ class Survey(Base):
         self.assertFalse(p["policy_rc_d_ours"])
 
     def test_busy_dpkg_and_broken_packages_are_seen(self):
-        self.h.w("/proc/4242/comm", "unattended-upgr\n")
+        self.h.proc(4242, "/usr/bin/python3", "/usr/bin/unattended-upgrade")
         self.h.state["audit"] = ["The following packages are only half configured:", " foo  a thing"]
         self.h.state["held"] = ["linux-image-generic", "vim"]
         s = self.run_ok("survey")["packages"]
-        self.assertEqual(s["package_processes"], ["unattended-upgr"])
+        self.assertEqual(s["package_processes"], ["unattended-upgrade"])
         self.assertEqual(len(s["dpkg_audit"]), 2)
         self.assertEqual(s["held_kernel"], ["linux-image-generic"])
 
@@ -257,6 +257,137 @@ class Survey(Base):
         # the subcommands that read are the ones main() puts in READ_ONLY mode
         src = open(os.path.join(HERE, "..", "files", "os_upgrade.py")).read()
         self.assertIn('a.cmd in ("survey", "simulate", "dump", "upgrade-status", "upgrade-log", "marker")', src)
+
+
+class PackageRunDetection(Base):
+    """Is a package run going on? The real hosts' first survey (run 39814880117) said yes on all three, because the idle Ubuntu daemons
+    `unattended-upgrade-shutdown --wait-for-signal` and `packagekitd` were judged by their comm, whose 15 characters make
+    "unattended-upgr" of both that daemon and a real unattended-upgrade."""
+
+    IDLE_LISTENER = ("/usr/bin/python3", "/usr/share/unattended-upgrades/unattended-upgrade-shutdown", "--wait-for-signal")
+
+    def pk(self):
+        return self.run_ok("survey")["packages"]
+
+    def test_the_idle_listener_and_an_idle_packagekit_are_not_a_package_run(self):
+        # the fake host runs both from the start (osu_fakehost.build): this is the state of every real host
+        self.assertEqual(open(self.h.root + "/proc/900/comm").read().strip(), "unattended-upgr")  # the premise: comm cannot tell them apart
+        self.assertEqual(open(self.h.root + "/proc/901/comm").read().strip(), "packagekitd")
+        pk = self.pk()
+        self.assertEqual(pk["package_processes"], [])
+        self.assertEqual(pk["locks_held"], [])
+        self.assertFalse(pk["dpkg_lock_held"])
+        self.assertEqual(osu.package_run_busy(), "")
+
+    def test_a_comm_that_only_looks_like_a_package_manager_is_not_enough(self):
+        # a kernel thread, a zombie (empty cmdline) and a process that merely has the comm of one
+        self.h.w("/proc/4000/comm", "dpkg\n")
+        self.h.w("/proc/4000/cmdline", "")
+        self.h.proc(4001, "/usr/bin/vim", "/var/log/dpkg.log", comm="dpkg")
+        self.h.proc(4002, "/usr/bin/less", "/usr/bin/apt-get")
+        self.h.proc(4003, "/usr/bin/dpkg-query", "-W")
+        self.assertEqual(self.pk()["package_processes"], [])
+
+    def test_a_real_apt_get_upgrade_is_a_package_run(self):
+        self.h.proc(4242, "/usr/bin/apt-get", "upgrade")
+        self.assertEqual(self.pk()["package_processes"], ["apt-get"])
+
+    def test_a_real_unattended_upgrade_is_a_package_run_though_its_comm_is_the_listeners(self):
+        self.h.proc(4243, "/usr/bin/python3", "/usr/bin/unattended-upgrade", "-d")
+        self.assertEqual(open(self.h.root + "/proc/4243/comm").read().strip(), "unattended-upgr")
+        self.assertEqual(self.pk()["package_processes"], ["unattended-upgrade"])
+
+    def test_every_program_of_the_list_is_found_whether_run_directly_or_as_a_script(self):
+        for i, argv in enumerate((("/usr/bin/apt", "install", "x"), ("/usr/bin/dpkg", "--configure", "-a"), ("/usr/bin/aptitude",),
+                                  ("/bin/sh", "/usr/lib/apt/apt.systemd.daily", "lock_is_held", "update"), ("/usr/bin/bash", "/usr/sbin/dkms", "autoinstall"),
+                                  ("/bin/sh", "/usr/sbin/update-grub"), ("/usr/bin/perl", "/usr/sbin/update-initramfs", "-u"),
+                                  ("/usr/bin/python3.13", "-u", "/usr/bin/unattended-upgrade"), ("/bin/sh", "/usr/sbin/grub-mkconfig", "-o", "/boot/grub/grub.cfg"))):
+            self.h.proc(5000 + i, *argv)
+        self.assertEqual(self.pk()["package_processes"],
+                         ["apt", "apt.systemd.daily", "aptitude", "dkms", "dpkg", "grub-mkconfig", "unattended-upgrade", "update-grub", "update-initramfs"])
+
+    def test_the_program_of_an_argv(self):
+        for argv, want in (([], ""), (["/usr/bin/apt-get", "-y"], "apt-get"), (["/usr/bin/python3", "/usr/bin/unattended-upgrade"], "unattended-upgrade"),
+                           (["/usr/bin/python3", "-u", "/usr/bin/unattended-upgrade"], "unattended-upgrade"),
+                           (["/bin/sh", "-c", "apt-get update"], "sh"), (["/usr/bin/python3", "-m", "pip"], "pip"), (["/usr/bin/python3"], "python3"),
+                           (["/usr/bin/python3", "/usr/share/unattended-upgrades/unattended-upgrade-shutdown", "--wait-for-signal"], "unattended-upgrade-shutdown")):
+            self.assertEqual(osu.process_program(argv), want, argv)
+
+    def test_a_held_lock_is_a_package_run_for_each_of_the_four_locks(self):
+        import fcntl
+        self.assertEqual(sorted(osu.APT_LOCKS), ["/var/cache/apt/archives/lock", "/var/lib/apt/lists/lock", "/var/lib/dpkg/lock", "/var/lib/dpkg/lock-frontend"])
+        for lock in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock", "/var/lib/apt/lists/lock", "/var/cache/apt/archives/lock"):
+            f = open(self.h.root + lock, "w")
+            fcntl.lockf(f, fcntl.LOCK_EX)
+            try:
+                pk = self.pk()  # a child process is refused the shared lock while this one holds the exclusive one
+            finally:
+                f.close()
+            self.assertEqual(pk["locks_held"], [lock], lock)
+            self.assertTrue(pk["dpkg_lock_held"], lock)
+            self.assertEqual(pk["package_processes"], [], lock)
+
+    def test_a_lock_file_that_nobody_holds_is_not_a_package_run(self):
+        self.assertEqual(self.pk()["locks_held"], [])
+        os.remove(self.h.root + "/var/lib/apt/lists/lock")  # an absent lock file is not a held one
+        self.assertEqual(self.pk()["locks_held"], [])
+
+    def test_the_busy_words_of_a_refusal(self):
+        self.h.save()
+        self.assertEqual(osu.package_run_busy(), "")
+        self.h.proc(4242, "/usr/bin/apt-get", "upgrade")
+        os.environ["OSU_ROOT"] = self.h.root
+        old, osu.ROOT = osu.ROOT, self.h.root
+        try:
+            self.assertEqual(osu.package_run_busy(), "apt-get")
+        finally:
+            osu.ROOT = old
+
+    def run_changing(self, *a):
+        self.h.save()
+        return self.h.run(*a)
+
+    def pinned(self):
+        self.h.save()
+        pin = self.h.run("pin-grub", "--running", "7.0.0-31-generic", "--run-id", "5")
+        self.assertEqual(pin.returncode, 0, pin.stderr)
+        self.h.load()
+
+    def test_every_refusal_to_go_on_into_a_package_run_names_the_real_process(self):
+        self.pinned()
+        self.h.proc(4242, "/usr/bin/apt-get", "-y", "full-upgrade")
+        for args in (("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic", "--run-id", "6"),
+                     ("arm-oneshot", "--running", "7.0.0-31-generic", "--target", "7.0.0-38-generic", "--run-id", "6")):
+            r = self.run_changing(*args)
+            self.assertEqual(r.returncode, 1, args)
+            self.assertIn("dpkg or apt is busy (apt-get)", r.stdout + r.stderr)
+        self.h.w("/usr/sbin/policy-rc.d", osu.POLICY, 0o755)
+        c = self.j(self.run_changing("upgrade-cleanup", "--run-id", "42"))
+        self.assertEqual(c["removed"], False)
+        self.assertIn("dpkg or apt is still running (apt-get)", c["reason"])
+
+    def test_with_only_the_idle_daemons_nothing_is_refused_and_the_cleanup_runs(self):
+        self.pinned()
+        self.h.w("/usr/sbin/policy-rc.d", osu.POLICY, 0o755)
+        self.assertEqual(self.j(self.run_changing("upgrade-cleanup", "--run-id", "42"))["removed"], True)
+        r = self.run_changing("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic", "--run-id", "6")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_held_lock_refuses_the_arming_and_the_cleanup(self):
+        import fcntl
+        self.pinned()
+        self.h.save()
+        f = open(self.h.root + "/var/lib/apt/lists/lock", "w")
+        fcntl.lockf(f, fcntl.LOCK_EX)
+        try:
+            r = self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic", "--run-id", "6")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("an apt or dpkg lock is held (/var/lib/apt/lists/lock)", r.stdout + r.stderr)
+            self.h.w("/usr/sbin/policy-rc.d", osu.POLICY, 0o755)
+            c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+            self.assertEqual(c["removed"], False)
+        finally:
+            f.close()
 
 
 class BootProof(Base):
@@ -527,11 +658,12 @@ class Upgrade(Base):
     def test_cleanup_waits_for_a_dpkg_that_outlives_its_wrapper(self):
         # the wrapper died (the OOM killer) and apt-get, reparented to init, still runs
         self.h.w("/usr/sbin/policy-rc.d", osu.POLICY, 0o755)
-        self.h.w("/proc/4343/comm", "dpkg\n")
+        self.h.proc(4343, "/usr/bin/dpkg", "--configure", "-a")
         self.h.save()
         c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
         self.assertEqual(c["removed"], False)
         self.assertIn("dpkg or apt is still running", c["reason"])
+        os.remove(self.h.root + "/proc/4343/cmdline")
         os.remove(self.h.root + "/proc/4343/comm")
         self.assertEqual(self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))["removed"], True)
 
@@ -715,7 +847,7 @@ class OneShotAndPermanent(DkmsCheck):
 
     def test_arming_into_a_running_package_run_is_refused(self):
         self.after_upgrade()
-        self.h.w("/proc/4242/comm", "unattended-upgr\n")
+        self.h.proc(4242, "/usr/bin/python3", "/usr/bin/unattended-upgrade")
         self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
         r = self.arm()
         self.assertEqual(r.returncode, 1)
@@ -1098,9 +1230,10 @@ class Rehearsal(Base):
 
     def test_it_refuses_into_a_running_package_run_and_disarms_what_it_cannot_verify(self):
         self.pinned()
-        self.h.w("/proc/4242/comm", "dpkg\n")
+        self.h.proc(4242, "/usr/bin/dpkg", "--configure", "-a")
         self.assertEqual(self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic").returncode, 1)
         os.remove(self.h.root + "/proc/4242/comm")
+        os.remove(self.h.root + "/proc/4242/cmdline")
         self.h.state["reboot_sets_wrong"] = True
         self.h.save()
         r = self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic")

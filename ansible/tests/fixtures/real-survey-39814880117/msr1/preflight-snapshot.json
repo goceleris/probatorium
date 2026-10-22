@@ -1,0 +1,579 @@
+{
+    "bonds": [
+        {
+            "bond": "bond0",
+            "mode": "IEEE 802.3ad Dynamic link aggregation",
+            "slaves": [
+                "enp1s0=up",
+                "enp49s0=up"
+            ]
+        }
+    ],
+    "boot_id": "BOOTID-MSR1",
+    "boot_time": "2026-09-09 10:43:09",
+    "btime": 1788950589,
+    "crash": [
+        "202609082320",
+        "202609091231",
+        "kdump_lock",
+        "kexec_cmd",
+        "linux-image-7.0.0-31-generic-202609082320.crash",
+        "linux-image-7.0.0-31-generic-202609091231.crash"
+    ],
+    "failed_units": [],
+    "grub_pinned_to_running": false,
+    "kernel": "7.0.0-31-generic",
+    "lan_ip": "-",
+    "lan_ip_present": null,
+    "manifest_present": false,
+    "max_vector_total": 4148637594,
+    "modinfo_r8127": true,
+    "newest_installed_kernel": "7.0.0-38-generic",
+    "nic_vectors": [
+        {
+            "affinity": "0",
+            "effective": "0",
+            "iface": "enp1s0",
+            "irq": 159,
+            "name": "enp1s0-0",
+            "total": 3054967609
+        },
+        {
+            "affinity": "0-11",
+            "effective": "9",
+            "iface": "enp1s0",
+            "irq": 160,
+            "name": "enp1s0-1",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "10",
+            "iface": "enp1s0",
+            "irq": 161,
+            "name": "enp1s0-2",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "11",
+            "iface": "enp1s0",
+            "irq": 162,
+            "name": "enp1s0-3",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "0",
+            "iface": "enp1s0",
+            "irq": 163,
+            "name": "enp1s0-4",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "1",
+            "iface": "enp1s0",
+            "irq": 164,
+            "name": "enp1s0-5",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "2",
+            "iface": "enp1s0",
+            "irq": 165,
+            "name": "enp1s0-6",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "3",
+            "iface": "enp1s0",
+            "irq": 166,
+            "name": "enp1s0-7",
+            "total": 0
+        },
+        {
+            "affinity": "1",
+            "effective": "1",
+            "iface": "enp1s0",
+            "irq": 167,
+            "name": "enp1s0-8",
+            "total": 2827095865
+        },
+        {
+            "affinity": "0-11",
+            "effective": "5",
+            "iface": "enp1s0",
+            "irq": 168,
+            "name": "enp1s0-9",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "6",
+            "iface": "enp1s0",
+            "irq": 169,
+            "name": "enp1s0-10",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "7",
+            "iface": "enp1s0",
+            "irq": 170,
+            "name": "enp1s0-11",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "8",
+            "iface": "enp1s0",
+            "irq": 171,
+            "name": "enp1s0-12",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "9",
+            "iface": "enp1s0",
+            "irq": 172,
+            "name": "enp1s0-13",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "10",
+            "iface": "enp1s0",
+            "irq": 173,
+            "name": "enp1s0-14",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "11",
+            "iface": "enp1s0",
+            "irq": 174,
+            "name": "enp1s0-15",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "0",
+            "iface": "enp1s0",
+            "irq": 175,
+            "name": "enp1s0-16",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "1",
+            "iface": "enp1s0",
+            "irq": 176,
+            "name": "enp1s0-17",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "2",
+            "iface": "enp1s0",
+            "irq": 177,
+            "name": "enp1s0-18",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "3",
+            "iface": "enp1s0",
+            "irq": 178,
+            "name": "enp1s0-19",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "4",
+            "iface": "enp1s0",
+            "irq": 179,
+            "name": "enp1s0-20",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "5",
+            "iface": "enp1s0",
+            "irq": 180,
+            "name": "enp1s0-21",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "6",
+            "iface": "enp1s0",
+            "irq": 181,
+            "name": "enp1s0-22",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "7",
+            "iface": "enp1s0",
+            "irq": 182,
+            "name": "enp1s0-23",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "8",
+            "iface": "enp1s0",
+            "irq": 183,
+            "name": "enp1s0-24",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "9",
+            "iface": "enp1s0",
+            "irq": 184,
+            "name": "enp1s0-25",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "10",
+            "iface": "enp1s0",
+            "irq": 185,
+            "name": "enp1s0-26",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "11",
+            "iface": "enp1s0",
+            "irq": 186,
+            "name": "enp1s0-27",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "0",
+            "iface": "enp1s0",
+            "irq": 187,
+            "name": "enp1s0-28",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "1",
+            "iface": "enp1s0",
+            "irq": 188,
+            "name": "enp1s0-29",
+            "total": 3
+        },
+        {
+            "affinity": "0-11",
+            "effective": "2",
+            "iface": "enp1s0",
+            "irq": 189,
+            "name": "enp1s0-30",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "3",
+            "iface": "enp1s0",
+            "irq": 190,
+            "name": "enp1s0-31",
+            "total": 0
+        },
+        {
+            "affinity": "6",
+            "effective": "6",
+            "iface": "enp49s0",
+            "irq": 127,
+            "name": "enp49s0-0",
+            "total": 2798492572
+        },
+        {
+            "affinity": "0-11",
+            "effective": "1",
+            "iface": "enp49s0",
+            "irq": 128,
+            "name": "enp49s0-1",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "2",
+            "iface": "enp49s0",
+            "irq": 129,
+            "name": "enp49s0-2",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "3",
+            "iface": "enp49s0",
+            "irq": 130,
+            "name": "enp49s0-3",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "4",
+            "iface": "enp49s0",
+            "irq": 131,
+            "name": "enp49s0-4",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "5",
+            "iface": "enp49s0",
+            "irq": 132,
+            "name": "enp49s0-5",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "6",
+            "iface": "enp49s0",
+            "irq": 133,
+            "name": "enp49s0-6",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "7",
+            "iface": "enp49s0",
+            "irq": 134,
+            "name": "enp49s0-7",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "8",
+            "iface": "enp49s0",
+            "irq": 135,
+            "name": "enp49s0-8",
+            "total": 4148637594
+        },
+        {
+            "affinity": "0-11",
+            "effective": "9",
+            "iface": "enp49s0",
+            "irq": 136,
+            "name": "enp49s0-9",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "10",
+            "iface": "enp49s0",
+            "irq": 137,
+            "name": "enp49s0-10",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "11",
+            "iface": "enp49s0",
+            "irq": 138,
+            "name": "enp49s0-11",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "0",
+            "iface": "enp49s0",
+            "irq": 139,
+            "name": "enp49s0-12",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "1",
+            "iface": "enp49s0",
+            "irq": 140,
+            "name": "enp49s0-13",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "2",
+            "iface": "enp49s0",
+            "irq": 141,
+            "name": "enp49s0-14",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "3",
+            "iface": "enp49s0",
+            "irq": 142,
+            "name": "enp49s0-15",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "4",
+            "iface": "enp49s0",
+            "irq": 143,
+            "name": "enp49s0-16",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "5",
+            "iface": "enp49s0",
+            "irq": 144,
+            "name": "enp49s0-17",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "6",
+            "iface": "enp49s0",
+            "irq": 145,
+            "name": "enp49s0-18",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "7",
+            "iface": "enp49s0",
+            "irq": 146,
+            "name": "enp49s0-19",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "8",
+            "iface": "enp49s0",
+            "irq": 147,
+            "name": "enp49s0-20",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "9",
+            "iface": "enp49s0",
+            "irq": 148,
+            "name": "enp49s0-21",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "10",
+            "iface": "enp49s0",
+            "irq": 149,
+            "name": "enp49s0-22",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "11",
+            "iface": "enp49s0",
+            "irq": 150,
+            "name": "enp49s0-23",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "0",
+            "iface": "enp49s0",
+            "irq": 151,
+            "name": "enp49s0-24",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "1",
+            "iface": "enp49s0",
+            "irq": 152,
+            "name": "enp49s0-25",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "2",
+            "iface": "enp49s0",
+            "irq": 153,
+            "name": "enp49s0-26",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "3",
+            "iface": "enp49s0",
+            "irq": 154,
+            "name": "enp49s0-27",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "4",
+            "iface": "enp49s0",
+            "irq": 155,
+            "name": "enp49s0-28",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "5",
+            "iface": "enp49s0",
+            "irq": 156,
+            "name": "enp49s0-29",
+            "total": 3
+        },
+        {
+            "affinity": "0-11",
+            "effective": "6",
+            "iface": "enp49s0",
+            "irq": 157,
+            "name": "enp49s0-30",
+            "total": 0
+        },
+        {
+            "affinity": "0-11",
+            "effective": "7",
+            "iface": "enp49s0",
+            "irq": 158,
+            "name": "enp49s0-31",
+            "total": 0
+        }
+    ],
+    "nics": [
+        {
+            "driver": "r8127",
+            "iface": "enp1s0"
+        },
+        {
+            "driver": "r8127",
+            "iface": "enp49s0"
+        }
+    ],
+    "peer_ip": "-",
+    "peer_ping_ok": null,
+    "placement_vector": "-",
+    "placement_vector_present": null,
+    "prereq": {
+        "apcupsd_active": true,
+        "power_event_installed": true,
+        "quiesce_hook": true,
+        "resume_check_enabled": true,
+        "run_celeris_owner": "root",
+        "tailscaled_active": true,
+        "tailscaled_enabled": "enabled",
+        "tmpfiles_conf": true
+    },
+    "r8127": true,
+    "results_entries": 0,
+    "results_list": [],
+    "resume_pending": false,
+    "runner_dirs": [],
+    "runner_listeners": 0,
+    "runner_workers": 0,
+    "system_state": "running",
+    "uptime_s": 3736229
+}

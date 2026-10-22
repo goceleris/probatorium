@@ -22,6 +22,10 @@ if ! command -v jq > /dev/null 2>&1; then
 fi
 
 hosts="msa2-server msr1 msa2-client"
+# The package-manager programs that count as a package run (os_upgrade.py PKG_RUN_NAMES, vars/os_upgrade_judge.yml os_busy_process_names:
+# a test compares the three lists). A survey recorded by the first release of the tool also listed the idle daemons `unattended-upgr`
+# and `packagekitd` (kernel comm names): they are not package runs, and are never shown as busy.
+busy_names="apt apt-get aptitude dpkg unattended-upgrade apt.systemd.daily dkms update-grub grub-mkconfig update-initramfs"
 j() { jq -r "$1" "$2" 2> /dev/null; }
 
 survey_section() {
@@ -29,14 +33,14 @@ survey_section() {
 	[ -s "$s" ] || { echo "- $1: no survey record"; return; }
 	echo "### $1"
 	echo
-	jq -r '
+	jq -r --arg busy "$busy_names" '
 		"- OS: \(.os_release.PRETTY_NAME // "?") (\(.arch)); running kernel `\(.kernel)`; installed: \(.installed_kernels | join(", ")); newest of the same flavor: `\(.newest_same_flavor)`",
 		"- grub: default after a power-cycle = `\(.boot.default_kernel)`, saved_entry `\(.boot.saved_entry)`, GRUB_DEFAULT=`\(.boot.settings.GRUB_DEFAULT // "unset")`, saved logic in grub.cfg: \(.boot.cfg_uses_saved), EFI: \(.boot.efi), Secure Boot: \(.boot.secure_boot), /boot/grub on `\(.boot.boot_fs)` (`\(.boot.boot_source)`), one-shot tools: grub-reboot \(.boot.grub_reboot) grub-set-default \(.boot.grub_set_default) grub-editenv \(.boot.grub_editenv) update-grub \(.boot.update_grub), recordfail timeout `\(.boot.cfg_recordfail_timeout)`",
 		"- **next boot** (what a power-cycle or the next reboot gives): \(if .boot.next_entry != "" then "the ONE-SHOT entry `" + .boot.next_entry + "` (a run armed it and the host has not booted it: dispatch mode=disarm, or expect that kernel once)" else "grub saved default `" + (.boot.default_kernel | if . == "" then "unknown" else . end) + "`" end); upgrade drop-in present: \(.boot.dropin_present); kernel packages newer than the running kernel: \(.packages.new_kernel_pkgs | join(", ") | if . == "" then "none" else . end); of which half-installed or recorded as failed: \(.packages.broken_kernel_pkgs | join(", ") | if . == "" then "none" else . end)",
 		"- **GRUB boot proof** (every one-shot and fallback depends on it): \(if .boot.proof.ok then "OK" else "NOT PROVEN: " + (.boot.proof.problems | join(" / ")) end); BOOT_IMAGE `\(.boot.proof.boot_image)`, EFI loader `\(.boot.proof.efi_loader)`, GRUB prefix `\(.boot.proof.prefix)`",
 		"- apt (lists \(.packages.lists_age_hours // "?") h old): would install/upgrade \(.packages.simulation.inst | length) package(s) (kernel packages: \(.packages.simulation.kernel_inst | join(", ") | if . == "" then "none" else . end)); would REMOVE: \(.packages.simulation.remv | join(", ") | if . == "" then "none" else . end); kept back: \(.packages.kept_back | join(", ") | if . == "" then "none" else . end); held back by phasing: \(.packages.phased_held_back | join(", ") | if . == "" then "none" else . end)",
 		"- held: \(.packages.held | join(", ") | if . == "" then "none" else . end) (kernel/boot/dkms: \(.packages.held_kernel | join(", ") | if . == "" then "none" else . end)); third-party repos: \(.packages.third_party_repos | join(", ") | if . == "" then "none" else . end); pin files: \(.packages.pin_files | join(", ") | if . == "" then "none" else . end)",
-		"- dpkg: audit \(.packages.dpkg_audit | length) finding(s), lock held \(.packages.dpkg_lock_held), package processes `\(.packages.package_processes | join(", "))`, policy-rc.d present \(.packages.policy_rc_d_present)",
+		"- dpkg: audit \(.packages.dpkg_audit | length) finding(s), lock held \(.packages.dpkg_lock_held)\(.packages.locks_held // [] | if length > 0 then " (" + join(", ") + ")" else "" end), package runs `\(.packages.package_processes | map(select(IN($busy | split(" ")[]))) | join(", ") | if . == "" then "none" else . end)`, policy-rc.d present \(.packages.policy_rc_d_present)",
 		"- unattended-upgrades: installed \(.unattended_upgrades.installed), periodic `\(.unattended_upgrades.unattended_upgrade)`, removes unused kernels `\(.unattended_upgrades.remove_unused_kernel_packages)`, automatic reboot `\(.unattended_upgrades.automatic_reboot)`, needrestart \(.unattended_upgrades.needrestart_installed); units: \(.unattended_upgrades.units | to_entries | map("\(.key)=\(.value.active)/\(.value.enabled)") | join(", "))",
 		"- reboot-required: \(.reboot_required) \(.reboot_required_pkgs | join(" "))",
 		"- disk free (KiB): / \(.disk["/"].free_kib // "?"), /boot \(.disk["/boot"].free_kib // "?"), /boot/efi \(.disk["/boot/efi"].free_kib // "n/a"), /var \(.disk["/var"].free_kib // "?")",
@@ -87,13 +91,15 @@ checklist() {
 		local sv=$out/$h/survey.json ps=$out/$h/preflight-snapshot.json
 		if [ ! -s "$sv" ]; then echo "| $h | survey record | none | FAIL | nothing can be decided for this host |"; continue; fi
 		[ -s "$ps" ] || ps=/dev/null
-		jq -r --arg h "$h" --argjson rootmin "$root_min" --argjson bootmin "$boot_min" --argjson efimin "$efi_min" --slurpfile snap <(if [ -s "$ps" ]; then cat "$ps"; else echo '{}'; fi) '
+		jq -r --arg h "$h" --arg busy "$busy_names" --argjson rootmin "$root_min" --argjson bootmin "$boot_min" --argjson efimin "$efi_min" --slurpfile snap <(if [ -s "$ps" ]; then cat "$ps"; else echo '{}'; fi) '
 			def row($c; $v; $m; $d): "| \($h) | \($c) | \($v | tostring | gsub("\\|"; "/")) | **\($m)** | \($d) |";
 			def gib($k): (((.disk[$k].free_kib // 0) / 1048576 * 10) | floor / 10);
 			($snap[0] // {}) as $sn
 			| (.boot.proof) as $pf
 			| .packages as $pk
 			| (.packages.simulation.inst | map(select(.name | test("^(docker|containerd|runc|tailscale|openssh-server|grub|shim|netplan|systemd$|linux-firmware)"))) | map("\(.name) \(.old) -> \(.new)") | join("; ")) as $access
+			| ($pk.package_processes | map(select(IN($busy | split(" ")[])))) as $busyprocs
+			| ($pk.locks_held // []) as $locks
 			| .newest_same_flavor as $nsf
 			| .kernel as $krun
 			| (.r8127.per_kernel[.newest_same_flavor] // null) as $nk
@@ -106,7 +112,7 @@ checklist() {
 			row("boot filesystem of /boot/grub"; "\(.boot.boot_fs) on \(.boot.boot_source) \(.boot.boot_stack)"; (if .boot.boot_stack == "" and (.boot.boot_fs | IN("ext4","vfat","xfs","ext3","ext2")) then "PASS" else "FAIL" end); "if FAIL, grub cannot write its environment block there, so no one-shot"),
 			row("GRUB_DEFAULT and the recordfail timeout"; "GRUB_DEFAULT=\(.boot.settings.GRUB_DEFAULT // "unset"); menu timeout after a failed boot \(.boot.cfg_recordfail_timeout | if . == "" then "n/a" else . end) s"; (if .boot.cfg_recordfail_timeout == "-1" then "FAIL" else "PASS" end); "-1 = a failed boot waits at the menu for ever (the pin sets 5 s)"),
 			row("apt would remove nothing protected"; ($pk.simulation.remv | join(", ") | if . == "" then "no removals" else . end) + (if ($pk.simulation.protected_removals | length) > 0 then "; PROTECTED: " + ($pk.simulation.protected_removals | join(", ")) else "" end); (if ($pk.simulation.protected_removals | length) == 0 and $pk.simulation.rc == 0 then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses before it changes a package"),
-			row("dpkg clean, nothing held, apt idle, no policy-rc.d"; "audit \($pk.dpkg_audit | length); held kernel/boot \($pk.held_kernel | join(",")); procs \($pk.package_processes | join(",")); lock \($pk.dpkg_lock_held); policy-rc.d \($pk.policy_rc_d_present)"; (if ($pk.dpkg_audit | length) == 0 and ($pk.held_kernel | length) == 0 and ($pk.package_processes | length) == 0 and ($pk.dpkg_lock_held | not) and ($pk.policy_rc_d_present | not) then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses (a broken dpkg: mode=repair)"),
+			row("dpkg clean, nothing held, apt idle, no policy-rc.d"; "audit \($pk.dpkg_audit | length); held kernel/boot \($pk.held_kernel | join(",")); package runs \($busyprocs | join(",") | if . == "" then "none" else . end); locks held \(if ($locks | length) > 0 then ($locks | join(",")) elif $pk.dpkg_lock_held then "yes" else "none" end); policy-rc.d \($pk.policy_rc_d_present)"; (if ($pk.dpkg_audit | length) == 0 and ($pk.held_kernel | length) == 0 and ($busyprocs | length) == 0 and ($locks | length) == 0 and ($pk.dpkg_lock_held | not) and ($pk.policy_rc_d_present | not) then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses (a broken dpkg: mode=repair; apt or dpkg busy: an unattended upgrade is running, wait for it)"),
 			row("the way in is intact today (sshd -t, ssh/tailscaled enabled, netplan generate)"; (.access_problems | join(" / ") | if . == "" then "ok" else . end); (if (.access_problems | length) == 0 then "PASS" else "FAIL" end); "if FAIL, an upgrade would change every package and then refuse to reboot, for ever"),
 			row("disk free"; "/ \(gib("/")) GiB (min \($rootmin / 1048576)); /boot \(gib("/boot")) GiB (min \($bootmin / 1048576 * 1000 | floor / 1000)); /boot/efi \(.disk["/boot/efi"].free_kib // "n/a") KiB (min \($efimin))"; (if ((.disk["/"].free_kib // 0) >= $rootmin) and ((.disk["/boot"].free_kib // 0) >= $bootmin) and ((.disk["/boot/efi"] == null) or (.disk["/boot/efi"].free_kib >= $efimin)) then "PASS" else "FAIL" end); "if FAIL, three kernels and their initrds do not fit: the upgrade refuses"),
 			row("clock synchronized"; .time_sync.raw; (if .time_sync.ntp_synchronized then "PASS" else "NOTE" end); "the verification compares it before and after"),

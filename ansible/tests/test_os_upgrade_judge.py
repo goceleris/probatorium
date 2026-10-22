@@ -206,8 +206,15 @@ class Judge(unittest.TestCase):
         case("disk_boot", {"refusals": "not enough free disk on /boot: 100000 KiB free"}, lambda c: c["pre_survey"]["disk"]["/boot"].update(free_kib=100000))
         case("disk_efi", {"refusals": "not enough free disk on /boot/efi"}, lambda c: c["pre_survey"]["disk"]["/boot/efi"].update(free_kib=100))
         case("disk_unreadable", {"refusals": "not enough free disk on /: unreadable"}, lambda c: c["pre_survey"]["disk"].update({"/": None}))
-        case("dpkg_lock", {"refusals": "dpkg or apt is busy (a dpkg lock is held)"}, lambda c: c["pre_survey"]["packages"].update(dpkg_lock_held=True))
-        case("apt_running", {"refusals": "dpkg or apt is busy (unattended-upgr)"}, lambda c: c["pre_survey"]["packages"].update(package_processes=["unattended-upgr"]))
+        case("dpkg_lock", {"refusals": "dpkg or apt is busy (an apt or dpkg lock is held)"}, lambda c: c["pre_survey"]["packages"].update(dpkg_lock_held=True))
+        case("apt_lists_lock", {"refusals": "dpkg or apt is busy (an apt or dpkg lock is held (/var/lib/apt/lists/lock))"},
+             lambda c: c["pre_survey"]["packages"].update(dpkg_lock_held=True, locks_held=["/var/lib/apt/lists/lock"]))
+        case("apt_running", {"refusals": "dpkg or apt is busy (unattended-upgrade)"}, lambda c: c["pre_survey"]["packages"].update(package_processes=["unattended-upgrade"]))
+        case("apt_get_running", {"refusals": "dpkg or apt is busy (apt-get, dpkg)"}, lambda c: c["pre_survey"]["packages"].update(package_processes=["apt-get", "dpkg"]))
+        # the idle daemons of every Ubuntu host (kernel comm names, as the first release of the tool recorded them) are not a package run
+        case("idle_daemons_are_not_apt_running", {}, lambda c: c["pre_survey"]["packages"].update(package_processes=["packagekitd", "unattended-upgr"]))
+        case("idle_daemons_beside_a_real_run", {"refusals": "dpkg or apt is busy (dpkg)"},
+             lambda c: c["pre_survey"]["packages"].update(package_processes=["dpkg", "packagekitd", "unattended-upgr"]))
         case("half_configured", {"refusals": "dpkg --audit reports half-configured or broken packages: foo"},
              lambda c: c["pre_survey"]["packages"].update(dpkg_audit=["foo"]))
         case("held_kernel", {"refusals": "held kernel, boot or DKMS packages: linux-image-generic"},
@@ -459,7 +466,7 @@ class Judge(unittest.TestCase):
         walk(self.dk, dkms_keys)
         walk(self.sim, survey_keys)
         walk(snapshot("a", "k", 1), survey_keys)
-        for var, keys in (("s", survey_keys), ("bs", survey_keys), ("d", dkms_keys), ("sim", survey_keys), ("tc", {"cc_ok", "https_ok"} | survey_keys)):
+        for var, keys in (("s", survey_keys), ("pk", survey_keys), ("bs", survey_keys), ("d", dkms_keys), ("sim", survey_keys), ("tc", {"cc_ok", "https_ok"} | survey_keys)):
             for m in re.finditer(r"\b%s\.([a-z_0-9]+)" % var, text):
                 self.assertIn(m.group(1), keys, "the judgement reads %s.%s, which the script does not write" % (var, m.group(1)))
 

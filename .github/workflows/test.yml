@@ -397,6 +397,11 @@ jobs:
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
         run: python3 -I ansible/tests/test_os_upgrade_play.py
+      # ... and the three REAL hosts' records (the first real survey) replayed through the checklist and the judgement.
+      - name: ansible/tests/test_os_upgrade_real_hosts.py
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: python3 -I ansible/tests/test_os_upgrade_real_hosts.py
 
   # Fan-in over every job above so branch protection can require ONE
   # stable check name ("ci-ok") instead of enumerating the adapter

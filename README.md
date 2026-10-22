@@ -323,7 +323,9 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
 - **It refuses, on the host, before touching anything:** any of the three hosts unreachable; a bench manifest on any of
   them; on the target a runner job executing, a power-loss resume pending, entries in `results_root`, the r8127
   shutdown quiesce hook missing, the r8127 module not available for the running kernel, tailscaled not enabled at boot,
-  too little disk on `/`, `/boot` and `/boot/efi`, dpkg or apt busy (an unattended upgrade) or half-configured
+  too little disk on `/`, `/boot` and `/boot/efi`, dpkg or apt busy (a real `apt`, `apt-get`, `dpkg`, `unattended-upgrade` ... process, read from `/proc/<pid>/cmdline`, or one of the four dpkg/apt lock
+  files held; the idle `unattended-upgrade-shutdown --wait-for-signal` listener and an idle `packagekitd` that every Ubuntu host runs do not count: both read
+  as `unattended-upgr` and `packagekitd` in `/proc/<pid>/comm`, a 15-character name, which is how the first real survey wrongly refused all three hosts) or half-configured
   packages, held kernel/boot/DKMS packages, an existing `policy-rc.d`, no usable GRUB, GRUB not PROVEN to have booted the host (`BOOT_IMAGE=` on the kernel command line naming the running kernel; on EFI the firmware's `BootCurrent` loader is `shim`/`grub` under `\EFI\<vendor>`; the ESP stub's `search`/`prefix` names the filesystem of `/boot/grub`; `grubenv` is a 1024-byte file: anything unknown counts as not proven), `GRUB_SAVEDEFAULT=true`, a
   `/boot/grub` on btrfs/zfs/lvm/mdraid (grub cannot make the boot one-shot there), no grub entry for the running kernel,
   a one-shot grub entry still pending, a saved default that differs from the running kernel after an earlier
