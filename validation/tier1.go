@@ -1123,7 +1123,7 @@ func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string
 	rng := rand.New(rand.NewPCG(seed, ^seed))
 	var pace startPacer
 	if period > 0 {
-		pace = startPacer{period: period, next: time.Now().Add(time.Duration(rng.Int64N(int64(period))))}
+		pace = newStartPacer(period, rng, time.Now())
 	}
 	for {
 		if ctx.Err() != nil || stop.Err() != nil {
@@ -1136,14 +1136,15 @@ func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string
 		// `request: METHOD path`; states without an entry are silent.
 		// See validation/markov/<refapp>.yaml.
 		if req, ok := m.Requests[state]; ok {
-			// A matrix-declared logout destroys the session on purpose;
-			// the 401 it causes on the next request is expected, so count
-			// it to keep the re-login budget honest.
-			if m.Logout.Method != "" && req.Method == m.Logout.Method && req.Path == m.Logout.Path {
-				tally.walkerLogouts.Add(1)
-			}
 			if !pace.wait(ctx, stop) {
 				return
+			}
+			// A matrix-declared logout destroys the session on purpose;
+			// the 401 it causes on the next request is expected, so count
+			// it to keep the re-login budget honest. Counted once the
+			// request is going out, not while it waits for its start.
+			if m.Logout.Method != "" && req.Method == m.Logout.Method && req.Path == m.Logout.Path {
+				tally.walkerLogouts.Add(1)
 			}
 			status := doMarkovRequest(ctx, hc, req.Method, base+req.Path, req.Expect5xx, req.ExpectPanic, tally)
 			if status == 401 && hasLogin && stop.Err() == nil {
@@ -1154,10 +1155,10 @@ func runMarkovWalker(ctx, stop context.Context, parent *http.Client, base string
 				// deliberate logout, so this climbing with request
 				// count means the server is not honouring the session
 				// at all (probatorium#292).
-				tally.walkerRelogins.Add(1)
 				if !pace.wait(ctx, stop) {
 					return
 				}
+				tally.walkerRelogins.Add(1)
 				_ = walkerLogin(ctx, hc, base, m.Login, username, password)
 			}
 		}
@@ -1177,24 +1178,38 @@ const loadShapingReason = "the refapp is a -race build, which costs every reques
 type startPacer struct {
 	period time.Duration
 	next   time.Time
+	timer  *time.Timer // reused across waits; allocated on the first
+}
+
+// newStartPacer books the walker's first start a share of period after now,
+// drawn from the walker's own generator: walkers (each with its own seed) do not
+// start in lockstep, and none waits a whole period. period must be > 0.
+func newStartPacer(period time.Duration, rng *rand.Rand, now time.Time) startPacer {
+	return startPacer{period: period, next: now.Add(time.Duration(rng.Int64N(int64(period))))}
 }
 
 // wait blocks until a request may start, then books the next start period after
 // this one, measured from the moment it actually starts: a late start is not
-// made up for. It returns false when the request context or the phase ended
-// first (so the pause never lengthens a phase's drain, runPhase).
+// made up for, and a response that is slow (or fast) does not move the booking.
+// It returns false when the request context or the phase ended first, in which
+// case no request may be sent (so the wait never lengthens a phase's drain,
+// runPhase).
 func (p *startPacer) wait(ctx, stop context.Context) bool {
 	if p.period <= 0 {
 		return true
 	}
 	if d := time.Until(p.next); d > 0 {
-		t := time.NewTimer(d)
+		if p.timer == nil {
+			p.timer = time.NewTimer(d)
+		} else {
+			p.timer.Reset(d)
+		}
 		select {
-		case <-t.C:
+		case <-p.timer.C:
 		case <-ctx.Done():
 		case <-stop.Done():
 		}
-		t.Stop()
+		p.timer.Stop()
 	}
 	if ctx.Err() != nil || stop.Err() != nil {
 		return false

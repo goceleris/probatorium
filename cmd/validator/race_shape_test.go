@@ -1,8 +1,13 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"os"
-	"regexp"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,7 +25,7 @@ func TestRaceAdaptiveCellKeepsItsCountsAndPacesItsWalkers(t *testing.T) {
 	if got := cellConcurrencyFloor("adaptive"); got != 110 {
 		t.Errorf("race adaptive walker floor = %d, want 110 (unchanged)", got)
 	}
-	if got := cellMarkovMinPeriod("adaptive", true); got != 6500*time.Microsecond {
+	if got := cellMarkovMinPeriod("auth_session_ratelimit", "adaptive", true); got != 6500*time.Microsecond {
 		t.Errorf("race adaptive Markov min period = %v, want 6.5ms", got)
 	}
 	if raceAdaptiveMarkovMinPeriod != 6500*time.Microsecond {
@@ -28,69 +33,165 @@ func TestRaceAdaptiveCellKeepsItsCountsAndPacesItsWalkers(t *testing.T) {
 	}
 }
 
-// Every configuration but the race tier's adaptive cell is byte-for-byte what
-// it was: no pause, the same worker cap, the same walker floor. A table of
-// today's values as literals, over every engine, with and without -race-tier
-// and with an explicit worker cap.
-func TestEveryOtherCellConfigurationIsUnchanged(t *testing.T) {
-	type row struct {
-		engine   string
-		raceTier bool
-		capFlag  int
-		workers  int
-		floor    int
-		period   time.Duration
-	}
-	rows := []row{
-		// Not the race tier: nightly, weekend, checkptr, PR, bench, soak.
-		{"adaptive", false, 0, 2, 110, 0},
-		{"adaptive", false, 4, 4, 110, 0},
-		{"iouring", false, 0, 0, 0, 0},
-		{"iouring", false, 8, 8, 0, 0},
-		{"epoll", false, 0, 0, 0, 0},
-		{"epoll", false, 8, 8, 0, 0},
-		{"std", false, 0, 0, 0, 0},
-		{"", false, 0, 0, 0, 0},
-		// The race tier's other engines: they pass today, so they are left alone.
-		{"iouring", true, 0, 0, 0, 0},
-		{"iouring", true, 8, 8, 0, 0},
-		{"epoll", true, 0, 0, 0, 0},
-		{"std", true, 0, 0, 0, 0},
-		{"", true, 0, 0, 0, 0},
-		// The race tier's adaptive cell: the counts stay, the pause is new.
-		{"adaptive", true, 0, 2, 110, 6500 * time.Microsecond},
-		{"adaptive", true, 4, 4, 110, 6500 * time.Microsecond},
-	}
-	for _, r := range rows {
+// The sizing of every engine is what it was: the same worker cap and the same
+// walker floor, with and without -race-tier. A table of today's values as
+// literals.
+func TestCellSizingIsUnchangedForEveryEngine(t *testing.T) {
+	for _, r := range []struct {
+		engine  string
+		capFlag int
+		workers int
+		floor   int
+	}{
+		{"adaptive", 0, 2, 110},
+		{"adaptive", 4, 4, 110},
+		{"iouring", 0, 0, 0},
+		{"iouring", 8, 8, 0},
+		{"epoll", 0, 0, 0},
+		{"epoll", 8, 8, 0},
+		{"std", 0, 0, 0},
+		{"", 0, 0, 0},
+	} {
 		if got := cellRefappWorkers(r.engine, r.capFlag); got != r.workers {
-			t.Errorf("engine=%q raceTier=%t cap=%d: workers %d, want %d", r.engine, r.raceTier, r.capFlag, got, r.workers)
+			t.Errorf("engine=%q cap=%d: workers %d, want %d", r.engine, r.capFlag, got, r.workers)
 		}
 		if got := cellConcurrencyFloor(r.engine); got != r.floor {
-			t.Errorf("engine=%q raceTier=%t: walker floor %d, want %d", r.engine, r.raceTier, got, r.floor)
-		}
-		if got := cellMarkovMinPeriod(r.engine, r.raceTier); got != r.period {
-			t.Errorf("engine=%q raceTier=%t: Markov min period %v, want %v", r.engine, r.raceTier, got, r.period)
+			t.Errorf("engine=%q: walker floor %d, want %d", r.engine, got, r.floor)
 		}
 	}
 }
 
-// matrix.go hands the pause to every matrix cell, and the single-cell path in
-// main.go never does: shaping is a matrix-only, adaptive-only, race-tier-only
-// decision, like cellConcurrencyFloor.
+// Exactly ONE cell of the matrix is shaped: the race tier's adaptive cell of
+// auth_session_ratelimit (on each arch). Every other refapp, every other engine
+// and every non-race tier keeps full load. The table is all eight refapps x the
+// four engines x with and without -race-tier, as literals; the 7 other adaptive
+// cells (run 39560945814: green at full load, 77 Markov walkers each, 21-46% of
+// their volume kept on amd64 had they been shaped) join only by a pre-registered,
+// data-driven decision (PREREG.md), which is a change to this table.
+func TestExactlyOneCellIsShaped(t *testing.T) {
+	refapps := []string{"auth_jwt_csrf", "auth_session_ratelimit", "driver_memcached", "driver_postgres",
+		"driver_redis", "kitchen_sink", "observability", "static_swagger_proxy"}
+	shaped := 0
+	for _, refapp := range refapps {
+		for _, engine := range []string{"adaptive", "iouring", "epoll", "std"} {
+			for _, raceTier := range []bool{false, true} {
+				want := time.Duration(0)
+				if refapp == "auth_session_ratelimit" && engine == "adaptive" && raceTier {
+					want = 6500 * time.Microsecond
+				}
+				got := cellMarkovMinPeriod(refapp, engine, raceTier)
+				if got != want {
+					t.Errorf("refapp=%s engine=%s raceTier=%t: Markov min period %v, want %v", refapp, engine, raceTier, got, want)
+				}
+				if got != 0 {
+					shaped++
+				}
+			}
+		}
+	}
+	if shaped != 1 {
+		t.Errorf("%d of 64 (refapp, engine, tier) cells are shaped, want exactly 1", shaped)
+	}
+	// An engine or refapp name the matrix does not know is unshaped too.
+	if got := cellMarkovMinPeriod("", "adaptive", true); got != 0 {
+		t.Errorf("an empty refapp is shaped: %v", got)
+	}
+	if got := cellMarkovMinPeriod("auth_session_ratelimit", "", true); got != 0 {
+		t.Errorf("an empty engine is shaped: %v", got)
+	}
+}
+
+// Shaping is a matrix-only, adaptive-only, race-tier-only decision, like
+// cellConcurrencyFloor, and nothing else in the validator may decide it. Read
+// from the syntax tree, not the text, so a later override cannot hide behind a
+// regexp that still matches the literal:
+//   - exactly one composite-literal key MarkovMinPeriod in the package, in
+//     matrix.go, whose value is cellMarkovMinPeriod(mc.Refapp, mc.Engine, cfg.RaceTier);
+//   - no assignment to any MarkovMinPeriod field anywhere (a
+//     `cellCfg.MarkovMinPeriod = ...` after the literal would shape every cell
+//     it reaches);
+//   - the constant is used once, inside cellMarkovMinPeriod;
+//   - main.go (the single-cell path) never mentions MarkovMinPeriod.
 func TestMarkovMinPeriodReachesTheMatrixCellConfigOnly(t *testing.T) {
-	m, err := os.ReadFile("matrix.go")
-	if err != nil {
-		t.Fatal(err)
+	fset := token.NewFileSet()
+	files, err := filepath.Glob("*.go")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no sources: %v", err)
 	}
-	if !regexp.MustCompile(`MarkovMinPeriod:\s+cellMarkovMinPeriod\(mc\.Engine,\s*cfg\.RaceTier\)`).Match(m) {
-		t.Error("matrix.go does not build the cell's validation.Config with MarkovMinPeriod: cellMarkovMinPeriod(mc.Engine, cfg.RaceTier)")
+	var literals, constUses int
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		tree, err := parser.ParseFile(fset, f, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := func(e ast.Expr) string {
+			var b strings.Builder
+			_ = printer.Fprint(&b, fset, e)
+			return b.String()
+		}
+		// Walk every top-level declaration with the name of its function ("" for
+		// a var/const/type), so a use of the constant can be placed.
+		for _, d := range tree.Decls {
+			inFunc := ""
+			if fd, ok := d.(*ast.FuncDecl); ok {
+				inFunc = fd.Name.Name
+			}
+			ast.Inspect(d, func(n ast.Node) bool {
+				switch x := n.(type) {
+				case *ast.ValueSpec:
+					// The declaration's own names are not uses.
+					for _, v := range x.Values {
+						ast.Inspect(v, func(m ast.Node) bool {
+							if id, ok := m.(*ast.Ident); ok && id.Name == "raceAdaptiveMarkovMinPeriod" {
+								t.Errorf("%s uses raceAdaptiveMarkovMinPeriod in a package-level initialiser: only cellMarkovMinPeriod may", f)
+							}
+							return true
+						})
+					}
+					return false
+				case *ast.KeyValueExpr:
+					if k, ok := x.Key.(*ast.Ident); ok && k.Name == "MarkovMinPeriod" {
+						literals++
+						if f != "matrix.go" {
+							t.Errorf("%s sets MarkovMinPeriod in a Config literal: only matrix.go may", f)
+						}
+						if got := src(x.Value); got != "cellMarkovMinPeriod(mc.Refapp, mc.Engine, cfg.RaceTier)" {
+							t.Errorf("%s: MarkovMinPeriod is set from %q, want cellMarkovMinPeriod(mc.Refapp, mc.Engine, cfg.RaceTier)", f, got)
+						}
+					}
+				case *ast.AssignStmt:
+					for _, l := range x.Lhs {
+						if sel, ok := l.(*ast.SelectorExpr); ok && sel.Sel.Name == "MarkovMinPeriod" {
+							t.Errorf("%s assigns %s: the period must be decided once, by cellMarkovMinPeriod, in the literal", f, src(l))
+						}
+					}
+				case *ast.Ident:
+					if x.Name == "raceAdaptiveMarkovMinPeriod" {
+						if inFunc == "cellMarkovMinPeriod" {
+							constUses++
+						} else {
+							t.Errorf("%s uses raceAdaptiveMarkovMinPeriod in %q: only cellMarkovMinPeriod may", f, inFunc)
+						}
+					}
+				}
+				return true
+			})
+		}
+		if f == "main.go" {
+			raw, _ := os.ReadFile(f)
+			if strings.Contains(string(raw), "MarkovMinPeriod") {
+				t.Error("main.go (the single-cell path) must not mention MarkovMinPeriod")
+			}
+		}
 	}
-	s, err := os.ReadFile("main.go")
-	if err != nil {
-		t.Fatal(err)
+	if literals != 1 {
+		t.Errorf("%d Config literals set MarkovMinPeriod, want exactly 1 (matrix.go)", literals)
 	}
-	if regexp.MustCompile(`MarkovMinPeriod`).Match(s) {
-		t.Error("main.go (the single-cell path) must not set MarkovMinPeriod")
+	if constUses != 1 {
+		t.Errorf("raceAdaptiveMarkovMinPeriod is used %d times inside cellMarkovMinPeriod, want 1", constUses)
 	}
 }
 

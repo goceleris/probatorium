@@ -551,7 +551,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		RefappWorkers:       cellRefappWorkers(mc.Engine, cfg.RefappWorkers),
 		ConcurrencyFloor:    cellConcurrencyFloor(mc.Engine),
 		WSEchoSlowTolerance: wsEchoSlowTolerance(cfg.RaceTier),
-		MarkovMinPeriod:     cellMarkovMinPeriod(mc.Engine, cfg.RaceTier),
+		MarkovMinPeriod:     cellMarkovMinPeriod(mc.Refapp, mc.Engine, cfg.RaceTier),
 		DriverMode:          cfg.DriverMode,
 		DriverSSHUser:       cfg.DriverSSHUser,
 		DriverSSHHost:       cfg.DriverSSHHost,
@@ -738,11 +738,12 @@ func wsEchoSlowTolerance(raceTier bool) int {
 }
 
 // raceAdaptiveMarkovMinPeriod is the least time between the STARTS of two
-// requests of one Markov walker in the RACE TIER's ADAPTIVE cells (all 16: eight
-// refapps, two arches; the sizing is uniform, so is the shape). Nothing else is
-// paced: the worker count (2), the walker count (110) and the connections they
-// hold are exactly the sizing above, because the controller promotes on conns
-// per worker, and each walker keeps its keep-alive connection while it waits.
+// requests of one Markov walker in ONE cell of the race tier: the ADAPTIVE cell
+// of auth_session_ratelimit (raceShapedRefapp), on both arches. Every other cell
+// of the matrix is untouched. Nothing else is paced in that cell: the worker
+// count (2), the walker count (110) and the connections they hold are exactly the
+// sizing above, because the controller promotes on conns per worker, and each
+// walker keeps its keep-alive connection while it waits.
 //
 // WHY. That sizing is closed-loop: 67 Markov walkers each send the next request
 // the instant the last one is answered. Without the detector that is a rate the
@@ -783,21 +784,34 @@ func wsEchoSlowTolerance(raceTier bool) int {
 // Promotion is still checked by the gate in every default race run
 // (ExpectAdaptiveSwitch), and a shaped cell that misses it says it was shaped.
 //
-// COST. The 15 adaptive cells that were green are shaped too (they get ~60% of
-// the Markov request volume under -race); pure engines and every non-race tier
-// keep their full load.
+// WHY ONE CELL. Shaping costs race-detector coverage (fewer interleavings
+// under load) and only the cell with measured saturation pays for it. The other
+// seven refapps' adaptive cells are green at full load, and they run 77 Markov
+// walkers (no /ws, so the ws and sse slots go back to the Markov mix), not 67: a
+// 6.5 ms period would have kept only 21 to 46% of their request volume on amd64
+// (postgres 21%, swagger 23%, memcached 33%, kitchen_sink 34%, jwt 35%,
+// observability 39%, redis 46%) and left the arm64 redis, memcached and
+// observability cells (closed-loop 7 to 9 ms a request) effectively unshaped:
+// a cost with no evidence behind it, unevenly spread. The arm64 cell of the
+// shaped refapp carried 18.6k requests a second with a healthy echo and passed;
+// the ceiling (10.3k) cuts it, which it has headroom for. Another refapp's
+// adaptive cell joins the shaped set only if a run shows a SLOW or reset-type
+// counter in THAT cell with the loops busy (PREREG.md), never pre-emptively.
 //
 // This is a load shape, not a threshold: no tolerance, no N, no timeout and no
 // oracle moves (probatorium#481).
 const raceAdaptiveMarkovMinPeriod = 6500 * time.Microsecond
 
+// raceShapedRefapp is the one refapp whose adaptive cell is shaped.
+const raceShapedRefapp = "auth_session_ratelimit"
+
 // cellMarkovMinPeriod is the Markov walkers' minimum period between request
-// starts for a cell: the race tier's adaptive cells only (-race-tier is passed
-// by the playbook for the -race refapp set only, like WSEchoSlowTolerance), zero
-// for every other cell, which keeps every other cell's walkers closed-loop
-// exactly as they have always run.
-func cellMarkovMinPeriod(engine string, raceTier bool) time.Duration {
-	if raceTier && engine == "adaptive" {
+// starts for a cell: the race tier's adaptive cell of auth_session_ratelimit
+// only (-race-tier is passed by the playbook for the -race refapp set only, like
+// WSEchoSlowTolerance), zero for every other cell, which keeps every other cell's
+// walkers closed-loop exactly as they have always run.
+func cellMarkovMinPeriod(refapp, engine string, raceTier bool) time.Duration {
+	if raceTier && engine == "adaptive" && refapp == raceShapedRefapp {
 		return raceAdaptiveMarkovMinPeriod
 	}
 	return 0
