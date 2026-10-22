@@ -84,6 +84,15 @@ func TestGateFailsAShapedCellThatShowsNoRaceBuild(t *testing.T) {
 		t.Error("a cell whose property loop did not run is accused of lacking the detector")
 	}
 
+	// The rule is the record's, not the engine's: a shaped cell of any engine
+	// is held to it.
+	e := shapedCell()
+	e.Engine = "epoll"
+	e.PropertiesNotInstrumented = []string{"I-RACE"}
+	if v := Gate([]ValidationCellResult{e}, nil, raceOpts()); len(v) != 1 || v[0].Field != "tier_1.load_shaping" || v[0].Engine != "epoll" {
+		t.Errorf("a shaped cell of another engine without I-RACE must fail the rule, got %v", v)
+	}
+
 	// Declared I-RACE: clean, and an unshaped cell without I-RACE is not this rule's business.
 	if v := Gate([]ValidationCellResult{shapedCell()}, nil, raceOpts()); len(v) != 0 {
 		t.Errorf("a shaped race cell with I-RACE declared must pass, got %v", v)
