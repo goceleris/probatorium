@@ -1102,6 +1102,49 @@ func TestClusterOSUpgradeNeverSpellsOutTheConsoleOverride(t *testing.T) {
 	}
 }
 
+// Review m1: the literal scan above is bypassed by a concatenation ('REHEARSE-' ~ os_host ~ '-CONSOLE'), a shell variable, or a print in the tool.
+// The token "-CONSOLE" is therefore allowed only on the lines that COMPARE a confirmation against it (and on the approver's display), never in a
+// message, in any of the files that print anything, and never in os_upgrade.py at all.
+func TestClusterOSUpgradeTheConsoleTokenIsOnlyEverCompared(t *testing.T) {
+	allowed := map[string][]*regexp.Regexp{
+		filepath.Join(".github", "workflows", osWorkflow): {
+			regexp.MustCompile(`^run-name: `), regexp.MustCompile(`^\s+name: os-upgrade `),
+			regexp.MustCompile(`^\s+if \[ "\$IN_MODE" = rehearse \] && \[ "\$IN_CONFIRM" != "REHEARSE-\$IN_HOST" \] && \[ "\$IN_CONFIRM" != "REHEARSE-\$IN_HOST-CONSOLE" \]; then$`),
+			regexp.MustCompile(`^\s+if \[ "\$IN_CONFIRM" = "REHEARSE-\$IN_HOST-CONSOLE" \]; then$`),
+		},
+		osRequest:  {regexp.MustCompile(`^      - \(os_mode == 'survey' and os_confirm == ''\) or `)},
+		osJudge:    {regexp.MustCompile(`^  \{% set console_attested = \(os_confirm \| default\(''\)\) == \('REHEARSE-' ~ os_host ~ '-CONSOLE'\) %\}$`)},
+		osPlaybook: {regexp.MustCompile(`^      confirm_kind: "\{\{ 'console-attested' if \(os_mode == 'rehearse' and \(os_confirm \| default\(''\)\) == \('REHEARSE-' ~ os_host ~ '-CONSOLE'\)\) else 'standard' \}\}"$`)},
+		osScript:   {},
+		filepath.Join(".github", "scripts", "os-upgrade-summary.sh"): {regexp.MustCompile(`^\t\*-CONSOLE\) echo "- confirmation: \*\*CONSOLE ATTESTED\*\*`)},
+	}
+	for file, ok := range allowed {
+		src := mustRead(t, file)
+		if file == osPlaybook || file == osScript {
+			src = stripComments(src)
+		}
+		for i, l := range strings.Split(src, "\n") {
+			if !strings.Contains(l, "-CONSOLE") {
+				continue
+			}
+			legit := false
+			for _, re := range ok {
+				if re.MatchString(l) {
+					legit = true
+				}
+			}
+			if !legit {
+				t.Errorf("%s:%d carries the console token outside a comparison (a message, a concatenation, a print): %s", file, i+1, strings.TrimSpace(l))
+			}
+		}
+	}
+	for _, f := range []string{filepath.Join("ansible", "tasks", "os_upgrade_phase.yml"), filepath.Join("ansible", "tasks", "os_upgrade_wait_apt.yml")} {
+		if strings.Contains(mustRead(t, f), "CONSOLE") {
+			t.Errorf("%s mentions the console token", f)
+		}
+	}
+}
+
 // The two scripts the playbook ships to a host are executable in the repository (reboot_snapshot.sh had lost its bit; ansible.builtin.script
 // makes its copy executable, so only a person running it by hand noticed).
 func TestOSUpgradeScriptsAreExecutable(t *testing.T) {
