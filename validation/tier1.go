@@ -919,6 +919,11 @@ func holdIdle(ctx context.Context, w *idleWindowPublisher, n int32, d time.Durat
 //     observes cancel even when blocked on a full lineCh
 //   - lineCh is closed when the goroutine exits so a concurrent
 //     reader doesn't deadlock either
+//   - the goroutine keeps reading (and discarding) the output to EOF
+//     after it stops reporting lines, so the driver's unbuffered output
+//     pipe always has a reader: the refapp's later output neither parks
+//     the driver's fan-in goroutines nor stalls the refapp in write(2)
+//     (probatorium#425)
 //
 // refappOutputCapMax bounds the buffered refapp output retained on
 // readiness failure. Big enough to capture a typical Go panic + stack
@@ -936,7 +941,8 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 		defer timeoutCancel()
 	}
 
-	scanner := bufio.NewScanner(proc.Stderr())
+	stream := proc.Stderr()
+	scanner := bufio.NewScanner(stream)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	lineCh := make(chan string, 1)
@@ -945,6 +951,20 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 		// Close lineCh on exit so any concurrent reader (none today,
 		// but defensive against future refactors) doesn't deadlock.
 		defer close(lineCh)
+		// Whatever ends the scan -- the ready line was found and readyCtx
+		// ended, a timeout, a line over the scanner's budget, EOF -- keep
+		// reading the process's output to EOF and throw it away. The
+		// driver's output pipe has no buffer: the fan-in goroutines write
+		// into it a line at a time and block until someone reads. Once
+		// this goroutine stopped reading, the next line the refapp wrote
+		// parked a fan-in goroutine (and its 256 KiB buffer, and the
+		// goroutine that closes the pipe) for good, even after the process
+		// was reaped, and a refapp that wrote enough more stalled in
+		// write(2) (probatorium#425). Reading to EOF ends with the process:
+		// the driver closes the pipe once both of its streams are done,
+		// after a grace if a descendant keeps them open. Deferred after
+		// close(lineCh), so it runs first.
+		defer func() { _, _ = io.Copy(io.Discard, stream) }()
 		for scanner.Scan() {
 			select {
 			case lineCh <- scanner.Text():
