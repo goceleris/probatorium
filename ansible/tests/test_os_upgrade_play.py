@@ -238,12 +238,12 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
     def calls(self):
         return self.h.calls()
 
-    def summary(self, mode, host, rc=None):
+    def summary(self, mode, host, rc=None, confirm=None):
         """The step summary the workflow renders from the evidence of the last play()."""
         if shutil.which("jq") is None:
             self.skipTest("jq not installed")
         script = os.path.join(ANSIBLE_DIR, "..", ".github", "scripts", "os-upgrade-summary.sh")
-        r = subprocess.run(["bash", script, self.out, mode, host, str(self.rc if rc is None else rc), "platform upgrade", "4242"],
+        r = subprocess.run(["bash", script, self.out, mode, host, str(self.rc if rc is None else rc), "platform upgrade", "4242"] + ([] if confirm is None else [confirm]),
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
@@ -667,7 +667,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(r["status"], "failed-verification")
         self.assertIn("No power-cycle needed while the host answers", r["power_cycle"])
         md = self.summary("upgrade", "msr1")
-        self.assertIn("not needed while msr1 answers", md)
+        self.assertIn("Power-cycle: No power-cycle needed while the host answers", md)  # the text of result.json, chosen by the survey after the reboot
         self.assertIn("the one-shot entry for 7.0.0-40-generic fell back", md)
 
     def test_a_host_that_never_answers_tells_the_person_to_power_cycle(self):
@@ -950,7 +950,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.fresh(rehearsed=False, keep38=True)
         self.refused("rehearse_entry0", self.RH, "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic")
         self.assertIn("no one-shot to fall back on", self.log)
-        self.assertIn("REHEARSE-msr1-CONSOLE", self.log)
+        self.assertIn("the console attestation described in the README", self.log)  # R4-m3: the refusal does not spell the override out
         self.no_call("grub-set-default")
         self.no_call("grub-reboot")
         self.no_call("FAKE-REBOOT")
@@ -974,6 +974,70 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
     def test_the_console_confirmation_is_only_for_a_rehearsal(self):
         self.fresh(keep38=True)
         self.refused("console_upgrade", dict(self.UP, os_confirm="UPGRADE-msr1-CONSOLE"), "os_confirm")
+        # V5-M2e: the console attestation of a REHEARSAL is no confirmation for an upgrade, a disarm or a repair either, in the playbook itself
+        # (the plan job refuses it first; this is the second line)
+        for name, extra in (("console_as_upgrade", dict(self.UP, os_confirm="REHEARSE-msr1-CONSOLE")),
+                            ("console_as_disarm", {"os_mode": "disarm", "os_host": "msr1", "os_confirm": "REHEARSE-msr1-CONSOLE"}),
+                            ("console_as_repair", dict(self.R, os_confirm="REHEARSE-msr1-CONSOLE"))):
+            self.refused(name, extra, "os_confirm must be exactly")
+            self.assertFalse(os.path.exists(os.path.join(self.out, "msr1", "pre-snapshot.json")), name)
+
+    # R4-m3: what the approver and the reader of the evidence see
+    def test_a_rehearsal_records_and_the_summary_says_whether_a_console_was_attested(self):
+        self.fresh(rehearsed=False, keep38=True)
+        self.play("rh_console", dict(self.RH, os_confirm="REHEARSE-msr1-CONSOLE"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.j("msr1", "result.json")["confirm_kind"], "console-attested")
+        md = self.summary("rehearse", "msr1", confirm="REHEARSE-msr1-CONSOLE")
+        self.assertIn("confirmation: **CONSOLE ATTESTED**", md)
+        self.assertNotIn("no console attested", md)
+        self.fresh(rehearsed=False)  # -31 is the first entry: no console needed
+        self.play("rh_standard", self.RH)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.j("msr1", "result.json")["confirm_kind"], "standard")
+        md = self.summary("rehearse", "msr1", confirm="REHEARSE-msr1")
+        self.assertIn("confirmation: no console attested", md)
+        self.assertNotIn("CONSOLE ATTESTED", md)
+        self.assertIn("confirmation: not recorded", self.summary("rehearse", "msr1", confirm=""))
+
+    def test_the_refusal_of_a_rehearsal_does_not_hand_out_the_console_override(self):
+        self.fresh(rehearsed=False, keep38=True)
+        self.refused("rh_refused_text", self.RH, "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic")
+        refusal = open(os.path.join(self.out, "msr1", "refusal.txt")).read()
+        self.assertNotRegex(refusal + self.log, r"REHEARSE-\S*CONSOLE")
+        self.assertIn("console attestation described in the README", refusal)
+        self.assertNotRegex(self.summary("rehearse", "msr1"), r"REHEARSE-\S*CONSOLE")
+
+    # R4-m4: an upgrade that came back with the one-shot still pending must not say "consumed ... a power-cycle boots the OLD kernel"
+    def test_an_upgrade_that_returned_with_a_one_shot_still_pending_says_what_a_power_cycle_really_boots(self):
+        self.fresh()
+        self.play("returned_pending", self.UP, env={"BOOT_MODE": "ignore-env"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-verification")
+        self.assertTrue(any("a one-shot is still pending" in p for p in r["problems"]), r["problems"])
+        pc = " ".join(r["power_cycle"].split())
+        for want in ("a one-shot is STILL PENDING", "GRUB did not consume it", "boots GRUB's FIRST menu entry, 7.0.0-40-generic", "NOT the saved default 7.0.0-31-generic",
+                     "only the console", "mode=disarm"):
+            self.assertIn(want, pc)
+        for stale in ("consumed by then", "boots the OLD kernel", "Reboot it back with the cluster-reboot workflow"):
+            self.assertNotIn(stale, pc)
+        md = " ".join(self.summary("upgrade", "msr1").split())
+        self.assertIn("a one-shot is STILL PENDING", md)
+        self.assertNotIn("consumed by then", md)
+        self.assertNotIn("boots the OLD kernel", md)
+        self.assertIn("Do NOT dispatch the upgrade again", md)
+
+    def test_an_upgrade_that_returned_with_the_one_shot_consumed_still_says_a_power_cycle_boots_the_old_kernel(self):
+        self.fresh()
+        self.play("returned_consumed", self.UP, env={"BOOT_MODE": "no-nic"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-verification")
+        pc = " ".join(r["power_cycle"].split())
+        self.assertIn("the one-shot is consumed by then: a power-cycle boots the OLD kernel 7.0.0-31-generic", pc)
+        self.assertNotIn("STILL PENDING", pc)
+        self.assertIn("Reboot it back with the cluster-reboot workflow", pc)
 
     def test_an_upgrade_is_refused_without_a_rehearsal(self):
         self.fresh(rehearsed=False)

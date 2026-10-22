@@ -228,7 +228,10 @@
     host_dir: "{{ os_out_dir }}/{{ inventory_hostname }}"
     # What a person must do, by how far the run got (result.json and the step summary carry it).
     power_cycle_rebooting: "{{ power_cycle_rebooting_rehearse if os_mode == 'rehearse' else power_cycle_rebooting_upgrade }}"
-    power_cycle_returned: "{{ power_cycle_returned_rehearse if os_mode == 'rehearse' else power_cycle_returned_upgrade }}"
+    power_cycle_returned: "{{ power_cycle_returned_rehearse if os_mode == 'rehearse' else (power_cycle_returned_upgrade_unconsumed if one_shot_pending_after else power_cycle_returned_upgrade) }}"
+    # did the host still hold a one-shot after it booted (the survey after the reboot says)? Then GRUB did not consume it: "the one-shot is
+    # consumed by then" would be false, and so would "a power-cycle boots the OLD kernel" (R4-m4).
+    one_shot_pending_after: "{{ (((post_survey | default({})).boot | default({})).next_entry | default('')) | length > 0 }}"
     power_cycle_rebooting_upgrade: >-
       The reboot was issued (or about to be) and {{ inventory_hostname }} did not answer within {{ reboot_timeout_seconds }} s,
       and it could not be asked to clear the one-shot. Which boot a power-cycle gives depends on why it is silent.
@@ -247,6 +250,13 @@
       later, treat it like a host that never returned (the one-shot is consumed by then: a power-cycle boots the OLD kernel
       {{ pre_survey.kernel }}). The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is
       still {{ pre_survey.kernel }}. Reboot it back with the cluster-reboot workflow (red with "kernel changed", expected).
+    power_cycle_returned_upgrade_unconsumed: >-
+      No power-cycle needed while the host answers: it answered after the reboot but failed verification, and a one-shot is STILL PENDING:
+      GRUB did not consume it, so it does not read the environment block Linux writes and the fallback is NOT proven. While that holds, a
+      power-cycle or a reboot (the cluster-reboot workflow included) boots GRUB's FIRST menu entry, {{ first_entry_kernel }}
+      (boot.entry0_kernel), NOT the saved default {{ pre_survey.kernel }}: only the console (Esc or Shift at power-on) or a reviewed change
+      brings {{ pre_survey.kernel }} back. Dispatch mode=disarm to clear the pending one-shot. The new kernel {{ target_kernel | default('') }}
+      was NOT made the default; the saved default is still {{ pre_survey.kernel }}.
     # A rehearsal arms the RUNNING kernel: there is no "new kernel" in it. What a silent host boots is its saved default (the running
     # kernel, pinned by the rehearsal) if GRUB reads the environment block, and the first menu entry of grub if it does not.
     power_cycle_rebooting_rehearse: >-
@@ -306,6 +316,7 @@
       boot_id_before: "{{ pre_target.boot_id }}"
       target_kernel: "{{ target_kernel | default('') }}"
       first_entry_kernel: "{{ first_entry_kernel }}"
+      confirm_kind: "{{ 'console-attested' if (os_mode == 'rehearse' and (os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE')) else 'standard' }}"
       access_packages_held: "{{ (((upgrade_start_raw | default({})).stdout | default('{}', true) | from_json).access_packages_held) | default([]) }}"
   tasks:
     - name: Target | the first records

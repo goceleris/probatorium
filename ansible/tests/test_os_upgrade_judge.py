@@ -234,6 +234,8 @@ class Judge(unittest.TestCase):
         refuse_rh = "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic"
         case("rehearse_while_entry0_is_another_kernel", {"refusals": refuse_rh}, rh("REHEARSE-msr1", "7.0.0-38-generic"))
         case("rehearse_names_what_it_would_boot", {"refusals": "no one-shot to fall back on"}, rh("REHEARSE-msr1", "7.0.0-38-generic"))
+        case("rehearse_refusal_points_to_the_readme_not_to_the_override", {"refusals": "the console attestation described in the README (Rehearsal at a console), which no refusal and no workflow text spells out"}, rh("REHEARSE-msr1", "7.0.0-38-generic"))
+        case("rehearse_with_the_attestation_of_another_host_is_refused", {"refusals": refuse_rh}, rh("REHEARSE-msa2-server-CONSOLE", "7.0.0-38-generic"))
         case("rehearse_with_a_console_is_allowed", {}, rh("REHEARSE-msr1-CONSOLE", "7.0.0-38-generic"))
         case("rehearse_when_entry0_is_the_running_kernel", {}, rh("REHEARSE-msr1", "7.0.0-31-generic"))
         case("rehearse_when_the_survey_has_no_entry0", {"refusals": "first menu entry of grub is unknown"}, rh("REHEARSE-msr1", ""))
@@ -449,6 +451,11 @@ class Judge(unittest.TestCase):
                 if want not in got[key]:
                     failures.append("%s: %s: expected %r in %r" % (name, key, want, got[key]))
         self.assertEqual(failures, [], "\n" + "\n".join(failures))
+
+    def test_no_verdict_spells_out_the_console_override(self):
+        for name, out in self.out.items():
+            for k, v in out.items():
+                self.assertNotRegex(v, r"REHEARSE-\S*CONSOLE", "%s: %s" % (name, k))
 
     def test_a_healthy_host_has_nothing_to_report(self):
         self.assertEqual(self.out["healthy"], {"refusals": "", "plan": "", "prereboot": "", "post": "", "maint": ""})

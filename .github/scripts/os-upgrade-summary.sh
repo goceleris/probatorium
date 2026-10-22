@@ -3,7 +3,8 @@
 # markdown job summary. Read-only (it also writes <host>/package-diff.txt next to the evidence); it works on whatever
 # the play managed to write, so a run that failed half way still gets a summary.
 #
-# usage: os-upgrade-summary.sh OUT_DIR MODE HOST ANSIBLE_RC "REASON" RUN_ID
+# usage: os-upgrade-summary.sh OUT_DIR MODE HOST ANSIBLE_RC "REASON" RUN_ID [CONFIRM]
+#   CONFIRM (optional) is the typed confirmation: a rehearsal's summary says whether it attested a console at the rack
 #   MODE survey | rehearse | upgrade | disarm | repair; HOST is "-" for a survey
 set -u
 out=${1:?out dir}
@@ -12,6 +13,7 @@ host=${3:?host}
 rc=${4:?ansible rc}
 reason=${5:-}
 run_id=${6:-}
+confirm=${7:-}
 safe_reason=${reason//\`/\'}
 
 if ! command -v jq > /dev/null 2>&1; then
@@ -108,7 +110,7 @@ checklist() {
 			row("GRUB booted this host and reads the grubenv Linux writes"; (if $pf.ok then "BOOT_IMAGE \($pf.boot_image); loader \($pf.efi_loader); prefix \($pf.prefix); stub fs \($pf.stub_uuid) = /boot/grub fs \($pf.boot_uuid)" else ($pf.problems | join(" / ")) end); (if $pf.ok then "PASS" else "FAIL" end); "if FAIL, every rehearsal and upgrade is refused; a one-shot cannot be trusted"),
 			row("no one-shot pending (next_entry)"; (if .boot.next_entry == "" then "none" else .boot.next_entry end); (if .boot.next_entry == "" then "PASS" else "FAIL" end); "if FAIL, mode=disarm first (an upgrade refuses)"),
 			row("upgrade pin vs the running kernel"; "drop-in \(.boot.dropin_present); saved default \(.boot.default_kernel | if . == "" then "unset" else . end); running \(.kernel)"; (if (.boot.dropin_present | not) then "NOTE" elif .boot.default_kernel == .kernel then "PASS" else "FAIL" end); "NOTE: not pinned yet, the first step pins. FAIL: the host runs a kernel other than its saved default: reboot it back (cluster-reboot) first"),
-			row("kernel a GRUB that ignores the grubenv would boot (first menu entry)"; "first entry `\(.boot.entry0_kernel | if . == "" then "unknown" else . end)`; running `\(.kernel)`; saved default `\(.boot.default_kernel | if . == "" then "unset" else . end)`"; (if .boot.entry0_kernel == .kernel then "PASS" else "FAIL" end); "FAIL = a rehearsal is refused (it would boot that kernel if GRUB does not read the grubenv, on every power-cycle after it) unless the confirmation is REHEARSE-<host>-CONSOLE with someone at the rack with a console"),
+			row("kernel a GRUB that ignores the grubenv would boot (first menu entry)"; "first entry `\(.boot.entry0_kernel | if . == "" then "unknown" else . end)`; running `\(.kernel)`; saved default `\(.boot.default_kernel | if . == "" then "unset" else . end)`"; (if .boot.entry0_kernel == .kernel then "PASS" else "FAIL" end); "FAIL = a rehearsal is refused (it would boot that kernel if GRUB does not read the grubenv, on every power-cycle after it) unless the dispatcher attests a person at the rack with a console (README, Rehearsal at a console)"),
 			row("boot filesystem of /boot/grub"; "\(.boot.boot_fs) on \(.boot.boot_source) \(.boot.boot_stack)"; (if .boot.boot_stack == "" and (.boot.boot_fs | IN("ext4","vfat","xfs","ext3","ext2")) then "PASS" else "FAIL" end); "if FAIL, grub cannot write its environment block there, so no one-shot"),
 			row("GRUB_DEFAULT and the recordfail timeout"; "GRUB_DEFAULT=\(.boot.settings.GRUB_DEFAULT // "unset"); menu timeout after a failed boot \(.boot.cfg_recordfail_timeout | if . == "" then "n/a" else . end) s"; (if .boot.cfg_recordfail_timeout == "-1" then "FAIL" else "PASS" end); "-1 = a failed boot waits at the menu for ever (the pin sets 5 s)"),
 			row("apt would remove nothing protected"; ($pk.simulation.remv | join(", ") | if . == "" then "no removals" else . end) + (if ($pk.simulation.protected_removals | length) > 0 then "; PROTECTED: " + ($pk.simulation.protected_removals | join(", ")) else "" end); (if ($pk.simulation.protected_removals | length) == 0 and $pk.simulation.rc == 0 then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses before it changes a package"),
@@ -150,6 +152,13 @@ echo "## Cluster OS $mode: $host"
 echo
 echo "- reason: \`$safe_reason\`"
 echo "- workflow run: $run_id"
+if [ "$mode" = rehearse ]; then
+	case "$confirm" in
+	*-CONSOLE) echo "- confirmation: **CONSOLE ATTESTED**: the dispatcher stated that a person is at the rack of $host with a console. A person approving this run should know that." ;;
+	"") echo "- confirmation: not recorded" ;;
+	*) echo "- confirmation: no console attested" ;;
+	esac
+fi
 
 if [ "$mode" = survey ]; then
 	if [ "$rc" -eq 0 ]; then echo "- **result: SURVEYED** (read-only; nothing on any host was changed, except, when refresh_lists was set, what apt-get update writes: /var/lib/apt/lists, /var/cache/apt/*.bin and its post-invoke hooks)"; else echo "- **result: SURVEY FAILED** (ansible-playbook exit $rc): the hosts that answered have a record below"; fi
@@ -193,7 +202,7 @@ if [ "$mode" = disarm ]; then
 	if [ -n "$(jq -r '.forgot_armed[0] // ""' "$d/disarm.json" 2> /dev/null)" ]; then
 		echo "- **The host has not rebooted since the arming** (same boot id): the armed record of $(jq -r '.forgot_armed | join(", ")' "$d/disarm.json") was dropped, that kernel never booted, so the next upgrade is not refused for a boot that never happened."
 	fi
-	echo "- Disarming clears only grub's next_entry. It does not touch the saved default, the packages or the running kernel. If the host did not answer, nothing was cleared: it is down, and a power-cycle boots whatever next_entry names (the NEW kernel, once) before the saved default."
+	echo "- Disarming clears only grub's next_entry. It does not touch the saved default, the packages or the running kernel. If the host did not answer, nothing was cleared: it is down, and a power-cycle boots whatever next_entry names before the saved default (after an upgrade's arming: the NEW kernel, once; after a rehearsal's arming: the running kernel again)."
 	for r in "$out"/*/refusal.txt; do
 		[ -s "$r" ] || continue
 		echo
@@ -282,10 +291,10 @@ verified)
 	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED or was refused (see the log; the step may have changed grub's saved default before failing: dispatch a survey and read \`boot.saved_entry\` and \`boot.next_entry\`; a one-shot still pending after the boot means GRUB did not consume it). Either accept the new kernel as the default by a reviewed change that runs grub-set-default for it, or reboot back with the cluster-reboot workflow (red with 'kernel changed', expected; only if GRUB consumed its one-shot: if boot.next_entry was still pending after the boot, GRUB ignores the grubenv and cluster-reboot boots GRUB's first menu entry, boot.entry0_kernel, again: then only the console helps) and dispatch the upgrade again. The upgrade REFUSES to run while the host runs a kernel other than grub's saved default."
 	;;
 returned)
-	if [ "$mode" = rehearse ]; then
-		echo "- Power-cycle: $(jq -r '.power_cycle // "see result.json"' "$d/result.json" 2> /dev/null)"
-	else
-	echo "- Power-cycle: **not needed while $host answers** (if it stops answering later, read the 'rebooting' case: the one-shot is consumed by now, so a power-cycle boots the OLD kernel). $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. Reboot it back with the cluster-reboot workflow: it returns to the old kernel and ends red with 'kernel changed', which is expected here, UNLESS a problem above says a one-shot is still pending (GRUB did not consume it, so it ignores the grubenv): then cluster-reboot boots GRUB's first menu entry (boot.entry0_kernel) again and only the console brings the old kernel back. Do NOT dispatch the upgrade again before that: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
+	# the text depends on whether a one-shot was still pending after the boot (result.json): never "consumed by now" beside a pending one
+	echo "- Power-cycle: $(jq -r '.power_cycle // "see result.json"' "$d/result.json" 2> /dev/null)"
+	if [ "$mode" != rehearse ]; then
+		echo "- The saved default is the OLD kernel; the new kernel was NOT made the default. Do NOT dispatch the upgrade again before the host is back on its saved default: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
 	fi
 	;;
 arming | rebooting)

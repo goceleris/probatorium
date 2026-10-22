@@ -23,7 +23,7 @@
       - os_out_dir is match('^/')
     fail_msg: >-
       refused: os_mode must be survey, upgrade, rehearse, disarm or repair; an upgrade, rehearsal, disarm or repair names ONE host (msa2-server, msr1 or
-      msa2-client) and os_confirm must be exactly UPGRADE-<host>, REHEARSE-<host> (REHEARSE-<host>-CONSOLE when someone is at the rack with a console), DISARM-<host> or REPAIR-<host>; a survey names no host ("-") and takes
+      msa2-client) and os_confirm must be exactly UPGRADE-<host>, REHEARSE-<host> (or the console attestation of a person at the rack, README), DISARM-<host> or REPAIR-<host>; a survey names no host ("-") and takes
       no confirmation; os_reason is one line of 1-200 characters; os_run_id digits; os_out_dir absolute.
     quiet: true
 

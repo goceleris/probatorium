@@ -217,8 +217,9 @@ gh workflow run cluster-reboot.yml --repo goceleris/probatorium --ref main \
   of them; on the target a runner job executing, a power-loss resume pending, entries in `results_root` (tmpfs: the
   reboot destroys them), an r8127 NIC without the shutdown quiesce hook or without the module for the running
   kernel, tailscaled running but not enabled at boot (the host would come back off the tailnet), or a newer kernel
-  installed than the one running (a decision for the maintainer: it changes comparability). The reasons are in the step
-  summary.
+  installed than the one running (a decision for the maintainer: it changes comparability) unless the OS-upgrade pin proves the
+  saved default is the running kernel (the drop-in and a valid rehearsal record, see "Upgrading a cluster host's OS"). The
+  reasons are in the step summary.
 - **It records, then reboots, then verifies.** Before: boot id, boot time, kernel, the NIC vectors found by name with
   their since-boot totals and IRQ affinity, bonds, crash dumps. Then `ansible.builtin.reboot` (bounded at 15 minutes),
   then a snapshot polled for up to 3 minutes. It FAILS unless the boot id changed, the kernel is the same, no new
@@ -274,7 +275,7 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   GRUB does not read the environment block, the host boots GRUB's FIRST menu entry, on that boot and every power-cycle after it;
   that is the running kernel only when nothing newer is installed (msr1 today: -38 is installed and is entry 0, running is -31).
   The survey shows `boot.entry0_kernel`, and a rehearsal is refused while it differs from the running kernel unless the
-  confirmation is `REHEARSE-<host>-CONSOLE`, which says someone is at the rack with a console); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
+  confirmation is the console attestation of a person at the rack, below); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
   clears a pending grub one-shot, nothing else; the playbook also does it by itself on any failure between arming and the new
   kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure`,
   `abort-new-kernel` or `release-holds`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the
@@ -288,6 +289,16 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   and never verified (below); it forgets that record only when the purge exited 0 and dpkg shows the version gone (a failed purge keeps
   the record, so `retry_kernel` stays required). `release-holds` releases the access-path holds that a dead run left (below) and
   nothing else.
+- **Rehearsal at a console.** While grub's first menu entry is not the running kernel (survey row "kernel a GRUB that ignores the grubenv would
+  boot": FAIL, today on all three hosts: -38 is installed and is entry 0, -31 runs), a rehearsal is refused, because if GRUB does not read the
+  environment block it boots that other kernel on every power-cycle. Only a person at the rack of THAT host with a console (HDMI and keyboard:
+  the GRUB menu is hidden, Esc or Shift at power-on) may run it, and that person's dispatch types `REHEARSE-<host>-CONSOLE` in `confirm`
+  (instead of `REHEARSE-<host>`), which is an attestation that they are there. No refusal, error or input description spells that string out
+  (an automated dispatcher that read a refusal could re-send it): it is described here and in the PLAN only. The `run-name` and the job name
+  (what the environment's approver sees: "Cluster OS rehearse [msr1] CONSOLE-ATTESTED ...", or "(no console attested)"), the `plan` job's
+  notice, the step summary and `result.json` (`confirm_kind`) all say which kind it was, so the approver approves only a console-attested run
+  when they know somebody is there. An `upgrade` never accepts it (`UPGRADE-<host>-CONSOLE` and `REHEARSE-<host>-CONSOLE` as an upgrade's
+  confirmation are refused by the `plan` job and again by the playbook).
 - **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
   job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's
   `HOLD-CLUSTER` marker lives outside this repository, so whoever dispatches honours it. The survey goes through the

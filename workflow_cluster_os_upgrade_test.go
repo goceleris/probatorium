@@ -903,7 +903,8 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"a listed disarm", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
 		{"a disarm confirmed in lower case", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "disarm-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly DISARM-msr1"},
 		{"a rehearsal with its confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
-		{"a rehearsal with the console confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1-CONSOLE", "ALLOWED_HOSTS": "msr1"}), true, ""},
+		{"a rehearsal with the console confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1-CONSOLE", "ALLOWED_HOSTS": "msr1"}), true, "CONSOLE ATTESTED: the dispatcher states that a person is at the rack of msr1 with a console"},
+		{"a rehearsal without it says no console is attested", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1", "ALLOWED_HOSTS": "msr1"}), true, "no console attested"},
 		{"a rehearsal with the console confirmation for another host", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msa2-server-CONSOLE", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
 		{"a console confirmation in lower case", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "rehearse-msr1-console", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
 		{"an upgrade confirmed as a console rehearsal", up("msr1", env{"IN_CONFIRM": "REHEARSE-msr1-CONSOLE"}), false, "confirm must be exactly UPGRADE-msr1"},
@@ -951,12 +952,94 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		if c.ok && err != nil {
 			t.Errorf("%s: refused: %s", c.name, out)
 		}
+		if c.ok && c.msg != "" && !strings.Contains(string(out), c.msg) {
+			t.Errorf("%s: accepted, but the log lacks %q: %s", c.name, c.msg, out)
+		}
 		if !c.ok {
 			if err == nil {
 				t.Errorf("%s: accepted", c.name)
 			} else if !strings.Contains(string(out), c.msg) {
 				t.Errorf("%s: refused for another reason than %q: %s", c.name, c.msg, out)
 			}
+			// R4-m3: a refusal never hands out the string that attests a console at the rack
+			if consoleOverride.Match(out) {
+				t.Errorf("%s: the refusal spells out the console override: %s", c.name, out)
+			}
+		}
+	}
+}
+
+// R4-m3: the environment's approver sees the run name and the job name, not the inputs. A rehearsal says in both whether the dispatcher
+// attests a person at the rack with a console.
+func TestClusterOSUpgradeTheApproverSeesTheConsoleAttestation(t *testing.T) {
+	src := readWorkflow(t, osWorkflow)
+	rn := regexp.MustCompile(`(?m)^run-name: (.*)$`).FindStringSubmatch(src)
+	jn := regexp.MustCompile(`(?m)^    name: (os-upgrade .*)$`).FindStringSubmatch(src)
+	if rn == nil || jn == nil {
+		t.Fatalf("run-name %v, os-upgrade job name %v", rn, jn)
+	}
+	for what, line := range map[string]string{"run-name": rn[1], "job name": jn[1]} {
+		for _, want := range []string{"inputs.mode == 'rehearse'", "endsWith(inputs.confirm, '-CONSOLE')", "CONSOLE-ATTESTED", "(no console attested)"} {
+			if !strings.Contains(line, want) {
+				t.Errorf("the %s lacks %q: %s", what, want, line)
+			}
+		}
+		if strings.Contains(line, "inputs.reason") {
+			t.Errorf("the %s carries free text: %s", what, line)
+		}
+	}
+	plan := jobSection(t, withoutComments(src), "plan")
+	for _, want := range []string{`"$IN_CONFIRM" = "REHEARSE-$IN_HOST-CONSOLE"`, "CONSOLE ATTESTED", "no console attested", "GITHUB_STEP_SUMMARY"} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("the plan job does not say whether a console is attested: lacks %q", want)
+		}
+	}
+	if sum := mustRead(t, filepath.Join(".github", "scripts", "os-upgrade-summary.sh")); !strings.Contains(sum, "CONSOLE ATTESTED") || !strings.Contains(src, `"$RUN_ID" "$IN_CONFIRM"`) {
+		t.Error("the step summary does not get the confirmation or does not say whether a console is attested")
+	}
+}
+
+var consoleOverride = regexp.MustCompile(`REHEARSE-[^\s'"]*CONSOLE`)
+
+// R4-m3: no refusal, error or input description spells out the confirmation that attests a console at the rack (an automated dispatcher that
+// read it could re-send it). The README describes how to type it, the checks compare against it.
+func TestClusterOSUpgradeNeverSpellsOutTheConsoleOverride(t *testing.T) {
+	wf := readWorkflow(t, osWorkflow)
+	for _, l := range strings.Split(wf, "\n") {
+		if (strings.Contains(l, "description:") || strings.Contains(l, "::error::") || strings.Contains(l, "::notice") || strings.Contains(l, "echo ")) && consoleOverride.MatchString(l) {
+			t.Errorf("the workflow spells out the override: %s", strings.TrimSpace(l))
+		}
+	}
+	req := mustRead(t, osRequest)
+	if i, j := strings.Index(req, "fail_msg:"), strings.Index(req, "quiet:"); i < 0 || j < i || consoleOverride.MatchString(req[i:j]) {
+		t.Error("the request's failure message spells out the override")
+	}
+	for _, l := range strings.Split(mustRead(t, osJudge), "\n") {
+		if i := strings.Index(l, "p.append("); i >= 0 && strings.Contains(l[i:], "CONSOLE") {
+			t.Errorf("a refusal of the judgement spells out the override: %s", strings.TrimSpace(l[i:]))
+		}
+	}
+	if consoleOverride.MatchString(stripComments(mustRead(t, osPlaybook))) {
+		t.Error("the playbook's texts spell out the override")
+	}
+	if consoleOverride.MatchString(mustRead(t, filepath.Join(".github", "scripts", "os-upgrade-summary.sh"))) {
+		t.Error("the summary spells out the override")
+	}
+	if !consoleOverride.MatchString(mustRead(t, "README.md")) {
+		t.Error("the README no longer says how a person at the rack attests a console")
+	}
+}
+
+// The two scripts the playbook ships to a host are executable in the repository (reboot_snapshot.sh had lost its bit; ansible.builtin.script
+// makes its copy executable, so only a person running it by hand noticed).
+func TestOSUpgradeScriptsAreExecutable(t *testing.T) {
+	for _, f := range []string{osScript, filepath.Join("ansible", "files", "reboot_snapshot.sh")} {
+		info, err := os.Stat(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&0o111 == 0 {
+			t.Errorf("%s is not executable (%v)", f, info.Mode())
 		}
 	}
 }

@@ -25,7 +25,10 @@
 #     without the shutdown quiesce hook (msr1 panics in the r8127 driver at power-off and then needs a
 #     physical power-cycle, see ops/power/quiesce-r8127.shutdown), an r8127 module not available for the
 #     running kernel, or a newer kernel already installed than the one running (the reboot would boot it:
-#     unplanned, and the out-of-tree driver may not be built for it, leaving no NIC and no way back).
+#     unplanned, and the out-of-tree driver may not be built for it, leaving no NIC and no way back) -- unless
+#     the OS-upgrade pin proves it will not (the drop-in, a rehearsal record for the running kernel with the
+#     grub and shim installed now, the saved entry the running kernel's own entry, no one-shot pending: README,
+#     "Upgrading a cluster host's OS", and the grub_pinned_to_running field of files/reboot_snapshot.sh).
 #
 # WHAT IT DOES
 #
