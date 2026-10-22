@@ -12,13 +12,14 @@
       - reboot_reason | trim | length > 0
       - reboot_reason | length <= 200
       - "'\n' not in reboot_reason"
+      - "'{' not in reboot_reason and '}' not in reboot_reason"
       - reboot_run_id is defined
       - reboot_run_id | string is match('^[0-9]+$')
       - reboot_out_dir is defined
       - reboot_out_dir is match('^/')
     fail_msg: >-
       refused: reboot_host must be msr1 or msa2-server (msa2-client drives both and is never rebooted here),
-      reboot_confirm must be exactly REBOOT-<host>, reboot_reason one line of 1-200 characters,
+      reboot_confirm must be exactly REBOOT-<host>, reboot_reason one line of 1-200 characters without braces (the workflow passes it as an unsafe string; this is the second line of defense),
       reboot_run_id digits, reboot_out_dir absolute.
     quiet: true
 

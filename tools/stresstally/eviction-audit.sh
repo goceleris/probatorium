@@ -32,7 +32,7 @@ if ! gh api --paginate "repos/$REPO/actions/runs?status=cancelled&created=%3E%3D
 fi
 jq -r --arg t "$CHECKED_AT" --arg u "$until" --arg self "$RUN_ID" '
 	select(.updated_at >= $t and .updated_at <= $u and (.id | tostring) != $self)
-	| select(.path | test("^\\.github/workflows/(matrix-[a-z]+-tier|benchmark-tier|celeris-stress|cluster-reboot)\\.yml$"))
+	| select(.path | test("^\\.github/workflows/(matrix-[a-z]+-tier|benchmark-tier|celeris-stress|cluster-reboot|cluster-os-upgrade)\\.yml$"))
 	| [(.id | tostring), .path, .updated_at, .display_title] | @tsv' cancelled.jsonl >evicted.tsv || true
 if [ -s evicted.tsv ]; then
 	while IFS=$'\t' read -r id path at title; do

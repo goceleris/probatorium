@@ -1,0 +1,10 @@
+---
+# Records the phase the upgrade of this host has reached (the step summary and the person reading a red run use it).
+# Included with vars: os_phase.
+- name: "Phase | {{ os_phase }}"
+  ansible.builtin.copy:
+    content: "{{ os_phase }}\n"
+    dest: "{{ os_out_dir }}/{{ inventory_hostname }}/phase.txt"
+    mode: "0644"
+  delegate_to: localhost
+  become: false

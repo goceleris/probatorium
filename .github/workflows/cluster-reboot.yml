@@ -95,6 +95,9 @@ jobs:
             echo "::error::reason must be one line without control characters"
             exit 1
           fi
+          case "$IN_REASON" in
+            *'{'* | *'}'*) echo "::error::reason must not contain braces"; exit 1 ;;
+          esac
           echo "request accepted: reboot $IN_HOST"
 
   # Outside matrix-tier-cluster, just before entering it. The tool is built first so the look (guard.sh) and
@@ -236,8 +239,9 @@ jobs:
           import json, os
           json.dump({
               "reboot_host": os.environ["REBOOT_HOST"],
-              "reboot_confirm": os.environ["IN_CONFIRM"],
-              "reboot_reason": os.environ["IN_REASON"],
+              # free text is data, never a template (ansible renders extra-vars from a file as Jinja)
+              "reboot_confirm": {"__ansible_unsafe": os.environ["IN_CONFIRM"]},
+              "reboot_reason": {"__ansible_unsafe": os.environ["IN_REASON"]},
               "reboot_run_id": os.environ["RUN_ID"],
               "reboot_out_dir": os.environ["REBOOT_OUT"],
               "allow_results_loss": os.environ["IN_ALLOW"] == "true",

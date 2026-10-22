@@ -1,0 +1,459 @@
+name: Cluster OS Upgrade
+
+# Survey the OS of the three cluster hosts (read-only), or upgrade ONE of them (kernel, packages, firmware) and prove
+# it came back. The only sanctioned path: nothing else in this repository changes a host's kernel or packages, and a
+# person does not ssh in (the tailnet policy denies it). Maintainer decision (2026-10-21): bring the kernel, the OS
+# packages and the software of all three hosts to the latest versions BEFORE the final release evidence;
+# comparability with older releases does not matter. Runbook: README.md, "Upgrading a cluster host's OS".
+#
+# Dispatch (from main only):
+#   gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
+#     -f mode=survey -f reason="platform survey before the OS upgrade"
+#   gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
+#     -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
+#
+# Job graph: plan -> cluster-guard -> os-upgrade -> verdict.
+#   plan           refuses a malformed request: a wrong mode (survey, rehearse, upgrade, disarm, repair), a survey that names a host or carries a confirm, an upgrade or
+#                  disarm without ONE host and its typed confirmation (UPGRADE-<host>, DISARM-<host>), a bad reason,
+#                  and any ref but main.
+#   cluster-guard  outside the group: lists every open run and refuses unless the cluster is IDLE
+#                  (tools/stresstally guard -idle: a holder refuses too, not only a pending run). The survey needs it
+#                  as well: it runs commands on the hosts and must not perturb a measurement.
+#   os-upgrade     inside matrix-tier-cluster for its whole length (ansible/os-upgrade.yml). The group keeps one
+#                  running and one pending run, and a run queued into it cancels the pending one; the guard above
+#                  refuses rather than queue, and this job refuses a verdict older than ten minutes. It needs no
+#                  runner: it runs on a GitHub-hosted machine that joins the tailnet, so there is nothing on the
+#                  upgraded host to strand. In survey mode it also compares the toolchains the roles install with
+#                  upstream (.github/scripts/os-upgrade-toolchains.sh).
+#   verdict        red unless the os-upgrade job succeeded: a skipped job (a re-run on an old guard verdict) must not
+#                  read as an upgrade that happened.
+#
+# It never runs on a schedule, and no host-changing mode can be dispatched until the maintainer lists the host in the
+# repository variable OS_UPGRADE_ALLOWED_HOSTS (empty by default; the plan job checks it) and, once the environment
+# cluster-host-change exists with a required reviewer, approves the run. The order of an upgrade campaign is enforced by the playbook: servers first, the load
+# generator (msa2-client) last.
+#
+# HOLD-CLUSTER: the orchestrator's marker file lives outside this repository and this workflow cannot see
+# it. Whoever dispatches honours it.
+
+run-name: Cluster OS ${{ inputs.mode }} [${{ inputs.host }}]
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "survey: read-only, all three hosts, no confirmation. rehearse: ONE host reboots into its OWN running kernel through a grub one-shot (proves the fallback mechanism; changes no package). upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host."
+        type: choice
+        options: [survey, rehearse, upgrade, disarm, repair]
+        required: true
+      host:
+        description: "rehearse, upgrade, disarm or repair: the host. Leave '-' for a survey."
+        type: choice
+        options: ["-", msa2-server, msr1, msa2-client]
+        required: false
+        default: "-"
+      confirm:
+        description: "rehearse: type REHEARSE-<host>, or REHEARSE-<host>-CONSOLE if someone is at the rack with a console (needed when grub's first menu entry is not the running kernel). upgrade: UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. A survey takes none."
+        type: string
+        required: false
+        default: ""
+      reason:
+        description: "Why (one line, up to 200 characters). Recorded in the step summary and the artifact."
+        type: string
+        required: true
+      allow_results_loss:
+        description: "Upgrade even though results_root on the host holds entries (tmpfs: the reboot destroys them). Default: refuse."
+        type: boolean
+        required: false
+        default: false
+      refresh_lists:
+        description: "survey only: run apt-get update first (writes /var/lib/apt/lists and /var/cache/apt/*.bin, runs the apt update post-invoke hooks) so the simulation is not stale."
+        type: boolean
+        required: false
+        default: false
+      repair_action:
+        description: "repair only: configure = dpkg --configure -a. abort-new-kernel = purge the kernels newer than the running one, then configure (the host stays on the old kernel). release-holds = release the access-path holds that a dead run of this tool left (only holds it recorded; nothing else)."
+        type: choice
+        options: [configure, abort-new-kernel, release-holds]
+        required: false
+        default: configure
+      retry_kernel:
+        description: "upgrade only: a kernel version (7.0.0-40-generic) that an earlier run armed and that never ended verified; leave empty to have the upgrade refuse to arm it again."
+        type: string
+        required: false
+        default: ""
+      hold_access_packages:
+        description: "upgrade only: hold grub*, shim*, openssh-server and tailscale* for the run (both kernels share them, so a power-cycle cannot undo a regression in them). auto = on for a host with an r8127 NIC (msr1), off otherwise."
+        type: choice
+        options: [auto, "on", "off"]
+        required: false
+        default: auto
+      blacklist_r8169:
+        description: "upgrade only: blacklist the in-tree r8169 when the new kernel's r8169 lists the r8127 PCI id (msr1). Default: refuse to reboot."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Refuse a malformed request before any host is touched
+        # The inputs reach the script only through env:, never through ${{ }} in run:.
+        env:
+          IN_MODE: ${{ inputs.mode }}
+          IN_HOST: ${{ inputs.host }}
+          IN_CONFIRM: ${{ inputs.confirm }}
+          IN_REASON: ${{ inputs.reason }}
+          IN_REPAIR_ACTION: ${{ inputs.repair_action }}
+          IN_RETRY_KERNEL: ${{ inputs.retry_kernel }}
+          IN_HOLD: ${{ inputs.hold_access_packages }}
+          # the maintainer's switch: hosts a host-changing mode may touch (comma or space separated). Empty by default.
+          ALLOWED_HOSTS: ${{ vars.OS_UPGRADE_ALLOWED_HOSTS }}
+          # reads the environment's protection rules; GITHUB_TOKEN may not be allowed to, then a token with Environments: read
+          GH_TOKEN: ${{ secrets.ENVIRONMENTS_READ_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eu
+          if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::dispatch from $DEFAULT_BRANCH only (got $REF): a host change runs reviewed code"
+            exit 1
+          fi
+          # every input the playbook receives is checked here in EVERY mode, a survey included (a survey job holds the cluster key,
+          # and each value is also written to extra-vars.json as a literal)
+          case "$IN_MODE" in
+            survey | rehearse | upgrade | disarm | repair) ;;
+            *) echo "::error::mode must be survey, rehearse, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
+          esac
+          case "$IN_HOST" in
+            "-" | msa2-server | msr1 | msa2-client) ;;
+            *) echo "::error::host must be '-', msa2-server, msr1 or msa2-client, got: $IN_HOST"; exit 1 ;;
+          esac
+          case "$IN_REPAIR_ACTION" in
+            configure | abort-new-kernel | release-holds) ;;
+            *) echo "::error::repair_action must be configure, abort-new-kernel or release-holds"; exit 1 ;;
+          esac
+          case "$IN_HOLD" in
+            auto | on | off) ;;
+            *) echo "::error::hold_access_packages must be auto, on or off"; exit 1 ;;
+          esac
+          if ! [[ "$IN_RETRY_KERNEL" =~ ^([0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z0-9-]+)?$ ]]; then
+            echo "::error::retry_kernel must be empty or a kernel version such as 7.0.0-40-generic"
+            exit 1
+          fi
+          case "$IN_MODE" in
+            survey)
+              if [ "$IN_HOST" != "-" ]; then
+                echo "::error::a survey covers all three hosts: leave host as '-' (got $IN_HOST)"
+                exit 1
+              fi
+              if [ -n "$IN_CONFIRM" ]; then
+                echo "::error::a survey takes no confirmation: leave confirm empty"
+                exit 1
+              fi
+              ;;
+            upgrade | rehearse | disarm | repair)
+              case "$IN_HOST" in
+                msa2-server|msr1|msa2-client) ;;
+                *) echo "::error::an upgrade, a rehearsal, a disarm or a repair names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
+              esac
+              # the extra control: a host-changing mode is impossible until the maintainer lists the host for the window
+              # (repository variable OS_UPGRADE_ALLOWED_HOSTS; README, "Enabling a host change")
+              case " $(printf '%s' "$ALLOWED_HOSTS" | tr ',' ' ') " in
+                *" $IN_HOST "*) ;;
+                *) echo "::error::$IN_HOST is not in the repository variable OS_UPGRADE_ALLOWED_HOSTS (it is '${ALLOWED_HOSTS:-empty}'): the maintainer enables a host change by listing the host there for the window"; exit 1 ;;
+              esac
+              # ... and the approval must exist: the environment cluster-host-change with a required reviewer and a deployment
+              # branch policy. GitHub creates a missing environment unprotected on first use, so the existence is checked here.
+              if ! envjson=$(gh api "repos/$REPO/environments/cluster-host-change" 2>&1); then
+                echo "::error::cannot read the environment cluster-host-change (gh said: $envjson). Either it does not exist, or the workflow token may not read environments: create it (README, Enabling a host change), or give the plan job a token with Environments: read in the secret ENVIRONMENTS_READ_TOKEN. A host-changing mode is refused until it can be checked"
+                exit 1
+              fi
+              if ! printf '%s' "$envjson" | jq -e '([.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers | length)] | add // 0) > 0' > /dev/null; then
+                echo "::error::the environment cluster-host-change has no required reviewer: a host-changing mode needs the maintainer's approval (README, Enabling a host change)"
+                exit 1
+              fi
+              if ! printf '%s' "$envjson" | jq -e '.deployment_branch_policy != null' > /dev/null; then
+                echo "::error::the environment cluster-host-change has no deployment branch policy: restrict it to main"
+                exit 1
+              fi
+              if [ "$IN_MODE" = upgrade ] && [ "$IN_CONFIRM" != "UPGRADE-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly UPGRADE-$IN_HOST"
+                exit 1
+              fi
+              if [ "$IN_MODE" = rehearse ] && [ "$IN_CONFIRM" != "REHEARSE-$IN_HOST" ] && [ "$IN_CONFIRM" != "REHEARSE-$IN_HOST-CONSOLE" ]; then
+                echo "::error::confirm must be exactly REHEARSE-$IN_HOST (REHEARSE-$IN_HOST-CONSOLE only with someone at the rack with a console)"
+                exit 1
+              fi
+              if [ "$IN_MODE" = disarm ] && [ "$IN_CONFIRM" != "DISARM-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly DISARM-$IN_HOST"
+                exit 1
+              fi
+              if [ "$IN_MODE" = repair ] && [ "$IN_CONFIRM" != "REPAIR-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly REPAIR-$IN_HOST"
+                exit 1
+              fi
+              ;;
+            *) echo "::error::mode must be survey, rehearse, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
+          esac
+          if [ -z "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ]; then
+            echo "::error::reason is empty"
+            exit 1
+          fi
+          if [ "${#IN_REASON}" -gt 200 ]; then
+            echo "::error::reason is longer than 200 characters"
+            exit 1
+          fi
+          if [ "$(printf '%s' "$IN_REASON" | wc -l)" -ne 0 ] || printf '%s' "$IN_REASON" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+            echo "::error::reason must be one line without control characters"
+            exit 1
+          fi
+          # defense in depth: the playbook receives it as an unsafe (literal) string, but there is no reason to carry
+          # template syntax into the audit trail
+          case "$IN_REASON" in
+            *'{'* | *'}'*) echo "::error::reason must not contain braces"; exit 1 ;;
+          esac
+          echo "request accepted: $IN_MODE $IN_HOST"
+
+  # Outside matrix-tier-cluster, just before entering it. The tool is built first so the look (guard.sh) and
+  # the verdict are seconds apart, as in celeris-stress.yml.
+  cluster-guard:
+    name: cluster-guard
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      checked_at: ${{ steps.guard.outputs.checked_at }}
+      # The attempt this verdict belongs to: the os-upgrade job runs only on a verdict from its own attempt.
+      attempt: ${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/stresstally
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Refuse unless the cluster is idle
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          GUARD_DIR: ${{ runner.temp }}/guard
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/stresstally" ./tools/stresstally
+          bash tools/stresstally/guard.sh
+          "$RUNNER_TEMP/stresstally" guard -idle -dir "$GUARD_DIR" -self "$RUN_ID"
+      - name: Upload the guard's evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: os-upgrade-cluster-guard
+          path: ${{ runner.temp }}/guard/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The survey or the upgrade, inside matrix-tier-cluster for its whole length. Job-level concurrency only: a
+  # workflow-level group would enter at dispatch, before the guard looked.
+  os-upgrade:
+    name: os-upgrade ${{ inputs.mode }} ${{ inputs.host }}
+    needs: [plan, cluster-guard]
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.cluster-guard.result == 'success' && needs.cluster-guard.outputs.attempt == github.run_attempt && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    concurrency:
+      group: matrix-tier-cluster
+      cancel-in-progress: false
+    # A host-changing mode runs in the repository environment cluster-host-change: the maintainer gives it a required
+    # reviewer and main as the only deployment branch (README, "Enabling a host change"), so the job waits for approval
+    # before it holds the key. A survey runs in cluster-read, which carries no protection: a survey never waits for approval.
+    # (GitHub makes an environment that does not exist yet, without protection: the variable gate in the plan job is what
+    # is enforced by this repository's code.)
+    environment: ${{ inputs.mode == 'survey' && 'cluster-read' || 'cluster-host-change' }}
+    runs-on: ubuntu-24.04
+    # Setup, apt (up to 3 rounds of 20 minutes of polls and the waits between them), a DKMS build (up to 30), a
+    # reboot bounded at 15 minutes, 3 minutes of settling, the checks and the summary.
+    timeout-minutes: 270
+    permissions:
+      actions: read
+      contents: read
+    env:
+      OS_MODE: ${{ inputs.mode }}
+      OS_HOST: ${{ inputs.host }}
+      OS_OUT: ${{ github.workspace }}/os-upgrade-evidence
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report any cluster run cancelled since the guard looked
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          CHECKED_AT: ${{ needs.cluster-guard.outputs.checked_at }}
+        run: bash tools/stresstally/eviction-audit.sh
+      - name: Refuse a stale idle verdict
+        shell: bash
+        env:
+          CHECKED_AT: ${{ needs.cluster-guard.outputs.checked_at }}
+        run: |
+          set -eu
+          if ! printf '%s' "$CHECKED_AT" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+            echo "::error::the guard's look is unknown ('$CHECKED_AT'): refusing"
+            exit 1
+          fi
+          age=$(( $(date -u +%s) - $(date -u -d "$CHECKED_AT" +%s) ))
+          echo "the cluster was idle $age s ago (looked at $CHECKED_AT)"
+          if [ "$age" -gt 600 ]; then
+            echo "::error::the idle verdict is $age s old (limit 600 s): either this job waited in matrix-tier-cluster behind a run that started after the guard looked, or it waited for the approval of the environment cluster-host-change (approve within ten minutes of the dispatch). Nothing was changed. Dispatch again when the cluster is idle and the reviewer is ready."
+            exit 1
+          fi
+      - name: Join tailnet (ephemeral)
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: latest
+      - name: Install ansible-core (the cluster's pin)
+        shell: bash
+        run: |
+          set -eu
+          core=$(sed -n 's/^[[:space:]]*ansible_core_version:[[:space:]]*"\([^"]*\)".*/\1/p' ansible/runner-setup.yml | head -n 1)
+          [ -n "$core" ] || { echo "::error::no ansible_core_version pin in ansible/runner-setup.yml"; exit 1; }
+          python3 -m venv "$RUNNER_TEMP/ansible"
+          "$RUNNER_TEMP/ansible/bin/pip" install --quiet "ansible-core==$core"
+          echo "$RUNNER_TEMP/ansible/bin" >> "$GITHUB_PATH"
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        run: |
+          set -eu
+          if [ -z "$SSH_KEY" ]; then
+            echo "::error::the CLUSTER_SSH_KEY secret is empty"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Names over the tailnet (MagicDNS), as the composites do. CLUSTER_USE_LAN stays UNSET: the
+          # reconnect after the reboot then goes over the tailnet, so it also proves tailscale came back.
+          ssh-keyscan -H msa2-server msa2-client msr1 >> ~/.ssh/known_hosts 2>/dev/null || true
+      - name: Toolchains the roles install, against upstream (survey)
+        if: ${{ env.OS_MODE == 'survey' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          mkdir -p "$OS_OUT"
+          # best effort and read-only: an upstream that does not answer is reported, never fatal
+          bash .github/scripts/os-upgrade-toolchains.sh "$OS_OUT/toolchains.json" || echo "the toolchain comparison failed; the survey goes on"
+      - name: Write the request for ansible
+        shell: bash
+        env:
+          IN_MODE: ${{ inputs.mode }}
+          IN_HOST: ${{ inputs.host }}
+          IN_CONFIRM: ${{ inputs.confirm }}
+          IN_REASON: ${{ inputs.reason }}
+          IN_ALLOW: ${{ inputs.allow_results_loss }}
+          IN_REFRESH: ${{ inputs.refresh_lists }}
+          IN_BLACKLIST: ${{ inputs.blacklist_r8169 }}
+          IN_REPAIR_ACTION: ${{ inputs.repair_action }}
+          IN_RETRY_KERNEL: ${{ inputs.retry_kernel }}
+          IN_HOLD: ${{ inputs.hold_access_packages }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          mkdir -p "$OS_OUT"
+          # A JSON file, not key=value: --extra-vars k=v splits on whitespace and the reason is free text.
+          python3 - <<'PY'
+          import json, os
+          json.dump({
+              # every string input is a literal (the choice inputs too: GitHub validates a choice, the plan job checks them all, and
+              # a template in any of them would still run on the runner that holds the cluster key)
+              "os_mode": {"__ansible_unsafe": os.environ["IN_MODE"]},
+              "os_host": {"__ansible_unsafe": os.environ["IN_HOST"]},
+              # free text is data, never a template: ansible renders extra-vars from a file as Jinja, and the
+              # runner holds the cluster key. __ansible_unsafe keeps '{{ ... }}' literal.
+              "os_confirm": {"__ansible_unsafe": os.environ["IN_CONFIRM"]},
+              "os_reason": {"__ansible_unsafe": os.environ["IN_REASON"]},
+              "os_run_id": os.environ["RUN_ID"],
+              "os_out_dir": os.environ["OS_OUT"],
+              "allow_results_loss": os.environ["IN_ALLOW"] == "true",
+              "refresh_lists": os.environ["IN_REFRESH"] == "true",
+              "blacklist_r8169": os.environ["IN_BLACKLIST"] == "true",
+              "repair_action": {"__ansible_unsafe": os.environ["IN_REPAIR_ACTION"]},
+              "retry_kernel": {"__ansible_unsafe": os.environ["IN_RETRY_KERNEL"]},
+              "hold_access_packages": {"__ansible_unsafe": os.environ["IN_HOLD"]},
+          }, open(os.path.join(os.environ["OS_OUT"], "extra-vars.json"), "w"), indent=2)
+          PY
+      - name: Survey or upgrade (ansible/os-upgrade.yml)
+        shell: bash
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_PRIVATE_KEY_FILE: ~/.ssh/id_ed25519
+        run: |
+          set -u
+          set +e
+          timeout -k 30 14400 ansible-playbook \
+            -i ansible/inventory.yml \
+            ansible/os-upgrade.yml \
+            --extra-vars "@${OS_OUT}/extra-vars.json" 2>&1 | tee "${OS_OUT}/ansible.log"
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > "${OS_OUT}/ansible.rc"
+          exit "$rc"
+      - name: Summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          IN_REASON: ${{ inputs.reason }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          rc=$(cat "${OS_OUT}/ansible.rc" 2>/dev/null || echo 99)
+          mkdir -p "$OS_OUT"
+          bash .github/scripts/os-upgrade-summary.sh "$OS_OUT" "$OS_MODE" "$OS_HOST" "$rc" "$IN_REASON" "$RUN_ID" | tee "$OS_OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-os-${{ inputs.mode }}-${{ inputs.host }}-${{ github.run_id }}
+          path: os-upgrade-evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+  verdict:
+    name: verdict
+    needs: [plan, cluster-guard, os-upgrade]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Red unless the survey was taken or the host was upgraded and verified
+        env:
+          PLAN: ${{ needs.plan.result }}
+          GUARD: ${{ needs.cluster-guard.result }}
+          RUN: ${{ needs.os-upgrade.result }}
+          ATTEMPT: ${{ github.run_attempt }}
+          GUARD_ATTEMPT: ${{ needs.cluster-guard.outputs.attempt }}
+        run: |
+          echo "plan=$PLAN cluster-guard=$GUARD os-upgrade=$RUN"
+          if [ "$RUN" != success ]; then
+            echo "::error::nothing was surveyed or upgraded and verified (plan $PLAN, cluster-guard $GUARD, os-upgrade $RUN; attempt $ATTEMPT, guard attempt ${GUARD_ATTEMPT:-none}). A re-run never reuses an old idle verdict: dispatch a new run."
+            exit 1
+          fi
