@@ -208,6 +208,8 @@ class Judge(unittest.TestCase):
              lambda c: c["pre_survey"]["packages"].update(dpkg_audit=["foo"]))
         case("held_kernel", {"refusals": "held kernel, boot or DKMS packages: linux-image-generic"},
              lambda c: c["pre_survey"]["packages"].update(held_kernel=["linux-image-generic"]))
+        case("the_way_in_is_already_broken", {"refusals": "the way in is ALREADY not intact on the current userland (sshd -t fails: x)"},
+             lambda c: c["pre_survey"].update(access_problems=["sshd -t fails: x"]))
         case("policy_rc_d", {"refusals": "policy-rc.d exists already"}, lambda c: c["pre_survey"]["packages"].update(policy_rc_d_present=True))
         case("no_grub", {"refusals": "no usable GRUB"}, lambda c: c["pre_survey"]["boot"].update(grub_reboot=False))
         case("no_grub_cfg", {"refusals": "no usable GRUB"}, lambda c: c["pre_survey"]["boot"].update(grub_cfg_present=False))
@@ -419,7 +421,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 73, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 74, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:

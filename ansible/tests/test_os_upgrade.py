@@ -212,6 +212,14 @@ class Survey(Base):
         self.h.state["boot_src"] = "/dev/mapper/vg-root"
         self.assertEqual(self.run_ok("survey")["boot"]["boot_stack"], "lvm-or-mdraid")
 
+    def test_the_survey_checks_the_way_in_before_anything_is_changed(self):
+        self.assertEqual(self.run_ok("survey")["access_problems"], [])
+        self.h.state["sshd_rc"] = 255
+        self.h.state["netplan_rc"] = 1
+        probs = " | ".join(self.run_ok("survey")["access_problems"])
+        self.assertIn("sshd -t fails", probs)
+        self.assertIn("netplan generate fails", probs)
+
     def test_survey_writes_nothing_and_runs_no_changing_command(self):
         self.h.save()
         before = self.h.snapshot()
@@ -368,6 +376,22 @@ class PinGrub(Base):
         self.assertIn("GRUB_SAVEDEFAULT=true", r.stdout + r.stderr)
         self.assertFalse(any(c.startswith("grub-set-default") for c in self.h.calls()))
 
+    def test_a_failed_pin_removes_its_drop_in(self):
+        self.h.state["update_grub_rc"] = 1
+        self.h.save()
+        self.assertEqual(self.pin().returncode, 1)
+        self.assertFalse(os.path.exists(self.h.root + "/etc/default/grub.d/99-celeris-os-upgrade.cfg"), "a failed pin left GRUB_DEFAULT=saved behind")
+
+    def test_a_pin_that_fails_after_the_drop_in_removes_it_and_regenerates(self):
+        bad = os.path.join(self.tmp, "bad2.cfg")
+        with open(bad, "w") as f:
+            f.write(cfg_text("grub-arm64-efi.cfg").replace("set timeout=5", "set timeout=-1"))
+        self.h.state["next_grub_cfg"] = bad
+        self.h.save()
+        self.assertEqual(self.pin().returncode, 1)
+        self.assertFalse(os.path.exists(self.h.root + "/etc/default/grub.d/99-celeris-os-upgrade.cfg"))
+        self.assertGreaterEqual(len([c for c in self.h.calls() if c == "update-grub "]), 2)  # the pin's and the undo's
+
     def test_refuses_when_another_file_overrides_grub_default(self):
         self.h.state["next_grub_cfg"] = None  # update-grub regenerates nothing: the cfg stays GRUB_DEFAULT=0
         self.h.save()
@@ -480,6 +504,24 @@ class Upgrade(Base):
         time.sleep(0.5)
         c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
         self.assertEqual(c["removed"], True)
+
+    def test_a_run_whose_pid_is_not_recorded_yet_is_running_not_died(self):
+        # between the creation of the log and the pid file
+        self.h.save()
+        os.makedirs(self.h.root + "/var/log/celeris-os-upgrade/42", exist_ok=True)
+        open(self.h.root + "/var/log/celeris-os-upgrade/42/apt-upgrade.log", "w").close()
+        self.assertEqual(self.j(self.h.run("upgrade-status", "--run-id", "42"))["state"], "running")
+
+    def test_cleanup_waits_for_a_dpkg_that_outlives_its_wrapper(self):
+        # the wrapper died (the OOM killer) and apt-get, reparented to init, still runs
+        self.h.w("/usr/sbin/policy-rc.d", osu.POLICY, 0o755)
+        self.h.w("/proc/4343/comm", "dpkg\n")
+        self.h.save()
+        c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+        self.assertEqual(c["removed"], False)
+        self.assertIn("dpkg or apt is still running", c["reason"])
+        os.remove(self.h.root + "/proc/4343/comm")
+        self.assertEqual(self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))["removed"], True)
 
     def test_status_can_wait_on_the_host(self):
         self.h.save()
@@ -760,6 +802,7 @@ class Repair(Base):
         self.h.state["upgrade_kernels"] = ["7.0.0-40-generic"]
         for pk, st in (("linux-image-7.0.0-40-generic", "installed"), ("linux-headers-7.0.0-40-generic", "half-configured"), ("linux-modules-7.0.0-40-generic", "installed")):
             self.h.state["packages"][pk] = {"version": "7.0.0-40", "status": st}
+        self.h.state["packages"]["linux-image-7.0.0-25-generic"] = {"version": "7.0.0-25", "status": "installed"}  # OLDER than the running kernel
         self.h.state["audit"] = ["linux-headers-7.0.0-40-generic  half-configured"]
         self.h.state["dkms_status"] = ["r8127/11.015.00, 7.0.0-31-generic, aarch64: installed"]
 
@@ -775,6 +818,7 @@ class Repair(Base):
     def test_survey_lists_the_kernel_packages_newer_than_the_running_kernel(self):
         self.broken()
         s = self.run_ok("survey")
+        self.assertNotIn("linux-image-7.0.0-25-generic", s["packages"]["new_kernel_pkgs"])  # older than the running kernel: never a candidate
         self.assertEqual(s["packages"]["new_kernel_pkgs"], ["linux-headers-7.0.0-40-generic", "linux-image-7.0.0-38-generic", "linux-image-7.0.0-40-generic", "linux-modules-7.0.0-40-generic"])
         # only the version a failed upgrade left half-installed is ours to abort; the -38 that was installed and working is not
         self.assertEqual(s["packages"]["broken_kernel_pkgs"], ["linux-headers-7.0.0-40-generic", "linux-image-7.0.0-40-generic", "linux-modules-7.0.0-40-generic"])
@@ -810,10 +854,37 @@ class Repair(Base):
         self.assertNotIn("linux-headers-7.0.0-40-generic", pk)
         self.assertIn("linux-image-7.0.0-31-generic", pk)  # the running kernel stays
         self.assertIn("linux-image-7.0.0-38-generic", pk)  # an older one stays
-        removes = [c for c in self.h.calls() if c.startswith("apt-get") and "remove" in c]
+        self.assertIn("linux-image-7.0.0-25-generic", pk)  # the older one stays
+        removes = [c for c in self.h.calls() if c.startswith("apt-get") and "remove" in c and " -s " not in c]
         self.assertEqual(len(removes), 1)
         self.assertNotIn("7.0.0-31", removes[0])
         self.assertNotIn("7.0.0-38", removes[0])
+
+
+class RepairCascade(Repair):
+    def test_the_abort_simulates_first_and_the_kernel_metapackages_may_follow(self):
+        self.broken()
+        self.h.state["remove_cascade"] = ["linux-generic", "linux-image-generic"]
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "abort-new-kernel"))
+        self.assertEqual(self.wait()["rc"], 0)
+        calls = self.h.calls()
+        sim = [i for i, c in enumerate(calls) if c.startswith("apt-get -s") and "remove" in c]
+        real = [i for i, c in enumerate(calls) if c.startswith("apt-get -y") and "remove" in c]
+        self.assertTrue(sim and real and sim[0] < real[0], calls)
+        log = self.h.run("upgrade-log", "--run-id", "9").stdout
+        self.assertIn("KERNEL METAPACKAGES REMOVED WITH IT: linux-generic, linux-image-generic", log)
+
+    def test_an_abort_that_would_remove_anything_else_removes_nothing(self):
+        self.broken()
+        self.h.state["remove_cascade"] = ["tailscale"]
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "abort-new-kernel"))
+        self.assertEqual(self.wait()["rc"], 3)
+        self.assertIn("tailscale", self.h.run("upgrade-log", "--run-id", "9").stdout)
+        self.assertFalse([c for c in self.h.calls() if c.startswith("apt-get -y") and "remove" in c])
+        self.assertIn("linux-image-7.0.0-40-generic", self.h.load()["packages"])
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
 
 
 class Toolcheck(Base):

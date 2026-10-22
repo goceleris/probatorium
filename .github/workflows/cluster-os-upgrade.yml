@@ -102,6 +102,9 @@ jobs:
           IN_REPAIR_ACTION: ${{ inputs.repair_action }}
           # the maintainer's switch: hosts a host-changing mode may touch (comma or space separated). Empty by default.
           ALLOWED_HOSTS: ${{ vars.OS_UPGRADE_ALLOWED_HOSTS }}
+          # reads the environment's protection rules; GITHUB_TOKEN may not be allowed to, then a token with Environments: read
+          GH_TOKEN: ${{ secrets.ENVIRONMENTS_READ_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
           REF: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -132,6 +135,20 @@ jobs:
                 *" $IN_HOST "*) ;;
                 *) echo "::error::$IN_HOST is not in the repository variable OS_UPGRADE_ALLOWED_HOSTS (it is '${ALLOWED_HOSTS:-empty}'): the maintainer enables a host change by listing the host there for the window"; exit 1 ;;
               esac
+              # ... and the approval must exist: the environment cluster-host-change with a required reviewer and a deployment
+              # branch policy. GitHub creates a missing environment unprotected on first use, so the existence is checked here.
+              if ! envjson=$(gh api "repos/$REPO/environments/cluster-host-change" 2>&1); then
+                echo "::error::cannot read the environment cluster-host-change (gh said: $envjson). Either it does not exist, or the workflow token may not read environments: create it (README, Enabling a host change), or give the plan job a token with Environments: read in the secret ENVIRONMENTS_READ_TOKEN. A host-changing mode is refused until it can be checked"
+                exit 1
+              fi
+              if ! printf '%s' "$envjson" | jq -e '([.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers | length)] | add // 0) > 0' > /dev/null; then
+                echo "::error::the environment cluster-host-change has no required reviewer: a host-changing mode needs the maintainer's approval (README, Enabling a host change)"
+                exit 1
+              fi
+              if ! printf '%s' "$envjson" | jq -e '.deployment_branch_policy != null' > /dev/null; then
+                echo "::error::the environment cluster-host-change has no deployment branch policy: restrict it to main"
+                exit 1
+              fi
               if [ "$IN_MODE" = repair ]; then
                 case "$IN_REPAIR_ACTION" in
                   configure | abort-new-kernel) ;;
@@ -268,7 +285,7 @@ jobs:
           age=$(( $(date -u +%s) - $(date -u -d "$CHECKED_AT" +%s) ))
           echo "the cluster was idle $age s ago (looked at $CHECKED_AT)"
           if [ "$age" -gt 600 ]; then
-            echo "::error::the idle verdict is $age s old (limit 600 s): this job waited in matrix-tier-cluster behind a run that started after the guard looked, so the cluster was not idle when this was dispatched. Nothing was changed. Dispatch again when the cluster is idle."
+            echo "::error::the idle verdict is $age s old (limit 600 s): either this job waited in matrix-tier-cluster behind a run that started after the guard looked, or it waited for the approval of the environment cluster-host-change (approve within ten minutes of the dispatch). Nothing was changed. Dispatch again when the cluster is idle and the reviewer is ready."
             exit 1
           fi
       - name: Join tailnet (ephemeral)

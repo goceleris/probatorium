@@ -98,12 +98,16 @@ if name == "dpkg":
             out(st["src_pkg"] + ": " + args[1] + "\n"); sys.exit(0)
         sys.exit(1)
 if name == "apt-get":
+    if "-s" in args and "remove" in args:
+        names = args[args.index("--purge") + 1:] if "--purge" in args else []
+        out("".join("Remv %s [1]\n" % n for n in names + st.get("remove_cascade", [])))
+        sys.exit(st.get("sim_rc", 0))
     if "-s" in args:
         out("\n".join(st.get("sim_phased" if any("Always-Include-Phased" in a for a in args) else "sim", [])) + "\n"); sys.exit(st.get("sim_rc", 0))
     if "update" in args:
         out("Hit:1 http://ports.ubuntu.com resolute InRelease\nReading package lists...\n"); sys.exit(st.get("update_rc", 0))
     if "remove" in args:
-        names = args[args.index("--purge") + 1:] if "--purge" in args else []
+        names = (args[args.index("--purge") + 1:] if "--purge" in args else []) + st.get("remove_cascade", [])
         out("Removing: %s\n" % " ".join(names))
         for n in names:
             pkgs().pop(n, None)

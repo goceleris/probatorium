@@ -4,7 +4,7 @@
 # the play managed to write, so a run that failed half way still gets a summary.
 #
 # usage: os-upgrade-summary.sh OUT_DIR MODE HOST ANSIBLE_RC "REASON" RUN_ID
-#   MODE survey | upgrade; HOST is "-" for a survey
+#   MODE survey | upgrade | disarm | repair; HOST is "-" for a survey
 set -u
 out=${1:?out dir}
 mode=${2:?mode}
@@ -32,6 +32,7 @@ survey_section() {
 	jq -r '
 		"- OS: \(.os_release.PRETTY_NAME // "?") (\(.arch)); running kernel `\(.kernel)`; installed: \(.installed_kernels | join(", ")); newest of the same flavor: `\(.newest_same_flavor)`",
 		"- grub: default after a power-cycle = `\(.boot.default_kernel)`, saved_entry `\(.boot.saved_entry)`, GRUB_DEFAULT=`\(.boot.settings.GRUB_DEFAULT // "unset")`, saved logic in grub.cfg: \(.boot.cfg_uses_saved), EFI: \(.boot.efi), Secure Boot: \(.boot.secure_boot), /boot/grub on `\(.boot.boot_fs)` (`\(.boot.boot_source)`), one-shot tools: grub-reboot \(.boot.grub_reboot) grub-set-default \(.boot.grub_set_default) grub-editenv \(.boot.grub_editenv) update-grub \(.boot.update_grub), recordfail timeout `\(.boot.cfg_recordfail_timeout)`",
+		"- **next boot** (what a power-cycle or the next reboot gives): \(if .boot.next_entry != "" then "the ONE-SHOT entry `" + .boot.next_entry + "` (a run armed it and the host has not booted it: dispatch mode=disarm, or expect that kernel once)" else "grub saved default `" + (.boot.default_kernel | if . == "" then "unknown" else . end) + "`" end); upgrade drop-in present: \(.boot.dropin_present); kernel packages newer than the running kernel: \(.packages.new_kernel_pkgs | join(", ") | if . == "" then "none" else . end); of which half-installed or recorded as failed: \(.packages.broken_kernel_pkgs | join(", ") | if . == "" then "none" else . end)",
 		"- **GRUB boot proof** (every one-shot and fallback depends on it): \(if .boot.proof.ok then "OK" else "NOT PROVEN: " + (.boot.proof.problems | join(" / ")) end); BOOT_IMAGE `\(.boot.proof.boot_image)`, EFI loader `\(.boot.proof.efi_loader)`, GRUB prefix `\(.boot.proof.prefix)`",
 		"- apt (lists \(.packages.lists_age_hours // "?") h old): would install/upgrade \(.packages.simulation.inst | length) package(s) (kernel packages: \(.packages.simulation.kernel_inst | join(", ") | if . == "" then "none" else . end)); would REMOVE: \(.packages.simulation.remv | join(", ") | if . == "" then "none" else . end); kept back: \(.packages.kept_back | join(", ") | if . == "" then "none" else . end); held back by phasing: \(.packages.phased_held_back | join(", ") | if . == "" then "none" else . end)",
 		"- held: \(.packages.held | join(", ") | if . == "" then "none" else . end) (kernel/boot/dkms: \(.packages.held_kernel | join(", ") | if . == "" then "none" else . end)); third-party repos: \(.packages.third_party_repos | join(", ") | if . == "" then "none" else . end); pin files: \(.packages.pin_files | join(", ") | if . == "" then "none" else . end)",
@@ -71,12 +72,12 @@ survey_section() {
 }
 
 host_table() {
-	echo "| host | OS | running kernel | grub default | newest same flavor | upgrades / removals / kept back | reboot-required | disk free / and /boot (GiB) | NTP | crash dumps |"
+	echo "| host | OS | running kernel | NEXT BOOT | newest same flavor | upgrades / removals / kept back | reboot-required | disk free / and /boot (GiB) | NTP | crash dumps |"
 	echo "|---|---|---|---|---|---|---|---|---|---|"
 	for h in $hosts; do
 		s=$out/$h/survey.json
 		[ -s "$s" ] || { echo "| $h | (no record) | | | | | | | | |"; continue; }
-		jq -r --arg h "$h" '"| \($h) | \(.os_release.PRETTY_NAME // "?") | `\(.kernel)` | `\(.boot.default_kernel)` | `\(.newest_same_flavor)` | \(.packages.simulation.inst | length) / \(.packages.simulation.remv | length) / \(.packages.kept_back | length) | \(.reboot_required) | \(((.disk["/"].free_kib // 0) / 1048576) | floor) / \(((.disk["/boot"].free_kib // 0) / 1048576 * 10) | floor / 10) | \(.time_sync.raw) | \(.crash | length) |"' "$s"
+		jq -r --arg h "$h" '"| \($h) | \(.os_release.PRETTY_NAME // "?") | `\(.kernel)` | `\(if .boot.next_entry != "" then "one-shot: " + .boot.next_entry else .boot.default_kernel end)` | `\(.newest_same_flavor)` | \(.packages.simulation.inst | length) / \(.packages.simulation.remv | length) / \(.packages.kept_back | length) | \(.reboot_required) | \(((.disk["/"].free_kib // 0) / 1048576) | floor) / \(((.disk["/boot"].free_kib // 0) / 1048576 * 10) | floor / 10) | \(.time_sync.raw) | \(.crash | length) |"' "$s"
 	done
 }
 
@@ -145,6 +146,9 @@ if [ "$mode" = repair ]; then
 		jq -r '"- action `\(.repair_action)`; running kernel `\(.kernel_running)` (not rebooted); grub saved default `\(.saved_entry)`; one-shot pending: `\(.next_entry_after)`",
 			"- dpkg --audit after: \(.dpkg_audit_after | length) finding(s) \(.dpkg_audit_after | join(" / ")); kernel packages newer than the running kernel still installed: \(.new_kernel_pkgs_after | join(", ") | if . == "" then "none" else . end)"' "$d/result.json"
 	fi
+	if [ -n "$(jq -r '.kernel_metapackages_removed // ""' "$d/result.json" 2> /dev/null)" ]; then
+		echo "- **KERNEL METAPACKAGES WERE REMOVED WITH THE ABORTED KERNEL: $(jq -r '.kernel_metapackages_removed' "$d/result.json").** Later full-upgrades install no kernel on $host until they are installed again (a deliberate decision: installing them brings the newest kernel back)."
+	fi
 	echo "- mode=repair never reboots and never touches grub's saved default. \`configure\` runs \`dpkg --configure -a\`; \`abort-new-kernel\` first purges the kernel versions newer than the running one that a failed upgrade left half-installed, so the host stays on the old kernel (a kernel installed and working before is never removed). If \`configure\` fails again because a DKMS module (r8127) does not build for the new kernel, the campaign cannot move this host to that kernel until the module builds: dispatch \`abort-new-kernel\`."
 	if [ -s "$d/repair.log" ]; then
 		echo
@@ -200,9 +204,15 @@ verified)
 returned)
 	echo "- Power-cycle: **not needed while $host answers** (if it stops answering later, read the 'rebooting' case: the one-shot is consumed by now, so a power-cycle boots the OLD kernel). $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. Reboot it back with the cluster-reboot workflow: it returns to the old kernel and ends red with 'kernel changed', which is expected here. Do NOT dispatch the upgrade again before that: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
 	;;
-rebooting)
+arming | rebooting)
 	st=$(jq -r '.status // ""' "$d/result.json" 2> /dev/null)
 	case "$st" in
+	failed-before-arming)
+		echo "- Power-cycle: **not needed**. The arming did not complete: nothing is armed and nothing was rebooted ($host answered the rescue and no one-shot is pending). The old kernel runs and is the default."
+		;;
+	failed-one-shot-gone-host-not-rebooted)
+		echo "- Power-cycle: **not needed while $host answers**. The arming succeeded, the host did not reboot, and no one-shot is pending any more: something cleared it (GRUB reading another environment block than the one Linux writes?). Dispatch a survey; do not dispatch the upgrade again before this is understood."
+		;;
 	failed-before-boot-disarmed)
 		echo "- Power-cycle: **not needed**. The run failed after arming the one-shot and before the new kernel booted; $host answered and the one-shot was CLEARED (disarm). The old kernel runs and is the default."
 		;;
@@ -210,7 +220,7 @@ rebooting)
 		echo "- Power-cycle: **not needed yet**. The run failed after arming, but no one-shot is pending any more: grub consumed it, so the NEW kernel has probably booted (slowly) and $host answers. Dispatch a survey before anything else."
 		;;
 	*)
-		echo "- Power-cycle: **YES if $host stays silent, and what it boots depends on why.** The reboot was issued (or about to be) and the host did not answer within the timeout; it could not be asked to clear the one-shot."
+		echo "- Power-cycle: **YES if $host stays silent, and what it boots depends on why.** The run stopped at \`$phase\`: **a one-shot may be armed** (the host did not answer the rescue, so it could not be asked to clear it), and the reboot may or may not have been issued."
 		echo "  1. The NEW kernel booted and has no network: grub already consumed the one-shot, so a power-cycle boots the saved default, the OLD kernel."
 		echo "  2. The OLD kernel hung or panicked while shutting down (msr1 has a documented r8127 power-off panic, ops/power/quiesce-r8127.shutdown), or the reboot was never issued and the host is unreachable for another reason: the one-shot is **STILL ARMED**, so the next boot after the power-cycle is the **NEW kernel**, once; if that fails too, a second power-cycle boots the OLD kernel."
 		echo "  3. The host is only slow (a run killed by its timeout reads the same): wait, then survey."

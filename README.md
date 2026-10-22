@@ -318,8 +318,8 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   TLS to github.com. (7) **Only then** `grub-set-default <new kernel>` and the record. On any failure the new kernel is
   NOT made the default.
 - **r8127 and the in-tree driver.** The upgrade keeps the out-of-tree r8127 behaviour. If the new kernel's `r8169` lists the
-  same PCI id as r8127 while the running kernel's does not, and `r8169` is not blacklisted, which driver binds the NIC would be a race, and the run refuses
-  to reboot. `blacklist_r8169=true` writes `/etc/modprobe.d/celeris-r8127.conf` (`blacklist r8169`) and rebuilds the
+  same PCI id as r8127 and `r8169` is not blacklisted (in the new kernel's initramfs too: it must have been rebuilt after the blacklist), which driver binds the NIC would be a race, and the run refuses
+  to reboot (whatever the running kernel's `r8169` lists). `blacklist_r8169=true` writes `/etc/modprobe.d/celeris-r8127.conf` (`blacklist r8169`) and rebuilds the
   initramfs of the new kernel, then goes on. Moving to the in-tree driver is a separate decision (PLAN.md of the
   upgrade lane lists what to test first); this workflow never makes it.
 - **If the host does not return.** The summary names the phase and says whether to do a **physical power-cycle**: only when the
@@ -346,16 +346,24 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
 No host-changing mode (`upgrade`, `disarm`, `repair`) can be dispatched until the maintainer enables it. The code enforces one control
 and supports a second; this repository does not create either (that is settings, not code).
 
+Be plain about what these controls are: settings that a person with the maintainer's token can also change (`gh variable set`,
+approving a pending deployment). They stop accidents and anyone without that token; they do not stop an agent that holds it.
+Rules of use: (a) empty the variable the moment a window ends; a "Re-run all jobs" of an old host-changing run re-executes it with
+its old typed confirmation for as long as the host is listed; (b) **approve within ten minutes of the dispatch**: the idle verdict
+of the cluster guard is refused after ten minutes, and the approval wait counts against it (the run then says so and must be
+dispatched again).
+
 1. **The switch (enforced by the `plan` job).** Settings, Secrets and variables, Actions, Variables: create the repository variable
    `OS_UPGRADE_ALLOWED_HOSTS`, a comma or space separated list of hosts, for the window: `msa2-server` for the first step. Add `msr1`
    only after the survey has answered the questions of the lane PLAN (d.2 does it boot through GRUB, d.3 the in-tree r8169, d.7 Secure
    Boot) and a person is at the rack; `msa2-client` last. Empty or missing (the default) means every host-changing dispatch is refused
-   in `plan`, before any approval is asked and before any host is touched. Empty the variable when the campaign is over.
+   in `plan`, before any approval is asked and before any host is touched. The `plan` job also reads the environment of step 2 through the API and
+   refuses unless it exists WITH a required reviewer and a deployment branch policy (if the workflow token may not read environments, it
+   refuses and says so: give it a token with Environments: read in the secret `ENVIRONMENTS_READ_TOKEN`). Empty the variable when the campaign is over.
 2. **The approval (GitHub environment `cluster-host-change`, used by host-changing modes only; a survey runs in `cluster-read` and
    never waits).** Settings, Environments, New environment `cluster-host-change`: Required reviewers = the maintainer (leave
    "Prevent self-review" off if the maintainer both dispatches and approves, or add a second reviewer); Deployment branches and
-   tags = Selected branches and tags: `main` only. Until this environment has a reviewer the job does not wait (GitHub creates a
-   missing environment with no protection), so the variable in step 1 is the control that is always there.
+   tags = Selected branches and tags: `main` only. The `plan` job refuses a host-changing mode until this environment exists with a reviewer (GitHub would otherwise create it unprotected on first use).
 3. **The secrets.** Environment secrets shadow repository secrets of the same name for a job in that environment. In
    `cluster-host-change` (and in `cluster-read`, which needs the same access for the survey) create `CLUSTER_SSH_KEY`,
    `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_SECRET`; their values cannot be read back from the repository, so re-enter them from where the

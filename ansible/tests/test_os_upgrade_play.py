@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,14 @@ INVENTORY = """all:
       children:
         bench_targets:
         loadgen:
+    ghosts:
+      hosts:
+        ghost:
+          ansible_connection: ssh
+          ansible_host: 127.0.0.1
+          ansible_port: 1
+          ansible_user: nobody
+          ansible_ssh_common_args: "-o ConnectTimeout=2 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 """
 
 
@@ -92,13 +101,30 @@ class Play(unittest.TestCase):
             shutil.copytree(os.path.join(ANSIBLE_DIR, d), os.path.join(cls.pb, d))
         with open(os.path.join(cls.pb, "os-upgrade.yml"), "w") as f:
             f.write(patch_playbook(os.path.join(ANSIBLE_DIR, "os-upgrade.yml"), cls.work))
+        wait_file = os.path.join(cls.pb, "tasks", "os_upgrade_wait_apt.yml")
+        with open(wait_file) as f:
+            wt = f.read()
+        assert "--wait 30" in wt
+        with open(wait_file, "w") as f:
+            f.write(wt.replace("--wait 30", "--wait 1"))  # a poll waits 1 s on the host, not 30: the same logic, a faster test
         with open(os.path.join(cls.pb, "inventory.yml"), "w") as f:
             f.write(INVENTORY)
+        # variants whose arm / reboot task is delegated to a host that refuses the connection: UNREACHABLE (not FAILED) is the
+        # class ansible does not rescue, and no stub produces it on a local connection
+        for name, old, new in (("unreach_arm", "        register: arm_raw\n        ignore_unreachable: true\n", "        register: arm_raw\n        ignore_unreachable: true\n        delegate_to: ghost\n"),
+                               ("unreach_reboot", "        register: reboot_result\n", "        register: reboot_result\n        delegate_to: ghost\n")):
+            d = os.path.join(cls.work, "pb_" + name)
+            shutil.copytree(cls.pb, d)
+            with open(os.path.join(d, "os-upgrade.yml")) as f:
+                pbtext = f.read()
+            assert old in pbtext, name
+            with open(os.path.join(d, "os-upgrade.yml"), "w") as f:
+                f.write(pbtext.replace(old, new, 1))
         cls.h = FakeHost(os.path.join(cls.work, "host"))
         w = cls.work
         with open(w + "/osu-wrapper.sh", "w") as f:
-            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
-                cls.h.state_dir, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
+            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
+                cls.h.state_dir, cls.h.log, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
         with open(w + "/snapshot-wrapper.sh", "w") as f:
             f.write('''#!/bin/bash
 # the preflight call carries a sixth argument, the host that asks; FAIL_HOST makes that host's preflight snapshot fail
@@ -169,7 +195,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
     MARK = "/tmp/osu-injection-mark"
     PAYLOAD = "{{ lookup('pipe', 'touch /tmp/osu-injection-mark') }}"
 
-    def play(self, name, extra, env=None):
+    def play(self, name, extra, env=None, pb=None, xvars=()):
         out = os.path.join(self.work, "out." + name)
         shutil.rmtree(out, ignore_errors=True)
         os.makedirs(out)
@@ -184,8 +210,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         if env:
             e.update(env)
         ev = self.write_extra_vars(out, base)
-        r = subprocess.run([PLAYBOOK, "-i", "inventory.yml", "os-upgrade.yml", "-e", "@" + ev, "-e", "upgrade_poll_retries=200", "-e", "os_out_dir=" + out],
-                           cwd=self.pb, capture_output=True, text=True, env=e, timeout=900)
+        r = subprocess.run([PLAYBOOK, "-i", "inventory.yml", "os-upgrade.yml", "-e", "@" + ev, "-e", "upgrade_poll_retries=200", "-e", "os_out_dir=" + out] + [x for v in xvars for x in ("-e", v)],
+                           cwd=pb or self.pb, capture_output=True, text=True, env=e, timeout=900)
         self.log = r.stdout + r.stderr
         self.rc = r.returncode
         self.out = out
@@ -331,6 +357,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
                 ("allhosts", {"os_mode": "upgrade", "os_host": "all", "os_confirm": "UPGRADE-all"}, 0),
                 ("multiline", dict(self.UP, os_reason="two\nlines"), 0),
                 ("surveyhost", {"os_mode": "survey", "os_host": "msr1", "os_confirm": ""}, 0),
+                ("lowercase", dict(self.UP, os_confirm="upgrade-msr1"), 0),
+                ("lowercase_disarm", {"os_mode": "disarm", "os_host": "msr1", "os_confirm": "disarm-msr1"}, 0),
                 ("badmode", {"os_mode": "dist-upgrade", "os_host": "msr1", "os_confirm": "UPGRADE-msr1"}, 0)):
             self.play(name, extra)
             self.assertNotEqual(self.rc, 0, name)
@@ -437,6 +465,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(len(r["dpkg_audit_after"]), 1)
         # the abort: the half-installed new kernel goes, the host stays on the old one
         before = len(self.calls())
+        self.h.state["remove_cascade"] = ["linux-generic"]  # apt removes the kernel metapackage with the image it depends on
+        self.h.save()
         self.play("sm_abort", dict(self.R, repair_action="abort-new-kernel"))
         self.assertEqual(self.rc, 0, self.log[-2500:])
         r = self.j("msr1", "result.json")
@@ -445,8 +475,10 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("linux-image-7.0.0-31-generic", self.h.state["packages"])
         self.assertEqual([c for c in self.calls()[before:] if c.startswith(("grub-set-default", "grub-reboot", "FAKE-REBOOT"))], [])  # a repair never touches grub
         self.assertEqual(self.phase(), "repaired")
+        self.assertEqual(r["kernel_metapackages_removed"], "linux-generic")
         md = self.summary("repair", "msr1")
         self.assertIn("REPAIRED", md)
+        self.assertIn("KERNEL METAPACKAGES WERE REMOVED", md)
 
     def test_a_repair_that_configures_lets_the_upgrade_run_to_the_end(self):
         self.fresh(upgrade_rc=100, upgrade_audit=["linux-headers-7.0.0-40-generic  half-configured"], configure_ok=True)
@@ -522,7 +554,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.fresh()
         self.play("notissued", self.UP, env={"BOOT_MODE": "not-issued"})
         self.assertNotEqual(self.rc, 0)
-        self.assertIn("The host answered and the one-shot was DISARMED", self.log)
+        self.assertIn("(failed-before-boot-disarmed)", self.log)
         self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
         self.assertIn("grub-editenv - unset next_entry", self.calls())
@@ -539,7 +571,13 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("one-shot disarmed: True", self.log)
         self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
         self.no_call("FAKE-REBOOT")
-        self.assertEqual(self.phase(), "dkms-ok")
+        self.assertEqual(self.phase(), "arming")
+        # an arming that failed BEFORE anything was armed must not read as "the new kernel has probably booted"
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-before-arming")
+        self.assertNotIn("probably booted", json.dumps(r))
+        self.assertIn("No power-cycle needed: nothing was rebooted", r["power_cycle"])
+        self.assertIn("not needed**. The arming did not complete", self.summary("upgrade", "msr1"))
 
     def test_the_disarm_mode_clears_only_the_one_shot(self):
         self.fresh()
@@ -562,6 +600,12 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
                 self.assertFalse(c.startswith(bad), c)
         md = self.summary("disarm", "msr1")
         self.assertIn("DISARMED", md)
+        # disarm and repair look at their target only: a peer that fails its preflight does not stop them
+        self.h.state["grubenv"].update(next_entry=ID_40)
+        self.h.save()
+        self.play("disarm_peer_down", D, env={"FAIL_HOST": "msa2-client"})
+        self.assertEqual(self.rc, 0, self.log[-1500:])
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
         # nothing pending: a no-op, still green
         self.play("disarm_again", D)
         self.assertEqual(self.rc, 0, self.log[-1500:])
@@ -582,6 +626,60 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.no_call("grub-reboot")
         self.no_call("FAKE-REBOOT")
         self.assertEqual(self.phase(), "upgrading")
+
+    def test_a_host_that_goes_unreachable_while_the_one_shot_is_armed_still_reaches_the_rescue(self):
+        self.fresh()
+        self.play("unreach_arm", self.UP, pb=os.path.join(self.work, "pb_unreach_arm"))
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("UNREACHABLE!", self.log)  # the arm task really was unreachable, not failed
+        self.assertIn("Rescue | disarm the one-shot", self.log)  # ... and the rescue ran all the same
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-before-arming")  # the rescue reached the host and nothing was armed there
+        self.assertEqual(self.phase(), "arming")
+
+    def test_an_unreachable_reboot_task_disarms_a_healthy_host(self):
+        self.fresh()
+        self.play("unreach_reboot", self.UP, pb=os.path.join(self.work, "pb_unreach_reboot"))
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("UNREACHABLE!", self.log)
+        self.assertIn("Rescue | disarm the one-shot", self.log)
+        self.no_call("FAKE-REBOOT")
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")  # armed by arm-oneshot, cleared by the rescue
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-before-boot-disarmed")
+        self.assertTrue(r["disarm"]["was_armed"])
+        self.assertIn("No power-cycle needed", r["power_cycle"])
+
+    def test_a_reboot_the_module_gave_up_on_but_which_happened_says_the_new_kernel_probably_booted(self):
+        self.fresh()
+        self.play("gaveup", self.UP, env={"BOOT_MODE": "booted-but-reported-failed"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-new-kernel-may-have-booted")
+        self.assertIn("probably booted", r["problems"][0])
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+        self.no_call("grub-set-default " + ID_40)
+
+    def test_an_apt_that_outlives_the_waits_keeps_its_policy_and_is_not_cleaned_up_under(self):
+        self.fresh(upgrade_sleep=12)
+        self.play("aptslow", self.UP, xvars=("upgrade_poll_retries=1", "upgrade_poll_rounds=1"))
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("STILL BE RUNNING", self.log)
+        self.assertEqual([c for c in self.calls() if c.startswith("OSU upgrade-cleanup")], [], "the cleanup ran while apt was still alive")
+        self.assertTrue(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"), "the services could restart under a running apt")
+        self.no_call("grub-reboot")
+        end = time.time() + 40  # let the detached run finish: it removes its own policy
+        while time.time() < end and os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"):
+            time.sleep(0.5)
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+
+    def test_a_wait_round_does_not_end_while_apt_is_still_running(self):
+        self.fresh(upgrade_sleep=5)
+        self.play("aptwait", self.UP, xvars=("upgrade_poll_rounds=1",))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.phase(), "permanent")
 
     def test_a_nic_that_did_not_come_back_is_not_verified(self):
         self.fresh()
@@ -648,6 +746,25 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertTrue(self.j("msr1", "survey.json")["r8127"]["per_kernel"][k]["intree_lists_id"]["10ec:8127"])
         md = self.summary("survey", "-")
         self.assertIn("in-tree driver as an option on `7.0.0-38-generic`: the in-tree r8169 of that kernel LISTS the PCI id", md)
+
+    def test_the_survey_summary_shows_a_pending_one_shot_and_the_pin(self):
+        self.fresh()
+        self.h.state["grubenv"].update(saved_entry=ID_31, next_entry=ID_40)
+        self.h.save()
+        self.play("survey_armed", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertEqual(self.rc, 0, self.log[-1500:])
+        md = self.summary("survey", "-")
+        self.assertIn("NEXT BOOT", md)
+        self.assertIn("one-shot: " + ID_40, md)
+        self.assertIn("dispatch mode=disarm", md)
+        self.assertIn("upgrade drop-in present: false", md)
+        self.assertIn("kernel packages newer than the running kernel:", md)
+
+    def test_the_survey_summary_marks_a_broken_way_in(self):
+        self.fresh(sshd_rc=255)
+        self.play("survey_ssh", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertEqual(self.rc, 0, self.log[-1500:])
+        self.assertIn("sshd -t fails", self.j("msr1", "survey.json")["access_problems"][0])
 
     def test_survey_can_refresh_the_apt_lists_when_asked(self):
         self.fresh()

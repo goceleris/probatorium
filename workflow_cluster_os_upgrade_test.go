@@ -410,6 +410,22 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 	if strings.Count(src, "osu }} upgrade-cleanup --run-id") < 2 || !strings.Contains(src, "Apt | take our policy-rc.d away if the run that left it is over") {
 		t.Error("the playbook does not clean up the policy-rc.d of a run that died")
 	}
+	// the two tasks that can leave the host armed must reach the rescue even when the host is UNREACHABLE (ansible does not rescue those)
+	for _, n := range []string{"osu }} arm-oneshot", "ansible.builtin.reboot:"} {
+		i := idx(n)
+		j := strings.Index(src[i:], "- name:")
+		if j < 0 {
+			j = 600
+		}
+		if !strings.Contains(src[i:i+j+400], "ignore_unreachable: true") {
+			t.Errorf("the task with %q does not carry ignore_unreachable: an unreachable host would skip the rescue", n)
+		}
+	}
+	for _, n := range []string{"when: arm_raw is unreachable", "when: reboot_result is unreachable", "Target | record the phase (from here on a one-shot may be armed)"} {
+		if !strings.Contains(src, n) {
+			t.Errorf("the playbook lost %q", n)
+		}
+	}
 	// a failure between the arming and the host's return disarms the one-shot: arm and reboot sit in a block whose rescue disarms
 	iArm := idx("osu }} arm-oneshot")
 	iRescue := idx("      rescue:")
@@ -443,7 +459,7 @@ func TestOSUpgradeScriptCannotAutoremoveAndGuardsItsReads(t *testing.T) {
 	code = stripComments(code)
 	// the one place that removes packages is mode=repair's abort, and only the half-installed newer kernel's
 	repairBody := regexp.MustCompile(`(?s)def cmd_repair_run\(a\):.*?\ndef cmd_upgrade_run`).FindString(code)
-	if repairBody == "" || !strings.Contains(repairBody, "new_kernel_pkgs(running_kernel(), broken_only=True)") || strings.Count(code, `"remove", "--purge"`) != 1 {
+	if repairBody == "" || !strings.Contains(repairBody, "new_kernel_pkgs(running_kernel(), broken_only=True)") || strings.Count(code, `"remove", "--purge"`) != 2 || strings.Count(repairBody, `"remove", "--purge"`) != 2 || !strings.Contains(repairBody, `"apt-get", "-s"`) {
 		t.Error("the only package removal is not the abort of mode=repair, limited to the half-installed newer kernels")
 	}
 	code = strings.Replace(code, repairBody, "", 1)
@@ -761,11 +777,35 @@ func planScript(t *testing.T) string {
 // the repository variable OS_UPGRADE_ALLOWED_HOSTS; free text cannot carry template syntax; the confirmations are exact.
 func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 	bash := needBash(t)
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
 	script := planScript(t)
+	// a gh that answers from a fixture: the environment's protection rules, or an error
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\ncat \"$GH_FIXTURE\"\nexit \"${GH_RC:-0}\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixtures := map[string]string{
+		"good":       `{"name":"cluster-host-change","protection_rules":[{"type":"required_reviewers","reviewers":[{"type":"User","reviewer":{"login":"maintainer"}}]}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}`,
+		"noreviewer": `{"name":"cluster-host-change","protection_rules":[],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}`,
+		"emptyrevs":  `{"name":"cluster-host-change","protection_rules":[{"type":"required_reviewers","reviewers":[]}],"deployment_branch_policy":{"custom_branch_policies":true}}`,
+		"nobranches": `{"name":"cluster-host-change","protection_rules":[{"type":"required_reviewers","reviewers":[{"type":"User"}]}],"deployment_branch_policy":null}`,
+		"waitonly":   `{"name":"cluster-host-change","protection_rules":[{"type":"wait_timer","wait_timer":5}],"deployment_branch_policy":{"custom_branch_policies":true}}`,
+		"notfound":   `gh: Not Found (HTTP 404)`,
+		"forbidden":  `gh: Resource not accessible by integration (HTTP 403)`,
+		"notjson":    `<html>`,
+	}
+	for k, v := range fixtures {
+		if err := os.WriteFile(filepath.Join(bin, k+".json"), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	type env = map[string]string
 	base := func(over env) env {
 		e := env{"IN_MODE": "survey", "IN_HOST": "-", "IN_CONFIRM": "", "IN_REASON": "platform survey", "IN_REPAIR_ACTION": "configure",
-			"ALLOWED_HOSTS": "", "REF": "refs/heads/main", "DEFAULT_BRANCH": "main"}
+			"ALLOWED_HOSTS": "", "REF": "refs/heads/main", "DEFAULT_BRANCH": "main", "REPO": "goceleris/probatorium",
+			"GH_FIXTURE": filepath.Join(bin, "good.json"), "GH_RC": "0"}
 		for k, v := range over {
 			e[k] = v
 		}
@@ -778,13 +818,23 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		}
 		return base(e)
 	}
+	envFix := func(name string, rc string) env {
+		return env{"GH_FIXTURE": filepath.Join(bin, name+".json"), "GH_RC": rc}
+	}
+	rep := func(over env) env {
+		e := env{"IN_MODE": "repair", "IN_HOST": "msr1", "IN_CONFIRM": "REPAIR-msr1", "ALLOWED_HOSTS": "msr1"}
+		for k, v := range over {
+			e[k] = v
+		}
+		return base(e)
+	}
 	for _, c := range []struct {
 		name string
 		env  env
 		ok   bool
 		msg  string
 	}{
-		{"a survey needs no switch", base(nil), true, ""},
+		{"a survey needs no switch and no environment", base(env{"GH_FIXTURE": filepath.Join(bin, "notfound.json"), "GH_RC": "1"}), true, ""},
 		{"a survey with a host", base(env{"IN_HOST": "msr1"}), false, "leave host as '-'"},
 		{"a survey with a confirmation", base(env{"IN_CONFIRM": "UPGRADE-msr1"}), false, "takes no confirmation"},
 		{"an upgrade with the variable empty", up("msr1", env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
@@ -793,14 +843,21 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"an upgrade of a listed host", up("msr1", env{"ALLOWED_HOSTS": "msa2-server,msr1"}), true, ""},
 		{"a list separated by spaces", up("msa2-server", env{"ALLOWED_HOSTS": "msr1 msa2-server"}), true, ""},
 		{"an upgrade with the wrong confirmation", up("msr1", env{"IN_CONFIRM": "UPGRADE-msa2-server"}), false, "confirm must be exactly UPGRADE-msr1"},
+		{"an upgrade confirmed in lower case", up("msr1", env{"IN_CONFIRM": "upgrade-msr1"}), false, "confirm must be exactly UPGRADE-msr1"},
+		{"an upgrade confirmed in mixed case", up("msr1", env{"IN_CONFIRM": "Upgrade-msr1"}), false, "confirm must be exactly UPGRADE-msr1"},
+		{"an upgrade confirmed with a trailing space", up("msr1", env{"IN_CONFIRM": "UPGRADE-msr1 "}), false, "confirm must be exactly UPGRADE-msr1"},
 		{"an upgrade confirmed as a disarm", up("msr1", env{"IN_CONFIRM": "DISARM-msr1"}), false, "confirm must be exactly UPGRADE-msr1"},
 		{"an upgrade of no host", up("-", env{"IN_HOST": "-", "IN_CONFIRM": "UPGRADE--"}), false, "names ONE host"},
 		{"an upgrade of all", up("all", nil), false, "names ONE host"},
 		{"a disarm is gated too", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1"}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
 		{"a listed disarm", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
-		{"a repair with its confirmation", base(env{"IN_MODE": "repair", "IN_HOST": "msr1", "IN_CONFIRM": "REPAIR-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
-		{"a repair with the upgrade confirmation", base(env{"IN_MODE": "repair", "IN_HOST": "msr1", "IN_CONFIRM": "UPGRADE-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REPAIR-msr1"},
-		{"a repair with an unknown action", base(env{"IN_MODE": "repair", "IN_HOST": "msr1", "IN_CONFIRM": "REPAIR-msr1", "ALLOWED_HOSTS": "msr1", "IN_REPAIR_ACTION": "rm-rf"}), false, "repair_action must be"},
+		{"a disarm confirmed in lower case", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "disarm-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly DISARM-msr1"},
+		{"a repair with its confirmation", rep(nil), true, ""},
+		{"a repair is gated too", rep(env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
+		{"a repair of a host that is not listed", rep(env{"ALLOWED_HOSTS": "msa2-server"}), false, "is not in the repository variable"},
+		{"a repair with the upgrade confirmation", rep(env{"IN_CONFIRM": "UPGRADE-msr1"}), false, "confirm must be exactly REPAIR-msr1"},
+		{"a repair confirmed in lower case", rep(env{"IN_CONFIRM": "repair-msr1"}), false, "confirm must be exactly REPAIR-msr1"},
+		{"a repair with an unknown action", rep(env{"IN_REPAIR_ACTION": "rm-rf"}), false, "repair_action must be"},
 		{"an unknown mode", base(env{"IN_MODE": "dist-upgrade"}), false, "mode must be"},
 		{"template syntax in the reason", base(env{"IN_REASON": "x {{ lookup('pipe','id') }}"}), false, "must not contain braces"},
 		{"a brace in the reason", up("msr1", env{"IN_REASON": "x {% y"}), false, "must not contain braces"},
@@ -808,9 +865,19 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"a long reason", base(env{"IN_REASON": strings.Repeat("a", 201)}), false, "longer than 200"},
 		{"a reason with a newline", base(env{"IN_REASON": "a\nb"}), false, "control characters"},
 		{"a branch ref", up("msr1", env{"REF": "refs/heads/feat/x"}), false, "dispatch from main only"},
+		// the approval must exist: the environment, a required reviewer, a deployment branch policy
+		{"the environment does not exist", up("msr1", envFix("notfound", "1")), false, "cannot read the environment cluster-host-change"},
+		{"the token may not read environments", up("msr1", envFix("forbidden", "1")), false, "may not read environments"},
+		{"an environment without a reviewer", up("msr1", envFix("noreviewer", "0")), false, "no required reviewer"},
+		{"an environment with an empty reviewer list", up("msr1", envFix("emptyrevs", "0")), false, "no required reviewer"},
+		{"an environment with only a wait timer", up("msr1", envFix("waitonly", "0")), false, "no required reviewer"},
+		{"an environment without a branch policy", up("msr1", envFix("nobranches", "0")), false, "no deployment branch policy"},
+		{"an answer that is not json", up("msr1", envFix("notjson", "0")), false, "no required reviewer"},
+		{"a disarm needs the environment too", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1", "GH_FIXTURE": filepath.Join(bin, "noreviewer.json")}), false, "no required reviewer"},
+		{"a repair needs the environment too", rep(envFix("noreviewer", "0")), false, "no required reviewer"},
 	} {
 		cmd := exec.Command(bash, "-c", script)
-		cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+		cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH")}
 		for k, v := range c.env {
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}

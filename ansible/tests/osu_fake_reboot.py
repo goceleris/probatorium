@@ -58,3 +58,6 @@ if mode == "no-nic":
     os.remove(root + "/sys/class/net/enp1s0/device")
 with open(sp, "w") as f:
     json.dump(st, f)
+if mode == "booted-but-reported-failed":
+    sys.stderr.write("the reboot module gave up waiting, but the host rebooted (test)\n")
+    sys.exit(1)

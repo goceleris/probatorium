@@ -5,7 +5,7 @@
 #
 #   ansible-playbook -i ansible/inventory.yml ansible/os-upgrade.yml --extra-vars @extra-vars.json
 #
-# extra-vars.json carries os_mode (survey | upgrade), os_host ("-" for a survey), os_confirm, os_reason, os_run_id,
+# extra-vars.json carries os_mode (survey | upgrade | disarm | repair), os_host ("-" for a survey), os_confirm, os_reason, os_run_id,
 # os_out_dir and optionally allow_results_loss, refresh_lists, blacklist_r8169. It is a FILE, never key=value on the
 # command line: that form is split on whitespace and the reason is free text.
 #
@@ -31,7 +31,7 @@
 #
 # MODE disarm (host-changing, ONE host, ONLY grub's pending one-shot): clears next_entry (grub-editenv - unset next_entry)
 #   and records the survey before and after. For a run that failed between arming the one-shot and the new kernel's boot
-#   with the host not reachable at that moment; it is safe beside a bench, because it changes nothing the bench reads.
+#   with the host not reachable at that moment. (The cluster guard refuses it beside a bench anyway.)
 #
 # MODE repair (host-changing, ONE host): a failed apt/dkms run leaves dpkg half-configured (a DKMS module that does not
 #   build for the new kernel fails the linux-headers postinst) and every later dispatch refuses. repair_action=configure runs
@@ -84,7 +84,8 @@
     - ansible.builtin.import_tasks: tasks/os_upgrade_request.yml
 
 - name: OS upgrade | preflight and survey on every host (read-only; one that does not answer stops the run)
-  hosts: cluster
+  # disarm and repair look at their target only: clearing msr1's one-shot must not wait for msa2-client to be up
+  hosts: "{{ 'cluster' if ((os_mode | default('survey')) in ['survey', 'upgrade']) else os_host }}"
   gather_facts: false
   # An unreachable or failed host must stop the run for every host: the target would otherwise go on while a peer's
   # state is unknown.
@@ -228,6 +229,10 @@
       {{ pre_survey.kernel }}). The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is
       still {{ pre_survey.kernel }}. Reboot it back with the cluster-reboot workflow (red with "kernel changed", expected).
     power_cycle_none: "No power-cycle needed: nothing was rebooted."
+    power_cycle_gone: >-
+      No power-cycle needed while the host answers. The arming succeeded, the host did not reboot, and no one-shot is pending any more:
+      something cleared it (GRUB reading another environment block than the one Linux writes?). Survey before anything else and do
+      not dispatch the upgrade again before it is understood.
     result_base:
       host: "{{ inventory_hostname }}"
       run_id: "{{ os_run_id }}"
@@ -504,13 +509,26 @@
       vars:
         os_phase: dkms-ok
 
+    # ansible does not run a rescue for an UNREACHABLE task: both tasks that can leave the host armed carry ignore_unreachable and
+    # an explicit failure, so that a tailnet blip at the worst moment still reaches the rescue below.
     - name: Boot | arm, reboot and wait for the host (a failure anywhere in here disarms the one-shot)
       block:
+      - name: Target | record the phase (from here on a one-shot may be armed)
+        ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+        vars:
+          os_phase: arming
+
       - name: Boot | make the next boot, and only the next, the new kernel
         ansible.builtin.script:
           cmd: "{{ osu }} arm-oneshot --running {{ pre_survey.kernel | quote }} --target {{ target_kernel | quote }}"
         become: true
         register: arm_raw
+        ignore_unreachable: true
+
+      - name: Boot | the arming reached the host
+        ansible.builtin.fail:
+          msg: "the host became unreachable while the one-shot was being armed: it may or may not be armed"
+        when: arm_raw is unreachable
 
       - name: Boot | keep the record
         ansible.builtin.copy:
@@ -547,6 +565,12 @@
           post_reboot_delay: 30
         become: true
         register: reboot_result
+        ignore_unreachable: true
+
+      - name: Boot | the reboot was issued
+        ansible.builtin.fail:
+          msg: "the host was unreachable when the reboot was to be issued, or did not answer its first probe: the reboot may not have been issued"
+        when: reboot_result is unreachable
 
       - name: Target | record the phase
         ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
@@ -555,8 +579,8 @@
 
       rescue:
         # Any failure from the arming to the host's return: the one-shot must not stay armed for a boot nobody watches.
-        # If the host answers (it never rebooted, or the reboot was never issued) it is disarmed here; if it does not,
-        # it is down or hung and the person power-cycling it needs to know the one-shot is probably still pending.
+        # If the host answers it is disarmed here, and its boot id says whether it rebooted at all; if it does not answer it is
+        # down or hung and the person power-cycling it needs to know that a one-shot may still be pending.
         - name: Rescue | disarm the one-shot (if the host answers)
           ansible.builtin.script:
             cmd: "{{ osu }} disarm"
@@ -565,6 +589,40 @@
           failed_when: false
           ignore_unreachable: true
 
+        - name: Rescue | did the host reboot? (its boot id, if it answers)
+          ansible.builtin.script:
+            cmd: "{{ snapshot_cmd }}"
+          become: true
+          register: rescue_snap
+          changed_when: false
+          failed_when: false
+          ignore_unreachable: true
+
+        - name: Rescue | what happened
+          ansible.builtin.set_fact:
+            rescue_arm_ok: "{{ arm_raw is defined and not (arm_raw is unreachable) and (arm_raw.rc | default(1)) == 0 and (arm_raw.stdout | default('', true) | length > 0) }}"
+            rescue_answered: "{{ (disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0) and not (disarm_raw is unreachable) }}"
+            rescue_disarm: "{{ (disarm_raw.stdout | default('{}', true) | from_json) if ((disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0)) else {} }}"
+            rescue_booted: "{{ (rescue_snap.stdout | default('', true) | length > 0) and ((rescue_snap.stdout | from_json).boot_id | default('')) != pre_target.boot_id }}"
+
+        - name: Rescue | the verdict
+          ansible.builtin.set_fact:
+            rescue_status: >-
+              {{ ('failed-unknown-armed' if rescue_arm_ok else 'failed-arming-unreachable') if not rescue_answered else
+                 ('failed-before-boot-disarmed' if (rescue_disarm.was_armed | default(false)) else
+                  ('failed-before-arming' if not rescue_arm_ok else
+                   ('failed-new-kernel-may-have-booted' if rescue_booted else 'failed-one-shot-gone-host-not-rebooted'))) }}
+            rescue_problem: >-
+              {{ ('the run failed after the one-shot was armed and the host did not answer: the one-shot (grub next_entry) is probably STILL ARMED' if rescue_arm_ok else 'the host stopped answering while the one-shot was being armed: it may or may not be armed') if not rescue_answered else
+                 ('the run failed after the one-shot was armed and before the new kernel booted; the host answered and the one-shot was cleared' if (rescue_disarm.was_armed | default(false)) else
+                  ('the arming did not complete (nothing is armed, nothing was rebooted): see the failed task' if not rescue_arm_ok else
+                   ('the run failed after the arming, no one-shot is pending any more and the host has a new boot id: grub consumed it, so the new kernel has probably booted (slowly); survey before anything else' if rescue_booted else
+                    'the arming succeeded, the host did not reboot, and no one-shot is pending any more: something cleared it (GRUB reading another environment block?); survey before anything else'))) }}
+            rescue_power: >-
+              {{ power_cycle_rebooting if not rescue_answered else
+                 (power_cycle_none if ((rescue_disarm.was_armed | default(false)) or not rescue_arm_ok) else
+                  (power_cycle_returned if rescue_booted else power_cycle_gone)) }}
+
         - name: Rescue | keep what happened
           ansible.builtin.copy:
             content: "{{ result_base | combine(extra) | to_nice_json }}\n"
@@ -572,22 +630,17 @@
             mode: "0644"
           delegate_to: localhost
           vars:
-            answered: "{{ (disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0) }}"
-            disarm_json: "{{ (disarm_raw.stdout | default('{}', true) | from_json) if answered else {} }}"
-            was_armed: "{{ disarm_json.was_armed | default(false) }}"
             extra:
-              status: "{{ ('failed-before-boot-disarmed' if was_armed else 'failed-new-kernel-may-have-booted') if answered else 'failed-unknown-armed' }}"
+              status: "{{ rescue_status | trim }}"
               problems:
-                - "{{ ('the run failed after the one-shot was armed and before the new kernel booted; the one-shot was cleared' if was_armed else 'the run failed after the one-shot was armed, but no one-shot is pending any more: grub consumed it, so the new kernel has probably booted (slowly); survey before anything else') if answered else 'the run failed after the one-shot was armed and the host did not answer: the one-shot (grub next_entry) is probably STILL ARMED' }}"
-              power_cycle: "{{ (power_cycle_none if was_armed else power_cycle_returned) if answered else power_cycle_rebooting }}"
+                - "{{ rescue_problem | trim }}"
+              power_cycle: "{{ rescue_power | trim }}"
               default_kernel: "{{ pre_survey.kernel }}"
-              disarm: "{{ disarm_json }}"
+              disarm: "{{ rescue_disarm }}"
 
         - name: Rescue | the run stops here
           ansible.builtin.fail:
-            msg: >-
-              the run failed between arming the one-shot and the new kernel's verification.
-              {{ 'The host answered and the one-shot was DISARMED: the old kernel is the default and runs, nothing is pending.' if ((disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('{}', true) | from_json).was_armed | default(false)) else ('The host answered and NO one-shot was pending: grub already consumed it, so the new kernel has probably booted: survey before anything else.' if (disarm_raw.rc | default(1)) == 0 else 'The host did not answer, so the one-shot could not be cleared and is probably STILL ARMED: see the power-cycle text in result.json.') }}
+            msg: "the run failed between the arming of the one-shot and the new kernel's verification ({{ rescue_status | trim }}): {{ rescue_problem | trim }}"
 
     - name: Post | snapshot until the host has settled (the fabric and the daemons need a moment)
       ansible.builtin.script:
@@ -853,6 +906,7 @@
           next_entry_after: "{{ after.boot.next_entry }}"
           dpkg_audit_after: "{{ after.packages.dpkg_audit }}"
           new_kernel_pkgs_after: "{{ after.packages.new_kernel_pkgs }}"
+          kernel_metapackages_removed: "{{ ((maint_log_raw.stdout | default('', true)) | regex_search('KERNEL METAPACKAGES REMOVED WITH IT: ([^(\\n]*)', '\\1') | default([''], true) | first | default('', true)) | trim }}"
           disarm: "{{ (maint_disarm_raw.stdout | default('{}', true) | from_json) }}"
           power_cycle: "No power-cycle needed: nothing was rebooted."
 

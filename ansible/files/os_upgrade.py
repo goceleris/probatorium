@@ -819,6 +819,7 @@ def survey():
         "reboot_required": bool(rr),
         "reboot_required_pkgs": rd("/var/run/reboot-required.pkgs").split(),
         "dkms": {"status": dkms_modules(), "installed_for_running": dkms_installed_for(running)},
+        "access_problems": access_problems(),
         "nics": nic_list,
         "r8127": r8127_report(sorted(set(kernels + ([running] if running else [])), key=kver_key), running, nic_list),
         "firmware": {"linux_firmware": dpkg_version("linux-firmware")},
@@ -1023,6 +1024,9 @@ def cmd_repair_start(a):
     start_detached(a.run_id, "_repair-run", ["--action", a.action])
 
 
+KERNEL_META = re.compile(r"^linux-(generic|image-generic|headers-generic|tools-generic|crashdump|virtual|image-virtual|headers-virtual)(-hwe[-0-9.]*)?(-64k)?$")
+
+
 def cmd_repair_run(a):
     """The detached half of mode=repair: dpkg --configure -a (and, for abort-new-kernel, the purge of the kernels newer than
     the running one first), under the same policy-rc.d discipline as the upgrade."""
@@ -1034,8 +1038,25 @@ def cmd_repair_run(a):
         if a.action == "abort-new-kernel":
             pk = new_kernel_pkgs(running_kernel(), broken_only=True)
             if pk:
-                steps.append(["apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", "-o", "DPkg::Lock::Timeout=600",
-                              "remove", "--purge"] + pk)
+                common = ["-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", "-o", "DPkg::Lock::Timeout=600"]
+                # apt removes whatever depends on a package it removes: linux-image-generic and the other kernel metapackages follow
+                # the new image. Simulate first; anything outside the set and the metapackages stops the abort.
+                rcs, outs, errs = run(["apt-get", "-s", "-o", "Debug::NoLocking=true"] + common[2:] + ["remove", "--purge"] + pk, env=APT_ENV)
+                sys.stdout.write("+ apt-get -s remove --purge %s\n%s%s\n" % (" ".join(pk), outs, errs))
+                cascade = sorted({m.group(1) for m in (REMV.match(l) for l in outs.splitlines()) if m} - set(pk))
+                alien = [c for c in cascade if not KERNEL_META.match(c)]
+                metas = [c for c in cascade if KERNEL_META.match(c)]
+                if rcs != 0 or alien:
+                    sys.stdout.write("REFUSED: the removal would also remove %s (simulation exit %d): nothing was removed\n" % (", ".join(alien) or "(unknown)", rcs))
+                    rc = 3
+                    pk = []
+                    steps = []
+                else:
+                    if metas:
+                        sys.stdout.write("KERNEL METAPACKAGES REMOVED WITH IT: %s (later full-upgrades install no kernel until they are installed again)\n" % ", ".join(metas))
+                    steps.append(["apt-get", "-y"] + common + ["remove", "--purge"] + pk)
+        if rc == 3:
+            return
         steps.append(["dpkg", "--force-confold", "--configure", "-a"])
         rc = 0
         for argv in steps:
@@ -1111,6 +1132,10 @@ def cmd_upgrade_cleanup(a):
     pid = int(rd(d + "/apt-upgrade.pid") or "0")
     if not os.path.exists(p(rcf)) and pid and pid_alive(pid):
         emit({"removed": False, "reason": "the apt run is still alive"})
+        return
+    # the detached wrapper can die (the OOM killer) while its apt-get child, reparented to init, still runs
+    if package_processes() or dpkg_lock_held():
+        emit({"removed": False, "reason": "dpkg or apt is still running (%s)" % (", ".join(package_processes()) or "a dpkg lock is held")})
         return
     if rd(POLICY_RC_D) == POLICY.strip():
         os.remove(p(POLICY_RC_D))
