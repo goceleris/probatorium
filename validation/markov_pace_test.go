@@ -3,6 +3,7 @@ package validation
 import (
 	"context"
 	"encoding/json"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/goceleris/probatorium/report"
+	"github.com/goceleris/probatorium/validation/markov"
 	"github.com/goceleris/probatorium/validation/remote"
 )
 
@@ -38,27 +40,56 @@ func runShortTier1(t *testing.T, concurrency int, period time.Duration, d time.D
 	return s
 }
 
-// arrivalServer answers every request 200 and records when each non-login
-// request arrived. The first one is held for hold (a slow response).
+// arrivalServer answers requests and records, in order, when each arrived and
+// whether it was the login. hold delays the FIRST non-login response; delayAll
+// delays EVERY non-login response (a slow server); unauth makes the first n
+// non-login requests answer 401, which drives the walker's re-login.
+//
+// The stamps are taken in the handler, after the scheduler has run it, so an
+// individual stamp can be late on a loaded box. The tests therefore never rely
+// on one gap: they compare sums of several consecutive gaps (spanOK), which one
+// late handler cannot distort by more than its own lateness.
 type arrivalServer struct {
 	*httptest.Server
-	mu   sync.Mutex
-	at   []time.Time
-	hold time.Duration
+	mu       sync.Mutex
+	ev       []arrival
+	hold     time.Duration
+	delayAll time.Duration
+	unauth   int
+	seen     int
 }
 
-func newArrivalServer(t *testing.T, hold time.Duration) *arrivalServer {
+type arrival struct {
+	at    time.Time
+	login bool
+}
+
+func newArrivalServer(t *testing.T, hold, delayAll time.Duration, unauth int) *arrivalServer {
 	t.Helper()
-	a := &arrivalServer{hold: hold}
+	a := &arrivalServer{hold: hold, delayAll: delayAll, unauth: unauth}
 	a.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/login" {
-			a.mu.Lock()
-			a.at = append(a.at, time.Now())
-			first := len(a.at) == 1
-			a.mu.Unlock()
+		login := r.URL.Path == "/login"
+		a.mu.Lock()
+		a.ev = append(a.ev, arrival{at: time.Now(), login: login})
+		var first bool
+		var unauthorized bool
+		if !login {
+			a.seen++
+			first = a.seen == 1
+			unauthorized = a.seen <= a.unauth
+		}
+		a.mu.Unlock()
+		if !login {
 			if first && a.hold > 0 {
 				time.Sleep(a.hold)
 			}
+			if a.delayAll > 0 {
+				time.Sleep(a.delayAll)
+			}
+		}
+		if unauthorized {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -66,10 +97,31 @@ func newArrivalServer(t *testing.T, hold time.Duration) *arrivalServer {
 	return a
 }
 
+// arrivals is the stamps of the non-login requests, in arrival order.
 func (a *arrivalServer) arrivals() []time.Time {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return append([]time.Time(nil), a.at...)
+	var out []time.Time
+	for _, e := range a.ev {
+		if !e.login {
+			out = append(out, e.at)
+		}
+	}
+	return out
+}
+
+// spanOK reports whether every k consecutive gaps of at sum to at least
+// frac*k*period. A pacer that keeps starts a period apart passes with room to
+// spare (frac 0.6); one that halves the period, makes up lateness in a burst or
+// ignores the period fails. One handler stamped late by less than (1-frac)*k
+// periods cannot fail it.
+func spanOK(at []time.Time, k int, period time.Duration, frac float64) (bool, int, time.Duration) {
+	for i := 0; i+k < len(at); i++ {
+		if sum := at[i+k].Sub(at[i]); sum < time.Duration(frac*float64(k)*float64(period)) {
+			return false, i, sum
+		}
+	}
+	return true, 0, 0
 }
 
 // walkFor runs one Markov walker against srv for window with the given period.
@@ -84,7 +136,7 @@ func walkFor(t *testing.T, srvURL string, window, period time.Duration) {
 // Without a period the walker is the closed loop it always was: against a
 // loopback server it sends as fast as the server answers.
 func TestMarkovWalkerWithoutPeriodIsClosedLoop(t *testing.T) {
-	a := newArrivalServer(t, 0)
+	a := newArrivalServer(t, 0, 0, 0)
 	walkFor(t, a.URL, 500*time.Millisecond, 0)
 	// ~17k on an idle laptop, ~5.7k under -race; even a 1 ms period would cap it
 	// at 500.
@@ -105,37 +157,143 @@ func TestMarkovWalkerStartsAreAtLeastOnePeriodApart(t *testing.T) {
 		{50 * time.Millisecond, 12, 21}, // 1 s / 50 ms = 20; twice the period gives 10, half gives 40
 		{100 * time.Millisecond, 6, 11}, // 1 s / 100 ms = 10; twice gives 5, half gives 20
 	} {
-		a := newArrivalServer(t, 0)
+		a := newArrivalServer(t, 0, 0, 0)
 		walkFor(t, a.URL, time.Second, tc.period)
 		at := a.arrivals()
 		if len(at) < tc.min || len(at) > tc.max {
 			t.Errorf("period %v: %d requests in 1s, want %d..%d", tc.period, len(at), tc.min, tc.max)
 		}
-		for i := 1; i < len(at); i++ {
-			// Server-side arrival times jitter a little; 80% leaves room for it
-			// and still fails a pacing at half the period.
-			if gap := at[i].Sub(at[i-1]); gap < tc.period*8/10 {
-				t.Errorf("period %v: requests %d and %d arrived %v apart", tc.period, i-1, i, gap)
-			}
+		if ok, i, sum := spanOK(at, 4, tc.period, 0.6); !ok {
+			t.Errorf("period %v: requests %d..%d arrived %v apart, under 0.6 x 4 periods", tc.period, i, i+4, sum)
 		}
 	}
 }
 
-// Open loop: a slow response makes the next start come at once but never earlier
-// than a period after the last start, and nothing is caught up afterwards -- no
-// burst of the starts that were missed while the response was pending.
-func TestMarkovWalkerDoesNotCatchUpAfterASlowResponse(t *testing.T) {
+// OPEN LOOP: the next start is booked from the ACTUAL START of the last request,
+// not from the end of its response. Every response here takes 30 ms against a
+// 50 ms period: open loop starts every 50 ms (about 20 in a second), a pause
+// after the response (a think time, the round-1 design) every 80 ms (about 12).
+// A fast response must not shorten the gap either (the span check, with the
+// responses at 0 ms elsewhere in this file). Counts, not stamps: a late handler
+// cannot change how many requests the walker started.
+func TestMarkovWalkerBooksFromTheStartNotTheResponse(t *testing.T) {
 	const period = 50 * time.Millisecond
-	a := newArrivalServer(t, 400*time.Millisecond) // eight periods
-	walkFor(t, a.URL, 1200*time.Millisecond, period)
+	a := newArrivalServer(t, 0, 30*time.Millisecond, 0)
+	walkFor(t, a.URL, time.Second, period)
 	at := a.arrivals()
-	if len(at) < 6 {
-		t.Fatalf("only %d requests: the walker did not resume after the slow response", len(at))
+	if len(at) < 16 || len(at) > 21 {
+		t.Fatalf("with 30ms responses and a 50ms period the walker started %d requests in 1s, want 16..21 (open loop ~20; a pause after the response gives ~12)", len(at))
 	}
-	for i := 1; i < len(at); i++ {
-		if gap := at[i].Sub(at[i-1]); gap < period*8/10 {
-			t.Errorf("requests %d and %d arrived %v apart after a slow response: a catch-up burst", i-1, i, gap)
+	if ok, i, sum := spanOK(at, 4, period, 0.6); !ok {
+		t.Errorf("requests %d..%d arrived %v apart, under 0.6 x 4 periods", i, i+4, sum)
+	}
+}
+
+// Open loop, slow response: a response slower than the period makes the next
+// start come at once but never earlier than a period after the last start, and
+// nothing is made up afterwards -- no burst of the starts missed while the
+// response was pending. Two stall lengths: eight periods and just two (a short
+// stall is the one a bounded catch-up would still make up).
+func TestMarkovWalkerDoesNotCatchUpAfterASlowResponse(t *testing.T) {
+	const period = 150 * time.Millisecond
+	for _, hold := range []time.Duration{1200 * time.Millisecond, 2 * period} {
+		a := newArrivalServer(t, hold, 0, 0)
+		walkFor(t, a.URL, hold+1500*time.Millisecond, period)
+		at := a.arrivals()
+		if len(at) < 6 {
+			t.Fatalf("hold %v: only %d requests: the walker did not resume after the slow response", hold, len(at))
 		}
+		// Skip the stalled gap itself: the check is on what follows it. Two
+		// consecutive gaps must sum to most of two periods: a start made up for
+		// the lateness (bounded catch-up) leaves one gap near zero and the pair
+		// at about one period.
+		if ok, i, sum := spanOK(at[1:], 2, period, 0.6); !ok {
+			t.Errorf("hold %v: requests %d..%d after the stall arrived %v apart: a catch-up burst", hold, i+1, i+3, sum)
+		}
+	}
+}
+
+// The first starts are staggered: each walker's seed gives it its own offset in
+// [0, period), so a fleet does not start in lockstep, and none waits a whole
+// period for its first request.
+func TestStartPacerStaggersTheFirstStart(t *testing.T) {
+	const period = 6500 * time.Microsecond
+	now := time.Unix(1_000_000, 0)
+	distinct := map[time.Duration]bool{}
+	var lo, hi time.Duration = period, 0
+	for seed := uint64(1); seed <= 64; seed++ {
+		p := newStartPacer(period, rand.New(rand.NewPCG(seed, ^seed)), now)
+		off := p.next.Sub(now)
+		if off < 0 || off >= period {
+			t.Fatalf("seed %d: first start offset %v is outside [0, %v)", seed, off, period)
+		}
+		distinct[off] = true
+		lo, hi = min(lo, off), max(hi, off)
+	}
+	if len(distinct) < 32 || hi-lo < period/2 {
+		t.Errorf("64 walkers got %d distinct first-start offsets spanning %v: the fleet starts in lockstep", len(distinct), hi-lo)
+	}
+}
+
+// A 401 draws a re-login, which is a request start like any other: it waits for
+// its own start, a period after the request that drew the 401. (Re-logins are
+// about 4% of the starts of the real refapp.)
+func TestMarkovWalkerPacesTheReloginAfterA401(t *testing.T) {
+	const period = 100 * time.Millisecond
+	a := newArrivalServer(t, 0, 0, 6)
+	walkFor(t, a.URL, 1800*time.Millisecond, period)
+	a.mu.Lock()
+	ev := append([]arrival(nil), a.ev...)
+	a.mu.Unlock()
+	var pairs, spaced int
+	for i := 1; i < len(ev); i++ {
+		if ev[i].login && !ev[i-1].login {
+			pairs++
+			if ev[i].at.Sub(ev[i-1].at) >= period/2 {
+				spaced++
+			}
+		}
+	}
+	if pairs < 4 {
+		t.Fatalf("premise: only %d request->re-login pairs seen", pairs)
+	}
+	// One stamp may be late; an unpaced re-login would fail every pair.
+	if spaced < pairs-1 {
+		t.Errorf("%d of %d re-logins came within half a period of the request that drew the 401: the re-login is not paced", pairs-spaced, pairs)
+	}
+}
+
+// A wait ended by stop sends nothing: the request a walker was about to start
+// when the phase ended is not sent, so a shaped cell's drain is the one an
+// unshaped cell has (probatorium#465).
+func TestMarkovWalkerSendsNothingAfterStop(t *testing.T) {
+	a := newArrivalServer(t, 0, 0, 0)
+	stop, endPhase := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var tally tier1Tally
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runMarkovWalker(ctx, stop, &http.Client{Timeout: time.Second}, a.URL, minimalMatrix(t), 0xa11ce, 400*time.Millisecond, &tally)
+	}()
+	// Wait for the first request, then end the phase while the walker waits for
+	// its second start (up to 400 ms away).
+	for len(a.arrivals()) < 1 {
+		select {
+		case <-done:
+			t.Fatal("walker ended before sending anything")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	endPhase()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the walker did not end with the phase")
+	}
+	if n := len(a.arrivals()); n > 1 {
+		t.Errorf("%d requests reached the server: the wait woken by stop still sent one", n)
 	}
 }
 
@@ -143,7 +301,7 @@ func TestMarkovWalkerDoesNotCatchUpAfterASlowResponse(t *testing.T) {
 // when stop fires returns at once, so a shaped cell ends when an unshaped one
 // would.
 func TestMarkovWalkerWaitEndsWithStop(t *testing.T) {
-	a := newArrivalServer(t, 0)
+	a := newArrivalServer(t, 0, 0, 0)
 	stop, endPhase := context.WithCancel(context.Background())
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -164,7 +322,7 @@ func TestMarkovWalkerWaitEndsWithStop(t *testing.T) {
 
 // And with the request context: a cut (the deadline) ends the wait too.
 func TestMarkovWalkerWaitEndsWithContext(t *testing.T) {
-	a := newArrivalServer(t, 0)
+	a := newArrivalServer(t, 0, 0, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	var tally tier1Tally
 	done := make(chan struct{})
@@ -243,6 +401,19 @@ func TestDriveTier1ReallyPacesTheMarkovFleet(t *testing.T) {
 		t.Errorf("paced fleet sent %d requests against %d closed-loop: the walkers were not paced (a record that says 50 ms over walkers that ran free)",
 			paced.RequestsSent, closed.RequestsSent)
 	}
+	// The period belongs to the Markov walkers alone: the interval-paced slices
+	// run at their own rates in both cells (a period leaking into the adversarial
+	// or h2c ticks would starve them). Paced, they get at least what they got
+	// beside a closed-loop fleet that competes with them for the CPU.
+	if closed.Adversarial.Sent < 10 {
+		t.Fatalf("premise: the adversarial slice sent only %d in the closed-loop cell", closed.Adversarial.Sent)
+	}
+	if paced.Adversarial.Sent*5 < closed.Adversarial.Sent*2 {
+		t.Errorf("adversarial slice sent %d paced against %d closed-loop: the period leaked into a non-Markov slice", paced.Adversarial.Sent, closed.Adversarial.Sent)
+	}
+	if closed.H2CChurn.Sent >= 5 && paced.H2CChurn.Sent*5 < closed.H2CChurn.Sent*2 {
+		t.Errorf("h2c slice sent %d paced against %d closed-loop: the period leaked into a non-Markov slice", paced.H2CChurn.Sent, closed.H2CChurn.Sent)
+	}
 	// And the upper bound the period implies, with generous slack for the
 	// fleet's start-up and the final tick: at most 9 walkers, one start per 50 ms
 	// each, over well under 5 s.
@@ -320,5 +491,48 @@ func TestUnshapedCellsGainNoLoadShapingKeyAnywhere(t *testing.T) {
 	raw, _ := json.Marshal(zero)
 	if strings.Contains(string(raw), "load_shaping") {
 		t.Errorf("a zero snapshot serialises load_shaping: %s", raw)
+	}
+}
+
+// A logout is counted when it is sent, not while it waits for its start: the
+// re-login budget (logouts + 10 x logins) is judged against the logouts that
+// reached the server. A phase that ends during the wait counts none.
+func TestMarkovWalkerCountsALogoutOnlyWhenItIsSent(t *testing.T) {
+	const yaml = `login: POST /login
+logout: POST /logout
+start: bye
+states:
+  bye:
+    request: POST /logout
+`
+	m, err := markov.LoadMatrix(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatalf("load matrix: %v", err)
+	}
+	const seed = 0xa11ce
+	// Premise: this walker's first start is far away, so stop arrives during
+	// the wait.
+	if off := time.Until(newStartPacer(time.Hour, rand.New(rand.NewPCG(seed, ^uint64(seed))), time.Now()).next); off < 10*time.Second {
+		t.Fatalf("premise: the seeded first start is only %v away", off)
+	}
+	a := newArrivalServer(t, 0, 0, 0)
+	stop, endPhase := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	var tally tier1Tally
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runMarkovWalker(ctx, stop, &http.Client{Timeout: time.Second}, a.URL, m, seed, time.Hour, &tally)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	endPhase()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the walker did not end with the phase")
+	}
+	if n, sent := tally.walkerLogouts.Load(), len(a.arrivals()); n != 0 || sent != 0 {
+		t.Errorf("logouts counted %d, requests sent %d: a logout that never left was counted", n, sent)
 	}
 }
