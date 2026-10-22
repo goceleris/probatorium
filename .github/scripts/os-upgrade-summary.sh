@@ -278,6 +278,15 @@ arming | rebooting)
 	failed-before-boot-disarmed)
 		echo "- Power-cycle: **not needed**. The run failed after arming the one-shot and before the new kernel booted; $host answered and the one-shot was CLEARED (disarm). The old kernel runs and is the default."
 		;;
+	failed-rebooted-one-shot-not-consumed)
+		echo "- Power-cycle: **not needed while $host answers, but it HAS REBOOTED** (new boot id) and GRUB did **not** consume the one-shot (next_entry was still set; the rescue cleared it): GRUB does not read the environment block Linux writes, so what a power-cycle boots is GRUB's first menu entry, not the saved default. Dispatch a survey (\`kernel\`, \`boot.default_kernel\`); do not dispatch the upgrade again before this is understood."
+		;;
+	failed-boot-unknown)
+		echo "- Power-cycle: **not needed while $host answers, but WHETHER IT REBOOTED IS UNKNOWN**: it answered the disarm and not the read of its boot id. Dispatch a survey before anything else (\`kernel\`, \`boot.next_entry\`, \`boot.saved_entry\`)."
+		;;
+	failed-rebooted-nothing-armed)
+		echo "- Power-cycle: **not needed while $host answers, but it HAS REBOOTED** (new boot id) although the arming did not complete: it rebooted for another reason and runs what GRUB chose. Dispatch a survey before anything else."
+		;;
 	failed-new-kernel-may-have-booted)
 		echo "- Power-cycle: **not needed yet**. The run failed after arming, but no one-shot is pending any more: grub consumed it, so the NEW kernel has probably booted (slowly) and $host answers. Dispatch a survey before anything else."
 		;;

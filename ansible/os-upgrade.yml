@@ -240,7 +240,17 @@
       later, treat it like a host that never returned (the one-shot is consumed by then: a power-cycle boots the OLD kernel
       {{ pre_survey.kernel }}). The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is
       still {{ pre_survey.kernel }}. Reboot it back with the cluster-reboot workflow (red with "kernel changed", expected).
-    power_cycle_none: "No power-cycle needed: nothing was rebooted."
+    power_cycle_none: "No power-cycle needed: nothing was rebooted (the boot id is unchanged)."
+    power_cycle_boot_unknown: >-
+      No power-cycle needed while the host answers, but WHETHER IT REBOOTED IS UNKNOWN: it answered the disarm and not the read of its boot id.
+      Dispatch a survey before anything else: kernel, boot.next_entry and boot.saved_entry say what happened.
+    power_cycle_rebooted_unconsumed: >-
+      No power-cycle needed while the host answers, but it HAS REBOOTED (new boot id). GRUB did not consume the one-shot (next_entry was
+      still set and was cleared now): it did not read the environment block Linux writes, so the saved default is not what a power-cycle
+      boots; GRUB's first menu entry is. Dispatch a survey (kernel, boot.default_kernel); do not dispatch the upgrade before it is understood.
+    power_cycle_rebooted_unarmed: >-
+      No power-cycle needed while the host answers, but it HAS REBOOTED (new boot id) although the arming did not complete: it rebooted
+      for another reason and runs what grub chose. Dispatch a survey before anything else.
     power_cycle_gone: >-
       No power-cycle needed while the host answers. The arming succeeded, the host did not reboot, and no one-shot is pending any more:
       something cleared it (GRUB reading another environment block than the one Linux writes?). Survey before anything else and do
@@ -626,25 +636,36 @@
             rescue_arm_ok: "{{ arm_raw is defined and not (arm_raw is unreachable) and (arm_raw.rc | default(1)) == 0 and (arm_raw.stdout | default('', true) | length > 0) }}"
             rescue_answered: "{{ (disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0) and not (disarm_raw is unreachable) }}"
             rescue_disarm: "{{ (disarm_raw.stdout | default('{}', true) | from_json) if ((disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0)) else {} }}"
-            rescue_booted: "{{ (rescue_snap.stdout | default('', true) | length > 0) and ((rescue_snap.stdout | from_json).boot_id | default('')) != pre_target.boot_id }}"
+            # did the host reboot? Its boot id answers that, and it is read BEFORE anything else is believed: a host that rebooted
+            # is not "nothing was rebooted", whatever the disarm found. 'unknown' when the snapshot did not answer.
+            rescue_boot: >-
+              {{ 'unknown' if not (rescue_snap.stdout | default('', true) | length > 0) else
+                 ('changed' if ((rescue_snap.stdout | from_json).boot_id | default('')) != pre_target.boot_id else 'same') }}
 
         - name: Rescue | the verdict
           ansible.builtin.set_fact:
             rescue_status: >-
               {{ ('failed-unknown-armed' if rescue_arm_ok else 'failed-arming-unreachable') if not rescue_answered else
-                 ('failed-before-boot-disarmed' if (rescue_disarm.was_armed | default(false)) else
-                  ('failed-before-arming' if not rescue_arm_ok else
-                   ('failed-new-kernel-may-have-booted' if rescue_booted else 'failed-one-shot-gone-host-not-rebooted'))) }}
+                 ('failed-boot-unknown' if rescue_boot == 'unknown' else
+                  (('failed-rebooted-one-shot-not-consumed' if (rescue_disarm.was_armed | default(false)) else
+                    ('failed-new-kernel-may-have-booted' if rescue_arm_ok else 'failed-rebooted-nothing-armed')) if rescue_boot == 'changed' else
+                   ('failed-before-boot-disarmed' if (rescue_disarm.was_armed | default(false)) else
+                    ('failed-before-arming' if not rescue_arm_ok else 'failed-one-shot-gone-host-not-rebooted')))) }}
             rescue_problem: >-
               {{ ('the run failed after the one-shot was armed and the host did not answer: the one-shot (grub next_entry) is probably STILL ARMED' if rescue_arm_ok else 'the host stopped answering while the one-shot was being armed: it may or may not be armed') if not rescue_answered else
-                 ('the run failed after the one-shot was armed and before the new kernel booted; the host answered and the one-shot was cleared' if (rescue_disarm.was_armed | default(false)) else
-                  ('the arming did not complete (nothing is armed, nothing was rebooted): see the failed task' if not rescue_arm_ok else
-                   ('the run failed after the arming, no one-shot is pending any more and the host has a new boot id: grub consumed it, so the new kernel has probably booted (slowly); survey before anything else' if rescue_booted else
-                    'the arming succeeded, the host did not reboot, and no one-shot is pending any more: something cleared it (GRUB reading another environment block?); survey before anything else'))) }}
+                 ('the run failed and the host answered the disarm but not the boot-id read: WHETHER IT REBOOTED IS UNKNOWN (' ~ ('a one-shot was pending and was cleared' if (rescue_disarm.was_armed | default(false)) else 'no one-shot is pending') ~ '); survey before anything else' if rescue_boot == 'unknown' else
+                  (('the run failed after the arming; the host HAS REBOOTED (new boot id) although grub did not consume the one-shot (next_entry was still ' ~ (rescue_disarm.next_entry_before | default('set')) ~ ' and was cleared now): GRUB did not read the environment block Linux writes, or booted something other than the one-shot; the host runs whatever grub chose (see kernel in a survey)' if (rescue_disarm.was_armed | default(false)) else
+                    ('the run failed after the arming, no one-shot is pending any more and the host has a new boot id: grub consumed it, so the new kernel has probably booted (slowly); survey before anything else' if rescue_arm_ok else
+                     'the host has a new boot id although the arming did not complete: it rebooted for another reason (a power loss, an unattended upgrade?) and runs the default of grub; survey before anything else')) if rescue_boot == 'changed' else
+                   ('the run failed after the one-shot was armed and before the new kernel booted; the host answered, has the same boot id (it did not reboot) and the one-shot was cleared' if (rescue_disarm.was_armed | default(false)) else
+                    ('the arming did not complete (nothing is armed; the boot id is unchanged, the host did not reboot): see the failed task' if not rescue_arm_ok else
+                     'the arming succeeded, the host did not reboot (same boot id), and no one-shot is pending any more: something cleared it (GRUB reading another environment block?); survey before anything else')))) }}
             rescue_power: >-
               {{ power_cycle_rebooting if not rescue_answered else
-                 (power_cycle_none if ((rescue_disarm.was_armed | default(false)) or not rescue_arm_ok) else
-                  (power_cycle_returned if rescue_booted else power_cycle_gone)) }}
+                 (power_cycle_boot_unknown if rescue_boot == 'unknown' else
+                  ((power_cycle_rebooted_unconsumed if (rescue_disarm.was_armed | default(false)) else
+                    (power_cycle_returned if rescue_arm_ok else power_cycle_rebooted_unarmed)) if rescue_boot == 'changed' else
+                   (power_cycle_none if ((rescue_disarm.was_armed | default(false)) or not rescue_arm_ok) else power_cycle_gone))) }}
 
         - name: Rescue | keep what happened
           ansible.builtin.copy:

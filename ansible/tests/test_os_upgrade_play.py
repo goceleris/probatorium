@@ -133,13 +133,15 @@ if [ $# -ge 6 ]; then
 	set -- "${@:1:5}"
 fi
 root=%s
+# SNAP_FAIL_AFTER_REBOOT=1: once the host has "rebooted", its snapshots fail (it answers the disarm but not the boot-id read)
+if [ -n "${SNAP_FAIL_AFTER_REBOOT:-}" ] && grep -q FAKE-REBOOT %s; then echo "snapshot failed after the reboot (test)" >&2; exit 3; fi
 # BOOT_MODE=stale-first: the first snapshot after the restart still shows the old boot
 if [ -s %s/stale_count ] && [ "$(cat %s/stale_count)" -gt 0 ]; then
 	echo $(( $(cat %s/stale_count) - 1 )) > %s/stale_count
 	root=%s/stale_root
 fi
 PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root exec bash %s "$@"
-''' % (cls.h.root, cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.bin, cls.h.state_dir, cls.h.log, os.path.join(ANSIBLE_DIR, "files", "reboot_snapshot.sh")))
+''' % (cls.h.root, os.path.join(cls.h.state_dir, "argv.log"), cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.bin, cls.h.state_dir, cls.h.log, os.path.join(ANSIBLE_DIR, "files", "reboot_snapshot.sh")))
         with open(w + "/fake-reboot.sh", "w") as f:
             f.write('#!/bin/bash\nexec %s %s %s %s\n' % (sys.executable, os.path.join(HERE, "osu_fake_reboot.py"), cls.h.root, cls.h.state_dir))
         os.makedirs(w + "/sbin")
@@ -681,6 +683,34 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("probably booted", r["problems"][0])
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
         self.no_call("grub-set-default " + ID_40)
+
+    def test_a_host_that_rebooted_but_kept_the_one_shot_is_not_called_unrebooted(self):
+        # R3-M3: grub rebooted the host and did not consume next_entry. The rescue clears it, and must NOT say nothing was rebooted.
+        self.fresh()
+        self.play("rebooted_unconsumed", self.UP, env={"BOOT_MODE": "keep-next-reported-failed"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertTrue(r["disarm"]["was_armed"])
+        self.assertEqual(r["status"], "failed-rebooted-one-shot-not-consumed")
+        self.assertIn("HAS REBOOTED", r["power_cycle"])
+        self.assertNotIn("nothing was rebooted", r["power_cycle"])
+        self.assertNotIn("No power-cycle needed: nothing", r["power_cycle"])
+        self.assertIn("HAS REBOOTED", r["problems"][0])
+        self.assertNotIn("did not reboot", r["problems"][0])
+        md = self.summary("upgrade", "msr1")
+        self.assertIn("HAS REBOOTED", md)
+        self.assertNotIn("not needed**. The run failed after arming the one-shot and before the new kernel booted", md)
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
+
+    def test_a_host_whose_boot_id_cannot_be_read_is_not_called_unrebooted(self):
+        self.fresh()
+        self.play("bootunknown", self.UP, env={"BOOT_MODE": "booted-but-reported-failed", "SNAP_FAIL_AFTER_REBOOT": "1"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-boot-unknown")
+        self.assertIn("WHETHER IT REBOOTED IS UNKNOWN", r["power_cycle"])
+        self.assertNotIn("nothing was rebooted", r["power_cycle"])
+        self.assertIn("UNKNOWN", self.summary("upgrade", "msr1"))
 
     def test_an_apt_that_outlives_the_waits_keeps_its_policy_and_is_not_cleaned_up_under(self):
         self.fresh(upgrade_sleep=12)
