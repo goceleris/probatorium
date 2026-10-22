@@ -1026,6 +1026,30 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("survey_entry0_ok", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
         self.assertRegex(self.summary("survey", "-"), r"kernel a GRUB that ignores the grubenv would boot[^\n]*\| \*\*PASS\*\*")
 
+    def test_the_checklist_does_not_say_the_same_kernel_when_an_installed_one_is_the_target(self):
+        # R3-m3 (msr1): apt offers no new image, but -38 is installed: the upgrade targets -38, not 'the same kernel'
+        self.fresh(keep38=True, sim=["Inst linux-image-generic (7.0.0.38 Ubuntu:26.04/resolute-updates [arm64])",
+                                     "Inst libc6 [2.43-0ubuntu1] (2.43-0ubuntu2 Ubuntu:26.04/resolute-updates [arm64])"])
+        self.play("survey_target", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertEqual(self.rc, 0, self.log[-1500:])
+        md = self.summary("survey", "-")
+        self.assertIn("a new kernel is on offer", md, md[:3000])
+        row = [l for l in md.splitlines() if "a new kernel is on offer" in l][0]
+        self.assertIn("`7.0.0-38-generic` is ALREADY INSTALLED", row)
+        self.assertNotIn("would reboot into the same kernel", row)
+        self.assertNotIn("linux-image-generic", row.split("|")[3])  # the metapackage is not a new ABI
+        self.assertNotIn("**PASS**", row)
+        # a jq error in the middle of the checklist used to cut it short without a word: every host shows its LAST row
+        self.assertEqual(md.count("| unattended-upgrades and phasing |"), 3)
+        self.assertRegex(md, r"\| msr1 \| run state \|[^\n]*\| \*\*PASS\*\*")
+        os.remove(os.path.join(self.out, "msr1", "preflight-snapshot.json"))  # no snapshot: nothing is known about a run on the host
+        self.assertRegex(self.summary("survey", "-"), r"\| msr1 \| run state \|[^\n]*\| \*\*NOTE\*\* \|")
+        self.fresh()
+        self.play("survey_offer", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        row = [l for l in self.summary("survey", "-").splitlines() if "a new kernel is on offer" in l][0]
+        self.assertIn("linux-image-7.0.0-40-generic", row)
+        self.assertIn("**PASS**", row)
+
     def test_the_survey_summary_marks_a_broken_way_in(self):
         self.fresh(sshd_rc=255)
         self.play("survey_ssh", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
