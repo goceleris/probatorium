@@ -111,7 +111,7 @@ class Play(unittest.TestCase):
             f.write(INVENTORY)
         # variants whose arm / reboot task is delegated to a host that refuses the connection: UNREACHABLE (not FAILED) is the
         # class ansible does not rescue, and no stub produces it on a local connection
-        for name, old, new in (("unreach_arm", "        register: arm_raw\n        ignore_unreachable: true\n", "        register: arm_raw\n        ignore_unreachable: true\n        delegate_to: ghost\n"),
+        for name, old, new in (("unreach_arm", "        register: arm_raw\n", "        register: arm_raw\n        delegate_to: ghost\n"),
                                ("unreach_reboot", "        register: reboot_result\n", "        register: reboot_result\n        delegate_to: ghost\n")):
             d = os.path.join(cls.work, "pb_" + name)
             shutil.copytree(cls.pb, d)
