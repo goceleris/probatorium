@@ -7,6 +7,7 @@ host-changing subcommand in the order the playbook runs them, and the refusals e
 
 workflow_cluster_os_upgrade_test.go runs this file in CI (skipping when python3 is absent).
 """
+import contextlib
 import json
 import os
 import shutil
@@ -57,6 +58,16 @@ class Base(unittest.TestCase):
     def j(self, r):
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout)
+
+    @contextlib.contextmanager
+    def in_fake_root(self):
+        """osu.* called IN THIS PROCESS reads /proc and the lock files under osu.ROOT, which is the real machine's unless pointed at the
+        fake host: the stub processes of the other shards (OSU_SHARD) and a real unattended upgrade of a CI machine would be seen."""
+        old, osu.ROOT = osu.ROOT, self.h.root
+        try:
+            yield
+        finally:
+            osu.ROOT = old
 
     def run_ok(self, *a):
         self.h.save()
@@ -277,7 +288,8 @@ class PackageRunDetection(Base):
         self.assertEqual(pk["package_processes"], [])
         self.assertEqual(pk["locks_held"], [])
         self.assertFalse(pk["dpkg_lock_held"])
-        self.assertEqual(osu.package_run_busy(), "")
+        with self.in_fake_root():
+            self.assertEqual(osu.package_run_busy(), "")
 
     def test_a_comm_that_only_looks_like_a_package_manager_is_not_enough(self):
         # a kernel thread, a zombie (empty cmdline) and a process that merely has the comm of one
@@ -334,12 +346,38 @@ class PackageRunDetection(Base):
 
     def test_the_busy_words_of_a_refusal(self):
         self.h.save()
-        self.assertEqual(osu.package_run_busy(), "")
-        self.h.proc(4242, "/usr/bin/apt-get", "upgrade")
-        os.environ["OSU_ROOT"] = self.h.root
-        old, osu.ROOT = osu.ROOT, self.h.root
-        try:
+        with self.in_fake_root():
+            self.assertEqual(osu.package_run_busy(), "")
+            self.h.proc(4242, "/usr/bin/apt-get", "upgrade")
             self.assertEqual(osu.package_run_busy(), "apt-get")
+
+    @unittest.skipUnless(os.path.isdir("/proc/self"), "needs a real /proc")
+    def test_a_scan_of_the_fake_root_never_sees_the_real_machines_processes(self):
+        """The leak the sharded run exposed: a REAL process whose argv[0] is apt-get (exec -a) is invisible to a scan of the fake root and
+        visible to a scan of the real one."""
+        p = subprocess.Popen(["bash", "-c", "exec -a apt-get sleep 60"])
+        try:
+            deadline = time.time() + 10
+            real = []
+            while time.time() < deadline and "apt-get" not in real:
+                time.sleep(0.05)
+                with self.in_real_root():
+                    real = osu.package_processes()
+            self.assertIn("apt-get", real, "the real-root scan does not see a real apt-get: the control of this test is broken")
+            with self.in_fake_root():
+                self.assertEqual(osu.package_processes(), [])
+                self.assertEqual(osu.package_run_busy(), "")
+            # and a child process (the script as the playbook runs it) is held to OSU_ROOT too
+            self.assertEqual(self.run_ok("survey")["packages"]["package_processes"], [])
+        finally:
+            p.kill()
+            p.wait()
+
+    @contextlib.contextmanager
+    def in_real_root(self):
+        old, osu.ROOT = osu.ROOT, ""
+        try:
+            yield
         finally:
             osu.ROOT = old
 

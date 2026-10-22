@@ -567,21 +567,23 @@ func TestOSUpgradeScript(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	ran := 0
+	ran, failed := 0, false
 	for i, r := range results {
 		if r.err != nil {
-			t.Errorf("test_os_upgrade.py shard %d/%d failed: %v\n%s", i, n, r.err, r.out)
+			failed = true
+			t.Errorf("test_os_upgrade.py shard %d/%d FAILED: %v\n%s", i, n, r.err, r.out)
 			continue
 		}
 		m := regexp.MustCompile(`Ran (\d+) tests?`).FindSubmatch(r.out)
 		if m == nil || !bytes.Contains(r.out, []byte("OK")) {
+			failed = true
 			t.Errorf("test_os_upgrade.py shard %d/%d did not report OK:\n%s", i, n, r.out)
 			continue
 		}
 		k, _ := strconv.Atoi(string(m[1]))
 		ran += k
 	}
-	if ran < 200 {
+	if ran < 200 && !failed { // after a failed shard the count is only a consequence of it
 		t.Errorf("the shards ran %d tests in all: the suite has more than 200 (a shard that silently ran nothing?)", ran)
 	}
 }
