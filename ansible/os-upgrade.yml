@@ -680,10 +680,11 @@
           failed_when: false
           ignore_unreachable: true
 
+        # an UNREACHABLE result carries no rc and no stdout, so the rc / stdout tests below already read it as 'did not answer'
         - name: Rescue | what happened
           ansible.builtin.set_fact:
-            rescue_arm_ok: "{{ arm_raw is defined and not (arm_raw is unreachable) and (arm_raw.rc | default(1)) == 0 and (arm_raw.stdout | default('', true) | length > 0) }}"
-            rescue_answered: "{{ (disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0) and not (disarm_raw is unreachable) }}"
+            rescue_arm_ok: "{{ arm_raw is defined and (arm_raw.rc | default(1)) == 0 and (arm_raw.stdout | default('', true) | length > 0) }}"
+            rescue_answered: "{{ (disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0) }}"
             rescue_disarm: "{{ (disarm_raw.stdout | default('{}', true) | from_json) if ((disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0)) else {} }}"
             # did the host reboot? Its boot id answers that, and it is read BEFORE anything else is believed: a host that rebooted
             # is not "nothing was rebooted", whatever the disarm found. 'unknown' when the snapshot did not answer.
