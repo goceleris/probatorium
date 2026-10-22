@@ -394,6 +394,8 @@ class Judge(unittest.TestCase):
         case("post_failed_unit", {"post": "new failed unit(s): foo.service"}, lambda c: post(c, failed_units=["foo.service"]))
         case("post_one_shot_not_consumed", {"post": "a one-shot is still pending (gnulinux-x) after the host booted: GRUB did not consume it"},
              lambda c: c["post_survey"]["boot"].update(next_entry="gnulinux-x"))
+        case("post_one_shot_not_consumed_names_what_a_boot_gives", {"post": "boots the first menu entry of grub (7.0.0-38-generic), not the saved default (7.0.0-31-generic)"},
+             lambda c: c["post_survey"]["boot"].update(next_entry="gnulinux-x", entry0_kernel="7.0.0-38-generic", default_kernel="7.0.0-31-generic"))
         case("post_no_snapshot", {"post": "no readable snapshot after the reboot"}, lambda c: c["post_raw"].update(stdout=""))
         case("post_nic_driver_changed", {"post": "NIC enp1s0 is bound to r8169, was r8127"},
              lambda c: c["post_survey"]["nics"][0].update(driver="r8169"))

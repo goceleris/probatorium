@@ -265,11 +265,21 @@ verified)
 	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED or was refused (see the log; the step may have changed grub's saved default before failing: dispatch a survey and read \`boot.saved_entry\` and \`boot.next_entry\`; a one-shot still pending after the boot means GRUB did not consume it). Either accept the new kernel as the default by a reviewed change that runs grub-set-default for it, or reboot back with the cluster-reboot workflow (red with 'kernel changed', expected) and dispatch the upgrade again. The upgrade REFUSES to run while the host runs a kernel other than grub's saved default."
 	;;
 returned)
+	if [ "$mode" = rehearse ]; then
+		echo "- Power-cycle: $(jq -r '.power_cycle // "see result.json"' "$d/result.json" 2> /dev/null)"
+	else
 	echo "- Power-cycle: **not needed while $host answers** (if it stops answering later, read the 'rebooting' case: the one-shot is consumed by now, so a power-cycle boots the OLD kernel). $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. Reboot it back with the cluster-reboot workflow: it returns to the old kernel and ends red with 'kernel changed', which is expected here. Do NOT dispatch the upgrade again before that: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
+	fi
 	;;
 arming | rebooting)
 	st=$(jq -r '.status // ""' "$d/result.json" 2> /dev/null)
+	if [ "$mode" = rehearse ]; then
+		# a rehearsal arms the running kernel: no new kernel is in play, the playbook words each case for it
+		echo "- Power-cycle: $(jq -r '.power_cycle // "see result.json"' "$d/result.json" 2> /dev/null)"
+		st=rehearse-text-printed
+	fi
 	case "$st" in
+	rehearse-text-printed) ;;
 	failed-before-arming)
 		echo "- Power-cycle: **not needed**. The arming did not complete: nothing is armed and nothing was rebooted ($host answered the rescue and no one-shot is pending). The old kernel runs and is the default."
 		;;

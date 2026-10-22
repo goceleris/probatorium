@@ -144,7 +144,7 @@ post_problems_str: >-
   {% set up_b = b.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
   {% if up_b < up_a %}{% set _ = p.append('bond lost a slave: ' ~ up_a ~ ' up before, ' ~ up_b ~ ' up now') %}{% endif %}
   {% if b.max_vector_total >= os_counter_ceiling %}{% set _ = p.append('a NIC vector counts ' ~ b.max_vector_total ~ ' since boot: the counters were not reset') %}{% endif %}
-  {% if bs | length > 0 and bs.boot.next_entry | length > 0 %}{% set _ = p.append('a one-shot is still pending (' ~ bs.boot.next_entry ~ ') after the host booted: GRUB did not consume it, so it reads or writes another environment block than the one Linux uses, and the fallback is NOT proven') %}{% endif %}
+  {% if bs | length > 0 and bs.boot.next_entry | length > 0 %}{% set _ = p.append('a one-shot is still pending (' ~ bs.boot.next_entry ~ ') after the host booted: GRUB did not consume it, so it reads or writes another environment block than the one Linux uses, and the fallback is NOT proven. While that holds, a power-cycle or a reboot boots the first menu entry of grub (' ~ (bs.boot.entry0_kernel | default('unknown')) ~ '), not the saved default (' ~ (bs.boot.default_kernel | default('unknown')) ~ '): have the console at hand; mode=disarm clears the pending one-shot') %}{% endif %}
   {% if (b.failed_units | difference(a.failed_units)) | length > 0 %}{% set _ = p.append('new failed unit(s): ' ~ (b.failed_units | difference(a.failed_units) | join(', '))) %}{% endif %}
   {% if bs | length == 0 %}{% set _ = p.append('no readable survey after the reboot') %}{% else %}
   {% for n in s.nics %}

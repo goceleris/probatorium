@@ -813,6 +813,40 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/rehearsal.json"))
         self.assertEqual(self.phase(), "returned")
 
+    NEW_KERNEL_WORDS = ("NEW kernel", "new kernel", "OLD kernel", "7.0.0-40", "cluster-reboot workflow (red", "Reboot it back")
+
+    def test_the_texts_of_a_rehearsal_that_ignored_the_one_shot_do_not_talk_of_a_new_kernel(self):
+        # R3-m1: the rehearsal has no new kernel, and a one-shot that was not consumed is not 'consumed by now'
+        self.fresh(rehearsed=False, keep38=True)
+        self.play("keepnext_texts", dict(self.RH, os_confirm="REHEARSE-msr1-CONSOLE"), env={"BOOT_MODE": "keep-next"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        txt = r["power_cycle"] + " " + " ".join(r["problems"])
+        for w in self.NEW_KERNEL_WORDS:
+            self.assertNotIn(w, txt)
+        self.assertNotIn("consumed by", txt)
+        self.assertIn("first menu entry of grub (7.0.0-38-generic), not 7.0.0-31-generic", r["power_cycle"])
+        self.assertIn("first menu entry of grub (7.0.0-38-generic), not the saved default (7.0.0-31-generic)", " ".join(r["problems"]))
+        self.assertIn("mode=disarm", r["power_cycle"])
+        md = self.summary("rehearse", "msr1")
+        for w in self.NEW_KERNEL_WORDS:
+            self.assertNotIn(w, md.split("Power-cycle:")[1].split("\n")[0], w)
+
+    def test_a_rehearsal_that_never_answers_names_what_a_power_cycle_boots(self):
+        self.fresh(rehearsed=False, keep38=True)
+        self.play("rehearse_hang", dict(self.RH, os_confirm="REHEARSE-msr1-CONSOLE"), env={"BOOT_MODE": "hang"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-unknown-armed")
+        for w in self.NEW_KERNEL_WORDS:
+            self.assertNotIn(w, r["power_cycle"])
+        self.assertIn("no other kernel was armed", r["power_cycle"])
+        self.assertIn("7.0.0-38-generic (a kernel this host has not run)", r["power_cycle"])
+        self.assertIn("restores the choice of KERNEL only", r["power_cycle"])
+        md = self.summary("rehearse", "msr1")
+        self.assertIn("no other kernel was armed", md)
+        self.assertNotIn("NEW kernel", md)
+
     def test_a_rehearsal_refuses_what_an_upgrade_refuses(self):
         self.fresh(rehearsed=False)
         self.h.state["boot_fs"] = "btrfs"

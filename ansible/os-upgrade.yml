@@ -227,7 +227,9 @@
       {{ lan_ip | quote }} {{ fabric_peer | quote }}
     host_dir: "{{ os_out_dir }}/{{ inventory_hostname }}"
     # What a person must do, by how far the run got (result.json and the step summary carry it).
-    power_cycle_rebooting: >-
+    power_cycle_rebooting: "{{ power_cycle_rebooting_rehearse if os_mode == 'rehearse' else power_cycle_rebooting_upgrade }}"
+    power_cycle_returned: "{{ power_cycle_returned_rehearse if os_mode == 'rehearse' else power_cycle_returned_upgrade }}"
+    power_cycle_rebooting_upgrade: >-
       The reboot was issued (or about to be) and {{ inventory_hostname }} did not answer within {{ reboot_timeout_seconds }} s,
       and it could not be asked to clear the one-shot. Which boot a power-cycle gives depends on why it is silent.
       (1) The NEW kernel {{ target_kernel | default('') }} booted and has no network: grub already consumed the one-shot, so a
@@ -240,11 +242,30 @@
       to clear a one-shot that is still armed if you do not want the new kernel tried again.
       A power-cycle restores the choice of KERNEL only. If the upgrade broke something both kernels share (the bootloader, ssh,
       tailscale, netplan, firmware) it restores nothing and the host needs its console.
-    power_cycle_returned: >-
+    power_cycle_returned_upgrade: >-
       No power-cycle needed while the host answers: it answered after the reboot but failed verification. If it stops answering
       later, treat it like a host that never returned (the one-shot is consumed by then: a power-cycle boots the OLD kernel
       {{ pre_survey.kernel }}). The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is
       still {{ pre_survey.kernel }}. Reboot it back with the cluster-reboot workflow (red with "kernel changed", expected).
+    # A rehearsal arms the RUNNING kernel: there is no "new kernel" in it. What a silent host boots is its saved default (the running
+    # kernel, pinned by the rehearsal) if GRUB reads the environment block, and the first menu entry of grub if it does not.
+    power_cycle_rebooting_rehearse: >-
+      The rehearsal reboot was issued (or about to be) and {{ inventory_hostname }} did not answer within {{ reboot_timeout_seconds }} s,
+      and it could not be asked to clear the one-shot. The one-shot names the kernel the host already runs ({{ pre_survey.kernel }}); no other
+      kernel was armed. (1) The host booted {{ pre_survey.kernel }} and is only slow, or has no network: a power-cycle boots the saved
+      default, {{ pre_survey.kernel }} again. (2) GRUB did not read the one-shot (the very thing tested) and booted its first menu entry,
+      {{ pre_survey.boot.entry0_kernel | default('unknown') }}{{ ' (a kernel this host has not run)' if (pre_survey.boot.entry0_kernel | default('')) != pre_survey.kernel else '' }}: it comes back on every power-cycle, and if it has no NIC only the GRUB menu at the
+      console (Esc or Shift at power-on) can choose {{ pre_survey.kernel }}. (3) The old kernel hung while shutting down (msr1's documented
+      r8127 power-off panic): the one-shot is STILL ARMED and the next boot is {{ pre_survey.kernel }}. A survey after the power-cycle tells
+      which case it was (running kernel; boot.next_entry). A power-cycle restores the choice of KERNEL only.
+    power_cycle_returned_rehearse: >-
+      No power-cycle needed while the host answers: it answered after the rehearsal reboot but failed verification (see the problems).
+      The saved default is {{ pre_survey.kernel }}, the kernel the rehearsal was run on; no other kernel is involved in this run and nothing was
+      made the default. If a problem says the one-shot is still pending, GRUB does NOT read the environment block Linux writes: a power-cycle
+      or a cluster-reboot then boots the first menu entry of grub ({{ pre_survey.boot.entry0_kernel | default('unknown') }}), not
+      {{ pre_survey.kernel }}; choose {{ pre_survey.kernel }} at the console, and dispatch mode=disarm to clear the pending one-shot. No
+      rehearsal record was written: an upgrade stays refused.
+    kernel_noun: "{{ 'the new kernel' if os_mode == 'upgrade' else 'the rehearsal boot (the running kernel again)' }}"
     power_cycle_none: "No power-cycle needed: nothing was rebooted (the boot id is unchanged)."
     power_cycle_boot_unknown: >-
       No power-cycle needed while the host answers, but WHETHER IT REBOOTED IS UNKNOWN: it answered the disarm and not the read of its boot id.
@@ -660,9 +681,9 @@
               {{ ('the run failed after the one-shot was armed and the host did not answer: the one-shot (grub next_entry) is probably STILL ARMED' if rescue_arm_ok else 'the host stopped answering while the one-shot was being armed: it may or may not be armed') if not rescue_answered else
                  ('the run failed and the host answered the disarm but not the boot-id read: WHETHER IT REBOOTED IS UNKNOWN (' ~ ('a one-shot was pending and was cleared' if (rescue_disarm.was_armed | default(false)) else 'no one-shot is pending') ~ '); survey before anything else' if rescue_boot == 'unknown' else
                   (('the run failed after the arming; the host HAS REBOOTED (new boot id) although grub did not consume the one-shot (next_entry was still ' ~ (rescue_disarm.next_entry_before | default('set')) ~ ' and was cleared now): GRUB did not read the environment block Linux writes, or booted something other than the one-shot; the host runs whatever grub chose (see kernel in a survey)' if (rescue_disarm.was_armed | default(false)) else
-                    ('the run failed after the arming, no one-shot is pending any more and the host has a new boot id: grub consumed it, so the new kernel has probably booted (slowly); survey before anything else' if rescue_arm_ok else
+                    ('the run failed after the arming, no one-shot is pending any more and the host has a new boot id: grub consumed it, so ' ~ kernel_noun ~ ' has probably booted (slowly); survey before anything else' if rescue_arm_ok else
                      'the host has a new boot id although the arming did not complete: it rebooted for another reason (a power loss, an unattended upgrade?) and runs the default of grub; survey before anything else')) if rescue_boot == 'changed' else
-                   ('the run failed after the one-shot was armed and before the new kernel booted; the host answered, has the same boot id (it did not reboot) and the one-shot was cleared' if (rescue_disarm.was_armed | default(false)) else
+                   ('the run failed after the one-shot was armed and before ' ~ kernel_noun ~ ' booted; the host answered, has the same boot id (it did not reboot) and the one-shot was cleared' if (rescue_disarm.was_armed | default(false)) else
                     ('the arming did not complete (nothing is armed; the boot id is unchanged, the host did not reboot): see the failed task' if not rescue_arm_ok else
                      'the arming succeeded, the host did not reboot (same boot id), and no one-shot is pending any more: something cleared it (GRUB reading another environment block?); survey before anything else')))) }}
             rescue_power: >-
@@ -689,7 +710,7 @@
 
         - name: Rescue | the run stops here
           ansible.builtin.fail:
-            msg: "the run failed between the arming of the one-shot and the new kernel's verification ({{ rescue_status | trim }}): {{ rescue_problem | trim }}"
+            msg: "the run failed between the arming of the one-shot and the verification of the boot ({{ rescue_status | trim }}): {{ rescue_problem | trim }}"
 
     - name: Post | snapshot until the host has settled (the fabric and the daemons need a moment)
       ansible.builtin.script:
