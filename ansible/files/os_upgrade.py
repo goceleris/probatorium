@@ -713,11 +713,47 @@ def armed_records():
     return out
 
 
+BOOT_CHAIN_GLOBS = ["grub-*", "grub2-common", "shim*"]
+
+
+def boot_chain():
+    """The installed boot-chain packages as "package=version", byte-sorted, joined by "|". ansible/files/reboot_snapshot.sh
+    computes the same string: a rehearsal proves the GRUB and shim that were installed when it ran, no others."""
+    rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package}=${Version} ${Status}\n"] + BOOT_CHAIN_GLOBS)
+    names = [parts[0] for parts in (line.split() for line in out.splitlines()) if len(parts) >= 2 and parts[-1] == "installed"]
+    return "|".join(sorted(names))
+
+
+def rehearsal_stale(rec, running, proof):
+    """Why a rehearsal record no longer counts, or "" when it still does."""
+    if not rec:
+        return "no rehearsal record"
+    if rec.get("kernel") != running or not rec.get("ok"):
+        return "the record is for %s, not the running kernel %s" % (rec.get("kernel", "none"), running)
+    if not rec.get("chain"):
+        return "the record names no boot-chain versions (grub, shim): repeat the rehearsal"
+    now = boot_chain()
+    if rec["chain"] != now:
+        return "grub or shim changed since the rehearsal (then %s; now %s): repeat the rehearsal" % (rec["chain"], now)
+    for k in ("efi_loader", "stub_uuid"):
+        if rec.get(k, "") != (proof or {}).get(k, ""):
+            return "the boot proof changed since the rehearsal (%s was %r, now %r): repeat the rehearsal" % (k, rec.get(k, ""), (proof or {}).get(k, ""))
+    return ""
+
+
 def rehearsal_record():
     try:
         return json.loads(rd(STATE_DIR + "/rehearsal.json") or "{}")
     except ValueError:
         return {}
+
+
+def rehearsal_with_validity(running, proof):
+    rec = rehearsal_record()
+    if not rec:
+        return {}
+    why = rehearsal_stale(rec, running, proof)
+    return dict(rec, valid=not why, stale=why)
 
 
 def marker():
@@ -865,7 +901,7 @@ def survey():
         "host_toolchain": host_toolchain(),
         "marker": marker(),
         "armed_kernels": armed_records(),
-        "rehearsal": rehearsal_record(),
+        "rehearsal": rehearsal_with_validity(running, boot["proof"]),
     }
     return d
 
@@ -1342,7 +1378,9 @@ def cmd_record_rehearsal(a):
         fail("the host runs %s, not %s" % (running_kernel(), a.kernel))
     if grub_editenv().get("next_entry"):
         fail("a one-shot is still pending: GRUB did not consume it")
-    rec = {"kernel": a.kernel, "run_id": a.run_id, "ok": True, "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    proof = boot_info()["proof"]
+    rec = {"kernel": a.kernel, "run_id": a.run_id, "ok": True, "chain": boot_chain(), "efi_loader": proof.get("efi_loader", ""),
+           "stub_uuid": proof.get("stub_uuid", ""), "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     write(STATE_DIR + "/rehearsal.json", json.dumps(rec, sort_keys=True) + "\n")
     emit(rec)
 

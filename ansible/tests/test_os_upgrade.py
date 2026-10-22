@@ -957,6 +957,63 @@ class Rehearsal(Base):
         self.assertEqual(self.run_ok("survey")["rehearsal"]["kernel"], "7.0.0-31-generic")
         self.assertTrue(rec["ok"])
 
+    def record(self):
+        self.h.save()
+        return self.j(self.h.run("record-rehearsal", "--kernel", "7.0.0-31-generic", "--run-id", "5"))
+
+    def test_the_record_keeps_the_boot_chain_and_the_boot_proof_it_was_taken_with(self):
+        rec = self.record()
+        self.assertEqual(rec["chain"], "grub-common=2.14|grub-efi-arm64-bin=2.14|shim-signed=1.60")
+        self.assertTrue(rec["efi_loader"] and rec["stub_uuid"])
+        r = self.run_ok("survey")["rehearsal"]
+        self.assertEqual((r["valid"], r["stale"]), (True, ""))
+
+    def test_a_grub_or_shim_upgrade_makes_the_record_stale(self):
+        self.record()
+        for pkg in ("grub-efi-arm64-bin", "shim-signed", "grub-common"):
+            st = self.h.load()
+            old = st["packages"][pkg]["version"]
+            st["packages"][pkg]["version"] = old + "+1"
+            self.h.save()
+            r = self.run_ok("survey")["rehearsal"]
+            self.assertFalse(r["valid"], pkg)
+            self.assertIn("grub or shim changed since the rehearsal", r["stale"])
+            self.assertIn(pkg + "=" + old + "+1", r["stale"])
+            st["packages"][pkg]["version"] = old
+            self.h.save()
+            self.assertTrue(self.run_ok("survey")["rehearsal"]["valid"])
+
+    def test_a_new_grub_package_changes_the_chain_too(self):
+        self.record()
+        st = self.h.load()
+        st["packages"]["grub-efi-arm64-signed"] = {"version": "1.200", "status": "installed"}
+        self.h.save()
+        self.assertFalse(self.run_ok("survey")["rehearsal"]["valid"])
+
+    def test_a_changed_boot_proof_makes_the_record_stale(self):
+        rec = self.record()
+        path = self.h.root + "/var/lib/celeris-os-upgrade/rehearsal.json"
+        with open(path) as fh:
+            data = json.load(fh)
+        data["efi_loader"] = "\\EFI\\other\\shimaa64.efi"
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+        r = self.run_ok("survey")["rehearsal"]
+        self.assertFalse(r["valid"])
+        self.assertIn("efi_loader", r["stale"])
+
+    def test_an_old_record_without_a_chain_is_stale(self):
+        self.h.w("/var/lib/celeris-os-upgrade/rehearsal.json", json.dumps({"kernel": "7.0.0-31-generic", "run_id": "1", "ok": True}))
+        r = self.run_ok("survey")["rehearsal"]
+        self.assertFalse(r["valid"])
+        self.assertIn("names no boot-chain versions", r["stale"])
+
+    def test_a_record_of_another_kernel_or_a_failed_one_is_stale(self):
+        self.h.w("/var/lib/celeris-os-upgrade/rehearsal.json", json.dumps({"kernel": "7.0.0-25-generic", "ok": True, "chain": "x"}))
+        self.assertIn("not the running kernel", self.run_ok("survey")["rehearsal"]["stale"])
+        self.h.w("/var/lib/celeris-os-upgrade/rehearsal.json", json.dumps({"kernel": "7.0.0-31-generic", "ok": False, "chain": "x"}))
+        self.assertFalse(self.run_ok("survey")["rehearsal"]["valid"])
+
     def test_it_uses_the_kernel_specific_entry_even_when_the_running_kernel_is_the_newest(self):
         os.remove(self.h.root + "/boot/vmlinuz-7.0.0-38-generic")
         self.h.state["packages"].pop("linux-image-7.0.0-38-generic")

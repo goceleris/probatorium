@@ -84,7 +84,7 @@ SERVER_MARKER = {"permanent": True, "kernel_after": "6.14.0-44-generic", "run_id
 
 def base_case(survey, sim, dk):
     pre_survey = copy.deepcopy(survey)
-    pre_survey["rehearsal"] = {"kernel": survey["kernel"], "run_id": "11", "ok": True}  # an upgrade needs a rehearsal on the running kernel
+    pre_survey["rehearsal"] = {"kernel": survey["kernel"], "run_id": "11", "ok": True, "valid": True, "stale": ""}  # an upgrade needs a rehearsal on the running kernel
     post_survey = copy.deepcopy(survey)
     post_survey["kernel"] = "7.0.0-40-generic"
     servers = {"msa2-server": {"kernel": "6.14.0-44-generic", "marker": copy.deepcopy(SERVER_MARKER)},
@@ -214,6 +214,8 @@ class Judge(unittest.TestCase):
              lambda c: c["pre_survey"]["packages"].update(held_kernel=["linux-image-generic"]))
         case("no_rehearsal", {"refusals": "no successful one-shot rehearsal of this host on the running kernel 7.0.0-31-generic (record: none)"},
              lambda c: c["pre_survey"].update(rehearsal={}))
+        case("a_stale_rehearsal", {"refusals": "(record: 7.0.0-31-generic; STALE: grub or shim changed since the rehearsal"},
+             lambda c: c["pre_survey"]["rehearsal"].update(valid=False, stale="grub or shim changed since the rehearsal (then a; now b): repeat the rehearsal"))
         case("a_rehearsal_of_another_kernel", {"refusals": "(record: 7.0.0-25-generic)"},
              lambda c: c["pre_survey"].update(rehearsal={"kernel": "7.0.0-25-generic"}))
         def rh(confirm, entry0, nic=True):

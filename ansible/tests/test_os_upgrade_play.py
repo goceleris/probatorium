@@ -168,8 +168,6 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         h.state["upgrade_sleep"] = 0.2
         h.state.update(state)
         h.w("/boot/grub/grub.cfg", "")
-        if rehearsed:  # an upgrade needs a one-shot rehearsal on the running kernel
-            h.w("/var/lib/celeris-os-upgrade/rehearsal.json", json.dumps({"kernel": "7.0.0-31-generic", "run_id": "1", "ok": True, "utc": "2026-10-22T00:00:00Z"}))
         h.save()
         subprocess.run([h.bin + "/update-grub"], env=h.env(), check=True)  # the cfg of a host with GRUB_DEFAULT=0
         h.load()
@@ -179,6 +177,10 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
             for p in ("/boot/vmlinuz-7.0.0-38-generic", "/boot/initrd.img-7.0.0-38-generic"):
                 os.remove(h.root + p)
             subprocess.run([h.bin + "/update-grub"], env=h.env(), check=True)
+        if rehearsed:  # an upgrade needs a one-shot rehearsal on the running kernel, taken with the boot chain installed now
+            r = h.run("record-rehearsal", "--kernel", "7.0.0-31-generic", "--run-id", "1")
+            assert r.returncode == 0, r.stdout + r.stderr
+            h.load()
         open(h.log, "w").close()
         return h
 
@@ -304,6 +306,17 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         for pre in ("grub-set-default", "grub-reboot", "update-grub", "apt-get -o DPkg::Lock::Timeout=600 update", "apt-get -y", "apt-mark manual", "dkms autoinstall", "FAKE-REBOOT"):
             self.no_call(pre)
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], "")
+
+    def refused_keep(self, name, extra, text, env=None):
+        """Like refused(), for a host that already has a saved default: nothing may have been changed."""
+        before = self.h.load()["grubenv"]["saved_entry"]
+        seen = len(self.calls())
+        self.play(name, extra, env)
+        self.assertNotEqual(self.rc, 0, self.log[-1500:])
+        self.assertIn(text, self.log)
+        for pre in ("grub-reboot", "update-grub", "apt-get -o DPkg::Lock::Timeout=600 update", "apt-get -y", "apt-mark manual", "dkms autoinstall", "FAKE-REBOOT"):
+            self.assertFalse([c for c in self.calls()[seen:] if c.startswith(pre)], "unexpected call " + pre)
+        self.assertEqual(self.h.load()["grubenv"]["saved_entry"], before)
 
     def test_results_in_results_root_refuse_and_allow_results_loss_overrides(self):
         self.fresh()
@@ -751,6 +764,19 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual((r["status"], r["kernel_before"], r["kernel_after"]), ("rehearsed", "7.0.0-31-generic", "7.0.0-31-generic"))
         self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/last-upgrade.json"), "a rehearsal is not an upgrade: no marker for the order rule")
         self.assertIn("REHEARSED", self.summary("rehearse", "msr1"))
+        # cluster-reboot's snapshot reads the record this rehearsal wrote (the chain string is computed twice, in python and in bash)
+        snap = subprocess.run(["bash", os.path.join(self.work, "snapshot-wrapper.sh"), "/tmp/m", "/tmp/r", "-", "-", "-"], capture_output=True, text=True)
+        self.assertIn('"grub_pinned_to_running":true', snap.stdout, snap.stdout[-600:] + snap.stderr[-600:])
+        # ... and after a grub upgrade the same snapshot says it is not pinned, and an upgrade is refused until a new rehearsal
+        st = self.h.load()
+        st["packages"]["grub-common"]["version"] = "2.15"
+        self.h.save()
+        snap = subprocess.run(["bash", os.path.join(self.work, "snapshot-wrapper.sh"), "/tmp/m", "/tmp/r", "-", "-", "-"], capture_output=True, text=True)
+        self.assertIn('"grub_pinned_to_running":false', snap.stdout)
+        self.refused_keep("stale_rehearsal", self.UP, "STALE: grub or shim changed since the rehearsal")
+        st = self.h.load()
+        st["packages"]["grub-common"]["version"] = "2.14"
+        self.h.save()
         # ... and now an upgrade is allowed
         self.play("after_rehearsal", self.UP)
         self.assertEqual(self.rc, 0, self.log[-2500:])

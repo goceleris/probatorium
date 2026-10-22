@@ -158,15 +158,43 @@ if [ "$r8127" = true ]; then
 fi
 
 # ---- the OS-upgrade pin: a newer kernel installed does not matter to a reboot when grub's saved default IS the running kernel and
-# no one-shot is pending (ansible/os-upgrade.yml writes the drop-in and sets the saved entry before it installs anything)
+# no one-shot is pending (ansible/os-upgrade.yml writes the drop-in and sets the saved entry before it installs anything).
+# That is only true if GRUB really reads the saved entry, which nothing but a completed rehearsal shows. ALL of these must hold:
+#   1. the drop-in of the OS upgrade exists (GRUB_DEFAULT=saved)
+#   2. a rehearsal record exists for the RUNNING kernel, was ok, and was taken with the boot chain (grub*, shim*) at the versions
+#      installed now (a GRUB that was upgraded since is a GRUB nobody rehearsed)
+#   3. grub.cfg really says set default="${saved_entry}"
+#   4. saved_entry is submenu>entry, the entry is a NORMAL (not recovery) entry of the running kernel, and both ids exist in grub.cfg
+#   5. no one-shot is pending
+# The chain string is the one ansible/files/os_upgrade.py boot_chain() records: installed grub-*, grub2-common and shim* as
+# package=version, byte-sorted, joined by "|".
+boot_chain() {
+	command -v dpkg-query > /dev/null 2>&1 || return 0
+	dpkg-query -W -f '${Package}=${Version} ${Status}\n' 'grub-*' 'grub2-common' 'shim*' 2> /dev/null |
+		awk '$NF == "installed" { print $1 }' | LC_ALL=C sort | paste -sd'|' -
+}
 pinned=false
-if [ -e "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg" ] && [ -n "$kernel" ] && command -v grub-editenv > /dev/null 2>&1; then
+rehearsal_json="$R/var/lib/celeris-os-upgrade/rehearsal.json"
+if [ -e "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg" ] && [ -n "$kernel" ] && [ -s "$rehearsal_json" ] && command -v grub-editenv > /dev/null 2>&1; then
+	rec=$(cat "$rehearsal_json" 2> /dev/null)
+	rec_chain=$(printf '%s' "$rec" | sed -n 's/.*"chain": "\([^"]*\)".*/\1/p')
+	cfg="$R/boot/grub/grub.cfg"
 	genv=$(grub-editenv list 2> /dev/null)
 	saved=$(printf '%s\n' "$genv" | sed -n 's/^saved_entry=//p')
 	pending=$(printf '%s\n' "$genv" | sed -n 's/^next_entry=//p')
-	case "$saved" in
-	*"gnulinux-$kernel-advanced-"*) [ -z "$pending" ] && pinned=true ;;
-	esac
+	parent=${saved%%>*}
+	leaf=${saved##*>}
+	if printf '%s' "$rec" | grep -qF "\"kernel\": \"$kernel\"" &&
+		printf '%s' "$rec" | grep -qF '"ok": true' &&
+		[ -n "$rec_chain" ] && [ "$rec_chain" = "$(boot_chain)" ] &&
+		[ -r "$cfg" ] && grep -qF 'set default="${saved_entry}"' "$cfg" &&
+		[ "$parent" != "$saved" ] && [ -n "$parent" ] && [ -n "$leaf" ] &&
+		case "$leaf" in "gnulinux-$kernel-advanced-"*) true ;; *) false ;; esac &&
+		grep -E '^[[:space:]]*submenu ' "$cfg" | grep -qF "\$menuentry_id_option '$parent'" &&
+		grep -E '^[[:space:]]*menuentry ' "$cfg" | grep -qF "\$menuentry_id_option '$leaf'" &&
+		[ -z "$pending" ]; then
+		pinned=true
+	fi
 fi
 
 # ---- the persistent prerequisites a reboot must leave in place (ansible/power-guard.yml) --------
