@@ -815,7 +815,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.phase(), "permanent")
 
     # ---------------------------------------------------------------------------------------- the one-shot rehearsal
-    def test_a_rehearsal_proves_the_one_shot_with_no_other_kernel_in_play(self):
+    def test_a_rehearsal_proves_the_one_shot_on_the_running_kernel(self):
         self.fresh(rehearsed=False)
         self.play("rehearse", self.RH)
         self.assertEqual(self.rc, 0, self.log[-2500:])

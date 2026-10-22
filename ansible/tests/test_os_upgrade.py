@@ -10,6 +10,7 @@ workflow_cluster_os_upgrade_test.go runs this file in CI (skipping when python3 
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -461,12 +462,18 @@ class Upgrade(Base):
         self.assertEqual(st["rc"], 0)
         self.assertTrue(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/42/os_upgrade.py"))
 
+    def until_policy_rc_d(self):
+        """The detached run writes its policy-rc.d first; a loaded machine may take a moment to start it."""
+        end = time.time() + 15
+        while time.time() < end and not os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"):
+            time.sleep(0.1)
+
     def test_a_died_run_is_reported_and_its_policy_rc_d_cleaned_up(self):
         import signal
         self.h.state["upgrade_sleep"] = 30
         self.h.save()
         started = self.j(self.h.run("upgrade-start", "--run-id", "42"))
-        time.sleep(0.5)
+        self.until_policy_rc_d()
         self.assertEqual(self.j(self.h.run("upgrade-status", "--run-id", "42"))["state"], "running")
         self.assertTrue(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
         os.kill(started["pid"], signal.SIGKILL)
@@ -492,7 +499,7 @@ class Upgrade(Base):
         self.h.state["upgrade_sleep"] = 20
         self.h.save()
         self.j(self.h.run("upgrade-start", "--run-id", "42"))
-        time.sleep(0.5)
+        self.until_policy_rc_d()
         c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
         self.assertEqual(c["removed"], False)
         self.assertIn("still alive", c["reason"])
@@ -501,8 +508,13 @@ class Upgrade(Base):
         pid = int(open(self.h.root + "/var/log/celeris-os-upgrade/42/apt-upgrade.pid").read())
         import signal
         os.kill(pid, signal.SIGKILL)
-        time.sleep(0.5)
-        c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+        end = time.time() + 15  # the kill is reaped when the machine gets to it
+        c = {}
+        while time.time() < end:
+            c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+            if c.get("removed"):
+                break
+            time.sleep(0.2)
         self.assertEqual(c["removed"], True)
 
     def test_a_run_whose_pid_is_not_recorded_yet_is_running_not_died(self):
@@ -1120,17 +1132,25 @@ class HoldAccessPackages(Base):
         self.assertNotIn("apt-mark hold", self.h.run("upgrade-log", "--run-id", "42").stdout)
 
     def test_a_run_that_died_with_the_holds_on_is_released_by_the_cleanup(self):
-        import signal
-        self.h.state["upgrade_sleep"] = 30
-        self.h.save()
-        started = self.j(self.h.run("upgrade-start", "--run-id", "42", "--hold"))
-        time.sleep(0.7)
+        # a run whose process is gone (OOM, power loss, runner lost): holds on, no rc file. The dead process is a real, finished one,
+        # not a kill raced against the reaping of a zombie (that made this test depend on the load of the machine)
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.j(self.h.run("hold-access", "--run-id", "42"))
+        self.h.w("/var/log/celeris-os-upgrade/42/apt-upgrade.log", "+ apt-get ... full-upgrade\n")
+        self.h.w("/var/log/celeris-os-upgrade/42/apt-upgrade.pid", "%d\n" % gone.pid)
         self.assertIn("tailscale", self.h.load()["held"])
-        os.kill(started["pid"], signal.SIGKILL)
-        time.sleep(0.7)
         c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
         self.assertIn("tailscale", c["unheld"])
         self.assertEqual(self.h.load()["held"], [])
+
+    def test_a_failing_apt_still_releases_the_holds(self):
+        self.h.state["held"] = ["vim"]
+        self.h.state["upgrade_rc"] = 100
+        self.h.save()
+        self.j(self.h.run("upgrade-start", "--run-id", "42", "--hold"))
+        self.assertEqual(self.wait()["rc"], 100)
+        self.assertEqual(self.h.load()["held"], ["vim"], "a failed apt left the access-path holds behind")
 
 
 class HoldBeforeTheSimulation(HoldAccessPackages):
