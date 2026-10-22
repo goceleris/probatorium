@@ -287,6 +287,11 @@ class Judge(unittest.TestCase):
              lambda c: c["pre_survey"]["boot"].update(next_entry="gnulinux-x"))
         case("earlier_run_left_an_unverified_default", {"refusals": "an earlier OS upgrade left grub saved default 7.0.0-31-generic while the host runs 7.0.0-40-generic"},
              lambda c: (c["pre_survey"].update(kernel="7.0.0-40-generic"), c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic")))
+        case("earlier_run_refusal_names_the_kernel_grub_boots_and_the_true_way_back",
+             {"refusals": "If GRUB does NOT (a rehearsal or an upgrade ended with a one-shot still pending: survey boot.next_entry), the host runs GRUB's first menu entry (boot.entry0_kernel 7.0.0-40-generic, not the saved default) and cluster-reboot boots that kernel again: only the console (Esc or Shift at power-on, choose 7.0.0-31-generic) or a reviewed change brings 7.0.0-31-generic back"},
+             lambda c: (c["pre_survey"].update(kernel="7.0.0-40-generic"), c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic", entry0_kernel="7.0.0-40-generic")))
+        case("earlier_run_refusal_says_unknown_without_entry0", {"refusals": "(boot.entry0_kernel unknown, not the saved default)"},
+             lambda c: (c["pre_survey"].update(kernel="7.0.0-40-generic"), c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic", entry0_kernel="")))
         case("default_differs_but_no_earlier_run", {}, lambda c: c["pre_survey"]["boot"].update(dropin_present=False, default_kernel="7.0.0-38-generic"))
         case("fell_back_default_is_the_running_kernel", {}, lambda c: c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic"))
 
@@ -411,7 +416,7 @@ class Judge(unittest.TestCase):
         case("post_failed_unit", {"post": "new failed unit(s): foo.service"}, lambda c: post(c, failed_units=["foo.service"]))
         case("post_one_shot_not_consumed", {"post": "a one-shot is still pending (gnulinux-x) after the host booted: GRUB did not consume it"},
              lambda c: c["post_survey"]["boot"].update(next_entry="gnulinux-x"))
-        case("post_one_shot_not_consumed_names_what_a_boot_gives", {"post": "boots the first menu entry of grub (7.0.0-38-generic), not the saved default (7.0.0-31-generic)"},
+        case("post_one_shot_not_consumed_names_what_a_boot_gives", {"post": "boots the first menu entry of grub (boot.entry0_kernel 7.0.0-38-generic), NOT the saved default (7.0.0-31-generic): only the console brings another kernel back"},
              lambda c: c["post_survey"]["boot"].update(next_entry="gnulinux-x", entry0_kernel="7.0.0-38-generic", default_kernel="7.0.0-31-generic"))
         case("post_no_snapshot", {"post": "no readable snapshot after the reboot"}, lambda c: c["post_raw"].update(stdout=""))
         case("post_nic_driver_changed", {"post": "NIC enp1s0 is bound to r8169, was r8127"},

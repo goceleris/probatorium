@@ -2,7 +2,7 @@
 """Stands in for the machine restarting in the tests of ansible/os-upgrade.yml: what grub would boot (the one-shot
 entry if next_entry is set, which grub then clears; else the saved entry) becomes the running kernel, the boot id
 changes and the interrupt counters reset. BOOT_MODE: keep-next (GRUB boots the saved entry and never clears next_entry: it reads another environment block) | not-issued (the reboot never happens, the host stays up) | ok | ignore-next (the new kernel fails early: grub falls back
-to the saved entry) | no-nic (the new kernel boots without enp1s0) | hang (the host never answers: exit 1) | keep-next-reported-failed (it rebooted, grub kept next_entry, and the module gave up) | booted-but-reported-failed.
+to the saved entry) | no-nic (the new kernel boots without enp1s0) | hang (the host never answers: exit 1) | keep-next-reported-failed (it rebooted, grub kept next_entry, and the module gave up) | booted-but-reported-failed | ignore-env (GRUB reads NO environment block: it boots the FIRST top-level menu entry, saved_entry and next_entry both ignored, and never clears next_entry) | ignore-env-gaveup (the same, and the module gave up).
 
     osu_fake_reboot.py ROOT STATE_DIR
 """
@@ -42,11 +42,15 @@ with open(root + "/boot/grub/grub.cfg") as f:
     entries = osu.parse_grub_cfg(f.read())
 env = st["grubenv"]
 ref = env.get("saved_entry", "")
-if env.get("next_entry") and mode not in ("ignore-next", "keep-next", "keep-next-reported-failed"):
+if env.get("next_entry") and mode not in ("ignore-next", "keep-next", "keep-next-reported-failed", "ignore-env", "ignore-env-gaveup"):
     ref = env["next_entry"]
-if mode not in ("keep-next", "keep-next-reported-failed"):
+if mode not in ("keep-next", "keep-next-reported-failed", "ignore-env", "ignore-env-gaveup"):
     env["next_entry"] = ""  # grub clears it as it boots it, whatever happens next (keep-next: it reads another environment block)
 kernel = osu.kernel_of_entry(entries, ref) or "unknown"
+if mode in ("ignore-env", "ignore-env-gaveup"):
+    # a GRUB that reads no environment block at all: default="0", the first top-level menu entry that has a kernel (the newest installed)
+    top = [e for e in entries if not e["parent"] and e["kernel"]]
+    kernel = top[0]["kernel"] if top else "unknown"
 with open(root + "/proc/sys/kernel/osrelease", "w") as f:
     f.write(kernel + "\n")
 with open(root + "/proc/sys/kernel/random/boot_id", "w") as f:
@@ -59,6 +63,6 @@ if mode == "no-nic":
     os.remove(root + "/sys/class/net/enp1s0/device")
 with open(sp, "w") as f:
     json.dump(st, f)
-if mode in ("booted-but-reported-failed", "keep-next-reported-failed"):
+if mode in ("booted-but-reported-failed", "keep-next-reported-failed", "ignore-env-gaveup"):
     sys.stderr.write("the reboot module gave up waiting, but the host rebooted (test)\n")
     sys.exit(1)

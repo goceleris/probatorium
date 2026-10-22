@@ -262,9 +262,13 @@
       No power-cycle needed while the host answers: it answered after the rehearsal reboot but failed verification (see the problems).
       The saved default is {{ pre_survey.kernel }}, the kernel the rehearsal was run on; no other kernel is involved in this run and nothing was
       made the default. If a problem says the one-shot is still pending, GRUB does NOT read the environment block Linux writes: a power-cycle
-      or a cluster-reboot then boots the first menu entry of grub ({{ pre_survey.boot.entry0_kernel | default('unknown') }}), not
-      {{ pre_survey.kernel }}; choose {{ pre_survey.kernel }} at the console, and dispatch mode=disarm to clear the pending one-shot. No
+      or a cluster-reboot then boots the first menu entry of grub ({{ first_entry_kernel }}, boot.entry0_kernel), not
+      {{ pre_survey.kernel }} (the saved default, which GRUB then ignores); choose {{ pre_survey.kernel }} at the console, and dispatch mode=disarm to clear the pending one-shot. No
       rehearsal record was written: an upgrade stays refused.
+    # GRUB's FIRST menu entry as this run leaves it: what GRUB boots (on this boot and on every power-cycle) when it does not read the environment
+    # block. An upgrade's update-grub put the NEW kernel there; a rehearsal installs nothing, so the survey's entry 0 holds. NOT boot.default_kernel
+    # (the saved default, which a GRUB that ignores the environment block does not use).
+    first_entry_kernel: "{{ (target_kernel | default('')) if (os_mode == 'upgrade' and (target_kernel | default('')) | length > 0) else (pre_survey.boot.entry0_kernel | default('unknown', true)) }}"
     kernel_noun: "{{ 'the new kernel' if os_mode == 'upgrade' else 'the rehearsal boot (the running kernel again)' }}"
     power_cycle_none: "No power-cycle needed: nothing was rebooted (the boot id is unchanged)."
     power_cycle_boot_unknown: >-
@@ -272,8 +276,11 @@
       Dispatch a survey before anything else: kernel, boot.next_entry and boot.saved_entry say what happened.
     power_cycle_rebooted_unconsumed: >-
       No power-cycle needed while the host answers, but it HAS REBOOTED (new boot id). GRUB did not consume the one-shot (next_entry was
-      still set and was cleared now): it did not read the environment block Linux writes, so the saved default is not what a power-cycle
-      boots; GRUB's first menu entry is. Dispatch a survey (kernel, boot.default_kernel); do not dispatch the upgrade before it is understood.
+      still set and was cleared now): it did not read the environment block Linux writes, so the saved default ({{ pre_survey.kernel }}) is
+      NOT what a power-cycle or a reboot boots. GRUB boots its FIRST menu entry, {{ first_entry_kernel }}, every time, and the
+      cluster-reboot workflow would boot it again: only the console (Esc or Shift at power-on, then choose {{ pre_survey.kernel }}) or a reviewed
+      change that makes {{ pre_survey.kernel }} the first entry brings another kernel back. Dispatch a survey (kernel, boot.entry0_kernel
+      is what GRUB boots; boot.default_kernel is only the saved default and is NOT what boots); do not dispatch the upgrade before it is understood.
     power_cycle_rebooted_unarmed: >-
       No power-cycle needed while the host answers, but it HAS REBOOTED (new boot id) although the arming did not complete: it rebooted
       for another reason and runs what grub chose. Dispatch a survey before anything else.
@@ -298,6 +305,7 @@
       kernel_before: "{{ pre_survey.kernel }}"
       boot_id_before: "{{ pre_target.boot_id }}"
       target_kernel: "{{ target_kernel | default('') }}"
+      first_entry_kernel: "{{ first_entry_kernel }}"
       access_packages_held: "{{ (((upgrade_start_raw | default({})).stdout | default('{}', true) | from_json).access_packages_held) | default([]) }}"
   tasks:
     - name: Target | the first records

@@ -845,6 +845,41 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertNotIn("not needed**. The run failed after arming the one-shot and before the new kernel booted", md)
         self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
 
+    # R4-m2: after a GRUB that ignored the one-shot, the kernel that boots is GRUB's FIRST menu entry (boot.entry0_kernel: the NEW kernel after an
+    # upgrade), not the saved default (boot.default_kernel, the old kernel); the cluster-reboot workflow boots the first entry again
+    def test_after_a_grub_that_ignored_the_one_shot_every_text_names_the_first_entry_not_the_saved_default(self):
+        self.fresh()
+        self.play("ignore_env", self.UP, env={"BOOT_MODE": "ignore-env-gaveup"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-rebooted-one-shot-not-consumed")
+        self.assertEqual((r["first_entry_kernel"], r["default_kernel"], r["kernel_before"]), ("7.0.0-40-generic", "7.0.0-31-generic", "7.0.0-31-generic"))
+        self.assertEqual(self.h.state["packages"]["linux-image-7.0.0-40-generic"]["version"], "7.0.0-40-generic")
+        pc = " ".join(r["power_cycle"].split())
+        for want in ("GRUB boots its FIRST menu entry, 7.0.0-40-generic, every time", "cluster-reboot workflow would boot it again", "only the console",
+                     "boot.entry0_kernel is what GRUB boots", "boot.default_kernel is only the saved default and is NOT what boots"):
+            self.assertIn(want, pc)
+        self.assertNotIn("(kernel, boot.default_kernel)", pc)
+        md = " ".join(self.summary("upgrade", "msr1").split())
+        for want in ("FIRST menu entry (`7.0.0-40-generic`) every time, the cluster-reboot workflow included", "`boot.entry0_kernel` = what GRUB boots",
+                     "`boot.default_kernel` is only the saved default and is NOT what boots"):
+            self.assertIn(want, md)
+        self.assertNotIn("(`kernel`, `boot.default_kernel`)", md)
+        # the host now runs the new kernel, saved default is the old one: a survey says both, the next upgrade is refused with the true way back
+        self.play("ignore_env_survey", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        b = self.j("msr1", "survey.json")["boot"]
+        self.assertEqual((b["entry0_kernel"], b["default_kernel"]), ("7.0.0-40-generic", "7.0.0-31-generic"))
+        survey_md = self.summary("survey", "-")
+        self.assertIn("GRUB's first menu entry `7.0.0-40-generic`", survey_md)
+        self.play("ignore_env_again", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        refusal = " ".join(open(os.path.join(self.out, "msr1", "refusal.txt")).read().split())
+        self.assertIn("an earlier OS upgrade left grub saved default 7.0.0-31-generic while the host runs 7.0.0-40-generic", refusal)
+        self.assertIn("If GRUB does NOT", refusal)
+        self.assertIn("boot.entry0_kernel 7.0.0-40-generic", refusal)
+        self.assertIn("cluster-reboot boots that kernel again", refusal)
+        self.assertIn("only the console", refusal)
+
     def test_a_host_whose_boot_id_cannot_be_read_is_not_called_unrebooted(self):
         self.fresh()
         self.play("bootunknown", self.UP, env={"BOOT_MODE": "booted-but-reported-failed", "SNAP_FAIL_AFTER_REBOOT": "1"})
@@ -965,8 +1000,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         for w in self.NEW_KERNEL_WORDS:
             self.assertNotIn(w, txt)
         self.assertNotIn("consumed by", txt)
-        self.assertIn("first menu entry of grub (7.0.0-38-generic), not 7.0.0-31-generic", r["power_cycle"])
-        self.assertIn("first menu entry of grub (7.0.0-38-generic), not the saved default (7.0.0-31-generic)", " ".join(r["problems"]))
+        self.assertIn("first menu entry of grub (7.0.0-38-generic, boot.entry0_kernel), not 7.0.0-31-generic", r["power_cycle"])
+        self.assertIn("first menu entry of grub (boot.entry0_kernel 7.0.0-38-generic), NOT the saved default (7.0.0-31-generic)", " ".join(r["problems"]))
         self.assertIn("mode=disarm", r["power_cycle"])
         md = self.summary("rehearse", "msr1")
         for w in self.NEW_KERNEL_WORDS:

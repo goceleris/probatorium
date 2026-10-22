@@ -362,7 +362,10 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   (bootloader, ssh, tailscale, netplan, systemd, firmware), it restores nothing and the host needs its console. Every other phase
   says "not needed". A host that came back but failed verification keeps the old kernel as its default: reboot it back with the
   cluster-reboot workflow, which ends red with "kernel changed" by design (and refuses outright when the OLD kernel runs with a
-  newer one installed, which needs no recovery). The upgrade itself refuses to run again while the host runs a kernel other than
+  newer one installed, which needs no recovery) -- but only when GRUB consumed its one-shot. If a problem says a one-shot is still
+  pending, GRUB does not read the environment block Linux writes: the saved default (`boot.default_kernel`) is NOT what boots, GRUB's FIRST
+  menu entry (`boot.entry0_kernel`, the NEW kernel after an upgrade) is, on every boot, and cluster-reboot boots it again; only the console
+  (Esc or Shift at power-on) or a reviewed change brings the old kernel back. `result.json` carries it as `first_entry_kernel`. The upgrade itself refuses to run again while the host runs a kernel other than
   grub's saved default, or while a one-shot is pending. The apt run is detached: if a poll is lost, the run fails with apt possibly
   still running; survey before anything else.
 - **What this does not prove.** The tests run the real playbook and script against stub `grub`, `apt`, `dkms` and
