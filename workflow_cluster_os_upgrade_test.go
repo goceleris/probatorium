@@ -445,7 +445,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 		t.Error("the arming and the reboot are not in a block whose rescue disarms the one-shot before the verification")
 	}
 	// R3-m4: the access path is held before the plan is simulated, and a refusal releases what the run held
-	if !(idx("osu }} hold-access") < idx("osu }} simulate") && idx("osu }} simulate") < idx("osu }} upgrade-start")) {
+	if idx("osu }} hold-access") >= idx("osu }} simulate") || idx("osu }} simulate") >= idx("osu }} upgrade-start") {
 		t.Error("the access-path holds are not put before the simulation")
 	}
 	if !strings.Contains(src, "osu }} release-access --run-id") {

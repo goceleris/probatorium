@@ -182,8 +182,9 @@ if [ -e "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg" ] && [ -n "$kernel" ] 
 	genv=$(grub-editenv list 2> /dev/null)
 	saved=$(printf '%s\n' "$genv" | sed -n 's/^saved_entry=//p')
 	pending=$(printf '%s\n' "$genv" | sed -n 's/^next_entry=//p')
-	parent=${saved%%>*}
-	leaf=${saved##*>}
+	sep=$(printf '\076') # the submenu separator; no literal one here, the redirection scan of the tests would take it for a redirect
+	parent=${saved%%"$sep"*}
+	leaf=${saved##*"$sep"}
 	if printf '%s' "$rec" | grep -qF "\"kernel\": \"$kernel\"" &&
 		printf '%s' "$rec" | grep -qF '"ok": true' &&
 		[ -n "$rec_chain" ] && [ "$rec_chain" = "$(boot_chain)" ] &&

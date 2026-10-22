@@ -982,7 +982,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.rc, 0, self.log[-2500:])
         with open(os.path.join(self.out, "msr1", "apt-upgrade.log")) as f:
             log = f.read()
-        self.assertIn("apt-mark hold grub-common grub-efi-arm64-bin openssh-server shim-signed tailscale", log)
+        # the holds are put by hold-access BEFORE the simulation (the host's own call log), and apt saw them
+        self.assertIn("apt-mark hold grub-common grub-efi-arm64-bin openssh-server shim-signed tailscale", self.calls())
         self.assertIn("held: grub-common grub-efi-arm64-bin openssh-server shim-signed tailscale", log)
         self.assertEqual(self.h.state["held"], [], "the holds outlived the run")
         self.assertEqual(self.j("msr1", "result.json")["access_packages_held"], ["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed", "tailscale"])
@@ -993,6 +994,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.rc, 0, self.log[-2500:])
         with open(os.path.join(self.out, "msr1", "apt-upgrade.log")) as f:
             self.assertNotIn("apt-mark hold", f.read())
+        self.no_call("apt-mark hold")
+        self.no_call("OSU hold-access")
         self.assertEqual(self.j("msr1", "result.json")["access_packages_held"], [])
 
     def test_the_hold_can_be_forced_on(self):
