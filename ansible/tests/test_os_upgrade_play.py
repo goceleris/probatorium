@@ -644,6 +644,21 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(r["status"], "failed-before-boot-disarmed")
         self.assertTrue(r["disarm"]["was_armed"])
         self.assertIn("No power-cycle needed", r["power_cycle"])
+        # R3-m7: the host did not reboot, so the kernel never booted: no armed record may keep refusing it
+        self.assertEqual(r["disarm"]["forgot_armed"], ["7.0.0-40-generic"])
+        self.assertIn("was dropped: that kernel never booted", r["problems"][0])
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"))
+        before = len(self.calls())
+        self.play("after_never_booted", self.UP)  # not refused for "was armed as a one-shot"
+        self.assertNotIn("was armed as a one-shot", self.log)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+
+    def test_a_rescue_after_a_real_reboot_keeps_the_armed_record(self):
+        self.fresh()
+        self.play("gaveup_record", self.UP, env={"BOOT_MODE": "booted-but-reported-failed"})
+        self.assertNotEqual(self.rc, 0)
+        self.assertTrue(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"), "a kernel that DID boot lost its suspicion")
+        self.assertEqual(self.j("msr1", "result.json")["disarm"]["forgot_armed"], [])
 
     def test_an_arming_that_does_not_verify_leaves_nothing_armed(self):
         self.fresh(reboot_sets_wrong=True)
@@ -691,6 +706,15 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("disarm_again", D)
         self.assertEqual(self.rc, 0, self.log[-1500:])
         self.assertFalse(self.j("msr1", "disarm.json")["was_armed"])
+        # R3-m7: a manual disarm of a kernel armed in THIS boot (the host never rebooted) drops its armed record, and says so
+        self.h.w("/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json", json.dumps({"kernel": "7.0.0-40-generic", "run_id": "7", "boot_id": "aaaaaaaa-0000-0000-0000-000000000001"}))
+        self.h.w("/var/lib/celeris-os-upgrade/armed-7.0.0-44-generic.json", json.dumps({"kernel": "7.0.0-44-generic", "run_id": "8", "boot_id": "ffffffff-0000-0000-0000-000000000000"}))
+        self.play("disarm_forgets", D)
+        self.assertEqual(self.rc, 0, self.log[-1500:])
+        self.assertEqual(self.j("msr1", "disarm.json")["forgot_armed"], ["7.0.0-40-generic"])
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"))
+        self.assertTrue(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-44-generic.json"), "a kernel armed in an earlier boot lost its suspicion")
+        self.assertIn("has not rebooted since the arming", self.summary("disarm", "msr1"))
 
     def test_a_host_that_answers_before_it_has_booted_is_judged_on_the_new_boot(self):
         self.fresh()
@@ -907,6 +931,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertNotEqual(self.rc, 0)
         self.assertEqual(self.j("msr1", "result.json")["status"], "failed-unknown-armed")
         os.remove(self.h.state_dir + "/down")  # the power-cycle
+        self.h.w("/proc/sys/kernel/random/boot_id", "cccccccc-0000-0000-0000-000000000009\n")  # ... which is a new boot
         self.h.load()
         self.h.state["grubenv"]["next_entry"] = ""  # consumed by the NIC-less boot
         self.h.save()

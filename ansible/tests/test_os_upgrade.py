@@ -908,6 +908,37 @@ class ArmedRecords(DkmsCheck):
         self.j(self.h.run("make-permanent", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic", "--run-id", "42"))
         self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"))
 
+    def armed_and_not_rebooted(self):
+        self.after_upgrade()
+        self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
+        self.j(self.arm_for_record())
+        self.h.load()
+        return self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"
+
+    def test_the_record_keeps_the_boot_it_was_made_in(self):
+        path = self.armed_and_not_rebooted()
+        self.assertEqual(json.loads(open(path).read())["boot_id"], "aaaaaaaa-0000-0000-0000-000000000001")
+
+    def test_a_disarm_in_the_same_boot_drops_the_record_of_a_kernel_that_never_booted(self):
+        path = self.armed_and_not_rebooted()
+        r = self.j(self.h.run("disarm"))
+        self.assertEqual((r["was_armed"], r["forgot_armed"]), (True, ["7.0.0-40-generic"]))
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(self.run_ok("survey")["armed_kernels"], [])
+        self.assertEqual(self.check()["target_armed_before"], [])
+
+    def test_a_disarm_after_a_reboot_keeps_the_record(self):
+        path = self.armed_and_not_rebooted()
+        self.h.w("/proc/sys/kernel/random/boot_id", "bbbbbbbb-0000-0000-0000-000000000002\n")  # the host rebooted since the arming
+        r = self.j(self.h.run("disarm"))
+        self.assertEqual(r["forgot_armed"], [])
+        self.assertTrue(os.path.exists(path), "a kernel that may have booted lost its suspicion")
+
+    def test_a_record_from_before_the_boot_id_was_kept_is_never_dropped(self):
+        self.h.w("/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json", json.dumps({"kernel": "7.0.0-40-generic", "run_id": "1"}))
+        self.assertEqual(self.j(self.h.run("disarm"))["forgot_armed"], [])
+        self.assertTrue(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json"))
+
     def arm_for_record(self):
         self.h.save()
         return self.h.run("arm-oneshot", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic", "--run-id", "42")

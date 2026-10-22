@@ -365,7 +365,7 @@ class Judge(unittest.TestCase):
         case("intree_does_not_list_the_id", {}, lambda c: c["dkms_check"].update(intree_lists_id=False))
         case("access_broken", {"prereboot": "the way in is not intact on the upgraded userland (both kernels share it, a power-cycle would not undo it): sshd -t fails: x / netplan generate fails"},
              lambda c: c["dkms_check"].update(access_problems=["sshd -t fails: x", "netplan generate fails"]))
-        case("target_was_armed_before", {"prereboot": "was armed as a one-shot by run 77 and no run ever verified the host on it"},
+        case("target_was_armed_before", {"prereboot": "was armed as a one-shot by run 77 and the host may have booted it since"},
              lambda c: c["dkms_check"].update(target_armed_before=[{"kernel": "7.0.0-40-generic", "run_id": "77"}]))
         case("target_was_armed_before_and_a_retry_is_asked", {},
              lambda c: (c["dkms_check"].update(target_armed_before=[{"kernel": "7.0.0-40-generic", "run_id": "77"}]), c.update(retry_kernel="7.0.0-40-generic")))

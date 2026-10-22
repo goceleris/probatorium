@@ -1361,16 +1361,41 @@ def cmd_dkms_check(a):
     emit(dkms_check(a.running, a.target, a.build))
 
 
+def current_boot_id():
+    return rd("/proc/sys/kernel/random/boot_id").strip()
+
+
+def forget_armed_without_a_reboot():
+    """An armed record says "this kernel was armed and no run verified the host on it": the suspicion that it stranded the host. A
+    record made in THIS boot (same boot id) cannot have stranded it: the host has not rebooted since. Called after a successful
+    disarm; returns the kernels whose record was dropped."""
+    bid = current_boot_id()
+    gone = []
+    if not bid:
+        return gone
+    for rec in armed_records():
+        if rec.get("boot_id") == bid and rec.get("kernel"):
+            try:
+                os.remove(p("%s/armed-%s.json" % (STATE_DIR, rec["kernel"])))
+                gone.append(rec["kernel"])
+            except OSError:
+                pass
+    return gone
+
+
 def disarm():
-    """Clears a pending one-shot (grub's next_entry). Returns the JSON of what it found and did."""
+    """Clears a pending one-shot (grub's next_entry). Returns the JSON of what it found and did. A kernel armed in this very boot
+    never booted: its armed record is dropped (forgot_armed), so the next upgrade is not refused for a boot that never happened."""
     env = grub_editenv()
     before = env.get("next_entry", "")
     rc, out, err = 0, "", ""
     if before:
         rc, out, err = run(["grub-editenv", "-", "unset", "next_entry"])
     after = grub_editenv().get("next_entry", "")
-    return {"ok": rc == 0 and not after, "was_armed": bool(before), "next_entry_before": before, "next_entry_after": after,
-            "saved_entry": env.get("saved_entry", ""), "error": (out + err)[-300:] if rc != 0 else ""}
+    ok = rc == 0 and not after
+    return {"ok": ok, "was_armed": bool(before), "next_entry_before": before, "next_entry_after": after,
+            "saved_entry": env.get("saved_entry", ""), "error": (out + err)[-300:] if rc != 0 else "",
+            "forgot_armed": forget_armed_without_a_reboot() if ok else []}
 
 
 def cmd_disarm(a):
@@ -1403,7 +1428,7 @@ def cmd_arm(a):
         d = disarm()  # never leave an unverified one-shot behind
         fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and %r; one-shot disarmed: %s" % (
             env.get("saved_entry"), env.get("next_entry"), old, new, d["ok"]))
-    write("%s/armed-%s.json" % (STATE_DIR, a.target), json.dumps({"kernel": a.target, "running": a.running, "run_id": a.run_id,
+    write("%s/armed-%s.json" % (STATE_DIR, a.target), json.dumps({"kernel": a.target, "running": a.running, "run_id": a.run_id, "boot_id": current_boot_id(),
           "armed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, sort_keys=True) + "\n")
     emit({"ok": True, "saved_entry": old, "next_entry": new, "running": a.running, "target": a.target})
 

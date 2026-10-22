@@ -184,6 +184,9 @@ if [ "$mode" = disarm ]; then
 	if [ -s "$d/result.json" ]; then
 		jq -r '"- running kernel `\(.kernel_running)`; saved default `\(.saved_entry)`; \(.power_cycle)"' "$d/result.json"
 	fi
+	if [ -n "$(jq -r '.forgot_armed[0] // ""' "$d/disarm.json" 2> /dev/null)" ]; then
+		echo "- **The host has not rebooted since the arming** (same boot id): the armed record of $(jq -r '.forgot_armed | join(", ")' "$d/disarm.json") was dropped, that kernel never booted, so the next upgrade is not refused for a boot that never happened."
+	fi
 	echo "- Disarming clears only grub's next_entry. It does not touch the saved default, the packages or the running kernel. If the host did not answer, nothing was cleared: it is down, and a power-cycle boots whatever next_entry names (the NEW kernel, once) before the saved default."
 	for r in "$out"/*/refusal.txt; do
 		[ -s "$r" ] || continue
