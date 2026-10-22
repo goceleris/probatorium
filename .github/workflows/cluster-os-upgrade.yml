@@ -13,8 +13,9 @@ name: Cluster OS Upgrade
 #     -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
 #
 # Job graph: plan -> cluster-guard -> os-upgrade -> verdict.
-#   plan           refuses a malformed request: a wrong mode, a survey that names a host, an upgrade without ONE host
-#                  and its typed confirmation (UPGRADE-<host>), a bad reason, and any ref but main.
+#   plan           refuses a malformed request: a wrong mode, a survey that names a host or carries a confirm, an upgrade or
+#                  disarm without ONE host and its typed confirmation (UPGRADE-<host>, DISARM-<host>), a bad reason,
+#                  and any ref but main.
 #   cluster-guard  outside the group: lists every open run and refuses unless the cluster is IDLE
 #                  (tools/stresstally guard -idle: a holder refuses too, not only a pending run). The survey needs it
 #                  as well: it runs commands on the hosts and must not perturb a measurement.
@@ -27,7 +28,9 @@ name: Cluster OS Upgrade
 #   verdict        red unless the os-upgrade job succeeded: a skipped job (a re-run on an old guard verdict) must not
 #                  read as an upgrade that happened.
 #
-# It never runs on a schedule. The order of an upgrade campaign is enforced by the playbook: servers first, the load
+# It never runs on a schedule, and no host-changing mode can be dispatched until the maintainer lists the host in the
+# repository variable OS_UPGRADE_ALLOWED_HOSTS (empty by default; the plan job checks it) and, once the environment
+# cluster-host-change exists with a required reviewer, approves the run. The order of an upgrade campaign is enforced by the playbook: servers first, the load
 # generator (msa2-client) last.
 #
 # HOLD-CLUSTER: the orchestrator's marker file lives outside this repository and this workflow cannot see
@@ -39,18 +42,18 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "survey: read-only, all three hosts, no confirmation. upgrade: host-changing, ONE host."
+        description: "survey: read-only, all three hosts, no confirmation. upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host."
         type: choice
-        options: [survey, upgrade]
+        options: [survey, upgrade, disarm, repair]
         required: true
       host:
-        description: "upgrade only: the host to upgrade. Leave '-' for a survey."
+        description: "upgrade, disarm or repair: the host. Leave '-' for a survey."
         type: choice
         options: ["-", msa2-server, msr1, msa2-client]
         required: false
         default: "-"
       confirm:
-        description: "upgrade only: type UPGRADE-<host> (UPGRADE-msa2-server, UPGRADE-msr1 or UPGRADE-msa2-client)."
+        description: "upgrade: type UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. A survey takes none."
         type: string
         required: false
         default: ""
@@ -68,6 +71,12 @@ on:
         type: boolean
         required: false
         default: false
+      repair_action:
+        description: "repair only: configure = dpkg --configure -a. abort-new-kernel = purge the kernels newer than the running one, then configure (the host stays on the old kernel)."
+        type: choice
+        options: [configure, abort-new-kernel]
+        required: false
+        default: configure
       blacklist_r8169:
         description: "upgrade only: blacklist the in-tree r8169 when the new kernel's r8169 lists the r8127 PCI id (msr1). Default: refuse to reboot."
         type: boolean
@@ -90,6 +99,9 @@ jobs:
           IN_HOST: ${{ inputs.host }}
           IN_CONFIRM: ${{ inputs.confirm }}
           IN_REASON: ${{ inputs.reason }}
+          IN_REPAIR_ACTION: ${{ inputs.repair_action }}
+          # the maintainer's switch: hosts a host-changing mode may touch (comma or space separated). Empty by default.
+          ALLOWED_HOSTS: ${{ vars.OS_UPGRADE_ALLOWED_HOSTS }}
           REF: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -109,17 +121,37 @@ jobs:
                 exit 1
               fi
               ;;
-            upgrade)
+            upgrade | disarm | repair)
               case "$IN_HOST" in
                 msa2-server|msr1|msa2-client) ;;
-                *) echo "::error::an upgrade names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
+                *) echo "::error::an upgrade, a disarm or a repair names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
               esac
-              if [ "$IN_CONFIRM" != "UPGRADE-$IN_HOST" ]; then
+              # the extra control: a host-changing mode is impossible until the maintainer lists the host for the window
+              # (repository variable OS_UPGRADE_ALLOWED_HOSTS; README, "Enabling a host change")
+              case " $(printf '%s' "$ALLOWED_HOSTS" | tr ',' ' ') " in
+                *" $IN_HOST "*) ;;
+                *) echo "::error::$IN_HOST is not in the repository variable OS_UPGRADE_ALLOWED_HOSTS (it is '${ALLOWED_HOSTS:-empty}'): the maintainer enables a host change by listing the host there for the window"; exit 1 ;;
+              esac
+              if [ "$IN_MODE" = repair ]; then
+                case "$IN_REPAIR_ACTION" in
+                  configure | abort-new-kernel) ;;
+                  *) echo "::error::repair_action must be configure or abort-new-kernel"; exit 1 ;;
+                esac
+              fi
+              if [ "$IN_MODE" = upgrade ] && [ "$IN_CONFIRM" != "UPGRADE-$IN_HOST" ]; then
                 echo "::error::confirm must be exactly UPGRADE-$IN_HOST"
                 exit 1
               fi
+              if [ "$IN_MODE" = disarm ] && [ "$IN_CONFIRM" != "DISARM-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly DISARM-$IN_HOST"
+                exit 1
+              fi
+              if [ "$IN_MODE" = repair ] && [ "$IN_CONFIRM" != "REPAIR-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly REPAIR-$IN_HOST"
+                exit 1
+              fi
               ;;
-            *) echo "::error::mode must be survey or upgrade, got: $IN_MODE"; exit 1 ;;
+            *) echo "::error::mode must be survey, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
           esac
           if [ -z "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ]; then
             echo "::error::reason is empty"
@@ -129,7 +161,7 @@ jobs:
             echo "::error::reason is longer than 200 characters"
             exit 1
           fi
-          if printf '%s' "$IN_REASON" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+          if [ "$(printf '%s' "$IN_REASON" | wc -l)" -ne 0 ] || printf '%s' "$IN_REASON" | LC_ALL=C grep -q '[[:cntrl:]]'; then
             echo "::error::reason must be one line without control characters"
             exit 1
           fi
@@ -194,10 +226,16 @@ jobs:
     concurrency:
       group: matrix-tier-cluster
       cancel-in-progress: false
+    # A host-changing mode runs in the repository environment cluster-host-change: the maintainer gives it a required
+    # reviewer and main as the only deployment branch (README, "Enabling a host change"), so the job waits for approval
+    # before it holds the key. A survey runs in cluster-read, which carries no protection: a survey never waits for approval.
+    # (GitHub makes an environment that does not exist yet, without protection: the variable gate in the plan job is what
+    # is enforced by this repository's code.)
+    environment: ${{ inputs.mode == 'survey' && 'cluster-read' || 'cluster-host-change' }}
     runs-on: ubuntu-24.04
-    # Setup, apt (up to 60 minutes polled), a DKMS build (up to 30), a reboot bounded at 15 minutes, 3 minutes of
-    # settling, the checks and the summary.
-    timeout-minutes: 180
+    # Setup, apt (up to 3 rounds of 20 minutes of polls and the waits between them), a DKMS build (up to 30), a
+    # reboot bounded at 15 minutes, 3 minutes of settling, the checks and the summary.
+    timeout-minutes: 270
     permissions:
       actions: read
       contents: read
@@ -286,6 +324,7 @@ jobs:
           IN_ALLOW: ${{ inputs.allow_results_loss }}
           IN_REFRESH: ${{ inputs.refresh_lists }}
           IN_BLACKLIST: ${{ inputs.blacklist_r8169 }}
+          IN_REPAIR_ACTION: ${{ inputs.repair_action }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -eu
@@ -305,6 +344,7 @@ jobs:
               "allow_results_loss": os.environ["IN_ALLOW"] == "true",
               "refresh_lists": os.environ["IN_REFRESH"] == "true",
               "blacklist_r8169": os.environ["IN_BLACKLIST"] == "true",
+              "repair_action": os.environ["IN_REPAIR_ACTION"],
           }, open(os.path.join(os.environ["OS_OUT"], "extra-vars.json"), "w"), indent=2)
           PY
       - name: Survey or upgrade (ansible/os-upgrade.yml)
@@ -315,7 +355,7 @@ jobs:
         run: |
           set -u
           set +e
-          timeout -k 30 9900 ansible-playbook \
+          timeout -k 30 14400 ansible-playbook \
             -i ansible/inventory.yml \
             ansible/os-upgrade.yml \
             --extra-vars "@${OS_OUT}/extra-vars.json" 2>&1 | tee "${OS_OUT}/ansible.log"
@@ -339,7 +379,7 @@ jobs:
           name: cluster-os-${{ inputs.mode }}-${{ inputs.host }}-${{ github.run_id }}
           path: os-upgrade-evidence/
           if-no-files-found: warn
-          retention-days: 90
+          retention-days: 30
 
   verdict:
     name: verdict

@@ -60,13 +60,10 @@ INVENTORY = """all:
 
 def patch_playbook(src, work):
     s = open(src).read()
-    m = re.search(r"    - name: Reboot \| issue the reboot.*?register: reboot_result\n", s, re.S)
+    m = re.search(r"^( *)- name: Reboot \| issue the reboot.*?register: reboot_result\n", s, re.S | re.M)
     assert m, "reboot task not found"
-    s = s.replace(m.group(0), """    - name: Reboot | (test) the restart
-      ansible.builtin.script:
-        cmd: "%s/fake-reboot.sh"
-      register: reboot_result
-""" % work)
+    i = m.group(1)
+    s = s.replace(m.group(0), (i + "- name: Reboot | (test) the restart\n" + i + "  ansible.builtin.script:\n" + i + "    cmd: \"%s/fake-reboot.sh\"\n" + i + "  register: reboot_result\n") % work)
     s = s.replace("{{ playbook_dir }}/files/os_upgrade.py", work + "/osu-wrapper.sh")
     s = s.replace("{{ playbook_dir }}/files/reboot_snapshot.sh", work + "/snapshot-wrapper.sh")
     old = "{{ manifest_path | quote }} {{ results_root | quote }} - - -"
@@ -78,8 +75,14 @@ def patch_playbook(src, work):
     return s
 
 
+if os.environ.get("CI") == "true" and (PLAYBOOK is None or not sys.platform.startswith("linux")):
+    raise SystemExit("CI=true: this suite needs ansible-playbook on Linux and must not skip itself (a broken ansible install would read as green)")
+
+
 @unittest.skipIf(PLAYBOOK is None or not sys.platform.startswith("linux"), "needs ansible-playbook on Linux")
 class Play(unittest.TestCase):
+    rid = 0
+
     @classmethod
     def setUpClass(cls):
         cls.work = tempfile.mkdtemp(prefix="osu-play-")
@@ -94,8 +97,8 @@ class Play(unittest.TestCase):
         cls.h = FakeHost(os.path.join(cls.work, "host"))
         w = cls.work
         with open(w + "/osu-wrapper.sh", "w") as f:
-            f.write('#!/bin/bash\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
-                cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
+            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
+                cls.h.state_dir, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
         with open(w + "/snapshot-wrapper.sh", "w") as f:
             f.write('''#!/bin/bash
 # the preflight call carries a sixth argument, the host that asks; FAIL_HOST makes that host's preflight snapshot fail
@@ -103,8 +106,14 @@ if [ $# -ge 6 ]; then
 	[ "$6" = "${FAIL_HOST:-}" ] && { echo "snapshot failed (test)" >&2; exit 3; }
 	set -- "${@:1:5}"
 fi
-PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec bash %s "$@"
-''' % (cls.h.bin, cls.h.state_dir, cls.h.log, cls.h.root, cls.h.root, os.path.join(ANSIBLE_DIR, "files", "reboot_snapshot.sh")))
+root=%s
+# BOOT_MODE=stale-first: the first snapshot after the restart still shows the old boot
+if [ -s %s/stale_count ] && [ "$(cat %s/stale_count)" -gt 0 ]; then
+	echo $(( $(cat %s/stale_count) - 1 )) > %s/stale_count
+	root=%s/stale_root
+fi
+PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root exec bash %s "$@"
+''' % (cls.h.root, cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.state_dir, cls.h.bin, cls.h.state_dir, cls.h.log, os.path.join(ANSIBLE_DIR, "files", "reboot_snapshot.sh")))
         with open(w + "/fake-reboot.sh", "w") as f:
             f.write('#!/bin/bash\nexec %s %s %s %s\n' % (sys.executable, os.path.join(HERE, "osu_fake_reboot.py"), cls.h.root, cls.h.state_dir))
         os.makedirs(w + "/sbin")
@@ -120,6 +129,9 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
     # ---- a host that is ready to be upgraded, fresh for each scenario
     def fresh(self, **state):
         h = self.h
+        for stale in ("down", "stale_count"):
+            if os.path.exists(h.state_dir + "/" + stale):
+                os.remove(h.state_dir + "/" + stale)
         shutil.rmtree(h.root, ignore_errors=True)
         open(h.log, "w").close()
         h.build("msr1", True)
@@ -149,7 +161,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         code = textwrap.dedent(m.group(1))
         env = dict(os.environ, IN_MODE=base["os_mode"], IN_HOST=base["os_host"], IN_CONFIRM=base.get("os_confirm", ""), IN_REASON=base["os_reason"],
                    IN_ALLOW=str(bool(base.get("allow_results_loss", False))).lower(), IN_REFRESH=str(bool(base.get("refresh_lists", False))).lower(),
-                   IN_BLACKLIST=str(bool(base.get("blacklist_r8169", False))).lower(), RUN_ID=base["os_run_id"], OS_OUT=out)
+                   IN_BLACKLIST=str(bool(base.get("blacklist_r8169", False))).lower(), IN_REPAIR_ACTION=base.get("repair_action", "configure"), RUN_ID=base["os_run_id"], OS_OUT=out)
         subprocess.run([sys.executable, "-c", code], env=env, check=True)
         return os.path.join(out, "extra-vars.json")
 
@@ -163,7 +175,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         os.makedirs(out)
         if os.path.exists(self.MARK):
             os.remove(self.MARK)
-        base = {"os_reason": "platform upgrade %s before the final evidence" % self.PAYLOAD, "os_run_id": "4242", "os_out_dir": out}
+        Play.rid += 1  # a workflow run id is unique: the host keeps a record per run
+        base = {"os_reason": "platform upgrade %s before the final evidence" % self.PAYLOAD, "os_run_id": str(4000 + Play.rid), "os_out_dir": out}
         base.update(extra)
         e = dict(os.environ, PATH=os.path.join(self.work, "sbin") + os.pathsep + os.environ["PATH"], ANSIBLE_LOCALHOST_WARNING="False",
                  ANSIBLE_INVENTORY_UNPARSED_WARNING="False", ANSIBLE_DEPRECATION_WARNINGS="False", ANSIBLE_ROLES_PATH="/nonexistent",
@@ -389,7 +402,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         self.fresh(new_kernel_alias_races=True)
         self.play("race", self.UP)
         self.assertNotEqual(self.rc, 0)
-        self.assertIn("in-tree r8169 of 7.0.0-40-generic lists the same PCI id as r8127 (the running kernel does not) and r8169 is not blacklisted", self.log)
+        self.assertIn("in-tree r8169 of 7.0.0-40-generic lists the same PCI id as r8127 and r8169 is not blacklisted in the new kernel initramfs as well", self.log)
         self.no_call("grub-reboot")
         self.no_call("FAKE-REBOOT")
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
@@ -398,6 +411,74 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         self.assertEqual(self.rc, 0, self.log[-2500:])
         self.assertLess(self.idx("update-initramfs -u -k 7.0.0-40-generic"), self.idx("grub-reboot"))
         self.assertIn("blacklist r8169", open(self.h.root + "/etc/modprobe.d/celeris-r8127.conf").read())
+
+    # ---------------------------------------------------------------------------------------- a failed dkms build and its repair
+    R = {"os_mode": "repair", "os_host": "msr1", "os_confirm": "REPAIR-msr1"}
+
+    def test_a_dkms_failure_that_fails_apt_has_a_sanctioned_repair_and_a_sanctioned_abort(self):
+        # the most likely failure on msr1: the linux-headers postinst fails because r8127 does not build, so apt exits non-zero
+        self.fresh(upgrade_rc=100, upgrade_audit=["linux-headers-7.0.0-40-generic  half-configured"], configure_ok=False)
+        self.play("sm_upgrade", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.phase(), "upgrading")
+        self.assertIn("mode=repair is the sanctioned way", self.log)
+        self.no_call("grub-reboot")
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+        # every further dispatch of the upgrade refuses on the broken dpkg state
+        self.play("sm_again", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("dpkg --audit reports half-configured or broken packages", self.log)
+        # a repair that cannot configure (the module still does not build) is red and says so
+        self.play("sm_configure_fails", dict(self.R, repair_action="configure"))
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["repair_action"]), ("repair-failed", "configure"))
+        self.assertIn("repair_action=abort-new-kernel", self.log)
+        self.assertEqual(len(r["dpkg_audit_after"]), 1)
+        # the abort: the half-installed new kernel goes, the host stays on the old one
+        before = len(self.calls())
+        self.play("sm_abort", dict(self.R, repair_action="abort-new-kernel"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["kernel_running"], r["saved_entry"], r["dpkg_audit_after"]), ("repaired", "7.0.0-31-generic", ID_31, []))
+        self.assertNotIn("linux-image-7.0.0-40-generic", self.h.state["packages"])
+        self.assertIn("linux-image-7.0.0-31-generic", self.h.state["packages"])
+        self.assertEqual([c for c in self.calls()[before:] if c.startswith(("grub-set-default", "grub-reboot", "FAKE-REBOOT"))], [])  # a repair never touches grub
+        self.assertEqual(self.phase(), "repaired")
+        md = self.summary("repair", "msr1")
+        self.assertIn("REPAIRED", md)
+
+    def test_a_repair_that_configures_lets_the_upgrade_run_to_the_end(self):
+        self.fresh(upgrade_rc=100, upgrade_audit=["linux-headers-7.0.0-40-generic  half-configured"], configure_ok=True)
+        self.play("smc_upgrade", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.play("smc_repair", dict(self.R, repair_action="configure"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.j("msr1", "result.json")["status"], "repaired")
+        # the cause is gone (say, a newer r8127 source): the same upgrade now completes
+        self.h.load()
+        self.h.state.update(upgrade_rc=0, upgrade_audit=None)
+        self.h.save()
+        self.play("smc_upgrade_again", self.UP)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.phase(), "permanent")
+
+    def test_repair_refuses_with_a_one_shot_pending_or_beside_a_bench_or_when_there_is_nothing_to_repair(self):
+        self.fresh()
+        self.play("rp_nothing", dict(self.R, repair_action="configure"))
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("nothing to repair: dpkg --audit is clean", self.log)
+        self.no_call("dpkg --force-confold")
+        self.fresh(audit=["x half-configured"])
+        self.h.state["grubenv"].update(saved_entry=ID_31, next_entry=ID_40)
+        self.h.save()
+        self.play("rp_armed", dict(self.R, repair_action="configure"))
+        self.assertIn("dispatch mode=disarm first", self.log)
+        self.fresh(audit=["x half-configured"])
+        self.h.w("/tmp/celeris-bench-manifest.json", "{}")
+        self.play("rp_bench", dict(self.R, repair_action="configure"))
+        self.assertNotEqual(self.rc, 0)
+        self.no_call("dpkg --force-confold")
 
     # ---------------------------------------------------------------------------------------- after the reboot
     def test_a_boot_that_fell_back_is_not_verified_and_not_made_permanent(self):
@@ -411,9 +492,9 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         self.assertEqual(self.phase(), "returned")
         r = self.j("msr1", "result.json")
         self.assertEqual(r["status"], "failed-verification")
-        self.assertIn("No power-cycle needed: the host answered but failed verification", r["power_cycle"])
+        self.assertIn("No power-cycle needed while the host answers", r["power_cycle"])
         md = self.summary("upgrade", "msr1")
-        self.assertIn("Power-cycle: **not needed**. msr1 answered after the reboot but failed verification", md)
+        self.assertIn("not needed while msr1 answers", md)
         self.assertIn("the one-shot entry for 7.0.0-40-generic fell back", md)
 
     def test_a_host_that_never_answers_tells_the_person_to_power_cycle(self):
@@ -422,16 +503,85 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         self.assertNotEqual(self.rc, 0)
         self.assertEqual(self.phase(), "rebooting")
         r = self.j("msr1", "result.json")
-        self.assertEqual(r["status"], "rebooting")
-        self.assertIn("Power-cycle msr1 PHYSICALLY", r["power_cycle"])
-        self.assertIn('"rebooting"', r["power_cycle"])
+        self.assertEqual(r["status"], "failed-unknown-armed")
+        self.assertEqual(r["disarm"], {})
+        self.assertIn("STILL ARMED", r["power_cycle"])
+        self.assertIn("NEW kernel, once", r["power_cycle"])
+        self.assertIn("restores the choice of KERNEL only", r["power_cycle"])
         self.assertIn("OLD kernel 7.0.0-31-generic", r["power_cycle"])
         md = self.summary("upgrade", "msr1")
-        self.assertIn("Power-cycle: **YES, if and only if msr1 does not answer.**", md)
+        self.assertIn("Power-cycle: **YES if msr1 stays silent, and what it boots depends on why.**", md)
+        self.assertIn("**STILL ARMED**", md)
+        self.assertIn("A power-cycle restores the choice of kernel only", md)
         self.assertIn("Ask the maintainer to power-cycle msr1 physically", md)
         # the old kernel is what a power-cycle boots
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
         self.assertEqual(self.h.state["grubenv"]["next_entry"], ID_40)
+
+    def test_a_reboot_that_was_never_issued_disarms_the_one_shot(self):
+        self.fresh()
+        self.play("notissued", self.UP, env={"BOOT_MODE": "not-issued"})
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("The host answered and the one-shot was DISARMED", self.log)
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+        self.assertIn("grub-editenv - unset next_entry", self.calls())
+        self.assertEqual(self.phase(), "rebooting")
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-before-boot-disarmed")
+        self.assertTrue(r["disarm"]["was_armed"])
+        self.assertIn("No power-cycle needed", r["power_cycle"])
+
+    def test_an_arming_that_does_not_verify_leaves_nothing_armed(self):
+        self.fresh(reboot_sets_wrong=True)
+        self.play("armwrong", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("one-shot disarmed: True", self.log)
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
+        self.no_call("FAKE-REBOOT")
+        self.assertEqual(self.phase(), "dkms-ok")
+
+    def test_the_disarm_mode_clears_only_the_one_shot(self):
+        self.fresh()
+        self.h.state["grubenv"].update(saved_entry=ID_31, next_entry=ID_40)
+        self.h.w("/tmp/celeris-bench-manifest.json", "{}")  # safe beside a bench: it changes nothing a bench reads
+        self.h.save()
+        D = {"os_mode": "disarm", "os_host": "msr1", "os_confirm": "DISARM-msr1"}
+        self.play("disarm_wrongconfirm", dict(D, os_confirm="UPGRADE-msr1"))
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], ID_40)
+        self.play("disarm", D)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+        self.assertEqual(self.phase(), "disarmed")
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["next_entry_after"]), ("disarmed", ""))
+        for c in self.calls():
+            for bad in ("grub-set-default", "grub-reboot", "update-grub", "apt-get -y", "apt-mark manual", "dkms autoinstall", "FAKE-REBOOT"):
+                self.assertFalse(c.startswith(bad), c)
+        md = self.summary("disarm", "msr1")
+        self.assertIn("DISARMED", md)
+        # nothing pending: a no-op, still green
+        self.play("disarm_again", D)
+        self.assertEqual(self.rc, 0, self.log[-1500:])
+        self.assertFalse(self.j("msr1", "disarm.json")["was_armed"])
+
+    def test_a_host_that_answers_before_it_has_booted_is_judged_on_the_new_boot(self):
+        self.fresh()
+        self.play("stale", self.UP, env={"BOOT_MODE": "stale-first"})
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.phase(), "permanent")
+
+    def test_a_detached_apt_that_dies_is_reported_and_its_policy_rc_d_cleaned_up(self):
+        self.fresh(upgrade_dies=True)
+        self.play("died", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("state died", self.log)
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"), "the playbook left the policy-rc.d of a dead run behind")
+        self.no_call("grub-reboot")
+        self.no_call("FAKE-REBOOT")
+        self.assertEqual(self.phase(), "upgrading")
 
     def test_a_nic_that_did_not_come_back_is_not_verified(self):
         self.fresh()

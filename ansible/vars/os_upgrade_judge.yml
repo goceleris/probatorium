@@ -11,6 +11,7 @@
 #   pre_reboot_problems_str  after the upgrade, BEFORE the reboot: the new kernel is not safe to boot (the old one stays
 #                          the default and nothing is rebooted)
 #   post_problems_str      after the reboot: the host is not verified (the new kernel is NOT made the default)
+#   maint_refusals_str     mode=repair: the host is not in a state to be repaired (mode=disarm has no refusals)
 #
 # Inputs, set by the play: os_host (the target), os_bench_targets, os_loadgen_hosts (inventory group members),
 # os_surveys (every host's preflight survey, by host name), pre_target (the target's reboot_snapshot.sh record
@@ -24,7 +25,7 @@ os_min_efi_free_kib: 32768
 os_counter_ceiling: 1000000000
 # what apt must never remove on a cluster host: the kernel and boot chain, DKMS and the NIC driver, and the ways
 # in (ssh, tailscale) and out (power guard, docker for the db fixtures)
-os_protected_regex: '^(linux-|grub|shim|dkms|openssh|tailscale|apcupsd|docker|containerd|runc|netplan|systemd|ifenslave|r8127|network)'
+os_protected_regex: '^(linux-|grub|shim|dkms|openssh|tailscale|apcupsd|docker|containerd|runc|netplan|systemd|ifenslave|r8127|network|sudo|python3|udev|kmod|initramfs-tools|iproute2|libc6|ca-certificates|efibootmgr|apt$|dpkg$|libapt|openssl|libssl|mokutil|ethtool|curl$)'
 
 post_snap: >-
   {{ (post_raw.stdout | from_json) if (post_raw.stdout | default('') | length > 0) else {} }}
@@ -64,6 +65,23 @@ refusals_str: >-
   {% endif %}
   {{ p | join(' ;; ') }}
 
+# mode=repair / mode=disarm: refusals of the maintenance play. Inputs: os_mode, repair_action, pre_target, pre_survey.
+maint_refusals_str: >-
+  {% set a = pre_target %}
+  {% set s = pre_survey %}
+  {% set p = [] %}
+  {% if os_mode == 'repair' %}
+  {% if a.manifest_present %}{% set _ = p.append('a bench or validation manifest exists on the target') %}{% endif %}
+  {% if a.runner_workers | int > 0 %}{% set _ = p.append(a.runner_workers ~ ' runner job(s) are executing on the host') %}{% endif %}
+  {% if s.packages.dpkg_lock_held or s.packages.package_processes | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (s.packages.package_processes | join(', ') if s.packages.package_processes | length > 0 else 'a dpkg lock is held') ~ '): a repair would race it') %}{% endif %}
+  {% if s.boot.next_entry | length > 0 %}{% set _ = p.append('grub has a one-shot entry pending (next_entry=' ~ s.boot.next_entry ~ '): dispatch mode=disarm first') %}{% endif %}
+  {% if s.packages.policy_rc_d_present and not s.packages.policy_rc_d_ours %}{% set _ = p.append('/usr/sbin/policy-rc.d exists and is not the one this workflow writes') %}{% endif %}
+  {% if repair_action == 'configure' and s.packages.dpkg_audit | length == 0 %}{% set _ = p.append('nothing to repair: dpkg --audit is clean') %}{% endif %}
+  {% if repair_action == 'abort-new-kernel' and s.packages.broken_kernel_pkgs | length == 0 %}{% set _ = p.append('nothing to abort: no kernel newer than the running one has a package that is not cleanly installed (a kernel installed and working before is not removed)') %}{% endif %}
+  {% if repair_action == 'abort-new-kernel' and not (s.boot.dropin_present and s.boot.default_kernel == s.kernel) %}{% set _ = p.append('grub saved default (' ~ s.boot.default_kernel ~ ') is not the running kernel ' ~ s.kernel ~ ' or the upgrade pin is missing: removing kernels could change what boots') %}{% endif %}
+  {% endif %}
+  {{ p | join(' ;; ') }}
+
 # What apt WOULD do (simulation on freshly updated lists): refuse before it does anything.
 plan_refusals_str: >-
   {% set p = [] %}
@@ -91,9 +109,11 @@ pre_reboot_problems_str: >-
   {% if d.nic_drivers_missing | length > 0 %}{% set _ = p.append('the driver(s) of the NICs in use are not available for ' ~ target_kernel ~ ': ' ~ (d.nic_drivers_missing | join(', '))) %}{% endif %}
   {% if a.r8127 and not d.r8127.found %}{% set _ = p.append('r8127 is NOT built for ' ~ target_kernel ~ ' (modinfo -k): the NIC would not come back') %}{% endif %}
   {% if a.r8127 and d.r8127.found and not d.r8127_aliases %}{% set _ = p.append('the r8127 module of ' ~ target_kernel ~ ' has no PCI aliases: it would never be loaded for the NIC') %}{% endif %}
-  {% if a.r8127 and d.r8127.found and d.secure_boot == 'enabled' and d.r8127.signer | length == 0 %}{% set _ = p.append('Secure Boot is enabled and the r8127 module of ' ~ target_kernel ~ ' is not signed: the kernel would refuse to load it') %}{% endif %}
+  {% if a.r8127 and d.r8127.found and d.secure_boot != 'disabled' and (d.r8127.signer | length == 0 or (d.running_r8127_signer | length > 0 and d.r8127.signer != d.running_r8127_signer)) %}{% set _ = p.append('Secure Boot is ' ~ d.secure_boot ~ ' and the r8127 module of ' ~ target_kernel ~ ' is not signed by the key the running module is signed with (' ~ d.r8127.signer ~ ' vs ' ~ d.running_r8127_signer ~ '): the kernel may refuse to load it') %}{% endif %}
+  {% if d.access_problems | length > 0 %}{% set _ = p.append('the way in is not intact on the upgraded userland (both kernels share it, a power-cycle would not undo it): ' ~ (d.access_problems | join(' / '))) %}{% endif %}
+  {% if d.target_older_than_running %}{% set _ = p.append('the intended kernel ' ~ target_kernel ~ ' is older than the running one ' ~ d.running) %}{% endif %}
   {% if a.r8127 and not d.quiesce_hook %}{% set _ = p.append('the shutdown quiesce hook of the r8127 NIC is missing') %}{% endif %}
-  {% if a.r8127 and d.intree_lists_id and not d.intree_lists_id_running and not d.r8169_blacklisted %}{% set _ = p.append('the in-tree r8169 of ' ~ target_kernel ~ ' lists the same PCI id as r8127 (the running kernel does not) and r8169 is not blacklisted: which driver binds the NIC would be a race (the bench pins the r8127 vector name). Dispatch with blacklist_r8169=true, or decide to move to the in-tree driver in a separate change') %}{% endif %}
+  {% if a.r8127 and d.intree_lists_id and not (d.r8169_blacklisted and d.r8169_blacklist_in_initrd) %}{% set _ = p.append('the in-tree r8169 of ' ~ target_kernel ~ ' lists the same PCI id as r8127 and r8169 is not blacklisted in the new kernel initramfs as well (blacklisted: ' ~ d.r8169_blacklisted ~ ', in the initramfs: ' ~ d.r8169_blacklist_in_initrd ~ '): which driver binds the NIC would be a race that the bench (it pins the r8127 vector name) would lose. DECIDE: dispatch with blacklist_r8169=true to keep r8127 (it writes /etc/modprobe.d/celeris-r8127.conf and rebuilds the initramfs), or move to the in-tree driver in a separate reviewed change') %}{% endif %}
   {{ p | join(' ;; ') }}
 
 # What is wrong with the host after the reboot (empty: verified).

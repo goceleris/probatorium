@@ -71,7 +71,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 		}
 		return out
 	}
-	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "upgrade"}) {
+	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "upgrade", "disarm", "repair"}) {
 		t.Errorf("modes = %v", got)
 	}
 	offered := choice("host", "confirm")
@@ -84,7 +84,10 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 			t.Errorf("input %s is not required", in)
 		}
 	}
-	for _, in := range []string{"allow_results_loss", "refresh_lists", "blacklist_r8169"} {
+	if got := choice("repair_action", "blacklist_r8169"); !slices.Equal(got, []string{"configure", "abort-new-kernel"}) {
+		t.Errorf("repair actions = %v", got)
+	}
+	for _, in := range []string{"allow_results_loss", "refresh_lists"} {
 		m := regexp.MustCompile(`(?ms)^      ` + in + `:\n(.*?)(?:^      [a-z_0-9]+:|^permissions:)`).FindStringSubmatch(src)
 		if m == nil || !strings.Contains(m[1], "default: false") {
 			t.Errorf("input %s does not default to false", in)
@@ -103,7 +106,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 	if !slices.Equal(accepted, osUpgradeHosts()) {
 		t.Errorf("the playbook accepts %v, want %v", accepted, osUpgradeHosts())
 	}
-	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "(os_mode == 'upgrade') or (os_host == '-')", "os_mode in ['survey', 'upgrade']"} {
+	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'disarm', 'repair']", "os_confirm == 'REPAIR-' ~ os_host"} {
 		if !strings.Contains(req, want) {
 			t.Errorf("the playbook's request check lacks %s", want)
 		}
@@ -117,11 +120,14 @@ func TestClusterOSUpgradePlanRefuses(t *testing.T) {
 	plan := jobSection(t, withoutComments(readWorkflow(t, osWorkflow)), "plan")
 	for _, want := range []string{
 		`"$IN_CONFIRM" != "UPGRADE-$IN_HOST"`,
+		`"$IN_CONFIRM" != "DISARM-$IN_HOST"`,
+		`"$IN_CONFIRM" != "REPAIR-$IN_HOST"`,
+		`OS_UPGRADE_ALLOWED_HOSTS`,
 		`"$REF" != "refs/heads/$DEFAULT_BRANCH"`,
 		`msa2-server|msr1|msa2-client) ;;`,
 		`"$IN_HOST" != "-"`,
 		`-gt 200`,
-		`mode must be survey or upgrade`,
+		`mode must be survey, upgrade, disarm or repair`,
 		`a survey takes no confirmation`,
 		`reason must not contain braces`,
 	} {
@@ -203,8 +209,8 @@ func TestClusterOSUpgradeWorkflowHygiene(t *testing.T) {
 	src := withoutComments(readWorkflow(t, osWorkflow))
 	lines := strings.Split(src, "\n")
 	for i, l := range lines {
-		if strings.Contains(l, "${{ inputs.") && !regexp.MustCompile(`^\s*(name|run-name|[A-Z][A-Z_]*):`).MatchString(l) {
-			t.Errorf("line %d: an input outside env:, run-name or a name: %s", i+1, l)
+		if strings.Contains(l, "${{ inputs.") && !regexp.MustCompile(`^\s*(name|run-name|environment|[A-Z][A-Z_]*):`).MatchString(l) {
+			t.Errorf("line %d: an input outside env:, run-name, environment or a name: %s", i+1, l)
 		}
 		if strings.Contains(l, "${{ secrets.") && !regexp.MustCompile(`^\s*(oauth-client-id|oauth-secret|[A-Z][A-Z_]*):`).MatchString(l) {
 			t.Errorf("line %d: a secret outside env: or the tailscale step's with: %s", i+1, l)
@@ -270,27 +276,46 @@ func TestClusterOSUpgradeWorkflowHygiene(t *testing.T) {
 	pb := mustRead(t, osPlaybook)
 	rt := regexp.MustCompile(`reboot_timeout_seconds: (\d+)`).FindStringSubmatch(pb)
 	retries := regexp.MustCompile(`upgrade_poll_retries: (\d+)`).FindStringSubmatch(pb)
+	rounds := regexp.MustCompile(`upgrade_poll_rounds: (\d+)`).FindStringSubmatch(pb)
 	at := regexp.MustCompile(`timeout -k 30 (\d+) ansible-playbook`).FindStringSubmatch(job)
-	if m == nil || rt == nil || retries == nil || at == nil {
-		t.Fatal("no timeout-minutes on the job, reboot_timeout_seconds / upgrade_poll_retries in the playbook, or timeout on ansible-playbook")
+	if m == nil || rt == nil || retries == nil || rounds == nil || at == nil {
+		t.Fatal("no timeout-minutes on the job, reboot_timeout_seconds / upgrade_poll_retries / upgrade_poll_rounds in the playbook, or timeout on ansible-playbook")
 	}
 	jobMin, _ := strconv.Atoi(m[1])
 	boot, _ := strconv.Atoi(rt[1])
 	poll, _ := strconv.Atoi(retries[1])
+	nround, _ := strconv.Atoi(rounds[1])
 	play, _ := strconv.Atoi(at[1])
 	if boot > 900 {
 		t.Errorf("reboot_timeout_seconds = %d: the bound is 15 minutes", boot)
 	}
-	const dkmsBuild = 1800 // dkms autoinstall's own timeout in os_upgrade.py
-	need := poll*(30+1) + dkmsBuild + boot + 36*5 + 24*5 + 600
+	// every bounded step at its worst, from os_upgrade.py's own bounds: apt update 1500, three update-grub runs of 600, a DKMS
+	// build 1800, an initramfs rebuild 900, two toolchain checks of 6 curls x 40 s, the settling loops, and the setup tasks
+	const (
+		aptUpdate, updateGrub, dkmsBuild, initramfs, toolchecks, settle, setup = 1500, 3 * 600, 1800, 900, 2 * 240, 36*5 + 24*5, 900
+	)
+	pollRounds := nround * (poll*(30+1) + 305) // each poll waits 30 s on the host; a round ends with up to 300 s of wait_for_connection
+	need := aptUpdate + updateGrub + dkmsBuild + initramfs + toolchecks + settle + setup + pollRounds + boot + 30
 	if play < need {
-		t.Errorf("ansible-playbook is bounded at %d s but apt (%d s, 30 s per poll) + a DKMS build (%d s) + the reboot (%d s) + settling + the checks need %d s", play, poll*31, dkmsBuild, boot, need)
+		t.Errorf("ansible-playbook is bounded at %d s but the bounded steps add up to %d s at their worst: the kill could land after the one-shot is armed", play, need)
 	}
 	if jobMin*60 < play+600 {
 		t.Errorf("the job's %d-minute timeout does not cover the %d s playbook bound and the setup", jobMin, play)
 	}
-	if !strings.Contains(mustRead(t, osScript), "timeout=1800") {
-		t.Error("os_upgrade.py no longer bounds the DKMS build at 1800 s: the timeout arithmetic above is stale")
+	script := mustRead(t, osScript)
+	for _, want := range []string{"timeout=1800", "timeout=900", "timeout=1500", "timeout=600"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("os_upgrade.py no longer has %q: the timeout arithmetic above is stale", want)
+		}
+	}
+	// the host-changing modes run in an environment the maintainer can protect; a survey in one that carries no protection
+	if !strings.Contains(job, "environment: ${{ inputs.mode == 'survey' && 'cluster-read' || 'cluster-host-change' }}") {
+		t.Error("the os-upgrade job does not run host-changing modes in the cluster-host-change environment and surveys in cluster-read")
+	}
+	for _, other := range []string{"plan", "cluster-guard", "verdict"} {
+		if strings.Contains(jobSection(t, src, other), "environment:") {
+			t.Errorf("job %s names an environment: only the os-upgrade job may", other)
+		}
 	}
 }
 
@@ -309,7 +334,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 	if !strings.Contains(src, "hostvars[os_host].os_upgrade_verified | default(false)") || !strings.Contains(src, "os_upgrade_verified: true") {
 		t.Error("no last play proves the target play ran to its end: a host pattern that matched nothing would read as success")
 	}
-	task := regexp.MustCompile(`(?s)ansible\.builtin\.reboot:\n(.*?)\n    - name:`).FindStringSubmatch(src)
+	task := regexp.MustCompile(`(?s)ansible\.builtin\.reboot:\n(.*?)\n\s+- name:`).FindStringSubmatch(src)
 	if task == nil {
 		t.Fatal("cannot find the reboot task")
 	}
@@ -331,8 +356,13 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 
 	// the subcommands the playbook may run on a host
 	allowed := []string{"apt-update", "survey", "simulate", "dump", "pin-grub", "upgrade-start", "upgrade-status", "upgrade-log",
-		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup"}
-	for _, m := range regexp.MustCompile(`\{\{ osu \}\} ([a-z0-9-]+)`).FindAllStringSubmatch(src, -1) {
+		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start"}
+	all := src
+	tasks, _ := filepath.Glob("ansible/tasks/os_upgrade_*.yml")
+	for _, tf := range tasks {
+		all += "\n" + stripComments(mustRead(t, tf))
+	}
+	for _, m := range regexp.MustCompile(`\{\{ osu \}\} ([a-z0-9-]+)`).FindAllStringSubmatch(all, -1) {
 		if !slices.Contains(allowed, m[1]) {
 			t.Errorf("the playbook runs the subcommand %q, which is not on the reviewed list %v", m[1], allowed)
 		}
@@ -347,7 +377,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 		"Apt | update the package lists",
 		"Apt | refuse when the plan is unacceptable",
 		"osu }} upgrade-start",
-		"osu }} upgrade-status",
+		"tasks/os_upgrade_wait_apt.yml",
 		"Apt | the full-upgrade must have finished with exit 0",
 		"osu }} dkms-check --build",
 		"Dkms | REFUSE TO REBOOT",
@@ -373,6 +403,20 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 	if idx("osu }} pin-grub") > idx("Apt | update the package lists") {
 		t.Error("the old kernel is not pinned before apt runs")
 	}
+	// the blacklist is written on an r8127 host only, and the playbook wires the cleanup of a dead run's policy-rc.d
+	if !strings.Contains(src, "when: (blacklist_r8169 | bool) and pre_target.r8127") {
+		t.Error("blacklist_r8169 is no longer limited to a host with an r8127 NIC")
+	}
+	if !strings.Contains(src, "osu }} upgrade-cleanup --run-id") {
+		t.Error("the playbook does not clean up the policy-rc.d of a run that died")
+	}
+	// a failure between the arming and the host's return disarms the one-shot: arm and reboot sit in a block whose rescue disarms
+	iArm := idx("osu }} arm-oneshot")
+	iRescue := idx("      rescue:")
+	iDisarm := strings.Index(src[iRescue:], "osu }} disarm")
+	if iArm >= iRescue || iDisarm < 0 || iRescue+iDisarm >= idx("Post | judge") || idx("ansible.builtin.reboot:") >= iRescue {
+		t.Error("the arming and the reboot are not in a block whose rescue disarms the one-shot before the verification")
+	}
 	// the judgement gates each step
 	for _, want := range []string{"when: refusals_str | trim | length > 0", "when: plan_refusals_str | trim | length > 0",
 		"when: pre_reboot_problems_str | trim | length > 0", "when: post_problems_str | trim | length > 0"} {
@@ -397,6 +441,12 @@ func TestOSUpgradeScriptCannotAutoremoveAndGuardsItsReads(t *testing.T) {
 	raw := mustRead(t, osScript)
 	code := regexp.MustCompile(`(?s)""".*?"""`).ReplaceAllString(raw, "")
 	code = stripComments(code)
+	// the one place that removes packages is mode=repair's abort, and only the half-installed newer kernel's
+	repairBody := regexp.MustCompile(`(?s)def cmd_repair_run\(a\):.*?\ndef cmd_upgrade_run`).FindString(code)
+	if repairBody == "" || !strings.Contains(repairBody, "new_kernel_pkgs(running_kernel(), broken_only=True)") || strings.Count(code, `"remove", "--purge"`) != 1 {
+		t.Error("the only package removal is not the abort of mode=repair, limited to the half-installed newer kernels")
+	}
+	code = strings.Replace(code, repairBody, "", 1)
 	for _, banned := range []string{"autoremove", `"purge"`, `"remove"`, "--purge", "rm -rf", `"reboot"`, `"shutdown"`, `"poweroff"`, "systemctl\", \"restart", "kexec"} {
 		if strings.Contains(code, banned) {
 			t.Errorf("os_upgrade.py contains %s", banned)
@@ -431,7 +481,7 @@ func TestClusterOSUpgradeJudgementCoversTheRequirements(t *testing.T) {
 		"would REMOVE protected package(s)", "apt-get -s full-upgrade failed",
 		"vmlinuz-", "initrd.img-", "has no menu entry for", "the fallback is not intact", "waits at the menu for ever", "linux-headers for",
 		"are installed for the running kernel and not for", "dkms autoinstall -k", "the driver(s) of the NICs in use", "is NOT built for",
-		"no PCI aliases", "Secure Boot is enabled", "lists the same PCI id as r8127", "boot_id did not change", "the one-shot entry for",
+		"no PCI aliases", "Secure Boot is ", "lists the same PCI id as r8127", "boot_id did not change", "the one-shot entry for",
 		"new crash dump(s)", "prerequisite regressed", "is not owned by", "is not in /proc/interrupts", "is not configured on the host",
 		"over the fabric", "bond lost a slave", "the counters were not reset", "new failed unit(s)", "link speed", "is bound to", "the clock is not synchronized",
 		"the system C compiler built and ran a program before", "verified before the upgrade", "one-shot entry pending", "an earlier OS upgrade left grub", "blacklist_r8169=true, but a NIC is bound to r8169", "no readable snapshot",
@@ -633,6 +683,13 @@ func TestOSUpgradeIsDocumented(t *testing.T) {
 		"HOLD-CLUSTER",
 		"ansible/os-upgrade.yml",
 		"allow_results_loss",
+		"mode=disarm",
+		"OS_UPGRADE_ALLOWED_HOSTS",
+		"cluster-host-change",
+		"abort-new-kernel",
+		"Required reviewers",
+		"still armed",
+		"restores the choice of kernel only",
 		"blacklist_r8169",
 		"refresh_lists",
 		"stub",
@@ -664,7 +721,109 @@ func TestFreeTextInputsAreWrittenAsUnsafeStrings(t *testing.T) {
 			t.Errorf("%s does not reject braces in the reason", c.file)
 		}
 	}
-	if !strings.Contains(mustRead(t, osRequest), "(os_mode == 'upgrade') or (os_confirm == '')") {
+	if !strings.Contains(mustRead(t, osRequest), "os_mode == 'survey' and os_confirm == ''") {
 		t.Error("the playbook accepts a confirmation in a survey")
+	}
+}
+
+// planScript is the inline script of the plan job's first step, as the runner would execute it.
+func planScript(t *testing.T) string {
+	t.Helper()
+	src := readWorkflow(t, osWorkflow)
+	i := strings.Index(src, "Refuse a malformed request before any host is touched")
+	if i < 0 {
+		t.Fatal("no plan step")
+	}
+	j := strings.Index(src[i:], "run: |\n")
+	if j < 0 {
+		t.Fatal("the plan step has no run: |")
+	}
+	var out []string
+	indent := -1
+	for _, l := range strings.Split(src[i+j+len("run: |\n"):], "\n") {
+		if strings.TrimSpace(l) == "" {
+			out = append(out, "")
+			continue
+		}
+		n := len(l) - len(strings.TrimLeft(l, " "))
+		if indent < 0 {
+			indent = n
+		}
+		if n < indent {
+			break
+		}
+		out = append(out, l[indent:])
+	}
+	return strings.Join(out, "\n")
+}
+
+// The plan job's gate, RUN: who may dispatch what. A host-changing mode is impossible until the maintainer lists the host in
+// the repository variable OS_UPGRADE_ALLOWED_HOSTS; free text cannot carry template syntax; the confirmations are exact.
+func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
+	bash := needBash(t)
+	script := planScript(t)
+	type env = map[string]string
+	base := func(over env) env {
+		e := env{"IN_MODE": "survey", "IN_HOST": "-", "IN_CONFIRM": "", "IN_REASON": "platform survey", "IN_REPAIR_ACTION": "configure",
+			"ALLOWED_HOSTS": "", "REF": "refs/heads/main", "DEFAULT_BRANCH": "main"}
+		for k, v := range over {
+			e[k] = v
+		}
+		return e
+	}
+	up := func(host string, over env) env {
+		e := env{"IN_MODE": "upgrade", "IN_HOST": host, "IN_CONFIRM": "UPGRADE-" + host, "ALLOWED_HOSTS": host}
+		for k, v := range over {
+			e[k] = v
+		}
+		return base(e)
+	}
+	for _, c := range []struct {
+		name string
+		env  env
+		ok   bool
+		msg  string
+	}{
+		{"a survey needs no switch", base(nil), true, ""},
+		{"a survey with a host", base(env{"IN_HOST": "msr1"}), false, "leave host as '-'"},
+		{"a survey with a confirmation", base(env{"IN_CONFIRM": "UPGRADE-msr1"}), false, "takes no confirmation"},
+		{"an upgrade with the variable empty", up("msr1", env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
+		{"an upgrade of a host that is not listed", up("msr1", env{"ALLOWED_HOSTS": "msa2-server"}), false, "is not in the repository variable"},
+		{"a host that merely starts like a listed one", up("msr1", env{"ALLOWED_HOSTS": "msr10"}), false, "is not in the repository variable"},
+		{"an upgrade of a listed host", up("msr1", env{"ALLOWED_HOSTS": "msa2-server,msr1"}), true, ""},
+		{"a list separated by spaces", up("msa2-server", env{"ALLOWED_HOSTS": "msr1 msa2-server"}), true, ""},
+		{"an upgrade with the wrong confirmation", up("msr1", env{"IN_CONFIRM": "UPGRADE-msa2-server"}), false, "confirm must be exactly UPGRADE-msr1"},
+		{"an upgrade confirmed as a disarm", up("msr1", env{"IN_CONFIRM": "DISARM-msr1"}), false, "confirm must be exactly UPGRADE-msr1"},
+		{"an upgrade of no host", up("-", env{"IN_HOST": "-", "IN_CONFIRM": "UPGRADE--"}), false, "names ONE host"},
+		{"an upgrade of all", up("all", nil), false, "names ONE host"},
+		{"a disarm is gated too", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1"}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
+		{"a listed disarm", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
+		{"a repair with its confirmation", base(env{"IN_MODE": "repair", "IN_HOST": "msr1", "IN_CONFIRM": "REPAIR-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
+		{"a repair with the upgrade confirmation", base(env{"IN_MODE": "repair", "IN_HOST": "msr1", "IN_CONFIRM": "UPGRADE-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REPAIR-msr1"},
+		{"a repair with an unknown action", base(env{"IN_MODE": "repair", "IN_HOST": "msr1", "IN_CONFIRM": "REPAIR-msr1", "ALLOWED_HOSTS": "msr1", "IN_REPAIR_ACTION": "rm-rf"}), false, "repair_action must be"},
+		{"an unknown mode", base(env{"IN_MODE": "dist-upgrade"}), false, "mode must be"},
+		{"template syntax in the reason", base(env{"IN_REASON": "x {{ lookup('pipe','id') }}"}), false, "must not contain braces"},
+		{"a brace in the reason", up("msr1", env{"IN_REASON": "x {% y"}), false, "must not contain braces"},
+		{"an empty reason", base(env{"IN_REASON": "   "}), false, "reason is empty"},
+		{"a long reason", base(env{"IN_REASON": strings.Repeat("a", 201)}), false, "longer than 200"},
+		{"a reason with a newline", base(env{"IN_REASON": "a\nb"}), false, "control characters"},
+		{"a branch ref", up("msr1", env{"REF": "refs/heads/feat/x"}), false, "dispatch from main only"},
+	} {
+		cmd := exec.Command(bash, "-c", script)
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+		for k, v := range c.env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		out, err := cmd.CombinedOutput()
+		if c.ok && err != nil {
+			t.Errorf("%s: refused: %s", c.name, out)
+		}
+		if !c.ok {
+			if err == nil {
+				t.Errorf("%s: accepted", c.name)
+			} else if !strings.Contains(string(out), c.msg) {
+				t.Errorf("%s: refused for another reason than %q: %s", c.name, c.msg, out)
+			}
+		}
 	}
 }

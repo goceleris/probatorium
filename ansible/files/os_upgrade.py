@@ -12,7 +12,7 @@ check that nothing was written):
     simulate          the JSON of `apt-get -s full-upgrade` (installs, removals, kept back) on the lists as they are
     dkms-check        (without --build) is the NEW kernel ready: modules, initrd, grub entry, signature, fallback
     dump WHAT         packages | policy | sysctl | cmdline | grub : plain text, for the evidence
-    upgrade-status    state of the detached apt run (running | done | none) and its exit code
+    upgrade-status    state of the detached apt run (running | done | died | none) and its exit code; --wait N waits on the host
     upgrade-log       the log of the detached apt run
     marker            the record of the last verified OS upgrade of this host ({} when none)
 
@@ -28,7 +28,13 @@ HOST-CHANGING subcommands (the upgrade mode only, in this order; each one is the
                                 out-of-tree r8127 for the same PCI id on the new kernel
     dkms-check --build          the check above, building the DKMS modules for the new kernel first when they are missing
     arm-oneshot                 grub-reboot <new kernel>: the next boot only; saved default stays the old kernel
-    make-permanent              grub-set-default <new kernel> and the marker: ONLY after the verification passed
+    disarm                      clears a pending one-shot (grub-editenv - unset next_entry): after any failure between
+                                arm-oneshot and the new kernel's boot, and as a mode of its own
+    make-permanent              grub-set-default <new kernel> and the marker: ONLY after the verification passed, and only on the
+                                host that RUNS that kernel
+    repair-start                (mode=repair) detached `dpkg --configure -a`, after purging the half-installed kernels newer than the
+                                running one when --action abort-new-kernel; upgrade-status/upgrade-log read it
+    upgrade-cleanup             removes OUR policy-rc.d once the detached run is over (never while its process is alive)
 
 Environment: OSU_ROOT is a test override, a prefix for every path read or written. Empty on a host.
 Exit 0 whatever a read found (a finding is data); 1 when a host-changing step could not do what it says.
@@ -53,6 +59,7 @@ DROPIN = "/etc/default/grub.d/99-celeris-os-upgrade.cfg"
 POLICY_RC_D = "/usr/sbin/policy-rc.d"
 MODPROBE_CONF = "/etc/modprobe.d/celeris-r8127.conf"
 READ_ONLY = False
+SBIN = "/usr/local/sbin:/usr/sbin:/sbin"
 
 PCI_REALTEK = "10ec"
 
@@ -94,6 +101,12 @@ def ro_allowed(a):
         return rest == ["--sb-state"]
     if n == "sysctl":
         return rest == ["-a"]
+    if n == "sshd":
+        return rest == ["-t"]
+    if n == "tailscaled":
+        return rest == ["--version"]
+    if n == "netplan":
+        return rest[:1] == ["generate"] and "--root-dir" in rest
     if n in ("gcc", "g++", "clang", "cmake", "make", "python3", "docker", "tailscale", "cc"):
         return rest == ["--version"]
     return False
@@ -105,6 +118,7 @@ def run(argv, timeout=600, env=None, check_ro=True):
         raise SystemExit("read-only violation: refusing to run " + " ".join(shlex.quote(x) for x in argv))
     e = dict(os.environ)
     e["LC_ALL"] = "C"
+    e["PATH"] = e.get("PATH", "") + os.pathsep + SBIN
     if env:
         e.update(env)
     try:
@@ -117,7 +131,7 @@ def run(argv, timeout=600, env=None, check_ro=True):
 
 
 def have(cmd):
-    return shutil.which(cmd) is not None
+    return shutil.which(cmd, path=os.environ.get("PATH", "") + os.pathsep + SBIN) is not None
 
 
 def write(path, content, mode=0o644):
@@ -582,6 +596,7 @@ def sources():
             continue
         for u in re.findall(r"^\s*deb(?:-src)?\s+(?:\[[^\]]*\]\s+)?(\S+)", text, re.M) + re.findall(r"^URIs:\s*(.+)$", text, re.M):
             for uri in u.split():
+                uri = re.sub(r"^(\w+://)[^/@]*@", r"\1", uri)  # these records are published: never a credential
                 host = re.sub(r"^\w+://", "", uri).split("/")[0]
                 official = bool(re.search(r"(^|\.)(ubuntu\.com|debian\.org|canonical\.com)$", host))
                 repos.append({"file": os.path.basename(f), "uri": uri, "official": official})
@@ -678,6 +693,70 @@ def marker():
 
 
 # ---------------------------------------------------------------------------------------------- survey
+NEW_KERNEL_PKG = re.compile(r"^linux-(?:image(?:-unsigned)?|modules(?:-extra)?|headers|tools)-(\d+\.\d+\.\d+-\d+)(?:-\S+)?$")
+
+
+def new_kernel_pkgs(running, broken_only=False):
+    """Installed (or half-installed) kernel packages of a kernel NEWER than the running one. With broken_only: only those of a
+    kernel version one of whose packages is not cleanly installed (the version a failed upgrade left behind), with ALL its
+    packages: a kernel that was installed before and works is not ours to remove."""
+    rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n", "linux-image-*", "linux-modules-*", "linux-headers-*", "linux-tools-*"])
+    by_version = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[-1] in ("not-installed", "config-files"):
+            continue
+        m = NEW_KERNEL_PKG.match(parts[0])
+        if m and kver_key(m.group(1) + "-generic") > kver_key(running):
+            by_version.setdefault(m.group(1), []).append((parts[0], parts[-1]))
+    names = []
+    for ver, pk in by_version.items():
+        if broken_only and all(st == "installed" for _, st in pk):
+            continue
+        names += [n for n, _ in pk]
+    return sorted(set(names))
+
+
+def access_problems():
+    """Read-only checks of the way in (ssh, tailscale, netplan): what BOTH kernels share and a power-cycle cannot undo."""
+    probs = []
+    if have("sshd"):
+        rc, _, err = run(["sshd", "-t"])
+        if rc != 0:
+            probs.append("sshd -t fails: " + err.strip()[-160:])
+    else:
+        probs.append("no sshd binary")
+    if not any(run(["systemctl", "is-enabled", u])[1].strip() in ("enabled", "static", "alias") for u in ("ssh", "ssh.socket", "sshd")):
+        probs.append("neither ssh.service nor ssh.socket is enabled")
+    if have("tailscaled"):
+        rc, _, err = run(["tailscaled", "--version"])
+        if rc != 0:
+            probs.append("the installed tailscaled does not run (--version): " + err.strip()[-120:])
+        if run(["systemctl", "is-enabled", "tailscaled"])[1].strip() != "enabled":
+            probs.append("tailscaled is not enabled")
+    if have("netplan") and os.path.isdir(p("/etc/netplan")):
+        t = tempfile.mkdtemp(prefix="osu-netplan-")
+        try:
+            shutil.copytree(p("/etc/netplan"), os.path.join(t, "etc", "netplan"))
+            rc, _, err = run(["netplan", "generate", "--root-dir", t])
+            if rc != 0:
+                probs.append("netplan generate fails on the installed configuration: " + err.strip()[-160:])
+        finally:
+            shutil.rmtree(t, ignore_errors=True)
+    return probs
+
+
+def blacklist_files():
+    out = []
+    for f in sorted(glob.glob(p("/etc/modprobe.d/*.conf"))):
+        try:
+            if re.search(r"^\s*(blacklist|install)\s+r8169\b", open(f, errors="replace").read(), re.M):
+                out.append(f)
+        except OSError:
+            pass
+    return out
+
+
 def survey():
     running = running_kernel()
     kernels = installed_kernels()
@@ -724,6 +803,9 @@ def survey():
             "package_processes": package_processes(),
             "dpkg_lock_held": dpkg_lock_held(),
             "policy_rc_d_present": os.path.exists(p(POLICY_RC_D)),
+            "policy_rc_d_ours": rd(POLICY_RC_D) == POLICY.strip(),
+            "new_kernel_pkgs": new_kernel_pkgs(running),
+            "broken_kernel_pkgs": new_kernel_pkgs(running, broken_only=True),
         },
         "unattended_upgrades": {
             "installed": bool(dpkg_version("unattended-upgrades")),
@@ -794,6 +876,13 @@ def dkms_check(running, target, build):
         # does the RUNNING kernel's r8169 list it too? Then the race (if any) exists today and works out as r8127
         "intree_lists_id_running": any("r8169" in pci_claims(running, i) for i in ids),
         "r8169_blacklisted": r8127_blacklisted(),
+        # the blacklist only holds in the initramfs when the initramfs was built after the blacklist file was written
+        "r8169_blacklist_in_initrd": bool(blacklist_files()) and all(
+            os.path.exists(p("/boot/initrd.img-%s" % target)) and os.path.getmtime(p("/boot/initrd.img-%s" % target)) >= os.path.getmtime(f)
+            for f in blacklist_files()),
+        "running_r8127_signer": modinfo(running, "r8127")["signer"],
+        "target_older_than_running": kver_key(target) < kver_key(running),
+        "access_problems": access_problems(),
         "secure_boot": boot_sb,
         "quiesce_hook": os.access(p("/usr/lib/systemd/system-shutdown/quiesce-r8127.shutdown"), os.X_OK),
         "target_entry_id": entry_id_for(entries, target),
@@ -828,21 +917,37 @@ def kernel_packages(kernel):
     return [l.split()[0] for l in out.splitlines() if l.endswith(" installed")]
 
 
+def unpin():
+    """Undo the drop-in of a pin that did not complete (best effort): the grub config goes back to what it was."""
+    try:
+        os.remove(p(DROPIN))
+    except OSError:
+        pass
+    run(["update-grub"], timeout=600)
+
+
 def cmd_pin_grub(a):
     running = a.running
     if not running:
         fail("--running is required")
-    # the evidence of what was there
+    settings, _ = grub_settings()
+    if settings.get("GRUB_SAVEDEFAULT", "") == "true":
+        fail("GRUB_SAVEDEFAULT=true: booting a one-shot entry would make it the saved default (nothing was written)")
     d = "%s/%s" % (STATE_DIR, a.run_id)
+    try:
+        return pin_grub_body(a, running, d)
+    except SystemExit:
+        unpin()  # a failed pin must not leave GRUB_DEFAULT=saved behind with a stale saved_entry
+        raise
+
+
+def pin_grub_body(a, running, d):
     cur = rd("/etc/default/grub")
     write(d + "/etc-default-grub.bak", cur + "\n")
     # GRUB_RECORDFAIL_TIMEOUT: after a failed boot a headless host must still come up on the saved (old) kernel
     # after a power-cycle, not wait at a menu for ever
     write(DROPIN, "# Managed by probatorium ansible/os-upgrade.yml (run %s): the saved entry is the boot default.\n"
           "GRUB_DEFAULT=saved\nGRUB_RECORDFAIL_TIMEOUT=5\n" % a.run_id)
-    settings, _ = grub_settings()
-    if settings.get("GRUB_SAVEDEFAULT", "") == "true":
-        fail("GRUB_SAVEDEFAULT=true: booting a one-shot entry would make it the saved default")
     rc, out, err = run(["update-grub"], timeout=600)
     if rc != 0:
         fail("update-grub failed: " + (out + err)[-300:])
@@ -887,25 +992,64 @@ def upgrade_paths(run_id):
     return d, d + "/apt-upgrade.log", d + "/apt-upgrade.rc"
 
 
-def cmd_upgrade_start(a):
-    d, log, rcf = upgrade_paths(a.run_id)
-    if os.path.exists(p(POLICY_RC_D)):
-        fail("%s exists already: not touching it" % POLICY_RC_D)
+def start_detached(run_id, subcmd, extra):
+    d, log, rcf = upgrade_paths(run_id)
+    if os.path.exists(p(POLICY_RC_D)) and rd(POLICY_RC_D) != POLICY.strip():
+        fail("%s exists already and is not ours: not touching it" % POLICY_RC_D)
     if os.path.exists(p(rcf)):
-        fail("an upgrade of run %s was started already" % a.run_id)
+        fail("a run %s was started already" % run_id)
     os.makedirs(p(d), exist_ok=True)
     # ansible.builtin.script runs a temporary copy of this file and deletes it when the task returns: the detached
     # half runs from a copy of its own, in a directory that stays
-    keep = "%s/%s/os_upgrade.py" % (STATE_DIR, a.run_id)
+    keep = "%s/%s/os_upgrade.py" % (STATE_DIR, run_id)
     os.makedirs(os.path.dirname(p(keep)), exist_ok=True)
     shutil.copyfile(os.path.abspath(__file__), p(keep))
     os.chmod(p(keep), 0o700)
     out = open(p(log), "w")
-    child = subprocess.Popen([sys.executable, p(keep), "_upgrade-run", "--run-id", a.run_id],
+    child = subprocess.Popen([sys.executable, p(keep), subcmd, "--run-id", run_id] + extra,
                              stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
                              cwd="/", env=dict(os.environ))
     write(d + "/apt-upgrade.pid", "%d\n" % child.pid)
     emit({"ok": True, "pid": child.pid, "log": log, "script": keep})
+
+
+def cmd_upgrade_start(a):
+    if os.path.exists(p(POLICY_RC_D)):
+        fail("%s exists already: not touching it" % POLICY_RC_D)
+    start_detached(a.run_id, "_upgrade-run", [])
+
+
+def cmd_repair_start(a):
+    start_detached(a.run_id, "_repair-run", ["--action", a.action])
+
+
+def cmd_repair_run(a):
+    """The detached half of mode=repair: dpkg --configure -a (and, for abort-new-kernel, the purge of the kernels newer than
+    the running one first), under the same policy-rc.d discipline as the upgrade."""
+    d, log, rcf = upgrade_paths(a.run_id)
+    rc = 1
+    try:
+        write(POLICY_RC_D, POLICY, 0o755)
+        steps = []
+        if a.action == "abort-new-kernel":
+            pk = new_kernel_pkgs(running_kernel(), broken_only=True)
+            if pk:
+                steps.append(["apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", "-o", "DPkg::Lock::Timeout=600",
+                              "remove", "--purge"] + pk)
+        steps.append(["dpkg", "--force-confold", "--configure", "-a"])
+        rc = 0
+        for argv in steps:
+            sys.stdout.write("+ " + " ".join(argv) + "\n")
+            sys.stdout.flush()
+            r = subprocess.run(argv, env=dict(os.environ, **APT_ENV, LC_ALL="C"), stdout=sys.stdout, stderr=subprocess.STDOUT)
+            if r.returncode != 0:
+                rc = r.returncode
+    finally:
+        try:
+            os.remove(p(POLICY_RC_D))
+        except OSError:
+            pass
+        write(rcf, "%d\n" % rc)
 
 
 def cmd_upgrade_run(a):
@@ -961,12 +1105,18 @@ def cmd_upgrade_status(a):
 
 
 def cmd_upgrade_cleanup(a):
-    """Removes OUR policy-rc.d if the detached run died before it could (never one that is not ours)."""
+    """Removes OUR policy-rc.d if the detached run is over (finished, or its process is gone) and did not remove it. Never
+    while the apt run is alive: a lost poll must not let the services restart under it. Never one that is not ours."""
+    d, log, rcf = upgrade_paths(a.run_id)
+    pid = int(rd(d + "/apt-upgrade.pid") or "0")
+    if not os.path.exists(p(rcf)) and pid and pid_alive(pid):
+        emit({"removed": False, "reason": "the apt run is still alive"})
+        return
     if rd(POLICY_RC_D) == POLICY.strip():
         os.remove(p(POLICY_RC_D))
         emit({"removed": True})
     else:
-        emit({"removed": False})
+        emit({"removed": False, "reason": "no policy-rc.d of ours"})
 
 
 def cmd_upgrade_log(a):
@@ -987,7 +1137,28 @@ def cmd_dkms_check(a):
     emit(dkms_check(a.running, a.target, a.build))
 
 
+def disarm():
+    """Clears a pending one-shot (grub's next_entry). Returns the JSON of what it found and did."""
+    env = grub_editenv()
+    before = env.get("next_entry", "")
+    rc, out, err = 0, "", ""
+    if before:
+        rc, out, err = run(["grub-editenv", "-", "unset", "next_entry"])
+    after = grub_editenv().get("next_entry", "")
+    return {"ok": rc == 0 and not after, "was_armed": bool(before), "next_entry_before": before, "next_entry_after": after,
+            "saved_entry": env.get("saved_entry", ""), "error": (out + err)[-300:] if rc != 0 else ""}
+
+
+def cmd_disarm(a):
+    r = disarm()
+    emit(r)
+    sys.exit(0 if r["ok"] else 1)
+
+
 def cmd_arm(a):
+    # an unattended upgrade that started since the check would be cut by the reboot
+    if package_processes() or dpkg_lock_held():
+        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % (", ".join(package_processes()) or "a dpkg lock is held"))
     rc, out, err = run(["update-grub"], timeout=600)
     if rc != 0:
         fail("update-grub failed: " + (out + err)[-300:])
@@ -1003,11 +1174,15 @@ def cmd_arm(a):
         fail("grub-reboot failed: " + (out + err)[-300:])
     env = grub_editenv()
     if env.get("saved_entry") != old or env.get("next_entry") != new:
-        fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and %r" % (env.get("saved_entry"), env.get("next_entry"), old, new))
+        d = disarm()  # never leave an unverified one-shot behind
+        fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and %r; one-shot disarmed: %s" % (
+            env.get("saved_entry"), env.get("next_entry"), old, new, d["ok"]))
     emit({"ok": True, "saved_entry": old, "next_entry": new, "running": a.running, "target": a.target})
 
 
 def cmd_make_permanent(a):
+    if running_kernel() != a.target:
+        fail("the host runs %s, not %s: refusing to make an unbooted kernel the default" % (running_kernel(), a.target))
     entries = grub_entries()
     eid = entry_id_for(entries, a.target)
     if not eid:
@@ -1017,7 +1192,8 @@ def cmd_make_permanent(a):
         fail("grub-set-default failed: " + (out + err)[-300:])
     env = grub_editenv()
     if env.get("saved_entry") != eid or env.get("next_entry"):
-        fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and no next_entry" % (env.get("saved_entry"), env.get("next_entry"), eid))
+        fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and no next_entry (the saved default is NOW %r)" % (
+            env.get("saved_entry"), env.get("next_entry"), eid, env.get("saved_entry")))
     rec = {"run_id": a.run_id, "host": rd("/etc/hostname"), "kernel_before": a.running, "kernel_after": a.target,
            "entry_id": eid, "permanent": True, "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     write(STATE_DIR + "/last-upgrade.json", json.dumps(rec, indent=1, sort_keys=True) + "\n")
@@ -1092,7 +1268,11 @@ def main():
     s.add_argument("what", choices=["packages", "policy", "sysctl", "cmdline", "grub"])
     st = add("upgrade-status", cmd_upgrade_status, "run-id")
     st.add_argument("--wait", type=int, default=0)
-    add("upgrade-cleanup", cmd_upgrade_cleanup)
+    add("upgrade-cleanup", cmd_upgrade_cleanup, "run-id")
+    rs = add("repair-start", cmd_repair_start, "run-id")
+    rs.add_argument("--action", choices=["configure", "abort-new-kernel"], default="configure")
+    rr = add("_repair-run", cmd_repair_run, "run-id")
+    rr.add_argument("--action", choices=["configure", "abort-new-kernel"], default="configure")
     add("upgrade-log", cmd_upgrade_log, "run-id")
     add("apt-update", cmd_apt_update)
     add("pin-grub", cmd_pin_grub, "running", "run-id")
@@ -1101,6 +1281,7 @@ def main():
     add("blacklist-r8169", cmd_blacklist, "run-id", "target")
     add("dkms-check", cmd_dkms_check, "running", "target", flags=("build",))
     add("arm-oneshot", cmd_arm, "running", "target")
+    add("disarm", cmd_disarm)
     add("make-permanent", cmd_make_permanent, "running", "target", "run-id")
     add("toolcheck", cmd_toolcheck)
     a = ap.parse_args()

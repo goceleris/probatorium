@@ -178,6 +178,12 @@ class Survey(Base):
         self.assertTrue(s["boot"]["cfg_uses_saved"])
         self.assertEqual(s["boot"]["default_kernel"], "7.0.0-31-generic")
 
+    def test_a_policy_rc_d_on_the_host_is_seen(self):
+        self.h.w("/usr/sbin/policy-rc.d", "#!/bin/sh\nexit 0\n", 0o755)
+        p = self.run_ok("survey")["packages"]
+        self.assertTrue(p["policy_rc_d_present"])
+        self.assertFalse(p["policy_rc_d_ours"])
+
     def test_busy_dpkg_and_broken_packages_are_seen(self):
         self.h.w("/proc/4242/comm", "unattended-upgr\n")
         self.h.state["audit"] = ["The following packages are only half configured:", " foo  a thing"]
@@ -448,14 +454,32 @@ class Upgrade(Base):
                 break
             time.sleep(0.2)
         self.assertEqual(st["state"], "died")
-        self.assertEqual(self.j(self.h.run("upgrade-cleanup"))["removed"], True)
+        self.assertEqual(self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))["removed"], True)
         self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
         # a policy-rc.d that is not ours is never removed
         self.h.w("/usr/sbin/policy-rc.d", "#!/bin/sh\nexit 0\n", 0o755)
-        self.assertEqual(self.j(self.h.run("upgrade-cleanup"))["removed"], False)
+        self.assertEqual(self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))["removed"], False)
         self.assertTrue(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
         subprocess_kill = [c for c in self.h.calls() if c.startswith("apt-get")]
         self.assertTrue(subprocess_kill)
+
+    def test_cleanup_never_removes_the_policy_while_apt_is_alive(self):
+        # a lost poll must not let the services restart under a running apt
+        self.h.state["upgrade_sleep"] = 20
+        self.h.save()
+        self.j(self.h.run("upgrade-start", "--run-id", "42"))
+        time.sleep(0.5)
+        c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+        self.assertEqual(c["removed"], False)
+        self.assertIn("still alive", c["reason"])
+        self.assertTrue(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+        # when the run is over it is the run itself that removes it
+        pid = int(open(self.h.root + "/var/log/celeris-os-upgrade/42/apt-upgrade.pid").read())
+        import signal
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+        c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+        self.assertEqual(c["removed"], True)
 
     def test_status_can_wait_on_the_host(self):
         self.h.save()
@@ -571,6 +595,15 @@ class DkmsCheck(Base):
         self.h.w("/boot/grub/grub.cfg", cfg_text("grub-arm64-efi.cfg"))
         self.assertEqual(self.check()["target_entry_id"], "")
 
+    def test_a_module_without_pci_aliases_is_reported(self):
+        self.after_upgrade()
+        self.h.state["dkms_build_ok"] = True
+        d = self.check()
+        self.assertTrue(d["r8127_aliases"])
+        self.h.load()  # the build of the first check registered the module
+        self.h.state["modinfo"]["7.0.0-40-generic/r8127"]["no_alias"] = True
+        self.assertFalse(self.check(build=False)["r8127_aliases"])
+
     def test_a_default_that_is_not_the_old_kernel(self):
         self.after_upgrade()
         self.h.state["grubenv"]["saved_entry"] = ID_40
@@ -609,6 +642,42 @@ class OneShotAndPermanent(DkmsCheck):
         self.assertEqual(r.returncode, 1)
         self.assertFalse(any(c.startswith("grub-reboot") for c in self.h.calls()))
 
+    def test_an_arming_that_reports_success_and_writes_nothing_is_not_trusted(self):
+        self.after_upgrade()
+        self.h.state["reboot_noop"] = True
+        self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
+        r = self.arm()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("grub-editenv:", r.stdout + r.stderr)
+
+    def test_an_arming_that_does_not_verify_is_disarmed(self):
+        self.after_upgrade()
+        self.h.state["reboot_sets_wrong"] = True
+        self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
+        r = self.arm()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("one-shot disarmed: True", r.stdout + r.stderr)
+        self.assertEqual(self.h.load()["grubenv"]["next_entry"], "")
+
+    def test_arming_into_a_running_package_run_is_refused(self):
+        self.after_upgrade()
+        self.h.w("/proc/4242/comm", "unattended-upgr\n")
+        self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
+        r = self.arm()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("dpkg or apt is busy", r.stdout + r.stderr)
+        self.assertFalse(any(c.startswith(("grub-reboot", "update-grub")) for c in self.h.calls()))
+
+    def test_disarm_clears_a_pending_one_shot_and_nothing_else(self):
+        self.after_upgrade()
+        self.h.state["grubenv"]["next_entry"] = ID_40
+        self.h.save()
+        d = self.j(self.h.run("disarm"))
+        self.assertEqual((d["ok"], d["was_armed"], d["next_entry_before"], d["next_entry_after"], d["saved_entry"]), (True, True, ID_40, "", ID_31))
+        d = self.j(self.h.run("disarm"))
+        self.assertEqual((d["ok"], d["was_armed"]), (True, False))
+        self.assertEqual(self.h.load()["grubenv"]["saved_entry"], ID_31)
+
     def test_make_permanent_refuses_while_the_one_shot_is_still_armed(self):
         self.after_upgrade()
         self.h.state["next_grub_cfg"] = self.h.root + "/boot/grub/grub.cfg"
@@ -621,6 +690,7 @@ class OneShotAndPermanent(DkmsCheck):
     def test_make_permanent_sets_the_new_default_and_writes_the_marker(self):
         self.after_upgrade()
         self.h.state["grubenv"]["next_entry"] = ""  # the one-shot was consumed by the boot
+        self.h.w("/proc/sys/kernel/osrelease", "7.0.0-40-generic\n")  # ... and the host runs the new kernel
         self.h.save()
         r = self.j(self.h.run("make-permanent", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic", "--run-id", "42"))
         self.assertTrue(r["permanent"])
@@ -628,6 +698,122 @@ class OneShotAndPermanent(DkmsCheck):
         m = self.j(self.h.run("marker"))
         self.assertEqual((m["kernel_before"], m["kernel_after"], m["run_id"], m["permanent"]), ("7.0.0-31-generic", "7.0.0-40-generic", "42", True))
         self.assertEqual(self.run_ok("survey")["marker"]["kernel_after"], "7.0.0-40-generic")
+
+
+class MakePermanentGuards(DkmsCheck):
+    def test_an_unbooted_kernel_is_never_made_the_default(self):
+        self.after_upgrade()
+        self.h.save()
+        r = self.h.run("make-permanent", "--running", "7.0.0-31-generic", "--target", "7.0.0-40-generic", "--run-id", "42")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("refusing to make an unbooted kernel the default", r.stdout + r.stderr)
+        self.assertEqual(self.h.load()["grubenv"]["saved_entry"], ID_31)
+
+
+class AccessAndInitrd(DkmsCheck):
+    def test_the_way_in_is_checked_on_the_upgraded_userland(self):
+        self.after_upgrade()
+        self.assertEqual(self.check()["access_problems"], [])
+        self.h.state["sshd_rc"] = 255
+        self.h.state["tailscaled_rc"] = 1
+        self.h.state["netplan_rc"] = 1
+        self.h.state["services"]["is-enabled ssh"] = "disabled"
+        probs = " | ".join(self.check()["access_problems"])
+        for want in ("sshd -t fails", "neither ssh.service nor ssh.socket is enabled", "tailscaled does not run", "netplan generate fails"):
+            self.assertIn(want, probs)
+
+    def test_an_older_target_is_flagged(self):
+        self.after_upgrade()
+        self.h.save()
+        d = self.j(self.h.run("dkms-check", "--running", "7.0.0-38-generic", "--target", "7.0.0-31-generic"))
+        self.assertTrue(d["target_older_than_running"])
+        self.assertFalse(self.check()["target_older_than_running"])
+
+    def test_a_blacklist_is_only_good_when_the_initramfs_was_built_after_it(self):
+        self.after_upgrade()
+        d = self.check()
+        self.assertFalse(d["r8169_blacklisted"])
+        self.assertFalse(d["r8169_blacklist_in_initrd"])
+        self.h.w("/etc/modprobe.d/celeris-r8127.conf", "blacklist r8169\n")
+        d = self.check()
+        self.assertTrue(d["r8169_blacklisted"])
+        os.utime(self.h.root + "/boot/initrd.img-7.0.0-40-generic", (1, 1))  # an initramfs older than the blacklist
+        self.assertFalse(self.check()["r8169_blacklist_in_initrd"])
+        os.utime(self.h.root + "/boot/initrd.img-7.0.0-40-generic", None)
+        self.assertTrue(self.check()["r8169_blacklist_in_initrd"])
+
+    def test_running_signer_is_reported(self):
+        self.after_upgrade()
+        self.h.state["modinfo"]["7.0.0-31-generic/r8127"]["signer"] = "Albert MOK"
+        self.assertEqual(self.check()["running_r8127_signer"], "Albert MOK")
+
+    def test_apt_sources_never_publish_a_credential(self):
+        self.h.w("/etc/apt/sources.list.d/private.list", "deb https://user:secret@repo.example.com/apt stable main\n")
+        s = self.run_ok("survey")
+        uris = [r["uri"] for r in s["packages"]["repos"]]
+        self.assertIn("https://repo.example.com/apt", uris)
+        self.assertNotIn("secret", json.dumps(s))
+
+
+class Repair(Base):
+    def broken(self):
+        self.h.state["upgrade_kernels"] = ["7.0.0-40-generic"]
+        for pk, st in (("linux-image-7.0.0-40-generic", "installed"), ("linux-headers-7.0.0-40-generic", "half-configured"), ("linux-modules-7.0.0-40-generic", "installed")):
+            self.h.state["packages"][pk] = {"version": "7.0.0-40", "status": st}
+        self.h.state["audit"] = ["linux-headers-7.0.0-40-generic  half-configured"]
+        self.h.state["dkms_status"] = ["r8127/11.015.00, 7.0.0-31-generic, aarch64: installed"]
+
+    def wait(self):
+        end = time.time() + 20
+        while time.time() < end:
+            st = self.j(self.h.run("upgrade-status", "--run-id", "9"))
+            if st["state"] == "done":
+                return st
+            time.sleep(0.1)
+        self.fail("the repair did not finish")
+
+    def test_survey_lists_the_kernel_packages_newer_than_the_running_kernel(self):
+        self.broken()
+        s = self.run_ok("survey")
+        self.assertEqual(s["packages"]["new_kernel_pkgs"], ["linux-headers-7.0.0-40-generic", "linux-image-7.0.0-38-generic", "linux-image-7.0.0-40-generic", "linux-modules-7.0.0-40-generic"])
+        # only the version a failed upgrade left half-installed is ours to abort; the -38 that was installed and working is not
+        self.assertEqual(s["packages"]["broken_kernel_pkgs"], ["linux-headers-7.0.0-40-generic", "linux-image-7.0.0-40-generic", "linux-modules-7.0.0-40-generic"])
+        self.assertEqual(len(s["packages"]["dpkg_audit"]), 1)
+        self.assertFalse(s["packages"]["policy_rc_d_ours"])
+
+    def test_configure_runs_dpkg_configure_detached_and_removes_the_policy(self):
+        self.broken()
+        self.h.state["configure_ok"] = True
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "configure"))
+        self.assertEqual(self.wait()["rc"], 0)
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+        self.assertEqual(self.h.load()["audit"], [])
+        self.assertIn("dpkg --force-confold --configure -a", self.h.calls())
+        self.assertFalse(any(c.startswith("apt-get") and "remove" in c for c in self.h.calls()))
+
+    def test_a_configure_that_keeps_failing_is_reported(self):
+        self.broken()
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "configure"))
+        self.assertEqual(self.wait()["rc"], 1)
+        self.assertEqual(len(self.h.load()["audit"]), 1)
+
+    def test_abort_purges_only_the_kernels_newer_than_the_running_one(self):
+        self.broken()
+        self.h.state["configure_ok"] = True
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "abort-new-kernel"))
+        self.assertEqual(self.wait()["rc"], 0)
+        pk = self.h.load()["packages"]
+        self.assertNotIn("linux-image-7.0.0-40-generic", pk)
+        self.assertNotIn("linux-headers-7.0.0-40-generic", pk)
+        self.assertIn("linux-image-7.0.0-31-generic", pk)  # the running kernel stays
+        self.assertIn("linux-image-7.0.0-38-generic", pk)  # an older one stays
+        removes = [c for c in self.h.calls() if c.startswith("apt-get") and "remove" in c]
+        self.assertEqual(len(removes), 1)
+        self.assertNotIn("7.0.0-31", removes[0])
+        self.assertNotIn("7.0.0-38", removes[0])
 
 
 class Toolcheck(Base):

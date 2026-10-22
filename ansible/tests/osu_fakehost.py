@@ -16,7 +16,7 @@ FIXTURES = os.path.join(HERE, "fixtures")
 
 COMMANDS = ["dpkg-query", "dpkg", "apt-get", "apt-mark", "apt-config", "apt-cache", "modinfo", "dkms", "grub-editenv",
             "grub-set-default", "grub-reboot", "update-grub", "update-initramfs", "findmnt", "df", "timedatectl", "systemctl",
-            "sysctl", "cc", "curl", "mokutil", "gcc", "make", "ip", "ping"]
+            "sysctl", "cc", "curl", "mokutil", "gcc", "make", "ip", "ping", "sshd", "tailscaled", "netplan"]
 
 STUB = r'''#!__PYTHON__
 import fnmatch, json, os, sys, time, shutil
@@ -83,6 +83,14 @@ if name == "dpkg-query":
             .replace("${Architecture}", "arm64").replace("${db:Status-Abbrev}", "ii "))
     sys.exit(0 if found or not pats else 1)
 if name == "dpkg":
+    if "--configure" in args:
+        if st.get("configure_ok") or not st.get("audit"):
+            st["audit"] = []
+            for n in pkgs():
+                if pkgs()[n].get("status") != "installed":
+                    pkgs()[n]["status"] = "installed"
+            save(); sys.exit(0)
+        sys.stderr.write("dpkg: error processing package linux-headers (--configure): dkms build failed\n"); sys.exit(1)
     if args[:1] == ["--audit"]:
         out("\n".join(st.get("audit", [])) + ("\n" if st.get("audit") else "")); sys.exit(0)
     if args[:1] == ["-S"]:
@@ -94,6 +102,23 @@ if name == "apt-get":
         out("\n".join(st.get("sim_phased" if any("Always-Include-Phased" in a for a in args) else "sim", [])) + "\n"); sys.exit(st.get("sim_rc", 0))
     if "update" in args:
         out("Hit:1 http://ports.ubuntu.com resolute InRelease\nReading package lists...\n"); sys.exit(st.get("update_rc", 0))
+    if "remove" in args:
+        names = args[args.index("--purge") + 1:] if "--purge" in args else []
+        out("Removing: %s\n" % " ".join(names))
+        for n in names:
+            pkgs().pop(n, None)
+            if n.startswith("linux-image-"):
+                k = n[len("linux-image-"):]
+                for pth in ("/boot/vmlinuz-" + k, "/boot/initrd.img-" + k):
+                    try:
+                        os.remove(root + pth)
+                    except OSError:
+                        pass
+        if st.get("abort_clears_audit", True):
+            st["audit"] = []
+        if st.get("grub_template"):
+            regen()
+        save(); sys.exit(0)
     if "full-upgrade" in args:
         out("policy-rc.d present: %s\n" % os.path.exists(root + "/usr/sbin/policy-rc.d"))
         out("env: %s %s %s\n" % (os.environ.get("DEBIAN_FRONTEND"), os.environ.get("NEEDRESTART_MODE"), os.environ.get("UCF_FORCE_CONFFOLD")))
@@ -101,6 +126,8 @@ if name == "apt-get":
         time.sleep(float(st.get("upgrade_sleep", 0.3)))
         for n, v in st.get("upgrade_adds", {}).items():
             pkgs()[n] = {"version": v, "status": "installed"}
+        if st.get("upgrade_audit"):
+            st["audit"] = st["upgrade_audit"]
         for k in st.get("upgrade_kernels", []):
             os.makedirs(root + "/boot", exist_ok=True)
             open(root + "/boot/vmlinuz-" + k, "w").close()
@@ -110,10 +137,15 @@ if name == "apt-get":
             open(root + "/lib/modules/" + k + "/modules.alias", "w").write(
                 ("alias pci:v000010ECd00008127sv*sd*bc*sc*i* r8169\n" if st.get("new_kernel_alias_races") else "") + "alias pci:v000010ECd00008127sv*sd*bc*sc*i* r8127\n")
             st["modinfo"][k + "/r8169"] = {"filename": "/lib/modules/" + k + "/kernel/r8169.ko.zst"}
+            pkgs()["linux-modules-" + k] = {"version": k, "status": "installed"}
+            pkgs()["linux-headers-" + k] = {"version": k, "status": "half-configured" if st.get("upgrade_audit") else "installed"}
             pkgs()["linux-image-" + k] = {"version": k, "status": "installed"}
         if st.get("upgrade_kernels"):
             regen()
         save()
+        if st.get("upgrade_dies"):
+            os.kill(os.getppid(), 9)  # the detached run is killed mid-apt (OOM, power): no rc file, no policy-rc.d removal
+            time.sleep(1)
         sys.exit(st.get("upgrade_rc", 0))
 if name == "apt-mark":
     if args[:1] == ["showhold"]:
@@ -133,7 +165,7 @@ if name == "modinfo":
     f = args[args.index("-F") + 1]
     v = d.get(f, "")
     if f == "alias":
-        v = "pci:v000010ECd00008127sv*sd*bc*sc*i*" if d.get("filename") else ""
+        v = "pci:v000010ECd00008127sv*sd*bc*sc*i*" if (d.get("filename") and not d.get("no_alias")) else ""
     out(v + "\n"); sys.exit(0)
 if name == "dkms":
     if args[:1] == ["status"]:
@@ -148,15 +180,23 @@ if name == "dkms":
             save(); sys.exit(0)
         save(); sys.stderr.write("Error! Bad return status for module build\n"); sys.exit(10)
 if name == "grub-editenv":
+    if args[:2] == ["-", "unset"]:
+        for k in args[2:]:
+            st["grubenv"][k] = ""
+        save(); sys.exit(0)
     if args[-1:] == ["list"]:
         out("".join("%s=%s\n" % kv for kv in st["grubenv"].items() if kv[1] != "")); sys.exit(0)
 if name == "grub-set-default":
     st["grubenv"]["saved_entry"] = args[0]; save(); sys.exit(st.get("set_default_rc", 0))
 if name == "grub-reboot":
-    st["grubenv"]["next_entry"] = args[0]; save(); sys.exit(0)
+    if st.get("reboot_noop"):
+        sys.exit(0)  # reports success and writes nothing
+    st["grubenv"]["next_entry"] = "wrong-entry" if st.get("reboot_sets_wrong") else args[0]; save(); sys.exit(0)
 if name == "update-grub":
     sys.exit(regen())
 if name == "update-initramfs":
+    if "-k" in args and os.path.exists(root + "/boot/initrd.img-" + args[args.index("-k") + 1]):
+        os.utime(root + "/boot/initrd.img-" + args[args.index("-k") + 1], None)  # rebuilt now
     sys.exit(st.get("initramfs_rc", 0))
 if name == "findmnt":
     out((st["boot_fs"] if "FSTYPE" in args else st.get("boot_uuid", "") if "UUID" in args else st["boot_src"]) + "\n"); sys.exit(0)
@@ -193,6 +233,13 @@ if name in ("cc", "gcc"):
     sys.exit(st.get("cc_rc", 0))
 if name == "curl":
     sys.exit(st.get("curl_rc", {}).get(args[-1].replace("https://", ""), 0))
+if name == "sshd":
+    sys.exit(st.get("sshd_rc", 0))
+if name == "tailscaled":
+    out("1.90.0\n"); sys.exit(st.get("tailscaled_rc", 0))
+if name == "netplan":
+    sys.stderr.write("netplan: invalid configuration\n") if st.get("netplan_rc", 0) else None
+    sys.exit(st.get("netplan_rc", 0))
 if name == "mokutil":
     out("SecureBoot %s\n" % st.get("sb", "disabled")); sys.exit(0)
 if name == "make":
@@ -285,6 +332,7 @@ class FakeHost:
         self.w("/etc/modprobe.d/blacklist.conf", "# nothing\n")
         self.build_snapshot_tree()
         self.build_boot_proof()
+        self.w("/etc/netplan/50-cloud-init.yaml", "network:\n  version: 2\n")
         pk = {"linux-image-" + k: {"version": k, "status": "installed"} for k in self.kernels}
         pk.update({"linux-modules-" + self.running: {"version": self.running, "status": "installed"},
                    "linux-headers-" + self.running: {"version": self.running, "status": "installed"},
@@ -307,7 +355,7 @@ class FakeHost:
                    "/boot/efi": {"total": 500000, "free": 480000}, "/var": {"total": 500000000, "free": 300000000}},
             "ntp": "yes",
             "services": {"is-active unattended-upgrades.service": "active", "is-enabled unattended-upgrades.service": "enabled",
-                         "is-active tailscaled": "active", "is-enabled tailscaled": "enabled", "is-active apcupsd": "active",
+                         "is-active tailscaled": "active", "is-enabled tailscaled": "enabled", "is-enabled ssh": "enabled", "is-active apcupsd": "active",
                          "is-enabled celeris-resume-check.service": "enabled"},
             "sim": ["Inst linux-image-7.0.0-40-generic (7.0.0-40.40 Ubuntu:26.04/resolute-updates [arm64])",
                     "Inst libc6 [2.43-0ubuntu1] (2.43-0ubuntu2 Ubuntu:26.04/resolute-updates [arm64])",

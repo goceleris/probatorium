@@ -112,6 +112,58 @@ if [ "$mode" = survey ]; then
 	exit 0
 fi
 
+# ---------------------------------------------------------------- disarm
+if [ "$mode" = disarm ]; then
+	d=$out/$host
+	if [ "$rc" -eq 0 ] && [ -s "$d/result.json" ]; then echo "- **result: DISARMED**"; else echo "- **result: NOT DISARMED** (ansible-playbook exit $rc)"; fi
+	echo
+	if [ -s "$d/disarm.json" ]; then
+		jq -r '"- one-shot pending before: `\(.next_entry_before)` (was armed: \(.was_armed)); after: `\(.next_entry_after)`; grub saved default: `\(.saved_entry)`"' "$d/disarm.json"
+	fi
+	if [ -s "$d/result.json" ]; then
+		jq -r '"- running kernel `\(.kernel_running)`; saved default `\(.saved_entry)`; \(.power_cycle)"' "$d/result.json"
+	fi
+	echo "- Disarming clears only grub's next_entry. It does not touch the saved default, the packages or the running kernel. If the host did not answer, nothing was cleared: it is down, and a power-cycle boots whatever next_entry names (the NEW kernel, once) before the saved default."
+	for r in "$out"/*/refusal.txt; do
+		[ -s "$r" ] || continue
+		echo
+		echo "### Refused: $(basename "$(dirname "$r")")"
+		echo
+		echo '```'
+		cat "$r"
+		echo '```'
+	done
+	exit 0
+fi
+
+# ---------------------------------------------------------------- repair
+if [ "$mode" = repair ]; then
+	d=$out/$host
+	if [ "$rc" -eq 0 ] && [ "$(jq -r '.status // ""' "$d/result.json" 2> /dev/null)" = repaired ]; then echo "- **result: REPAIRED**"; else echo "- **result: NOT REPAIRED** (ansible-playbook exit $rc)"; fi
+	echo
+	if [ -s "$d/result.json" ]; then
+		jq -r '"- action `\(.repair_action)`; running kernel `\(.kernel_running)` (not rebooted); grub saved default `\(.saved_entry)`; one-shot pending: `\(.next_entry_after)`",
+			"- dpkg --audit after: \(.dpkg_audit_after | length) finding(s) \(.dpkg_audit_after | join(" / ")); kernel packages newer than the running kernel still installed: \(.new_kernel_pkgs_after | join(", ") | if . == "" then "none" else . end)"' "$d/result.json"
+	fi
+	echo "- mode=repair never reboots and never touches grub's saved default. \`configure\` runs \`dpkg --configure -a\`; \`abort-new-kernel\` first purges the kernel versions newer than the running one that a failed upgrade left half-installed, so the host stays on the old kernel (a kernel installed and working before is never removed). If \`configure\` fails again because a DKMS module (r8127) does not build for the new kernel, the campaign cannot move this host to that kernel until the module builds: dispatch \`abort-new-kernel\`."
+	if [ -s "$d/repair.log" ]; then
+		echo
+		echo '```'
+		tail -n 30 "$d/repair.log"
+		echo '```'
+	fi
+	for r in "$out"/*/refusal.txt; do
+		[ -s "$r" ] || continue
+		echo
+		echo "### Refused: $(basename "$(dirname "$r")")"
+		echo
+		echo '```'
+		cat "$r"
+		echo '```'
+	done
+	exit 0
+fi
+
 # ---------------------------------------------------------------- upgrade
 d=$out/$host
 pre=$d/pre-snapshot.json
@@ -120,14 +172,23 @@ phase=$(cat "$d/phase.txt" 2> /dev/null || echo "none (the play never started on
 phase=${phase//$'\n'/}
 echo "- last phase reached: \`$phase\` (preflight-ok, pinned, upgrading, upgraded, dkms-ok, rebooting, returned, verified, permanent)"
 if [ "$rc" -eq 0 ] && [ "$phase" = permanent ]; then
-	echo "- **result: UPGRADED, VERIFIED, NEW KERNEL IS NOW THE DEFAULT**"
+	if [ "$(jq -r '.kernel_before == .kernel_after' "$d/result.json" 2> /dev/null)" = true ]; then
+		echo "- **result: UPGRADED AND VERIFIED; no new kernel was installed, the running kernel stays the default**"
+	else
+		echo "- **result: UPGRADED, VERIFIED, NEW KERNEL IS NOW THE DEFAULT**"
+	fi
 else
 	echo "- **result: NOT COMPLETE** (ansible-playbook exit $rc)"
 fi
 
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+	echo "- **ansible-playbook was killed by its overall timeout (exit $rc) in phase \`$phase\`.** The host may be slow, not dead: do not power-cycle on this alone; survey first."
+fi
 # What the person must do. Exact, by how far the run got.
 echo
 echo "### Power-cycle and recovery: what a person must do"
+echo
+echo "> A power-cycle changes **which kernel boots**. It restores nothing else: a regression in what both kernels share (bootloader, ssh, tailscale, netplan, systemd, firmware) is not undone by it, and the host would then need its console."
 echo
 case "$phase" in
 permanent)
@@ -137,15 +198,37 @@ verified)
 	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED (see the log). grub's saved default is still the OLD kernel, so a reboot returns to it. Either accept the new kernel as the default by a reviewed change that runs grub-set-default for it, or reboot back with the cluster-reboot workflow (red with 'kernel changed', expected) and dispatch the upgrade again. The upgrade REFUSES to run while the host runs a kernel other than grub's saved default."
 	;;
 returned)
-	echo "- Power-cycle: **not needed**. $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. Reboot it back with the cluster-reboot workflow: it returns to the old kernel and ends red with 'kernel changed', which is expected here. Do NOT dispatch the upgrade again before that: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
+	echo "- Power-cycle: **not needed while $host answers** (if it stops answering later, read the 'rebooting' case: the one-shot is consumed by now, so a power-cycle boots the OLD kernel). $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. Reboot it back with the cluster-reboot workflow: it returns to the old kernel and ends red with 'kernel changed', which is expected here. Do NOT dispatch the upgrade again before that: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
 	;;
 rebooting)
-	echo "- Power-cycle: **YES, if and only if $host does not answer.** The reboot was issued and the host did not answer over the tailnet within the timeout (15 minutes). It may be down (msr1 has a documented shutdown panic in the r8127 driver, ops/power/quiesce-r8127.shutdown, that needs a PHYSICAL power-cycle), hung, or UP without a NIC (the new kernel's r8127 did not load). **Ask the maintainer to power-cycle $host physically** (not a soft reboot). The next boot takes grub's saved default, the OLD kernel (the one-shot was consumed by the first boot of the new kernel, or never used). Then dispatch a survey to see which kernel it runs. Do not dispatch anything else on $host until it answers."
+	st=$(jq -r '.status // ""' "$d/result.json" 2> /dev/null)
+	case "$st" in
+	failed-before-boot-disarmed)
+		echo "- Power-cycle: **not needed**. The run failed after arming the one-shot and before the new kernel booted; $host answered and the one-shot was CLEARED (disarm). The old kernel runs and is the default."
+		;;
+	failed-new-kernel-may-have-booted)
+		echo "- Power-cycle: **not needed yet**. The run failed after arming, but no one-shot is pending any more: grub consumed it, so the NEW kernel has probably booted (slowly) and $host answers. Dispatch a survey before anything else."
+		;;
+	*)
+		echo "- Power-cycle: **YES if $host stays silent, and what it boots depends on why.** The reboot was issued (or about to be) and the host did not answer within the timeout; it could not be asked to clear the one-shot."
+		echo "  1. The NEW kernel booted and has no network: grub already consumed the one-shot, so a power-cycle boots the saved default, the OLD kernel."
+		echo "  2. The OLD kernel hung or panicked while shutting down (msr1 has a documented r8127 power-off panic, ops/power/quiesce-r8127.shutdown), or the reboot was never issued and the host is unreachable for another reason: the one-shot is **STILL ARMED**, so the next boot after the power-cycle is the **NEW kernel**, once; if that fails too, a second power-cycle boots the OLD kernel."
+		echo "  3. The host is only slow (a run killed by its timeout reads the same): wait, then survey."
+		echo "  After the power-cycle, dispatch a survey: \`kernel\` and \`boot.next_entry\` say which case it was; \`mode=disarm\` clears a one-shot that is still armed. **A power-cycle restores the choice of kernel only**: if the upgrade broke what both kernels share (bootloader, ssh, tailscale, netplan, firmware), it restores nothing and the host needs its console. **Ask the maintainer to power-cycle $host physically** only when it is silent."
+		;;
+	esac
 	;;
 upgrading)
 	echo "- Power-cycle: **not needed**. Nothing was rebooted (upgrading). The apt run is DETACHED on the host: if this run lost its poll, apt may still be running. Dispatch a survey and wait until its \`package_processes\` is empty before anything else. The old kernel is still running and is grub's saved default."
 	;;
-none* | preflight-ok | pinned | upgraded | dkms-ok)
+dkms-ok)
+	if [ -s "$d/arm.json" ]; then
+		echo "- Power-cycle: **not needed**, nothing was rebooted. But the arming step ran ($(jq -r '"next_entry `" + .next_entry + "`"' "$d/arm.json")): if the run failed before the reboot step and could not clear it, the one-shot may be STILL ARMED. Dispatch **mode=disarm** for $host (it is a no-op when nothing is pending)."
+	else
+		echo "- Power-cycle: **not needed**. Nothing was rebooted (dkms-ok) and no one-shot was armed. The old kernel is still running and is grub's saved default."
+	fi
+	;;
+none* | preflight-ok | pinned | upgraded)
 	echo "- Power-cycle: **not needed**. Nothing was rebooted ($phase). The old kernel is still running and is still grub's default (from phase \`pinned\` on, it is pinned as the saved default)."
 	;;
 esac

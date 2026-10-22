@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stands in for the machine restarting in the tests of ansible/os-upgrade.yml: what grub would boot (the one-shot
 entry if next_entry is set, which grub then clears; else the saved entry) becomes the running kernel, the boot id
-changes and the interrupt counters reset. BOOT_MODE: ok | ignore-next (the new kernel fails early: grub falls back
+changes and the interrupt counters reset. BOOT_MODE: not-issued (the reboot never happens, the host stays up) | ok | ignore-next (the new kernel fails early: grub falls back
 to the saved entry) | no-nic (the new kernel boots without enp1s0) | hang (the host never answers: exit 1).
 
     osu_fake_reboot.py ROOT STATE_DIR
@@ -19,12 +19,23 @@ import os_upgrade as osu  # noqa: E402
 
 osu.ROOT = root
 mode = os.environ.get("BOOT_MODE", "ok")
+if mode == "not-issued":
+    sys.stderr.write("the reboot was not issued (test): the host is up on its old boot\n")
+    sys.exit(1)
 with open(os.path.join(state_dir, "argv.log"), "a") as f:
     f.write("FAKE-REBOOT\n")
 if mode == "hang":
+    open(os.path.join(state_dir, "down"), "w").close()  # every later command on the host fails, as on a dead host
     sys.stderr.write("the host did not come back (test)\n")
     sys.exit(1)
 sp = os.path.join(state_dir, "state.json")
+if mode == "stale-first":
+    # the host answers ssh before it has finished booting: the first snapshots still show the OLD boot
+    import shutil
+    shutil.rmtree(os.path.join(state_dir, "stale_root"), ignore_errors=True)
+    shutil.copytree(root, os.path.join(state_dir, "stale_root"), symlinks=True)
+    with open(os.path.join(state_dir, "stale_count"), "w") as f:
+        f.write("1\n")
 with open(sp) as f:
     st = json.load(f)
 with open(root + "/boot/grub/grub.cfg") as f:

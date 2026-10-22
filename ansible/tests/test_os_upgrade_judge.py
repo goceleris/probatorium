@@ -122,13 +122,15 @@ PLAY = """
     os_loadgen_hosts: [msa2-client]
   tasks:
     - ansible.builtin.copy:
-        content: "{{{{ {{'refusals': refusals_str | trim, 'plan': plan_refusals_str | trim, 'prereboot': pre_reboot_problems_str | trim, 'post': post_problems_str | trim}} | to_json }}}}"
+        content: "{{{{ {{'refusals': refusals_str | trim, 'plan': plan_refusals_str | trim, 'prereboot': pre_reboot_problems_str | trim, 'post': post_problems_str | trim, 'maint': maint_refusals_str | trim}} | to_json }}}}"
         dest: "{{{{ out_dir }}}}/{{{{ item.key }}}}.json"
       loop: "{{{{ cases | dict2items }}}}"
       loop_control:
         label: "{{{{ item.key }}}}"
       vars:
         os_host: "{{{{ item.value.os_host }}}}"
+        os_mode: "{{{{ item.value.os_mode | default('upgrade') }}}}"
+        repair_action: "{{{{ item.value.repair_action | default('configure') }}}}"
         blacklist_r8169: "{{{{ item.value.blacklist_r8169 | default(false) }}}}"
         pre_toolcheck: "{{{{ item.value.pre_toolcheck }}}}"
         allow_results_loss: "{{{{ item.value.allow_results_loss }}}}"
@@ -164,6 +166,10 @@ def judge_all(cases):
         return out
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+if os.environ.get("CI") == "true" and ANSIBLE is None:
+    raise SystemExit("CI=true: this suite needs ansible-playbook and must not skip itself (a broken ansible install would read as green)")
 
 
 @unittest.skipIf(ANSIBLE is None, "ansible-playbook not installed")
@@ -254,6 +260,30 @@ class Judge(unittest.TestCase):
         case("blacklist_with_an_r8169_nic", {"refusals": "blacklist_r8169=true, but a NIC is bound to r8169 (enp1s0)"}, r8169_nic)
         case("blacklist_without_an_r8169_nic", {}, lambda c: c.update(blacklist_r8169=True))
 
+        # ---- mode=repair / mode=disarm
+        def repair(action="configure", **kw):
+            def m(c):
+                c.update(os_mode="repair", repair_action=action)
+                c["pre_survey"]["packages"].update(dpkg_audit=["linux-headers half-configured"], broken_kernel_pkgs=["linux-headers-7.0.0-40-generic"], new_kernel_pkgs=["linux-headers-7.0.0-40-generic"])
+                c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic")
+                for k, v in kw.items():
+                    section, key = k.split("__")
+                    (c["pre_target"] if section == "t" else c["pre_survey"]["packages"] if section == "p" else c["pre_survey"]["boot"]).update({key: v})
+            return m
+        case("repair_ok", {}, repair())
+        case("repair_abort_ok", {}, repair("abort-new-kernel"))
+        case("repair_beside_a_bench", {"maint": "a bench or validation manifest exists"}, repair(t__manifest_present=True))
+        case("repair_beside_a_runner_job", {"maint": "1 runner job(s) are executing"}, repair(t__runner_workers=1))
+        case("repair_into_a_running_apt", {"maint": "dpkg or apt is busy (apt)"}, repair(p__package_processes=["apt"]))
+        case("repair_with_a_one_shot_pending", {"maint": "dispatch mode=disarm first"}, repair(b__next_entry="gnulinux-x"))
+        case("repair_with_a_foreign_policy_rc_d", {"maint": "is not the one this workflow writes"}, repair(p__policy_rc_d_present=True, p__policy_rc_d_ours=False))
+        case("repair_with_our_leftover_policy_rc_d", {}, repair(p__policy_rc_d_present=True, p__policy_rc_d_ours=True))
+        case("repair_nothing_to_configure", {"maint": "nothing to repair: dpkg --audit is clean"}, repair(p__dpkg_audit=[]))
+        case("abort_nothing_broken", {"maint": "nothing to abort"}, repair("abort-new-kernel", p__broken_kernel_pkgs=[]))
+        case("abort_with_the_default_not_the_running_kernel", {"maint": "removing kernels could change what boots"}, repair("abort-new-kernel", b__default_kernel="7.0.0-40-generic"))
+        case("abort_without_the_pin", {"maint": "removing kernels could change what boots"}, repair("abort-new-kernel", b__dropin_present=False))
+        case("disarm_has_no_refusals", {}, lambda c: c.update(os_mode="disarm"))
+
         # ---- the plan
         case("plan_removes_a_kernel", {"plan": "would REMOVE protected package(s): linux-image-7.0.0-31-generic"},
              lambda c: c["sim"].update(remv=["linux-image-7.0.0-31-generic", "libfoo"]))
@@ -279,14 +309,29 @@ class Judge(unittest.TestCase):
              lambda c: c["dkms_check"].update(nic_drivers_missing=["r8127"]))
         case("r8127_not_built", {"prereboot": "r8127 is NOT built for 7.0.0-40-generic"}, lambda c: c["dkms_check"]["r8127"].update(found=False))
         case("r8127_no_aliases", {"prereboot": "no PCI aliases"}, lambda c: c["dkms_check"].update(r8127_aliases=False))
-        case("secure_boot_unsigned", {"prereboot": "Secure Boot is enabled and the r8127 module"},
+        case("secure_boot_unsigned", {"prereboot": "Secure Boot is enabled and the r8127 module of 7.0.0-40-generic is not signed by the key"},
              lambda c: c["dkms_check"].update(secure_boot="enabled") or c["dkms_check"]["r8127"].update(signer=""))
         case("secure_boot_signed", {}, lambda c: c["dkms_check"].update(secure_boot="enabled"))
         case("target_hook_missing", {"prereboot": "shutdown quiesce hook of the r8127 NIC is missing"}, lambda c: c["dkms_check"].update(quiesce_hook=False))
-        case("intree_races_r8127", {"prereboot": "in-tree r8169 of 7.0.0-40-generic lists the same PCI id as r8127 (the running kernel does not)"},
-             lambda c: c["dkms_check"].update(intree_lists_id=True, intree_lists_id_running=False, r8169_blacklisted=False))
-        case("intree_lists_it_on_the_running_kernel_too", {}, lambda c: c["dkms_check"].update(intree_lists_id=True, intree_lists_id_running=True, r8169_blacklisted=False))
-        case("intree_but_blacklisted", {}, lambda c: c["dkms_check"].update(intree_lists_id=True, intree_lists_id_running=False, r8169_blacklisted=True))
+        RACE = "in-tree r8169 of 7.0.0-40-generic lists the same PCI id as r8127 and r8169 is not blacklisted in the new kernel initramfs as well"
+        case("intree_races_r8127", {"prereboot": RACE},
+             lambda c: c["dkms_check"].update(intree_lists_id=True, intree_lists_id_running=False, r8169_blacklisted=False, r8169_blacklist_in_initrd=False))
+        # the old exemption is gone: a running kernel whose r8169 also lists the id is no reason to trust a newer r8169
+        case("intree_lists_it_on_the_running_kernel_too", {"prereboot": RACE},
+             lambda c: c["dkms_check"].update(intree_lists_id=True, intree_lists_id_running=True, r8169_blacklisted=False, r8169_blacklist_in_initrd=False))
+        case("intree_blacklisted_but_the_initramfs_is_older", {"prereboot": RACE},
+             lambda c: c["dkms_check"].update(intree_lists_id=True, r8169_blacklisted=True, r8169_blacklist_in_initrd=False))
+        case("intree_blacklisted_in_the_initramfs_too", {},
+             lambda c: c["dkms_check"].update(intree_lists_id=True, r8169_blacklisted=True, r8169_blacklist_in_initrd=True))
+        case("intree_does_not_list_the_id", {}, lambda c: c["dkms_check"].update(intree_lists_id=False))
+        case("access_broken", {"prereboot": "the way in is not intact on the upgraded userland (both kernels share it, a power-cycle would not undo it): sshd -t fails: x / netplan generate fails"},
+             lambda c: c["dkms_check"].update(access_problems=["sshd -t fails: x", "netplan generate fails"]))
+        case("target_older_than_running", {"prereboot": "is older than the running one"}, lambda c: c["dkms_check"].update(target_older_than_running=True))
+        case("secure_boot_other_key", {"prereboot": "not signed by the key the running module is signed with"},
+             lambda c: c["dkms_check"].update(secure_boot="enabled", running_r8127_signer="Albert MOK") or c["dkms_check"]["r8127"].update(signer="Someone Else"))
+        case("secure_boot_same_key", {}, lambda c: c["dkms_check"].update(secure_boot="enabled", running_r8127_signer="Albert MOK") or c["dkms_check"]["r8127"].update(signer="Albert MOK"))
+        case("secure_boot_unknown_and_unsigned", {"prereboot": "Secure Boot is unknown"},
+             lambda c: c["dkms_check"].update(secure_boot="unknown") or c["dkms_check"]["r8127"].update(signer=""))
         case("a_host_without_r8127_needs_none_of_it", {}, lambda c: (c["pre_target"].update(r8127=False, modinfo_r8127=None),
                                                                      c["dkms_check"]["r8127"].update(found=False)))
 
@@ -334,6 +379,8 @@ class Judge(unittest.TestCase):
         for name, (_, expect) in self.cases.items():
             got = self.out[name]
             if not expect:
+                if self.cases[name][0].get("os_mode", "upgrade") != "upgrade":
+                    got = {"maint": got["maint"]}  # a maintenance mode is judged by maint_refusals_str alone
                 if any(got.values()):
                     failures.append("%s: expected nothing, got %r" % (name, got))
                 continue
@@ -343,7 +390,7 @@ class Judge(unittest.TestCase):
         self.assertEqual(failures, [], "\n" + "\n".join(failures))
 
     def test_a_healthy_host_has_nothing_to_report(self):
-        self.assertEqual(self.out["healthy"], {"refusals": "", "plan": "", "prereboot": "", "post": ""})
+        self.assertEqual(self.out["healthy"], {"refusals": "", "plan": "", "prereboot": "", "post": "", "maint": ""})
 
     def test_the_judgement_reads_only_fields_the_scripts_write(self):
         """Every s.<field> / d.<field> / a.<field> of the judgement is a field of the record the script prints."""
@@ -372,8 +419,8 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 63, "the judgement has %d messages; add a case for each new one and update this count" % n)
-        covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0}
+        self.assertEqual(n, 73, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:
                 covered[k] += 1

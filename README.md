@@ -261,11 +261,20 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
 ```
 
 - **Inputs.** `mode` is `survey` or `upgrade`; an upgrade names ONE `host` and `confirm` must be exactly
-  `UPGRADE-<host>`; `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
+  `UPGRADE-<host>` (`DISARM-<host>` for `mode=disarm`, which only clears a pending grub one-shot); `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
   `results_root` holds entries (the reboot destroys the tmpfs). `refresh_lists` (survey only, default false) runs
   `apt-get update` first so the simulation is not stale: it WRITES `/var/lib/apt/lists` and the apt caches
   (`/var/cache/apt/*.bin`) and runs the apt update post-invoke hooks, so it is the one thing a survey changes, and only when asked. `blacklist_r8169`
   (upgrade only, default false) is explained below. Dispatch from `main` only; it never runs on a schedule.
+- **Four modes.** `survey` (read-only, all hosts); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
+  clears a pending grub one-shot, nothing else; the playbook also does it by itself on any failure between arming and the new
+  kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure` or
+  `abort-new-kernel`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the
+  `linux-headers` postinst, so `apt-get` exits non-zero and leaves dpkg half-configured, and every later dispatch refuses on
+  `dpkg --audit`. `configure` runs `dpkg --configure -a` (detached, same `policy-rc.d` discipline as the upgrade).
+  `abort-new-kernel` first purges the kernel versions newer than the running one that the failed upgrade left half-installed
+  (a kernel that was installed and working before is never removed), so the host stays on the old kernel. A repair never reboots
+  and never touches grub's saved default, and refuses while a one-shot is pending.
 - **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
   job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's
   `HOLD-CLUSTER` marker lives outside this repository, so whoever dispatches honours it. The survey goes through the
@@ -313,20 +322,55 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   to reboot. `blacklist_r8169=true` writes `/etc/modprobe.d/celeris-r8127.conf` (`blacklist r8169`) and rebuilds the
   initramfs of the new kernel, then goes on. Moving to the in-tree driver is a separate decision (PLAN.md of the
   upgrade lane lists what to test first); this workflow never makes it.
-- **If the host does not return.** The summary names the phase and says exactly whether to do a **physical power-cycle**:
-  only when the run is red in phase `rebooting` (the host did not answer within 15 minutes). The next boot takes
-  grub's saved default, the old kernel, because the one-shot was consumed by the first boot of the new one. Every other
-  phase says "not needed". A host that came back but failed verification is up and keeps the old kernel as its default:
-  reboot it back with the cluster-reboot workflow, which ends red with "kernel changed" by design (and refuses
-  outright when the OLD kernel runs with a newer one installed, which needs no recovery). The upgrade itself refuses to
-  run again while the host runs a kernel other than grub's saved default. The apt run is detached: if a poll is lost, the
-  run fails with apt possibly still running; survey before anything else.
+- **If the host does not return.** The summary names the phase and says whether to do a **physical power-cycle**: only when the
+  run is red in phase `rebooting` and the host stays silent. What the power-cycle boots depends on why it is silent: (1) the
+  NEW kernel booted without a NIC: grub already consumed the one-shot, so it boots the saved default, the OLD kernel; (2) the OLD
+  kernel hung or panicked while shutting down (msr1's documented r8127 power-off panic) or the reboot was never issued: the
+  one-shot is **still armed**, so the next boot is the NEW kernel, once, and a second power-cycle is what returns to the old
+  one; (3) the host is only slow (a run killed by its timeout reads the same): survey first. `mode=disarm` clears a one-shot
+  that is still armed. If the host still answers, the playbook disarms by itself on any failure between arming and the new
+  kernel's boot. **A power-cycle restores the choice of kernel only**: if the upgrade broke something both kernels share
+  (bootloader, ssh, tailscale, netplan, systemd, firmware), it restores nothing and the host needs its console. Every other phase
+  says "not needed". A host that came back but failed verification keeps the old kernel as its default: reboot it back with the
+  cluster-reboot workflow, which ends red with "kernel changed" by design (and refuses outright when the OLD kernel runs with a
+  newer one installed, which needs no recovery). The upgrade itself refuses to run again while the host runs a kernel other than
+  grub's saved default, or while a one-shot is pending. The apt run is detached: if a poll is lost, the run fails with apt possibly
+  still running; survey before anything else.
 - **What this does not prove.** The tests run the real playbook and script against stub `grub`, `apt`, `dkms` and
   `modinfo` commands and a fake `/proc`/`/sys`: they prove the order, the refusals and the verdicts, not that a real GRUB
   on msr1 honours `grub-reboot`, that r8127 builds for a real kernel, or that the NIC comes up. The first real
   evidence is the survey, then `msa2-server`.
 
-Tests: `go test -run 'ClusterOSUpgrade|OSUpgrade'`, and `python3 -I ansible/tests/test_os_upgrade.py` (the script against a fake
+#### Enabling a host change
+
+No host-changing mode (`upgrade`, `disarm`, `repair`) can be dispatched until the maintainer enables it. The code enforces one control
+and supports a second; this repository does not create either (that is settings, not code).
+
+1. **The switch (enforced by the `plan` job).** Settings, Secrets and variables, Actions, Variables: create the repository variable
+   `OS_UPGRADE_ALLOWED_HOSTS`, a comma or space separated list of hosts, for the window: `msa2-server` for the first step. Add `msr1`
+   only after the survey has answered the questions of the lane PLAN (d.2 does it boot through GRUB, d.3 the in-tree r8169, d.7 Secure
+   Boot) and a person is at the rack; `msa2-client` last. Empty or missing (the default) means every host-changing dispatch is refused
+   in `plan`, before any approval is asked and before any host is touched. Empty the variable when the campaign is over.
+2. **The approval (GitHub environment `cluster-host-change`, used by host-changing modes only; a survey runs in `cluster-read` and
+   never waits).** Settings, Environments, New environment `cluster-host-change`: Required reviewers = the maintainer (leave
+   "Prevent self-review" off if the maintainer both dispatches and approves, or add a second reviewer); Deployment branches and
+   tags = Selected branches and tags: `main` only. Until this environment has a reviewer the job does not wait (GitHub creates a
+   missing environment with no protection), so the variable in step 1 is the control that is always there.
+3. **The secrets.** Environment secrets shadow repository secrets of the same name for a job in that environment. In
+   `cluster-host-change` (and in `cluster-read`, which needs the same access for the survey) create `CLUSTER_SSH_KEY`,
+   `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_SECRET`; their values cannot be read back from the repository, so re-enter them from where the
+   maintainer keeps them (a separate, less privileged key for `cluster-read` is better). **Be aware:** copying them does not remove
+   the repository-level secrets, and the tier workflows, `cluster-reboot` and the runner bootstrap read those. Deleting them would
+   break those workflows unless they adopt environments too. So until that separate decision, a workflow pushed on a branch by
+   someone with write access can still read the repository secrets; the variable and the reviewer protect this workflow, not the key.
+4. **Verify.** (a) With the variable empty, `gh workflow run cluster-os-upgrade.yml --ref main -f mode=disarm -f host=msr1
+   -f confirm=DISARM-msr1 -f reason=test` fails in the `plan` job with "not in the repository variable OS_UPGRADE_ALLOWED_HOSTS" and
+   touches nothing. (b) `gh variable list` shows the list; `gh api repos/goceleris/probatorium/environments/cluster-host-change
+   --jq '.protection_rules, .deployment_branch_policy'` shows the required reviewer and the `main`-only policy. (c) With
+   `msa2-server` listed, an upgrade of `msa2-server` stops at the `os-upgrade` job with a "Waiting for review" state until approved,
+   while a survey does not wait. If (c) does not wait, the environment has no reviewer yet.
+
+Tests: `go test -run 'ClusterOSUpgrade|OSUpgrade|FreeText'`, and `python3 -I ansible/tests/test_os_upgrade.py` (the script against a fake
 host), `python3 -I ansible/tests/test_os_upgrade_judge.py` (the real Jinja judgement under ansible, every refusal) and
 `python3 -I ansible/tests/test_os_upgrade_play.py` (the whole playbook on local connections, Linux only); the last two run
 in the ansible CI job.
