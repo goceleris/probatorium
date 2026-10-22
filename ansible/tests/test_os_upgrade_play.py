@@ -1131,6 +1131,14 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("linux-image-7.0.0-40-generic", row)
         self.assertIn("**PASS**", row)
 
+    def test_the_checklist_marks_a_kernel_armed_earlier_and_never_verified(self):
+        self.fresh()
+        self.play("survey_noarmed", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertRegex(self.summary("survey", "-"), r"\| msr1 \| kernels armed earlier and never verified \| none \| \*\*PASS\*\*")
+        self.h.w("/var/lib/celeris-os-upgrade/armed-7.0.0-40-generic.json", json.dumps({"kernel": "7.0.0-40-generic", "run_id": "77", "boot_id": "x"}))
+        self.play("survey_armed", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertRegex(self.summary("survey", "-"), r"\| msr1 \| kernels armed earlier and never verified \| 7\.0\.0-40-generic \(run 77\) \| \*\*FAIL\*\*")
+
     def test_the_checklist_shows_a_stale_rehearsal_as_not_done(self):
         self.fresh()
         self.play("survey_rehearsed", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
