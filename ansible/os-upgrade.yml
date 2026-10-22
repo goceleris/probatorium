@@ -239,10 +239,12 @@
     host_dir: "{{ os_out_dir }}/{{ inventory_hostname }}"
     # What a person must do, by how far the run got (result.json and the step summary carry it).
     power_cycle_rebooting: "{{ power_cycle_rebooting_rehearse if os_mode == 'rehearse' else power_cycle_rebooting_upgrade }}"
-    power_cycle_returned: "{{ power_cycle_returned_rehearse if os_mode == 'rehearse' else (power_cycle_returned_upgrade_unconsumed if one_shot_pending_after else power_cycle_returned_upgrade) }}"
+    power_cycle_returned: "{{ power_cycle_returned_rehearse if os_mode == 'rehearse' else (power_cycle_returned_upgrade_unconsumed if one_shot_state_after == 'pending' else (power_cycle_returned_upgrade_unknown if one_shot_state_after == 'unknown' else power_cycle_returned_upgrade)) }}"
     # did the host still hold a one-shot after it booted (the survey after the reboot says)? Then GRUB did not consume it: "the one-shot is
     # consumed by then" would be false, and so would "a power-cycle boots the OLD kernel" (R4-m4).
-    one_shot_pending_after: "{{ (((post_survey | default({})).boot | default({})).next_entry | default('')) | length > 0 }}"
+    # pending / clear / unknown. 'clear' also when there is no post-reboot survey VARIABLE at all (the rescue, which learned it from the disarm); a survey
+    # that was taken and is empty is 'unknown': the one-shot may well be pending (review m2)
+    one_shot_state_after: "{{ 'clear' if post_survey is not defined else ('unknown' if ((post_survey.boot | default({})) | length == 0) else ('pending' if (post_survey.boot.next_entry | default('')) | length > 0 else 'clear')) }}"
     power_cycle_rebooting_upgrade: >-
       The reboot was issued (or about to be) and {{ inventory_hostname }} did not answer within {{ reboot_timeout_seconds }} s,
       and it could not be asked to clear the one-shot. Which boot a power-cycle gives depends on why it is silent.
@@ -261,6 +263,12 @@
       later, treat it like a host that never returned (the one-shot is consumed by then: a power-cycle boots the OLD kernel
       {{ pre_survey.kernel }}). The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is
       still {{ pre_survey.kernel }}. Reboot it back with the cluster-reboot workflow (red with "kernel changed", expected).
+    power_cycle_returned_upgrade_unknown: >-
+      No power-cycle needed while the host answers: it answered after the reboot but failed verification, and its survey after the reboot was
+      unreadable, so whether GRUB consumed the one-shot is UNPROVEN. If it did, a power-cycle boots the saved default, the OLD kernel
+      {{ pre_survey.kernel }}; if it did not, a power-cycle or a reboot (the cluster-reboot workflow included) boots GRUB's first menu entry,
+      the new kernel, and only the console brings the old one back. Dispatch a survey (boot.next_entry, boot.entry0_kernel) before trusting a
+      power-cycle. The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is still {{ pre_survey.kernel }}.
     power_cycle_returned_upgrade_unconsumed: >-
       No power-cycle needed while the host answers: it answered after the reboot but failed verification, and a one-shot is STILL PENDING:
       GRUB did not consume it, so it does not read the environment block Linux writes and the fallback is NOT proven. While that holds, a
@@ -289,7 +297,7 @@
     # GRUB's FIRST menu entry as this run leaves it: what GRUB boots (on this boot and on every power-cycle) when it does not read the environment
     # block. An upgrade's update-grub put the NEW kernel there; a rehearsal installs nothing, so the survey's entry 0 holds. NOT boot.default_kernel
     # (the saved default, which a GRUB that ignores the environment block does not use).
-    first_entry_kernel: "{{ (target_kernel | default('')) if (os_mode == 'upgrade' and (target_kernel | default('')) | length > 0) else (pre_survey.boot.entry0_kernel | default('unknown', true)) }}"
+    first_entry_kernel: "{{ ((((post_survey | default({})).boot | default({})).entry0_kernel | default('')) or ((target_kernel | default('')) if os_mode == 'upgrade' else '') or (pre_survey.boot.entry0_kernel | default('unknown', true))) }}"
     kernel_noun: "{{ 'the new kernel' if os_mode == 'upgrade' else 'the rehearsal boot (the running kernel again)' }}"
     power_cycle_none: "No power-cycle needed: nothing was rebooted (the boot id is unchanged)."
     power_cycle_boot_unknown: >-

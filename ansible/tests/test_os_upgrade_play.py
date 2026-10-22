@@ -124,8 +124,8 @@ class Play(unittest.TestCase):
         cls.h = FakeHost(os.path.join(cls.work, "host"))
         w = cls.work
         with open(w + "/osu-wrapper.sh", "w") as f:
-            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
-                cls.h.state_dir, cls.h.log, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
+            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\n[ -n "${SURVEY_FAIL_AFTER_REBOOT:-}" ] && [ "$1" = survey ] && grep -q FAKE-REBOOT %s && { echo "survey failed after the reboot (test)" >&2; exit 3; }\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
+                cls.h.state_dir, cls.h.log, cls.h.log, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
         with open(w + "/snapshot-wrapper.sh", "w") as f:
             f.write('''#!/bin/bash
 # the preflight call carries a sixth argument, the host that asks; FAIL_HOST makes that host's preflight snapshot fail
@@ -1173,6 +1173,30 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertNotIn("consumed by then", md)
         self.assertNotIn("boots the OLD kernel", md)
         self.assertIn("Do NOT dispatch the upgrade again", md)
+
+    def test_an_upgrade_whose_survey_after_the_reboot_is_unreadable_does_not_claim_the_one_shot_was_consumed(self):
+        # review m2: no survey is not "no one-shot pending"
+        self.fresh()
+        self.play("returned_unknown", self.UP, env={"SURVEY_FAIL_AFTER_REBOOT": "1"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-verification")
+        self.assertTrue(any("no readable survey after the reboot" in p for p in r["problems"]), r["problems"])
+        pc = " ".join(r["power_cycle"].split())
+        self.assertIn("UNPROVEN", pc)
+        self.assertIn("boot.next_entry", pc)
+        for stale in ("consumed by then", "STILL PENDING"):
+            self.assertNotIn(stale, pc)
+        self.assertIn("UNPROVEN", " ".join(self.summary("upgrade", "msr1").split()))
+
+    def test_the_first_entry_of_an_upgrade_is_read_from_the_survey_after_the_reboot_not_guessed(self):
+        # review m3: the target is the newest kernel of the running flavor, GRUB's first entry can be another
+        self.fresh()
+        self.play("entry0_other", self.UP, env={"BOOT_MODE": "ignore-env", "ENTRY0_AFTER": "7.0.0-99-generic"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["target_kernel"], r["first_entry_kernel"]), ("7.0.0-40-generic", "7.0.0-99-generic"))
+        self.assertIn("boots GRUB's FIRST menu entry, 7.0.0-99-generic", " ".join(r["power_cycle"].split()))
 
     def test_an_upgrade_that_returned_with_the_one_shot_consumed_still_says_a_power_cycle_boots_the_old_kernel(self):
         self.fresh()

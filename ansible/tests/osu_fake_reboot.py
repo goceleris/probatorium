@@ -38,6 +38,16 @@ if mode == "stale-first":
         f.write("1\n")
 with open(sp) as f:
     st = json.load(f)
+if os.environ.get("ENTRY0_AFTER"):
+    # grub's first menu entry is ANOTHER kernel than the one the upgrade targeted (an HWE or newer-flavor kernel sorts first)
+    with open(root + "/boot/grub/grub.cfg") as f:
+        cfg_text = f.read()
+    i = cfg_text.index("vmlinuz-") + len("vmlinuz-")
+    j = i
+    while cfg_text[j] not in " \t\n":
+        j += 1
+    with open(root + "/boot/grub/grub.cfg", "w") as f:
+        f.write(cfg_text[:i] + os.environ["ENTRY0_AFTER"] + cfg_text[j:])
 with open(root + "/boot/grub/grub.cfg") as f:
     entries = osu.parse_grub_cfg(f.read())
 env = st["grubenv"]
