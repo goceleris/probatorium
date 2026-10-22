@@ -1034,6 +1034,61 @@ class HoldAccessPackages(Base):
         self.assertEqual(self.h.load()["held"], [])
 
 
+class AbortKeepsTheSuspicionUntilTheKernelIsGone(Repair):
+    def arm_record(self, kernel, run_id="77"):
+        self.h.w("/var/lib/celeris-os-upgrade/armed-%s.json" % kernel, json.dumps({"kernel": kernel, "run_id": run_id, "running": "7.0.0-31-generic"}))
+
+    def record(self, kernel):
+        return os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/armed-%s.json" % kernel)
+
+    def test_a_failed_purge_keeps_the_armed_record_so_the_kernel_is_not_armed_again_blindly(self):
+        self.broken()
+        self.arm_record("7.0.0-40-generic")
+        self.h.state["remove_rc"] = 100
+        self.h.state["configure_ok"] = True
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "abort-new-kernel"))
+        self.assertNotEqual(self.wait()["rc"], 0)
+        self.assertIn("linux-image-7.0.0-40-generic", self.h.load()["packages"])  # still installed
+        self.assertTrue(self.record("7.0.0-40-generic"), "a failed purge forgot the kernel that stranded the host")
+
+    def test_a_purge_that_exits_zero_but_leaves_the_version_installed_keeps_the_record(self):
+        self.broken()
+        self.arm_record("7.0.0-40-generic")
+        self.h.state["configure_ok"] = True
+        self.h.state["remove_noop"] = True  # apt reports success and dpkg still lists the packages
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "abort-new-kernel"))
+        self.wait()
+        self.assertIn("linux-image-7.0.0-40-generic", self.h.load()["packages"])
+        self.assertTrue(self.record("7.0.0-40-generic"))
+
+    def test_a_successful_purge_forgets_only_the_purged_versions(self):
+        self.broken()
+        self.arm_record("7.0.0-40-generic")
+        self.arm_record("7.0.0-45-generic", "78")  # another kernel's record: not among the purged packages
+        self.h.state["configure_ok"] = True
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "abort-new-kernel"))
+        self.assertEqual(self.wait()["rc"], 0)
+        self.assertFalse(self.record("7.0.0-40-generic"))
+        self.assertTrue(self.record("7.0.0-45-generic"), "the abort forgot a kernel it did not remove")
+
+    def test_configure_never_forgets_a_record(self):
+        self.broken()
+        self.arm_record("7.0.0-40-generic")
+        self.h.state["configure_ok"] = True
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "configure"))
+        self.assertEqual(self.wait()["rc"], 0)
+        self.assertTrue(self.record("7.0.0-40-generic"))
+
+    def test_the_record_of_a_kernel_with_another_flavor_is_matched_by_its_version(self):
+        self.assertEqual(osu.kver_prefix("7.0.0-40-generic"), "7.0.0-40")
+        self.assertEqual(osu.kver_prefix("7.0.0-40-generic-64k"), "7.0.0-40")
+        self.assertEqual(osu.kver_prefix("garbage"), "")
+
+
 class Toolcheck(Base):
     def test_ok_and_failing(self):
         self.h.save()

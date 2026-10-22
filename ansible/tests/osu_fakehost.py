@@ -109,6 +109,10 @@ if name == "apt-get":
     if "remove" in args:
         names = (args[args.index("--purge") + 1:] if "--purge" in args else []) + st.get("remove_cascade", [])
         out("Removing: %s\n" % " ".join(names))
+        if st.get("remove_noop"):
+            sys.exit(0)
+        if st.get("remove_rc"):
+            sys.stderr.write("E: Sub-process /usr/bin/dpkg returned an error code (1)\n"); sys.exit(st["remove_rc"])
         for n in names:
             pkgs().pop(n, None)
             if n.startswith("linux-image-"):

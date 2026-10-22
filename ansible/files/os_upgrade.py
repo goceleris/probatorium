@@ -690,6 +690,12 @@ def host_toolchain():
     return {"packages": {k: v for k, v in pk.items() if v}, "binaries": bins}
 
 
+def kver_prefix(kernel):
+    """"7.0.0-40" of "7.0.0-40-generic" or "7.0.0-40-generic-64k": what a kernel's packages share, whatever the flavor."""
+    m = re.match(r"^(\d+\.\d+\.\d+-\d+)", kernel or "")
+    return m.group(1) if m else ""
+
+
 def armed_records():
     """Kernels a run armed as a one-shot and that no run made permanent: the host may have been stranded by them."""
     out = []
@@ -726,7 +732,7 @@ def new_kernel_pkgs(running, broken_only=False):
     packages: a kernel that was installed before and works is not ours to remove."""
     rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n", "linux-image-*", "linux-modules-*", "linux-headers-*", "linux-tools-*"])
     by_version = {}
-    armed = {re.sub(r"-[a-z0-9]+$", "", r.get("kernel", "")) for r in armed_records()}  # "7.0.0-40" of "7.0.0-40-generic"
+    armed = {kver_prefix(r.get("kernel", "")) for r in armed_records()}
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 4 or parts[-1] in ("not-installed", "config-files"):
@@ -1052,6 +1058,18 @@ def cmd_repair_start(a):
     start_detached(a.run_id, "_repair-run", ["--action", a.action])
 
 
+def kernel_version_installed(prefix):
+    """True while any package of the kernel version PREFIX (7.0.0-40) is installed or half-installed."""
+    rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n", "linux-image-*", "linux-modules-*", "linux-headers-*", "linux-tools-*"])
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[-1] not in ("not-installed", "config-files"):
+            m = NEW_KERNEL_PKG.match(parts[0])
+            if m and m.group(1) == prefix:
+                return True
+    return False
+
+
 KERNEL_META = re.compile(r"^linux-(generic|image-generic|headers-generic|tools-generic|crashdump|virtual|image-virtual|headers-virtual)(-hwe[-0-9.]*)?(-64k)?$")
 
 
@@ -1094,12 +1112,16 @@ def cmd_repair_run(a):
             r = subprocess.run(argv, env=dict(os.environ, **APT_ENV, LC_ALL="C"), stdout=sys.stdout, stderr=subprocess.STDOUT)
             if r.returncode != 0:
                 rc = r.returncode
-        for rec in armed_records():  # an explicit decision resets the suspicion of a kernel that is gone
-            if re.sub(r"-[a-z0-9]+$", "", rec.get("kernel", "")) in purged_versions:
-                try:
-                    os.remove(p("%s/armed-%s.json" % (STATE_DIR, rec["kernel"])))
-                except OSError:
-                    pass
+        # An explicit decision resets the suspicion of a kernel that is GONE: the purge exited 0 AND dpkg no longer shows the version.
+        # A failed purge keeps the record: the kernel is still installed and still stranded the host.
+        if rc == 0:
+            for rec in armed_records():
+                pre = kver_prefix(rec.get("kernel", ""))
+                if pre in purged_versions and not kernel_version_installed(pre):
+                    try:
+                        os.remove(p("%s/armed-%s.json" % (STATE_DIR, rec["kernel"])))
+                    except OSError:
+                        pass
     finally:
         try:
             os.remove(p(POLICY_RC_D))
