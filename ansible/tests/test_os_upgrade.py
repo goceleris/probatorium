@@ -244,6 +244,72 @@ class Survey(Base):
         self.assertIn('a.cmd in ("survey", "simulate", "dump", "upgrade-status", "upgrade-log", "marker")', src)
 
 
+class BootProof(Base):
+    """GRUB must be shown to have BOOTED the host and to read the grubenv Linux writes; unknown is not proven."""
+
+    def proof(self):
+        self.h.save()
+        return self.run_ok("survey")["boot"]["proof"]
+
+    def test_a_grub_booted_host_is_proven(self):
+        p = self.proof()
+        self.assertTrue(p["ok"], p["problems"])
+        self.assertEqual(p["boot_image"], "/boot/vmlinuz-7.0.0-31-generic")
+        self.assertEqual(p["efi_loader"], "\\EFI\\ubuntu\\shimaa64.efi")
+        self.assertEqual(p["prefix"], "/boot/grub")
+
+    def test_a_cmdline_without_boot_image_is_refused(self):
+        self.h.w("/proc/cmdline", "root=/dev/nvme0n1p2 ro console=ttyAMA0\n")
+        p = self.proof()
+        self.assertFalse(p["ok"])
+        self.assertIn("no BOOT_IMAGE=", p["problems"][0])
+
+    def test_a_boot_image_of_another_kernel_is_refused(self):
+        self.h.w("/proc/cmdline", "BOOT_IMAGE=/boot/vmlinuz-7.0.0-38-generic ro\n")
+        self.assertIn("does not name vmlinuz-7.0.0-31-generic", self.proof()["problems"][0])
+
+    def test_a_firmware_that_booted_something_else_is_refused(self):
+        self.h.set_efi_boot("\\EFI\\systemd\\systemd-bootaa64.efi")
+        p = self.proof()
+        self.assertFalse(p["ok"])
+        self.assertIn("not shim or grub", p["problems"][0])
+
+    def test_the_removable_media_path_is_unsure_and_refused(self):
+        self.h.set_efi_boot("\\EFI\\BOOT\\BOOTAA64.EFI")
+        self.assertFalse(self.proof()["ok"])
+
+    def test_unreadable_efi_variables_are_unsure_and_refused(self):
+        shutil.rmtree(self.h.root + "/sys/firmware/efi/efivars")
+        p = self.proof()
+        self.assertFalse(p["ok"])
+        self.assertIn("EFI variables are not readable", p["problems"][0])
+
+    def test_grub_reading_another_filesystem_than_grub_editenv_writes_is_refused(self):
+        self.h.w("/boot/efi/EFI/ubuntu/grub.cfg", "search.fs_uuid bbbbbbbb-0000-0000-0000-000000000000 root hd0,gpt1\nset prefix=($root)'/boot/grub'\n")
+        p = self.proof()
+        self.assertFalse(p["ok"])
+        self.assertIn("never reads", p["problems"][0])
+
+    def test_a_prefix_on_the_esp_is_refused(self):
+        self.h.w("/boot/efi/EFI/ubuntu/grub.cfg", "search.fs_uuid %s root hd0,gpt2\nset prefix=($root)'/EFI/ubuntu'\n" % self.h.BOOT_UUID)
+        self.assertIn("not /boot/grub", self.proof()["problems"][0])
+
+    def test_a_missing_stub_is_unsure_and_refused(self):
+        os.remove(self.h.root + "/boot/efi/EFI/ubuntu/grub.cfg")
+        self.assertIn("no readable search/prefix", self.proof()["problems"][0])
+
+    def test_a_missing_or_short_grubenv_is_refused(self):
+        with open(self.h.root + "/boot/grub/grubenv", "w") as f:
+            f.write("# short\n")
+        self.assertIn("not 1024", self.proof()["problems"][0])
+        os.remove(self.h.root + "/boot/grub/grubenv")
+        self.assertIn("does not exist", self.proof()["problems"][0])
+
+    def test_a_non_efi_host_is_proven_by_boot_image_and_grubenv_alone(self):
+        shutil.rmtree(self.h.root + "/sys/firmware/efi")
+        self.assertTrue(self.proof()["ok"])
+
+
 class Simulate(Base):
     def test_removals_are_listed(self):
         self.h.state["sim"] += ["Remv linux-image-7.0.0-25-generic [7.0.0-25.25]", "Remv foo [1]"]

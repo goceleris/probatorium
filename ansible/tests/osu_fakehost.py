@@ -159,7 +159,7 @@ if name == "update-grub":
 if name == "update-initramfs":
     sys.exit(st.get("initramfs_rc", 0))
 if name == "findmnt":
-    out(st["boot_fs"] + "\n" if "FSTYPE" in args else st["boot_src"] + "\n"); sys.exit(0)
+    out((st["boot_fs"] if "FSTYPE" in args else st.get("boot_uuid", "") if "UUID" in args else st["boot_src"]) + "\n"); sys.exit(0)
 if name == "df":
     path = args[-1][len(root):] or "/"
     best = None
@@ -284,6 +284,7 @@ class FakeHost:
         self.w("/proc/stat", "btime 1\n")
         self.w("/etc/modprobe.d/blacklist.conf", "# nothing\n")
         self.build_snapshot_tree()
+        self.build_boot_proof()
         pk = {"linux-image-" + k: {"version": k, "status": "installed"} for k in self.kernels}
         pk.update({"linux-modules-" + self.running: {"version": self.running, "status": "installed"},
                    "linux-headers-" + self.running: {"version": self.running, "status": "installed"},
@@ -301,7 +302,7 @@ class FakeHost:
             "modinfo": modinfo,
             "dkms_status": ["r8127/11.015.00, %s, aarch64: installed" % self.running, "r8127/11.015.00, %s, aarch64: installed" % self.kernels[0]],
             "grubenv": {"saved_entry": "", "next_entry": ""},
-            "boot_fs": "ext4", "boot_src": "/dev/nvme0n1p2",
+            "boot_fs": "ext4", "boot_src": "/dev/nvme0n1p2", "boot_uuid": self.BOOT_UUID,
             "df": {"/": {"total": 500000000, "free": 300000000}, "/boot": {"total": 1800000, "free": 1200000},
                    "/boot/efi": {"total": 500000, "free": 480000}, "/var": {"total": 500000000, "free": 300000000}},
             "ntp": "yes",
@@ -320,6 +321,32 @@ class FakeHost:
         }
         self.state["sim_phased"] = self.state["sim"] + ["Inst phased-pkg (2 Ubuntu:26.04/resolute-updates [arm64])"]
         self.save()
+
+    BOOT_UUID = "aaaaaaaa-1111-2222-3333-444444444444"
+    EFI_GLOBAL = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+    def efi_load_option(self, description, path):
+        """The bytes of an EFI variable holding a load option: attributes, then EFI_LOAD_OPTION with one file-path node."""
+        node_path = (path + "\0").encode("utf-16le")
+        nodes = bytes([4, 4]) + (4 + len(node_path)).to_bytes(2, "little") + node_path + bytes([0x7F, 0xFF, 4, 0])
+        opt = (1).to_bytes(4, "little") + len(nodes).to_bytes(2, "little") + (description + "\0").encode("utf-16le") + nodes
+        return (7).to_bytes(4, "little") + opt
+
+    def set_efi_boot(self, path="\\EFI\\ubuntu\\shimaa64.efi", current=1):
+        d = self.root + "/sys/firmware/efi/efivars"
+        os.makedirs(d, exist_ok=True)
+        with open("%s/BootCurrent-%s" % (d, self.EFI_GLOBAL), "wb") as f:
+            f.write((7).to_bytes(4, "little") + current.to_bytes(2, "little"))
+        with open("%s/Boot%04X-%s" % (d, current, self.EFI_GLOBAL), "wb") as f:
+            f.write(self.efi_load_option("ubuntu", path))
+
+    def build_boot_proof(self):
+        """What the survey needs to PROVE that GRUB booted this host and reads the grubenv Linux writes."""
+        self.w("/proc/cmdline", "BOOT_IMAGE=/boot/vmlinuz-%s root=UUID=%s ro quiet splash\n" % (self.running, self.BOOT_UUID))
+        self.set_efi_boot()
+        self.w("/boot/efi/EFI/ubuntu/grub.cfg", "search.fs_uuid %s root hd0,gpt2\nset prefix=($root)'/boot/grub'\nconfigfile $prefix/grub.cfg\n" % self.BOOT_UUID)
+        with open(self.root + "/boot/grub/grubenv", "w") as f:
+            f.write(("# GRUB Environment Block\n").ljust(1024, "#"))
 
     def build_snapshot_tree(self):
         """What reboot_snapshot.sh reads: interrupts, the bond, a boot id, the power guard's files."""

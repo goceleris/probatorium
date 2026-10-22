@@ -265,6 +265,87 @@ def cfg_recordfail_timeout(text):
     return m.group(1) if m else ""
 
 
+def efi_boot_current():
+    """The loader the firmware booted (BootCurrent -> its Boot#### load option), read from the EFI variables. None
+    when the variables are not there (not an EFI boot, or unreadable)."""
+    d = p("/sys/firmware/efi/efivars")
+    bc = sorted(glob.glob(d + "/BootCurrent-*"))
+    if not bc:
+        return None
+    try:
+        with open(bc[0], "rb") as f:
+            num = int.from_bytes(f.read()[4:6], "little")
+        ents = sorted(glob.glob("%s/Boot%04X-*" % (d, num)))
+        if not ents:
+            return {"number": num, "paths": []}
+        with open(ents[0], "rb") as f:
+            data = f.read()[4:]  # skip the variable attributes; the load option starts here
+    except OSError:
+        return None
+    # EFI_LOAD_OPTION: attributes u32, file path list length u16, description UTF-16 NUL, then device-path nodes whose
+    # file-path nodes hold UTF-16 text. Every field up to the nodes is 2-byte aligned, so decode from the start.
+    text = data.decode("utf-16le", errors="ignore")
+    return {"number": num, "paths": re.findall(r"\\EFI\\[^\x00-\x1f]*?\.efi", text, re.I)}
+
+
+GRUB_LOADER = re.compile(r"^\\EFI\\[^\\]+\\(shim|grub)[^\\]*\.efi$", re.I)
+
+
+def esp_stub_prefix(loader):
+    """(uuid, prefix) from the grub.cfg stub on the ESP beside the loader GRUB was started from."""
+    m = re.match(r"^\\EFI\\([^\\]+)\\", loader)
+    if not m:
+        return "", ""
+    text = rd("/boot/efi/EFI/%s/grub.cfg" % m.group(1))
+    u = re.search(r"search\.fs_uuid\s+(\S+)", text)
+    pr = re.search(r"set prefix=\(\$root\)'?([^'\s]+)'?", text)
+    return (u.group(1).lower() if u else ""), (pr.group(1) if pr else "")
+
+
+def boot_proof(running, efi, boot_uuid):
+    """Did GRUB boot this host, and does GRUB read the grubenv that grub-editenv writes? Everything one-shot and every
+    fallback depends on both; the presence of the grub tools proves neither. Unknown counts as not proven."""
+    problems = []
+    cmd = rd("/proc/cmdline")
+    m = re.search(r"(?:^|\s)BOOT_IMAGE=(\S+)", cmd)
+    image = m.group(1) if m else ""
+    if not image:
+        problems.append("/proc/cmdline has no BOOT_IMAGE=: GRUB's linux command adds it, U-Boot and systemd-boot do not (cmdline: %s)" % (cmd[:120] or "unreadable"))
+    elif not re.search(r"vmlinuz-%s$" % re.escape(running), image):
+        problems.append("BOOT_IMAGE=%s does not name vmlinuz-%s" % (image, running))
+    loader, prefix, stub_uuid = "", "", ""
+    if efi:
+        cur = efi_boot_current()
+        paths = (cur or {}).get("paths", [])
+        if cur is None:
+            problems.append("the EFI variables are not readable: cannot tell which loader the firmware booted")
+        else:
+            gl = [x for x in paths if GRUB_LOADER.match(x)]
+            if not gl:
+                problems.append("the firmware booted %s (Boot%04X), not shim or grub under \\EFI\\<vendor>" % (", ".join(paths) or "an unknown loader", cur["number"]))
+            else:
+                loader = gl[0]
+                stub_uuid, prefix = esp_stub_prefix(loader)
+                if not stub_uuid or not prefix:
+                    problems.append("the grub.cfg stub on the ESP beside %s has no readable search/prefix: cannot tell which filesystem GRUB reads grubenv from" % loader)
+                elif prefix.rstrip("/") not in ("/boot/grub", "/grub"):
+                    problems.append("GRUB's prefix is %s, not /boot/grub: it reads another grubenv than grub-editenv writes" % prefix)
+                elif not boot_uuid:
+                    problems.append("the filesystem of /boot/grub has no readable UUID: cannot compare it with GRUB's search")
+                elif stub_uuid != boot_uuid.lower():
+                    problems.append("GRUB reads its environment from filesystem %s, but /boot/grub is on %s: grub-reboot and grub-set-default would write a file GRUB never reads" % (stub_uuid, boot_uuid))
+    genv = p("/boot/grub/grubenv")
+    try:
+        st = os.lstat(genv)
+        if not os.path.isfile(genv) or os.path.islink(genv):
+            problems.append("/boot/grub/grubenv is not a regular file")
+        elif st.st_size != 1024:
+            problems.append("/boot/grub/grubenv is %d bytes, not 1024" % st.st_size)
+    except OSError:
+        problems.append("/boot/grub/grubenv does not exist")
+    return {"ok": not problems, "problems": problems, "boot_image": image, "efi_loader": loader, "prefix": prefix, "stub_uuid": stub_uuid}
+
+
 def boot_info():
     cfg = rd("/boot/grub/grub.cfg")
     settings, files = grub_settings()
@@ -280,6 +361,8 @@ def boot_info():
     rc, fstype, _ = run(["findmnt", "-n", "-o", "FSTYPE", "-T", p("/boot/grub")])
     rc2, src, _ = run(["findmnt", "-n", "-o", "SOURCE", "-T", p("/boot/grub")])
     src = src.strip()
+    rc4, uuid_out, _ = run(["findmnt", "-n", "-o", "UUID", "-T", p("/boot/grub")])
+    rc4_uuid = uuid_out.strip()
     stack = ""
     if src.startswith("/dev/mapper/") or src.startswith("/dev/md") or src.startswith("/dev/dm-"):
         stack = "lvm-or-mdraid"
@@ -321,6 +404,7 @@ def boot_info():
         "boot_fs": fstype.strip(),
         "boot_source": src,
         "boot_stack": stack,
+        "proof": boot_proof(running_kernel(), efi, rc4_uuid),
     }
 
 

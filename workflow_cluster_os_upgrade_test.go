@@ -426,7 +426,7 @@ func TestClusterOSUpgradeJudgementCoversTheRequirements(t *testing.T) {
 	for _, want := range []string{
 		"a bench or validation manifest", "runner job(s) are executing", "resume-pending.json", "results_root", "no shutdown quiesce hook",
 		"r8127 module is not available for the running kernel", "tailscaled is running but", "not enough free disk on /:", "not enough free disk on /boot:",
-		"dpkg or apt is busy", "dpkg --audit", "held kernel, boot or DKMS packages", "policy-rc.d", "no usable GRUB", "GRUB_SAVEDEFAULT=true",
+		"dpkg or apt is busy", "dpkg --audit", "held kernel, boot or DKMS packages", "policy-rc.d", "no usable GRUB", "GRUB is not proven to have booted this host", "GRUB_SAVEDEFAULT=true",
 		"grub cannot write its environment block", "no menu entry for the running kernel", "order: ",
 		"would REMOVE protected package(s)", "apt-get -s full-upgrade failed",
 		"vmlinuz-", "initrd.img-", "has no menu entry for", "the fallback is not intact", "waits at the menu for ever", "linux-headers for",

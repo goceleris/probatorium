@@ -205,6 +205,8 @@ class Judge(unittest.TestCase):
         case("policy_rc_d", {"refusals": "policy-rc.d exists already"}, lambda c: c["pre_survey"]["packages"].update(policy_rc_d_present=True))
         case("no_grub", {"refusals": "no usable GRUB"}, lambda c: c["pre_survey"]["boot"].update(grub_reboot=False))
         case("no_grub_cfg", {"refusals": "no usable GRUB"}, lambda c: c["pre_survey"]["boot"].update(grub_cfg_present=False))
+        case("grub_not_proven", {"refusals": "GRUB is not proven to have booted this host"},
+             lambda c: c["pre_survey"]["boot"]["proof"].update(ok=False, problems=["/proc/cmdline has no BOOT_IMAGE="]))
         case("savedefault", {"refusals": "GRUB_SAVEDEFAULT=true"}, lambda c: c["pre_survey"]["boot"].update(savedefault=True))
         case("boot_btrfs", {"refusals": "/boot/grub is on btrfs"}, lambda c: c["pre_survey"]["boot"].update(boot_stack="btrfs"))
         case("boot_lvm", {"refusals": "/boot/grub is on lvm-or-mdraid"}, lambda c: c["pre_survey"]["boot"].update(boot_stack="lvm-or-mdraid"))
@@ -370,7 +372,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 62, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 63, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:

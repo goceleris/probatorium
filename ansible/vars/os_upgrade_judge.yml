@@ -49,6 +49,7 @@ refusals_str: >-
   {% if s.packages.held_kernel | length > 0 %}{% set _ = p.append('held kernel, boot or DKMS packages: ' ~ (s.packages.held_kernel | join(', ')) ~ ' (apt-mark unhold them deliberately, or leave the host)') %}{% endif %}
   {% if s.packages.policy_rc_d_present %}{% set _ = p.append('/usr/sbin/policy-rc.d exists already: the upgrade installs its own for the length of the apt run and will not overwrite one') %}{% endif %}
   {% if not (s.boot.grub_cfg_present and s.boot.grub_reboot and s.boot.grub_set_default and s.boot.grub_editenv and s.boot.update_grub) %}{% set _ = p.append('no usable GRUB (grub.cfg, grub-reboot, grub-set-default, grub-editenv and update-grub are all needed): the boot cannot be made one-shot, so a failed boot would not fall back to the old kernel') %}{% endif %}
+  {% if not s.boot.proof.ok %}{% set _ = p.append('GRUB is not proven to have booted this host (and every fallback depends on it): ' ~ (s.boot.proof.problems | join(' / '))) %}{% endif %}
   {% if s.boot.savedefault %}{% set _ = p.append('GRUB_SAVEDEFAULT=true: booting the one-shot entry would make it the saved default') %}{% endif %}
   {% if s.boot.boot_stack | length > 0 %}{% set _ = p.append('/boot/grub is on ' ~ s.boot.boot_stack ~ ': grub cannot write its environment block there, so the boot is never one-shot') %}{% endif %}
   {% if s.boot.running_entry_id | length == 0 %}{% set _ = p.append('grub.cfg has no menu entry for the running kernel ' ~ s.kernel ~ ': it cannot be made the fallback') %}{% endif %}
