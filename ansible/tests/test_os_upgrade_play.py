@@ -648,7 +648,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
     def checklist_row(self, host="msr1"):
         md = self.summary("survey", "-", rc=0)
         for line in md.splitlines():
-            if line.startswith("| %s | platform frozen against self-updates" % host):
+            if line.startswith("| %s | platform frozen against apt self-updates" % host):
                 return line
         self.fail("no freeze row for " + host)
 

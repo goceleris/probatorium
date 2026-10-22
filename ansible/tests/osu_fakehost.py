@@ -16,7 +16,7 @@ FIXTURES = os.path.join(HERE, "fixtures")
 
 COMMANDS = ["dpkg-query", "dpkg", "apt-get", "apt-mark", "apt-config", "apt-cache", "modinfo", "dkms", "grub-editenv",
             "grub-set-default", "grub-reboot", "update-grub", "update-initramfs", "findmnt", "df", "timedatectl", "systemctl",
-            "sysctl", "cc", "curl", "mokutil", "gcc", "make", "ip", "ping", "sshd", "tailscaled", "netplan"]
+            "sysctl", "cc", "curl", "mokutil", "gcc", "make", "ip", "ping", "sshd", "tailscaled", "tailscale", "snap", "netplan"]
 
 STUB = r'''#!__PYTHON__
 import fnmatch, json, os, sys, time, shutil
@@ -279,6 +279,18 @@ if name == "curl":
     sys.exit(st.get("curl_rc", {}).get(args[-1].replace("https://", ""), 0))
 if name == "sshd":
     sys.exit(st.get("sshd_rc", 0))
+if name == "tailscale":
+    if args[:2] == ["debug", "prefs"]:
+        if st.get("tailscale_prefs_rc"):
+            sys.exit(st["tailscale_prefs_rc"])
+        out(json.dumps({"AutoUpdate": st.get("tailscale_autoupdate", {"Check": True, "Apply": False})}) + "\n"); sys.exit(0)
+    out("1.90.0\n"); sys.exit(0)
+if name == "snap":
+    if args[:2] == ["refresh", "--time"]:
+        if st.get("snap_refresh_rc"):
+            sys.exit(st["snap_refresh_rc"])
+        out("timer: 00:00~24:00/4\nlast: today at 06:12 CEST\nnext: today at 18:30 CEST\n"); sys.exit(0)
+    sys.exit(1)
 if name == "tailscaled":
     out("1.90.0\n"); sys.exit(st.get("tailscaled_rc", 0))
 if name == "netplan":

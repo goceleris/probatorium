@@ -298,12 +298,12 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   list-only (`/etc/needrestart/conf.d/zzz-celeris-freeze.conf`, only when it is installed and not list-only already), checks the states, and records
   the platform: the evidence holds `freeze.json` (with the kernel, the OS, the package count, a SHA-256 of every installed package and version, and
   the holds), `dpkg-l.txt` (`dpkg -l`), `apt-held.txt` (`apt-mark showhold`), `kernel.txt` and the survey after, so the release results can name the
-  exact platform. The survey shows the freeze and whether it still holds (`freeze.drifted`; checklist row "platform frozen against self-updates":
+  exact platform. The survey shows the freeze and whether it still holds (`freeze.drifted`; checklist row "platform frozen against apt self-updates":
   NOTE not frozen, PASS frozen, FAIL drifted or incomplete). `mode=thaw` (`THAW-<host>`) restores ONLY what the record says the freeze changed
   (enable what it disabled, start what it stopped, remove its needrestart file: a unit that was already off stays off) and archives the record; the
   apt timers are persistent, so they may run within minutes of a thaw. A freeze that failed half way is undone by `mode=thaw`. It does not stop
   `mode=upgrade` (which runs apt itself) and it covers nothing but these units and needrestart: snapd refreshes, motd-news, firmware updates and
-  other self-updaters are not touched. **The survey recomputes the recorded platform**: the running kernel, the package list (SHA-256), the holds and grub's saved default
+  other self-updaters are not touched. The survey records the two that matter most and a freeze does not stop (`self_updaters`: `tailscale debug prefs` AutoUpdate, which runs apt-get by itself, and `snap refresh --time`), and the checklist row names what it does not cover (tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client). **The survey recomputes the recorded platform**: the running kernel, the package list (SHA-256), the holds and grub's saved default
   kernel; any difference is `freeze.drifted` and the checklist row FAILs (an upgrade, tailscale's own updater, a manual apt, a reboot onto
   another kernel). `mode=upgrade` is therefore REFUSED on a frozen host (its record would name a platform that no longer exists): the order is
   rehearse (a frozen host may be rehearsed), thaw, upgrade, and freeze again once every host is upgraded and verified, then the evidence

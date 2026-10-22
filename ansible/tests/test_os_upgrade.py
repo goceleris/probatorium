@@ -1885,6 +1885,25 @@ class FreezeThaw(Base):
         self.h.load()
         self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], [])
 
+    def test_the_survey_names_what_a_freeze_does_not_stop(self):
+        self.h.save()
+        u = self.run_ok("survey")["self_updaters"]
+        self.assertEqual((u["tailscale_auto_update"], u["tailscale_check_updates"]), ("false", "true"))
+        self.assertIn("timer: 00:00~24:00/4", u["snap_refresh"])
+        self.h.state["tailscale_autoupdate"] = {"Check": True, "Apply": True}
+        self.h.state["snap_refresh_rc"] = 1
+        self.h.save()
+        u = self.run_ok("survey")["self_updaters"]
+        self.assertEqual((u["tailscale_auto_update"], u["snap_refresh"]), ("true", "unknown"))
+        self.h.state["tailscale_prefs_rc"] = 1
+        self.h.save()
+        self.assertEqual(self.run_ok("survey")["self_updaters"]["tailscale_auto_update"], "unknown")
+
+    def test_these_reads_are_on_the_read_only_list_and_no_other_tailscale_or_snap_command_is(self):
+        for argv, ok in ((["tailscale", "debug", "prefs"], True), (["snap", "refresh", "--time"], True), (["tailscale", "set", "--auto-update=false"], False),
+                         (["tailscale", "up"], False), (["snap", "refresh"], False), (["snap", "refresh", "--hold"], False), (["snap", "remove", "x"], False)):
+            self.assertEqual(osu.ro_allowed(argv), ok, argv)
+
     def test_a_package_that_moves_under_a_freeze_is_drift(self):
         self.frozen_survey()
         self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"  # tailscale's own updater, a manual apt ...

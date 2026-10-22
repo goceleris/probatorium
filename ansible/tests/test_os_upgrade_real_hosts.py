@@ -72,7 +72,7 @@ COMMON = {
     "kernels armed earlier and never verified": "PASS",
     "run state": "PASS",
     "access-path packages and third-party moves the full-upgrade brings": "NOTE",
-    "platform frozen against self-updates (apt timers, unattended-upgrades, needrestart restarts)": "NOTE",  # the first survey knew no freeze
+    "platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts); NOT covered: tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client": "NOTE",  # the first survey knew no freeze
     "unattended-upgrades and phasing": "NOTE",
 }
 R8127 = {
@@ -167,7 +167,7 @@ class ChecklistReplay(unittest.TestCase):
         self.assertEqual(self.md.count("package runs `none`"), 3)
 
     def test_the_freeze_row_reads_a_freeze_record(self):
-        row = "platform frozen against self-updates (apt timers, unattended-upgrades, needrestart restarts)"
+        row = "platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts); NOT covered: tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client"
         for name, rec, want in (("frozen and holding", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS"),
                                 ("frozen but a unit came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["apt-daily.timer=active/enabled"]}, "FAIL"),
                                 ("a freeze that did not complete", {"run_id": "1", "utc": "t", "status": "freezing-failed", "drifted": []}, "FAIL")):

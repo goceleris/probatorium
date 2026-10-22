@@ -112,6 +112,10 @@ def ro_allowed(a):
         return rest == ["-t"]
     if n == "tailscaled":
         return rest == ["--version"]
+    if n == "tailscale" and rest == ["debug", "prefs"]:
+        return True
+    if n == "snap":
+        return rest == ["refresh", "--time"]
     if n == "netplan":
         return rest[:1] == ["generate"] and "--root-dir" in rest
     if n in ("gcc", "g++", "clang", "cmake", "make", "python3", "docker", "tailscale", "cc"):
@@ -955,6 +959,7 @@ def survey():
         "armed_kernels": armed_records(),
         "rehearsal": rehearsal_with_validity(running, boot["proof"]),
         "freeze": freeze_state(),
+        "self_updaters": self_updaters(),
     }
     return d
 
@@ -1677,6 +1682,26 @@ def cmd_dump(a):
         sys.stdout.write("saved_entry=%s\nnext_entry=%s\n" % (env.get("saved_entry", ""), env.get("next_entry", "")))
         for e in grub_entries():
             sys.stdout.write("%s\t%s\t%s\n" % (e["kernel"], e["full_id"], "recovery" if e["recovery"] else ""))
+
+
+def self_updaters():
+    """What changes a host's packages by itself and that a freeze does NOT stop (read-only): tailscale's own updater (`tailscale set
+    --auto-update` runs apt-get and restarts tailscaled) and snapd's refresh timer. "absent" when the program is not installed, "unknown" when it
+    did not answer."""
+    out = {"tailscale_auto_update": "absent", "tailscale_check_updates": "absent", "snap_refresh": "absent"}
+    if have("tailscale"):
+        out["tailscale_auto_update"] = out["tailscale_check_updates"] = "unknown"
+        rc, o, _ = run(["tailscale", "debug", "prefs"], timeout=30)
+        try:
+            au = json.loads(o).get("AutoUpdate") or {}
+            out["tailscale_auto_update"] = {True: "true", False: "false"}.get(au.get("Apply"), "unset")
+            out["tailscale_check_updates"] = {True: "true", False: "false"}.get(au.get("Check"), "unset")
+        except (ValueError, AttributeError):
+            pass
+    if have("snap"):
+        rc, o, _ = run(["snap", "refresh", "--time"], timeout=30)
+        out["snap_refresh"] = " ; ".join(x.strip() for x in o.splitlines() if x.strip()) if rc == 0 and o.strip() else "unknown"
+    return out
 
 
 # ---------------------------------------------------------------------------------------------- freeze / thaw
