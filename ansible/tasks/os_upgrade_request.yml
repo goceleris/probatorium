@@ -11,6 +11,7 @@
       - (os_mode == 'survey') or (os_host in ['msa2-server', 'msr1', 'msa2-client'])
       - os_confirm is defined
       - (os_mode == 'survey') or (os_confirm == 'UPGRADE-' ~ os_host)
+      - (os_mode == 'upgrade') or (os_confirm == '')
       - os_reason is defined
       - os_reason | trim | length > 0
       - os_reason | length <= 200
@@ -21,7 +22,7 @@
       - os_out_dir is match('^/')
     fail_msg: >-
       refused: os_mode must be survey or upgrade; an upgrade names ONE host (msa2-server, msr1 or msa2-client) and
-      os_confirm must be exactly UPGRADE-<host>; a survey names no host ("-"); os_reason is one line of 1-200
+      os_confirm must be exactly UPGRADE-<host>; a survey names no host ("-") and takes no confirmation; os_reason is one line of 1-200
       characters; os_run_id digits; os_out_dir absolute.
     quiet: true
 

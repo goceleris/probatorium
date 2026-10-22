@@ -263,7 +263,8 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
 - **Inputs.** `mode` is `survey` or `upgrade`; an upgrade names ONE `host` and `confirm` must be exactly
   `UPGRADE-<host>`; `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
   `results_root` holds entries (the reboot destroys the tmpfs). `refresh_lists` (survey only, default false) runs
-  `apt-get update` first so the simulation is not stale (it touches `/var/lib/apt/lists` only). `blacklist_r8169`
+  `apt-get update` first so the simulation is not stale: it WRITES `/var/lib/apt/lists` and the apt caches
+  (`/var/cache/apt/*.bin`) and runs the apt update post-invoke hooks, so it is the one thing a survey changes, and only when asked. `blacklist_r8169`
   (upgrade only, default false) is explained below. Dispatch from `main` only; it never runs on a schedule.
 - **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
   job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's

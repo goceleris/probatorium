@@ -122,6 +122,8 @@ func TestClusterOSUpgradePlanRefuses(t *testing.T) {
 		`"$IN_HOST" != "-"`,
 		`-gt 200`,
 		`mode must be survey or upgrade`,
+		`a survey takes no confirmation`,
+		`reason must not contain braces`,
 	} {
 		if !strings.Contains(plan, want) {
 			t.Errorf("the plan job no longer checks %s", want)
@@ -641,5 +643,28 @@ func TestOSUpgradeIsDocumented(t *testing.T) {
 	}
 	if !strings.Contains(mustRead(t, filepath.Join("ansible", "RUNNER_BOOTSTRAP.md")), "cluster-os-upgrade.yml") {
 		t.Error("RUNNER_BOOTSTRAP.md does not point at the sanctioned OS upgrade path")
+	}
+}
+
+// Free text is data. ansible renders extra-vars from a file as Jinja templates, on a runner that holds the cluster
+// key, in survey mode too (no typed confirmation there): reason and confirm must reach it as unsafe strings.
+func TestFreeTextInputsAreWrittenAsUnsafeStrings(t *testing.T) {
+	for _, c := range []struct{ file, confirm, reason string }{
+		{osWorkflow, "os_confirm", "os_reason"},
+		{"cluster-reboot.yml", "reboot_confirm", "reboot_reason"},
+	} {
+		src := withoutComments(readWorkflow(t, c.file))
+		for _, key := range []string{c.confirm, c.reason} {
+			want := `"` + key + `": {"__ansible_unsafe": os.environ[`
+			if !strings.Contains(src, want) {
+				t.Errorf("%s writes %s without __ansible_unsafe: a reason like {{ lookup('pipe', ...) }} would run on the runner", c.file, key)
+			}
+		}
+		if !strings.Contains(src, `*'{'* | *'}'*)`) {
+			t.Errorf("%s does not reject braces in the reason", c.file)
+		}
+	}
+	if !strings.Contains(mustRead(t, osRequest), "(os_mode == 'upgrade') or (os_confirm == '')") {
+		t.Error("the playbook accepts a confirmation in a survey")
 	}
 }

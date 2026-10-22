@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -138,22 +139,44 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         open(h.log, "w").close()
         return h
 
+    def write_extra_vars(self, out, base):
+        """extra-vars.json written by the REAL snippet of .github/workflows/cluster-os-upgrade.yml, from the same
+        environment variables the workflow gives it: what is tested is what the runner does with free text."""
+        with open(os.path.join(ANSIBLE_DIR, "..", ".github", "workflows", "cluster-os-upgrade.yml")) as f:
+            wf = f.read()
+        m = re.search(r"python3 - <<'PY'\n(.*?)\n\s*PY\n", wf, re.S)
+        assert m, "the request writer is not in the workflow"
+        code = textwrap.dedent(m.group(1))
+        env = dict(os.environ, IN_MODE=base["os_mode"], IN_HOST=base["os_host"], IN_CONFIRM=base.get("os_confirm", ""), IN_REASON=base["os_reason"],
+                   IN_ALLOW=str(bool(base.get("allow_results_loss", False))).lower(), IN_REFRESH=str(bool(base.get("refresh_lists", False))).lower(),
+                   IN_BLACKLIST=str(bool(base.get("blacklist_r8169", False))).lower(), RUN_ID=base["os_run_id"], OS_OUT=out)
+        subprocess.run([sys.executable, "-c", code], env=env, check=True)
+        return os.path.join(out, "extra-vars.json")
+
+    # free text that is a Jinja template: it must stay text
+    MARK = "/tmp/osu-injection-mark"
+    PAYLOAD = "{{ lookup('pipe', 'touch /tmp/osu-injection-mark') }}"
+
     def play(self, name, extra, env=None):
         out = os.path.join(self.work, "out." + name)
         shutil.rmtree(out, ignore_errors=True)
         os.makedirs(out)
-        base = {"os_reason": "platform upgrade before the final evidence", "os_run_id": "4242", "os_out_dir": out}
+        if os.path.exists(self.MARK):
+            os.remove(self.MARK)
+        base = {"os_reason": "platform upgrade %s before the final evidence" % self.PAYLOAD, "os_run_id": "4242", "os_out_dir": out}
         base.update(extra)
         e = dict(os.environ, PATH=os.path.join(self.work, "sbin") + os.pathsep + os.environ["PATH"], ANSIBLE_LOCALHOST_WARNING="False",
                  ANSIBLE_INVENTORY_UNPARSED_WARNING="False", ANSIBLE_DEPRECATION_WARNINGS="False", ANSIBLE_ROLES_PATH="/nonexistent",
                  STATE=self.h.state_dir)
         if env:
             e.update(env)
-        r = subprocess.run([PLAYBOOK, "-i", "inventory.yml", "os-upgrade.yml", "-e", json.dumps(base), "-e", "upgrade_poll_retries=200"],
+        ev = self.write_extra_vars(out, base)
+        r = subprocess.run([PLAYBOOK, "-i", "inventory.yml", "os-upgrade.yml", "-e", "@" + ev, "-e", "upgrade_poll_retries=200", "-e", "os_out_dir=" + out],
                            cwd=self.pb, capture_output=True, text=True, env=e, timeout=900)
         self.log = r.stdout + r.stderr
         self.rc = r.returncode
         self.out = out
+        self.assertFalse(os.path.exists(self.MARK), "free text was run as a Jinja template on the runner")
         self.h.load()
         return r
 
@@ -211,6 +234,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
         r = self.j("msr1", "result.json")
         self.assertEqual((r["status"], r["kernel_before"], r["kernel_after"], r["default_kernel"]), ("permanent", "7.0.0-31-generic", "7.0.0-40-generic", "7.0.0-40-generic"))
         self.assertTrue(r["marker"]["permanent"])
+        self.assertIn(self.PAYLOAD, r["reason"])
         self.assertIn("No power-cycle needed", r["power_cycle"])
         for f in ("preflight-snapshot.json", "pre-snapshot.json", "post-snapshot.json", "pre-survey.json", "post-survey.json", "survey.json", "dkms.json",
                   "simulate.json", "pin.json", "arm.json", "toolcheck.json", "dpkg-before.txt", "dpkg-after.txt", "apt-policy-before.txt",
@@ -271,6 +295,20 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=%s HOST_SNAPSHOT_ROOT=%s exec b
     def test_a_boot_that_cannot_be_one_shot_refuses(self):
         self.fresh(boot_fs="btrfs")
         self.refused("btrfs", self.UP, "/boot/grub is on btrfs")
+
+    def test_template_syntax_in_free_text_is_data(self):
+        self.fresh()
+        # a survey takes no confirmation: a template there is refused, not rendered
+        self.play("inj_survey_confirm", {"os_mode": "survey", "os_host": "-", "os_confirm": self.PAYLOAD})
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.calls(), [])
+        # an upgrade with a template as the confirmation: refused, no host touched
+        self.play("inj_upgrade_confirm", dict(self.UP, os_confirm=self.PAYLOAD))
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.calls(), [])
+        # a template as the reason (the default of play()) in a survey: taken literally, the survey works
+        self.play("inj_survey_reason", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertEqual(self.rc, 0, self.log[-1500:])
 
     def test_a_wrong_request_touches_nothing(self):
         self.fresh()

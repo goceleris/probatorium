@@ -64,7 +64,7 @@ on:
         required: false
         default: false
       refresh_lists:
-        description: "survey only: run apt-get update first (touches /var/lib/apt/lists only) so the simulation is not stale."
+        description: "survey only: run apt-get update first (writes /var/lib/apt/lists and /var/cache/apt/*.bin, runs the apt update post-invoke hooks) so the simulation is not stale."
         type: boolean
         required: false
         default: false
@@ -104,6 +104,10 @@ jobs:
                 echo "::error::a survey covers all three hosts: leave host as '-' (got $IN_HOST)"
                 exit 1
               fi
+              if [ -n "$IN_CONFIRM" ]; then
+                echo "::error::a survey takes no confirmation: leave confirm empty"
+                exit 1
+              fi
               ;;
             upgrade)
               case "$IN_HOST" in
@@ -129,6 +133,11 @@ jobs:
             echo "::error::reason must be one line without control characters"
             exit 1
           fi
+          # defense in depth: the playbook receives it as an unsafe (literal) string, but there is no reason to carry
+          # template syntax into the audit trail
+          case "$IN_REASON" in
+            *'{'* | *'}'*) echo "::error::reason must not contain braces"; exit 1 ;;
+          esac
           echo "request accepted: $IN_MODE $IN_HOST"
 
   # Outside matrix-tier-cluster, just before entering it. The tool is built first so the look (guard.sh) and
@@ -287,8 +296,10 @@ jobs:
           json.dump({
               "os_mode": os.environ["IN_MODE"],
               "os_host": os.environ["IN_HOST"],
-              "os_confirm": os.environ["IN_CONFIRM"],
-              "os_reason": os.environ["IN_REASON"],
+              # free text is data, never a template: ansible renders extra-vars from a file as Jinja, and the
+              # runner holds the cluster key. __ansible_unsafe keeps '{{ ... }}' literal.
+              "os_confirm": {"__ansible_unsafe": os.environ["IN_CONFIRM"]},
+              "os_reason": {"__ansible_unsafe": os.environ["IN_REASON"]},
               "os_run_id": os.environ["RUN_ID"],
               "os_out_dir": os.environ["OS_OUT"],
               "allow_results_loss": os.environ["IN_ALLOW"] == "true",

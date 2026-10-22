@@ -25,8 +25,9 @@
 #   time sync, crash dumps, the run state (manifests, runner jobs), the last boot, and the host's compiler and
 #   service package versions. It writes <os_out_dir>/<host>/survey.json for each host. (The toolchains the roles
 #   install are not on the hosts: the workflow compares their pins with upstream, see
-#   .github/scripts/os-upgrade-toolchains.sh.) refresh_lists=true first runs `apt-get update` (it touches
-#   /var/lib/apt/lists only) so that the simulation is not stale.
+#   .github/scripts/os-upgrade-toolchains.sh.) refresh_lists=true first runs `apt-get update`, which WRITES /var/lib/apt/lists
+#   and the apt package caches (/var/cache/apt/*.bin) and runs the APT::Update::Post-Invoke hooks, so that the simulation
+#   is not stale. It is the one thing a survey changes on a host, and only when asked.
 #
 # MODE upgrade (host-changing, ONE host per dispatch)
 #   REFUSES, before touching anything (vars/os_upgrade_judge.yml, refusals_str): any of the three hosts unreachable,
@@ -100,7 +101,7 @@
         mode: "0755"
       delegate_to: localhost
 
-    - name: Preflight | refresh the apt lists when asked (it touches /var/lib/apt/lists only)
+    - name: Preflight | refresh the apt lists when asked (writes the apt lists and caches, runs the update hooks)
       ansible.builtin.script:
         cmd: "{{ osu }} apt-update"
       become: true

@@ -85,7 +85,7 @@ echo "- reason: \`$safe_reason\`"
 echo "- workflow run: $run_id"
 
 if [ "$mode" = survey ]; then
-	if [ "$rc" -eq 0 ]; then echo "- **result: SURVEYED** (read-only; nothing on any host was changed, except /var/lib/apt/lists when refresh_lists was set)"; else echo "- **result: SURVEY FAILED** (ansible-playbook exit $rc): the hosts that answered have a record below"; fi
+	if [ "$rc" -eq 0 ]; then echo "- **result: SURVEYED** (read-only; nothing on any host was changed, except, when refresh_lists was set, what apt-get update writes: /var/lib/apt/lists, /var/cache/apt/*.bin and its post-invoke hooks)"; else echo "- **result: SURVEY FAILED** (ansible-playbook exit $rc): the hosts that answered have a record below"; fi
 	echo
 	host_table
 	echo

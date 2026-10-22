@@ -17,7 +17,8 @@ check that nothing was written):
     marker            the record of the last verified OS upgrade of this host ({} when none)
 
 HOST-CHANGING subcommands (the upgrade mode only, in this order; each one is the only thing its task does):
-    apt-update                  apt-get update (touches /var/lib/apt/lists only; the survey mode may also use it)
+    apt-update                  apt-get update (writes /var/lib/apt/lists and /var/cache/apt/*.bin, runs the APT::Update::Post-Invoke hooks;
+                                the survey mode may also use it, when asked)
     pin-grub                    GRUB_DEFAULT=saved in a drop-in, update-grub, grub-set-default <RUNNING kernel>, and the
                                 running kernel's packages marked manual: BEFORE a new kernel is installed, so that a
                                 power-cycle at any later point boots the old kernel
