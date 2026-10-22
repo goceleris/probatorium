@@ -47,7 +47,7 @@
 #
 # MODE repair (host-changing, ONE host): a failed apt/dkms run leaves dpkg half-configured (a DKMS module that does not
 #   build for the new kernel fails the linux-headers postinst) and every later dispatch refuses. repair_action=configure runs
-#   `dpkg --configure -a` (detached, same policy-rc.d discipline as the upgrade); repair_action=abort-new-kernel first purges the
+#   `dpkg --configure -a` (detached, same policy-rc.d discipline as the upgrade); repair_action=release-holds releases the access-path holds a dead run of this tool left (nothing else is touched); repair_action=abort-new-kernel first purges the
 #   kernels NEWER than the running one, so the host stays on the old kernel. It never touches grub's saved default and refuses
 #   while a one-shot is pending.
 #
@@ -411,47 +411,70 @@
             mode: "0644"
           delegate_to: localhost
 
-        - name: Apt | what full-upgrade would do (simulation on the fresh lists, read-only)
-          ansible.builtin.script:
-            cmd: "{{ osu }} simulate"
-          become: true
-          register: sim_raw
-          changed_when: false
+        # The access-path packages are held BEFORE the plan is simulated: the plan judged below is the plan that runs. A refusal (or
+        # any failure before apt starts) releases what this run held; a run that dies later leaves its holds for repair release-holds.
+        - name: Apt | the plan (hold the access path, simulate, judge, start)
+          block:
+            - name: Apt | hold the access-path packages (the simulation below is made with them held)
+              ansible.builtin.script:
+                cmd: "{{ osu }} hold-access --run-id {{ os_run_id }}"
+              become: true
+              when: hold_access
 
-        - name: Apt | parse and keep
-          ansible.builtin.set_fact:
-            sim: "{{ sim_raw.stdout | from_json }}"
+            - name: Apt | what full-upgrade would do (simulation on the fresh lists, read-only)
+              ansible.builtin.script:
+                cmd: "{{ osu }} simulate"
+              become: true
+              register: sim_raw
+              changed_when: false
 
-        - name: Apt | keep the simulation
-          ansible.builtin.copy:
-            content: "{{ sim | to_nice_json }}\n"
-            dest: "{{ host_dir }}/simulate.json"
-            mode: "0644"
-          delegate_to: localhost
+            - name: Apt | parse and keep
+              ansible.builtin.set_fact:
+                sim: "{{ sim_raw.stdout | from_json }}"
 
-        - name: Apt | record the refusals (the step summary prints them)
-          ansible.builtin.copy:
-            content: "{{ plan_refusals_str | trim | replace(' ;; ', '; ') }}\n"
-            dest: "{{ host_dir }}/refusal.txt"
-            mode: "0644"
-          delegate_to: localhost
-          when: plan_refusals_str | trim | length > 0
+            - name: Apt | keep the simulation
+              ansible.builtin.copy:
+                content: "{{ sim | to_nice_json }}\n"
+                dest: "{{ host_dir }}/simulate.json"
+                mode: "0644"
+              delegate_to: localhost
 
-        - name: Apt | refuse when the plan is unacceptable (plan_refusals_str)
-          ansible.builtin.fail:
-            msg: "refused, no package was changed (the grub pin was applied and is harmless): {{ plan_refusals_str | trim | replace(' ;; ', '; ') }}"
-          when: plan_refusals_str | trim | length > 0
+            - name: Apt | record the refusals (the step summary prints them)
+              ansible.builtin.copy:
+                content: "{{ plan_refusals_str | trim | replace(' ;; ', '; ') }}\n"
+                dest: "{{ host_dir }}/refusal.txt"
+                mode: "0644"
+              delegate_to: localhost
+              when: plan_refusals_str | trim | length > 0
 
-        - name: Target | record the phase
-          ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
-          vars:
-            os_phase: upgrading
+            - name: Apt | refuse when the plan is unacceptable (plan_refusals_str)
+              ansible.builtin.fail:
+                msg: "refused, no package was changed (the grub pin was applied and is harmless): {{ plan_refusals_str | trim | replace(' ;; ', '; ') }}"
+              when: plan_refusals_str | trim | length > 0
 
-        - name: Apt | start the full-upgrade, detached
-          ansible.builtin.script:
-            cmd: "{{ osu }} upgrade-start --run-id {{ os_run_id }}{{ ' --hold' if hold_access else '' }}"
-          become: true
-          register: upgrade_start_raw
+            - name: Target | record the phase
+              ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+              vars:
+                os_phase: upgrading
+
+            - name: Apt | start the full-upgrade, detached
+              ansible.builtin.script:
+                cmd: "{{ osu }} upgrade-start --run-id {{ os_run_id }}{{ ' --hold' if hold_access else '' }}"
+              become: true
+              register: upgrade_start_raw
+
+          rescue:
+            - name: Apt | release the holds this run put (no package was changed)
+              ansible.builtin.script:
+                cmd: "{{ osu }} release-access --run-id {{ os_run_id }}"
+              become: true
+              failed_when: false
+              ignore_unreachable: true
+              when: hold_access
+
+            - name: Apt | the run stops here
+              ansible.builtin.fail:
+                msg: "{{ ansible_failed_result.msg | default('the plan was refused') }}"
 
         - name: Apt | wait for it (rounds of polls; a dropped ssh connection does not stop apt and does not end the wait)
           ansible.builtin.include_tasks: tasks/os_upgrade_wait_apt.yml
@@ -997,7 +1020,7 @@
         label: "{{ item.name }}"
       vars:
         after: "{{ maint_after_raw.stdout | from_json }}"
-        repair_ok: "{{ os_mode == 'repair' and (apt_status.state | default('')) == 'done' and (apt_status.rc | default(1)) == 0 and (after.packages.dpkg_audit | length == 0 or repair_action == 'abort-new-kernel') }}"
+        repair_ok: "{{ os_mode == 'repair' and (apt_status.state | default('')) == 'done' and (apt_status.rc | default(1)) == 0 and (after.packages.dpkg_audit | length == 0 or repair_action in ['abort-new-kernel', 'release-holds']) }}"
         result:
           host: "{{ inventory_hostname }}"
           run_id: "{{ os_run_id }}"
@@ -1012,6 +1035,7 @@
           new_kernel_pkgs_after: "{{ after.packages.new_kernel_pkgs }}"
           kernel_metapackages_removed: "{{ ((maint_log_raw.stdout | default('', true)) | regex_search('KERNEL METAPACKAGES REMOVED WITH IT: ([^(\\n]*)', '\\1') | default([''], true) | first | default('', true)) | trim }}"
           disarm: "{{ (maint_disarm_raw.stdout | default('{}', true) | from_json) }}"
+          holds_released: "{{ ((maint_log_raw.stdout | default('', true)) | regex_findall('HOLDS RELEASED: ([^\\n]*)')) }}"
           power_cycle: "No power-cycle needed: nothing was rebooted."
 
     - name: Maintenance | the one-shot is gone
@@ -1026,7 +1050,7 @@
         that:
           - (apt_status.state | default('')) == 'done'
           - (apt_status.rc | default(1)) == 0
-          - (maint_after_raw.stdout | from_json).packages.dpkg_audit | length == 0 or repair_action == 'abort-new-kernel'
+          - (maint_after_raw.stdout | from_json).packages.dpkg_audit | length == 0 or repair_action in ['abort-new-kernel', 'release-holds']
         fail_msg: >-
           the repair did not succeed (state {{ apt_status.state | default('unknown') }}, exit {{ apt_status.rc | default('none') }}, dpkg --audit
           after: {{ (maint_after_raw.stdout | from_json).packages.dpkg_audit | length }} finding(s)). See repair.log. The old kernel is

@@ -33,8 +33,11 @@ HOST-CHANGING subcommands (the upgrade mode only, in this order; each one is the
     make-permanent              grub-set-default <new kernel> and the marker: ONLY after the verification passed, and only on the
                                 host that RUNS that kernel
     repair-start                (mode=repair) detached `dpkg --configure -a`, after purging the half-installed kernels newer than the
-                                running one when --action abort-new-kernel; upgrade-status/upgrade-log read it
+                                running one when --action abort-new-kernel, or --action release-holds: releases the access-path holds
+                                a dead run of this tool left (recorded in held.txt); upgrade-status/upgrade-log read it
     upgrade-cleanup             removes OUR policy-rc.d once the detached run is over (never while its process is alive)
+    hold-access / release-access  apt-mark hold of the access-path packages BEFORE the simulation (so the plan judged is the plan that
+                                runs), recorded in the run's held.txt; released by the run, or by repair release-holds when it died
 
 Environment: OSU_ROOT is a test override, a prefix for every path read or written. Empty on a host.
 Exit 0 whatever a read found (a finding is data); 1 when a host-changing step could not do what it says.
@@ -867,6 +870,7 @@ def survey():
             "phased_held_back": phased_held,
             "held": held,
             "held_kernel": [h for h in held if h.startswith(("linux-", "grub", "dkms"))],
+            "tool_holds": tool_holds(),
             "lists_age_hours": lists_age_hours(),
             "repos": sources(),
             "third_party_repos": sorted({r["uri"] for r in sources() if not r["official"]}),
@@ -1092,7 +1096,8 @@ def start_detached(run_id, subcmd, extra, held=()):
 def cmd_upgrade_start(a):
     if os.path.exists(p(POLICY_RC_D)):
         fail("%s exists already: not touching it" % POLICY_RC_D)
-    start_detached(a.run_id, "_upgrade-run", ["--hold"] if a.hold else [], held=access_to_hold() if a.hold else [])
+    prior = [x for x in rd(upgrade_paths(a.run_id)[0] + "/held.txt").split() if x]
+    start_detached(a.run_id, "_upgrade-run", ["--hold"] if a.hold else [], held=(set(prior) | set(access_to_hold())) if a.hold else [])
 
 
 def cmd_repair_start(a):
@@ -1119,6 +1124,16 @@ def cmd_repair_run(a):
     the running one first), under the same policy-rc.d discipline as the upgrade."""
     d, log, rcf = upgrade_paths(a.run_id)
     rc = 1
+    if a.action == "release-holds":
+        # no policy-rc.d, no dpkg: apt-mark unhold of what this tool held (held.txt of every run) and nothing else
+        try:
+            released = release_tool_holds()
+            if not released:
+                sys.stdout.write("nothing to release: no hold of this tool is in place\n")
+            rc = 0
+        finally:
+            write(rcf, "%d\n" % rc)
+        return
     try:
         write(POLICY_RC_D, POLICY, 0o755)
         steps = []
@@ -1186,6 +1201,54 @@ def access_to_hold():
     return [n for n in access_packages() if n not in held_before]
 
 
+def tool_holds():
+    """Holds this tool put (recorded in a run's held.txt) that are still in place: [{run_id, packages}]. A run that died after
+    holding leaves them, and they dead-end every later upgrade."""
+    held_now = set(run(["apt-mark", "showhold"])[1].split())
+    out = []
+    for f in sorted(glob.glob(p(LOG_DIR + "/*/held.txt"))):
+        run_id = os.path.basename(os.path.dirname(f))
+        names = sorted(n for n in rd("%s/%s/held.txt" % (LOG_DIR, run_id)).split() if n in held_now)
+        if names:
+            out.append({"run_id": run_id, "packages": names})
+    return out
+
+
+def release_tool_holds():
+    """Releases every hold this tool put and records it in the output. Returns [{run_id, packages}] released. Never touches a hold
+    that is not in a held.txt (somebody else's)."""
+    released = []
+    for rec in tool_holds():
+        run(["apt-mark", "unhold"] + rec["packages"])
+        sys.stdout.write("+ apt-mark unhold %s\nHOLDS RELEASED: %s (put by run %s)\n" % (" ".join(rec["packages"]), " ".join(rec["packages"]), rec["run_id"]))
+        released.append(rec)
+    for f in glob.glob(p(LOG_DIR + "/*/held.txt")):
+        try:
+            os.remove(f)  # the record of a hold that is gone (or was just released)
+        except OSError:
+            pass
+    return released
+
+
+def cmd_hold_access(a):
+    """Holds the access-path packages now, before the plan is simulated, and records them for this run."""
+    d, log, rcf = upgrade_paths(a.run_id)
+    prior = [x for x in rd(d + "/held.txt").split() if x]
+    new = access_to_hold()
+    os.makedirs(p(d), exist_ok=True)
+    write(d + "/held.txt", " ".join(sorted(set(prior) | set(new))) + "\n")
+    if new:
+        rc, out, err = run(["apt-mark", "hold"] + new)
+        if rc != 0:
+            unhold_ours(a.run_id)
+            fail("apt-mark hold failed: " + (out + err)[-300:])
+    emit({"ok": True, "held": new, "recorded": sorted(set(prior) | set(new))})
+
+
+def cmd_release_access(a):
+    emit({"ok": True, "released": unhold_ours(a.run_id)})
+
+
 def unhold_ours(run_id):
     """Releases the holds THIS run put (never one that was there before)."""
     d, log, rcf = upgrade_paths(run_id)
@@ -1205,11 +1268,13 @@ def cmd_upgrade_run(a):
     rc = 1
     try:
         if a.hold:
-            ours = access_to_hold()
-            write(d + "/held.txt", " ".join(ours) + "\n")
-            if ours:
-                sys.stdout.write("+ apt-mark hold %s\n" % " ".join(ours))
-                run(["apt-mark", "hold"] + ours)
+            # the holds were normally put by hold-access, before the simulation; whatever is not held yet is held now
+            prior = [x for x in rd(d + "/held.txt").split() if x]
+            new = access_to_hold()
+            write(d + "/held.txt", " ".join(sorted(set(prior) | set(new))) + "\n")
+            if new:
+                sys.stdout.write("+ apt-mark hold %s\n" % " ".join(new))
+                run(["apt-mark", "hold"] + new)
         write(POLICY_RC_D, POLICY, 0o755)
         argv = ["apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold",
                 "-o", "Dpkg::Use-Pty=0", "-o", "DPkg::Lock::Timeout=600", "full-upgrade"]
@@ -1483,12 +1548,14 @@ def main():
     st.add_argument("--wait", type=int, default=0)
     add("upgrade-cleanup", cmd_upgrade_cleanup, "run-id")
     rs = add("repair-start", cmd_repair_start, "run-id")
-    rs.add_argument("--action", choices=["configure", "abort-new-kernel"], default="configure")
+    rs.add_argument("--action", choices=["configure", "abort-new-kernel", "release-holds"], default="configure")
     rr = add("_repair-run", cmd_repair_run, "run-id")
-    rr.add_argument("--action", choices=["configure", "abort-new-kernel"], default="configure")
+    rr.add_argument("--action", choices=["configure", "abort-new-kernel", "release-holds"], default="configure")
     add("upgrade-log", cmd_upgrade_log, "run-id")
     add("apt-update", cmd_apt_update)
     add("pin-grub", cmd_pin_grub, "running", "run-id")
+    add("hold-access", cmd_hold_access, "run-id")
+    add("release-access", cmd_release_access, "run-id")
     add("upgrade-start", cmd_upgrade_start, "run-id", flags=("hold",))
     add("_upgrade-run", cmd_upgrade_run, "run-id", flags=("hold",))
     add("blacklist-r8169", cmd_blacklist, "run-id", "target")

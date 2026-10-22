@@ -72,9 +72,9 @@ on:
         required: false
         default: false
       repair_action:
-        description: "repair only: configure = dpkg --configure -a. abort-new-kernel = purge the kernels newer than the running one, then configure (the host stays on the old kernel)."
+        description: "repair only: configure = dpkg --configure -a. abort-new-kernel = purge the kernels newer than the running one, then configure (the host stays on the old kernel). release-holds = release the access-path holds that a dead run of this tool left (only holds it recorded; nothing else)."
         type: choice
-        options: [configure, abort-new-kernel]
+        options: [configure, abort-new-kernel, release-holds]
         required: false
         default: configure
       retry_kernel:
@@ -137,8 +137,8 @@ jobs:
             *) echo "::error::host must be '-', msa2-server, msr1 or msa2-client, got: $IN_HOST"; exit 1 ;;
           esac
           case "$IN_REPAIR_ACTION" in
-            configure | abort-new-kernel) ;;
-            *) echo "::error::repair_action must be configure or abort-new-kernel"; exit 1 ;;
+            configure | abort-new-kernel | release-holds) ;;
+            *) echo "::error::repair_action must be configure, abort-new-kernel or release-holds"; exit 1 ;;
           esac
           case "$IN_HOLD" in
             auto | on | off) ;;

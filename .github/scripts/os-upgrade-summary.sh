@@ -210,6 +210,9 @@ if [ "$mode" = repair ]; then
 		echo "- **KERNEL METAPACKAGES WERE REMOVED WITH THE ABORTED KERNEL: $(jq -r '.kernel_metapackages_removed' "$d/result.json").** Later full-upgrades install no kernel on $host until they are installed again (a deliberate decision: installing them brings the newest kernel back)."
 	fi
 	echo "- mode=repair never reboots and never touches grub's saved default. \`configure\` runs \`dpkg --configure -a\`; \`abort-new-kernel\` first purges the kernel versions newer than the running one that a failed upgrade left half-installed, so the host stays on the old kernel (a kernel installed and working before is never removed). If \`configure\` fails again because a DKMS module (r8127) does not build for the new kernel, the campaign cannot move this host to that kernel until the module builds: dispatch \`abort-new-kernel\`."
+	if [ -n "$(jq -r '.holds_released[0] // ""' "$d/result.json" 2> /dev/null)" ]; then
+		echo "- **HOLDS RELEASED** (put by this tool and left by a run that died): $(jq -r '.holds_released | join(" ; ")' "$d/result.json"). Only holds recorded by this tool are released; any other hold is somebody's decision."
+	fi
 	if [ -s "$d/repair.log" ]; then
 		echo
 		echo '```'

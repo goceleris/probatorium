@@ -12,6 +12,7 @@ fell back or came back wrong is NOT made permanent, what a person is told, and t
 The grub, apt and dkms commands are STUBS and the kernel never boots: this proves the playbook's ordering and
 verdicts, not that a real GRUB honours grub-reboot or that r8127 builds for a real kernel.
 """
+import glob
 import json
 import os
 import re
@@ -425,6 +426,23 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.no_call("FAKE-REBOOT")
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)  # the (harmless) pin was done
         self.assertEqual(self.phase(), "pinned")
+        # R3-m4: the access path was held for the simulation; a refused plan changed no package, so the holds are released too
+        self.assertIn("OSU hold-access", "\n".join(self.calls()))
+        self.assertEqual(self.h.load()["held"], [], "a refused plan left the access-path holds behind")
+        self.assertIn("OSU release-access", "\n".join(self.calls()))
+        self.assertEqual(glob.glob(self.h.root + "/var/log/celeris-os-upgrade/*/held.txt"), [])
+
+    def test_the_plan_is_simulated_with_the_access_path_held_and_apt_runs_with_the_same_holds(self):
+        # R3-m4: msr1 holds by default; the plan judged (protected removals, the checklist) is the plan that runs
+        self.fresh()
+        self.play("holds_order", self.UP)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        c = self.calls()
+        self.assertLess(self.idx("OSU hold-access"), self.idx("OSU simulate"))
+        self.assertLess(self.idx("OSU simulate"), self.idx("OSU upgrade-start"))
+        r = self.j("msr1", "result.json")
+        self.assertEqual(sorted(r["access_packages_held"]), ["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed", "tailscale"])
+        self.assertEqual(self.h.load()["held"], [])  # released after apt
 
     def test_a_failing_apt_stops_before_the_reboot(self):
         self.fresh(upgrade_rc=100)
@@ -530,6 +548,33 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("smc_upgrade_again", self.UP)
         self.assertEqual(self.rc, 0, self.log[-2500:])
         self.assertEqual(self.phase(), "permanent")
+
+    def test_holds_a_dead_run_left_are_refused_with_the_exact_repair_and_the_repair_releases_them(self):
+        # R3-m2: the wrapper of an earlier run died with the access-path holds on; no sanctioned path used to release them
+        self.fresh()
+        self.h.state["held"] = ["grub-common", "tailscale", "vim"]
+        self.h.save()
+        self.h.w("/var/log/celeris-os-upgrade/41/held.txt", "grub-common tailscale\n")
+        self.refused_keep("dead_holds", self.UP, "THIS TOOL put the holds of 41 (grub-common tailscale)")
+        self.assertIn("repair_action=release-holds", self.log)
+        self.play("release", dict(self.R, repair_action="release-holds"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.h.load()["held"], ["vim"])  # somebody else's hold stays
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["repair_action"]), ("repaired", "release-holds"))
+        self.assertEqual(r["holds_released"], ["grub-common tailscale (put by run 41)"])
+        self.assertIn("HOLDS RELEASED", self.summary("repair", "msr1"))
+        self.no_call("dpkg --force-confold")
+        # nothing left to release now
+        self.play("release_again", dict(self.R, repair_action="release-holds"))
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("nothing to release", self.log)
+        # ... and a hold somebody else put is never offered for release
+        self.h.state["held"] = ["grub-common", "vim"]
+        self.h.save()
+        self.play("release_foreign", dict(self.R, repair_action="release-holds"))
+        self.assertIn("nothing to release", self.log)
+        self.assertEqual(self.h.load()["held"], ["grub-common", "vim"])
 
     def test_repair_refuses_with_a_one_shot_pending_or_beside_a_bench_or_when_there_is_nothing_to_repair(self):
         self.fresh()

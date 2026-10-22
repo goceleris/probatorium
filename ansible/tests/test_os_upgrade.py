@@ -1102,6 +1102,76 @@ class HoldAccessPackages(Base):
         self.assertEqual(self.h.load()["held"], [])
 
 
+class HoldBeforeTheSimulation(HoldAccessPackages):
+    """R3-m4: the holds are put BEFORE the plan is simulated, and the detached run adopts them. R3-m2: holds a dead run left are seen,
+    refused with the exact repair, and released by it (only the ones this tool recorded)."""
+
+    def test_hold_access_holds_records_and_the_simulation_sees_the_holds(self):
+        self.h.state["held"] = ["vim", "shim-signed"]
+        self.h.save()
+        r = self.j(self.h.run("hold-access", "--run-id", "42"))
+        self.assertEqual(r["held"], ["grub-common", "grub-efi-arm64-bin", "openssh-server", "tailscale"])
+        self.assertEqual(self.h.load()["held"], ["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed", "tailscale", "vim"])
+        self.assertEqual(open(self.h.root + "/var/log/celeris-os-upgrade/42/held.txt").read().split(), ["grub-common", "grub-efi-arm64-bin", "openssh-server", "tailscale"])
+        s = self.run_ok("survey")
+        self.assertEqual(s["packages"]["tool_holds"], [{"run_id": "42", "packages": ["grub-common", "grub-efi-arm64-bin", "openssh-server", "tailscale"]}])
+        # the simulation is made with the holds in place: the stub prints what apt would see held
+        self.assertEqual(self.run_ok("simulate")["rc"], 0)
+        calls = self.h.calls()
+        self.assertLess(max(i for i, c in enumerate(calls) if c.startswith("apt-mark hold")), max(i for i, c in enumerate(calls) if c.startswith("apt-get") and " -s" in c))
+
+    def test_the_detached_run_adopts_the_holds_and_releases_them_at_its_end(self):
+        self.h.state["held"] = ["vim"]
+        self.h.save()
+        self.j(self.h.run("hold-access", "--run-id", "42"))
+        out = self.j(self.h.run("upgrade-start", "--run-id", "42", "--hold"))
+        self.assertEqual(out["access_packages_held"], ["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed", "tailscale"])  # not [] after hold-access
+        self.assertEqual(self.wait()["rc"], 0)
+        log = self.h.run("upgrade-log", "--run-id", "42").stdout
+        self.assertIn("held: grub-common grub-efi-arm64-bin openssh-server shim-signed tailscale vim", log)
+        self.assertEqual(self.h.load()["held"], ["vim"])  # only the ones this run put go; vim was somebody's
+        self.assertEqual(self.run_ok("survey")["packages"]["tool_holds"], [])
+
+    def test_release_access_releases_what_the_run_held_and_not_the_rest(self):
+        self.h.state["held"] = ["vim", "shim-signed"]
+        self.h.save()
+        self.j(self.h.run("hold-access", "--run-id", "42"))
+        r = self.j(self.h.run("release-access", "--run-id", "42"))
+        self.assertEqual(r["released"], ["grub-common", "grub-efi-arm64-bin", "openssh-server", "tailscale"])
+        self.assertEqual(self.h.load()["held"], ["shim-signed", "vim"])
+
+    def dead_run(self):
+        self.h.state["held"] = ["vim", "shim-signed"]
+        self.h.save()
+        self.j(self.h.run("hold-access", "--run-id", "41"))  # the run died here: nobody released
+
+    def test_repair_release_holds_releases_what_a_dead_run_left_and_records_it(self):
+        self.dead_run()
+        seen = len(self.h.calls())
+        self.j(self.h.run("repair-start", "--run-id", "43", "--action", "release-holds"))
+        self.assertEqual(self.wait("43")["rc"], 0)
+        self.assertFalse(any(c.startswith(("dpkg ", "apt-get")) for c in self.h.calls()[seen:]), "release-holds touched dpkg or apt")
+        self.assertEqual(self.h.load()["held"], ["shim-signed", "vim"])  # somebody else's holds stay
+        log = self.h.run("upgrade-log", "--run-id", "43").stdout
+        self.assertIn("HOLDS RELEASED: grub-common grub-efi-arm64-bin openssh-server tailscale (put by run 41)", log)
+        self.assertEqual(self.run_ok("survey")["packages"]["tool_holds"], [])
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+
+    def test_repair_release_holds_never_unholds_a_hold_it_did_not_record(self):
+        self.h.state["held"] = ["linux-image-generic", "vim"]
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "43", "--action", "release-holds"))
+        self.assertEqual(self.wait("43")["rc"], 0)
+        self.assertEqual(self.h.load()["held"], ["linux-image-generic", "vim"])
+        self.assertIn("nothing to release", self.h.run("upgrade-log", "--run-id", "43").stdout)
+
+    def test_a_hold_no_longer_in_place_is_not_reported(self):
+        self.dead_run()
+        self.h.state["held"] = []  # somebody released them by hand
+        self.h.save()
+        self.assertEqual(self.run_ok("survey")["packages"]["tool_holds"], [])
+
+
 class AbortKeepsTheSuspicionUntilTheKernelIsGone(Repair):
     def arm_record(self, kernel, run_id="77"):
         self.h.w("/var/lib/celeris-os-upgrade/armed-%s.json" % kernel, json.dumps({"kernel": kernel, "run_id": run_id, "running": "7.0.0-31-generic"}))

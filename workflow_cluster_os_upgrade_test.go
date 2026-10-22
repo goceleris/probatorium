@@ -87,7 +87,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 	if got := choice("hold_access_packages", "blacklist_r8169"); !slices.Equal(got, []string{"auto", "on", "off"}) {
 		t.Errorf("hold_access_packages = %v", got)
 	}
-	if got := choice("repair_action", "retry_kernel"); !slices.Equal(got, []string{"configure", "abort-new-kernel"}) {
+	if got := choice("repair_action", "retry_kernel"); !slices.Equal(got, []string{"configure", "abort-new-kernel", "release-holds"}) {
 		t.Errorf("repair actions = %v", got)
 	}
 	for _, in := range []string{"allow_results_loss", "refresh_lists"} {

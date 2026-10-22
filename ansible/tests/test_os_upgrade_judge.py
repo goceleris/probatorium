@@ -299,7 +299,17 @@ class Judge(unittest.TestCase):
                     section, key = k.split("__")
                     (c["pre_target"] if section == "t" else c["pre_survey"]["packages"] if section == "p" else c["pre_survey"]["boot"]).update({key: v})
             return m
+        TH = [{"run_id": "41", "packages": ["grub-common", "tailscale"]}]
         case("repair_ok", {}, repair())
+        case("release_holds_with_holds_left", {}, repair("release-holds", p__tool_holds=TH, p__dpkg_audit=[], p__broken_kernel_pkgs=[]))
+        case("release_holds_with_nothing_to_release", {"maint": "nothing to release: no hold put by this tool is in place"}, repair("release-holds", p__tool_holds=[]))
+        case("configure_hints_at_leftover_holds", {"maint": "nothing to repair: dpkg --audit is clean (this tool left holds in place: use repair_action=release-holds)"},
+             repair("configure", p__dpkg_audit=[], p__tool_holds=TH))
+        case("release_holds_into_a_running_apt", {"maint": "dpkg or apt is busy (apt)"}, repair("release-holds", p__tool_holds=TH, p__package_processes=["apt"]))
+        case("held_by_a_dead_run_names_the_repair", {"refusals": "THIS TOOL put the holds of 41 (grub-common tailscale) and a run that died left them: dispatch mode=repair with repair_action=release-holds"},
+             lambda c: c["pre_survey"]["packages"].update(held_kernel=["grub-common", "tailscale"], tool_holds=TH))
+        case("held_by_somebody_else_does_not_offer_the_release", {"refusals": "held kernel, boot or DKMS packages: grub-common (apt-mark unhold them deliberately, or leave the host)"},
+             lambda c: c["pre_survey"]["packages"].update(held_kernel=["grub-common"], tool_holds=[]))
         case("repair_abort_ok", {}, repair("abort-new-kernel"))
         case("repair_beside_a_bench", {"maint": "a bench or validation manifest exists"}, repair(t__manifest_present=True))
         case("repair_beside_a_runner_job", {"maint": "1 runner job(s) are executing"}, repair(t__runner_workers=1))
@@ -458,7 +468,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 78, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 79, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:

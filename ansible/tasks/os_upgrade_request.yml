@@ -10,7 +10,7 @@
       - (os_mode == 'survey' and os_host == '-') or (os_mode != 'survey' and os_host in ['msa2-server', 'msr1', 'msa2-client'])
       - os_confirm is defined
       - (os_mode == 'survey' and os_confirm == '') or (os_mode == 'upgrade' and os_confirm == 'UPGRADE-' ~ os_host) or (os_mode == 'rehearse' and os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']) or (os_mode == 'disarm' and os_confirm == 'DISARM-' ~ os_host) or (os_mode == 'repair' and os_confirm == 'REPAIR-' ~ os_host)
-      - repair_action | default('configure') in ['configure', 'abort-new-kernel']
+      - repair_action | default('configure') in ['configure', 'abort-new-kernel', 'release-holds']
       - (retry_kernel | default('')) is match('^$|^[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+-[a-z0-9-]+$')
       - (hold_access_packages | default('auto')) in ['auto', 'on', 'off']
       - os_reason is defined
