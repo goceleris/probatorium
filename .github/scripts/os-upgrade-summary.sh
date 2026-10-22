@@ -222,6 +222,9 @@ if [ "$mode" = repair ]; then
 	if [ -n "$(jq -r '.holds_released[0] // ""' "$d/result.json" 2> /dev/null)" ]; then
 		echo "- **HOLDS RELEASED** (put by this tool and left by a run that died): $(jq -r '.holds_released | join(" ; ")' "$d/result.json"). Only holds recorded by this tool are released; any other hold is somebody's decision."
 	fi
+	if [ -n "$(jq -r '.holds_not_released[0] // ""' "$d/result.json" 2> /dev/null)" ]; then
+		echo "- **HOLDS NOT RELEASED** (apt-mark unhold did not take, the dpkg lock was busy?): $(jq -r '.holds_not_released | join(" ; ")' "$d/result.json"). They and their record are still in place: dispatch mode=repair with repair_action=release-holds again."
+	fi
 	if [ -s "$d/repair.log" ]; then
 		echo
 		echo '```'
@@ -348,6 +351,15 @@ for r in "$out"/*/refusal.txt; do
 	[ -s "$r" ] || continue
 	echo
 	echo "### Refused: $(basename "$(dirname "$r")")"
+	echo
+	echo '```'
+	cat "$r"
+	echo '```'
+done
+for r in "$out"/*/holds-left.txt; do
+	[ -s "$r" ] || continue
+	echo
+	echo "### ACCESS-PATH HOLDS NOT RELEASED: $(basename "$(dirname "$r")")"
 	echo
 	echo '```'
 	cat "$r"

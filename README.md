@@ -302,8 +302,8 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   recovery) Advanced entry and exists in grub.cfg, and no one-shot is pending. A host that was never rehearsed stays refused.
 - **The access path can be held.** `hold_access_packages` (`auto`, `on`, `off`; `auto` = on for a host with an r8127 NIC) holds
   `grub-*`, `shim*`, `openssh-server` and `tailscale*` BEFORE the plan is simulated (so the protected-removal judgement describes the plan that runs) and for the length of the apt run,
-  and releases only the holds this run put (a refusal releases them at once). If the run dies with the holds on, the survey lists them
-  (`packages.tool_holds`), every upgrade refuses naming the repair, and `mode=repair repair_action=release-holds` releases them. Both
+  and releases only the holds this run put (a refusal releases them at once). A hold counts as released only when `apt-mark showhold` no longer lists it (`apt-mark unhold` can fail while unattended-upgrades has the dpkg lock): one that stays keeps its record, the run says so (the step summary prints `holds-left.txt`) and, after the apt run, fails before any reboot. If the run dies with the holds on, the survey lists them
+  (`packages.tool_holds`), every upgrade refuses naming the repair, and `mode=repair repair_action=release-holds` releases them (and fails, keeping the record, if a hold stays: dispatch it again). Both
   kernels share those packages, so no fallback helps if one breaks: upgrade them in a separate dispatch (`hold_access_packages=off`)
   with a person at the rack and a console.
 - **Order: servers first, the load generator last.** `msa2-client` is refused until `msa2-server` and `msr1` each carry

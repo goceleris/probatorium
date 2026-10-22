@@ -281,6 +281,16 @@
       No power-cycle needed while the host answers. The arming succeeded, the host did not reboot, and no one-shot is pending any more:
       something cleared it (GRUB reading another environment block than the one Linux writes?). Survey before anything else and do
       not dispatch the upgrade again before it is understood.
+    # what a person must know when apt-mark could not release the access-path holds this run put (the record of them is kept)
+    holds_left_msg: >-
+      THE ACCESS-PATH HOLDS COULD NOT BE RELEASED{{ (': ' ~ (((release_raw.stdout | trim | from_json).still_held | default([])) | join(' ')) ~ ' are still held') if ((release_raw | default({})).stdout | default('', true) | trim | regex_search('^[{]')) else '' }}
+      (apt-mark unhold did not take: the dpkg lock was busy?). The record of them is kept: the next survey lists them
+      (packages.tool_holds) and every upgrade refuses until mode=repair with repair_action=release-holds has released them.
+    # the same, for a cleanup after the apt run (upgrade-cleanup exits 1 and names the holds that stay)
+    cleanup_holds_msg: >-
+      THE ACCESS-PATH HOLDS COULD NOT BE RELEASED{{ (': ' ~ (((cleanup_raw.stdout | trim | from_json).still_held | default([])) | join(' ')) ~ ' are still held') if ((cleanup_raw | default({})).stdout | default('', true) | trim | regex_search('^[{]')) else '' }}
+      (apt-mark unhold did not take: the dpkg lock was busy?). The record of them is kept: the next survey lists them
+      (packages.tool_holds) and every upgrade refuses until mode=repair with repair_action=release-holds has released them.
     result_base:
       host: "{{ inventory_hostname }}"
       run_id: "{{ os_run_id }}"
@@ -468,13 +478,23 @@
               ansible.builtin.script:
                 cmd: "{{ osu }} release-access --run-id {{ os_run_id }}"
               become: true
+              register: release_raw
               failed_when: false
               ignore_unreachable: true
               when: hold_access
 
+            # apt-mark unhold can fail (the dpkg frontend lock is taken): a hold that stays keeps its record, and the run says so
+            - name: Apt | the holds could NOT be released (the record is kept; the step summary prints it)
+              ansible.builtin.copy:
+                content: "{{ holds_left_msg }}\n"
+                dest: "{{ host_dir }}/holds-left.txt"
+                mode: "0644"
+              delegate_to: localhost
+              when: hold_access and (release_raw.rc | default(0)) != 0 and not (release_raw is unreachable)
+
             - name: Apt | the run stops here
               ansible.builtin.fail:
-                msg: "{{ ansible_failed_result.msg | default('the plan was refused') }}"
+                msg: "{{ ansible_failed_result.msg | default('the plan was refused') }}{{ (' ;; ' ~ holds_left_msg) if (hold_access and (release_raw.rc | default(0)) != 0 and not (release_raw is unreachable)) else '' }}"
 
         - name: Apt | wait for it (rounds of polls; a dropped ssh connection does not stop apt and does not end the wait)
           ansible.builtin.include_tasks: tasks/os_upgrade_wait_apt.yml
@@ -482,11 +502,14 @@
           loop_control:
             loop_var: apt_round
 
+        # a cleanup that exits 1 means the access-path holds could not be released: the log and the holds-left record are kept BEFORE the run stops
         - name: Apt | take our policy-rc.d away if the run that left it is over (never while apt is alive)
           ansible.builtin.script:
             cmd: "{{ osu }} upgrade-cleanup --run-id {{ os_run_id }}"
           become: true
+          register: cleanup_raw
           changed_when: false
+          failed_when: false
           when: apt_finished | default(false)
 
         - name: Apt | fetch the log
@@ -502,6 +525,19 @@
             dest: "{{ host_dir }}/apt-upgrade.log"
             mode: "0644"
           delegate_to: localhost
+
+        - name: Apt | the holds could NOT be released after the run (the record is kept; the step summary prints it)
+          ansible.builtin.copy:
+            content: "{{ cleanup_holds_msg }}\n"
+            dest: "{{ host_dir }}/holds-left.txt"
+            mode: "0644"
+          delegate_to: localhost
+          when: (cleanup_raw.rc | default(0)) != 0 and not (cleanup_raw is skipped)
+
+        - name: Apt | NOTHING IS REBOOTED while the access path is still held
+          ansible.builtin.fail:
+            msg: "{{ cleanup_holds_msg }} Nothing was rebooted; the OLD kernel {{ pre_survey.kernel }} is still grub's default."
+          when: (cleanup_raw.rc | default(0)) != 0 and not (cleanup_raw is skipped)
 
         - name: Apt | the full-upgrade must have finished with exit 0
           ansible.builtin.fail:
@@ -1037,6 +1073,7 @@
           kernel_metapackages_removed: "{{ ((maint_log_raw.stdout | default('', true)) | regex_search('KERNEL METAPACKAGES REMOVED WITH IT: ([^(\\n]*)', '\\1') | default([''], true) | first | default('', true)) | trim }}"
           disarm: "{{ (maint_disarm_raw.stdout | default('{}', true) | from_json) }}"
           holds_released: "{{ ((maint_log_raw.stdout | default('', true)) | regex_findall('HOLDS RELEASED: ([^\\n]*)')) }}"
+          holds_not_released: "{{ ((maint_log_raw.stdout | default('', true)) | regex_findall('HOLDS NOT RELEASED: ([^\\n]*?\\(put by run [0-9]+\\))')) }}"
           power_cycle: "No power-cycle needed: nothing was rebooted."
 
     - name: Maintenance | the one-shot is gone
@@ -1057,6 +1094,8 @@
           after: {{ (maint_after_raw.stdout | from_json).packages.dpkg_audit | length }} finding(s)). See repair.log. The old kernel is
           untouched and is still the default. If configure keeps failing (a DKMS module that does not build for the new kernel),
           dispatch mode=repair with repair_action=abort-new-kernel to remove the new kernel's packages and stay on the old one.
+          For repair_action=release-holds: a line "HOLDS NOT RELEASED" in repair.log means apt-mark unhold did not take (the dpkg lock was busy?):
+          the holds and their record are still in place; dispatch it again.
         quiet: true
       when: os_mode == 'repair'
 

@@ -576,6 +576,66 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("nothing to release", self.log)
         self.assertEqual(self.h.load()["held"], ["grub-common", "vim"])
 
+    # R4-m1: apt-mark unhold fails (the dpkg frontend lock is taken) and changes nothing: no path may say "released" or lose the record
+    HELD5 = ["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed", "tailscale"]
+
+    def test_a_refused_plan_whose_holds_cannot_be_released_says_so_and_the_next_dispatch_names_the_repair(self):
+        self.fresh(unhold_rc=100)
+        self.h.state["sim"] = self.h.state["sim"] + ["Remv linux-image-7.0.0-31-generic [7.0.0-31.31]"]
+        self.h.save()
+        self.play("holds_stay", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("would REMOVE protected package(s): linux-image-7.0.0-31-generic", self.log)
+        self.assertIn("THE ACCESS-PATH HOLDS COULD NOT BE RELEASED: %s are still held" % " ".join(self.HELD5), self.log)
+        with open(os.path.join(self.out, "msr1", "holds-left.txt")) as f:
+            self.assertIn("COULD NOT BE RELEASED", f.read())
+        self.assertEqual(self.h.load()["held"], self.HELD5)
+        self.assertEqual(len(glob.glob(self.h.root + "/var/log/celeris-os-upgrade/*/held.txt")), 1)  # the record stays
+        md = self.summary("upgrade", "msr1")
+        self.assertIn("### ACCESS-PATH HOLDS NOT RELEASED: msr1", md)
+        # the next upgrade is refused naming the repair (not a silent dead end) ...
+        self.h.state["sim"] = self.h.state["sim"][:-1]
+        self.h.state["unhold_rc"] = 0
+        self.h.save()
+        self.play("holds_stay2", self.UP)
+        self.assertIn("THIS TOOL put the holds of", self.log)
+        self.assertIn("repair_action=release-holds", self.log)
+        # ... and the repair releases them
+        self.play("holds_stay3", dict(self.R, repair_action="release-holds"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.h.load()["held"], [])
+        self.assertEqual(glob.glob(self.h.root + "/var/log/celeris-os-upgrade/*/held.txt"), [])
+
+    def test_an_upgrade_whose_holds_cannot_be_released_after_apt_stops_before_the_reboot(self):
+        self.fresh(unhold_rc_after_upgrade=100)
+        self.play("holds_stay_after_apt", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("could NOT be released", self.log)
+        self.assertIn("Nothing was rebooted; the OLD kernel 7.0.0-31-generic is still grub's default", self.log)
+        self.no_call("grub-reboot")
+        self.no_call("FAKE-REBOOT")
+        self.assertEqual(self.h.load()["held"], self.HELD5)
+        self.assertEqual(len(glob.glob(self.h.root + "/var/log/celeris-os-upgrade/*/held.txt")), 1)
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"), "the services stay down behind a failed run")
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)  # the old kernel is still the default
+        # the evidence survives the failed cleanup: the log, the holds-left record, the summary
+        self.assertIn("HOLDS NOT RELEASED", open(os.path.join(self.out, "msr1", "apt-upgrade.log")).read())
+        self.assertIn("COULD NOT BE RELEASED: %s are still held" % " ".join(self.HELD5), open(os.path.join(self.out, "msr1", "holds-left.txt")).read())
+        self.assertIn("### ACCESS-PATH HOLDS NOT RELEASED: msr1", self.summary("upgrade", "msr1"))
+
+    def test_a_repair_that_cannot_release_the_holds_fails_and_says_which_stay(self):
+        self.fresh(unhold_rc=100)
+        self.h.state["held"] = ["grub-common", "tailscale", "vim"]
+        self.h.save()
+        self.h.w("/var/log/celeris-os-upgrade/41/held.txt", "grub-common tailscale\n")
+        self.play("release_fails", dict(self.R, repair_action="release-holds"))
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["holds_released"], r["holds_not_released"]), ("repair-failed", [], ["grub-common tailscale (put by run 41)"]))
+        self.assertIn("HOLDS NOT RELEASED", self.summary("repair", "msr1"))
+        self.assertEqual(self.h.load()["held"], ["grub-common", "tailscale", "vim"])
+        self.assertTrue(os.path.exists(self.h.root + "/var/log/celeris-os-upgrade/41/held.txt"))
+
     def test_repair_refuses_with_a_one_shot_pending_or_beside_a_bench_or_when_there_is_nothing_to_repair(self):
         self.fresh()
         self.play("rp_nothing", dict(self.R, repair_action="configure"))

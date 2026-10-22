@@ -151,6 +151,8 @@ if name == "apt-get":
             pkgs()["linux-image-" + k] = {"version": k, "status": "installed"}
         if st.get("upgrade_kernels"):
             regen()
+        if st.get("unhold_rc_after_upgrade"):  # unattended-upgrades takes the dpkg frontend lock while the detached run ends
+            st["unhold_rc"] = st["unhold_rc_after_upgrade"]
         save()
         if st.get("upgrade_dies"):
             os.kill(os.getppid(), 9)  # the detached run is killed mid-apt (OOM, power): no rc file, no policy-rc.d removal
@@ -158,11 +160,16 @@ if name == "apt-get":
         sys.exit(st.get("upgrade_rc", 0))
 if name == "apt-mark":
     if args[:1] == ["showhold"]:
+        if st.get("showhold_rc"):
+            sys.stderr.write("E: Could not open file /var/lib/dpkg/status (test)\n"); sys.exit(st["showhold_rc"])
         out("\n".join(st.get("held", [])) + "\n"); sys.exit(0)
     if args[:1] == ["hold"]:
         st["held"] = sorted(set(st.get("held", [])) | set(args[1:])); save(); sys.exit(0)
     if args[:1] == ["unhold"]:
-        st["held"] = [h for h in st.get("held", []) if h not in args[1:]]; save(); sys.exit(0)
+        if st.get("unhold_rc"):  # the dpkg frontend lock is taken (unattended-upgrades): fails and changes nothing
+            sys.stderr.write("E: Could not get lock /var/lib/dpkg/lock-frontend (test)\n"); sys.exit(st["unhold_rc"])
+        # unhold_keeps: names that stay held although apt-mark says it worked
+        st["held"] = [h for h in st.get("held", []) if h not in args[1:] or h in st.get("unhold_keeps", [])]; save(); sys.exit(0)
     sys.exit(st.get("apt_mark_rc", 0))
 if name == "apt-config":
     out("\n".join('%s "%s";' % kv for kv in st.get("apt_config", {}).items()) + "\n"); sys.exit(0)

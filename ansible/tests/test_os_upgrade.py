@@ -1285,6 +1285,7 @@ class HoldAccessPackages(Base):
         self.assertIn("tailscale", self.h.load()["held"])
         c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
         self.assertIn("tailscale", c["unheld"])
+        self.assertEqual(c["still_held"], [])
         self.assertEqual(self.h.load()["held"], [])
 
     def test_a_failing_apt_still_releases_the_holds(self):
@@ -1364,6 +1365,189 @@ class HoldBeforeTheSimulation(HoldAccessPackages):
         self.h.state["held"] = []  # somebody released them by hand
         self.h.save()
         self.assertEqual(self.run_ok("survey")["packages"]["tool_holds"], [])
+
+
+ACCESS_PATH = ["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed", "tailscale"]  # the access path of the fake host
+
+
+class HoldReleaseIsVerified(Base):
+    """R4-m1: `apt-mark unhold` fails (and changes nothing) while unattended-upgrades or PackageKit has the dpkg frontend lock. The tool used to
+    say "HOLDS RELEASED", delete the record of the holds and leave the holds in place: every later upgrade was refused and release-holds
+    answered "nothing to release". Now a hold counts as released only when `apt-mark showhold` no longer lists it, and the record of a
+    hold that stays is kept, on all three release paths: release-access (a refusal), the end of the detached upgrade with its
+    cleanup, and repair release-holds."""
+
+    def wait(self, run_id):
+        end = time.time() + 20
+        while time.time() < end:
+            st = self.j(self.h.run("upgrade-status", "--run-id", run_id))
+            if st["state"] == "done":
+                return st
+            time.sleep(0.1)
+        self.fail("run %s did not finish" % run_id)
+
+    def held_txt(self, run_id):
+        try:
+            return open(self.h.root + "/var/log/celeris-os-upgrade/%s/held.txt" % run_id).read().split()
+        except OSError:
+            return None
+
+    def hold(self, run_id="42"):
+        self.h.save()
+        self.j(self.h.run("hold-access", "--run-id", run_id))
+        self.h.load()
+
+    def failing(self, **kw):
+        self.h.load()
+        self.h.state.update(kw)
+        self.h.save()
+
+    def tool_holds(self):
+        return self.run_ok("survey")["packages"]["tool_holds"]
+
+    # ---- release-access (the refusal path)
+    def test_release_access_with_a_failing_unhold_keeps_the_holds_the_record_and_says_so(self):
+        self.hold()
+        self.failing(unhold_rc=100)
+        r = self.h.run("release-access", "--run-id", "42")
+        self.assertEqual(r.returncode, 1)
+        d = json.loads(r.stdout)
+        self.assertEqual((d["ok"], d["released"], d["still_held"]), (False, [], ACCESS_PATH))
+        self.assertIn("could NOT be released", d["error"])
+        self.assertIn("repair_action=release-holds", d["error"])
+        self.assertEqual(self.h.load()["held"], ACCESS_PATH)  # still held
+        self.assertEqual(self.held_txt("42"), ACCESS_PATH)  # the record stays
+        self.assertEqual(self.tool_holds(), [{"run_id": "42", "packages": ACCESS_PATH}])
+
+    def test_release_access_where_one_hold_stays_releases_the_rest_and_keeps_that_one(self):
+        self.hold()
+        self.failing(unhold_keeps=["tailscale"])  # apt-mark exits 0 and tailscale stays held
+        r = self.h.run("release-access", "--run-id", "42")
+        self.assertEqual(r.returncode, 1)
+        d = json.loads(r.stdout)
+        self.assertEqual((d["released"], d["still_held"]), (["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed"], ["tailscale"]))
+        self.assertEqual(self.held_txt("42"), ["tailscale"])
+        self.assertEqual(self.h.load()["held"], ["tailscale"])
+
+    def test_a_showhold_that_cannot_be_read_proves_nothing_released(self):
+        self.hold()
+        self.failing(showhold_rc=100)
+        r = self.h.run("release-access", "--run-id", "42")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(json.loads(r.stdout)["still_held"], ACCESS_PATH)
+        self.assertEqual(self.held_txt("42"), ACCESS_PATH)
+
+    def test_release_access_that_works_still_releases_and_removes_the_record(self):
+        self.hold()
+        r = self.j(self.h.run("release-access", "--run-id", "42"))
+        self.assertEqual((r["ok"], r["released"], r["still_held"]), (True, ACCESS_PATH, []))
+        self.assertIsNone(self.held_txt("42"))
+        self.assertEqual(self.h.load()["held"], [])
+
+    # ---- repair release-holds
+    def dead_run(self):
+        self.h.state["held"] = ["vim"]
+        self.hold("41")  # the run died here: nobody released
+
+    def test_repair_release_holds_with_a_failing_unhold_is_a_failed_repair_that_keeps_the_record(self):
+        self.dead_run()
+        self.failing(unhold_rc=100)
+        self.j(self.h.run("repair-start", "--run-id", "43", "--action", "release-holds"))
+        self.assertNotEqual(self.wait("43")["rc"], 0)
+        log = self.h.run("upgrade-log", "--run-id", "43").stdout
+        self.assertIn("HOLDS NOT RELEASED: %s (put by run 41)" % " ".join(ACCESS_PATH), log)
+        self.assertNotIn("HOLDS RELEASED", log)
+        self.assertEqual(self.held_txt("41"), ACCESS_PATH)
+        self.assertEqual(self.h.load()["held"], sorted(ACCESS_PATH + ["vim"]))
+        # the survey still names the holds, so the next upgrade still names the repair, and the repair is NOT "nothing to release"
+        self.assertEqual(self.tool_holds(), [{"run_id": "41", "packages": ACCESS_PATH}])
+        # and it can simply be dispatched again once apt-mark works
+        self.failing(unhold_rc=0)
+        self.j(self.h.run("repair-start", "--run-id", "44", "--action", "release-holds"))
+        self.assertEqual(self.wait("44")["rc"], 0)
+        self.assertIn("HOLDS RELEASED: %s (put by run 41)" % " ".join(ACCESS_PATH), self.h.run("upgrade-log", "--run-id", "44").stdout)
+        self.assertEqual(self.h.load()["held"], ["vim"])
+        self.assertIsNone(self.held_txt("41"))
+
+    def test_repair_release_holds_where_one_hold_stays_says_both_and_fails(self):
+        self.dead_run()
+        self.failing(unhold_keeps=["openssh-server"])
+        self.j(self.h.run("repair-start", "--run-id", "43", "--action", "release-holds"))
+        self.assertNotEqual(self.wait("43")["rc"], 0)
+        log = self.h.run("upgrade-log", "--run-id", "43").stdout
+        self.assertIn("HOLDS RELEASED: grub-common grub-efi-arm64-bin shim-signed tailscale (put by run 41)", log)
+        self.assertIn("HOLDS NOT RELEASED: openssh-server (put by run 41)", log)
+        self.assertEqual(self.held_txt("41"), ["openssh-server"])
+
+    # ---- the end of the detached upgrade, and its cleanup
+    def test_a_detached_run_whose_unhold_fails_logs_it_keeps_the_record_and_its_cleanup_fails_the_run(self):
+        self.h.state["unhold_rc_after_upgrade"] = 100  # apt-mark unhold starts failing while apt runs (unattended-upgrades took the lock)
+        self.h.save()
+        self.j(self.h.run("upgrade-start", "--run-id", "42", "--hold"))
+        self.assertEqual(self.wait("42")["rc"], 0)  # apt itself succeeded
+        log = self.h.run("upgrade-log", "--run-id", "42").stdout
+        self.assertIn("HOLDS NOT RELEASED: ", log)
+        self.assertEqual(self.held_txt("42"), ACCESS_PATH)
+        self.assertEqual(self.h.load()["held"], ACCESS_PATH)
+        c = self.h.run("upgrade-cleanup", "--run-id", "42")
+        self.assertEqual(c.returncode, 1)
+        d = json.loads(c.stdout)
+        self.assertEqual((d["ok"], d["still_held"]), (False, ACCESS_PATH))
+        self.assertIn("nothing is rebooted", d["error"])
+        self.assertEqual(self.held_txt("42"), ACCESS_PATH)
+        # once apt-mark works the same cleanup releases them
+        self.failing(unhold_rc=0)
+        c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+        self.assertEqual((c["unheld"], c["still_held"]), (ACCESS_PATH, []))
+        self.assertIsNone(self.held_txt("42"))
+        self.assertEqual(self.h.load()["held"], [])
+
+    def test_the_cleanup_of_a_dead_run_removes_our_policy_rc_d_even_when_a_hold_stays(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.hold("42")
+        self.h.w("/var/log/celeris-os-upgrade/42/apt-upgrade.log", "+ apt-get ... full-upgrade\n")
+        self.h.w("/var/log/celeris-os-upgrade/42/apt-upgrade.pid", "%d\n" % gone.pid)
+        self.h.w("/usr/sbin/policy-rc.d", osu.POLICY, 0o755)
+        self.failing(unhold_rc=100)
+        c = self.h.run("upgrade-cleanup", "--run-id", "42")
+        self.assertEqual(c.returncode, 1)
+        self.assertTrue(json.loads(c.stdout)["removed"])  # no policy-rc.d is left behind to keep services down
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"))
+        self.assertEqual(self.held_txt("42"), ACCESS_PATH)
+
+    def test_a_cleanup_with_nothing_held_still_succeeds(self):
+        self.h.save()
+        c = self.j(self.h.run("upgrade-cleanup", "--run-id", "42"))
+        self.assertEqual((c["still_held"], c["unheld"]), ([], []))
+
+    # ---- R4-m6: a record that names a hold that is gone must not claim a hold somebody puts later
+    def test_a_stale_record_is_pruned_by_the_next_tool_run_and_never_claims_a_later_hold(self):
+        self.dead_run()
+        self.failing(held=["vim"])  # somebody released the tool's holds by hand
+        self.j(self.h.run("upgrade-cleanup", "--run-id", "99"))  # any later run of the tool as root prunes the dead run's record
+        self.assertIsNone(self.held_txt("41"))
+        self.failing(held=["openssh-server", "vim"])  # and later holds openssh-server, deliberately
+        self.assertEqual(self.tool_holds(), [])
+        rel = self.h.run("repair-start", "--run-id", "43", "--action", "release-holds")
+        self.assertEqual(rel.returncode, 0)
+        self.wait("43")
+        self.assertEqual(self.h.load()["held"], ["openssh-server", "vim"])  # not released: it is not ours
+
+    def test_hold_access_prunes_a_stale_record_before_it_holds(self):
+        self.dead_run()
+        self.failing(held=["vim"])  # somebody released the dead run's holds by hand
+        self.j(self.h.run("hold-access", "--run-id", "42"))
+        self.h.load()
+        self.assertIsNone(self.held_txt("41"))
+        self.assertEqual(self.held_txt("42"), ACCESS_PATH)
+        self.assertEqual(self.tool_holds(), [{"run_id": "42", "packages": ACCESS_PATH}])
+
+    def test_pruning_keeps_every_record_when_showhold_cannot_be_read(self):
+        self.dead_run()
+        self.failing(showhold_rc=100)
+        self.h.run("upgrade-cleanup", "--run-id", "99")
+        self.assertEqual(self.held_txt("41"), ACCESS_PATH)
 
 
 class AbortKeepsTheSuspicionUntilTheKernelIsGone(Repair):

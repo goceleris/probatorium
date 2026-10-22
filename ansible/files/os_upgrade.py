@@ -1170,10 +1170,11 @@ def cmd_repair_run(a):
     if a.action == "release-holds":
         # no policy-rc.d, no dpkg: apt-mark unhold of what this tool held (held.txt of every run) and nothing else
         try:
-            released = release_tool_holds()
-            if not released:
+            released, left = release_tool_holds()
+            if not released and not left:
                 sys.stdout.write("nothing to release: no hold of this tool is in place\n")
-            rc = 0
+            # a hold that apt-mark could not release is a failed repair, not "HOLDS RELEASED": the record stays and so does the repair
+            rc = 1 if left else 0
         finally:
             write(rcf, "%d\n" % rc)
         return
@@ -1260,25 +1261,68 @@ def tool_holds():
     return out
 
 
+def unhold(names):
+    """apt-mark unhold NAMES, then ask apt which of them are STILL held: (released, remaining). The exit code of `apt-mark unhold` is not
+    believed (it fails, and changes nothing, while unattended-upgrades or PackageKit has the dpkg frontend lock): only what
+    `apt-mark showhold` no longer lists is released. If showhold cannot be read, nothing counts as released."""
+    names = sorted(set(names))
+    if not names:
+        return [], []
+    run(["apt-mark", "unhold"] + names)
+    rc, out, _ = run(["apt-mark", "showhold"])
+    if rc != 0:
+        return [], names
+    still = set(out.split())
+    return [n for n in names if n not in still], [n for n in names if n in still]
+
+
+def keep_record(held_txt, names):
+    """The record of the holds this tool put: exactly NAMES (the ones still in place), or no record when none is."""
+    if names:
+        write(held_txt, " ".join(sorted(names)) + "\n")
+        return
+    try:
+        os.remove(p(held_txt))
+    except OSError:
+        pass
+
+
+def prune_hold_records():
+    """A record names holds that are no longer in place (somebody unheld them by hand): drop those names, so that a hold put later
+    by a person is never claimed by a dead run's record (and released by it)."""
+    rc, out, _ = run(["apt-mark", "showhold"])
+    if rc != 0:
+        return  # cannot tell what is held: every record stays
+    held_now = set(out.split())
+    for f in sorted(glob.glob(p(LOG_DIR + "/*/held.txt"))):
+        rel = f[len(ROOT):] if ROOT else f
+        names = [n for n in rd(rel).split() if n]
+        if [n for n in names if n in held_now] != names:
+            keep_record(rel, [n for n in names if n in held_now])
+
+
 def release_tool_holds():
-    """Releases every hold this tool put and records it in the output. Returns [{run_id, packages}] released. Never touches a hold
-    that is not in a held.txt (somebody else's)."""
-    released = []
+    """Releases every hold this tool put and records it in the output. Returns ([{run_id, packages}] released, [{run_id, packages}] still
+    held). Never touches a hold that is not in a held.txt (somebody else's). A hold that is still in place afterwards keeps its record
+    (so the next survey and the next upgrade still name the repair) and is reported as NOT released."""
+    released, left = [], []
     for rec in tool_holds():
-        run(["apt-mark", "unhold"] + rec["packages"])
-        sys.stdout.write("+ apt-mark unhold %s\nHOLDS RELEASED: %s (put by run %s)\n" % (" ".join(rec["packages"]), " ".join(rec["packages"]), rec["run_id"]))
-        released.append(rec)
-    for f in glob.glob(p(LOG_DIR + "/*/held.txt")):
-        try:
-            os.remove(f)  # the record of a hold that is gone (or was just released)
-        except OSError:
-            pass
-    return released
+        done, remaining = unhold(rec["packages"])
+        sys.stdout.write("+ apt-mark unhold %s\n" % " ".join(rec["packages"]))
+        if done:
+            sys.stdout.write("HOLDS RELEASED: %s (put by run %s)\n" % (" ".join(done), rec["run_id"]))
+            released.append({"run_id": rec["run_id"], "packages": done})
+        if remaining:
+            sys.stdout.write("HOLDS NOT RELEASED: %s (put by run %s): still held after apt-mark unhold, the record is kept\n" % (" ".join(remaining), rec["run_id"]))
+            left.append({"run_id": rec["run_id"], "packages": remaining})
+    prune_hold_records()  # the records of holds that are gone (or were just released) go; the ones still in place stay
+    return released, left
 
 
 def cmd_hold_access(a):
     """Holds the access-path packages now, before the plan is simulated, and records them for this run."""
     d, log, rcf = upgrade_paths(a.run_id)
+    prune_hold_records()
     prior = [x for x in rd(d + "/held.txt").split() if x]
     new = access_to_hold()
     os.makedirs(p(d), exist_ok=True)
@@ -1292,20 +1336,25 @@ def cmd_hold_access(a):
 
 
 def cmd_release_access(a):
-    emit({"ok": True, "released": unhold_ours(a.run_id)})
+    released, left = unhold_ours(a.run_id)
+    if left:
+        msg = "the access-path holds %s could NOT be released (apt-mark unhold did not take: the dpkg lock is busy?); the record is kept: dispatch mode=repair with repair_action=release-holds" % " ".join(left)
+        sys.stderr.write("os_upgrade.py: " + msg + "\n")
+        emit({"ok": False, "released": released, "still_held": left, "error": msg})
+        sys.exit(1)
+    emit({"ok": True, "released": released, "still_held": []})
 
 
 def unhold_ours(run_id):
-    """Releases the holds THIS run put (never one that was there before)."""
+    """Releases the holds THIS run put (never one that was there before). Returns (released, still_held): a hold that apt-mark could not
+    release (see unhold) stays in the run's record, so it is found and named later."""
     d, log, rcf = upgrade_paths(run_id)
     names = [x for x in rd(d + "/held.txt").split() if x]
-    if names:
-        run(["apt-mark", "unhold"] + names)
-        try:
-            os.remove(p(d + "/held.txt"))
-        except OSError:
-            pass
-    return names
+    if not names:
+        return [], []
+    released, remaining = unhold(names)
+    keep_record(d + "/held.txt", remaining)
+    return released, remaining
 
 
 def cmd_upgrade_run(a):
@@ -1333,7 +1382,11 @@ def cmd_upgrade_run(a):
             os.remove(p(POLICY_RC_D))
         except OSError:
             pass
-        unhold_ours(a.run_id)
+        # the apt run is over: the holds this run put are released, and a hold apt-mark could not release is said in the log (the
+        # record stays, upgrade-cleanup tries again and fails the run if it is still there)
+        _, left = unhold_ours(a.run_id)
+        if left:
+            sys.stdout.write("HOLDS NOT RELEASED: %s (put by run %s): still held after apt-mark unhold, the record is kept\n" % (" ".join(left), a.run_id))
         write(rcf, "%d\n" % rc)
 
 
@@ -1382,12 +1435,21 @@ def cmd_upgrade_cleanup(a):
     if busy:
         emit({"removed": False, "reason": "dpkg or apt is still running (%s)" % busy})
         return
-    unheld = unhold_ours(a.run_id)  # a run that died with its holds on
-    if rd(POLICY_RC_D) == POLICY.strip():
+    unheld, left = unhold_ours(a.run_id)  # a run that died with its holds on
+    prune_hold_records()
+    removed = rd(POLICY_RC_D) == POLICY.strip()
+    if removed:
         os.remove(p(POLICY_RC_D))
-        emit({"removed": True, "unheld": unheld})
-    else:
-        emit({"removed": False, "reason": "no policy-rc.d of ours", "unheld": unheld})
+    res = {"removed": removed, "unheld": unheld, "still_held": left}
+    if not removed:
+        res["reason"] = "no policy-rc.d of ours"
+    if left:
+        # the run must not go on to a reboot with the access path held, and the record stays: the next survey lists it
+        msg = "the access-path holds %s of run %s could NOT be released (apt-mark unhold did not take: the dpkg lock is busy?); the record is kept and nothing is rebooted: dispatch mode=repair with repair_action=release-holds" % (" ".join(left), a.run_id)
+        sys.stderr.write("os_upgrade.py: " + msg + "\n")
+        emit(dict(res, ok=False, error=msg))
+        sys.exit(1)
+    emit(res)
 
 
 def cmd_upgrade_log(a):
