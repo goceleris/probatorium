@@ -360,7 +360,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 
 	// the subcommands the playbook may run on a host
 	allowed := []string{"apt-update", "survey", "simulate", "dump", "pin-grub", "upgrade-start", "upgrade-status", "upgrade-log",
-		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start", "arm-rehearsal", "record-rehearsal"}
+		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start", "arm-rehearsal", "record-rehearsal", "hold-access", "release-access"}
 	all := src
 	tasks, _ := filepath.Glob("ansible/tasks/os_upgrade_*.yml")
 	for _, tf := range tasks {
@@ -439,10 +439,17 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 	}
 	// a failure between the arming and the host's return disarms the one-shot: arm and reboot sit in a block whose rescue disarms
 	iArm := idx("'arm-oneshot' if (os_mode == 'upgrade') else 'arm-rehearsal'")
-	iRescue := idx("      rescue:")
+	iRescue := idx("\n      rescue:")
 	iDisarm := strings.Index(src[iRescue:], "osu }} disarm")
 	if iArm >= iRescue || iDisarm < 0 || iRescue+iDisarm >= idx("Post | judge") || idx("ansible.builtin.reboot:") >= iRescue {
 		t.Error("the arming and the reboot are not in a block whose rescue disarms the one-shot before the verification")
+	}
+	// R3-m4: the access path is held before the plan is simulated, and a refusal releases what the run held
+	if !(idx("osu }} hold-access") < idx("osu }} simulate") && idx("osu }} simulate") < idx("osu }} upgrade-start")) {
+		t.Error("the access-path holds are not put before the simulation")
+	}
+	if !strings.Contains(src, "osu }} release-access --run-id") {
+		t.Error("a refused plan does not release the holds the run put")
 	}
 	// the judgement gates each step
 	for _, want := range []string{"when: refusals_str | trim | length > 0", "when: plan_refusals_str | trim | length > 0",
