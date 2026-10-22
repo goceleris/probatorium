@@ -748,6 +748,13 @@ func TestFreeTextInputsAreWrittenAsUnsafeStrings(t *testing.T) {
 			t.Errorf("%s does not reject braces in the reason", c.file)
 		}
 	}
+	// the other string inputs of the os-upgrade workflow are literals too, and not only the free text
+	osSrc := withoutComments(readWorkflow(t, osWorkflow))
+	for _, key := range []string{"os_mode", "os_host", "repair_action", "retry_kernel", "hold_access_packages"} {
+		if !strings.Contains(osSrc, `"`+key+`": {"__ansible_unsafe": os.environ[`) {
+			t.Errorf("%s writes %s without __ansible_unsafe: a template in a choice input would run on the runner", osWorkflow, key)
+		}
+	}
 	if !strings.Contains(mustRead(t, osRequest), "os_mode == 'survey' and os_confirm == ''") {
 		t.Error("the playbook accepts a confirmation in a survey")
 	}
@@ -848,6 +855,14 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 	}{
 		{"a survey needs no switch and no environment", base(env{"GH_FIXTURE": filepath.Join(bin, "notfound.json"), "GH_RC": "1"}), true, ""},
 		{"a survey with a host", base(env{"IN_HOST": "msr1"}), false, "leave host as '-'"},
+		{"a survey with a template as the repair action", base(env{"IN_REPAIR_ACTION": "{{ lookup('pipe','id') }}"}), false, "repair_action must be"},
+		{"a survey with an unknown repair action", base(env{"IN_REPAIR_ACTION": "rm-rf"}), false, "repair_action must be"},
+		{"a survey with a template as the hold", base(env{"IN_HOLD": "{{ lookup('pipe','id') }}"}), false, "hold_access_packages must be"},
+		{"a survey with an unknown hold", base(env{"IN_HOLD": "maybe"}), false, "hold_access_packages must be"},
+		{"a survey with a template as the retry kernel", base(env{"IN_RETRY_KERNEL": "{{ x }}"}), false, "retry_kernel must be"},
+		{"a survey with a retry kernel", base(env{"IN_RETRY_KERNEL": "latest"}), false, "retry_kernel must be"},
+		{"a survey with a template as the host", base(env{"IN_HOST": "{{ lookup('pipe','id') }}"}), false, "host must be"},
+		{"a survey with a template as the mode", base(env{"IN_MODE": "{{ lookup('pipe','id') }}"}), false, "mode must be"},
 		{"a survey with a confirmation", base(env{"IN_CONFIRM": "UPGRADE-msr1"}), false, "takes no confirmation"},
 		{"an upgrade with the variable empty", up("msr1", env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
 		{"an upgrade of a host that is not listed", up("msr1", env{"ALLOWED_HOSTS": "msa2-server"}), false, "is not in the repository variable"},
@@ -860,7 +875,7 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"an upgrade confirmed with a trailing space", up("msr1", env{"IN_CONFIRM": "UPGRADE-msr1 "}), false, "confirm must be exactly UPGRADE-msr1"},
 		{"an upgrade confirmed as a disarm", up("msr1", env{"IN_CONFIRM": "DISARM-msr1"}), false, "confirm must be exactly UPGRADE-msr1"},
 		{"an upgrade of no host", up("-", env{"IN_HOST": "-", "IN_CONFIRM": "UPGRADE--"}), false, "names ONE host"},
-		{"an upgrade of all", up("all", nil), false, "names ONE host"},
+		{"an upgrade of all", up("all", nil), false, "host must be"},
 		{"a disarm is gated too", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1"}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
 		{"a listed disarm", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
 		{"a disarm confirmed in lower case", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "disarm-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly DISARM-msr1"},

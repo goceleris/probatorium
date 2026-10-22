@@ -126,6 +126,28 @@ jobs:
             echo "::error::dispatch from $DEFAULT_BRANCH only (got $REF): a host change runs reviewed code"
             exit 1
           fi
+          # every input the playbook receives is checked here in EVERY mode, a survey included (a survey job holds the cluster key,
+          # and each value is also written to extra-vars.json as a literal)
+          case "$IN_MODE" in
+            survey | rehearse | upgrade | disarm | repair) ;;
+            *) echo "::error::mode must be survey, rehearse, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
+          esac
+          case "$IN_HOST" in
+            "-" | msa2-server | msr1 | msa2-client) ;;
+            *) echo "::error::host must be '-', msa2-server, msr1 or msa2-client, got: $IN_HOST"; exit 1 ;;
+          esac
+          case "$IN_REPAIR_ACTION" in
+            configure | abort-new-kernel) ;;
+            *) echo "::error::repair_action must be configure or abort-new-kernel"; exit 1 ;;
+          esac
+          case "$IN_HOLD" in
+            auto | on | off) ;;
+            *) echo "::error::hold_access_packages must be auto, on or off"; exit 1 ;;
+          esac
+          if ! [[ "$IN_RETRY_KERNEL" =~ ^([0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z0-9-]+)?$ ]]; then
+            echo "::error::retry_kernel must be empty or a kernel version such as 7.0.0-40-generic"
+            exit 1
+          fi
           case "$IN_MODE" in
             survey)
               if [ "$IN_HOST" != "-" ]; then
@@ -161,20 +183,6 @@ jobs:
               if ! printf '%s' "$envjson" | jq -e '.deployment_branch_policy != null' > /dev/null; then
                 echo "::error::the environment cluster-host-change has no deployment branch policy: restrict it to main"
                 exit 1
-              fi
-              if ! [[ "$IN_RETRY_KERNEL" =~ ^([0-9]+\.[0-9]+\.[0-9]+-[0-9]+-[a-z0-9-]+)?$ ]]; then
-                echo "::error::retry_kernel must be empty or a kernel version such as 7.0.0-40-generic"
-                exit 1
-              fi
-              case "$IN_HOLD" in
-                auto | on | off) ;;
-                *) echo "::error::hold_access_packages must be auto, on or off"; exit 1 ;;
-              esac
-              if [ "$IN_MODE" = repair ]; then
-                case "$IN_REPAIR_ACTION" in
-                  configure | abort-new-kernel) ;;
-                  *) echo "::error::repair_action must be configure or abort-new-kernel"; exit 1 ;;
-                esac
               fi
               if [ "$IN_MODE" = upgrade ] && [ "$IN_CONFIRM" != "UPGRADE-$IN_HOST" ]; then
                 echo "::error::confirm must be exactly UPGRADE-$IN_HOST"
@@ -377,8 +385,10 @@ jobs:
           python3 - <<'PY'
           import json, os
           json.dump({
-              "os_mode": os.environ["IN_MODE"],
-              "os_host": os.environ["IN_HOST"],
+              # every string input is a literal (the choice inputs too: GitHub validates a choice, the plan job checks them all, and
+              # a template in any of them would still run on the runner that holds the cluster key)
+              "os_mode": {"__ansible_unsafe": os.environ["IN_MODE"]},
+              "os_host": {"__ansible_unsafe": os.environ["IN_HOST"]},
               # free text is data, never a template: ansible renders extra-vars from a file as Jinja, and the
               # runner holds the cluster key. __ansible_unsafe keeps '{{ ... }}' literal.
               "os_confirm": {"__ansible_unsafe": os.environ["IN_CONFIRM"]},
@@ -388,9 +398,9 @@ jobs:
               "allow_results_loss": os.environ["IN_ALLOW"] == "true",
               "refresh_lists": os.environ["IN_REFRESH"] == "true",
               "blacklist_r8169": os.environ["IN_BLACKLIST"] == "true",
-              "repair_action": os.environ["IN_REPAIR_ACTION"],
+              "repair_action": {"__ansible_unsafe": os.environ["IN_REPAIR_ACTION"]},
               "retry_kernel": {"__ansible_unsafe": os.environ["IN_RETRY_KERNEL"]},
-              "hold_access_packages": os.environ["IN_HOLD"],
+              "hold_access_packages": {"__ansible_unsafe": os.environ["IN_HOLD"]},
           }, open(os.path.join(os.environ["OS_OUT"], "extra-vars.json"), "w"), indent=2)
           PY
       - name: Survey or upgrade (ansible/os-upgrade.yml)

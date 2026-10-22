@@ -352,6 +352,23 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("inj_survey_reason", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
         self.assertEqual(self.rc, 0, self.log[-1500:])
 
+    def test_a_template_in_any_string_input_is_data_and_is_refused_by_the_request(self):
+        """Run the real playbook with a template in each input in turn (the workflow's real writer wraps every one as a literal)."""
+        self.fresh()
+        for key, extra in (("os_mode", {"os_mode": self.PAYLOAD, "os_host": "-", "os_confirm": ""}),
+                           ("os_host", {"os_mode": "survey", "os_host": self.PAYLOAD, "os_confirm": ""}),
+                           ("os_host_upgrade", {"os_mode": "upgrade", "os_host": self.PAYLOAD, "os_confirm": "UPGRADE-" + self.PAYLOAD}),
+                           ("repair_action", {"os_mode": "survey", "os_host": "-", "os_confirm": "", "repair_action": self.PAYLOAD}),
+                           ("hold_access_packages", {"os_mode": "survey", "os_host": "-", "os_confirm": "", "hold_access_packages": self.PAYLOAD}),
+                           ("retry_kernel", {"os_mode": "survey", "os_host": "-", "os_confirm": "", "retry_kernel": self.PAYLOAD}),
+                           ("retry_kernel_malformed", {"os_mode": "survey", "os_host": "-", "os_confirm": "", "retry_kernel": "latest"}),
+                           ("hold_unknown", dict(self.UP, hold_access_packages="maybe")),
+                           ("repair_unknown", {"os_mode": "survey", "os_host": "-", "os_confirm": "", "repair_action": "rm-rf"})):
+            self.play("tpl_" + key, extra)
+            self.assertNotEqual(self.rc, 0, key)
+            self.assertEqual(self.calls(), [], key + ": a host was touched")
+            self.assertFalse(os.path.exists(self.MARK), key + ": a template ran on the runner")
+
     def test_a_wrong_request_touches_nothing(self):
         self.fresh()
         for name, extra, _ in (
