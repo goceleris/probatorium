@@ -781,7 +781,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("HAS REBOOTED", r["problems"][0])
         self.assertNotIn("did not reboot", r["problems"][0])
         md = self.summary("upgrade", "msr1")
-        self.assertIn("HAS REBOOTED", md)
+        self.assertIn("- Power-cycle: **not needed while msr1 answers, but it HAS REBOOTED** (new boot id) and GRUB did **not** consume the one-shot", md)
         self.assertNotIn("not needed**. The run failed after arming the one-shot and before the new kernel booted", md)
         self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
 
@@ -793,7 +793,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(r["status"], "failed-boot-unknown")
         self.assertIn("WHETHER IT REBOOTED IS UNKNOWN", r["power_cycle"])
         self.assertNotIn("nothing was rebooted", r["power_cycle"])
-        self.assertIn("UNKNOWN", self.summary("upgrade", "msr1"))
+        self.assertIn("- Power-cycle: **not needed while msr1 answers, but WHETHER IT REBOOTED IS UNKNOWN**", self.summary("upgrade", "msr1"))
 
     def test_an_apt_that_outlives_the_waits_keeps_its_policy_and_is_not_cleaned_up_under(self):
         self.fresh(upgrade_sleep=12)
@@ -864,6 +864,17 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.rc, 0, self.log[-2500:])
         self.assertEqual(self.phase(), "rehearsed")
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+
+    def test_a_retry_kernel_that_is_not_a_kernel_is_refused_by_the_playbook(self):
+        # the playbook is the last guard: a value that is not X.Y.Z-N-flavor must never reach a command or a template
+        self.fresh()
+        for bad in ("7.0.0-40-generic;touch /tmp/x", "7.0.0-40", "../../etc", "7.0.0-40-generic extra", "{{ 1+1 }}"):
+            self.play("badretry", dict(self.UP, retry_kernel=bad))
+            self.assertNotEqual(self.rc, 0, bad)
+            self.assertIn("refused: os_mode must be survey", self.log, bad)
+            self.no_call("OSU")
+        self.play("goodretry", dict(self.UP, retry_kernel="7.0.0-40-generic"))
+        self.assertEqual(self.rc, 0, self.log[-1500:])
 
     def test_the_console_confirmation_is_only_for_a_rehearsal(self):
         self.fresh(keep38=True)
