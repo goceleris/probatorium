@@ -175,8 +175,8 @@ boot_chain() {
 }
 pinned=false
 rehearsal_json="$R/var/lib/celeris-os-upgrade/rehearsal.json"
-if [ -e "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg" ] && [ -n "$kernel" ] && [ -s "$rehearsal_json" ] && command -v grub-editenv > /dev/null 2>&1; then
-	rec=$(cat "$rehearsal_json" 2> /dev/null)
+if [ -e "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg" ] && [ -n "$kernel" ] && command -v grub-editenv > /dev/null 2>&1; then
+	rec=$(cat "$rehearsal_json" 2> /dev/null) # missing: empty, and the checks below fail
 	rec_chain=$(printf '%s' "$rec" | sed -n 's/.*"chain": "\([^"]*\)".*/\1/p')
 	cfg="$R/boot/grub/grub.cfg"
 	genv=$(grub-editenv list 2> /dev/null)
@@ -188,7 +188,6 @@ if [ -e "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg" ] && [ -n "$kernel" ] 
 		printf '%s' "$rec" | grep -qF '"ok": true' &&
 		[ -n "$rec_chain" ] && [ "$rec_chain" = "$(boot_chain)" ] &&
 		[ -r "$cfg" ] && grep -qF 'set default="${saved_entry}"' "$cfg" &&
-		[ "$parent" != "$saved" ] && [ -n "$parent" ] && [ -n "$leaf" ] &&
 		case "$leaf" in "gnulinux-$kernel-advanced-"*) true ;; *) false ;; esac &&
 		grep -E '^[[:space:]]*submenu ' "$cfg" | grep -qF "\$menuentry_id_option '$parent'" &&
 		grep -E '^[[:space:]]*menuentry ' "$cfg" | grep -qF "\$menuentry_id_option '$leaf'" &&
