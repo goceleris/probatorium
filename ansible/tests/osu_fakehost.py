@@ -126,7 +126,7 @@ if name == "apt-get":
             st["audit"] = []
         if st.get("grub_template"):
             regen()
-        save(); sys.exit(0)
+        save(); sys.exit(st.get("remove_rc_after", 0))  # remove_rc_after: the packages are gone and apt still reports an error
     if "full-upgrade" in args:
         out("policy-rc.d present: %s\n" % os.path.exists(root + "/usr/sbin/policy-rc.d"))
         out("held: %s\n" % " ".join(st.get("held", [])))
@@ -194,6 +194,8 @@ if name == "dkms":
         save(); sys.stderr.write("Error! Bad return status for module build\n"); sys.exit(10)
 if name == "grub-editenv":
     if args[:2] == ["-", "unset"]:
+        if st.get("unset_rc"):
+            sys.stderr.write("grub-editenv: cannot write the environment block (test)\n"); sys.exit(st["unset_rc"])
         for k in args[2:]:
             st["grubenv"][k] = ""
         save(); sys.exit(0)

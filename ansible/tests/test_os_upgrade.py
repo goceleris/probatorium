@@ -939,6 +939,16 @@ class ArmedRecords(DkmsCheck):
         self.assertEqual(self.run_ok("survey")["armed_kernels"], [])
         self.assertEqual(self.check()["target_armed_before"], [])
 
+    def test_a_disarm_that_failed_keeps_the_record(self):
+        path = self.armed_and_not_rebooted()
+        self.h.state["unset_rc"] = 1  # the one-shot could not be cleared: it is still armed, and the kernel may yet boot
+        self.h.save()
+        r = self.h.run("disarm")
+        self.assertEqual(r.returncode, 1)
+        out = json.loads(r.stdout)
+        self.assertEqual((out["ok"], out["was_armed"], out["forgot_armed"]), (False, True, []))
+        self.assertTrue(os.path.exists(path), "a record was dropped for a one-shot that is still armed")
+
     def test_a_disarm_after_a_reboot_keeps_the_record(self):
         path = self.armed_and_not_rebooted()
         self.h.w("/proc/sys/kernel/random/boot_id", "bbbbbbbb-0000-0000-0000-000000000002\n")  # the host rebooted since the arming
@@ -1240,6 +1250,17 @@ class AbortKeepsTheSuspicionUntilTheKernelIsGone(Repair):
         self.assertNotEqual(self.wait()["rc"], 0)
         self.assertIn("linux-image-7.0.0-40-generic", self.h.load()["packages"])  # still installed
         self.assertTrue(self.record("7.0.0-40-generic"), "a failed purge forgot the kernel that stranded the host")
+
+    def test_a_purge_that_reports_an_error_keeps_the_record_even_when_the_packages_are_gone(self):
+        self.broken()
+        self.arm_record("7.0.0-40-generic")
+        self.h.state["remove_rc_after"] = 100
+        self.h.state["configure_ok"] = True
+        self.h.save()
+        self.j(self.h.run("repair-start", "--run-id", "9", "--action", "abort-new-kernel"))
+        self.assertNotEqual(self.wait()["rc"], 0)
+        self.assertNotIn("linux-image-7.0.0-40-generic", self.h.load()["packages"])
+        self.assertTrue(self.record("7.0.0-40-generic"), "the record went although the purge did not exit 0")
 
     def test_a_purge_that_exits_zero_but_leaves_the_version_installed_keeps_the_record(self):
         self.broken()

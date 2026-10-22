@@ -1162,15 +1162,18 @@ def cmd_repair_run(a):
         steps.append(["dpkg", "--force-confold", "--configure", "-a"])
         purged_versions = {NEW_KERNEL_PKG.match(n).group(1) for n in (pk if a.action == "abort-new-kernel" else []) if NEW_KERNEL_PKG.match(n)}
         rc = 0
+        purge_rc = 0
         for argv in steps:
             sys.stdout.write("+ " + " ".join(argv) + "\n")
             sys.stdout.flush()
             r = subprocess.run(argv, env=dict(os.environ, **APT_ENV, LC_ALL="C"), stdout=sys.stdout, stderr=subprocess.STDOUT)
+            if "remove" in argv:
+                purge_rc = r.returncode
             if r.returncode != 0:
                 rc = r.returncode
         # An explicit decision resets the suspicion of a kernel that is GONE: the purge exited 0 AND dpkg no longer shows the version.
         # A failed purge keeps the record: the kernel is still installed and still stranded the host.
-        if rc == 0:
+        if purge_rc == 0:
             for rec in armed_records():
                 pre = kver_prefix(rec.get("kernel", ""))
                 if pre in purged_versions and not kernel_version_installed(pre):
