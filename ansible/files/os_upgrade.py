@@ -145,7 +145,8 @@ def have(cmd):
     return shutil.which(cmd, path=os.environ.get("PATH", "") + os.pathsep + SBIN) is not None
 
 
-def write(path, content, mode=0o644):
+def write(path, content, mode=0o644, durable=False):
+    """Writes PATH atomically. durable: the file and its directory are fsynced, so a power loss right after cannot leave an empty record."""
     if READ_ONLY:
         raise SystemExit("read-only violation: refusing to write " + path)
     full = p(path)
@@ -153,8 +154,17 @@ def write(path, content, mode=0o644):
     tmp = full + ".tmp"
     with open(tmp, "w") as f:
         f.write(content)
+        if durable:
+            f.flush()
+            os.fsync(f.fileno())
     os.chmod(tmp, mode)
     os.replace(tmp, full)
+    if durable:
+        fd = os.open(os.path.dirname(full), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def emit(obj):
@@ -1708,6 +1718,7 @@ def self_updaters():
 # A 131-hour benchmark must not see a package or a service change under it, and these hosts update themselves: unattended-upgrades
 # installed the kernel -38 on its own. `freeze` stops the platform from moving by itself (the apt timers and unattended-upgrades, and
 # needrestart's automatic service restarts) and records the platform it froze; `thaw` puts back exactly what freeze recorded it changed.
+TRUE_WORDS = ("true", "1", "yes", "on", "with", "enable")  # what apt's FindB reads as true
 FREEZE_UNITS = ("apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service")
 FREEZE_RECORD = STATE_DIR + "/freeze.json"
 NEEDRESTART_DROPIN = "/etc/needrestart/conf.d/zzz-celeris-freeze.conf"
@@ -1722,11 +1733,20 @@ def unit_state(unit):
     return st
 
 
-def needrestart_mode():
+ON_ENABLED = ("enabled", "enabled-runtime")  # enabled-runtime: enabled until the next boot; a freeze turns it off too
+
+
+def unit_on(st):
+    return st["active"] == "active" or st["enabled"] in ON_ENABLED
+
+
+def needrestart_mode(skip_ours=False):
     """The restart mode needrestart is configured with ('a' automatic, 'l' list only, 'i' interactive), "" when it is not set anywhere
-    (needrestart's own default). Later files win: needrestart.conf, then conf.d/*.conf in name order."""
+    (needrestart's own default). Later files win: needrestart.conf, then conf.d/*.conf in name order. skip_ours: without the file a freeze wrote."""
     mode = ""
     for f in [p("/etc/needrestart/needrestart.conf")] + sorted(glob.glob(p("/etc/needrestart/conf.d/*.conf"))):
+        if skip_ours and f == p(NEEDRESTART_DROPIN):
+            continue
         try:
             text = open(f, errors="replace").read()
         except OSError:
@@ -1767,10 +1787,8 @@ def freeze_state():
         return {}
     drifted = []
     for u, info in sorted(rec.get("units", {}).items()):
-        if not info.get("present"):
-            continue  # a unit this host does not have cannot come back
-        now = unit_state(u)  # every unit of the freeze, whether it changed it or found it off already: none may run
-        if now["active"] == "active" or now["enabled"] == "enabled":
+        now = unit_state(u)  # every unit of the freeze, whether it changed it, found it off already or did not have it (a package may bring it): none may run
+        if unit_on(now):
             drifted.append("%s=%s/%s" % (u, now["active"], now["enabled"]))
     # the PLATFORM the freeze recorded, recomputed: a frozen host whose kernel, package list, holds or boot default moved is not the platform the
     # release results cite, whatever the units say (an upgrade, tailscale's own updater, a manual apt, a reboot onto the saved default ...)
@@ -1788,6 +1806,10 @@ def freeze_state():
     return dict(rec, drifted=drifted)
 
 
+def save_freeze(rec):
+    write(FREEZE_RECORD, json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
+
+
 def cmd_freeze(a):
     if not a.run_id:
         fail("--run-id is required")
@@ -1799,45 +1821,55 @@ def cmd_freeze(a):
     if busy:
         fail("dpkg or apt is busy (%s): not stopping unattended-upgrades or the apt timers under a package run" % busy)
     ios = apt_config().get("Unattended-Upgrade::InstallOnShutdown", "")
-    if ios.lower() in ("true", "1", "yes", "on"):
+    if ios.lower() in TRUE_WORDS:
         fail("Unattended-Upgrade::InstallOnShutdown is %r: the shutdown listener (unattended-upgrade-shutdown, which this freeze stops) installs packages "
              "when the host shuts down, and what stopping it does then is not known here: set it to false by a reviewed change first (nothing was changed)" % ios)
     before = {u: unit_state(u) for u in FREEZE_UNITS}
-    nr_before = needrestart_mode() if dpkg_version("needrestart") else None
+    # a needrestart file of ours that an earlier freeze left (its record lost) is adopted: this freeze's thaw removes it
+    adopted = os.path.exists(p(NEEDRESTART_DROPIN)) and rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip()
+    nr_before = needrestart_mode(skip_ours=True) if dpkg_version("needrestart") else None
     rec = {"run_id": a.run_id, "host": rd("/etc/hostname"), "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "freezing",
            "units": {u: {"before": {"active": s["active"], "enabled": s["enabled"]}, "present": s["present"], "changes": []} for u, s in before.items()},
-           "needrestart": {"installed": nr_before is not None, "mode_before": nr_before or "", "dropin_written": False},
+           "needrestart": {"installed": nr_before is not None, "mode_before": nr_before or "", "dropin_written": False, "adopted": adopted},
            "install_on_shutdown": ios}
-    # the record is written BEFORE anything changes: a freeze that fails half way can still be thawed
-    write(FREEZE_RECORD, json.dumps(rec, indent=1, sort_keys=True) + "\n")
+    # the record is written BEFORE anything changes, and before AND after every change ("pending" names the change about to be made): a freeze
+    # killed half way, even between a change and its record, is thawed to the states it recorded
+    save_freeze(rec)
     errors = []
     for u, s in before.items():
         if not s["present"]:
             continue
+        info = rec["units"][u]
         if s["active"] == "active":
+            info["pending"] = "stopped"
+            save_freeze(rec)
             rc, out, err = run(["systemctl", "stop", u], timeout=120)
+            info.pop("pending")
             if rc != 0:
                 errors.append("systemctl stop %s: %s" % (u, (out + err).strip()[-160:]))
             else:
-                rec["units"][u]["changes"].append("stopped")
-                write(FREEZE_RECORD, json.dumps(rec, indent=1, sort_keys=True) + "\n")  # every change is recorded as it is made
-        if s["enabled"] == "enabled":
+                info["changes"].append("stopped")
+            save_freeze(rec)
+        if s["enabled"] in ON_ENABLED:
+            info["pending"] = "disabled"
+            save_freeze(rec)
             rc, out, err = run(["systemctl", "disable", u], timeout=120)
+            info.pop("pending")
             if rc != 0:
                 errors.append("systemctl disable %s: %s" % (u, (out + err).strip()[-160:]))
             else:
-                rec["units"][u]["changes"].append("disabled")
-                write(FREEZE_RECORD, json.dumps(rec, indent=1, sort_keys=True) + "\n")
-    if nr_before is not None and nr_before != "l":
+                info["changes"].append("disabled")
+            save_freeze(rec)
+    if nr_before is not None and (nr_before != "l" or adopted):
         try:
-            write(NEEDRESTART_DROPIN, NEEDRESTART_TEXT)
+            write(NEEDRESTART_DROPIN, NEEDRESTART_TEXT, durable=True)
             rec["needrestart"]["dropin_written"] = True
-            write(FREEZE_RECORD, json.dumps(rec, indent=1, sort_keys=True) + "\n")
+            save_freeze(rec)
         except OSError as x:
             errors.append("cannot write %s: %s" % (NEEDRESTART_DROPIN, x))
     after = {u: unit_state(u) for u in FREEZE_UNITS}
     for u, s in after.items():
-        if s["present"] and (s["active"] == "active" or s["enabled"] == "enabled"):
+        if s["present"] and unit_on(s):
             errors.append("%s is still %s/%s after the freeze" % (u, s["active"], s["enabled"]))
     if rec["needrestart"]["installed"] and needrestart_mode() != "l":
         errors.append("needrestart is still configured with restart mode %r" % needrestart_mode())
@@ -1845,7 +1877,7 @@ def cmd_freeze(a):
     rec["platform"] = platform_identity()
     rec["status"] = "frozen" if not errors else "freezing-failed"
     rec["errors"] = errors
-    write(FREEZE_RECORD, json.dumps(rec, indent=1, sort_keys=True) + "\n")
+    save_freeze(rec)
     if errors:
         fail("the freeze did not complete (%s); the record is kept: mode=thaw restores what it changed" % "; ".join(errors))
     emit(dict(rec, ok=True))
@@ -1856,21 +1888,32 @@ def cmd_thaw(a):
         fail("--run-id is required")
     rec = freeze_record()
     if not rec or rec.get("status") == "unreadable":
-        fail("nothing to thaw: no readable freeze record at %s (this tool changed nothing, or the record is gone: put the timers back by hand and say so)" % FREEZE_RECORD)
+        fail("nothing to thaw: no readable freeze record at %s. This tool froze nothing here, or the record is gone; if units were stopped by a freeze whose record is lost, put back by hand ONLY the "
+             "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; rm %s" % (FREEZE_RECORD, NEEDRESTART_DROPIN))
     errors, done = [], []
     for u, info in sorted(rec.get("units", {}).items()):
-        for change in reversed(info.get("changes", [])):  # only what freeze recorded that it changed, in reverse
-            verb = {"disabled": "enable", "stopped": "start"}.get(change)
-            if not verb:
-                continue
-            rc, out, err = run(["systemctl", verb, u], timeout=120)
-            if rc != 0:
-                errors.append("systemctl %s %s: %s" % (verb, u, (out + err).strip()[-160:]))
-            else:
-                done.append("%s %s" % (verb, u))
-        now = unit_state(u)
         want = info.get("before", {})
-        if info.get("changes") and (now["active"] != want.get("active") or now["enabled"] != want.get("enabled")):
+        # what the freeze recorded it changed, plus the change it was about to make when it died (it may or may not have happened); each is undone
+        # only if the unit is not already as it was, so a second thaw changes nothing it has put back
+        effective = list(info.get("changes", [])) + ([info["pending"]] if info.get("pending") and info["pending"] not in info.get("changes", []) else [])
+        for change in reversed(effective):
+            now = unit_state(u)
+            if change == "disabled" and want.get("enabled") in ON_ENABLED and now["enabled"] not in ON_ENABLED:
+                if now["enabled"] == "masked":
+                    errors.append("%s is MASKED (by hand?): it cannot be enabled; unmask it and dispatch mode=thaw again" % u)
+                    continue
+                argv = ["systemctl", "enable"] + (["--runtime"] if want.get("enabled") == "enabled-runtime" else []) + [u]
+            elif change == "stopped" and want.get("active") == "active" and now["active"] != "active":
+                argv = ["systemctl", "start", u]
+            else:
+                continue
+            rc, out, err = run(argv, timeout=120)
+            if rc != 0:
+                errors.append("%s: %s" % (" ".join(argv), (out + err).strip()[-160:]))
+            else:
+                done.append(" ".join(argv[1:]))
+        now = unit_state(u)
+        if effective and (now["active"] != want.get("active") or now["enabled"] != want.get("enabled")) and now["enabled"] != "masked":
             errors.append("%s is %s/%s, was %s/%s before the freeze" % (u, now["active"], now["enabled"], want.get("active"), want.get("enabled")))
     nr = rec.get("needrestart", {})
     if nr.get("dropin_written"):
@@ -1890,7 +1933,7 @@ def cmd_thaw(a):
     rec["thawed_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     rec["thawed_by_run"] = a.run_id
     rec["restored"] = done
-    write("%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x")), json.dumps(rec, indent=1, sort_keys=True) + "\n")
+    write("%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x")), json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
     os.remove(p(FREEZE_RECORD))
     emit(dict(rec, ok=True))
 

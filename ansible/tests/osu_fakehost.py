@@ -251,16 +251,25 @@ if name == "systemctl":
     if args[0] == "is-system-running":
         out("running\n"); sys.exit(0)
     if args[0] in ("stop", "disable", "start", "enable"):
-        key = {"stop": ("is-active", "inactive"), "start": ("is-active", "active"), "disable": ("is-enabled", "disabled"), "enable": ("is-enabled", "enabled")}[args[0]]
-        if args[0] + " " + args[1] in st.get("systemctl_fail", []):
-            sys.stderr.write("Failed to %s %s: Unit is busy (test)\n" % (args[0], args[1])); sys.exit(1)
-        if args[0] + " " + args[1] in st.get("systemctl_kill", []):
+        unit = args[-1]  # "enable --runtime U": the unit is the last word
+        key = {"stop": ("is-active", "inactive"), "start": ("is-active", "active"), "disable": ("is-enabled", "disabled"),
+               "enable": ("is-enabled", "enabled-runtime" if "--runtime" in args else "enabled")}[args[0]]
+        if args[0] + " " + unit in st.get("systemctl_fail", []):
+            sys.stderr.write("Failed to %s %s: Unit is busy (test)\n" % (args[0], unit)); sys.exit(1)
+        if args[0] + " " + unit in st.get("systemctl_kill", []):
             os.kill(os.getppid(), 9)  # the freeze is killed here (a runner lost, a power loss): the verb is not applied
             time.sleep(1)
             sys.exit(1)
-        if args[0] + " " + args[1] in st.get("systemctl_noop", []):
+        if args[0] + " " + unit in st.get("systemctl_noop", []):
             sys.exit(0)  # reports success and changes nothing
-        st["services"][key[0] + " " + args[1]] = key[1]; save(); sys.exit(0)
+        if st.get("services", {}).get(key[0] + " " + unit) == "masked" and args[0] == "enable":
+            sys.stderr.write("Failed to enable unit: Unit %s is masked (test)\n" % unit); sys.exit(1)
+        st["services"][key[0] + " " + unit] = key[1]; save()
+        if args[0] + " " + unit in st.get("systemctl_kill_after", []):
+            os.kill(os.getppid(), 9)  # the verb WAS applied and the process dies before it can record it
+            time.sleep(1)
+            sys.exit(1)
+        sys.exit(0)
     out(st.get("services", {}).get(args[0] + " " + args[1], "inactive" if args[0] == "is-active" else "disabled") + "\n"); sys.exit(0)
 if name == "ip":
     if st.get("addr", True):

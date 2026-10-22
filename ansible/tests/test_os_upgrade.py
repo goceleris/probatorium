@@ -1642,7 +1642,7 @@ class FreezeThaw(Base):
             self.assertEqual(rec["units"][u]["before"], {"active": "active", "enabled": "enabled"})
             self.assertEqual(rec["units"][u]["changes"], ["stopped", "disabled"])
             self.assertEqual(rec["after"][u], {"active": "inactive", "enabled": "disabled"})
-        self.assertEqual(rec["needrestart"], {"installed": True, "mode_before": "", "dropin_written": True})
+        self.assertEqual(rec["needrestart"], {"installed": True, "mode_before": "", "dropin_written": True, "adopted": False})
         self.assertEqual(open(self.h.root + NR_DROPIN).read().count("$nrconf{restart} = 'l';"), 1)
         p = rec["platform"]
         self.assertEqual((p["kernel"], p["os"]), ("7.0.0-31-generic", "Ubuntu 26.04 LTS"))
@@ -1830,7 +1830,7 @@ class FreezeThaw(Base):
     def test_needrestart_already_list_only_is_left_alone(self):
         self.h.w("/etc/needrestart/conf.d/10-local.conf", "$nrconf{restart} = 'l';\n")
         self.assertEqual(self.freeze().returncode, 0)
-        self.assertEqual(self.record()["needrestart"], {"installed": True, "mode_before": "l", "dropin_written": False})
+        self.assertEqual(self.record()["needrestart"], {"installed": True, "mode_before": "l", "dropin_written": False, "adopted": False})
         self.assertFalse(os.path.exists(self.h.root + NR_DROPIN))
         self.assertEqual(self.thaw().returncode, 0)
         self.assertTrue(os.path.exists(self.h.root + "/etc/needrestart/conf.d/10-local.conf"))
@@ -1838,7 +1838,7 @@ class FreezeThaw(Base):
     def test_needrestart_set_to_automatic_is_put_back_by_the_thaw(self):
         self.h.w("/etc/needrestart/needrestart.conf", "$nrconf{restart} = 'a';\n")
         self.assertEqual(self.freeze().returncode, 0)
-        self.assertEqual(self.record()["needrestart"], {"installed": True, "mode_before": "a", "dropin_written": True})
+        self.assertEqual(self.record()["needrestart"], {"installed": True, "mode_before": "a", "dropin_written": True, "adopted": False})
         self.assertEqual(self.thaw().returncode, 0)
         self.assertFalse(os.path.exists(self.h.root + NR_DROPIN))
         self.assertIn("$nrconf{restart} = 'a';", open(self.h.root + "/etc/needrestart/needrestart.conf").read())  # the person's file was never touched
@@ -1856,7 +1856,7 @@ class FreezeThaw(Base):
         del self.h.state["packages"]["needrestart"]
         self.h.save()
         self.assertEqual(self.freeze().returncode, 0)
-        self.assertEqual(self.record()["needrestart"], {"installed": False, "mode_before": "", "dropin_written": False})
+        self.assertEqual(self.record()["needrestart"], {"installed": False, "mode_before": "", "dropin_written": False, "adopted": False})
         self.assertFalse(os.path.exists(self.h.root + NR_DROPIN))
 
     def test_a_unit_the_host_does_not_have_is_not_touched(self):
@@ -1937,6 +1937,139 @@ class FreezeThaw(Base):
         self.h.w(FREEZE_RECORD, json.dumps(rec))
         self.h.state["packages"]["linux-firmware"]["version"] = "x"
         self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], [])
+
+    # ---- review m4: each of these killed a mutant that had survived
+    def test_a_timer_enabled_by_hand_but_not_started_is_drift_and_so_is_one_started_but_not_enabled(self):
+        self.frozen_survey()
+        self.set_svc("apt-daily.timer", "inactive", "enabled")
+        self.set_svc("apt-daily-upgrade.timer", "active", "disabled")
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], ["apt-daily-upgrade.timer=active/disabled", "apt-daily.timer=inactive/enabled"])
+
+    def test_a_disable_that_did_not_take_fails_the_freeze_though_the_stop_did(self):
+        r = self.freeze(systemctl_noop=["disable apt-daily.timer"])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("apt-daily.timer is still inactive/enabled after the freeze", r.stdout + r.stderr)
+
+    def test_a_start_that_did_not_take_fails_the_thaw_though_the_enable_did(self):
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["systemctl_noop"] = ["start apt-daily.timer"]
+        self.h.save()
+        r = self.thaw()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("apt-daily.timer is inactive/enabled, was active/enabled before the freeze", r.stdout + r.stderr)
+        self.assertTrue(os.path.exists(self.h.root + FREEZE_RECORD))
+
+    def test_a_thaw_that_leaves_needrestart_in_another_mode_than_before_fails(self):
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.w("/etc/needrestart/conf.d/zzzz-person.conf", "$nrconf{restart} = 'a';\n")  # a person's file, written after the freeze
+        r = self.thaw()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("needrestart restart mode is 'a', was '' before the freeze", r.stdout + r.stderr)
+        self.assertTrue(os.path.exists(self.h.root + FREEZE_RECORD))
+
+    def test_install_on_shutdown_is_refused_in_every_spelling_apt_reads_as_true(self):
+        for v in ("TRUE", "1", "yes", "on", "with", "enable"):
+            self.h.load()
+            self.h.state["apt_config"]["Unattended-Upgrade::InstallOnShutdown"] = v
+            self.h.save()
+            r = self.freeze()
+            self.assertEqual(r.returncode, 1, v)
+            self.assertIn("InstallOnShutdown is", r.stdout + r.stderr)
+
+    # ---- review m5: the freeze and the thaw converge
+    def test_a_freeze_killed_right_after_a_change_and_before_its_record_is_thawed_to_the_recorded_states(self):
+        r = self.freeze(systemctl_kill_after=["stop apt-daily.timer"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.svc("apt-daily.timer"), ("inactive", "enabled"))  # the stop WAS applied
+        rec = self.record()
+        self.assertEqual(rec["units"]["apt-daily.timer"]["changes"], [])  # and not recorded as done ...
+        self.assertEqual(rec["units"]["apt-daily.timer"]["pending"], "stopped")  # ... but recorded as about to be
+        self.h.load()
+        self.h.state["systemctl_kill_after"] = []
+        self.h.save()
+        t = self.thaw()
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        for u in FREEZE_UNITS:
+            self.assertEqual(self.svc(u), ("active", "enabled"), u)
+
+    def test_a_pending_change_that_never_happened_is_not_undone_by_a_thaw(self):
+        r = self.freeze(systemctl_kill=["stop apt-daily.timer"])  # killed BEFORE the stop
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.record()["units"]["apt-daily.timer"]["pending"], "stopped")
+        self.h.load()
+        self.h.state["systemctl_kill"] = []
+        self.h.save()
+        seen = len(self.h.calls())
+        self.assertEqual(self.thaw().returncode, 0)
+        self.assertEqual(self.sysctl_calls_since(seen, "start", "enable"), [])  # it was never stopped: nothing to start
+
+    def sysctl_calls_since(self, n, *verbs):
+        return [c for c in self.h.calls()[n:] if c.split(" ")[0] == "systemctl" and c.split(" ")[1] in verbs]
+
+    def test_a_thaw_that_stopped_half_way_is_finished_by_the_next_one_and_changes_nothing_twice(self):
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["systemctl_fail"] = ["start unattended-upgrades.service"]
+        self.h.save()
+        self.assertEqual(self.thaw().returncode, 1)
+        self.assertEqual(self.svc("apt-daily.timer"), ("active", "enabled"))  # the others are back
+        self.h.load()
+        self.h.state["systemctl_fail"] = []
+        self.h.save()
+        seen = len(self.h.calls())
+        self.assertEqual(self.thaw("9").returncode, 0)
+        self.assertEqual([c for c in self.sysctl_calls_since(seen, "start", "enable")], ["systemctl start unattended-upgrades.service"])
+        for u in FREEZE_UNITS:
+            self.assertEqual(self.svc(u), ("active", "enabled"), u)
+
+    def test_a_unit_masked_by_hand_after_the_freeze_is_named_and_the_rest_is_restored(self):
+        self.assertEqual(self.freeze().returncode, 0)
+        self.set_svc("apt-daily.timer", "inactive", "masked")
+        r = self.thaw()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("apt-daily.timer is MASKED (by hand?)", r.stdout + r.stderr)
+        self.assertEqual(self.svc("unattended-upgrades.service"), ("active", "enabled"))
+        self.set_svc("apt-daily.timer", "inactive", "disabled")  # unmasked
+        self.assertEqual(self.thaw("9").returncode, 0)
+        self.assertEqual(self.svc("apt-daily.timer"), ("active", "enabled"))
+
+    def test_a_timer_enabled_only_until_the_next_boot_is_frozen_and_thawed_as_it_was(self):
+        self.set_svc("apt-daily.timer", "active", "enabled-runtime")
+        r = self.freeze()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.svc("apt-daily.timer"), ("inactive", "disabled"))
+        self.assertEqual(self.record()["units"]["apt-daily.timer"]["changes"], ["stopped", "disabled"])
+        self.assertEqual(self.thaw().returncode, 0)
+        self.assertEqual(self.svc("apt-daily.timer"), ("active", "enabled-runtime"))
+        self.assertIn("systemctl enable --runtime apt-daily.timer", self.h.calls())
+
+    def test_a_needrestart_file_an_earlier_freeze_left_is_adopted_by_the_next_freeze(self):
+        self.h.w(NR_DROPIN, "# Managed by probatorium ansible/os-upgrade.yml (mode=freeze): needrestart lists the services that need a restart and restarts NONE, so the\n"
+                 "# platform stays fixed under a measurement. mode=thaw removes this file.\n$nrconf{restart} = 'l';\n")  # its record was lost
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.record()["needrestart"], {"installed": True, "mode_before": "", "dropin_written": True, "adopted": True})
+        self.assertEqual(self.thaw().returncode, 0)
+        self.assertFalse(os.path.exists(self.h.root + NR_DROPIN))
+
+    def test_a_unit_that_a_package_brings_after_the_freeze_is_drift(self):
+        self.set_svc("apt-daily-upgrade.timer", "inactive", "not-found")
+        self.frozen_survey()
+        self.set_svc("apt-daily-upgrade.timer", "active", "enabled")
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], ["apt-daily-upgrade.timer=active/enabled"])
+
+    def test_the_freeze_record_is_written_durably(self):
+        calls = []
+        real = os.fsync
+        os.fsync = lambda fd: (calls.append(fd), real(fd))[1]
+        try:
+            with self.in_fake_root():
+                osu.write("/var/lib/x/rec.json", "{}", durable=True)
+                self.assertEqual(len(calls), 2)  # the file, then its directory
+                osu.write("/var/lib/x/other.json", "{}")
+                self.assertEqual(len(calls), 2)
+        finally:
+            os.fsync = real
 
     def test_a_unit_the_freeze_found_off_and_left_alone_is_drift_too_when_it_comes_back(self):
         self.set_svc("apt-daily-upgrade.timer", "inactive", "disabled")  # a person had switched it off: the freeze leaves it

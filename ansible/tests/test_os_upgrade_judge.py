@@ -360,6 +360,9 @@ class Judge(unittest.TestCase):
              fz("freeze", p__dpkg_lock_held=True, p__locks_held=["/var/lib/dpkg/lock"]))
         case("freeze_with_install_on_shutdown", {"maint": "Unattended-Upgrade::InstallOnShutdown is true: the shutdown listener a freeze stops installs packages when the host shuts down"},
              lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
+        for v in ("True", "TRUE", "yes", "on", "1", "with", "enable"):
+            case("freeze_with_install_on_shutdown_" + v, {"maint": "Unattended-Upgrade::InstallOnShutdown is %s: the shutdown listener" % v},
+                 (lambda v: lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown=v)))(v))
         case("freeze_with_install_on_shutdown_off_is_fine", {}, lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="false")))
         case("thaw_ignores_install_on_shutdown", {}, lambda c: (c.update(os_mode="thaw"), c["pre_survey"].update(freeze=dict(FROZEN)), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
         case("upgrade_of_a_frozen_host", {"refusals": "this host is frozen (run 41, 2026-10-23T10:00:00Z): an upgrade changes the platform the freeze recorded"},

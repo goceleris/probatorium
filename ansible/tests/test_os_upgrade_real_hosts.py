@@ -170,6 +170,7 @@ class ChecklistReplay(unittest.TestCase):
         row = "platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts); NOT covered: tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client"
         for name, rec, want in (("frozen and holding", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS"),
                                 ("frozen but a unit came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["apt-daily.timer=active/enabled"]}, "FAIL"),
+                                ("a freeze interrupted half way", {"run_id": "1", "utc": "t", "status": "freezing", "drifted": []}, "FAIL"),
                                 ("a freeze that did not complete", {"run_id": "1", "utc": "t", "status": "freezing-failed", "drifted": []}, "FAIL")):
             d = tempfile.mkdtemp(prefix="osu-real-freeze-")
             try:
