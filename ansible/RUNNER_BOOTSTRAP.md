@@ -170,7 +170,7 @@ on every run made each tier depend on four internet services at once
   the bootstrap recreates those as links into the cache on every run.
   Teardown removes the links and leaves the cache.
 - **Cleared by a reboot**, because `/tmp` is RAM-backed on these hosts, so the first bootstrap after one is cold.
-  A host is rebooted only through `.github/workflows/cluster-reboot.yml` (README, "Rebooting a cluster host").
+  A host is rebooted only through `.github/workflows/cluster-reboot.yml` (README, "Rebooting a cluster host"); its kernel and packages change only through `.github/workflows/cluster-os-upgrade.yml` (README, "Upgrading a cluster host's OS"), which reboots the host too.
 - **Eaten by age, file by file.** `systemd-tmpfiles-clean` runs daily with the
   stock `q /tmp 1777 root root 10d` and deletes every file nothing has read,
   written or changed for ten days, from the middle of a tree that is otherwise

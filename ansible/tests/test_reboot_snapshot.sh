@@ -186,6 +186,106 @@ out=$(PATH=$work/stub:$PATH HOST_SNAPSHOT_ROOT=$R bash "$snap" /tmp/m /tmp/r - -
 check "tailscaled active and its unit-file state" '"tailscaled_active":true,"tailscaled_enabled":"enabled-runtime"'
 out=$(HOST_SNAPSHOT_ROOT=$R PATH=/usr/bin:/bin bash "$snap" /tmp/m /tmp/r - - - 2>&1)
 
+# the OS-upgrade pin: a newer kernel installed is harmless to a reboot when grub's saved default IS the running kernel AND the one-shot
+# mechanism was rehearsed on it AND grub.cfg really reads the saved entry. Each of those is a case below.
+check "no drop-in of the OS upgrade: not pinned" '"grub_pinned_to_running":false'
+mkdir -p "$R/etc/default/grub.d" "$R/boot/grub" "$R/var/lib/celeris-os-upgrade" "$work/stubg"
+touch "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg"
+printf '#!/bin/bash\ncat "${STUB_ENV:?}"\n' > "$work/stubg/grub-editenv"
+# a dpkg-query of the boot chain: package=version plus the Status field, as the real one prints it for the three patterns
+printf '#!/bin/bash\ncat "${STUB_DPKG:?}"\n' > "$work/stubg/dpkg-query"
+chmod +x "$work/stubg/grub-editenv" "$work/stubg/dpkg-query"
+write_cfg() { # write_cfg DEFAULT-LINE
+	cat > "$R/boot/grub/grub.cfg" << EOT
+set default="$1"
+menuentry 'Ubuntu' --class ubuntu \$menuentry_id_option 'gnulinux-simple-U' {
+	linux /vmlinuz-7.0.0-20-generic
+}
+submenu 'Advanced options for Ubuntu' \$menuentry_id_option 'gnulinux-advanced-U' {
+	menuentry 'Ubuntu, with Linux 7.0.0-20-generic' --class ubuntu \$menuentry_id_option 'gnulinux-7.0.0-20-generic-advanced-U' {
+		linux /vmlinuz-7.0.0-20-generic
+	}
+	menuentry 'Ubuntu, with Linux 7.0.0-20-generic (recovery mode)' --class ubuntu \$menuentry_id_option 'gnulinux-7.0.0-20-generic-recovery-U' {
+		linux /vmlinuz-7.0.0-20-generic single
+	}
+	menuentry 'Ubuntu, with Linux 7.0.0-14-generic' --class ubuntu \$menuentry_id_option 'gnulinux-7.0.0-14-generic-advanced-U' {
+		linux /vmlinuz-7.0.0-14-generic
+	}
+	menuentry 'Ubuntu, with Linux 7.0.0-14-generic (recovery mode)' --class ubuntu \$menuentry_id_option 'gnulinux-7.0.0-14-generic-recovery-U' {
+		linux /vmlinuz-7.0.0-14-generic single
+	}
+}
+EOT
+}
+CHAIN='grub-common=2.14|grub-efi-arm64-bin=2.14|shim-signed=1.60'
+write_dpkg() { # write_dpkg VERSION-OF-GRUB-COMMON
+	printf 'grub-common=%s install ok installed\ngrub-efi-arm64-bin=2.14 install ok installed\nshim-signed=1.60 install ok installed\ngrub-pc=1 install ok config-files\n' "$1" > "$work/dpkg-out"
+}
+rehearsal() { # rehearsal KERNEL OK CHAIN
+	printf '{"chain": "%s", "efi_loader": "x", "kernel": "%s", "ok": %s, "run_id": "5"}\n' "$3" "$1" "$2" > "$R/var/lib/celeris-os-upgrade/rehearsal.json"
+}
+good_env='saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-14-generic-advanced-U\nnext_entry=\n'
+pin() { # pin ENV-FILE-CONTENT
+	printf '%b' "$1" > "$work/grubenv"
+	out=$(PATH=$work/stubg:$PATH STUB_ENV=$work/grubenv STUB_DPKG=$work/dpkg-out HOST_SNAPSHOT_ROOT=$R bash "$snap" /tmp/m /tmp/r - - - 2>&1)
+}
+write_cfg '${saved_entry}'
+write_dpkg 2.14
+rehearsal 7.0.0-14-generic true "$CHAIN"
+pin "$good_env"
+check "rehearsed, the saved default is the running kernel's entry, no one-shot: pinned" '"grub_pinned_to_running":true'
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-14-generic-advanced-U\nnext_entry=gnulinux-advanced-U>gnulinux-7.0.0-20-generic-advanced-U\n'
+check "a one-shot pending: not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-20-generic-advanced-U\n'
+check "the saved default is another kernel: not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-140-generic-advanced-U\n'
+check "a kernel whose name merely contains the running one: not pinned" '"grub_pinned_to_running":false'
+# R3-M4 (R04): the RECOVERY entry of the running kernel is not the running kernel's entry
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-14-generic-recovery-U\nnext_entry=\n'
+check "the saved default is the RECOVERY entry of the running kernel: not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=gnulinux-7.0.0-14-generic-advanced-U\n'
+check "a saved id without its submenu: not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=gnulinux-simple-U\n'
+check "the top-level entry as the saved default (newest at boot time): not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=gnulinux-advanced-U>gnulinux-7.0.0-14-generic-advanced-GONE\n'
+check "a saved id that names no entry of grub.cfg (GRUB falls back to entry 0): not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=gnulinux-advanced-GONE>gnulinux-7.0.0-14-generic-advanced-U\n'
+check "a saved id whose submenu is not in grub.cfg: not pinned" '"grub_pinned_to_running":false'
+pin 'saved_entry=\n'
+check "no saved default: not pinned" '"grub_pinned_to_running":false'
+# grub.cfg that does not read the saved entry: GRUB would boot entry 0, the newest kernel
+write_cfg '0'
+pin "$good_env"
+check "grub.cfg says set default=0 although the drop-in exists: not pinned" '"grub_pinned_to_running":false'
+write_cfg '${saved_entry}'
+rm "$R/boot/grub/grub.cfg"
+pin "$good_env"
+check "no readable grub.cfg: not pinned" '"grub_pinned_to_running":false'
+write_cfg '${saved_entry}'
+# the rehearsal record
+rm "$R/var/lib/celeris-os-upgrade/rehearsal.json"
+pin "$good_env"
+check "no rehearsal record (a pin that was never tested): not pinned" '"grub_pinned_to_running":false'
+rehearsal 7.0.0-20-generic true "$CHAIN"
+pin "$good_env"
+check "a rehearsal of another kernel: not pinned" '"grub_pinned_to_running":false'
+rehearsal 7.0.0-14-generic false "$CHAIN"
+pin "$good_env"
+check "a rehearsal that did not succeed: not pinned" '"grub_pinned_to_running":false'
+rehearsal 7.0.0-14-generic true ""
+pin "$good_env"
+check "a rehearsal record without its boot chain: not pinned" '"grub_pinned_to_running":false'
+rehearsal 7.0.0-14-generic true "$CHAIN"
+write_dpkg 2.15
+pin "$good_env"
+check "grub was upgraded since the rehearsal: not pinned" '"grub_pinned_to_running":false'
+write_dpkg 2.14
+pin "$good_env"
+check "the chain is back: pinned again" '"grub_pinned_to_running":true'
+rm "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg"
+pin "$good_env"
+check "no drop-in even with everything else in place: not pinned" '"grub_pinned_to_running":false'
+
 # usage
 out=$(bash "$snap" a b 2>&1)
 rc=$?

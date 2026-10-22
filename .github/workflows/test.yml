@@ -384,6 +384,19 @@ jobs:
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
         run: bash ansible/tests/test_reboot_play.sh
+      # The sanctioned OS survey and upgrade (ansible/os-upgrade.yml): the script against a
+      # fake host with stub grub/apt/dkms commands, the real Jinja judgement (every refusal) and the
+      # whole playbook on local connections, under the cluster's ansible pin.
+      - name: ansible/tests/test_os_upgrade.py
+        run: python3 -I ansible/tests/test_os_upgrade.py
+      - name: ansible/tests/test_os_upgrade_judge.py
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: python3 -I ansible/tests/test_os_upgrade_judge.py
+      - name: ansible/tests/test_os_upgrade_play.py
+        env:
+          ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
+        run: python3 -I ansible/tests/test_os_upgrade_play.py
 
   # Fan-in over every job above so branch protection can require ONE
   # stable check name ("ci-ok") instead of enumerating the adapter

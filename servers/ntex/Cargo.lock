@@ -491,9 +491,9 @@ dependencies = [
 
 [[package]]
 name = "ntex"
-version = "4.2.0"
+version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "596104c252e66e6b4494e8bb1544b8b10661d7d38aa47784c2971d83c1120459"
+checksum = "5d9316fca61aa07cd20e3dc9a9c8a151db153f0a7a3c915f8ff06b581008873f"
 dependencies = [
  "atoi_simd",
  "base64",

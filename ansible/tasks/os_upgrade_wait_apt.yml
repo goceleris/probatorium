@@ -1,0 +1,31 @@
+---
+# One round of waiting for the detached apt (or dpkg) run of this host, included several times in a loop by
+# ansible/os-upgrade.yml. Each poll waits up to 30 s ON the host. ansible may end a round early when one poll is unreachable
+# (it does not retry an unreachable result): the next round first waits for the connection to come back, so one tailnet blip
+# neither ends the wait nor lets anything proceed while apt still runs. Needs: os_run_id, osu, upgrade_poll_retries.
+- name: Apt | wait for it (one round of polls)
+  ansible.builtin.script:
+    cmd: "{{ osu }} upgrade-status --run-id {{ os_run_id }} --wait 30"
+  become: true
+  register: apt_poll_raw
+  changed_when: false
+  failed_when: false
+  ignore_unreachable: true
+  until: (apt_poll_raw.stdout | default('') | length > 0) and ((apt_poll_raw.stdout | from_json).state in ['done', 'died'])
+  retries: "{{ upgrade_poll_retries }}"
+  delay: 1
+  when: not (apt_finished | default(false))
+
+- name: Apt | note how the round ended
+  ansible.builtin.set_fact:
+    apt_finished: "{{ (apt_poll_raw.stdout | default('', true) | length > 0) and ((apt_poll_raw.stdout | from_json).state in ['done', 'died']) }}"
+    apt_status: "{{ (apt_poll_raw.stdout | from_json) if (apt_poll_raw.stdout | default('', true) | length > 0) else {'state': 'unreachable', 'rc': none} }}"
+  when: not (apt_finished | default(false))
+
+- name: Apt | wait for the connection to come back before the next round
+  ansible.builtin.wait_for_connection:
+    timeout: 300
+    delay: 5
+  failed_when: false
+  ignore_unreachable: true
+  when: not (apt_finished | default(false))
