@@ -1961,5 +1961,24 @@ class Toolcheck(Base):
         self.assertEqual(len(t["warnings"]), 1)
 
 
+def load_tests(loader, tests, pattern):
+    """OSU_SHARD=i/n runs every n-th test (by position in the full suite) so that a caller with several cores can run n processes at once:
+    workflow_cluster_os_upgrade_test.go does, to keep the root package's go test fast. Without it, or with a test named on the command line,
+    nothing changes."""
+    shard = os.environ.get("OSU_SHARD", "")
+    if not shard:
+        return tests
+    i, n = (int(x) for x in shard.split("/"))
+
+    def flat(suite):
+        for t in suite:
+            if isinstance(t, unittest.TestSuite):
+                yield from flat(t)
+            else:
+                yield t
+    picked = unittest.TestSuite(t for k, t in enumerate(flat(tests)) if k % n == i)
+    return picked
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

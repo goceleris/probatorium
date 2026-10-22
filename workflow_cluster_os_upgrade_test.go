@@ -7,9 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -544,14 +546,43 @@ func pythonOrSkip(t *testing.T) string {
 
 // TestOSUpgradeScript runs ansible/tests/test_os_upgrade.py: the grub menu parser, the survey (read-only: nothing
 // written, no changing command run), and each host-changing subcommand against a fake host with stub commands.
+// The suite is ~200 tests that each start dozens of stub processes, and the root package has a 5 minute budget under -race:
+// it runs as OSU_SHARD=i/n shards, one python process each, at once (the tests share nothing; each has its own temp dir).
 func TestOSUpgradeScript(t *testing.T) {
 	py := pythonOrSkip(t)
-	out, err := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade.py")).CombinedOutput()
-	if err != nil {
-		t.Fatalf("test_os_upgrade.py failed: %v\n%s", err, out)
+	n := min(max(runtime.NumCPU(), 1), 4)
+	type res struct {
+		out []byte
+		err error
 	}
-	if !bytes.Contains(out, []byte("OK")) {
-		t.Fatalf("test_os_upgrade.py did not report OK:\n%s", out)
+	results := make([]res, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cmd := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade.py"))
+			cmd.Env = append(os.Environ(), "OSU_SHARD="+strconv.Itoa(i)+"/"+strconv.Itoa(n))
+			results[i].out, results[i].err = cmd.CombinedOutput()
+		}()
+	}
+	wg.Wait()
+	ran := 0
+	for i, r := range results {
+		if r.err != nil {
+			t.Errorf("test_os_upgrade.py shard %d/%d failed: %v\n%s", i, n, r.err, r.out)
+			continue
+		}
+		m := regexp.MustCompile(`Ran (\d+) tests?`).FindSubmatch(r.out)
+		if m == nil || !bytes.Contains(r.out, []byte("OK")) {
+			t.Errorf("test_os_upgrade.py shard %d/%d did not report OK:\n%s", i, n, r.out)
+			continue
+		}
+		k, _ := strconv.Atoi(string(m[1]))
+		ran += k
+	}
+	if ran < 200 {
+		t.Errorf("the shards ran %d tests in all: the suite has more than 200 (a shard that silently ran nothing?)", ran)
 	}
 }
 
