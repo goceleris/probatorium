@@ -407,7 +407,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 	if !strings.Contains(src, "when: (blacklist_r8169 | bool) and pre_target.r8127") {
 		t.Error("blacklist_r8169 is no longer limited to a host with an r8127 NIC")
 	}
-	if !strings.Contains(src, "osu }} upgrade-cleanup --run-id") {
+	if strings.Count(src, "osu }} upgrade-cleanup --run-id") < 2 || !strings.Contains(src, "Apt | take our policy-rc.d away if the run that left it is over") {
 		t.Error("the playbook does not clean up the policy-rc.d of a run that died")
 	}
 	// a failure between the arming and the host's return disarms the one-shot: arm and reboot sit in a block whose rescue disarms
