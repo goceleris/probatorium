@@ -724,6 +724,18 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("fz_idle", self.FZ)  # the fake host runs unattended-upgrade-shutdown and packagekitd, as every real host does
         self.assertEqual(self.rc, 0, self.log[-2000:])
 
+    def test_a_freeze_and_a_thaw_are_refused_while_a_power_loss_resume_is_pending(self):
+        self.fresh()
+        self.h.w("/var/lib/celeris-power/resume-pending.json", "{}")
+        self.play("fz_resume", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("a power-loss resume is pending", self.log)
+        self.play("th_resume", self.TH)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("a power-loss resume is pending", self.log)
+        self.assertEqual([c for c in self.calls() if c.startswith(("systemctl stop", "systemctl disable", "systemctl start", "systemctl enable"))], [])
+        self.assertEqual(self.unit("unattended-upgrades.service"), ("active", "enabled"))
+
     def test_a_freeze_that_did_not_take_is_red_keeps_its_record_and_the_survey_marks_it(self):
         self.fresh(systemctl_noop=["stop apt-daily.timer", "disable apt-daily.timer"])
         self.play("fz_fail", self.FZ)

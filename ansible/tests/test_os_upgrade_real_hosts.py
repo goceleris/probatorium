@@ -248,6 +248,8 @@ class JudgementReplay(unittest.TestCase):
             case("disarm-" + h, h, "disarm", "DISARM-" + h)
             case("freeze-" + h, h, "freeze", "FREEZE-" + h)
             case("thaw-" + h, h, "thaw", "THAW-" + h)
+            for mode in ("freeze", "thaw"):
+                case("resume-%s-%s" % (mode, h), h, mode, "%s-%s" % (mode.upper(), h), lambda c: c["pre_target"].update(resume_pending=True))
         # a refusal predicate fires on a real record when the real value is what trips it
         case("upgrade-msr1-after-a-real-run-started", "msr1", "upgrade", "UPGRADE-msr1",
              lambda c: c["pre_survey"]["packages"].update(package_processes=["apt-get", "packagekitd", "unattended-upgr"]))
@@ -323,6 +325,12 @@ class JudgementReplay(unittest.TestCase):
         for h in HOSTS:
             self.assertEqual(self.maint("freeze-" + h), [], h)
             self.assertEqual(self.maint("thaw-" + h), ["nothing to thaw: no freeze record on this host (this tool froze nothing here, or its record is gone)"], h)
+
+    def test_a_freeze_or_a_thaw_is_refused_on_a_real_host_with_a_power_loss_resume_pending(self):
+        for h in HOSTS:
+            for mode in ("freeze", "thaw"):
+                got = self.out["resume-%s-%s" % (mode, h)]["maint"]
+                self.assertIn("a power-loss resume is pending", got, (mode, h))
 
     def test_a_disarm_has_no_refusal(self):
         for h in HOSTS:

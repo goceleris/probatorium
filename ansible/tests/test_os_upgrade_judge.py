@@ -352,6 +352,8 @@ class Judge(unittest.TestCase):
         case("freeze_ok", {}, fz("freeze"))
         case("freeze_beside_idle_daemons_is_fine", {}, fz("freeze", p__package_processes=["packagekitd", "unattended-upgr"]))
         case("freeze_beside_a_bench", {"maint": "a bench or validation manifest exists"}, fz("freeze", t__manifest_present=True))
+        case("freeze_with_a_power_loss_resume_pending", {"maint": "a power-loss resume is pending (cluster-power-restore --list). A freeze changes the platform"}, fz("freeze", t__resume_pending=True))
+        case("thaw_with_a_power_loss_resume_pending", {"maint": "A thaw re-enables the apt timers, which are persistent and can run unattended-upgrades within minutes"}, fz("thaw", FROZEN, t__resume_pending=True))
         case("freeze_beside_a_runner_job", {"maint": "1 runner job(s) are executing"}, fz("freeze", t__runner_workers=1))
         case("freeze_into_a_running_apt", {"maint": "dpkg or apt is busy (apt-get): a freeze would stop unattended-upgrades or the apt timers under a package run"}, fz("freeze", p__package_processes=["apt-get"]))
         case("freeze_into_a_held_lock", {"maint": "dpkg or apt is busy (an apt or dpkg lock is held (/var/lib/dpkg/lock)): a freeze would stop"},
@@ -518,7 +520,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 85, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 86, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:
