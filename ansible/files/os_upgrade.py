@@ -373,6 +373,10 @@ def boot_info():
     else:
         top = [e for e in entries if not e["parent"] and e["kernel"]]
         default_kernel = top[0]["kernel"] if top and settings.get("GRUB_DEFAULT", "0") == "0" else ""
+    # what a GRUB that does not read the environment block boots: the FIRST menu entry (default="0", or the fallback when the
+    # saved entry is unusable). With the newest kernel installed it is that kernel, not the running one.
+    top0 = [e for e in entries if not e["parent"] and e["kernel"]]
+    entry0_kernel = top0[0]["kernel"] if top0 else ""
     rc, fstype, _ = run(["findmnt", "-n", "-o", "FSTYPE", "-T", p("/boot/grub")])
     rc2, src, _ = run(["findmnt", "-n", "-o", "SOURCE", "-T", p("/boot/grub")])
     src = src.strip()
@@ -415,6 +419,7 @@ def boot_info():
         "next_entry": env.get("next_entry", ""),
         "dropin_present": os.path.exists(p(DROPIN)),
         "default_kernel": default_kernel,
+        "entry0_kernel": entry0_kernel,
         "entries": [{"kernel": e["kernel"], "id": e["full_id"], "title": e["title"]} for e in entries if e["kernel"] and not e["recovery"]],
         "boot_fs": fstype.strip(),
         "boot_source": src,
@@ -1303,9 +1308,11 @@ def cmd_arm(a):
 
 
 def cmd_arm_rehearsal(a):
-    """Arms next_entry to a boot of the RUNNING kernel (its top-level menu entry when that is the running kernel, else its Advanced
-    entry, which is also the saved default). It proves that GRUB reads the environment block Linux writes (next_entry is empty after
-    the boot) with no other kernel in play. If GRUB read another block it would boot entry 0, what any power cut gives today."""
+    """Arms next_entry to a boot of the RUNNING kernel through its own Advanced entry, the entry id that names this kernel only
+    (a top-level id such as gnulinux-simple-<uuid> means "the newest kernel at boot time": a kernel installed between the arming
+    and the reboot would be booted). It proves that GRUB reads the environment block Linux writes (next_entry is empty after the
+    boot). NOT a zero-kernel-risk test: if GRUB ignores the block it boots its first menu entry (see boot.entry0_kernel), which is
+    another kernel while a newer one is installed; the judge refuses that unless the maintainer confirmed a console."""
     if package_processes() or dpkg_lock_held():
         fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % (", ".join(package_processes()) or "a dpkg lock is held"))
     rc, out, err = run(["update-grub"], timeout=600)
@@ -1318,8 +1325,7 @@ def cmd_arm_rehearsal(a):
     env = grub_editenv()
     if env.get("saved_entry") != saved_id:
         fail("the saved default is %r, not the running kernel's entry %r: pin it first" % (env.get("saved_entry"), saved_id))
-    top = [e for e in entries if not e["parent"] and e["kernel"] == a.running and not e["recovery"]]
-    new = top[0]["full_id"] if top else saved_id
+    new = saved_id
     rc, out, err = run(["grub-reboot", new])
     if rc != 0:
         fail("grub-reboot failed: " + (out + err)[-300:])
@@ -1328,8 +1334,7 @@ def cmd_arm_rehearsal(a):
         d = disarm()
         fail("grub-editenv: saved_entry=%r next_entry=%r, expected %r and %r; one-shot disarmed: %s" % (
             env.get("saved_entry"), env.get("next_entry"), saved_id, new, d["ok"]))
-    emit({"ok": True, "saved_entry": saved_id, "next_entry": new, "running": a.running, "target": a.running,
-          "via": "top-level entry" if top else "advanced entry"})
+    emit({"ok": True, "saved_entry": saved_id, "next_entry": new, "running": a.running, "target": a.running, "via": "advanced entry"})
 
 
 def cmd_record_rehearsal(a):

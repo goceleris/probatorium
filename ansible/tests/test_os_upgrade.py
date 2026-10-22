@@ -957,16 +957,27 @@ class Rehearsal(Base):
         self.assertEqual(self.run_ok("survey")["rehearsal"]["kernel"], "7.0.0-31-generic")
         self.assertTrue(rec["ok"])
 
-    def test_it_uses_the_top_level_entry_when_the_running_kernel_is_the_newest(self):
+    def test_it_uses_the_kernel_specific_entry_even_when_the_running_kernel_is_the_newest(self):
         os.remove(self.h.root + "/boot/vmlinuz-7.0.0-38-generic")
         self.h.state["packages"].pop("linux-image-7.0.0-38-generic")
         self.h.state["grub_template"] = os.path.join(FIXTURES, "grub-arm64-efi.cfg")
         self.h.state["next_grub_cfg"] = None
         self.pinned()
         r = self.j(self.h.run("arm-rehearsal", "--running", "7.0.0-31-generic", "--target", "7.0.0-31-generic"))
-        self.assertEqual(r["via"], "top-level entry")
-        self.assertTrue(r["next_entry"].startswith("gnulinux-simple-"))
-        self.assertNotEqual(r["next_entry"], r["saved_entry"])
+        # R3-M2: gnulinux-simple-<uuid> means "the newest kernel at boot time"; a kernel installed between arming and reboot would boot
+        self.assertEqual(r["via"], "advanced entry")
+        self.assertNotIn("simple", r["next_entry"])
+        self.assertEqual(r["next_entry"], ID_31)
+        self.assertEqual(r["next_entry"], r["saved_entry"])
+        self.assertEqual(self.run_ok("survey")["boot"]["entry0_kernel"], "7.0.0-31-generic")
+
+    def test_the_survey_names_the_kernel_that_grub_boots_when_it_ignores_the_environment_block(self):
+        self.h.save()
+        b = self.run_ok("survey")["boot"]
+        self.assertEqual((b["entry0_kernel"], b["default_kernel"]), ("7.0.0-38-generic", "7.0.0-38-generic"))
+        self.pinned()
+        b = self.run_ok("survey")["boot"]  # pinned: the saved default is the running kernel, entry 0 still is -38
+        self.assertEqual((b["entry0_kernel"], b["default_kernel"]), ("7.0.0-38-generic", "7.0.0-31-generic"))
 
     def test_it_refuses_when_the_running_kernel_is_not_the_saved_default(self):
         self.h.save()

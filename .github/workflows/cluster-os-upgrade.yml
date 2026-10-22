@@ -53,7 +53,7 @@ on:
         required: false
         default: "-"
       confirm:
-        description: "rehearse: type REHEARSE-<host>. upgrade: UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. A survey takes none."
+        description: "rehearse: type REHEARSE-<host>, or REHEARSE-<host>-CONSOLE if someone is at the rack with a console (needed when grub's first menu entry is not the running kernel). upgrade: UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. A survey takes none."
         type: string
         required: false
         default: ""
@@ -188,8 +188,8 @@ jobs:
                 echo "::error::confirm must be exactly UPGRADE-$IN_HOST"
                 exit 1
               fi
-              if [ "$IN_MODE" = rehearse ] && [ "$IN_CONFIRM" != "REHEARSE-$IN_HOST" ]; then
-                echo "::error::confirm must be exactly REHEARSE-$IN_HOST"
+              if [ "$IN_MODE" = rehearse ] && [ "$IN_CONFIRM" != "REHEARSE-$IN_HOST" ] && [ "$IN_CONFIRM" != "REHEARSE-$IN_HOST-CONSOLE" ]; then
+                echo "::error::confirm must be exactly REHEARSE-$IN_HOST (REHEARSE-$IN_HOST-CONSOLE only with someone at the rack with a console)"
                 exit 1
               fi
               if [ "$IN_MODE" = disarm ] && [ "$IN_CONFIRM" != "DISARM-$IN_HOST" ]; then

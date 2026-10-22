@@ -29,9 +29,14 @@
 #   and the apt package caches (/var/cache/apt/*.bin) and runs the APT::Update::Post-Invoke hooks, so that the simulation
 #   is not stale. It is the one thing a survey changes on a host, and only when asked.
 #
-# MODE rehearse (host-changing in the lightest way, ONE host, REHEARSE-<host>): the zero-kernel-risk proof of the one-shot
-#   mechanism that every fallback of the upgrade depends on. It pins the running kernel as grub's saved default, arms next_entry
-#   to a boot of the SAME kernel (its top-level menu entry when that is the running kernel, else its Advanced entry), reboots, and
+# MODE rehearse (host-changing in the lightest way, ONE host, REHEARSE-<host>): the test of the one-shot mechanism that every
+#   fallback of the upgrade depends on. It changes no package, but it is NOT free of kernel risk: it is zero-kernel-risk only when
+#   GRUB's first menu entry (boot.entry0_kernel) is the running kernel. If GRUB does not read the environment block (the very thing
+#   tested), the host boots that first entry on this boot and on every power-cycle; while a newer kernel is installed that is a kernel
+#   the host never ran (on msr1 today -38, with an r8127 status nobody has checked). The judge therefore REFUSES a rehearsal while
+#   the first entry is not the running kernel, unless the confirmation is REHEARSE-<host>-CONSOLE (someone at the rack with a console).
+#   It pins the running kernel as grub's saved default, arms next_entry to a boot of the SAME kernel through its own Advanced entry
+#   (never the top-level "newest at boot time" id), reboots, and
 #   requires: a new boot id, the same kernel, an EMPTY next_entry (GRUB read and cleared the environment block Linux writes),
 #   and everything the upgrade's verification requires. No package, no DKMS, no kernel changes. An upgrade is refused until the
 #   host carries a rehearsal record for the kernel it runs.

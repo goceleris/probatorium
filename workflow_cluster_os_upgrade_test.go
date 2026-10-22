@@ -109,7 +109,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 	if !slices.Equal(accepted, osUpgradeHosts()) {
 		t.Errorf("the playbook accepts %v, want %v", accepted, osUpgradeHosts())
 	}
-	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_confirm == 'REHEARSE-' ~ os_host", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'rehearse', 'disarm', 'repair']", "os_confirm == 'REPAIR-' ~ os_host"} {
+	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'rehearse', 'disarm', 'repair']", "os_confirm == 'REPAIR-' ~ os_host"} {
 		if !strings.Contains(req, want) {
 			t.Errorf("the playbook's request check lacks %s", want)
 		}
@@ -880,6 +880,10 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"a listed disarm", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
 		{"a disarm confirmed in lower case", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "disarm-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly DISARM-msr1"},
 		{"a rehearsal with its confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
+		{"a rehearsal with the console confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1-CONSOLE", "ALLOWED_HOSTS": "msr1"}), true, ""},
+		{"a rehearsal with the console confirmation for another host", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msa2-server-CONSOLE", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
+		{"a console confirmation in lower case", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "rehearse-msr1-console", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
+		{"an upgrade confirmed as a console rehearsal", up("msr1", env{"IN_CONFIRM": "REHEARSE-msr1-CONSOLE"}), false, "confirm must be exactly UPGRADE-msr1"},
 		{"a rehearsal is gated too", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1"}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
 		{"a rehearsal confirmed as an upgrade", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "UPGRADE-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
 		{"a rehearsal confirmed in lower case", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "rehearse-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},

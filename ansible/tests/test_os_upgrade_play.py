@@ -155,7 +155,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         shutil.rmtree(cls.work, ignore_errors=True)
 
     # ---- a host that is ready to be upgraded, fresh for each scenario
-    def fresh(self, rehearsed=True, **state):
+    def fresh(self, rehearsed=True, keep38=False, **state):
         h = self.h
         for stale in ("down", "stale_count"):
             if os.path.exists(h.state_dir + "/" + stale):
@@ -173,11 +173,12 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         h.save()
         subprocess.run([h.bin + "/update-grub"], env=h.env(), check=True)  # the cfg of a host with GRUB_DEFAULT=0
         h.load()
-        h.state["packages"].pop("linux-image-7.0.0-38-generic")
-        h.save()
-        for p in ("/boot/vmlinuz-7.0.0-38-generic", "/boot/initrd.img-7.0.0-38-generic"):
-            os.remove(h.root + p)
-        subprocess.run([h.bin + "/update-grub"], env=h.env(), check=True)
+        if not keep38:  # msr1 today: -38 is installed, the running -31 is not the first menu entry
+            h.state["packages"].pop("linux-image-7.0.0-38-generic")
+            h.save()
+            for p in ("/boot/vmlinuz-7.0.0-38-generic", "/boot/initrd.img-7.0.0-38-generic"):
+                os.remove(h.root + p)
+            subprocess.run([h.bin + "/update-grub"], env=h.env(), check=True)
         open(h.log, "w").close()
         return h
 
@@ -754,6 +755,25 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("after_rehearsal", self.UP)
         self.assertEqual(self.rc, 0, self.log[-2500:])
 
+    def test_a_rehearsal_is_refused_while_grub_would_boot_another_kernel_without_a_console(self):
+        # R3-M2: msr1 today. -38 is installed and is GRUB's first entry; if GRUB ignores the env block the rehearsal boots -38
+        self.fresh(rehearsed=False, keep38=True)
+        self.refused("rehearse_entry0", self.RH, "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic")
+        self.assertIn("no one-shot to fall back on", self.log)
+        self.assertIn("REHEARSE-msr1-CONSOLE", self.log)
+        self.no_call("grub-set-default")
+        self.no_call("grub-reboot")
+        self.no_call("FAKE-REBOOT")
+        # with someone at the rack the rehearsal may run; it arms -31's own entry
+        self.play("rehearse_console", dict(self.RH, os_confirm="REHEARSE-msr1-CONSOLE"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.phase(), "rehearsed")
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
+
+    def test_the_console_confirmation_is_only_for_a_rehearsal(self):
+        self.fresh(keep38=True)
+        self.refused("console_upgrade", dict(self.UP, os_confirm="UPGRADE-msr1-CONSOLE"), "os_confirm")
+
     def test_an_upgrade_is_refused_without_a_rehearsal(self):
         self.fresh(rehearsed=False)
         self.refused("norehearsal", self.UP, "no successful one-shot rehearsal of this host on the running kernel")
@@ -935,6 +955,16 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.rc, 0, self.log[-1500:])
         md = self.summary("survey", "-")
         self.assertRegex(md, r"GRUB booted this host and reads the grubenv Linux writes \| /proc/cmdline has no BOOT_IMAGE=[^|]*\| \*\*FAIL\*\*")
+
+    def test_the_checklist_marks_a_first_menu_entry_that_is_not_the_running_kernel(self):
+        self.fresh(keep38=True)
+        self.play("survey_entry0", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertEqual(self.rc, 0, self.log[-1500:])
+        self.assertEqual(self.j("msr1", "survey.json")["boot"]["entry0_kernel"], "7.0.0-38-generic")
+        self.assertRegex(self.summary("survey", "-"), r"kernel a GRUB that ignores the grubenv would boot[^\n]*7\.0\.0-38-generic[^\n]*\| \*\*FAIL\*\*")
+        self.fresh()
+        self.play("survey_entry0_ok", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertRegex(self.summary("survey", "-"), r"kernel a GRUB that ignores the grubenv would boot[^\n]*\| \*\*PASS\*\*")
 
     def test_the_survey_summary_marks_a_broken_way_in(self):
         self.fresh(sshd_rc=255)

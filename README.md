@@ -270,7 +270,11 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   dispatch, each with a PASS / FAIL / NOTE mark and the decision it informs); `rehearse` (ONE host, `REHEARSE-<host>`: pins the
   running kernel, arms a one-shot to a boot of the SAME kernel, reboots, and requires a new boot id, the same kernel, an EMPTY
   `next_entry` (GRUB read and cleared the environment block Linux writes) and the usual verification; no package or kernel changes;
-  an `upgrade` is refused until the host carries a rehearsal record for the kernel it runs); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
+  an `upgrade` is refused until the host carries a rehearsal record for the kernel it runs. **It is not free of kernel risk**: if
+  GRUB does not read the environment block, the host boots GRUB's FIRST menu entry, on that boot and every power-cycle after it;
+  that is the running kernel only when nothing newer is installed (msr1 today: -38 is installed and is entry 0, running is -31).
+  The survey shows `boot.entry0_kernel`, and a rehearsal is refused while it differs from the running kernel unless the
+  confirmation is `REHEARSE-<host>-CONSOLE`, which says someone is at the rack with a console); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
   clears a pending grub one-shot, nothing else; the playbook also does it by itself on any failure between arming and the new
   kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure` or
   `abort-new-kernel`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the

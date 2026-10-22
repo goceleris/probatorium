@@ -92,6 +92,7 @@ def base_case(survey, sim, dk):
                "msa2-client": {"kernel": "6.14.0-37-generic", "marker": {}}}
     return {
         "os_host": "msr1",
+        "os_confirm": "UPGRADE-msr1",
         "allow_results_loss": False,
         "pre_target": snapshot("aaaa", "7.0.0-31-generic", 4050000000),
         "pre_survey": pre_survey,
@@ -131,6 +132,7 @@ PLAY = """
       vars:
         os_host: "{{{{ item.value.os_host }}}}"
         os_mode: "{{{{ item.value.os_mode | default('upgrade') }}}}"
+        os_confirm: "{{{{ item.value.os_confirm | default('') }}}}"
         retry_kernel: "{{{{ item.value.retry_kernel | default('') }}}}"
         repair_action: "{{{{ item.value.repair_action | default('configure') }}}}"
         blacklist_r8169: "{{{{ item.value.blacklist_r8169 | default(false) }}}}"
@@ -214,8 +216,22 @@ class Judge(unittest.TestCase):
              lambda c: c["pre_survey"].update(rehearsal={}))
         case("a_rehearsal_of_another_kernel", {"refusals": "(record: 7.0.0-25-generic)"},
              lambda c: c["pre_survey"].update(rehearsal={"kernel": "7.0.0-25-generic"}))
-        case("a_rehearsal_needs_no_rehearsal", {}, lambda c: (c.update(os_mode="rehearse"), c["pre_survey"].update(rehearsal={})))
-        case("a_rehearsal_has_no_order_rule", {}, lambda c: (c.update(os_mode="rehearse", os_host="msa2-client"), c["pre_survey"].update(rehearsal={}),
+        def rh(confirm, entry0, nic=True):
+            def f(c):
+                c.update(os_mode="rehearse", os_confirm=confirm)
+                c["pre_survey"].update(rehearsal={})
+                c["pre_survey"]["boot"].update(entry0_kernel=entry0)
+            return f
+        refuse_rh = "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic"
+        case("rehearse_while_entry0_is_another_kernel", {"refusals": refuse_rh}, rh("REHEARSE-msr1", "7.0.0-38-generic"))
+        case("rehearse_names_what_it_would_boot", {"refusals": "no one-shot to fall back on"}, rh("REHEARSE-msr1", "7.0.0-38-generic"))
+        case("rehearse_with_a_console_is_allowed", {}, rh("REHEARSE-msr1-CONSOLE", "7.0.0-38-generic"))
+        case("rehearse_when_entry0_is_the_running_kernel", {}, rh("REHEARSE-msr1", "7.0.0-31-generic"))
+        case("rehearse_when_the_survey_has_no_entry0", {"refusals": "first menu entry of grub is unknown"}, rh("REHEARSE-msr1", ""))
+        case("the_console_confirmation_does_not_help_an_upgrade", {"refusals": "no successful one-shot rehearsal"},
+             lambda c: (c.update(os_confirm="REHEARSE-msr1-CONSOLE"), c["pre_survey"].update(rehearsal={})))
+        case("a_rehearsal_needs_no_rehearsal", {}, lambda c: (c.update(os_mode="rehearse"), c["pre_survey"].update(rehearsal={}), c["pre_survey"]["boot"].update(entry0_kernel=c["pre_survey"]["kernel"])))
+        case("a_rehearsal_has_no_order_rule", {}, lambda c: (c.update(os_mode="rehearse", os_host="msa2-client"), c["pre_survey"].update(rehearsal={}), c["pre_survey"]["boot"].update(entry0_kernel=c["pre_survey"]["kernel"]),
                                                               c.update(os_surveys={"msa2-server": {"kernel": "x", "marker": {}}, "msr1": {"kernel": "x", "marker": {}}, "msa2-client": {"kernel": "x", "marker": {}}})))
         case("the_way_in_is_already_broken", {"refusals": "the way in is ALREADY not intact on the current userland (sshd -t fails: x)"},
              lambda c: c["pre_survey"].update(access_problems=["sshd -t fails: x"]))
@@ -438,7 +454,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 77, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 78, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:
