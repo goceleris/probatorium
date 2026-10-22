@@ -157,6 +157,46 @@ if [ "$r8127" = true ]; then
 	fi
 fi
 
+# ---- the OS-upgrade pin: a newer kernel installed does not matter to a reboot when grub's saved default IS the running kernel and
+# no one-shot is pending (ansible/os-upgrade.yml writes the drop-in and sets the saved entry before it installs anything).
+# That is only true if GRUB really reads the saved entry, which nothing but a completed rehearsal shows. ALL of these must hold:
+#   1. the drop-in of the OS upgrade exists (GRUB_DEFAULT=saved)
+#   2. a rehearsal record exists for the RUNNING kernel, was ok, and was taken with the boot chain (grub*, shim*) at the versions
+#      installed now (a GRUB that was upgraded since is a GRUB nobody rehearsed)
+#   3. grub.cfg really says set default="${saved_entry}"
+#   4. saved_entry is submenu>entry, the entry is a NORMAL (not recovery) entry of the running kernel, and both ids exist in grub.cfg
+#   5. no one-shot is pending
+# The chain string is the one ansible/files/os_upgrade.py boot_chain() records: installed grub-*, grub2-common and shim* as
+# package=version, byte-sorted, joined by "|".
+boot_chain() {
+	command -v dpkg-query > /dev/null 2>&1 || return 0
+	dpkg-query -W -f '${Package}=${Version} ${Status}\n' 'grub-*' 'grub2-common' 'shim*' 2> /dev/null |
+		awk '$NF == "installed" { print $1 }' | LC_ALL=C sort | paste -sd'|' -
+}
+pinned=false
+rehearsal_json="$R/var/lib/celeris-os-upgrade/rehearsal.json"
+if [ -e "$R/etc/default/grub.d/99-celeris-os-upgrade.cfg" ] && [ -n "$kernel" ] && command -v grub-editenv > /dev/null 2>&1; then
+	rec=$(cat "$rehearsal_json" 2> /dev/null) # missing: empty, and the checks below fail
+	rec_chain=$(printf '%s' "$rec" | sed -n 's/.*"chain": "\([^"]*\)".*/\1/p')
+	cfg="$R/boot/grub/grub.cfg"
+	genv=$(grub-editenv list 2> /dev/null)
+	saved=$(printf '%s\n' "$genv" | sed -n 's/^saved_entry=//p')
+	pending=$(printf '%s\n' "$genv" | sed -n 's/^next_entry=//p')
+	sep=$(printf '\076') # the submenu separator; no literal one here, the redirection scan of the tests would take it for a redirect
+	parent=${saved%%"$sep"*}
+	leaf=${saved##*"$sep"}
+	if printf '%s' "$rec" | grep -qF "\"kernel\": \"$kernel\"" &&
+		printf '%s' "$rec" | grep -qF '"ok": true' &&
+		[ -n "$rec_chain" ] && [ "$rec_chain" = "$(boot_chain)" ] &&
+		[ -r "$cfg" ] && grep -qF 'set default="${saved_entry}"' "$cfg" &&
+		case "$leaf" in "gnulinux-$kernel-advanced-"*) true ;; *) false ;; esac &&
+		grep -E '^[[:space:]]*submenu ' "$cfg" | grep -qF "\$menuentry_id_option '$parent'" &&
+		grep -E '^[[:space:]]*menuentry ' "$cfg" | grep -qF "\$menuentry_id_option '$leaf'" &&
+		[ -z "$pending" ]; then
+		pinned=true
+	fi
+fi
+
 # ---- the persistent prerequisites a reboot must leave in place (ansible/power-guard.yml) --------
 run_celeris_owner=""
 [ -d "$R/run/celeris" ] && run_celeris_owner=$(stat -c %U "$R/run/celeris" 2> /dev/null)
@@ -187,7 +227,7 @@ printf '"lan_ip":%s,"lan_ip_present":%s,"peer_ip":%s,"peer_ping_ok":%s,' \
 	"$(js "$lan_ip")" "$lan_present" "$(js "$peer_ip")" "$peer_ping"
 printf '"manifest_present":%s,"results_entries":%s,"results_list":%s,"resume_pending":%s,"runner_dirs":%s,"runner_listeners":%s,"runner_workers":%s,' \
 	"$manifest_present" "$results_entries" "$results_list" "$resume_pending" "$runner_dirs" "$listeners" "$workers"
-printf '"crash":%s,"r8127":%s,"modinfo_r8127":%s,' "$crash" "$r8127" "$modinfo_r8127"
+printf '"crash":%s,"r8127":%s,"modinfo_r8127":%s,"grub_pinned_to_running":%s,' "$crash" "$r8127" "$modinfo_r8127" "$pinned"
 printf '"prereq":{"tailscaled_active":%s,"tailscaled_enabled":%s,"apcupsd_active":%s,"resume_check_enabled":%s,"power_event_installed":%s,"tmpfiles_conf":%s,"quiesce_hook":%s,"run_celeris_owner":%s},' \
 	"$tailscaled" "$(js "$tailscaled_enabled")" "$apcupsd" "$resume_check" "$power_event" "$tmpfiles_conf" "$quiesce_hook" "$(js "$run_celeris_owner")"
 printf '"system_state":%s,"failed_units":%s}\n' "$(js "$system_state")" "$failed_units"

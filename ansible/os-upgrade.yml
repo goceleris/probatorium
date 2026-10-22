@@ -1,0 +1,1091 @@
+---
+# os-upgrade.yml - survey the OS of the cluster hosts, or upgrade ONE of them (kernel, packages, firmware), audited,
+# and prove it came back. Driven by .github/workflows/cluster-os-upgrade.yml (the only sanctioned path; README.md,
+# "Upgrading a cluster host's OS").
+#
+#   ansible-playbook -i ansible/inventory.yml ansible/os-upgrade.yml --extra-vars @extra-vars.json
+#
+# extra-vars.json carries os_mode (survey | rehearse | upgrade | disarm | repair), os_host ("-" for a survey), os_confirm, os_reason, os_run_id,
+# os_out_dir and optionally allow_results_loss, refresh_lists, blacklist_r8169, repair_action, retry_kernel, hold_access_packages. It is a FILE, never key=value on the
+# command line: that form is split on whitespace and the reason is free text.
+#
+# Every command on a host is a subcommand of ansible/files/os_upgrade.py: this playbook has no shell or command task.
+# That file's header lists them; its read-only ones are what the survey uses.
+#
+# WHY. The maintainer decided (2026-10-21) to bring the kernel, the OS packages and the software of ALL THREE hosts
+# to the latest versions BEFORE the final release evidence. Comparability with older releases does not matter. A
+# kernel change is the one cluster action that can leave a host without a NIC and recoverable only physically (msr1
+# has an out-of-tree r8127 driver and panics at power-off), so it is done like this and no other way.
+#
+# MODE survey (read-only, all three hosts, no confirmation)
+#   Records per host: os-release, running vs installed kernels, which kernel grub boots by default, GRUB_DEFAULT,
+#   what `apt-get -s full-upgrade` would do (installs, removals, kept back, phased updates, held packages,
+#   third-party repos, pins), unattended-upgrades, reboot-required, dkms status per kernel, the NIC drivers in use,
+#   the r8127 module (version, source) against the in-tree r8169 of every installed kernel, linux-firmware, disk,
+#   time sync, crash dumps, the run state (manifests, runner jobs), the last boot, and the host's compiler and
+#   service package versions. It writes <os_out_dir>/<host>/survey.json for each host. (The toolchains the roles
+#   install are not on the hosts: the workflow compares their pins with upstream, see
+#   .github/scripts/os-upgrade-toolchains.sh.) refresh_lists=true first runs `apt-get update`, which WRITES /var/lib/apt/lists
+#   and the apt package caches (/var/cache/apt/*.bin) and runs the APT::Update::Post-Invoke hooks, so that the simulation
+#   is not stale. It is the one thing a survey changes on a host, and only when asked.
+#
+# MODE rehearse (host-changing in the lightest way, ONE host, REHEARSE-<host>): the test of the one-shot mechanism that every
+#   fallback of the upgrade depends on. It changes no package, but it is NOT free of kernel risk: it is zero-kernel-risk only when
+#   GRUB's first menu entry (boot.entry0_kernel) is the running kernel. If GRUB does not read the environment block (the very thing
+#   tested), the host boots that first entry on this boot and on every power-cycle; while a newer kernel is installed that is a kernel
+#   the host never ran (on msr1 today -38, with an r8127 status nobody has checked). The judge therefore REFUSES a rehearsal while
+#   the first entry is not the running kernel, unless the confirmation is REHEARSE-<host>-CONSOLE (someone at the rack with a console).
+#   It pins the running kernel as grub's saved default, arms next_entry to a boot of the SAME kernel through its own Advanced entry
+#   (never the top-level "newest at boot time" id), reboots, and
+#   requires: a new boot id, the same kernel, an EMPTY next_entry (GRUB read and cleared the environment block Linux writes),
+#   and everything the upgrade's verification requires. No package, no DKMS, no kernel changes. An upgrade is refused until the
+#   host carries a rehearsal record for the kernel it runs.
+#
+# MODE disarm (host-changing, ONE host, ONLY grub's pending one-shot): clears next_entry (grub-editenv - unset next_entry)
+#   and records the survey before and after. For a run that failed between arming the one-shot and the new kernel's boot
+#   with the host not reachable at that moment. (The cluster guard refuses it beside a bench anyway.)
+#
+# MODE repair (host-changing, ONE host): a failed apt/dkms run leaves dpkg half-configured (a DKMS module that does not
+#   build for the new kernel fails the linux-headers postinst) and every later dispatch refuses. repair_action=configure runs
+#   `dpkg --configure -a` (detached, same policy-rc.d discipline as the upgrade); repair_action=release-holds releases the access-path holds a dead run of this tool left (nothing else is touched); repair_action=abort-new-kernel first purges the
+#   kernels NEWER than the running one, so the host stays on the old kernel. It never touches grub's saved default and refuses
+#   while a one-shot is pending.
+#
+# MODE upgrade (host-changing, ONE host per dispatch)
+#   REFUSES, before touching anything (vars/os_upgrade_judge.yml, refusals_str): any of the three hosts unreachable,
+#   a bench/validate manifest on any of them, a runner job executing, a power-loss resume pending, entries in
+#   results_root (unless allow_results_loss), the r8127 shutdown hook missing, r8127 not available for the running
+#   kernel, tailscaled not enabled at boot, not enough disk on / and /boot, a busy or broken dpkg, held kernel
+#   packages, an existing policy-rc.d, no usable GRUB / GRUB_SAVEDEFAULT=true / a /boot/grub grub cannot write to
+#   (the boot could not be one-shot), no grub entry for the running kernel, a wrong confirmation, and ORDER: the
+#   load generator (msa2-client) only after both servers have a record of a verified upgrade. Servers first, client
+#   last, because every server is verified against the client (fabric ping, and it drives the bench).
+#
+#   THEN, in this order:
+#     pinned      GRUB_DEFAULT=saved (a drop-in, the old /etc/default/grub backed up), update-grub, the RUNNING kernel
+#                 made grub's saved default, its packages marked manual (so no autoremove, and unattended-upgrades,
+#                 can drop it). Done BEFORE a new kernel is installed: from here on a power-cycle at any moment boots
+#                 the old kernel.
+#     apt update; simulate; REFUSE if apt would remove the kernel, boot chain, DKMS, ssh, tailscale, power guard
+#     upgraded    apt-get full-upgrade, detached (an ssh drop cannot half-configure dpkg), no service restarted behind
+#                 the run (policy-rc.d for its length, needrestart list-only), --force-confold. Never autoremove.
+#     dkms-ok     the DKMS modules built for the NEW kernel (built here when the upgrade did not), initrd, grub entry,
+#                 module signature, the fallback intact. If r8127 is not built for the new kernel, or anything else
+#                 here fails: REFUSES TO REBOOT. The old kernel stays the default. Nothing was rebooted.
+#     armed       grub-reboot <new kernel>: the next boot only. saved_entry stays the old kernel.
+#     rebooting   ansible.builtin.reboot, bounded by reboot_timeout_seconds
+#     returned    the host answers
+#     verified    boot id changed, running kernel == the intended new kernel, no new crash dump, power-guard
+#                 prerequisites hold, fabric address and peer, bond, the NIC vector bench.yml pins, small interrupt
+#                 totals, each NIC's driver and link speed unchanged, time sync, no new failed unit, the toolchain
+#                 bootstrap's prerequisites (a C compiler that builds and runs, TLS to github.com)
+#     permanent   ONLY now grub-set-default <new kernel>, and /var/lib/celeris-os-upgrade/last-upgrade.json
+#   On any failure the new kernel is NOT made the default: the old one is, so a power-cycle returns to it.
+#
+# Evidence: os_out_dir/<host>/{preflight-snapshot,pre-snapshot,post-snapshot}.json, survey.json (every host),
+# pre-survey.json, post-survey.json, dkms.json, simulate.json, dpkg-before/after.txt, apt-policy-before.txt,
+# apt-update.log, apt-upgrade.log, sysctl-before/after.txt, cmdline-*.txt, grub-*.txt, phase.txt, refusal.txt,
+# result.json; the workflow adds package-diff.txt and renders the summary.
+
+- name: OS upgrade | refuse anything but a well formed request
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.import_tasks: tasks/os_upgrade_request.yml
+
+- name: OS upgrade | preflight and survey on every host (read-only; one that does not answer stops the run)
+  # disarm and repair look at their target only: clearing msr1's one-shot must not wait for msa2-client to be up
+  hosts: "{{ 'cluster' if ((os_mode | default('survey')) in ['survey', 'upgrade', 'rehearse']) else os_host }}"
+  gather_facts: false
+  # An unreachable or failed host must stop the run for every host: the target would otherwise go on while a peer's
+  # state is unknown.
+  any_errors_fatal: true
+  vars:
+    osu: "{{ playbook_dir }}/files/os_upgrade.py"
+    ansible_ssh_common_args: >-
+      -o ControlMaster=no
+      -o ControlPath=none
+      -o ConnectTimeout=20
+      -o ServerAliveInterval=5
+      -o ServerAliveCountMax=6
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
+  tasks:
+    # The same checks again, here: a failed play does not by itself stop the plays after it.
+    - ansible.builtin.import_tasks: tasks/os_upgrade_request.yml
+
+    - name: Preflight | the evidence directory of this host
+      ansible.builtin.file:
+        path: "{{ os_out_dir }}/{{ inventory_hostname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+
+    - name: Preflight | refresh the apt lists when asked (writes the apt lists and caches, runs the update hooks)
+      ansible.builtin.script:
+        cmd: "{{ osu }} apt-update"
+      become: true
+      when: (os_mode == 'survey') and (refresh_lists | default(false) | bool)
+      register: survey_apt_update
+
+    - name: Preflight | snapshot (read-only)
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/files/reboot_snapshot.sh
+          {{ manifest_path | quote }} {{ results_root | quote }} - - -
+      become: true
+      register: preflight_raw
+      changed_when: false
+
+    - name: Preflight | survey (read-only)
+      ansible.builtin.script:
+        cmd: "{{ osu }} survey"
+      become: true
+      register: survey_raw
+      changed_when: false
+
+    - name: Preflight | parse
+      ansible.builtin.set_fact:
+        preflight_snap: "{{ preflight_raw.stdout | from_json }}"
+        preflight_survey: "{{ survey_raw.stdout | from_json }}"
+
+    - name: Preflight | keep the records
+      ansible.builtin.copy:
+        content: "{{ item.content | to_nice_json }}\n"
+        dest: "{{ os_out_dir }}/{{ inventory_hostname }}/{{ item.name }}"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      loop:
+        - { name: preflight-snapshot.json, content: "{{ preflight_snap }}" }
+        - { name: survey.json, content: "{{ preflight_survey }}" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Preflight | record a refusal (the step summary prints it)
+      ansible.builtin.copy:
+        content: "{{ manifest_path }} exists on {{ inventory_hostname }}: a bench or validation owns the cluster (a manual mage run?)\n"
+        dest: "{{ os_out_dir }}/{{ inventory_hostname }}/refusal.txt"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      when: (os_mode in ['upgrade', 'repair', 'rehearse']) and preflight_snap.manifest_present
+
+    - name: Preflight | no run owns this host
+      ansible.builtin.assert:
+        that: (os_mode not in ['upgrade', 'repair', 'rehearse']) or (not preflight_snap.manifest_present)
+        fail_msg: >-
+          refused: {{ manifest_path }} exists on {{ inventory_hostname }}: a bench or validation owns the
+          cluster (a manual mage run?). Nothing was changed.
+        quiet: true
+
+- name: OS upgrade | the target (an upgrade or a rehearsal)
+  # Never an empty match that "succeeds" without doing anything: the request was validated twice above, and the
+  # last play fails unless this one verified the host. The default only lets `--syntax-check` load the file.
+  hosts: "{{ os_host if ((os_mode | default('survey')) in ['upgrade', 'rehearse']) else 'none' }}"
+  gather_facts: false
+  any_errors_fatal: true
+  become: false
+  vars_files:
+    - vars/os_upgrade_judge.yml
+  vars:
+    osu: "{{ playbook_dir }}/files/os_upgrade.py"
+    reboot_timeout_seconds: 900
+    # `apt-get full-upgrade` and its DKMS builds: each poll waits up to 30 s on the host, 40 polls make a round of 20 minutes,
+    # three rounds an hour (more if the connection drops: see tasks/os_upgrade_wait_apt.yml)
+    upgrade_poll_retries: 40
+    upgrade_poll_rounds: 3
+    repair_action: configure
+    allow_results_loss: false
+    blacklist_r8169: false
+    retry_kernel: ''
+    hold_access_packages: auto
+    # the packages of the way in and of the bootloader are held for the run on an r8127 host (msr1) unless asked otherwise:
+    # both kernels share them, so no fallback helps if one breaks. They are upgraded in a separate dispatch, with a person at the rack.
+    hold_access: "{{ (hold_access_packages == 'on') or (hold_access_packages == 'auto' and pre_target.r8127) }}"
+    placement_vector: "{{ (nic_irq_placement | default({})).vector | default('-') }}"
+    os_bench_targets: "{{ groups['bench_targets'] }}"
+    os_loadgen_hosts: "{{ groups['loadgen'] }}"
+    os_surveys: "{{ dict(groups['cluster'] | zip(groups['cluster'] | map('extract', hostvars, 'preflight_survey'))) }}"
+    # every server is verified against the load generator; the load generator against a server
+    fabric_peer: "{{ hostvars[(groups['bench_targets'] | first)].lan_ip if (os_host in groups['loadgen']) else hostvars[(groups['loadgen'] | first)].lan_ip }}"
+    ansible_ssh_common_args: >-
+      -o ControlMaster=no
+      -o ControlPath=none
+      -o ConnectTimeout=20
+      -o ServerAliveInterval=5
+      -o ServerAliveCountMax=6
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
+    snapshot_cmd: >-
+      {{ playbook_dir }}/files/reboot_snapshot.sh
+      {{ manifest_path | quote }} {{ results_root | quote }} {{ placement_vector | quote }}
+      {{ lan_ip | quote }} {{ fabric_peer | quote }}
+    host_dir: "{{ os_out_dir }}/{{ inventory_hostname }}"
+    # What a person must do, by how far the run got (result.json and the step summary carry it).
+    power_cycle_rebooting: "{{ power_cycle_rebooting_rehearse if os_mode == 'rehearse' else power_cycle_rebooting_upgrade }}"
+    power_cycle_returned: "{{ power_cycle_returned_rehearse if os_mode == 'rehearse' else power_cycle_returned_upgrade }}"
+    power_cycle_rebooting_upgrade: >-
+      The reboot was issued (or about to be) and {{ inventory_hostname }} did not answer within {{ reboot_timeout_seconds }} s,
+      and it could not be asked to clear the one-shot. Which boot a power-cycle gives depends on why it is silent.
+      (1) The NEW kernel {{ target_kernel | default('') }} booted and has no network: grub already consumed the one-shot, so a
+      power-cycle boots grub's saved default, the OLD kernel {{ pre_survey.kernel }}.
+      (2) The OLD kernel hung or panicked while shutting down (msr1's documented r8127 power-off panic), or the reboot was never
+      issued and the host is unreachable for another reason: the one-shot is STILL ARMED, so the next boot after a power-cycle is the
+      NEW kernel, once; if that boot fails too, a second power-cycle boots the OLD kernel.
+      (3) The host is only slow: wait, then survey.
+      A survey after the power-cycle tells which case it was (running kernel; boot.next_entry). Dispatch mode=disarm for the host
+      to clear a one-shot that is still armed if you do not want the new kernel tried again.
+      A power-cycle restores the choice of KERNEL only. If the upgrade broke something both kernels share (the bootloader, ssh,
+      tailscale, netplan, firmware) it restores nothing and the host needs its console.
+    power_cycle_returned_upgrade: >-
+      No power-cycle needed while the host answers: it answered after the reboot but failed verification. If it stops answering
+      later, treat it like a host that never returned (the one-shot is consumed by then: a power-cycle boots the OLD kernel
+      {{ pre_survey.kernel }}). The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is
+      still {{ pre_survey.kernel }}. Reboot it back with the cluster-reboot workflow (red with "kernel changed", expected).
+    # A rehearsal arms the RUNNING kernel: there is no "new kernel" in it. What a silent host boots is its saved default (the running
+    # kernel, pinned by the rehearsal) if GRUB reads the environment block, and the first menu entry of grub if it does not.
+    power_cycle_rebooting_rehearse: >-
+      The rehearsal reboot was issued (or about to be) and {{ inventory_hostname }} did not answer within {{ reboot_timeout_seconds }} s,
+      and it could not be asked to clear the one-shot. The one-shot names the kernel the host already runs ({{ pre_survey.kernel }}); no other
+      kernel was armed. (1) The host booted {{ pre_survey.kernel }} and is only slow, or has no network: a power-cycle boots the saved
+      default, {{ pre_survey.kernel }} again. (2) GRUB did not read the one-shot (the very thing tested) and booted its first menu entry,
+      {{ pre_survey.boot.entry0_kernel | default('unknown') }}{{ ' (a kernel this host has not run)' if (pre_survey.boot.entry0_kernel | default('')) != pre_survey.kernel else '' }}: it comes back on every power-cycle, and if it has no NIC only the GRUB menu at the
+      console (Esc or Shift at power-on) can choose {{ pre_survey.kernel }}. (3) The old kernel hung while shutting down (msr1's documented
+      r8127 power-off panic): the one-shot is STILL ARMED and the next boot is {{ pre_survey.kernel }}. A survey after the power-cycle tells
+      which case it was (running kernel; boot.next_entry). A power-cycle restores the choice of KERNEL only.
+    power_cycle_returned_rehearse: >-
+      No power-cycle needed while the host answers: it answered after the rehearsal reboot but failed verification (see the problems).
+      The saved default is {{ pre_survey.kernel }}, the kernel the rehearsal was run on; no other kernel is involved in this run and nothing was
+      made the default. If a problem says the one-shot is still pending, GRUB does NOT read the environment block Linux writes: a power-cycle
+      or a cluster-reboot then boots the first menu entry of grub ({{ pre_survey.boot.entry0_kernel | default('unknown') }}), not
+      {{ pre_survey.kernel }}; choose {{ pre_survey.kernel }} at the console, and dispatch mode=disarm to clear the pending one-shot. No
+      rehearsal record was written: an upgrade stays refused.
+    kernel_noun: "{{ 'the new kernel' if os_mode == 'upgrade' else 'the rehearsal boot (the running kernel again)' }}"
+    power_cycle_none: "No power-cycle needed: nothing was rebooted (the boot id is unchanged)."
+    power_cycle_boot_unknown: >-
+      No power-cycle needed while the host answers, but WHETHER IT REBOOTED IS UNKNOWN: it answered the disarm and not the read of its boot id.
+      Dispatch a survey before anything else: kernel, boot.next_entry and boot.saved_entry say what happened.
+    power_cycle_rebooted_unconsumed: >-
+      No power-cycle needed while the host answers, but it HAS REBOOTED (new boot id). GRUB did not consume the one-shot (next_entry was
+      still set and was cleared now): it did not read the environment block Linux writes, so the saved default is not what a power-cycle
+      boots; GRUB's first menu entry is. Dispatch a survey (kernel, boot.default_kernel); do not dispatch the upgrade before it is understood.
+    power_cycle_rebooted_unarmed: >-
+      No power-cycle needed while the host answers, but it HAS REBOOTED (new boot id) although the arming did not complete: it rebooted
+      for another reason and runs what grub chose. Dispatch a survey before anything else.
+    power_cycle_gone: >-
+      No power-cycle needed while the host answers. The arming succeeded, the host did not reboot, and no one-shot is pending any more:
+      something cleared it (GRUB reading another environment block than the one Linux writes?). Survey before anything else and do
+      not dispatch the upgrade again before it is understood.
+    result_base:
+      host: "{{ inventory_hostname }}"
+      run_id: "{{ os_run_id }}"
+      reason: "{{ os_reason }}"
+      kernel_before: "{{ pre_survey.kernel }}"
+      boot_id_before: "{{ pre_target.boot_id }}"
+      target_kernel: "{{ target_kernel | default('') }}"
+      access_packages_held: "{{ (((upgrade_start_raw | default({})).stdout | default('{}', true) | from_json).access_packages_held) | default([]) }}"
+  tasks:
+    - name: Target | the first records
+      ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+      vars:
+        os_phase: preflight-ok
+
+    - name: Target | snapshot before (read-only)
+      ansible.builtin.script:
+        cmd: "{{ snapshot_cmd }}"
+      become: true
+      register: pre_raw
+      changed_when: false
+
+    - name: Target | survey before (read-only)
+      ansible.builtin.script:
+        cmd: "{{ osu }} survey"
+      become: true
+      register: pre_survey_raw
+      changed_when: false
+
+    - name: Target | parse
+      ansible.builtin.set_fact:
+        pre_target: "{{ pre_raw.stdout | from_json }}"
+        pre_survey: "{{ pre_survey_raw.stdout | from_json }}"
+
+    - name: Target | the toolchain bootstrap prerequisites before (a host without a C compiler is not blamed for it afterwards)
+      ansible.builtin.script:
+        cmd: "{{ osu }} toolcheck"
+      become: true
+      register: pre_toolcheck_raw
+      changed_when: false
+
+    - name: Target | parse the toolchain check
+      ansible.builtin.set_fact:
+        pre_toolcheck: "{{ pre_toolcheck_raw.stdout | from_json }}"
+
+    - name: Target | keep the records
+      ansible.builtin.copy:
+        content: "{{ item.content | to_nice_json }}\n"
+        dest: "{{ host_dir }}/{{ item.name }}"
+        mode: "0644"
+      delegate_to: localhost
+      loop:
+        - { name: pre-snapshot.json, content: "{{ pre_target }}" }
+        - { name: pre-survey.json, content: "{{ pre_survey }}" }
+        - { name: toolcheck-before.json, content: "{{ pre_toolcheck }}" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Target | what is installed and configured before (read-only)
+      ansible.builtin.script:
+        cmd: "{{ osu }} dump {{ item.what }}"
+      become: true
+      changed_when: false
+      register: dumps_before
+      loop:
+        - { what: packages, file: dpkg-before.txt }
+        - { what: policy, file: apt-policy-before.txt }
+        - { what: sysctl, file: sysctl-before.txt }
+        - { what: cmdline, file: cmdline-before.txt }
+        - { what: grub, file: grub-before.txt }
+      loop_control:
+        label: "{{ item.what }}"
+
+    - name: Target | keep the dumps
+      ansible.builtin.copy:
+        content: "{{ item.stdout }}"
+        dest: "{{ host_dir }}/{{ item.item.file }}"
+        mode: "0644"
+      delegate_to: localhost
+      loop: "{{ dumps_before.results }}"
+      loop_control:
+        label: "{{ item.item.file }}"
+
+    - name: Target | record the refusals (the step summary prints them)
+      ansible.builtin.copy:
+        content: "{{ refusals_str | trim | replace(' ;; ', '; ') }}\n"
+        dest: "{{ host_dir }}/refusal.txt"
+        mode: "0644"
+      delegate_to: localhost
+      when: refusals_str | trim | length > 0
+
+    - name: Target | refuse when vars/os_upgrade_judge.yml says so (refusals_str)
+      ansible.builtin.fail:
+        msg: "refused, nothing was changed: {{ refusals_str | trim | replace(' ;; ', '; ') }}"
+      when: refusals_str | trim | length > 0
+
+    - name: Target | pin the running kernel as grub's saved default (BEFORE a new kernel is installed)
+      ansible.builtin.script:
+        cmd: "{{ osu }} pin-grub --running {{ pre_survey.kernel | quote }} --run-id {{ os_run_id }}"
+      become: true
+      register: pin_raw
+
+    - name: Target | keep the pin record
+      ansible.builtin.copy:
+        content: "{{ pin_raw.stdout }}"
+        dest: "{{ host_dir }}/pin.json"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Target | record the phase
+      ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+      vars:
+        os_phase: pinned
+
+    # mode=upgrade only: packages, DKMS and the checks of the new kernel. mode=rehearse skips all of it: it reboots into the SAME kernel.
+    - name: Upgrade | the packages, DKMS and the checks of the new kernel
+      when: os_mode == 'upgrade'
+      block:
+        - name: Apt | update the package lists
+          ansible.builtin.script:
+            cmd: "{{ osu }} apt-update"
+          become: true
+          register: apt_update_raw
+
+        - name: Apt | keep the log
+          ansible.builtin.copy:
+            content: "{{ apt_update_raw.stdout }}{{ apt_update_raw.stderr }}"
+            dest: "{{ host_dir }}/apt-update.log"
+            mode: "0644"
+          delegate_to: localhost
+
+        # The access-path packages are held BEFORE the plan is simulated: the plan judged below is the plan that runs. A refusal (or
+        # any failure before apt starts) releases what this run held; a run that dies later leaves its holds for repair release-holds.
+        - name: Apt | the plan (hold the access path, simulate, judge, start)
+          block:
+            - name: Apt | hold the access-path packages (the simulation below is made with them held)
+              ansible.builtin.script:
+                cmd: "{{ osu }} hold-access --run-id {{ os_run_id }}"
+              become: true
+              when: hold_access
+
+            - name: Apt | what full-upgrade would do (simulation on the fresh lists, read-only)
+              ansible.builtin.script:
+                cmd: "{{ osu }} simulate"
+              become: true
+              register: sim_raw
+              changed_when: false
+
+            - name: Apt | parse and keep
+              ansible.builtin.set_fact:
+                sim: "{{ sim_raw.stdout | from_json }}"
+
+            - name: Apt | keep the simulation
+              ansible.builtin.copy:
+                content: "{{ sim | to_nice_json }}\n"
+                dest: "{{ host_dir }}/simulate.json"
+                mode: "0644"
+              delegate_to: localhost
+
+            - name: Apt | record the refusals (the step summary prints them)
+              ansible.builtin.copy:
+                content: "{{ plan_refusals_str | trim | replace(' ;; ', '; ') }}\n"
+                dest: "{{ host_dir }}/refusal.txt"
+                mode: "0644"
+              delegate_to: localhost
+              when: plan_refusals_str | trim | length > 0
+
+            - name: Apt | refuse when the plan is unacceptable (plan_refusals_str)
+              ansible.builtin.fail:
+                msg: "refused, no package was changed (the grub pin was applied and is harmless): {{ plan_refusals_str | trim | replace(' ;; ', '; ') }}"
+              when: plan_refusals_str | trim | length > 0
+
+            - name: Target | record the phase
+              ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+              vars:
+                os_phase: upgrading
+
+            - name: Apt | start the full-upgrade, detached
+              ansible.builtin.script:
+                cmd: "{{ osu }} upgrade-start --run-id {{ os_run_id }}{{ ' --hold' if hold_access else '' }}"
+              become: true
+              register: upgrade_start_raw
+
+          rescue:
+            - name: Apt | release the holds this run put (no package was changed)
+              ansible.builtin.script:
+                cmd: "{{ osu }} release-access --run-id {{ os_run_id }}"
+              become: true
+              failed_when: false
+              ignore_unreachable: true
+              when: hold_access
+
+            - name: Apt | the run stops here
+              ansible.builtin.fail:
+                msg: "{{ ansible_failed_result.msg | default('the plan was refused') }}"
+
+        - name: Apt | wait for it (rounds of polls; a dropped ssh connection does not stop apt and does not end the wait)
+          ansible.builtin.include_tasks: tasks/os_upgrade_wait_apt.yml
+          loop: "{{ range(0, upgrade_poll_rounds | int) | list }}"
+          loop_control:
+            loop_var: apt_round
+
+        - name: Apt | take our policy-rc.d away if the run that left it is over (never while apt is alive)
+          ansible.builtin.script:
+            cmd: "{{ osu }} upgrade-cleanup --run-id {{ os_run_id }}"
+          become: true
+          changed_when: false
+          when: apt_finished | default(false)
+
+        - name: Apt | fetch the log
+          ansible.builtin.script:
+            cmd: "{{ osu }} upgrade-log --run-id {{ os_run_id }}"
+          become: true
+          register: upgrade_log_raw
+          changed_when: false
+
+        - name: Apt | keep the log
+          ansible.builtin.copy:
+            content: "{{ upgrade_log_raw.stdout }}"
+            dest: "{{ host_dir }}/apt-upgrade.log"
+            mode: "0644"
+          delegate_to: localhost
+
+        - name: Apt | the full-upgrade must have finished with exit 0
+          ansible.builtin.fail:
+            msg: >-
+              apt-get full-upgrade did not succeed (state {{ apt_status.state | default('unknown') }}, exit {{ apt_status.rc | default('none') }}):
+              packages may be half-configured (mode=repair is the sanctioned way to try dpkg --configure -a, or to abort the new
+              kernel), or apt may STILL BE RUNNING detached on the host (a lost poll, or "running" after the waits ran out): dispatch
+              a survey before anything else. NOTHING was rebooted, and the OLD kernel {{ pre_survey.kernel }} is still grub's default.
+              See apt-upgrade.log.
+          when: not (apt_finished | default(false)) or (apt_status.state | default('')) != 'done' or (apt_status.rc | default(1)) != 0
+
+        - name: Target | record the phase
+          ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+          vars:
+            os_phase: upgraded
+
+        - name: Target | survey after the upgrade (read-only), to find the new kernel
+          ansible.builtin.script:
+            cmd: "{{ osu }} survey"
+          become: true
+          register: mid_raw
+          changed_when: false
+
+        - name: Target | the intended new kernel is the newest installed one of the running flavor
+          ansible.builtin.set_fact:
+            target_kernel: "{{ (mid_raw.stdout | from_json).newest_same_flavor }}"
+
+        - name: Dkms | keep out the in-tree r8169 when asked (the new kernel lists the r8127 PCI id)
+          ansible.builtin.script:
+            cmd: "{{ osu }} blacklist-r8169 --run-id {{ os_run_id }} --target {{ target_kernel | quote }}"
+          become: true
+          when: (blacklist_r8169 | bool) and pre_target.r8127
+
+        - name: Dkms | is the new kernel ready (building the DKMS modules for it when the upgrade did not)
+          ansible.builtin.script:
+            cmd: "{{ osu }} dkms-check --build --running {{ pre_survey.kernel | quote }} --target {{ target_kernel | quote }}"
+          become: true
+          register: dk_raw
+
+        - name: Dkms | parse and keep
+          ansible.builtin.set_fact:
+            dkms_check: "{{ dk_raw.stdout | from_json }}"
+
+        - name: Dkms | keep the record (with the make logs)
+          ansible.builtin.copy:
+            content: "{{ dkms_check | to_nice_json }}\n"
+            dest: "{{ host_dir }}/dkms.json"
+            mode: "0644"
+          delegate_to: localhost
+
+        - name: Dkms | record the refusal to reboot (the step summary prints it)
+          ansible.builtin.copy:
+            content: "{{ pre_reboot_problems_str | trim | replace(' ;; ', '; ') }}\n"
+            dest: "{{ host_dir }}/refusal.txt"
+            mode: "0644"
+          delegate_to: localhost
+          when: pre_reboot_problems_str | trim | length > 0
+
+        - name: Dkms | keep the verdict of a refused reboot
+          ansible.builtin.copy:
+            content: "{{ result_base | combine(extra) | to_nice_json }}\n"
+            dest: "{{ host_dir }}/result.json"
+            mode: "0644"
+          delegate_to: localhost
+          when: pre_reboot_problems_str | trim | length > 0
+          vars:
+            extra:
+              status: refused-reboot
+              problems: "{{ (pre_reboot_problems_str | trim).split(' ;; ') }}"
+              power_cycle: "{{ power_cycle_none }}"
+              default_kernel: "{{ pre_survey.kernel }}"
+
+        - name: Dkms | REFUSE TO REBOOT when the new kernel is not safe to boot (pre_reboot_problems_str)
+          ansible.builtin.fail:
+            msg: >-
+              REFUSED TO REBOOT, nothing was rebooted: {{ pre_reboot_problems_str | trim | replace(' ;; ', '; ') }}.
+              The packages are upgraded; the OLD kernel {{ pre_survey.kernel }} is still grub's default and still runs.
+          when: pre_reboot_problems_str | trim | length > 0
+
+        - name: Target | record the phase
+          ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+          vars:
+            os_phase: dkms-ok
+
+    - name: Rehearse | the kernel under test is the running one
+      ansible.builtin.set_fact:
+        target_kernel: "{{ pre_survey.kernel }}"
+      when: os_mode == 'rehearse'
+
+    # ansible does not run a rescue for an UNREACHABLE task: both tasks that can leave the host armed carry ignore_unreachable and
+    # an explicit failure, so that a tailnet blip at the worst moment still reaches the rescue below.
+    - name: Boot | arm, reboot and wait for the host (a failure anywhere in here disarms the one-shot)
+      block:
+      - name: Target | record the phase (from here on a one-shot may be armed)
+        ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+        vars:
+          os_phase: arming
+
+      - name: Boot | make the next boot, and only the next, the new kernel
+        ansible.builtin.script:
+          cmd: "{{ osu }} {{ 'arm-oneshot' if (os_mode == 'upgrade') else 'arm-rehearsal' }} --running {{ pre_survey.kernel | quote }} --target {{ target_kernel | quote }} --run-id {{ os_run_id }}"
+        become: true
+        register: arm_raw
+        ignore_unreachable: true
+
+      - name: Boot | the arming reached the host
+        ansible.builtin.fail:
+          msg: "the host became unreachable while the one-shot was being armed: it may or may not be armed"
+        when: arm_raw is unreachable
+
+      - name: Boot | keep the record
+        ansible.builtin.copy:
+          content: "{{ arm_raw.stdout }}"
+          dest: "{{ host_dir }}/arm.json"
+          mode: "0644"
+        delegate_to: localhost
+
+      - name: Target | record the phase
+        ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+        vars:
+          os_phase: rebooting
+
+      - name: Target | keep the verdict so far (what a person must do if the host never answers)
+        ansible.builtin.copy:
+          content: "{{ result_base | combine(extra) | to_nice_json }}\n"
+          dest: "{{ host_dir }}/result.json"
+          mode: "0644"
+        delegate_to: localhost
+        vars:
+          extra:
+            status: rebooting
+            problems: []
+            power_cycle: "{{ power_cycle_rebooting }}"
+            default_kernel: "{{ pre_survey.kernel }}"
+
+      # The message is FIXED text plus a validated run id: the reboot module puts it inside double quotes in a root
+      # shell command, so the free-text reason never goes near it.
+      - name: Reboot | issue the reboot and wait for the host to answer again
+        ansible.builtin.reboot:
+          msg: "cluster-os-upgrade workflow run {{ os_run_id }}"
+          reboot_timeout: "{{ reboot_timeout_seconds | int }}"
+          connect_timeout: 20
+          post_reboot_delay: 30
+        become: true
+        register: reboot_result
+        ignore_unreachable: true
+
+      - name: Boot | the reboot was issued
+        ansible.builtin.fail:
+          msg: "the host was unreachable when the reboot was to be issued, or did not answer its first probe: the reboot may not have been issued"
+        when: reboot_result is unreachable
+
+      - name: Target | record the phase
+        ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+        vars:
+          os_phase: returned
+
+      rescue:
+        # Any failure from the arming to the host's return: the one-shot must not stay armed for a boot nobody watches.
+        # If the host answers it is disarmed here, and its boot id says whether it rebooted at all; if it does not answer it is
+        # down or hung and the person power-cycling it needs to know that a one-shot may still be pending.
+        - name: Rescue | disarm the one-shot (if the host answers)
+          ansible.builtin.script:
+            cmd: "{{ osu }} disarm"
+          become: true
+          register: disarm_raw
+          failed_when: false
+          ignore_unreachable: true
+
+        - name: Rescue | did the host reboot? (its boot id, if it answers)
+          ansible.builtin.script:
+            cmd: "{{ snapshot_cmd }}"
+          become: true
+          register: rescue_snap
+          changed_when: false
+          failed_when: false
+          ignore_unreachable: true
+
+        # an UNREACHABLE result carries no rc and no stdout, so the rc / stdout tests below already read it as 'did not answer'
+        - name: Rescue | what happened
+          ansible.builtin.set_fact:
+            rescue_arm_ok: "{{ arm_raw is defined and (arm_raw.rc | default(1)) == 0 and (arm_raw.stdout | default('', true) | length > 0) }}"
+            rescue_answered: "{{ (disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0) }}"
+            rescue_disarm: "{{ (disarm_raw.stdout | default('{}', true) | from_json) if ((disarm_raw.rc | default(1)) == 0 and (disarm_raw.stdout | default('', true) | length > 0)) else {} }}"
+            # did the host reboot? Its boot id answers that, and it is read BEFORE anything else is believed: a host that rebooted
+            # is not "nothing was rebooted", whatever the disarm found. 'unknown' when the snapshot did not answer.
+            rescue_boot: >-
+              {{ 'unknown' if not (rescue_snap.stdout | default('', true) | length > 0) else
+                 ('changed' if ((rescue_snap.stdout | from_json).boot_id | default('')) != pre_target.boot_id else 'same') }}
+
+        - name: Rescue | the verdict
+          ansible.builtin.set_fact:
+            rescue_status: >-
+              {{ ('failed-unknown-armed' if rescue_arm_ok else 'failed-arming-unreachable') if not rescue_answered else
+                 ('failed-boot-unknown' if rescue_boot == 'unknown' else
+                  (('failed-rebooted-one-shot-not-consumed' if (rescue_disarm.was_armed | default(false)) else
+                    ('failed-new-kernel-may-have-booted' if rescue_arm_ok else 'failed-rebooted-nothing-armed')) if rescue_boot == 'changed' else
+                   ('failed-before-boot-disarmed' if (rescue_disarm.was_armed | default(false)) else
+                    ('failed-before-arming' if not rescue_arm_ok else 'failed-one-shot-gone-host-not-rebooted')))) }}
+            rescue_problem: >-
+              {{ ('the run failed after the one-shot was armed and the host did not answer: the one-shot (grub next_entry) is probably STILL ARMED' if rescue_arm_ok else 'the host stopped answering while the one-shot was being armed: it may or may not be armed') if not rescue_answered else
+                 ('the run failed and the host answered the disarm but not the boot-id read: WHETHER IT REBOOTED IS UNKNOWN (' ~ ('a one-shot was pending and was cleared' if (rescue_disarm.was_armed | default(false)) else 'no one-shot is pending') ~ '); survey before anything else' if rescue_boot == 'unknown' else
+                  (('the run failed after the arming; the host HAS REBOOTED (new boot id) although grub did not consume the one-shot (next_entry was still ' ~ (rescue_disarm.next_entry_before | default('set')) ~ ' and was cleared now): GRUB did not read the environment block Linux writes, or booted something other than the one-shot; the host runs whatever grub chose (see kernel in a survey)' if (rescue_disarm.was_armed | default(false)) else
+                    ('the run failed after the arming, no one-shot is pending any more and the host has a new boot id: grub consumed it, so ' ~ kernel_noun ~ ' has probably booted (slowly); survey before anything else' if rescue_arm_ok else
+                     'the host has a new boot id although the arming did not complete: it rebooted for another reason (a power loss, an unattended upgrade?) and runs the default of grub; survey before anything else')) if rescue_boot == 'changed' else
+                   ('the run failed after the one-shot was armed and before ' ~ kernel_noun ~ ' booted; the host answered, has the same boot id (it did not reboot) and the one-shot was cleared' ~ ((' ; the armed record of ' ~ (rescue_disarm.forgot_armed | join(', ')) ~ ' was dropped: that kernel never booted') if (rescue_disarm.forgot_armed | default([])) | length > 0 else '') if (rescue_disarm.was_armed | default(false)) else
+                    ('the arming did not complete (nothing is armed; the boot id is unchanged, the host did not reboot): see the failed task' if not rescue_arm_ok else
+                     'the arming succeeded, the host did not reboot (same boot id), and no one-shot is pending any more: something cleared it (GRUB reading another environment block?); survey before anything else')))) }}
+            rescue_power: >-
+              {{ power_cycle_rebooting if not rescue_answered else
+                 (power_cycle_boot_unknown if rescue_boot == 'unknown' else
+                  ((power_cycle_rebooted_unconsumed if (rescue_disarm.was_armed | default(false)) else
+                    (power_cycle_returned if rescue_arm_ok else power_cycle_rebooted_unarmed)) if rescue_boot == 'changed' else
+                   (power_cycle_none if ((rescue_disarm.was_armed | default(false)) or not rescue_arm_ok) else power_cycle_gone))) }}
+
+        - name: Rescue | keep what happened
+          ansible.builtin.copy:
+            content: "{{ result_base | combine(extra) | to_nice_json }}\n"
+            dest: "{{ host_dir }}/result.json"
+            mode: "0644"
+          delegate_to: localhost
+          vars:
+            extra:
+              status: "{{ rescue_status | trim }}"
+              problems:
+                - "{{ rescue_problem | trim }}"
+              power_cycle: "{{ rescue_power | trim }}"
+              default_kernel: "{{ pre_survey.kernel }}"
+              disarm: "{{ rescue_disarm }}"
+
+        - name: Rescue | the run stops here
+          ansible.builtin.fail:
+            msg: "the run failed between the arming of the one-shot and the verification of the boot ({{ rescue_status | trim }}): {{ rescue_problem | trim }}"
+
+    - name: Post | snapshot until the host has settled (the fabric and the daemons need a moment)
+      ansible.builtin.script:
+        cmd: "{{ snapshot_cmd }}"
+      become: true
+      register: post_raw
+      changed_when: false
+      failed_when: false
+      until: (post_raw.stdout | default('') | length > 0) and ((post_snap.boot_id | default('')) != pre_target.boot_id) and (post_snap.peer_ping_ok | default(false))
+      retries: 36
+      delay: 5
+
+    - name: Post | survey (read-only), until the clock has synchronized
+      ansible.builtin.script:
+        cmd: "{{ osu }} survey"
+      become: true
+      register: post_survey_raw
+      changed_when: false
+      failed_when: false
+      until: (post_survey_raw.stdout | default('') | length > 0) and (((post_survey_raw.stdout | from_json).time_sync.ntp_synchronized) or (not pre_survey.time_sync.ntp_synchronized))
+      retries: 24
+      delay: 5
+
+    - name: Post | the toolchain bootstrap prerequisites (a C compiler that builds and runs, TLS to github.com)
+      ansible.builtin.script:
+        cmd: "{{ osu }} toolcheck"
+      become: true
+      register: toolcheck_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Post | parse
+      ansible.builtin.set_fact:
+        post_survey: "{{ (post_survey_raw.stdout | from_json) if (post_survey_raw.stdout | default('') | length > 0) else {} }}"
+        toolcheck: "{{ (toolcheck_raw.stdout | from_json) if (toolcheck_raw.stdout | default('') | length > 0) else {} }}"
+
+    - name: Post | the dumps after the upgrade (read-only)
+      ansible.builtin.script:
+        cmd: "{{ osu }} dump {{ item.what }}"
+      become: true
+      changed_when: false
+      failed_when: false
+      register: dumps_after
+      loop:
+        - { what: packages, file: dpkg-after.txt }
+        - { what: sysctl, file: sysctl-after.txt }
+        - { what: cmdline, file: cmdline-after.txt }
+        - { what: grub, file: grub-after.txt }
+      loop_control:
+        label: "{{ item.what }}"
+
+    - name: Post | keep the records (before judging them)
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ host_dir }}/{{ item.name }}"
+        mode: "0644"
+      delegate_to: localhost
+      loop:
+        - { name: post-snapshot.json, content: "{{ post_snap | to_nice_json }}\n" }
+        - { name: post-survey.json, content: "{{ post_survey | to_nice_json }}\n" }
+        - { name: toolcheck.json, content: "{{ toolcheck | to_nice_json }}\n" }
+        - { name: dpkg-after.txt, content: "{{ dumps_after.results[0].stdout | default('') }}" }
+        - { name: sysctl-after.txt, content: "{{ dumps_after.results[1].stdout | default('') }}" }
+        - { name: cmdline-after.txt, content: "{{ dumps_after.results[2].stdout | default('') }}" }
+        - { name: grub-after.txt, content: "{{ dumps_after.results[3].stdout | default('') }}" }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Post | keep the verdict
+      ansible.builtin.copy:
+        content: "{{ result_base | combine(extra) | to_nice_json }}\n"
+        dest: "{{ host_dir }}/result.json"
+        mode: "0644"
+      delegate_to: localhost
+      vars:
+        extra:
+          status: "{{ 'failed-verification' if (post_problems_str | trim | length > 0) else 'verified' }}"
+          elapsed_seconds: "{{ reboot_result.elapsed | default(0) }}"
+          boot_id_after: "{{ post_snap.boot_id | default('') }}"
+          kernel_after: "{{ post_snap.kernel | default('') }}"
+          default_kernel: "{{ pre_survey.kernel }}"
+          problems: "{{ (post_problems_str | trim).split(' ;; ') if (post_problems_str | trim | length > 0) else [] }}"
+          power_cycle: "{{ power_cycle_returned if (post_problems_str | trim | length > 0) else power_cycle_none }}"
+
+    - name: Post | judge
+      ansible.builtin.fail:
+        msg: >-
+          the host rebooted but is NOT verified, and {{ target_kernel }} was NOT made the default (the old kernel
+          {{ pre_survey.kernel }} is): {{ post_problems_str | trim | replace(' ;; ', '; ') }}
+      when: post_problems_str | trim | length > 0
+
+    - name: Target | record the phase
+      ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+      vars:
+        os_phase: verified
+
+    - name: Permanent | the new kernel becomes the default
+      when: os_mode == 'upgrade'
+      block:
+        - name: Permanent | the new kernel becomes grub's default, and the record is written (ONLY after the verification)
+          ansible.builtin.script:
+            cmd: "{{ osu }} make-permanent --running {{ pre_survey.kernel | quote }} --target {{ target_kernel | quote }} --run-id {{ os_run_id }}"
+          become: true
+          register: perm_raw
+
+        - name: Permanent | keep the verdict
+          ansible.builtin.copy:
+            content: "{{ result_base | combine(extra) | to_nice_json }}\n"
+            dest: "{{ host_dir }}/result.json"
+            mode: "0644"
+          delegate_to: localhost
+          vars:
+            extra:
+              status: permanent
+              elapsed_seconds: "{{ reboot_result.elapsed | default(0) }}"
+              boot_id_after: "{{ post_snap.boot_id | default('') }}"
+              kernel_after: "{{ post_snap.kernel | default('') }}"
+              default_kernel: "{{ target_kernel }}"
+              problems: []
+              power_cycle: "{{ power_cycle_none }}"
+              marker: "{{ perm_raw.stdout | from_json }}"
+
+        - name: Target | record the phase
+          ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+          vars:
+            os_phase: permanent
+
+    - name: Rehearsal | the one-shot mechanism works on this host
+      when: os_mode == 'rehearse'
+      block:
+        - name: Rehearsal | record it (only a host that runs the same kernel with no one-shot pending)
+          ansible.builtin.script:
+            cmd: "{{ osu }} record-rehearsal --kernel {{ pre_survey.kernel | quote }} --run-id {{ os_run_id }}"
+          become: true
+          register: rehearsal_raw
+
+        - name: Rehearsal | keep the verdict
+          ansible.builtin.copy:
+            content: "{{ result_base | combine(extra) | to_nice_json }}\n"
+            dest: "{{ host_dir }}/result.json"
+            mode: "0644"
+          delegate_to: localhost
+          vars:
+            extra:
+              status: rehearsed
+              elapsed_seconds: "{{ reboot_result.elapsed | default(0) }}"
+              boot_id_after: "{{ post_snap.boot_id | default('') }}"
+              kernel_after: "{{ post_snap.kernel | default('') }}"
+              default_kernel: "{{ pre_survey.kernel }}"
+              problems: []
+              power_cycle: "{{ power_cycle_none }}"
+              rehearsal: "{{ rehearsal_raw.stdout | from_json }}"
+
+        - name: Target | record the phase
+          ansible.builtin.include_tasks: tasks/os_upgrade_phase.yml
+          vars:
+            os_phase: rehearsed
+
+    # Last, so the last play can prove this one ran.
+    - name: Post | the host is upgraded and verified
+      ansible.builtin.set_fact:
+        os_upgrade_verified: true
+
+- name: OS upgrade | maintenance on the target (disarm, repair)
+  hosts: "{{ os_host if (os_mode | default('survey') in ['disarm', 'repair']) else 'none' }}"
+  gather_facts: false
+  any_errors_fatal: true
+  become: false
+  vars_files:
+    - vars/os_upgrade_judge.yml
+  vars:
+    osu: "{{ playbook_dir }}/files/os_upgrade.py"
+    host_dir: "{{ os_out_dir }}/{{ inventory_hostname }}"
+    repair_action: configure
+    upgrade_poll_retries: 40
+    upgrade_poll_rounds: 3
+    snapshot_cmd: >-
+      {{ playbook_dir }}/files/reboot_snapshot.sh
+      {{ manifest_path | quote }} {{ results_root | quote }} - - -
+    ansible_ssh_common_args: >-
+      -o ControlMaster=no
+      -o ControlPath=none
+      -o ConnectTimeout=20
+      -o ServerAliveInterval=5
+      -o ServerAliveCountMax=6
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=accept-new
+      -o UserKnownHostsFile={{ lookup('env', 'CLUSTER_KNOWN_HOSTS') | default('~/.ssh/known_hosts', true) }}
+  tasks:
+    - name: Maintenance | the snapshot and the survey before
+      ansible.builtin.script:
+        cmd: "{{ item }}"
+      become: true
+      register: maint_before
+      changed_when: false
+      loop:
+        - "{{ snapshot_cmd }}"
+        - "{{ osu }} survey"
+
+    - name: Maintenance | parse
+      ansible.builtin.set_fact:
+        pre_target: "{{ maint_before.results[0].stdout | from_json }}"
+        pre_survey: "{{ maint_before.results[1].stdout | from_json }}"
+
+    - name: Maintenance | keep the survey before
+      ansible.builtin.copy:
+        content: "{{ pre_survey | to_nice_json }}\n"
+        dest: "{{ host_dir }}/pre-survey.json"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Maintenance | record the refusals (the step summary prints them)
+      ansible.builtin.copy:
+        content: "{{ maint_refusals_str | trim | replace(' ;; ', '; ') }}\n"
+        dest: "{{ host_dir }}/refusal.txt"
+        mode: "0644"
+      delegate_to: localhost
+      when: maint_refusals_str | trim | length > 0
+
+    - name: Maintenance | refuse when vars/os_upgrade_judge.yml says so (maint_refusals_str)
+      ansible.builtin.fail:
+        msg: "refused, nothing was changed: {{ maint_refusals_str | trim | replace(' ;; ', '; ') }}"
+      when: maint_refusals_str | trim | length > 0
+
+    # ---------------- disarm
+    - name: Maintenance | disarm the one-shot (a no-op when none is pending)
+      ansible.builtin.script:
+        cmd: "{{ osu }} disarm"
+      become: true
+      register: maint_disarm_raw
+      when: os_mode == 'disarm'
+
+    # ---------------- repair (a detached dpkg --configure -a, optionally after purging the kernels newer than the running one)
+    - name: Maintenance | start the repair, detached
+      ansible.builtin.script:
+        cmd: "{{ osu }} repair-start --run-id {{ os_run_id }} --action {{ repair_action }}"
+      become: true
+      when: os_mode == 'repair'
+
+    - name: Maintenance | wait for it
+      ansible.builtin.include_tasks: tasks/os_upgrade_wait_apt.yml
+      loop: "{{ range(0, upgrade_poll_rounds | int) | list }}"
+      loop_control:
+        loop_var: apt_round
+      when: os_mode == 'repair'
+
+    - name: Maintenance | take our policy-rc.d away if the run is over and left it
+      ansible.builtin.script:
+        cmd: "{{ osu }} upgrade-cleanup --run-id {{ os_run_id }}"
+      become: true
+      changed_when: false
+      when: os_mode == 'repair' and (apt_finished | default(false))
+
+    - name: Maintenance | fetch the log
+      ansible.builtin.script:
+        cmd: "{{ osu }} upgrade-log --run-id {{ os_run_id }}"
+      become: true
+      register: maint_log_raw
+      changed_when: false
+      when: os_mode == 'repair'
+
+    - name: Maintenance | the survey after
+      ansible.builtin.script:
+        cmd: "{{ osu }} survey"
+      become: true
+      register: maint_after_raw
+      changed_when: false
+
+    - name: Maintenance | keep the records
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ host_dir }}/{{ item.name }}"
+        mode: "0644"
+      delegate_to: localhost
+      loop:
+        - { name: post-survey.json, content: "{{ maint_after_raw.stdout }}" }
+        - { name: disarm.json, content: "{{ maint_disarm_raw.stdout | default('{}', true) }}" }
+        - { name: repair.log, content: "{{ maint_log_raw.stdout | default('') }}" }
+        - name: result.json
+          content: "{{ result | to_nice_json }}\n"
+        - name: phase.txt
+          content: "{{ 'disarmed' if os_mode == 'disarm' else ('repaired' if repair_ok else 'repair-failed') }}\n"
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        after: "{{ maint_after_raw.stdout | from_json }}"
+        repair_ok: "{{ os_mode == 'repair' and (apt_status.state | default('')) == 'done' and (apt_status.rc | default(1)) == 0 and (after.packages.dpkg_audit | length == 0 or repair_action in ['abort-new-kernel', 'release-holds']) }}"
+        result:
+          host: "{{ inventory_hostname }}"
+          run_id: "{{ os_run_id }}"
+          reason: "{{ os_reason }}"
+          mode: "{{ os_mode }}"
+          status: "{{ 'disarmed' if os_mode == 'disarm' else ('repaired' if repair_ok else 'repair-failed') }}"
+          repair_action: "{{ repair_action if os_mode == 'repair' else '' }}"
+          kernel_running: "{{ after.kernel }}"
+          saved_entry: "{{ after.boot.saved_entry }}"
+          next_entry_after: "{{ after.boot.next_entry }}"
+          dpkg_audit_after: "{{ after.packages.dpkg_audit }}"
+          new_kernel_pkgs_after: "{{ after.packages.new_kernel_pkgs }}"
+          kernel_metapackages_removed: "{{ ((maint_log_raw.stdout | default('', true)) | regex_search('KERNEL METAPACKAGES REMOVED WITH IT: ([^(\\n]*)', '\\1') | default([''], true) | first | default('', true)) | trim }}"
+          disarm: "{{ (maint_disarm_raw.stdout | default('{}', true) | from_json) }}"
+          holds_released: "{{ ((maint_log_raw.stdout | default('', true)) | regex_findall('HOLDS RELEASED: ([^\\n]*)')) }}"
+          power_cycle: "No power-cycle needed: nothing was rebooted."
+
+    - name: Maintenance | the one-shot is gone
+      ansible.builtin.assert:
+        that: (maint_after_raw.stdout | from_json).boot.next_entry == ''
+        fail_msg: "next_entry is still set after the disarm"
+        quiet: true
+      when: os_mode == 'disarm'
+
+    - name: Maintenance | the repair must have worked
+      ansible.builtin.assert:
+        that:
+          - (apt_status.state | default('')) == 'done'
+          - (apt_status.rc | default(1)) == 0
+          - (maint_after_raw.stdout | from_json).packages.dpkg_audit | length == 0 or repair_action in ['abort-new-kernel', 'release-holds']
+        fail_msg: >-
+          the repair did not succeed (state {{ apt_status.state | default('unknown') }}, exit {{ apt_status.rc | default('none') }}, dpkg --audit
+          after: {{ (maint_after_raw.stdout | from_json).packages.dpkg_audit | length }} finding(s)). See repair.log. The old kernel is
+          untouched and is still the default. If configure keeps failing (a DKMS module that does not build for the new kernel),
+          dispatch mode=repair with repair_action=abort-new-kernel to remove the new kernel's packages and stay on the old one.
+        quiet: true
+      when: os_mode == 'repair'
+
+    - name: Maintenance | done
+      ansible.builtin.set_fact:
+        os_maintenance_done: true
+
+- name: OS upgrade | the survey was taken, or the target was upgraded and verified
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Done | a survey has a record of every host
+      ansible.builtin.assert:
+        that: groups['cluster'] | map('extract', hostvars, 'preflight_survey') | select('defined') | list | length == groups['cluster'] | length
+        fail_msg: "the survey has no record of some host"
+        quiet: true
+      when: os_mode == 'survey'
+
+    - name: Done | the target play ran to its end
+      ansible.builtin.assert:
+        that: hostvars[os_host].os_upgrade_verified | default(false)
+        fail_msg: "{{ os_host }} was not upgraded (or rehearsed) and verified (the target play did not run to its end)"
+        quiet: true
+      when: os_mode in ['upgrade', 'rehearse']
+
+    - name: Done | the maintenance play ran to its end
+      ansible.builtin.assert:
+        that: hostvars[os_host].os_maintenance_done | default(false)
+        fail_msg: "{{ os_host }}: the maintenance play did not run to its end"
+        quiet: true
+      when: os_mode in ['disarm', 'repair']

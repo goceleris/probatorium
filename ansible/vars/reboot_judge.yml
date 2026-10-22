@@ -22,7 +22,7 @@ refusals_str: >-
   {% if a.r8127 and not a.prereq.quiesce_hook %}{% set _ = p.append('the host has an r8127 NIC and no shutdown quiesce hook: msr1 panics at power-off and then needs a physical power-cycle; run ansible/power-guard.yml') %}{% endif %}
   {% if a.r8127 and a.modinfo_r8127 != true %}{% set _ = p.append('the r8127 module is not available for the running kernel ' ~ a.kernel ~ ': the NIC would not come back') %}{% endif %}
   {% if a.prereq.tailscaled_active and a.prereq.tailscaled_enabled != 'enabled' %}{% set _ = p.append('tailscaled is running but systemctl is-enabled says "' ~ a.prereq.tailscaled_enabled ~ '": it would not start at boot and the host would be off the tailnet, unreachable to CI (enable it first)') %}{% endif %}
-  {% if a.newest_installed_kernel | length > 0 and a.newest_installed_kernel != a.kernel %}{% set _ = p.append('kernel ' ~ a.newest_installed_kernel ~ ' is installed and ' ~ a.kernel ~ ' is running: the reboot would boot another kernel') %}{% endif %}
+  {% if a.newest_installed_kernel | length > 0 and a.newest_installed_kernel != a.kernel and not a.grub_pinned_to_running %}{% set _ = p.append('kernel ' ~ a.newest_installed_kernel ~ ' is installed and ' ~ a.kernel ~ ' is running: the reboot would boot another kernel') %}{% endif %}
   {{ p | join(' ;; ') }}
 
 # What is wrong with the host after the reboot (empty: verified).

@@ -405,6 +405,7 @@ type snapshotRecord struct {
 	Crash           []string `json:"crash"`
 	R8127           bool     `json:"r8127"`
 	ModinfoR8127    *bool    `json:"modinfo_r8127"`
+	GrubPinned      bool     `json:"grub_pinned_to_running"`
 	Prereq          struct {
 		TailscaledActive    bool   `json:"tailscaled_active"`
 		TailscaledEnabled   string `json:"tailscaled_enabled"`

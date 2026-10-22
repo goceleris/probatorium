@@ -242,6 +242,174 @@ properties as text, the snapshot script against a fake `/proc`/`/sys`, the summa
 (the idle guard), and `bash ansible/tests/test_reboot_judge.sh` (the real Jinja judgement under ansible) and `bash ansible/tests/test_reboot_play.sh` (the whole playbook on local
 connections with only the restart faked), both run by the ansible CI job.
 
+### Upgrading a cluster host's OS
+
+The kernel, the OS packages and the firmware of a cluster host are changed by one sanctioned path and no other: the
+[`Cluster OS Upgrade`](.github/workflows/cluster-os-upgrade.yml) workflow, which runs
+[`ansible/os-upgrade.yml`](ansible/os-upgrade.yml) from a GitHub-hosted machine on the tailnet. Every command on a host
+is a subcommand of [`ansible/files/os_upgrade.py`](ansible/files/os_upgrade.py) (the playbook has no shell task); its
+header lists them. Nobody ssh-es in. Decision (maintainer, 2026-10-21): bring all three hosts to the latest versions
+before the final release evidence; comparability with older releases does not matter.
+
+```
+# 1. read-only, all three hosts, no confirmation
+gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
+  -f mode=survey -f reason="platform survey before the OS upgrade"
+# 2. ONE host per dispatch, servers first, the load generator last
+gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
+  -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
+```
+
+- **Inputs.** `mode` is `survey` or `upgrade`; an upgrade names ONE `host` and `confirm` must be exactly
+  `UPGRADE-<host>` (`DISARM-<host>` for `mode=disarm`, which only clears a pending grub one-shot); `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
+  `results_root` holds entries (the reboot destroys the tmpfs). `refresh_lists` (survey only, default false) runs
+  `apt-get update` first so the simulation is not stale: it WRITES `/var/lib/apt/lists` and the apt caches
+  (`/var/cache/apt/*.bin`) and runs the apt update post-invoke hooks, so it is the one thing a survey changes, and only when asked. `blacklist_r8169`
+  (upgrade only, default false) is explained below. Dispatch from `main` only; it never runs on a schedule.
+- **Five modes.** `survey` (read-only, all hosts; its summary opens with a checklist of every fact to read before a host-changing
+  dispatch, each with a PASS / FAIL / NOTE mark and the decision it informs); `rehearse` (ONE host, `REHEARSE-<host>`: pins the
+  running kernel, arms a one-shot to a boot of the SAME kernel, reboots, and requires a new boot id, the same kernel, an EMPTY
+  `next_entry` (GRUB read and cleared the environment block Linux writes) and the usual verification; no package or kernel changes;
+  an `upgrade` is refused until the host carries a rehearsal record for the kernel it runs. **It is not free of kernel risk**: if
+  GRUB does not read the environment block, the host boots GRUB's FIRST menu entry, on that boot and every power-cycle after it;
+  that is the running kernel only when nothing newer is installed (msr1 today: -38 is installed and is entry 0, running is -31).
+  The survey shows `boot.entry0_kernel`, and a rehearsal is refused while it differs from the running kernel unless the
+  confirmation is `REHEARSE-<host>-CONSOLE`, which says someone is at the rack with a console); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
+  clears a pending grub one-shot, nothing else; the playbook also does it by itself on any failure between arming and the new
+  kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure`,
+  `abort-new-kernel` or `release-holds`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the
+  `linux-headers` postinst, so `apt-get` exits non-zero and leaves dpkg half-configured, and every later dispatch refuses on
+  `dpkg --audit`. `configure` runs `dpkg --configure -a` (detached, same `policy-rc.d` discipline as the upgrade).
+  `abort-new-kernel` first purges the kernel versions newer than the running one that the failed upgrade left half-installed
+  (a kernel that was installed and working before is never removed), so the host stays on the old kernel. A repair never reboots
+  and never touches grub's saved default, and refuses while a one-shot is pending. `abort-new-kernel` simulates first (`apt-get -s`):
+  it stops on anything beyond the kernel metapackages, and when apt removes them with the image it says so (later full-upgrades
+  install no kernel until they are installed again). It also removes a kernel that installed cleanly but that an earlier run armed
+  and never verified (below); it forgets that record only when the purge exited 0 and dpkg shows the version gone (a failed purge keeps
+  the record, so `retry_kernel` stays required). `release-holds` releases the access-path holds that a dead run left (below) and
+  nothing else.
+- **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
+  job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's
+  `HOLD-CLUSTER` marker lives outside this repository, so whoever dispatches honours it. The survey goes through the
+  same gate: it runs commands on the hosts.
+- **A kernel that stranded a host is not armed twice.** `arm-oneshot` leaves `/var/lib/celeris-os-upgrade/armed-<kernel>.json`; a
+  verified boot removes it. After msr1's documented failure (the new kernel without a NIC, a power-cycle back to the old kernel) the
+  record is still there: the next `upgrade` refuses to arm that kernel again unless dispatched with `retry_kernel=<kernel>`, and
+  `repair` with `abort-new-kernel` accepts it for removal. A disarm that finds the host on the same boot (the reboot was never
+  issued) drops the record, because that kernel never booted. `cluster-reboot` no longer refuses a host forever for "a newer kernel is
+  installed", but accepts it only with proof: the drop-in exists, a rehearsal record exists for the running kernel with the grub and
+  shim versions installed now, grub.cfg says `set default="${saved_entry}"`, the saved entry is the running kernel's normal (not
+  recovery) Advanced entry and exists in grub.cfg, and no one-shot is pending. A host that was never rehearsed stays refused.
+- **The access path can be held.** `hold_access_packages` (`auto`, `on`, `off`; `auto` = on for a host with an r8127 NIC) holds
+  `grub-*`, `shim*`, `openssh-server` and `tailscale*` BEFORE the plan is simulated (so the protected-removal judgement describes the plan that runs) and for the length of the apt run,
+  and releases only the holds this run put (a refusal releases them at once). If the run dies with the holds on, the survey lists them
+  (`packages.tool_holds`), every upgrade refuses naming the repair, and `mode=repair repair_action=release-holds` releases them. Both
+  kernels share those packages, so no fallback helps if one breaks: upgrade them in a separate dispatch (`hold_access_packages=off`)
+  with a person at the rack and a console.
+- **Order: servers first, the load generator last.** `msa2-client` is refused until `msa2-server` and `msr1` each carry
+  a record of a verified upgrade (`/var/lib/celeris-os-upgrade/last-upgrade.json`, written only after verification)
+  that still matches the kernel they run. Why: every server is verified against the client (fabric ping), so the
+  client stays on the known-good platform while the servers are proven; the client's own verification then uses the
+  upgraded servers. The two servers have no order between them; `msa2-server` (no out-of-tree driver) is the rehearsal
+  to do before `msr1`.
+- **Survey** (read-only; its commands are on an allow-list the process enforces) records per host: os-release, running
+  and installed kernels, which kernel grub boots after a power-cycle, `GRUB_DEFAULT`, EFI and Secure Boot, what
+  `apt-get -s full-upgrade` would install, remove and keep back, phased updates, held packages, third-party
+  repositories and pins, unattended-upgrades, reboot-required, `dkms status`, the NIC drivers, PCI ids and link speeds,
+  linux-firmware, disk, time sync, crash dumps, the run state, and the packages of the compilers and services. For the
+  r8127 NIC it also records the out-of-tree module (version, where it came from), and, per installed kernel, whether the
+  in-tree `r8169` lists the NIC's PCI id, so the summary shows whether the in-tree driver is already an option. A
+  separate step compares the toolchains the roles install (pinned or floating) with upstream.
+- **It refuses, on the host, before touching anything:** any of the three hosts unreachable; a bench manifest on any of
+  them; on the target a runner job executing, a power-loss resume pending, entries in `results_root`, the r8127
+  shutdown quiesce hook missing, the r8127 module not available for the running kernel, tailscaled not enabled at boot,
+  too little disk on `/`, `/boot` and `/boot/efi`, dpkg or apt busy (an unattended upgrade) or half-configured
+  packages, held kernel/boot/DKMS packages, an existing `policy-rc.d`, no usable GRUB, GRUB not PROVEN to have booted the host (`BOOT_IMAGE=` on the kernel command line naming the running kernel; on EFI the firmware's `BootCurrent` loader is `shim`/`grub` under `\EFI\<vendor>`; the ESP stub's `search`/`prefix` names the filesystem of `/boot/grub`; `grubenv` is a 1024-byte file: anything unknown counts as not proven), `GRUB_SAVEDEFAULT=true`, a
+  `/boot/grub` on btrfs/zfs/lvm/mdraid (grub cannot make the boot one-shot there), no grub entry for the running kernel,
+  a one-shot grub entry still pending, a saved default that differs from the running kernel after an earlier
+  run (a second dispatch would move the fallback to an unverified kernel), `blacklist_r8169` with a NIC bound to
+  `r8169`, a wrong confirmation, and the order rule. Each is a message in `vars/os_upgrade_judge.yml` with a test case.
+- **Then, in this order.** (1) The *running* kernel becomes grub's saved default (`GRUB_DEFAULT=saved` in a drop-in, the
+  old `/etc/default/grub` backed up, `update-grub`, `grub-set-default`) and its packages are marked manual, BEFORE a new
+  kernel is installed: from then on a power-cycle at any moment boots the old kernel. (2) `apt-get update`, a simulation,
+  and a refusal if apt would remove the kernel, the boot chain, DKMS, ssh, tailscale, the power guard or docker.
+  (3) `apt-get full-upgrade`, detached (a dropped ssh connection cannot half-configure dpkg), non-interactive,
+  `--force-confold`, with a temporary `policy-rc.d` so no service is restarted behind the run and `needrestart` in
+  list-only mode; **never `autoremove`**, so the old kernel stays installed. (4) The DKMS modules are built for the new
+  kernel (`dkms autoinstall -k`, make log kept) and checked: headers, initrd, grub entry, the r8127 module found by
+  `modinfo -k`, its PCI aliases, its signature when Secure Boot is on, the shutdown hook, the fallback still intact.
+  **If anything fails here the host is not rebooted**: the old kernel is the default and still runs. (5)
+  `grub-reboot <new kernel>` (the next boot only; `saved_entry` stays the old kernel), `ansible.builtin.reboot` bounded
+  at 15 minutes. (6) Verification, like the reboot plus: running kernel == the intended one (a fall-back to the old one is
+  reported as such), each NIC's driver and link speed, time sync, no new failed unit, a C compiler that builds and runs,
+  TLS to github.com. (7) **Only then** `grub-set-default <new kernel>` and the record. On any failure the new kernel is
+  NOT made the default.
+- **r8127 and the in-tree driver.** The upgrade keeps the out-of-tree r8127 behaviour. If the new kernel's `r8169` lists the
+  same PCI id as r8127 and `r8169` is not blacklisted (in the new kernel's initramfs too: it must have been rebuilt after the blacklist), which driver binds the NIC would be a race, and the run refuses
+  to reboot (whatever the running kernel's `r8169` lists). `blacklist_r8169=true` writes `/etc/modprobe.d/celeris-r8127.conf` (`blacklist r8169`) and rebuilds the
+  initramfs of the new kernel, then goes on. Moving to the in-tree driver is a separate decision (PLAN.md of the
+  upgrade lane lists what to test first); this workflow never makes it.
+- **If the host does not return.** The summary names the phase and says whether to do a **physical power-cycle**: only when the
+  run is red in phase `rebooting` and the host stays silent. What the power-cycle boots depends on why it is silent: (1) the
+  NEW kernel booted without a NIC: grub already consumed the one-shot, so it boots the saved default, the OLD kernel; (2) the OLD
+  kernel hung or panicked while shutting down (msr1's documented r8127 power-off panic) or the reboot was never issued: the
+  one-shot is **still armed**, so the next boot is the NEW kernel, once, and a second power-cycle is what returns to the old
+  one; (3) the host is only slow (a run killed by its timeout reads the same): survey first. `mode=disarm` clears a one-shot
+  that is still armed. If the host still answers, the playbook disarms by itself on any failure between arming and the new
+  kernel's boot. **A power-cycle restores the choice of kernel only**: if the upgrade broke something both kernels share
+  (bootloader, ssh, tailscale, netplan, systemd, firmware), it restores nothing and the host needs its console. Every other phase
+  says "not needed". A host that came back but failed verification keeps the old kernel as its default: reboot it back with the
+  cluster-reboot workflow, which ends red with "kernel changed" by design (and refuses outright when the OLD kernel runs with a
+  newer one installed, which needs no recovery). The upgrade itself refuses to run again while the host runs a kernel other than
+  grub's saved default, or while a one-shot is pending. The apt run is detached: if a poll is lost, the run fails with apt possibly
+  still running; survey before anything else.
+- **What this does not prove.** The tests run the real playbook and script against stub `grub`, `apt`, `dkms` and
+  `modinfo` commands and a fake `/proc`/`/sys`: they prove the order, the refusals and the verdicts, not that a real GRUB
+  on msr1 honours `grub-reboot`, that r8127 builds for a real kernel, or that the NIC comes up. The first real
+  evidence is the survey, then `msa2-server`.
+
+#### Enabling a host change
+
+No host-changing mode (`upgrade`, `disarm`, `repair`) can be dispatched until the maintainer enables it. The code enforces one control
+and supports a second; this repository does not create either (that is settings, not code).
+
+Be plain about what these controls are: settings that a person with the maintainer's token can also change (`gh variable set`,
+approving a pending deployment). They stop accidents and anyone without that token; they do not stop an agent that holds it.
+Rules of use: (a) empty the variable the moment a window ends; a "Re-run all jobs" of an old host-changing run re-executes it with
+its old typed confirmation for as long as the host is listed; (b) **approve within ten minutes of the dispatch**: the idle verdict
+of the cluster guard is refused after ten minutes, and the approval wait counts against it (the run then says so and must be
+dispatched again).
+
+1. **The switch (enforced by the `plan` job).** Settings, Secrets and variables, Actions, Variables: create the repository variable
+   `OS_UPGRADE_ALLOWED_HOSTS`, a comma or space separated list of hosts, for the window: `msa2-server` for the first step. Add `msr1`
+   only after the survey has answered the questions of the lane PLAN (d.2 does it boot through GRUB, d.3 the in-tree r8169, d.7 Secure
+   Boot) and a person is at the rack; `msa2-client` last. Empty or missing (the default) means every host-changing dispatch is refused
+   in `plan`, before any approval is asked and before any host is touched. The `plan` job also reads the environment of step 2 through the API and
+   refuses unless it exists WITH a required reviewer and a deployment branch policy (if the workflow token may not read environments, it
+   refuses and says so: give it a token with Environments: read in the secret `ENVIRONMENTS_READ_TOKEN`). Empty the variable when the campaign is over.
+2. **The approval (GitHub environment `cluster-host-change`, used by host-changing modes only; a survey runs in `cluster-read` and
+   never waits).** Settings, Environments, New environment `cluster-host-change`: Required reviewers = the maintainer (leave
+   "Prevent self-review" off if the maintainer both dispatches and approves, or add a second reviewer); Deployment branches and
+   tags = Selected branches and tags: `main` only. The `plan` job refuses a host-changing mode until this environment exists with a reviewer (GitHub would otherwise create it unprotected on first use).
+3. **The secrets.** Environment secrets shadow repository secrets of the same name for a job in that environment. In
+   `cluster-host-change` (and in `cluster-read`, which needs the same access for the survey) create `CLUSTER_SSH_KEY`,
+   `TS_OAUTH_CLIENT_ID` and `TS_OAUTH_SECRET`; their values cannot be read back from the repository, so re-enter them from where the
+   maintainer keeps them (a separate, less privileged key for `cluster-read` is better). **Be aware:** copying them does not remove
+   the repository-level secrets, and the tier workflows, `cluster-reboot` and the runner bootstrap read those. Deleting them would
+   break those workflows unless they adopt environments too. So until that separate decision, a workflow pushed on a branch by
+   someone with write access can still read the repository secrets; the variable and the reviewer protect this workflow, not the key.
+4. **Verify.** (a) With the variable empty, `gh workflow run cluster-os-upgrade.yml --ref main -f mode=disarm -f host=msr1
+   -f confirm=DISARM-msr1 -f reason=test` fails in the `plan` job with "not in the repository variable OS_UPGRADE_ALLOWED_HOSTS" and
+   touches nothing. (b) `gh variable list` shows the list; `gh api repos/goceleris/probatorium/environments/cluster-host-change
+   --jq '.protection_rules, .deployment_branch_policy'` shows the required reviewer and the `main`-only policy. (c) With
+   `msa2-server` listed, an upgrade of `msa2-server` stops at the `os-upgrade` job with a "Waiting for review" state until approved,
+   while a survey does not wait. If (c) does not wait, the environment has no reviewer yet.
+
+Tests: `go test -run 'ClusterOSUpgrade|OSUpgrade|FreeText'`, and `python3 -I ansible/tests/test_os_upgrade.py` (the script against a fake
+host), `python3 -I ansible/tests/test_os_upgrade_judge.py` (the real Jinja judgement under ansible, every refusal) and
+`python3 -I ansible/tests/test_os_upgrade_play.py` (the whole playbook on local connections, Linux only); the last two run
+in the ansible CI job.
+
 ## Bench tier
 
 ### The field

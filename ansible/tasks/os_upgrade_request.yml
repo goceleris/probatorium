@@ -1,0 +1,34 @@
+---
+# The request of ansible/os-upgrade.yml, validated. Imported by the first two plays: a failed play does not by itself
+# stop the plays after it, and the host pattern of the target plays is the very variable checked here.
+- name: OS upgrade | the request is well formed
+  ansible.builtin.assert:
+    that:
+      - os_mode is defined
+      - os_mode in ['survey', 'upgrade', 'rehearse', 'disarm', 'repair']
+      - os_host is defined
+      - (os_mode == 'survey' and os_host == '-') or (os_mode != 'survey' and os_host in ['msa2-server', 'msr1', 'msa2-client'])
+      - os_confirm is defined
+      - (os_mode == 'survey' and os_confirm == '') or (os_mode == 'upgrade' and os_confirm == 'UPGRADE-' ~ os_host) or (os_mode == 'rehearse' and os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']) or (os_mode == 'disarm' and os_confirm == 'DISARM-' ~ os_host) or (os_mode == 'repair' and os_confirm == 'REPAIR-' ~ os_host)
+      - repair_action | default('configure') in ['configure', 'abort-new-kernel', 'release-holds']
+      - (retry_kernel | default('')) is match('^$|^[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+-[a-z0-9-]+$')
+      - (hold_access_packages | default('auto')) in ['auto', 'on', 'off']
+      - os_reason is defined
+      - os_reason | trim | length > 0
+      - os_reason | length <= 200
+      - "'\n' not in os_reason"
+      - os_run_id is defined
+      - os_run_id | string is match('^[0-9]+$')
+      - os_out_dir is defined
+      - os_out_dir is match('^/')
+    fail_msg: >-
+      refused: os_mode must be survey, upgrade, rehearse, disarm or repair; an upgrade, rehearsal, disarm or repair names ONE host (msa2-server, msr1 or
+      msa2-client) and os_confirm must be exactly UPGRADE-<host>, REHEARSE-<host> (REHEARSE-<host>-CONSOLE when someone is at the rack with a console), DISARM-<host> or REPAIR-<host>; a survey names no host ("-") and takes
+      no confirmation; os_reason is one line of 1-200 characters; os_run_id digits; os_out_dir absolute.
+    quiet: true
+
+- name: OS upgrade | the host is a host of the inventory
+  ansible.builtin.assert:
+    that: (os_mode == 'survey') or (os_host in groups['cluster'])
+    fail_msg: "refused: {{ os_host }} is not a host of the inventory's cluster group"
+    quiet: true

@@ -171,6 +171,19 @@ check "a multi-line reason is refused" test "$rc" != 0
 play all '{"reboot_host":"all","reboot_confirm":"REBOOT-all"}'
 check "a host pattern such as all is refused" test "$rc" != 0
 
+# free text is data: the workflow writes reason and confirm as __ansible_unsafe strings (workflow_cluster_os_upgrade_test.go checks
+# that), and neither a template in the reason nor one in the confirmation runs on the runner that holds the cluster key
+mark=$work/injected
+payload=$(python3 -c 'import json,sys; t="{{ lookup(\"pipe\", \"touch " + sys.argv[1] + "\") }}"; print(json.dumps({"reboot_reason": {"__ansible_unsafe": "x " + t + " y"}}))' "$mark")
+play inj_reason "$(python3 -c 'import json,sys; d={"reboot_host":"msr1","reboot_confirm":{"__ansible_unsafe":"REBOOT-msr1"}}; d.update(json.loads(sys.argv[1])); print(json.dumps(d))' "$payload")"
+check "a template in the reason is refused (braces), not run" test "$rc" != 0
+check "a template in the reason did not run on the runner" bash -c "! [ -e '$mark' ]"
+check "a template in the reason reboots nothing" bash -c "! [ -e '$work/state/rebooted' ]"
+payload=$(python3 -c 'import json,sys; t="{{ lookup(\"pipe\", \"touch " + sys.argv[1] + "\") }}"; print(json.dumps({"reboot_host":"msr1","reboot_confirm": {"__ansible_unsafe": t}}))' "$mark")
+play inj_confirm "$payload"
+check "a template as the confirmation is refused, not run" test "$rc" != 0
+check "a template as the confirmation did not run on the runner" bash -c "! [ -e '$mark' ]"
+
 # refusals on the target
 mkdir -p "$work/before/tmp/celeris-results/old"
 play results "$GOOD"
