@@ -72,6 +72,7 @@ COMMON = {
     "kernels armed earlier and never verified": "PASS",
     "run state": "PASS",
     "access-path packages and third-party moves the full-upgrade brings": "NOTE",
+    "platform frozen against self-updates (apt timers, unattended-upgrades, needrestart restarts)": "NOTE",  # the first survey knew no freeze
     "unattended-upgrades and phasing": "NOTE",
 }
 R8127 = {
@@ -165,6 +166,25 @@ class ChecklistReplay(unittest.TestCase):
         self.assertNotIn("packagekitd`", self.md)
         self.assertEqual(self.md.count("package runs `none`"), 3)
 
+    def test_the_freeze_row_reads_a_freeze_record(self):
+        row = "platform frozen against self-updates (apt timers, unattended-upgrades, needrestart restarts)"
+        for name, rec, want in (("frozen and holding", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS"),
+                                ("frozen but a unit came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["apt-daily.timer=active/enabled"]}, "FAIL"),
+                                ("a freeze that did not complete", {"run_id": "1", "utc": "t", "status": "freezing-failed", "drifted": []}, "FAIL")):
+            d = tempfile.mkdtemp(prefix="osu-real-freeze-")
+            try:
+                for h in HOSTS:
+                    shutil.copytree(os.path.join(REAL, h), os.path.join(d, h))
+                p = os.path.join(d, "msr1", "survey.json")
+                s = json.load(open(p))
+                s["freeze"] = rec
+                json.dump(s, open(p, "w"))
+                r = subprocess.run(["bash", SUMMARY, d, "survey", "-", "0", "x", "1"], capture_output=True, text=True, timeout=120)
+                m = re.search(r"^\| msr1 \| %s \| .* \| \*\*(\w+)\*\* \|" % re.escape(row), r.stdout, re.M)
+                self.assertEqual(m and m.group(1), want, name)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
     def test_a_real_run_in_the_same_survey_is_marked_busy(self):
         d = tempfile.mkdtemp(prefix="osu-real-busy-")
         try:
@@ -226,6 +246,8 @@ class JudgementReplay(unittest.TestCase):
             for action in ("configure", "release-holds", "abort-new-kernel"):
                 case("repair-%s-%s" % (action, h), h, "repair", "REPAIR-" + h, repair_action=action)
             case("disarm-" + h, h, "disarm", "DISARM-" + h)
+            case("freeze-" + h, h, "freeze", "FREEZE-" + h)
+            case("thaw-" + h, h, "thaw", "THAW-" + h)
         # a refusal predicate fires on a real record when the real value is what trips it
         case("upgrade-msr1-after-a-real-run-started", "msr1", "upgrade", "UPGRADE-msr1",
              lambda c: c["pre_survey"]["packages"].update(package_processes=["apt-get", "packagekitd", "unattended-upgr"]))
@@ -296,6 +318,11 @@ class JudgementReplay(unittest.TestCase):
             self.assertEqual(len(r), 2, (h, r))
             self.assertTrue(r[0].startswith(NOTHING_TO_ABORT), (h, r))
             self.assertTrue(r[1].startswith(PIN_MISSING), (h, r))
+
+    def test_a_freeze_of_a_real_host_is_not_refused_though_the_idle_daemons_are_running_and_a_thaw_has_nothing_to_do(self):
+        for h in HOSTS:
+            self.assertEqual(self.maint("freeze-" + h), [], h)
+            self.assertEqual(self.maint("thaw-" + h), ["nothing to thaw: no freeze record on this host (this tool froze nothing here, or its record is gone)"], h)
 
     def test_a_disarm_has_no_refusal(self):
         for h in HOSTS:

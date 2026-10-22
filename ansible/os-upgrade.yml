@@ -5,7 +5,7 @@
 #
 #   ansible-playbook -i ansible/inventory.yml ansible/os-upgrade.yml --extra-vars @extra-vars.json
 #
-# extra-vars.json carries os_mode (survey | rehearse | upgrade | disarm | repair), os_host ("-" for a survey), os_confirm, os_reason, os_run_id,
+# extra-vars.json carries os_mode (survey | rehearse | upgrade | disarm | repair | freeze | thaw), os_host ("-" for a survey), os_confirm, os_reason, os_run_id,
 # os_out_dir and optionally allow_results_loss, refresh_lists, blacklist_r8169, repair_action, retry_kernel, hold_access_packages. It is a FILE, never key=value on the
 # command line: that form is split on whitespace and the reason is free text.
 #
@@ -50,6 +50,17 @@
 #   `dpkg --configure -a` (detached, same policy-rc.d discipline as the upgrade); repair_action=release-holds releases the access-path holds a dead run of this tool left (nothing else is touched); repair_action=abort-new-kernel first purges the
 #   kernels NEWER than the running one, so the host stays on the old kernel. It never touches grub's saved default and refuses
 #   while a one-shot is pending.
+#
+# MODE freeze / MODE thaw (host-changing, ONE host, FREEZE-<host> / THAW-<host>): the platform stays FIXED during the evidence campaign. The hosts
+#   update themselves (unattended-upgrades installed the kernel -38 on its own; needrestart restarts services behind an apt run), and a 131-hour
+#   benchmark must not see a package or a service change under it. freeze refuses while apt or dpkg is busy, writes its record BEFORE it changes
+#   anything (the timestamp, the previous active/enabled state of every unit, and whether it wrote a needrestart drop-in), stops and disables
+#   apt-daily.timer, apt-daily-upgrade.timer and unattended-upgrades.service, sets needrestart to list-only (a drop-in, only when it is installed and
+#   not list-only already), verifies the states, and records the platform (kernel, a hash of every installed package and version, the holds): the
+#   evidence directory gets freeze.json, dpkg-l.txt (dpkg -l), apt-held.txt (apt-mark showhold) and kernel.txt, so the release results can name the
+#   exact platform. The survey shows the freeze and whether it still holds (drifted). thaw restores ONLY what the record says freeze changed
+#   (enable what it disabled, start what it stopped, remove its needrestart drop-in) and archives the record. It does not touch the OS upgrade
+#   (mode=upgrade runs apt itself) and does not stop any other self-updater (snapd refreshes, motd-news): the survey lists only what it covers.
 #
 # MODE upgrade (host-changing, ONE host per dispatch)
 #   REFUSES, before touching anything (vars/os_upgrade_judge.yml, refusals_str): any of the three hosts unreachable,
@@ -953,8 +964,8 @@
       ansible.builtin.set_fact:
         os_upgrade_verified: true
 
-- name: OS upgrade | maintenance on the target (disarm, repair)
-  hosts: "{{ os_host if (os_mode | default('survey') in ['disarm', 'repair']) else 'none' }}"
+- name: OS upgrade | maintenance on the target (disarm, repair, freeze, thaw)
+  hosts: "{{ os_host if (os_mode | default('survey') in ['disarm', 'repair', 'freeze', 'thaw']) else 'none' }}"
   gather_facts: false
   any_errors_fatal: true
   become: false
@@ -1051,6 +1062,33 @@
       changed_when: false
       when: os_mode == 'repair'
 
+    # ---------------- freeze (record, stop, disable) and thaw (restore what the record says was changed). A failure is kept as evidence before the play stops.
+    - name: Maintenance | freeze the platform (the record is written first)
+      ansible.builtin.script:
+        cmd: "{{ osu }} freeze --run-id {{ os_run_id }}"
+      become: true
+      register: maint_freeze_raw
+      failed_when: false
+      when: os_mode == 'freeze'
+
+    - name: Maintenance | thaw the platform (what the freeze recorded it changed, and nothing else)
+      ansible.builtin.script:
+        cmd: "{{ osu }} thaw --run-id {{ os_run_id }}"
+      become: true
+      register: maint_thaw_raw
+      failed_when: false
+      when: os_mode == 'thaw'
+
+    - name: Maintenance | the platform as it is now (dpkg -l, the holds, the kernel)
+      ansible.builtin.script:
+        cmd: "{{ osu }} dump {{ item }}"
+      become: true
+      changed_when: false
+      failed_when: false
+      register: maint_platform
+      loop: [dpkg-l, held, kernel]
+      when: os_mode in ['freeze', 'thaw']
+
     - name: Maintenance | the survey after
       ansible.builtin.script:
         cmd: "{{ osu }} survey"
@@ -1058,12 +1096,51 @@
       register: maint_after_raw
       changed_when: false
 
+    - name: Maintenance | keep the records of a freeze or a thaw
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ host_dir }}/{{ item.name }}"
+        mode: "0644"
+      delegate_to: localhost
+      loop:
+        - { name: post-survey.json, content: "{{ maint_after_raw.stdout }}" }
+        - { name: freeze.json, content: "{{ (maint_freeze_raw.stdout | default('', true)) if os_mode == 'freeze' else (maint_thaw_raw.stdout | default('', true)) }}" }
+        - { name: dpkg-l.txt, content: "{{ maint_platform.results[0].stdout | default('') }}" }
+        - { name: apt-held.txt, content: "{{ maint_platform.results[1].stdout | default('') }}" }
+        - { name: kernel.txt, content: "{{ maint_platform.results[2].stdout | default('') }}" }
+        - name: result.json
+          content: "{{ freeze_result | to_nice_json }}\n"
+        - name: phase.txt
+          content: "{{ ('frozen' if freeze_ok else 'freeze-failed') if os_mode == 'freeze' else ('thawed' if freeze_ok else 'thaw-failed') }}\n"
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        freeze_rc: "{{ (maint_freeze_raw if os_mode == 'freeze' else maint_thaw_raw).rc | default(1) }}"
+        freeze_out: "{{ ((maint_freeze_raw if os_mode == 'freeze' else maint_thaw_raw).stdout | default('{}', true)) }}"
+        freeze_json: "{{ freeze_out | from_json if (freeze_out | trim | regex_search('^[{]')) else {} }}"
+        after_f: "{{ maint_after_raw.stdout | from_json }}"
+        freeze_ok: "{{ freeze_rc | int == 0 and (freeze_json.ok | default(false)) and ((after_f.freeze | default({})) | length > 0) == (os_mode == 'freeze') }}"
+        freeze_result:
+          host: "{{ inventory_hostname }}"
+          run_id: "{{ os_run_id }}"
+          reason: "{{ os_reason }}"
+          mode: "{{ os_mode }}"
+          status: "{{ (freeze_json.status | default('thawed' if os_mode == 'thaw' else 'frozen')) if freeze_ok else (os_mode ~ '-failed') }}"
+          freeze_ok: "{{ freeze_ok }}"
+          kernel_running: "{{ after_f.kernel }}"
+          freeze: "{{ (after_f.freeze | default({})) if ((after_f.freeze | default({})) | length > 0) else freeze_json }}"
+          error: "{{ freeze_json.error | default('') }}"
+          drifted_after: "{{ (after_f.freeze | default({})).drifted | default([]) }}"
+          power_cycle: "No power-cycle needed: nothing was rebooted."
+      when: os_mode in ['freeze', 'thaw']
+
     - name: Maintenance | keep the records
       ansible.builtin.copy:
         content: "{{ item.content }}"
         dest: "{{ host_dir }}/{{ item.name }}"
         mode: "0644"
       delegate_to: localhost
+      when: os_mode in ['disarm', 'repair']
       loop:
         - { name: post-survey.json, content: "{{ maint_after_raw.stdout }}" }
         - { name: disarm.json, content: "{{ maint_disarm_raw.stdout | default('{}', true) }}" }
@@ -1118,6 +1195,20 @@
         quiet: true
       when: os_mode == 'repair'
 
+    - name: Maintenance | the freeze (or thaw) must have completed, and the survey after must agree
+      ansible.builtin.assert:
+        that:
+          - (maint_freeze_raw if os_mode == 'freeze' else maint_thaw_raw).rc | default(1) == 0
+          - ((maint_freeze_raw if os_mode == 'freeze' else maint_thaw_raw).stdout | from_json).ok | default(false)
+          - ((maint_after_raw.stdout | from_json).freeze | default({})) | length > 0 if os_mode == 'freeze' else ((maint_after_raw.stdout | from_json).freeze | default({})) | length == 0
+          - os_mode != 'freeze' or ((maint_after_raw.stdout | from_json).freeze.drifted | default([])) | length == 0
+        fail_msg: >-
+          the {{ os_mode }} did not complete: {{ (((maint_freeze_raw if os_mode == 'freeze' else maint_thaw_raw).stdout | default('', true) | trim | from_json).error | default('see freeze.json')) if (((maint_freeze_raw if os_mode == 'freeze' else maint_thaw_raw).stdout | default('', true) | trim | regex_search('^[{]'))) else 'see freeze.json' }}.
+          Its record is kept on the host (/var/lib/celeris-os-upgrade/freeze.json) and in freeze.json of the evidence: a freeze that failed half way is undone by mode=thaw,
+          a thaw that failed by mode=thaw again.
+        quiet: true
+      when: os_mode in ['freeze', 'thaw']
+
     - name: Maintenance | done
       ansible.builtin.set_fact:
         os_maintenance_done: true
@@ -1146,4 +1237,4 @@
         that: hostvars[os_host].os_maintenance_done | default(false)
         fail_msg: "{{ os_host }}: the maintenance play did not run to its end"
         quiet: true
-      when: os_mode in ['disarm', 'repair']
+      when: os_mode in ['disarm', 'repair', 'freeze', 'thaw']

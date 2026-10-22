@@ -81,7 +81,7 @@ refusals_str: >-
   {% endif %}
   {{ p | join(' ;; ') }}
 
-# mode=repair / mode=disarm: refusals of the maintenance play. Inputs: os_mode, repair_action, pre_target, pre_survey.
+# mode=repair / mode=disarm / mode=freeze / mode=thaw: refusals of the maintenance play. Inputs: os_mode, repair_action, pre_target, pre_survey.
 maint_refusals_str: >-
   {% set a = pre_target %}
   {% set s = pre_survey %}
@@ -96,6 +96,14 @@ maint_refusals_str: >-
   {% if repair_action == 'release-holds' and (s.packages.tool_holds | default([])) | length == 0 %}{% set _ = p.append('nothing to release: no hold put by this tool is in place (a hold that is there was not recorded by it: apt-mark unhold it deliberately)') %}{% endif %}
   {% if repair_action == 'abort-new-kernel' and s.packages.broken_kernel_pkgs | length == 0 %}{% set _ = p.append('nothing to abort: no kernel newer than the running one has a package that is not cleanly installed (a kernel installed and working before is not removed)') %}{% endif %}
   {% if repair_action == 'abort-new-kernel' and not (s.boot.dropin_present and s.boot.default_kernel == s.kernel) %}{% set _ = p.append('grub saved default (' ~ s.boot.default_kernel ~ ') is not the running kernel ' ~ s.kernel ~ ' or the upgrade pin is missing: removing kernels could change what boots') %}{% endif %}
+  {% endif %}
+  {% if os_mode in ['freeze', 'thaw'] %}
+  {% if a.manifest_present %}{% set _ = p.append('a bench or validation manifest exists on the target') %}{% endif %}
+  {% if a.runner_workers | int > 0 %}{% set _ = p.append(a.runner_workers ~ ' runner job(s) are executing on the host') %}{% endif %}
+  {% if os_mode == 'freeze' and (apt_busy_str | trim) | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (apt_busy_str | trim) ~ '): a freeze would stop unattended-upgrades or the apt timers under a package run') %}{% endif %}
+  {% if os_mode == 'freeze' and ((s.unattended_upgrades.install_on_shutdown | default('')) | lower) in ['true', '1', 'yes', 'on'] %}{% set _ = p.append('Unattended-Upgrade::InstallOnShutdown is ' ~ s.unattended_upgrades.install_on_shutdown ~ ': the shutdown listener a freeze stops installs packages when the host shuts down, and what stopping it does then is not known here. Set it to false by a reviewed change first') %}{% endif %}
+  {% if os_mode == 'freeze' and (s.freeze | default({})) | length > 0 %}{% set _ = p.append('this host is already frozen (run ' ~ (s.freeze.run_id | default('?')) ~ ', ' ~ (s.freeze.utc | default('?')) ~ ', status ' ~ (s.freeze.status | default('?')) ~ '): dispatch mode=thaw first. The record of what the first freeze changed is kept, so the previous states are never overwritten') %}{% endif %}
+  {% if os_mode == 'thaw' and (s.freeze | default({})) | length == 0 %}{% set _ = p.append('nothing to thaw: no freeze record on this host (this tool froze nothing here, or its record is gone)') %}{% endif %}
   {% endif %}
   {{ p | join(' ;; ') }}
 

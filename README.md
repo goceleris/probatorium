@@ -261,13 +261,13 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
 ```
 
-- **Inputs.** `mode` is `survey` or `upgrade`; an upgrade names ONE `host` and `confirm` must be exactly
-  `UPGRADE-<host>` (`DISARM-<host>` for `mode=disarm`, which only clears a pending grub one-shot); `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
+- **Inputs.** `mode` is `survey`, `rehearse`, `upgrade`, `disarm`, `repair`, `freeze` or `thaw`; an upgrade names ONE `host` and `confirm` must be exactly
+  `UPGRADE-<host>` (`DISARM-<host>` for `mode=disarm`, which only clears a pending grub one-shot; `FREEZE-<host>`, `THAW-<host>`); `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
   `results_root` holds entries (the reboot destroys the tmpfs). `refresh_lists` (survey only, default false) runs
   `apt-get update` first so the simulation is not stale: it WRITES `/var/lib/apt/lists` and the apt caches
   (`/var/cache/apt/*.bin`) and runs the apt update post-invoke hooks, so it is the one thing a survey changes, and only when asked. `blacklist_r8169`
   (upgrade only, default false) is explained below. Dispatch from `main` only; it never runs on a schedule.
-- **Five modes.** `survey` (read-only, all hosts; its summary opens with a checklist of every fact to read before a host-changing
+- **Seven modes.** `survey` (read-only, all hosts; its summary opens with a checklist of every fact to read before a host-changing
   dispatch, each with a PASS / FAIL / NOTE mark and the decision it informs); `rehearse` (ONE host, `REHEARSE-<host>`: pins the
   running kernel, arms a one-shot to a boot of the SAME kernel, reboots, and requires a new boot id, the same kernel, an EMPTY
   `next_entry` (GRUB read and cleared the environment block Linux writes) and the usual verification; no package or kernel changes;
@@ -288,7 +288,23 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   install no kernel until they are installed again). It also removes a kernel that installed cleanly but that an earlier run armed
   and never verified (below); it forgets that record only when the purge exited 0 and dpkg shows the version gone (a failed purge keeps
   the record, so `retry_kernel` stays required). `release-holds` releases the access-path holds that a dead run left (below) and
-  nothing else.
+  nothing else. `freeze` and `thaw` (ONE host, `FREEZE-<host>` / `THAW-<host>`) keep the platform fixed during the evidence campaign (next bullet).
+- **Freeze and thaw: the platform stays FIXED during the evidence campaign.** The hosts update themselves (`unattended-upgrades` and `needrestart`
+  are active: they installed the kernel -38 on their own), and a 131-hour benchmark must not see a package or a service change under it.
+  `mode=freeze` (`FREEZE-<host>`, one host per dispatch, behind the same `OS_UPGRADE_ALLOWED_HOSTS` gate, the `cluster-host-change` approval and the
+  idle cluster) refuses while apt or dpkg is busy, while the host is already frozen, or while `Unattended-Upgrade::InstallOnShutdown` is true (the shutdown listener it stops would install at power-off, and what stopping it does then is not known), writes its record BEFORE it changes anything
+  (`/var/lib/celeris-os-upgrade/freeze.json`: the timestamp, every unit's previous `active`/`enabled` state, what it changed, whether it wrote a
+  needrestart drop-in), stops and disables `apt-daily.timer`, `apt-daily-upgrade.timer` and `unattended-upgrades.service`, sets `needrestart` to
+  list-only (`/etc/needrestart/conf.d/zzz-celeris-freeze.conf`, only when it is installed and not list-only already), checks the states, and records
+  the platform: the evidence holds `freeze.json` (with the kernel, the OS, the package count, a SHA-256 of every installed package and version, and
+  the holds), `dpkg-l.txt` (`dpkg -l`), `apt-held.txt` (`apt-mark showhold`), `kernel.txt` and the survey after, so the release results can name the
+  exact platform. The survey shows the freeze and whether it still holds (`freeze.drifted`; checklist row "platform frozen against self-updates":
+  NOTE not frozen, PASS frozen, FAIL drifted or incomplete). `mode=thaw` (`THAW-<host>`) restores ONLY what the record says the freeze changed
+  (enable what it disabled, start what it stopped, remove its needrestart file: a unit that was already off stays off) and archives the record; the
+  apt timers are persistent, so they may run within minutes of a thaw. A freeze that failed half way is undone by `mode=thaw`. It does not stop
+  `mode=upgrade` (which runs apt itself) and it covers nothing but these units and needrestart: snapd refreshes, motd-news, firmware updates and
+  other self-updaters are not touched. Freeze before the rehearsals (an unattended grub or shim upgrade makes a rehearsal record stale), thaw
+  after the evidence.
 - **Rehearsal at a console.** While grub's first menu entry is not the running kernel (survey row "kernel a GRUB that ignores the grubenv would
   boot": FAIL, today on all three hosts: -38 is installed and is entry 0, -31 runs), a rehearsal is refused, because if GRUB does not read the
   environment block it boots that other kernel on every power-cycle. Only a person at the rack of THAT host with a console (HDMI and keyboard:

@@ -48,7 +48,8 @@ survey_section() {
 		"- disk free (KiB): / \(.disk["/"].free_kib // "?"), /boot \(.disk["/boot"].free_kib // "?"), /boot/efi \(.disk["/boot/efi"].free_kib // "n/a"), /var \(.disk["/var"].free_kib // "?")",
 		"- time sync: NTPSynchronized=`\(.time_sync.raw)`; crash dumps: \(.crash | join(", ") | if . == "" then "none" else . end); linux-firmware `\(.firmware.linux_firmware)`",
 		"- dkms: \(.dkms.status | map("\(.name)/\(.version) \(.kernel) \(.state)") | join("; ") | if . == "" then "none" else . end)",
-		"- last OS-upgrade record: \(.marker | if . == {} then "none" else "run \(.run_id): \(.kernel_before) -> \(.kernel_after), permanent \(.permanent), \(.finished_utc)" end)"
+		"- last OS-upgrade record: \(.marker | if . == {} then "none" else "run \(.run_id): \(.kernel_before) -> \(.kernel_after), permanent \(.permanent), \(.finished_utc)" end)",
+		"- freeze: \(.freeze // {} | if . == {} then "not frozen: the apt timers and unattended-upgrades run, so the platform can change by itself" else "run \(.run_id) at \(.utc), status \(.status); stopped or disabled: \(.units | to_entries | map(select(.value.changes | length > 0) | "\(.key) (\(.value.changes | join("+")))") | join(", ") | if . == "" then "nothing" else . end); needrestart list-only drop-in: \(.needrestart.dropin_written); platform: \(.platform.kernel // "?"), \(.platform.packages // "?") packages, sha256 \((.platform.dpkg_sha256 // "?")[0:16]), holds \(.platform.held // [] | join(",") | if . == "" then "none" else . end); drifted since: \(.drifted // [] | join("; ") | if . == "" then "no" else . end)" end)"
 	' "$s"
 	local ps=$out/$1/preflight-snapshot.json
 	if [ -s "$ps" ]; then
@@ -125,6 +126,7 @@ checklist() {
 			row("kernels armed earlier and never verified"; ([.armed_kernels[] | "\(.kernel) (run \(.run_id))"] | join(", ") | if . == "" then "none" else . end); (if (.armed_kernels | length) == 0 then "PASS" else "FAIL" end); "if FAIL, the host may have been stranded by it; retry_kernel=<it> to try again, or mode=repair abort-new-kernel"),
 			row("run state"; "manifest \($sn.manifest_present // "?"); runner jobs \($sn.runner_workers // "?"); power-loss resume \($sn.resume_pending // "?"); crash dumps \(.crash | length)"; (if ($sn | length) == 0 then "NOTE" elif ($sn.manifest_present // false) or (($sn.runner_workers // 0) > 0) or ($sn.resume_pending // false) then "FAIL" else "PASS" end); "NOTE: no preflight snapshot of this host, so nothing is known about a run on it. If FAIL, the upgrade refuses beside a run"),
 			row("access-path packages and third-party moves the full-upgrade brings"; ($access | if . == "" then "none" else . end) + "; third-party repos: " + ($pk.third_party_repos | join(", ") | if . == "" then "none" else . end); "NOTE"; "read the major jumps (docker, containerd, tailscale, openssh, grub, shim, netplan, systemd, linux-firmware): a full-upgrade has no checkpoint, and none of them is undone by a power-cycle"),
+			row("platform frozen against self-updates (apt timers, unattended-upgrades, needrestart restarts)"; "units \(.unattended_upgrades.units | to_entries | map("\(.key)=\(.value.active)/\(.value.enabled)") | join(", "))" + (if (.freeze // {}) != {} then "; freeze of run \(.freeze.run_id) at \(.freeze.utc), status \(.freeze.status); drifted: \(.freeze.drifted // [] | join("; ") | if . == "" then "no" else . end)" else "; no freeze record" end); (if (.freeze // {}) == {} then "NOTE" elif .freeze.status == "frozen" and ((.freeze.drifted // []) | length) == 0 then "PASS" else "FAIL" end); "NOTE: not frozen, the host updates itself (unattended-upgrades already installed the kernel -38 by itself): dispatch mode=freeze before the evidence campaign. FAIL: frozen, but a unit came back or the freeze did not complete: mode=thaw, then mode=freeze again"),
 			row("unattended-upgrades and phasing"; "periodic \(.unattended_upgrades.unattended_upgrade); removes unused kernels \(.unattended_upgrades.remove_unused_kernel_packages); phased and held back: \($pk.phased_held_back | join(", ") | if . == "" then "none" else . end)"; "NOTE"; "the pin keeps the old kernel from unattended removal; phased packages are not forced (PLAN d.4, d.5)")
 			),
 			(if .r8127.present then (
@@ -203,6 +205,39 @@ if [ "$mode" = disarm ]; then
 		echo "- **The host has not rebooted since the arming** (same boot id): the armed record of $(jq -r '.forgot_armed | join(", ")' "$d/disarm.json") was dropped, that kernel never booted, so the next upgrade is not refused for a boot that never happened."
 	fi
 	echo "- Disarming clears only grub's next_entry. It does not touch the saved default, the packages or the running kernel. If the host did not answer, nothing was cleared: it is down, and a power-cycle boots whatever next_entry names before the saved default (after an upgrade's arming: the NEW kernel, once; after a rehearsal's arming: the running kernel again)."
+	for r in "$out"/*/refusal.txt; do
+		[ -s "$r" ] || continue
+		echo
+		echo "### Refused: $(basename "$(dirname "$r")")"
+		echo
+		echo '```'
+		cat "$r"
+		echo '```'
+	done
+	exit 0
+fi
+
+# ---------------------------------------------------------------- freeze / thaw
+if [ "$mode" = freeze ] || [ "$mode" = thaw ]; then
+	d=$out/$host
+	ok=$(jq -r '.freeze_ok // false' "$d/result.json" 2> /dev/null)
+	if [ "$mode" = freeze ]; then
+		if [ "$rc" -eq 0 ] && [ "$ok" = true ]; then echo "- **result: FROZEN**: the apt timers and unattended-upgrades are stopped and disabled on $host (needrestart restarts nothing by itself), and the platform below is recorded. Nothing was rebooted; no package changed."; else echo "- **result: NOT FROZEN, OR NOT COMPLETELY** (ansible-playbook exit $rc): the record of what was changed is kept on the host; mode=thaw undoes a freeze that failed half way."; fi
+	else
+		if [ "$rc" -eq 0 ] && [ "$ok" = true ]; then echo "- **result: THAWED**: the units the freeze recorded it changed are back as they were (they may run within minutes: the apt timers are persistent), and the needrestart drop-in is gone. The host updates itself again."; else echo "- **result: NOT THAWED, OR NOT COMPLETELY** (ansible-playbook exit $rc): the freeze record is kept; dispatch mode=thaw again."; fi
+	fi
+	echo
+	if [ -s "$d/result.json" ]; then
+		jq -r --arg mode "$mode" '"- status `\(.status)`; running kernel `\(.kernel_running)` (not rebooted)\(if (.error // "") != "" then "; error: " + .error else "" end)",
+			(.freeze as $f | if ($f // {}) == {} then empty else
+			"- record of run \($f.run_id) at \($f.utc) (previous states, what was changed, what it is now):",
+			($f.units | to_entries[] | "  - `\(.key)`: present \(.value.present); before \(.value.before.active)/\(.value.before.enabled); changed: \(.value.changes | join(" + ") | if . == "" then "nothing" else . end)\(if $mode == "freeze" then "; now " + ($f.after[.key].active // "?") + "/" + ($f.after[.key].enabled // "?") else "" end)"),
+			(if $mode == "thaw" then "- restored: \($f.restored // [] | join("; ") | if . == "" then "nothing" else . end)" else empty end),
+			"- needrestart: installed \($f.needrestart.installed); restart mode before `\($f.needrestart.mode_before)`; list-only drop-in written: \($f.needrestart.dropin_written)",
+			"- **platform** (what the release results can cite): kernel `\($f.platform.kernel // "?")`, \($f.platform.os // "?"), \($f.platform.packages // "?") packages, sha256 of the package list `\($f.platform.dpkg_sha256 // "?")`, holds: \($f.platform.held // [] | join(", ") | if . == "" then "none" else . end)" end)' "$d/result.json" 2> /dev/null
+		jq -r '"- drifted after: \(.drifted_after // [] | join("; ") | if . == "" then "nothing" else . end)"' "$d/result.json" 2> /dev/null
+	fi
+	echo "- The evidence directory holds freeze.json (the record, or the thaw's), dpkg-l.txt (dpkg -l), apt-held.txt (apt-mark showhold), kernel.txt and the survey after (post-survey.json): the exact platform. A freeze covers the apt timers, unattended-upgrades and needrestart's automatic restarts only: snapd refreshes, motd-news, firmware updates and anything else a host does by itself are not touched."
 	for r in "$out"/*/refusal.txt; do
 		[ -s "$r" ] || continue
 		echo

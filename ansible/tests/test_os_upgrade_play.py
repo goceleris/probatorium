@@ -632,9 +632,125 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertNotEqual(self.rc, 0)
         r = self.j("msr1", "result.json")
         self.assertEqual((r["status"], r["holds_released"], r["holds_not_released"]), ("repair-failed", [], ["grub-common tailscale (put by run 41)"]))
-        self.assertIn("HOLDS NOT RELEASED", self.summary("repair", "msr1"))
+        self.assertIn("- **HOLDS NOT RELEASED** (apt-mark unhold did not take", self.summary("repair", "msr1"))
         self.assertEqual(self.h.load()["held"], ["grub-common", "tailscale", "vim"])
         self.assertTrue(os.path.exists(self.h.root + "/var/log/celeris-os-upgrade/41/held.txt"))
+
+    # ---------------------------------------------------------------------------------------- freeze / thaw
+    FZ = {"os_mode": "freeze", "os_host": "msr1", "os_confirm": "FREEZE-msr1"}
+    TH = {"os_mode": "thaw", "os_host": "msr1", "os_confirm": "THAW-msr1"}
+    FREEZE_UNITS = ("apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service")
+
+    def unit(self, u):
+        st = self.h.load()["services"]
+        return st.get("is-active " + u, "inactive"), st.get("is-enabled " + u, "disabled")
+
+    def checklist_row(self, host="msr1"):
+        md = self.summary("survey", "-", rc=0)
+        for line in md.splitlines():
+            if line.startswith("| %s | platform frozen against self-updates" % host):
+                return line
+        self.fail("no freeze row for " + host)
+
+    def test_a_freeze_and_a_thaw_through_the_playbook_leave_the_evidence_of_the_platform(self):
+        self.fresh()
+        self.play("fz0", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertIn("**NOTE**", self.checklist_row())
+        self.play("fz", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-3000:])
+        self.assertEqual(self.phase(), "frozen")
+        for u in self.FREEZE_UNITS:
+            self.assertEqual(self.unit(u), ("inactive", "disabled"), u)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["freeze_ok"], r["mode"], r["kernel_running"], r["drifted_after"]), ("frozen", True, "freeze", "7.0.0-31-generic", []))
+        self.assertEqual(r["freeze"]["status"], "frozen")
+        self.assertRegex(r["freeze"]["platform"]["dpkg_sha256"], r"^[0-9a-f]{64}$")
+        for f in ("freeze.json", "dpkg-l.txt", "apt-held.txt", "kernel.txt", "post-survey.json", "result.json", "phase.txt", "pre-survey.json"):
+            self.assertTrue(os.path.getsize(os.path.join(self.out, "msr1", f)) > 0, f)
+        self.assertIn("linux-image-7.0.0-31-generic", open(os.path.join(self.out, "msr1", "dpkg-l.txt")).read())
+        self.assertIn("running_kernel: 7.0.0-31-generic", open(os.path.join(self.out, "msr1", "kernel.txt")).read())
+        self.assertEqual(self.j("msr1", "post-survey.json")["freeze"]["status"], "frozen")
+        md = self.summary("freeze", "msr1")
+        for want in ("result: FROZEN", "sha256 of the package list", "`apt-daily.timer`: present true; before active/enabled; changed: stopped + disabled; now inactive/disabled", "kernel `7.0.0-31-generic`",
+                     "needrestart: installed true"):
+            self.assertIn(want, md)
+        # a freeze changes timers and one needrestart file: no reboot, no grub, no package
+        for pre in ("FAKE-REBOOT", "grub-set-default", "grub-reboot", "update-grub", "apt-get -y", "apt-get -o DPkg", "apt-mark hold", "dpkg --configure"):
+            self.no_call(pre)
+        # the survey now shows it: PASS
+        self.play("fz1", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertIn("**PASS**", self.checklist_row())
+        # and a thaw puts the units back
+        self.play("th", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-3000:])
+        self.assertEqual(self.phase(), "thawed")
+        for u in self.FREEZE_UNITS:
+            self.assertEqual(self.unit(u), ("active", "enabled"), u)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["freeze_ok"], r["mode"]), ("thawed", True, "thaw"))
+        md = self.summary("thaw", "msr1")
+        self.assertIn("result: THAWED", md)
+        self.assertIn("- restored: ", md)
+        self.assertIn("enable apt-daily.timer", md)
+        self.assertNotIn("; now inactive/disabled", md)  # a thaw does not describe the frozen state as the present one
+        self.assertEqual(self.j("msr1", "post-survey.json")["freeze"], {})
+        self.play("th1", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertIn("**NOTE**", self.checklist_row())
+
+    def test_a_second_freeze_and_a_thaw_without_a_freeze_are_refused_and_change_nothing(self):
+        self.fresh()
+        self.play("th_none", self.TH)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("nothing to thaw", self.log)
+        self.assertEqual([c for c in self.calls() if c.startswith(("systemctl stop", "systemctl disable", "systemctl start", "systemctl enable"))], [])
+        self.play("fz_a", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        first = open(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json").read()
+        self.play("fz_b", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("this host is already frozen", self.log)
+        self.assertEqual(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json").read(), first)
+        self.assertIn("### Refused: msr1", self.summary("freeze", "msr1"))
+
+    def test_a_freeze_is_refused_into_a_running_package_run_but_not_for_the_idle_daemons(self):
+        self.fresh()
+        self.h.proc(4242, "/usr/bin/apt-get", "-y", "full-upgrade")
+        self.play("fz_busy", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("dpkg or apt is busy (apt-get): a freeze would stop", self.log)
+        self.assertEqual(self.unit("unattended-upgrades.service"), ("active", "enabled"))
+        os.remove(self.h.root + "/proc/4242/cmdline")
+        os.remove(self.h.root + "/proc/4242/comm")
+        self.play("fz_idle", self.FZ)  # the fake host runs unattended-upgrade-shutdown and packagekitd, as every real host does
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+
+    def test_a_freeze_that_did_not_take_is_red_keeps_its_record_and_the_survey_marks_it(self):
+        self.fresh(systemctl_noop=["stop apt-daily.timer", "disable apt-daily.timer"])
+        self.play("fz_fail", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.phase(), "freeze-failed")
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["freeze_ok"]), ("freeze-failed", False))
+        self.assertIn("apt-daily.timer is still active/enabled after the freeze", r["error"])
+        self.assertEqual(self.j("msr1", "post-survey.json")["freeze"]["status"], "freezing-failed")
+        self.assertIn("NOT FROZEN, OR NOT COMPLETELY", self.summary("freeze", "msr1"))
+        self.play("fz_fail_survey", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertIn("**FAIL**", self.checklist_row())
+        # the half freeze is thawed by the thaw (the host answers the units now)
+        self.h.state["systemctl_noop"] = []
+        self.h.save()
+        self.play("fz_fail_thaw", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        for u in self.FREEZE_UNITS:
+            self.assertEqual(self.unit(u), ("active", "enabled"), u)
+
+    def test_freeze_and_thaw_need_their_exact_confirmation_in_the_playbook(self):
+        self.fresh()
+        self.refused("fz_bad", dict(self.FZ, os_confirm="UPGRADE-msr1"), "os_confirm must be exactly")
+        self.refused("th_bad", dict(self.TH, os_confirm="FREEZE-msr1"), "os_confirm must be exactly")
+        self.refused("fz_bad2", dict(self.FZ, os_confirm="THAW-msr1"), "os_confirm must be exactly")
+        self.refused("up_as_fz", dict(self.UP, os_confirm="FREEZE-msr1"), "os_confirm must be exactly")
+        self.assertEqual(self.unit("unattended-upgrades.service"), ("active", "enabled"))
 
     def test_repair_refuses_with_a_one_shot_pending_or_beside_a_bench_or_when_there_is_nothing_to_repair(self):
         self.fresh()

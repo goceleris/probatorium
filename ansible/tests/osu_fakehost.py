@@ -83,6 +83,8 @@ if name == "dpkg-query":
             .replace("${Architecture}", "arm64").replace("${db:Status-Abbrev}", "ii "))
     sys.exit(0 if found or not pats else 1)
 if name == "dpkg":
+    if args[:1] == ["-l"]:
+        out("Desired=Unknown/Install/Remove/Purge/Hold\n" + "".join("ii  %s  %s  arm64  test package\n" % (n, pkgs()[n]["version"]) for n in sorted(pkgs())) ); sys.exit(0)
     if "--configure" in args:
         if st.get("configure_ok") or not st.get("audit"):
             st["audit"] = []
@@ -237,8 +239,28 @@ if name == "timedatectl":
 if name == "systemctl":
     if args[0] == "--failed":
         sys.exit(0)
+    nth = st.get("systemctl_kill_nth", {}).get(" ".join(args[:2]))
+    if nth:  # killed at the Nth call of this very command (a read too): "is-active apt-daily.timer" 2 is the check after the freeze's changes
+        cnt = st.setdefault("systemctl_counts", {})
+        cnt[" ".join(args[:2])] = cnt.get(" ".join(args[:2]), 0) + 1
+        save()
+        if cnt[" ".join(args[:2])] == nth:
+            os.kill(os.getppid(), 9)
+            time.sleep(1)
+            sys.exit(1)
     if args[0] == "is-system-running":
         out("running\n"); sys.exit(0)
+    if args[0] in ("stop", "disable", "start", "enable"):
+        key = {"stop": ("is-active", "inactive"), "start": ("is-active", "active"), "disable": ("is-enabled", "disabled"), "enable": ("is-enabled", "enabled")}[args[0]]
+        if args[0] + " " + args[1] in st.get("systemctl_fail", []):
+            sys.stderr.write("Failed to %s %s: Unit is busy (test)\n" % (args[0], args[1])); sys.exit(1)
+        if args[0] + " " + args[1] in st.get("systemctl_kill", []):
+            os.kill(os.getppid(), 9)  # the freeze is killed here (a runner lost, a power loss): the verb is not applied
+            time.sleep(1)
+            sys.exit(1)
+        if args[0] + " " + args[1] in st.get("systemctl_noop", []):
+            sys.exit(0)  # reports success and changes nothing
+        st["services"][key[0] + " " + args[1]] = key[1]; save(); sys.exit(0)
     out(st.get("services", {}).get(args[0] + " " + args[1], "inactive" if args[0] == "is-active" else "disabled") + "\n"); sys.exit(0)
 if name == "ip":
     if st.get("addr", True):
@@ -366,6 +388,8 @@ class FakeHost:
         self.w("/proc/1/comm", "systemd\n")
         self.w("/proc/stat", "btime 1\n")
         self.w("/etc/modprobe.d/blacklist.conf", "# nothing\n")
+        self.w("/etc/needrestart/needrestart.conf", "# Restart mode: (l)ist only, (i)nteractive or (a)utomatically.\n#$nrconf{restart} = 'i';\n")
+        os.makedirs(self.root + "/etc/needrestart/conf.d", exist_ok=True)
         self.build_snapshot_tree()
         self.build_boot_proof()
         self.w("/etc/netplan/50-cloud-init.yaml", "network:\n  version: 2\n")
@@ -374,6 +398,7 @@ class FakeHost:
                    "linux-headers-" + self.running: {"version": self.running, "status": "installed"},
                    "linux-firmware": {"version": "20260301.git1", "status": "installed"},
                    "unattended-upgrades": {"version": "2.12", "status": "installed"},
+                   "needrestart": {"version": "3.8", "status": "installed"},
                    "build-essential": {"version": "12.12", "status": "installed"},
                    "tailscale": {"version": "1.90.0", "status": "installed"},
                    "grub-efi-arm64-bin": {"version": "2.14", "status": "installed"}, "grub-common": {"version": "2.14", "status": "installed"},
@@ -394,7 +419,9 @@ class FakeHost:
             "ntp": "yes",
             "services": {"is-active unattended-upgrades.service": "active", "is-enabled unattended-upgrades.service": "enabled",
                          "is-active tailscaled": "active", "is-enabled tailscaled": "enabled", "is-enabled ssh": "enabled", "is-active apcupsd": "active",
-                         "is-enabled celeris-resume-check.service": "enabled"},
+                         "is-enabled celeris-resume-check.service": "enabled",
+                         "is-active apt-daily.timer": "active", "is-enabled apt-daily.timer": "enabled",
+                         "is-active apt-daily-upgrade.timer": "active", "is-enabled apt-daily-upgrade.timer": "enabled"},
             "sim": ["Inst linux-image-7.0.0-40-generic (7.0.0-40.40 Ubuntu:26.04/resolute-updates [arm64])",
                     "Inst libc6 [2.43-0ubuntu1] (2.43-0ubuntu2 Ubuntu:26.04/resolute-updates [arm64])",
                     "Conf libc6 (2.43-0ubuntu2 Ubuntu:26.04/resolute-updates [arm64])",

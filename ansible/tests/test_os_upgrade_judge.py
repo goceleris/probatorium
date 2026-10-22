@@ -337,6 +337,37 @@ class Judge(unittest.TestCase):
         case("abort_without_the_pin", {"maint": "removing kernels could change what boots"}, repair("abort-new-kernel", b__dropin_present=False))
         case("disarm_has_no_refusals", {}, lambda c: c.update(os_mode="disarm"))
 
+        # ---- mode=freeze / mode=thaw
+        FROZEN = {"run_id": "41", "utc": "2026-10-23T10:00:00Z", "status": "frozen", "drifted": [], "units": {}, "needrestart": {}}
+
+        def fz(mode, frozen=None, **kw):
+            def m(c):
+                c.update(os_mode=mode)
+                if frozen is not None:
+                    c["pre_survey"]["freeze"] = copy.deepcopy(frozen)
+                for k, v in kw.items():
+                    section, key = k.split("__")
+                    (c["pre_target"] if section == "t" else c["pre_survey"]["packages"]).update({key: v})
+            return m
+        case("freeze_ok", {}, fz("freeze"))
+        case("freeze_beside_idle_daemons_is_fine", {}, fz("freeze", p__package_processes=["packagekitd", "unattended-upgr"]))
+        case("freeze_beside_a_bench", {"maint": "a bench or validation manifest exists"}, fz("freeze", t__manifest_present=True))
+        case("freeze_beside_a_runner_job", {"maint": "1 runner job(s) are executing"}, fz("freeze", t__runner_workers=1))
+        case("freeze_into_a_running_apt", {"maint": "dpkg or apt is busy (apt-get): a freeze would stop unattended-upgrades or the apt timers under a package run"}, fz("freeze", p__package_processes=["apt-get"]))
+        case("freeze_into_a_held_lock", {"maint": "dpkg or apt is busy (an apt or dpkg lock is held (/var/lib/dpkg/lock)): a freeze would stop"},
+             fz("freeze", p__dpkg_lock_held=True, p__locks_held=["/var/lib/dpkg/lock"]))
+        case("freeze_with_install_on_shutdown", {"maint": "Unattended-Upgrade::InstallOnShutdown is true: the shutdown listener a freeze stops installs packages when the host shuts down"},
+             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
+        case("freeze_with_install_on_shutdown_off_is_fine", {}, lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="false")))
+        case("thaw_ignores_install_on_shutdown", {}, lambda c: (c.update(os_mode="thaw"), c["pre_survey"].update(freeze=dict(FROZEN)), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
+        case("freeze_twice", {"maint": "this host is already frozen (run 41, 2026-10-23T10:00:00Z, status frozen): dispatch mode=thaw first. The record of what the first freeze changed is kept"}, fz("freeze", FROZEN))
+        case("freeze_over_a_failed_freeze", {"maint": "status freezing-failed): dispatch mode=thaw first"}, fz("freeze", dict(FROZEN, status="freezing-failed")))
+        case("thaw_ok", {}, fz("thaw", FROZEN))
+        case("thaw_of_a_failed_freeze_is_fine", {}, fz("thaw", dict(FROZEN, status="freezing-failed")))
+        case("thaw_nothing", {"maint": "nothing to thaw: no freeze record on this host"}, fz("thaw"))
+        case("thaw_beside_a_bench", {"maint": "a bench or validation manifest exists"}, fz("thaw", FROZEN, t__manifest_present=True))
+        case("thaw_beside_apt_is_fine", {}, fz("thaw", FROZEN, p__package_processes=["apt-get"]))  # a thaw only puts units back; it does not race a package run
+
         # ---- the plan
         case("plan_removes_a_kernel", {"plan": "would REMOVE protected package(s): linux-image-7.0.0-31-generic"},
              lambda c: c["sim"].update(remv=["linux-image-7.0.0-31-generic", "libfoo"]))
@@ -442,7 +473,7 @@ class Judge(unittest.TestCase):
         for name, (_, expect) in self.cases.items():
             got = self.out[name]
             if not expect:
-                if self.cases[name][0].get("os_mode", "upgrade") in ("repair", "disarm"):
+                if self.cases[name][0].get("os_mode", "upgrade") in ("repair", "disarm", "freeze", "thaw"):
                     got = {"maint": got["maint"]}  # a maintenance mode is judged by maint_refusals_str alone
                 if any(got.values()):
                     failures.append("%s: expected nothing, got %r" % (name, got))
@@ -487,7 +518,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 79, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 85, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:

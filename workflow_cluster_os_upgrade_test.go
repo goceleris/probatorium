@@ -71,7 +71,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 		}
 		return out
 	}
-	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "rehearse", "upgrade", "disarm", "repair"}) {
+	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "rehearse", "upgrade", "disarm", "repair", "freeze", "thaw"}) {
 		t.Errorf("modes = %v", got)
 	}
 	offered := choice("host", "confirm")
@@ -109,7 +109,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 	if !slices.Equal(accepted, osUpgradeHosts()) {
 		t.Errorf("the playbook accepts %v, want %v", accepted, osUpgradeHosts())
 	}
-	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'rehearse', 'disarm', 'repair']", "os_confirm == 'REPAIR-' ~ os_host"} {
+	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'rehearse', 'disarm', 'repair', 'freeze', 'thaw']", "os_confirm == 'FREEZE-' ~ os_host", "os_confirm == 'THAW-' ~ os_host", "os_confirm == 'REPAIR-' ~ os_host"} {
 		if !strings.Contains(req, want) {
 			t.Errorf("the playbook's request check lacks %s", want)
 		}
@@ -126,12 +126,14 @@ func TestClusterOSUpgradePlanRefuses(t *testing.T) {
 		`"$IN_CONFIRM" != "DISARM-$IN_HOST"`,
 		`"$IN_CONFIRM" != "REHEARSE-$IN_HOST"`,
 		`"$IN_CONFIRM" != "REPAIR-$IN_HOST"`,
+		`"$IN_CONFIRM" != "FREEZE-$IN_HOST"`,
+		`"$IN_CONFIRM" != "THAW-$IN_HOST"`,
 		`OS_UPGRADE_ALLOWED_HOSTS`,
 		`"$REF" != "refs/heads/$DEFAULT_BRANCH"`,
 		`msa2-server|msr1|msa2-client) ;;`,
 		`"$IN_HOST" != "-"`,
 		`-gt 200`,
-		`mode must be survey, rehearse, upgrade, disarm or repair`,
+		`mode must be survey, rehearse, upgrade, disarm, repair, freeze or thaw`,
 		`a survey takes no confirmation`,
 		`reason must not contain braces`,
 	} {
@@ -360,7 +362,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 
 	// the subcommands the playbook may run on a host
 	allowed := []string{"apt-update", "survey", "simulate", "dump", "pin-grub", "upgrade-start", "upgrade-status", "upgrade-log",
-		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start", "arm-rehearsal", "record-rehearsal", "hold-access", "release-access"}
+		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start", "arm-rehearsal", "record-rehearsal", "hold-access", "release-access", "freeze", "thaw"}
 	all := src
 	tasks, _ := filepath.Glob("ansible/tasks/os_upgrade_*.yml")
 	for _, tf := range tasks {
@@ -743,6 +745,17 @@ func TestOSUpgradeIsDocumented(t *testing.T) {
 		"blacklist_r8169",
 		"refresh_lists",
 		"stub",
+		"only when GRUB consumed its one-shot",
+		"first_entry_kernel",
+		"Rehearsal at a console",
+		"mode=freeze",
+		"mode=thaw",
+		"FREEZE-<host>",
+		"THAW-<host>",
+		"zzz-celeris-freeze.conf",
+		"freeze.drifted",
+		"apt-daily-upgrade.timer",
+		"unattended-upgrades.service",
 	} {
 		if !strings.Contains(sec, want) {
 			t.Errorf("the README section lacks %q", want)
@@ -870,6 +883,13 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		}
 		return base(e)
 	}
+	fz := func(mode string, over env) env {
+		e := env{"IN_MODE": mode, "IN_HOST": "msr1", "IN_CONFIRM": strings.ToUpper(mode) + "-msr1", "ALLOWED_HOSTS": "msr1"}
+		for k, v := range over {
+			e[k] = v
+		}
+		return base(e)
+	}
 	for _, c := range []struct {
 		name string
 		env  env
@@ -942,6 +962,25 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"an answer that is not json", up("msr1", envFix("notjson", "0")), false, "no required reviewer"},
 		{"a disarm needs the environment too", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1", "GH_FIXTURE": filepath.Join(bin, "noreviewer.json")}), false, "no required reviewer"},
 		{"a repair needs the environment too", rep(envFix("noreviewer", "0")), false, "no required reviewer"},
+		// freeze and thaw: the same gate, the same approval, an exact confirmation each
+		{"a freeze is gated too", fz("freeze", env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
+		{"a freeze of a host that is not listed", fz("freeze", env{"ALLOWED_HOSTS": "msa2-server"}), false, "is not in the repository variable"},
+		{"a listed freeze", fz("freeze", nil), true, ""},
+		{"a freeze needs the environment too", fz("freeze", envFix("noreviewer", "0")), false, "no required reviewer"},
+		{"a freeze needs the branch policy too", fz("freeze", envFix("nobranches", "0")), false, "no deployment branch policy"},
+		{"a freeze confirmed as an upgrade", fz("freeze", env{"IN_CONFIRM": "UPGRADE-msr1"}), false, "confirm must be exactly FREEZE-msr1"},
+		{"a freeze confirmed as a thaw", fz("freeze", env{"IN_CONFIRM": "THAW-msr1"}), false, "confirm must be exactly FREEZE-msr1"},
+		{"a freeze confirmed in lower case", fz("freeze", env{"IN_CONFIRM": "freeze-msr1"}), false, "confirm must be exactly FREEZE-msr1"},
+		{"a freeze confirmed for another host", fz("freeze", env{"IN_CONFIRM": "FREEZE-msa2-server"}), false, "confirm must be exactly FREEZE-msr1"},
+		{"a freeze of no host", fz("freeze", env{"IN_HOST": "-", "IN_CONFIRM": "FREEZE--"}), false, "names ONE host"},
+		{"a freeze of all", fz("freeze", env{"IN_HOST": "all"}), false, "host must be"},
+		{"a thaw is gated too", fz("thaw", env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
+		{"a listed thaw", fz("thaw", nil), true, ""},
+		{"a thaw needs the environment too", fz("thaw", envFix("noreviewer", "0")), false, "no required reviewer"},
+		{"a thaw confirmed as a freeze", fz("thaw", env{"IN_CONFIRM": "FREEZE-msr1"}), false, "confirm must be exactly THAW-msr1"},
+		{"a thaw confirmed in lower case", fz("thaw", env{"IN_CONFIRM": "thaw-msr1"}), false, "confirm must be exactly THAW-msr1"},
+		{"an upgrade confirmed as a freeze", up("msr1", env{"IN_CONFIRM": "FREEZE-msr1"}), false, "confirm must be exactly UPGRADE-msr1"},
+		{"a freeze with template syntax in the reason", fz("freeze", env{"IN_REASON": "x {{ y }}"}), false, "must not contain braces"},
 	} {
 		cmd := exec.Command(bash, "-c", script)
 		cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH")}
@@ -1025,7 +1064,7 @@ func TestClusterOSUpgradeNeverSpellsOutTheConsoleOverride(t *testing.T) {
 	if consoleOverride.MatchString(mustRead(t, filepath.Join(".github", "scripts", "os-upgrade-summary.sh"))) {
 		t.Error("the summary spells out the override")
 	}
-	if !consoleOverride.MatchString(mustRead(t, "README.md")) {
+	if !strings.Contains(mustRead(t, "README.md"), "that person's dispatch types `REHEARSE-<host>-CONSOLE` in `confirm`") {
 		t.Error("the README no longer says how a person at the rack attests a console")
 	}
 }

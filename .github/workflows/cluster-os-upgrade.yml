@@ -14,9 +14,9 @@ name: Cluster OS Upgrade
 #
 # Job graph: plan -> cluster-guard -> os-upgrade -> verdict.
 #   plan           refuses a malformed request, every input checked in EVERY mode (a survey included): a wrong mode (survey, rehearse, upgrade,
-#                  disarm, repair), a survey that names a host or carries a confirm, a host-changing mode without ONE host, a host that is not
+#                  disarm, repair, freeze, thaw), a survey that names a host or carries a confirm, a host-changing mode without ONE host, a host that is not
 #                  in OS_UPGRADE_ALLOWED_HOSTS, an environment cluster-host-change without a required reviewer, a wrong confirmation (UPGRADE-<host>,
-#                  REHEARSE-<host> or the console attestation of a person at the rack, DISARM-<host>, REPAIR-<host>), a bad repair_action,
+#                  REHEARSE-<host> or the console attestation of a person at the rack, DISARM-<host>, REPAIR-<host>, FREEZE-<host>, THAW-<host>), a bad repair_action,
 #                  hold_access_packages or retry_kernel, a bad reason, and any ref but main. For a rehearsal it also says, in the log and the step
 #                  summary, whether a console is attested (run-name and the job name carry it for the environment's approver).
 #   cluster-guard  outside the group: lists every open run and refuses unless the cluster is IDLE
@@ -46,18 +46,18 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "survey: read-only, all three hosts, no confirmation. rehearse: ONE host reboots into its OWN running kernel through a grub one-shot (proves the fallback mechanism; changes no package). upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host."
+        description: "survey: read-only, all three hosts, no confirmation. rehearse: ONE host reboots into its OWN running kernel through a grub one-shot (proves the fallback mechanism; changes no package). upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host. freeze: stop and disable the apt timers and unattended-upgrades on ONE host (and set needrestart to list-only) so the platform stays fixed during the evidence campaign; records what it changed and the platform. thaw: put back exactly what the freeze recorded."
         type: choice
-        options: [survey, rehearse, upgrade, disarm, repair]
+        options: [survey, rehearse, upgrade, disarm, repair, freeze, thaw]
         required: true
       host:
-        description: "rehearse, upgrade, disarm or repair: the host. Leave '-' for a survey."
+        description: "rehearse, upgrade, disarm, repair, freeze or thaw: the host. Leave '-' for a survey."
         type: choice
         options: ["-", msa2-server, msr1, msa2-client]
         required: false
         default: "-"
       confirm:
-        description: "rehearse: type REHEARSE-<host>; when grub's first menu entry is not the running kernel the rehearsal is refused unless a person is at the rack with a console and the dispatcher attests it (README, Rehearsal at a console). upgrade: UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. A survey takes none."
+        description: "rehearse: type REHEARSE-<host>; when grub's first menu entry is not the running kernel the rehearsal is refused unless a person is at the rack with a console and the dispatcher attests it (README, Rehearsal at a console). upgrade: UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. freeze: FREEZE-<host>. thaw: THAW-<host>. A survey takes none."
         type: string
         required: false
         default: ""
@@ -133,8 +133,8 @@ jobs:
           # every input the playbook receives is checked here in EVERY mode, a survey included (a survey job holds the cluster key,
           # and each value is also written to extra-vars.json as a literal)
           case "$IN_MODE" in
-            survey | rehearse | upgrade | disarm | repair) ;;
-            *) echo "::error::mode must be survey, rehearse, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
+            survey | rehearse | upgrade | disarm | repair | freeze | thaw) ;;
+            *) echo "::error::mode must be survey, rehearse, upgrade, disarm, repair, freeze or thaw, got: $IN_MODE"; exit 1 ;;
           esac
           case "$IN_HOST" in
             "-" | msa2-server | msr1 | msa2-client) ;;
@@ -163,10 +163,10 @@ jobs:
                 exit 1
               fi
               ;;
-            upgrade | rehearse | disarm | repair)
+            upgrade | rehearse | disarm | repair | freeze | thaw)
               case "$IN_HOST" in
                 msa2-server|msr1|msa2-client) ;;
-                *) echo "::error::an upgrade, a rehearsal, a disarm or a repair names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
+                *) echo "::error::an upgrade, a rehearsal, a disarm, a repair, a freeze or a thaw names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
               esac
               # the extra control: a host-changing mode is impossible until the maintainer lists the host for the window
               # (repository variable OS_UPGRADE_ALLOWED_HOSTS; README, "Enabling a host change")
@@ -204,8 +204,16 @@ jobs:
                 echo "::error::confirm must be exactly REPAIR-$IN_HOST"
                 exit 1
               fi
+              if [ "$IN_MODE" = freeze ] && [ "$IN_CONFIRM" != "FREEZE-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly FREEZE-$IN_HOST"
+                exit 1
+              fi
+              if [ "$IN_MODE" = thaw ] && [ "$IN_CONFIRM" != "THAW-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly THAW-$IN_HOST"
+                exit 1
+              fi
               ;;
-            *) echo "::error::mode must be survey, rehearse, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
+            *) echo "::error::mode must be survey, rehearse, upgrade, disarm, repair, freeze or thaw, got: $IN_MODE"; exit 1 ;;
           esac
           if [ -z "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ]; then
             echo "::error::reason is empty"
