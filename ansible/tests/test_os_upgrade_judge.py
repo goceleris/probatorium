@@ -371,6 +371,9 @@ class Judge(unittest.TestCase):
         case("rehearse_of_a_frozen_host_is_fine", {}, lambda c: (c.update(os_mode="rehearse", os_confirm="REHEARSE-msr1-CONSOLE"), c["pre_survey"].update(freeze=copy.deepcopy(FROZEN), rehearsal={})))
         case("freeze_while_the_saved_default_is_not_the_running_kernel", {"maint": "grub saved default kernel is 7.0.0-38-generic and the host runs 7.0.0-31-generic: any reboot"},
              lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel="7.0.0-38-generic")))
+        case("freeze_while_the_saved_default_is_not_the_running_kernel_names_the_ways_out",
+             {"maint": "an un-upgraded host whose first menu entry is another kernel needs a console rehearsal; a host that runs the new kernel after a failed verification goes back to the old one with the cluster-reboot workflow"},
+             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel="7.0.0-38-generic")))
         case("freeze_while_the_saved_default_is_unknown", {"maint": "grub saved default kernel is unknown and the host runs"},
              lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel="")))
         case("thaw_ignores_the_saved_default", {}, lambda c: (c.update(os_mode="thaw"), c["pre_survey"].update(freeze=copy.deepcopy(FROZEN)), c["pre_survey"]["boot"].update(default_kernel="7.0.0-38-generic")))
