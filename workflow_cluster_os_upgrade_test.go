@@ -1102,40 +1102,43 @@ func TestClusterOSUpgradeNeverSpellsOutTheConsoleOverride(t *testing.T) {
 	}
 }
 
-// Review m1: the literal scan above is bypassed by a concatenation ('REHEARSE-' ~ os_host ~ '-CONSOLE'), a shell variable, or a print in the tool.
-// The token "-CONSOLE" is therefore allowed only on the lines that COMPARE a confirmation against it (and on the approver's display), never in a
-// message, in any of the files that print anything, and never in os_upgrade.py at all.
+// Review m1 (and r2 F9): the literal scan above is bypassed by a concatenation ('REHEARSE-' ~ os_host ~ '-' ~ 'CONSOLE'), a format filter, a Python % or a
+// literal on an allow-listed line. In every file that prints anything, a line (comments stripped) may carry the word CONSOLE only inside the exact
+// fragments that COMPARE a confirmation against it or show the approver that one was attested, and each file has exactly that many such lines: what
+// is left of a line after the fragments are removed must not contain CONSOLE, and the tool (os_upgrade.py) has none at all.
 func TestClusterOSUpgradeTheConsoleTokenIsOnlyEverCompared(t *testing.T) {
-	allowed := map[string][]*regexp.Regexp{
-		filepath.Join(".github", "workflows", osWorkflow): {
-			regexp.MustCompile(`^run-name: `), regexp.MustCompile(`^\s+name: os-upgrade `),
-			regexp.MustCompile(`^\s+if \[ "\$IN_MODE" = rehearse \] && \[ "\$IN_CONFIRM" != "REHEARSE-\$IN_HOST" \] && \[ "\$IN_CONFIRM" != "REHEARSE-\$IN_HOST-CONSOLE" \]; then$`),
-			regexp.MustCompile(`^\s+if \[ "\$IN_CONFIRM" = "REHEARSE-\$IN_HOST-CONSOLE" \]; then$`),
-		},
-		osRequest:  {regexp.MustCompile(`^      - \(os_mode == 'survey' and os_confirm == ''\) or `)},
-		osJudge:    {regexp.MustCompile(`^  \{% set console_attested = \(os_confirm \| default\(''\)\) == \('REHEARSE-' ~ os_host ~ '-CONSOLE'\) %\}$`)},
-		osPlaybook: {regexp.MustCompile(`^      confirm_kind: "\{\{ 'console-attested' if \(os_mode == 'rehearse' and \(os_confirm \| default\(''\)\) == \('REHEARSE-' ~ os_host ~ '-CONSOLE'\)\) else 'standard' \}\}"$`)},
-		osScript:   {},
-		filepath.Join(".github", "scripts", "os-upgrade-summary.sh"): {regexp.MustCompile(`^\t\*-CONSOLE\) echo "- confirmation: \*\*CONSOLE ATTESTED\*\*`)},
+	type allow struct {
+		fragments []string
+		lines     int
+	}
+	allowed := map[string]allow{
+		filepath.Join(".github", "workflows", osWorkflow): {[]string{
+			`endsWith(inputs.confirm, '-CONSOLE')`, ` CONSOLE-ATTESTED`,
+			`[ "$IN_CONFIRM" != "REHEARSE-$IN_HOST-CONSOLE" ]`, `[ "$IN_CONFIRM" = "REHEARSE-$IN_HOST-CONSOLE" ]`,
+			`kind="CONSOLE ATTESTED: the dispatcher states that a person is at the rack of $IN_HOST with a console"`}, 5},
+		osRequest:  {[]string{`os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']`}, 1},
+		osJudge:    {[]string{`{% set console_attested = (os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE') %}`}, 1},
+		osPlaybook: {[]string{`(os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE')`}, 1},
+		osScript:   {nil, 0},
+		filepath.Join(".github", "scripts", "os-upgrade-summary.sh"): {[]string{`*-CONSOLE) echo "- confirmation: **CONSOLE ATTESTED**:`}, 1},
 	}
 	for file, ok := range allowed {
-		src := mustRead(t, file)
-		if file == osPlaybook || file == osScript {
-			src = stripComments(src)
-		}
-		for i, l := range strings.Split(src, "\n") {
-			if !strings.Contains(l, "-CONSOLE") {
+		n := 0
+		for _, l := range strings.Split(stripComments(mustRead(t, file)), "\n") {
+			if !strings.Contains(l, "CONSOLE") {
 				continue
 			}
-			legit := false
-			for _, re := range ok {
-				if re.MatchString(l) {
-					legit = true
-				}
+			n++
+			rest := l
+			for _, fr := range ok.fragments {
+				rest = strings.ReplaceAll(rest, fr, "")
 			}
-			if !legit {
-				t.Errorf("%s:%d carries the console token outside a comparison (a message, a concatenation, a print): %s", file, i+1, strings.TrimSpace(l))
+			if strings.Contains(rest, "CONSOLE") {
+				t.Errorf("%s: a line carries the word CONSOLE outside the comparisons and the approver's display (a message, a concatenation, a format, a print): %s", file, strings.TrimSpace(l))
 			}
+		}
+		if n != ok.lines {
+			t.Errorf("%s has %d lines with the word CONSOLE, want exactly %d (a new line needs a review of what it prints)", file, n, ok.lines)
 		}
 	}
 	for _, f := range []string{filepath.Join("ansible", "tasks", "os_upgrade_phase.yml"), filepath.Join("ansible", "tasks", "os_upgrade_wait_apt.yml")} {
