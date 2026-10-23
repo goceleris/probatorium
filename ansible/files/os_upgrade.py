@@ -1523,8 +1523,9 @@ def disarm():
         rc, out, err = run(["grub-editenv", "-", "unset", "next_entry"])
     after = grub_editenv().get("next_entry", "")
     ok = rc == 0 and not after
+    top0 = [e for e in grub_entries() if not e["parent"] and e["kernel"]]
     return {"ok": ok, "was_armed": bool(before), "next_entry_before": before, "next_entry_after": after,
-            "saved_entry": env.get("saved_entry", ""), "error": (out + err)[-300:] if rc != 0 else "",
+            "saved_entry": env.get("saved_entry", ""), "entry0_kernel": top0[0]["kernel"] if top0 else "", "error": (out + err)[-300:] if rc != 0 else "",
             "forgot_armed": forget_armed_without_a_reboot() if ok else []}
 
 
@@ -1820,6 +1821,11 @@ def cmd_freeze(a):
     busy = package_run_busy()
     if busy:
         fail("dpkg or apt is busy (%s): not stopping unattended-upgrades or the apt timers under a package run" % busy)
+    bd, run_k = boot_info()["default_kernel"], running_kernel()
+    if bd != run_k:
+        fail("grub's saved default kernel is %r and the host runs %r: any reboot (a power loss, a panic, cluster-reboot) boots %s, so the platform this freeze would "
+             "record is not the one that comes back. Pin the running kernel first (a rehearsal or an upgrade does), or finish the upgrade (nothing was changed)" % (
+                 bd or "unknown", run_k, bd or "something else"))
     ios = apt_config().get("Unattended-Upgrade::InstallOnShutdown", "")
     if ios.lower() in TRUE_WORDS:
         fail("Unattended-Upgrade::InstallOnShutdown is %r: the shutdown listener (unattended-upgrade-shutdown, which this freeze stops) installs packages "
@@ -1847,6 +1853,7 @@ def cmd_freeze(a):
             info.pop("pending")
             if rc != 0:
                 errors.append("systemctl stop %s: %s" % (u, (out + err).strip()[-160:]))
+                info.setdefault("attempted", []).append("stopped")  # a stop that timed out (rc 124) or errored may well have taken effect: the thaw looks
             else:
                 info["changes"].append("stopped")
             save_freeze(rec)
@@ -1857,6 +1864,7 @@ def cmd_freeze(a):
             info.pop("pending")
             if rc != 0:
                 errors.append("systemctl disable %s: %s" % (u, (out + err).strip()[-160:]))
+                info.setdefault("attempted", []).append("disabled")
             else:
                 info["changes"].append("disabled")
             save_freeze(rec)
@@ -1889,13 +1897,19 @@ def cmd_thaw(a):
     rec = freeze_record()
     if not rec or rec.get("status") == "unreadable":
         fail("nothing to thaw: no readable freeze record at %s. This tool froze nothing here, or the record is gone; if units were stopped by a freeze whose record is lost, put back by hand ONLY the "
-             "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; rm %s" % (FREEZE_RECORD, NEEDRESTART_DROPIN))
+             "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; then rm %s %s "
+             "(the unreadable record itself: until it is gone, an upgrade and a new freeze are refused)" % (FREEZE_RECORD, NEEDRESTART_DROPIN, FREEZE_RECORD))
+    # the end-of-campaign proof: what moved since the freeze, read BEFORE the thaw changes anything (the survey after a thaw has no record to compare with)
+    drifted_at_thaw = freeze_state().get("drifted", [])
     errors, done = [], []
     for u, info in sorted(rec.get("units", {}).items()):
         want = info.get("before", {})
         # what the freeze recorded it changed, plus the change it was about to make when it died (it may or may not have happened); each is undone
         # only if the unit is not already as it was, so a second thaw changes nothing it has put back
-        effective = list(info.get("changes", [])) + ([info["pending"]] if info.get("pending") and info["pending"] not in info.get("changes", []) else [])
+        effective = list(info.get("changes", []))
+        for extra in list(info.get("attempted", [])) + ([info["pending"]] if info.get("pending") else []):
+            if extra not in effective:
+                effective.append(extra)
         for change in reversed(effective):
             now = unit_state(u)
             if change == "disabled" and want.get("enabled") in ON_ENABLED and now["enabled"] not in ON_ENABLED:
@@ -1916,7 +1930,8 @@ def cmd_thaw(a):
         if effective and (now["active"] != want.get("active") or now["enabled"] != want.get("enabled")) and now["enabled"] != "masked":
             errors.append("%s is %s/%s, was %s/%s before the freeze" % (u, now["active"], now["enabled"], want.get("active"), want.get("enabled")))
     nr = rec.get("needrestart", {})
-    if nr.get("dropin_written"):
+    # also when the record does not say it wrote the file (a kill between the write and the record): a file with exactly our text is ours
+    if nr.get("dropin_written") or (os.path.exists(p(NEEDRESTART_DROPIN)) and rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip()):
         try:
             if rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip():
                 os.remove(p(NEEDRESTART_DROPIN))
@@ -1933,6 +1948,7 @@ def cmd_thaw(a):
     rec["thawed_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     rec["thawed_by_run"] = a.run_id
     rec["restored"] = done
+    rec["drifted_at_thaw"] = drifted_at_thaw
     write("%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x")), json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
     os.remove(p(FREEZE_RECORD))
     emit(dict(rec, ok=True))

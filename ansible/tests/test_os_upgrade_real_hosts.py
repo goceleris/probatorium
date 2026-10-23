@@ -249,6 +249,7 @@ class JudgementReplay(unittest.TestCase):
             case("disarm-" + h, h, "disarm", "DISARM-" + h)
             case("freeze-" + h, h, "freeze", "FREEZE-" + h)
             case("thaw-" + h, h, "thaw", "THAW-" + h)
+            case("freeze-pinned-" + h, h, "freeze", "FREEZE-" + h, lambda c: c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"]))
             for mode in ("freeze", "thaw"):
                 case("resume-%s-%s" % (mode, h), h, mode, "%s-%s" % (mode.upper(), h), lambda c: c["pre_target"].update(resume_pending=True))
         # a refusal predicate fires on a real record when the real value is what trips it
@@ -322,9 +323,12 @@ class JudgementReplay(unittest.TestCase):
             self.assertTrue(r[0].startswith(NOTHING_TO_ABORT), (h, r))
             self.assertTrue(r[1].startswith(PIN_MISSING), (h, r))
 
-    def test_a_freeze_of_a_real_host_is_not_refused_though_the_idle_daemons_are_running_and_a_thaw_has_nothing_to_do(self):
+    def test_a_freeze_of_a_real_host_is_refused_today_only_for_its_saved_default_and_not_for_the_idle_daemons_and_a_thaw_has_nothing_to_do(self):
         for h in HOSTS:
-            self.assertEqual(self.maint("freeze-" + h), [], h)
+            got = self.maint("freeze-" + h)
+            self.assertEqual(len(got), 1, (h, got))  # -38 is grub's saved default on all three, -31 runs: not the idle daemons, not a lock
+            self.assertTrue(got[0].startswith("grub saved default kernel is 7.0.0-38-generic and the host runs 7.0.0-31-generic"), got)
+            self.assertEqual(self.maint("freeze-pinned-" + h), [], h)  # once the running kernel is the saved default, the idle daemons do not stop it
             self.assertEqual(self.maint("thaw-" + h), ["nothing to thaw: no freeze record on this host (this tool froze nothing here, or its record is gone)"], h)
 
     def test_a_freeze_or_a_thaw_is_refused_on_a_real_host_with_a_power_loss_resume_pending(self):

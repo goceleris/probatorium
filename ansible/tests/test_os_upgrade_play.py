@@ -742,6 +742,57 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.rc, 0, self.log[-2000:])
         self.assertEqual(self.j("msr1", "result.json")["freeze"]["platform"]["kernel"], "7.0.0-40-generic")
 
+    def test_the_thaw_summary_shows_the_drift_found_at_thaw_time(self):  # r2 F2
+        self.fresh()
+        self.play("th_d0", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.h.load()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"  # tailscale's updater, a manual apt ...
+        self.h.save()
+        self.play("th_d1", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        r = self.j("msr1", "result.json")
+        self.assertEqual(len(r["drifted_at_thaw"]), 1)
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("PLATFORM MOVED since the freeze", md)
+        self.assertIn("package list (sha256) changed", md)
+        self.assertNotIn("drifted after: nothing", md)
+        self.play("th_d2", self.FZ)
+        self.play("th_d3", self.TH)
+        self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
+        self.assertIn("platform at thaw time: DID NOT MOVE", " ".join(self.summary("thaw", "msr1").split()))
+
+    def test_a_freeze_is_refused_while_the_saved_default_is_not_the_running_kernel(self):  # r2 F7
+        self.fresh(keep38=True)  # -38 installed and entry 0, -31 runs: today's three hosts
+        self.play("fz_unpinned", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("grub saved default kernel is 7.0.0-38-generic and the host runs 7.0.0-31-generic", self.log)
+        self.assertEqual(self.unit("unattended-upgrades.service"), ("active", "enabled"))
+
+    def test_an_unreadable_grubenv_after_the_reboot_is_not_read_as_a_consumed_one_shot(self):  # r2 F5
+        self.fresh()
+        self.play("returned_noenv", self.UP, env={"BOOT_MODE": "no-nic", "EDITENV_FAIL": "1"})
+        self.assertNotEqual(self.rc, 0)
+        pc = " ".join(self.j("msr1", "result.json")["power_cycle"].split())
+        self.assertIn("UNPROVEN", pc)
+        self.assertNotIn("consumed by then", pc)
+
+    def test_the_rescue_names_grubs_first_entry_from_the_disarm_not_the_target(self):  # r2 F6
+        self.fresh()
+        self.play("rescue_entry0", self.UP, env={"BOOT_MODE": "ignore-env-gaveup", "ENTRY0_AFTER": "7.0.0-99-generic"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["target_kernel"], r["first_entry_kernel"]), ("failed-rebooted-one-shot-not-consumed", "7.0.0-40-generic", "7.0.0-99-generic"))
+        self.assertIn("boots its FIRST menu entry, 7.0.0-99-generic, every time", " ".join(r["power_cycle"].split()))
+
+    def test_the_unknown_text_names_the_first_entry_and_the_disarm(self):  # r2 F6
+        self.fresh()
+        self.play("returned_unknown2", self.UP, env={"SURVEY_FAIL_AFTER_REBOOT": "1"})
+        pc = " ".join(self.j("msr1", "result.json")["power_cycle"].split())
+        self.assertIn("boots GRUB's first menu entry, 7.0.0-40-generic", pc)
+        self.assertNotIn("the new kernel,", pc)
+        self.assertIn("mode=disarm", pc)
+
     def test_a_freeze_and_a_thaw_are_refused_while_a_power_loss_resume_is_pending(self):
         self.fresh()
         self.h.w("/var/lib/celeris-power/resume-pending.json", "{}")

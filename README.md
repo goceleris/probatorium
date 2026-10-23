@@ -302,13 +302,14 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   NOTE not frozen, PASS frozen, FAIL drifted or incomplete). `mode=thaw` (`THAW-<host>`) restores ONLY what the record says the freeze changed
   (enable what it disabled, start what it stopped, remove its needrestart file: a unit that was already off stays off) and archives the record; the
   apt timers are persistent, so they may run within minutes of a thaw. A freeze that failed half way, or was killed even between a change and its record, is undone by `mode=thaw` (the record is written durably before and after every change, with the change about to be made marked `pending`; a thaw undoes only what is not already as it was, so it can be repeated; a unit masked by hand is named; a needrestart file an earlier freeze left is adopted). It does not stop
-  `mode=upgrade` (which runs apt itself) and it covers nothing but these units and needrestart: snapd refreshes, motd-news, firmware updates and
+  the apt run `mode=upgrade` starts itself (which is why an upgrade is refused on a frozen host) and it covers nothing but these units and needrestart: snapd refreshes, motd-news, firmware updates and
   other self-updaters are not touched. The survey records the two that matter most and a freeze does not stop (`self_updaters`: `tailscale debug prefs` AutoUpdate, which runs apt-get by itself, and `snap refresh --time`), and the checklist row names what it does not cover (tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client). **The survey recomputes the recorded platform**: the running kernel, the package list (SHA-256), the holds and grub's saved default
   kernel; any difference is `freeze.drifted` and the checklist row FAILs (an upgrade, tailscale's own updater, a manual apt, a reboot onto
-  another kernel). `mode=upgrade` is therefore REFUSED on a frozen host (its record would name a platform that no longer exists): the order is
-  rehearse (a frozen host may be rehearsed), thaw, upgrade, and freeze again once every host is upgraded and verified, then the evidence
-  campaign, then thaw. Freezing before the rehearsals keeps an unattended grub or shim upgrade from making a rehearsal record stale, at the price
-  of a thaw before each upgrade.
+  another kernel). `mode=upgrade` is therefore REFUSED on a frozen host (its record would name a platform that no longer exists), and a freeze
+  is refused while grub's saved default kernel is not the running kernel (a reboot would boot the other one). The order is: rehearse all three
+  hosts, upgrade them (`msa2-server`, `msr1`, `msa2-client`), a final survey, then freeze the three, the evidence campaign, then thaw. The thaw's
+  summary shows the drift found AT THAW TIME ("did not move", or what moved): the end-of-campaign proof for the release results. A freeze
+  needed before an upgrade is `thaw`, upgrade, freeze again.
 - **Rehearsal at a console.** While grub's first menu entry is not the running kernel (survey row "kernel a GRUB that ignores the grubenv would
   boot": FAIL, today on all three hosts: -38 is installed and is entry 0, -31 runs), a rehearsal is refused, because if GRUB does not read the
   environment block it boots that other kernel on every power-cycle. Only a person at the rack of THAT host with a console (HDMI and keyboard:

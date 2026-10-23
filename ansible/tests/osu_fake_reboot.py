@@ -67,6 +67,8 @@ with open(root + "/proc/sys/kernel/random/boot_id", "w") as f:
     f.write(str(uuid.uuid4()) + "\n")
 with open(root + "/proc/interrupts", "w") as f:
     f.write(" 135:  1200  0  ITS-MSI 4  Edge      enp49s0-8\n 167:  0  9  ITS-MSI 2  Edge      enp1s0-8\n")
+if os.environ.get("EDITENV_FAIL"):
+    st["grubenv_list_rc"] = 1  # the host comes back, and grub-editenv cannot read the environment block (/boot not mounted?)
 if mode == "no-ping":
     st["ping"] = False
 if mode == "no-nic":

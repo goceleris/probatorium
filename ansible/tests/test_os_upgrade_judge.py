@@ -343,6 +343,7 @@ class Judge(unittest.TestCase):
         def fz(mode, frozen=None, **kw):
             def m(c):
                 c.update(os_mode=mode)
+                c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"])  # a pinned host: a freeze is refused otherwise (F7)
                 if frozen is not None:
                     c["pre_survey"]["freeze"] = copy.deepcopy(frozen)
                 for k, v in kw.items():
@@ -359,15 +360,20 @@ class Judge(unittest.TestCase):
         case("freeze_into_a_held_lock", {"maint": "dpkg or apt is busy (an apt or dpkg lock is held (/var/lib/dpkg/lock)): a freeze would stop"},
              fz("freeze", p__dpkg_lock_held=True, p__locks_held=["/var/lib/dpkg/lock"]))
         case("freeze_with_install_on_shutdown", {"maint": "Unattended-Upgrade::InstallOnShutdown is true: the shutdown listener a freeze stops installs packages when the host shuts down"},
-             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
-        for v in ("True", "TRUE", "yes", "on", "1", "with", "enable"):
-            case("freeze_with_install_on_shutdown_" + v, {"maint": "Unattended-Upgrade::InstallOnShutdown is %s: the shutdown listener" % v},
-                 (lambda v: lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown=v)))(v))
-        case("freeze_with_install_on_shutdown_off_is_fine", {}, lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="false")))
+             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"]), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
+        for k, v in enumerate(("True", "TRUE", "yes", "on", "1", "with", "enable")):
+            case("freeze_with_install_on_shutdown_%d_%s" % (k, v.lower() + ("_upper" if v.isupper() else "")), {"maint": "Unattended-Upgrade::InstallOnShutdown is %s: the shutdown listener" % v},
+                 (lambda v: lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"]), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown=v)))(v))
+        case("freeze_with_install_on_shutdown_off_is_fine", {}, lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"]), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="false")))
         case("thaw_ignores_install_on_shutdown", {}, lambda c: (c.update(os_mode="thaw"), c["pre_survey"].update(freeze=dict(FROZEN)), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
         case("upgrade_of_a_frozen_host", {"refusals": "this host is frozen (run 41, 2026-10-23T10:00:00Z): an upgrade changes the platform the freeze recorded"},
              lambda c: c["pre_survey"].update(freeze=copy.deepcopy(FROZEN)))
         case("rehearse_of_a_frozen_host_is_fine", {}, lambda c: (c.update(os_mode="rehearse", os_confirm="REHEARSE-msr1-CONSOLE"), c["pre_survey"].update(freeze=copy.deepcopy(FROZEN), rehearsal={})))
+        case("freeze_while_the_saved_default_is_not_the_running_kernel", {"maint": "grub saved default kernel is 7.0.0-38-generic and the host runs 7.0.0-31-generic: any reboot"},
+             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel="7.0.0-38-generic")))
+        case("freeze_while_the_saved_default_is_unknown", {"maint": "grub saved default kernel is unknown and the host runs"},
+             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel="")))
+        case("thaw_ignores_the_saved_default", {}, lambda c: (c.update(os_mode="thaw"), c["pre_survey"].update(freeze=copy.deepcopy(FROZEN)), c["pre_survey"]["boot"].update(default_kernel="7.0.0-38-generic")))
         case("freeze_twice", {"maint": "this host is already frozen (run 41, 2026-10-23T10:00:00Z, status frozen): dispatch mode=thaw first. The record of what the first freeze changed is kept"}, fz("freeze", FROZEN))
         case("freeze_over_a_failed_freeze", {"maint": "status freezing-failed): dispatch mode=thaw first"}, fz("freeze", dict(FROZEN, status="freezing-failed")))
         case("thaw_ok", {}, fz("thaw", FROZEN))
@@ -526,7 +532,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 87, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 88, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:

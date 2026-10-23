@@ -59,8 +59,11 @@
 #   not list-only already), verifies the states, and records the platform (kernel, a hash of every installed package and version, the holds): the
 #   evidence directory gets freeze.json, dpkg-l.txt (dpkg -l), apt-held.txt (apt-mark showhold) and kernel.txt, so the release results can name the
 #   exact platform. The survey shows the freeze and whether it still holds (drifted). thaw restores ONLY what the record says freeze changed
-#   (enable what it disabled, start what it stopped, remove its needrestart drop-in) and archives the record. It does not touch the OS upgrade
-#   (mode=upgrade runs apt itself) and does not stop any other self-updater (snapd refreshes, motd-news): the survey lists only what it covers.
+#   (enable what it disabled, start what it stopped, remove its needrestart drop-in) and archives the record, with the drift found at thaw time (the
+#   end-of-campaign proof that the platform did not move). Every survey recomputes the recorded platform (running kernel, grub saved default kernel, package
+#   list SHA-256, holds): a difference is `drifted`. freeze and thaw are refused while a bench manifest, a runner job or a power-loss resume is on the host;
+#   a freeze also while grub's saved default kernel is not the running kernel. mode=upgrade is REFUSED on a frozen host (thaw, upgrade, freeze again). A
+#   freeze does not stop tailscale's own updater, snapd refreshes, fwupd, motd-news or ubuntu-pro-client (the survey records `self_updaters`).
 #
 # MODE upgrade (host-changing, ONE host per dispatch)
 #   REFUSES, before touching anything (vars/os_upgrade_judge.yml, refusals_str): any of the three hosts unreachable,
@@ -243,8 +246,8 @@
     # did the host still hold a one-shot after it booted (the survey after the reboot says)? Then GRUB did not consume it: "the one-shot is
     # consumed by then" would be false, and so would "a power-cycle boots the OLD kernel" (R4-m4).
     # pending / clear / unknown. 'clear' also when there is no post-reboot survey VARIABLE at all (the rescue, which learned it from the disarm); a survey
-    # that was taken and is empty is 'unknown': the one-shot may well be pending (review m2)
-    one_shot_state_after: "{{ 'clear' if post_survey is not defined else ('unknown' if ((post_survey.boot | default({})) | length == 0) else ('pending' if (post_survey.boot.next_entry | default('')) | length > 0 else 'clear')) }}"
+    # that was taken and is empty, or whose grubenv could not be read (no saved_entry: grub-editenv failed), is 'unknown': the one-shot may well be pending (review m2, F5)
+    one_shot_state_after: "{{ 'clear' if post_survey is not defined else ('unknown' if (((post_survey.boot | default({})) | length == 0) or ((post_survey.boot.saved_entry | default('')) | length == 0)) else ('pending' if (post_survey.boot.next_entry | default('')) | length > 0 else 'clear')) }}"
     power_cycle_rebooting_upgrade: >-
       The reboot was issued (or about to be) and {{ inventory_hostname }} did not answer within {{ reboot_timeout_seconds }} s,
       and it could not be asked to clear the one-shot. Which boot a power-cycle gives depends on why it is silent.
@@ -265,10 +268,10 @@
       still {{ pre_survey.kernel }}. Reboot it back with the cluster-reboot workflow (red with "kernel changed", expected).
     power_cycle_returned_upgrade_unknown: >-
       No power-cycle needed while the host answers: it answered after the reboot but failed verification, and its survey after the reboot was
-      unreadable, so whether GRUB consumed the one-shot is UNPROVEN. If it did, a power-cycle boots the saved default, the OLD kernel
-      {{ pre_survey.kernel }}; if it did not, a power-cycle or a reboot (the cluster-reboot workflow included) boots GRUB's first menu entry,
-      the new kernel, and only the console brings the old one back. Dispatch a survey (boot.next_entry, boot.entry0_kernel) before trusting a
-      power-cycle. The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is still {{ pre_survey.kernel }}.
+      unreadable (or its grubenv could not be read), so whether GRUB consumed the one-shot is UNPROVEN. If it did, a power-cycle boots the saved
+      default, the OLD kernel {{ pre_survey.kernel }}; if it did not, a power-cycle or a reboot (the cluster-reboot workflow included) boots GRUB's
+      first menu entry, {{ first_entry_kernel }}, and only the console brings the old one back. Dispatch a survey (boot.next_entry,
+      boot.entry0_kernel) before trusting a power-cycle, and mode=disarm to clear a one-shot that is still pending. The new kernel {{ target_kernel | default('') }} was NOT made the default; the saved default is still {{ pre_survey.kernel }}.
     power_cycle_returned_upgrade_unconsumed: >-
       No power-cycle needed while the host answers: it answered after the reboot but failed verification, and a one-shot is STILL PENDING:
       GRUB did not consume it, so it does not read the environment block Linux writes and the fallback is NOT proven. While that holds, a
@@ -297,7 +300,7 @@
     # GRUB's FIRST menu entry as this run leaves it: what GRUB boots (on this boot and on every power-cycle) when it does not read the environment
     # block. An upgrade's update-grub put the NEW kernel there; a rehearsal installs nothing, so the survey's entry 0 holds. NOT boot.default_kernel
     # (the saved default, which a GRUB that ignores the environment block does not use).
-    first_entry_kernel: "{{ ((((post_survey | default({})).boot | default({})).entry0_kernel | default('')) or ((target_kernel | default('')) if os_mode == 'upgrade' else '') or (pre_survey.boot.entry0_kernel | default('unknown', true))) }}"
+    first_entry_kernel: "{{ ((((post_survey | default({})).boot | default({})).entry0_kernel | default('')) or ((rescue_disarm | default({})).entry0_kernel | default('')) or ((target_kernel | default('')) if os_mode == 'upgrade' else '') or (pre_survey.boot.entry0_kernel | default('unknown', true))) }}"
     kernel_noun: "{{ 'the new kernel' if os_mode == 'upgrade' else 'the rehearsal boot (the running kernel again)' }}"
     power_cycle_none: "No power-cycle needed: nothing was rebooted (the boot id is unchanged)."
     power_cycle_boot_unknown: >-
@@ -1139,6 +1142,7 @@
           freeze: "{{ (after_f.freeze | default({})) if ((after_f.freeze | default({})) | length > 0) else freeze_json }}"
           error: "{{ freeze_json.error | default('') }}"
           drifted_after: "{{ (after_f.freeze | default({})).drifted | default([]) }}"
+          drifted_at_thaw: "{{ (freeze_json.drifted_at_thaw | default([])) if os_mode == 'thaw' else [] }}"
           power_cycle: "No power-cycle needed: nothing was rebooted."
       when: os_mode in ['freeze', 'thaw']
 

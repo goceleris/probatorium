@@ -1597,6 +1597,13 @@ class FreezeThaw(Base):
     """mode=freeze / mode=thaw: the platform stays FIXED during the evidence campaign. These hosts update themselves (unattended-upgrades
     installed the kernel -38 on its own) and a 131 h benchmark must not see a package or a service change under it."""
 
+    def setUp(self):
+        super().setUp()
+        # a PINNED host (grub's saved default is the running kernel): a freeze is refused otherwise (r2 F7); the Revision-2 order freezes after the upgrades
+        self.h.w("/boot/grub/grub.cfg", cfg_text("grub-arm64-efi.cfg"))
+        self.h.state["grubenv"]["saved_entry"] = ID_31
+        self.h.save()
+
     def svc(self, unit):
         st = self.h.load()["services"]
         return st.get("is-active " + unit, "inactive"), st.get("is-enabled " + unit, "disabled")
@@ -1649,7 +1656,7 @@ class FreezeThaw(Base):
         self.assertRegex(p["dpkg_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(p["packages"], len(self.h.load()["packages"]))
         # no package, no kernel, no grub: a freeze changes timers and one needrestart file
-        self.assertFalse([c for c in self.h.calls() if c.startswith(("apt-get -y", "grub-set-default", "grub-reboot", "update-grub", "dpkg --configure", "apt-mark hold", "apt-mark unhold"))])
+        self.assertFalse([c for c in self.h.calls() if c.startswith(("apt-get -y", "update-grub", "dpkg --configure", "apt-mark hold", "apt-mark unhold")) or (c.startswith("grub-") and c != "grub-editenv list")])
 
     def test_the_platform_identity_names_the_packages_and_changes_with_them(self):
         a = self.freeze("7")
@@ -1923,12 +1930,22 @@ class FreezeThaw(Base):
 
     def test_a_grub_default_that_changes_under_a_freeze_is_drift(self):
         self.frozen_survey()
-        self.h.state["next_grub_cfg"] = os.path.join(FIXTURES, "grub-arm64-efi.cfg")  # what update-grub generates once pinned
-        self.h.save()
-        self.assertEqual(self.h.run("pin-grub", "--running", "7.0.0-31-generic", "--run-id", "5").returncode, 0)  # the saved default was -38 (entry 0)
-        self.h.load()
+        self.h.state["grubenv"]["saved_entry"] = ID_38  # a pin moved, or a person ran grub-set-default
         d = self.run_ok("survey")["freeze"]["drifted"]
-        self.assertIn("grub saved default kernel changed: recorded 7.0.0-38-generic, now 7.0.0-31-generic", d)
+        self.assertEqual(d, ["grub saved default kernel changed: recorded 7.0.0-31-generic, now 7.0.0-38-generic"])
+
+    def test_a_freeze_is_refused_while_grubs_saved_default_is_not_the_running_kernel(self):
+        # r2 F7: any reboot boots the saved default, so the platform the freeze would record is not the one that comes back
+        self.h.w("/boot/grub/grub.cfg", unpinned_cfg(cfg_text("grub-arm64-efi.cfg")))  # GRUB_DEFAULT=0: the default is entry 0, -38
+        self.h.state["grubenv"]["saved_entry"] = ""
+        r = self.freeze()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("grub's saved default kernel is '7.0.0-38-generic' and the host runs '7.0.0-31-generic'", r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))
+        self.assertEqual(self.sysctl_calls("stop", "disable"), [])
+        # a thaw does not care
+        self.assertEqual(self.thaw().returncode, 1)  # nothing to thaw, for its own reason
+        self.assertIn("nothing to thaw", self.h.run("thaw", "--run-id", "9").stdout)
 
     def test_an_old_record_without_a_platform_is_not_compared(self):
         self.frozen_survey()
@@ -2070,6 +2087,80 @@ class FreezeThaw(Base):
                 self.assertEqual(len(calls), 2)
         finally:
             os.fsync = real
+
+    # ---- r2
+    def test_a_stop_that_timed_out_but_took_effect_is_still_undone_by_the_thaw(self):  # F1
+        r = self.freeze(systemctl_apply_fail=["stop unattended-upgrades.service"])
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.svc("unattended-upgrades.service"), ("inactive", "disabled"))  # the stop WAS applied
+        rec = self.record()
+        self.assertEqual(rec["units"]["unattended-upgrades.service"]["attempted"], ["stopped"])
+        self.assertEqual(rec["units"]["unattended-upgrades.service"]["changes"], ["disabled"])
+        self.h.load()
+        self.h.state["systemctl_apply_fail"] = []
+        self.h.save()
+        t = self.thaw()
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        for u in FREEZE_UNITS:
+            self.assertEqual(self.svc(u), ("active", "enabled"), u)
+
+    def test_a_disable_that_timed_out_but_took_effect_is_still_undone_by_the_thaw(self):  # F1
+        r = self.freeze(systemctl_apply_fail=["disable apt-daily.timer"])
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.record()["units"]["apt-daily.timer"]["attempted"], ["disabled"])
+        self.h.load()
+        self.h.state["systemctl_apply_fail"] = []
+        self.h.save()
+        self.assertEqual(self.thaw().returncode, 0)
+        self.assertEqual(self.svc("apt-daily.timer"), ("active", "enabled"))
+
+    def test_the_thaw_records_what_moved_since_the_freeze_before_it_changes_anything(self):  # F2
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"
+        self.h.save()
+        t = self.thaw()
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        d = json.loads(t.stdout)["drifted_at_thaw"]
+        self.assertEqual(len(d), 1)
+        self.assertTrue(d[0].startswith("package list (sha256) changed"))
+        arch = json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"))
+        self.assertEqual(arch["drifted_at_thaw"], d)
+
+    def test_a_thaw_of_a_platform_that_did_not_move_says_so(self):  # F2
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        t = self.thaw()
+        self.assertEqual(json.loads(t.stdout)["drifted_at_thaw"], [])
+
+    def test_the_message_for_an_unreadable_record_names_the_command_that_clears_it(self):  # F3
+        self.h.w(FREEZE_RECORD, "{ not json")
+        r = self.thaw()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("rm %s %s " % (NR_DROPIN, FREEZE_RECORD), (r.stdout + r.stderr).replace("\\n", " "))
+        self.assertIn("an upgrade and a new freeze are refused", r.stdout + r.stderr)
+
+    def test_a_needrestart_file_of_ours_that_the_record_does_not_know_is_removed_by_the_thaw(self):  # F4
+        r = self.freeze(systemctl_kill_nth={"is-active apt-daily.timer": 2})
+        self.assertNotEqual(r.returncode, 0)
+        rec = self.record()
+        rec["needrestart"]["dropin_written"] = False  # the kill came between the write of the file and the save of the record
+        self.h.w(FREEZE_RECORD, json.dumps(rec))
+        self.assertTrue(os.path.exists(self.h.root + NR_DROPIN))
+        self.h.load()
+        self.h.state["systemctl_kill_nth"] = {}
+        self.h.save()
+        self.assertEqual(self.thaw().returncode, 0)
+        self.assertFalse(os.path.exists(self.h.root + NR_DROPIN))
+
+    def test_a_needrestart_file_of_somebody_else_at_that_path_is_not_removed_without_a_record(self):  # F4
+        self.assertEqual(self.freeze().returncode, 0)
+        rec = self.record()
+        rec["needrestart"]["dropin_written"] = False
+        self.h.w(FREEZE_RECORD, json.dumps(rec))
+        self.h.w(NR_DROPIN, "$nrconf{restart} = 'a'; # a person's own\n")
+        self.assertEqual(self.thaw().returncode, 0)
+        self.assertIn("a person's own", open(self.h.root + NR_DROPIN).read())
 
     def test_a_unit_the_freeze_found_off_and_left_alone_is_drift_too_when_it_comes_back(self):
         self.set_svc("apt-daily-upgrade.timer", "inactive", "disabled")  # a person had switched it off: the freeze leaves it

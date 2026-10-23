@@ -208,6 +208,8 @@ if name == "grub-editenv":
         for k in args[2:]:
             st["grubenv"][k] = ""
         save(); sys.exit(0)
+    if args[-1:] == ["list"] and st.get("grubenv_list_rc"):
+        sys.stderr.write("grub-editenv: error: cannot open grubenv (test)\n"); sys.exit(st["grubenv_list_rc"])
     if args[-1:] == ["list"]:
         out("".join("%s=%s\n" % kv for kv in st["grubenv"].items() if kv[1] != "")); sys.exit(0)
 if name == "grub-set-default":
@@ -260,6 +262,9 @@ if name == "systemctl":
             os.kill(os.getppid(), 9)  # the freeze is killed here (a runner lost, a power loss): the verb is not applied
             time.sleep(1)
             sys.exit(1)
+        if args[0] + " " + unit in st.get("systemctl_apply_fail", []):
+            st["services"][key[0] + " " + unit] = key[1]; save()  # the verb takes effect and systemctl reports failure (a timeout: rc 124)
+            sys.stderr.write("Job for %s timed out (test)\n" % unit); sys.exit(124)
         if args[0] + " " + unit in st.get("systemctl_noop", []):
             sys.exit(0)  # reports success and changes nothing
         if st.get("services", {}).get(key[0] + " " + unit) == "masked" and args[0] == "enable":
