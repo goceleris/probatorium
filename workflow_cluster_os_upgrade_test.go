@@ -1122,19 +1122,23 @@ func TestClusterOSUpgradeTheConsoleTokenIsOnlyEverCompared(t *testing.T) {
 		osScript:   {nil, 0},
 		filepath.Join(".github", "scripts", "os-upgrade-summary.sh"): {[]string{`*-CONSOLE) echo "- confirmation: **CONSOLE ATTESTED**:`}, 1},
 	}
+	jinjaComment := regexp.MustCompile(`\{#.*?#\}`)
+	trailingComment := regexp.MustCompile(`\s#(\s.*)?$`)
+	// the ways to build the word without writing it whole: 'console' | upper, 'x'.upper(), 'CONS' ~ 'OLE'
+	assembled := regexp.MustCompile(`(?i)['"]console['"]|\|\s*(upper|capitalize|title|swapcase)\b|['"]\s*\.\s*upper\(|['"][-a-z]*cons['"]|['"]ole[-a-z]*['"]`)
 	for file, ok := range allowed {
 		n := 0
-		for _, l := range strings.Split(stripComments(mustRead(t, file)), "\n") {
-			if !strings.Contains(l, "CONSOLE") {
-				continue
-			}
-			n++
+		for _, raw := range strings.Split(stripComments(mustRead(t, file)), "\n") {
+			l := trailingComment.ReplaceAllString(jinjaComment.ReplaceAllString(raw, ""), "") // a trailing or Jinja comment may talk about the token
 			rest := l
 			for _, fr := range ok.fragments {
 				rest = strings.ReplaceAll(rest, fr, "")
 			}
-			if strings.Contains(rest, "CONSOLE") {
-				t.Errorf("%s: a line carries the word CONSOLE outside the comparisons and the approver's display (a message, a concatenation, a format, a print): %s", file, strings.TrimSpace(l))
+			if strings.Contains(rest, "CONSOLE") || assembled.MatchString(rest) {
+				t.Errorf("%s: a line carries the word CONSOLE, or builds it, outside the comparisons and the approver's display (a message, a concatenation, a format, a case filter, a print): %s", file, strings.TrimSpace(l))
+			}
+			if strings.Contains(l, "CONSOLE") {
+				n++
 			}
 		}
 		if n != ok.lines {

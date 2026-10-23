@@ -237,7 +237,9 @@ if [ "$mode" = freeze ] || [ "$mode" = thaw ]; then
 			"- needrestart: installed \($f.needrestart.installed); restart mode before `\($f.needrestart.mode_before)`; list-only drop-in written: \($f.needrestart.dropin_written)",
 			"- **platform** (what the release results can cite): kernel `\($f.platform.kernel // "?")`, \($f.platform.os // "?"), \($f.platform.packages // "?") packages, sha256 of the package list `\($f.platform.dpkg_sha256 // "?")`, holds: \($f.platform.held // [] | join(", ") | if . == "" then "none" else . end)" end)' "$d/result.json" 2> /dev/null
 		if [ "$mode" = thaw ]; then
-			jq -r 'if (.drifted_at_thaw // []) | length == 0 then "- **platform at thaw time: DID NOT MOVE** since the freeze (running kernel, grub saved default, package list SHA-256, holds, units): the end-of-campaign proof" else "- **PLATFORM MOVED since the freeze** (found at thaw time): \(.drifted_at_thaw | join("; ")). The results of the campaign do not name this host as frozen" end' "$d/result.json" 2> /dev/null
+			jq -r 'if (.freeze_ok // false) | not then "- **platform drift at thaw time: NOT ESTABLISHED**: the thaw did not complete, and the completed thaw is the one that establishes it. Found before this attempt changed anything: \(.drifted_at_thaw // [] | join("; ") | if . == "" then "nothing" else . end)"
+			elif (.drift_proof // false) | not then "- **platform drift at thaw time: NOT ESTABLISHED**: the freeze record has no recorded platform to compare with (the freeze did not complete, or it is an old record)"
+			elif (.drifted_at_thaw // []) | length == 0 then "- **platform at thaw time: DID NOT MOVE** since the freeze (running kernel, grub saved default, package list SHA-256, holds, units): the end-of-campaign proof" else "- **PLATFORM MOVED since the freeze** (found at thaw time): \(.drifted_at_thaw | join("; ")). The results of the campaign do not name this host as frozen" end' "$d/result.json" 2> /dev/null
 		else
 			jq -r '"- drifted after: \(.drifted_after // [] | join("; ") | if . == "" then "nothing" else . end)"' "$d/result.json" 2> /dev/null
 		fi
