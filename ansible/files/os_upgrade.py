@@ -1932,6 +1932,8 @@ def cmd_thaw(a):
     if "drifted_at_thaw" not in rec:
         rec["drifted_at_thaw"] = freeze_state().get("drifted", [])
         rec["drift_proof"] = rec.get("status") == "frozen" and bool(rec.get("platform"))
+        rec["drift_checked_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # a retry days later reports THIS check, and the record says when it was made
+        rec["drift_checked_by_run"] = a.run_id
         save_freeze(rec)
     drifted_at_thaw = rec["drifted_at_thaw"]
     errors, done = [], list(rec.get("restored", []))  # what every attempt restored, kept in the record as it goes
@@ -1983,7 +1985,8 @@ def cmd_thaw(a):
             errors.append("needrestart restart mode is %r, was %r before the freeze" % (needrestart_mode(), nr.get("mode_before", "")))
     if errors:
         fail("the thaw did not complete (%s); the freeze record is kept: run mode=thaw again" % "; ".join(errors),
-             drifted_at_thaw=drifted_at_thaw, drift_proof=rec.get("drift_proof", False))
+             drifted_at_thaw=drifted_at_thaw, drift_proof=rec.get("drift_proof", False),
+             drift_checked_utc=rec.get("drift_checked_utc", ""), drift_checked_by_run=rec.get("drift_checked_by_run", ""))
     arch = "%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x"))
     prev = None
     if os.path.exists(p(arch)):

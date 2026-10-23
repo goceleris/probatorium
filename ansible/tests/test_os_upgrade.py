@@ -2371,6 +2371,23 @@ class FreezeThaw(Base):
         bad = [c for c in self.h.calls()[seen:] if c.startswith(("apt", "dpkg", "update-", "dkms", "grub-")) and not c.startswith(reads)]
         self.assertEqual(bad, [])
 
+    def test_the_drift_check_says_when_and_by_which_run_it_was_made(self):  # r4 8
+        self.assertEqual(self.freeze().returncode, 0)
+        self.set_svc("apt-daily.timer", "inactive", "masked")
+        r = self.thaw("8")
+        self.assertEqual(r.returncode, 1)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["drift_checked_by_run"], "8")
+        self.assertRegex(out["drift_checked_utc"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        checked = self.record()["drift_checked_utc"]
+        self.assertEqual(self.record()["drift_checked_by_run"], "8")
+        self.set_svc("apt-daily.timer", "inactive", "disabled")
+        time.sleep(1.1)
+        t = json.loads(self.thaw("9").stdout)
+        self.assertEqual((t["drift_checked_by_run"], t["drift_checked_utc"]), ("8", checked))  # the retry reports the first attempt's check, not its own
+        a = self.archive()
+        self.assertEqual((a["drift_checked_by_run"], a["drift_checked_utc"], a["thawed_by_run"]), ("8", checked, "9"))
+
     def test_the_message_for_an_unreadable_record_names_the_command_that_clears_it(self):  # F3
         self.h.w(FREEZE_RECORD, "{ not json")
         r = self.thaw()
