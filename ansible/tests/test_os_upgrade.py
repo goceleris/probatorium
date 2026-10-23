@@ -2251,6 +2251,49 @@ class FreezeThaw(Base):
         t = self.thaw()
         self.assertEqual(json.loads(t.stdout)["drifted_at_thaw"], [])
 
+    # ---- r4
+    def archive(self, run="7"):
+        return json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze-%s-thawed.json" % run))
+
+    def test_a_thaw_killed_in_the_middle_of_its_restores_is_retried_with_the_drift_of_the_first_attempt(self):  # r4 3 (kills a drift persist moved after the restores)
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"  # a real drift, before the thaw
+        self.h.save()
+        self.h.load()
+        self.h.state["systemctl_kill"] = ["enable apt-daily.timer"]
+        self.h.save()
+        r = self.thaw()
+        self.assertNotEqual(r.returncode, 0)  # killed, with the first unit back on and the second not
+        self.assertEqual(self.svc("apt-daily-upgrade.timer"), ("active", "enabled"))
+        self.assertEqual(self.svc("apt-daily.timer"), ("inactive", "disabled"))
+        rec = self.record()
+        self.assertEqual(len(rec["drifted_at_thaw"]), 1)  # saved by the first attempt BEFORE its first restore
+        self.assertTrue(rec["drifted_at_thaw"][0].startswith("package list (sha256) changed"))
+        self.h.load()
+        self.h.state["systemctl_kill"] = []
+        self.h.save()
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        out = json.loads(t.stdout)
+        self.assertEqual(out["drifted_at_thaw"], rec["drifted_at_thaw"])  # not "apt-daily-upgrade.timer=active/enabled", which the first attempt itself put back
+        self.assertEqual(self.archive()["drifted_at_thaw"], rec["drifted_at_thaw"])
+
+    def test_a_thaw_killed_right_after_its_first_restore_on_a_platform_that_did_not_move_still_says_so(self):  # r4 3 (the restore took effect and the kill came before it was recorded)
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["systemctl_kill_after"] = ["enable apt-daily-upgrade.timer"]
+        self.h.save()
+        self.assertNotEqual(self.thaw().returncode, 0)
+        self.assertEqual(self.svc("apt-daily-upgrade.timer")[1], "enabled")
+        self.assertEqual(self.record()["drifted_at_thaw"], [])  # saved before the first restore, not with it
+        self.h.load()
+        self.h.state["systemctl_kill_after"] = []
+        self.h.save()
+        out = json.loads(self.thaw("9").stdout)
+        self.assertEqual(out["drifted_at_thaw"], [])
+        self.assertTrue(out["drift_proof"])
+
     def test_the_message_for_an_unreadable_record_names_the_command_that_clears_it(self):  # F3
         self.h.w(FREEZE_RECORD, "{ not json")
         r = self.thaw()
