@@ -2252,6 +2252,8 @@ class FreezeThaw(Base):
         self.assertEqual(json.loads(t.stdout)["drifted_at_thaw"], [])
 
     # ---- r4
+    UNITS_RESTORED_BEFORE_THE_KILL = ["enable apt-daily-upgrade.timer", "start apt-daily-upgrade.timer"]  # the thaw goes through the units in sorted order
+
     def archive(self, run="7"):
         return json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze-%s-thawed.json" % run))
 
@@ -2270,6 +2272,7 @@ class FreezeThaw(Base):
         rec = self.record()
         self.assertEqual(len(rec["drifted_at_thaw"]), 1)  # saved by the first attempt BEFORE its first restore
         self.assertTrue(rec["drifted_at_thaw"][0].startswith("package list (sha256) changed"))
+        self.assertEqual(rec["restored"], self.UNITS_RESTORED_BEFORE_THE_KILL)
         self.h.load()
         self.h.state["systemctl_kill"] = []
         self.h.save()
@@ -2293,6 +2296,70 @@ class FreezeThaw(Base):
         out = json.loads(self.thaw("9").stdout)
         self.assertEqual(out["drifted_at_thaw"], [])
         self.assertTrue(out["drift_proof"])
+
+    def test_the_archive_lists_what_every_attempt_restored(self):  # r4 4
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["systemctl_kill"] = ["enable apt-daily.timer"]
+        self.h.save()
+        self.assertNotEqual(self.thaw().returncode, 0)
+        self.h.load()
+        self.h.state["systemctl_kill"] = []
+        self.h.save()
+        seen = len(self.h.calls())
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        second = [" ".join(c.split(" ")[1:]) for c in self.sysctl_calls_since(seen, "start", "enable")]
+        self.assertNotIn("enable apt-daily-upgrade.timer", second)  # the first attempt's work is not repeated...
+        want = self.UNITS_RESTORED_BEFORE_THE_KILL + second + ["removed " + NR_DROPIN]
+        self.assertEqual(self.archive()["restored"], want)  # ...and is not lost from the archive
+        self.assertEqual(json.loads(t.stdout)["restored"], want)
+        self.assertEqual((self.archive()["thawed_by_run"]), "9")
+
+    def test_the_archive_lists_what_a_failed_attempt_restored_too(self):  # r4 4
+        self.assertEqual(self.freeze().returncode, 0)
+        self.set_svc("apt-daily.timer", "inactive", "masked")
+        self.assertEqual(self.thaw().returncode, 1)
+        self.assertEqual(self.record()["restored"][:2], self.UNITS_RESTORED_BEFORE_THE_KILL)
+        self.set_svc("apt-daily.timer", "inactive", "disabled")
+        self.assertEqual(self.thaw("9").returncode, 0)
+        r = self.archive()["restored"]
+        self.assertEqual(r[:2], self.UNITS_RESTORED_BEFORE_THE_KILL)
+        self.assertIn("enable apt-daily.timer", r)
+        self.assertEqual(r.count("enable apt-daily-upgrade.timer"), 1)  # what the first attempt put back is not put back again
+
+    def test_a_retry_after_a_complete_archive_keeps_the_archive_as_it_is(self):  # r4 4
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.thaw().returncode, 0)
+        arch_path = self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"
+        first = open(arch_path).read()
+        rec = json.loads(first)  # killed after the archive and before the removal of the record: the record is the one the first attempt saved
+        for k in ("thawed_utc", "thawed_by_run"):
+            rec.pop(k)
+        rec["status"] = "frozen"
+        self.h.w(FREEZE_RECORD, json.dumps(rec))
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        self.assertEqual(open(arch_path).read(), first)  # not rewritten: the run that thawed, the time and what was restored are the first attempt's
+        self.assertEqual(json.loads(t.stdout)["thawed_by_run"], "8")
+        self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))
+
+    def test_the_archive_of_an_earlier_freeze_with_the_same_run_id_is_not_taken_for_this_one(self):  # r4 4 (a re-run of the workflow freezes again under the same run id)
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.thaw("8").returncode, 0)
+        time.sleep(1.1)
+        self.assertEqual(self.freeze().returncode, 0)  # the same run id, a new freeze
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        self.assertEqual(self.archive()["thawed_by_run"], "9")
+        self.assertEqual(json.loads(t.stdout)["thawed_by_run"], "9")
+
+    def test_a_corrupt_archive_does_not_stop_a_retry_from_writing_a_new_one(self):
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.w("/var/lib/celeris-os-upgrade/freeze-7-thawed.json", "[1, 2]")  # valid JSON, not a record
+        t = self.thaw()
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        self.assertEqual(self.archive()["thawed_by_run"], "8")
 
     def test_the_message_for_an_unreadable_record_names_the_command_that_clears_it(self):  # F3
         self.h.w(FREEZE_RECORD, "{ not json")

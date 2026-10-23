@@ -1818,6 +1818,8 @@ def last_thaw():
                 r = json.load(fh)
         except (OSError, ValueError):
             continue
+        if not isinstance(r, dict):
+            continue
         if r.get("thawed_utc", "") >= best.get("thawed_utc", ""):
             best = r
     return {k: best[k] for k in ("run_id", "thawed_by_run", "thawed_utc", "drifted_at_thaw") if k in best}
@@ -1933,7 +1935,13 @@ def cmd_thaw(a):
         rec["drift_proof"] = rec.get("status") == "frozen" and bool(rec.get("platform"))
         save_freeze(rec)
     drifted_at_thaw = rec["drifted_at_thaw"]
-    errors, done = [], []
+    errors, done = [], list(rec.get("restored", []))  # what every attempt restored, kept in the record as it goes
+
+    def restored(what):
+        done.append(what)
+        rec["restored"] = done
+        save_freeze(rec)
+
     for u, info in sorted(rec.get("units", {}).items()):
         want = info.get("before", {})
         # what the freeze recorded it changed, plus the change it was about to make when it died (it may or may not have happened); each is undone
@@ -1957,7 +1965,7 @@ def cmd_thaw(a):
             if rc != 0:
                 errors.append("%s: %s" % (" ".join(argv), (out + err).strip()[-160:]))
             else:
-                done.append(" ".join(argv[1:]))
+                restored(" ".join(argv[1:]))
         now = unit_state(u)
         if effective and (now["active"] != want.get("active") or now["enabled"] != want.get("enabled")) and now["enabled"] != "masked":
             errors.append("%s is %s/%s, was %s/%s before the freeze" % (u, now["active"], now["enabled"], want.get("active"), want.get("enabled")))
@@ -1967,7 +1975,7 @@ def cmd_thaw(a):
         try:
             if rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip():
                 os.remove(p(NEEDRESTART_DROPIN))
-                done.append("removed " + NEEDRESTART_DROPIN)
+                restored("removed " + NEEDRESTART_DROPIN)
             elif os.path.exists(p(NEEDRESTART_DROPIN)):
                 errors.append("%s is no longer the file the freeze wrote: left alone" % NEEDRESTART_DROPIN)
         except OSError as x:
@@ -1977,13 +1985,29 @@ def cmd_thaw(a):
     if errors:
         fail("the thaw did not complete (%s); the freeze record is kept: run mode=thaw again" % "; ".join(errors),
              drifted_at_thaw=drifted_at_thaw, drift_proof=rec.get("drift_proof", False))
-    rec["status"] = "thawed"
-    rec["thawed_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    rec["thawed_by_run"] = a.run_id
-    rec["restored"] = done
-    write("%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x")), json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
+    arch = "%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x"))
+    prev = None
+    if os.path.exists(p(arch)):
+        # an earlier attempt finished, wrote the archive and died before it removed the record: that archive is the complete one (what every attempt
+        # restored, who thawed and when); this retry only removes the record
+        try:
+            with open(p(arch)) as fh:
+                prev = json.load(fh)
+        except (OSError, ValueError):
+            prev = None
+        if not isinstance(prev, dict) or prev.get("utc") != rec.get("utc"):
+            prev = None  # not an archive, or the archive of an EARLIER freeze that had the same run id (a re-run of the workflow): this thaw writes its own
+    if prev is None:
+        rec["status"] = "thawed"
+        rec["thawed_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rec["thawed_by_run"] = a.run_id
+        rec["restored"] = done
+        write(arch, json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
+        out = rec
+    else:
+        out = prev
     os.remove(p(FREEZE_RECORD))
-    emit(dict(rec, ok=True))
+    emit(dict(out, ok=True))
 
 
 # ---------------------------------------------------------------------------------------------- main
