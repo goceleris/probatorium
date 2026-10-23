@@ -454,6 +454,13 @@ class Judge(unittest.TestCase):
              lambda c: post(c, kernel="7.0.0-31-generic"))
         case("post_other_kernel", {"post": "runs 7.0.0-38-generic, not the intended 7.0.0-40-generic"}, lambda c: post(c, kernel="7.0.0-38-generic"))
         case("post_crash", {"post": "new crash dump(s) in /var/crash: 20261022"}, lambda c: post(c, crash=["20261022"]))
+        # kdump-tools' bookkeeping (kdump_lock, kexec_cmd) is not a crash dump: msa2-client (run 40035368440) had an empty /var/crash before the reboot and exactly these
+        # two after it, and was failed for it. A real dump next to them is still named, alone (test_kdump_bookkeeping_is_not_a_crash_dump checks the exact text).
+        case("post_kdump_bookkeeping_only", {}, lambda c: (c["pre_target"].update(crash=[]), post(c, crash=["kdump_lock", "kexec_cmd"])))
+        case("post_kdump_bookkeeping_and_a_dump", {"post": "new crash dump(s) in /var/crash: 20261022"},
+             lambda c: (c["pre_target"].update(crash=[]), post(c, crash=["kdump_lock", "kexec_cmd", "20261022"])))
+        case("post_kdump_lookalike_is_a_dump", {"post": "new crash dump(s) in /var/crash: kdump_lock.old"},
+             lambda c: (c["pre_target"].update(crash=[]), post(c, crash=["kdump_lock.old"])))
         for k in ("tailscaled_active", "apcupsd_active", "resume_check_enabled", "power_event_installed", "tmpfiles_conf", "quiesce_hook"):
             case("post_regressed_" + k, {"post": "prerequisite regressed: " + k},
                  (lambda k: lambda c: post(c, prereq=dict(json.loads(c["post_raw"]["stdout"])["prereq"], **{k: False})))(k))
@@ -512,6 +519,13 @@ class Judge(unittest.TestCase):
         for name, out in self.out.items():
             for k, v in out.items():
                 self.assertNotRegex(v, r"REHEARSE-\S*CONSOLE", "%s: %s" % (name, k))
+
+    def test_kdump_bookkeeping_is_not_a_crash_dump(self):
+        self.assertEqual(self.out["post_kdump_bookkeeping_only"]["post"], "")
+        # a real dump beside the bookkeeping is the ONLY thing named
+        self.assertEqual(self.out["post_kdump_bookkeeping_and_a_dump"]["post"], "new crash dump(s) in /var/crash: 20261022")
+        self.assertEqual(self.out["post_crash"]["post"], "new crash dump(s) in /var/crash: 20261022")
+        self.assertEqual(self.out["post_kdump_lookalike_is_a_dump"]["post"], "new crash dump(s) in /var/crash: kdump_lock.old")
 
     def test_a_healthy_host_has_nothing_to_report(self):
         self.assertEqual(self.out["healthy"], {"refusals": "", "plan": "", "prereboot": "", "post": "", "maint": ""})

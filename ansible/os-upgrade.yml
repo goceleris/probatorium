@@ -303,6 +303,9 @@
     first_entry_kernel: "{{ ((((post_survey | default({})).boot | default({})).entry0_kernel | default('')) or ((rescue_disarm | default({})).entry0_kernel | default('')) or ((target_kernel | default('')) if os_mode == 'upgrade' else '') or (pre_survey.boot.entry0_kernel | default('unknown', true))) }}"
     kernel_noun: "{{ 'the new kernel' if os_mode == 'upgrade' else 'the rehearsal boot (the running kernel again)' }}"
     power_cycle_none: "No power-cycle needed: nothing was rebooted (the boot id is unchanged)."
+    # The host DID reboot (its boot id changed: the judge proved it) and passed verification: "nothing was rebooted" would be false (measured: msa2-server run
+    # 40033187774, msr1 run 40034486973 printed it with boot ids that differed and an uptime of 27-51 s). power_cycle_none stays for the runs whose boot id is unchanged.
+    power_cycle_rebooted_ok: "No power-cycle needed: the host rebooted (the boot id changed) and came back on the intended kernel, verified."
     power_cycle_boot_unknown: >-
       No power-cycle needed while the host answers, but WHETHER IT REBOOTED IS UNKNOWN: it answered the disarm and not the read of its boot id.
       Dispatch a survey before anything else: kernel, boot.next_entry and boot.saved_entry say what happened.
@@ -894,7 +897,7 @@
           kernel_after: "{{ post_snap.kernel | default('') }}"
           default_kernel: "{{ pre_survey.kernel }}"
           problems: "{{ (post_problems_str | trim).split(' ;; ') if (post_problems_str | trim | length > 0) else [] }}"
-          power_cycle: "{{ power_cycle_returned if (post_problems_str | trim | length > 0) else power_cycle_none }}"
+          power_cycle: "{{ power_cycle_returned if (post_problems_str | trim | length > 0) else power_cycle_rebooted_ok }}"
 
     - name: Post | judge
       ansible.builtin.fail:
@@ -931,7 +934,7 @@
               kernel_after: "{{ post_snap.kernel | default('') }}"
               default_kernel: "{{ target_kernel }}"
               problems: []
-              power_cycle: "{{ power_cycle_none }}"
+              power_cycle: "{{ power_cycle_rebooted_ok }}"
               marker: "{{ perm_raw.stdout | from_json }}"
 
         - name: Target | record the phase
@@ -962,7 +965,7 @@
               kernel_after: "{{ post_snap.kernel | default('') }}"
               default_kernel: "{{ pre_survey.kernel }}"
               problems: []
-              power_cycle: "{{ power_cycle_none }}"
+              power_cycle: "{{ power_cycle_rebooted_ok }}"
               rehearsal: "{{ rehearsal_raw.stdout | from_json }}"
 
         - name: Target | record the phase
