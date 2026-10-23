@@ -961,10 +961,18 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 		// goroutine that closes the pipe) for good, even after the process
 		// was reaped, and a refapp that wrote enough more stalled in
 		// write(2) (probatorium#425). Reading to EOF ends with the process:
-		// the driver closes the pipe once both of its streams are done,
-		// after a grace if a descendant keeps them open. Deferred after
-		// close(lineCh), so it runs first.
-		defer func() { _, _ = io.Copy(io.Discard, stream) }()
+		// the driver closes the pipe once both of its streams are done. If
+		// a descendant keeps them open after the exit, the local driver
+		// force-closes its read ends after pipeOrphanGrace, but only once
+		// something has called Wait (the grace starts at the reap), and the
+		// SSH driver has no grace at all: there it ends when the session
+		// does. Deferred after close(lineCh), so it runs first.
+		defer func() {
+			// The scan is over; do not hold its buffer (up to 1 MiB) for
+			// as long as the refapp lives.
+			scanner = nil
+			_, _ = io.Copy(io.Discard, stream)
+		}()
 		for scanner.Scan() {
 			select {
 			case lineCh <- scanner.Text():
