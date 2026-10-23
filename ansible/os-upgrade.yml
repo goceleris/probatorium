@@ -1142,7 +1142,9 @@
           freeze: "{{ (after_f.freeze | default({})) if ((after_f.freeze | default({})) | length > 0) else freeze_json }}"
           error: "{{ freeze_json.error | default('') }}"
           drifted_after: "{{ (after_f.freeze | default({})).drifted | default([]) }}"
-          drifted_at_thaw: "{{ (freeze_json.drifted_at_thaw | default([])) if os_mode == 'thaw' else [] }}"
+          # from the tool's answer, which a FAILED thaw gives too; else from the kept record (its first attempt stored the drift before it changed anything)
+          drifted_at_thaw: "{{ (freeze_json.drifted_at_thaw | default((after_f.freeze | default({})).drifted_at_thaw | default([]))) if os_mode == 'thaw' else [] }}"
+          drift_proof: "{{ (freeze_json.drift_proof | default((after_f.freeze | default({})).drift_proof | default(false))) if os_mode == 'thaw' else false }}"
           power_cycle: "No power-cycle needed: nothing was rebooted."
       when: os_mode in ['freeze', 'thaw']
 

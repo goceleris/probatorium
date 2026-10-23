@@ -2127,6 +2127,96 @@ class FreezeThaw(Base):
         arch = json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"))
         self.assertEqual(arch["drifted_at_thaw"], d)
 
+    # ---- r3
+    def test_a_failed_thaw_carries_the_drift_it_found_before_it_changed_anything(self):  # r3 1a
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"
+        self.h.save()
+        self.set_svc("apt-daily.timer", "inactive", "masked")
+        r = self.thaw()
+        self.assertEqual(r.returncode, 1)
+        out = json.loads(r.stdout)
+        self.assertFalse(out["ok"])
+        self.assertEqual(len(out["drifted_at_thaw"]), 1)
+        self.assertTrue(out["drifted_at_thaw"][0].startswith("package list (sha256) changed"))
+        self.assertTrue(out["drift_proof"])
+
+    def test_a_retried_thaw_reuses_the_drift_of_the_first_attempt_and_not_what_the_first_attempt_restored(self):  # r3 1b
+        self.assertEqual(self.freeze().returncode, 0)
+        self.set_svc("apt-daily.timer", "inactive", "masked")
+        self.assertEqual(self.thaw().returncode, 1)  # the other units are back: they now read as "on"
+        self.assertEqual(self.record()["drifted_at_thaw"], [])  # stored by the first attempt, before it changed anything
+        self.set_svc("apt-daily.timer", "inactive", "disabled")
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        self.assertEqual(json.loads(t.stdout)["drifted_at_thaw"], [])
+        arch = json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"))
+        self.assertEqual(arch["drifted_at_thaw"], [])
+
+    def test_a_retry_does_not_overwrite_the_archive_with_drift_the_thaw_itself_caused(self):  # r3 1c
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.thaw().returncode, 0)
+        arch_path = self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"
+        first = open(arch_path).read()
+        # killed between the archive and the removal of the record: the record is still there, as the first attempt saved it
+        rec = json.loads(first)
+        for k in ("thawed_utc", "thawed_by_run", "restored"):
+            rec.pop(k)
+        rec["status"] = "frozen"
+        self.h.w(FREEZE_RECORD, json.dumps(rec))
+        self.h.load()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"  # and the units are on: both would read as drift now
+        self.h.save()
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        again = json.load(open(arch_path))
+        self.assertEqual(again["drifted_at_thaw"], [])
+        self.assertEqual(json.loads(first)["drifted_at_thaw"], [])
+
+    def test_a_record_without_a_platform_gives_no_drift_proof(self):  # r3 2
+        r = self.freeze(systemctl_kill=["stop apt-daily.timer"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("platform", self.record())
+        self.h.load()
+        self.h.state["systemctl_kill"] = []
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"
+        self.h.save()
+        t = self.thaw()
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        out = json.loads(t.stdout)
+        self.assertFalse(out["drift_proof"])  # nothing was compared: no "did not move"
+
+    def test_a_completed_freeze_gives_a_drift_proof(self):  # r3 2
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertTrue(json.loads(self.thaw().stdout)["drift_proof"])
+
+    def test_a_timer_that_came_back_is_in_the_drift_at_thaw_time(self):  # r3 5
+        self.assertEqual(self.freeze().returncode, 0)
+        self.set_svc("apt-daily.timer", "active", "enabled")  # a package upgrade switched it back on
+        out = json.loads(self.thaw().stdout)
+        self.assertEqual(out["drifted_at_thaw"], ["apt-daily.timer=active/enabled"])
+
+    def test_a_freeze_refusal_for_the_saved_default_names_the_real_ways_out(self):  # r3 6
+        self.h.w("/boot/grub/grub.cfg", unpinned_cfg(cfg_text("grub-arm64-efi.cfg")))
+        self.h.state["grubenv"]["saved_entry"] = ""
+        msg = " ".join((self.freeze().stdout).split())
+        self.assertIn("an un-upgraded host whose first menu entry is another kernel needs a console rehearsal", msg)
+        self.assertIn("cluster-reboot workflow", msg)
+        self.assertNotIn("finish the upgrade", msg)
+
+    def test_a_thaw_killed_after_it_finished_is_told_so_by_the_next_one(self):  # r3 7
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.thaw().returncode, 0)  # the record is gone and the archive complete: what a kill before the answer leaves
+        r = self.thaw("9")
+        self.assertEqual(r.returncode, 1)
+        msg = r.stdout + r.stderr
+        self.assertIn("the last freeze (run 7) was thawed by run 8", msg)
+        self.assertIn("freeze-7-thawed.json", msg)
+        self.assertIn("do not thaw again", msg)
+        self.h.load()
+        self.assertEqual(self.run_ok("survey")["freeze_last_thaw"]["thawed_by_run"], "8")
+
     def test_a_thaw_of_a_platform_that_did_not_move_says_so(self):  # F2
         self.assertEqual(self.freeze().returncode, 0)
         self.h.load()

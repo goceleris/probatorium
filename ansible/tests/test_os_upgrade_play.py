@@ -762,6 +762,42 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
         self.assertIn("platform at thaw time: DID NOT MOVE", " ".join(self.summary("thaw", "msr1").split()))
 
+    def test_a_failed_thaw_does_not_claim_the_platform_did_not_move_and_the_retry_proves_it(self):  # r3 1a, 1b
+        self.fresh()
+        self.play("th_f0", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.h.load()
+        self.h.state["services"]["is-enabled apt-daily.timer"] = "masked"
+        self.h.state["services"]["is-active apt-daily.timer"] = "inactive"
+        self.h.save()
+        self.play("th_f1", self.TH)
+        self.assertNotEqual(self.rc, 0)
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("NOT ESTABLISHED", md)
+        self.assertIn("the thaw did not complete", md)
+        self.assertNotIn("DID NOT MOVE", md)
+        self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
+        self.h.load()
+        self.h.state["services"]["is-enabled apt-daily.timer"] = "disabled"
+        self.h.save()
+        self.play("th_f2", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("platform at thaw time: DID NOT MOVE", md)  # not the restores of the first attempt
+        self.assertNotIn("PLATFORM MOVED", md)
+
+    def test_a_thaw_of_a_record_without_a_platform_claims_nothing(self):  # r3 2
+        self.fresh()
+        u = {"before": {"active": "active", "enabled": "enabled"}, "present": True, "changes": []}
+        self.h.w("/var/lib/celeris-os-upgrade/freeze.json", json.dumps({"run_id": "41", "utc": "t", "status": "freezing", "units": {n: u for n in self.FREEZE_UNITS},
+                                                                         "needrestart": {"installed": True, "mode_before": "", "dropin_written": False}}))
+        self.play("th_np", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("NOT ESTABLISHED", md)
+        self.assertIn("has no recorded platform", md)
+        self.assertNotIn("DID NOT MOVE", md)
+
     def test_a_freeze_is_refused_while_the_saved_default_is_not_the_running_kernel(self):  # r2 F7
         self.fresh(keep38=True)  # -38 installed and entry 0, -31 runs: today's three hosts
         self.play("fz_unpinned", self.FZ)
