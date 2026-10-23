@@ -2361,6 +2361,14 @@ class FreezeThaw(Base):
         self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
         self.assertEqual(self.archive()["thawed_by_run"], "8")
 
+    def test_a_thaw_changes_no_package_and_no_grub(self):  # r4 6 (kills a grub-mkconfig or a package command in the thaw)
+        self.assertEqual(self.freeze().returncode, 0)
+        seen = len(self.h.calls())
+        self.assertEqual(self.thaw().returncode, 0)
+        reads = ("dpkg-query", "apt-mark showhold", "grub-editenv list")  # the drift check reads the package list and the holds
+        bad = [c for c in self.h.calls()[seen:] if c.startswith(("apt", "dpkg", "update-", "dkms", "grub-")) and not c.startswith(reads)]
+        self.assertEqual(bad, [])
+
     def test_the_message_for_an_unreadable_record_names_the_command_that_clears_it(self):  # F3
         self.h.w(FREEZE_RECORD, "{ not json")
         r = self.thaw()
