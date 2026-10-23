@@ -2187,6 +2187,32 @@ class FreezeThaw(Base):
         out = json.loads(t.stdout)
         self.assertFalse(out["drift_proof"])  # nothing was compared: no "did not move"
 
+    def test_an_old_frozen_record_without_a_platform_gives_no_drift_proof(self):  # r3 2
+        self.assertEqual(self.freeze().returncode, 0)
+        rec = self.record()
+        del rec["platform"]
+        self.h.w(FREEZE_RECORD, json.dumps(rec))
+        self.assertFalse(json.loads(self.thaw().stdout)["drift_proof"])
+
+    def test_a_freeze_that_did_not_complete_gives_no_drift_proof_though_it_recorded_a_platform(self):  # r3 2
+        r = self.freeze(systemctl_noop=["disable apt-daily.timer"])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("platform", self.record())
+        self.assertEqual(self.record()["status"], "freezing-failed")
+        self.h.load()
+        self.h.state["systemctl_noop"] = []
+        self.h.save()
+        self.assertFalse(json.loads(self.thaw().stdout)["drift_proof"])
+
+    def test_the_newest_archive_is_the_last_thaw(self):  # r3 7
+        for run, thaw in (("7", "8"), ("9", "10")):
+            self.assertEqual(self.freeze(run).returncode, 0)
+            self.h.load()
+            self.assertEqual(self.thaw(thaw).returncode, 0)
+            time.sleep(1.1)  # the archives are told apart by the second of their thaw
+        self.h.load()
+        self.assertEqual(self.run_ok("survey")["freeze_last_thaw"]["run_id"], "9")
+
     def test_a_completed_freeze_gives_a_drift_proof(self):  # r3 2
         self.assertEqual(self.freeze().returncode, 0)
         self.assertTrue(json.loads(self.thaw().stdout)["drift_proof"])
