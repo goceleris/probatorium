@@ -156,6 +156,16 @@ expect "a real dump beside the bookkeeping is the ONLY thing named" "$problems" 
 case "$problems" in *kdump_lock* | *kexec_cmd*) bad "the bookkeeping files are named next to a real dump: $problems" ;; *) ok "the bookkeeping files are not named next to a real dump" ;; esac
 judge "$work/pre.json" "$(mut "$work/post.json" 's/"crash":\[\]/"crash":["kdump_lock.old"]/')"
 expect "a lookalike of a bookkeeping name is still a crash dump" "$problems" "new crash dump(s) in /var/crash: kdump_lock.old"
+# kdump-tools RE-NAMES the dumps a host holds for the kernel it boots (msr1, upgrade run 40037534396): the same two September timestamps under -38 are not new dumps
+msr1_pre=$(mut "$work/pre.json" 's/"crash":\[\]/"crash":["202609082320","202609091231","kdump_lock","kexec_cmd","linux-image-7.0.0-31-generic-202609082320.crash","linux-image-7.0.0-31-generic-202609091231.crash"]/')
+judge "$msr1_pre" "$(mut "$work/post.json" 's/"crash":\[\]/"crash":["202609082320","202609091231","kdump_lock","kexec_cmd","linux-image-7.0.0-31-generic-202609082320.crash","linux-image-7.0.0-31-generic-202609091231.crash","linux-image-7.0.0-38-generic-202609082320.crash","linux-image-7.0.0-38-generic-202609091231.crash"]/')"
+expect "the same dumps re-named for the new kernel are not new" "$problems" ""
+judge "$msr1_pre" "$(mut "$work/post.json" 's/"crash":\[\]/"crash":["202609082320","202609091231","kdump_lock","kexec_cmd","linux-image-7.0.0-31-generic-202609082320.crash","linux-image-7.0.0-31-generic-202609091231.crash","linux-image-7.0.0-38-generic-202609082320.crash","linux-image-7.0.0-38-generic-202609091231.crash","linux-image-7.0.0-38-generic-202610240900.crash"]/')"
+expect "a dump with a timestamp not there before is new (as a .crash file)" "$problems" "new crash dump(s) in /var/crash: linux-image-7.0.0-38-generic-202610240900.crash"
+judge "$msr1_pre" "$(mut "$work/post.json" 's/"crash":\[\]/"crash":["202609082320","202609091231","kdump_lock","kexec_cmd","linux-image-7.0.0-31-generic-202609082320.crash","linux-image-7.0.0-31-generic-202609091231.crash","linux-image-7.0.0-38-generic-202609082320.crash","linux-image-7.0.0-38-generic-202609091231.crash","202610240900"]/')"
+expect "a dump with a timestamp not there before is new (as a bare timestamp)" "$problems" "new crash dump(s) in /var/crash: 202610240900"
+judge "$msr1_pre" "$(mut "$work/post.json" 's/"crash":\[\]/"crash":["202609082320","202609091231","kdump_lock","kexec_cmd","linux-image-7.0.0-31-generic-202609082320.crash","linux-image-7.0.0-31-generic-202609091231.crash","linux-image-7.0.0-38-generic-202609082320.crash","linux-image-7.0.0-38-generic-202609091231.crash","202610240900"]/')"
+case "$problems" in *202609082320* | *202609091231* | *kdump_lock* | *kexec_cmd*) bad "the re-named or bookkeeping entries are named next to a real dump: $problems" ;; *) ok "only the real dump is named next to re-named dumps" ;; esac
 judge "$work/pre.json" "$(mut "$work/post.json" 's/"apcupsd_active":true/"apcupsd_active":false/')"
 expect "a power-guard prerequisite that held before and does not now is a failure" "$problems" "prerequisite regressed: apcupsd_active"
 judge "$work/pre.json" "$(mut "$work/post.json" 's/"tailscaled_active":true/"tailscaled_active":false/')"
