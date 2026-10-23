@@ -206,8 +206,15 @@ class Judge(unittest.TestCase):
         case("disk_boot", {"refusals": "not enough free disk on /boot: 100000 KiB free"}, lambda c: c["pre_survey"]["disk"]["/boot"].update(free_kib=100000))
         case("disk_efi", {"refusals": "not enough free disk on /boot/efi"}, lambda c: c["pre_survey"]["disk"]["/boot/efi"].update(free_kib=100))
         case("disk_unreadable", {"refusals": "not enough free disk on /: unreadable"}, lambda c: c["pre_survey"]["disk"].update({"/": None}))
-        case("dpkg_lock", {"refusals": "dpkg or apt is busy (a dpkg lock is held)"}, lambda c: c["pre_survey"]["packages"].update(dpkg_lock_held=True))
-        case("apt_running", {"refusals": "dpkg or apt is busy (unattended-upgr)"}, lambda c: c["pre_survey"]["packages"].update(package_processes=["unattended-upgr"]))
+        case("dpkg_lock", {"refusals": "dpkg or apt is busy (an apt or dpkg lock is held)"}, lambda c: c["pre_survey"]["packages"].update(dpkg_lock_held=True))
+        case("apt_lists_lock", {"refusals": "dpkg or apt is busy (an apt or dpkg lock is held (/var/lib/apt/lists/lock))"},
+             lambda c: c["pre_survey"]["packages"].update(dpkg_lock_held=True, locks_held=["/var/lib/apt/lists/lock"]))
+        case("apt_running", {"refusals": "dpkg or apt is busy (unattended-upgrade)"}, lambda c: c["pre_survey"]["packages"].update(package_processes=["unattended-upgrade"]))
+        case("apt_get_running", {"refusals": "dpkg or apt is busy (apt-get, dpkg)"}, lambda c: c["pre_survey"]["packages"].update(package_processes=["apt-get", "dpkg"]))
+        # the idle daemons of every Ubuntu host (kernel comm names, as the first release of the tool recorded them) are not a package run
+        case("idle_daemons_are_not_apt_running", {}, lambda c: c["pre_survey"]["packages"].update(package_processes=["packagekitd", "unattended-upgr"]))
+        case("idle_daemons_beside_a_real_run", {"refusals": "dpkg or apt is busy (dpkg)"},
+             lambda c: c["pre_survey"]["packages"].update(package_processes=["dpkg", "packagekitd", "unattended-upgr"]))
         case("half_configured", {"refusals": "dpkg --audit reports half-configured or broken packages: foo"},
              lambda c: c["pre_survey"]["packages"].update(dpkg_audit=["foo"]))
         case("held_kernel", {"refusals": "held kernel, boot or DKMS packages: linux-image-generic"},
@@ -227,6 +234,8 @@ class Judge(unittest.TestCase):
         refuse_rh = "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic"
         case("rehearse_while_entry0_is_another_kernel", {"refusals": refuse_rh}, rh("REHEARSE-msr1", "7.0.0-38-generic"))
         case("rehearse_names_what_it_would_boot", {"refusals": "no one-shot to fall back on"}, rh("REHEARSE-msr1", "7.0.0-38-generic"))
+        case("rehearse_refusal_points_to_the_readme_not_to_the_override", {"refusals": "the console attestation described in the README (Rehearsal at a console), which no refusal and no workflow text spells out"}, rh("REHEARSE-msr1", "7.0.0-38-generic"))
+        case("rehearse_with_the_attestation_of_another_host_is_refused", {"refusals": refuse_rh}, rh("REHEARSE-msa2-server-CONSOLE", "7.0.0-38-generic"))
         case("rehearse_with_a_console_is_allowed", {}, rh("REHEARSE-msr1-CONSOLE", "7.0.0-38-generic"))
         case("rehearse_when_entry0_is_the_running_kernel", {}, rh("REHEARSE-msr1", "7.0.0-31-generic"))
         case("rehearse_when_the_survey_has_no_entry0", {"refusals": "first menu entry of grub is unknown"}, rh("REHEARSE-msr1", ""))
@@ -280,6 +289,11 @@ class Judge(unittest.TestCase):
              lambda c: c["pre_survey"]["boot"].update(next_entry="gnulinux-x"))
         case("earlier_run_left_an_unverified_default", {"refusals": "an earlier OS upgrade left grub saved default 7.0.0-31-generic while the host runs 7.0.0-40-generic"},
              lambda c: (c["pre_survey"].update(kernel="7.0.0-40-generic"), c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic")))
+        case("earlier_run_refusal_names_the_kernel_grub_boots_and_the_true_way_back",
+             {"refusals": "If GRUB does NOT (a rehearsal or an upgrade ended with a one-shot still pending: survey boot.next_entry), the host runs GRUB's first menu entry (boot.entry0_kernel 7.0.0-40-generic, not the saved default) and cluster-reboot boots that kernel again: only the console (Esc or Shift at power-on, choose 7.0.0-31-generic) or a reviewed change brings 7.0.0-31-generic back"},
+             lambda c: (c["pre_survey"].update(kernel="7.0.0-40-generic"), c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic", entry0_kernel="7.0.0-40-generic")))
+        case("earlier_run_refusal_says_unknown_without_entry0", {"refusals": "(boot.entry0_kernel unknown, not the saved default)"},
+             lambda c: (c["pre_survey"].update(kernel="7.0.0-40-generic"), c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic", entry0_kernel="")))
         case("default_differs_but_no_earlier_run", {}, lambda c: c["pre_survey"]["boot"].update(dropin_present=False, default_kernel="7.0.0-38-generic"))
         case("fell_back_default_is_the_running_kernel", {}, lambda c: c["pre_survey"]["boot"].update(dropin_present=True, default_kernel="7.0.0-31-generic"))
 
@@ -322,6 +336,51 @@ class Judge(unittest.TestCase):
         case("abort_with_the_default_not_the_running_kernel", {"maint": "removing kernels could change what boots"}, repair("abort-new-kernel", b__default_kernel="7.0.0-40-generic"))
         case("abort_without_the_pin", {"maint": "removing kernels could change what boots"}, repair("abort-new-kernel", b__dropin_present=False))
         case("disarm_has_no_refusals", {}, lambda c: c.update(os_mode="disarm"))
+
+        # ---- mode=freeze / mode=thaw
+        FROZEN = {"run_id": "41", "utc": "2026-10-23T10:00:00Z", "status": "frozen", "drifted": [], "units": {}, "needrestart": {}}
+
+        def fz(mode, frozen=None, **kw):
+            def m(c):
+                c.update(os_mode=mode)
+                c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"])  # a pinned host: a freeze is refused otherwise (F7)
+                if frozen is not None:
+                    c["pre_survey"]["freeze"] = copy.deepcopy(frozen)
+                for k, v in kw.items():
+                    section, key = k.split("__")
+                    (c["pre_target"] if section == "t" else c["pre_survey"]["packages"]).update({key: v})
+            return m
+        case("freeze_ok", {}, fz("freeze"))
+        case("freeze_beside_idle_daemons_is_fine", {}, fz("freeze", p__package_processes=["packagekitd", "unattended-upgr"]))
+        case("freeze_beside_a_bench", {"maint": "a bench or validation manifest exists"}, fz("freeze", t__manifest_present=True))
+        case("freeze_with_a_power_loss_resume_pending", {"maint": "a power-loss resume is pending (cluster-power-restore --list). A freeze changes the platform"}, fz("freeze", t__resume_pending=True))
+        case("thaw_with_a_power_loss_resume_pending", {"maint": "A thaw re-enables the apt timers, which are persistent and can run unattended-upgrades within minutes"}, fz("thaw", FROZEN, t__resume_pending=True))
+        case("freeze_beside_a_runner_job", {"maint": "1 runner job(s) are executing"}, fz("freeze", t__runner_workers=1))
+        case("freeze_into_a_running_apt", {"maint": "dpkg or apt is busy (apt-get): a freeze would stop unattended-upgrades or the apt timers under a package run"}, fz("freeze", p__package_processes=["apt-get"]))
+        case("freeze_into_a_held_lock", {"maint": "dpkg or apt is busy (an apt or dpkg lock is held (/var/lib/dpkg/lock)): a freeze would stop"},
+             fz("freeze", p__dpkg_lock_held=True, p__locks_held=["/var/lib/dpkg/lock"]))
+        case("freeze_with_install_on_shutdown", {"maint": "Unattended-Upgrade::InstallOnShutdown is true: the shutdown listener a freeze stops installs packages when the host shuts down"},
+             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"]), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
+        for k, v in enumerate(("True", "TRUE", "yes", "on", "1", "with", "enable")):
+            case("freeze_with_install_on_shutdown_%d_%s" % (k, v.lower() + ("_upper" if v.isupper() else "")), {"maint": "Unattended-Upgrade::InstallOnShutdown is %s: the shutdown listener" % v},
+                 (lambda v: lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"]), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown=v)))(v))
+        case("freeze_with_install_on_shutdown_off_is_fine", {}, lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel=c["pre_survey"]["kernel"]), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="false")))
+        case("thaw_ignores_install_on_shutdown", {}, lambda c: (c.update(os_mode="thaw"), c["pre_survey"].update(freeze=dict(FROZEN)), c["pre_survey"]["unattended_upgrades"].update(install_on_shutdown="true")))
+        case("upgrade_of_a_frozen_host", {"refusals": "this host is frozen (run 41, 2026-10-23T10:00:00Z): an upgrade changes the platform the freeze recorded"},
+             lambda c: c["pre_survey"].update(freeze=copy.deepcopy(FROZEN)))
+        case("rehearse_of_a_frozen_host_is_fine", {}, lambda c: (c.update(os_mode="rehearse", os_confirm="REHEARSE-msr1-CONSOLE"), c["pre_survey"].update(freeze=copy.deepcopy(FROZEN), rehearsal={})))
+        case("freeze_while_the_saved_default_is_not_the_running_kernel", {"maint": "grub saved default kernel is 7.0.0-38-generic and the host runs 7.0.0-31-generic: any reboot"},
+             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel="7.0.0-38-generic")))
+        case("freeze_while_the_saved_default_is_unknown", {"maint": "grub saved default kernel is unknown and the host runs"},
+             lambda c: (c.update(os_mode="freeze"), c["pre_survey"]["boot"].update(default_kernel="")))
+        case("thaw_ignores_the_saved_default", {}, lambda c: (c.update(os_mode="thaw"), c["pre_survey"].update(freeze=copy.deepcopy(FROZEN)), c["pre_survey"]["boot"].update(default_kernel="7.0.0-38-generic")))
+        case("freeze_twice", {"maint": "this host is already frozen (run 41, 2026-10-23T10:00:00Z, status frozen): dispatch mode=thaw first. The record of what the first freeze changed is kept"}, fz("freeze", FROZEN))
+        case("freeze_over_a_failed_freeze", {"maint": "status freezing-failed): dispatch mode=thaw first"}, fz("freeze", dict(FROZEN, status="freezing-failed")))
+        case("thaw_ok", {}, fz("thaw", FROZEN))
+        case("thaw_of_a_failed_freeze_is_fine", {}, fz("thaw", dict(FROZEN, status="freezing-failed")))
+        case("thaw_nothing", {"maint": "nothing to thaw: no freeze record on this host"}, fz("thaw"))
+        case("thaw_beside_a_bench", {"maint": "a bench or validation manifest exists"}, fz("thaw", FROZEN, t__manifest_present=True))
+        case("thaw_beside_apt_is_fine", {}, fz("thaw", FROZEN, p__package_processes=["apt-get"]))  # a thaw only puts units back; it does not race a package run
 
         # ---- the plan
         case("plan_removes_a_kernel", {"plan": "would REMOVE protected package(s): linux-image-7.0.0-31-generic"},
@@ -404,7 +463,7 @@ class Judge(unittest.TestCase):
         case("post_failed_unit", {"post": "new failed unit(s): foo.service"}, lambda c: post(c, failed_units=["foo.service"]))
         case("post_one_shot_not_consumed", {"post": "a one-shot is still pending (gnulinux-x) after the host booted: GRUB did not consume it"},
              lambda c: c["post_survey"]["boot"].update(next_entry="gnulinux-x"))
-        case("post_one_shot_not_consumed_names_what_a_boot_gives", {"post": "boots the first menu entry of grub (7.0.0-38-generic), not the saved default (7.0.0-31-generic)"},
+        case("post_one_shot_not_consumed_names_what_a_boot_gives", {"post": "boots the first menu entry of grub (boot.entry0_kernel 7.0.0-38-generic), NOT the saved default (7.0.0-31-generic): only the console brings another kernel back"},
              lambda c: c["post_survey"]["boot"].update(next_entry="gnulinux-x", entry0_kernel="7.0.0-38-generic", default_kernel="7.0.0-31-generic"))
         case("post_no_snapshot", {"post": "no readable snapshot after the reboot"}, lambda c: c["post_raw"].update(stdout=""))
         case("post_nic_driver_changed", {"post": "NIC enp1s0 is bound to r8169, was r8127"},
@@ -428,7 +487,7 @@ class Judge(unittest.TestCase):
         for name, (_, expect) in self.cases.items():
             got = self.out[name]
             if not expect:
-                if self.cases[name][0].get("os_mode", "upgrade") in ("repair", "disarm"):
+                if self.cases[name][0].get("os_mode", "upgrade") in ("repair", "disarm", "freeze", "thaw"):
                     got = {"maint": got["maint"]}  # a maintenance mode is judged by maint_refusals_str alone
                 if any(got.values()):
                     failures.append("%s: expected nothing, got %r" % (name, got))
@@ -437,6 +496,11 @@ class Judge(unittest.TestCase):
                 if want not in got[key]:
                     failures.append("%s: %s: expected %r in %r" % (name, key, want, got[key]))
         self.assertEqual(failures, [], "\n" + "\n".join(failures))
+
+    def test_no_verdict_spells_out_the_console_override(self):
+        for name, out in self.out.items():
+            for k, v in out.items():
+                self.assertNotRegex(v, r"REHEARSE-\S*CONSOLE", "%s: %s" % (name, k))
 
     def test_a_healthy_host_has_nothing_to_report(self):
         self.assertEqual(self.out["healthy"], {"refusals": "", "plan": "", "prereboot": "", "post": "", "maint": ""})
@@ -459,7 +523,7 @@ class Judge(unittest.TestCase):
         walk(self.dk, dkms_keys)
         walk(self.sim, survey_keys)
         walk(snapshot("a", "k", 1), survey_keys)
-        for var, keys in (("s", survey_keys), ("bs", survey_keys), ("d", dkms_keys), ("sim", survey_keys), ("tc", {"cc_ok", "https_ok"} | survey_keys)):
+        for var, keys in (("s", survey_keys), ("pk", survey_keys), ("bs", survey_keys), ("d", dkms_keys), ("sim", survey_keys), ("tc", {"cc_ok", "https_ok"} | survey_keys)):
             for m in re.finditer(r"\b%s\.([a-z_0-9]+)" % var, text):
                 self.assertIn(m.group(1), keys, "the judgement reads %s.%s, which the script does not write" % (var, m.group(1)))
 
@@ -468,7 +532,7 @@ class Judge(unittest.TestCase):
         message without a case makes this fail until the count and the cases are updated together."""
         with open(JUDGE) as f:
             n = len(re.findall(r"p\.append\(", re.sub(r"(?m)^\s*#.*$", "", f.read())))
-        self.assertEqual(n, 79, "the judgement has %d messages; add a case for each new one and update this count" % n)
+        self.assertEqual(n, 88, "the judgement has %d messages; add a case for each new one and update this count" % n)
         covered = {"refusals": 0, "plan": 0, "prereboot": 0, "post": 0, "maint": 0}
         for _, (_, expect) in self.cases.items():
             for k in expect:

@@ -11,7 +11,7 @@ check that nothing was written):
     survey            one JSON object: os-release, kernels, grub, packages, dkms, NICs, r8127 vs in-tree, disk, time
     simulate          the JSON of `apt-get -s full-upgrade` (installs, removals, kept back) on the lists as they are
     dkms-check        (without --build) is the NEW kernel ready: modules, initrd, grub entry, signature, fallback
-    dump WHAT         packages | policy | sysctl | cmdline | grub : plain text, for the evidence
+    dump WHAT         packages | policy | sysctl | cmdline | grub | dpkg-l | held | kernel : plain text, for the evidence
     upgrade-status    state of the detached apt run (running | done | died | none) and its exit code; --wait N waits on the host
     upgrade-log       the log of the detached apt run
     marker            the record of the last verified OS upgrade of this host ({} when none)
@@ -36,6 +36,10 @@ HOST-CHANGING subcommands (the upgrade mode only, in this order; each one is the
                                 running one when --action abort-new-kernel, or --action release-holds: releases the access-path holds
                                 a dead run of this tool left (recorded in held.txt); upgrade-status/upgrade-log read it
     upgrade-cleanup             removes OUR policy-rc.d once the detached run is over (never while its process is alive)
+    freeze / thaw               (mode=freeze, mode=thaw) the platform stays FIXED for the evidence campaign: freeze records what it will change, stops and
+                                disables apt-daily.timer, apt-daily-upgrade.timer and unattended-upgrades.service and sets needrestart to list-only
+                                (no automatic service restart), and records the platform (kernel, a hash of every installed package and version, the holds);
+                                thaw puts back exactly what freeze recorded it changed, and nothing else
     hold-access / release-access  apt-mark hold of the access-path packages BEFORE the simulation (so the plan judged is the plan that
                                 runs), recorded in the run's held.txt; released by the run, or by repair release-holds when it died
 
@@ -87,7 +91,7 @@ def ro_allowed(a):
     if n in ("dpkg-query", "modinfo", "findmnt", "df", "apt-config", "apt-cache", "uname"):
         return True
     if n == "dpkg":
-        return bool(rest) and rest[0] in ("--audit", "-S", "-L", "-s")
+        return bool(rest) and rest[0] in ("--audit", "-S", "-L", "-s", "-l")
     if n == "apt-get":
         return any(x in ("-s", "--simulate", "--just-print", "--dry-run") for x in rest)
     if n == "apt-mark":
@@ -108,6 +112,10 @@ def ro_allowed(a):
         return rest == ["-t"]
     if n == "tailscaled":
         return rest == ["--version"]
+    if n == "tailscale" and rest == ["debug", "prefs"]:
+        return True
+    if n == "snap":
+        return rest == ["refresh", "--time"]
     if n == "netplan":
         return rest[:1] == ["generate"] and "--root-dir" in rest
     if n in ("gcc", "g++", "clang", "cmake", "make", "python3", "docker", "tailscale", "cc"):
@@ -137,7 +145,8 @@ def have(cmd):
     return shutil.which(cmd, path=os.environ.get("PATH", "") + os.pathsep + SBIN) is not None
 
 
-def write(path, content, mode=0o644):
+def write(path, content, mode=0o644, durable=False):
+    """Writes PATH atomically. durable: the file and its directory are fsynced, so a power loss right after cannot leave an empty record."""
     if READ_ONLY:
         raise SystemExit("read-only violation: refusing to write " + path)
     full = p(path)
@@ -145,8 +154,17 @@ def write(path, content, mode=0o644):
     tmp = full + ".tmp"
     with open(tmp, "w") as f:
         f.write(content)
+        if durable:
+            f.flush()
+            os.fsync(f.fileno())
     os.chmod(tmp, mode)
     os.replace(tmp, full)
+    if durable:
+        fd = os.open(os.path.dirname(full), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def emit(obj):
@@ -627,32 +645,73 @@ def lists_age_hours():
     return round((time.time() - newest) / 3600, 1) if newest else None
 
 
-PKG_PROCS = {"apt", "apt-get", "dpkg", "unattended-upgr", "apt.systemd.dai", "packagekitd", "aptd", "dkms", "update-grub", "grub-mkconfig", "update-initramfs"}
+# What counts as a package run: a process that EXECUTES one of these programs (or a script of that name). The name is read from
+# /proc/<pid>/cmdline and NEVER decided from /proc/<pid>/comm: the kernel keeps 15 characters of a name, and "unattended-upgr" is
+# exactly 15, so the idle daemon Ubuntu always runs (`unattended-upgrade-shutdown --wait-for-signal`, waiting for a shutdown signal) and
+# a real `unattended-upgrade` run read alike. packagekitd idles when nobody uses it. Neither is a package run: when either one is
+# working it holds the dpkg or apt locks, which are checked next. (Release 1.6.0's first survey judged both by comm and
+# refused every host forever: probatorium run 39814880117.) The same words are in vars/os_upgrade_judge.yml (os_busy_process_names)
+# and .github/scripts/os-upgrade-summary.sh (busy_names): a test compares them.
+PKG_RUN_NAMES = frozenset("apt apt-get aptitude dpkg unattended-upgrade apt.systemd.daily dkms update-grub grub-mkconfig update-initramfs".split())
+SCRIPT_RUNNERS = re.compile(r"^(python[0-9.]*|perl|sh|bash|dash)$")
+APT_LOCKS = ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock", "/var/lib/apt/lists/lock", "/var/cache/apt/archives/lock")
+
+
+def process_program(argv):
+    """The program a process runs: argv[0]'s base name, or, for a script started through its interpreter (python3
+    /usr/bin/unattended-upgrade, /bin/sh /usr/lib/apt/apt.systemd.daily), the script's. "" for no argv (a kernel thread, a zombie)."""
+    if not argv:
+        return ""
+    name = os.path.basename(argv[0])
+    if SCRIPT_RUNNERS.match(name):
+        for a in argv[1:]:
+            if a == "-c":
+                return name  # sh -c "...": a command string, not a script
+            if a.startswith("-"):
+                continue
+            return os.path.basename(a)
+    return name
 
 
 def package_processes():
+    """The package-manager programs running now, by name, sorted: real apt, apt-get, dpkg, unattended-upgrade ... processes, read from
+    /proc/<pid>/cmdline. The idle unattended-upgrade-shutdown listener and an idle packagekitd are not among them."""
     found = []
-    for c in glob.glob(p("/proc/[0-9]*/comm")):
+    for c in glob.glob(p("/proc/[0-9]*/cmdline")):
         try:
-            name = open(c).read().strip()
+            with open(c, "rb") as f:
+                raw = f.read()
         except OSError:
             continue
-        if name in PKG_PROCS:
+        name = process_program([x.decode("utf-8", "replace") for x in raw.split(b"\0") if x])
+        if name in PKG_RUN_NAMES:
             found.append(name)
     return sorted(found)
 
 
-def dpkg_lock_held():
-    for lock in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"):
+def locks_held():
+    """The dpkg and apt lock files another process holds right now (apt, dpkg, unattended-upgrade and PackageKit all take them while they
+    work, and not while they idle). A shared lock is asked for without waiting: a refusal means somebody holds it exclusively."""
+    held = []
+    for lock in APT_LOCKS:
         try:
             with open(p(lock), "rb") as f:
                 try:
                     fcntl.lockf(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 except OSError:
-                    return True
+                    held.append(lock)
         except OSError:
             continue
-    return False
+    return held
+
+
+def package_run_busy():
+    """"" when no package run is going on, else the words for a refusal: the programs running, or the locks held."""
+    procs = package_processes()
+    if procs:
+        return ", ".join(procs)
+    held = locks_held()
+    return ("an apt or dpkg lock is held (%s)" % ", ".join(held)) if held else ""
 
 
 def apt_config():
@@ -853,6 +912,7 @@ def survey():
     ent = boot["entries"]
     boot["running_entry_id"] = entry_id_for(parse_grub_cfg(rd("/boot/grub/grub.cfg")), running)
     ntp = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])[1].strip()
+    lock_files = locks_held()
     d = {
         "schema": 1,
         "host": rd("/etc/hostname"),
@@ -877,7 +937,8 @@ def survey():
             "pin_files": sorted(os.path.basename(x) for x in glob.glob(p("/etc/apt/preferences.d/*")) + glob.glob(p("/etc/apt/preferences"))),
             "dpkg_audit": [x for x in run(["dpkg", "--audit"])[1].splitlines() if x.strip()],
             "package_processes": package_processes(),
-            "dpkg_lock_held": dpkg_lock_held(),
+            "locks_held": lock_files,
+            "dpkg_lock_held": bool(lock_files),
             "policy_rc_d_present": os.path.exists(p(POLICY_RC_D)),
             "policy_rc_d_ours": rd(POLICY_RC_D) == POLICY.strip(),
             "new_kernel_pkgs": new_kernel_pkgs(running),
@@ -889,6 +950,7 @@ def survey():
             "unattended_upgrade": cfg.get("APT::Periodic::Unattended-Upgrade", ""),
             "remove_unused_kernel_packages": cfg.get("Unattended-Upgrade::Remove-Unused-Kernel-Packages", ""),
             "automatic_reboot": cfg.get("Unattended-Upgrade::Automatic-Reboot", ""),
+            "install_on_shutdown": cfg.get("Unattended-Upgrade::InstallOnShutdown", ""),
             "units": {u: svc(u) for u in ("unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer")},
             "needrestart_installed": bool(dpkg_version("needrestart")),
         },
@@ -906,6 +968,8 @@ def survey():
         "marker": marker(),
         "armed_kernels": armed_records(),
         "rehearsal": rehearsal_with_validity(running, boot["proof"]),
+        "freeze": freeze_state(),
+        "self_updaters": self_updaters(),
     }
     return d
 
@@ -1127,10 +1191,11 @@ def cmd_repair_run(a):
     if a.action == "release-holds":
         # no policy-rc.d, no dpkg: apt-mark unhold of what this tool held (held.txt of every run) and nothing else
         try:
-            released = release_tool_holds()
-            if not released:
+            released, left = release_tool_holds()
+            if not released and not left:
                 sys.stdout.write("nothing to release: no hold of this tool is in place\n")
-            rc = 0
+            # a hold that apt-mark could not release is a failed repair, not "HOLDS RELEASED": the record stays and so does the repair
+            rc = 1 if left else 0
         finally:
             write(rcf, "%d\n" % rc)
         return
@@ -1217,25 +1282,68 @@ def tool_holds():
     return out
 
 
+def unhold(names):
+    """apt-mark unhold NAMES, then ask apt which of them are STILL held: (released, remaining). The exit code of `apt-mark unhold` is not
+    believed (it fails, and changes nothing, while unattended-upgrades or PackageKit has the dpkg frontend lock): only what
+    `apt-mark showhold` no longer lists is released. If showhold cannot be read, nothing counts as released."""
+    names = sorted(set(names))
+    if not names:
+        return [], []
+    run(["apt-mark", "unhold"] + names)
+    rc, out, _ = run(["apt-mark", "showhold"])
+    if rc != 0:
+        return [], names
+    still = set(out.split())
+    return [n for n in names if n not in still], [n for n in names if n in still]
+
+
+def keep_record(held_txt, names):
+    """The record of the holds this tool put: exactly NAMES (the ones still in place), or no record when none is."""
+    if names:
+        write(held_txt, " ".join(sorted(names)) + "\n")
+        return
+    try:
+        os.remove(p(held_txt))
+    except OSError:
+        pass
+
+
+def prune_hold_records():
+    """A record names holds that are no longer in place (somebody unheld them by hand): drop those names, so that a hold put later
+    by a person is never claimed by a dead run's record (and released by it)."""
+    rc, out, _ = run(["apt-mark", "showhold"])
+    if rc != 0:
+        return  # cannot tell what is held: every record stays
+    held_now = set(out.split())
+    for f in sorted(glob.glob(p(LOG_DIR + "/*/held.txt"))):
+        rel = f[len(ROOT):] if ROOT else f
+        names = [n for n in rd(rel).split() if n]
+        if [n for n in names if n in held_now] != names:
+            keep_record(rel, [n for n in names if n in held_now])
+
+
 def release_tool_holds():
-    """Releases every hold this tool put and records it in the output. Returns [{run_id, packages}] released. Never touches a hold
-    that is not in a held.txt (somebody else's)."""
-    released = []
+    """Releases every hold this tool put and records it in the output. Returns ([{run_id, packages}] released, [{run_id, packages}] still
+    held). Never touches a hold that is not in a held.txt (somebody else's). A hold that is still in place afterwards keeps its record
+    (so the next survey and the next upgrade still name the repair) and is reported as NOT released."""
+    released, left = [], []
     for rec in tool_holds():
-        run(["apt-mark", "unhold"] + rec["packages"])
-        sys.stdout.write("+ apt-mark unhold %s\nHOLDS RELEASED: %s (put by run %s)\n" % (" ".join(rec["packages"]), " ".join(rec["packages"]), rec["run_id"]))
-        released.append(rec)
-    for f in glob.glob(p(LOG_DIR + "/*/held.txt")):
-        try:
-            os.remove(f)  # the record of a hold that is gone (or was just released)
-        except OSError:
-            pass
-    return released
+        done, remaining = unhold(rec["packages"])
+        sys.stdout.write("+ apt-mark unhold %s\n" % " ".join(rec["packages"]))
+        if done:
+            sys.stdout.write("HOLDS RELEASED: %s (put by run %s)\n" % (" ".join(done), rec["run_id"]))
+            released.append({"run_id": rec["run_id"], "packages": done})
+        if remaining:
+            sys.stdout.write("HOLDS NOT RELEASED: %s (put by run %s): still held after apt-mark unhold, the record is kept\n" % (" ".join(remaining), rec["run_id"]))
+            left.append({"run_id": rec["run_id"], "packages": remaining})
+    prune_hold_records()  # the records of holds that are gone (or were just released) go; the ones still in place stay
+    return released, left
 
 
 def cmd_hold_access(a):
     """Holds the access-path packages now, before the plan is simulated, and records them for this run."""
     d, log, rcf = upgrade_paths(a.run_id)
+    prune_hold_records()
     prior = [x for x in rd(d + "/held.txt").split() if x]
     new = access_to_hold()
     os.makedirs(p(d), exist_ok=True)
@@ -1249,20 +1357,25 @@ def cmd_hold_access(a):
 
 
 def cmd_release_access(a):
-    emit({"ok": True, "released": unhold_ours(a.run_id)})
+    released, left = unhold_ours(a.run_id)
+    if left:
+        msg = "the access-path holds %s could NOT be released (apt-mark unhold did not take: the dpkg lock is busy?); the record is kept: dispatch mode=repair with repair_action=release-holds" % " ".join(left)
+        sys.stderr.write("os_upgrade.py: " + msg + "\n")
+        emit({"ok": False, "released": released, "still_held": left, "error": msg})
+        sys.exit(1)
+    emit({"ok": True, "released": released, "still_held": []})
 
 
 def unhold_ours(run_id):
-    """Releases the holds THIS run put (never one that was there before)."""
+    """Releases the holds THIS run put (never one that was there before). Returns (released, still_held): a hold that apt-mark could not
+    release (see unhold) stays in the run's record, so it is found and named later."""
     d, log, rcf = upgrade_paths(run_id)
     names = [x for x in rd(d + "/held.txt").split() if x]
-    if names:
-        run(["apt-mark", "unhold"] + names)
-        try:
-            os.remove(p(d + "/held.txt"))
-        except OSError:
-            pass
-    return names
+    if not names:
+        return [], []
+    released, remaining = unhold(names)
+    keep_record(d + "/held.txt", remaining)
+    return released, remaining
 
 
 def cmd_upgrade_run(a):
@@ -1290,7 +1403,11 @@ def cmd_upgrade_run(a):
             os.remove(p(POLICY_RC_D))
         except OSError:
             pass
-        unhold_ours(a.run_id)
+        # the apt run is over: the holds this run put are released, and a hold apt-mark could not release is said in the log (the
+        # record stays, upgrade-cleanup tries again and fails the run if it is still there)
+        _, left = unhold_ours(a.run_id)
+        if left:
+            sys.stdout.write("HOLDS NOT RELEASED: %s (put by run %s): still held after apt-mark unhold, the record is kept\n" % (" ".join(left), a.run_id))
         write(rcf, "%d\n" % rc)
 
 
@@ -1335,15 +1452,25 @@ def cmd_upgrade_cleanup(a):
         emit({"removed": False, "reason": "the apt run is still alive"})
         return
     # the detached wrapper can die (the OOM killer) while its apt-get child, reparented to init, still runs
-    if package_processes() or dpkg_lock_held():
-        emit({"removed": False, "reason": "dpkg or apt is still running (%s)" % (", ".join(package_processes()) or "a dpkg lock is held")})
+    busy = package_run_busy()
+    if busy:
+        emit({"removed": False, "reason": "dpkg or apt is still running (%s)" % busy})
         return
-    unheld = unhold_ours(a.run_id)  # a run that died with its holds on
-    if rd(POLICY_RC_D) == POLICY.strip():
+    unheld, left = unhold_ours(a.run_id)  # a run that died with its holds on
+    prune_hold_records()
+    removed = rd(POLICY_RC_D) == POLICY.strip()
+    if removed:
         os.remove(p(POLICY_RC_D))
-        emit({"removed": True, "unheld": unheld})
-    else:
-        emit({"removed": False, "reason": "no policy-rc.d of ours", "unheld": unheld})
+    res = {"removed": removed, "unheld": unheld, "still_held": left}
+    if not removed:
+        res["reason"] = "no policy-rc.d of ours"
+    if left:
+        # the run must not go on to a reboot with the access path held, and the record stays: the next survey lists it
+        msg = "the access-path holds %s of run %s could NOT be released (apt-mark unhold did not take: the dpkg lock is busy?); the record is kept and nothing is rebooted: dispatch mode=repair with repair_action=release-holds" % (" ".join(left), a.run_id)
+        sys.stderr.write("os_upgrade.py: " + msg + "\n")
+        emit(dict(res, ok=False, error=msg))
+        sys.exit(1)
+    emit(res)
 
 
 def cmd_upgrade_log(a):
@@ -1396,8 +1523,9 @@ def disarm():
         rc, out, err = run(["grub-editenv", "-", "unset", "next_entry"])
     after = grub_editenv().get("next_entry", "")
     ok = rc == 0 and not after
+    top0 = [e for e in grub_entries() if not e["parent"] and e["kernel"]]
     return {"ok": ok, "was_armed": bool(before), "next_entry_before": before, "next_entry_after": after,
-            "saved_entry": env.get("saved_entry", ""), "error": (out + err)[-300:] if rc != 0 else "",
+            "saved_entry": env.get("saved_entry", ""), "entry0_kernel": top0[0]["kernel"] if top0 else "", "error": (out + err)[-300:] if rc != 0 else "",
             "forgot_armed": forget_armed_without_a_reboot() if ok else []}
 
 
@@ -1411,8 +1539,9 @@ def cmd_arm(a):
     if not a.run_id:
         fail("--run-id is required")
     # an unattended upgrade that started since the check would be cut by the reboot
-    if package_processes() or dpkg_lock_held():
-        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % (", ".join(package_processes()) or "a dpkg lock is held"))
+    busy = package_run_busy()
+    if busy:
+        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % busy)
     rc, out, err = run(["update-grub"], timeout=600)
     if rc != 0:
         fail("update-grub failed: " + (out + err)[-300:])
@@ -1442,8 +1571,9 @@ def cmd_arm_rehearsal(a):
     and the reboot would be booted). It proves that GRUB reads the environment block Linux writes (next_entry is empty after the
     boot). NOT a zero-kernel-risk test: if GRUB ignores the block it boots its first menu entry (see boot.entry0_kernel), which is
     another kernel while a newer one is installed; the judge refuses that unless the maintainer confirmed a console."""
-    if package_processes() or dpkg_lock_held():
-        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % (", ".join(package_processes()) or "a dpkg lock is held"))
+    busy = package_run_busy()
+    if busy:
+        fail("dpkg or apt is busy (%s): not arming a reboot into a running package run" % busy)
     rc, out, err = run(["update-grub"], timeout=600)
     if rc != 0:
         fail("update-grub failed: " + (out + err)[-300:])
@@ -1545,11 +1675,283 @@ def cmd_dump(a):
         sys.stdout.write("".join(sorted(run(["sysctl", "-a"])[1].splitlines(True))))
     elif a.what == "cmdline":
         sys.stdout.write(rd("/proc/cmdline") + "\n")
+    elif a.what == "dpkg-l":
+        sys.stdout.write(run(["dpkg", "-l"])[1])
+    elif a.what == "held":
+        sys.stdout.write("\n".join(sorted(x for x in run(["apt-mark", "showhold"])[1].split() if x)) + "\n")
+    elif a.what == "kernel":
+        osr = {}
+        for line in rd("/etc/os-release").splitlines():
+            k, _, v = line.partition("=")
+            if k in ("PRETTY_NAME", "VERSION_ID"):
+                osr[k] = v.strip('"')
+        sys.stdout.write("os: %s\nrunning_kernel: %s\ninstalled_kernels: %s\nnewest_same_flavor: %s\ncmdline: %s\nboot_id: %s\n" % (
+            osr.get("PRETTY_NAME", ""), running_kernel(), " ".join(installed_kernels()),
+            ([k for k in installed_kernels() if flavor(k) == flavor(running_kernel())] or [""])[-1], rd("/proc/cmdline"), current_boot_id()))
     elif a.what == "grub":
         env = grub_editenv()
         sys.stdout.write("saved_entry=%s\nnext_entry=%s\n" % (env.get("saved_entry", ""), env.get("next_entry", "")))
         for e in grub_entries():
             sys.stdout.write("%s\t%s\t%s\n" % (e["kernel"], e["full_id"], "recovery" if e["recovery"] else ""))
+
+
+def self_updaters():
+    """What changes a host's packages by itself and that a freeze does NOT stop (read-only): tailscale's own updater (`tailscale set
+    --auto-update` runs apt-get and restarts tailscaled) and snapd's refresh timer. "absent" when the program is not installed, "unknown" when it
+    did not answer."""
+    out = {"tailscale_auto_update": "absent", "tailscale_check_updates": "absent", "snap_refresh": "absent"}
+    if have("tailscale"):
+        out["tailscale_auto_update"] = out["tailscale_check_updates"] = "unknown"
+        rc, o, _ = run(["tailscale", "debug", "prefs"], timeout=30)
+        try:
+            au = json.loads(o).get("AutoUpdate") or {}
+            out["tailscale_auto_update"] = {True: "true", False: "false"}.get(au.get("Apply"), "unset")
+            out["tailscale_check_updates"] = {True: "true", False: "false"}.get(au.get("Check"), "unset")
+        except (ValueError, AttributeError):
+            pass
+    if have("snap"):
+        rc, o, _ = run(["snap", "refresh", "--time"], timeout=30)
+        out["snap_refresh"] = " ; ".join(x.strip() for x in o.splitlines() if x.strip()) if rc == 0 and o.strip() else "unknown"
+    return out
+
+
+# ---------------------------------------------------------------------------------------------- freeze / thaw
+# A 131-hour benchmark must not see a package or a service change under it, and these hosts update themselves: unattended-upgrades
+# installed the kernel -38 on its own. `freeze` stops the platform from moving by itself (the apt timers and unattended-upgrades, and
+# needrestart's automatic service restarts) and records the platform it froze; `thaw` puts back exactly what freeze recorded it changed.
+TRUE_WORDS = ("true", "1", "yes", "on", "with", "enable")  # what apt's FindB reads as true
+FREEZE_UNITS = ("apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service")
+FREEZE_RECORD = STATE_DIR + "/freeze.json"
+NEEDRESTART_DROPIN = "/etc/needrestart/conf.d/zzz-celeris-freeze.conf"
+NEEDRESTART_TEXT = ("# Managed by probatorium ansible/os-upgrade.yml (mode=freeze): needrestart lists the services that need a restart and restarts NONE, so the\n"
+                    "# platform stays fixed under a measurement. mode=thaw removes this file.\n$nrconf{restart} = 'l';\n")
+
+
+def unit_state(unit):
+    st = svc(unit)
+    # a unit this host does not have: is-active says inactive and is-enabled says not-found (or prints nothing)
+    st["present"] = st["enabled"] not in ("not-found", "")
+    return st
+
+
+ON_ENABLED = ("enabled", "enabled-runtime")  # enabled-runtime: enabled until the next boot; a freeze turns it off too
+
+
+def unit_on(st):
+    return st["active"] == "active" or st["enabled"] in ON_ENABLED
+
+
+def needrestart_mode(skip_ours=False):
+    """The restart mode needrestart is configured with ('a' automatic, 'l' list only, 'i' interactive), "" when it is not set anywhere
+    (needrestart's own default). Later files win: needrestart.conf, then conf.d/*.conf in name order. skip_ours: without the file a freeze wrote."""
+    mode = ""
+    for f in [p("/etc/needrestart/needrestart.conf")] + sorted(glob.glob(p("/etc/needrestart/conf.d/*.conf"))):
+        if skip_ours and f == p(NEEDRESTART_DROPIN):
+            continue
+        try:
+            text = open(f, errors="replace").read()
+        except OSError:
+            continue
+        for m in re.finditer(r"^\s*\$nrconf\{restart\}\s*=\s*['\"]?([a-z])['\"]?\s*;", text, re.M):
+            mode = m.group(1)
+    return mode
+
+
+def platform_identity():
+    """What the release results can cite as THE platform: the kernel, the OS, the held packages and a hash of every installed package and
+    version (the full list is in the evidence: dpkg-l.txt)."""
+    import hashlib
+    rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package}\t${Version}\t${Architecture}\t${db:Status-Abbrev}\n"])
+    lines = sorted(out.splitlines())
+    osr = {}
+    for line in rd("/etc/os-release").splitlines():
+        k, _, v = line.partition("=")
+        if k in ("PRETTY_NAME", "VERSION_ID"):
+            osr[k] = v.strip('"')
+    return {"kernel": running_kernel(), "boot_default_kernel": boot_info()["default_kernel"], "os": osr.get("PRETTY_NAME", ""), "packages": len(lines),
+            "dpkg_sha256": hashlib.sha256("\n".join(lines).encode()).hexdigest(),
+            "held": sorted(x for x in run(["apt-mark", "showhold"])[1].split() if x)}
+
+
+def freeze_record():
+    try:
+        return json.loads(rd(FREEZE_RECORD) or "{}")
+    except ValueError:
+        return {"status": "unreadable"}
+
+
+def freeze_state():
+    """The freeze record and what it says about NOW: for every unit it changed, is it still stopped and disabled? `drifted` names those that
+    are not (something re-enabled them: a package upgrade, a person), so the survey shows a freeze that no longer holds."""
+    rec = freeze_record()
+    if not rec:
+        return {}
+    drifted = []
+    for u, info in sorted(rec.get("units", {}).items()):
+        now = unit_state(u)  # every unit of the freeze, whether it changed it, found it off already or did not have it (a package may bring it): none may run
+        if unit_on(now):
+            drifted.append("%s=%s/%s" % (u, now["active"], now["enabled"]))
+    # the PLATFORM the freeze recorded, recomputed: a frozen host whose kernel, package list, holds or boot default moved is not the platform the
+    # release results cite, whatever the units say (an upgrade, tailscale's own updater, a manual apt, a reboot onto the saved default ...)
+    plat = rec.get("platform") or {}
+    if plat:
+        now = platform_identity()
+        for k, label in (("kernel", "running kernel"), ("boot_default_kernel", "grub saved default kernel"), ("dpkg_sha256", "package list (sha256)")):
+            if k in plat and plat[k] != now.get(k):
+                drifted.append("%s changed: recorded %s, now %s" % (label, plat[k], now.get(k)))
+        if "held" in plat and sorted(plat["held"]) != now["held"]:
+            drifted.append("holds changed: recorded %s, now %s" % (",".join(sorted(plat["held"])) or "none", ",".join(now["held"]) or "none"))
+    nr = rec.get("needrestart", {})
+    if nr.get("dropin_written") and needrestart_mode() != "l":
+        drifted.append("needrestart restart mode is %r, not 'l'" % needrestart_mode())
+    return dict(rec, drifted=drifted)
+
+
+def save_freeze(rec):
+    write(FREEZE_RECORD, json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
+
+
+def cmd_freeze(a):
+    if not a.run_id:
+        fail("--run-id is required")
+    rec = freeze_record()
+    if rec:
+        fail("this host is already frozen (run %s, %s, status %s): mode=thaw first. Its record is kept, so the previous states it holds are not overwritten" % (
+            rec.get("run_id", "?"), rec.get("utc", "?"), rec.get("status", "?")))
+    busy = package_run_busy()
+    if busy:
+        fail("dpkg or apt is busy (%s): not stopping unattended-upgrades or the apt timers under a package run" % busy)
+    bd, run_k = boot_info()["default_kernel"], running_kernel()
+    if bd != run_k:
+        fail("grub's saved default kernel is %r and the host runs %r: any reboot (a power loss, a panic, cluster-reboot) boots %s, so the platform this freeze would "
+             "record is not the one that comes back. Pin the running kernel first (a rehearsal or an upgrade does), or finish the upgrade (nothing was changed)" % (
+                 bd or "unknown", run_k, bd or "something else"))
+    ios = apt_config().get("Unattended-Upgrade::InstallOnShutdown", "")
+    if ios.lower() in TRUE_WORDS:
+        fail("Unattended-Upgrade::InstallOnShutdown is %r: the shutdown listener (unattended-upgrade-shutdown, which this freeze stops) installs packages "
+             "when the host shuts down, and what stopping it does then is not known here: set it to false by a reviewed change first (nothing was changed)" % ios)
+    before = {u: unit_state(u) for u in FREEZE_UNITS}
+    # a needrestart file of ours that an earlier freeze left (its record lost) is adopted: this freeze's thaw removes it
+    adopted = os.path.exists(p(NEEDRESTART_DROPIN)) and rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip()
+    nr_before = needrestart_mode(skip_ours=True) if dpkg_version("needrestart") else None
+    rec = {"run_id": a.run_id, "host": rd("/etc/hostname"), "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "freezing",
+           "units": {u: {"before": {"active": s["active"], "enabled": s["enabled"]}, "present": s["present"], "changes": []} for u, s in before.items()},
+           "needrestart": {"installed": nr_before is not None, "mode_before": nr_before or "", "dropin_written": False, "adopted": adopted},
+           "install_on_shutdown": ios}
+    # the record is written BEFORE anything changes, and before AND after every change ("pending" names the change about to be made): a freeze
+    # killed half way, even between a change and its record, is thawed to the states it recorded
+    save_freeze(rec)
+    errors = []
+    for u, s in before.items():
+        if not s["present"]:
+            continue
+        info = rec["units"][u]
+        if s["active"] == "active":
+            info["pending"] = "stopped"
+            save_freeze(rec)
+            rc, out, err = run(["systemctl", "stop", u], timeout=120)
+            info.pop("pending")
+            if rc != 0:
+                errors.append("systemctl stop %s: %s" % (u, (out + err).strip()[-160:]))
+                info.setdefault("attempted", []).append("stopped")  # a stop that timed out (rc 124) or errored may well have taken effect: the thaw looks
+            else:
+                info["changes"].append("stopped")
+            save_freeze(rec)
+        if s["enabled"] in ON_ENABLED:
+            info["pending"] = "disabled"
+            save_freeze(rec)
+            rc, out, err = run(["systemctl", "disable", u], timeout=120)
+            info.pop("pending")
+            if rc != 0:
+                errors.append("systemctl disable %s: %s" % (u, (out + err).strip()[-160:]))
+                info.setdefault("attempted", []).append("disabled")
+            else:
+                info["changes"].append("disabled")
+            save_freeze(rec)
+    if nr_before is not None and (nr_before != "l" or adopted):
+        try:
+            write(NEEDRESTART_DROPIN, NEEDRESTART_TEXT, durable=True)
+            rec["needrestart"]["dropin_written"] = True
+            save_freeze(rec)
+        except OSError as x:
+            errors.append("cannot write %s: %s" % (NEEDRESTART_DROPIN, x))
+    after = {u: unit_state(u) for u in FREEZE_UNITS}
+    for u, s in after.items():
+        if s["present"] and unit_on(s):
+            errors.append("%s is still %s/%s after the freeze" % (u, s["active"], s["enabled"]))
+    if rec["needrestart"]["installed"] and needrestart_mode() != "l":
+        errors.append("needrestart is still configured with restart mode %r" % needrestart_mode())
+    rec["after"] = {u: {"active": s["active"], "enabled": s["enabled"]} for u, s in after.items()}
+    rec["platform"] = platform_identity()
+    rec["status"] = "frozen" if not errors else "freezing-failed"
+    rec["errors"] = errors
+    save_freeze(rec)
+    if errors:
+        fail("the freeze did not complete (%s); the record is kept: mode=thaw restores what it changed" % "; ".join(errors))
+    emit(dict(rec, ok=True))
+
+
+def cmd_thaw(a):
+    if not a.run_id:
+        fail("--run-id is required")
+    rec = freeze_record()
+    if not rec or rec.get("status") == "unreadable":
+        fail("nothing to thaw: no readable freeze record at %s. This tool froze nothing here, or the record is gone; if units were stopped by a freeze whose record is lost, put back by hand ONLY the "
+             "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; then rm %s %s "
+             "(the unreadable record itself: until it is gone, an upgrade and a new freeze are refused)" % (FREEZE_RECORD, NEEDRESTART_DROPIN, FREEZE_RECORD))
+    # the end-of-campaign proof: what moved since the freeze, read BEFORE the thaw changes anything (the survey after a thaw has no record to compare with)
+    drifted_at_thaw = freeze_state().get("drifted", [])
+    errors, done = [], []
+    for u, info in sorted(rec.get("units", {}).items()):
+        want = info.get("before", {})
+        # what the freeze recorded it changed, plus the change it was about to make when it died (it may or may not have happened); each is undone
+        # only if the unit is not already as it was, so a second thaw changes nothing it has put back
+        effective = list(info.get("changes", []))
+        for extra in list(info.get("attempted", [])) + ([info["pending"]] if info.get("pending") else []):
+            if extra not in effective:
+                effective.append(extra)
+        for change in reversed(effective):
+            now = unit_state(u)
+            if change == "disabled" and want.get("enabled") in ON_ENABLED and now["enabled"] not in ON_ENABLED:
+                if now["enabled"] == "masked":
+                    errors.append("%s is MASKED (by hand?): it cannot be enabled; unmask it and dispatch mode=thaw again" % u)
+                    continue
+                argv = ["systemctl", "enable"] + (["--runtime"] if want.get("enabled") == "enabled-runtime" else []) + [u]
+            elif change == "stopped" and want.get("active") == "active" and now["active"] != "active":
+                argv = ["systemctl", "start", u]
+            else:
+                continue
+            rc, out, err = run(argv, timeout=120)
+            if rc != 0:
+                errors.append("%s: %s" % (" ".join(argv), (out + err).strip()[-160:]))
+            else:
+                done.append(" ".join(argv[1:]))
+        now = unit_state(u)
+        if effective and (now["active"] != want.get("active") or now["enabled"] != want.get("enabled")) and now["enabled"] != "masked":
+            errors.append("%s is %s/%s, was %s/%s before the freeze" % (u, now["active"], now["enabled"], want.get("active"), want.get("enabled")))
+    nr = rec.get("needrestart", {})
+    # also when the record does not say it wrote the file (a kill between the write and the record): a file with exactly our text is ours
+    if nr.get("dropin_written") or (os.path.exists(p(NEEDRESTART_DROPIN)) and rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip()):
+        try:
+            if rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip():
+                os.remove(p(NEEDRESTART_DROPIN))
+                done.append("removed " + NEEDRESTART_DROPIN)
+            elif os.path.exists(p(NEEDRESTART_DROPIN)):
+                errors.append("%s is no longer the file the freeze wrote: left alone" % NEEDRESTART_DROPIN)
+        except OSError as x:
+            errors.append("cannot remove %s: %s" % (NEEDRESTART_DROPIN, x))
+        if needrestart_mode() != nr.get("mode_before", ""):
+            errors.append("needrestart restart mode is %r, was %r before the freeze" % (needrestart_mode(), nr.get("mode_before", "")))
+    if errors:
+        fail("the thaw did not complete (%s); the freeze record is kept: run mode=thaw again" % "; ".join(errors))
+    rec["status"] = "thawed"
+    rec["thawed_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rec["thawed_by_run"] = a.run_id
+    rec["restored"] = done
+    rec["drifted_at_thaw"] = drifted_at_thaw
+    write("%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x")), json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
+    os.remove(p(FREEZE_RECORD))
+    emit(dict(rec, ok=True))
 
 
 # ---------------------------------------------------------------------------------------------- main
@@ -1571,7 +1973,7 @@ def main():
     add("simulate", lambda a: emit(simulate()))
     add("marker", lambda a: emit(marker()))
     s = add("dump", cmd_dump)
-    s.add_argument("what", choices=["packages", "policy", "sysctl", "cmdline", "grub"])
+    s.add_argument("what", choices=["packages", "policy", "sysctl", "cmdline", "grub", "dpkg-l", "held", "kernel"])
     st = add("upgrade-status", cmd_upgrade_status, "run-id")
     st.add_argument("--wait", type=int, default=0)
     add("upgrade-cleanup", cmd_upgrade_cleanup, "run-id")
@@ -1594,6 +1996,8 @@ def main():
     add("disarm", cmd_disarm)
     add("make-permanent", cmd_make_permanent, "running", "target", "run-id")
     add("toolcheck", cmd_toolcheck)
+    add("freeze", cmd_freeze, "run-id")
+    add("thaw", cmd_thaw, "run-id")
     a = ap.parse_args()
     # survey, simulate, dump, marker and the status reads: nothing may be written or changed. dkms-check without
     # --build is a read too (with it, it runs `dkms autoinstall`).

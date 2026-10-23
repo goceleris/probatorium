@@ -16,7 +16,7 @@ FIXTURES = os.path.join(HERE, "fixtures")
 
 COMMANDS = ["dpkg-query", "dpkg", "apt-get", "apt-mark", "apt-config", "apt-cache", "modinfo", "dkms", "grub-editenv",
             "grub-set-default", "grub-reboot", "update-grub", "update-initramfs", "findmnt", "df", "timedatectl", "systemctl",
-            "sysctl", "cc", "curl", "mokutil", "gcc", "make", "ip", "ping", "sshd", "tailscaled", "netplan"]
+            "sysctl", "cc", "curl", "mokutil", "gcc", "make", "ip", "ping", "sshd", "tailscaled", "tailscale", "snap", "netplan"]
 
 STUB = r'''#!__PYTHON__
 import fnmatch, json, os, sys, time, shutil
@@ -83,6 +83,8 @@ if name == "dpkg-query":
             .replace("${Architecture}", "arm64").replace("${db:Status-Abbrev}", "ii "))
     sys.exit(0 if found or not pats else 1)
 if name == "dpkg":
+    if args[:1] == ["-l"]:
+        out("Desired=Unknown/Install/Remove/Purge/Hold\n" + "".join("ii  %s  %s  arm64  test package\n" % (n, pkgs()[n]["version"]) for n in sorted(pkgs())) ); sys.exit(0)
     if "--configure" in args:
         if st.get("configure_ok") or not st.get("audit"):
             st["audit"] = []
@@ -151,6 +153,8 @@ if name == "apt-get":
             pkgs()["linux-image-" + k] = {"version": k, "status": "installed"}
         if st.get("upgrade_kernels"):
             regen()
+        if st.get("unhold_rc_after_upgrade"):  # unattended-upgrades takes the dpkg frontend lock while the detached run ends
+            st["unhold_rc"] = st["unhold_rc_after_upgrade"]
         save()
         if st.get("upgrade_dies"):
             os.kill(os.getppid(), 9)  # the detached run is killed mid-apt (OOM, power): no rc file, no policy-rc.d removal
@@ -158,11 +162,16 @@ if name == "apt-get":
         sys.exit(st.get("upgrade_rc", 0))
 if name == "apt-mark":
     if args[:1] == ["showhold"]:
+        if st.get("showhold_rc"):
+            sys.stderr.write("E: Could not open file /var/lib/dpkg/status (test)\n"); sys.exit(st["showhold_rc"])
         out("\n".join(st.get("held", [])) + "\n"); sys.exit(0)
     if args[:1] == ["hold"]:
         st["held"] = sorted(set(st.get("held", [])) | set(args[1:])); save(); sys.exit(0)
     if args[:1] == ["unhold"]:
-        st["held"] = [h for h in st.get("held", []) if h not in args[1:]]; save(); sys.exit(0)
+        if st.get("unhold_rc"):  # the dpkg frontend lock is taken (unattended-upgrades): fails and changes nothing
+            sys.stderr.write("E: Could not get lock /var/lib/dpkg/lock-frontend (test)\n"); sys.exit(st["unhold_rc"])
+        # unhold_keeps: names that stay held although apt-mark says it worked
+        st["held"] = [h for h in st.get("held", []) if h not in args[1:] or h in st.get("unhold_keeps", [])]; save(); sys.exit(0)
     sys.exit(st.get("apt_mark_rc", 0))
 if name == "apt-config":
     out("\n".join('%s "%s";' % kv for kv in st.get("apt_config", {}).items()) + "\n"); sys.exit(0)
@@ -199,6 +208,8 @@ if name == "grub-editenv":
         for k in args[2:]:
             st["grubenv"][k] = ""
         save(); sys.exit(0)
+    if args[-1:] == ["list"] and st.get("grubenv_list_rc"):
+        sys.stderr.write("grub-editenv: error: cannot open grubenv (test)\n"); sys.exit(st["grubenv_list_rc"])
     if args[-1:] == ["list"]:
         out("".join("%s=%s\n" % kv for kv in st["grubenv"].items() if kv[1] != "")); sys.exit(0)
 if name == "grub-set-default":
@@ -230,8 +241,40 @@ if name == "timedatectl":
 if name == "systemctl":
     if args[0] == "--failed":
         sys.exit(0)
+    nth = st.get("systemctl_kill_nth", {}).get(" ".join(args[:2]))
+    if nth:  # killed at the Nth call of this very command (a read too): "is-active apt-daily.timer" 2 is the check after the freeze's changes
+        cnt = st.setdefault("systemctl_counts", {})
+        cnt[" ".join(args[:2])] = cnt.get(" ".join(args[:2]), 0) + 1
+        save()
+        if cnt[" ".join(args[:2])] == nth:
+            os.kill(os.getppid(), 9)
+            time.sleep(1)
+            sys.exit(1)
     if args[0] == "is-system-running":
         out("running\n"); sys.exit(0)
+    if args[0] in ("stop", "disable", "start", "enable"):
+        unit = args[-1]  # "enable --runtime U": the unit is the last word
+        key = {"stop": ("is-active", "inactive"), "start": ("is-active", "active"), "disable": ("is-enabled", "disabled"),
+               "enable": ("is-enabled", "enabled-runtime" if "--runtime" in args else "enabled")}[args[0]]
+        if args[0] + " " + unit in st.get("systemctl_fail", []):
+            sys.stderr.write("Failed to %s %s: Unit is busy (test)\n" % (args[0], unit)); sys.exit(1)
+        if args[0] + " " + unit in st.get("systemctl_kill", []):
+            os.kill(os.getppid(), 9)  # the freeze is killed here (a runner lost, a power loss): the verb is not applied
+            time.sleep(1)
+            sys.exit(1)
+        if args[0] + " " + unit in st.get("systemctl_apply_fail", []):
+            st["services"][key[0] + " " + unit] = key[1]; save()  # the verb takes effect and systemctl reports failure (a timeout: rc 124)
+            sys.stderr.write("Job for %s timed out (test)\n" % unit); sys.exit(124)
+        if args[0] + " " + unit in st.get("systemctl_noop", []):
+            sys.exit(0)  # reports success and changes nothing
+        if st.get("services", {}).get(key[0] + " " + unit) == "masked" and args[0] == "enable":
+            sys.stderr.write("Failed to enable unit: Unit %s is masked (test)\n" % unit); sys.exit(1)
+        st["services"][key[0] + " " + unit] = key[1]; save()
+        if args[0] + " " + unit in st.get("systemctl_kill_after", []):
+            os.kill(os.getppid(), 9)  # the verb WAS applied and the process dies before it can record it
+            time.sleep(1)
+            sys.exit(1)
+        sys.exit(0)
     out(st.get("services", {}).get(args[0] + " " + args[1], "inactive" if args[0] == "is-active" else "disabled") + "\n"); sys.exit(0)
 if name == "ip":
     if st.get("addr", True):
@@ -250,6 +293,18 @@ if name == "curl":
     sys.exit(st.get("curl_rc", {}).get(args[-1].replace("https://", ""), 0))
 if name == "sshd":
     sys.exit(st.get("sshd_rc", 0))
+if name == "tailscale":
+    if args[:2] == ["debug", "prefs"]:
+        if st.get("tailscale_prefs_rc"):
+            sys.exit(st["tailscale_prefs_rc"])
+        out(json.dumps({"AutoUpdate": st.get("tailscale_autoupdate", {"Check": True, "Apply": False})}) + "\n"); sys.exit(0)
+    out("1.90.0\n"); sys.exit(0)
+if name == "snap":
+    if args[:2] == ["refresh", "--time"]:
+        if st.get("snap_refresh_rc"):
+            sys.exit(st["snap_refresh_rc"])
+        out("timer: 00:00~24:00/4\nlast: today at 06:12 CEST\nnext: today at 18:30 CEST\n"); sys.exit(0)
+    sys.exit(1)
 if name == "tailscaled":
     out("1.90.0\n"); sys.exit(st.get("tailscaled_rc", 0))
 if name == "netplan":
@@ -302,6 +357,15 @@ class FakeHost:
         if mode:
             os.chmod(full, mode)
 
+    def proc(self, pid, *argv, comm=None):
+        """A running process: /proc/<pid>/cmdline (NUL separated, as the kernel prints it) and /proc/<pid>/comm (the first 15
+        characters of the program or script name, as the kernel keeps them)."""
+        self.w("/proc/%d/cmdline" % pid)
+        with open("%s/proc/%d/cmdline" % (self.root, pid), "wb") as f:
+            f.write(b"".join(a.encode() + b"\0" for a in argv))
+        base = os.path.basename(argv[1] if len(argv) > 1 and os.path.basename(argv[0]).startswith(("python", "perl", "sh", "bash", "dash")) else argv[0])
+        self.w("/proc/%d/comm" % pid, (comm if comm is not None else base[:15]) + "\n")
+
     def build(self, hostname, arm64):
         self.w("/etc/hostname", hostname + "\n")
         self.w("/etc/os-release", 'PRETTY_NAME="Ubuntu 26.04 LTS"\nNAME="Ubuntu"\nVERSION_ID="26.04"\nID=ubuntu\nVERSION_CODENAME=resolute\n')
@@ -342,9 +406,16 @@ class FakeHost:
         self.w("/var/lib/apt/lists/ports.ubuntu.com_InRelease")
         self.w("/var/lib/dpkg/lock-frontend")
         self.w("/var/lib/dpkg/lock")
+        self.w("/var/cache/apt/archives/lock")
+        self.w("/var/lib/apt/lists/lock")
+        # what an idle Ubuntu host always runs: neither is a package run (their comm is "unattended-upgr" and "packagekitd")
+        self.proc(900, "/usr/bin/python3", "/usr/share/unattended-upgrades/unattended-upgrade-shutdown", "--wait-for-signal")
+        self.proc(901, "/usr/libexec/packagekitd")
         self.w("/proc/1/comm", "systemd\n")
         self.w("/proc/stat", "btime 1\n")
         self.w("/etc/modprobe.d/blacklist.conf", "# nothing\n")
+        self.w("/etc/needrestart/needrestart.conf", "# Restart mode: (l)ist only, (i)nteractive or (a)utomatically.\n#$nrconf{restart} = 'i';\n")
+        os.makedirs(self.root + "/etc/needrestart/conf.d", exist_ok=True)
         self.build_snapshot_tree()
         self.build_boot_proof()
         self.w("/etc/netplan/50-cloud-init.yaml", "network:\n  version: 2\n")
@@ -353,6 +424,7 @@ class FakeHost:
                    "linux-headers-" + self.running: {"version": self.running, "status": "installed"},
                    "linux-firmware": {"version": "20260301.git1", "status": "installed"},
                    "unattended-upgrades": {"version": "2.12", "status": "installed"},
+                   "needrestart": {"version": "3.8", "status": "installed"},
                    "build-essential": {"version": "12.12", "status": "installed"},
                    "tailscale": {"version": "1.90.0", "status": "installed"},
                    "grub-efi-arm64-bin": {"version": "2.14", "status": "installed"}, "grub-common": {"version": "2.14", "status": "installed"},
@@ -373,7 +445,9 @@ class FakeHost:
             "ntp": "yes",
             "services": {"is-active unattended-upgrades.service": "active", "is-enabled unattended-upgrades.service": "enabled",
                          "is-active tailscaled": "active", "is-enabled tailscaled": "enabled", "is-enabled ssh": "enabled", "is-active apcupsd": "active",
-                         "is-enabled celeris-resume-check.service": "enabled"},
+                         "is-enabled celeris-resume-check.service": "enabled",
+                         "is-active apt-daily.timer": "active", "is-enabled apt-daily.timer": "enabled",
+                         "is-active apt-daily-upgrade.timer": "active", "is-enabled apt-daily-upgrade.timer": "enabled"},
             "sim": ["Inst linux-image-7.0.0-40-generic (7.0.0-40.40 Ubuntu:26.04/resolute-updates [arm64])",
                     "Inst libc6 [2.43-0ubuntu1] (2.43-0ubuntu2 Ubuntu:26.04/resolute-updates [arm64])",
                     "Conf libc6 (2.43-0ubuntu2 Ubuntu:26.04/resolute-updates [arm64])",

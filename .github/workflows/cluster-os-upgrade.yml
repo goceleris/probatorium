@@ -13,9 +13,12 @@ name: Cluster OS Upgrade
 #     -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
 #
 # Job graph: plan -> cluster-guard -> os-upgrade -> verdict.
-#   plan           refuses a malformed request: a wrong mode (survey, rehearse, upgrade, disarm, repair), a survey that names a host or carries a confirm, an upgrade or
-#                  disarm without ONE host and its typed confirmation (UPGRADE-<host>, DISARM-<host>), a bad reason,
-#                  and any ref but main.
+#   plan           refuses a malformed request, every input checked in EVERY mode (a survey included): a wrong mode (survey, rehearse, upgrade,
+#                  disarm, repair, freeze, thaw), a survey that names a host or carries a confirm, a host-changing mode without ONE host, a host that is not
+#                  in OS_UPGRADE_ALLOWED_HOSTS, an environment cluster-host-change without a required reviewer, a wrong confirmation (UPGRADE-<host>,
+#                  REHEARSE-<host> or the console attestation of a person at the rack, DISARM-<host>, REPAIR-<host>, FREEZE-<host>, THAW-<host>), a bad repair_action,
+#                  hold_access_packages or retry_kernel, a bad reason, and any ref but main. For a rehearsal it also says, in the log and the step
+#                  summary, whether a console is attested (run-name and the job name carry it for the environment's approver).
 #   cluster-guard  outside the group: lists every open run and refuses unless the cluster is IDLE
 #                  (tools/stresstally guard -idle: a holder refuses too, not only a pending run). The survey needs it
 #                  as well: it runs commands on the hosts and must not perturb a measurement.
@@ -36,24 +39,25 @@ name: Cluster OS Upgrade
 # HOLD-CLUSTER: the orchestrator's marker file lives outside this repository and this workflow cannot see
 # it. Whoever dispatches honours it.
 
-run-name: Cluster OS ${{ inputs.mode }} [${{ inputs.host }}]
+# The environment approver sees THIS line (and the job name), not the inputs: a rehearsal says whether the dispatcher attests a person at the rack.
+run-name: Cluster OS ${{ inputs.mode }} [${{ inputs.host }}]${{ inputs.mode == 'rehearse' && (endsWith(inputs.confirm, '-CONSOLE') && ' CONSOLE-ATTESTED (a person is at the rack with a console)' || ' (no console attested)') || '' }}
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "survey: read-only, all three hosts, no confirmation. rehearse: ONE host reboots into its OWN running kernel through a grub one-shot (proves the fallback mechanism; changes no package). upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host."
+        description: "survey: read-only, all three hosts, no confirmation. rehearse: ONE host reboots into its OWN running kernel through a grub one-shot (proves the fallback mechanism; changes no package). upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host. freeze: stop and disable the apt timers and unattended-upgrades on ONE host (and set needrestart to list-only) so the platform stays fixed during the evidence campaign; records what it changed and the platform. thaw: put back exactly what the freeze recorded."
         type: choice
-        options: [survey, rehearse, upgrade, disarm, repair]
+        options: [survey, rehearse, upgrade, disarm, repair, freeze, thaw]
         required: true
       host:
-        description: "rehearse, upgrade, disarm or repair: the host. Leave '-' for a survey."
+        description: "rehearse, upgrade, disarm, repair, freeze or thaw: the host. Leave '-' for a survey."
         type: choice
         options: ["-", msa2-server, msr1, msa2-client]
         required: false
         default: "-"
       confirm:
-        description: "rehearse: type REHEARSE-<host>, or REHEARSE-<host>-CONSOLE if someone is at the rack with a console (needed when grub's first menu entry is not the running kernel). upgrade: UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. A survey takes none."
+        description: "rehearse: type REHEARSE-<host>; when grub's first menu entry is not the running kernel the rehearsal is refused unless a person is at the rack with a console and the dispatcher attests it (README, Rehearsal at a console). upgrade: UPGRADE-<host>. disarm: DISARM-<host>. repair: REPAIR-<host>. freeze: FREEZE-<host>. thaw: THAW-<host>. A survey takes none."
         type: string
         required: false
         default: ""
@@ -129,8 +133,8 @@ jobs:
           # every input the playbook receives is checked here in EVERY mode, a survey included (a survey job holds the cluster key,
           # and each value is also written to extra-vars.json as a literal)
           case "$IN_MODE" in
-            survey | rehearse | upgrade | disarm | repair) ;;
-            *) echo "::error::mode must be survey, rehearse, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
+            survey | rehearse | upgrade | disarm | repair | freeze | thaw) ;;
+            *) echo "::error::mode must be survey, rehearse, upgrade, disarm, repair, freeze or thaw, got: $IN_MODE"; exit 1 ;;
           esac
           case "$IN_HOST" in
             "-" | msa2-server | msr1 | msa2-client) ;;
@@ -159,10 +163,10 @@ jobs:
                 exit 1
               fi
               ;;
-            upgrade | rehearse | disarm | repair)
+            upgrade | rehearse | disarm | repair | freeze | thaw)
               case "$IN_HOST" in
                 msa2-server|msr1|msa2-client) ;;
-                *) echo "::error::an upgrade, a rehearsal, a disarm or a repair names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
+                *) echo "::error::an upgrade, a rehearsal, a disarm, a repair, a freeze or a thaw names ONE host (msa2-server, msr1 or msa2-client), got: $IN_HOST"; exit 1 ;;
               esac
               # the extra control: a host-changing mode is impossible until the maintainer lists the host for the window
               # (repository variable OS_UPGRADE_ALLOWED_HOSTS; README, "Enabling a host change")
@@ -189,7 +193,7 @@ jobs:
                 exit 1
               fi
               if [ "$IN_MODE" = rehearse ] && [ "$IN_CONFIRM" != "REHEARSE-$IN_HOST" ] && [ "$IN_CONFIRM" != "REHEARSE-$IN_HOST-CONSOLE" ]; then
-                echo "::error::confirm must be exactly REHEARSE-$IN_HOST (REHEARSE-$IN_HOST-CONSOLE only with someone at the rack with a console)"
+                echo "::error::confirm must be exactly REHEARSE-$IN_HOST, or the console attestation of a person at the rack (README, Rehearsal at a console): it is typed by that person, never read off an error"
                 exit 1
               fi
               if [ "$IN_MODE" = disarm ] && [ "$IN_CONFIRM" != "DISARM-$IN_HOST" ]; then
@@ -200,8 +204,16 @@ jobs:
                 echo "::error::confirm must be exactly REPAIR-$IN_HOST"
                 exit 1
               fi
+              if [ "$IN_MODE" = freeze ] && [ "$IN_CONFIRM" != "FREEZE-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly FREEZE-$IN_HOST"
+                exit 1
+              fi
+              if [ "$IN_MODE" = thaw ] && [ "$IN_CONFIRM" != "THAW-$IN_HOST" ]; then
+                echo "::error::confirm must be exactly THAW-$IN_HOST"
+                exit 1
+              fi
               ;;
-            *) echo "::error::mode must be survey, rehearse, upgrade, disarm or repair, got: $IN_MODE"; exit 1 ;;
+            *) echo "::error::mode must be survey, rehearse, upgrade, disarm, repair, freeze or thaw, got: $IN_MODE"; exit 1 ;;
           esac
           if [ -z "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ]; then
             echo "::error::reason is empty"
@@ -221,6 +233,16 @@ jobs:
             *'{'* | *'}'*) echo "::error::reason must not contain braces"; exit 1 ;;
           esac
           echo "request accepted: $IN_MODE $IN_HOST"
+          # a rehearsal says in the log, the step summary and (run-name, job name) the approval whether the dispatcher attests a console at the rack
+          if [ "$IN_MODE" = rehearse ]; then
+            if [ "$IN_CONFIRM" = "REHEARSE-$IN_HOST-CONSOLE" ]; then
+              kind="CONSOLE ATTESTED: the dispatcher states that a person is at the rack of $IN_HOST with a console"
+            else
+              kind="no console attested"
+            fi
+            echo "::notice title=Rehearsal of $IN_HOST::$kind"
+            echo "### Rehearsal of $IN_HOST: $kind" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
 
   # Outside matrix-tier-cluster, just before entering it. The tool is built first so the look (guard.sh) and
   # the verdict are seconds apart, as in celeris-stress.yml.
@@ -270,7 +292,7 @@ jobs:
   # The survey or the upgrade, inside matrix-tier-cluster for its whole length. Job-level concurrency only: a
   # workflow-level group would enter at dispatch, before the guard looked.
   os-upgrade:
-    name: os-upgrade ${{ inputs.mode }} ${{ inputs.host }}
+    name: os-upgrade ${{ inputs.mode }} ${{ inputs.host }}${{ inputs.mode == 'rehearse' && (endsWith(inputs.confirm, '-CONSOLE') && ' CONSOLE-ATTESTED' || ' (no console attested)') || '' }}
     needs: [plan, cluster-guard]
     if: ${{ github.event_name == 'workflow_dispatch' && needs.cluster-guard.result == 'success' && needs.cluster-guard.outputs.attempt == github.run_attempt && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     concurrency:
@@ -423,11 +445,12 @@ jobs:
         shell: bash
         env:
           IN_REASON: ${{ inputs.reason }}
+          IN_CONFIRM: ${{ inputs.confirm }}
           RUN_ID: ${{ github.run_id }}
         run: |
           rc=$(cat "${OS_OUT}/ansible.rc" 2>/dev/null || echo 99)
           mkdir -p "$OS_OUT"
-          bash .github/scripts/os-upgrade-summary.sh "$OS_OUT" "$OS_MODE" "$OS_HOST" "$rc" "$IN_REASON" "$RUN_ID" | tee "$OS_OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          bash .github/scripts/os-upgrade-summary.sh "$OS_OUT" "$OS_MODE" "$OS_HOST" "$rc" "$IN_REASON" "$RUN_ID" "$IN_CONFIRM" | tee "$OS_OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

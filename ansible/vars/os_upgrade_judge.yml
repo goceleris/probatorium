@@ -27,6 +27,18 @@ os_counter_ceiling: 1000000000
 # in (ssh, tailscale) and out (power guard, docker for the db fixtures)
 os_protected_regex: '^(linux-|grub|shim|dkms|openssh|tailscale|apcupsd|docker|containerd|runc|netplan|systemd|ifenslave|r8127|network|sudo|python3|udev|kmod|initramfs-tools|iproute2|libc6|ca-certificates|efibootmgr|apt$|dpkg$|libapt|openssl|libssl|mokutil|ethtool|curl$)'
 
+# The package-manager programs the tool reports as running (os_upgrade.py PKG_RUN_NAMES, read from /proc/<pid>/cmdline; a test compares the
+# two lists). Only these count here too: the first survey of release 1.6.0 (run 39814880117) recorded the kernel's 15-character comm names, among them
+# the idle daemons `unattended-upgr` (unattended-upgrade-shutdown --wait-for-signal) and `packagekitd`, which are not package runs.
+os_busy_process_names: 'apt apt-get aptitude dpkg unattended-upgrade apt.systemd.daily dkms update-grub grub-mkconfig update-initramfs'
+
+# Is a package run going on on the target (pre_survey)? "" when not; else the programs running, or the lock files held.
+apt_busy_str: >-
+  {% set pk = pre_survey.packages %}
+  {% set procs = pk.package_processes | select('in', os_busy_process_names.split()) | list %}
+  {% set locks = pk.locks_held | default([]) %}
+  {% if procs | length > 0 %}{{ procs | join(', ') }}{% elif pk.dpkg_lock_held or locks | length > 0 %}an apt or dpkg lock is held{{ (' (' ~ (locks | join(', ')) ~ ')') if locks | length > 0 else '' }}{% endif %}
+
 post_snap: >-
   {{ (post_raw.stdout | from_json) if (post_raw.stdout | default('') | length > 0) else {} }}
 
@@ -35,6 +47,7 @@ refusals_str: >-
   {% set a = pre_target %}
   {% set s = pre_survey %}
   {% set p = [] %}
+  {% set console_attested = (os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE') %}
   {% if a.manifest_present %}{% set _ = p.append('a bench or validation manifest exists on the target') %}{% endif %}
   {% if a.results_entries | int > 0 and not (allow_results_loss | bool) %}{% set _ = p.append('results_root ' ~ results_root ~ ' holds ' ~ a.results_entries ~ ' entr(ies) the reboot destroys (' ~ (a.results_list | join(', ')) ~ '): rescue or fetch them, or dispatch with allow_results_loss=true') %}{% endif %}
   {% if a.resume_pending %}{% set _ = p.append('/var/lib/celeris-power/resume-pending.json exists: a power-loss resume is pending (cluster-power-restore --list)') %}{% endif %}
@@ -45,7 +58,7 @@ refusals_str: >-
   {% if s.disk['/'] is none or s.disk['/'].free_kib < os_min_root_free_kib %}{% set _ = p.append('not enough free disk on /: ' ~ (s.disk['/'].free_kib if s.disk['/'] is not none else 'unreadable') ~ ' KiB free, ' ~ os_min_root_free_kib ~ ' needed') %}{% endif %}
   {% if s.disk['/boot'] is none or s.disk['/boot'].free_kib < os_min_boot_free_kib %}{% set _ = p.append('not enough free disk on /boot: ' ~ (s.disk['/boot'].free_kib if s.disk['/boot'] is not none else 'unreadable') ~ ' KiB free, ' ~ os_min_boot_free_kib ~ ' needed (three kernels and their initrds)') %}{% endif %}
   {% if s.disk['/boot/efi'] is not none and s.disk['/boot/efi'].free_kib < os_min_efi_free_kib %}{% set _ = p.append('not enough free disk on /boot/efi: ' ~ s.disk['/boot/efi'].free_kib ~ ' KiB free, ' ~ os_min_efi_free_kib ~ ' needed') %}{% endif %}
-  {% if s.packages.dpkg_lock_held or s.packages.package_processes | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (s.packages.package_processes | join(', ') if s.packages.package_processes | length > 0 else 'a dpkg lock is held') ~ '): an unattended upgrade or another package run is in progress') %}{% endif %}
+  {% if (apt_busy_str | trim) | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (apt_busy_str | trim) ~ '): an unattended upgrade or another package run is in progress') %}{% endif %}
   {% if s.packages.dpkg_audit | length > 0 %}{% set _ = p.append('dpkg --audit reports half-configured or broken packages: ' ~ (s.packages.dpkg_audit | join(' / '))) %}{% endif %}
   {% if s.packages.held_kernel | length > 0 %}{% set _ = p.append('held kernel, boot or DKMS packages: ' ~ (s.packages.held_kernel | join(', ')) ~ ' (apt-mark unhold them deliberately, or leave the host)' ~ (('. Of these, THIS TOOL put the holds of ' ~ (s.packages.tool_holds | map(attribute='run_id') | join(', ')) ~ ' (' ~ (s.packages.tool_holds | map(attribute='packages') | map('join', ' ') | join(' / ')) ~ ') and a run that died left them: dispatch mode=repair with repair_action=release-holds, which releases only holds this tool recorded') if (s.packages.tool_holds | default([])) | length > 0 else '')) %}{% endif %}
   {% if s.access_problems | length > 0 %}{% set _ = p.append('the way in is ALREADY not intact on the current userland (' ~ (s.access_problems | join(' / ')) ~ '): an upgrade would change every package and then refuse to reboot, for ever. Fix it first') %}{% endif %}
@@ -56,10 +69,11 @@ refusals_str: >-
   {% if s.boot.boot_stack | length > 0 %}{% set _ = p.append('/boot/grub is on ' ~ s.boot.boot_stack ~ ': grub cannot write its environment block there, so the boot is never one-shot') %}{% endif %}
   {% if s.boot.running_entry_id | length == 0 %}{% set _ = p.append('grub.cfg has no menu entry for the running kernel ' ~ s.kernel ~ ': it cannot be made the fallback') %}{% endif %}
   {% if s.boot.next_entry | length > 0 %}{% set _ = p.append('grub has a one-shot entry pending (next_entry=' ~ s.boot.next_entry ~ '): an earlier run armed it and the host has not booted it; settle that first') %}{% endif %}
-  {% if s.boot.dropin_present and s.boot.default_kernel | length > 0 and s.boot.default_kernel != s.kernel %}{% set _ = p.append('an earlier OS upgrade left grub saved default ' ~ s.boot.default_kernel ~ ' while the host runs ' ~ s.kernel ~ ': a new run would pin the running kernel and move the fallback to a kernel that was not verified. Reboot the host back to ' ~ s.boot.default_kernel ~ ' first (the cluster-reboot workflow does that and ends red with "kernel changed", by design)') %}{% endif %}
+  {% if s.boot.dropin_present and s.boot.default_kernel | length > 0 and s.boot.default_kernel != s.kernel %}{% set _ = p.append('an earlier OS upgrade left grub saved default ' ~ s.boot.default_kernel ~ ' while the host runs ' ~ s.kernel ~ ': a new run would pin the running kernel and move the fallback to a kernel that was not verified. The host has to run ' ~ s.boot.default_kernel ~ ' first. If GRUB reads its environment block, the cluster-reboot workflow boots it (and ends red with "kernel changed", by design). If GRUB does NOT (a rehearsal or an upgrade ended with a one-shot still pending: survey boot.next_entry), the host runs GRUB\'s first menu entry (boot.entry0_kernel ' ~ ((s.boot.entry0_kernel | default('')) or 'unknown') ~ ', not the saved default) and cluster-reboot boots that kernel again: only the console (Esc or Shift at power-on, choose ' ~ s.boot.default_kernel ~ ') or a reviewed change brings ' ~ s.boot.default_kernel ~ ' back') %}{% endif %}
   {% if (blacklist_r8169 | bool) and (s.nics | selectattr('driver', 'equalto', 'r8169') | list | length > 0) %}{% set _ = p.append('blacklist_r8169=true, but a NIC is bound to r8169 (' ~ (s.nics | selectattr('driver', 'equalto', 'r8169') | map(attribute='iface') | join(', ')) ~ '): the blacklist would remove it under every kernel, the old one included') %}{% endif %}
-  {% if os_mode == 'rehearse' and (s.boot.entry0_kernel | default('')) != s.kernel and (os_confirm | default('')) != ('REHEARSE-' ~ os_host ~ '-CONSOLE') %}{% set _ = p.append('the first menu entry of grub is ' ~ ((s.boot.entry0_kernel | default('')) or 'unknown') ~ ', not the running kernel ' ~ s.kernel ~ ': the rehearsal tests whether GRUB reads the environment block, and if it does NOT, GRUB boots that first entry (not the saved default) on this boot and on every power-cycle after it, with no one-shot to fall back on. That is a kernel this host has not run' ~ (' (its r8127 driver is unproven: no NIC is possible)' if s.nics | selectattr('driver', 'equalto', 'r8127') | list | length > 0 else '') ~ '. Only with someone at the rack with a console (the GRUB menu may be hidden: Esc or Shift at power-on) confirm with REHEARSE-' ~ os_host ~ '-CONSOLE. Otherwise the running kernel has to be made the first entry of grub first, which no workflow mode does (the console, or a reviewed change)') %}{% endif %}
+  {% if os_mode == 'rehearse' and (s.boot.entry0_kernel | default('')) != s.kernel and not console_attested %}{% set _ = p.append('the first menu entry of grub is ' ~ ((s.boot.entry0_kernel | default('')) or 'unknown') ~ ', not the running kernel ' ~ s.kernel ~ ': the rehearsal tests whether GRUB reads the environment block, and if it does NOT, GRUB boots that first entry (not the saved default) on this boot and on every power-cycle after it, with no one-shot to fall back on. That is a kernel this host has not run' ~ (' (its r8127 driver is unproven: no NIC is possible)' if s.nics | selectattr('driver', 'equalto', 'r8127') | list | length > 0 else '') ~ '. Only a person at the rack with a console (the GRUB menu may be hidden: Esc or Shift at power-on) can run it: that person types the console attestation described in the README (Rehearsal at a console), which no refusal and no workflow text spells out. Otherwise the running kernel has to be made the first entry of grub first, which no workflow mode does (the console, or a reviewed change)') %}{% endif %}
   {% if os_mode == 'upgrade' and (s.rehearsal.kernel | default('')) != s.kernel or os_mode == 'upgrade' and not (s.rehearsal.valid | default(false)) %}{% set _ = p.append('no successful one-shot rehearsal of this host on the running kernel ' ~ s.kernel ~ ' (record: ' ~ (s.rehearsal.kernel | default('none')) ~ (('; STALE: ' ~ s.rehearsal.stale) if (s.rehearsal.stale | default('')) | length > 0 else '') ~ '): dispatch mode=rehearse first. It tests that GRUB reads and clears the environment block Linux writes, which every fallback of the upgrade depends on') %}{% endif %}
+  {% if os_mode == 'upgrade' and (s.freeze | default({})) | length > 0 %}{% set _ = p.append('this host is frozen (run ' ~ (s.freeze.run_id | default('?')) ~ ', ' ~ (s.freeze.utc | default('?')) ~ '): an upgrade changes the platform the freeze recorded, so its record would name a platform that no longer exists. Dispatch mode=thaw, upgrade, and freeze again once the host is upgraded and verified') %}{% endif %}
   {% if os_mode == 'upgrade' and os_host in os_loadgen_hosts %}
   {% for h in os_bench_targets %}
   {% set m = (os_surveys[h].marker | default({})) %}
@@ -68,7 +82,7 @@ refusals_str: >-
   {% endif %}
   {{ p | join(' ;; ') }}
 
-# mode=repair / mode=disarm: refusals of the maintenance play. Inputs: os_mode, repair_action, pre_target, pre_survey.
+# mode=repair / mode=disarm / mode=freeze / mode=thaw: refusals of the maintenance play. Inputs: os_mode, repair_action, pre_target, pre_survey.
 maint_refusals_str: >-
   {% set a = pre_target %}
   {% set s = pre_survey %}
@@ -76,13 +90,23 @@ maint_refusals_str: >-
   {% if os_mode == 'repair' %}
   {% if a.manifest_present %}{% set _ = p.append('a bench or validation manifest exists on the target') %}{% endif %}
   {% if a.runner_workers | int > 0 %}{% set _ = p.append(a.runner_workers ~ ' runner job(s) are executing on the host') %}{% endif %}
-  {% if s.packages.dpkg_lock_held or s.packages.package_processes | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (s.packages.package_processes | join(', ') if s.packages.package_processes | length > 0 else 'a dpkg lock is held') ~ '): a repair would race it') %}{% endif %}
+  {% if (apt_busy_str | trim) | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (apt_busy_str | trim) ~ '): a repair would race it') %}{% endif %}
   {% if s.boot.next_entry | length > 0 %}{% set _ = p.append('grub has a one-shot entry pending (next_entry=' ~ s.boot.next_entry ~ '): dispatch mode=disarm first') %}{% endif %}
   {% if s.packages.policy_rc_d_present and not s.packages.policy_rc_d_ours %}{% set _ = p.append('/usr/sbin/policy-rc.d exists and is not the one this workflow writes') %}{% endif %}
   {% if repair_action == 'configure' and s.packages.dpkg_audit | length == 0 %}{% set _ = p.append('nothing to repair: dpkg --audit is clean' ~ (' (this tool left holds in place: use repair_action=release-holds)' if (s.packages.tool_holds | default([])) | length > 0 else '')) %}{% endif %}
   {% if repair_action == 'release-holds' and (s.packages.tool_holds | default([])) | length == 0 %}{% set _ = p.append('nothing to release: no hold put by this tool is in place (a hold that is there was not recorded by it: apt-mark unhold it deliberately)') %}{% endif %}
   {% if repair_action == 'abort-new-kernel' and s.packages.broken_kernel_pkgs | length == 0 %}{% set _ = p.append('nothing to abort: no kernel newer than the running one has a package that is not cleanly installed (a kernel installed and working before is not removed)') %}{% endif %}
   {% if repair_action == 'abort-new-kernel' and not (s.boot.dropin_present and s.boot.default_kernel == s.kernel) %}{% set _ = p.append('grub saved default (' ~ s.boot.default_kernel ~ ') is not the running kernel ' ~ s.kernel ~ ' or the upgrade pin is missing: removing kernels could change what boots') %}{% endif %}
+  {% endif %}
+  {% if os_mode in ['freeze', 'thaw'] %}
+  {% if a.manifest_present %}{% set _ = p.append('a bench or validation manifest exists on the target') %}{% endif %}
+  {% if a.runner_workers | int > 0 %}{% set _ = p.append(a.runner_workers ~ ' runner job(s) are executing on the host') %}{% endif %}
+  {% if a.resume_pending %}{% set _ = p.append('/var/lib/celeris-power/resume-pending.json exists: a power-loss resume is pending (cluster-power-restore --list). ' ~ ('A thaw re-enables the apt timers, which are persistent and can run unattended-upgrades within minutes, on a host whose campaign is about to resume' if os_mode == 'thaw' else 'A freeze changes the platform of a host whose campaign is about to resume')) %}{% endif %}
+  {% if os_mode == 'freeze' and (apt_busy_str | trim) | length > 0 %}{% set _ = p.append('dpkg or apt is busy (' ~ (apt_busy_str | trim) ~ '): a freeze would stop unattended-upgrades or the apt timers under a package run') %}{% endif %}
+  {% if os_mode == 'freeze' and (s.boot.default_kernel | default('')) != s.kernel %}{% set _ = p.append('grub saved default kernel is ' ~ ((s.boot.default_kernel | default('')) or 'unknown') ~ ' and the host runs ' ~ s.kernel ~ ': any reboot (a power loss, a panic, cluster-reboot) boots the saved default, so the platform a freeze would record is not the one that comes back. Pin the running kernel first (a rehearsal or an upgrade does), or finish the upgrade') %}{% endif %}
+  {% if os_mode == 'freeze' and ((s.unattended_upgrades.install_on_shutdown | default('')) | lower) in ['true', '1', 'yes', 'on', 'with', 'enable'] %}{% set _ = p.append('Unattended-Upgrade::InstallOnShutdown is ' ~ s.unattended_upgrades.install_on_shutdown ~ ': the shutdown listener a freeze stops installs packages when the host shuts down, and what stopping it does then is not known here. Set it to false by a reviewed change first') %}{% endif %}
+  {% if os_mode == 'freeze' and (s.freeze | default({})) | length > 0 %}{% set _ = p.append('this host is already frozen (run ' ~ (s.freeze.run_id | default('?')) ~ ', ' ~ (s.freeze.utc | default('?')) ~ ', status ' ~ (s.freeze.status | default('?')) ~ '): dispatch mode=thaw first. The record of what the first freeze changed is kept, so the previous states are never overwritten') %}{% endif %}
+  {% if os_mode == 'thaw' and (s.freeze | default({})) | length == 0 %}{% set _ = p.append('nothing to thaw: no freeze record on this host (this tool froze nothing here, or its record is gone)') %}{% endif %}
   {% endif %}
   {{ p | join(' ;; ') }}
 
@@ -145,7 +169,7 @@ post_problems_str: >-
   {% set up_b = b.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
   {% if up_b < up_a %}{% set _ = p.append('bond lost a slave: ' ~ up_a ~ ' up before, ' ~ up_b ~ ' up now') %}{% endif %}
   {% if b.max_vector_total >= os_counter_ceiling %}{% set _ = p.append('a NIC vector counts ' ~ b.max_vector_total ~ ' since boot: the counters were not reset') %}{% endif %}
-  {% if bs | length > 0 and bs.boot.next_entry | length > 0 %}{% set _ = p.append('a one-shot is still pending (' ~ bs.boot.next_entry ~ ') after the host booted: GRUB did not consume it, so it reads or writes another environment block than the one Linux uses, and the fallback is NOT proven. While that holds, a power-cycle or a reboot boots the first menu entry of grub (' ~ (bs.boot.entry0_kernel | default('unknown')) ~ '), not the saved default (' ~ (bs.boot.default_kernel | default('unknown')) ~ '): have the console at hand; mode=disarm clears the pending one-shot') %}{% endif %}
+  {% if bs | length > 0 and bs.boot.next_entry | length > 0 %}{% set _ = p.append('a one-shot is still pending (' ~ bs.boot.next_entry ~ ') after the host booted: GRUB did not consume it, so it reads or writes another environment block than the one Linux uses, and the fallback is NOT proven. While that holds, a power-cycle or a reboot (the cluster-reboot workflow included) boots the first menu entry of grub (boot.entry0_kernel ' ~ (bs.boot.entry0_kernel | default('unknown')) ~ '), NOT the saved default (' ~ (bs.boot.default_kernel | default('unknown')) ~ '): only the console brings another kernel back, so have it at hand; mode=disarm clears the pending one-shot') %}{% endif %}
   {% if (b.failed_units | difference(a.failed_units)) | length > 0 %}{% set _ = p.append('new failed unit(s): ' ~ (b.failed_units | difference(a.failed_units) | join(', '))) %}{% endif %}
   {% if bs | length == 0 %}{% set _ = p.append('no readable survey after the reboot') %}{% else %}
   {% for n in s.nics %}

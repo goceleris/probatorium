@@ -1,0 +1,556 @@
+{
+    "access_problems": [],
+    "arch": "aarch64",
+    "armed_kernels": [],
+    "boot": {
+        "boot_fs": "ext4",
+        "boot_source": "/dev/nvme0n1p2",
+        "boot_stack": "",
+        "cfg_recordfail_timeout": "30",
+        "cfg_uses_saved": false,
+        "default_kernel": "7.0.0-38-generic",
+        "dropin_present": false,
+        "efi": true,
+        "entries": [
+            {
+                "id": "gnulinux-simple-ROOTFS-MSR1",
+                "kernel": "7.0.0-38-generic",
+                "title": "Ubuntu"
+            },
+            {
+                "id": "gnulinux-advanced-ROOTFS-MSR1>gnulinux-7.0.0-38-generic-advanced-ROOTFS-MSR1",
+                "kernel": "7.0.0-38-generic",
+                "title": "Ubuntu, with Linux 7.0.0-38-generic"
+            },
+            {
+                "id": "gnulinux-advanced-ROOTFS-MSR1>gnulinux-7.0.0-31-generic-advanced-ROOTFS-MSR1",
+                "kernel": "7.0.0-31-generic",
+                "title": "Ubuntu, with Linux 7.0.0-31-generic"
+            }
+        ],
+        "entry0_kernel": "7.0.0-38-generic",
+        "grub_cfg_present": true,
+        "grub_editenv": true,
+        "grub_reboot": true,
+        "grub_set_default": true,
+        "next_entry": "",
+        "proof": {
+            "boot_image": "/vmlinuz-7.0.0-31-generic",
+            "boot_uuid": "BOOTFS-MSR1",
+            "efi_loader": "\\EFI\\ubuntu\\shimaa64.efi",
+            "ok": true,
+            "prefix": "/grub",
+            "problems": [],
+            "stub_uuid": "BOOTFS-MSR1"
+        },
+        "running_entry_id": "gnulinux-advanced-ROOTFS-MSR1>gnulinux-7.0.0-31-generic-advanced-ROOTFS-MSR1",
+        "saved_entry": "",
+        "savedefault": false,
+        "secure_boot": "disabled",
+        "settings": {
+            "GRUB_CMDLINE_LINUX": "",
+            "GRUB_CMDLINE_LINUX_DEFAULT": "$GRUB_CMDLINE_LINUX_DEFAULT crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M",
+            "GRUB_DEFAULT": "0",
+            "GRUB_TIMEOUT": "0",
+            "GRUB_TIMEOUT_STYLE": "hidden"
+        },
+        "settings_files": [
+            "/etc/default/grub",
+            "/etc/default/grub.d/kdump-tools.cfg"
+        ],
+        "update_grub": true
+    },
+    "crash": [
+        "202609082320",
+        "202609091231",
+        "kdump_lock",
+        "kexec_cmd",
+        "linux-image-7.0.0-31-generic-202609082320.crash",
+        "linux-image-7.0.0-31-generic-202609091231.crash"
+    ],
+    "disk": {
+        "/": {
+            "free_kib": 876020192,
+            "mount": "/",
+            "total_kib": 957150424
+        },
+        "/boot": {
+            "free_kib": 1701404,
+            "mount": "/boot",
+            "total_kib": 1992552
+        },
+        "/boot/efi": {
+            "free_kib": 1091952,
+            "mount": "/boot/efi",
+            "total_kib": 1098632
+        },
+        "/var": {
+            "free_kib": 876020192,
+            "mount": "/",
+            "total_kib": 957150424
+        }
+    },
+    "dkms": {
+        "installed_for_running": [
+            "r8127"
+        ],
+        "status": [
+            {
+                "arch": "aarch64",
+                "kernel": "7.0.0-31-generic",
+                "name": "r8127",
+                "state": "installed",
+                "version": "11.015.00"
+            },
+            {
+                "arch": "aarch64",
+                "kernel": "7.0.0-38-generic",
+                "name": "r8127",
+                "state": "installed",
+                "version": "11.015.00"
+            }
+        ]
+    },
+    "firmware": {
+        "linux_firmware": "20260319.git217ca6e4.1ubuntu"
+    },
+    "host": "msr1",
+    "host_toolchain": {
+        "binaries": {
+            "cmake": "cmake version 4.2.3",
+            "docker": "Docker version 29.1.3, build 29.1.3-0ubuntu4.1",
+            "g++": "g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+            "gcc": "gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+            "make": "GNU Make 4.4.1",
+            "python3": "Python 3.14.4",
+            "tailscale": "1.102.3"
+        },
+        "packages": {
+            "apcupsd": "3.14.14-7",
+            "build-essential": "12.12ubuntu2.26.04.2",
+            "ca-certificates": "20260816ubuntu0.26.04.1",
+            "cmake": "4.2.3-2ubuntu2",
+            "containerd": "2.2.2-0ubuntu1.1",
+            "curl": "8.18.0-1ubuntu2.8",
+            "dkms": "3.2.2-1ubuntu1",
+            "docker.io": "29.1.3-0ubuntu4.1",
+            "g++": "4:15.2.0-5ubuntu1",
+            "gcc": "4:15.2.0-5ubuntu1",
+            "git": "1:2.53.0-1ubuntu1.1",
+            "grub-efi-arm64": "2.14-2ubuntu1",
+            "grub-efi-arm64-signed": "1.215+2.14-2ubuntu1",
+            "libc6": "2.43-2ubuntu2.4",
+            "linux-firmware": "20260319.git217ca6e4.1ubuntu",
+            "linux-generic": "7.0.0-38.38",
+            "linux-headers-generic": "7.0.0-38.38",
+            "linux-image-generic": "7.0.0-38.38",
+            "make": "4.4.1-3",
+            "needrestart": "3.11-1ubuntu2",
+            "openssh-server": "1:10.2p1-2ubuntu3.8",
+            "python3": "3.14.3-0ubuntu2",
+            "r8127-dkms": "11.015.00-1",
+            "runc": "1.4.0-0ubuntu1",
+            "shim-signed": "1.59+15.8-0ubuntu2",
+            "systemd": "259.5-0ubuntu3.4",
+            "tailscale": "1.102.3",
+            "unattended-upgrades": "2.12ubuntu9"
+        }
+    },
+    "installed_kernels": [
+        "7.0.0-31-generic",
+        "7.0.0-38-generic"
+    ],
+    "kernel": "7.0.0-31-generic",
+    "kernel_flavor": "generic",
+    "marker": {},
+    "newest_same_flavor": "7.0.0-38-generic",
+    "nics": [
+        {
+            "driver": "r8127",
+            "driver_version": "11.015.00-NAPI",
+            "iface": "enp1s0",
+            "operstate": "up",
+            "pci_id": "10ec:8127",
+            "pci_slot": "0000:01:00.0",
+            "speed_mbps": 10000
+        },
+        {
+            "driver": "r8127",
+            "driver_version": "11.015.00-NAPI",
+            "iface": "enp49s0",
+            "operstate": "up",
+            "pci_id": "10ec:8127",
+            "pci_slot": "0000:31:00.0",
+            "speed_mbps": 10000
+        }
+    ],
+    "os_release": {
+        "ID": "ubuntu",
+        "NAME": "Ubuntu",
+        "PRETTY_NAME": "Ubuntu 26.04.1 LTS",
+        "VERSION_CODENAME": "resolute",
+        "VERSION_ID": "26.04"
+    },
+    "packages": {
+        "broken_kernel_pkgs": [],
+        "dpkg_audit": [],
+        "dpkg_lock_held": false,
+        "held": [],
+        "held_kernel": [],
+        "kept_back": [],
+        "lists_age_hours": 0.8,
+        "new_kernel_pkgs": [
+            "linux-headers-7.0.0-38",
+            "linux-headers-7.0.0-38-generic",
+            "linux-image-7.0.0-38-generic",
+            "linux-modules-7.0.0-38-generic",
+            "linux-tools-7.0.0-38",
+            "linux-tools-7.0.0-38-generic"
+        ],
+        "package_processes": [
+            "packagekitd",
+            "unattended-upgr"
+        ],
+        "phased_held_back": [
+            "containerd",
+            "python3-software-properties",
+            "software-properties-common"
+        ],
+        "pin_files": [],
+        "policy_rc_d_ours": false,
+        "policy_rc_d_present": false,
+        "repos": [
+            {
+                "file": "tailscale.list",
+                "official": false,
+                "uri": "https://pkgs.tailscale.com/stable/ubuntu"
+            },
+            {
+                "file": "ubuntu.sources",
+                "official": true,
+                "uri": "http://es.archive.ubuntu.com/ubuntu/"
+            },
+            {
+                "file": "ubuntu.sources",
+                "official": true,
+                "uri": "http://security.ubuntu.com/ubuntu/"
+            },
+            {
+                "file": "ubuntu.sources.curtin.orig",
+                "official": true,
+                "uri": "http://archive.ubuntu.com/ubuntu/"
+            },
+            {
+                "file": "ubuntu.sources.curtin.orig",
+                "official": true,
+                "uri": "http://security.ubuntu.com/ubuntu/"
+            }
+        ],
+        "simulation": {
+            "error": "",
+            "inst": [
+                {
+                    "name": "libsystemd0",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "libpam-systemd",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "systemd-sysv",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "systemd-resolved",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "libsystemd-shared",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "systemd",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "systemd-cryptsetup",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "udev",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "libudev1",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "open-iscsi",
+                    "new": "2.1.11-3ubuntu3.1",
+                    "old": "2.1.11-3ubuntu3"
+                },
+                {
+                    "name": "libopeniscsiusr",
+                    "new": "2.1.11-3ubuntu3.1",
+                    "old": "2.1.11-3ubuntu3"
+                },
+                {
+                    "name": "libaudit-common",
+                    "new": "1:4.1.2-1ubuntu0.1",
+                    "old": "1:4.1.2-1build1"
+                },
+                {
+                    "name": "libaudit1",
+                    "new": "1:4.1.2-1ubuntu0.1",
+                    "old": "1:4.1.2-1build1"
+                },
+                {
+                    "name": "rust-coreutils",
+                    "new": "0.10.0-1ubuntu2~26.04.1",
+                    "old": "0.8.0-0ubuntu3"
+                },
+                {
+                    "name": "python3-netplan",
+                    "new": "1.2-1ubuntu5.1",
+                    "old": "1.2-1ubuntu5"
+                },
+                {
+                    "name": "netplan-generator",
+                    "new": "1.2-1ubuntu5.1",
+                    "old": "1.2-1ubuntu5"
+                },
+                {
+                    "name": "netplan.io",
+                    "new": "1.2-1ubuntu5.1",
+                    "old": "1.2-1ubuntu5"
+                },
+                {
+                    "name": "libnetplan1",
+                    "new": "1.2-1ubuntu5.1",
+                    "old": "1.2-1ubuntu5"
+                },
+                {
+                    "name": "libnss-systemd",
+                    "new": "259.9-0ubuntu0.1",
+                    "old": "259.5-0ubuntu3.4"
+                },
+                {
+                    "name": "python-apt-common",
+                    "new": "3.1.0ubuntu1.1",
+                    "old": "3.1.0ubuntu1"
+                },
+                {
+                    "name": "python3-apt",
+                    "new": "3.1.0ubuntu1.1",
+                    "old": "3.1.0ubuntu1"
+                },
+                {
+                    "name": "ubuntu-release-upgrader-core",
+                    "new": "1:26.04.27",
+                    "old": "1:26.04.23"
+                },
+                {
+                    "name": "python3-distupgrade",
+                    "new": "1:26.04.27",
+                    "old": "1:26.04.23"
+                },
+                {
+                    "name": "cloud-init-base",
+                    "new": "26.2-0ubuntu1~26.04.1",
+                    "old": "26.1-0ubuntu3~26.04.1"
+                },
+                {
+                    "name": "cloud-init",
+                    "new": "26.2-0ubuntu1~26.04.1",
+                    "old": "26.1-0ubuntu3~26.04.1"
+                },
+                {
+                    "name": "dnsmasq-base",
+                    "new": "2.92-1ubuntu0.5",
+                    "old": "2.92-1ubuntu0.4"
+                },
+                {
+                    "name": "libc-ares-dev",
+                    "new": "1.34.6-1ubuntu0.2",
+                    "old": "1.34.6-1ubuntu0.1"
+                },
+                {
+                    "name": "libcares2",
+                    "new": "1.34.6-1ubuntu0.2",
+                    "old": "1.34.6-1ubuntu0.1"
+                },
+                {
+                    "name": "mdadm",
+                    "new": "4.5-5ubuntu1.1",
+                    "old": "4.5-5ubuntu1"
+                },
+                {
+                    "name": "snapd",
+                    "new": "2.77.1+ubuntu26.04.2",
+                    "old": "2.76.3+ubuntu26.04"
+                },
+                {
+                    "name": "ubuntu-kernel-accessories",
+                    "new": "1.570.4",
+                    "old": "1.570.3"
+                },
+                {
+                    "name": "ubuntu-server-minimal",
+                    "new": "1.570.4",
+                    "old": "1.570.3"
+                },
+                {
+                    "name": "tailscale",
+                    "new": "1.104.2",
+                    "old": "1.102.3"
+                }
+            ],
+            "kept_back": [],
+            "kernel_inst": [],
+            "protected_removals": [],
+            "rc": 0,
+            "remv": []
+        },
+        "third_party_repos": [
+            "https://pkgs.tailscale.com/stable/ubuntu"
+        ],
+        "tool_holds": []
+    },
+    "r8127": {
+        "bound": {
+            "enp1s0": "r8127",
+            "enp49s0": "r8127"
+        },
+        "dkms": [
+            {
+                "arch": "aarch64",
+                "kernel": "7.0.0-31-generic",
+                "name": "r8127",
+                "state": "installed",
+                "version": "11.015.00"
+            },
+            {
+                "arch": "aarch64",
+                "kernel": "7.0.0-38-generic",
+                "name": "r8127",
+                "state": "installed",
+                "version": "11.015.00"
+            }
+        ],
+        "dkms_source_dirs": [
+            "/usr/src/r8127-11.015.00"
+        ],
+        "firmware_rtl8127_files": [
+            "rtl8127a-1.fw.zst"
+        ],
+        "firmware_rtl_nic_files": 40,
+        "linux_firmware": "20260319.git217ca6e4.1ubuntu",
+        "loaded_version": "11.015.00-NAPI",
+        "modprobe_lines": [
+            "blacklist-r8169.conf: blacklist r8169"
+        ],
+        "pci_ids": [
+            "10ec:8127"
+        ],
+        "per_kernel": {
+            "7.0.0-31-generic": {
+                "claims": {
+                    "10ec:8127": [
+                        "r8127",
+                        "r8169"
+                    ]
+                },
+                "intree_lists_id": {
+                    "10ec:8127": true
+                },
+                "r8127": {
+                    "dkms_state": [
+                        "installed"
+                    ],
+                    "filename": "/lib/modules/7.0.0-31-generic/updates/dkms/r8127.ko.zst",
+                    "found": true,
+                    "signer": "msr1 Secure Boot Module Signature key",
+                    "version": "11.015.00-NAPI"
+                },
+                "r8169": {
+                    "builtin": false,
+                    "found": true
+                }
+            },
+            "7.0.0-38-generic": {
+                "claims": {
+                    "10ec:8127": [
+                        "r8127",
+                        "r8169"
+                    ]
+                },
+                "intree_lists_id": {
+                    "10ec:8127": true
+                },
+                "r8127": {
+                    "dkms_state": [
+                        "installed"
+                    ],
+                    "filename": "/lib/modules/7.0.0-38-generic/updates/dkms/r8127.ko.zst",
+                    "found": true,
+                    "signer": "msr1 Secure Boot Module Signature key",
+                    "version": "11.015.00-NAPI"
+                },
+                "r8169": {
+                    "builtin": false,
+                    "found": true
+                }
+            }
+        },
+        "present": true,
+        "r8169_blacklisted": true,
+        "source": "package:r8127-dkms"
+    },
+    "reboot_required": false,
+    "reboot_required_pkgs": [
+        "linux-image-7.0.0-34-generic",
+        "linux-image-7.0.0-38-generic"
+    ],
+    "rehearsal": {},
+    "schema": 1,
+    "time_sync": {
+        "ntp_synchronized": true,
+        "raw": "yes"
+    },
+    "unattended_upgrades": {
+        "automatic_reboot": "",
+        "installed": true,
+        "needrestart_installed": true,
+        "remove_unused_kernel_packages": "",
+        "unattended_upgrade": "1",
+        "units": {
+            "apt-daily-upgrade.timer": {
+                "active": "active",
+                "enabled": "enabled"
+            },
+            "apt-daily.timer": {
+                "active": "active",
+                "enabled": "enabled"
+            },
+            "unattended-upgrades.service": {
+                "active": "active",
+                "enabled": "enabled"
+            }
+        },
+        "update_package_lists": "1"
+    },
+    "vmlinuz_versions": [
+        "7.0.0-31-generic",
+        "7.0.0-38-generic"
+    ]
+}

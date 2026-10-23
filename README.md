@@ -217,8 +217,9 @@ gh workflow run cluster-reboot.yml --repo goceleris/probatorium --ref main \
   of them; on the target a runner job executing, a power-loss resume pending, entries in `results_root` (tmpfs: the
   reboot destroys them), an r8127 NIC without the shutdown quiesce hook or without the module for the running
   kernel, tailscaled running but not enabled at boot (the host would come back off the tailnet), or a newer kernel
-  installed than the one running (a decision for the maintainer: it changes comparability). The reasons are in the step
-  summary.
+  installed than the one running (a decision for the maintainer: it changes comparability) unless the OS-upgrade pin proves the
+  saved default is the running kernel (the drop-in and a valid rehearsal record, see "Upgrading a cluster host's OS"). The
+  reasons are in the step summary.
 - **It records, then reboots, then verifies.** Before: boot id, boot time, kernel, the NIC vectors found by name with
   their since-boot totals and IRQ affinity, bonds, crash dumps. Then `ansible.builtin.reboot` (bounded at 15 minutes),
   then a snapshot polled for up to 3 minutes. It FAILS unless the boot id changed, the kernel is the same, no new
@@ -260,13 +261,13 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   -f mode=upgrade -f host=msa2-server -f confirm=UPGRADE-msa2-server -f reason="platform upgrade before the final evidence"
 ```
 
-- **Inputs.** `mode` is `survey` or `upgrade`; an upgrade names ONE `host` and `confirm` must be exactly
-  `UPGRADE-<host>` (`DISARM-<host>` for `mode=disarm`, which only clears a pending grub one-shot); `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
+- **Inputs.** `mode` is `survey`, `rehearse`, `upgrade`, `disarm`, `repair`, `freeze` or `thaw`; an upgrade names ONE `host` and `confirm` must be exactly
+  `UPGRADE-<host>` (`DISARM-<host>` for `mode=disarm`, which only clears a pending grub one-shot; `FREEZE-<host>`, `THAW-<host>`); `reason` is one line. `allow_results_loss` (default false) lets an upgrade go ahead although
   `results_root` holds entries (the reboot destroys the tmpfs). `refresh_lists` (survey only, default false) runs
   `apt-get update` first so the simulation is not stale: it WRITES `/var/lib/apt/lists` and the apt caches
   (`/var/cache/apt/*.bin`) and runs the apt update post-invoke hooks, so it is the one thing a survey changes, and only when asked. `blacklist_r8169`
   (upgrade only, default false) is explained below. Dispatch from `main` only; it never runs on a schedule.
-- **Five modes.** `survey` (read-only, all hosts; its summary opens with a checklist of every fact to read before a host-changing
+- **Seven modes.** `survey` (read-only, all hosts; its summary opens with a checklist of every fact to read before a host-changing
   dispatch, each with a PASS / FAIL / NOTE mark and the decision it informs); `rehearse` (ONE host, `REHEARSE-<host>`: pins the
   running kernel, arms a one-shot to a boot of the SAME kernel, reboots, and requires a new boot id, the same kernel, an EMPTY
   `next_entry` (GRUB read and cleared the environment block Linux writes) and the usual verification; no package or kernel changes;
@@ -274,7 +275,7 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   GRUB does not read the environment block, the host boots GRUB's FIRST menu entry, on that boot and every power-cycle after it;
   that is the running kernel only when nothing newer is installed (msr1 today: -38 is installed and is entry 0, running is -31).
   The survey shows `boot.entry0_kernel`, and a rehearsal is refused while it differs from the running kernel unless the
-  confirmation is `REHEARSE-<host>-CONSOLE`, which says someone is at the rack with a console); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
+  confirmation is the console attestation of a person at the rack, below); `upgrade` (ONE host, the sequence below); `disarm` (ONE host, `DISARM-<host>`:
   clears a pending grub one-shot, nothing else; the playbook also does it by itself on any failure between arming and the new
   kernel's boot while the host still answers); `repair` (ONE host, `REPAIR-<host>`, `repair_action` `configure`,
   `abort-new-kernel` or `release-holds`). Why `repair`: a DKMS module that does not build for the new kernel (r8127 on msr1) most likely fails the
@@ -287,7 +288,38 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   install no kernel until they are installed again). It also removes a kernel that installed cleanly but that an earlier run armed
   and never verified (below); it forgets that record only when the purge exited 0 and dpkg shows the version gone (a failed purge keeps
   the record, so `retry_kernel` stays required). `release-holds` releases the access-path holds that a dead run left (below) and
-  nothing else.
+  nothing else. `freeze` and `thaw` (ONE host, `FREEZE-<host>` / `THAW-<host>`) keep the platform fixed during the evidence campaign (next bullet).
+- **Freeze and thaw: the platform stays FIXED during the evidence campaign.** The hosts update themselves (`unattended-upgrades` and `needrestart`
+  are active: they installed the kernel -38 on their own), and a 131-hour benchmark must not see a package or a service change under it.
+  `mode=freeze` (`FREEZE-<host>`, one host per dispatch, behind the same `OS_UPGRADE_ALLOWED_HOSTS` gate, the `cluster-host-change` approval and the
+  idle cluster) refuses while apt or dpkg is busy, while a power-loss resume is pending (a thaw would re-enable timers on a host about to resume), while the host is already frozen, or while `Unattended-Upgrade::InstallOnShutdown` is true (the shutdown listener it stops would install at power-off, and what stopping it does then is not known), writes its record BEFORE it changes anything
+  (`/var/lib/celeris-os-upgrade/freeze.json`: the timestamp, every unit's previous `active`/`enabled` state, what it changed, whether it wrote a
+  needrestart drop-in), stops and disables `apt-daily.timer`, `apt-daily-upgrade.timer` and `unattended-upgrades.service`, sets `needrestart` to
+  list-only (`/etc/needrestart/conf.d/zzz-celeris-freeze.conf`, only when it is installed and not list-only already), checks the states, and records
+  the platform: the evidence holds `freeze.json` (with the kernel, the OS, the package count, a SHA-256 of every installed package and version, and
+  the holds), `dpkg-l.txt` (`dpkg -l`), `apt-held.txt` (`apt-mark showhold`), `kernel.txt` and the survey after, so the release results can name the
+  exact platform. The survey shows the freeze and whether it still holds (`freeze.drifted`; checklist row "platform frozen against apt self-updates":
+  NOTE not frozen, PASS frozen, FAIL drifted or incomplete). `mode=thaw` (`THAW-<host>`) restores ONLY what the record says the freeze changed
+  (enable what it disabled, start what it stopped, remove its needrestart file: a unit that was already off stays off) and archives the record; the
+  apt timers are persistent, so they may run within minutes of a thaw. A freeze that failed half way, or was killed even between a change and its record, is undone by `mode=thaw` (the record is written durably before and after every change, with the change about to be made marked `pending`; a thaw undoes only what is not already as it was, so it can be repeated; a unit masked by hand is named; a needrestart file an earlier freeze left is adopted). It does not stop
+  the apt run `mode=upgrade` starts itself (which is why an upgrade is refused on a frozen host) and it covers nothing but these units and needrestart: snapd refreshes, motd-news, firmware updates and
+  other self-updaters are not touched. The survey records the two that matter most and a freeze does not stop (`self_updaters`: `tailscale debug prefs` AutoUpdate, which runs apt-get by itself, and `snap refresh --time`), and the checklist row names what it does not cover (tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client). **The survey recomputes the recorded platform**: the running kernel, the package list (SHA-256), the holds and grub's saved default
+  kernel; any difference is `freeze.drifted` and the checklist row FAILs (an upgrade, tailscale's own updater, a manual apt, a reboot onto
+  another kernel). `mode=upgrade` is therefore REFUSED on a frozen host (its record would name a platform that no longer exists), and a freeze
+  is refused while grub's saved default kernel is not the running kernel (a reboot would boot the other one). The order is: rehearse all three
+  hosts, upgrade them (`msa2-server`, `msr1`, `msa2-client`), a final survey, then freeze the three, the evidence campaign, then thaw. The thaw's
+  summary shows the drift found AT THAW TIME ("did not move", or what moved): the end-of-campaign proof for the release results. A freeze
+  needed before an upgrade is `thaw`, upgrade, freeze again.
+- **Rehearsal at a console.** While grub's first menu entry is not the running kernel (survey row "kernel a GRUB that ignores the grubenv would
+  boot": FAIL, today on all three hosts: -38 is installed and is entry 0, -31 runs), a rehearsal is refused, because if GRUB does not read the
+  environment block it boots that other kernel on every power-cycle. Only a person at the rack of THAT host with a console (HDMI and keyboard:
+  the GRUB menu is hidden, Esc or Shift at power-on) may run it, and that person's dispatch types `REHEARSE-<host>-CONSOLE` in `confirm`
+  (instead of `REHEARSE-<host>`), which is an attestation that they are there. No refusal, error or input description spells that string out
+  (an automated dispatcher that read a refusal could re-send it): it is described here and in the PLAN only. The `run-name` and the job name
+  (what the environment's approver sees: "Cluster OS rehearse [msr1] CONSOLE-ATTESTED ...", or "(no console attested)"), the `plan` job's
+  notice, the step summary and `result.json` (`confirm_kind`) all say which kind it was, so the approver approves only a console-attested run
+  when they know somebody is there. An `upgrade` never accepts it (`UPGRADE-<host>-CONSOLE` and `REHEARSE-<host>-CONSOLE` as an upgrade's
+  confirmation are refused by the `plan` job and again by the playbook).
 - **It refuses rather than queues**, exactly like the reboot: a `cluster-guard` job runs `stresstally guard -idle`, the
   job holds `matrix-tier-cluster`, an idle verdict older than ten minutes is refused, and the orchestrator's
   `HOLD-CLUSTER` marker lives outside this repository, so whoever dispatches honours it. The survey goes through the
@@ -302,8 +334,8 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   recovery) Advanced entry and exists in grub.cfg, and no one-shot is pending. A host that was never rehearsed stays refused.
 - **The access path can be held.** `hold_access_packages` (`auto`, `on`, `off`; `auto` = on for a host with an r8127 NIC) holds
   `grub-*`, `shim*`, `openssh-server` and `tailscale*` BEFORE the plan is simulated (so the protected-removal judgement describes the plan that runs) and for the length of the apt run,
-  and releases only the holds this run put (a refusal releases them at once). If the run dies with the holds on, the survey lists them
-  (`packages.tool_holds`), every upgrade refuses naming the repair, and `mode=repair repair_action=release-holds` releases them. Both
+  and releases only the holds this run put (a refusal releases them at once). A hold counts as released only when `apt-mark showhold` no longer lists it (`apt-mark unhold` can fail while unattended-upgrades has the dpkg lock): one that stays keeps its record, the run says so (the step summary prints `holds-left.txt`) and, after the apt run, fails before any reboot. If the run dies with the holds on, the survey lists them
+  (`packages.tool_holds`), every upgrade refuses naming the repair, and `mode=repair repair_action=release-holds` releases them (and fails, keeping the record, if a hold stays: dispatch it again). Both
   kernels share those packages, so no fallback helps if one breaks: upgrade them in a separate dispatch (`hold_access_packages=off`)
   with a person at the rack and a console.
 - **Order: servers first, the load generator last.** `msa2-client` is refused until `msa2-server` and `msr1` each carry
@@ -311,7 +343,12 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   that still matches the kernel they run. Why: every server is verified against the client (fabric ping), so the
   client stays on the known-good platform while the servers are proven; the client's own verification then uses the
   upgraded servers. The two servers have no order between them; `msa2-server` (no out-of-tree driver) is the rehearsal
-  to do before `msr1`.
+  to do before `msr1`. **The rule is for `mode=upgrade` only**: a rehearsal of any host may run in any order (the judge checks the order only
+  in an upgrade, and a test replays the three real hosts' records to show a client rehearsal with neither server upgraded has no refusal), so
+  one rack session can rehearse all three hosts first (each needs the console attestation while grub's first menu entry is not its running
+  kernel) and the upgrades then follow in order: `msa2-server`, `msr1`, `msa2-client`. A rehearsal record goes stale when grub or shim change
+  on THAT host (an unattended upgrade, or an upgrade run with `hold_access_packages=off`): hold the access path (`hold_access_packages=on`) in
+  every upgrade that follows a rehearsal, or the upgrade's own reboot uses a GRUB nobody rehearsed.
 - **Survey** (read-only; its commands are on an allow-list the process enforces) records per host: os-release, running
   and installed kernels, which kernel grub boots after a power-cycle, `GRUB_DEFAULT`, EFI and Secure Boot, what
   `apt-get -s full-upgrade` would install, remove and keep back, phased updates, held packages, third-party
@@ -323,7 +360,9 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
 - **It refuses, on the host, before touching anything:** any of the three hosts unreachable; a bench manifest on any of
   them; on the target a runner job executing, a power-loss resume pending, entries in `results_root`, the r8127
   shutdown quiesce hook missing, the r8127 module not available for the running kernel, tailscaled not enabled at boot,
-  too little disk on `/`, `/boot` and `/boot/efi`, dpkg or apt busy (an unattended upgrade) or half-configured
+  too little disk on `/`, `/boot` and `/boot/efi`, dpkg or apt busy (a real `apt`, `apt-get`, `dpkg`, `unattended-upgrade` ... process, read from `/proc/<pid>/cmdline`, or one of the four dpkg/apt lock
+  files held; the idle `unattended-upgrade-shutdown --wait-for-signal` listener and an idle `packagekitd` that every Ubuntu host runs do not count: both read
+  as `unattended-upgr` and `packagekitd` in `/proc/<pid>/comm`, a 15-character name, which is how the first real survey wrongly refused all three hosts) or half-configured
   packages, held kernel/boot/DKMS packages, an existing `policy-rc.d`, no usable GRUB, GRUB not PROVEN to have booted the host (`BOOT_IMAGE=` on the kernel command line naming the running kernel; on EFI the firmware's `BootCurrent` loader is `shim`/`grub` under `\EFI\<vendor>`; the ESP stub's `search`/`prefix` names the filesystem of `/boot/grub`; `grubenv` is a 1024-byte file: anything unknown counts as not proven), `GRUB_SAVEDEFAULT=true`, a
   `/boot/grub` on btrfs/zfs/lvm/mdraid (grub cannot make the boot one-shot there), no grub entry for the running kernel,
   a one-shot grub entry still pending, a saved default that differs from the running kernel after an earlier
@@ -360,7 +399,10 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   (bootloader, ssh, tailscale, netplan, systemd, firmware), it restores nothing and the host needs its console. Every other phase
   says "not needed". A host that came back but failed verification keeps the old kernel as its default: reboot it back with the
   cluster-reboot workflow, which ends red with "kernel changed" by design (and refuses outright when the OLD kernel runs with a
-  newer one installed, which needs no recovery). The upgrade itself refuses to run again while the host runs a kernel other than
+  newer one installed, which needs no recovery) -- but only when GRUB consumed its one-shot. If a problem says a one-shot is still
+  pending, GRUB does not read the environment block Linux writes: the saved default (`boot.default_kernel`) is NOT what boots, GRUB's FIRST
+  menu entry (`boot.entry0_kernel`, the NEW kernel after an upgrade) is, on every boot, and cluster-reboot boots it again; only the console
+  (Esc or Shift at power-on) or a reviewed change brings the old kernel back. `result.json` carries it as `first_entry_kernel`. The upgrade itself refuses to run again while the host runs a kernel other than
   grub's saved default, or while a one-shot is pending. The apt run is detached: if a poll is lost, the run fails with apt possibly
   still running; survey before anything else.
 - **What this does not prove.** The tests run the real playbook and script against stub `grub`, `apt`, `dkms` and

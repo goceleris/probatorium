@@ -124,8 +124,8 @@ class Play(unittest.TestCase):
         cls.h = FakeHost(os.path.join(cls.work, "host"))
         w = cls.work
         with open(w + "/osu-wrapper.sh", "w") as f:
-            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
-                cls.h.state_dir, cls.h.log, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
+            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\n[ -n "${SURVEY_FAIL_AFTER_REBOOT:-}" ] && [ "$1" = survey ] && grep -q FAKE-REBOOT %s && { echo "survey failed after the reboot (test)" >&2; exit 3; }\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
+                cls.h.state_dir, cls.h.log, cls.h.log, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
         with open(w + "/snapshot-wrapper.sh", "w") as f:
             f.write('''#!/bin/bash
 # the preflight call carries a sixth argument, the host that asks; FAIL_HOST makes that host's preflight snapshot fail
@@ -238,12 +238,12 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
     def calls(self):
         return self.h.calls()
 
-    def summary(self, mode, host, rc=None):
+    def summary(self, mode, host, rc=None, confirm=None):
         """The step summary the workflow renders from the evidence of the last play()."""
         if shutil.which("jq") is None:
             self.skipTest("jq not installed")
         script = os.path.join(ANSIBLE_DIR, "..", ".github", "scripts", "os-upgrade-summary.sh")
-        r = subprocess.run(["bash", script, self.out, mode, host, str(self.rc if rc is None else rc), "platform upgrade", "4242"],
+        r = subprocess.run(["bash", script, self.out, mode, host, str(self.rc if rc is None else rc), "platform upgrade", "4242"] + ([] if confirm is None else [confirm]),
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
@@ -576,6 +576,263 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("nothing to release", self.log)
         self.assertEqual(self.h.load()["held"], ["grub-common", "vim"])
 
+    # R4-m1: apt-mark unhold fails (the dpkg frontend lock is taken) and changes nothing: no path may say "released" or lose the record
+    HELD5 = ["grub-common", "grub-efi-arm64-bin", "openssh-server", "shim-signed", "tailscale"]
+
+    def test_a_refused_plan_whose_holds_cannot_be_released_says_so_and_the_next_dispatch_names_the_repair(self):
+        self.fresh(unhold_rc=100)
+        self.h.state["sim"] = self.h.state["sim"] + ["Remv linux-image-7.0.0-31-generic [7.0.0-31.31]"]
+        self.h.save()
+        self.play("holds_stay", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("would REMOVE protected package(s): linux-image-7.0.0-31-generic", self.log)
+        self.assertIn("THE ACCESS-PATH HOLDS COULD NOT BE RELEASED: %s are still held" % " ".join(self.HELD5), self.log)
+        with open(os.path.join(self.out, "msr1", "holds-left.txt")) as f:
+            self.assertIn("COULD NOT BE RELEASED", f.read())
+        self.assertEqual(self.h.load()["held"], self.HELD5)
+        self.assertEqual(len(glob.glob(self.h.root + "/var/log/celeris-os-upgrade/*/held.txt")), 1)  # the record stays
+        md = self.summary("upgrade", "msr1")
+        self.assertIn("### ACCESS-PATH HOLDS NOT RELEASED: msr1", md)
+        # the next upgrade is refused naming the repair (not a silent dead end) ...
+        self.h.state["sim"] = self.h.state["sim"][:-1]
+        self.h.state["unhold_rc"] = 0
+        self.h.save()
+        self.play("holds_stay2", self.UP)
+        self.assertIn("THIS TOOL put the holds of", self.log)
+        self.assertIn("repair_action=release-holds", self.log)
+        # ... and the repair releases them
+        self.play("holds_stay3", dict(self.R, repair_action="release-holds"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.h.load()["held"], [])
+        self.assertEqual(glob.glob(self.h.root + "/var/log/celeris-os-upgrade/*/held.txt"), [])
+
+    def test_an_upgrade_whose_holds_cannot_be_released_after_apt_stops_before_the_reboot(self):
+        self.fresh(unhold_rc_after_upgrade=100)
+        self.play("holds_stay_after_apt", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("could NOT be released", self.log)
+        self.assertIn("Nothing was rebooted; the OLD kernel 7.0.0-31-generic is still grub's default", self.log)
+        self.no_call("grub-reboot")
+        self.no_call("FAKE-REBOOT")
+        self.assertEqual(self.h.load()["held"], self.HELD5)
+        self.assertEqual(len(glob.glob(self.h.root + "/var/log/celeris-os-upgrade/*/held.txt")), 1)
+        self.assertFalse(os.path.exists(self.h.root + "/usr/sbin/policy-rc.d"), "the services stay down behind a failed run")
+        self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)  # the old kernel is still the default
+        # the evidence survives the failed cleanup: the log, the holds-left record, the summary
+        self.assertIn("HOLDS NOT RELEASED", open(os.path.join(self.out, "msr1", "apt-upgrade.log")).read())
+        self.assertIn("COULD NOT BE RELEASED: %s are still held" % " ".join(self.HELD5), open(os.path.join(self.out, "msr1", "holds-left.txt")).read())
+        self.assertIn("### ACCESS-PATH HOLDS NOT RELEASED: msr1", self.summary("upgrade", "msr1"))
+
+    def test_a_repair_that_cannot_release_the_holds_fails_and_says_which_stay(self):
+        self.fresh(unhold_rc=100)
+        self.h.state["held"] = ["grub-common", "tailscale", "vim"]
+        self.h.save()
+        self.h.w("/var/log/celeris-os-upgrade/41/held.txt", "grub-common tailscale\n")
+        self.play("release_fails", dict(self.R, repair_action="release-holds"))
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["holds_released"], r["holds_not_released"]), ("repair-failed", [], ["grub-common tailscale (put by run 41)"]))
+        self.assertIn("- **HOLDS NOT RELEASED** (apt-mark unhold did not take", self.summary("repair", "msr1"))
+        self.assertEqual(self.h.load()["held"], ["grub-common", "tailscale", "vim"])
+        self.assertTrue(os.path.exists(self.h.root + "/var/log/celeris-os-upgrade/41/held.txt"))
+
+    # ---------------------------------------------------------------------------------------- freeze / thaw
+    FZ = {"os_mode": "freeze", "os_host": "msr1", "os_confirm": "FREEZE-msr1"}
+    TH = {"os_mode": "thaw", "os_host": "msr1", "os_confirm": "THAW-msr1"}
+    FREEZE_UNITS = ("apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service")
+
+    def unit(self, u):
+        st = self.h.load()["services"]
+        return st.get("is-active " + u, "inactive"), st.get("is-enabled " + u, "disabled")
+
+    def checklist_row(self, host="msr1"):
+        md = self.summary("survey", "-", rc=0)
+        for line in md.splitlines():
+            if line.startswith("| %s | platform frozen against apt self-updates" % host):
+                return line
+        self.fail("no freeze row for " + host)
+
+    def test_a_freeze_and_a_thaw_through_the_playbook_leave_the_evidence_of_the_platform(self):
+        self.fresh()
+        self.play("fz0", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertIn("**NOTE**", self.checklist_row())
+        self.play("fz", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-3000:])
+        self.assertEqual(self.phase(), "frozen")
+        for u in self.FREEZE_UNITS:
+            self.assertEqual(self.unit(u), ("inactive", "disabled"), u)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["freeze_ok"], r["mode"], r["kernel_running"], r["drifted_after"]), ("frozen", True, "freeze", "7.0.0-31-generic", []))
+        self.assertEqual(r["freeze"]["status"], "frozen")
+        self.assertRegex(r["freeze"]["platform"]["dpkg_sha256"], r"^[0-9a-f]{64}$")
+        for f in ("freeze.json", "dpkg-l.txt", "apt-held.txt", "kernel.txt", "post-survey.json", "result.json", "phase.txt", "pre-survey.json"):
+            self.assertTrue(os.path.getsize(os.path.join(self.out, "msr1", f)) > 0, f)
+        self.assertIn("linux-image-7.0.0-31-generic", open(os.path.join(self.out, "msr1", "dpkg-l.txt")).read())
+        self.assertIn("running_kernel: 7.0.0-31-generic", open(os.path.join(self.out, "msr1", "kernel.txt")).read())
+        self.assertEqual(self.j("msr1", "post-survey.json")["freeze"]["status"], "frozen")
+        md = self.summary("freeze", "msr1")
+        for want in ("result: FROZEN", "sha256 of the package list", "`apt-daily.timer`: present true; before active/enabled; changed: stopped + disabled; now inactive/disabled", "kernel `7.0.0-31-generic`",
+                     "needrestart: installed true"):
+            self.assertIn(want, md)
+        # a freeze changes timers and one needrestart file: no reboot, no grub, no package
+        for pre in ("FAKE-REBOOT", "grub-set-default", "grub-reboot", "update-grub", "apt-get -y", "apt-get -o DPkg", "apt-mark hold", "dpkg --configure"):
+            self.no_call(pre)
+        # the survey now shows it: PASS
+        self.play("fz1", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertIn("**PASS**", self.checklist_row())
+        # and a thaw puts the units back
+        self.play("th", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-3000:])
+        self.assertEqual(self.phase(), "thawed")
+        for u in self.FREEZE_UNITS:
+            self.assertEqual(self.unit(u), ("active", "enabled"), u)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["freeze_ok"], r["mode"]), ("thawed", True, "thaw"))
+        md = self.summary("thaw", "msr1")
+        self.assertIn("result: THAWED", md)
+        self.assertIn("- restored: ", md)
+        self.assertIn("enable apt-daily.timer", md)
+        self.assertNotIn("; now inactive/disabled", md)  # a thaw does not describe the frozen state as the present one
+        self.assertEqual(self.j("msr1", "post-survey.json")["freeze"], {})
+        self.play("th1", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertIn("**NOTE**", self.checklist_row())
+
+    def test_a_second_freeze_and_a_thaw_without_a_freeze_are_refused_and_change_nothing(self):
+        self.fresh()
+        self.play("th_none", self.TH)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("nothing to thaw", self.log)
+        self.assertEqual([c for c in self.calls() if c.startswith(("systemctl stop", "systemctl disable", "systemctl start", "systemctl enable"))], [])
+        self.play("fz_a", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        first = open(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json").read()
+        self.play("fz_b", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("this host is already frozen", self.log)
+        self.assertEqual(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json").read(), first)
+        self.assertIn("### Refused: msr1", self.summary("freeze", "msr1"))
+
+    def test_a_freeze_is_refused_into_a_running_package_run_but_not_for_the_idle_daemons(self):
+        self.fresh()
+        self.h.proc(4242, "/usr/bin/apt-get", "-y", "full-upgrade")
+        self.play("fz_busy", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("dpkg or apt is busy (apt-get): a freeze would stop", self.log)
+        self.assertEqual(self.unit("unattended-upgrades.service"), ("active", "enabled"))
+        os.remove(self.h.root + "/proc/4242/cmdline")
+        os.remove(self.h.root + "/proc/4242/comm")
+        self.play("fz_idle", self.FZ)  # the fake host runs unattended-upgrade-shutdown and packagekitd, as every real host does
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+
+    def test_an_upgrade_is_refused_on_a_frozen_host_and_goes_ahead_after_the_thaw(self):
+        self.fresh()
+        self.play("fz_up0", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.play("fz_up1", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("this host is frozen (run", self.log)
+        self.no_call("apt-get -y")
+        self.no_call("grub-set-default")
+        self.play("fz_up2", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.play("fz_up3", self.UP)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.phase(), "permanent")
+        self.play("fz_up4", self.FZ)  # and the host is frozen again, on the platform it has now
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.assertEqual(self.j("msr1", "result.json")["freeze"]["platform"]["kernel"], "7.0.0-40-generic")
+
+    def test_the_thaw_summary_shows_the_drift_found_at_thaw_time(self):  # r2 F2
+        self.fresh()
+        self.play("th_d0", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.h.load()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"  # tailscale's updater, a manual apt ...
+        self.h.save()
+        self.play("th_d1", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        r = self.j("msr1", "result.json")
+        self.assertEqual(len(r["drifted_at_thaw"]), 1)
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("PLATFORM MOVED since the freeze", md)
+        self.assertIn("package list (sha256) changed", md)
+        self.assertNotIn("drifted after: nothing", md)
+        self.play("th_d2", self.FZ)
+        self.play("th_d3", self.TH)
+        self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
+        self.assertIn("platform at thaw time: DID NOT MOVE", " ".join(self.summary("thaw", "msr1").split()))
+
+    def test_a_freeze_is_refused_while_the_saved_default_is_not_the_running_kernel(self):  # r2 F7
+        self.fresh(keep38=True)  # -38 installed and entry 0, -31 runs: today's three hosts
+        self.play("fz_unpinned", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("grub saved default kernel is 7.0.0-38-generic and the host runs 7.0.0-31-generic", self.log)
+        self.assertEqual(self.unit("unattended-upgrades.service"), ("active", "enabled"))
+
+    def test_an_unreadable_grubenv_after_the_reboot_is_not_read_as_a_consumed_one_shot(self):  # r2 F5
+        self.fresh()
+        self.play("returned_noenv", self.UP, env={"BOOT_MODE": "no-nic", "EDITENV_FAIL": "1"})
+        self.assertNotEqual(self.rc, 0)
+        pc = " ".join(self.j("msr1", "result.json")["power_cycle"].split())
+        self.assertIn("UNPROVEN", pc)
+        self.assertNotIn("consumed by then", pc)
+
+    def test_the_rescue_names_grubs_first_entry_from_the_disarm_not_the_target(self):  # r2 F6
+        self.fresh()
+        self.play("rescue_entry0", self.UP, env={"BOOT_MODE": "ignore-env-gaveup", "ENTRY0_AFTER": "7.0.0-99-generic"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["target_kernel"], r["first_entry_kernel"]), ("failed-rebooted-one-shot-not-consumed", "7.0.0-40-generic", "7.0.0-99-generic"))
+        self.assertIn("boots its FIRST menu entry, 7.0.0-99-generic, every time", " ".join(r["power_cycle"].split()))
+
+    def test_the_unknown_text_names_the_first_entry_and_the_disarm(self):  # r2 F6
+        self.fresh()
+        self.play("returned_unknown2", self.UP, env={"SURVEY_FAIL_AFTER_REBOOT": "1"})
+        pc = " ".join(self.j("msr1", "result.json")["power_cycle"].split())
+        self.assertIn("boots GRUB's first menu entry, 7.0.0-40-generic", pc)
+        self.assertNotIn("the new kernel,", pc)
+        self.assertIn("mode=disarm", pc)
+
+    def test_a_freeze_and_a_thaw_are_refused_while_a_power_loss_resume_is_pending(self):
+        self.fresh()
+        self.h.w("/var/lib/celeris-power/resume-pending.json", "{}")
+        self.play("fz_resume", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("a power-loss resume is pending", self.log)
+        self.play("th_resume", self.TH)
+        self.assertNotEqual(self.rc, 0)
+        self.assertIn("a power-loss resume is pending", self.log)
+        self.assertEqual([c for c in self.calls() if c.startswith(("systemctl stop", "systemctl disable", "systemctl start", "systemctl enable"))], [])
+        self.assertEqual(self.unit("unattended-upgrades.service"), ("active", "enabled"))
+
+    def test_a_freeze_that_did_not_take_is_red_keeps_its_record_and_the_survey_marks_it(self):
+        self.fresh(systemctl_noop=["stop apt-daily.timer", "disable apt-daily.timer"])
+        self.play("fz_fail", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.phase(), "freeze-failed")
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["status"], r["freeze_ok"]), ("freeze-failed", False))
+        self.assertIn("apt-daily.timer is still active/enabled after the freeze", r["error"])
+        self.assertEqual(self.j("msr1", "post-survey.json")["freeze"]["status"], "freezing-failed")
+        self.assertIn("NOT FROZEN, OR NOT COMPLETELY", self.summary("freeze", "msr1"))
+        self.play("fz_fail_survey", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        self.assertIn("**FAIL**", self.checklist_row())
+        # the half freeze is thawed by the thaw (the host answers the units now)
+        self.h.state["systemctl_noop"] = []
+        self.h.save()
+        self.play("fz_fail_thaw", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        for u in self.FREEZE_UNITS:
+            self.assertEqual(self.unit(u), ("active", "enabled"), u)
+
+    def test_freeze_and_thaw_need_their_exact_confirmation_in_the_playbook(self):
+        self.fresh()
+        self.refused("fz_bad", dict(self.FZ, os_confirm="UPGRADE-msr1"), "os_confirm must be exactly")
+        self.refused("th_bad", dict(self.TH, os_confirm="FREEZE-msr1"), "os_confirm must be exactly")
+        self.refused("fz_bad2", dict(self.FZ, os_confirm="THAW-msr1"), "os_confirm must be exactly")
+        self.refused("up_as_fz", dict(self.UP, os_confirm="FREEZE-msr1"), "os_confirm must be exactly")
+        self.assertEqual(self.unit("unattended-upgrades.service"), ("active", "enabled"))
+
     def test_repair_refuses_with_a_one_shot_pending_or_beside_a_bench_or_when_there_is_nothing_to_repair(self):
         self.fresh()
         self.play("rp_nothing", dict(self.R, repair_action="configure"))
@@ -607,7 +864,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(r["status"], "failed-verification")
         self.assertIn("No power-cycle needed while the host answers", r["power_cycle"])
         md = self.summary("upgrade", "msr1")
-        self.assertIn("not needed while msr1 answers", md)
+        self.assertIn("Power-cycle: No power-cycle needed while the host answers", md)  # the text of result.json, chosen by the survey after the reboot
         self.assertIn("the one-shot entry for 7.0.0-40-generic fell back", md)
 
     def test_a_host_that_never_answers_tells_the_person_to_power_cycle(self):
@@ -785,6 +1042,41 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertNotIn("not needed**. The run failed after arming the one-shot and before the new kernel booted", md)
         self.assertEqual(self.h.state["grubenv"]["next_entry"], "")
 
+    # R4-m2: after a GRUB that ignored the one-shot, the kernel that boots is GRUB's FIRST menu entry (boot.entry0_kernel: the NEW kernel after an
+    # upgrade), not the saved default (boot.default_kernel, the old kernel); the cluster-reboot workflow boots the first entry again
+    def test_after_a_grub_that_ignored_the_one_shot_every_text_names_the_first_entry_not_the_saved_default(self):
+        self.fresh()
+        self.play("ignore_env", self.UP, env={"BOOT_MODE": "ignore-env-gaveup"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-rebooted-one-shot-not-consumed")
+        self.assertEqual((r["first_entry_kernel"], r["default_kernel"], r["kernel_before"]), ("7.0.0-40-generic", "7.0.0-31-generic", "7.0.0-31-generic"))
+        self.assertEqual(self.h.state["packages"]["linux-image-7.0.0-40-generic"]["version"], "7.0.0-40-generic")
+        pc = " ".join(r["power_cycle"].split())
+        for want in ("GRUB boots its FIRST menu entry, 7.0.0-40-generic, every time", "cluster-reboot workflow would boot it again", "only the console",
+                     "boot.entry0_kernel is what GRUB boots", "boot.default_kernel is only the saved default and is NOT what boots"):
+            self.assertIn(want, pc)
+        self.assertNotIn("(kernel, boot.default_kernel)", pc)
+        md = " ".join(self.summary("upgrade", "msr1").split())
+        for want in ("FIRST menu entry (`7.0.0-40-generic`) every time, the cluster-reboot workflow included", "`boot.entry0_kernel` = what GRUB boots",
+                     "`boot.default_kernel` is only the saved default and is NOT what boots"):
+            self.assertIn(want, md)
+        self.assertNotIn("(`kernel`, `boot.default_kernel`)", md)
+        # the host now runs the new kernel, saved default is the old one: a survey says both, the next upgrade is refused with the true way back
+        self.play("ignore_env_survey", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
+        b = self.j("msr1", "survey.json")["boot"]
+        self.assertEqual((b["entry0_kernel"], b["default_kernel"]), ("7.0.0-40-generic", "7.0.0-31-generic"))
+        survey_md = self.summary("survey", "-")
+        self.assertIn("GRUB's first menu entry `7.0.0-40-generic`", survey_md)
+        self.play("ignore_env_again", self.UP)
+        self.assertNotEqual(self.rc, 0)
+        refusal = " ".join(open(os.path.join(self.out, "msr1", "refusal.txt")).read().split())
+        self.assertIn("an earlier OS upgrade left grub saved default 7.0.0-31-generic while the host runs 7.0.0-40-generic", refusal)
+        self.assertIn("If GRUB does NOT", refusal)
+        self.assertIn("boot.entry0_kernel 7.0.0-40-generic", refusal)
+        self.assertIn("cluster-reboot boots that kernel again", refusal)
+        self.assertIn("only the console", refusal)
+
     def test_a_host_whose_boot_id_cannot_be_read_is_not_called_unrebooted(self):
         self.fresh()
         self.play("bootunknown", self.UP, env={"BOOT_MODE": "booted-but-reported-failed", "SNAP_FAIL_AFTER_REBOOT": "1"})
@@ -855,7 +1147,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.fresh(rehearsed=False, keep38=True)
         self.refused("rehearse_entry0", self.RH, "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic")
         self.assertIn("no one-shot to fall back on", self.log)
-        self.assertIn("REHEARSE-msr1-CONSOLE", self.log)
+        self.assertIn("the console attestation described in the README", self.log)  # R4-m3: the refusal does not spell the override out
         self.no_call("grub-set-default")
         self.no_call("grub-reboot")
         self.no_call("FAKE-REBOOT")
@@ -879,6 +1171,94 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
     def test_the_console_confirmation_is_only_for_a_rehearsal(self):
         self.fresh(keep38=True)
         self.refused("console_upgrade", dict(self.UP, os_confirm="UPGRADE-msr1-CONSOLE"), "os_confirm")
+        # V5-M2e: the console attestation of a REHEARSAL is no confirmation for an upgrade, a disarm or a repair either, in the playbook itself
+        # (the plan job refuses it first; this is the second line)
+        for name, extra in (("console_as_upgrade", dict(self.UP, os_confirm="REHEARSE-msr1-CONSOLE")),
+                            ("console_as_disarm", {"os_mode": "disarm", "os_host": "msr1", "os_confirm": "REHEARSE-msr1-CONSOLE"}),
+                            ("console_as_repair", dict(self.R, os_confirm="REHEARSE-msr1-CONSOLE"))):
+            self.refused(name, extra, "os_confirm must be exactly")
+            self.assertFalse(os.path.exists(os.path.join(self.out, "msr1", "pre-snapshot.json")), name)
+
+    # R4-m3: what the approver and the reader of the evidence see
+    def test_a_rehearsal_records_and_the_summary_says_whether_a_console_was_attested(self):
+        self.fresh(rehearsed=False, keep38=True)
+        self.play("rh_console", dict(self.RH, os_confirm="REHEARSE-msr1-CONSOLE"))
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.j("msr1", "result.json")["confirm_kind"], "console-attested")
+        md = self.summary("rehearse", "msr1", confirm="REHEARSE-msr1-CONSOLE")
+        self.assertIn("confirmation: **CONSOLE ATTESTED**", md)
+        self.assertNotIn("no console attested", md)
+        self.fresh(rehearsed=False)  # -31 is the first entry: no console needed
+        self.play("rh_standard", self.RH)
+        self.assertEqual(self.rc, 0, self.log[-2500:])
+        self.assertEqual(self.j("msr1", "result.json")["confirm_kind"], "standard")
+        md = self.summary("rehearse", "msr1", confirm="REHEARSE-msr1")
+        self.assertIn("confirmation: no console attested", md)
+        self.assertNotIn("CONSOLE ATTESTED", md)
+        self.assertIn("confirmation: not recorded", self.summary("rehearse", "msr1", confirm=""))
+
+    def test_the_refusal_of_a_rehearsal_does_not_hand_out_the_console_override(self):
+        self.fresh(rehearsed=False, keep38=True)
+        self.refused("rh_refused_text", self.RH, "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic")
+        refusal = open(os.path.join(self.out, "msr1", "refusal.txt")).read()
+        self.assertNotRegex(refusal + self.log, r"REHEARSE-\S*CONSOLE")
+        self.assertIn("console attestation described in the README", refusal)
+        self.assertNotRegex(self.summary("rehearse", "msr1"), r"REHEARSE-\S*CONSOLE")
+
+    # R4-m4: an upgrade that came back with the one-shot still pending must not say "consumed ... a power-cycle boots the OLD kernel"
+    def test_an_upgrade_that_returned_with_a_one_shot_still_pending_says_what_a_power_cycle_really_boots(self):
+        self.fresh()
+        self.play("returned_pending", self.UP, env={"BOOT_MODE": "ignore-env"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-verification")
+        self.assertTrue(any("a one-shot is still pending" in p for p in r["problems"]), r["problems"])
+        pc = " ".join(r["power_cycle"].split())
+        for want in ("a one-shot is STILL PENDING", "GRUB did not consume it", "boots GRUB's FIRST menu entry, 7.0.0-40-generic", "NOT the saved default 7.0.0-31-generic",
+                     "only the console", "mode=disarm"):
+            self.assertIn(want, pc)
+        for stale in ("consumed by then", "boots the OLD kernel", "Reboot it back with the cluster-reboot workflow"):
+            self.assertNotIn(stale, pc)
+        md = " ".join(self.summary("upgrade", "msr1").split())
+        self.assertIn("a one-shot is STILL PENDING", md)
+        self.assertNotIn("consumed by then", md)
+        self.assertNotIn("boots the OLD kernel", md)
+        self.assertIn("Do NOT dispatch the upgrade again", md)
+
+    def test_an_upgrade_whose_survey_after_the_reboot_is_unreadable_does_not_claim_the_one_shot_was_consumed(self):
+        # review m2: no survey is not "no one-shot pending"
+        self.fresh()
+        self.play("returned_unknown", self.UP, env={"SURVEY_FAIL_AFTER_REBOOT": "1"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-verification")
+        self.assertTrue(any("no readable survey after the reboot" in p for p in r["problems"]), r["problems"])
+        pc = " ".join(r["power_cycle"].split())
+        self.assertIn("UNPROVEN", pc)
+        self.assertIn("boot.next_entry", pc)
+        for stale in ("consumed by then", "STILL PENDING"):
+            self.assertNotIn(stale, pc)
+        self.assertIn("UNPROVEN", " ".join(self.summary("upgrade", "msr1").split()))
+
+    def test_the_first_entry_of_an_upgrade_is_read_from_the_survey_after_the_reboot_not_guessed(self):
+        # review m3: the target is the newest kernel of the running flavor, GRUB's first entry can be another
+        self.fresh()
+        self.play("entry0_other", self.UP, env={"BOOT_MODE": "ignore-env", "ENTRY0_AFTER": "7.0.0-99-generic"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual((r["target_kernel"], r["first_entry_kernel"]), ("7.0.0-40-generic", "7.0.0-99-generic"))
+        self.assertIn("boots GRUB's FIRST menu entry, 7.0.0-99-generic", " ".join(r["power_cycle"].split()))
+
+    def test_an_upgrade_that_returned_with_the_one_shot_consumed_still_says_a_power_cycle_boots_the_old_kernel(self):
+        self.fresh()
+        self.play("returned_consumed", self.UP, env={"BOOT_MODE": "no-nic"})
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertEqual(r["status"], "failed-verification")
+        pc = " ".join(r["power_cycle"].split())
+        self.assertIn("the one-shot is consumed by then: a power-cycle boots the OLD kernel 7.0.0-31-generic", pc)
+        self.assertNotIn("STILL PENDING", pc)
+        self.assertIn("Reboot it back with the cluster-reboot workflow", pc)
 
     def test_an_upgrade_is_refused_without_a_rehearsal(self):
         self.fresh(rehearsed=False)
@@ -905,8 +1285,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         for w in self.NEW_KERNEL_WORDS:
             self.assertNotIn(w, txt)
         self.assertNotIn("consumed by", txt)
-        self.assertIn("first menu entry of grub (7.0.0-38-generic), not 7.0.0-31-generic", r["power_cycle"])
-        self.assertIn("first menu entry of grub (7.0.0-38-generic), not the saved default (7.0.0-31-generic)", " ".join(r["problems"]))
+        self.assertIn("first menu entry of grub (7.0.0-38-generic, boot.entry0_kernel), not 7.0.0-31-generic", r["power_cycle"])
+        self.assertIn("first menu entry of grub (boot.entry0_kernel 7.0.0-38-generic), NOT the saved default (7.0.0-31-generic)", " ".join(r["problems"]))
         self.assertIn("mode=disarm", r["power_cycle"])
         md = self.summary("rehearse", "msr1")
         for w in self.NEW_KERNEL_WORDS:

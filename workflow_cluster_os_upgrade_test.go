@@ -7,9 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -71,7 +73,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 		}
 		return out
 	}
-	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "rehearse", "upgrade", "disarm", "repair"}) {
+	if got := choice("mode", "host"); !slices.Equal(got, []string{"survey", "rehearse", "upgrade", "disarm", "repair", "freeze", "thaw"}) {
 		t.Errorf("modes = %v", got)
 	}
 	offered := choice("host", "confirm")
@@ -109,7 +111,7 @@ func TestClusterOSUpgradeInputs(t *testing.T) {
 	if !slices.Equal(accepted, osUpgradeHosts()) {
 		t.Errorf("the playbook accepts %v, want %v", accepted, osUpgradeHosts())
 	}
-	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'rehearse', 'disarm', 'repair']", "os_confirm == 'REPAIR-' ~ os_host"} {
+	for _, want := range []string{"os_confirm == 'UPGRADE-' ~ os_host", "os_confirm == 'DISARM-' ~ os_host", "os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']", "os_mode == 'survey' and os_host == '-'", "os_mode in ['survey', 'upgrade', 'rehearse', 'disarm', 'repair', 'freeze', 'thaw']", "os_confirm == 'FREEZE-' ~ os_host", "os_confirm == 'THAW-' ~ os_host", "os_confirm == 'REPAIR-' ~ os_host"} {
 		if !strings.Contains(req, want) {
 			t.Errorf("the playbook's request check lacks %s", want)
 		}
@@ -126,12 +128,14 @@ func TestClusterOSUpgradePlanRefuses(t *testing.T) {
 		`"$IN_CONFIRM" != "DISARM-$IN_HOST"`,
 		`"$IN_CONFIRM" != "REHEARSE-$IN_HOST"`,
 		`"$IN_CONFIRM" != "REPAIR-$IN_HOST"`,
+		`"$IN_CONFIRM" != "FREEZE-$IN_HOST"`,
+		`"$IN_CONFIRM" != "THAW-$IN_HOST"`,
 		`OS_UPGRADE_ALLOWED_HOSTS`,
 		`"$REF" != "refs/heads/$DEFAULT_BRANCH"`,
 		`msa2-server|msr1|msa2-client) ;;`,
 		`"$IN_HOST" != "-"`,
 		`-gt 200`,
-		`mode must be survey, rehearse, upgrade, disarm or repair`,
+		`mode must be survey, rehearse, upgrade, disarm, repair, freeze or thaw`,
 		`a survey takes no confirmation`,
 		`reason must not contain braces`,
 	} {
@@ -360,7 +364,7 @@ func TestClusterOSUpgradePlaybookSafety(t *testing.T) {
 
 	// the subcommands the playbook may run on a host
 	allowed := []string{"apt-update", "survey", "simulate", "dump", "pin-grub", "upgrade-start", "upgrade-status", "upgrade-log",
-		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start", "arm-rehearsal", "record-rehearsal", "hold-access", "release-access"}
+		"blacklist-r8169", "dkms-check", "arm-oneshot", "make-permanent", "toolcheck", "upgrade-cleanup", "disarm", "repair-start", "arm-rehearsal", "record-rehearsal", "hold-access", "release-access", "freeze", "thaw"}
 	all := src
 	tasks, _ := filepath.Glob("ansible/tasks/os_upgrade_*.yml")
 	for _, tf := range tasks {
@@ -542,14 +546,45 @@ func pythonOrSkip(t *testing.T) string {
 
 // TestOSUpgradeScript runs ansible/tests/test_os_upgrade.py: the grub menu parser, the survey (read-only: nothing
 // written, no changing command run), and each host-changing subcommand against a fake host with stub commands.
+// The suite is ~200 tests that each start dozens of stub processes, and the root package has a 5 minute budget under -race:
+// it runs as OSU_SHARD=i/n shards, one python process each, at once (the tests share nothing; each has its own temp dir).
 func TestOSUpgradeScript(t *testing.T) {
 	py := pythonOrSkip(t)
-	out, err := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade.py")).CombinedOutput()
-	if err != nil {
-		t.Fatalf("test_os_upgrade.py failed: %v\n%s", err, out)
+	n := min(max(runtime.NumCPU(), 1), 4)
+	type res struct {
+		out []byte
+		err error
 	}
-	if !bytes.Contains(out, []byte("OK")) {
-		t.Fatalf("test_os_upgrade.py did not report OK:\n%s", out)
+	results := make([]res, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cmd := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade.py"))
+			cmd.Env = append(os.Environ(), "OSU_SHARD="+strconv.Itoa(i)+"/"+strconv.Itoa(n))
+			results[i].out, results[i].err = cmd.CombinedOutput()
+		}()
+	}
+	wg.Wait()
+	ran, failed := 0, false
+	for i, r := range results {
+		if r.err != nil {
+			failed = true
+			t.Errorf("test_os_upgrade.py shard %d/%d FAILED: %v\n%s", i, n, r.err, r.out)
+			continue
+		}
+		m := regexp.MustCompile(`Ran (\d+) tests?`).FindSubmatch(r.out)
+		if m == nil || !bytes.Contains(r.out, []byte("OK")) {
+			failed = true
+			t.Errorf("test_os_upgrade.py shard %d/%d did not report OK:\n%s", i, n, r.out)
+			continue
+		}
+		k, _ := strconv.Atoi(string(m[1]))
+		ran += k
+	}
+	if ran < 200 && !failed { // after a failed shard the count is only a consequence of it
+		t.Errorf("the shards ran %d tests in all: the suite has more than 200 (a shard that silently ran nothing?)", ran)
 	}
 }
 
@@ -585,6 +620,22 @@ func TestOSUpgradePlay(t *testing.T) {
 	}
 }
 
+// TestOSUpgradeRealHosts replays the three real hosts' records (the first real survey, run 39814880117) through the summary's
+// checklist and the judgement (test_os_upgrade_real_hosts.py): the row that read FAIL on every host because of two idle daemons is PASS.
+func TestOSUpgradeRealHosts(t *testing.T) {
+	py := pythonOrSkip(t)
+	if os.Getenv("PROBATORIUM_ANSIBLE_TESTS") != "1" {
+		t.Skip("set PROBATORIUM_ANSIBLE_TESTS=1 to replay the real hosts' records (needs jq and ansible-playbook); the ansible CI job runs it")
+	}
+	if _, err := exec.LookPath("ansible-playbook"); err != nil {
+		t.Fatal("PROBATORIUM_ANSIBLE_TESTS=1 but ansible-playbook is not installed")
+	}
+	out, err := exec.Command(py, "-I", filepath.Join("ansible", "tests", "test_os_upgrade_real_hosts.py")).CombinedOutput()
+	if err != nil {
+		t.Fatalf("test_os_upgrade_real_hosts.py failed: %v\n%s", err, out)
+	}
+}
+
 func linuxPython(t *testing.T) string {
 	t.Helper()
 	_ = linuxBash(t) // skips off Linux: the play reads /proc with GNU tools
@@ -594,7 +645,7 @@ func linuxPython(t *testing.T) string {
 // The ansible CI job runs the three python tests under the cluster's ansible pin.
 func TestAnsibleJobRunsTheOSUpgradeTests(t *testing.T) {
 	wf := mustRead(t, filepath.Join(".github", "workflows", "test.yml"))
-	for _, s := range []string{"test_os_upgrade", "test_os_upgrade_judge", "test_os_upgrade_play"} {
+	for _, s := range []string{"test_os_upgrade", "test_os_upgrade_judge", "test_os_upgrade_play", "test_os_upgrade_real_hosts"} {
 		if !regexp.MustCompile(`(?m)^\s*run: python3 -I ansible/tests/` + s + `\.py\s*$`).MatchString(wf) {
 			t.Errorf("test.yml's ansible job does not run `python3 -I ansible/tests/%s.py`", s)
 		}
@@ -727,6 +778,17 @@ func TestOSUpgradeIsDocumented(t *testing.T) {
 		"blacklist_r8169",
 		"refresh_lists",
 		"stub",
+		"only when GRUB consumed its one-shot",
+		"first_entry_kernel",
+		"Rehearsal at a console",
+		"mode=freeze",
+		"mode=thaw",
+		"FREEZE-<host>",
+		"THAW-<host>",
+		"zzz-celeris-freeze.conf",
+		"freeze.drifted",
+		"apt-daily-upgrade.timer",
+		"unattended-upgrades.service",
 	} {
 		if !strings.Contains(sec, want) {
 			t.Errorf("the README section lacks %q", want)
@@ -854,6 +916,13 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		}
 		return base(e)
 	}
+	fz := func(mode string, over env) env {
+		e := env{"IN_MODE": mode, "IN_HOST": "msr1", "IN_CONFIRM": strings.ToUpper(mode) + "-msr1", "ALLOWED_HOSTS": "msr1"}
+		for k, v := range over {
+			e[k] = v
+		}
+		return base(e)
+	}
 	for _, c := range []struct {
 		name string
 		env  env
@@ -887,7 +956,8 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"a listed disarm", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
 		{"a disarm confirmed in lower case", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "disarm-msr1", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly DISARM-msr1"},
 		{"a rehearsal with its confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1", "ALLOWED_HOSTS": "msr1"}), true, ""},
-		{"a rehearsal with the console confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1-CONSOLE", "ALLOWED_HOSTS": "msr1"}), true, ""},
+		{"a rehearsal with the console confirmation", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1-CONSOLE", "ALLOWED_HOSTS": "msr1"}), true, "CONSOLE ATTESTED: the dispatcher states that a person is at the rack of msr1 with a console"},
+		{"a rehearsal without it says no console is attested", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msr1", "ALLOWED_HOSTS": "msr1"}), true, "no console attested"},
 		{"a rehearsal with the console confirmation for another host", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "REHEARSE-msa2-server-CONSOLE", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
 		{"a console confirmation in lower case", base(env{"IN_MODE": "rehearse", "IN_HOST": "msr1", "IN_CONFIRM": "rehearse-msr1-console", "ALLOWED_HOSTS": "msr1"}), false, "confirm must be exactly REHEARSE-msr1"},
 		{"an upgrade confirmed as a console rehearsal", up("msr1", env{"IN_CONFIRM": "REHEARSE-msr1-CONSOLE"}), false, "confirm must be exactly UPGRADE-msr1"},
@@ -925,6 +995,25 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		{"an answer that is not json", up("msr1", envFix("notjson", "0")), false, "no required reviewer"},
 		{"a disarm needs the environment too", base(env{"IN_MODE": "disarm", "IN_HOST": "msr1", "IN_CONFIRM": "DISARM-msr1", "ALLOWED_HOSTS": "msr1", "GH_FIXTURE": filepath.Join(bin, "noreviewer.json")}), false, "no required reviewer"},
 		{"a repair needs the environment too", rep(envFix("noreviewer", "0")), false, "no required reviewer"},
+		// freeze and thaw: the same gate, the same approval, an exact confirmation each
+		{"a freeze is gated too", fz("freeze", env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
+		{"a freeze of a host that is not listed", fz("freeze", env{"ALLOWED_HOSTS": "msa2-server"}), false, "is not in the repository variable"},
+		{"a listed freeze", fz("freeze", nil), true, ""},
+		{"a freeze needs the environment too", fz("freeze", envFix("noreviewer", "0")), false, "no required reviewer"},
+		{"a freeze needs the branch policy too", fz("freeze", envFix("nobranches", "0")), false, "no deployment branch policy"},
+		{"a freeze confirmed as an upgrade", fz("freeze", env{"IN_CONFIRM": "UPGRADE-msr1"}), false, "confirm must be exactly FREEZE-msr1"},
+		{"a freeze confirmed as a thaw", fz("freeze", env{"IN_CONFIRM": "THAW-msr1"}), false, "confirm must be exactly FREEZE-msr1"},
+		{"a freeze confirmed in lower case", fz("freeze", env{"IN_CONFIRM": "freeze-msr1"}), false, "confirm must be exactly FREEZE-msr1"},
+		{"a freeze confirmed for another host", fz("freeze", env{"IN_CONFIRM": "FREEZE-msa2-server"}), false, "confirm must be exactly FREEZE-msr1"},
+		{"a freeze of no host", fz("freeze", env{"IN_HOST": "-", "IN_CONFIRM": "FREEZE--"}), false, "names ONE host"},
+		{"a freeze of all", fz("freeze", env{"IN_HOST": "all"}), false, "host must be"},
+		{"a thaw is gated too", fz("thaw", env{"ALLOWED_HOSTS": ""}), false, "OS_UPGRADE_ALLOWED_HOSTS"},
+		{"a listed thaw", fz("thaw", nil), true, ""},
+		{"a thaw needs the environment too", fz("thaw", envFix("noreviewer", "0")), false, "no required reviewer"},
+		{"a thaw confirmed as a freeze", fz("thaw", env{"IN_CONFIRM": "FREEZE-msr1"}), false, "confirm must be exactly THAW-msr1"},
+		{"a thaw confirmed in lower case", fz("thaw", env{"IN_CONFIRM": "thaw-msr1"}), false, "confirm must be exactly THAW-msr1"},
+		{"an upgrade confirmed as a freeze", up("msr1", env{"IN_CONFIRM": "FREEZE-msr1"}), false, "confirm must be exactly UPGRADE-msr1"},
+		{"a freeze with template syntax in the reason", fz("freeze", env{"IN_REASON": "x {{ y }}"}), false, "must not contain braces"},
 	} {
 		cmd := exec.Command(bash, "-c", script)
 		cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH")}
@@ -935,12 +1024,140 @@ func TestClusterOSUpgradePlanScriptBehaviour(t *testing.T) {
 		if c.ok && err != nil {
 			t.Errorf("%s: refused: %s", c.name, out)
 		}
+		if c.ok && c.msg != "" && !strings.Contains(string(out), c.msg) {
+			t.Errorf("%s: accepted, but the log lacks %q: %s", c.name, c.msg, out)
+		}
 		if !c.ok {
 			if err == nil {
 				t.Errorf("%s: accepted", c.name)
 			} else if !strings.Contains(string(out), c.msg) {
 				t.Errorf("%s: refused for another reason than %q: %s", c.name, c.msg, out)
 			}
+			// R4-m3: a refusal never hands out the string that attests a console at the rack
+			if consoleOverride.Match(out) {
+				t.Errorf("%s: the refusal spells out the console override: %s", c.name, out)
+			}
+		}
+	}
+}
+
+// R4-m3: the environment's approver sees the run name and the job name, not the inputs. A rehearsal says in both whether the dispatcher
+// attests a person at the rack with a console.
+func TestClusterOSUpgradeTheApproverSeesTheConsoleAttestation(t *testing.T) {
+	src := readWorkflow(t, osWorkflow)
+	rn := regexp.MustCompile(`(?m)^run-name: (.*)$`).FindStringSubmatch(src)
+	jn := regexp.MustCompile(`(?m)^    name: (os-upgrade .*)$`).FindStringSubmatch(src)
+	if rn == nil || jn == nil {
+		t.Fatalf("run-name %v, os-upgrade job name %v", rn, jn)
+	}
+	for what, line := range map[string]string{"run-name": rn[1], "job name": jn[1]} {
+		for _, want := range []string{"inputs.mode == 'rehearse'", "endsWith(inputs.confirm, '-CONSOLE')", "CONSOLE-ATTESTED", "(no console attested)"} {
+			if !strings.Contains(line, want) {
+				t.Errorf("the %s lacks %q: %s", what, want, line)
+			}
+		}
+		if strings.Contains(line, "inputs.reason") {
+			t.Errorf("the %s carries free text: %s", what, line)
+		}
+	}
+	plan := jobSection(t, withoutComments(src), "plan")
+	for _, want := range []string{`"$IN_CONFIRM" = "REHEARSE-$IN_HOST-CONSOLE"`, "CONSOLE ATTESTED", "no console attested", "GITHUB_STEP_SUMMARY"} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("the plan job does not say whether a console is attested: lacks %q", want)
+		}
+	}
+	if sum := mustRead(t, filepath.Join(".github", "scripts", "os-upgrade-summary.sh")); !strings.Contains(sum, "CONSOLE ATTESTED") || !strings.Contains(src, `"$RUN_ID" "$IN_CONFIRM"`) {
+		t.Error("the step summary does not get the confirmation or does not say whether a console is attested")
+	}
+}
+
+var consoleOverride = regexp.MustCompile(`REHEARSE-[^\s'"]*CONSOLE`)
+
+// R4-m3: no refusal, error or input description spells out the confirmation that attests a console at the rack (an automated dispatcher that
+// read it could re-send it). The README describes how to type it, the checks compare against it.
+func TestClusterOSUpgradeNeverSpellsOutTheConsoleOverride(t *testing.T) {
+	wf := readWorkflow(t, osWorkflow)
+	for _, l := range strings.Split(wf, "\n") {
+		if (strings.Contains(l, "description:") || strings.Contains(l, "::error::") || strings.Contains(l, "::notice") || strings.Contains(l, "echo ")) && consoleOverride.MatchString(l) {
+			t.Errorf("the workflow spells out the override: %s", strings.TrimSpace(l))
+		}
+	}
+	req := mustRead(t, osRequest)
+	if i, j := strings.Index(req, "fail_msg:"), strings.Index(req, "quiet:"); i < 0 || j < i || consoleOverride.MatchString(req[i:j]) {
+		t.Error("the request's failure message spells out the override")
+	}
+	for _, l := range strings.Split(mustRead(t, osJudge), "\n") {
+		if i := strings.Index(l, "p.append("); i >= 0 && strings.Contains(l[i:], "CONSOLE") {
+			t.Errorf("a refusal of the judgement spells out the override: %s", strings.TrimSpace(l[i:]))
+		}
+	}
+	if consoleOverride.MatchString(stripComments(mustRead(t, osPlaybook))) {
+		t.Error("the playbook's texts spell out the override")
+	}
+	if consoleOverride.MatchString(mustRead(t, filepath.Join(".github", "scripts", "os-upgrade-summary.sh"))) {
+		t.Error("the summary spells out the override")
+	}
+	if !strings.Contains(mustRead(t, "README.md"), "that person's dispatch types `REHEARSE-<host>-CONSOLE` in `confirm`") {
+		t.Error("the README no longer says how a person at the rack attests a console")
+	}
+}
+
+// Review m1 (and r2 F9): the literal scan above is bypassed by a concatenation ('REHEARSE-' ~ os_host ~ '-' ~ 'CONSOLE'), a format filter, a Python % or a
+// literal on an allow-listed line. In every file that prints anything, a line (comments stripped) may carry the word CONSOLE only inside the exact
+// fragments that COMPARE a confirmation against it or show the approver that one was attested, and each file has exactly that many such lines: what
+// is left of a line after the fragments are removed must not contain CONSOLE, and the tool (os_upgrade.py) has none at all.
+func TestClusterOSUpgradeTheConsoleTokenIsOnlyEverCompared(t *testing.T) {
+	type allow struct {
+		fragments []string
+		lines     int
+	}
+	allowed := map[string]allow{
+		filepath.Join(".github", "workflows", osWorkflow): {[]string{
+			`endsWith(inputs.confirm, '-CONSOLE')`, ` CONSOLE-ATTESTED`,
+			`[ "$IN_CONFIRM" != "REHEARSE-$IN_HOST-CONSOLE" ]`, `[ "$IN_CONFIRM" = "REHEARSE-$IN_HOST-CONSOLE" ]`,
+			`kind="CONSOLE ATTESTED: the dispatcher states that a person is at the rack of $IN_HOST with a console"`}, 5},
+		osRequest:  {[]string{`os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']`}, 1},
+		osJudge:    {[]string{`{% set console_attested = (os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE') %}`}, 1},
+		osPlaybook: {[]string{`(os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE')`}, 1},
+		osScript:   {nil, 0},
+		filepath.Join(".github", "scripts", "os-upgrade-summary.sh"): {[]string{`*-CONSOLE) echo "- confirmation: **CONSOLE ATTESTED**:`}, 1},
+	}
+	for file, ok := range allowed {
+		n := 0
+		for _, l := range strings.Split(stripComments(mustRead(t, file)), "\n") {
+			if !strings.Contains(l, "CONSOLE") {
+				continue
+			}
+			n++
+			rest := l
+			for _, fr := range ok.fragments {
+				rest = strings.ReplaceAll(rest, fr, "")
+			}
+			if strings.Contains(rest, "CONSOLE") {
+				t.Errorf("%s: a line carries the word CONSOLE outside the comparisons and the approver's display (a message, a concatenation, a format, a print): %s", file, strings.TrimSpace(l))
+			}
+		}
+		if n != ok.lines {
+			t.Errorf("%s has %d lines with the word CONSOLE, want exactly %d (a new line needs a review of what it prints)", file, n, ok.lines)
+		}
+	}
+	for _, f := range []string{filepath.Join("ansible", "tasks", "os_upgrade_phase.yml"), filepath.Join("ansible", "tasks", "os_upgrade_wait_apt.yml")} {
+		if strings.Contains(mustRead(t, f), "CONSOLE") {
+			t.Errorf("%s mentions the console token", f)
+		}
+	}
+}
+
+// The two scripts the playbook ships to a host are executable in the repository (reboot_snapshot.sh had lost its bit; ansible.builtin.script
+// makes its copy executable, so only a person running it by hand noticed).
+func TestOSUpgradeScriptsAreExecutable(t *testing.T) {
+	for _, f := range []string{osScript, filepath.Join("ansible", "files", "reboot_snapshot.sh")} {
+		info, err := os.Stat(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&0o111 == 0 {
+			t.Errorf("%s is not executable (%v)", f, info.Mode())
 		}
 	}
 }
@@ -955,6 +1172,19 @@ func TestOSUpgradeConstantsAgree(t *testing.T) {
 		b := regexp.MustCompile(`(?m)^` + c[1] + `: (\d+)$`).FindStringSubmatch(judge)
 		if a == nil || b == nil || a[1] != b[1] {
 			t.Errorf("%s in the summary (%v) and %s in the judge (%v) differ", c[0], a, c[1], b)
+		}
+	}
+	// the package-manager programs that count as a package run: the tool's list, the judge's and the summary's are one list
+	words := func(s string) string { f := strings.Fields(s); slices.Sort(f); return strings.Join(f, " ") }
+	bs := regexp.MustCompile(`(?m)^PKG_RUN_NAMES = frozenset\("([^"]+)"\.split\(\)\)$`).FindStringSubmatch(mustRead(t, osScript))
+	bj := regexp.MustCompile(`(?m)^os_busy_process_names: '([^']+)'$`).FindStringSubmatch(judge)
+	bm := regexp.MustCompile(`(?m)^busy_names="([^"]+)"$`).FindStringSubmatch(sum)
+	if bs == nil || bj == nil || bm == nil || words(bs[1]) != words(bj[1]) || words(bs[1]) != words(bm[1]) {
+		t.Errorf("the busy program lists differ: script %v, judge %v, summary %v", bs, bj, bm)
+	}
+	for _, idle := range []string{"unattended-upgr", "packagekitd", "unattended-upgrade-shutdown"} {
+		if strings.Contains(" "+words(bs[1])+" ", " "+idle+" ") {
+			t.Errorf("%s is an idle daemon, not a package run: it must not be in the list", idle)
 		}
 	}
 	rj := regexp.MustCompile(`(?m)^os_protected_regex: '(.*)'$`).FindStringSubmatch(judge)

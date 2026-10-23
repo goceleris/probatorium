@@ -3,7 +3,8 @@
 # markdown job summary. Read-only (it also writes <host>/package-diff.txt next to the evidence); it works on whatever
 # the play managed to write, so a run that failed half way still gets a summary.
 #
-# usage: os-upgrade-summary.sh OUT_DIR MODE HOST ANSIBLE_RC "REASON" RUN_ID
+# usage: os-upgrade-summary.sh OUT_DIR MODE HOST ANSIBLE_RC "REASON" RUN_ID [CONFIRM]
+#   CONFIRM (optional) is the typed confirmation: a rehearsal's summary says whether it attested a console at the rack
 #   MODE survey | rehearse | upgrade | disarm | repair; HOST is "-" for a survey
 set -u
 out=${1:?out dir}
@@ -12,6 +13,7 @@ host=${3:?host}
 rc=${4:?ansible rc}
 reason=${5:-}
 run_id=${6:-}
+confirm=${7:-}
 safe_reason=${reason//\`/\'}
 
 if ! command -v jq > /dev/null 2>&1; then
@@ -22,6 +24,10 @@ if ! command -v jq > /dev/null 2>&1; then
 fi
 
 hosts="msa2-server msr1 msa2-client"
+# The package-manager programs that count as a package run (os_upgrade.py PKG_RUN_NAMES, vars/os_upgrade_judge.yml os_busy_process_names:
+# a test compares the three lists). A survey recorded by the first release of the tool also listed the idle daemons `unattended-upgr`
+# and `packagekitd` (kernel comm names): they are not package runs, and are never shown as busy.
+busy_names="apt apt-get aptitude dpkg unattended-upgrade apt.systemd.daily dkms update-grub grub-mkconfig update-initramfs"
 j() { jq -r "$1" "$2" 2> /dev/null; }
 
 survey_section() {
@@ -29,20 +35,22 @@ survey_section() {
 	[ -s "$s" ] || { echo "- $1: no survey record"; return; }
 	echo "### $1"
 	echo
-	jq -r '
+	jq -r --arg busy "$busy_names" '
 		"- OS: \(.os_release.PRETTY_NAME // "?") (\(.arch)); running kernel `\(.kernel)`; installed: \(.installed_kernels | join(", ")); newest of the same flavor: `\(.newest_same_flavor)`",
-		"- grub: default after a power-cycle = `\(.boot.default_kernel)`, saved_entry `\(.boot.saved_entry)`, GRUB_DEFAULT=`\(.boot.settings.GRUB_DEFAULT // "unset")`, saved logic in grub.cfg: \(.boot.cfg_uses_saved), EFI: \(.boot.efi), Secure Boot: \(.boot.secure_boot), /boot/grub on `\(.boot.boot_fs)` (`\(.boot.boot_source)`), one-shot tools: grub-reboot \(.boot.grub_reboot) grub-set-default \(.boot.grub_set_default) grub-editenv \(.boot.grub_editenv) update-grub \(.boot.update_grub), recordfail timeout `\(.boot.cfg_recordfail_timeout)`",
-		"- **next boot** (what a power-cycle or the next reboot gives): \(if .boot.next_entry != "" then "the ONE-SHOT entry `" + .boot.next_entry + "` (a run armed it and the host has not booted it: dispatch mode=disarm, or expect that kernel once)" else "grub saved default `" + (.boot.default_kernel | if . == "" then "unknown" else . end) + "`" end); upgrade drop-in present: \(.boot.dropin_present); kernel packages newer than the running kernel: \(.packages.new_kernel_pkgs | join(", ") | if . == "" then "none" else . end); of which half-installed or recorded as failed: \(.packages.broken_kernel_pkgs | join(", ") | if . == "" then "none" else . end)",
+		"- grub: saved default `\(.boot.default_kernel)` (what a power-cycle boots when GRUB reads the grubenv, see the boot proof), GRUB'"'"'s first menu entry `\(.boot.entry0_kernel // "unknown")` (what it boots when it does not), saved_entry `\(.boot.saved_entry)`, GRUB_DEFAULT=`\(.boot.settings.GRUB_DEFAULT // "unset")`, saved logic in grub.cfg: \(.boot.cfg_uses_saved), EFI: \(.boot.efi), Secure Boot: \(.boot.secure_boot), /boot/grub on `\(.boot.boot_fs)` (`\(.boot.boot_source)`), one-shot tools: grub-reboot \(.boot.grub_reboot) grub-set-default \(.boot.grub_set_default) grub-editenv \(.boot.grub_editenv) update-grub \(.boot.update_grub), recordfail timeout `\(.boot.cfg_recordfail_timeout)`",
+		"- **next boot** (what a power-cycle or the next reboot gives): \(if .boot.next_entry != "" then "the ONE-SHOT entry `" + .boot.next_entry + "` (a run armed it and the host has not booted it: dispatch mode=disarm, or expect that kernel once)" else "grub saved default `" + (.boot.default_kernel | if . == "" then "unknown" else . end) + "` (a GRUB that ignores the grubenv boots its first menu entry `" + (.boot.entry0_kernel // "unknown") + "` instead)" end); upgrade drop-in present: \(.boot.dropin_present); kernel packages newer than the running kernel: \(.packages.new_kernel_pkgs | join(", ") | if . == "" then "none" else . end); of which half-installed or recorded as failed: \(.packages.broken_kernel_pkgs | join(", ") | if . == "" then "none" else . end)",
 		"- **GRUB boot proof** (every one-shot and fallback depends on it): \(if .boot.proof.ok then "OK" else "NOT PROVEN: " + (.boot.proof.problems | join(" / ")) end); BOOT_IMAGE `\(.boot.proof.boot_image)`, EFI loader `\(.boot.proof.efi_loader)`, GRUB prefix `\(.boot.proof.prefix)`",
 		"- apt (lists \(.packages.lists_age_hours // "?") h old): would install/upgrade \(.packages.simulation.inst | length) package(s) (kernel packages: \(.packages.simulation.kernel_inst | join(", ") | if . == "" then "none" else . end)); would REMOVE: \(.packages.simulation.remv | join(", ") | if . == "" then "none" else . end); kept back: \(.packages.kept_back | join(", ") | if . == "" then "none" else . end); held back by phasing: \(.packages.phased_held_back | join(", ") | if . == "" then "none" else . end)",
 		"- held: \(.packages.held | join(", ") | if . == "" then "none" else . end) (kernel/boot/dkms: \(.packages.held_kernel | join(", ") | if . == "" then "none" else . end)); third-party repos: \(.packages.third_party_repos | join(", ") | if . == "" then "none" else . end); pin files: \(.packages.pin_files | join(", ") | if . == "" then "none" else . end)",
-		"- dpkg: audit \(.packages.dpkg_audit | length) finding(s), lock held \(.packages.dpkg_lock_held), package processes `\(.packages.package_processes | join(", "))`, policy-rc.d present \(.packages.policy_rc_d_present)",
+		"- dpkg: audit \(.packages.dpkg_audit | length) finding(s), lock held \(.packages.dpkg_lock_held)\(.packages.locks_held // [] | if length > 0 then " (" + join(", ") + ")" else "" end), package runs `\(.packages.package_processes | map(select(IN($busy | split(" ")[]))) | join(", ") | if . == "" then "none" else . end)`, policy-rc.d present \(.packages.policy_rc_d_present)",
 		"- unattended-upgrades: installed \(.unattended_upgrades.installed), periodic `\(.unattended_upgrades.unattended_upgrade)`, removes unused kernels `\(.unattended_upgrades.remove_unused_kernel_packages)`, automatic reboot `\(.unattended_upgrades.automatic_reboot)`, needrestart \(.unattended_upgrades.needrestart_installed); units: \(.unattended_upgrades.units | to_entries | map("\(.key)=\(.value.active)/\(.value.enabled)") | join(", "))",
 		"- reboot-required: \(.reboot_required) \(.reboot_required_pkgs | join(" "))",
 		"- disk free (KiB): / \(.disk["/"].free_kib // "?"), /boot \(.disk["/boot"].free_kib // "?"), /boot/efi \(.disk["/boot/efi"].free_kib // "n/a"), /var \(.disk["/var"].free_kib // "?")",
 		"- time sync: NTPSynchronized=`\(.time_sync.raw)`; crash dumps: \(.crash | join(", ") | if . == "" then "none" else . end); linux-firmware `\(.firmware.linux_firmware)`",
 		"- dkms: \(.dkms.status | map("\(.name)/\(.version) \(.kernel) \(.state)") | join("; ") | if . == "" then "none" else . end)",
-		"- last OS-upgrade record: \(.marker | if . == {} then "none" else "run \(.run_id): \(.kernel_before) -> \(.kernel_after), permanent \(.permanent), \(.finished_utc)" end)"
+		"- last OS-upgrade record: \(.marker | if . == {} then "none" else "run \(.run_id): \(.kernel_before) -> \(.kernel_after), permanent \(.permanent), \(.finished_utc)" end)",
+		"- NOT stopped by a freeze: tailscale auto-update `\(.self_updaters.tailscale_auto_update // "not recorded")` (check `\(.self_updaters.tailscale_check_updates // "not recorded")`), snapd refresh `\(.self_updaters.snap_refresh // "not recorded")`; also fwupd, motd-news and ubuntu-pro-client timers where installed",
+		"- freeze: \(.freeze // {} | if . == {} then "not frozen: the apt timers and unattended-upgrades run, so the platform can change by itself" else "run \(.run_id) at \(.utc), status \(.status); stopped or disabled: \(.units | to_entries | map(select(.value.changes | length > 0) | "\(.key) (\(.value.changes | join("+")))") | join(", ") | if . == "" then "nothing" else . end); needrestart list-only drop-in: \(.needrestart.dropin_written); platform: \(.platform.kernel // "?"), \(.platform.packages // "?") packages, sha256 \((.platform.dpkg_sha256 // "?")[0:16]), holds \(.platform.held // [] | join(",") | if . == "" then "none" else . end); drifted since: \(.drifted // [] | join("; ") | if . == "" then "no" else . end)" end)"
 	' "$s"
 	local ps=$out/$1/preflight-snapshot.json
 	if [ -s "$ps" ]; then
@@ -87,13 +95,15 @@ checklist() {
 		local sv=$out/$h/survey.json ps=$out/$h/preflight-snapshot.json
 		if [ ! -s "$sv" ]; then echo "| $h | survey record | none | FAIL | nothing can be decided for this host |"; continue; fi
 		[ -s "$ps" ] || ps=/dev/null
-		jq -r --arg h "$h" --argjson rootmin "$root_min" --argjson bootmin "$boot_min" --argjson efimin "$efi_min" --slurpfile snap <(if [ -s "$ps" ]; then cat "$ps"; else echo '{}'; fi) '
+		jq -r --arg h "$h" --arg busy "$busy_names" --argjson rootmin "$root_min" --argjson bootmin "$boot_min" --argjson efimin "$efi_min" --slurpfile snap <(if [ -s "$ps" ]; then cat "$ps"; else echo '{}'; fi) '
 			def row($c; $v; $m; $d): "| \($h) | \($c) | \($v | tostring | gsub("\\|"; "/")) | **\($m)** | \($d) |";
 			def gib($k): (((.disk[$k].free_kib // 0) / 1048576 * 10) | floor / 10);
 			($snap[0] // {}) as $sn
 			| (.boot.proof) as $pf
 			| .packages as $pk
 			| (.packages.simulation.inst | map(select(.name | test("^(docker|containerd|runc|tailscale|openssh-server|grub|shim|netplan|systemd$|linux-firmware)"))) | map("\(.name) \(.old) -> \(.new)") | join("; ")) as $access
+			| ($pk.package_processes | map(select(IN($busy | split(" ")[])))) as $busyprocs
+			| ($pk.locks_held // []) as $locks
 			| .newest_same_flavor as $nsf
 			| .kernel as $krun
 			| (.r8127.per_kernel[.newest_same_flavor] // null) as $nk
@@ -102,11 +112,11 @@ checklist() {
 			row("GRUB booted this host and reads the grubenv Linux writes"; (if $pf.ok then "BOOT_IMAGE \($pf.boot_image); loader \($pf.efi_loader); prefix \($pf.prefix); stub fs \($pf.stub_uuid) = /boot/grub fs \($pf.boot_uuid)" else ($pf.problems | join(" / ")) end); (if $pf.ok then "PASS" else "FAIL" end); "if FAIL, every rehearsal and upgrade is refused; a one-shot cannot be trusted"),
 			row("no one-shot pending (next_entry)"; (if .boot.next_entry == "" then "none" else .boot.next_entry end); (if .boot.next_entry == "" then "PASS" else "FAIL" end); "if FAIL, mode=disarm first (an upgrade refuses)"),
 			row("upgrade pin vs the running kernel"; "drop-in \(.boot.dropin_present); saved default \(.boot.default_kernel | if . == "" then "unset" else . end); running \(.kernel)"; (if (.boot.dropin_present | not) then "NOTE" elif .boot.default_kernel == .kernel then "PASS" else "FAIL" end); "NOTE: not pinned yet, the first step pins. FAIL: the host runs a kernel other than its saved default: reboot it back (cluster-reboot) first"),
-			row("kernel a GRUB that ignores the grubenv would boot (first menu entry)"; "first entry `\(.boot.entry0_kernel | if . == "" then "unknown" else . end)`; running `\(.kernel)`; saved default `\(.boot.default_kernel | if . == "" then "unset" else . end)`"; (if .boot.entry0_kernel == .kernel then "PASS" else "FAIL" end); "FAIL = a rehearsal is refused (it would boot that kernel if GRUB does not read the grubenv, on every power-cycle after it) unless the confirmation is REHEARSE-<host>-CONSOLE with someone at the rack with a console"),
+			row("kernel a GRUB that ignores the grubenv would boot (first menu entry)"; "first entry `\(.boot.entry0_kernel | if . == "" then "unknown" else . end)`; running `\(.kernel)`; saved default `\(.boot.default_kernel | if . == "" then "unset" else . end)`"; (if .boot.entry0_kernel == .kernel then "PASS" else "FAIL" end); "FAIL = a rehearsal is refused (it would boot that kernel if GRUB does not read the grubenv, on every power-cycle after it) unless the dispatcher attests a person at the rack with a console (README, Rehearsal at a console)"),
 			row("boot filesystem of /boot/grub"; "\(.boot.boot_fs) on \(.boot.boot_source) \(.boot.boot_stack)"; (if .boot.boot_stack == "" and (.boot.boot_fs | IN("ext4","vfat","xfs","ext3","ext2")) then "PASS" else "FAIL" end); "if FAIL, grub cannot write its environment block there, so no one-shot"),
 			row("GRUB_DEFAULT and the recordfail timeout"; "GRUB_DEFAULT=\(.boot.settings.GRUB_DEFAULT // "unset"); menu timeout after a failed boot \(.boot.cfg_recordfail_timeout | if . == "" then "n/a" else . end) s"; (if .boot.cfg_recordfail_timeout == "-1" then "FAIL" else "PASS" end); "-1 = a failed boot waits at the menu for ever (the pin sets 5 s)"),
 			row("apt would remove nothing protected"; ($pk.simulation.remv | join(", ") | if . == "" then "no removals" else . end) + (if ($pk.simulation.protected_removals | length) > 0 then "; PROTECTED: " + ($pk.simulation.protected_removals | join(", ")) else "" end); (if ($pk.simulation.protected_removals | length) == 0 and $pk.simulation.rc == 0 then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses before it changes a package"),
-			row("dpkg clean, nothing held, apt idle, no policy-rc.d"; "audit \($pk.dpkg_audit | length); held kernel/boot \($pk.held_kernel | join(",")); procs \($pk.package_processes | join(",")); lock \($pk.dpkg_lock_held); policy-rc.d \($pk.policy_rc_d_present)"; (if ($pk.dpkg_audit | length) == 0 and ($pk.held_kernel | length) == 0 and ($pk.package_processes | length) == 0 and ($pk.dpkg_lock_held | not) and ($pk.policy_rc_d_present | not) then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses (a broken dpkg: mode=repair)"),
+			row("dpkg clean, nothing held, apt idle, no policy-rc.d"; "audit \($pk.dpkg_audit | length); held kernel/boot \($pk.held_kernel | join(",")); package runs \($busyprocs | join(",") | if . == "" then "none" else . end); locks held \(if ($locks | length) > 0 then ($locks | join(",")) elif $pk.dpkg_lock_held then "yes" else "none" end); policy-rc.d \($pk.policy_rc_d_present)"; (if ($pk.dpkg_audit | length) == 0 and ($pk.held_kernel | length) == 0 and ($busyprocs | length) == 0 and ($locks | length) == 0 and ($pk.dpkg_lock_held | not) and ($pk.policy_rc_d_present | not) then "PASS" else "FAIL" end); "if FAIL, the upgrade refuses (a broken dpkg: mode=repair; apt or dpkg busy: an unattended upgrade is running, wait for it)"),
 			row("the way in is intact today (sshd -t, ssh/tailscaled enabled, netplan generate)"; (.access_problems | join(" / ") | if . == "" then "ok" else . end); (if (.access_problems | length) == 0 then "PASS" else "FAIL" end); "if FAIL, an upgrade would change every package and then refuse to reboot, for ever"),
 			row("disk free"; "/ \(gib("/")) GiB (min \($rootmin / 1048576)); /boot \(gib("/boot")) GiB (min \($bootmin / 1048576 * 1000 | floor / 1000)); /boot/efi \(.disk["/boot/efi"].free_kib // "n/a") KiB (min \($efimin))"; (if ((.disk["/"].free_kib // 0) >= $rootmin) and ((.disk["/boot"].free_kib // 0) >= $bootmin) and ((.disk["/boot/efi"] == null) or (.disk["/boot/efi"].free_kib >= $efimin)) then "PASS" else "FAIL" end); "if FAIL, three kernels and their initrds do not fit: the upgrade refuses"),
 			row("clock synchronized"; .time_sync.raw; (if .time_sync.ntp_synchronized then "PASS" else "NOTE" end); "the verification compares it before and after"),
@@ -117,6 +127,7 @@ checklist() {
 			row("kernels armed earlier and never verified"; ([.armed_kernels[] | "\(.kernel) (run \(.run_id))"] | join(", ") | if . == "" then "none" else . end); (if (.armed_kernels | length) == 0 then "PASS" else "FAIL" end); "if FAIL, the host may have been stranded by it; retry_kernel=<it> to try again, or mode=repair abort-new-kernel"),
 			row("run state"; "manifest \($sn.manifest_present // "?"); runner jobs \($sn.runner_workers // "?"); power-loss resume \($sn.resume_pending // "?"); crash dumps \(.crash | length)"; (if ($sn | length) == 0 then "NOTE" elif ($sn.manifest_present // false) or (($sn.runner_workers // 0) > 0) or ($sn.resume_pending // false) then "FAIL" else "PASS" end); "NOTE: no preflight snapshot of this host, so nothing is known about a run on it. If FAIL, the upgrade refuses beside a run"),
 			row("access-path packages and third-party moves the full-upgrade brings"; ($access | if . == "" then "none" else . end) + "; third-party repos: " + ($pk.third_party_repos | join(", ") | if . == "" then "none" else . end); "NOTE"; "read the major jumps (docker, containerd, tailscale, openssh, grub, shim, netplan, systemd, linux-firmware): a full-upgrade has no checkpoint, and none of them is undone by a power-cycle"),
+			row("platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts); NOT covered: tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client"; "tailscale auto-update \(.self_updaters.tailscale_auto_update // "not recorded"), snap refresh \(.self_updaters.snap_refresh // "not recorded"); units \(.unattended_upgrades.units | to_entries | map("\(.key)=\(.value.active)/\(.value.enabled)") | join(", "))" + (if (.freeze // {}) != {} then "; freeze of run \(.freeze.run_id) at \(.freeze.utc), status \(.freeze.status); drifted: \(.freeze.drifted // [] | join("; ") | if . == "" then "no" else . end)" else "; no freeze record" end); (if (.freeze // {}) == {} then "NOTE" elif .freeze.status == "frozen" and ((.freeze.drifted // []) | length) == 0 then "PASS" else "FAIL" end); "NOTE: not frozen, the host updates itself (unattended-upgrades already installed the kernel -38 by itself): dispatch mode=freeze before the evidence campaign. FAIL: frozen, but a unit came back, the PLATFORM it recorded changed (the running kernel, the package list, the holds or the grub saved default: an upgrade, tailscale or a manual apt, a reboot onto another kernel) or the freeze did not complete: mode=thaw, fix, then mode=freeze again (an upgrade is refused on a frozen host: thaw, upgrade, freeze again)"),
 			row("unattended-upgrades and phasing"; "periodic \(.unattended_upgrades.unattended_upgrade); removes unused kernels \(.unattended_upgrades.remove_unused_kernel_packages); phased and held back: \($pk.phased_held_back | join(", ") | if . == "" then "none" else . end)"; "NOTE"; "the pin keeps the old kernel from unattended removal; phased packages are not forced (PLAN d.4, d.5)")
 			),
 			(if .r8127.present then (
@@ -144,6 +155,13 @@ echo "## Cluster OS $mode: $host"
 echo
 echo "- reason: \`$safe_reason\`"
 echo "- workflow run: $run_id"
+if [ "$mode" = rehearse ]; then
+	case "$confirm" in
+	*-CONSOLE) echo "- confirmation: **CONSOLE ATTESTED**: the dispatcher stated that a person is at the rack of $host with a console. A person approving this run should know that." ;;
+	"") echo "- confirmation: not recorded" ;;
+	*) echo "- confirmation: no console attested" ;;
+	esac
+fi
 
 if [ "$mode" = survey ]; then
 	if [ "$rc" -eq 0 ]; then echo "- **result: SURVEYED** (read-only; nothing on any host was changed, except, when refresh_lists was set, what apt-get update writes: /var/lib/apt/lists, /var/cache/apt/*.bin and its post-invoke hooks)"; else echo "- **result: SURVEY FAILED** (ansible-playbook exit $rc): the hosts that answered have a record below"; fi
@@ -187,7 +205,44 @@ if [ "$mode" = disarm ]; then
 	if [ -n "$(jq -r '.forgot_armed[0] // ""' "$d/disarm.json" 2> /dev/null)" ]; then
 		echo "- **The host has not rebooted since the arming** (same boot id): the armed record of $(jq -r '.forgot_armed | join(", ")' "$d/disarm.json") was dropped, that kernel never booted, so the next upgrade is not refused for a boot that never happened."
 	fi
-	echo "- Disarming clears only grub's next_entry. It does not touch the saved default, the packages or the running kernel. If the host did not answer, nothing was cleared: it is down, and a power-cycle boots whatever next_entry names (the NEW kernel, once) before the saved default."
+	echo "- Disarming clears only grub's next_entry. It does not touch the saved default, the packages or the running kernel. If the host did not answer, nothing was cleared: it is down, and a power-cycle boots whatever next_entry names before the saved default (after an upgrade's arming: the NEW kernel, once; after a rehearsal's arming: the running kernel again)."
+	for r in "$out"/*/refusal.txt; do
+		[ -s "$r" ] || continue
+		echo
+		echo "### Refused: $(basename "$(dirname "$r")")"
+		echo
+		echo '```'
+		cat "$r"
+		echo '```'
+	done
+	exit 0
+fi
+
+# ---------------------------------------------------------------- freeze / thaw
+if [ "$mode" = freeze ] || [ "$mode" = thaw ]; then
+	d=$out/$host
+	ok=$(jq -r '.freeze_ok // false' "$d/result.json" 2> /dev/null)
+	if [ "$mode" = freeze ]; then
+		if [ "$rc" -eq 0 ] && [ "$ok" = true ]; then echo "- **result: FROZEN**: the apt timers and unattended-upgrades are stopped and disabled on $host (needrestart restarts nothing by itself), and the platform below is recorded. Nothing was rebooted; no package changed."; else echo "- **result: NOT FROZEN, OR NOT COMPLETELY** (ansible-playbook exit $rc): the record of what was changed is kept on the host; mode=thaw undoes a freeze that failed half way."; fi
+	else
+		if [ "$rc" -eq 0 ] && [ "$ok" = true ]; then echo "- **result: THAWED**: the units the freeze recorded it changed are back as they were (they may run within minutes: the apt timers are persistent), and the needrestart drop-in is gone. The host updates itself again."; else echo "- **result: NOT THAWED, OR NOT COMPLETELY** (ansible-playbook exit $rc): the freeze record is kept; dispatch mode=thaw again."; fi
+	fi
+	echo
+	if [ -s "$d/result.json" ]; then
+		jq -r --arg mode "$mode" '"- status `\(.status)`; running kernel `\(.kernel_running)` (not rebooted)\(if (.error // "") != "" then "; error: " + .error else "" end)",
+			(.freeze as $f | if ($f // {}) == {} then empty else
+			"- record of run \($f.run_id) at \($f.utc) (previous states, what was changed, what it is now):",
+			($f.units | to_entries[] | "  - `\(.key)`: present \(.value.present); before \(.value.before.active)/\(.value.before.enabled); changed: \(.value.changes | join(" + ") | if . == "" then "nothing" else . end)\(if $mode == "freeze" then "; now " + ($f.after[.key].active // "?") + "/" + ($f.after[.key].enabled // "?") else "" end)"),
+			(if $mode == "thaw" then "- restored: \($f.restored // [] | join("; ") | if . == "" then "nothing" else . end)" else empty end),
+			"- needrestart: installed \($f.needrestart.installed); restart mode before `\($f.needrestart.mode_before)`; list-only drop-in written: \($f.needrestart.dropin_written)",
+			"- **platform** (what the release results can cite): kernel `\($f.platform.kernel // "?")`, \($f.platform.os // "?"), \($f.platform.packages // "?") packages, sha256 of the package list `\($f.platform.dpkg_sha256 // "?")`, holds: \($f.platform.held // [] | join(", ") | if . == "" then "none" else . end)" end)' "$d/result.json" 2> /dev/null
+		if [ "$mode" = thaw ]; then
+			jq -r 'if (.drifted_at_thaw // []) | length == 0 then "- **platform at thaw time: DID NOT MOVE** since the freeze (running kernel, grub saved default, package list SHA-256, holds, units): the end-of-campaign proof" else "- **PLATFORM MOVED since the freeze** (found at thaw time): \(.drifted_at_thaw | join("; ")). The results of the campaign do not name this host as frozen" end' "$d/result.json" 2> /dev/null
+		else
+			jq -r '"- drifted after: \(.drifted_after // [] | join("; ") | if . == "" then "nothing" else . end)"' "$d/result.json" 2> /dev/null
+		fi
+	fi
+	echo "- The evidence directory holds freeze.json (the record, or the thaw's), dpkg-l.txt (dpkg -l), apt-held.txt (apt-mark showhold), kernel.txt and the survey after (post-survey.json): the exact platform. A freeze covers the apt timers, unattended-upgrades and needrestart's automatic restarts only: snapd refreshes, motd-news, firmware updates and anything else a host does by itself are not touched."
 	for r in "$out"/*/refusal.txt; do
 		[ -s "$r" ] || continue
 		echo
@@ -215,6 +270,9 @@ if [ "$mode" = repair ]; then
 	echo "- mode=repair never reboots and never touches grub's saved default. \`configure\` runs \`dpkg --configure -a\`; \`abort-new-kernel\` first purges the kernel versions newer than the running one that a failed upgrade left half-installed, so the host stays on the old kernel (a kernel installed and working before is never removed). If \`configure\` fails again because a DKMS module (r8127) does not build for the new kernel, the campaign cannot move this host to that kernel until the module builds: dispatch \`abort-new-kernel\`."
 	if [ -n "$(jq -r '.holds_released[0] // ""' "$d/result.json" 2> /dev/null)" ]; then
 		echo "- **HOLDS RELEASED** (put by this tool and left by a run that died): $(jq -r '.holds_released | join(" ; ")' "$d/result.json"). Only holds recorded by this tool are released; any other hold is somebody's decision."
+	fi
+	if [ -n "$(jq -r '.holds_not_released[0] // ""' "$d/result.json" 2> /dev/null)" ]; then
+		echo "- **HOLDS NOT RELEASED** (apt-mark unhold did not take, the dpkg lock was busy?): $(jq -r '.holds_not_released | join(" ; ")' "$d/result.json"). They and their record are still in place: dispatch mode=repair with repair_action=release-holds again."
 	fi
 	if [ -s "$d/repair.log" ]; then
 		echo
@@ -270,13 +328,13 @@ rehearsed)
 	echo "- Power-cycle: **not needed**. The host booted the one-shot and runs its kernel normally."
 	;;
 verified)
-	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED or was refused (see the log; the step may have changed grub's saved default before failing: dispatch a survey and read \`boot.saved_entry\` and \`boot.next_entry\`; a one-shot still pending after the boot means GRUB did not consume it). Either accept the new kernel as the default by a reviewed change that runs grub-set-default for it, or reboot back with the cluster-reboot workflow (red with 'kernel changed', expected) and dispatch the upgrade again. The upgrade REFUSES to run while the host runs a kernel other than grub's saved default."
+	echo "- Power-cycle: **not needed**. The new kernel runs and passed verification, but making it the default FAILED or was refused (see the log; the step may have changed grub's saved default before failing: dispatch a survey and read \`boot.saved_entry\` and \`boot.next_entry\`; a one-shot still pending after the boot means GRUB did not consume it). Either accept the new kernel as the default by a reviewed change that runs grub-set-default for it, or reboot back with the cluster-reboot workflow (red with 'kernel changed', expected; only if GRUB consumed its one-shot: if boot.next_entry was still pending after the boot, GRUB ignores the grubenv and cluster-reboot boots GRUB's first menu entry, boot.entry0_kernel, again: then only the console helps) and dispatch the upgrade again. The upgrade REFUSES to run while the host runs a kernel other than grub's saved default."
 	;;
 returned)
-	if [ "$mode" = rehearse ]; then
-		echo "- Power-cycle: $(jq -r '.power_cycle // "see result.json"' "$d/result.json" 2> /dev/null)"
-	else
-	echo "- Power-cycle: **not needed while $host answers** (if it stops answering later, read the 'rebooting' case: the one-shot is consumed by now, so a power-cycle boots the OLD kernel). $host answered after the reboot but failed verification (below). The saved default is the OLD kernel; the new kernel was NOT made the default. Reboot it back with the cluster-reboot workflow: it returns to the old kernel and ends red with 'kernel changed', which is expected here. Do NOT dispatch the upgrade again before that: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
+	# the text depends on whether a one-shot was still pending after the boot (result.json): never "consumed by now" beside a pending one
+	echo "- Power-cycle: $(jq -r '.power_cycle // "see result.json"' "$d/result.json" 2> /dev/null)"
+	if [ "$mode" != rehearse ]; then
+		echo "- The saved default is the OLD kernel; the new kernel was NOT made the default. Do NOT dispatch the upgrade again before the host is back on its saved default: the run refuses (it would move the fallback to the unverified kernel). Do not run measurements on $host until this is understood."
 	fi
 	;;
 arming | rebooting)
@@ -298,7 +356,7 @@ arming | rebooting)
 		echo "- Power-cycle: **not needed**. The run failed after arming the one-shot and before the new kernel booted; $host answered and the one-shot was CLEARED (disarm). The old kernel runs and is the default."
 		;;
 	failed-rebooted-one-shot-not-consumed)
-		echo "- Power-cycle: **not needed while $host answers, but it HAS REBOOTED** (new boot id) and GRUB did **not** consume the one-shot (next_entry was still set; the rescue cleared it): GRUB does not read the environment block Linux writes, so what a power-cycle boots is GRUB's first menu entry, not the saved default. Dispatch a survey (\`kernel\`, \`boot.default_kernel\`); do not dispatch the upgrade again before this is understood."
+		echo "- Power-cycle: **not needed while $host answers, but it HAS REBOOTED** (new boot id) and GRUB did **not** consume the one-shot (next_entry was still set; the rescue cleared it): GRUB does not read the environment block Linux writes, so the saved default is NOT what a power-cycle or a reboot boots: GRUB boots its FIRST menu entry (\`$(jq -r '.first_entry_kernel // "unknown"' "$d/result.json" 2> /dev/null)\`) every time, the cluster-reboot workflow included, and only the console (Esc or Shift at power-on) or a reviewed change brings another kernel back. Dispatch a survey (\`kernel\`, \`boot.entry0_kernel\` = what GRUB boots; \`boot.default_kernel\` is only the saved default and is NOT what boots); do not dispatch the upgrade again before this is understood."
 		;;
 	failed-boot-unknown)
 		echo "- Power-cycle: **not needed while $host answers, but WHETHER IT REBOOTED IS UNKNOWN**: it answered the disarm and not the read of its boot id. Dispatch a survey before anything else (\`kernel\`, \`boot.next_entry\`, \`boot.saved_entry\`)."
@@ -342,6 +400,15 @@ for r in "$out"/*/refusal.txt; do
 	[ -s "$r" ] || continue
 	echo
 	echo "### Refused: $(basename "$(dirname "$r")")"
+	echo
+	echo '```'
+	cat "$r"
+	echo '```'
+done
+for r in "$out"/*/holds-left.txt; do
+	[ -s "$r" ] || continue
+	echo
+	echo "### ACCESS-PATH HOLDS NOT RELEASED: $(basename "$(dirname "$r")")"
 	echo
 	echo '```'
 	cat "$r"
