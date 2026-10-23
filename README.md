@@ -308,8 +308,13 @@ gh workflow run cluster-os-upgrade.yml --repo goceleris/probatorium --ref main \
   another kernel). `mode=upgrade` is therefore REFUSED on a frozen host (its record would name a platform that no longer exists), and a freeze
   is refused while grub's saved default kernel is not the running kernel (a reboot would boot the other one). The order is: rehearse all three
   hosts, upgrade them (`msa2-server`, `msr1`, `msa2-client`), a final survey, then freeze the three, the evidence campaign, then thaw. The thaw's
-  summary shows the drift found AT THAW TIME ("did not move", or what moved): the end-of-campaign proof for the release results. A freeze
-  needed before an upgrade is `thaw`, upgrade, freeze again.
+  summary shows the drift found AT THAW TIME ("did not move", or what moved): the end-of-campaign proof for the release results. The drift is
+  read ONCE, by the first thaw attempt, before it changes anything, and stored in the record with the run and the time of that check
+  (`drift_checked_by_run`, `drift_checked_utc`): a retry after a failure or a kill reports that check, not its own restores. A thaw that did not
+  complete says "NOT ESTABLISHED" (and "not measured" if even the check did not run). `restored` in the archive `freeze-<run>-thawed.json`
+  lists what EVERY attempt restored, and an archive a killed thaw had already written is kept as it is by the retry. A thaw with no record to
+  thaw names the newest archived thaw; if that thaw run ended red it was killed after it had finished, and the answer is to read the archive,
+  not to thaw again. A freeze needed before an upgrade is `thaw`, upgrade, freeze again.
 - **Rehearsal at a console.** While grub's first menu entry is not the running kernel (survey row "kernel a GRUB that ignores the grubenv would
   boot": FAIL, today on all three hosts: -38 is installed and is entry 0, -31 runs), a rehearsal is refused, because if GRUB does not read the
   environment block it boots that other kernel on every power-cycle. Only a person at the rack of THAT host with a console (HDMI and keyboard:

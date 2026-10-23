@@ -1818,6 +1818,8 @@ def last_thaw():
                 r = json.load(fh)
         except (OSError, ValueError):
             continue
+        if not isinstance(r, dict):
+            continue
         if r.get("thawed_utc", "") >= best.get("thawed_utc", ""):
             best = r
     return {k: best[k] for k in ("run_id", "thawed_by_run", "thawed_utc", "drifted_at_thaw") if k in best}
@@ -1840,9 +1842,8 @@ def cmd_freeze(a):
     bd, run_k = boot_info()["default_kernel"], running_kernel()
     if bd != run_k:
         fail("grub's saved default kernel is %r and the host runs %r: any reboot (a power loss, a panic, cluster-reboot) boots %s, so the platform this freeze would "
-             "record is not the one that comes back. Pin the running kernel first: an un-upgraded host whose first menu entry is another kernel needs a console rehearsal; a host that "
-             "runs the new kernel after a failed verification goes back to the old one with the cluster-reboot workflow (red with 'kernel changed', by design; if a one-shot is "
-             "pending, only the console) (nothing was changed)" % (
+             "record is not the one that comes back. Pin the running kernel first: an un-upgraded host whose first menu entry is another kernel needs a console rehearsal; a host whose saved default is unknown but whose first menu entry is the running kernel needs a plain rehearsal (it pins); a host that "
+             "runs the new kernel after a failed verification goes back to the old one with the cluster-reboot workflow (red with 'kernel changed', by design); if a one-shot is pending, GRUB ignores the environment block: only the console, and mode=disarm clears the one-shot (nothing was changed)" % (
                  bd or "unknown", run_k, bd or "something else"))
     ios = apt_config().get("Unattended-Upgrade::InstallOnShutdown", "")
     if ios.lower() in TRUE_WORDS:
@@ -1915,9 +1916,12 @@ def cmd_thaw(a):
     rec = freeze_record()
     last = last_thaw()
     if not rec and last:
-        fail("nothing to thaw: the last freeze (run %s) was thawed by run %s at %s and its record is archived in %s/freeze-%s-thawed.json (drifted at thaw time: %s). If that thaw "
-             "ended red, it was killed after it had finished: read the archive, do not thaw again" % (
-                 last.get("run_id"), last.get("thawed_by_run"), last.get("thawed_utc"), STATE_DIR, last.get("run_id"), "; ".join(last.get("drifted_at_thaw", [])) or "nothing"))
+        fail("nothing to thaw: there is no freeze record here. The newest archived thaw is of the freeze of run %s (thawed by run %s at %s, archive %s/freeze-%s-thawed.json, "
+             "drifted at thaw time: %s). If that thaw run ended red, it was killed after it had finished: read the archive, do not thaw again. If a LATER freeze was made since and "
+             "its record is gone, the units it stopped are still stopped: put back by hand ONLY the ones you know were on: systemctl enable --now apt-daily.timer "
+             "apt-daily-upgrade.timer unattended-upgrades.service; then rm %s" % (
+                 last.get("run_id"), last.get("thawed_by_run"), last.get("thawed_utc"), STATE_DIR, last.get("run_id"), "; ".join(last.get("drifted_at_thaw", [])) or "nothing",
+                 NEEDRESTART_DROPIN))
     if not rec or rec.get("status") == "unreadable":
         fail("nothing to thaw: no readable freeze record at %s. This tool froze nothing here, or the record is gone; if units were stopped by a freeze whose record is lost, put back by hand ONLY the "
              "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; then rm %s %s "
@@ -1928,9 +1932,17 @@ def cmd_thaw(a):
     if "drifted_at_thaw" not in rec:
         rec["drifted_at_thaw"] = freeze_state().get("drifted", [])
         rec["drift_proof"] = rec.get("status") == "frozen" and bool(rec.get("platform"))
+        rec["drift_checked_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # a retry days later reports THIS check, and the record says when it was made
+        rec["drift_checked_by_run"] = a.run_id
         save_freeze(rec)
     drifted_at_thaw = rec["drifted_at_thaw"]
-    errors, done = [], []
+    errors, done = [], list(rec.get("restored", []))  # what every attempt restored, kept in the record as it goes
+
+    def restored(what):
+        done.append(what)
+        rec["restored"] = done
+        save_freeze(rec)
+
     for u, info in sorted(rec.get("units", {}).items()):
         want = info.get("before", {})
         # what the freeze recorded it changed, plus the change it was about to make when it died (it may or may not have happened); each is undone
@@ -1954,7 +1966,7 @@ def cmd_thaw(a):
             if rc != 0:
                 errors.append("%s: %s" % (" ".join(argv), (out + err).strip()[-160:]))
             else:
-                done.append(" ".join(argv[1:]))
+                restored(" ".join(argv[1:]))
         now = unit_state(u)
         if effective and (now["active"] != want.get("active") or now["enabled"] != want.get("enabled")) and now["enabled"] != "masked":
             errors.append("%s is %s/%s, was %s/%s before the freeze" % (u, now["active"], now["enabled"], want.get("active"), want.get("enabled")))
@@ -1964,7 +1976,7 @@ def cmd_thaw(a):
         try:
             if rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip():
                 os.remove(p(NEEDRESTART_DROPIN))
-                done.append("removed " + NEEDRESTART_DROPIN)
+                restored("removed " + NEEDRESTART_DROPIN)
             elif os.path.exists(p(NEEDRESTART_DROPIN)):
                 errors.append("%s is no longer the file the freeze wrote: left alone" % NEEDRESTART_DROPIN)
         except OSError as x:
@@ -1973,14 +1985,31 @@ def cmd_thaw(a):
             errors.append("needrestart restart mode is %r, was %r before the freeze" % (needrestart_mode(), nr.get("mode_before", "")))
     if errors:
         fail("the thaw did not complete (%s); the freeze record is kept: run mode=thaw again" % "; ".join(errors),
-             drifted_at_thaw=drifted_at_thaw, drift_proof=rec.get("drift_proof", False))
-    rec["status"] = "thawed"
-    rec["thawed_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    rec["thawed_by_run"] = a.run_id
-    rec["restored"] = done
-    write("%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x")), json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
+             drifted_at_thaw=drifted_at_thaw, drift_proof=rec.get("drift_proof", False),
+             drift_checked_utc=rec.get("drift_checked_utc", ""), drift_checked_by_run=rec.get("drift_checked_by_run", ""))
+    arch = "%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x"))
+    prev = None
+    if os.path.exists(p(arch)):
+        # an earlier attempt finished, wrote the archive and died before it removed the record: that archive is the complete one (what every attempt
+        # restored, who thawed and when); this retry only removes the record
+        try:
+            with open(p(arch)) as fh:
+                prev = json.load(fh)
+        except (OSError, ValueError):
+            prev = None
+        if not isinstance(prev, dict) or prev.get("utc") != rec.get("utc"):
+            prev = None  # not an archive, or the archive of an EARLIER freeze that had the same run id (a re-run of the workflow): this thaw writes its own
+    if prev is None:
+        rec["status"] = "thawed"
+        rec["thawed_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rec["thawed_by_run"] = a.run_id
+        rec["restored"] = done
+        write(arch, json.dumps(rec, indent=1, sort_keys=True) + "\n", durable=True)
+        out = rec
+    else:
+        out = prev
     os.remove(p(FREEZE_RECORD))
-    emit(dict(rec, ok=True))
+    emit(dict(out, ok=True))
 
 
 # ---------------------------------------------------------------------------------------------- main

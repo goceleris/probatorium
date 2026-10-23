@@ -124,7 +124,7 @@ class Play(unittest.TestCase):
         cls.h = FakeHost(os.path.join(cls.work, "host"))
         w = cls.work
         with open(w + "/osu-wrapper.sh", "w") as f:
-            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\n[ -n "${SURVEY_FAIL_AFTER_REBOOT:-}" ] && [ "$1" = survey ] && grep -q FAKE-REBOOT %s && { echo "survey failed after the reboot (test)" >&2; exit 3; }\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
+            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\n[ -n "${SURVEY_FAIL_AFTER_REBOOT:-}" ] && [ "$1" = survey ] && grep -q FAKE-REBOOT %s && { echo "survey failed after the reboot (test)" >&2; exit 3; }\n[ -n "${THAW_NO_ANSWER:-}" ] && [ "$1" = thaw ] && { echo "the thaw tool died before it answered (test)" >&2; exit 3; }\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
                 cls.h.state_dir, cls.h.log, cls.h.log, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
         with open(w + "/snapshot-wrapper.sh", "w") as f:
             f.write('''#!/bin/bash
@@ -777,6 +777,10 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("the thaw did not complete", md)
         self.assertNotIn("DID NOT MOVE", md)
         self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
+        r = self.j("msr1", "result.json")
+        self.assertTrue(r["drift_checked_by_run"] and r["drift_checked_utc"])  # r4 8
+        self.assertIn("Found by the FIRST thaw attempt (run %s at %s), before it changed anything: nothing" % (r["drift_checked_by_run"], r["drift_checked_utc"]), md)  # r4 5
+        self.assertNotIn("not measured", md)
         self.h.load()
         self.h.state["services"]["is-enabled apt-daily.timer"] = "disabled"
         self.h.save()
@@ -784,7 +788,27 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.rc, 0, self.log[-2000:])
         md = " ".join(self.summary("thaw", "msr1").split())
         self.assertIn("platform at thaw time: DID NOT MOVE", md)  # not the restores of the first attempt
+        self.assertIn("(checked by the first thaw attempt: run %s at %s)" % (r["drift_checked_by_run"], r["drift_checked_utc"]), md)  # r4 8: the run that checked, not the retry
         self.assertNotIn("PLATFORM MOVED", md)
+
+    def test_a_thaw_that_died_before_its_drift_check_is_not_measured_end_to_end(self):  # r4 5
+        self.fresh()
+        self.play("th_k0", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.play("th_k", self.TH, env={"THAW_NO_ANSWER": "1"})  # the tool answers nothing: no drift in its answer, none in the record
+        self.assertNotEqual(self.rc, 0)
+        self.assertNotIn("drifted_at_thaw", json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json")))
+        r = self.j("msr1", "result.json")
+        self.assertIsNone(r["drifted_at_thaw"])  # null, not []: nothing was measured
+        self.assertFalse(r["drift_proof"])
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("NOT ESTABLISHED", md)
+        self.assertIn("The drift check itself did not run (not measured)", md)
+        self.assertNotIn("Found by the FIRST thaw attempt", md)
+        self.assertNotIn("DID NOT MOVE", md)
+        self.play("th_k2", self.TH)  # and the host is thawed by the next dispatch, with a drift check of its own
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
 
     def test_a_thaw_of_a_record_without_a_platform_claims_nothing(self):  # r3 2
         self.fresh()
