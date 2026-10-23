@@ -2228,7 +2228,9 @@ class FreezeThaw(Base):
         self.h.state["grubenv"]["saved_entry"] = ""
         msg = " ".join((self.freeze().stdout).split())
         self.assertIn("an un-upgraded host whose first menu entry is another kernel needs a console rehearsal", msg)
-        self.assertIn("cluster-reboot workflow", msg)
+        self.assertIn("needs a plain rehearsal (it pins)", msg)  # r4 2: the host whose saved default is unknown
+        self.assertIn("cluster-reboot workflow (red with 'kernel changed', by design)", msg)
+        self.assertIn("mode=disarm clears the one-shot (nothing was changed)", msg)
         self.assertNotIn("finish the upgrade", msg)
 
     def test_a_thaw_killed_after_it_finished_is_told_so_by_the_next_one(self):  # r3 7

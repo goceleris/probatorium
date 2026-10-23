@@ -1842,9 +1842,8 @@ def cmd_freeze(a):
     bd, run_k = boot_info()["default_kernel"], running_kernel()
     if bd != run_k:
         fail("grub's saved default kernel is %r and the host runs %r: any reboot (a power loss, a panic, cluster-reboot) boots %s, so the platform this freeze would "
-             "record is not the one that comes back. Pin the running kernel first: an un-upgraded host whose first menu entry is another kernel needs a console rehearsal; a host that "
-             "runs the new kernel after a failed verification goes back to the old one with the cluster-reboot workflow (red with 'kernel changed', by design; if a one-shot is "
-             "pending, only the console) (nothing was changed)" % (
+             "record is not the one that comes back. Pin the running kernel first: an un-upgraded host whose first menu entry is another kernel needs a console rehearsal; a host whose saved default is unknown but whose first menu entry is the running kernel needs a plain rehearsal (it pins); a host that "
+             "runs the new kernel after a failed verification goes back to the old one with the cluster-reboot workflow (red with 'kernel changed', by design); if a one-shot is pending, GRUB ignores the environment block: only the console, and mode=disarm clears the one-shot (nothing was changed)" % (
                  bd or "unknown", run_k, bd or "something else"))
     ios = apt_config().get("Unattended-Upgrade::InstallOnShutdown", "")
     if ios.lower() in TRUE_WORDS:
