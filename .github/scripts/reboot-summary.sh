@@ -82,7 +82,7 @@ if [ -s "$pre" ]; then
 		a=$(if [ -s "$post" ]; then jq -r ".prereq.$f" "$post"; else echo "(no snapshot)"; fi)
 		echo "| prerequisite $f | $b | $a |"
 	done
-	for f in lan_ip_present peer_ping_ok placement_vector_present max_vector_total runner_listeners; do
+	for f in lan_ip_present peer_ping_ok peer_probe placement_vector_present max_vector_total runner_listeners; do
 		b=$(jq -r ".$f" "$pre")
 		a=$(if [ -s "$post" ]; then jq -r ".$f" "$post"; else echo "(no snapshot)"; fi)
 		echo "| $f | $b | $a |"

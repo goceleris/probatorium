@@ -40,7 +40,7 @@ post_problems_str: >-
   {% if a.prereq.run_celeris_owner == ansible_user and b.prereq.run_celeris_owner != ansible_user %}{% set _ = p.append('/run/celeris is not owned by ' ~ ansible_user ~ ' (' ~ b.prereq.run_celeris_owner ~ '): the tmpfiles.d entry of power-guard.yml did not apply') %}{% endif %}
   {% if placement_vector != '-' and not b.placement_vector_present %}{% set _ = p.append('NIC vector ' ~ placement_vector ~ ' (bench.yml pins it) is not in /proc/interrupts') %}{% endif %}
   {% if b.lan_ip_present != true %}{% set _ = p.append('fabric address ' ~ lan_ip ~ ' is not configured on the host') %}{% endif %}
-  {% if b.peer_ping_ok != true %}{% set _ = p.append('no answer from ' ~ fabric_peer ~ ' over the fabric') %}{% endif %}
+  {% if b.peer_ping_ok != true %}{% set _ = p.append('no answer from ' ~ fabric_peer ~ ' over the fabric (probe: ' ~ ((b.peer_probe | default('')) or 'not recorded, an older snapshot') ~ ')') %}{% endif %}
   {% set up_a = a.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
   {% set up_b = b.bonds | map(attribute='slaves') | flatten | select('match', '.*=up$') | list | length %}
   {% if up_b < up_a %}{% set _ = p.append('bond lost a slave: ' ~ up_a ~ ' up before, ' ~ up_b ~ ' up now') %}{% endif %}
