@@ -222,7 +222,7 @@ check "the evidence of a failed verification is kept" bash -c "test -s '$out/msr
 rm -f "$work/flags/ping"
 play noping "$GOOD"
 touch "$work/flags/ping"
-check "no answer from the loadgen over the fabric is not verified" logged "no answer from 192.168.50.195 over the fabric"
+check "no answer from the loadgen over the fabric is not verified" logged "no answer from 192.168.50.195 over the fabric (probe: icmp)"
 
 echo "reboot_play: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

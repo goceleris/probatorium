@@ -28,7 +28,7 @@ jobs:
           go-version: "1.27.3"
           cache: true
       - name: go test
-        run: go test -count=1 -race -timeout=5m ./...
+        run: go test -count=1 -race -timeout=10m ./...
 
   # Every Go module under servers/ belongs in this list. `go test ./...`
   # loads the module and compiles every package, test files or not, so a

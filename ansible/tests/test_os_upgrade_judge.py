@@ -73,7 +73,7 @@ def snapshot(boot_id, kernel, total, crash=()):
         "manifest_present": False, "results_entries": 0, "results_list": [], "resume_pending": False, "runner_workers": 0,
         "prereq": {"tailscaled_active": True, "tailscaled_enabled": "enabled", "apcupsd_active": True, "resume_check_enabled": True,
                    "power_event_installed": True, "tmpfiles_conf": True, "quiesce_hook": True, "run_celeris_owner": "mini"},
-        "placement_vector_present": True, "lan_ip_present": True, "peer_ping_ok": True,
+        "placement_vector_present": True, "lan_ip_present": True, "peer_ping_ok": True, "peer_probe": "icmp",
         "bonds": [{"bond": "bond0", "mode": "802.3ad", "slaves": ["enp1s0=up", "enp49s0=up"]}],
         "max_vector_total": total, "failed_units": [],
     }
@@ -461,7 +461,13 @@ class Judge(unittest.TestCase):
              lambda c: post(c, prereq=dict(json.loads(c["post_raw"]["stdout"])["prereq"], run_celeris_owner="root")))
         case("post_vector", {"post": "NIC vector enp1s0-8 (bench.yml pins it) is not in /proc/interrupts"}, lambda c: post(c, placement_vector_present=False))
         case("post_lan", {"post": "fabric address 192.168.50.199 is not configured"}, lambda c: post(c, lan_ip_present=False))
-        case("post_peer", {"post": "no answer from 192.168.50.195 over the fabric"}, lambda c: post(c, peer_ping_ok=False))
+        case("post_peer", {"post": "no answer from 192.168.50.195 over the fabric (probe: icmp)"}, lambda c: post(c, peer_ping_ok=False))
+        case("post_peer_names_the_tcp_probe", {"post": "no answer from 192.168.50.195 over the fabric (probe: tcp22)"}, lambda c: post(c, peer_ping_ok=False, peer_probe="tcp22"))
+        case("post_peer_names_no_probe_when_none_ran", {"post": "no answer from 192.168.50.195 over the fabric (probe: none)"}, lambda c: post(c, peer_ping_ok=False, peer_probe="none"))
+        case("post_peer_of_an_older_snapshot_without_the_field", {"post": "no answer from 192.168.50.195 over the fabric (probe: not recorded, an older snapshot)"},
+             lambda c: c["post_raw"].update(stdout=json.dumps({k: v for k, v in dict(json.loads(c["post_raw"]["stdout"]), peer_ping_ok=False).items() if k != "peer_probe"})))
+        case("post_peer_answering_by_tcp_is_fine", {}, lambda c: post(c, peer_probe="tcp22"))
+        case("post_older_snapshot_without_the_field_is_fine", {}, lambda c: c["post_raw"].update(stdout=json.dumps({k: v for k, v in json.loads(c["post_raw"]["stdout"]).items() if k != "peer_probe"})))
         case("post_bond", {"post": "bond lost a slave: 2 up before, 1 up now"},
              lambda c: post(c, bonds=[{"bond": "bond0", "mode": "802.3ad", "slaves": ["enp1s0=up", "enp49s0=down"]}]))
         case("post_counters", {"post": "the counters were not reset"}, lambda c: post(c, max_vector_total=4050000000))

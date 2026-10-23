@@ -1457,7 +1457,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.fresh()
         self.play("noping", self.UP, env={"BOOT_MODE": "no-ping"})
         self.assertNotEqual(self.rc, 0)
-        self.assertIn("no answer from 192.168.50.195 over the fabric", self.log)
+        self.assertIn("no answer from 192.168.50.195 over the fabric (probe: icmp)", self.log)
         self.no_call("grub-set-default " + ID_40)
         self.assertEqual(self.h.state["grubenv"]["saved_entry"], ID_31)
         # the host now RUNS the unverified new kernel while grub's default is still the old one: a second dispatch must

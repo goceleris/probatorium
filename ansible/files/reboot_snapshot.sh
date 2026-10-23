@@ -9,7 +9,7 @@
 #   RESULTS_ROOT      the results tmpfs dir (/tmp/celeris-results); entries in it die with a reboot
 #   PLACEMENT_VECTOR  the interrupt NAME bench.yml pins (enp1s0-8), or "-" when the host has none
 #   LAN_IP            this host's address on the 20G fabric (inventory lan_ip), or "-"
-#   PEER_IP           a peer's fabric address to ping, or "-"
+#   PEER_IP           a peer's fabric address to reach (ping, or a TCP connect to port 22 on a host without ping), or "-"
 # Environment: HOST_SNAPSHOT_ROOT is a test override, a prefix for every path read. Empty on a host.
 #
 # stdout: ONE JSON object. Exit 0 whatever it found (a finding is data, not an error); 2 on bad usage.
@@ -121,11 +121,27 @@ if [ "$lan_ip" != "-" ]; then
 		lan_present=true
 	fi
 fi
+# The peer is reached by ICMP when the host has a ping binary (msr1 has; msa2-server has NOT: iputils-ping is not installed there, so the
+# check read false before any reboot, run 39929284025). Without ping it is a TCP connect to the peer's sshd on port 22 (bash's /dev/tcp,
+# 3 s each, 3 attempts like `ping -c 3`, true if ANY connects). peer_ping_ok is true only when the peer was actually reached; peer_probe
+# says which probe ran: icmp, tcp22, or none (no peer asked, or neither ping nor timeout exists: then the answer is false, never true).
 peer_ping=null
+peer_probe=none
 if [ "$peer_ip" != "-" ]; then
 	peer_ping=false
-	if command -v ping > /dev/null 2>&1 && ping -c 3 -W 2 -- "$peer_ip" > /dev/null 2>&1; then
-		peer_ping=true
+	if command -v ping > /dev/null 2>&1; then
+		peer_probe=icmp
+		if ping -c 3 -W 2 -- "$peer_ip" > /dev/null 2>&1; then
+			peer_ping=true
+		fi
+	elif command -v timeout > /dev/null 2>&1; then
+		peer_probe=tcp22
+		for _attempt in 1 2 3; do
+			if timeout 3 bash -c 'exec 3<> "/dev/tcp/$0/$1"' "$peer_ip" 22 > /dev/null 2>&1; then
+				peer_ping=true
+				break
+			fi
+		done
 	fi
 fi
 
@@ -223,8 +239,8 @@ printf '{"boot_id":%s,"boot_time":%s,"btime":%s,"uptime_s":%s,"kernel":%s,"newes
 	"$(js "$boot_id")" "$(js "$boot_time")" "$btime" "$uptime_s" "$(js "$kernel")" "$(js "$newest_kernel")"
 printf '"nics":[%s],"nic_vectors":[%s],"max_vector_total":%s,"placement_vector":%s,"placement_vector_present":%s,"bonds":[%s],' \
 	"$nics" "$vectors" "$max_total" "$(js "$placement_vector")" "$placement_json" "$bonds"
-printf '"lan_ip":%s,"lan_ip_present":%s,"peer_ip":%s,"peer_ping_ok":%s,' \
-	"$(js "$lan_ip")" "$lan_present" "$(js "$peer_ip")" "$peer_ping"
+printf '"lan_ip":%s,"lan_ip_present":%s,"peer_ip":%s,"peer_ping_ok":%s,"peer_probe":%s,' \
+	"$(js "$lan_ip")" "$lan_present" "$(js "$peer_ip")" "$peer_ping" "$(js "$peer_probe")"
 printf '"manifest_present":%s,"results_entries":%s,"results_list":%s,"resume_pending":%s,"runner_dirs":%s,"runner_listeners":%s,"runner_workers":%s,' \
 	"$manifest_present" "$results_entries" "$results_list" "$resume_pending" "$runner_dirs" "$listeners" "$workers"
 printf '"crash":%s,"r8127":%s,"modinfo_r8127":%s,"grub_pinned_to_running":%s,' "$crash" "$r8127" "$modinfo_r8127" "$pinned"
