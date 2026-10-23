@@ -395,6 +395,7 @@ type snapshotRecord struct {
 	LanIPPresent    *bool    `json:"lan_ip_present"`
 	PeerIP          string   `json:"peer_ip"`
 	PeerPingOK      *bool    `json:"peer_ping_ok"`
+	PeerProbe       string   `json:"peer_probe"`
 	ManifestPresent bool     `json:"manifest_present"`
 	ResultsEntries  int      `json:"results_entries"`
 	ResultsList     []string `json:"results_list"`
@@ -526,9 +527,12 @@ func TestRebootSnapshotCannotDisturbAHost(t *testing.T) {
 			t.Errorf("the snapshot does something destructive: %q", m)
 		}
 	}
+	// the one other redirection: the TCP connect to the peer's sshd on a host without ping (bash /dev/tcp opens a socket, it writes nothing);
+	// the target is exactly the host and port the script passes as arguments, nothing else is allowed
+	tcpProbe := `"/dev/tcp/$0/$1"'`
 	for _, m := range regexp.MustCompile(`\d?>>?\s*(\S+)`).FindAllStringSubmatch(src, -1) {
 		target := strings.TrimRight(m[1], `);"`)
-		if target != "/dev/null" && !strings.HasPrefix(target, "&") {
+		if target != "/dev/null" && !strings.HasPrefix(target, "&") && m[1] != tcpProbe {
 			t.Errorf("the snapshot redirects output to %q", m[1])
 		}
 	}

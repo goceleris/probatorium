@@ -170,6 +170,87 @@ else
 	echo "SKIP fabric address checks: no ip(8)"
 fi
 
+# the peer probe: ICMP when the host has a ping binary, a TCP connect to port 22 when it does not (msa2-server has no iputils-ping), and
+# "reached" only when the peer really answered. PATH is a directory of symlinks to every tool but ping and timeout (the snapshot needs
+# awk, sort, ls ...), plus stand-ins: a ping that answers when $PROBE/ping-up exists and logs its call, and a timeout that logs its
+# call, maps the real port 22 to the test listener's port and runs the real timeout.
+if ! command -v python3 > /dev/null 2>&1 || ! command -v timeout > /dev/null 2>&1; then
+	bad "the peer probe cases need python3 (a listener) and timeout"
+else
+	real_timeout=$(command -v timeout)
+	probe=$work/probe
+	mkdir -p "$probe/base" "$probe/with-ping" "$probe/with-timeout" "$probe/with-both"
+	for d in /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+		for x in "$d"/*; do
+			n=${x##*/}
+			[ -x "$x" ] && [ ! -d "$x" ] && [ "$n" != ping ] && [ "$n" != ping6 ] && [ "$n" != timeout ] && [ ! -e "$probe/base/$n" ] && ln -s "$x" "$probe/base/$n"
+		done
+	done
+	printf '#!/bin/bash\necho "$*" >> "${PROBE_LOG:?}"\n[ -e "${PROBE_DIR:?}/ping-up" ]\n' > "$probe/ping"
+	printf '#!/bin/bash\necho "$*" >> "${PROBE_LOG:?}"\nargs=("$@")\nn=${#args[@]}\n[ "${args[n-1]}" = 22 ] && args[n-1]=${PROBE_PORT:?}\nexec %s "${args[@]}"\n' "$real_timeout" > "$probe/timeout"
+	chmod +x "$probe/ping" "$probe/timeout"
+	# PATH variants: neither ping nor timeout, timeout only, ping only, both
+	for v in none timeout ping both; do
+		mkdir -p "$probe/p-$v"
+		cp -a "$probe/base/." "$probe/p-$v/"
+	done
+	cp "$probe/timeout" "$probe/p-timeout/timeout"; cp "$probe/timeout" "$probe/p-both/timeout"
+	cp "$probe/ping" "$probe/p-ping/ping"; cp "$probe/ping" "$probe/p-both/ping"
+	# a listener on a free port, and a free port nobody listens on
+	python3 - "$probe" << 'PYEOF' &
+import socket, sys
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(16)
+c = socket.socket(); c.bind(("127.0.0.1", 0))
+open(sys.argv[1] + "/ports", "w").write("%d %d\n" % (s.getsockname()[1], c.getsockname()[1]))
+c.close()   # nobody listens on the second port
+import time
+while True:
+    try:
+        s.accept()[0].close()
+    except Exception:
+        time.sleep(0.1)
+PYEOF
+	listener=$!
+	for _ in $(seq 1 50); do [ -s "$probe/ports" ] && break; sleep 0.1; done
+	read -r open_port closed_port < "$probe/ports"
+	runprobe() { # runprobe PATHVARIANT PORT [PEER] -> $out and $calls (the log of the stand-ins)
+		: > "$probe/log"
+		out=$(PROBE_DIR=$probe PROBE_LOG=$probe/log PROBE_PORT=$2 PATH=$probe/p-$1 HOST_SNAPSHOT_ROOT=$R bash "$snap" /tmp/m /tmp/r - - "${3:-127.0.0.1}" 2> "$work/stderr")
+		calls=$(cat "$probe/log")
+	}
+
+	rm -f "$probe/ping-up"
+	touch "$probe/ping-up"
+	runprobe both "$open_port"
+	check "ping present and the peer up: reached by ICMP" '"peer_ping_ok":true,"peer_probe":"icmp"'
+	[ -z "$(grep -F ' 22' <<< "$calls")" ] && ok "ping present: no TCP connect is made" || bad "ping present but the TCP probe ran: $calls"
+	rm -f "$probe/ping-up"
+	runprobe both "$open_port"
+	check "ping present and the peer down: false, by ICMP, even though the port is open (the TCP probe does not cover for ping)" '"peer_ping_ok":false,"peer_probe":"icmp"'
+	[ -z "$(grep -F ' 22' <<< "$calls")" ] && ok "ping present and failing: no fallback to TCP" || bad "a failing ping fell back to TCP: $calls"
+	runprobe ping "$open_port"
+	check "ping only (no timeout), peer down: false by ICMP" '"peer_ping_ok":false,"peer_probe":"icmp"'
+
+	runprobe timeout "$open_port"
+	check "no ping binary, port 22 open: reached by TCP" '"peer_ping_ok":true,"peer_probe":"tcp22"'
+	[ "$(grep -c -F -- '3 bash -c' <<< "$calls")" = 1 ] && grep -qF -- ' 22' <<< "$calls" && ok "it connects to port 22 with a 3 s bound, once when the first attempt connects" || bad "the TCP probe call is not 'timeout 3 bash -c ... 22' once: $calls"
+	runprobe timeout "$closed_port"
+	check "no ping binary, port 22 closed: false, never true" '"peer_ping_ok":false,"peer_probe":"tcp22"'
+	[ "$(grep -c -F -- '3 bash -c' <<< "$calls")" = 3 ] && ok "three attempts like ping -c 3" || bad "the closed port was not tried three times: $calls"
+	runprobe timeout "$closed_port" 203.0.113.77
+	check "no ping binary and an address nobody has: false" '"peer_ping_ok":false,"peer_probe":"tcp22"'
+
+	runprobe none "$open_port"
+	check "neither ping nor timeout: false, and the probe says none ran" '"peer_ping_ok":false,"peer_probe":"none"'
+	runprobe timeout "$open_port" -
+	check "no peer asked (-) with no ping: null, no probe" '"peer_ping_ok":null,"peer_probe":"none"'
+	runprobe both "$open_port" -
+	check "no peer asked (-) with ping: null, no probe" '"peer_ping_ok":null,"peer_probe":"none"'
+	[ -z "$calls" ] && ok "no peer asked: nothing is probed" || bad "a probe ran with no peer: $calls"
+	kill "$listener" 2> /dev/null
+	wait "$listener" 2> /dev/null
+fi
+
 # the unit-file state of tailscaled is reported as systemctl prints it (a stand-in systemctl on PATH)
 mkdir -p "$work/stub"
 cat > "$work/stub/systemctl" << 'EOT'
