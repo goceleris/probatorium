@@ -106,6 +106,25 @@ func TestLocal_NoSignalOnceTheExitIsRecorded(t *testing.T) {
 
 	t.Run("the run context ended as at the end of a Tier 1 cell", func(t *testing.T) {
 		l, k := recordingLocal()
+		// The context's kill is held at the gate until the Wait has
+		// returned. Wait may answer with the context's cancel or, once the
+		// process is reaped, with its exit, and a Wait goroutine that runs
+		// after the cancel, the kill and the reap finds the exit first (its
+		// first, non-blocking look is at the reaper, not at ctx). Both are
+		// right, so a test that holds the Wait to the cancel must keep the
+		// process alive until it has: with the kill at the gate the reaper
+		// cannot finish, whenever the goroutines run, and ctx is the only
+		// thing Wait can return on (probatorium#461).
+		gate := make(chan struct{})
+		var openGate sync.Once
+		release := func() { openGate.Do(func() { close(gate) }) }
+		defer release()
+		k.note = func(_ int, sig syscall.Signal) string {
+			if sig == syscall.SIGKILL {
+				<-gate
+			}
+			return ""
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		proc, err := l.Start(ctx, []string{"-c", "exec sleep 30"})
@@ -116,7 +135,9 @@ func TestLocal_NoSignalOnceTheExitIsRecorded(t *testing.T) {
 		waitErr := make(chan error, 1)
 		go func() { _, err := proc.Wait(ctx); waitErr <- err }()
 		cancel()
-		if err := <-waitErr; !errors.Is(err, context.Canceled) {
+		err = <-waitErr
+		release()
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("watchProcessExit's Wait: got %v, want the context's cancel", err)
 		}
 		awaitReaped(t, proc)

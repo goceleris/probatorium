@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -337,6 +338,75 @@ func TestWaitForReady_NoGoroutineLeak(t *testing.T) {
 	if growth := final - base; growth > growthBound {
 		t.Errorf("goroutine count grew by %d over %d iterations (base=%d final=%d) — likely leak",
 			growth, iterations, base, final)
+	}
+}
+
+// TestWaitForReady_KeepsReadingAfterTheReadyLine: after the ready line,
+// waitForReady stops reporting lines but must keep reading the refapp's
+// output to EOF (probatorium#425). The driver's output pipe has no buffer, so
+// with no reader the refapp's next line parks a driver goroutine in a write
+// for good, even once the refapp is reaped, and a refapp that writes more
+// than a pipe holds stalls in write(2).
+//
+// Each refapp prints the ready line, then a flood, then exits on its own.
+// Nothing signals it, so there is no race to win: it can exit only if its
+// output is read, and once it has, every driver goroutine must be gone. The
+// deadlines only bound how long a red takes. A leak never converges.
+func TestWaitForReady_KeepsReadingAfterTheReadyLine(t *testing.T) {
+	// The count is of goroutines in this test binary, not of this test's
+	// own, so it is taken against what the earlier tests left behind.
+	fanIns := func() int {
+		buf := make([]byte, 1<<20)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				return strings.Count(string(buf[:n]), "remote.fanInLines(")
+			}
+			buf = make([]byte, 2*len(buf))
+		}
+	}
+	for _, tc := range []struct {
+		name, flood string
+	}{
+		// ~700 bytes: the OS pipe holds it all, so the refapp exits, but
+		// the driver's fan-in is parked writing the lines nobody takes.
+		{"a flood the OS pipe holds", "seq 1 200"},
+		// ~590 KB: more than the OS pipe and the driver's pipe can hold
+		// between them, so the refapp itself stalls in write(2).
+		{"a flood the OS pipe does not hold", "seq 1 100000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := fanIns()
+			proc, err := remote.NewLocal("/bin/sh").Start(context.Background(),
+				[]string{"-c", `echo "ready addr=127.0.0.1:0"; ` + tc.flood})
+			if err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			// A refapp that stalls is killed and reaped, so a red leaves
+			// no process behind (probatorium#415).
+			t.Cleanup(func() {
+				_ = proc.Signal(int(syscall.SIGKILL))
+				ctx, cancel := context.WithTimeout(context.Background(), tier1TestBudget)
+				defer cancel()
+				_, _ = proc.Wait(ctx)
+			})
+			if _, err := waitForReady(context.Background(), proc, tier1TestReadyTimeout); err != nil {
+				t.Fatalf("waitForReady: %v", err)
+			}
+			waitCtx, waitCancel := context.WithTimeout(context.Background(), tier1TestBudget)
+			defer waitCancel()
+			res, err := proc.Wait(waitCtx)
+			if err != nil || res != (remote.WaitResult{}) {
+				t.Fatalf("the refapp did not exit on its own (Wait: %+v, %v): its output is not being read, so it is stalled in write(2)", res, err)
+			}
+			deadline := time.Now().Add(tier1TestBudget)
+			for n := fanIns(); n > base; n = fanIns() {
+				if time.Now().After(deadline) {
+					t.Fatalf("%d driver fan-in goroutine(s) still running %s after the refapp exited and was reaped (base %d): nothing reads the output pipe, so they are parked in a write", n-base, tier1TestBudget, base)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 }
 
