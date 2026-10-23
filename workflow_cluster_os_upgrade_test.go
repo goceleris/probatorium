@@ -1102,6 +1102,101 @@ func TestClusterOSUpgradeNeverSpellsOutTheConsoleOverride(t *testing.T) {
 	}
 }
 
+// stripTrailingComment cuts a trailing " # comment" and a Jinja {# comment #} from a line, but only where the # is OUTSIDE every quoted string: a
+// string may contain " # " (r4 minor 1: the first version cut from the first " #", so `"attest: # " + "REHEARSE-%s-CONSOLE"` was neither scanned nor counted).
+// An unbalanced quote (an apostrophe in plain YAML text) just means nothing is cut: the line is scanned whole.
+func stripTrailingComment(l string) string {
+	rs := []rune(l)
+	var q rune
+	var out []rune
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		switch {
+		case q != 0:
+			if r == '\\' && i+1 < len(rs) {
+				out = append(out, r, rs[i+1])
+				i++
+				continue
+			}
+			if r == q {
+				q = 0
+			}
+		case r == '\'' || r == '"':
+			q = r
+		case r == '{' && i+1 < len(rs) && rs[i+1] == '#':
+			if j := strings.Index(string(rs[i+2:]), "#}"); j >= 0 {
+				i += 2 + len([]rune(string(rs[i+2:])[:j])) + 1 // past the closing #}
+				continue
+			}
+		case r == '#' && i > 0 && (rs[i-1] == ' ' || rs[i-1] == '\t') && (i+1 == len(rs) || rs[i+1] == ' ' || rs[i+1] == '\t'):
+			return string(out)
+		}
+		out = append(out, r)
+	}
+	return string(out)
+}
+
+var assembledConsole = regexp.MustCompile(`(?i)['"]console['"]|\|\s*(upper|capitalize|title|swapcase)\b|['"]\s*\.\s*upper\(|['"][-a-z]*cons['"]|['"]ole[-a-z]*['"]`)
+
+// consoleTokenProblems scans SRC (comments already stripped): the lines that carry the word CONSOLE, or build it, outside FRAGMENTS, and how many lines carry it.
+func consoleTokenProblems(src string, fragments []string) (problems []string, n int) {
+	for _, raw := range strings.Split(src, "\n") {
+		l := stripTrailingComment(raw)
+		rest := l
+		for _, fr := range fragments {
+			rest = strings.ReplaceAll(rest, fr, "")
+		}
+		if strings.Contains(rest, "CONSOLE") || assembledConsole.MatchString(rest) {
+			problems = append(problems, "a line carries the word CONSOLE, or builds it, outside the comparisons and the approver's display (a message, a concatenation, a format, a case filter, a print): "+strings.TrimSpace(l))
+		}
+		if strings.Contains(l, "CONSOLE") {
+			n++
+		}
+	}
+	return problems, n
+}
+
+func TestStripTrailingComment(t *testing.T) {
+	for in, want := range map[string]string{
+		`echo ok # a trailing comment`: `echo ok `,
+		`echo ok #`:                    `echo ok `,
+		`x: "a # b" # real`:            `x: "a # b" `,
+		`print("attest: # " + "REHEARSE-%s-CONSOLE" % h)`:           `print("attest: # " + "REHEARSE-%s-CONSOLE" % h)`,
+		`msg: {{ 'type # ' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' }}`: `msg: {{ 'type # ' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' }}`,
+		`a {# a jinja comment #} b`:                                 `a  b`,
+		`a '{# ' ~ 'REHEARSE-x-CONSOLE' ~ ' #}' b`:                  `a '{# ' ~ 'REHEARSE-x-CONSOLE' ~ ' #}' b`,
+		`it's # unbalanced`:                                         `it's # unbalanced`,
+		`${#IN_REASON} is not a comment`:                            `${#IN_REASON} is not a comment`,
+		`"esc \" # still inside" # out`:                             `"esc \" # still inside" `,
+	} {
+		if got := stripTrailingComment(in); got != want {
+			t.Errorf("stripTrailingComment(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestConsoleTokenScanKnowsALegitimateCommentFromAStringThatLooksLikeOne(t *testing.T) {
+	frag := []string{`== ('REHEARSE-' ~ os_host ~ '-CONSOLE')`}
+	if p, n := consoleTokenProblems("x: 1 # the console attestation REHEARSE-<host>-CONSOLE is in the README\n{# REHEARSE-h-CONSOLE #} y: 2", frag); len(p) != 0 || n != 0 {
+		t.Errorf("a trailing or Jinja comment must be tolerated: %v (%d lines)", p, n)
+	}
+	for _, bad := range []string{
+		`print("attest: # " + "REHEARSE-%s-CONSOLE" % host)`,           // G1: " # " inside a string
+		`msg: {{ 'type # ' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' }}`,    // G2
+		`msg: {{ '{#' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' ~ '#}' }}`,  // a Jinja comment opened inside a string
+		`msg: {{ 'REHEARSE-' ~ os_host ~ '-' ~ ('console' | upper) }}`, // a case filter
+		`msg: {{ 'REHEARSE-' ~ os_host ~ '-CONS' ~ 'OLE' }}`,           // a split word
+		`x = "REHEARSE-" + host + "-" + "console".upper()  # fine`,     // .upper() before a comment
+	} {
+		if p, _ := consoleTokenProblems(bad, frag); len(p) == 0 {
+			t.Errorf("a bypass passes the console-token scan: %s", bad)
+		}
+	}
+	if p, n := consoleTokenProblems("c: "+frag[0], frag); len(p) != 0 || n != 1 {
+		t.Errorf("the comparison itself is the allowed line: %v (%d)", p, n)
+	}
+}
+
 // Review m1 (and r2 F9): the literal scan above is bypassed by a concatenation ('REHEARSE-' ~ os_host ~ '-' ~ 'CONSOLE'), a format filter, a Python % or a
 // literal on an allow-listed line. In every file that prints anything, a line (comments stripped) may carry the word CONSOLE only inside the exact
 // fragments that COMPARE a confirmation against it or show the approver that one was attested, and each file has exactly that many such lines: what
@@ -1122,24 +1217,10 @@ func TestClusterOSUpgradeTheConsoleTokenIsOnlyEverCompared(t *testing.T) {
 		osScript:   {nil, 0},
 		filepath.Join(".github", "scripts", "os-upgrade-summary.sh"): {[]string{`*-CONSOLE) echo "- confirmation: **CONSOLE ATTESTED**:`}, 1},
 	}
-	jinjaComment := regexp.MustCompile(`\{#.*?#\}`)
-	trailingComment := regexp.MustCompile(`\s#(\s.*)?$`)
-	// the ways to build the word without writing it whole: 'console' | upper, 'x'.upper(), 'CONS' ~ 'OLE'
-	assembled := regexp.MustCompile(`(?i)['"]console['"]|\|\s*(upper|capitalize|title|swapcase)\b|['"]\s*\.\s*upper\(|['"][-a-z]*cons['"]|['"]ole[-a-z]*['"]`)
 	for file, ok := range allowed {
-		n := 0
-		for _, raw := range strings.Split(stripComments(mustRead(t, file)), "\n") {
-			l := trailingComment.ReplaceAllString(jinjaComment.ReplaceAllString(raw, ""), "") // a trailing or Jinja comment may talk about the token
-			rest := l
-			for _, fr := range ok.fragments {
-				rest = strings.ReplaceAll(rest, fr, "")
-			}
-			if strings.Contains(rest, "CONSOLE") || assembled.MatchString(rest) {
-				t.Errorf("%s: a line carries the word CONSOLE, or builds it, outside the comparisons and the approver's display (a message, a concatenation, a format, a case filter, a print): %s", file, strings.TrimSpace(l))
-			}
-			if strings.Contains(l, "CONSOLE") {
-				n++
-			}
+		problems, n := consoleTokenProblems(stripComments(mustRead(t, file)), ok.fragments)
+		for _, p := range problems {
+			t.Errorf("%s: %s", file, p)
 		}
 		if n != ok.lines {
 			t.Errorf("%s has %d lines with the word CONSOLE, want exactly %d (a new line needs a review of what it prints)", file, n, ok.lines)
