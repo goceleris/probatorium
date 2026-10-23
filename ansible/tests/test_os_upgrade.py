@@ -2237,8 +2237,10 @@ class FreezeThaw(Base):
         r = self.thaw("9")
         self.assertEqual(r.returncode, 1)
         msg = r.stdout + r.stderr
-        self.assertIn("the last freeze (run 7) was thawed by run 8", msg)
+        self.assertIn("newest archived thaw is of the freeze of run 7 (thawed by run 8", msg)
         self.assertIn("freeze-7-thawed.json", msg)
+        self.assertIn("If that thaw run ended red, it was killed after it had finished", msg)  # a conditional, not a fact: a green thaw run is the other possibility
+        self.assertIn("If a LATER freeze was made since and its record is gone", msg)
         self.assertIn("do not thaw again", msg)
         self.h.load()
         self.assertEqual(self.run_ok("survey")["freeze_last_thaw"]["thawed_by_run"], "8")

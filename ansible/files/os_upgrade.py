@@ -1915,9 +1915,12 @@ def cmd_thaw(a):
     rec = freeze_record()
     last = last_thaw()
     if not rec and last:
-        fail("nothing to thaw: the last freeze (run %s) was thawed by run %s at %s and its record is archived in %s/freeze-%s-thawed.json (drifted at thaw time: %s). If that thaw "
-             "ended red, it was killed after it had finished: read the archive, do not thaw again" % (
-                 last.get("run_id"), last.get("thawed_by_run"), last.get("thawed_utc"), STATE_DIR, last.get("run_id"), "; ".join(last.get("drifted_at_thaw", [])) or "nothing"))
+        fail("nothing to thaw: there is no freeze record here. The newest archived thaw is of the freeze of run %s (thawed by run %s at %s, archive %s/freeze-%s-thawed.json, "
+             "drifted at thaw time: %s). If that thaw run ended red, it was killed after it had finished: read the archive, do not thaw again. If a LATER freeze was made since and "
+             "its record is gone, the units it stopped are still stopped: put back by hand ONLY the ones you know were on: systemctl enable --now apt-daily.timer "
+             "apt-daily-upgrade.timer unattended-upgrades.service; then rm %s" % (
+                 last.get("run_id"), last.get("thawed_by_run"), last.get("thawed_utc"), STATE_DIR, last.get("run_id"), "; ".join(last.get("drifted_at_thaw", [])) or "nothing",
+                 NEEDRESTART_DROPIN))
     if not rec or rec.get("status") == "unreadable":
         fail("nothing to thaw: no readable freeze record at %s. This tool froze nothing here, or the record is gone; if units were stopped by a freeze whose record is lost, put back by hand ONLY the "
              "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; then rm %s %s "
