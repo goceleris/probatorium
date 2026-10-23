@@ -2228,7 +2228,9 @@ class FreezeThaw(Base):
         self.h.state["grubenv"]["saved_entry"] = ""
         msg = " ".join((self.freeze().stdout).split())
         self.assertIn("an un-upgraded host whose first menu entry is another kernel needs a console rehearsal", msg)
-        self.assertIn("cluster-reboot workflow", msg)
+        self.assertIn("needs a plain rehearsal (it pins)", msg)  # r4 2: the host whose saved default is unknown
+        self.assertIn("cluster-reboot workflow (red with 'kernel changed', by design)", msg)
+        self.assertIn("mode=disarm clears the one-shot (nothing was changed)", msg)
         self.assertNotIn("finish the upgrade", msg)
 
     def test_a_thaw_killed_after_it_finished_is_told_so_by_the_next_one(self):  # r3 7
@@ -2237,8 +2239,10 @@ class FreezeThaw(Base):
         r = self.thaw("9")
         self.assertEqual(r.returncode, 1)
         msg = r.stdout + r.stderr
-        self.assertIn("the last freeze (run 7) was thawed by run 8", msg)
+        self.assertIn("newest archived thaw is of the freeze of run 7 (thawed by run 8", msg)
         self.assertIn("freeze-7-thawed.json", msg)
+        self.assertIn("If that thaw run ended red, it was killed after it had finished", msg)  # a conditional, not a fact: a green thaw run is the other possibility
+        self.assertIn("If a LATER freeze was made since and its record is gone", msg)
         self.assertIn("do not thaw again", msg)
         self.h.load()
         self.assertEqual(self.run_ok("survey")["freeze_last_thaw"]["thawed_by_run"], "8")
@@ -2248,6 +2252,141 @@ class FreezeThaw(Base):
         self.h.load()
         t = self.thaw()
         self.assertEqual(json.loads(t.stdout)["drifted_at_thaw"], [])
+
+    # ---- r4
+    UNITS_RESTORED_BEFORE_THE_KILL = ["enable apt-daily-upgrade.timer", "start apt-daily-upgrade.timer"]  # the thaw goes through the units in sorted order
+
+    def archive(self, run="7"):
+        return json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze-%s-thawed.json" % run))
+
+    def test_a_thaw_killed_in_the_middle_of_its_restores_is_retried_with_the_drift_of_the_first_attempt(self):  # r4 3 (kills a drift persist moved after the restores)
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"  # a real drift, before the thaw
+        self.h.save()
+        self.h.load()
+        self.h.state["systemctl_kill"] = ["enable apt-daily.timer"]
+        self.h.save()
+        r = self.thaw()
+        self.assertNotEqual(r.returncode, 0)  # killed, with the first unit back on and the second not
+        self.assertEqual(self.svc("apt-daily-upgrade.timer"), ("active", "enabled"))
+        self.assertEqual(self.svc("apt-daily.timer"), ("inactive", "disabled"))
+        rec = self.record()
+        self.assertEqual(len(rec["drifted_at_thaw"]), 1)  # saved by the first attempt BEFORE its first restore
+        self.assertTrue(rec["drifted_at_thaw"][0].startswith("package list (sha256) changed"))
+        self.assertEqual(rec["restored"], self.UNITS_RESTORED_BEFORE_THE_KILL)
+        self.h.load()
+        self.h.state["systemctl_kill"] = []
+        self.h.save()
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        out = json.loads(t.stdout)
+        self.assertEqual(out["drifted_at_thaw"], rec["drifted_at_thaw"])  # not "apt-daily-upgrade.timer=active/enabled", which the first attempt itself put back
+        self.assertEqual(self.archive()["drifted_at_thaw"], rec["drifted_at_thaw"])
+
+    def test_a_thaw_killed_right_after_its_first_restore_on_a_platform_that_did_not_move_still_says_so(self):  # r4 3 (the restore took effect and the kill came before it was recorded)
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["systemctl_kill_after"] = ["enable apt-daily-upgrade.timer"]
+        self.h.save()
+        self.assertNotEqual(self.thaw().returncode, 0)
+        self.assertEqual(self.svc("apt-daily-upgrade.timer")[1], "enabled")
+        self.assertEqual(self.record()["drifted_at_thaw"], [])  # saved before the first restore, not with it
+        self.h.load()
+        self.h.state["systemctl_kill_after"] = []
+        self.h.save()
+        out = json.loads(self.thaw("9").stdout)
+        self.assertEqual(out["drifted_at_thaw"], [])
+        self.assertTrue(out["drift_proof"])
+
+    def test_the_archive_lists_what_every_attempt_restored(self):  # r4 4
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.h.state["systemctl_kill"] = ["enable apt-daily.timer"]
+        self.h.save()
+        self.assertNotEqual(self.thaw().returncode, 0)
+        self.h.load()
+        self.h.state["systemctl_kill"] = []
+        self.h.save()
+        seen = len(self.h.calls())
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        second = [" ".join(c.split(" ")[1:]) for c in self.sysctl_calls_since(seen, "start", "enable")]
+        self.assertNotIn("enable apt-daily-upgrade.timer", second)  # the first attempt's work is not repeated...
+        want = self.UNITS_RESTORED_BEFORE_THE_KILL + second + ["removed " + NR_DROPIN]
+        self.assertEqual(self.archive()["restored"], want)  # ...and is not lost from the archive
+        self.assertEqual(json.loads(t.stdout)["restored"], want)
+        self.assertEqual((self.archive()["thawed_by_run"]), "9")
+
+    def test_the_archive_lists_what_a_failed_attempt_restored_too(self):  # r4 4
+        self.assertEqual(self.freeze().returncode, 0)
+        self.set_svc("apt-daily.timer", "inactive", "masked")
+        self.assertEqual(self.thaw().returncode, 1)
+        self.assertEqual(self.record()["restored"][:2], self.UNITS_RESTORED_BEFORE_THE_KILL)
+        self.set_svc("apt-daily.timer", "inactive", "disabled")
+        self.assertEqual(self.thaw("9").returncode, 0)
+        r = self.archive()["restored"]
+        self.assertEqual(r[:2], self.UNITS_RESTORED_BEFORE_THE_KILL)
+        self.assertIn("enable apt-daily.timer", r)
+        self.assertEqual(r.count("enable apt-daily-upgrade.timer"), 1)  # what the first attempt put back is not put back again
+
+    def test_a_retry_after_a_complete_archive_keeps_the_archive_as_it_is(self):  # r4 4
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.thaw().returncode, 0)
+        arch_path = self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"
+        first = open(arch_path).read()
+        rec = json.loads(first)  # killed after the archive and before the removal of the record: the record is the one the first attempt saved
+        for k in ("thawed_utc", "thawed_by_run"):
+            rec.pop(k)
+        rec["status"] = "frozen"
+        self.h.w(FREEZE_RECORD, json.dumps(rec))
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        self.assertEqual(open(arch_path).read(), first)  # not rewritten: the run that thawed, the time and what was restored are the first attempt's
+        self.assertEqual(json.loads(t.stdout)["thawed_by_run"], "8")
+        self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))
+
+    def test_the_archive_of_an_earlier_freeze_with_the_same_run_id_is_not_taken_for_this_one(self):  # r4 4 (a re-run of the workflow freezes again under the same run id)
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.thaw("8").returncode, 0)
+        time.sleep(1.1)
+        self.assertEqual(self.freeze().returncode, 0)  # the same run id, a new freeze
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        self.assertEqual(self.archive()["thawed_by_run"], "9")
+        self.assertEqual(json.loads(t.stdout)["thawed_by_run"], "9")
+
+    def test_a_corrupt_archive_does_not_stop_a_retry_from_writing_a_new_one(self):
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.w("/var/lib/celeris-os-upgrade/freeze-7-thawed.json", "[1, 2]")  # valid JSON, not a record
+        t = self.thaw()
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        self.assertEqual(self.archive()["thawed_by_run"], "8")
+
+    def test_a_thaw_changes_no_package_and_no_grub(self):  # r4 6 (kills a grub-mkconfig or a package command in the thaw)
+        self.assertEqual(self.freeze().returncode, 0)
+        seen = len(self.h.calls())
+        self.assertEqual(self.thaw().returncode, 0)
+        reads = ("dpkg-query", "apt-mark showhold", "grub-editenv list")  # the drift check reads the package list and the holds
+        bad = [c for c in self.h.calls()[seen:] if c.startswith(("apt", "dpkg", "update-", "dkms", "grub-")) and not c.startswith(reads)]
+        self.assertEqual(bad, [])
+
+    def test_the_drift_check_says_when_and_by_which_run_it_was_made(self):  # r4 8
+        self.assertEqual(self.freeze().returncode, 0)
+        self.set_svc("apt-daily.timer", "inactive", "masked")
+        r = self.thaw("8")
+        self.assertEqual(r.returncode, 1)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["drift_checked_by_run"], "8")
+        self.assertRegex(out["drift_checked_utc"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        checked = self.record()["drift_checked_utc"]
+        self.assertEqual(self.record()["drift_checked_by_run"], "8")
+        self.set_svc("apt-daily.timer", "inactive", "disabled")
+        time.sleep(1.1)
+        t = json.loads(self.thaw("9").stdout)
+        self.assertEqual((t["drift_checked_by_run"], t["drift_checked_utc"]), ("8", checked))  # the retry reports the first attempt's check, not its own
+        a = self.archive()
+        self.assertEqual((a["drift_checked_by_run"], a["drift_checked_utc"], a["thawed_by_run"]), ("8", checked, "9"))
 
     def test_the_message_for_an_unreadable_record_names_the_command_that_clears_it(self):  # F3
         self.h.w(FREEZE_RECORD, "{ not json")
