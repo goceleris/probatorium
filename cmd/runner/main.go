@@ -61,6 +61,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -360,6 +361,14 @@ type cellResultFile struct {
 	// Empty unless rated mode ran.
 	RatedPasses []ratedPassFile `json:"rated_passes,omitempty"`
 
+	// RatedPassesNotKept is every pass of the sweep that is not in
+	// RatedPasses: skipped (loadgen ran and returned nothing usable) or never
+	// run, each with a status, a reason and the partial counts loadgen had
+	// (schema 5.24, probatorium#441). A separate array on purpose: a reader
+	// that predates it reads target_rps and p99 out of rated_passes, and a pass
+	// that sent nothing would read there as a perfect pass.
+	RatedPassesNotKept []ratedPassFile `json:"rated_passes_not_kept,omitempty"`
+
 	// LoadClass is the scenario's client-load class, heavy or light
 	// (scenarios.ClientLoadOf). Recorded on every cell that drove load.
 	LoadClass string `json:"load_class,omitempty"`
@@ -382,11 +391,11 @@ type passWindowFile struct {
 	End       time.Time `json:"end"`
 }
 
-// ratedPassFile is one rated pass recorded in the per-cell JSON.
-type ratedPassFile struct {
-	TargetRPS float64       `json:"target_rps"`
-	P99       time.Duration `json:"p99"`
-}
+// ratedPassFile is one rated pass recorded in the per-cell JSON: its target
+// and CO-corrected p99 (the two keys every reader has used) and, since schema
+// 5.24, the rate loadgen achieved, its errors and a status. The mage merge
+// reads the same type (ratedPassWire), so the two cannot drift.
+type ratedPassFile = report.RatedPassRecord
 
 // runManifest is the top-level summary written next to per-cell files.
 type runManifest struct {
@@ -807,6 +816,11 @@ type cellOutcome struct {
 	// Aggregate can reduce it into LatencyAtSLO.
 	RatedSamples []report.RatedSample
 
+	// RatedPasses is every pass of the rated sweep, kept or not, in fraction
+	// order (schema 5.24, probatorium#441). Threaded into report.CellResult
+	// beside RatedSamples; it does not feed LatencyAtSLO.
+	RatedPasses []report.RatedPassRecord
+
 	// Status is the classified outcome of this cell (schema v5.3).
 	// ErrorMsg is the synthesised per-cell error string it was classified
 	// from (empty for an OK cell). Both survive even when Result is nil
@@ -899,6 +913,9 @@ func (s *resultsSink) recordRun(cell interleave.Cell, out cellOutcome, rated boo
 		cr.HistogramsB64 = append(cr.HistogramsB64, out.HistogramB64)
 		if rated {
 			cr.RatedSamples = append(cr.RatedSamples, out.RatedSamples)
+			if len(out.RatedPasses) > 0 {
+				cr.RatedPassRecords = append(cr.RatedPassRecords, out.RatedPasses)
+			}
 		}
 	}
 	cr.Status = reduceCellStatus(cr.RunStatuses, len(cr.Samples) > 0, s.demoted[key])
@@ -1371,8 +1388,13 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 		// Suspect: keep the measurement — surfacing the number next to
 		// the flag is the point of the status — but skip the rated sweep
 		// below, whose targets would anchor on a saturation figure we
-		// just flagged.
+		// just flagged. A cell in the rated scope records each pass it did
+		// not run (probatorium#441): the skip is never silent.
 		fmt.Fprintf(os.Stderr, "  cell flagged: %s\n", v.ErrMsg)
+		if cfg.ratesCell(cell.Scenario.Name() + "/" + cell.Server.Name()) {
+			oc.RatedPasses = notRunRatedPasses(cfg, report.RatedReasonCellFlagged, v.ErrMsg)
+			cellRes.RatedPassesNotKept = oc.RatedPasses
+		}
 		return oc, nil
 	}
 
@@ -1384,10 +1406,17 @@ func executeCell(parent context.Context, cfg Config, cell interleave.Cell) (out 
 	// scale anchor, so the targets stay adapter-relative.
 	if cfg.ratesCell(cell.Scenario.Name()+"/"+cell.Server.Name()) && res != nil && res.RequestsPerSec > 0 {
 		cellRes.SaturationModeRPS = res.RequestsPerSec
-		samples, passes, windows := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
-		oc.RatedSamples = samples
-		cellRes.RatedPasses = passes
-		cellRes.PassWindows = append(cellRes.PassWindows, windows...)
+		sw := runRatedSweep(parent, cfg, lgCfg, res.RequestsPerSec)
+		oc.RatedSamples = sw.samples
+		oc.RatedPasses = sw.all
+		cellRes.RatedPasses = sw.kept
+		cellRes.RatedPassesNotKept = sw.notKept
+		cellRes.PassWindows = append(cellRes.PassWindows, sw.windows...)
+	} else if cfg.ratesCell(cell.Scenario.Name() + "/" + cell.Server.Name()) {
+		// In the rated scope, but the saturation pass measured no rate to
+		// take fractions of.
+		oc.RatedPasses = notRunRatedPasses(cfg, report.RatedReasonNoSatRate, "the saturation pass measured no requests per second")
+		cellRes.RatedPassesNotKept = oc.RatedPasses
 	}
 	return oc, nil
 }
@@ -1664,18 +1693,42 @@ var newRatedBench = func(cfg loadgen.Config) (ratedBench, error) {
 	return bm, nil
 }
 
+// ratedSweep is what one cell's rated sweep produced: the (target, p99) samples
+// of the kept passes that latency_at_slo is built from, the passes in the two
+// on-disk arrays, every pass in fraction order, and the pass windows.
+type ratedSweep struct {
+	samples []report.RatedSample
+	kept    []ratedPassFile
+	notKept []ratedPassFile
+	all     []ratedPassFile
+	windows []passWindowFile
+}
+
+func (sw *ratedSweep) add(rec ratedPassFile) {
+	sw.all = append(sw.all, rec)
+	if rec.Status == report.RatedPassOK {
+		sw.kept = append(sw.kept, rec)
+		sw.samples = append(sw.samples, report.RatedSample{TargetRPS: rec.TargetRPS, P99: rec.P99})
+		return
+	}
+	sw.notKept = append(sw.notKept, rec)
+}
+
 // runRatedSweep drives one rated (closed-loop, CO-corrected) pass per
-// configured fraction of saturationRPS, returning the (target, P99) samples
-// for aggregation plus the on-disk pass records. A pass that errors or returns
-// zero requests is skipped rather than failing the cell — a partial sweep is
-// still useful, and the saturation pass already succeeded.
-func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, saturationRPS float64) ([]report.RatedSample, []ratedPassFile, []passWindowFile) {
-	var samples []report.RatedSample
-	var passes []ratedPassFile
-	var windows []passWindowFile
+// configured fraction of saturationRPS. A pass that errors or returns zero
+// requests does not fail the cell (a partial sweep is still useful, and the
+// saturation pass already succeeded) and is not kept for latency_at_slo, but it
+// is recorded with a status and a reason: every fraction leaves exactly one
+// record (probatorium#441). A pass that drove no load (loadgen would not
+// build) has no pass window.
+func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, saturationRPS float64) ratedSweep {
+	var sw ratedSweep
 	for _, frac := range cfg.RatedFractions {
 		target := saturationRPS * frac
 		if target <= 0 {
+			sw.add(ratedPassFile{Fraction: frac, TargetRPS: target, Status: report.RatedPassNotRun,
+				Reason: report.RatedReasonBadTarget, Detail: fmt.Sprintf("target %.0f", target),
+				Start: time.Now().UTC(), End: time.Now().UTC()})
 			continue
 		}
 		lgCfg := base
@@ -1688,21 +1741,75 @@ func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, satu
 		if err != nil {
 			cancel()
 			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: loadgen.New: %v\n", target, err)
+			now := time.Now().UTC()
+			sw.add(ratedPassFile{Fraction: frac, TargetRPS: target, Status: report.RatedPassNotRun,
+				Reason: report.RatedReasonLoadgenNew, Detail: err.Error(), Start: now, End: now})
 			continue
 		}
 		passStart := time.Now().UTC()
 		rres, err := bm.Run(ctx)
 		cancel()
-		windows = append(windows, passWindowFile{
-			Kind: report.LoadKindRated, TargetRPS: target, Start: passStart, End: time.Now().UTC()})
-		if err != nil || rres == nil || rres.Requests == 0 {
-			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: skipped (err=%v)\n", target, err)
-			continue
+		passEnd := time.Now().UTC()
+		sw.windows = append(sw.windows, passWindowFile{
+			Kind: report.LoadKindRated, TargetRPS: target, Start: passStart, End: passEnd})
+		rec := newRatedPassRecord(frac, target, cfg.RatedDuration, rres, err, parent.Err() != nil, passStart, passEnd)
+		if rec.Status != report.RatedPassOK {
+			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: skipped (%s, err=%v)\n", target, rec.Reason, err)
 		}
-		samples = append(samples, report.RatedSample{TargetRPS: target, P99: rres.Latency.P99})
-		passes = append(passes, ratedPassFile{TargetRPS: target, P99: rres.Latency.P99})
+		sw.add(rec)
 	}
-	return samples, passes, windows
+	return sw
+}
+
+// newRatedPassRecord turns what loadgen returned for one rated pass into its
+// record. A pass is kept (status ok) exactly when loadgen returned no error and
+// a result with requests: the condition under which the runner has always kept
+// one. Anything else is skipped, with the reason and whatever counts loadgen
+// had. interrupted says the run's own context was cancelled, which makes an
+// error an interruption rather than a failure of the pass.
+func newRatedPassRecord(frac, target float64, window time.Duration, res *loadgen.Result, runErr error, interrupted bool, start, end time.Time) ratedPassFile {
+	rec := ratedPassFile{Fraction: frac, TargetRPS: target, Start: start, End: end}
+	if res != nil {
+		rec.AchievedRPS = res.RequestsPerSec
+		if target > 0 {
+			rec.AchievedRatio = res.RequestsPerSec / target
+		}
+		rec.Requests, rec.Errors = res.Requests, res.Errors
+		rec.ConnectErrors, rec.DialRetries, rec.CloseAborts = res.ConnectErrors, res.DialRetries, res.CloseAborts
+		d := res.Duration
+		if d <= 0 {
+			d = window
+		}
+		rec.Duration = res.Duration
+		rec.ShortfallRequests = int64(math.Round(target*d.Seconds())) - res.Requests - res.Errors
+		rec.P50, rec.P999, rec.Max = res.Latency.P50, res.Latency.P999, res.Latency.Max
+		rec.LoadgenVersion = res.LoadgenVersion
+	}
+	switch {
+	case runErr != nil:
+		rec.Status, rec.Reason, rec.Detail = report.RatedPassSkipped, report.RatedReasonRunError, runErr.Error()
+		if interrupted {
+			rec.Reason = report.RatedReasonInterrupted
+		}
+	case res == nil:
+		rec.Status, rec.Reason = report.RatedPassSkipped, report.RatedReasonNilResult
+	case res.Requests == 0:
+		rec.Status, rec.Reason = report.RatedPassSkipped, report.RatedReasonZeroRequests
+	default:
+		rec.Status = report.RatedPassOK
+		rec.P99 = res.Latency.P99
+	}
+	return rec
+}
+
+// notRunRatedPasses is the record of a sweep that did not start: one not_run
+// pass per configured fraction, with the reason the sweep was skipped.
+func notRunRatedPasses(cfg Config, reason, detail string) []ratedPassFile {
+	out := make([]ratedPassFile, 0, len(cfg.RatedFractions))
+	for _, frac := range cfg.RatedFractions {
+		out = append(out, ratedPassFile{Fraction: frac, Status: report.RatedPassNotRun, Reason: reason, Detail: detail})
+	}
+	return out
 }
 
 // adapterServer adapts an [servers.Adapter] to the in-process

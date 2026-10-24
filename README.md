@@ -527,8 +527,12 @@ The validation run of 2026-10-21 showed the arch lock holds on the scoped rows (
 exemption of light cells did not (P6 fails on arm64), so the default policy is now `all`
 ([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md), "Verdict"). #442 stays open for the
 three rows only a full both-arch run reads (get-simple-1024c, get-json-h2, post-4k-h2), so dispatch headline and
-full with `publish=false` until both are settled. The runner keeps no achieved rate per pass, so no rated number
-can tell a slow server from load that loadgen never sent (#441).
+full with `publish=false` until both are settled. Since schema 5.24 the artifact keeps the achieved rate, the
+errors and a status for every rated pass ([#441](https://github.com/goceleris/probatorium/issues/441),
+see "Result: latency at SLO"), so a rated number can be read against the load loadgen actually sent. #441
+stays open for the rest: no pass is yet marked invalid for a shortfall, `latency_at_slo` still counts every
+kept pass whatever it achieved, and loadgen does not export its end-of-window schedule lag (loadgen#102).
+Until those land, read `achieved_ratio` before you read a rated p99 as the server's.
 
 ### A both-arch run: the two arches share one client (#442)
 
@@ -728,6 +732,48 @@ concurrency sweep, `get-json-1k`, the H2 rows, `ws-large-echo`, and the WS hub a
 publish saturation data only; [`budget/profiles.go`](budget/profiles.go) gives the measured reason for
 each. Datasets published before [#418](https://github.com/goceleris/probatorium/issues/418) also carry
 rated data for those scenarios.
+
+#### What the artifact records per rated pass (schema 5.24, #441)
+
+Every fraction the sweep plans leaves exactly one record, whatever became of it. `benchmarks[].rated_passes`
+maps a scenario to the list of its passes, one entry per pass per run (`run` counts the runs that carried
+rated data):
+
+| field | meaning |
+| --- | --- |
+| `fraction`, `target_rps` | the offered load: the fraction of the cell's saturation rate, and the rate |
+| `achieved_rps`, `achieved_ratio` | requests per second loadgen delivered over the measured window, and that over the target. Below 1 is load loadgen never sent: the p99 of that pass is its backlog (about 0.99 x window x (1 - ratio)), not the server's latency |
+| `requests`, `errors`, `connect_errors`, `dial_retries`, `close_aborts` | loadgen's counts; `errors - connect_errors` are request failures, `connect_errors` the dial/handshake subset |
+| `shortfall_requests` | target x duration - requests - errors: the slots of the schedule loadgen did not fill |
+| `p99` (ns), `p50`, `p99_9`, `max`, `duration`, `start`, `end`, `loadgen_version` | the pass's latency, window and loadgen build (`start`/`end` are on the loadgen host's clock, warmup included, the same clock as `load_windows`) |
+| `status` | `ok`: counted in `latency_at_slo` and the headline. `skipped`: the pass ran and produced nothing usable. `not_run`: it never started |
+| `reason`, `detail` | for a pass that is not `ok`: `loadgen_new` (loadgen would not build), `run_error`, `nil_result`, `zero_requests`, `interrupted` (the run was cancelled), `cell_flagged` (the cell's saturation pass was flagged suspect, so no sweep ran), `no_saturation_rate`, `non_positive_target`; and the error text |
+
+`rated_headline_target_rps` names the target `rated_mode_p99_at_target_rps` was read at: the highest target
+among the `ok` passes. When the 0.9 pass was lost it is the 0.75 pass's (or lower), and this says so; compare
+it with the `fraction` of the cell's passes. A cell with no `ok` pass has records and no
+`latency_at_slo`, headline or `rated_headline_target_rps`.
+
+`mage Publish` prints a rated line in its integrity summary (passes by status, `ok` passes below 98 % of their
+target, and the cells whose headline is not their top planned pass). It is informational: nothing is refused
+for it, because the validity rule is still open on #441. `summary.json` carries `rated_passes` (about 0.4 KB a
+pass, so under 1 MB for a full rated run; `summary.json` of run 37091941051 is already 8 MB with its resource series).
+
+**For a reader that predates 5.24.** Nothing it reads changes. `latency_at_slo` and
+`rated_mode_p99_at_target_rps` are built from the `ok` passes exactly as they were built from the kept passes;
+`saturation_mode_rps` and every other key are untouched; the two new keys are ignored. In the runner's per-cell
+JSON and `raw/<host>.json`, `rated_passes` still holds only the passes the runner kept (each now with the added
+keys, `target_rps` and `p99` as before); the passes it did not keep are a separate array,
+`rated_passes_not_kept`, so a script that reads `target_rps` and `p99` out of `rated_passes` never counts a
+pass that sent nothing as a pass with a p99 of zero. A script that wants the full picture reads both arrays.
+A cell in the rated scope whose saturation pass was flagged now has `rated_passes_not_kept` with `not_run`
+records where it used to have no rated key at all. A cell that failed before its saturation pass finished
+(`dnf`, `not_applicable`) has no rated record: its status in `cell_statuses` is the explicit record.
+
+`mage Publish` publishes ONE results file per call (`PUBLISH_RESULTS`, a single arch's `results-<arch>.json`)
+into `results/<version>/<date>/<arch>/`. It does not merge two artifacts: two single-arch artifacts publish as
+two calls, which land side by side under the same version and date only if `BENCH_START_DATE` (or the day of the
+call) agrees.
 
 ## Validation tier
 
