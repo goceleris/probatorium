@@ -2137,6 +2137,15 @@ class FreezeThaw(Base):
         self.assertFalse(self.called("tailscale set", seen) or self.called("snap refresh", seen) or self.called("snap set", seen))
         self.assertEqual((self.prefs()["Apply"], self.hold()), (True, ""))
 
+    def test_a_tailscale_auto_update_that_was_never_set_and_comes_on_under_a_freeze_is_drift(self):
+        self.ts_state(Check=True)  # Apply unset: the freeze leaves it alone; a tailnet-wide default can set it on later
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.su()["tailscale"]["auto_update_after"], "unset")
+        self.h.load()
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], [])
+        self.ts_state(Check=True, Apply=True)
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], ["tailscale auto-update is on, was unset after the freeze"])
+
     def test_a_self_updater_that_comes_back_under_a_freeze_is_drift(self):
         self.ts_state(Check=True, Apply=True)
         self.assertEqual(self.freeze().returncode, 0)
@@ -2144,11 +2153,11 @@ class FreezeThaw(Base):
         self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], [])
         self.ts_state(Check=True, Apply=True)  # something turned the auto-update on again
         self.put(snap_hold="")  # and a person removed the hold
-        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], ["tailscale auto-update is true again", "snap refresh hold is 'none', not 'forever'"])
+        self.assertEqual(self.run_ok("survey")["freeze"]["drifted"], ["tailscale auto-update is on, was false after the freeze", "snap refresh hold is 'none', not 'forever'"])
         th = self.thaw()  # the drift is the end-of-campaign proof, read before the thaw changes anything
         self.assertEqual(th.returncode, 0, th.stdout + th.stderr)
         self.assertEqual(json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"))["drifted_at_thaw"],
-                         ["tailscale auto-update is true again", "snap refresh hold is 'none', not 'forever'"])
+                         ["tailscale auto-update is on, was false after the freeze", "snap refresh hold is 'none', not 'forever'"])
 
 
     def test_these_reads_are_on_the_read_only_list_and_no_other_tailscale_or_snap_command_is(self):

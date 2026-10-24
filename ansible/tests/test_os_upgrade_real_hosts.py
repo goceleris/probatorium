@@ -166,6 +166,12 @@ class ChecklistReplay(unittest.TestCase):
         self.assertNotIn("packagekitd`", self.md)
         self.assertEqual(self.md.count("package runs `none`"), 3)
 
+    def test_the_survey_says_what_a_freeze_stops_and_what_it_does_not(self):
+        # the real records predate `self_updaters`: "not recorded", and the section still names the three a freeze never touches
+        self.assertEqual(self.md.count("NOT stopped by a freeze: fwupd, motd-news and ubuntu-pro-client timers where installed"), 3)
+        self.assertEqual(self.md.count("tailscale auto-update `not recorded`"), 3)
+        self.assertNotIn("NOT stopped by a freeze: tailscale", self.md)
+
     def test_the_freeze_row_reads_a_freeze_record(self):
         row = "platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts, and tailscale auto-update and snapd refresh when the freeze record says it held them); NOT covered: fwupd, motd-news, ubuntu-pro-client"
         held = {"tailscale": {"auto_update_before": "true", "auto_update_after": "false"}, "snap": {"hold_before": "none", "hold_after": "forever"}}
@@ -174,8 +180,8 @@ class ChecklistReplay(unittest.TestCase):
                                         ("frozen before the self-updaters were covered", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS",
                                          "this freeze PREDATES the self-updater cover: tailscale auto-update and snapd refresh were NOT stopped by it"),
                                         ("frozen but a unit came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["apt-daily.timer=active/enabled"]}, "FAIL", ""),
-                                        ("frozen but tailscale's updater came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["tailscale auto-update is true again"], "self_updaters": held}, "FAIL",
-                                         "drifted: tailscale auto-update is true again"),
+                                        ("frozen but tailscale's updater came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["tailscale auto-update is on, was false after the freeze"], "self_updaters": held}, "FAIL",
+                                         "drifted: tailscale auto-update is on, was false after the freeze"),
                                         ("a freeze interrupted half way", {"run_id": "1", "utc": "t", "status": "freezing", "drifted": []}, "FAIL", ""),
                                         ("a freeze that did not complete", {"run_id": "1", "utc": "t", "status": "freezing-failed", "drifted": []}, "FAIL", "")):
             d = tempfile.mkdtemp(prefix="osu-real-freeze-")

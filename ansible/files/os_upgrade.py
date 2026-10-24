@@ -1838,8 +1838,10 @@ def freeze_state():
         drifted.append("needrestart restart mode is %r, not 'l'" % needrestart_mode())
     # the two self-updaters the freeze verified off (a record from before they were covered has no *_after: nothing to compare)
     su = rec.get("self_updaters") or {}
-    if (su.get("tailscale") or {}).get("auto_update_after") == "false" and tailscale_autoupdate()[0] != "false":
-        drifted.append("tailscale auto-update is %s again" % tailscale_autoupdate()[0])
+    # (recorded "unset" too: a tailnet-wide default can turn an auto-update that was never set on, once the control server answers)
+    ts_after = (su.get("tailscale") or {}).get("auto_update_after")
+    if ts_after in ("false", "unset") and tailscale_autoupdate()[0] == "true":
+        drifted.append("tailscale auto-update is on, was %s after the freeze" % ts_after)
     if (su.get("snap") or {}).get("hold_after") == "forever" and snap_hold() != "forever":
         drifted.append("snap refresh hold is %r, not 'forever'" % (snap_hold() or "none"))
     return dict(rec, drifted=drifted)
@@ -1956,7 +1958,7 @@ def cmd_freeze(a):
     # snapd's refresh: ALL automatic refreshes held with `snap refresh --hold=forever` (snapd 2.58+, 26.04 ships 2.77.1). It writes the config
     # `refresh.hold` ("forever", or an RFC 3339 time) that snapd checks before every automatic refresh and `snap refresh --time` prints as "hold:
     # forever". The 90 days of snapcraft.io's "Manage updates" belong to the old docs of `snap set system refresh.hold=<time>`: in snapd 2.77.1
-    # (overlord/configstate/configcore/refresh.go, overlord/snapstate/autorefresh.go) the config accepts "forever" or an RFC 3339 time with no
+    # (daemon/api_snaps.go snapHoldMany, overlord/configstate/configcore/refresh.go, overlord/snapstate/autorefresh.go) the config accepts "forever" or an RFC 3339 time with no
     # limit, and isRefreshHeld is only holdTime.After(now). A manual `snap refresh` is not held, only the automatic refreshes.
     sn = rec["self_updaters"]["snap"]
     if sn["hold_before"] == "unknown":
