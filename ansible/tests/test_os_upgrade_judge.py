@@ -471,8 +471,13 @@ class Judge(unittest.TestCase):
         case("post_new_dump_as_bare_timestamp", {"post": "new crash dump(s) in /var/crash: 202610240900"},
              lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_after + ["202610240900"])))
         case("post_renamed_and_new_dumps_mixed", {"post": "new crash dump(s) in /var/crash: linux-image-7.0.0-38-generic-202610240900.crash"},
-             lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_after + ["kdump_lock", "linux-image-7.0.0-38-generic-202610240900.crash"])))
+             lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_after + ["linux-image-7.0.0-38-generic-202610240900.crash"])))
         # the bare timestamp before, the same timestamp as a .crash file for another kernel after (and the reverse): the same dump
+        # names that are not dumps of the msr1 timestamps must still be named when the before list is POPULATED (a normalisation that maps names with no digits, or a name
+        # ending in an old timestamp, onto a key already there hides them; against an EMPTY before list it would not). Each is named alone.
+        for extra in ("vmcore", "kdump_lock.old", "dump.202609082320", "foo-202609082320", "linux-image--202609082320.crash"):
+            case("post_populated_" + extra, {"post": "new crash dump(s) in /var/crash: " + extra},
+                 (lambda extra: lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_before + [extra])))(extra))
         case("post_bare_dump_renamed_is_not_new", {}, lambda c: (c["pre_target"].update(crash=["202609082320"]), post(c, crash=["202609082320", "linux-image-7.0.0-38-generic-202609082320.crash"])))
         case("post_crash_file_as_bare_is_not_new", {}, lambda c: (c["pre_target"].update(crash=["linux-image-7.0.0-31-generic-202609082320.crash"]), post(c, crash=["202609082320", "linux-image-7.0.0-31-generic-202609082320.crash"])))
         for k in ("tailscaled_active", "apcupsd_active", "resume_check_enabled", "power_event_installed", "tmpfiles_conf", "quiesce_hook"):
@@ -547,6 +552,8 @@ class Judge(unittest.TestCase):
         self.assertEqual(self.out["post_renamed_and_new_dumps_mixed"]["post"], "new crash dump(s) in /var/crash: linux-image-7.0.0-38-generic-202610240900.crash")
         self.assertEqual(self.out["post_new_dump_as_crash_file"]["post"], "new crash dump(s) in /var/crash: linux-image-7.0.0-38-generic-202610240900.crash")
         self.assertEqual(self.out["post_new_dump_as_bare_timestamp"]["post"], "new crash dump(s) in /var/crash: 202610240900")
+        for extra in ("vmcore", "kdump_lock.old", "dump.202609082320", "foo-202609082320", "linux-image--202609082320.crash"):
+            self.assertEqual(self.out["post_populated_" + extra]["post"], "new crash dump(s) in /var/crash: " + extra)
 
     def test_a_healthy_host_has_nothing_to_report(self):
         self.assertEqual(self.out["healthy"], {"refusals": "", "plan": "", "prereboot": "", "post": "", "maint": ""})
