@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/goceleris/probatorium/budget"
 	"github.com/goceleris/probatorium/interleave"
+	"github.com/goceleris/probatorium/report"
 	"github.com/goceleris/probatorium/servers"
 )
 
@@ -287,5 +289,131 @@ func TestFlaggedCellRecordsItsRatedPassesAsNotRun(t *testing.T) {
 		if str(e, "detail") == "" {
 			t.Errorf("not-kept[%d] has no detail: the reason must carry the cell's flag", i)
 		}
+	}
+}
+
+// TestResultsSinkKeepsEveryRatedPassInProcess: the in-process runner (no
+// cluster merge) builds its own results.json from the sink. A run's passes, kept
+// and not, reach the document's rated_passes; the lost one is listed and does
+// not enter latency_at_slo.
+func TestResultsSinkKeepsEveryRatedPassInProcess(t *testing.T) {
+	cfg := Config{Out: t.TempDir()}
+	sink := newResultsSink(cfg, time.Now().UTC())
+	cell := sinkCell(t, "get-json", "gin-h1")
+	sink.recordRun(cell, cellOutcome{
+		Result: &loadgen.Result{Requests: 100, RequestsPerSec: 400000, Duration: time.Second},
+		RatedSamples: []report.RatedSample{
+			{TargetRPS: 100000, P99: 8 * time.Millisecond},
+			{TargetRPS: 200000, P99: 30 * time.Millisecond},
+		},
+		RatedPasses: []report.RatedPassRecord{
+			{Fraction: 0.25, TargetRPS: 100000, P99: 8 * time.Millisecond, Status: report.RatedPassOK, AchievedRPS: 99000},
+			{Fraction: 0.5, TargetRPS: 200000, P99: 30 * time.Millisecond, Status: report.RatedPassOK, AchievedRPS: 190000},
+			{Fraction: 0.9, TargetRPS: 360000, Status: report.RatedPassSkipped, Reason: report.RatedReasonZeroRequests},
+		},
+	}, true)
+	if err := sink.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(cfg.Out, "results.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Benchmarks []struct {
+			RatedPasses  map[string][]map[string]any `json:"rated_passes"`
+			Headline     map[string]float64          `json:"rated_headline_target_rps"`
+			LatencyAtSLO map[string]map[string]int   `json:"latency_at_slo"`
+		} `json:"benchmarks"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Benchmarks) != 1 {
+		t.Fatalf("%d benchmark rows, want 1", len(doc.Benchmarks))
+	}
+	b := doc.Benchmarks[0]
+	got := b.RatedPasses["get-json"]
+	if len(got) != 3 || got[2]["status"] != "skipped" || got[2]["reason"] != "zero_requests" || got[0]["achieved_rps"] != float64(99000) {
+		t.Errorf("rated_passes = %v, want the 3 passes with the lost one listed", got)
+	}
+	if b.Headline["get-json"] != 200000 {
+		t.Errorf("rated_headline_target_rps = %v, want 200000", b.Headline)
+	}
+	for ms, rps := range b.LatencyAtSLO["get-json"] {
+		if rps == 360000 {
+			t.Errorf("latency_at_slo[%s] counts the skipped pass", ms)
+		}
+	}
+}
+
+// TestRatedSweepRecordsANonPositiveTarget: a fraction whose target is not
+// positive leaves a not_run record instead of vanishing from the sweep.
+func TestRatedSweepRecordsANonPositiveTarget(t *testing.T) {
+	withRatedScript(t, func(_ int, cfg loadgen.Config) (ratedBench, error) {
+		return scriptedBench{res: &loadgen.Result{Requests: 10, Duration: time.Second, RequestsPerSec: cfg.Rate,
+			Latency: loadgen.Percentiles{P99: time.Millisecond}}}, nil
+	})
+	sw := runRatedSweep(context.Background(), Config{RatedFractions: []float64{0, 0.5}, RatedDuration: time.Second, Warmup: time.Second},
+		loadgen.Config{}, 1000)
+	if len(sw.all) != 2 {
+		t.Fatalf("%d records for 2 fractions, want 2", len(sw.all))
+	}
+	if r := sw.all[0]; r.Status != report.RatedPassNotRun || r.Reason != report.RatedReasonBadTarget || r.Fraction != 0 {
+		t.Errorf("fraction 0 = %+v, want not_run/non_positive_target", r)
+	}
+	if r := sw.all[1]; r.Status != report.RatedPassOK || len(sw.kept) != 1 || len(sw.notKept) != 1 || len(sw.samples) != 1 {
+		t.Errorf("fraction 0.5 = %+v, kept %d notKept %d samples %d", r, len(sw.kept), len(sw.notKept), len(sw.samples))
+	}
+}
+
+// TestNotRunRatedPassesCoversEveryFraction: the record of a sweep that did not
+// start has one not_run pass per configured fraction, with the reason and the
+// detail. (The no_saturation_rate branch of executeCell is not reachable from a
+// clean saturation pass, so this is where its reason is pinned.)
+func TestNotRunRatedPassesCoversEveryFraction(t *testing.T) {
+	got := notRunRatedPasses(Config{RatedFractions: []float64{0.25, 0.5, 0.75, 0.9}}, report.RatedReasonNoSatRate, "no rate")
+	if len(got) != 4 {
+		t.Fatalf("%d records, want 4", len(got))
+	}
+	for i, r := range got {
+		if r.Fraction != []float64{0.25, 0.5, 0.75, 0.9}[i] || r.Status != report.RatedPassNotRun || r.Reason != "no_saturation_rate" || r.Detail != "no rate" {
+			t.Errorf("record %d = %+v", i, r)
+		}
+	}
+}
+
+// TestSkippedPassStderrLineKeepsItsShape: the census scripts of the #441
+// evidence match the runner's stderr line "rated pass target=N: skipped
+// (err=<nil>)" and "rated pass target=N: loadgen.New: ..." to count the passes
+// the artifact did not record. The reason class goes after the closing
+// parenthesis, so those patterns keep matching.
+func TestSkippedPassStderrLineKeepsItsShape(t *testing.T) {
+	withRatedScript(t, func(i int, cfg loadgen.Config) (ratedBench, error) {
+		if i == 0 {
+			return nil, errors.New("connection refused")
+		}
+		return scriptedBench{res: &loadgen.Result{Duration: time.Second}}, nil // zero requests
+	})
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	runRatedSweep(context.Background(), Config{RatedFractions: []float64{0.5, 0.9}, RatedDuration: time.Second, Warmup: time.Second},
+		loadgen.Config{}, 1000)
+	os.Stderr = orig
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("stderr = %q, want 2 lines", out)
+	}
+	if want := "  rated pass target=500: loadgen.New: connection refused"; lines[0] != want {
+		t.Errorf("line 0 = %q, want %q", lines[0], want)
+	}
+	if want := "  rated pass target=900: skipped (err=<nil>) reason=zero_requests"; lines[1] != want {
+		t.Errorf("line 1 = %q, want %q", lines[1], want)
 	}
 }

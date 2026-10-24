@@ -1754,7 +1754,10 @@ func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, satu
 			Kind: report.LoadKindRated, TargetRPS: target, Start: passStart, End: passEnd})
 		rec := newRatedPassRecord(frac, target, cfg.RatedDuration, rres, err, parent.Err() != nil, passStart, passEnd)
 		if rec.Status != report.RatedPassOK {
-			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: skipped (%s, err=%v)\n", target, rec.Reason, err)
+			// The text up to the closing parenthesis is the line the census
+			// scripts match ("rated pass target=N: skipped (err=...)"); the
+			// reason class goes after it so they keep matching.
+			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: skipped (err=%v) reason=%s\n", target, err, rec.Reason)
 		}
 		sw.add(rec)
 	}

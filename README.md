@@ -770,10 +770,17 @@ A cell in the rated scope whose saturation pass was flagged now has `rated_passe
 records where it used to have no rated key at all. A cell that failed before its saturation pass finished
 (`dnf`, `not_applicable`) has no rated record: its status in `cell_statuses` is the explicit record.
 
-`mage Publish` publishes ONE results file per call (`PUBLISH_RESULTS`, a single arch's `results-<arch>.json`)
-into `results/<version>/<date>/<arch>/`. It does not merge two artifacts: two single-arch artifacts publish as
-two calls, which land side by side under the same version and date only if `BENCH_START_DATE` (or the day of the
-call) agrees.
+**Two single-arch artifacts and `mage Publish`.** `Publish` takes ONE results file per call (`PUBLISH_RESULTS`,
+or the newest `results/*-bench-*/results.json`; the arch tag comes from the document's own `host_arch_pair`) and
+writes `results/<version>/<date>/<arch>/`. It merges nothing: two single-arch artifacts (a `target=msa2-server`
+run and a `target=msr1` run, each with `publish=false`) are two calls, each with its artifact unpacked under
+`results/<ts>-bench-<version>/` and `PUBLISH_VERSION` set, and they land in two arch directories of the same
+version. Set `BENCH_START_DATE` to the same day on both calls if you want them in the same date directory;
+the date only names the directory. The docs build ([goceleris/docs](https://github.com/goceleris/docs),
+`scripts/build-data.ts`, `src/lib/results/aggregate.ts`) groups the cells by (version, arch) over every date
+and run and AVERAGES them, so the two arches compose into one release dataset by version, and a second publish
+of the same version and arch, on any date, is averaged with the first, not a replacement for it. (Checked by
+`PUBLISH_DRYRUN=1` on both arch files of run 37091941051, and by reading the docs build.)
 
 ## Validation tier
 
