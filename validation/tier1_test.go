@@ -2,6 +2,7 @@ package validation
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -338,6 +339,43 @@ func TestWaitForReady_NoGoroutineLeak(t *testing.T) {
 	if growth := final - base; growth > growthBound {
 		t.Errorf("goroutine count grew by %d over %d iterations (base=%d final=%d) — likely leak",
 			growth, iterations, base, final)
+	}
+}
+
+// readyThenEOF is a remote.Process that writes its ready line and closes its
+// stderr at once, so the scanner goroutine inside waitForReady has the line
+// and the end of the stream both ready before the caller looks at either.
+type readyThenEOF struct{}
+
+func (readyThenEOF) PID() int         { return 1 }
+func (readyThenEOF) Signal(int) error { return nil }
+func (readyThenEOF) Wait(context.Context) (remote.WaitResult, error) {
+	return remote.WaitResult{}, nil
+}
+func (readyThenEOF) Stderr() io.Reader {
+	return strings.NewReader("noise\nready addr=127.0.0.1:7\n")
+}
+
+// TestWaitForReady_ReadyLineIsNotLostToTheEndOfTheStream: a refapp that wrote
+// its ready line and then closed its stderr is ready. waitForReady used to
+// select between the line and the end of the stream at random when the
+// caller was late, and lost the ready line as "refapp exited before ready:
+// EOF" (#546, which surfaced as TestReplayOneSeed_TeardownFailureIsReported
+// failing with ExitCode -1). The race is a scheduling one, so the test
+// repeats it; the leading noise line makes the scanner park on the cap-1
+// lineCh, which makes the loss frequent (about half of the calls). With the
+// fix reverted it fails on every run at -cpu 1, 2, 4 and 10.
+func TestWaitForReady_ReadyLineIsNotLostToTheEndOfTheStream(t *testing.T) {
+	const iterations = 2000
+	lost := 0
+	for i := 0; i < iterations; i++ {
+		addr, err := waitForReady(context.Background(), readyThenEOF{}, tier1TestReadyTimeout)
+		if err != nil || addr != "127.0.0.1:7" {
+			lost++
+		}
+	}
+	if lost > 0 {
+		t.Errorf("%d of %d waitForReady calls lost a ready line that was written before the stream ended", lost, iterations)
 	}
 }
 

@@ -631,6 +631,19 @@ func TestRebootSummary(t *testing.T) {
 			t.Errorf("verified summary lacks %q:\n%s", want, got)
 		}
 	}
+	// a snapshot from before the probe was recorded has no peer_probe: the row reads n/a, not null; a recorded probe prints as is, and a
+	// false peer_ping_ok is not turned into n/a
+	if !strings.Contains(got, "| peer_probe | n/a | n/a |") || strings.Contains(got, "null") {
+		t.Errorf("an old snapshot without peer_probe must print n/a, never null:\n%s", got)
+	}
+	write("pre-snapshot.json", strings.Replace(snap("aaa", 4050000000), `"peer_ping_ok":true,`, `"peer_ping_ok":false,"peer_probe":"tcp22",`, 1))
+	got = run("0", "x")
+	for _, want := range []string{"| peer_probe | tcp22 | n/a |", "| peer_ping_ok | false | true |"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("a recorded probe is not printed as recorded: lacks %q:\n%s", want, got)
+		}
+	}
+	write("pre-snapshot.json", snap("aaa", 4050000000))
 
 	write("phase.txt", "rebooting\n")
 	if err := os.Remove(filepath.Join(host, "post-snapshot.json")); err != nil {

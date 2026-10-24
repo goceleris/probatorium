@@ -174,8 +174,10 @@ fi
 # "reached" only when the peer really answered. PATH is a directory of symlinks to every tool but ping and timeout (the snapshot needs
 # awk, sort, ls ...), plus stand-ins: a ping that answers when $PROBE/ping-up exists and logs its call, and a timeout that logs its
 # call, maps the real port 22 to the test listener's port and runs the real timeout.
+# A machine without them (macOS has no timeout) skips the cases, like the ip(8) block above: it says "not available", it does not fail. The
+# hosts have timeout (uutils 0.8.0); the CI runners have GNU timeout and python3.
 if ! command -v python3 > /dev/null 2>&1 || ! command -v timeout > /dev/null 2>&1; then
-	bad "the peer probe cases need python3 (a listener) and timeout"
+	echo "SKIP peer probe cases: python3 (a listener) and timeout are not available here"
 else
 	real_timeout=$(command -v timeout)
 	probe=$work/probe

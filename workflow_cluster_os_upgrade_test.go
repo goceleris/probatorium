@@ -1102,52 +1102,22 @@ func TestClusterOSUpgradeNeverSpellsOutTheConsoleOverride(t *testing.T) {
 	}
 }
 
-// stripTrailingComment cuts a trailing " # comment" and a Jinja {# comment #} from a line, but only where the # is OUTSIDE every quoted string: a
-// string may contain " # " (r4 minor 1: the first version cut from the first " #", so `"attest: # " + "REHEARSE-%s-CONSOLE"` was neither scanned nor counted).
-// An unbalanced quote (an apostrophe in plain YAML text) just means nothing is cut: the line is scanned whole.
-func stripTrailingComment(l string) string {
-	rs := []rune(l)
-	var q rune
-	var out []rune
-	for i := 0; i < len(rs); i++ {
-		r := rs[i]
-		switch {
-		case q != 0:
-			if r == '\\' && i+1 < len(rs) {
-				out = append(out, r, rs[i+1])
-				i++
-				continue
-			}
-			if r == q {
-				q = 0
-			}
-		case r == '\'' || r == '"':
-			q = r
-		case r == '{' && i+1 < len(rs) && rs[i+1] == '#':
-			if j := strings.Index(string(rs[i+2:]), "#}"); j >= 0 {
-				i += 2 + len([]rune(string(rs[i+2:])[:j])) + 1 // past the closing #}
-				continue
-			}
-		case r == '#' && i > 0 && (rs[i-1] == ' ' || rs[i-1] == '\t') && (i+1 == len(rs) || rs[i+1] == ' ' || rs[i+1] == '\t'):
-			return string(out)
-		}
-		out = append(out, r)
-	}
-	return string(out)
-}
-
 var assembledConsole = regexp.MustCompile(`(?i)['"]console['"]|\|\s*(upper|capitalize|title|swapcase)\b|['"]\s*\.\s*upper\(|['"][-a-z]*cons['"]|['"]ole[-a-z]*['"]`)
 
-// consoleTokenProblems scans SRC (comments already stripped): the lines that carry the word CONSOLE, or build it, outside FRAGMENTS, and how many lines carry it.
+// consoleTokenProblems scans SRC: the lines that carry the word CONSOLE, or build it, outside FRAGMENTS, and how many lines carry it.
+//
+// SRC is the RAW file, comments included, and no line is cut at a " # ". An earlier version stripped the comments first (full-line and trailing,
+// then quote-aware, r4 minor 1), and r5 N1 still bypassed it with a " # " on a continuation line of a multi-line string: a YAML `>-` block
+// scalar, a Python triple-quoted string or a two-line quoted scalar. A line cannot tell by itself whether it is a comment or a string's text, so
+// none is trusted to be a comment: the one comment that names the token is allow-listed through FRAGMENTS like any other line.
 func consoleTokenProblems(src string, fragments []string) (problems []string, n int) {
-	for _, raw := range strings.Split(src, "\n") {
-		l := stripTrailingComment(raw)
+	for _, l := range strings.Split(src, "\n") {
 		rest := l
 		for _, fr := range fragments {
 			rest = strings.ReplaceAll(rest, fr, "")
 		}
 		if strings.Contains(rest, "CONSOLE") || assembledConsole.MatchString(rest) {
-			problems = append(problems, "a line carries the word CONSOLE, or builds it, outside the comparisons and the approver's display (a message, a concatenation, a format, a case filter, a print): "+strings.TrimSpace(l))
+			problems = append(problems, "a line carries the word CONSOLE, or builds it, outside the comparisons and the approver's display (a message, a concatenation, a format, a case filter, a print, a comment that may be a string's text): "+strings.TrimSpace(l))
 		}
 		if strings.Contains(l, "CONSOLE") {
 			n++
@@ -1156,49 +1126,33 @@ func consoleTokenProblems(src string, fragments []string) (problems []string, n 
 	return problems, n
 }
 
-func TestStripTrailingComment(t *testing.T) {
-	for in, want := range map[string]string{
-		`echo ok # a trailing comment`: `echo ok `,
-		`echo ok #`:                    `echo ok `,
-		`x: "a # b" # real`:            `x: "a # b" `,
-		`print("attest: # " + "REHEARSE-%s-CONSOLE" % h)`:           `print("attest: # " + "REHEARSE-%s-CONSOLE" % h)`,
-		`msg: {{ 'type # ' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' }}`: `msg: {{ 'type # ' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' }}`,
-		`a {# a jinja comment #} b`:                                 `a  b`,
-		`a '{# ' ~ 'REHEARSE-x-CONSOLE' ~ ' #}' b`:                  `a '{# ' ~ 'REHEARSE-x-CONSOLE' ~ ' #}' b`,
-		`it's # unbalanced`:                                         `it's # unbalanced`,
-		`${#IN_REASON} is not a comment`:                            `${#IN_REASON} is not a comment`,
-		`"esc \" # still inside" # out`:                             `"esc \" # still inside" `,
-	} {
-		if got := stripTrailingComment(in); got != want {
-			t.Errorf("stripTrailingComment(%q) = %q, want %q", in, got, want)
-		}
+func TestConsoleTokenScanTrustsNoLineToBeAComment(t *testing.T) {
+	comment := "#   unless the confirmation is REHEARSE-<host>-CONSOLE (someone at the rack with a console)."
+	frag := []string{`== ('REHEARSE-' ~ os_host ~ '-CONSOLE')`, "unless the confirmation is REHEARSE-<host>-CONSOLE (someone at the rack with a console)."}
+	if p, n := consoleTokenProblems("c: "+frag[0]+"\n"+comment, frag); len(p) != 0 || n != 2 {
+		t.Errorf("the comparison and the allow-listed comment are the allowed lines: %v (%d)", p, n)
 	}
-}
-
-func TestConsoleTokenScanKnowsALegitimateCommentFromAStringThatLooksLikeOne(t *testing.T) {
-	frag := []string{`== ('REHEARSE-' ~ os_host ~ '-CONSOLE')`}
-	if p, n := consoleTokenProblems("x: 1 # the console attestation REHEARSE-<host>-CONSOLE is in the README\n{# REHEARSE-h-CONSOLE #} y: 2", frag); len(p) != 0 || n != 0 {
-		t.Errorf("a trailing or Jinja comment must be tolerated: %v (%d lines)", p, n)
-	}
-	for _, bad := range []string{
-		`print("attest: # " + "REHEARSE-%s-CONSOLE" % host)`,           // G1: " # " inside a string
-		`msg: {{ 'type # ' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' }}`,    // G2
-		`msg: {{ '{#' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' ~ '#}' }}`,  // a Jinja comment opened inside a string
-		`msg: {{ 'REHEARSE-' ~ os_host ~ '-' ~ ('console' | upper) }}`, // a case filter
-		`msg: {{ 'REHEARSE-' ~ os_host ~ '-CONS' ~ 'OLE' }}`,           // a split word
-		`x = "REHEARSE-" + host + "-" + "console".upper()  # fine`,     // .upper() before a comment
+	for name, bad := range map[string]string{
+		"a comment that is not allow-listed":           "x: 1 # the console attestation REHEARSE-<host>-CONSOLE is in the README",
+		"a full-line comment that is not allow-listed": "# REHEARSE-h-CONSOLE",
+		"GM1: a line of a >- block scalar":             "msg: >-\n  attest # REHEARSE-{{ os_host }}-CONSOLE",
+		"GM2: a line of a Python triple-quoted string": "m = \"\"\"\nattest # REHEARSE-%s-CONSOLE\n\"\"\"",
+		"GM3: the second line of a quoted scalar":      "msg: \"attest\n  # REHEARSE-{{ os_host }}-CONSOLE\"",
+		"G1: \" # \" inside a string":                  `print("attest: # " + "REHEARSE-%s-CONSOLE" % host)`,
+		"G2: ' # ' inside a Jinja string":              `msg: {{ 'type # ' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' }}`,
+		"a Jinja comment opened inside a string":       `msg: {{ '{#' ~ 'REHEARSE-' ~ os_host ~ '-CONSOLE' ~ '#}' }}`,
+		"a case filter":                                `msg: {{ 'REHEARSE-' ~ os_host ~ '-' ~ ('console' | upper) }}`,
+		"a split word":                                 `msg: {{ 'REHEARSE-' ~ os_host ~ '-CONS' ~ 'OLE' }}`,
+		".upper() before a comment":                    `x = "REHEARSE-" + host + "-" + "console".upper()  # fine`,
 	} {
 		if p, _ := consoleTokenProblems(bad, frag); len(p) == 0 {
-			t.Errorf("a bypass passes the console-token scan: %s", bad)
+			t.Errorf("a bypass passes the console-token scan (%s): %s", name, bad)
 		}
-	}
-	if p, n := consoleTokenProblems("c: "+frag[0], frag); len(p) != 0 || n != 1 {
-		t.Errorf("the comparison itself is the allowed line: %v (%d)", p, n)
 	}
 }
 
 // Review m1 (and r2 F9): the literal scan above is bypassed by a concatenation ('REHEARSE-' ~ os_host ~ '-' ~ 'CONSOLE'), a format filter, a Python % or a
-// literal on an allow-listed line. In every file that prints anything, a line (comments stripped) may carry the word CONSOLE only inside the exact
+// literal on an allow-listed line. In every file that prints anything, a line (comments included, see consoleTokenProblems) may carry the word CONSOLE only inside the exact
 // fragments that COMPARE a confirmation against it or show the approver that one was attested, and each file has exactly that many such lines: what
 // is left of a line after the fragments are removed must not contain CONSOLE, and the tool (os_upgrade.py) has none at all.
 func TestClusterOSUpgradeTheConsoleTokenIsOnlyEverCompared(t *testing.T) {
@@ -1211,14 +1165,15 @@ func TestClusterOSUpgradeTheConsoleTokenIsOnlyEverCompared(t *testing.T) {
 			`endsWith(inputs.confirm, '-CONSOLE')`, ` CONSOLE-ATTESTED`,
 			`[ "$IN_CONFIRM" != "REHEARSE-$IN_HOST-CONSOLE" ]`, `[ "$IN_CONFIRM" = "REHEARSE-$IN_HOST-CONSOLE" ]`,
 			`kind="CONSOLE ATTESTED: the dispatcher states that a person is at the rack of $IN_HOST with a console"`}, 5},
-		osRequest:  {[]string{`os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']`}, 1},
-		osJudge:    {[]string{`{% set console_attested = (os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE') %}`}, 1},
-		osPlaybook: {[]string{`(os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE')`}, 1},
-		osScript:   {nil, 0},
+		osRequest: {[]string{`os_confirm in ['REHEARSE-' ~ os_host, 'REHEARSE-' ~ os_host ~ '-CONSOLE']`}, 1},
+		osJudge:   {[]string{`{% set console_attested = (os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE') %}`}, 1},
+		osPlaybook: {[]string{`(os_confirm | default('')) == ('REHEARSE-' ~ os_host ~ '-CONSOLE')`,
+			`unless the confirmation is REHEARSE-<host>-CONSOLE (someone at the rack with a console).`}, 2}, // the second is the header comment; the scan trusts no line to be a comment (r5 N1)
+		osScript: {nil, 0},
 		filepath.Join(".github", "scripts", "os-upgrade-summary.sh"): {[]string{`*-CONSOLE) echo "- confirmation: **CONSOLE ATTESTED**:`}, 1},
 	}
 	for file, ok := range allowed {
-		problems, n := consoleTokenProblems(stripComments(mustRead(t, file)), ok.fragments)
+		problems, n := consoleTokenProblems(mustRead(t, file), ok.fragments)
 		for _, p := range problems {
 			t.Errorf("%s: %s", file, p)
 		}

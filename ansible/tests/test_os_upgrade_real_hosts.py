@@ -230,6 +230,23 @@ class ChecklistReplay(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+    def test_the_before_and_after_table_prints_n_a_for_a_snapshot_without_the_probe(self):
+        # a snapshot taken before peer_probe was recorded (an older run's evidence) has no such key: the row reads n/a, never null;
+        # a recorded probe prints as recorded, and a false peer_ping_ok stays false (jq's // would turn false into n/a)
+        d = tempfile.mkdtemp(prefix="osu-real-probe-")
+        try:
+            os.makedirs(os.path.join(d, "msr1"))
+            old = {"lan_ip_present": True, "peer_ping_ok": False, "placement_vector_present": True, "max_vector_total": 1, "runner_listeners": 0}
+            for name, rec in (("pre-snapshot.json", dict(old)), ("post-snapshot.json", dict(old, peer_probe="tcp22"))):
+                json.dump(rec, open(os.path.join(d, "msr1", name), "w"))
+            r = subprocess.run(["bash", SUMMARY, d, "upgrade", "msr1", "0", "x", "1"], capture_output=True, text=True, timeout=120)
+            self.assertIn("| peer_probe | n/a | tcp22 |", r.stdout)
+            self.assertIn("| peer_ping_ok | false | false |", r.stdout)
+            self.assertNotIn("| peer_probe | null", r.stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 REHEARSE_FIRST_ENTRY = "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic"
 NO_REHEARSAL = "no successful one-shot rehearsal of this host on the running kernel 7.0.0-31-generic (record: none)"
 NOTHING_TO_REPAIR = "nothing to repair: dpkg --audit is clean"

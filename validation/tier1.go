@@ -1028,7 +1028,28 @@ func waitForReady(ctx context.Context, proc remote.Process, timeout time.Duratio
 			}
 			captureLine(line)
 		case err := <-errCh:
-			return "", appendCaptured(fmt.Errorf("refapp exited before ready: %w", err))
+			// The scanner goroutine sends a line before it can send the
+			// end of the stream, and lineCh holds one. A refapp that wrote
+			// its ready line and closed its stderr at once leaves both
+			// channels ready here, and select picks one at random: half
+			// of the time that was this case and the ready line was
+			// thrown away as "exited before ready: EOF" (#546). The end
+			// of the stream cannot overtake a line, so take what lineCh
+			// still holds before giving up.
+			for {
+				select {
+				case line, ok := <-lineCh:
+					if !ok {
+						return "", appendCaptured(fmt.Errorf("refapp exited before ready: %w", err))
+					}
+					if strings.HasPrefix(line, "ready addr=") {
+						return strings.TrimSpace(strings.TrimPrefix(line, "ready addr=")), nil
+					}
+					captureLine(line)
+				default:
+					return "", appendCaptured(fmt.Errorf("refapp exited before ready: %w", err))
+				}
+			}
 		}
 	}
 }

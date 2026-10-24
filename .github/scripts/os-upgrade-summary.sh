@@ -467,8 +467,10 @@ if [ -s "$pre" ]; then
 		echo "| prerequisite $f | $b | $a |"
 	done
 	for f in lan_ip_present peer_ping_ok peer_probe placement_vector_present max_vector_total runner_listeners; do
-		b=$(j ".$f" "$pre")
-		a=$(if [ -s "$post" ]; then j ".$f" "$post"; else echo "(no snapshot)"; fi)
+		# a snapshot taken before the probe was recorded has no peer_probe: "n/a", not "null" (peer_ping_ok is a boolean, jq's // would eat false)
+		q=".$f"; [ "$f" = peer_probe ] && q='.peer_probe // "n/a"'
+		b=$(j "$q" "$pre")
+		a=$(if [ -s "$post" ]; then j "$q" "$post"; else echo "(no snapshot)"; fi)
 		echo "| $f | $b | $a |"
 	done
 	if [ -s "$d/pre-survey.json" ] && [ -s "$d/post-survey.json" ]; then
