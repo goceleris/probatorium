@@ -256,8 +256,15 @@ class Survey(Base):
         try:
             for argv in (["apt-get", "update"], ["apt-get", "-y", "full-upgrade"], ["grub-set-default", "x"], ["apt-mark", "manual", "x"],
                          ["dkms", "autoinstall"], ["rm", "-rf", "/"], ["systemctl", "restart", "x"], ["dpkg", "--configure", "-a"]):
-                with self.assertRaises(SystemExit, msg=" ".join(argv)):
-                    osu.run(argv)
+                self.assertFalse(osu.ro_allowed(argv), " ".join(argv))
+                # the guard must raise before anything is executed; if it did not, a PATH of one empty directory makes the program "not found" (rc 127),
+                # not a real `rm -rf /` of this machine (r2 n5; the tool appends only the sbin directories)
+                saved_path, os.environ["PATH"] = os.environ.get("PATH", ""), self.enterContext(tempfile.TemporaryDirectory())
+                try:
+                    with self.assertRaises(SystemExit, msg=" ".join(argv)):
+                        osu.run(argv)
+                finally:
+                    os.environ["PATH"] = saved_path
             with self.assertRaises(SystemExit):
                 osu.write("/x", "y")
             self.assertTrue(osu.ro_allowed(["apt-get", "-s", "full-upgrade"]))
@@ -2072,9 +2079,27 @@ class FreezeThaw(Base):
         self.put(snap_hold=self.SNAP_FUTURE)
         r = self.thaw()
         self.assertEqual(r.returncode, 1)
-        self.assertIn("snap refresh hold is '%s', no longer the 'forever' the freeze set: left alone" % self.SNAP_FUTURE, r.stdout + r.stderr)
+        self.assertIn("snap refresh hold is '%s': neither the 'none' the freeze found nor the 'forever' it set, so someone changed it since: left alone. "
+                      "Put it back with `snap refresh --unhold` (or `snap refresh --hold=forever`) and dispatch mode=thaw again" % self.SNAP_FUTURE, r.stdout + r.stderr)
         self.assertEqual(self.hold(), self.SNAP_FUTURE)
         self.assertTrue(os.path.exists(self.h.root + FREEZE_RECORD))
+        self.put(snap_hold="forever")  # the way out the message names: the thaw then takes the hold it set off, and finishes
+        self.assertEqual(self.thaw("9").returncode, 0)
+        self.assertEqual(self.hold(), "")
+
+    def test_a_snap_hold_changed_after_a_freeze_whose_hold_failed_does_not_blame_the_forever_it_never_set(self):  # r2 m1
+        self.put(snap_hold=self.SNAP_PAST)
+        self.assertEqual(self.freeze(snap_change_rc=1).returncode, 1)  # the previous hold had expired and the 'forever' was refused
+        self.put(snap_change_rc=0, snap_hold=self.SNAP_FUTURE)  # someone sets another hold
+        r = self.thaw()
+        self.assertEqual(r.returncode, 1)
+        msg = r.stdout + r.stderr
+        self.assertIn("snap refresh hold is '%s': neither the '%s' the freeze found nor the 'forever' it tried to set, so someone changed it since: left alone. " % (self.SNAP_FUTURE, self.SNAP_PAST), msg)
+        self.assertIn("Put it back with `snap set system refresh.hold=%s` (or `snap refresh --hold=forever`) and dispatch mode=thaw again" % self.SNAP_PAST, msg)
+        self.assertNotIn("the freeze set: left alone", msg)
+        self.put(snap_hold=self.SNAP_PAST)  # the way out
+        self.assertEqual(self.thaw("9").returncode, 0)
+        self.assertEqual(self.hold(), self.SNAP_PAST)
 
     def test_a_tailscale_set_that_fails_fails_the_freeze_and_keeps_the_record(self):
         self.ts_state(Check=True, Apply=True)
@@ -2116,6 +2141,15 @@ class FreezeThaw(Base):
             self.assertEqual(self.svc(u), ("active", "enabled"), u)
         self.put(tailscale_prefs_rc=0)
         self.assertEqual(self.freeze().returncode, 0)  # and the next dispatch freezes
+
+    def test_two_updaters_that_do_not_answer_are_named_in_the_plural(self):  # r2 n2
+        self.ts_state(Check=True, Apply=True)
+        r = self.freeze(snap_get_rc=1, tailscale_prefs_rc=1)
+        self.assertEqual(r.returncode, 1)
+        msg = r.stdout + r.stderr
+        self.assertIn("tailscale (`tailscale debug prefs`) and snapd (`snap get system refresh.hold`) are installed but did not answer: their self-update state is not known", msg)
+        self.assertNotIn(" is installed but", msg)
+        self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))
 
     def test_a_snap_hold_that_fails_or_does_not_take_fails_the_freeze_and_keeps_the_record(self):
         r = self.freeze(snap_change_rc=1)
@@ -2589,6 +2623,8 @@ class FreezeThaw(Base):
         self.assertIn("needs a plain rehearsal (it pins)", msg)  # r4 2: the host whose saved default is unknown
         self.assertIn("cluster-reboot workflow (red with 'kernel changed', by design)", msg)
         self.assertIn("mode=disarm clears the one-shot (nothing was changed)", msg)
+        self.assertIn("a one-shot that is still pending decides the next boot (that kernel, not the saved default), and a host that already booted with it pending has a GRUB that ignores the environment block: only the console", msg)  # r5 N7: a fact only after a boot
+        self.assertNotIn("if a one-shot is pending, GRUB ignores", msg)
         self.assertNotIn("finish the upgrade", msg)
 
     def test_a_thaw_killed_after_it_finished_is_told_so_by_the_next_one(self):  # r3 7
@@ -2602,8 +2638,13 @@ class FreezeThaw(Base):
         self.assertIn("If that thaw run ended red, it was killed after it had finished", msg)  # a conditional, not a fact: a green thaw run is the other possibility
         self.assertIn("If a LATER freeze was made since and its record is gone", msg)
         self.assertIn("do not thaw again", msg)
+        self.assertIn("; and, ONLY if that freeze turned them off or held them, tailscale set --auto-update=true and snap refresh --unhold; then rm " + NR_DROPIN, msg)  # r1 m2
         self.h.load()
         self.assertEqual(self.run_ok("survey")["freeze_last_thaw"]["thawed_by_run"], "8")
+        # the survey carries the proof of that thaw too (r2 n1, r5 N3: the answer of a thaw that was killed before it could give it)
+        last = self.run_ok("survey")["freeze_last_thaw"]
+        self.assertEqual((last["not_measured_at_thaw"], last["drift_proof"], last["drift_checked_by_run"]), ([], True, "8"))
+        self.assertRegex(last["drift_checked_utc"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 
     def test_a_thaw_of_a_platform_that_did_not_move_says_so(self):  # F2
         self.assertEqual(self.freeze().returncode, 0)
@@ -2704,6 +2745,40 @@ class FreezeThaw(Base):
         self.assertEqual(json.loads(t.stdout)["thawed_by_run"], "8")
         self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))
 
+    def test_a_retry_after_a_complete_archive_adds_the_restores_it_made_itself_to_the_archive(self):  # r5 N4
+        self.assertEqual(self.freeze().returncode, 0)
+        self.assertEqual(self.thaw().returncode, 0)
+        arch_path = self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"
+        first = json.load(open(arch_path))
+        rec = dict(first)  # killed after the archive and before the removal of the record
+        for k in ("thawed_utc", "thawed_by_run"):
+            rec.pop(k)
+        rec["status"] = "frozen"
+        self.h.w(FREEZE_RECORD, json.dumps(rec))
+        self.set_svc("apt-daily.timer", "inactive", "disabled")  # and something disabled a unit again before the retry
+        t = self.thaw("9")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        want = first["restored"] + ["enable apt-daily.timer", "start apt-daily.timer"]
+        a = self.archive()
+        self.assertEqual(a["restored"], want)  # the archive names what the retry restored ...
+        self.assertEqual(json.loads(t.stdout)["restored"], want)  # ... and so does the answer
+        self.assertEqual((a["thawed_by_run"], a["thawed_utc"]), ("8", first["thawed_utc"]))  # who thawed and when stay the first attempt's
+        self.assertEqual(self.svc("apt-daily.timer"), ("active", "enabled"))
+        self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))
+
+    def test_a_tailscale_set_whose_read_back_failed_is_in_the_archive_of_the_retry_that_finds_it_done(self):  # r2 n4
+        self.ts_state(Check=True, Apply=True)
+        self.assertEqual(self.freeze().returncode, 0)
+        self.put(tailscale_set_breaks_prefs=True)
+        r = self.thaw("9")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("tailscale auto-update could not be read after `tailscale set --auto-update=true`", r.stdout + r.stderr)
+        self.assertIn("tailscale set --auto-update=true (rc 0, not verified: the read did not answer)", self.record()["restored"])
+        self.put(tailscale_set_breaks_prefs=False, tailscale_prefs_rc=0)
+        t = self.thaw("10")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        self.assertIn("tailscale set --auto-update=true (rc 0, not verified: the read did not answer)", self.archive()["restored"])  # the retry skipped it: the pref was on
+
     def test_the_archive_of_an_earlier_freeze_with_the_same_run_id_is_not_taken_for_this_one(self):  # r4 4 (a re-run of the workflow freezes again under the same run id)
         self.assertEqual(self.freeze().returncode, 0)
         self.assertEqual(self.thaw("8").returncode, 0)
@@ -2721,13 +2796,22 @@ class FreezeThaw(Base):
         self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
         self.assertEqual(self.archive()["thawed_by_run"], "8")
 
-    def test_a_thaw_changes_no_package_and_no_grub(self):  # r4 6 (kills a grub-mkconfig or a package command in the thaw)
+    def test_a_thaw_changes_no_package_and_no_grub(self):  # r4 6, r5 N6 (an allowlist: kills grub-mkconfig, a package command, `unattended-upgrade` run directly, a start of another unit)
+        self.ts_state(Check=True, Apply=True)  # so the thaw also puts tailscale's auto-update back
         self.assertEqual(self.freeze().returncode, 0)
         seen = len(self.h.calls())
         self.assertEqual(self.thaw().returncode, 0)
-        reads = ("dpkg-query", "apt-mark showhold", "grub-editenv list")  # the drift check reads the package list and the holds
-        bad = [c for c in self.h.calls()[seen:] if c.startswith(("apt", "dpkg", "update-", "dkms", "grub-")) and not c.startswith(reads)]
-        self.assertEqual(bad, [])
+        reads = ("dpkg-query ", "apt-mark showhold", "grub-editenv list", "findmnt ", "mokutil --sb-state", "snap get system", "snap refresh --time", "tailscale debug prefs")  # the drift check and the proof
+
+        def allowed(c):
+            if c.startswith(reads) or c in ("snap refresh --unhold", "tailscale set --auto-update=true"):
+                return True
+            w = c.split(" ")
+            return w[0] == "systemctl" and (w[1] in ("is-active", "is-enabled") or (w[1] in ("start", "enable") and w[-1] in FREEZE_UNITS))
+
+        calls = [c for c in self.h.calls()[seen:] if c]
+        self.assertTrue(any(c.startswith("systemctl start") for c in calls))  # the thaw did run: the list is not empty by accident
+        self.assertEqual([c for c in calls if not allowed(c)], [])
 
     def test_the_drift_check_says_when_and_by_which_run_it_was_made(self):  # r4 8
         self.assertEqual(self.freeze().returncode, 0)
@@ -2752,6 +2836,7 @@ class FreezeThaw(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("rm %s %s " % (NR_DROPIN, FREEZE_RECORD), (r.stdout + r.stderr).replace("\\n", " "))
         self.assertIn("an upgrade and a new freeze are refused", r.stdout + r.stderr)
+        self.assertIn("tailscale set --auto-update=true and snap refresh --unhold; then rm", (r.stdout + r.stderr).replace("\\n", " "))  # r1 m2
 
     def test_a_needrestart_file_of_ours_that_the_record_does_not_know_is_removed_by_the_thaw(self):  # F4
         r = self.freeze(systemctl_kill_nth={"is-active apt-daily.timer": 2})

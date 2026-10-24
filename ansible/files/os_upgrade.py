@@ -1871,7 +1871,7 @@ def last_thaw():
             continue
         if r.get("thawed_utc", "") >= best.get("thawed_utc", ""):
             best = r
-    return {k: best[k] for k in ("run_id", "thawed_by_run", "thawed_utc", "drifted_at_thaw") if k in best}
+    return {k: best[k] for k in ("run_id", "utc", "thawed_by_run", "thawed_utc", "drifted_at_thaw", "not_measured_at_thaw", "drift_proof", "drift_checked_utc", "drift_checked_by_run") if k in best}
 
 
 def save_freeze(rec):
@@ -1892,7 +1892,7 @@ def cmd_freeze(a):
     if bd != run_k:
         fail("grub's saved default kernel is %r and the host runs %r: any reboot (a power loss, a panic, cluster-reboot) boots %s, so the platform this freeze would "
              "record is not the one that comes back. Pin the running kernel first: an un-upgraded host whose first menu entry is another kernel needs a console rehearsal; a host whose saved default is unknown but whose first menu entry is the running kernel needs a plain rehearsal (it pins); a host that "
-             "runs the new kernel after a failed verification goes back to the old one with the cluster-reboot workflow (red with 'kernel changed', by design); if a one-shot is pending, GRUB ignores the environment block: only the console, and mode=disarm clears the one-shot (nothing was changed)" % (
+             "runs the new kernel after a failed verification goes back to the old one with the cluster-reboot workflow (red with 'kernel changed', by design); a one-shot that is still pending decides the next boot (that kernel, not the saved default), and a host that already booted with it pending has a GRUB that ignores the environment block: only the console, and mode=disarm clears the one-shot (nothing was changed)" % (
                  bd or "unknown", run_k, bd or "something else"))
     ios = apt_config().get("Unattended-Upgrade::InstallOnShutdown", "")
     if ios.lower() in TRUE_WORDS:
@@ -1908,8 +1908,8 @@ def cmd_freeze(a):
     # an installed updater that does not answer: its state cannot be recorded, so nothing is changed (a refusal, like the others, with no record)
     silent = [x for x, v in (("tailscale (`tailscale debug prefs`)", ts_before and ts_before[0]), ("snapd (`snap get system refresh.hold`)", snap_before)) if v == "unknown"]
     if silent:
-        fail("%s is installed but did not answer: its self-update state is not known, so the freeze cannot record it before it changes it (nothing was changed). "
-             "Check that tailscaled and snapd run and dispatch mode=freeze again" % " and ".join(silent))
+        fail("%s %s installed but did not answer: %s self-update state is not known, so the freeze cannot record it before it changes it (nothing was changed). "
+             "Check that tailscaled and snapd run and dispatch mode=freeze again" % (" and ".join(silent), "are" if len(silent) > 1 else "is", "their" if len(silent) > 1 else "its"))
     rec = {"run_id": a.run_id, "host": rd("/etc/hostname"), "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "freezing",
            "units": {u: {"before": {"active": s["active"], "enabled": s["enabled"]}, "present": s["present"], "changes": []} for u, s in before.items()},
            "needrestart": {"installed": nr_before is not None, "mode_before": nr_before or "", "dropin_written": False, "adopted": adopted},
@@ -2025,12 +2025,12 @@ def cmd_thaw(a):
         fail("nothing to thaw: there is no freeze record here. The newest archived thaw is of the freeze of run %s (thawed by run %s at %s, archive %s/freeze-%s-thawed.json, "
              "drifted at thaw time: %s). If that thaw run ended red, it was killed after it had finished: read the archive, do not thaw again. If a LATER freeze was made since and "
              "its record is gone, the units it stopped are still stopped: put back by hand ONLY the ones you know were on: systemctl enable --now apt-daily.timer "
-             "apt-daily-upgrade.timer unattended-upgrades.service; then rm %s" % (
+             "apt-daily-upgrade.timer unattended-upgrades.service; and, ONLY if that freeze turned them off or held them, tailscale set --auto-update=true and snap refresh --unhold; then rm %s" % (
                  last.get("run_id"), last.get("thawed_by_run"), last.get("thawed_utc"), STATE_DIR, last.get("run_id"), "; ".join(last.get("drifted_at_thaw", [])) or "nothing",
                  NEEDRESTART_DROPIN))
     if not rec or rec.get("status") == "unreadable":
         fail("nothing to thaw: no readable freeze record at %s. This tool froze nothing here, or the record is gone; if units were stopped by a freeze whose record is lost, put back by hand ONLY the "
-             "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; then rm %s %s "
+             "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; and, ONLY if that freeze turned them off or held them, tailscale set --auto-update=true and snap refresh --unhold; then rm %s %s "
              "(the unreadable record itself: until it is gone, an upgrade and a new freeze are refused)" % (FREEZE_RECORD, NEEDRESTART_DROPIN, FREEZE_RECORD))
     # the end-of-campaign proof: what moved since the freeze, read BEFORE the thaw changes anything (the survey after a thaw has no record to compare with)
     # and stored in the record, durably, by the FIRST attempt: a retry (after a masked unit, a kill) reuses it, because by then the first attempt's own
@@ -2088,6 +2088,7 @@ def cmd_thaw(a):
             errors.append("tailscale set --auto-update=true: %s" % (out + err).strip()[-160:])
         elif ts_now == "unknown":
             errors.append("tailscale auto-update could not be read after `tailscale set --auto-update=true` (`tailscale debug prefs` did not answer)")
+            restored("tailscale set --auto-update=true (rc 0, not verified: the read did not answer)")  # the retry finds the pref on and skips it: the archive must still name it
         elif ts_now != "true":
             errors.append("tailscale auto-update is %s, was true before the freeze" % ts_now)
         else:
@@ -2111,7 +2112,11 @@ def cmd_thaw(a):
         elif now == "unknown":
             errors.append("snap refresh hold could not be read (`snap get system refresh.hold` did not answer): not restored, run mode=thaw again")
         elif now not in (want, found):  # neither what the freeze set, nor what it found, nor what the thaw puts back: someone changed it since
-            errors.append("snap refresh hold is %r, no longer the 'forever' the freeze set: left alone" % (now or "none"))
+            # who set what: after a hold the freeze set, "forever" is what it set; after one it only tried to set (it failed, or was killed), nothing of its own is there
+            errors.append("snap refresh hold is %r: neither the %r the freeze found nor the 'forever' it %s, so someone changed it since: left alone. Put it back with `%s` "
+                          "(or `snap refresh --hold=forever`) and dispatch mode=thaw again" % (
+                              now or "none", found or "none", "set" if sn.get("changed") else "tried to set",
+                              ("snap set system refresh.hold=" + found) if found else "snap refresh --unhold"))
     nr = rec.get("needrestart", {})
     # also when the record does not say it wrote the file (a kill between the write and the record): a file with exactly our text is ours
     if nr.get("dropin_written") or (os.path.exists(p(NEEDRESTART_DROPIN)) and rd(NEEDRESTART_DROPIN) == NEEDRESTART_TEXT.strip()):
@@ -2150,6 +2155,10 @@ def cmd_thaw(a):
         out = rec
     else:
         out = prev
+        if len(done) > len(prev.get("restored", [])):
+            # this retry restored things the killed attempt had not (a unit that was disabled again before it): the archive names them too
+            prev["restored"] = done
+            write(arch, json.dumps(prev, indent=1, sort_keys=True) + "\n", durable=True)
     os.remove(p(FREEZE_RECORD))
     emit(dict(out, ok=True))
 

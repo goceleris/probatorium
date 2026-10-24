@@ -83,8 +83,10 @@ if [ -s "$pre" ]; then
 		echo "| prerequisite $f | $b | $a |"
 	done
 	for f in lan_ip_present peer_ping_ok peer_probe placement_vector_present max_vector_total runner_listeners; do
-		b=$(jq -r ".$f" "$pre")
-		a=$(if [ -s "$post" ]; then jq -r ".$f" "$post"; else echo "(no snapshot)"; fi)
+		# a snapshot taken before the probe was recorded has no peer_probe: "n/a", not "null" (peer_ping_ok is a boolean, jq's // would eat false)
+		q=".$f"; [ "$f" = peer_probe ] && q='.peer_probe // "n/a"'
+		b=$(jq -r "$q" "$pre")
+		a=$(if [ -s "$post" ]; then jq -r "$q" "$post"; else echo "(no snapshot)"; fi)
 		echo "| $f | $b | $a |"
 	done
 	echo

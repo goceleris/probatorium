@@ -16,7 +16,7 @@ FIXTURES = os.path.join(HERE, "fixtures")
 
 COMMANDS = ["dpkg-query", "dpkg", "apt-get", "apt-mark", "apt-config", "apt-cache", "modinfo", "dkms", "grub-editenv",
             "grub-set-default", "grub-reboot", "update-grub", "grub-mkconfig", "grub-install", "update-initramfs", "findmnt", "df", "timedatectl", "systemctl",
-            "sysctl", "cc", "curl", "mokutil", "gcc", "make", "ip", "ping", "sshd", "tailscaled", "tailscale", "snap", "netplan"]
+            "sysctl", "cc", "curl", "mokutil", "gcc", "make", "ip", "ping", "sshd", "tailscaled", "tailscale", "snap", "netplan", "unattended-upgrade"]
 
 STUB = r'''#!__PYTHON__
 import fnmatch, json, os, sys, time, shutil

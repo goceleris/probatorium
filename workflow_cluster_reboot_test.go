@@ -441,6 +441,11 @@ func TestRebootSnapshotScript(t *testing.T) {
 	if !bytes.Contains(out, []byte(" 0 failed")) {
 		t.Fatalf("test_reboot_snapshot.sh reported failures:\n%s", out)
 	}
+	// The script skips the peer probe cases on a machine without python3 or timeout (a Mac), instead of failing. On the Linux that runs this
+	// test they must run: a runner that lost either would otherwise drop them without a word.
+	if bytes.Contains(out, []byte("SKIP peer probe")) {
+		t.Fatalf("test_reboot_snapshot.sh skipped the peer probe cases on Linux (python3 and timeout are expected here):\n%s", out)
+	}
 }
 
 // TestRebootSnapshotRecordMatchesWhatIsRead decodes the script's JSON strictly, and ties the judgement's field
@@ -631,6 +636,19 @@ func TestRebootSummary(t *testing.T) {
 			t.Errorf("verified summary lacks %q:\n%s", want, got)
 		}
 	}
+	// a snapshot from before the probe was recorded has no peer_probe: the row reads n/a, not null; a recorded probe prints as is, and a
+	// false peer_ping_ok is not turned into n/a
+	if !strings.Contains(got, "| peer_probe | n/a | n/a |") || strings.Contains(got, "null") {
+		t.Errorf("an old snapshot without peer_probe must print n/a, never null:\n%s", got)
+	}
+	write("pre-snapshot.json", strings.Replace(snap("aaa", 4050000000), `"peer_ping_ok":true,`, `"peer_ping_ok":false,"peer_probe":"tcp22",`, 1))
+	got = run("0", "x")
+	for _, want := range []string{"| peer_probe | tcp22 | n/a |", "| peer_ping_ok | false | true |"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("a recorded probe is not printed as recorded: lacks %q:\n%s", want, got)
+		}
+	}
+	write("pre-snapshot.json", snap("aaa", 4050000000))
 
 	write("phase.txt", "rebooting\n")
 	if err := os.Remove(filepath.Join(host, "post-snapshot.json")); err != nil {

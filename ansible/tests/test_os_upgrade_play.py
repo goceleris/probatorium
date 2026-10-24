@@ -124,8 +124,11 @@ class Play(unittest.TestCase):
         cls.h = FakeHost(os.path.join(cls.work, "host"))
         w = cls.work
         with open(w + "/osu-wrapper.sh", "w") as f:
-            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\n[ -n "${SURVEY_FAIL_AFTER_REBOOT:-}" ] && [ "$1" = survey ] && grep -q FAKE-REBOOT %s && { echo "survey failed after the reboot (test)" >&2; exit 3; }\n[ -n "${THAW_NO_ANSWER:-}" ] && [ "$1" = thaw ] && { echo "the thaw tool died before it answered (test)" >&2; exit 3; }\nPATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s exec %s %s "$@"\n' % (
-                cls.h.state_dir, cls.h.log, cls.h.log, cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py")))
+            tool = "env PATH=%s:$PATH OSU_ROOT=%s STUB_STATE=%s STUB_LOG=%s %s %s" % (cls.h.bin, cls.h.root, cls.h.state_dir, cls.h.log, sys.executable, os.path.join(ANSIBLE_DIR, "files", "os_upgrade.py"))
+            # THAW_NO_ANSWER: the thaw tool dies before it does anything. THAW_LOSE_ANSWER: it does everything (the archive, the removal of the record) and is killed
+            # before its answer reaches the play (exit 137, nothing on stdout)
+            f.write('#!/bin/bash\n[ -e %s/down ] && { echo "ssh: connect to host: Connection timed out" >&2; exit 255; }\necho "OSU $*" >> %s\n[ -n "${SURVEY_FAIL_AFTER_REBOOT:-}" ] && [ "$1" = survey ] && grep -q FAKE-REBOOT %s && { echo "survey failed after the reboot (test)" >&2; exit 3; }\n[ -n "${THAW_NO_ANSWER:-}" ] && [ "$1" = thaw ] && { echo "the thaw tool died before it answered (test)" >&2; exit 3; }\n[ -n "${THAW_LOSE_ANSWER:-}" ] && [ "$1" = thaw ] && { %s "$@" > /dev/null 2>&1; echo "the thaw tool was killed after it finished (test)" >&2; exit 137; }\nexec %s "$@"\n' % (
+                cls.h.state_dir, cls.h.log, cls.h.log, tool, tool))
         with open(w + "/snapshot-wrapper.sh", "w") as f:
             f.write('''#!/bin/bash
 # the preflight call carries a sixth argument, the host that asks; FAIL_HOST makes that host's preflight snapshot fail
@@ -823,6 +826,74 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("th_k2", self.TH)  # and the host is thawed by the next dispatch, with a drift check of its own
         self.assertEqual(self.rc, 0, self.log[-2000:])
         self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
+
+    def test_a_thaw_killed_after_it_finished_shows_the_drift_found_in_the_archive_not_not_measured(self):  # r5 N3
+        self.fresh()
+        self.play("lt_fz", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.h.load()
+        self.h.state["packages"]["linux-firmware"]["version"] = "20260319.git2"  # a real drift
+        self.h.save()
+        self.play("lt_th", self.TH, env={"THAW_LOSE_ANSWER": "1"})  # the tool archived, removed the record, and was killed before it answered
+        self.assertNotEqual(self.rc, 0)
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json"))
+        r = self.j("msr1", "result.json")
+        self.assertEqual(len(r["drifted_at_thaw"]), 1)  # from the archive, not null
+        self.assertTrue(r["drift_checked_by_run"] and r["drift_checked_utc"])
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("NOT ESTABLISHED", md)  # the thaw run is red: the proof is not claimed
+        self.assertIn("Found by the FIRST thaw attempt (run %s at %s), before it changed anything: package list (sha256) changed" % (r["drift_checked_by_run"], r["drift_checked_utc"]), md)
+        self.assertNotIn("The drift check itself did not run (not measured)", md)
+        self.assertNotIn("DID NOT MOVE", md)
+        self.assertIn("**result: NOT CONFIRMED** (ansible-playbook exit", md)  # the record is gone: the headline does not say it is kept
+        self.assertIn("there is no freeze record on msr1 any more", md)
+        self.assertNotIn("the freeze record is kept", md)
+        self.assertNotIn("dispatch mode=thaw again.", md)
+
+    def test_the_archive_of_another_freeze_is_not_the_proof_of_a_thaw_that_died_before_its_check(self):  # r5 N3 (run id equal, time not)
+        self.fresh()
+        self.play("ls_fz0", self.FZ)
+        self.play("ls_th0", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.play("ls_fz1", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        rid = self.j("msr1", "result.json")["run_id"]
+        stale = dict(json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json")), utc="1999-01-01T00:00:00Z", thawed_utc="2999-01-01T00:00:00Z",
+                     thawed_by_run="1", status="thawed", drifted_at_thaw=["STALE DRIFT OF AN EARLIER FREEZE"])
+        self.h.w("/var/lib/celeris-os-upgrade/freeze-%s-thawed.json" % rid, json.dumps(stale))  # the newest archive, the same run id, another freeze
+        self.play("ls_th1", self.TH, env={"THAW_NO_ANSWER": "1"})  # and a thaw that dies before it does anything
+        self.assertNotEqual(self.rc, 0)
+        r = self.j("msr1", "result.json")
+        self.assertIsNone(r["drifted_at_thaw"])
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("The drift check itself did not run (not measured)", md)
+        self.assertNotIn("STALE DRIFT", md)
+
+    def test_a_freeze_refused_before_it_wrote_a_record_says_nothing_was_changed_and_nothing_is_to_thaw(self):  # r2 m3
+        self.fresh()
+        self.h.load()
+        self.h.state["snap_get_rc"] = 1  # snapd does not answer: the tool refuses, with no record
+        self.h.save()
+        self.play("rf_fz", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json"))
+        md = " ".join(self.summary("freeze", "msr1").split())
+        self.assertIn("**result: NOT FROZEN** (ansible-playbook exit", md)
+        self.assertIn("refused or failed before it wrote a record, so nothing was changed and there is no record to thaw", md)
+        self.assertIn("did not answer", md)  # the tool's own error is still shown
+        self.assertNotIn("the record of what was changed is kept", md)
+        self.assertNotIn("mode=thaw undoes", md)
+        self.assertNotIn("record of run", md)  # the refusal's JSON is no record: no "record of run null at null" line
+        self.h.load()
+        self.h.state["snap_get_rc"] = 0
+        self.h.state["snap_change_rc"] = 1  # now it freezes half way: the record IS kept, and the old wording is true
+        self.h.save()
+        self.play("rf_fz2", self.FZ)
+        self.assertNotEqual(self.rc, 0)
+        self.assertTrue(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/freeze.json"))
+        md = " ".join(self.summary("freeze", "msr1").split())
+        self.assertIn("NOT FROZEN, OR NOT COMPLETELY", md)
+        self.assertIn("the record of what was changed is kept on the host; mode=thaw undoes a freeze that failed half way", md)
 
     def test_a_thaw_whose_proof_could_not_read_an_updater_says_not_measured_and_not_drift(self):
         self.fresh()

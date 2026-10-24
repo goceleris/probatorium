@@ -178,7 +178,7 @@ class ChecklistReplay(unittest.TestCase):
         for name, rec, want, detail in (("frozen and holding", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": [], "self_updaters": held}, "PASS",
                                          "self-updaters held by the freeze: tailscale auto-update true -> false, snap refresh hold none -> forever"),
                                         ("frozen, an updater did not answer (not measured is not drift)", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": [], "self_updaters": held,
-                                                                                         "not_measured": ["snap refresh hold (`snap get system refresh.hold` did not answer)"]}, "PASS",
+                                                                                         "not_measured": ["snap refresh hold (`snap get system refresh.hold` did not answer)"]}, "NOTE",  # not a full green: something was not read (r2 n3)
                                          "NOT MEASURED (did not answer, not drift): snap refresh hold"),
                                         ("frozen before the self-updaters were covered", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS",
                                          "this freeze PREDATES the self-updater cover: tailscale auto-update and snapd refresh were NOT stopped by it"),
@@ -228,6 +228,89 @@ class ChecklistReplay(unittest.TestCase):
             self.assertIn("locks held yes", rows["msa2-client"][1])
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+    def test_the_before_and_after_table_prints_n_a_for_a_snapshot_without_the_probe(self):
+        # a snapshot taken before peer_probe was recorded (an older run's evidence) has no such key: the row reads n/a, never null;
+        # a recorded probe prints as recorded, and a false peer_ping_ok stays false (jq's // would turn false into n/a)
+        d = tempfile.mkdtemp(prefix="osu-real-probe-")
+        try:
+            os.makedirs(os.path.join(d, "msr1"))
+            old = {"lan_ip_present": True, "peer_ping_ok": False, "placement_vector_present": True, "max_vector_total": 1, "runner_listeners": 0}
+            for name, rec in (("pre-snapshot.json", dict(old)), ("post-snapshot.json", dict(old, peer_probe="tcp22"))):
+                json.dump(rec, open(os.path.join(d, "msr1", name), "w"))
+            r = subprocess.run(["bash", SUMMARY, d, "upgrade", "msr1", "0", "x", "1"], capture_output=True, text=True, timeout=120)
+            self.assertIn("| peer_probe | n/a | tcp22 |", r.stdout)
+            self.assertIn("| peer_ping_ok | false | false |", r.stdout)
+            self.assertNotIn("| peer_probe | null", r.stdout)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+    def test_the_thaw_summary_flags_what_was_not_measured_and_never_prints_an_empty_run(self):
+        # r2 n1 (the failed-thaw line names it too), n3 (the headline says it), r5 N5 (a record without the drift check's run and time: jq's // keeps "")
+        nm = ["snap refresh hold (`snap get system refresh.hold` did not answer)"]
+        base = {"mode": "thaw", "status": "thawed", "freeze_ok": True, "kernel_running": "7.0.0-31-generic", "freeze": {}, "drifted_at_thaw": [], "drift_proof": True,
+                "drift_checked_by_run": "", "drift_checked_utc": "", "not_measured_at_thaw": nm}
+        for name, over, wants, unwanted in (
+                ("proof with a hole", {}, ["**platform at thaw time: DID NOT MOVE** (an updater was NOT MEASURED: see the end of this line) since the freeze",
+                                           "(checked by the first thaw attempt: run ? at ?)", "NOT MEASURED at thaw time (it did not answer, so it is neither drift nor proof): snap refresh hold"], ["run  at"]),
+                ("proof without a hole", {"not_measured_at_thaw": []}, ["**platform at thaw time: DID NOT MOVE** since the freeze"], ["NOT MEASURED"]),
+                ("a thaw that did not complete", {"freeze_ok": False, "status": "thaw-failed"},
+                 ["NOT ESTABLISHED", "Found by the FIRST thaw attempt (run ? at ?), before it changed anything: nothing", "NOT MEASURED at thaw time (it did not answer, so it is neither drift nor proof): snap refresh hold"], ["run  at", "DID NOT MOVE"]),
+                ("a platform that moved", {"drifted_at_thaw": ["package list (sha256) changed"]},
+                 ["**PLATFORM MOVED since the freeze** (found at thaw time, by run ? at ?)", "NOT MEASURED at thaw time"], ["run  at"])):
+            d = tempfile.mkdtemp(prefix="osu-real-thaw-")
+            try:
+                os.makedirs(os.path.join(d, "msr1"))
+                json.dump(dict(base, **over), open(os.path.join(d, "msr1", "result.json"), "w"))
+                r = subprocess.run(["bash", SUMMARY, d, "thaw", "msr1", "0", "x", "1"], capture_output=True, text=True, timeout=120)
+                md = " ".join(r.stdout.split())
+                for w in wants:
+                    self.assertIn(w, md, name)
+                for u in unwanted:
+                    self.assertNotIn(u, md, name)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
+
+    def test_the_freeze_and_thaw_headlines_do_not_guess_about_a_record_from_a_result_that_was_never_written(self):  # r1 M1, m1
+        # The play writes result.json last. A judge refusal, an unreachable host or a dropped connection leaves none, and the step summary runs on every red
+        # run: "the record is gone" or "the record is kept" can be said only when something says so (a result.json with a record, the judge's own refusal).
+        nothing = "nothing to thaw: no freeze record on this host (this tool froze nothing here, or its record is gone)"
+        resume = "/var/lib/celeris-power/resume-pending.json exists: a power-loss resume is pending (cluster-power-restore --list)"
+        frozen = "this host is already frozen (run 41, 2026-10-23T10:00:00Z, status frozen): dispatch mode=thaw first."
+        neutral_thaw = ["**result: NOT THAWED** (ansible-playbook exit 2): the run stopped before the result was recorded", "dispatch mode=survey to read it, and mode=thaw again if it is still there"]
+        neutral_freeze = ["**result: NOT FROZEN** (ansible-playbook exit 2): the run stopped before the result was recorded", "dispatch mode=survey: a record of a freeze that failed half way may exist"]
+        gone = ["NOT CONFIRMED", "no freeze record on msr1 any more", "there is no record to thaw", "Do not dispatch mode=thaw again"]
+        unreadable = {"mode": "thaw", "status": "thaw-failed", "freeze_ok": False, "freeze": {"status": "unreadable"}, "error": "nothing to thaw: no readable freeze record at /x"}
+        for name, mode, result, refusal, wants, unwanted in (
+                ("thaw, a judge refusal, no result", "thaw", None, resume, neutral_thaw, gone),
+                ("thaw, host unreachable (nothing written)", "thaw", None, None, neutral_thaw, gone),
+                ("thaw, the judge's nothing to thaw", "thaw", None, nothing, ["**result: NOT THAWED** (ansible-playbook exit 2): refused, there is no freeze record on msr1: nothing to thaw"],
+                 ["NOT CONFIRMED", "dispatch mode=thaw again", "the freeze record is kept"]),
+                ("freeze, a judge refusal, no result", "freeze", None, resume, neutral_freeze, gone),
+                ("freeze, host unreachable", "freeze", None, None, neutral_freeze, gone),
+                ("freeze, already frozen", "freeze", None, frozen, ["**result: NOT FROZEN** (ansible-playbook exit 2): refused, this host is already frozen. Its record is kept"],
+                 gone + ["the run stopped before"]),
+                ("thaw, an unreadable record", "thaw", unreadable, None, ["**result: NOT THAWED, OR NOT COMPLETELY** (ansible-playbook exit 2): the freeze record is kept"], gone),
+                ("thaw, a tool answer without a record (killed after it finished)", "thaw", {"mode": "thaw", "status": "thaw-failed", "freeze_ok": False, "freeze": {}},
+                 None, ["**result: NOT CONFIRMED** (ansible-playbook exit 2): there is no freeze record on msr1 any more"], ["the run stopped before", "the freeze record is kept"])):
+            d = tempfile.mkdtemp(prefix="osu-real-headline-")
+            try:
+                os.makedirs(os.path.join(d, "msr1"))
+                if result is not None:
+                    json.dump(result, open(os.path.join(d, "msr1", "result.json"), "w"))
+                if refusal is not None:
+                    open(os.path.join(d, "msr1", "refusal.txt"), "w").write(refusal + "\n")
+                r = subprocess.run(["bash", SUMMARY, d, mode, "msr1", "2", "x", "1"], capture_output=True, text=True, timeout=120)
+                md = " ".join(r.stdout.split())
+                for w in wants:
+                    self.assertIn(w, md, name)
+                for u in unwanted:
+                    self.assertNotIn(u, md, name)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
 
 
 REHEARSE_FIRST_ENTRY = "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic"

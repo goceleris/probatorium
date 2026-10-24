@@ -46,6 +46,9 @@ func TestFireH2CChurn_SlowCloseLandsInRingWithError(t *testing.T) {
 	if f.Err != "EOF" {
 		t.Errorf("err = %q, want the verbatim \"EOF\" (the string six reviews could not recover from the v1.5.11 artifact)", f.Err)
 	}
+	// No timer-skew allowance here, unlike TestFireWSTorture_SlowRejectLandsInRingWithStatus (#541): this handler has the same read-then-sleep shape,
+	// so the same few-ms skew can happen, but this assertion has never failed and there is no measurement to size an allowance from. If it does, add
+	// the same allowance with the evidence in the comment.
 	if f.ReadMs < hold.Milliseconds() {
 		t.Errorf("read_ms = %d, want >= %d", f.ReadMs, hold.Milliseconds())
 	}
@@ -176,8 +179,17 @@ func TestFireWSTorture_SlowRejectLandsInRingWithStatus(t *testing.T) {
 	if f.Outcome != "handshake-fail-status" || !strings.HasPrefix(f.Status, "HTTP/1.1 400") {
 		t.Errorf("ring entry lost the outcome or the status line: %+v", f)
 	}
-	if f.ReadMs < hold.Milliseconds() || f.Err != "" {
-		t.Errorf("read_ms=%d err=%q, want >= %d and no error", f.ReadMs, f.Err, hold.Milliseconds())
+	// The read leg is timed from when conn.Write returns on the client, but
+	// the handler's hold starts when the server has read the request, which
+	// on a loaded runner can be a moment before the client's timer starts;
+	// ReadMs is also truncated to whole milliseconds. Together they put the
+	// client's reading a few ms under the hold (CI run 39918940944: 1197 for
+	// a 1200 ms hold, #541). The allowance is 10 ms, about three times the
+	// one miss seen. A handler that did not hold lands a second short.
+	const timerSkew = 10 * time.Millisecond
+	if want := (hold - timerSkew).Milliseconds(); f.ReadMs < want || f.Err != "" {
+		t.Errorf("read_ms=%d err=%q, want >= %d (hold %d less %d for timer skew) and no error",
+			f.ReadMs, f.Err, want, hold.Milliseconds(), timerSkew.Milliseconds())
 	}
 	if !strings.HasPrefix(f.LocalAddr, "127.0.0.1:") || f.RemoteAddr != hostPort {
 		t.Errorf("addresses lost: %+v", f)
