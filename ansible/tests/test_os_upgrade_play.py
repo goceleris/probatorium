@@ -680,8 +680,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.j("msr1", "freeze.json")["self_updaters"]["snap"]["hold_before"], "2099-01-01T00:00:00+00:00")
         self.assertEqual(self.j("msr1", "post-survey.json")["self_updaters"]["snap_refresh_hold"], "forever")
         md = self.summary("freeze", "msr1")
-        for want in ("result: FROZEN", "sha256 of the package list", "- tailscale auto-update: before the freeze `true` (check-updates `true`), changed by the freeze: True, after it `false`",
-                     "- snapd refresh hold: before the freeze `2099-01-01T00:00:00+00:00`, changed by the freeze: True, after it `forever`", "`apt-daily.timer`: present true; before active/enabled; changed: stopped + disabled; now inactive/disabled", "kernel `7.0.0-31-generic`",
+        for want in ("result: FROZEN", "sha256 of the package list", "- tailscale auto-update: before the freeze `true` (check-updates `true`), changed by the freeze: true, after it `false`",
+                     "- snapd refresh hold: before the freeze `2099-01-01T00:00:00+00:00`, changed by the freeze: true, after it `forever`", "`apt-daily.timer`: present true; before active/enabled; changed: stopped + disabled; now inactive/disabled", "kernel `7.0.0-31-generic`",
                      "needrestart: installed true"):
             self.assertIn(want, md)
         # a freeze changes timers and one needrestart file: no reboot, no grub, no package
