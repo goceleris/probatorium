@@ -845,6 +845,10 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("Found by the FIRST thaw attempt (run %s at %s), before it changed anything: package list (sha256) changed" % (r["drift_checked_by_run"], r["drift_checked_utc"]), md)
         self.assertNotIn("The drift check itself did not run (not measured)", md)
         self.assertNotIn("DID NOT MOVE", md)
+        self.assertIn("**result: NOT CONFIRMED** (ansible-playbook exit", md)  # the record is gone: the headline does not say it is kept
+        self.assertIn("there is no freeze record on msr1 any more", md)
+        self.assertNotIn("the freeze record is kept", md)
+        self.assertNotIn("dispatch mode=thaw again.", md)
 
     def test_the_archive_of_another_freeze_is_not_the_proof_of_a_thaw_that_died_before_its_check(self):  # r5 N3 (run id equal, time not)
         self.fresh()
