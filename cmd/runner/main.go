@@ -1648,6 +1648,22 @@ func (c Config) ratesCell(id string) bool {
 	return matchCellGlob(include, exclude, id)
 }
 
+// ratedBench is the one method of *loadgen.Benchmarker a rated pass uses.
+type ratedBench interface {
+	Run(ctx context.Context) (*loadgen.Result, error)
+}
+
+// newRatedBench builds the loadgen for one rated pass. It is a variable so a
+// test can hand runRatedSweep a fake result (an under-delivered pass, an
+// errored one, a failed construction) without a server that misbehaves on cue.
+var newRatedBench = func(cfg loadgen.Config) (ratedBench, error) {
+	bm, err := loadgen.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return bm, nil
+}
+
 // runRatedSweep drives one rated (closed-loop, CO-corrected) pass per
 // configured fraction of saturationRPS, returning the (target, P99) samples
 // for aggregation plus the on-disk pass records. A pass that errors or returns
@@ -1668,7 +1684,7 @@ func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, satu
 
 		timeout := 5*cfg.Warmup + 2*cfg.RatedDuration + 60*time.Second
 		ctx, cancel := context.WithTimeout(parent, timeout)
-		bm, err := loadgen.New(lgCfg)
+		bm, err := newRatedBench(lgCfg)
 		if err != nil {
 			cancel()
 			fmt.Fprintf(os.Stderr, "  rated pass target=%.0f: loadgen.New: %v\n", target, err)
