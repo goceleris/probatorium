@@ -257,6 +257,13 @@ jobs:
       # (mage_tier.go setBenchEnvFromProfile honours a non-blank preset the
       # same way it honours BENCH_DURATION / BENCH_WARMUP).
       BENCH_CELLS: ${{ github.event.inputs.cells || '' }}
+      # AB (throwaway branch ab/p2-pinplan-confirm-38, not for merge): the 90 s / 20 s window of the PINPLAN io512 cell, as a preset keyed on the
+      # cells input (the workflow has no per-cell window: one value per run). A run whose cells glob names an io512 column gets 90 s / 20 s; every
+      # other run, and any dispatch with an empty cells input, gets '' = the profile's own window (mage_tier.go setBenchEnvFromProfile keeps a
+      # non-blank BENCH_DURATION / BENCH_WARMUP and fills a blank one from the profile; ansible sizes the hang guard from them). This is the
+      # ab/pinplan-v6-90s preset commit as an expression, so ONE branch serves both dispatches of the P2 run.
+      BENCH_DURATION: ${{ contains(github.event.inputs.cells, '-io512') && '90s' || '' }}
+      BENCH_WARMUP: ${{ contains(github.event.inputs.cells, '-io512') && '20s' || '' }}
       # PUBLISH POLICY. Two rules, in order:
       #
       #   1. profile=fast NEVER publishes — full stop, regardless of the
