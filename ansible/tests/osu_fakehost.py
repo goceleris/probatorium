@@ -298,12 +298,48 @@ if name == "tailscale":
         if st.get("tailscale_prefs_rc"):
             sys.exit(st["tailscale_prefs_rc"])
         out(json.dumps({"AutoUpdate": st.get("tailscale_autoupdate", {"Check": True, "Apply": False})}) + "\n"); sys.exit(0)
+    if args[:1] == ["set"]:  # `tailscale set --auto-update=<bool>` edits the one pref; tailscale_set_rc fails, tailscale_set_noop reports success and changes nothing
+        if st.get("tailscale_set_rc"):
+            sys.stderr.write("tailscale set: tailscaled is not running (test)\n"); sys.exit(st["tailscale_set_rc"])
+        if not st.get("tailscale_set_noop"):
+            for a in args:
+                if a.startswith("--auto-update="):
+                    st.setdefault("tailscale_autoupdate", {"Check": True, "Apply": False})["Apply"] = a.endswith("=true")
+                    if st.get("tailscale_set_flips_check"):
+                        st["tailscale_autoupdate"]["Check"] = False
+            save()
+        if st.get("tailscale_set_kill_after"):
+            os.kill(os.getppid(), 9)  # the pref WAS changed and the process dies before it can record it
+            time.sleep(1)
+            sys.exit(1)
+        sys.exit(0)
     out("1.90.0\n"); sys.exit(0)
 if name == "snap":
     if args[:2] == ["refresh", "--time"]:
         if st.get("snap_refresh_rc"):
             sys.exit(st["snap_refresh_rc"])
-        out("timer: 00:00~24:00/4\nlast: today at 06:12 CEST\nnext: today at 18:30 CEST\n"); sys.exit(0)
+        hold = st.get("snap_hold", "")
+        out("timer: 00:00~24:00/4\nlast: today at 06:12 CEST\n" + ("hold: %s\n" % hold if hold else "") + "next: today at 18:30 CEST\n"); sys.exit(0)
+    if args[:3] == ["get", "system", "refresh.hold"]:
+        if st.get("snap_get_rc"):
+            sys.stderr.write("error: cannot communicate with server (test)\n"); sys.exit(st["snap_get_rc"])
+        if not st.get("snap_hold"):
+            sys.stderr.write('error: snap "core" has no "refresh.hold" configuration option\n'); sys.exit(1)
+        out(st["snap_hold"] + "\n"); sys.exit(0)
+    # the verbs that change the system-wide hold (the config refresh.hold): snap_change_rc fails them, snap_change_noop reports success and changes nothing
+    verb = {("refresh", "--hold=forever"): "forever", ("refresh", "--unhold"): ""}.get(tuple(args[:2]))
+    if verb is None and args[:2] == ["set", "system"] and len(args) == 3 and args[2].startswith("refresh.hold="):
+        verb = args[2].split("=", 1)[1]
+    if verb is not None:
+        if st.get("snap_change_rc"):
+            sys.stderr.write("error: cannot perform the following tasks: snapd is busy (test)\n"); sys.exit(st["snap_change_rc"])
+        if not st.get("snap_change_noop"):
+            st["snap_hold"] = verb; save()
+        if st.get("snap_change_kill_after"):
+            os.kill(os.getppid(), 9)  # the hold WAS changed and the process dies before it can record it
+            time.sleep(1)
+            sys.exit(1)
+        sys.exit(0)
     sys.exit(1)
 if name == "tailscaled":
     out("1.90.0\n"); sys.exit(st.get("tailscaled_rc", 0))
