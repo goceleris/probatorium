@@ -1232,4 +1232,19 @@ func TestOSUpgradeConstantsAgree(t *testing.T) {
 	if rj == nil || rs == nil || rj[1] != rs[1] {
 		t.Errorf("os_protected_regex (%v) and PROTECTED_RE (%v) differ", rj, rs)
 	}
+	// the judge's "nothing to thaw" text spells out the hand restore (r5 N2: a thaw dispatch is refused before the tool can say it): the
+	// units and the needrestart file are the tool's
+	script := mustRead(t, osScript)
+	fu := regexp.MustCompile(`(?m)^FREEZE_UNITS = \(([^)]*)\)$`).FindStringSubmatch(script)
+	nd := regexp.MustCompile(`(?m)^NEEDRESTART_DROPIN = "([^"]+)"$`).FindStringSubmatch(script)
+	if fu == nil || nd == nil {
+		t.Fatalf("FREEZE_UNITS %v, NEEDRESTART_DROPIN %v not found in the tool", fu, nd)
+	}
+	var units []string
+	for _, m := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(fu[1], -1) {
+		units = append(units, m[1])
+	}
+	if want := "systemctl enable --now " + strings.Join(units, " ") + "; then rm " + nd[1]; !strings.Contains(judge, want) {
+		t.Errorf("the judge's nothing-to-thaw text lacks the hand restore the tool names: %q", want)
+	}
 }

@@ -178,7 +178,7 @@ class ChecklistReplay(unittest.TestCase):
         for name, rec, want, detail in (("frozen and holding", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": [], "self_updaters": held}, "PASS",
                                          "self-updaters held by the freeze: tailscale auto-update true -> false, snap refresh hold none -> forever"),
                                         ("frozen, an updater did not answer (not measured is not drift)", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": [], "self_updaters": held,
-                                                                                         "not_measured": ["snap refresh hold (`snap get system refresh.hold` did not answer)"]}, "PASS",
+                                                                                         "not_measured": ["snap refresh hold (`snap get system refresh.hold` did not answer)"]}, "NOTE",  # not a full green: something was not read (r2 n3)
                                          "NOT MEASURED (did not answer, not drift): snap refresh hold"),
                                         ("frozen before the self-updaters were covered", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS",
                                          "this freeze PREDATES the self-updater cover: tailscale auto-update and snapd refresh were NOT stopped by it"),
@@ -245,6 +245,33 @@ class ChecklistReplay(unittest.TestCase):
             self.assertNotIn("| peer_probe | null", r.stdout)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+    def test_the_thaw_summary_flags_what_was_not_measured_and_never_prints_an_empty_run(self):
+        # r2 n1 (the failed-thaw line names it too), n3 (the headline says it), r5 N5 (a record without the drift check's run and time: jq's // keeps "")
+        nm = ["snap refresh hold (`snap get system refresh.hold` did not answer)"]
+        base = {"mode": "thaw", "status": "thawed", "freeze_ok": True, "kernel_running": "7.0.0-31-generic", "freeze": {}, "drifted_at_thaw": [], "drift_proof": True,
+                "drift_checked_by_run": "", "drift_checked_utc": "", "not_measured_at_thaw": nm}
+        for name, over, wants, unwanted in (
+                ("proof with a hole", {}, ["**platform at thaw time: DID NOT MOVE** (an updater was NOT MEASURED: see the end of this line) since the freeze",
+                                           "(checked by the first thaw attempt: run ? at ?)", "NOT MEASURED at thaw time (it did not answer, so it is neither drift nor proof): snap refresh hold"], ["run  at"]),
+                ("proof without a hole", {"not_measured_at_thaw": []}, ["**platform at thaw time: DID NOT MOVE** since the freeze"], ["NOT MEASURED"]),
+                ("a thaw that did not complete", {"freeze_ok": False, "status": "thaw-failed"},
+                 ["NOT ESTABLISHED", "Found by the FIRST thaw attempt (run ? at ?), before it changed anything: nothing", "NOT MEASURED at thaw time (it did not answer, so it is neither drift nor proof): snap refresh hold"], ["run  at", "DID NOT MOVE"]),
+                ("a platform that moved", {"drifted_at_thaw": ["package list (sha256) changed"]},
+                 ["**PLATFORM MOVED since the freeze** (found at thaw time, by run ? at ?)", "NOT MEASURED at thaw time"], ["run  at"])):
+            d = tempfile.mkdtemp(prefix="osu-real-thaw-")
+            try:
+                os.makedirs(os.path.join(d, "msr1"))
+                json.dump(dict(base, **over), open(os.path.join(d, "msr1", "result.json"), "w"))
+                r = subprocess.run(["bash", SUMMARY, d, "thaw", "msr1", "0", "x", "1"], capture_output=True, text=True, timeout=120)
+                md = " ".join(r.stdout.split())
+                for w in wants:
+                    self.assertIn(w, md, name)
+                for u in unwanted:
+                    self.assertNotIn(u, md, name)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
 
 
 REHEARSE_FIRST_ENTRY = "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic"

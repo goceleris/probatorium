@@ -1139,6 +1139,10 @@
         freeze_out: "{{ ((maint_freeze_raw if os_mode == 'freeze' else maint_thaw_raw).stdout | default('{}', true)) }}"
         freeze_json: "{{ freeze_out | from_json if (freeze_out | trim | regex_search('^[{]')) else {} }}"
         after_f: "{{ maint_after_raw.stdout | from_json }}"
+        # a thaw killed after it archived the freeze and removed the record, before it answered, leaves neither an answer nor a record: its proof is in the
+        # newest archive, which is this freeze's only when run id AND time agree with the record the thaw started from (r5 N3)
+        lt_raw: "{{ after_f.freeze_last_thaw | default({}) }}"
+        lt: "{{ lt_raw if ((lt_raw.run_id | default('a')) == ((pre_survey.freeze | default({})).run_id | default('b')) and (lt_raw.utc | default('a')) == ((pre_survey.freeze | default({})).utc | default('b'))) else {} }}"
         freeze_ok: "{{ freeze_rc | int == 0 and (freeze_json.ok | default(false)) and ((after_f.freeze | default({})) | length > 0) == (os_mode == 'freeze') }}"
         freeze_result:
           host: "{{ inventory_hostname }}"
@@ -1152,11 +1156,11 @@
           error: "{{ freeze_json.error | default('') }}"
           drifted_after: "{{ (after_f.freeze | default({})).drifted | default([]) }}"
           # from the tool's answer, which a FAILED thaw gives too; else from the kept record (its first attempt stored the drift before it changed anything)
-          drifted_at_thaw: "{{ (freeze_json.drifted_at_thaw | default((after_f.freeze | default({})).drifted_at_thaw | default(none))) if os_mode == 'thaw' else [] }}"
-          drift_checked_utc: "{{ (freeze_json.drift_checked_utc | default((after_f.freeze | default({})).drift_checked_utc | default(''))) if os_mode == 'thaw' else '' }}"
-          drift_checked_by_run: "{{ (freeze_json.drift_checked_by_run | default((after_f.freeze | default({})).drift_checked_by_run | default(''))) if os_mode == 'thaw' else '' }}"
-          not_measured_at_thaw: "{{ (freeze_json.not_measured_at_thaw | default((after_f.freeze | default({})).not_measured_at_thaw | default([]))) if os_mode == 'thaw' else [] }}"
-          drift_proof: "{{ (freeze_json.drift_proof | default((after_f.freeze | default({})).drift_proof | default(false))) if os_mode == 'thaw' else false }}"
+          drifted_at_thaw: "{{ (freeze_json.drifted_at_thaw | default((after_f.freeze | default({})).drifted_at_thaw | default(lt.drifted_at_thaw | default(none)))) if os_mode == 'thaw' else [] }}"
+          drift_checked_utc: "{{ (freeze_json.drift_checked_utc | default((after_f.freeze | default({})).drift_checked_utc | default(lt.drift_checked_utc | default('')))) if os_mode == 'thaw' else '' }}"
+          drift_checked_by_run: "{{ (freeze_json.drift_checked_by_run | default((after_f.freeze | default({})).drift_checked_by_run | default(lt.drift_checked_by_run | default('')))) if os_mode == 'thaw' else '' }}"
+          not_measured_at_thaw: "{{ (freeze_json.not_measured_at_thaw | default((after_f.freeze | default({})).not_measured_at_thaw | default(lt.not_measured_at_thaw | default([])))) if os_mode == 'thaw' else [] }}"
+          drift_proof: "{{ (freeze_json.drift_proof | default((after_f.freeze | default({})).drift_proof | default(lt.drift_proof | default(false)))) if os_mode == 'thaw' else false }}"
           power_cycle: "No power-cycle needed: nothing was rebooted."
       when: os_mode in ['freeze', 'thaw']
 

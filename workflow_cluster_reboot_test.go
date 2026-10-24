@@ -441,6 +441,11 @@ func TestRebootSnapshotScript(t *testing.T) {
 	if !bytes.Contains(out, []byte(" 0 failed")) {
 		t.Fatalf("test_reboot_snapshot.sh reported failures:\n%s", out)
 	}
+	// The script skips the peer probe cases on a machine without python3 or timeout (a Mac), instead of failing. On the Linux that runs this
+	// test they must run: a runner that lost either would otherwise drop them without a word.
+	if bytes.Contains(out, []byte("SKIP peer probe")) {
+		t.Fatalf("test_reboot_snapshot.sh skipped the peer probe cases on Linux (python3 and timeout are expected here):\n%s", out)
+	}
 }
 
 // TestRebootSnapshotRecordMatchesWhatIsRead decodes the script's JSON strictly, and ties the judgement's field
