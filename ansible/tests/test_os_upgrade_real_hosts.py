@@ -177,6 +177,9 @@ class ChecklistReplay(unittest.TestCase):
         held = {"tailscale": {"auto_update_before": "true", "auto_update_after": "false"}, "snap": {"hold_before": "none", "hold_after": "forever"}}
         for name, rec, want, detail in (("frozen and holding", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": [], "self_updaters": held}, "PASS",
                                          "self-updaters held by the freeze: tailscale auto-update true -> false, snap refresh hold none -> forever"),
+                                        ("frozen, an updater did not answer (not measured is not drift)", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": [], "self_updaters": held,
+                                                                                         "not_measured": ["snap refresh hold (`snap get system refresh.hold` did not answer)"]}, "PASS",
+                                         "NOT MEASURED (did not answer, not drift): snap refresh hold"),
                                         ("frozen before the self-updaters were covered", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS",
                                          "this freeze PREDATES the self-updater cover: tailscale auto-update and snapd refresh were NOT stopped by it"),
                                         ("frozen but a unit came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["apt-daily.timer=active/enabled"]}, "FAIL", ""),

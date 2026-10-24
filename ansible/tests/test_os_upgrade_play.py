@@ -824,6 +824,26 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(self.rc, 0, self.log[-2000:])
         self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
 
+    def test_a_thaw_whose_proof_could_not_read_an_updater_says_not_measured_and_not_drift(self):
+        self.fresh()
+        self.play("nm_fz", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.h.load()
+        self.h.state["snap_get_rc"] = 1  # snapd does not answer at the first thaw attempt
+        self.h.save()
+        self.play("nm_th1", self.TH)
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.j("msr1", "result.json")["not_measured_at_thaw"], ["snap refresh hold (`snap get system refresh.hold` did not answer)"])
+        self.h.load()
+        self.h.state["snap_get_rc"] = 0
+        self.h.save()
+        self.play("nm_th2", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("platform at thaw time: DID NOT MOVE", md)
+        self.assertIn("NOT MEASURED at thaw time (it did not answer, so it is neither drift nor proof): snap refresh hold", md)
+        self.assertNotIn("PLATFORM MOVED", md)
+
     def test_a_thaw_of_a_record_without_a_platform_claims_nothing(self):  # r3 2
         self.fresh()
         u = {"before": {"active": "active", "enabled": "enabled"}, "present": True, "changes": []}

@@ -1839,12 +1839,23 @@ def freeze_state():
     # the two self-updaters the freeze verified off (a record from before they were covered has no *_after: nothing to compare)
     su = rec.get("self_updaters") or {}
     # (recorded "unset" too: a tailnet-wide default can turn an auto-update that was never set on, once the control server answers)
+    # An updater that does not answer is NOT MEASURED, which is not drift (tailscaled or snapd restarting would redden a good freeze and the end-of-campaign
+    # proof) and not "fine" either: it is listed apart, and a real flip to on is drift whenever it can be read.
+    not_measured = []
     ts_after = (su.get("tailscale") or {}).get("auto_update_after")
-    if ts_after in ("false", "unset") and tailscale_autoupdate()[0] == "true":
-        drifted.append("tailscale auto-update is on, was %s after the freeze" % ts_after)
-    if (su.get("snap") or {}).get("hold_after") == "forever" and snap_hold() != "forever":
-        drifted.append("snap refresh hold is %r, not 'forever'" % (snap_hold() or "none"))
-    return dict(rec, drifted=drifted)
+    if ts_after in ("false", "unset"):
+        ts_now = tailscale_autoupdate()[0]
+        if ts_now == "unknown":
+            not_measured.append("tailscale auto-update (`tailscale debug prefs` did not answer)")
+        elif ts_now == "true":
+            drifted.append("tailscale auto-update is on, was %s after the freeze" % ts_after)
+    if (su.get("snap") or {}).get("hold_after") == "forever":
+        hold_now = snap_hold()
+        if hold_now == "unknown":
+            not_measured.append("snap refresh hold (`snap get system refresh.hold` did not answer)")
+        elif hold_now != "forever":
+            drifted.append("snap refresh hold is %r, not 'forever'" % (hold_now or "none"))
+    return dict(rec, drifted=drifted, not_measured=not_measured)
 
 
 def last_thaw():
@@ -1894,6 +1905,11 @@ def cmd_freeze(a):
     # the self-updaters' previous states are READ here, before the first save (reads change nothing); None: the program is not installed
     ts_before = tailscale_autoupdate() if have("tailscale") else None
     snap_before = snap_hold() if have("snap") else None
+    # an installed updater that does not answer: its state cannot be recorded, so nothing is changed (a refusal, like the others, with no record)
+    silent = [x for x, v in (("tailscale (`tailscale debug prefs`)", ts_before and ts_before[0]), ("snapd (`snap get system refresh.hold`)", snap_before)) if v == "unknown"]
+    if silent:
+        fail("%s is installed but did not answer: its self-update state is not known, so the freeze cannot record it before it changes it (nothing was changed). "
+             "Check that tailscaled and snapd run and dispatch mode=freeze again" % " and ".join(silent))
     rec = {"run_id": a.run_id, "host": rd("/etc/hostname"), "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "freezing",
            "units": {u: {"before": {"active": s["active"], "enabled": s["enabled"]}, "present": s["present"], "changes": []} for u, s in before.items()},
            "needrestart": {"installed": nr_before is not None, "mode_before": nr_before or "", "dropin_written": False, "adopted": adopted},
@@ -1942,9 +1958,7 @@ def cmd_freeze(a):
     # tailscale's own updater: only an auto-update that is ON is turned off. Apply "unset" is left alone (no flag unsets it, so a thaw could not put it
     # back), and a tailnet-wide default can still set it once the control server answers: the survey's self_updaters shows it
     ts = rec["self_updaters"]["tailscale"]
-    if ts["auto_update_before"] == "unknown":
-        errors.append("tailscale is installed but `tailscale debug prefs` did not answer: its auto-update is not known")
-    elif ts["auto_update_before"] == "true":
+    if ts["auto_update_before"] == "true":
         ts["pending"] = "auto-update=false"
         save_freeze(rec)
         rc, out, err = run(["tailscale", "set", "--auto-update=false"], timeout=60)  # `set` edits ONE pref (not `up`, which resets the others)
@@ -1961,9 +1975,7 @@ def cmd_freeze(a):
     # (daemon/api_snaps.go snapHoldMany, overlord/configstate/configcore/refresh.go, overlord/snapstate/autorefresh.go) the config accepts "forever" or an RFC 3339 time with no
     # limit, and isRefreshHeld is only holdTime.After(now). A manual `snap refresh` is not held, only the automatic refreshes.
     sn = rec["self_updaters"]["snap"]
-    if sn["hold_before"] == "unknown":
-        errors.append("snapd is installed but `snap get system refresh.hold` did not answer: its refresh hold is not known")
-    elif sn["hold_before"] not in ("absent", "forever"):  # a hold that is forever already is left as it is
+    if sn["hold_before"] not in ("absent", "forever"):  # a hold that is forever already is left as it is
         sn["pending"] = "hold"
         save_freeze(rec)
         rc, out, err = run(["snap", "refresh", "--hold=forever"], timeout=120)
@@ -1980,15 +1992,19 @@ def cmd_freeze(a):
             errors.append("%s is still %s/%s after the freeze" % (u, s["active"], s["enabled"]))
     if rec["needrestart"]["installed"] and needrestart_mode() != "l":
         errors.append("needrestart is still configured with restart mode %r" % needrestart_mode())
-    if ts["installed"] and ts["auto_update_before"] != "unknown":
+    if ts["installed"]:
         ts["auto_update_after"], ts["check_updates_after"] = tailscale_autoupdate()
-        if ts["auto_update_before"] == "true" and ts["auto_update_after"] != "false":
+        if ts["auto_update_after"] == "unknown":
+            errors.append("tailscale auto-update could not be read after the freeze (`tailscale debug prefs` did not answer)")
+        elif ts["auto_update_before"] == "true" and ts["auto_update_after"] != "false":
             errors.append("tailscale auto-update is still %s after the freeze" % ts["auto_update_after"])
-        if ts["check_updates_after"] != ts["check_updates_before"]:
+        if ts["auto_update_after"] != "unknown" and ts["check_updates_after"] != ts["check_updates_before"]:
             errors.append("tailscale check-updates changed from %s to %s: the freeze only turns the auto-update off" % (ts["check_updates_before"], ts["check_updates_after"]))
-    if sn["installed"] and sn["hold_before"] != "unknown":
+    if sn["installed"]:
         sn["hold_after"], sn["time_after"] = snap_hold() or "none", snap_refresh_time()
-        if sn["hold_after"] != "forever" or "hold: forever" not in sn["time_after"].split(" ; "):
+        if sn["hold_after"] == "unknown":
+            errors.append("snap refresh hold could not be read after the freeze (`snap get system refresh.hold` did not answer)")
+        elif sn["hold_after"] != "forever" or "hold: forever" not in sn["time_after"].split(" ; "):
             errors.append("snap refresh is not held after the freeze (refresh.hold %r, `snap refresh --time`: %s)" % (sn["hold_after"], sn["time_after"]))
     rec["after"] = {u: {"active": s["active"], "enabled": s["enabled"]} for u, s in after.items()}
     rec["platform"] = platform_identity()
@@ -2020,7 +2036,9 @@ def cmd_thaw(a):
     # and stored in the record, durably, by the FIRST attempt: a retry (after a masked unit, a kill) reuses it, because by then the first attempt's own
     # restores read as drift. The proof only counts for a completed freeze that recorded a platform.
     if "drifted_at_thaw" not in rec:
-        rec["drifted_at_thaw"] = freeze_state().get("drifted", [])
+        fs = freeze_state()
+        rec["drifted_at_thaw"] = fs.get("drifted", [])
+        rec["not_measured_at_thaw"] = fs.get("not_measured", [])  # an updater that did not answer then: the proof says so, it is not drift
         rec["drift_proof"] = rec.get("status") == "frozen" and bool(rec.get("platform"))
         rec["drift_checked_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())  # a retry days later reports THIS check, and the record says when it was made
         rec["drift_checked_by_run"] = a.run_id
@@ -2065,15 +2083,21 @@ def cmd_thaw(a):
     ts, sn = su.get("tailscale") or {}, su.get("snap") or {}
     if ts.get("auto_update_before") == "true" and (ts.get("changed") or ts.get("attempted") or ts.get("pending")) and tailscale_autoupdate()[0] != "true":
         rc, out, err = run(["tailscale", "set", "--auto-update=true"], timeout=60)
+        ts_now = tailscale_autoupdate()[0]
         if rc != 0:
             errors.append("tailscale set --auto-update=true: %s" % (out + err).strip()[-160:])
-        elif tailscale_autoupdate()[0] != "true":
-            errors.append("tailscale auto-update is %s, was true before the freeze" % tailscale_autoupdate()[0])
+        elif ts_now == "unknown":
+            errors.append("tailscale auto-update could not be read after `tailscale set --auto-update=true` (`tailscale debug prefs` did not answer)")
+        elif ts_now != "true":
+            errors.append("tailscale auto-update is %s, was true before the freeze" % ts_now)
         else:
             restored("tailscale set --auto-update=true")
     if sn.get("hold_before") not in (None, "absent", "unknown", "forever") and (sn.get("changed") or sn.get("attempted") or sn.get("pending")):
-        # a recorded time that has passed by now is no hold: snapd clears it by itself, so setting it back could not be verified
-        want = "" if sn["hold_before"] == "none" or hold_expired(sn["hold_before"]) else sn["hold_before"]
+        # found: the hold as the freeze found it ("" none). want: what the thaw puts back: a recorded time that has already passed is no hold, and setting it
+        # back could not be verified (snapd clears an expired hold only when its auto-refresh loop runs: the cluster hosts show an expired seed hold,
+        # `hold: 2026-04-29`, that was never cleared, so an expired recorded hold reads back as itself, not as none)
+        found = "" if sn["hold_before"] == "none" else sn["hold_before"]
+        want = "" if not found or hold_expired(found) else found
         now = snap_hold()
         if now == "forever":  # what the freeze set: back to the recorded hold (none: removed)
             argv = ["snap", "refresh", "--unhold"] if not want else ["snap", "set", "system", "refresh.hold=" + want]
@@ -2084,7 +2108,9 @@ def cmd_thaw(a):
                 errors.append("snap refresh hold is %r, was %r before the freeze" % (snap_hold() or "none", want or "none"))
             else:
                 restored(" ".join(argv))
-        elif now != want:  # neither what the freeze set nor what it found: someone changed it since
+        elif now == "unknown":
+            errors.append("snap refresh hold could not be read (`snap get system refresh.hold` did not answer): not restored, run mode=thaw again")
+        elif now not in (want, found):  # neither what the freeze set, nor what it found, nor what the thaw puts back: someone changed it since
             errors.append("snap refresh hold is %r, no longer the 'forever' the freeze set: left alone" % (now or "none"))
     nr = rec.get("needrestart", {})
     # also when the record does not say it wrote the file (a kill between the write and the record): a file with exactly our text is ours
@@ -2101,7 +2127,7 @@ def cmd_thaw(a):
             errors.append("needrestart restart mode is %r, was %r before the freeze" % (needrestart_mode(), nr.get("mode_before", "")))
     if errors:
         fail("the thaw did not complete (%s); the freeze record is kept: run mode=thaw again" % "; ".join(errors),
-             drifted_at_thaw=drifted_at_thaw, drift_proof=rec.get("drift_proof", False),
+             drifted_at_thaw=drifted_at_thaw, not_measured_at_thaw=rec.get("not_measured_at_thaw", []), drift_proof=rec.get("drift_proof", False),
              drift_checked_utc=rec.get("drift_checked_utc", ""), drift_checked_by_run=rec.get("drift_checked_by_run", ""))
     arch = "%s/freeze-%s-thawed.json" % (STATE_DIR, rec.get("run_id", "x"))
     prev = None

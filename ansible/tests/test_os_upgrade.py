@@ -1939,6 +1939,9 @@ class FreezeThaw(Base):
     def su(self):
         return self.record()["self_updaters"]
 
+    def snap_writes(self, since=0):
+        return [c for c in self.h.calls()[since:] if c.startswith("snap") and not c.startswith(("snap get ", "snap refresh --time"))]
+
     def called(self, prefix, since=0):
         return [c for c in self.h.calls()[since:] if c.startswith(prefix)]
 
@@ -1973,17 +1976,23 @@ class FreezeThaw(Base):
     def test_a_host_without_tailscale_or_snapd_is_frozen_and_thawed_with_both_recorded_absent(self):
         for c in ("tailscale", "snap"):
             os.remove(os.path.join(self.h.bin, c))
-        # the PATH is the stubs' directory ONLY: the machine running the test may have a real tailscale or snap, and a test must never reach it
-        only = {"PATH": self.h.bin}
-        self.h.load()
-        self.h.save()
-        r = self.h.run("freeze", "--run-id", "7", extra_env=only)
+        r = self.freeze()  # the PATH of every fake-host run is the stubs' directory ONLY (see the guard test below)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         su = self.su()
         self.assertEqual((su["tailscale"]["installed"], su["tailscale"]["auto_update_before"], su["snap"]["installed"], su["snap"]["hold_before"]), (False, "absent", False, "absent"))
         self.assertEqual(self.record()["status"], "frozen")
-        self.assertEqual(self.h.run("thaw", "--run-id", "8", extra_env=only).returncode, 0)
+        self.assertEqual(self.thaw().returncode, 0)
         self.assertFalse(self.called("tailscale") or self.called("snap"))
+
+    def test_no_real_tailscale_snap_or_systemctl_is_reachable_from_a_fake_host_run(self):
+        # a fake-host run sees the stubs and nothing else: not what the machine running the tests has installed (the tool appends its own sbin directories too)
+        path = self.h.env()["PATH"]
+        self.assertEqual(path, self.h.bin)
+        for c in ("tailscale", "snap", "systemctl"):
+            self.assertEqual(os.path.dirname(shutil.which(c, path=path + os.pathsep + osu.SBIN)), self.h.bin, c)
+        for c in ("tailscale", "snap"):  # and a host "without" them has no real one behind the stub
+            os.remove(os.path.join(self.h.bin, c))
+            self.assertIsNone(shutil.which(c, path=path + os.pathsep + osu.SBIN), "a real %s is reachable from the sbin directories of this machine" % c)
 
     def test_a_freeze_holds_every_automatic_snap_refresh_forever_and_the_thaw_removes_the_hold_it_set(self):
         r = self.freeze()
@@ -2015,12 +2024,40 @@ class FreezeThaw(Base):
         self.assertFalse(self.called("snap refresh --unhold", seen))
 
     def test_a_snap_hold_that_ran_out_during_the_campaign_is_removed_not_set_back(self):
-        self.put(snap_hold=self.SNAP_PAST)  # snapd clears an expired hold by itself: setting it back could not be verified
+        self.put(snap_hold=self.SNAP_PAST)  # an expired hold is no hold: setting it back could not be verified (snapd only clears it when its auto-refresh loop runs)
         self.assertEqual(self.freeze().returncode, 0)
         th = self.thaw()
         self.assertEqual(th.returncode, 0, th.stdout + th.stderr)
         self.assertEqual(self.hold(), "")
         self.assertFalse(self.called("snap set"))
+
+    def test_an_expired_snap_hold_the_freeze_could_not_replace_is_left_as_found_by_the_thaw(self):
+        # the cluster hosts today: an expired seed hold that snapd never cleared (`hold: 2026-04-29`, `last: n/a`)
+        self.put(snap_hold=self.SNAP_PAST)
+        r = self.freeze(snap_change_rc=1)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.su()["snap"]["attempted"], True)
+        self.put(snap_change_rc=0)
+        seen = len(self.h.calls())
+        th = self.thaw()
+        self.assertEqual(th.returncode, 0, th.stdout + th.stderr)  # the hold is what the freeze found: nothing to put back, nothing to blame on someone
+        self.assertEqual(self.snap_writes(seen), [])  # it reads the hold, it changes nothing
+        self.assertEqual(self.hold(), self.SNAP_PAST)
+        self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))
+        self.assertEqual(self.thaw("9").returncode, 1)  # the record is archived: nothing to thaw twice
+
+    def test_an_expired_snap_hold_with_a_freeze_killed_before_the_hold_ran_is_thawed_too(self):
+        self.put(snap_hold=self.SNAP_PAST)
+        r = self.freeze(snap_change_noop=True, snap_change_kill_after=True)  # killed with `pending` recorded; the hold never took
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.su()["snap"]["pending"], "hold")
+        self.assertEqual(self.hold(), self.SNAP_PAST)
+        self.put(snap_change_noop=False, snap_change_kill_after=False)
+        seen = len(self.h.calls())
+        th = self.thaw()
+        self.assertEqual(th.returncode, 0, th.stdout + th.stderr)
+        self.assertEqual(self.snap_writes(seen), [])  # it reads the hold, it changes nothing
+        self.assertEqual(self.hold(), self.SNAP_PAST)
 
     def test_a_snap_hold_that_is_forever_already_is_left_as_it_is(self):
         self.put(snap_hold="forever")
@@ -2068,12 +2105,17 @@ class FreezeThaw(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("tailscale check-updates changed from true to false", r.stdout + r.stderr)
 
-    def test_a_tailscale_that_does_not_answer_fails_the_freeze_before_it_changes_anything_of_it(self):
+    def test_a_tailscale_that_does_not_answer_refuses_the_freeze_before_anything_is_changed(self):
         r = self.freeze(tailscale_prefs_rc=1)
         self.assertEqual(r.returncode, 1)
-        self.assertIn("`tailscale debug prefs` did not answer", r.stdout + r.stderr)
-        self.assertFalse(self.called("tailscale set"))
-        self.assertEqual(self.su()["tailscale"]["auto_update_before"], "unknown")
+        self.assertIn("did not answer", r.stdout + r.stderr)
+        self.assertIn("nothing was changed", r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))  # a refusal, like the others: no record, so a retry is not "already frozen"
+        self.assertFalse(self.sysctl_calls("stop", "disable") or self.called("tailscale set") or self.called("snap refresh --hold") or os.path.exists(self.h.root + NR_DROPIN))
+        for u in FREEZE_UNITS:
+            self.assertEqual(self.svc(u), ("active", "enabled"), u)
+        self.put(tailscale_prefs_rc=0)
+        self.assertEqual(self.freeze().returncode, 0)  # and the next dispatch freezes
 
     def test_a_snap_hold_that_fails_or_does_not_take_fails_the_freeze_and_keeps_the_record(self):
         r = self.freeze(snap_change_rc=1)
@@ -2088,12 +2130,14 @@ class FreezeThaw(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("snap refresh is not held after the freeze (refresh.hold 'none'", r.stdout + r.stderr)
 
-    def test_a_snapd_that_does_not_answer_fails_the_freeze_before_it_changes_anything_of_it(self):
+    def test_a_snapd_that_does_not_answer_refuses_the_freeze_before_anything_is_changed(self):
+        self.ts_state(Check=True, Apply=True)
         r = self.freeze(snap_get_rc=1)
         self.assertEqual(r.returncode, 1)
-        self.assertIn("`snap get system refresh.hold` did not answer", r.stdout + r.stderr)
-        self.assertFalse(self.called("snap refresh --hold"))
-        self.assertEqual(self.su()["snap"]["hold_before"], "unknown")
+        self.assertIn("snapd (`snap get system refresh.hold`) is installed but did not answer", r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(self.h.root + FREEZE_RECORD))
+        self.assertFalse(self.sysctl_calls("stop", "disable") or self.called("tailscale set") or self.called("snap refresh --hold"))
+        self.assertEqual(self.prefs()["Apply"], True)  # the other updater was not touched either: no half-frozen host
 
     def test_a_freeze_killed_right_after_the_tailscale_change_is_thawed_to_the_recorded_state(self):
         self.ts_state(Check=True, Apply=True)
@@ -2136,6 +2180,64 @@ class FreezeThaw(Base):
         self.assertEqual(th.returncode, 0, th.stdout + th.stderr)
         self.assertFalse(self.called("tailscale set", seen) or self.called("snap refresh", seen) or self.called("snap set", seen))
         self.assertEqual((self.prefs()["Apply"], self.hold()), (True, ""))
+
+    def test_an_updater_that_does_not_answer_is_not_measured_and_is_not_drift(self):
+        self.ts_state(Check=True, Apply=True)
+        self.assertEqual(self.freeze().returncode, 0)
+        self.h.load()
+        self.assertEqual(self.run_ok("survey")["freeze"]["not_measured"], [])
+        self.put(snap_get_rc=1)
+        f = self.run_ok("survey")["freeze"]
+        self.assertEqual((f["drifted"], f["not_measured"]), ([], ["snap refresh hold (`snap get system refresh.hold` did not answer)"]))
+        self.put(snap_get_rc=0, tailscale_prefs_rc=1)
+        f = self.run_ok("survey")["freeze"]
+        self.assertEqual((f["drifted"], f["not_measured"]), ([], ["tailscale auto-update (`tailscale debug prefs` did not answer)"]))
+        # a real flip is still drift whenever it can be read, and one updater not answering does not hide the other's
+        self.put(tailscale_prefs_rc=0, snap_get_rc=1)
+        self.ts_state(Check=True, Apply=True)
+        f = self.run_ok("survey")["freeze"]
+        self.assertEqual((f["drifted"], f["not_measured"]), (["tailscale auto-update is on, was false after the freeze"], ["snap refresh hold (`snap get system refresh.hold` did not answer)"]))
+        self.put(snap_get_rc=0, snap_hold="")
+        f = self.run_ok("survey")["freeze"]
+        self.assertEqual(f["drifted"], ["tailscale auto-update is on, was false after the freeze", "snap refresh hold is 'none', not 'forever'"])
+
+    def test_an_updater_that_does_not_answer_at_thaw_time_is_in_the_proof_as_not_measured_not_as_drift(self):
+        self.assertEqual(self.freeze().returncode, 0)
+        self.put(snap_get_rc=1)
+        r = self.thaw("9")  # the first attempt stores the proof, then cannot read the hold to restore it
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("snap refresh hold could not be read (`snap get system refresh.hold` did not answer): not restored, run mode=thaw again", r.stdout + r.stderr)
+        self.assertNotIn("left alone", r.stdout + r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual((out["drifted_at_thaw"], out["not_measured_at_thaw"]), ([], ["snap refresh hold (`snap get system refresh.hold` did not answer)"]))
+        self.put(snap_get_rc=0)
+        t = self.thaw("10")
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        old = json.load(open(self.h.root + "/var/lib/celeris-os-upgrade/freeze-7-thawed.json"))
+        self.assertEqual((old["drifted_at_thaw"], old["not_measured_at_thaw"], old["drift_proof"]), ([], ["snap refresh hold (`snap get system refresh.hold` did not answer)"], True))
+        self.assertEqual(self.hold(), "")
+
+    def test_a_read_that_fails_after_a_change_says_so_and_does_not_blame_the_change(self):
+        self.ts_state(Check=True, Apply=True)
+        r = self.freeze(tailscale_set_breaks_prefs=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("tailscale auto-update could not be read after the freeze (`tailscale debug prefs` did not answer)", r.stdout + r.stderr)
+        self.assertNotIn("check-updates changed", r.stdout + r.stderr)
+        self.put(tailscale_set_breaks_prefs=False, tailscale_prefs_rc=0)
+        self.assertEqual(self.thaw().returncode, 0)
+        r = self.freeze("9", snap_change_breaks_get=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("snap refresh hold could not be read after the freeze (`snap get system refresh.hold` did not answer)", r.stdout + r.stderr)
+        self.assertNotIn("is not held after the freeze", r.stdout + r.stderr)
+        # and the thaw: tailscale set works, then tailscaled does not answer
+        self.put(snap_change_breaks_get=False, snap_get_rc=0)
+        self.assertEqual(self.thaw("10").returncode, 0)
+        self.ts_state(Check=True, Apply=True)
+        self.assertEqual(self.freeze("11").returncode, 0)
+        self.put(tailscale_set_breaks_prefs=True)
+        r = self.thaw("12")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("tailscale auto-update could not be read after `tailscale set --auto-update=true`", r.stdout + r.stderr)
 
     def test_a_tailscale_auto_update_that_was_never_set_and_comes_on_under_a_freeze_is_drift(self):
         self.ts_state(Check=True)  # Apply unset: the freeze leaves it alone; a tailnet-wide default can set it on later

@@ -67,7 +67,9 @@
 #   list SHA-256, holds): a difference is `drifted`. freeze and thaw are refused while a bench manifest, a runner job or a power-loss resume is on the host;
 #   a freeze also while grub's saved default kernel is not the running kernel. mode=upgrade is REFUSED on a frozen host (thaw, upgrade, freeze again). A
 #   freeze does not stop fwupd, motd-news or ubuntu-pro-client (the survey records the tailscale and snapd `self_updaters`; a host frozen BEFORE they were
-#   covered has a record without them: it reads and thaws as before, and its tailscale and snapd were not stopped).
+#   covered has a record without them: it reads and thaws as before, and its tailscale and snapd were not stopped). A tailscale or snapd that is installed but does not answer
+#   REFUSES the freeze before anything is changed (its previous state cannot be recorded); once frozen, an updater that does not answer is listed
+#   as `not_measured` (and in the thaw proof as `not_measured_at_thaw`), apart from `drifted`: not measured is neither drift nor proof.
 #
 # MODE upgrade (host-changing, ONE host per dispatch)
 #   REFUSES, before touching anything (vars/os_upgrade_judge.yml, refusals_str): any of the three hosts unreachable,
@@ -1153,6 +1155,7 @@
           drifted_at_thaw: "{{ (freeze_json.drifted_at_thaw | default((after_f.freeze | default({})).drifted_at_thaw | default(none))) if os_mode == 'thaw' else [] }}"
           drift_checked_utc: "{{ (freeze_json.drift_checked_utc | default((after_f.freeze | default({})).drift_checked_utc | default(''))) if os_mode == 'thaw' else '' }}"
           drift_checked_by_run: "{{ (freeze_json.drift_checked_by_run | default((after_f.freeze | default({})).drift_checked_by_run | default(''))) if os_mode == 'thaw' else '' }}"
+          not_measured_at_thaw: "{{ (freeze_json.not_measured_at_thaw | default((after_f.freeze | default({})).not_measured_at_thaw | default([]))) if os_mode == 'thaw' else [] }}"
           drift_proof: "{{ (freeze_json.drift_proof | default((after_f.freeze | default({})).drift_proof | default(false))) if os_mode == 'thaw' else false }}"
           power_cycle: "No power-cycle needed: nothing was rebooted."
       when: os_mode in ['freeze', 'thaw']

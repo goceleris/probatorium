@@ -308,6 +308,9 @@ if name == "tailscale":
                     if st.get("tailscale_set_flips_check"):
                         st["tailscale_autoupdate"]["Check"] = False
             save()
+        if st.get("tailscale_set_breaks_prefs"):
+            st["tailscale_prefs_rc"] = 1  # tailscaled stops answering right after the change
+            save()
         if st.get("tailscale_set_kill_after"):
             os.kill(os.getppid(), 9)  # the pref WAS changed and the process dies before it can record it
             time.sleep(1)
@@ -335,6 +338,9 @@ if name == "snap":
             sys.stderr.write("error: cannot perform the following tasks: snapd is busy (test)\n"); sys.exit(st["snap_change_rc"])
         if not st.get("snap_change_noop"):
             st["snap_hold"] = verb; save()
+        if st.get("snap_change_breaks_get"):
+            st["snap_get_rc"] = 1  # snapd stops answering right after the change
+            save()
         if st.get("snap_change_kill_after"):
             os.kill(os.getppid(), 9)  # the hold WAS changed and the process dies before it can record it
             time.sleep(1)
@@ -553,7 +559,9 @@ class FakeHost:
     # ---- running
     def env(self, extra=None):
         e = dict(os.environ)
-        e.update({"PATH": self.bin + os.pathsep + e["PATH"], "OSU_ROOT": self.root, "STUB_STATE": self.state_dir, "STUB_LOG": self.log})
+        # the PATH is the stubs' directory ONLY: the machine running the tests may have a real tailscale, snap or systemctl, and a fake-host run must never reach it
+        # (the tool appends its own sbin directories: test_no_real_tailscale_snap_or_systemctl_is_reachable guards them)
+        e.update({"PATH": self.bin, "OSU_ROOT": self.root, "STUB_STATE": self.state_dir, "STUB_LOG": self.log})
         if extra:
             e.update(extra)
         return e
