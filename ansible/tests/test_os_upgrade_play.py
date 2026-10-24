@@ -879,6 +879,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("did not answer", md)  # the tool's own error is still shown
         self.assertNotIn("the record of what was changed is kept", md)
         self.assertNotIn("mode=thaw undoes", md)
+        self.assertNotIn("record of run", md)  # the refusal's JSON is no record: no "record of run null at null" line
         self.h.load()
         self.h.state["snap_get_rc"] = 0
         self.h.state["snap_change_rc"] = 1  # now it freezes half way: the record IS kept, and the old wording is true
