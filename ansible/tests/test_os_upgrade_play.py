@@ -657,7 +657,8 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.fail("no freeze row for " + host)
 
     def test_a_freeze_and_a_thaw_through_the_playbook_leave_the_evidence_of_the_platform(self):
-        self.fresh()
+        # the two self-updaters a freeze also stops: tailscale's auto-update is on, snapd has a hold of its own
+        self.fresh(tailscale_autoupdate={"Check": True, "Apply": True}, snap_hold="2099-01-01T00:00:00+00:00")
         self.play("fz0", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
         self.assertIn("**NOTE**", self.checklist_row())
         self.play("fz", self.FZ)
@@ -674,8 +675,13 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertIn("linux-image-7.0.0-31-generic", open(os.path.join(self.out, "msr1", "dpkg-l.txt")).read())
         self.assertIn("running_kernel: 7.0.0-31-generic", open(os.path.join(self.out, "msr1", "kernel.txt")).read())
         self.assertEqual(self.j("msr1", "post-survey.json")["freeze"]["status"], "frozen")
+        st = self.h.load()
+        self.assertEqual((st["tailscale_autoupdate"], st["snap_hold"]), ({"Check": True, "Apply": False}, "forever"))
+        self.assertEqual(self.j("msr1", "freeze.json")["self_updaters"]["snap"]["hold_before"], "2099-01-01T00:00:00+00:00")
+        self.assertEqual(self.j("msr1", "post-survey.json")["self_updaters"]["snap_refresh_hold"], "forever")
         md = self.summary("freeze", "msr1")
-        for want in ("result: FROZEN", "sha256 of the package list", "`apt-daily.timer`: present true; before active/enabled; changed: stopped + disabled; now inactive/disabled", "kernel `7.0.0-31-generic`",
+        for want in ("result: FROZEN", "sha256 of the package list", "- tailscale auto-update: before the freeze `true` (check-updates `true`), changed by the freeze: true, after it `false`",
+                     "- snapd refresh hold: before the freeze `2099-01-01T00:00:00+00:00`, changed by the freeze: true, after it `forever`", "`apt-daily.timer`: present true; before active/enabled; changed: stopped + disabled; now inactive/disabled", "kernel `7.0.0-31-generic`",
                      "needrestart: installed true"):
             self.assertIn(want, md)
         # a freeze changes timers and one needrestart file: no reboot, no grub, no package
@@ -684,6 +690,7 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         # the survey now shows it: PASS
         self.play("fz1", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
         self.assertIn("**PASS**", self.checklist_row())
+        self.assertIn("self-updaters held by the freeze: tailscale auto-update true -> false, snap refresh hold 2099-01-01T00:00:00+00:00 -> forever", self.checklist_row())
         # and a thaw puts the units back
         self.play("th", self.TH)
         self.assertEqual(self.rc, 0, self.log[-3000:])
@@ -692,8 +699,11 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
             self.assertEqual(self.unit(u), ("active", "enabled"), u)
         r = self.j("msr1", "result.json")
         self.assertEqual((r["status"], r["freeze_ok"], r["mode"]), ("thawed", True, "thaw"))
+        st = self.h.load()
+        self.assertEqual((st["tailscale_autoupdate"], st["snap_hold"]), ({"Check": True, "Apply": True}, "2099-01-01T00:00:00+00:00"))
         md = self.summary("thaw", "msr1")
         self.assertIn("result: THAWED", md)
+        self.assertIn("tailscale set --auto-update=true", md)
         self.assertIn("- restored: ", md)
         self.assertIn("enable apt-daily.timer", md)
         self.assertNotIn("; now inactive/disabled", md)  # a thaw does not describe the frozen state as the present one
@@ -813,6 +823,26 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.play("th_k2", self.TH)  # and the host is thawed by the next dispatch, with a drift check of its own
         self.assertEqual(self.rc, 0, self.log[-2000:])
         self.assertEqual(self.j("msr1", "result.json")["drifted_at_thaw"], [])
+
+    def test_a_thaw_whose_proof_could_not_read_an_updater_says_not_measured_and_not_drift(self):
+        self.fresh()
+        self.play("nm_fz", self.FZ)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        self.h.load()
+        self.h.state["snap_get_rc"] = 1  # snapd does not answer at the first thaw attempt
+        self.h.save()
+        self.play("nm_th1", self.TH)
+        self.assertNotEqual(self.rc, 0)
+        self.assertEqual(self.j("msr1", "result.json")["not_measured_at_thaw"], ["snap refresh hold (`snap get system refresh.hold` did not answer)"])
+        self.h.load()
+        self.h.state["snap_get_rc"] = 0
+        self.h.save()
+        self.play("nm_th2", self.TH)
+        self.assertEqual(self.rc, 0, self.log[-2000:])
+        md = " ".join(self.summary("thaw", "msr1").split())
+        self.assertIn("platform at thaw time: DID NOT MOVE", md)
+        self.assertIn("NOT MEASURED at thaw time (it did not answer, so it is neither drift nor proof): snap refresh hold", md)
+        self.assertNotIn("PLATFORM MOVED", md)
 
     def test_a_thaw_of_a_record_without_a_platform_claims_nothing(self):  # r3 2
         self.fresh()
