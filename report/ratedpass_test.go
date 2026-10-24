@@ -33,17 +33,26 @@ func TestMergeRatedPassRecordsOrdersAndMarksLegacy(t *testing.T) {
 	kept := []RatedPassRecord{
 		{TargetRPS: 200000, P99: 30 * time.Millisecond}, // pre-5.24: no status, no fraction
 		okPass(0.25, 100000, 8*time.Millisecond, 99000),
+		okPass(0.75, 300000, 40*time.Millisecond, 299000),
 	}
-	notKept := []RatedPassRecord{lostPass(0.9, 360000, RatedPassSkipped, RatedReasonZeroRequests)}
+	notKept := []RatedPassRecord{
+		lostPass(0.9, 360000, RatedPassSkipped, RatedReasonZeroRequests),
+		lostPass(0.5, 200000, RatedPassNotRun, RatedReasonLoadgenNew),
+	}
 	keptBefore := append([]RatedPassRecord(nil), kept...)
 
 	got := MergeRatedPassRecords(kept, notKept)
-	if len(got) != 3 {
-		t.Fatalf("%d records, want 3", len(got))
+	if len(got) != 5 {
+		t.Fatalf("%d records, want 5", len(got))
 	}
-	// Ordered by fraction, then target: the legacy pass (no fraction) first.
-	if got[0].TargetRPS != 200000 || got[1].Fraction != 0.25 || got[2].Fraction != 0.9 {
-		t.Errorf("order = %v", got)
+	// Ordered by fraction, then target: the legacy pass (no fraction) first,
+	// and a lost pass sits between the kept ones, not after them.
+	var fr []float64
+	for _, r := range got {
+		fr = append(fr, r.Fraction)
+	}
+	if !reflect.DeepEqual(fr, []float64{0, 0.25, 0.5, 0.75, 0.9}) {
+		t.Errorf("order by fraction = %v", fr)
 	}
 	if got[0].Status != RatedPassOK {
 		t.Errorf("a kept pass from a runner that predates 5.24 has status %q, want ok", got[0].Status)
