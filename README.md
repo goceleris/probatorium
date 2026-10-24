@@ -736,18 +736,18 @@ rated data for those scenarios.
 #### What the artifact records per rated pass (schema 5.24, #441)
 
 Every fraction the sweep plans leaves exactly one record, whatever became of it. `benchmarks[].rated_passes`
-maps a scenario to the list of its passes, one entry per pass per run (`run` counts the runs that carried
-rated data):
+maps a scenario to the list of its passes, one entry per pass per run. `run` counts the runs of the cell that carried rated
+data, from 0: it is not the cell's run index (a DNF run takes no number), so it does not join to `cell_run_statuses`:
 
 | field | meaning |
 | --- | --- |
 | `fraction`, `target_rps` | the offered load: the fraction of the cell's saturation rate, and the rate |
-| `achieved_rps`, `achieved_ratio` | requests per second loadgen delivered over the measured window, and that over the target. Below 1 is load loadgen never sent: the p99 of that pass is its backlog (about 0.99 x window x (1 - ratio)), not the server's latency |
-| `requests`, `errors`, `connect_errors`, `dial_retries`, `close_aborts` | loadgen's counts; `errors - connect_errors` are request failures, `connect_errors` the dial/handshake subset |
+| `achieved_rps`, `achieved_ratio` | requests per second loadgen delivered over the measured window, and that over the target. Below 1 is load loadgen never sent: the p99 of that pass is its backlog (about 0.99 x window x (1 - ratio)), not the server's latency. The ratio reads slightly low: `requests` counts successes only and loadgen's elapsed time includes teardown, so set any validity line (the 0.98 of #441) knowing that |
+| `requests`, `errors`, `connect_errors`, `dial_retries`, `close_aborts` | loadgen's counts. `requests` are successes, `errors` failed requests, `connect_errors` a separate counter of dial/handshake failures that overlaps `errors` only where a failed dial also failed a request (the h1 reconnect path): it is not a subset of `errors`, and `errors - connect_errors` can be negative |
 | `shortfall_requests` | target x duration - requests - errors: the slots of the schedule loadgen did not fill |
 | `p99` (ns), `p50`, `p99_9`, `max`, `duration`, `start`, `end`, `loadgen_version` | the pass's latency, window and loadgen build (`start`/`end` are on the loadgen host's clock, warmup included, the same clock as `load_windows`) |
 | `status` | `ok`: counted in `latency_at_slo` and the headline. `skipped`: the pass ran and produced nothing usable. `not_run`: it never started |
-| `reason`, `detail` | for a pass that is not `ok`: `loadgen_new` (loadgen would not build), `run_error`, `nil_result`, `zero_requests`, `interrupted` (the run was cancelled), `cell_flagged` (the cell's saturation pass was flagged suspect, so no sweep ran), `no_saturation_rate`, `non_positive_target`; and the error text |
+| `reason`, `detail` | for a pass that is not `ok` (and `interrupted` on a cut-short `ok` one): `loadgen_new` (loadgen would not build), `run_error`, `nil_result`, `zero_requests`, `interrupted` (the run was cancelled: any pass after the cancel, and also an `ok` pass cut short, which loadgen returns as a short, error-free result and which stays `ok` and kept, as it always was, with the measured window in `detail`), `cell_flagged` (the cell's saturation pass was flagged suspect, so no sweep ran), `no_saturation_rate`, `non_positive_target`; and the error text |
 
 `rated_headline_target_rps` names the target `rated_mode_p99_at_target_rps` was read at: the highest target
 among the `ok` passes. When the 0.9 pass was lost it is the 0.75 pass's (or lower), and this says so; compare
@@ -756,8 +756,14 @@ it with the `fraction` of the cell's passes. A cell with no `ok` pass has record
 
 `mage Publish` prints a rated line in its integrity summary (passes by status, `ok` passes below 98 % of their
 target, and the cells whose headline is not their top planned pass). It is informational: nothing is refused
-for it, because the validity rule is still open on #441. `summary.json` carries `rated_passes` (about 0.4 KB a
-pass, so under 1 MB for a full rated run; `summary.json` of run 37091941051 is already 8 MB with its resource series).
+for it, because the validity rule is still open on #441. `summary.json` carries `rated_passes`: a full record is about 0.7 KB
+indented, so about 1.1 MB per arch for a full rated run (about 6 % of the 18 MB `summary.json` of 38431303162).
+
+**Records from runs that predate 5.24.** A pass record without `status` was written by a runner before 5.24:
+only `target_rps` and `p99`, kept, and the merge does not fill the status in. Such a run never recorded a pass it
+dropped, so a document merged from it (a re-merge of bench 38431303162, whose stderr shows 41 skipped passes)
+says nothing about lost passes. `mage Publish` counts those records as `legacy=N`, prints a `RATED LEGACY`
+line, and its `skipped=0` is not a statement that none was lost.
 
 **For a reader that predates 5.24.** Nothing it reads changes. `latency_at_slo` and
 `rated_mode_p99_at_target_rps` are built from the `ok` passes exactly as they were built from the kept passes;

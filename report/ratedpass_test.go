@@ -54,8 +54,8 @@ func TestMergeRatedPassRecordsOrdersAndMarksLegacy(t *testing.T) {
 	if !reflect.DeepEqual(fr, []float64{0, 0.25, 0.5, 0.75, 0.9}) {
 		t.Errorf("order by fraction = %v", fr)
 	}
-	if got[0].Status != RatedPassOK {
-		t.Errorf("a kept pass from a runner that predates 5.24 has status %q, want ok", got[0].Status)
+	if got[0].Status != "" || !got[0].Kept() {
+		t.Errorf("a kept pass from a run that predates 5.24 has status %q (kept=%v), want it left empty and still kept: nothing is known about the passes that run dropped", got[0].Status, got[0].Kept())
 	}
 	if got[0].AchievedRPS != 0 {
 		t.Errorf("the legacy pass was given an achieved rate (%v) nobody measured", got[0].AchievedRPS)

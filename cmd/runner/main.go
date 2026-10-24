@@ -1791,9 +1791,6 @@ func newRatedPassRecord(frac, target float64, window time.Duration, res *loadgen
 	switch {
 	case runErr != nil:
 		rec.Status, rec.Reason, rec.Detail = report.RatedPassSkipped, report.RatedReasonRunError, runErr.Error()
-		if interrupted {
-			rec.Reason = report.RatedReasonInterrupted
-		}
 	case res == nil:
 		rec.Status, rec.Reason = report.RatedPassSkipped, report.RatedReasonNilResult
 	case res.Requests == 0:
@@ -1801,6 +1798,22 @@ func newRatedPassRecord(frac, target float64, window time.Duration, res *loadgen
 	default:
 		rec.Status = report.RatedPassOK
 		rec.P99 = res.Latency.P99
+	}
+	// A cancelled run (SIGTERM reaches the runner) is not a failure of the
+	// pass. Real loadgen returns a short, error-free result when its context
+	// is cancelled mid-window and nothing at all for the passes that follow, so
+	// the error is not what shows it; the parent context is. A pass that is not
+	// ok is an interruption whatever it returned. A pass that is ok keeps its
+	// status (the keep rule is main's: error-free and with requests), and says
+	// it was cut short when its measured window is shorter than the planned one.
+	if interrupted {
+		switch {
+		case rec.Status != report.RatedPassOK:
+			rec.Reason = report.RatedReasonInterrupted
+		case res.Duration < window*95/100:
+			rec.Reason = report.RatedReasonInterrupted
+			rec.Detail = fmt.Sprintf("the run was cancelled mid-pass: measured %s of %s; kept, as the keep rule has always done", res.Duration.Round(time.Millisecond), window)
+		}
 	}
 	return rec
 }

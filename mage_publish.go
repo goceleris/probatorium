@@ -443,7 +443,14 @@ type publishIntegrity struct {
 	// lost or under-delivered.
 	RatedPasses      map[string]int
 	RatedBelowTarget int
-	RatedHeadlineLow []string
+	// RatedLegacy counts rated passes recorded by a run that predates 5.24
+	// (no status): kept, with nothing known about the passes that run dropped.
+	// A document built from such runs, such as a re-merge of bench
+	// 38431303162, shows skipped=0 and that is NOT a statement that no pass was
+	// lost. RatedInterruptedKept counts ok passes cut short by a cancelled run.
+	RatedLegacy          int
+	RatedInterruptedKept int
+	RatedHeadlineLow     []string
 }
 
 // publishRatedMinAchieved is the achieved/target ratio below which the
@@ -516,11 +523,14 @@ func collectPublishIntegrity(resultsDir string, doc *report.Document) publishInt
 		for sc, passes := range b.RatedPasses {
 			top := 0.0
 			for _, p := range passes {
-				st := p.Status
-				if st == "" {
-					st = report.RatedPassOK
+				if p.Status == "" {
+					pi.RatedLegacy++
+				} else {
+					pi.RatedPasses[p.Status]++
 				}
-				pi.RatedPasses[st]++
+				if p.Status == report.RatedPassOK && p.Reason == report.RatedReasonInterrupted {
+					pi.RatedInterruptedKept++
+				}
 				if p.Fraction > top {
 					top = p.Fraction
 				}
@@ -625,10 +635,13 @@ func renderPublishIntegrity(pi publishIntegrity) string {
 	for _, s := range pi.ServerDied {
 		fmt.Fprintf(&sb, "  SERVER DIED     %s\n", s)
 	}
-	if total := pi.RatedPasses[report.RatedPassOK] + pi.RatedPasses[report.RatedPassSkipped] + pi.RatedPasses[report.RatedPassNotRun]; total > 0 {
-		fmt.Fprintf(&sb, "  rated passes: %d total  ok=%d skipped=%d not_run=%d  ok below %.0f%% of target=%d\n",
+	if total := pi.RatedPasses[report.RatedPassOK] + pi.RatedPasses[report.RatedPassSkipped] + pi.RatedPasses[report.RatedPassNotRun] + pi.RatedLegacy; total > 0 {
+		fmt.Fprintf(&sb, "  rated passes: %d total  ok=%d skipped=%d not_run=%d legacy=%d  ok below %.0f%% of target=%d  ok but interrupted=%d\n",
 			total, pi.RatedPasses[report.RatedPassOK], pi.RatedPasses[report.RatedPassSkipped],
-			pi.RatedPasses[report.RatedPassNotRun], publishRatedMinAchieved*100, pi.RatedBelowTarget)
+			pi.RatedPasses[report.RatedPassNotRun], pi.RatedLegacy, publishRatedMinAchieved*100, pi.RatedBelowTarget, pi.RatedInterruptedKept)
+		if pi.RatedLegacy > 0 {
+			fmt.Fprintf(&sb, "  RATED LEGACY    %d pass(es) come from runs that predate schema 5.24: a pass such a run dropped was never recorded, so skipped=0 above does not say none was lost\n", pi.RatedLegacy)
+		}
 		for _, c := range pi.RatedHeadlineLow {
 			fmt.Fprintf(&sb, "  RATED HEADLINE  %s: the headline p99 is not at the cell's top planned pass (it was not kept)\n", c)
 		}

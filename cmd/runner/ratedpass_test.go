@@ -137,7 +137,7 @@ func TestEveryRatedPassIsRecordedWithItsRateAndErrors(t *testing.T) {
 		default: // loadgen failed after sending part of the load
 			return scriptedBench{
 				res: &loadgen.Result{Requests: 50, Errors: 40, Duration: dur, RequestsPerSec: 333,
-					Latency: loadgen.Percentiles{P99: 5 * time.Second}},
+					Latency: loadgen.Percentiles{P99: 5 * time.Second}}, // a failed pass reports a p99; the record must not
 				err: errors.New("pass aborted"),
 			}, nil
 		}
@@ -214,6 +214,9 @@ func TestEveryRatedPassIsRecordedWithItsRateAndErrors(t *testing.T) {
 		}
 		if got := num(t, e, "target_rps"); math.Abs(got-w.fraction*sat) > 1 {
 			t.Errorf("not-kept[%d] target_rps = %v, want %v", i, got, w.fraction*sat)
+		}
+		if p99, _ := e["p99"].(float64); p99 != 0 {
+			t.Errorf("not-kept[%d] p99 = %v: a pass that is not kept carries no p99", i, p99)
 		}
 		if got, _ := e["requests"].(float64); got != w.requests {
 			t.Errorf("not-kept[%d] requests = %v, want %v (what loadgen reported before it failed)", i, got, w.requests)
@@ -415,5 +418,76 @@ func TestSkippedPassStderrLineKeepsItsShape(t *testing.T) {
 	}
 	if want := "  rated pass target=900: skipped (err=<nil>) reason=zero_requests"; lines[1] != want {
 		t.Errorf("line 1 = %q, want %q", lines[1], want)
+	}
+}
+
+// TestCancelledRunIsRecordedHonestly is the shape real loadgen has: when its
+// context is cancelled mid-window it returns a SHORT result and NO error, and
+// the passes after it return nothing at all (no requests, no error). The first
+// pass keeps its status ok (the keep rule is main's, so latency_at_slo does not
+// move) and says it was cut short; the later passes are interruptions, not the
+// zero_requests the census attributes to a failing store.
+func TestCancelledRunIsRecordedHonestly(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withRatedScript(t, func(i int, cfg loadgen.Config) (ratedBench, error) {
+		if i == 0 {
+			return scriptedBench{before: cancel, res: &loadgen.Result{
+				Requests: 4000, Duration: 40 * time.Millisecond, RequestsPerSec: cfg.Rate, // 40 ms of a 150 ms window
+				Latency: loadgen.Percentiles{P99: 2 * time.Millisecond}}}, nil
+		}
+		return scriptedBench{res: &loadgen.Result{}}, nil // cancelled before it sent anything, no error
+	})
+	m := ratedCellJSON(t, okServer(t), "0.25,0.5,0.9", parent)
+	kept := entries(t, m, "rated_passes")
+	notKept := entries(t, m, "rated_passes_not_kept")
+	if len(kept) != 1 || str(kept[0], "status") != "ok" {
+		t.Fatalf("kept = %v, want the cut-short pass still kept with status ok (main's keep rule)", kept)
+	}
+	if str(kept[0], "reason") != "interrupted" || str(kept[0], "detail") == "" {
+		t.Errorf("the cut-short pass = reason %q detail %q, want interrupted with the measured window", str(kept[0], "reason"), str(kept[0], "detail"))
+	}
+	if len(notKept) != 2 {
+		t.Fatalf("not kept = %v, want the 2 later passes", notKept)
+	}
+	for i, e := range notKept {
+		if str(e, "status") != "skipped" || str(e, "reason") != "interrupted" {
+			t.Errorf("later pass %d = %q/%q, want skipped/interrupted (not zero_requests)", i, str(e, "status"), str(e, "reason"))
+		}
+	}
+}
+
+// TestFullWindowPassUnderACancelledRunIsNotTagged: the run was cancelled right
+// after a pass finished its whole window. That pass is complete and carries no
+// interruption mark; only a pass cut short does.
+func TestFullWindowPassUnderACancelledRunIsNotTagged(t *testing.T) {
+	window := 150 * time.Millisecond
+	full := &loadgen.Result{Requests: 100, Duration: window + 20*time.Millisecond, RequestsPerSec: 500}
+	if rec := newRatedPassRecord(0.5, 500, window, full, nil, true, time.Time{}, time.Time{}); rec.Status != report.RatedPassOK || rec.Reason != "" || rec.Detail != "" {
+		t.Errorf("full-window pass under a cancelled run = %+v, want a plain ok", rec)
+	}
+	cut := &loadgen.Result{Requests: 100, Duration: window / 2, RequestsPerSec: 500}
+	if rec := newRatedPassRecord(0.5, 500, window, cut, nil, true, time.Time{}, time.Time{}); rec.Status != report.RatedPassOK || rec.Reason != report.RatedReasonInterrupted {
+		t.Errorf("half-window pass under a cancelled run = %+v, want ok + interrupted", rec)
+	}
+	if rec := newRatedPassRecord(0.5, 500, window, cut, nil, false, time.Time{}, time.Time{}); rec.Reason != "" {
+		t.Errorf("a short pass under a live run = reason %q, want none (only a cancelled run is an interruption)", rec.Reason)
+	}
+	if rec := newRatedPassRecord(0.5, 500, window, nil, nil, true, time.Time{}, time.Time{}); rec.Status != report.RatedPassSkipped || rec.Reason != report.RatedReasonInterrupted {
+		t.Errorf("nil result under a cancelled run = %+v, want skipped/interrupted", rec)
+	}
+}
+
+// TestShortfallFallsBackToThePlannedWindow: a result with no measured duration
+// (a loadgen that reports none) is priced over the planned window, not as zero.
+func TestShortfallFallsBackToThePlannedWindow(t *testing.T) {
+	window := 2 * time.Second
+	res := &loadgen.Result{Requests: 600, Errors: 4, RequestsPerSec: 300}
+	rec := newRatedPassRecord(0.5, 400, window, res, nil, false, time.Time{}, time.Time{})
+	if want := int64(400*2 - 600 - 4); rec.ShortfallRequests != want {
+		t.Errorf("shortfall = %d, want %d (target x planned window - requests - errors)", rec.ShortfallRequests, want)
+	}
+	if rec.Duration != 0 {
+		t.Errorf("duration = %v: the planned window must not be reported as measured", rec.Duration)
 	}
 }

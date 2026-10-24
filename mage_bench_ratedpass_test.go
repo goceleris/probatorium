@@ -183,7 +183,7 @@ func TestMergeKeepsACellWhoseRatedPassesAllFailed(t *testing.T) {
 // TestMergeAcceptsARunnerThatPredatesTheRecord: a per-cell JSON from a runner
 // older than 5.24 has rated_passes entries of {target_rps, p99} and nothing
 // else. They merge exactly as before (latency_at_slo, headline) and show up in
-// the pass list as kept passes with no measured rate; the list never invents an
+// the pass list as they are, with no status and no measured rate; the list never invents an
 // achieved rate for them.
 func TestMergeAcceptsARunnerThatPredatesTheRecord(t *testing.T) {
 	resultsDir := t.TempDir()
@@ -206,8 +206,8 @@ func TestMergeAcceptsARunnerThatPredatesTheRecord(t *testing.T) {
 		t.Fatalf("%d records, want the 2 legacy passes", len(got))
 	}
 	for i, e := range got {
-		if e["status"] != "ok" {
-			t.Errorf("legacy pass %d status = %v, want ok (it was kept)", i, e["status"])
+		if v, present := e["status"]; present {
+			t.Errorf("legacy pass %d status = %v, want none: the merge must not vouch for a run that recorded no status", i, v)
 		}
 		if v, present := e["achieved_rps"]; present && v != float64(0) {
 			t.Errorf("legacy pass %d carries an achieved_rps %v nobody measured", i, v)

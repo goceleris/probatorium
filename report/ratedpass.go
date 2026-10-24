@@ -41,7 +41,7 @@ const (
 	RatedReasonRunError     = "run_error"          // loadgen.Run returned an error
 	RatedReasonNilResult    = "nil_result"         // loadgen.Run returned neither a result nor an error
 	RatedReasonZeroRequests = "zero_requests"      // loadgen.Run returned a result with no requests
-	RatedReasonInterrupted  = "interrupted"        // the run's context was cancelled during the pass
+	RatedReasonInterrupted  = "interrupted"        // the run's context was cancelled during the pass (also set on an ok pass cut short, which is kept)
 	RatedReasonCellFlagged  = "cell_flagged"       // the saturation pass was flagged (suspect), so no sweep ran
 	RatedReasonNoSatRate    = "no_saturation_rate" // the saturation pass measured no rate to take fractions of
 	RatedReasonBadTarget    = "non_positive_target"
@@ -51,9 +51,12 @@ const (
 // and p99 are the ones every reader before 5.24 uses; the rest is additive.
 //
 // A count that is absent is zero when Status is present (the runner omits
-// zeros to keep the file small). A record without Status comes from a runner
-// that predates 5.24: only TargetRPS and P99 were recorded, and a missing
-// AchievedRPS there means "not measured", not "nothing delivered".
+// zeros to keep the file small). A record without Status comes from a run
+// that predates 5.24, in the raw files and in a merged document alike (the
+// merge does not fill it in): only TargetRPS and P99 were recorded, a missing
+// AchievedRPS there means "not measured", not "nothing delivered", and a pass
+// the old runner dropped was never recorded at all, so a document built only
+// from such runs cannot say that no pass was lost.
 type RatedPassRecord struct {
 	// Fraction of the cell's saturation rate this pass offered (0.25, 0.5,
 	// 0.75, 0.9 by default). Absent on a pre-5.24 record.
@@ -73,14 +76,20 @@ type RatedPassRecord struct {
 	Detail string `json:"detail,omitempty"`
 
 	// AchievedRPS is loadgen's requests per second over the measured window
-	// and AchievedRatio is AchievedRPS / TargetRPS. A ratio below 1 is load
+	// and AchievedRatio is AchievedRPS / TargetRPS. Both read slightly low:
+	// requests counts successes only, and loadgen's elapsed time runs to after
+	// its workers have stopped, so it includes teardown (about teardown / 30 s).
+	// Set any validity line (the 0.98 of #441) knowing that. A ratio below 1 is load
 	// loadgen never sent: the p99 of such a pass is the pass's backlog, not the
 	// server's latency (probatorium#441, loadgen#102).
 	AchievedRPS   float64 `json:"achieved_rps,omitempty"`
 	AchievedRatio float64 `json:"achieved_ratio,omitempty"`
-	// Requests and Errors are loadgen's counts for the window; ConnectErrors is
-	// the dial/handshake subset of Errors, so Errors - ConnectErrors are the
-	// request failures. DialRetries and CloseAborts are loadgen's own counters.
+	// Requests (successes) and Errors (failed requests) are loadgen's counts
+	// for the window. ConnectErrors is a separate counter of dial/handshake
+	// failures that overlaps Errors only where a failed dial also failed a
+	// request (the h1 reconnect path), so it is not a subset of Errors and
+	// Errors - ConnectErrors can be negative. DialRetries and CloseAborts are
+	// loadgen's own counters.
 	Requests      int64  `json:"requests,omitempty"`
 	Errors        int64  `json:"errors,omitempty"`
 	ConnectErrors uint64 `json:"connect_errors,omitempty"`
@@ -105,14 +114,16 @@ type RatedPassRecord struct {
 }
 
 // Kept reports whether the record is a pass latency_at_slo and the headline
-// are built from. A record from a runner that predates 5.24 has no status and
+// are built from. A record from a run that predates 5.24 has no status and
 // was kept by definition (the old runner recorded nothing else).
 func (r RatedPassRecord) Kept() bool {
 	return r.Status == "" || r.Status == RatedPassOK
 }
 
-// RatedPassResult is a RatedPassRecord in the merged document: Run is the
-// position of the run among the cell's runs that carried rated data.
+// RatedPassResult is a RatedPassRecord in the merged document. Run counts the
+// runs of the cell that carried rated data, from 0: it is NOT the cell's run
+// index (a run that was DNF, or ran without a sweep, takes no number), so it
+// does not join to cell_run_statuses.
 type RatedPassResult struct {
 	Run int `json:"run"`
 	RatedPassRecord
@@ -121,18 +132,14 @@ type RatedPassResult struct {
 // MergeRatedPassRecords joins one run's kept passes (the wire array
 // rated_passes) and its passes that were not kept (rated_passes_not_kept)
 // into the run's list, ordered by fraction then target. A kept pass from a
-// runner that predates 5.24 gets status "ok". Neither input is modified.
+// runner that predates 5.24 keeps its empty status (it was kept, and nothing
+// was recorded about the passes it dropped). Neither input is modified.
 func MergeRatedPassRecords(kept, notKept []RatedPassRecord) []RatedPassRecord {
 	if len(kept)+len(notKept) == 0 {
 		return nil
 	}
 	out := make([]RatedPassRecord, 0, len(kept)+len(notKept))
-	for _, k := range kept {
-		if k.Status == "" {
-			k.Status = RatedPassOK
-		}
-		out = append(out, k)
-	}
+	out = append(out, kept...)
 	out = append(out, notKept...)
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Fraction != out[j].Fraction {
