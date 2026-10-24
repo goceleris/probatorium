@@ -9,6 +9,18 @@
 # joined by " ;; " (a plain string survives every ansible-core version's templating; a JSON list in a string
 # is turned into a list by some versions and not by others). Empty means nothing to report.
 
+# Files of /var/crash that are NOT crash dumps: kdump-tools' bookkeeping, which it writes at boot when it loads the capture kernel (kdump_lock is its lock,
+# kexec_cmd the kexec command line it used). A host that never had a dump can show them after a reboot (measured: msa2-client, run 40035368440, /var/crash was
+# empty before the reboot and held exactly these two after it, while msa2-server and msr1 already had them). The snapshots keep listing every entry (the evidence
+# stays complete, and an old snapshot judges the same way); only the NEW entries on the AFTER side are filtered here. Anything else is still a crash dump.
+crash_bookkeeping_names: ['kdump_lock', 'kexec_cmd']
+# kdump-tools also RE-NAMES the dumps a host already holds for the kernel it boots: msr1 (upgrade run 40037534396) held the dumps 202609082320 and 202609091231 (as a
+# bare directory and as linux-image-7.0.0-31-generic-<timestamp>.crash) before the reboot, and after booting 7.0.0-38 held linux-image-7.0.0-38-generic-<timestamp>.crash for
+# the SAME two timestamps: the old dumps under a new kernel version, not new crashes. A dump is identified by its timestamp: the entry linux-image-<version>-<timestamp>.crash
+# has the key <timestamp>, any other entry is its own key, and an AFTER entry is new only when neither its name nor its key was there BEFORE. A timestamp that was not
+# there before is a new dump in either form. (The pattern's group 1 is the timestamp.)
+crash_timestamp_pattern: '^linux-image-.+-([0-9]+)\.crash$'
+
 post_snap: >-
   {{ (post_raw.stdout | from_json) if (post_raw.stdout | default('') | length > 0) else {} }}
 
@@ -33,7 +45,10 @@ post_problems_str: >-
   {% if b | length == 0 %}{% set _ = p.append('no readable snapshot after the reboot') %}{% else %}
   {% if b.boot_id == a.boot_id %}{% set _ = p.append('boot_id did not change (' ~ a.boot_id ~ '): the host did not reboot') %}{% endif %}
   {% if b.kernel != a.kernel %}{% set _ = p.append('kernel changed: ' ~ a.kernel ~ ' -> ' ~ b.kernel) %}{% endif %}
-  {% if (b.crash | difference(a.crash)) | length > 0 %}{% set _ = p.append('new crash dump(s) in /var/crash: ' ~ (b.crash | difference(a.crash) | join(', '))) %}{% endif %}
+  {% set a_crash_ts = a.crash | map('regex_replace', crash_timestamp_pattern, '\\1') | list %}
+  {% set new_crash = [] %}
+  {% for e in b.crash %}{% if e not in a.crash and e not in crash_bookkeeping_names and (e | regex_replace(crash_timestamp_pattern, '\\1')) not in a_crash_ts %}{% set _ = new_crash.append(e) %}{% endif %}{% endfor %}
+  {% if new_crash | length > 0 %}{% set _ = p.append('new crash dump(s) in /var/crash: ' ~ (new_crash | join(', '))) %}{% endif %}
   {% for k in ['tailscaled_active', 'apcupsd_active', 'resume_check_enabled', 'power_event_installed', 'tmpfiles_conf', 'quiesce_hook'] %}
   {% if a.prereq[k] and not b.prereq[k] %}{% set _ = p.append('prerequisite regressed: ' ~ k ~ ' held before the reboot and does not now') %}{% endif %}
   {% endfor %}

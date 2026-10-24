@@ -454,6 +454,32 @@ class Judge(unittest.TestCase):
              lambda c: post(c, kernel="7.0.0-31-generic"))
         case("post_other_kernel", {"post": "runs 7.0.0-38-generic, not the intended 7.0.0-40-generic"}, lambda c: post(c, kernel="7.0.0-38-generic"))
         case("post_crash", {"post": "new crash dump(s) in /var/crash: 20261022"}, lambda c: post(c, crash=["20261022"]))
+        # kdump-tools' bookkeeping (kdump_lock, kexec_cmd) is not a crash dump: msa2-client (run 40035368440) had an empty /var/crash before the reboot and exactly these
+        # two after it, and was failed for it. A real dump next to them is still named, alone (test_kdump_bookkeeping_is_not_a_crash_dump checks the exact text).
+        case("post_kdump_bookkeeping_only", {}, lambda c: (c["pre_target"].update(crash=[]), post(c, crash=["kdump_lock", "kexec_cmd"])))
+        case("post_kdump_bookkeeping_and_a_dump", {"post": "new crash dump(s) in /var/crash: 20261022"},
+             lambda c: (c["pre_target"].update(crash=[]), post(c, crash=["kdump_lock", "kexec_cmd", "20261022"])))
+        case("post_kdump_lookalike_is_a_dump", {"post": "new crash dump(s) in /var/crash: kdump_lock.old"},
+             lambda c: (c["pre_target"].update(crash=[]), post(c, crash=["kdump_lock.old"])))
+        # kdump-tools RE-NAMES the dumps a host holds for the kernel it boots (msr1, upgrade run 40037534396): the same two September timestamps, under -38 now. Not new.
+        msr1_before = ["202609082320", "202609091231", "kdump_lock", "kexec_cmd", "linux-image-7.0.0-31-generic-202609082320.crash", "linux-image-7.0.0-31-generic-202609091231.crash"]
+        msr1_after = msr1_before + ["linux-image-7.0.0-38-generic-202609082320.crash", "linux-image-7.0.0-38-generic-202609091231.crash"]
+        case("post_kdump_renamed_dumps_are_not_new", {}, lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_after)))
+        # ... but a timestamp that was NOT there before is new, in both forms
+        case("post_new_dump_as_crash_file", {"post": "new crash dump(s) in /var/crash: linux-image-7.0.0-38-generic-202610240900.crash"},
+             lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_after + ["linux-image-7.0.0-38-generic-202610240900.crash"])))
+        case("post_new_dump_as_bare_timestamp", {"post": "new crash dump(s) in /var/crash: 202610240900"},
+             lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_after + ["202610240900"])))
+        case("post_renamed_and_new_dumps_mixed", {"post": "new crash dump(s) in /var/crash: linux-image-7.0.0-38-generic-202610240900.crash"},
+             lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_after + ["linux-image-7.0.0-38-generic-202610240900.crash"])))
+        # the bare timestamp before, the same timestamp as a .crash file for another kernel after (and the reverse): the same dump
+        # names that are not dumps of the msr1 timestamps must still be named when the before list is POPULATED (a normalisation that maps names with no digits, or a name
+        # ending in an old timestamp, onto a key already there hides them; against an EMPTY before list it would not). Each is named alone.
+        for extra in ("vmcore", "kdump_lock.old", "dump.202609082320", "foo-202609082320", "linux-image--202609082320.crash"):
+            case("post_populated_" + extra, {"post": "new crash dump(s) in /var/crash: " + extra},
+                 (lambda extra: lambda c: (c["pre_target"].update(crash=msr1_before), post(c, crash=msr1_before + [extra])))(extra))
+        case("post_bare_dump_renamed_is_not_new", {}, lambda c: (c["pre_target"].update(crash=["202609082320"]), post(c, crash=["202609082320", "linux-image-7.0.0-38-generic-202609082320.crash"])))
+        case("post_crash_file_as_bare_is_not_new", {}, lambda c: (c["pre_target"].update(crash=["linux-image-7.0.0-31-generic-202609082320.crash"]), post(c, crash=["202609082320", "linux-image-7.0.0-31-generic-202609082320.crash"])))
         for k in ("tailscaled_active", "apcupsd_active", "resume_check_enabled", "power_event_installed", "tmpfiles_conf", "quiesce_hook"):
             case("post_regressed_" + k, {"post": "prerequisite regressed: " + k},
                  (lambda k: lambda c: post(c, prereq=dict(json.loads(c["post_raw"]["stdout"])["prereq"], **{k: False})))(k))
@@ -512,6 +538,22 @@ class Judge(unittest.TestCase):
         for name, out in self.out.items():
             for k, v in out.items():
                 self.assertNotRegex(v, r"REHEARSE-\S*CONSOLE", "%s: %s" % (name, k))
+
+    def test_kdump_bookkeeping_is_not_a_crash_dump(self):
+        self.assertEqual(self.out["post_kdump_bookkeeping_only"]["post"], "")
+        # a real dump beside the bookkeeping is the ONLY thing named
+        self.assertEqual(self.out["post_kdump_bookkeeping_and_a_dump"]["post"], "new crash dump(s) in /var/crash: 20261022")
+        self.assertEqual(self.out["post_crash"]["post"], "new crash dump(s) in /var/crash: 20261022")
+        self.assertEqual(self.out["post_kdump_lookalike_is_a_dump"]["post"], "new crash dump(s) in /var/crash: kdump_lock.old")
+        self.assertEqual(self.out["post_kdump_renamed_dumps_are_not_new"]["post"], "")
+        self.assertEqual(self.out["post_bare_dump_renamed_is_not_new"]["post"], "")
+        self.assertEqual(self.out["post_crash_file_as_bare_is_not_new"]["post"], "")
+        # the real dump is the ONLY thing named, whatever else changed (the renamed dumps and the bookkeeping are not)
+        self.assertEqual(self.out["post_renamed_and_new_dumps_mixed"]["post"], "new crash dump(s) in /var/crash: linux-image-7.0.0-38-generic-202610240900.crash")
+        self.assertEqual(self.out["post_new_dump_as_crash_file"]["post"], "new crash dump(s) in /var/crash: linux-image-7.0.0-38-generic-202610240900.crash")
+        self.assertEqual(self.out["post_new_dump_as_bare_timestamp"]["post"], "new crash dump(s) in /var/crash: 202610240900")
+        for extra in ("vmcore", "kdump_lock.old", "dump.202609082320", "foo-202609082320", "linux-image--202609082320.crash"):
+            self.assertEqual(self.out["post_populated_" + extra]["post"], "new crash dump(s) in /var/crash: " + extra)
 
     def test_a_healthy_host_has_nothing_to_report(self):
         self.assertEqual(self.out["healthy"], {"refusals": "", "plan": "", "prereboot": "", "post": "", "maint": ""})

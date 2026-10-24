@@ -284,6 +284,10 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertTrue(r["marker"]["permanent"])
         self.assertIn(self.PAYLOAD, r["reason"])
         self.assertIn("No power-cycle needed", r["power_cycle"])
+        # the host REBOOTED (boot id changed): "nothing was rebooted" would be false (measured on msa2-server 40033187774 and msr1 40034486973)
+        self.assertNotEqual(r["boot_id_after"], self.j("msr1", "pre-snapshot.json")["boot_id"])
+        self.assertIn("the host rebooted (the boot id changed)", r["power_cycle"])
+        self.assertNotIn("nothing was rebooted", r["power_cycle"])
         for f in ("preflight-snapshot.json", "pre-snapshot.json", "post-snapshot.json", "pre-survey.json", "post-survey.json", "survey.json", "dkms.json",
                   "simulate.json", "pin.json", "arm.json", "toolcheck.json", "dpkg-before.txt", "dpkg-after.txt", "apt-policy-before.txt",
                   "apt-update.log", "apt-upgrade.log", "sysctl-before.txt", "sysctl-after.txt", "grub-before.txt", "grub-after.txt", "phase.txt", "result.json"):
@@ -1183,6 +1187,9 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         self.assertEqual(rec["kernel"], "7.0.0-31-generic")
         r = self.j("msr1", "result.json")
         self.assertEqual((r["status"], r["kernel_before"], r["kernel_after"]), ("rehearsed", "7.0.0-31-generic", "7.0.0-31-generic"))
+        self.assertNotEqual(r["boot_id_after"], self.j("msr1", "pre-snapshot.json")["boot_id"])
+        self.assertIn("the host rebooted (the boot id changed)", r["power_cycle"])
+        self.assertNotIn("nothing was rebooted", r["power_cycle"])
         self.assertFalse(os.path.exists(self.h.root + "/var/lib/celeris-os-upgrade/last-upgrade.json"), "a rehearsal is not an upgrade: no marker for the order rule")
         self.assertIn("REHEARSED", self.summary("rehearse", "msr1"))
         # cluster-reboot's snapshot reads the record this rehearsal wrote (the chain string is computed twice, in python and in bash)
