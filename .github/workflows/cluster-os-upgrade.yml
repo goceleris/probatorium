@@ -46,7 +46,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "survey: read-only, all three hosts, no confirmation. rehearse: ONE host reboots into its OWN running kernel through a grub one-shot (proves the fallback mechanism; changes no package). upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host. freeze: stop and disable the apt timers and unattended-upgrades on ONE host (and set needrestart to list-only) so the platform stays fixed during the evidence campaign; records what it changed and the platform. thaw: put back exactly what the freeze recorded."
+        description: "survey: read-only, all three hosts, no confirmation. rehearse: ONE host reboots into its OWN running kernel through a grub one-shot (proves the fallback mechanism; changes no package). upgrade: host-changing, ONE host. disarm: clear a pending grub one-shot on ONE host. repair: dpkg --configure -a (or abort the new kernel) on ONE host. freeze: stop and disable the apt timers and unattended-upgrades on ONE host (set needrestart to list-only, turn tailscale's auto-update off, hold snapd's refreshes) so the platform stays fixed during the evidence campaign; records what it changed and the platform. thaw: put back exactly what the freeze recorded."
         type: choice
         options: [survey, rehearse, upgrade, disarm, repair, freeze, thaw]
         required: true

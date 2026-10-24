@@ -54,16 +54,20 @@
 # MODE freeze / MODE thaw (host-changing, ONE host, FREEZE-<host> / THAW-<host>): the platform stays FIXED during the evidence campaign. The hosts
 #   update themselves (unattended-upgrades installed the kernel -38 on its own; needrestart restarts services behind an apt run), and a 131-hour
 #   benchmark must not see a package or a service change under it. freeze refuses while apt or dpkg is busy, writes its record BEFORE it changes
-#   anything (the timestamp, the previous active/enabled state of every unit, and whether it wrote a needrestart drop-in), stops and disables
-#   apt-daily.timer, apt-daily-upgrade.timer and unattended-upgrades.service, sets needrestart to list-only (a drop-in, only when it is installed and
-#   not list-only already), verifies the states, and records the platform (kernel, a hash of every installed package and version, the holds): the
+#   anything (the timestamp, the previous active/enabled state of every unit, whether it wrote a needrestart drop-in, tailscale's previous auto-update and
+#   snapd's previous refresh hold), stops and disables apt-daily.timer, apt-daily-upgrade.timer and unattended-upgrades.service, sets needrestart to
+#   list-only (a drop-in, only when it is installed and not list-only already), turns tailscale's own auto-update off (`tailscale set --auto-update=false`,
+#   only when it is on) and holds ALL of snapd's automatic refreshes (`snap refresh --hold=forever`, unless they are held forever already; a manual
+#   `snap refresh` still works), verifies the states, and records the platform (kernel, a hash of every installed package and version, the holds): the
 #   evidence directory gets freeze.json, dpkg-l.txt (dpkg -l), apt-held.txt (apt-mark showhold) and kernel.txt, so the release results can name the
 #   exact platform. The survey shows the freeze and whether it still holds (drifted). thaw restores ONLY what the record says freeze changed
-#   (enable what it disabled, start what it stopped, remove its needrestart drop-in) and archives the record, with the drift found at thaw time (the
+#   (enable what it disabled, start what it stopped, remove its needrestart drop-in, `tailscale set --auto-update=true` only if the record says it was on and
+#   the freeze turned it off, the snap hold back to the recorded one: removed if there was none) and archives the record, with the drift found at thaw time (the
 #   end-of-campaign proof that the platform did not move). Every survey recomputes the recorded platform (running kernel, grub saved default kernel, package
 #   list SHA-256, holds): a difference is `drifted`. freeze and thaw are refused while a bench manifest, a runner job or a power-loss resume is on the host;
 #   a freeze also while grub's saved default kernel is not the running kernel. mode=upgrade is REFUSED on a frozen host (thaw, upgrade, freeze again). A
-#   freeze does not stop tailscale's own updater, snapd refreshes, fwupd, motd-news or ubuntu-pro-client (the survey records `self_updaters`).
+#   freeze does not stop fwupd, motd-news or ubuntu-pro-client (the survey records the tailscale and snapd `self_updaters`; a host frozen BEFORE they were
+#   covered has a record without them: it reads and thaws as before, and its tailscale and snapd were not stopped).
 #
 # MODE upgrade (host-changing, ONE host per dispatch)
 #   REFUSES, before touching anything (vars/os_upgrade_judge.yml, refusals_str): any of the three hosts unreachable,

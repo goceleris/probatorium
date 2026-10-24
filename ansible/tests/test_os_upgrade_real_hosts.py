@@ -72,7 +72,7 @@ COMMON = {
     "kernels armed earlier and never verified": "PASS",
     "run state": "PASS",
     "access-path packages and third-party moves the full-upgrade brings": "NOTE",
-    "platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts); NOT covered: tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client": "NOTE",  # the first survey knew no freeze
+    "platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts, and tailscale auto-update and snapd refresh when the freeze record says it held them); NOT covered: fwupd, motd-news, ubuntu-pro-client": "NOTE",  # the first survey knew no freeze
     "unattended-upgrades and phasing": "NOTE",
 }
 R8127 = {
@@ -167,11 +167,17 @@ class ChecklistReplay(unittest.TestCase):
         self.assertEqual(self.md.count("package runs `none`"), 3)
 
     def test_the_freeze_row_reads_a_freeze_record(self):
-        row = "platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts); NOT covered: tailscale auto-update, snapd refresh, fwupd, motd-news, ubuntu-pro-client"
-        for name, rec, want in (("frozen and holding", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS"),
-                                ("frozen but a unit came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["apt-daily.timer=active/enabled"]}, "FAIL"),
-                                ("a freeze interrupted half way", {"run_id": "1", "utc": "t", "status": "freezing", "drifted": []}, "FAIL"),
-                                ("a freeze that did not complete", {"run_id": "1", "utc": "t", "status": "freezing-failed", "drifted": []}, "FAIL")):
+        row = "platform frozen against apt self-updates (apt timers, unattended-upgrades, needrestart restarts, and tailscale auto-update and snapd refresh when the freeze record says it held them); NOT covered: fwupd, motd-news, ubuntu-pro-client"
+        held = {"tailscale": {"auto_update_before": "true", "auto_update_after": "false"}, "snap": {"hold_before": "none", "hold_after": "forever"}}
+        for name, rec, want, detail in (("frozen and holding", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": [], "self_updaters": held}, "PASS",
+                                         "self-updaters held by the freeze: tailscale auto-update true -> false, snap refresh hold none -> forever"),
+                                        ("frozen before the self-updaters were covered", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": []}, "PASS",
+                                         "this freeze PREDATES the self-updater cover: tailscale auto-update and snapd refresh were NOT stopped by it"),
+                                        ("frozen but a unit came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["apt-daily.timer=active/enabled"]}, "FAIL", ""),
+                                        ("frozen but tailscale's updater came back", {"run_id": "1", "utc": "t", "status": "frozen", "drifted": ["tailscale auto-update is true again"], "self_updaters": held}, "FAIL",
+                                         "drifted: tailscale auto-update is true again"),
+                                        ("a freeze interrupted half way", {"run_id": "1", "utc": "t", "status": "freezing", "drifted": []}, "FAIL", ""),
+                                        ("a freeze that did not complete", {"run_id": "1", "utc": "t", "status": "freezing-failed", "drifted": []}, "FAIL", "")):
             d = tempfile.mkdtemp(prefix="osu-real-freeze-")
             try:
                 for h in HOSTS:
@@ -181,8 +187,11 @@ class ChecklistReplay(unittest.TestCase):
                 s["freeze"] = rec
                 json.dump(s, open(p, "w"))
                 r = subprocess.run(["bash", SUMMARY, d, "survey", "-", "0", "x", "1"], capture_output=True, text=True, timeout=120)
-                m = re.search(r"^\| msr1 \| %s \| .* \| \*\*(\w+)\*\* \|" % re.escape(row), r.stdout, re.M)
-                self.assertEqual(m and m.group(1), want, name)
+                m = re.search(r"^\| msr1 \| %s \| (.*) \| \*\*(\w+)\*\* \|" % re.escape(row), r.stdout, re.M)
+                self.assertEqual(m and m.group(2), want, name)
+                self.assertIn(detail, m.group(1), name)
+                if "self_updaters" not in rec:
+                    self.assertNotIn("held by the freeze", m.group(1), name)  # the wording stays true for a freeze made before the cover
             finally:
                 shutil.rmtree(d, ignore_errors=True)
 
