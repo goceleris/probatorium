@@ -2638,6 +2638,7 @@ class FreezeThaw(Base):
         self.assertIn("If that thaw run ended red, it was killed after it had finished", msg)  # a conditional, not a fact: a green thaw run is the other possibility
         self.assertIn("If a LATER freeze was made since and its record is gone", msg)
         self.assertIn("do not thaw again", msg)
+        self.assertIn("; and, ONLY if that freeze turned them off or held them, tailscale set --auto-update=true and snap refresh --unhold; then rm " + NR_DROPIN, msg)  # r1 m2
         self.h.load()
         self.assertEqual(self.run_ok("survey")["freeze_last_thaw"]["thawed_by_run"], "8")
         # the survey carries the proof of that thaw too (r2 n1, r5 N3: the answer of a thaw that was killed before it could give it)
@@ -2835,6 +2836,7 @@ class FreezeThaw(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("rm %s %s " % (NR_DROPIN, FREEZE_RECORD), (r.stdout + r.stderr).replace("\\n", " "))
         self.assertIn("an upgrade and a new freeze are refused", r.stdout + r.stderr)
+        self.assertIn("tailscale set --auto-update=true and snap refresh --unhold; then rm", (r.stdout + r.stderr).replace("\\n", " "))  # r1 m2
 
     def test_a_needrestart_file_of_ours_that_the_record_does_not_know_is_removed_by_the_thaw(self):  # F4
         r = self.freeze(systemctl_kill_nth={"is-active apt-daily.timer": 2})

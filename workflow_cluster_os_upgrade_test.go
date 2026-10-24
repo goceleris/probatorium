@@ -1244,7 +1244,11 @@ func TestOSUpgradeConstantsAgree(t *testing.T) {
 	for _, m := range regexp.MustCompile(`"([^"]+)"`).FindAllStringSubmatch(fu[1], -1) {
 		units = append(units, m[1])
 	}
-	if want := "systemctl enable --now " + strings.Join(units, " ") + "; then rm " + nd[1]; !strings.Contains(judge, want) {
+	// and the two self-updaters, only if that freeze changed them (r1 m2)
+	if want := "systemctl enable --now " + strings.Join(units, " ") + "; and, ONLY if that freeze turned them off or held them, tailscale set --auto-update=true and snap refresh --unhold; then rm " + nd[1]; !strings.Contains(judge, want) {
 		t.Errorf("the judge's nothing-to-thaw text lacks the hand restore the tool names: %q", want)
+	}
+	if n := strings.Count(script, "ONLY if that freeze turned them off or held them, tailscale set --auto-update=true and snap refresh --unhold; then rm"); n != 2 {
+		t.Errorf("the tool's two nothing-to-thaw messages (an archive, an unreadable record) must both name the self-updaters' hand restore, found %d", n)
 	}
 }

@@ -274,6 +274,45 @@ class ChecklistReplay(unittest.TestCase):
                 shutil.rmtree(d, ignore_errors=True)
 
 
+    def test_the_freeze_and_thaw_headlines_do_not_guess_about_a_record_from_a_result_that_was_never_written(self):  # r1 M1, m1
+        # The play writes result.json last. A judge refusal, an unreachable host or a dropped connection leaves none, and the step summary runs on every red
+        # run: "the record is gone" or "the record is kept" can be said only when something says so (a result.json with a record, the judge's own refusal).
+        nothing = "nothing to thaw: no freeze record on this host (this tool froze nothing here, or its record is gone)"
+        resume = "/var/lib/celeris-power/resume-pending.json exists: a power-loss resume is pending (cluster-power-restore --list)"
+        frozen = "this host is already frozen (run 41, 2026-10-23T10:00:00Z, status frozen): dispatch mode=thaw first."
+        neutral_thaw = ["**result: NOT THAWED** (ansible-playbook exit 2): the run stopped before the result was recorded", "dispatch mode=survey to read it, and mode=thaw again if it is still there"]
+        neutral_freeze = ["**result: NOT FROZEN** (ansible-playbook exit 2): the run stopped before the result was recorded", "dispatch mode=survey: a record of a freeze that failed half way may exist"]
+        gone = ["NOT CONFIRMED", "no freeze record on msr1 any more", "there is no record to thaw", "Do not dispatch mode=thaw again"]
+        unreadable = {"mode": "thaw", "status": "thaw-failed", "freeze_ok": False, "freeze": {"status": "unreadable"}, "error": "nothing to thaw: no readable freeze record at /x"}
+        for name, mode, result, refusal, wants, unwanted in (
+                ("thaw, a judge refusal, no result", "thaw", None, resume, neutral_thaw, gone),
+                ("thaw, host unreachable (nothing written)", "thaw", None, None, neutral_thaw, gone),
+                ("thaw, the judge's nothing to thaw", "thaw", None, nothing, ["**result: NOT THAWED** (ansible-playbook exit 2): refused, there is no freeze record on msr1: nothing to thaw"],
+                 ["NOT CONFIRMED", "dispatch mode=thaw again", "the freeze record is kept"]),
+                ("freeze, a judge refusal, no result", "freeze", None, resume, neutral_freeze, gone),
+                ("freeze, host unreachable", "freeze", None, None, neutral_freeze, gone),
+                ("freeze, already frozen", "freeze", None, frozen, ["**result: NOT FROZEN** (ansible-playbook exit 2): refused, this host is already frozen. Its record is kept"],
+                 gone + ["the run stopped before"]),
+                ("thaw, an unreadable record", "thaw", unreadable, None, ["**result: NOT THAWED, OR NOT COMPLETELY** (ansible-playbook exit 2): the freeze record is kept"], gone),
+                ("thaw, a tool answer without a record (killed after it finished)", "thaw", {"mode": "thaw", "status": "thaw-failed", "freeze_ok": False, "freeze": {}},
+                 None, ["**result: NOT CONFIRMED** (ansible-playbook exit 2): there is no freeze record on msr1 any more"], ["the run stopped before", "the freeze record is kept"])):
+            d = tempfile.mkdtemp(prefix="osu-real-headline-")
+            try:
+                os.makedirs(os.path.join(d, "msr1"))
+                if result is not None:
+                    json.dump(result, open(os.path.join(d, "msr1", "result.json"), "w"))
+                if refusal is not None:
+                    open(os.path.join(d, "msr1", "refusal.txt"), "w").write(refusal + "\n")
+                r = subprocess.run(["bash", SUMMARY, d, mode, "msr1", "2", "x", "1"], capture_output=True, text=True, timeout=120)
+                md = " ".join(r.stdout.split())
+                for w in wants:
+                    self.assertIn(w, md, name)
+                for u in unwanted:
+                    self.assertNotIn(u, md, name)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
+
 REHEARSE_FIRST_ENTRY = "the first menu entry of grub is 7.0.0-38-generic, not the running kernel 7.0.0-31-generic"
 NO_REHEARSAL = "no successful one-shot rehearsal of this host on the running kernel 7.0.0-31-generic (record: none)"
 NOTHING_TO_REPAIR = "nothing to repair: dpkg --audit is clean"

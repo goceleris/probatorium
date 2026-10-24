@@ -46,6 +46,9 @@ func TestFireH2CChurn_SlowCloseLandsInRingWithError(t *testing.T) {
 	if f.Err != "EOF" {
 		t.Errorf("err = %q, want the verbatim \"EOF\" (the string six reviews could not recover from the v1.5.11 artifact)", f.Err)
 	}
+	// No timer-skew allowance here, unlike TestFireWSTorture_SlowRejectLandsInRingWithStatus (#541): this handler has the same read-then-sleep shape,
+	// so the same few-ms skew can happen, but this assertion has never failed and there is no measurement to size an allowance from. If it does, add
+	// the same allowance with the evidence in the comment.
 	if f.ReadMs < hold.Milliseconds() {
 		t.Errorf("read_ms = %d, want >= %d", f.ReadMs, hold.Milliseconds())
 	}

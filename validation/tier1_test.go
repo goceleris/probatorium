@@ -356,6 +356,36 @@ func (readyThenEOF) Stderr() io.Reader {
 	return strings.NewReader("noise\nready addr=127.0.0.1:7\n")
 }
 
+// earlyExit is a remote.Process that dies before it ever prints a ready line, leaving a panic on stderr.
+type earlyExit struct{}
+
+func (earlyExit) PID() int         { return 1 }
+func (earlyExit) Signal(int) error { return nil }
+func (earlyExit) Wait(context.Context) (remote.WaitResult, error) {
+	return remote.WaitResult{}, nil
+}
+func (earlyExit) Stderr() io.Reader {
+	return strings.NewReader("panic: boom\ngoroutine 1 [running]:\nexit status 2\n")
+}
+
+// TestWaitForReady_ARefappThatNeverSaysReadyIsReportedWithItsStderr: the other side of the test below. A refapp that exits before its ready line is
+// "exited before ready", with every line it wrote under "--- refapp stderr ---", the last one included: the drain of lineCh on the end of the stream
+// must not turn that into a ready, nor lose the line the scanner had buffered (before the #546 fix the last line was lost in a few calls of 2000).
+func TestWaitForReady_ARefappThatNeverSaysReadyIsReportedWithItsStderr(t *testing.T) {
+	for i := 0; i < 2000; i++ {
+		addr, err := waitForReady(context.Background(), earlyExit{}, tier1TestReadyTimeout)
+		if err == nil || addr != "" {
+			t.Fatalf("iteration %d: addr=%q err=%v, want an error and no address", i, addr, err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"refapp exited before ready", "--- refapp stderr ---", "panic: boom", "goroutine 1 [running]:", "exit status 2"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("iteration %d: the error lacks %q: %q", i, want, msg)
+			}
+		}
+	}
+}
+
 // TestWaitForReady_ReadyLineIsNotLostToTheEndOfTheStream: a refapp that wrote
 // its ready line and then closed its stderr is ready. waitForReady used to
 // select between the line and the end of the stream at random when the

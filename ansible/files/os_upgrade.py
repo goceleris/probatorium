@@ -2025,12 +2025,12 @@ def cmd_thaw(a):
         fail("nothing to thaw: there is no freeze record here. The newest archived thaw is of the freeze of run %s (thawed by run %s at %s, archive %s/freeze-%s-thawed.json, "
              "drifted at thaw time: %s). If that thaw run ended red, it was killed after it had finished: read the archive, do not thaw again. If a LATER freeze was made since and "
              "its record is gone, the units it stopped are still stopped: put back by hand ONLY the ones you know were on: systemctl enable --now apt-daily.timer "
-             "apt-daily-upgrade.timer unattended-upgrades.service; then rm %s" % (
+             "apt-daily-upgrade.timer unattended-upgrades.service; and, ONLY if that freeze turned them off or held them, tailscale set --auto-update=true and snap refresh --unhold; then rm %s" % (
                  last.get("run_id"), last.get("thawed_by_run"), last.get("thawed_utc"), STATE_DIR, last.get("run_id"), "; ".join(last.get("drifted_at_thaw", [])) or "nothing",
                  NEEDRESTART_DROPIN))
     if not rec or rec.get("status") == "unreadable":
         fail("nothing to thaw: no readable freeze record at %s. This tool froze nothing here, or the record is gone; if units were stopped by a freeze whose record is lost, put back by hand ONLY the "
-             "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; then rm %s %s "
+             "ones you know were on: systemctl enable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; and, ONLY if that freeze turned them off or held them, tailscale set --auto-update=true and snap refresh --unhold; then rm %s %s "
              "(the unreadable record itself: until it is gone, an upgrade and a new freeze are refused)" % (FREEZE_RECORD, NEEDRESTART_DROPIN, FREEZE_RECORD))
     # the end-of-campaign proof: what moved since the freeze, read BEFORE the thaw changes anything (the survey after a thaw has no record to compare with)
     # and stored in the record, durably, by the FIRST attempt: a retry (after a masked unit, a kill) reuses it, because by then the first attempt's own
