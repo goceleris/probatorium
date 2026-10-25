@@ -55,7 +55,8 @@
 # fifteen forks a tick); the fine one is a read-only /proc parser that costs
 # 0.03 % of ONE core at 1 s (about 0.3 ms of CPU per tick) and 0.35 % at 0.05 s
 # (20 Hz), measured over 60 s with this playbook on an 8-CPU Linux container with two
-# busy CPUs; 10-11 MiB of RSS and 9 descriptors. Output: 100-250 bytes a tick.
+# busy CPUs (fine.stats of every run reports the real figure); 10-11 MiB of RSS and
+# 9 descriptors. Output: about 45 bytes a tick plus 18 per CPU that did anything.
 #
 # It runs at nice 10 (never raised), so under contention the SUT keeps the CPU
 # and the sampler shows the starvation as a gap in its own series instead of

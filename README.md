@@ -742,9 +742,11 @@ touched, no BenchTier variable is added, and the SUT is not told. It is a separa
 series), reads four `/proc` files and each `ksoftirqd` thread's `schedstat` per tick with `pread` and forks nothing. Measured over 60 s with the
 real playbook on an 8-CPU Linux container (2 busy CPUs): **0.03 % of one CPU at 1 s (about 0.3 ms a tick) and 0.35 % at 0.05 s (about 0.2 ms a tick)**, 10-11 MiB RSS,
 9 descriptors. The 60 s shell sampler costs about 24 ms per sample (0.04 % of a CPU).
-Output goes to tmpfs (`/run/celeris/fine`) and is capped at two generations of 16 MiB, so it keeps the last 35-90
-hours at 1 s (100-250 bytes a tick) and 2-6 hours at 0.05 s; the event log (4 MiB cap) covers the whole run.
-Use 0.05 s for a scoped run (`cells=...`), not for a multi-day grid.
+Output goes to tmpfs (`/run/celeris/fine`) and is capped at two generations of 16 MiB. A tick is about 45 bytes
+plus 18 per CPU that did anything, so the series keeps the last 90 h at 1 s on a quiet host, 36 h with 12 busy CPUs
+and 15 h with all 32 CPUs of the loadgen busy, and 45 minutes to 6 hours at 0.05 s; the event log (4 MiB cap) covers
+the whole run. Use 0.05 s for a scoped run (`cells=...`), not for a multi-day grid. The CPU figures were measured on
+8 CPUs; `self_cpu_pct` in each host's `fine/fine.stats` is the figure of the real run.
 
 **Lifetime.** `SAMPLER_DURATION` is keyed like the job's `timeout-minutes` (the largest budget the key admits plus
 3 h, inside the ceiling). The stop step (`if: always()`, `continue-on-error`, 5 minutes) ends both processes with a

@@ -63,6 +63,7 @@
     forensics_max_lines: 1500
     forensics_reason: unspecified
     sampler_outdir: /var/log/celeris-host-sampler
+    sampler_fine_dir: /run/celeris/fine
     # Short, deliberate SSH bounds for this play only. The inventory's values
     # (ConnectTimeout=60, ServerAliveCountMax=18 => ~3 min of dead air
     # tolerated) exist so a saturated host mid-bench is not dropped as
@@ -147,6 +148,23 @@
       # 51 s for one dead host, against 11 s with the guard. Bounding the
       # capture is the requirement; four retries of a known-dead connection
       # is the opposite of it.
+      when: forensics.stdout is defined
+
+    # The fine series' small files (the bench tier's sub-minute sampler,
+    # ops/host-sampler/celeris-host-sampler-fine): the starvation / gap event
+    # log and the stats. They are on tmpfs, so a runner that died leaves them
+    # until the host reboots; the series itself is fetched by the stop step.
+    - name: Fetch the fine host sampler events
+      ansible.builtin.fetch:
+        src: "{{ sampler_fine_dir }}/{{ item }}"
+        dest: "{{ forensics_local_dir }}/{{ inventory_hostname }}/fine/{{ item }}"
+        flat: true
+        fail_on_missing: false
+        validate_checksum: false
+      loop:
+        - fine-events.log
+        - fine.stats
+      failed_when: false
       when: forensics.stdout is defined
 
     # Past this point a host that never answered is allowed back into the

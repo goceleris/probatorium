@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The fine host sampler (ops/host-sampler/celeris-host-sampler-fine, the
@@ -21,7 +23,10 @@ func TestFineHostSamplerUnitTests(t *testing.T) {
 	if err != nil {
 		t.Skip("python3 not installed")
 	}
-	out, err := exec.Command(py, "-I", "ops/host-sampler/test_fine_sampler.py").CombinedOutput()
+	// bounded: a loop that never ends (a deadline ignored) must fail here, not at the suite's timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, py, "-I", "ops/host-sampler/test_fine_sampler.py").CombinedOutput()
 	t.Logf("%s", out)
 	if err != nil {
 		t.Fatalf("ops/host-sampler/test_fine_sampler.py: %v", err)
