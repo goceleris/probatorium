@@ -1,0 +1,297 @@
+//go:build linux
+
+// Package bindiag holds the shared bind/listen retry + diagnostic
+// helpers used by both the epoll and iouring engines. Linux-only
+// (the build tag above excludes everything else); on non-linux the
+// engines aren't compiled at all.
+//
+// Two responsibilities:
+//
+//   - [BindWithRetry] wraps unix.Bind with bounded exponential-with-
+//     jitter retries on transient EADDRINUSE. The race we mitigate is
+//     the kernel's per-port bind-table contention when the adaptive
+//     engine starts iouring + N epoll-loop sockets concurrently into
+//     the same SO_REUSEPORT group; one of the binds occasionally
+//     observes EADDRINUSE despite SO_REUSEPORT being set on every
+//     member of the group. The condition clears in microseconds.
+//
+//   - [Format] produces the structured "addr=… SO_REUSEADDR=… …" string
+//     attached to bind/listen error messages so a real conflict
+//     (post-retry-budget) carries enough state to triage without
+//     reproducing.
+package bindiag
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// BindRetries is the maximum number of unix.Bind attempts. Sized so the
+// total worst-case sleep budget covers the kernel-bind-table races we've
+// observed in cluster matrix runs (sub-ms per race; <100ms across the
+// entire SO_REUSEPORT group at startup) while bounding pathological
+// kernel state at ~½ second.
+const BindRetries = 9
+
+// baseBindDelay is the first retry's base sleep. Jitter doubles each
+// attempt, so attempt N sleeps in [base, 2·base) · 2^(N-1).
+const baseBindDelay = 250 * time.Microsecond
+
+// BindWithRetry calls unix.Bind on fd with sa, retrying on EADDRINUSE
+// up to [BindRetries] times with exponential backoff + per-attempt
+// jitter. Non-EADDRINUSE errors short-circuit immediately. The jitter
+// matters because all SO_REUSEPORT-group members in a single process
+// retry against the same kernel bind table; without it 12+ loops
+// sleep+wake in lockstep and re-collide on every attempt.
+//
+// Sleep schedule (worst-case, no early success):
+//
+//	attempt 1: [250 µs, 500 µs)
+//	attempt 2: [500 µs, 1 ms)
+//	...
+//	attempt 8: [32 ms, 64 ms)
+//	total worst-case across 8 sleeps ≈ 128 ms (rare; typical: 0–1 ms).
+func BindWithRetry(fd int, sa unix.Sockaddr) error {
+	var err error
+	for attempt := range BindRetries {
+		if attempt > 0 {
+			scale := time.Duration(1 << (attempt - 1))
+			// rand.N panics on a zero-or-negative argument; baseBindDelay·scale
+			// is always positive and well below the int64 limit (max
+			// 32 ms·1 = 32 ms at attempt 8 with the current schedule).
+			jitter := time.Duration(rand.Int64N(int64(baseBindDelay * scale)))
+			time.Sleep(baseBindDelay*scale + jitter)
+		}
+		err = unix.Bind(fd, sa)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, unix.EADDRINUSE) {
+			return err
+		}
+	}
+	return err
+}
+
+// Format returns a one-line diagnostic snapshot useful when bind() or
+// listen() fails. Captures the port being bound, the FD's actual
+// SO_REUSE* socket-option values (in case a setsockopt didn't take
+// effect), the list of other LISTEN sockets currently on the same
+// port, and our process's open-FD count. Errors during diagnosis are
+// reported inline so a malformed /proc cannot mask the original bind
+// failure.
+func Format(fd int, sa unix.Sockaddr) string {
+	var b strings.Builder
+
+	port := sockaddrPort(sa)
+	addr := SockaddrString(fd, sa)
+	if addr == "" {
+		addr = "?"
+	}
+	fmt.Fprintf(&b, "addr=%s", addr)
+
+	if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR); err == nil {
+		fmt.Fprintf(&b, " SO_REUSEADDR=%d", v)
+	} else {
+		fmt.Fprintf(&b, " SO_REUSEADDR=err(%v)", err)
+	}
+	if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT); err == nil {
+		fmt.Fprintf(&b, " SO_REUSEPORT=%d", v)
+	} else {
+		fmt.Fprintf(&b, " SO_REUSEPORT=err(%v)", err)
+	}
+
+	if port > 0 {
+		if listeners := procListenersOnPort(port); len(listeners) > 0 {
+			fmt.Fprintf(&b, " listeners_on_port=[%s]", strings.Join(listeners, ","))
+		} else {
+			b.WriteString(" listeners_on_port=[]")
+		}
+	}
+
+	if n, err := countFDs(); err == nil {
+		fmt.Fprintf(&b, " our_open_fds=%d", n)
+	}
+
+	return b.String()
+}
+
+func sockaddrPort(sa unix.Sockaddr) int {
+	switch v := sa.(type) {
+	case *unix.SockaddrInet4:
+		return v.Port
+	case *unix.SockaddrInet6:
+		return v.Port
+	}
+	return 0
+}
+
+// SockaddrString formats a socket address exactly as net.TCPAddr.String
+// prints the same peer (celeris#925, std's RemoteAddr): "a.b.c.d:port" for
+// IPv4, and for an IPv4-mapped IPv6 address, which is an IPv4 client of a
+// dual-stack "[::]:port" listener; "[ip]:port" for IPv6; "[ip%zone]:port" when
+// the scope id is nonzero, with the zone named by zoneName. An unknown address
+// type gives "".
+//
+// fd is any socket in the network namespace the address belongs to (the
+// accepted connection, or the listener); it resolves a scope id to an
+// interface name and is not read otherwise.
+//
+// It runs once per accepted connection on the event loop, so the IPv4 form is
+// built by hand into a stack buffer, and a scope id costs one SIOCGIFNAME
+// ioctl, not the netlink dump of net.InterfaceByIndex (celeris#925 review).
+func SockaddrString(fd int, sa unix.Sockaddr) string {
+	switch v := sa.(type) {
+	case *unix.SockaddrInet4:
+		return ipv4Port(v.Addr, v.Port)
+	case *unix.SockaddrInet6:
+		if v.ZoneId == 0 && isV4Mapped(v.Addr) {
+			return ipv4Port([4]byte{v.Addr[12], v.Addr[13], v.Addr[14], v.Addr[15]}, v.Port)
+		}
+		host := net.IP(v.Addr[:]).String()
+		if zone := zoneName(fd, v.ZoneId); zone != "" {
+			host += "%" + zone
+		}
+		return net.JoinHostPort(host, strconv.Itoa(v.Port))
+	}
+	return ""
+}
+
+// BoundAddr is the bound address of the socket fd as a *net.TCPAddr, or nil
+// when Getsockname fails. The zone is set only for a nonzero scope id: an
+// unscoped "[::]:port" listener printed as "[::%0]:port" before celeris#925.
+func BoundAddr(fd int) net.Addr {
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		return nil
+	}
+	switch v := sa.(type) {
+	case *unix.SockaddrInet4:
+		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port}
+	case *unix.SockaddrInet6:
+		return &net.TCPAddr{IP: v.Addr[:], Port: v.Port, Zone: zoneName(fd, v.ZoneId)}
+	}
+	return nil
+}
+
+// zoneName is a scope id as net.Conn names it: the interface name, or the
+// number when no interface has that index, and "" for 0. The name is resolved
+// with SIOCGIFNAME on fd: one syscall, no lock, no cache to expire. It does
+// not use net.InterfaceByIndex, which is an RTM_GETLINK dump of every
+// interface (16 us with 12 interfaces, 255 us with 212, 1.7 MB of garbage),
+// too much for the accept path of an event loop that a link-local client can
+// reach once per connection. A failed ioctl (no such interface: ENODEV, or an
+// unusable fd) gives the number, as std does for an unknown interface.
+func zoneName(fd int, id uint32) string {
+	if id == 0 {
+		return ""
+	}
+	if name, ok := ifName(fd, id); ok {
+		return name
+	}
+	return strconv.FormatUint(uint64(id), 10)
+}
+
+// ifName is the name of the interface with index id, from SIOCGIFNAME on fd.
+func ifName(fd int, id uint32) (string, bool) {
+	ifr, err := unix.NewIfreq("")
+	if err != nil {
+		return "", false
+	}
+	ifr.SetUint32(id)
+	if err := unix.IoctlIfreq(fd, unix.SIOCGIFNAME, ifr); err != nil {
+		return "", false
+	}
+	if name := ifr.Name(); name != "" {
+		return name, true
+	}
+	return "", false
+}
+
+// isV4Mapped reports whether a is an IPv4-mapped IPv6 address, ::ffff:a.b.c.d.
+func isV4Mapped(a [16]byte) bool {
+	for _, b := range a[:10] {
+		if b != 0 {
+			return false
+		}
+	}
+	return a[10] == 0xff && a[11] == 0xff
+}
+
+// ipv4Port formats "a.b.c.d:port" into a stack buffer.
+func ipv4Port(a [4]byte, port int) string {
+	// Max "255.255.255.255:65535" = 21 bytes.
+	var b [21]byte
+	buf := b[:0]
+	buf = strconv.AppendInt(buf, int64(a[0]), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(a[1]), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(a[2]), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendInt(buf, int64(a[3]), 10)
+	buf = append(buf, ':')
+	buf = strconv.AppendInt(buf, int64(port), 10)
+	return string(buf)
+}
+
+func procListenersOnPort(port int) []string {
+	var out []string
+	for _, file := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		fam := "tcp4"
+		if strings.HasSuffix(file, "tcp6") {
+			fam = "tcp6"
+		}
+		f, err := os.Open(file)
+		if err != nil {
+			out = append(out, fmt.Sprintf("%s=open(%v)", fam, err))
+			continue
+		}
+		s := bufio.NewScanner(f)
+		s.Buffer(make([]byte, 0, 64<<10), 256<<10)
+		first := true
+		for s.Scan() {
+			if first {
+				first = false
+				continue
+			}
+			fields := strings.Fields(s.Text())
+			if len(fields) < 10 {
+				continue
+			}
+			// fields[1] = local_addr:port (hex), fields[3] = state (hex);
+			// 0A = TCP_LISTEN.
+			if fields[3] != "0A" {
+				continue
+			}
+			localParts := strings.Split(fields[1], ":")
+			if len(localParts) != 2 {
+				continue
+			}
+			p, err := strconv.ParseInt(localParts[1], 16, 32)
+			if err != nil || int(p) != port {
+				continue
+			}
+			out = append(out, fmt.Sprintf("%s %s uid=%s inode=%s", fam, fields[1], fields[7], fields[9]))
+		}
+		_ = f.Close()
+	}
+	return out
+}
+
+func countFDs() (int, error) {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return 0, err
+	}
+	return len(entries), nil
+}

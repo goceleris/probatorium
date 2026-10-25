@@ -1,0 +1,287 @@
+package session
+
+import (
+	"strings"
+	"time"
+
+	"github.com/goceleris/celeris"
+
+	"github.com/goceleris/celeris/middleware/internal/randutil"
+	"github.com/goceleris/celeris/middleware/store"
+)
+
+// ContextKey is the context store key for the session object.
+const ContextKey = "session"
+
+// absExpKey is the reserved session data key for absolute expiry timestamp.
+const absExpKey = "_abs_exp"
+
+// Extractor is a function that extracts the session ID from a request.
+// The default extractor reads the session cookie. For API clients, use
+// [HeaderExtractor] or [QueryExtractor] instead.
+type Extractor func(c *celeris.Context) string
+
+// CookieExtractor returns an [Extractor] that reads the session ID from
+// the named cookie.
+func CookieExtractor(cookieName string) Extractor {
+	return func(c *celeris.Context) string {
+		v, err := c.Cookie(cookieName)
+		if err != nil {
+			return ""
+		}
+		return v
+	}
+}
+
+// HeaderExtractor returns an [Extractor] that reads the session ID from
+// the named request header. Use this for API clients that cannot store
+// cookies. Header name is pre-lowercased so c.Header's own fast-path
+// fires without allocating per request.
+func HeaderExtractor(headerName string) Extractor {
+	h := strings.ToLower(headerName)
+	return func(c *celeris.Context) string {
+		return c.Header(h)
+	}
+}
+
+// QueryExtractor returns an [Extractor] that reads the session ID from
+// the named query parameter.
+func QueryExtractor(paramName string) Extractor {
+	return func(c *celeris.Context) string {
+		return c.Query(paramName)
+	}
+}
+
+// Config defines the session middleware configuration.
+type Config struct {
+	// Skip defines a function to skip this middleware for certain requests.
+	Skip func(c *celeris.Context) bool
+
+	// SkipPaths lists paths to skip (exact match).
+	SkipPaths []string
+
+	// Store is the session backend. Default: [NewMemoryStore].
+	// Sessions are JSON-encoded before persistence; custom [store.KV]
+	// backends (Redis, Postgres) must preserve byte slice contents.
+	Store store.KV
+
+	// Extractor extracts the session ID from the request. Default:
+	// CookieExtractor(CookieName). When a non-cookie extractor is used,
+	// the session ID is also set in a response header named after the
+	// cookie name for API clients.
+	Extractor Extractor
+
+	// CookieName is the session cookie name. Default: "celeris_session".
+	CookieName string
+
+	// CookiePath is the cookie Path attribute. Default: "/".
+	CookiePath string
+
+	// CookieDomain is the cookie Domain attribute.
+	CookieDomain string
+
+	// CookieMaxAge is the cookie Max-Age in seconds.
+	// nil means "use default (86400 = 24h)". A non-nil pointer selects
+	// the exact value: 0 for a session cookie (no Max-Age attribute),
+	// positive for an explicit lifetime.
+	//
+	// Note: CookieMaxAge controls browser-side cookie lifetime and is
+	// independent of IdleTimeout (server-side store expiry). If CookieMaxAge
+	// is shorter than IdleTimeout, the browser will discard the cookie while
+	// the server still holds the session data. If longer, the browser may
+	// send a cookie for a session the server has already evicted. For
+	// consistent behavior, align CookieMaxAge with IdleTimeout (e.g.,
+	// CookieMaxAge = intPtr(int(IdleTimeout.Seconds()))).
+	CookieMaxAge *int
+
+	// CookieSecure flags the cookie for HTTPS-only transmission.
+	CookieSecure bool
+
+	// CookieHTTPOnly prevents client-side scripts from accessing the cookie.
+	// nil means "use default (true)". Set to a non-nil pointer to
+	// explicitly enable or disable: BoolPtr(false) disables HTTPOnly
+	// for JS-based session management.
+	CookieHTTPOnly *bool
+
+	// CookieSameSite controls cross-site request cookie behavior.
+	// Default: celeris.SameSiteLaxMode.
+	CookieSameSite celeris.SameSite
+
+	// IdleTimeout is how long a session can be idle before expiring.
+	// Default: 30 minutes.
+	IdleTimeout time.Duration
+
+	// AbsoluteTimeout is the maximum lifetime of a session regardless of
+	// activity. Default: 24 hours. Set to 0 for the default, or -1 to
+	// disable absolute timeout enforcement entirely.
+	AbsoluteTimeout time.Duration
+
+	// KeyGenerator generates new session IDs. Default: 32-byte crypto/rand hex.
+	KeyGenerator func() string
+
+	// ErrorHandler is called when a store operation fails. If nil, the error
+	// is returned up the middleware chain.
+	ErrorHandler func(c *celeris.Context, err error) error
+
+	// WriteBehind moves the post-handler session store write OFF the response
+	// critical path. Default: false (the store write completes before the
+	// response is sent, exactly as it does today).
+	//
+	// When true, the encoded session body is snapshotted and handed to a
+	// single bounded background worker, so the store.Set overlaps the next
+	// request instead of gating the current response. This closes the gap to
+	// write-behind competitors on session-heavy workloads.
+	//
+	// Durability tradeoff (opt-in for a reason): a response acknowledged to
+	// the client is no longer a guarantee the session is already durable in
+	// the store. An abrupt process death (SIGKILL, panic, power loss) between
+	// the response and the deferred write loses that one update. A graceful
+	// shutdown does NOT: closing the middleware ([Handler.Close], or the
+	// io.Closer returned by [NewWithCloser]) drains every in-flight and
+	// queued write before returning. Leave this false for flows where the
+	// next read after a write must observe it across a crash (e.g. financial
+	// state, anti-replay nonces); enable it for high-throughput,
+	// crash-tolerant session updates (last-seen, view counters, cart state).
+	//
+	// Concurrency is bounded: one worker goroutine, never a per-request
+	// goroutine fan-out, so a slow store applies backpressure rather than
+	// exploding goroutine count. Writes are serialized in enqueue order.
+	//
+	// WriteBehind has no effect on [Session.Destroy] (cookie/session removal
+	// stays synchronous) and is independent of the cookie write, which is
+	// emitted synchronously at the first mutation of the request (see the
+	// package documentation and SaveUnmodified).
+	WriteBehind bool
+
+	// SaveUnmodified forces eager persistence of fresh, unmodified sessions.
+	// Default: false (lazy session creation: a fresh session is only persisted
+	// and its cookie emitted if the handler modifies the session data, e.g. via
+	// [Session.Set], [Session.Delete], [Session.Clear], [Session.Regenerate],
+	// [Session.SetIdleTimeout], or explicit [Session.Save]).
+	//
+	// When true, a fresh session's cookie is put on the response before the
+	// handler runs, so it reaches the client regardless of whether — or when —
+	// the handler writes a body.
+	//
+	// Under the default (false), cookieless requests that do not mutate the
+	// session (crawlers, health checks, read-only API calls) never write to the
+	// store or emit a Set-Cookie header, preventing unbounded store growth
+	// under anonymous load (celeris#487). The session ID returned by [Session.ID]
+	// is provisional until committed by a write, and the session's absolute
+	// timeout window starts on its first write.
+	//
+	// Legacy edge: a client presenting an expired, evicted, or legacy cookie
+	// (such as a blob persisted by an older build missing _abs_exp) is treated
+	// as expired; previously it was immediately re-persisted with a new session
+	// and cookie, now a read-only request leaves nothing in the store until the
+	// handler writes. Stale-cookie clients are not rotated until their next write.
+	//
+	// Set to true only if your application requires assigning persistent session
+	// IDs and tracking cookies to anonymous visitors before any session data
+	// is written.
+	SaveUnmodified bool
+}
+
+// defaultCookieMaxAge is the default cookie Max-Age in seconds (24h).
+var defaultCookieMaxAge = 86400
+
+// defaultCookieHTTPOnly is the default for the HTTPOnly cookie attribute.
+var defaultCookieHTTPOnly = true
+
+var defaultConfig = Config{
+	CookieName:      "celeris_session",
+	CookiePath:      "/",
+	CookieMaxAge:    &defaultCookieMaxAge,
+	CookieHTTPOnly:  &defaultCookieHTTPOnly,
+	CookieSameSite:  celeris.SameSiteLaxMode,
+	IdleTimeout:     30 * time.Minute,
+	AbsoluteTimeout: 24 * time.Hour,
+}
+
+// BoolPtr returns a pointer to the given bool value. Use this to
+// explicitly set [Config].CookieHTTPOnly:
+//
+//	session.New(session.Config{CookieHTTPOnly: session.BoolPtr(false)})
+func BoolPtr(v bool) *bool { return &v }
+
+// IntPtr returns a pointer to the given int value. Use this to
+// explicitly set [Config].CookieMaxAge:
+//
+//	session.New(session.Config{CookieMaxAge: session.IntPtr(0)}) // session cookie
+func IntPtr(v int) *int { return &v }
+
+// ChainExtractor returns an [Extractor] that tries each extractor in order
+// and returns the first non-empty result. This is useful when session IDs
+// may arrive via different transport mechanisms (e.g., cookie for browsers,
+// header for API clients).
+func ChainExtractor(extractors ...Extractor) Extractor {
+	return func(c *celeris.Context) string {
+		for _, e := range extractors {
+			if sid := e(c); sid != "" {
+				return sid
+			}
+		}
+		return ""
+	}
+}
+
+func applyDefaults(cfg Config) Config {
+	// When no store is provided, applyDefaults creates a MemoryStore which
+	// spawns a background cleanup goroutine. This is intentional: the
+	// middleware is typically created once at startup and the goroutine
+	// runs for the process lifetime. Use [store.MemoryKVConfig].CleanupContext
+	// or the [store.MemoryKV.Close] method for deterministic shutdown.
+	if cfg.Store == nil {
+		cfg.Store = NewMemoryStore()
+	}
+	if cfg.CookieName == "" {
+		cfg.CookieName = defaultConfig.CookieName
+	}
+	if cfg.CookiePath == "" {
+		cfg.CookiePath = defaultConfig.CookiePath
+	}
+	if cfg.CookieMaxAge == nil {
+		cfg.CookieMaxAge = defaultConfig.CookieMaxAge
+	}
+	if cfg.CookieSameSite == 0 {
+		cfg.CookieSameSite = defaultConfig.CookieSameSite
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = defaultConfig.IdleTimeout
+	}
+	// AbsoluteTimeout: 0 → default (24h), -1 → disabled, >0 → as-is.
+	if cfg.AbsoluteTimeout == 0 {
+		cfg.AbsoluteTimeout = defaultConfig.AbsoluteTimeout
+	}
+	if cfg.KeyGenerator == nil {
+		cfg.KeyGenerator = func() string { return randutil.HexToken(keyBytes) }
+	}
+	if cfg.CookieHTTPOnly == nil {
+		cfg.CookieHTTPOnly = defaultConfig.CookieHTTPOnly
+	}
+	return cfg
+}
+
+func (cfg Config) validate() {
+	if cfg.AbsoluteTimeout > 0 && cfg.AbsoluteTimeout < cfg.IdleTimeout {
+		panic("session: AbsoluteTimeout must be >= IdleTimeout")
+	}
+	if cfg.CookieSameSite == celeris.SameSiteNoneMode && !cfg.CookieSecure {
+		panic("session: CookieSecure must be true when CookieSameSite is None")
+	}
+}
+
+const keyBytes = 32
+const sessionIDHexLen = keyBytes * 2
+
+// newBufferedKeyGenerator returns a key generator backed by the shared
+// randutil buffered generator. Retained for test compatibility.
+func newBufferedKeyGenerator() *bufferedKeyGen {
+	return &bufferedKeyGen{}
+}
+
+type bufferedKeyGen struct{}
+
+func (g *bufferedKeyGen) generate() string {
+	return randutil.HexToken(keyBytes)
+}

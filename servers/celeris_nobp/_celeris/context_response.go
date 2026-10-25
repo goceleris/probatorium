@@ -1,0 +1,2065 @@
+package celeris
+
+import (
+	"bytes"
+	"encoding/json"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"math"
+	"mime"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+	"unsafe"
+
+	"github.com/goceleris/celeris/internal/httprange"
+	"github.com/goceleris/celeris/internal/negotiate"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+)
+
+var smallInts [1000]string
+
+func init() {
+	for i := range smallInts {
+		smallInts[i] = strconv.Itoa(i)
+	}
+}
+
+func itoa(n int) string {
+	if uint(n) < uint(len(smallInts)) {
+		return smallInts[n]
+	}
+	return strconv.Itoa(n)
+}
+
+type jsonState struct {
+	buf bytes.Buffer
+	enc *json.Encoder
+}
+
+var jsonEncPool = sync.Pool{New: func() any {
+	s := &jsonState{}
+	s.enc = json.NewEncoder(&s.buf)
+	s.enc.SetEscapeHTML(false)
+	return s
+}}
+
+// Status sets the response status code and returns the Context for chaining.
+// Note: response methods (JSON, Blob, etc.) take their own status code
+// parameter and do not read the value set by Status.
+func (c *Context) Status(code int) *Context {
+	c.statusCode = code
+	return c
+}
+
+// StatusJSON serializes v as JSON using the status code set by [Status].
+// Equivalent to c.JSON(c.statusCode, v).
+func (c *Context) StatusJSON(v any) error { return c.JSON(c.statusCode, v) }
+
+// StatusXML serializes v as XML using the status code set by [Status].
+// Equivalent to c.XML(c.statusCode, v).
+func (c *Context) StatusXML(v any) error { return c.XML(c.statusCode, v) }
+
+// StatusString writes a plain-text response using the status code set by [Status].
+// Equivalent to c.Blob(c.statusCode, "text/plain", []byte(s)).
+func (c *Context) StatusString(s string) error {
+	return c.Blob(c.statusCode, "text/plain", unsafe.Slice(unsafe.StringData(s), len(s)))
+}
+
+// StatusBlob writes a response using the status code set by [Status].
+// Equivalent to c.Blob(c.statusCode, contentType, data).
+func (c *Context) StatusBlob(contentType string, data []byte) error {
+	return c.Blob(c.statusCode, contentType, data)
+}
+
+// jsonFastBufPool backs the reflection-free fast path in [Context.JSON]
+// for common API response shapes (map[string]string with ASCII-safe
+// values). c.Blob either copies the payload into capturedBody
+// (buffered mode) or writes it synchronously to the stream, so the
+// buffer is always safe to recycle once Blob returns.
+var jsonFastBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
+
+// JSON serializes v as JSON and writes it with the given status code.
+// Returns ErrResponseWritten if a response has already been sent.
+func (c *Context) JSON(code int, v any) error {
+	// Fast path: primitive/map/slice shapes the reflection-free
+	// encoder can emit byte-identically to stdlib encoding/json.
+	// Nested maps and slices are supported recursively — covers the
+	// bulk of JSON-over-HTTP traffic (status envelopes, list endpoints,
+	// {"data": [...]} shapes). See jsonSafeValue for the whitelist.
+	if jsonSafeValue(v) {
+		bp := jsonFastBufPool.Get().(*[]byte)
+		buf := appendJSONValue((*bp)[:0], v)
+		err := c.Blob(code, "application/json", buf)
+		*bp = buf
+		jsonFastBufPool.Put(bp)
+		return err
+	}
+	js := jsonEncPool.Get().(*jsonState)
+	js.buf.Reset()
+	if err := js.enc.Encode(v); err != nil {
+		jsonEncPool.Put(js)
+		return err
+	}
+	b := js.buf.Bytes()
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	err := c.Blob(code, "application/json", b)
+	jsonEncPool.Put(js)
+	return err
+}
+
+// jsonFastMaxKeys caps the number of entries the map fast paths
+// handle. Keeps the key-sort stack buffer finite; larger maps fall
+// back to encoding/json. Captures the 99th percentile of status /
+// error / info response shapes.
+const jsonFastMaxKeys = 16
+
+// jsonSafeValue reports whether v and all nested values are shapes
+// and primitives the reflection-free encoder can emit byte-identically
+// to stdlib encoding/json. Floats, non-ASCII strings, maps with >16
+// keys, and anything outside the explicit whitelist fall through to
+// encoding/json — the fast path never emits a divergent byte.
+func jsonSafeValue(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return true
+	case string:
+		return jsonClassifyString(x) != jsonStringBail
+	case int, int8, int16, int32, int64,
+		uint8, uint16, uint32, uint, uint64, uintptr:
+		return true
+	case float32:
+		f := float64(x)
+		return !math.IsNaN(f) && !math.IsInf(f, 0)
+	case float64:
+		return !math.IsNaN(x) && !math.IsInf(x, 0)
+	case map[string]string:
+		if len(x) > jsonFastMaxKeys {
+			return false
+		}
+		for k, v := range x {
+			// Keys must be verbatim-safe (we don't escape keys); values
+			// can use the escape emitter.
+			if !jsonIsSafeASCII(k) || jsonClassifyString(v) == jsonStringBail {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		if len(x) > jsonFastMaxKeys {
+			return false
+		}
+		for k, v := range x {
+			if !jsonIsSafeASCII(k) || !jsonSafeValue(v) {
+				return false
+			}
+		}
+		return true
+	case []string:
+		for i := range x {
+			if jsonClassifyString(x[i]) == jsonStringBail {
+				return false
+			}
+		}
+		return true
+	case []any:
+		for i := range x {
+			if !jsonSafeValue(x[i]) {
+				return false
+			}
+		}
+		return true
+	case []int, []int64, []bool, []uint64:
+		// Element types that emit byte-identically via strconv.Append*
+		// / "true"/"false". No per-element safety check needed.
+		return true
+	default:
+		_ = x
+		return false
+	}
+}
+
+// appendJSONValue emits v's JSON encoding into dst. Caller must have
+// verified v via jsonSafeValue — any other input results in undefined
+// output. Output is byte-identical to what encoding/json with
+// SetEscapeHTML(false) would produce.
+func appendJSONValue(dst []byte, v any) []byte {
+	switch x := v.(type) {
+	case nil:
+		return append(dst, "null"...)
+	case bool:
+		if x {
+			return append(dst, "true"...)
+		}
+		return append(dst, "false"...)
+	case string:
+		return appendJSONString(dst, x)
+	case int:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int8:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int16:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int32:
+		return strconv.AppendInt(dst, int64(x), 10)
+	case int64:
+		return strconv.AppendInt(dst, x, 10)
+	case uint8:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint16:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint32:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case uint64:
+		return strconv.AppendUint(dst, x, 10)
+	case uintptr:
+		return strconv.AppendUint(dst, uint64(x), 10)
+	case float32:
+		return appendJSONFloat(dst, float64(x))
+	case float64:
+		return appendJSONFloat(dst, x)
+	case map[string]string:
+		var keyBuf [jsonFastMaxKeys]string
+		keys := keyBuf[:0]
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sortJSONKeys(keys)
+		dst = append(dst, '{')
+		for i, k := range keys {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, '"')
+			dst = append(dst, k...)
+			dst = append(dst, '"', ':')
+			dst = appendJSONString(dst, x[k])
+		}
+		return append(dst, '}')
+	case map[string]any:
+		var keyBuf [jsonFastMaxKeys]string
+		keys := keyBuf[:0]
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sortJSONKeys(keys)
+		dst = append(dst, '{')
+		for i, k := range keys {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(dst, '"')
+			dst = append(dst, k...)
+			dst = append(dst, '"', ':')
+			dst = appendJSONValue(dst, x[k])
+		}
+		return append(dst, '}')
+	case []string:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, s := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendJSONString(dst, s)
+		}
+		return append(dst, ']')
+	case []any:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, e := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendJSONValue(dst, e)
+		}
+		return append(dst, ']')
+	case []int:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendInt(dst, int64(n), 10)
+		}
+		return append(dst, ']')
+	case []int64:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendInt(dst, n, 10)
+		}
+		return append(dst, ']')
+	case []uint64:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, n := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendUint(dst, n, 10)
+		}
+		return append(dst, ']')
+	case []bool:
+		if x == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '[')
+		for i, b := range x {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			if b {
+				dst = append(dst, "true"...)
+			} else {
+				dst = append(dst, "false"...)
+			}
+		}
+		return append(dst, ']')
+	}
+	return dst
+}
+
+// sortJSONKeys is an in-place insertion sort for the small key slices
+// the JSON fast paths produce (≤ jsonFastMaxKeys = 16 entries). Avoids
+// the interface-conversion heap alloc that sort.Strings would require
+// and is competitive with quicksort at these sizes.
+func sortJSONKeys(keys []string) {
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+			keys[j-1], keys[j] = keys[j], keys[j-1]
+		}
+	}
+}
+
+// appendJSONFloat emits f using stdlib encoding/json's format rules:
+// 'f' notation inside [1e-6, 1e21) and 'e' outside. The exponent
+// gets stdlib's "e-09 → e-9" cleanup pass. Caller must have
+// excluded NaN/Inf via jsonSafeValue.
+func appendJSONFloat(dst []byte, f float64) []byte {
+	abs := math.Abs(f)
+	format := byte('f')
+	if abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
+	}
+	start := len(dst)
+	dst = strconv.AppendFloat(dst, f, format, -1, 64)
+	if format == 'e' {
+		n := len(dst)
+		if n-start >= 4 && dst[n-4] == 'e' && dst[n-3] == '-' && dst[n-2] == '0' {
+			dst[n-2] = dst[n-1]
+			dst = dst[:n-1]
+		}
+	}
+	return dst
+}
+
+// appendJSONString writes s as a JSON-quoted string with stdlib-
+// compatible escaping for ", \, control characters, and the
+// U+2028/U+2029 separators. Callers must have classified s as
+// non-bail via jsonClassifyString — invalid UTF-8 inputs produce
+// divergent output vs stdlib here.
+//
+// Runs of unescaped bytes are appended as a single span, so the
+// common case (no escapes at all) costs a single append plus the
+// two quote bytes.
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		b := s[i]
+		// ASCII escape-needing bytes: < 0x20, " (0x22), \ (0x5C).
+		// 0x7F (DEL) is NOT escaped by stdlib under SetEscapeHTML(false),
+		// so we pass it through verbatim.
+		if b < 0x80 {
+			if b < 0x20 || b == '"' || b == '\\' {
+				dst = append(dst, s[start:i]...)
+				dst = appendJSONEscapeByte(dst, b)
+				i++
+				start = i
+				continue
+			}
+			i++
+			continue
+		}
+		// U+2028 (E2 80 A8) / U+2029 (E2 80 A9) — stdlib escapes even
+		// with HTML off. Detect without full UTF-8 decode.
+		if b == 0xE2 && i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0xA8 || s[i+2] == 0xA9) {
+			dst = append(dst, s[start:i]...)
+			dst = append(dst, '\\', 'u', '2', '0', '2')
+			if s[i+2] == 0xA8 {
+				dst = append(dst, '8')
+			} else {
+				dst = append(dst, '9')
+			}
+			i += 3
+			start = i
+			continue
+		}
+		// Any other 0x80+ byte is a valid UTF-8 continuation/lead
+		// (classified non-bail by caller); emit verbatim.
+		i++
+	}
+	dst = append(dst, s[start:]...)
+	return append(dst, '"')
+}
+
+// appendJSONEscapeByte writes the stdlib-compatible escape for a
+// single byte known to require escaping (< 0x20, ", or \).
+func appendJSONEscapeByte(dst []byte, b byte) []byte {
+	switch b {
+	case '"':
+		return append(dst, '\\', '"')
+	case '\\':
+		return append(dst, '\\', '\\')
+	case '\n':
+		return append(dst, '\\', 'n')
+	case '\r':
+		return append(dst, '\\', 'r')
+	case '\t':
+		return append(dst, '\\', 't')
+	case '\b':
+		return append(dst, '\\', 'b')
+	case '\f':
+		return append(dst, '\\', 'f')
+	}
+	const hex = "0123456789abcdef"
+	return append(dst, '\\', 'u', '0', '0', hex[b>>4], hex[b&0xF])
+}
+
+// jsonStringClass classifies how s can participate in the fast path.
+const (
+	jsonStringVerbatim = iota // emit as-is between quotes, no escaping
+	jsonStringEscape          // needs byte-level escaping but still fast
+	jsonStringBail            // invalid UTF-8; fall back to encoding/json
+)
+
+// jsonClassifyString returns jsonStringVerbatim when s is printable
+// ASCII + valid UTF-8 with no escape-triggering bytes, jsonStringEscape
+// when s is valid UTF-8 but contains " / \ / control chars /
+// U+2028 / U+2029 (which appendJSONEscapedString handles), and
+// jsonStringBail when s contains invalid UTF-8 (stdlib emits \ufffd
+// for each invalid byte — cheaper to fall back than to replicate).
+func jsonClassifyString(s string) int {
+	kind := jsonStringVerbatim
+	for i := 0; i < len(s); {
+		b := s[i]
+		if b < 0x20 || b == '"' || b == '\\' {
+			kind = jsonStringEscape
+			i++
+			continue
+		}
+		if b < 0x80 {
+			// Printable ASCII and 0x7F: both pass through without
+			// escaping under SetEscapeHTML(false).
+			i++
+			continue
+		}
+		// Multi-byte UTF-8: validate and check for U+2028 / U+2029
+		// (the only non-ASCII runes stdlib still escapes with HTML
+		// off). Invalid UTF-8 bails — stdlib emits \ufffd for each
+		// invalid byte and that format is awkward to replicate.
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return jsonStringBail
+		}
+		if r == 0x2028 || r == 0x2029 {
+			kind = jsonStringEscape
+		}
+		i += size
+	}
+	return kind
+}
+
+// jsonIsSafeASCII (legacy shim) returns true iff s is verbatim-safe.
+// The broader classification is jsonClassifyString; existing callers
+// (map/slice key scans) only care about the boolean answer.
+func jsonIsSafeASCII(s string) bool {
+	return jsonClassifyString(s) == jsonStringVerbatim
+}
+
+// XML serializes v as XML and writes it with the given status code.
+// Returns ErrResponseWritten if a response has already been sent.
+func (c *Context) XML(code int, v any) error {
+	data, err := xml.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return c.Blob(code, "application/xml", data)
+}
+
+// HTML writes an HTML response with the given status code.
+// Returns ErrResponseWritten if a response has already been sent.
+func (c *Context) HTML(code int, html string) error {
+	return c.Blob(code, "text/html; charset=utf-8", unsafe.Slice(unsafe.StringData(html), len(html)))
+}
+
+// String writes a formatted string response.
+// Returns ErrResponseWritten if a response has already been sent.
+func (c *Context) String(code int, format string, args ...any) error {
+	var body string
+	if len(args) > 0 {
+		body = fmt.Sprintf(format, args...)
+	} else {
+		body = format
+	}
+	return c.Blob(code, "text/plain", unsafe.Slice(unsafe.StringData(body), len(body)))
+}
+
+// Blob writes a response with the given content type and data.
+// Returns ErrResponseWritten if a response has already been sent.
+// Returns ErrDetached if the Context has been detached (e.g. by a
+// WebSocket or SSE middleware) — use the middleware's own write API.
+func (c *Context) Blob(code int, contentType string, data []byte) error {
+	if c.written {
+		return ErrResponseWritten
+	}
+	if c.detached {
+		return ErrDetached
+	}
+	if c.bufferDepth > 0 {
+		c.capturedBody = append(c.capturedBody[:0], data...)
+		c.capturedStatus = code
+		c.capturedType = contentType
+		c.statusCode = code
+		c.buffered = true
+		return nil
+	}
+	c.statusCode = code
+	c.written = true
+	c.bytesWritten = len(data)
+	if c.captureBody {
+		c.capturedBody = make([]byte, len(data))
+		copy(c.capturedBody, data)
+		c.capturedStatus = code
+		c.capturedType = contentType
+	}
+	// Skip the stripCRLF function call when the contentType is already
+	// clean (the dominant case — handlers pass string literals like
+	// "application/json"). Inline the ContainsAny check so the common
+	// path is one branch + zero allocations.
+	ct := contentType
+	for i := 0; i < len(contentType); i++ {
+		b := contentType[i]
+		if b == '\r' || b == '\n' || b == 0 {
+			ct = stripCRLF(contentType)
+			break
+		}
+	}
+	nUser := len(c.respHeaders)
+	total := nUser + 2
+	var headers [][2]string
+	if total <= len(c.respHdrBuf) {
+		// respHeaders shares backing array with respHdrBuf — copy user
+		// headers to a stack temporary before overwriting the buffer.
+		// Sized respHdrBufCap - 2: the max user headers reachable on this
+		// path once content-type + content-length take two slots. Derived
+		// from the same const as respHdrBuf so the two cannot drift.
+		var tmp [respHdrBufCap - 2][2]string
+		copy(tmp[:nUser], c.respHeaders)
+		headers = c.respHdrBuf[:0:len(c.respHdrBuf)]
+		headers = append(headers, [2]string{"content-type", ct})
+		headers = append(headers, [2]string{"content-length", itoa(len(data))})
+		headers = append(headers, tmp[:nUser]...)
+	} else {
+		// Reuse a per-Context scratch instead of allocating per request — the
+		// dominant header-heavy Blob alloc (total > respHdrBuf) lived here.
+		// respHeaders never aliases blobHdrScratch (separate buffers; the
+		// append below copies the [2]string values).
+		if cap(c.blobHdrScratch) < total {
+			c.blobHdrScratch = make([][2]string, 0, total)
+		}
+		headers = c.blobHdrScratch[:0]
+		headers = append(headers, [2]string{"content-type", ct})
+		headers = append(headers, [2]string{"content-length", itoa(len(data))})
+		headers = append(headers, c.respHeaders...)
+	}
+	if c.stream.ResponseWriter != nil {
+		return c.stream.ResponseWriter.WriteResponse(c.stream, code, headers, data)
+	}
+	return nil
+}
+
+// NoContent writes a response with no body.
+// Returns ErrResponseWritten if a response has already been sent.
+// Returns ErrDetached if the Context has been detached, as [Context.Blob]
+// does: a detached request is answered by whoever took it over, and on
+// HTTP/2 the stream a late call would write to may by then be another
+// request's.
+func (c *Context) NoContent(code int) error {
+	if c.written {
+		return ErrResponseWritten
+	}
+	if c.detached {
+		return ErrDetached
+	}
+	if c.bufferDepth > 0 {
+		c.capturedStatus = code
+		c.capturedBody = nil
+		c.capturedType = ""
+		c.statusCode = code
+		c.buffered = true
+		return nil
+	}
+	c.statusCode = code
+	c.written = true
+	c.bytesWritten = 0
+	if c.stream.ResponseWriter != nil {
+		return c.stream.ResponseWriter.WriteResponse(c.stream, code, c.respHeaders, nil)
+	}
+	return nil
+}
+
+// SetHeader sets a response header, replacing any existing value for the key.
+// Keys are lowercased for HTTP/2 compliance (RFC 7540 §8.1.2).
+// CRLF characters are stripped to prevent header injection.
+func (c *Context) SetHeader(key, value string) {
+	// Inline fast path: most programmatic header keys are already lowercase
+	// and clean. Scan for uppercase/CRLF and skip function call if clean (P8).
+	k := key
+	for i := range len(key) {
+		b := key[i]
+		if b >= 'A' && b <= 'Z' || b == '\r' || b == '\n' || b == 0 {
+			k = sanitizeHeaderKey(key)
+			break
+		}
+	}
+	v := value
+	for i := range len(value) {
+		b := value[i]
+		if b == '\r' || b == '\n' || b == 0 {
+			v = stripCRLF(value)
+			break
+		}
+	}
+	for i, h := range c.respHeaders {
+		if h[0] == k {
+			c.respHeaders[i][1] = v
+			return
+		}
+	}
+	c.respHeaders = append(c.respHeaders, [2]string{k, v})
+}
+
+// SetHeaderTrust replaces an existing header with the same key (or
+// appends a new one if absent) without sanitizing key or value. The
+// caller MUST guarantee:
+//
+//   - key is lowercase ASCII (no characters in [A-Z]) and contains no
+//     CR, LF, or NUL bytes
+//   - value contains no CR, LF, or NUL bytes
+//
+// Compared to [Context.SetHeader] this skips the byte-by-byte
+// sanitization scan; compared to [Context.AppendRespHeader] it keeps
+// the linear dedup walk so callers do not need to assert that a
+// matching key cannot already be present.
+//
+// Use [Context.SetHeader] when any of these invariants might not hold.
+// Suitable for middleware that emits a single header per request from
+// validated input (e.g. request-id middleware writing a generated UUID
+// under a config-validated header name).
+func (c *Context) SetHeaderTrust(key, value string) {
+	for i, h := range c.respHeaders {
+		if h[0] == key {
+			c.respHeaders[i][1] = value
+			return
+		}
+	}
+	c.respHeaders = append(c.respHeaders, [2]string{key, value})
+}
+
+// AppendRespHeader appends a response header without sanitization or
+// dedup walk. The caller MUST guarantee:
+//
+//   - key is lowercase ASCII (no characters in [A-Z]) and contains no
+//     CR, LF, or NUL bytes
+//   - value contains no CR, LF, or NUL bytes
+//   - no header with the same key already exists on the response
+//
+// Intended for middleware that pre-validates static header pairs at
+// initialization (e.g. the secure-headers middleware emitting fixed
+// X-Frame-Options / X-Content-Type-Options / etc.) so the per-request
+// hot path skips the byte-by-byte sanitization scan and the linear
+// dedup walk that [Context.SetHeader] performs.
+//
+// Use [Context.SetHeader] when any of these invariants might not hold
+// — it is the safe default.
+func (c *Context) AppendRespHeader(key, value string) {
+	c.respHeaders = append(c.respHeaders, [2]string{key, value})
+}
+
+// AddHeader appends a response header value. Unlike SetHeader, it does not
+// replace existing values — use this for headers that allow multiple values
+// (e.g. set-cookie).
+func (c *Context) AddHeader(key, value string) {
+	k := key
+	for i := range len(key) {
+		b := key[i]
+		if b >= 'A' && b <= 'Z' || b == '\r' || b == '\n' || b == 0 {
+			k = sanitizeHeaderKey(key)
+			break
+		}
+	}
+	v := value
+	for i := range len(value) {
+		b := value[i]
+		if b == '\r' || b == '\n' || b == 0 {
+			v = stripCRLF(value)
+			break
+		}
+	}
+	c.respHeaders = append(c.respHeaders, [2]string{k, v})
+}
+
+// varyOn adds name to the response's Vary header, unless a Vary line already
+// lists it (in any case) or is "*". name is a canonical header name, clean
+// of CR, LF and NUL.
+func (c *Context) varyOn(name string) {
+	for _, h := range c.respHeaders {
+		if h[0] == "vary" && varyLists(h[1], name) {
+			return
+		}
+	}
+	c.respHeaders = append(c.respHeaders, [2]string{"vary", name})
+}
+
+// varyLists reports whether the Vary value v lists name, or is "*".
+func varyLists(v, name string) bool {
+	for v != "" {
+		tok := v
+		if i := strings.IndexByte(v, ','); i >= 0 {
+			tok, v = v[:i], v[i+1:]
+		} else {
+			v = ""
+		}
+		tok = strings.TrimSpace(tok)
+		if tok == "*" || strings.EqualFold(tok, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeHeaderKey lowercases and strips CRLF/null bytes. Fast path avoids
+// allocation when the key is already lowercase and clean (common case).
+func sanitizeHeaderKey(s string) string {
+	for i := range len(s) {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c == '\r' || c == '\n' || c == 0 {
+			return stripCRLF(strings.ToLower(s))
+		}
+	}
+	return s
+}
+
+var crlfReplacer = strings.NewReplacer("\r", "", "\n", "", "\x00", "")
+
+// stripCRLF removes \r, \n, and \x00 to prevent HTTP response splitting
+// (CWE-113) and null-byte header smuggling.
+func stripCRLF(s string) string {
+	if strings.ContainsAny(s, "\r\n\x00") {
+		return crlfReplacer.Replace(s)
+	}
+	return s
+}
+
+// ResponseHeaders returns the response headers that have been set so far.
+// The returned slice must not be modified. Use SetHeader or AddHeader to
+// change response headers.
+func (c *Context) ResponseHeaders() [][2]string {
+	return c.respHeaders
+}
+
+// SetResponseHeaders replaces all response headers. Used by caching middleware
+// to replay stored responses. The provided headers are copied; the caller
+// retains ownership of the slice.
+func (c *Context) SetResponseHeaders(headers [][2]string) {
+	if len(headers) <= len(c.respHdrBuf) {
+		copy(c.respHdrBuf[:len(headers)], headers)
+		c.respHeaders = c.respHdrBuf[:len(headers)]
+	} else if cap(c.respHdrScratch) >= len(headers) {
+		c.respHeaders = c.respHdrScratch[:len(headers)]
+		copy(c.respHeaders, headers)
+	} else {
+		c.respHeaders = make([][2]string, len(headers))
+		copy(c.respHeaders, headers)
+		c.respHdrScratch = c.respHeaders
+	}
+}
+
+// StatusCode returns the response status code set by the handler.
+func (c *Context) StatusCode() int {
+	return c.statusCode
+}
+
+// DeleteCookie appends a Set-Cookie header that instructs the client to delete
+// the named cookie. The path must match the original cookie's path.
+func (c *Context) DeleteCookie(name, path string) {
+	c.SetCookie(&Cookie{Name: name, Path: path, MaxAge: -1})
+}
+
+// Redirect sends an HTTP redirect to the given URL with the specified status code.
+// Returns [ErrInvalidRedirectCode] if code is not in the range 300–308.
+// Returns [ErrResponseWritten] if a response has already been sent.
+func (c *Context) Redirect(code int, url string) error {
+	if code < 300 || code > 308 {
+		return fmt.Errorf("%w: %d", ErrInvalidRedirectCode, code)
+	}
+	c.SetHeader("location", url)
+	return c.NoContent(code)
+}
+
+var cookieUnsafeReplacer = strings.NewReplacer(";", "", "\r", "", "\n", "")
+
+// stripCookieUnsafe strips characters that could inject cookie attributes
+// (semicolons) or cause header injection (CRLF) from cookie field values.
+func stripCookieUnsafe(s string) string {
+	if strings.ContainsAny(s, ";\r\n") {
+		return cookieUnsafeReplacer.Replace(s)
+	}
+	return s
+}
+
+// SetCookie appends a Set-Cookie header to the response.
+// Cookie values are sent as-is without encoding (per RFC 6265).
+// Callers are responsible for encoding values if needed.
+// Semicolons in Name, Value, Path, and Domain are stripped to prevent
+// cookie attribute injection.
+func (c *Context) SetCookie(cookie *Cookie) {
+	// Typical Set-Cookie values are <200B (session/csrf tokens with path,
+	// max-age, flags). The 256-byte stack buffer holds the common case
+	// without heap; oversize cookies grow via append into heap.
+	var buf [256]byte
+	dst := buf[:0]
+	dst = append(dst, stripCookieUnsafe(cookie.Name)...)
+	dst = append(dst, '=')
+	dst = append(dst, stripCookieUnsafe(cookie.Value)...)
+	if cookie.Path != "" {
+		dst = append(dst, "; Path="...)
+		dst = append(dst, stripCookieUnsafe(cookie.Path)...)
+	}
+	if cookie.Domain != "" {
+		dst = append(dst, "; Domain="...)
+		dst = append(dst, stripCookieUnsafe(cookie.Domain)...)
+	}
+	if !cookie.Expires.IsZero() {
+		dst = append(dst, "; Expires="...)
+		dst = cookie.Expires.UTC().AppendFormat(dst, http.TimeFormat)
+	}
+	if cookie.MaxAge > 0 {
+		dst = append(dst, "; Max-Age="...)
+		// AppendInt avoids strconv.Itoa's intermediate string alloc.
+		dst = strconv.AppendInt(dst, int64(cookie.MaxAge), 10)
+	} else if cookie.MaxAge < 0 {
+		dst = append(dst, "; Max-Age=0"...)
+	}
+	if cookie.HTTPOnly {
+		dst = append(dst, "; HttpOnly"...)
+	}
+	if cookie.Secure {
+		dst = append(dst, "; Secure"...)
+	}
+	switch cookie.SameSite {
+	case SameSiteLaxMode:
+		dst = append(dst, "; SameSite=Lax"...)
+	case SameSiteStrictMode:
+		dst = append(dst, "; SameSite=Strict"...)
+	case SameSiteNoneMode:
+		dst = append(dst, "; SameSite=None"...)
+	}
+	c.AddHeader("set-cookie", string(dst))
+}
+
+// File serves the named file. The content type is detected from the file
+// extension.
+//
+// A GET with a single byte range gets 206 Partial Content (a last-pos past
+// the end, or a suffix longer than the file, is cut to the file). A range
+// set that no byte of the file satisfies gets 416 Range Not Satisfiable with
+// "Content-Range: bytes */<size>" and no body. An If-Range header is
+// honoured against the ETag and Last-Modified response headers already set
+// when File is called (File sets neither itself): the range is served only
+// while the client's validator matches (strong comparison for an
+// entity-tag, so a weak tag never matches; the same instant for a date),
+// otherwise the whole file is sent as a 200. HEAD and other methods ignore
+// Range, as do an unknown range unit, an invalid range set, and a set with
+// more than one satisfiable range (multipart/byteranges is not supported).
+// A 416 carries no Content-Encoding even if the handler set one: its body is
+// empty, not an encoded stream. See RFC 9110 §14 and §13.1.5.
+//
+// The file is capped at 100 MB: [HTTPError] with status 413 if it is larger.
+// The file is sent with sendfile(2), not read into memory, only on epoll, for
+// an HTTP/1.1 response of at least 16 KiB, when the server has no async
+// handlers and no middleware buffers or captures the response (see the
+// Response memory section of [Config]). Every other response reads the whole
+// file into memory, up to the cap: io_uring, std, HTTP/2, an async route, a
+// buffered or captured response, and a response that a pipelined one makes the
+// engine copy into its write buffer. For large files, consider using
+// StreamWriter instead.
+//
+// Security: filePath is opened directly — callers MUST sanitize user-supplied
+// paths (e.g. filepath.Clean + prefix check) to prevent directory traversal.
+func (c *Context) File(filePath string) error {
+	return c.serveFile(filePath, "", nil)
+}
+
+// serveFile is File. contentType, when not empty, replaces the type taken from
+// filePath's extension. onOpen, when not nil, runs once the file is open and
+// its size and mtime are read from the open descriptor, before the response is
+// decided and only for a file that is going to be sent (not for a 413):
+// middleware/static sets its validators from them there, so they describe the
+// bytes that are sent even when the path is replaced meanwhile (celeris#846).
+func (c *Context) serveFile(filePath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := stat.Size()
+
+	if size > int64(maxStreamBodySize) {
+		return NewHTTPError(413, "file exceeds 100MB limit")
+	}
+
+	if onOpen != nil {
+		onOpen(stat.ModTime(), size)
+	}
+
+	if contentType == "" {
+		contentType = mime.TypeByExtension(filepath.Ext(filePath))
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+	}
+
+	c.SetHeader("accept-ranges", "bytes")
+
+	if rng := c.Header("range"); rng != "" {
+		// If-Range is checked against the validators already on the
+		// response (an ETag / Last-Modified the handler or middleware/static
+		// set before calling File); File itself sets neither.
+		start, end, out := httprange.Decide(c.method, rng, c.Header("if-range"),
+			c.respHeader("etag"), c.respHeader("last-modified"), size)
+		switch out {
+		case httprange.Unsatisfiable:
+			var crBuf [32]byte
+			c.SetHeader("content-range", string(httprange.AppendUnsatisfied(crBuf[:0], size)))
+			// The empty body of a 416 is not an encoded stream.
+			c.delRespHeader("content-encoding")
+			return c.NoContent(http.StatusRequestedRangeNotSatisfiable)
+		case httprange.Partial:
+			length := end - start + 1
+			var crBuf [64]byte
+			c.SetHeader("content-range", string(httprange.AppendContentRange(crBuf[:0], start, end, size)))
+			// Zero-copy sendfile(2) path (epoll). Falls through to the
+			// buffered read+seek path when the engine can't / won't take it.
+			if handled, err := c.trySendFile(f, 206, contentType, start, length); handled {
+				return err
+			}
+			if _, err := f.Seek(start, io.SeekStart); err != nil {
+				return err
+			}
+			data := make([]byte, length)
+			if _, err := io.ReadFull(f, data); err != nil {
+				return err
+			}
+			return c.Blob(206, contentType, data)
+		}
+	}
+
+	// Zero-copy sendfile(2) path for the full-file (200) response.
+	if handled, err := c.trySendFile(f, 200, contentType, 0, size); handled {
+		return err
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+	return c.Blob(200, contentType, data)
+}
+
+// trySendFile attempts to serve [offset, offset+length) of f as the
+// response body via the engine's zero-copy sendfile(2) path
+// (stream.FileResponder, implemented by the epoll H1 response adapter).
+//
+// It returns handled=false (having emitted nothing) — so the caller MUST
+// fall back to the buffered read+write path — when:
+//   - the response is already written or detached;
+//   - response buffering or body capture is active (the body must pass
+//     through userspace to be buffered/captured);
+//   - the ResponseWriter does not implement FileResponder (iouring, std,
+//     HTTP/2), or it declines (body below the sendfile threshold).
+//
+// contentType is emitted as the content-type header; any headers already
+// set via c.SetHeader (accept-ranges, content-range, etag, last-modified,
+// cache-control, …) are carried through. content-length is supplied by
+// the responder from length.
+func (c *Context) trySendFile(f *os.File, status int, contentType string, offset, length int64) (bool, error) {
+	if c.written || c.detached {
+		return false, nil
+	}
+	// Buffering / capture need the body in userspace; decline so the
+	// buffered path runs and the bytes are captured/replayable.
+	if c.bufferDepth > 0 || c.captureBody {
+		return false, nil
+	}
+	if c.stream == nil {
+		return false, nil
+	}
+	fr, ok := c.stream.ResponseWriter.(stream.FileResponder)
+	if !ok {
+		return false, nil
+	}
+	// Build the header slice: content-type first, then the user headers
+	// already accumulated on the Context. content-length is injected by
+	// the responder. Mirrors c.Blob's header ordering minus content-length.
+	headers := make([][2]string, 0, len(c.respHeaders)+1)
+	headers = append(headers, [2]string{"content-type", contentType})
+	headers = append(headers, c.respHeaders...)
+
+	handled, err := fr.WriteFileResponse(c.stream, status, headers, f, offset, length)
+	if !handled {
+		return false, nil
+	}
+	c.statusCode = status
+	c.written = true
+	if length >= 0 {
+		c.bytesWritten = int(length)
+	}
+	return true, err
+}
+
+// FileFromDir safely serves a file from within baseDir. The userPath is
+// cleaned and joined with baseDir; if the result escapes baseDir, a 400
+// error is returned. Symlinks are resolved and rechecked to prevent a
+// symlink under baseDir from escaping the directory boundary.
+func (c *Context) FileFromDir(baseDir, userPath string) error {
+	return c.fileFromDir(baseDir, userPath, "", nil)
+}
+
+// fileFromDir is FileFromDir with serveFile's contentType and onOpen.
+func (c *Context) fileFromDir(baseDir, userPath, contentType string, onOpen func(modTime time.Time, size int64)) error {
+	abs := filepath.Clean(filepath.Join(baseDir, filepath.FromSlash(userPath)))
+	base := filepath.Clean(baseDir)
+	if abs != base && !strings.HasPrefix(abs, base+string(filepath.Separator)) {
+		return NewHTTPError(400, "invalid file path")
+	}
+	// Resolve symlinks and recheck prefix to prevent symlink escape.
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return err
+	}
+	resolvedBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return err
+	}
+	if resolved != resolvedBase && !strings.HasPrefix(resolved, resolvedBase+string(filepath.Separator)) {
+		return NewHTTPError(400, "invalid file path")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return NewHTTPError(400, "invalid file path")
+	}
+	return c.serveFile(resolved, contentType, onOpen)
+}
+
+// FileFromFS serves a named file from an [fs.FS] (e.g. embed.FS). The content
+// type is detected from the file extension. The file is capped at 100 MB:
+// [HTTPError] with status 413 if it is larger. How it is read follows
+// [Context.File]: sendfile(2) only where that applies and for a file backed by
+// an *os.File (such as os.DirFS), otherwise the whole file is read into memory.
+//
+// Security: name is passed directly to fsys.Open — callers MUST sanitize
+// user-supplied paths to prevent directory traversal. For untrusted input,
+// use [Context.FileFromDir] instead.
+func (c *Context) FileFromFS(name string, fsys fs.FS) error {
+	f, err := fsys.Open(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if stat.IsDir() {
+		return NewHTTPError(400, "path is a directory")
+	}
+	size := stat.Size()
+	if size > int64(maxStreamBodySize) {
+		return NewHTTPError(413, "file exceeds 100MB limit")
+	}
+
+	contentType := mime.TypeByExtension(filepath.Ext(name))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	// Zero-copy sendfile(2) when the fs.FS file is backed by a real
+	// *os.File (e.g. os.DirFS). embed.FS and in-memory FSes are not, so
+	// this falls through to the buffered read below.
+	if osFile, ok := f.(*os.File); ok {
+		if handled, err := c.trySendFile(osFile, 200, contentType, 0, size); handled {
+			return err
+		}
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+	return c.Blob(200, contentType, data)
+}
+
+// delRespHeader removes the response header key (lowercase, as SetHeader
+// stores it) if it is set.
+func (c *Context) delRespHeader(key string) {
+	for i, h := range c.respHeaders {
+		if h[0] == key {
+			last := len(c.respHeaders) - 1
+			copy(c.respHeaders[i:], c.respHeaders[i+1:])
+			// The slot past the new end is cleared, so reset (which clears up to
+			// len) leaves no stale header pointing into a request buffer.
+			c.respHeaders[last] = [2]string{}
+			c.respHeaders = c.respHeaders[:last]
+			return
+		}
+	}
+}
+
+// respHeader returns the value of the response header key (lowercase, as
+// SetHeader stores it) set so far, or "".
+func (c *Context) respHeader(key string) string {
+	for _, h := range c.respHeaders {
+		if h[0] == key {
+			return h[1]
+		}
+	}
+	return ""
+}
+
+// Stream reads all data from r (capped at 100 MB) and writes it as the
+// response with the given status code and content type. Returns [HTTPError]
+// with status 413 if the data exceeds 100 MB.
+//
+// Despite the name, Stream BUFFERS the entire reader before writing —
+// it is not incremental. Use [Context.StreamWriter] for true streaming
+// responses. The [Context.StreamReader] alias is the preferred name
+// going forward and makes the buffering behavior obvious at the call
+// site; Stream is retained for backwards compatibility.
+func (c *Context) Stream(code int, contentType string, r io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(r, int64(maxStreamBodySize)+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxStreamBodySize {
+		return NewHTTPError(413, "stream body exceeds 100MB limit")
+	}
+	return c.Blob(code, contentType, data)
+}
+
+// StreamReader is the preferred name for [Context.Stream] — it makes
+// clear that the entire reader is buffered before writing, vs the
+// truly-incremental [Context.StreamWriter]. Behavior is identical to
+// [Context.Stream].
+func (c *Context) StreamReader(code int, contentType string, r io.Reader) error {
+	return c.Stream(code, contentType, r)
+}
+
+// Negotiate inspects the Accept header and returns the best matching content type
+// from the provided offers. Returns "" if no match. Supports quality values (q=):
+// a type is weighed by the most specific range that matches it, so
+// "text/html;q=0, text/*" refuses text/html and accepts the rest of text,
+// and "*/*;q=0, text/html" accepts text/html alone (RFC 9110 12.5.1). Of the
+// types with the highest weight, the one whose entry comes first in the header
+// wins, and then the first offer: "*/*, application/json" gives the first of
+// the offers, whichever it is.
+//
+// The response then depends on Accept, so Negotiate adds Accept to the
+// response's Vary header (once): a shared cache, or middleware/singleflight,
+// must not hand this response to a request that asked for another type
+// (celeris#912).
+func (c *Context) Negotiate(offers ...string) string {
+	c.varyOn("Accept")
+	accept := c.Header("accept")
+	if accept == "" {
+		if len(offers) > 0 {
+			return offers[0]
+		}
+		return ""
+	}
+	return negotiate.Accept(accept, offers)
+}
+
+// Respond writes the response in the format that best matches the Accept header.
+// Supported types: application/json, application/xml, text/plain.
+// Falls back to JSON if no match. Like [Context.Negotiate], it names Accept
+// in the response's Vary header.
+func (c *Context) Respond(code int, v any) error {
+	best := c.Negotiate("application/json", "application/xml", "text/plain")
+	switch best {
+	case "application/xml":
+		return c.XML(code, v)
+	case "text/plain":
+		return c.String(code, "%v", v)
+	default:
+		return c.JSON(code, v)
+	}
+}
+
+// CaptureResponse enables response body capture for this request.
+// After calling Next(), use ResponseBody() and ResponseContentType() to inspect.
+// The response is written to the wire AND a copy is captured for inspection
+// (ideal for loggers). Use BufferResponse to defer the wire write entirely.
+func (c *Context) CaptureResponse() {
+	c.extended = true
+	c.captureBody = true
+}
+
+// ResponseBody returns the captured response body, or nil if capture was not
+// enabled. Available after [Context.CaptureResponse] + c.Next(), or after
+// [Context.BufferResponse] + a response method (JSON, Blob, etc.).
+func (c *Context) ResponseBody() []byte {
+	// The backing array of capturedBody persists across pool cycles for
+	// allocation reuse (see [Context.reset] — the slice header is reset
+	// to len=0 instead of nil when the cap fits the retention policy).
+	// Gate the return on the capture / buffered flags so callers who
+	// never opted into capture still observe nil.
+	if !c.captureBody && !c.buffered {
+		return nil
+	}
+	return c.capturedBody
+}
+
+// ResponseContentType returns the captured Content-Type, or "" if not captured.
+func (c *Context) ResponseContentType() string { return c.capturedType }
+
+// BufferResponse instructs response methods (JSON, XML, Blob, NoContent, etc.)
+// to capture the response instead of writing to the wire. Multiple middleware
+// layers can call BufferResponse — responses are depth-tracked and only sent
+// when the outermost layer calls FlushResponse.
+func (c *Context) BufferResponse() {
+	c.extended = true
+	c.bufferDepth++
+}
+
+// FlushResponse sends the buffered response to the wire. Each call decrements
+// the buffer depth; the actual write happens when depth reaches zero.
+// Returns nil if nothing was buffered. Returns ErrResponseWritten if already sent.
+// Calling FlushResponse without a prior BufferResponse is a safe no-op.
+func (c *Context) FlushResponse() error {
+	if c.written {
+		return ErrResponseWritten
+	}
+	if !c.buffered {
+		return nil
+	}
+	if c.bufferDepth > 0 {
+		c.bufferDepth--
+	}
+	if c.bufferDepth > 0 {
+		return nil
+	}
+	c.bufferDepth = 0
+	c.buffered = false
+	if c.capturedType == "" {
+		return c.NoContent(c.capturedStatus)
+	}
+	return c.Blob(c.capturedStatus, c.capturedType, c.capturedBody)
+}
+
+// DiscardBufferedResponse decrements the buffer depth and clears any captured
+// response data without writing to the wire. Used by timeout middleware to
+// discard a stale buffered response before writing an error response.
+func (c *Context) DiscardBufferedResponse() {
+	if c.bufferDepth > 0 {
+		c.bufferDepth--
+	}
+	c.buffered = false
+	c.capturedBody = c.capturedBody[:0]
+	c.capturedStatus = 0
+	c.capturedType = ""
+}
+
+// SetResponseBody replaces the buffered response body. Only valid after
+// BufferResponse + c.Next(). Used by transform middleware (compress, etc.).
+func (c *Context) SetResponseBody(body []byte) {
+	c.capturedBody = append(c.capturedBody[:0], body...)
+}
+
+// ResponseStatus returns the captured response status code.
+func (c *Context) ResponseStatus() int { return c.capturedStatus }
+
+// IsWritten returns true if a response has been written to the wire.
+func (c *Context) IsWritten() bool { return c.written }
+
+// BytesWritten returns the response body size in bytes, or 0 if no response
+// was written. For NoContent responses, returns 0. For streamed responses
+// (via [StreamWriter]), returns the total bytes written so far (may increase
+// while streaming is in progress).
+func (c *Context) BytesWritten() int {
+	if c.streamWriter != nil {
+		return int(c.streamWriter.bytesWritten.Load())
+	}
+	return c.bytesWritten
+}
+
+// Hijack takes over the underlying TCP connection. After Hijack, the caller
+// owns the connection and is responsible for closing it. Supported on all
+// engines for HTTP/1.1 connections. HTTP/2 connections cannot be hijacked
+// (multiplexed streams share a single TCP connection).
+//
+// The request's strings stay valid after Hijack, for the handler and for
+// any goroutine it hands them to, and that includes the ones read BEFORE
+// Hijack (celeris#733, celeris#868). On epoll and io_uring they are views of
+// the receive buffer, which the engine does not give to another connection
+// once the connection is hijacked: epoll and io_uring's default receive give
+// up the connection's buffer, and io_uring's opt-in multishot receive mode
+// (CELERIS_IOURING_MULTISHOT_RECV=1) keeps the ring buffer the request was
+// read into and gives the ring a fresh one. On that mode the kept buffer's
+// memory is not returned before the process exits, and it costs twice the
+// ring: each slot a hijack retires is replaced by a heap buffer of the same
+// size, which is live Go heap while the engine runs, and the slot's own
+// pages stay mapped. Each is at most one ring's worth per worker (the ring's
+// buffer count times the buffer size: at least 1024 buffers, which is 8 MiB
+// at 8 KiB each), reached after about as many hijacks as the ring has buffers
+// and not grown by more; the mapped pages are kept per engine start. Hijack
+// also copies the request values the Context holds, as [Context.Detach]
+// does, so the path, params, headers, query, cookies and body read from the
+// Context after Hijack are copies.
+//
+// On io_uring's multishot receive mode, Hijack can fail when the engine's
+// submission queue is full: the receive still armed on the socket has to be
+// cancelled before the socket can be handed over, and the cancel needs a free
+// queue entry. The connection is then left untouched and still the engine's,
+// so the handler can answer the request (a 503, say) and the connection goes
+// on serving. The failure is transient under engine back-pressure, and the
+// error is not exported: treat any Hijack error as "answer the request".
+func (c *Context) Hijack() (net.Conn, error) {
+	if c.written {
+		return nil, errors.New("celeris: cannot hijack after response written")
+	}
+	h, ok := c.stream.ResponseWriter.(stream.Hijacker)
+	if !ok {
+		return nil, ErrHijackNotSupported
+	}
+	// Before the engine lets go of the connection, and so of its receive
+	// buffer (celeris#733).
+	c.cloneRequestValues()
+	conn, err := h.Hijack(c.stream)
+	if err != nil {
+		return nil, err
+	}
+	c.written = true
+	c.hijacked = true
+	return conn, nil
+}
+
+// UpgradeWebSocket installs a data delivery callback for engine-integrated
+// WebSocket support. After the HTTP 101 upgrade is sent and Detach is called,
+// subsequent data arriving on the connection is delivered to the callback
+// instead of being parsed as HTTP. Returns false if the engine does not
+// support integrated WebSocket (e.g. std engine), in which case the caller
+// should fall back to [Context.Hijack].
+//
+// The callback is invoked on the engine's event loop thread and must not
+// block. Typically it writes to an [io.PipeWriter].
+//
+// Call ordering for engine-integrated WebSocket setup:
+//  1. UpgradeWebSocket(deliveryFn) — installs the data callback
+//  2. SetWSErrorHandler / SetWSIdleDeadline / SetWSDetachClose
+//     (optional, but install BEFORE Detach to avoid losing pre-existing
+//     engine errors that fire as soon as Detach completes)
+//  3. Detach() — engine takes ownership of the connection
+//  4. WSRawWriteFn() — returns the raw write fn (Hijack-like; nil before Detach)
+//  5. WSReadPauser() — returns engine pause/resume callbacks (after Detach)
+func (c *Context) UpgradeWebSocket(delivery func(data []byte)) bool {
+	if c.stream.OnWSUpgrade == nil {
+		return false
+	}
+	c.stream.OnWSUpgrade(delivery)
+	return true
+}
+
+// SetWSDetachClose installs a callback that the engine invokes when it
+// closes a detached connection (timeout, error, shutdown). This allows
+// detached-stream middleware (WebSocket, SSE) to unblock its handler
+// goroutine: WebSocket closes its io.Pipe and data channel, SSE cancels
+// Client.Context() (celeris#494).
+//
+// The callback runs on the engine thread under the connection's detach
+// mutex and must not block, take middleware locks, or call back into the
+// StreamWriter / raw write function.
+//
+// May be called either before or after [Context.Detach] — the underlying
+// H1State.OnDetachClose field is just stored; the engine reads it when
+// firing the close. Installing it BEFORE Detach is preferred so a peer
+// RST landing in the Detach race window is not lost. On the std engine
+// the callback is backed by context.AfterFunc on the request context, so
+// it fires when the client connection closes or when ServeHTTP returns
+// (also for an h2c stream there). No-op on HTTP/2 streams on the native
+// engines.
+func (c *Context) SetWSDetachClose(fn func()) {
+	if c.stream.OnWSDetachClose != nil {
+		c.stream.OnWSDetachClose(fn)
+	}
+}
+
+// WSRawWriteFn returns the raw write function for WebSocket frames,
+// bypassing chunked encoding. Returns nil if not available (e.g., before
+// Detach or on the std engine). Must be called AFTER [Context.Detach].
+func (c *Context) WSRawWriteFn() func([]byte) {
+	if c.stream.OnWSRawWrite == nil {
+		return nil
+	}
+	return c.stream.OnWSRawWrite()
+}
+
+// SetWSErrorHandler installs a handler called by the engine when an I/O
+// failure occurs on this detached connection. The WebSocket middleware uses
+// this to surface engine-side errors from the next user-level Read or Write
+// call; the SSE middleware uses it to cancel Client.Context() (celeris#494).
+//
+// The handler runs on the engine thread under the connection's detach
+// mutex and must not block, take middleware locks, or call back into the
+// StreamWriter / raw write function.
+//
+// May be called either before or after [Context.Detach] — installing
+// BEFORE Detach is preferred so a pre-existing peer RST landing in the
+// Detach race window is not lost. No-op on engines that do not support
+// engine-integrated detached streams (e.g. std, H2).
+func (c *Context) SetWSErrorHandler(fn func(error)) {
+	if c.stream.OnWSSetError != nil {
+		c.stream.OnWSSetError(fn)
+	}
+}
+
+// WSReadPauser returns the engine's pause/resume callbacks for inbound
+// WebSocket data, or (nil, nil) if the engine does not support TCP-level
+// backpressure (e.g. std). Must be called AFTER [Context.Detach]. The
+// returned callbacks are safe to call from any goroutine.
+func (c *Context) WSReadPauser() (pause, resume func()) {
+	if c.stream.OnWSReadPauser == nil {
+		return nil, nil
+	}
+	return c.stream.OnWSReadPauser()
+}
+
+// SetWSIdleDeadline sets the absolute deadline (Unix nanoseconds) at which
+// the engine should close this detached connection. Used by the WebSocket
+// middleware to enforce IdleTimeout on the engine path. Pass 0 to clear.
+// May be called repeatedly to extend the deadline. No-op on engines that
+// do not support engine-integrated WebSocket.
+func (c *Context) SetWSIdleDeadline(ns int64) {
+	if c.stream.OnWSSetIdleDeadline != nil {
+		c.stream.OnWSSetIdleDeadline(ns)
+	}
+}
+
+// EngineSupportsAsyncDetach reports whether the active engine has the
+// machinery to keep the connection alive after the request handler
+// returns. True on native engines (epoll, io_uring) and on stream
+// transports that have wired an OnDetach hook; false on the std engine
+// (which closes the conn the moment the request handler returns).
+//
+// Middleware that spawns a goroutine to drive a long-lived stream
+// (Server-Sent Events, WebSocket, chunked progress) should consult
+// this before returning from the request handler:
+//
+//   - true:  return nil from the handler; the spawned goroutine writes
+//     via the engine's guarded write path and the engine flushes.
+//   - false: the spawned goroutine must complete before the handler
+//     returns (e.g. block on a done channel); otherwise the
+//     net/http server treats the response as finished and may
+//     close the conn underneath the still-running goroutine.
+//
+// Added in celeris v1.4.4 to fix the engine asymmetry that caused
+// goceleris/probatorium#103 to file celeris#273: SSE responses were
+// hanging on native engines because the middleware ran the user
+// handler inline and blocked the worker thread.
+func (c *Context) EngineSupportsAsyncDetach() bool {
+	return c != nil && c.stream != nil && c.stream.OnDetach != nil
+}
+
+// Detach removes the Context from the handler chain's lifecycle.
+// After Detach, the Context will not be released when the handler returns.
+// The caller MUST call the returned done function when finished with the Context —
+// failure to do so permanently leaks the Context from the pool.
+// This is required for streaming responses on native engines where the handler
+// must return to free the event loop thread.
+//
+// On the std engine, Detach changes how the request's timeouts apply. net/http
+// arms one write deadline for the whole response (WriteTimeout); Detach clears
+// it for this request, so the stream is not cut at WriteTimeout, as it is not
+// on the native engines. ReadTimeout never cuts a stream there: net/http has
+// stopped it by the time the handler runs. In its place, each Write or Flush
+// of the detached stream fails if it has not finished within WriteTimeout (a
+// client that stays connected and reads nothing ends the stream that way; no
+// bound at WriteTimeout -1), and when Shutdown's budget runs out the writes of
+// the streams still running fail. A handler that detaches for a long-poll or a
+// stream of its own gets the same. The writes may come from more than one
+// goroutine, as far as the response writer allows it; the bound is kept per
+// stream. The native engines apply neither timeout to a detached connection.
+//
+// Detach after a successful [Context.Hijack] only keeps the Context out of the
+// pool until done is called. The connection is the caller's by then, so no
+// engine hook runs and no deadline is set on it (on epoll the hook would run
+// against connection state the hijack has released).
+//
+// Detach copies the request values the Context holds, so they stay valid
+// after the handler returns (on HTTP/2 the headers and the body are the
+// exception, see below): the headers, method, path and query, the route
+// params, the parsed query and cookies, the Host, the strings stored with
+// SetRequestID, SetClientIP, SetHost, SetScheme and SetString, the request
+// body (so Body, FormValue, Bind and BodyReader called after Detach read the
+// request), and the response headers set so far (middleware echo request
+// headers into them). It cannot copy what was read out of the Context before
+// the call (a string, a Body slice, a BodyReader), values stored with
+// [Context.Set], or values in the std context ([Context.Context],
+// [Context.SetContext]), which a detached WebSocket or SSE stream keeps as
+// its own context: on epoll and io_uring those may still refer to the
+// connection's receive buffer, so whoever stores them must clone them.
+//
+// On HTTP/2 the engine ends the stream when the handler returns, detached or
+// not, so [Context.Context] is cancelled then; it stays the request's
+// context, cancelled, when called after that.
+//
+// What the Context reads from the stream at call time is not the request's
+// after that: Header, RequestHeaders, Body, RemoteAddr and the :authority Host
+// read from a stream that has been reset, so they may return empty values, and
+// never another request's (a detached stream is not handed to another
+// request). A goroutine that needs the headers or the body of an HTTP/2
+// request reads them before the handler returns. [Context.NoContent] (and
+// [Context.Redirect]), like [Context.Blob], return [ErrDetached], and a
+// [Context.StreamWriter] taken after that returns a writer whose calls all
+// fail.
+func (c *Context) Detach() (done func()) {
+	if c.detached {
+		return func() {} // already detached — return no-op done
+	}
+	c.cloneRequestValues()
+	// On HTTP/2 Context() asks the stream for its context, and the H2
+	// processor releases the stream when the handler returns, detached or
+	// not. Keep this use's context now, so a c.Context() after that is still
+	// this request's, cancelled when the stream is released, and does not
+	// read the stream (celeris#836).
+	if c.ctx == nil && c.stream != nil {
+		c.ctx = c.stream.Context()
+	}
+
+	c.extended = true
+	// The Context is marked detached (c.detached) and given its detachDone
+	// only after the engine hooks below have returned: recoverAndRelease
+	// waits on detachDone for every detached Context. An OnDetach (or
+	// StreamDetached) that panics never returns the done func, so no
+	// goroutine will ever own the Context; with the mark not yet set, the
+	// request ends as an ordinary one that panicked. recoverAndRelease
+	// answers it with a 500, records its real status and elapsed time, and
+	// releases the Context as for any request, with the CachedCtx check: on
+	// a native HTTP/1 connection that stays open the stream still caches
+	// this Context, and returning it to contextPool then would give it two
+	// owners (celeris#512). A handler that recovers the panic and calls
+	// Detach again runs the hooks again. The stream was marked detached
+	// above the hooks (an HTTP/2 stream is then not pooled when it is
+	// released: one allocation, only after an engine fault). (#889 item 33)
+	//
+	// The use this Context is detached from. Its goroutine can outlive the
+	// handler, and on HTTP/2 the stream goes back to the pool then: the token
+	// lets StreamWriter tell the stream's next use from this one, and the mark
+	// keeps the pool from handing the stream to another request while this
+	// Context still points at it (celeris#904).
+	c.detachGen = c.stream.Gen()
+	c.stream.MarkDetached()
+	// A hijacked connection is the caller's: the engine has let go of it, and
+	// on epoll its OnDetach hook would run against the connection state the
+	// hijack released (a nil dereference, and a detached count that never
+	// ends). The Context is still detached below, so a goroutine that holds it
+	// keeps it past the handler.
+	if !c.hijacked {
+		if c.stream.OnDetach != nil {
+			c.stream.OnDetach()
+		}
+		// The std engine's writer clears the write deadline net/http armed for
+		// the request, so a detached stream (SSE) is not cut at WriteTimeout,
+		// as it is not on the native engines (celeris#855); the per-write
+		// stall bound takes its place. The read deadline is left alone:
+		// net/http has stopped it by the time the handler runs. Here, not in
+		// OnDetach, which std leaves nil: EngineSupportsAsyncDetach reads it.
+		if dn, ok := c.stream.ResponseWriter.(stream.DetachNotifier); ok {
+			dn.StreamDetached()
+		}
+	}
+	ch := make(chan struct{})
+	c.detachDone = ch
+	c.detached = true
+	return func() {
+		// Snapshot status + elapsed BEFORE close so the metrics goroutine
+		// can read these without racing late writes from a handler that
+		// touches Context fields after calling done() (contract violation
+		// but observed in practice with deferred logger blocks). Heap-
+		// allocated only on the Detach slow path so non-detached requests
+		// don't pay the field cost in every pooled Context.
+		// From startTimeNs when HandleStream set it: startTime is then still
+		// the zero Time (StartTime materializes it lazily), and
+		// time.Since(c.startTime) was ~292 years on the native HTTP/1
+		// engines. One clock read either way.
+		// A Context that did not go through HandleStream has neither set; it
+		// records a meaningless value, which nothing in production reaches.
+		var elapsed time.Duration
+		if !c.startTime.IsZero() {
+			elapsed = time.Since(c.startTime) // monotonic, as before
+		} else {
+			elapsed = time.Duration(time.Now().UnixNano() - c.startTimeNs)
+		}
+		c.detachSnap = &detachSnapshot{
+			status:  c.statusCode,
+			elapsed: elapsed,
+		}
+		close(ch)
+	}
+}
+
+// cloneRequestValues copies every request value the Context holds that can be
+// a view of the engine's receive buffer, for [Context.Detach] and
+// [Context.Hijack]: after either, the handler, or a goroutine it starts, can
+// keep using those values after the engine has received into, or given
+// away, the buffer they view.
+func (c *Context) cloneRequestValues() {
+	// Materialize any unsafe string headers (zero-copy H1 headers backed by
+	// the connection's read buffer) before the handler returns and the buffer
+	// is reused for the next recv. Pseudo-header keys are string literals
+	// (safe), but their values (:authority, :path for non-"/" paths, :method
+	// for non-standard methods) may be UnsafeString backed by the buffer.
+	c.stream.MaterializeHeaders()
+	for i, h := range c.stream.Headers {
+		if len(h[0]) > 0 && h[0][0] == ':' {
+			c.stream.Headers[i][1] = strings.Clone(h[1])
+			continue
+		}
+		c.stream.Headers[i][0] = strings.Clone(h[0])
+		c.stream.Headers[i][1] = strings.Clone(h[1])
+	}
+	// Also materialize extracted fields that may reference the buffer.
+	c.method = strings.Clone(c.method)
+	c.path = strings.Clone(c.path)
+	c.rawQuery = strings.Clone(c.rawQuery)
+	c.materializeRequestViews()
+}
+
+// materializeRequestViews clones, for [Context.Detach] and [Context.Hijack],
+// the request-derived strings the Context keeps outside the header slice and
+// the method, path and raw query: the route params, the parsed query and cookie caches, the H1
+// Host, the strings middleware store on the Context from request headers
+// (request ID, client-IP/host/scheme overrides, SetString values), the
+// request body, and the response headers set so far.
+//
+// On epoll and io_uring each of these can be a view of the engine's receive
+// buffer, which is safe to compare while the request is handled and unsafe to
+// keep after it: a detached Context outlives the handler, and the engine keeps
+// receiving into that buffer (celeris#718; celeris#714 is the same defect in
+// the WebSocket middleware). The params are substrings of the path, the
+// caches are substrings of the raw query and the Cookie header, and Host
+// reads Stream.Authority, which the H1 parser sets to a view of the Host
+// header. Values stored with [Context.Set] are opaque and are not copied.
+func (c *Context) materializeRequestViews() {
+	for i := range c.params {
+		c.params[i].Value = strings.Clone(c.params[i].Value)
+	}
+	if c.queryCached && len(c.queryCache) > 0 {
+		qc := make(url.Values, len(c.queryCache))
+		for k, vs := range c.queryCache {
+			cp := make([]string, len(vs))
+			for i, v := range vs {
+				cp[i] = strings.Clone(v)
+			}
+			qc[strings.Clone(k)] = cp
+		}
+		c.queryCache = qc
+	}
+	for i, kv := range c.cookieCache {
+		c.cookieCache[i] = [2]string{strings.Clone(kv[0]), strings.Clone(kv[1])}
+	}
+	c.stream.Authority = strings.Clone(c.stream.Authority)
+	c.requestID = strings.Clone(c.requestID)
+	c.clientIPOverride = strings.Clone(c.clientIPOverride)
+	c.hostOverride = strings.Clone(c.hostOverride)
+	c.schemeOverride = strings.Clone(c.schemeOverride)
+	for k, v := range c.stringKeys {
+		c.stringKeys[k] = strings.Clone(v)
+	}
+	// The body. The native H1 engines install it as a slice of the receive
+	// buffer (internal/conn/h1.go, SetRawBody), and Body, FormValue, Bind and
+	// BodyReader read it lazily. Copied only when there is one, and only
+	// where the handler can return before the stream ends (OnDetach is set):
+	// elsewhere the handler outlives the stream, and std's body is a heap
+	// copy already. A GET upgrade or stream pays nothing.
+	if c.stream.OnDetach != nil {
+		if b := c.stream.GetData(); len(b) > 0 {
+			c.stream.SetRawBody(bytes.Clone(b))
+		}
+	}
+	// The response headers set so far: middleware echo request headers into
+	// them (requestid's x-request-id, cors's access-control-allow-origin),
+	// and a detached goroutine serializes them when it writes the response
+	// head (Blob, NoContent, StreamWriter.WriteHeader(code,
+	// c.ResponseHeaders())).
+	cloneHeaderPairs(c.respHeaders)
+}
+
+// cloneHeaderPairs replaces every key and value of hs, in place, with a copy.
+// The copies share one buffer, so this is one allocation however many headers
+// there are. The buffer is never written after it is filled, so the strings
+// cut from it stay immutable.
+func cloneHeaderPairs(hs [][2]string) {
+	n := 0
+	for _, h := range hs {
+		n += len(h[0]) + len(h[1])
+	}
+	if n == 0 {
+		return
+	}
+	buf := make([]byte, 0, n)
+	for i := range hs {
+		hs[i][0] = appendClone(&buf, hs[i][0])
+		hs[i][1] = appendClone(&buf, hs[i][1])
+	}
+}
+
+// appendClone appends s to *buf and returns the appended bytes as a string.
+// *buf must have room for s: the append must not move the buffer, or strings
+// returned earlier would keep the old one.
+func appendClone(buf *[]byte, s string) string {
+	if s == "" {
+		return ""
+	}
+	off := len(*buf)
+	*buf = append(*buf, s...)
+	return unsafe.String(&(*buf)[off], len(s))
+}
+
+// StreamWriter provides incremental response writing. Obtained via [Context.StreamWriter].
+// Bytes written through the StreamWriter are tracked and reflected in
+// [Context.BytesWritten]. The counter uses atomic operations and is safe
+// for use from a detached goroutine. Its other methods are not: calls on one
+// StreamWriter must not be concurrent (the HTTP/1 writer keeps the first error
+// of a response for the calls after it), so a handler that shares one between
+// goroutines serialises them.
+type StreamWriter struct {
+	streamer stream.Streamer
+	stream   *stream.Stream
+	// use, when set, is the streamer taken as a stream.UseStreamer and gen the
+	// stream's use token from when the writer was made: on HTTP/2 the stream
+	// ends when the handler returns, and a call that arrives later is refused
+	// instead of acting on whatever the pooled stream serves next
+	// (celeris#904).
+	use stream.UseStreamer
+	gen uint64
+	// refused, when set, is the writer of a Context whose stream's use was
+	// over when the writer was asked for (a detached Context's goroutine
+	// calling Context.StreamWriter after the HTTP/2 handler returned): every
+	// call returns it and touches nothing (celeris#904).
+	refused      error
+	bytesWritten atomic.Int64
+	// used is the owning Context's streamUsed, shared by every StreamWriter
+	// taken on the request. Set by the first WriteHeader, Write, Flush or
+	// Close: from then on the response may be on the wire (celeris#835).
+	used *atomic.Bool
+}
+
+// markUsed records that this request's response may have reached the wire.
+// A load first, so a stream of writes does not store on every chunk.
+func (sw *StreamWriter) markUsed() {
+	if !sw.used.Load() {
+		sw.used.Store(true)
+	}
+}
+
+// WriteHeader sends the status line and headers. Must be called once before Write.
+func (sw *StreamWriter) WriteHeader(status int, headers [][2]string) error {
+	if sw.refused != nil {
+		return sw.refused
+	}
+	sw.markUsed()
+	if sw.use != nil {
+		return sw.use.WriteHeaderUse(sw.stream, sw.gen, status, headers)
+	}
+	return sw.streamer.WriteHeader(sw.stream, status, headers)
+}
+
+// Write sends a chunk of the response body. May be called multiple times.
+//
+// On HTTP/2 the chunk is held to the peer's flow-control windows
+// (RFC 9113 §6.9.1). Called from a worker-pool goroutine (an async route), Write
+// blocks until the windows let the whole chunk go, for no longer than the
+// server's WriteTimeout from the call (0 = no bound): then the stream is reset
+// with INTERNAL_ERROR and Write returns an error wrapping
+// [os.ErrDeadlineExceeded]. It returns the stream's context error when the
+// peer resets the stream or the connection closes. Called from a handler on
+// the event loop, it does not block: what the windows refuse is buffered and
+// sent as the peer grants window. When Write returns an error it reports 0
+// bytes written, though part of the chunk may already have been sent on
+// HTTP/2, and [StreamWriter.BytesWritten] does not count it. On HTTP/1.1 on
+// epoll, io_uring and Adaptive none of the chunk is staged when it returns an
+// error (see [StreamWriter.Flush] for the limits that refuse one).
+//
+// On HTTP/2 the stream ends when the handler returns, detached or not (see
+// [Context.Detach]): a Write, WriteHeader or Close from a goroutine that
+// outlived the handler returns an error and sends nothing, so it can never
+// reach another request's response. Finish the stream before the handler
+// returns.
+func (sw *StreamWriter) Write(data []byte) (int, error) {
+	if sw.refused != nil {
+		return 0, sw.refused
+	}
+	sw.markUsed()
+	var err error
+	if sw.use != nil {
+		err = sw.use.WriteUse(sw.stream, sw.gen, data)
+	} else {
+		err = sw.streamer.Write(sw.stream, data)
+	}
+	if err != nil {
+		return 0, err
+	}
+	sw.bytesWritten.Add(int64(len(data)))
+	return len(data), nil
+}
+
+// BytesWritten returns the total bytes written through this StreamWriter.
+// Safe for concurrent use.
+func (sw *StreamWriter) BytesWritten() int64 {
+	return sw.bytesWritten.Load()
+}
+
+// Flush asks the engine to send buffered data to the network. It is a request,
+// not a guarantee, and on HTTP/1.1 on epoll, io_uring and Adaptive (the Linux
+// default, which runs on the first two) it sends nothing: what reaches the
+// peer, and when, is decided by [StreamWriter.Write]. Until
+// [Context.Detach] those engines only append each Write to the connection's
+// send buffer, which goes out when the handler returns, so every byte
+// written so far stays in memory until then, however often Flush is called.
+// That buffer is bounded at 64 MiB: a Write (or Close) that would take the
+// response held unsent past it stages nothing and returns an error with a count
+// of 0, as does every later Write, Flush and Close of the response. The
+// response is cut, and the connection is closed once the bytes staged before
+// the refused Write have gone out, so the client sees a chunked body that
+// never ends. A response that needs more than that has to Detach. After Detach
+// each Write is handed to the connection at once (the calling goroutine
+// usually tries the send, and the engine finishes what the socket does not
+// take). The std engine flushes through [net/http.Flusher]. To deliver bytes
+// while the handler is still running, Detach it (see
+// [Context.EngineSupportsAsyncDetach]).
+//
+// On those engines Write, Flush and Close report a connection the engine has
+// torn down, as net/http does: after the peer has gone away they return an
+// error wrapping [net.ErrClosed]. The engine learns of it on its own thread,
+// so a Write issued at the moment the peer resets can still return nil, and
+// one made before Detach by a handler that blocks the engine's thread cannot
+// see it at all. A detached connection whose peer stopped reading is closed
+// once more than 64 MiB are unsent: the Write that finds them over the limit
+// is dropped and returns an error (not one wrapping [net.ErrClosed]), and so
+// does each one after it. The Write before it, which took them over, was
+// staged and counted, so a detached connection holds at most 64 MiB plus one
+// chunk. The behavior above is HTTP/1.1's; Flush is not a delivery guarantee
+// on HTTP/2 either.
+func (sw *StreamWriter) Flush() error {
+	if sw.refused != nil {
+		return sw.refused
+	}
+	sw.markUsed()
+	return sw.streamer.Flush(sw.stream)
+}
+
+// Close signals end of the response body and syncs the byte count back to
+// the owning Context so that [Context.BytesWritten] reflects the total.
+func (sw *StreamWriter) Close() error {
+	if sw.refused != nil {
+		return sw.refused
+	}
+	sw.markUsed()
+	if sw.use != nil {
+		return sw.use.CloseUse(sw.stream, sw.gen)
+	}
+	return sw.streamer.Close(sw.stream)
+}
+
+// StreamWriter returns a [StreamWriter] for incremental response writing.
+// Returns nil if the engine does not support streaming or if buffering is
+// active (see below).
+//
+// StreamWriter is incompatible with [Context.BufferResponse] -- if buffering
+// is active, StreamWriter returns nil. Streaming writes data incrementally
+// to the wire, which cannot be deferred or replayed by a buffer layer.
+// [Context.CaptureResponse] does not capture streamed bytes.
+// [Context.IsWritten] returns true and [Context.BytesWritten] tracks bytes
+// after StreamWriter is used.
+//
+// Taking the StreamWriter commits nothing by itself. An error the handler
+// returns, or a panic, before anything has been sent through it (no
+// WriteHeader, Write, Flush or Close yet) is still answered as if the writer
+// had never been taken: the error handler or the default error response
+// writes it (celeris#835). This is what lets a handler such as sse.New take
+// the writer, then reject the request (authentication in OnConnect) with a
+// proper status. Once the writer has been used, or the Context detached, the
+// response belongs to the stream and an error is not written.
+//
+// On native engines (epoll, io_uring), the caller must call [Context.Detach]
+// before spawning a goroutine that uses the StreamWriter. Call Close() when done.
+// On HTTP/2 that goroutine must finish the stream before the handler returns
+// (join it, as the sse middleware does): the stream ends with the handler,
+// detached or not, and a StreamWriter call after that returns an error and
+// sends nothing. That holds for a writer taken before the handler returned and
+// for one the detached goroutine takes with this method afterwards: the
+// Context remembers the stream's use as of [Context.Detach], and the writer it
+// returns for an ended use is a non-nil writer whose calls all return an
+// error. On HTTP/1 the stream lives until the detached goroutine is done.
+//
+// On HTTP/2 a handler that returns without calling Close does not leave the
+// client waiting, as net/http does not either: on the native engines the
+// stream is ended with END_STREAM when the response is complete (the headers
+// are sent and, for a declared content-length, exactly that many bytes were written;
+// with none declared it is complete whatever was written) and reset with
+// RST_STREAM (INTERNAL_ERROR) when it is not: a body not as long as its declared
+// content-length (short of it or over it, or a content-length that is not a
+// plain number), or a handler that panicked, returned an error or called
+// runtime.Goexit after its headers went out. END_STREAM is never sent for a
+// body that is not as long as its declared length. The reset is logged through
+// [Config].Logger, and the end of an unclosed complete response at Debug level.
+func (c *Context) StreamWriter() *StreamWriter {
+	// Streaming is fundamentally incompatible with response buffering:
+	// buffered responses are held in memory for possible mutation/discard,
+	// but streamed bytes go directly to the wire and cannot be recalled.
+	if c.bufferDepth > 0 {
+		return nil
+	}
+	if c.stream == nil {
+		// A Context used after it was released (done() was called, or a
+		// handler kept a Context it never detached). Not a streaming engine's
+		// answer (nil): a refusal, so a goroutine that writes through it gets
+		// an error rather than a nil pointer.
+		return &StreamWriter{refused: stream.ErrStreamEnded, used: &c.streamUsed}
+	}
+	var rw stream.ResponseWriter
+	var gen uint64
+	if !c.detached {
+		rw, gen = c.stream.ResponseWriter, c.stream.Gen()
+	} else {
+		// A detached Context's goroutine may call this after the handler
+		// returned, when on HTTP/2 the stream has ended and the pooled object
+		// may serve another request. Read the writer only if the stream is
+		// still the use this Context was detached from; the read is ordered
+		// against the release's reset, so it cannot see the next use's.
+		var live bool
+		if rw, live = c.stream.UseResponseWriter(c.detachGen); !live {
+			return &StreamWriter{refused: stream.ErrStreamEnded, used: &c.streamUsed}
+		}
+		gen = c.detachGen
+	}
+	s, ok := rw.(stream.Streamer)
+	if !ok {
+		return nil
+	}
+	if !c.written {
+		// Nothing was written before the writer was taken: an error before
+		// its first use is still answered (reclaimUnusedStreamWriter).
+		c.streamTakenOnly = true
+	}
+	// reset clears streamWriter, streamTakenOnly and streamUsed only on the
+	// extended path. Without this a StreamWriter used without Detach stayed
+	// on the pooled Context, and the next request on it reported its bytes
+	// as its own (BytesWritten).
+	c.extended = true
+	c.written = true
+	sw := &StreamWriter{streamer: s, stream: c.stream, used: &c.streamUsed}
+	if u, ok := s.(stream.UseStreamer); ok {
+		sw.use, sw.gen = u, gen
+	}
+	c.streamWriter = sw
+	return sw
+}
+
+// reclaimUnusedStreamWriter gives the response back when it is "written" only
+// because StreamWriter was taken and nothing has been sent through any writer
+// taken since, on a Context that is not detached (celeris#835). It reports
+// whether it did: the caller (an error or panic path) may then write the
+// response itself.
+func (c *Context) reclaimUnusedStreamWriter() bool {
+	if !c.streamTakenOnly || c.detached || c.streamUsed.Load() {
+		return false
+	}
+	c.streamTakenOnly = false
+	c.streamWriter = nil
+	c.written = false
+	return true
+}
+
+// Attachment sets the Content-Disposition header to "attachment" with the
+// given filename, prompting the client to download the response.
+func (c *Context) Attachment(filename string) {
+	if filename != "" {
+		c.SetHeader("content-disposition",
+			fmt.Sprintf(`attachment; filename="%s"`, EscapeQuotedString(filename)))
+	} else {
+		c.SetHeader("content-disposition", "attachment")
+	}
+}
+
+// Inline sets the Content-Disposition header to "inline" with the given
+// filename, suggesting the client display the content in-browser.
+func (c *Context) Inline(filename string) {
+	if filename != "" {
+		c.SetHeader("content-disposition",
+			fmt.Sprintf(`inline; filename="%s"`, EscapeQuotedString(filename)))
+	} else {
+		c.SetHeader("content-disposition", "inline")
+	}
+}
+
+// EscapeQuotedString escapes backslash and double-quote characters for use
+// in RFC 7230 quoted-string header values.
+func EscapeQuotedString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
+}

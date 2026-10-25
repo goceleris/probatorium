@@ -1,0 +1,651 @@
+package celeris
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/validation"
+)
+
+type routerAdapter struct {
+	server *Server
+	// notFoundChain and methodNotAllowedChain answer a request no route
+	// matches (celeris#852, celeris#156): the global middleware, then the
+	// custom NotFound / MethodNotAllowed handler or the built-in answer
+	// (newUnmatchedChain). Built by buildUnmatchedChains when Start
+	// installs the adapter; nil on a bare adapter (tests), where
+	// handleUnmatched builds them per request.
+	notFoundChain         []HandlerFunc
+	methodNotAllowedChain []HandlerFunc
+	// optionsChain answers an OPTIONS request to a path that has routes but
+	// no OPTIONS route (celeris#421): the global middleware, so a CORS
+	// middleware installed with Server.Use answers its preflight, then
+	// autoOptions. Built by doPrepare; nil on a bare adapter (tests), where
+	// handleUnmatched builds it per request.
+	optionsChain []HandlerFunc
+	errorHandler func(*Context, error)
+}
+
+// autoOptions is the end of optionsChain: 200 with Content-Length: 0 and the
+// Allow header handleUnmatched already set (RFC 9110 §9.3.7: a successful
+// OPTIONS response without content MUST carry Content-Length: 0, which std's
+// net/http would otherwise replace with chunked framing).
+func autoOptions(c *Context) error {
+	c.SetHeader("content-length", "0")
+	return c.NoContent(200)
+}
+
+// newOptionsChain is the global middleware followed by autoOptions, which
+// answers only if no middleware has (a CORS preflight's 204 is not answered
+// again: answerUnlessAnswered, celeris#852).
+func newOptionsChain(middleware []HandlerFunc) []HandlerFunc {
+	chain := make([]HandlerFunc, 0, len(middleware)+1)
+	chain = append(chain, middleware...)
+	return append(chain, answerUnlessAnswered(autoOptions))
+}
+
+// buildUnmatchedChains builds the chains a request no route matches runs,
+// once, when Start installs the adapter. The global middleware runs for
+// unmatched requests too, whether or not a NotFound / MethodNotAllowed
+// handler is set (celeris#852).
+//
+// Under the AsyncHandlers default those chains can block an engine worker as
+// a route's can, so when they run more than the built-in answer an
+// unmatched request is dispatched like a route inheriting that default:
+// inline until a run blocks, then async (router.unmatchedAdaptive). Without
+// that, every 404 from a blocking global middleware (a remote session store,
+// an auth upstream) would stall the worker and every connection on it.
+func (a *routerAdapter) buildUnmatchedChains() {
+	s := a.server
+	a.notFoundChain = newUnmatchedChain(s.middleware, s.notFoundHandler, builtinNotFound)
+	a.methodNotAllowedChain = newUnmatchedChain(s.middleware, s.methodNotAllowedHandler, builtinMethodNotAllowed)
+	// Written only when true: Server.AsyncHandlers, which a driver opened
+	// WithEngine may call while Start runs, reads the flag only when the
+	// default is sync, and then nothing writes it.
+	if s.router.defaultAsync &&
+		(len(s.middleware) > 0 || s.notFoundHandler != nil || s.methodNotAllowedHandler != nil) {
+		s.router.unmatchedAdaptive = true
+	}
+}
+
+// newUnmatchedChain is the chain a request no route matches runs
+// (celeris#852): the global middleware ([Server.Use]), so logger, metrics,
+// otel and requestid see the request and a middleware that serves its own
+// paths (swagger, pprof, debug, healthcheck, metrics' endpoint, static)
+// answers them, then custom (the NotFound or MethodNotAllowed handler), or
+// builtin when custom is nil. The end of the chain answers only if nothing
+// before it has (answerUnlessAnswered).
+func newUnmatchedChain(middleware []HandlerFunc, custom, builtin HandlerFunc) []HandlerFunc {
+	end := builtin
+	if custom != nil {
+		end = custom
+	}
+	chain := make([]HandlerFunc, 0, len(middleware)+1)
+	chain = append(chain, middleware...)
+	return append(chain, answerUnlessAnswered(end))
+}
+
+// answerUnlessAnswered runs h only if no handler before it in the chain has
+// answered the request: written the response, had it captured by a buffering
+// middleware (compress, etag, cache, ...) or taken the connection over.
+// [Context.Next] already ends the chain when a handler that answered returns
+// (celeris#927); this also covers a middleware that answers and then calls
+// Next itself. Without it the not-found answer would run after such a
+// middleware: on the wire the first write wins, but a buffered page would be
+// overwritten by the 404, and the handler's ErrResponseWritten would reach
+// every middleware above it.
+func answerUnlessAnswered(h HandlerFunc) HandlerFunc {
+	return func(c *Context) error {
+		if c.written || c.buffered || c.detached {
+			return nil
+		}
+		return h(c)
+	}
+}
+
+// builtinNotFound and builtinMethodNotAllowed are the answers to an unmatched
+// request when no NotFound / MethodNotAllowed handler is set. They write
+// through the Context, as a route handler does, so buffering middleware sees
+// the response; handleUnmatched has set the Allow header of a 405.
+func builtinNotFound(c *Context) error {
+	return c.Blob(404, "text/plain", []byte("404 Not Found"))
+}
+
+func builtinMethodNotAllowed(c *Context) error {
+	return c.Blob(405, "text/plain", []byte("405 Method Not Allowed"))
+}
+
+func (a *routerAdapter) HandleStream(ctx context.Context, s *stream.Stream) error {
+	c := acquireContext(s)
+	// Prefer the engine's worker-local cached "now" (set on the stream
+	// by populateCachedStream from H1State.NowNs) over a per-request
+	// time.Now() vDSO. Falls back to time.Now() for synthetic / std-engine
+	// streams that didn't go through populateCachedStream.
+	if s.StartTimeNs != 0 {
+		// Defer the time.Unix conversion: store the raw ns and only
+		// materialize a time.Time when c.StartTime() is actually called
+		// (rare — the per-request hot path only needs ns for the duration
+		// computation in recoverAndRelease).
+		c.startTimeNs = s.StartTimeNs
+	} else {
+		t := time.Now()
+		c.startTime = t
+		c.startTimeNs = t.UnixNano()
+	}
+	c.trustedNets = a.server.trustedNets
+
+	// Propagate engine-supplied worker affinity into the celeris.Context.
+	// Prefer the value stashed on the stream (set by the engine at accept
+	// time on the per-conn cached H1State and copied to the stream by
+	// populateCachedStream) — that's a direct field load. Fall back to
+	// ctxkit for streams that didn't go through populateCachedStream
+	// (synthetic test contexts, std engine path).
+	if s.WorkerIDSet {
+		c.workerID = s.WorkerID
+		c.workerIDSet = true
+	} else if ctx != nil {
+		if wid, ok := ctxkit.WorkerIDFrom(ctx); ok {
+			c.workerID = int32(wid)
+			c.workerIDSet = true
+		}
+	}
+
+	if a.server.config.MaxFormSize != 0 {
+		c.maxFormSize = a.server.config.MaxFormSize
+	}
+
+	// WriteTimeout is enforced at the engine level via periodic timeout checks
+	// (epoll/iouring) or http.Server.WriteTimeout (std), avoiding per-request
+	// timer allocations.
+
+	defer a.recoverAndRelease(c, s)
+
+	// Run pre-routing middleware before route lookup. Pre-middleware may modify
+	// c.method or c.path (e.g. URL rewriting, method override). If any
+	// pre-middleware aborts, skip routing entirely.
+	if len(a.server.preMiddleware) > 0 {
+		c.handlers = a.server.preMiddleware
+		c.index = -1
+		// Error AND abort: error wins — handleError still runs, then we
+		// flush any buffered body.
+		if err := c.Next(); err != nil {
+			a.handleError(c, s, err)
+			if c.buffered && !c.written {
+				c.bufferDepth = 1
+				_ = c.FlushResponse()
+			}
+			return nil
+		}
+		// Pure abort (handler wrote a response and called Abort with no
+		// error), or a pre-middleware that answered the request without
+		// Abort (celeris#927): skip routing and flush.
+		if c.IsAborted() || c.answered() {
+			if c.buffered && !c.written {
+				c.bufferDepth = 1
+				_ = c.FlushResponse()
+			}
+			return nil
+		}
+		// Reset for the actual handler chain.
+		c.handlers = nil
+		c.index = -1
+	}
+
+	// Per-connection route cache: keep-alive connections that hit the
+	// same static method+path on every request can skip the static-route
+	// map lookup. Only valid when the lookup produced no params (a fully
+	// static route — dynamic routes need fresh params each time).
+	//
+	// strings.Clone on cache fill: c.method and c.path may alias the H1
+	// recv buffer, which is reused on the next request. Cloning gives
+	// the cache a stable backing array so the byte-wise compare on the
+	// next request reads the right bytes. Allocates once per conn (per
+	// route fill); amortized across the entire keep-alive session.
+	var handlers []HandlerFunc
+	var fullPath string
+	if cached, ok := s.CachedRouteHandlers.([]HandlerFunc); ok &&
+		s.CachedRouteMethod == c.method && s.CachedRoutePath == c.path {
+		handlers = cached
+		fullPath = s.CachedRouteFullPath
+	} else {
+		var routeAsync bool
+		n := len(c.params)
+		handlers, fullPath, routeAsync = a.server.router.find(c.method, c.path, &c.params)
+		if handlers == nil && c.method == "HEAD" {
+			// celeris#421: HEAD without a HEAD route runs the GET route.
+			handlers, fullPath, routeAsync = a.server.router.findHEADAsGET(c.path, &c.params, n)
+		}
+		if handlers != nil && len(c.params) == 0 {
+			s.CachedRouteMethod = strings.Clone(c.method)
+			s.CachedRoutePath = strings.Clone(c.path)
+			s.CachedRouteHandlers = handlers
+			s.CachedRouteFullPath = fullPath
+			s.CachedRouteAsync = routeAsync
+		}
+	}
+
+	if handlers == nil {
+		// celeris#852: timed and promoted like an adaptive route (below)
+		// while router.unmatchedAdaptive is learning; one key for all
+		// unmatched requests (unmatchedAdaptiveKey).
+		if rt := a.server.router; rt.unmatchedAdaptive && rt.adaptiveLearning(unmatchedAdaptiveKey) {
+			start := time.Now()
+			a.handleUnmatched(c, s)
+			if dur := time.Since(start); dur > adaptiveBlockingThreshold {
+				rt.promoteRouteImmediate(unmatchedAdaptiveKey)
+			} else {
+				rt.recordInlineRun(unmatchedAdaptiveKey, dur > adaptivePromoteThreshold)
+			}
+			return nil
+		}
+		a.handleUnmatched(c, s)
+		return nil
+	}
+
+	c.handlers = handlers
+	c.fullPath = fullPath
+
+	// celeris#356: an adaptive route (inherited the AsyncHandlers=true default)
+	// runs INLINE here until observed to block. Time this inline run; if the
+	// handler chain exceeds adaptivePromoteThreshold it is genuinely blocking,
+	// so promote the route to async dispatch — future requests then run on a
+	// goroutine instead of stalling the event-loop worker. Non-adaptive configs
+	// (no AsyncHandlers default) hit the empty-map fast path and skip timing.
+	rt := a.server.router
+	if rt.adaptiveRoutes[fullPath] && rt.adaptiveLearning(fullPath) {
+		start := time.Now()
+		err := c.Next()
+		dur := time.Since(start)
+		if dur > adaptiveBlockingThreshold {
+			// Unambiguously a blocking I/O round-trip: promote on the first such
+			// run rather than waiting for adaptivePromoteStreak slow runs.
+			rt.promoteRouteImmediate(fullPath)
+		} else {
+			rt.recordInlineRun(fullPath, dur > adaptivePromoteThreshold)
+		}
+		if err != nil {
+			a.handleError(c, s, err)
+		}
+	} else if err := c.Next(); err != nil {
+		a.handleError(c, s, err)
+	}
+	if c.buffered && !c.written {
+		c.bufferDepth = 1
+		_ = c.FlushResponse()
+	}
+	return nil
+}
+
+// adaptivePromoteThreshold is the inline handler duration that counts as a
+// "slow" run for adaptive promotion (celeris#356). A non-blocking handler —
+// even a heavy middleware chain — returns in tens of microseconds; a blocking
+// one (DB/cache round-trip) takes hundreds of µs to ms. The bar sits well above
+// the CPU-bound range so a transient GC/scheduling burst cannot push a
+// CPU-bound chain over it for adaptivePromoteStreak consecutive runs and
+// wrongly promote it to the slower async path — a 50µs bar did exactly that,
+// intermittently collapsing iouring-async chain-fullstack (celeris#364).
+// Genuinely-blocking routes are marked .Async() explicitly (opting out of
+// adaptive); auto-promotion is a safety net for an unmarked handler that blocks
+// on EVERY request.
+const adaptivePromoteThreshold = 300 * time.Microsecond
+
+// adaptiveBlockingThreshold is the inline duration that is UNAMBIGUOUSLY a
+// blocking I/O round-trip (not CPU work under contention). A single inline run
+// over this bar promotes the route IMMEDIATELY, skipping the
+// adaptivePromoteStreak hysteresis — a genuinely-blocking handler that an
+// operator forgot to mark .Async() then stalls a worker for at most one request
+// instead of adaptivePromoteStreak of them. The bar sits far above any CPU-bound
+// chain's wall-clock (even under GC/scheduling jitter), so it cannot misfire on
+// a CPU route; the 300µs/streak path still handles the borderline 300µs–2ms band.
+const adaptiveBlockingThreshold = 2 * time.Millisecond
+
+// adaptivePromoteStreak is how many CONSECUTIVE slow inline runs promote an
+// adaptive route to async. The consecutive requirement (a fast run resets the
+// streak) makes a one-off cold start / GC pause harmless, while a handler that
+// blocks on every request promotes within a handful of requests.
+const adaptivePromoteStreak = 8
+
+// adaptiveSettleStreak is how many CONSECUTIVE fast inline runs SETTLE an
+// adaptive route (celeris#361): proven non-blocking, it is removed from the
+// timed path so the hot loop stops paying two time.Now() vDSO calls per
+// request forever. High enough that only consistently-static routes settle (a
+// slow run resets the streak); at scale a static route settles in well under a
+// millisecond. A genuinely-blocking handler should be marked .Async() — it
+// promotes long before it could settle.
+const adaptiveSettleStreak = 256
+
+// adaptivePromoteTTL bounds how long a promotion lasts before the route is
+// re-evaluated inline (celeris#364). Promotion is otherwise terminal — a
+// promoted route runs async and is never re-timed — so a CPU-bound chain that
+// was falsely promoted by a transient load/jitter spike (inline wall-clock
+// crossing adaptivePromoteThreshold under worker contention, not actual
+// blocking) stayed on the ~32%-slower async path until restart. After the TTL
+// the route runs inline again and re-settles if fast, or re-promotes within
+// adaptivePromoteStreak runs if genuinely blocking. The clock is read only for
+// already-promoted routes, so the fast path is unaffected.
+const adaptivePromoteTTL = 5 * time.Second
+
+// adaptiveSettleTTL bounds how long a SETTLED classification lasts before the
+// route is re-timed (celeris#592). Settling is otherwise TERMINAL — a settled
+// route is dropped from the timed path (adaptiveLearning short-circuits on
+// `settled`) and the only statement that ever removed it again was an explicit
+// .Async()/.Sync() at registration — so a route that settled while its backend
+// was fast (a sub-300µs store call) and whose backend LATER turns slow kept
+// running inline on the engine worker for every request, forever, pinning the
+// worker and queueing every other connection on it behind the blocking call
+// (measured under celeris#589: 20/20 runs on both native engines ended
+// settled, never promoted, with an unrelated /ping on the same worker stalled
+// in 100% of samples at a ~1.2 s median).
+//
+// Mirrors adaptivePromoteTTL so both terminal states are re-evaluated on the
+// same cadence: the promoted set expires per-route on read, the settled set is
+// cleared wholesale by a background ticker (router.startSettleReopener).
+//
+// Why a ticker instead of per-request sampling: the whole point of celeris#361
+// was to take the two time.Now() vDSO calls OFF the settled hot path, so the
+// re-timing decision must not put anything back on it — no counter, no clock
+// read, no extra atomic. The fast path is byte-for-byte what it was: one
+// sync.Map load in adaptiveLearning. The re-opener runs off-path on one
+// per-server goroutine that wakes every adaptiveSettleTTL and clears the
+// settled set.
+//
+// Cost, MEASURED (TestRouteAdaptive_SettleReopenCost, 200 re-opens per case).
+// Clearing the settled set opens a gate that stays open until the FIRST
+// re-timed run returns and stores `settled` again — the fast streak is
+// deliberately not reset, so a route that is still fast re-settles on its very
+// next run — and every inline run that passes the gate inside that window is
+// timed. That is one timed run per CONCURRENTLY-EXECUTING inline handler, not
+// one per tick and not one per request: an inline run occupies its engine
+// worker for the whole run, so that worker's next request cannot start until
+// the route has already re-settled. Timed runs per re-open at K concurrent
+// inline runners, with the maximum seen in any single re-open in brackets:
+//
+//	darwin/arm64, 10 cores:  K=1 1.00 [1]  K=2 1.96 [2]  K=4 3.96 [4]  K=8 7.75 [8]
+//	golang:1.27, 4 CPUs:     K=1 1.00 [1]  K=2 1.99 [2]  K=4 3.39 [4]  K=8 3.02 [8]
+//
+// The maximum is exactly K at every K on both; the 4-CPU mean falls below K
+// from K=4 because only GOMAXPROCS runs are truly concurrent there, which is
+// the same bound seen from the other side. One timed run costs a measured
+// 124 ns more than a settled one in the container (116 ns on darwin/arm64) —
+// two time.Now() calls plus recordInlineRun — so a route served inline by W
+// workers pays W×~120 ns, under 1 µs, of extra CPU per adaptiveSettleTTL. As a
+// share of traffic: at 1M req/s on one route with 4 workers that is ~3.4 timed
+// runs per 5 s, about 1 request in 1.5 million.
+//
+// A route whose backend has turned slow is caught by the first re-timed run:
+// 300µs–2ms feeds the adaptivePromoteStreak hysteresis, and anything over
+// adaptiveBlockingThreshold promotes immediately. Worst-case detection latency
+// is therefore adaptiveSettleTTL plus one request.
+const adaptiveSettleTTL = 5 * time.Second
+
+// recoverAndRelease handles panic recovery and context release. Extracted to a
+// separate noinline function so that HandleStream's stack frame is not inflated
+// by the deferred closure and debug.Stack() call (P5).
+//
+// Layering with middleware/recovery: this is the last-resort safety net.
+// Panics from user handlers normally hit middleware/recovery (when
+// installed) inside the chain, which converts them to errors before
+// they reach this function. recover() here is for catastrophic cases
+// where recovery middleware itself panics, isn't installed, or where
+// pre-routing middleware panics outside the route chain. Custom panic
+// handling (Sentry, structured 500 responses, etc.) belongs in
+// middleware/recovery — this function's a.handlePanic is intentionally
+// minimal.
+//
+//go:noinline
+func (a *routerAdapter) recoverAndRelease(c *Context, s *stream.Stream) {
+	if r := recover(); r != nil {
+		a.handlePanic(c, s, r)
+	}
+	if c.detached {
+		go func() {
+			<-c.detachDone
+			if a.server.collector != nil {
+				// Read the snapshot captured by Detach's done() callback
+				// to avoid racing late writes from a handler that touched
+				// the Context after calling done().
+				status := 200
+				var elapsed time.Duration
+				if snap := c.detachSnap; snap != nil {
+					if snap.status != 0 {
+						status = snap.status
+					}
+					elapsed = snap.elapsed
+				}
+				a.server.collector.RecordRequestSharded(uint32(c.workerID), elapsed, status)
+			}
+			releaseContext(c)
+		}()
+		return
+	}
+	if a.server.collector != nil {
+		status := c.statusCode
+		if status == 0 {
+			status = 200
+		}
+		// Use the raw int64 ns. time.Since on a time.Unix-constructed
+		// time.Time falls back to wall-clock subtraction; this saves the
+		// detour through time.Time.Sub.
+		duration := time.Duration(time.Now().UnixNano() - c.startTimeNs)
+		a.server.collector.RecordRequestSharded(uint32(c.workerID), duration, status)
+	}
+	releaseContext(c)
+}
+
+// handlePanic logs the panic and writes a 500 response. Separated from
+// recoverAndRelease so debug.Stack() only runs when a panic actually occurs.
+//
+//go:noinline
+func (a *routerAdapter) handlePanic(c *Context, s *stream.Stream, r any) {
+	// validation.RecordPanic is a no-op in production (zero-cost stub
+	// from validation/disabled.go); under -tags=validation it bumps
+	// PanicCount, which probatorium reads via the unix socket to
+	// assert that no panics escape the recover safety net.
+	validation.RecordPanic()
+	// Copies: Config.Logger's handler may keep the record (slog's
+	// Record.Clone shares the strings), and on epoll and io_uring the method
+	// and path are views of the connection's receive buffer, which the engine
+	// reuses for the next request (celeris#732).
+	a.server.logger().Error("handler panic recovered",
+		"error", fmt.Sprint(r),
+		"method", strings.Clone(c.method),
+		"path", strings.Clone(c.path),
+		"stack", string(debug.Stack()),
+	)
+	c.statusCode = 500
+	// A StreamWriter taken but not used yet has sent nothing: the 500 still
+	// goes out (celeris#835). A detached request's response is its taker's
+	// (celeris#852).
+	if !c.detached && (!c.written || c.reclaimUnusedStreamWriter()) && s.ResponseWriter != nil {
+		hdrs := make([][2]string, 0, len(c.respHeaders)+2)
+		hdrs = append(hdrs, c.respHeaders...)
+		hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
+		hdrs = append(hdrs, [2]string{"cache-control", "no-store"})
+		_ = s.ResponseWriter.WriteResponse(s, 500, hdrs, []byte("Internal Server Error"))
+		c.written = true
+	} else {
+		// No 500 can follow a response that is under way: tell the HTTP/2
+		// processor that a streamed one is broken off, so it resets the stream
+		// instead of ending it at the handler's return (celeris#889).
+		s.FailResponse()
+	}
+}
+
+func (a *routerAdapter) handleUnmatched(c *Context, s *stream.Stream) {
+	var allowed []string
+	if c.method == "OPTIONS" {
+		// celeris#421: a path with routes but no OPTIONS route is answered
+		// with what it allows (OPTIONS included). That list is never empty
+		// for a routed path, so an empty one means the path has no route at
+		// all: a 404, with no second walk of the method trees (celeris#889).
+		if allowed = a.server.router.allowedMethods(c.path, ""); len(allowed) > 0 {
+			a.answerOptions(c, s, strings.Join(allowed, ", "))
+			return
+		}
+	} else {
+		allowed = a.server.router.allowedMethods(c.path, c.method)
+	}
+	if len(allowed) > 0 {
+		c.statusCode = 405
+		c.fullPath = "<method-not-allowed>"
+		allowVal := strings.Join(allowed, ", ")
+		chain := a.methodNotAllowedChain
+		if chain == nil {
+			chain = newUnmatchedChain(a.server.middleware, a.server.methodNotAllowedHandler, builtinMethodNotAllowed)
+		}
+		// Set before the chain, so the Allow header is on the response
+		// whichever handler writes it.
+		c.SetHeader("allow", allowVal)
+		a.runUnmatched(c, s, chain)
+		if !c.written && !c.detached && s.ResponseWriter != nil {
+			// Nothing answered: a middleware aborted without writing, or
+			// the custom handler wrote nothing.
+			hdrs := make([][2]string, 0, len(c.respHeaders)+2)
+			hdrs = append(hdrs, c.respHeaders...)
+			hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
+			if !slices.ContainsFunc(c.respHeaders, func(h [2]string) bool { return h[0] == "allow" }) {
+				hdrs = append(hdrs, [2]string{"allow", allowVal})
+			}
+			_ = s.ResponseWriter.WriteResponse(s, 405, hdrs, []byte("405 Method Not Allowed"))
+			c.written = true
+		}
+	} else {
+		c.statusCode = 404
+		c.fullPath = "<unmatched>"
+		chain := a.notFoundChain
+		if chain == nil {
+			chain = newUnmatchedChain(a.server.middleware, a.server.notFoundHandler, builtinNotFound)
+		}
+		a.runUnmatched(c, s, chain)
+		if !c.written && !c.detached && s.ResponseWriter != nil {
+			// Nothing answered: a middleware aborted without writing, or
+			// the custom handler wrote nothing.
+			hdrs := make([][2]string, 0, len(c.respHeaders)+1)
+			hdrs = append(hdrs, c.respHeaders...)
+			hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
+			_ = s.ResponseWriter.WriteResponse(s, 404, hdrs, []byte("404 Not Found"))
+			c.written = true
+		}
+	}
+}
+
+// runUnmatched runs an unmatched request's chain (newUnmatchedChain) and,
+// like HandleStream after a route's chain, flushes a response a buffering
+// middleware captured and did not send.
+func (a *routerAdapter) runUnmatched(c *Context, s *stream.Stream, chain []HandlerFunc) {
+	c.handlers = chain
+	a.handleError(c, s, c.Next())
+	if c.buffered && !c.written {
+		c.bufferDepth = 1
+		_ = c.FlushResponse()
+	}
+}
+
+// answerOptions runs optionsChain for an OPTIONS request the router answers
+// itself (celeris#421). The Allow header is set before the chain runs, so it
+// is on the response whether autoOptions or a middleware (a CORS preflight's
+// 204) writes it.
+func (a *routerAdapter) answerOptions(c *Context, s *stream.Stream, allowVal string) {
+	c.fullPath = "<options>"
+	c.SetHeader("allow", allowVal)
+	chain := a.optionsChain
+	if chain == nil {
+		chain = newOptionsChain(a.server.middleware)
+	}
+	c.handlers = chain
+	a.handleError(c, s, c.Next())
+	if c.buffered && !c.written {
+		c.bufferDepth = 1
+		_ = c.FlushResponse()
+	}
+	if !c.written && !c.detached && s.ResponseWriter != nil {
+		// A middleware returned without writing and without calling Next.
+		hdrs := make([][2]string, 0, len(c.respHeaders)+1)
+		hdrs = append(hdrs, c.respHeaders...)
+		hdrs = append(hdrs, [2]string{"content-length", "0"})
+		c.statusCode = 200
+		_ = s.ResponseWriter.WriteResponse(s, 200, hdrs, nil)
+		c.written = true
+	}
+}
+
+func (a *routerAdapter) handleError(c *Context, s *stream.Stream, err error) {
+	// A response marked written only because a StreamWriter was taken, with
+	// nothing sent through it yet, is still answered (celeris#835): sse.New
+	// takes the writer before OnConnect, whose rejection must reach the
+	// client.
+	if err == nil {
+		return
+	}
+	if c.written && !c.reclaimUnusedStreamWriter() {
+		// The response is under way and cannot be answered with the error. A
+		// streamed one that ends here would be taken for whole by the HTTP/2
+		// processor, which ends a response its handler did not close
+		// (celeris#889): tell it the response is broken off.
+		s.FailResponse()
+		return
+	}
+	if a.errorHandler != nil {
+		a.errorHandler(c, err)
+		if c.written {
+			return
+		}
+	}
+	if c.detached {
+		// A request a middleware detached (WebSocket, SSE) is answered by
+		// whoever took it over (celeris#852). A middleware that detaches and
+		// returns ends the chain (celeris#927), but one that detaches and
+		// calls Next lets a later handler's error reach here. The Context's
+		// writers refuse a detached request (ErrDetached); the writes below
+		// would not.
+		return
+	}
+	hdrs := make([][2]string, 0, len(c.respHeaders)+2)
+	hdrs = append(hdrs, c.respHeaders...)
+	hdrs = append(hdrs, [2]string{"content-type", "text/plain"})
+	hdrs = append(hdrs, [2]string{"cache-control", "no-store"})
+	var he *HTTPError
+	if errors.As(err, &he) {
+		c.statusCode = he.Code
+		if s.ResponseWriter != nil {
+			_ = s.ResponseWriter.WriteResponse(s, he.Code, hdrs, []byte(he.Message))
+			c.written = true
+		}
+	} else {
+		c.statusCode = 500
+		if s.ResponseWriter != nil {
+			_ = s.ResponseWriter.WriteResponse(s, 500, hdrs, []byte("Internal Server Error"))
+			c.written = true
+		}
+	}
+}
+
+// RouteAsync reports whether the route matching method+path is configured
+// for async dispatch. Implements stream.AsyncRouteResolver so the H2
+// processor can choose inline vs. pooled handler execution per stream.
+func (a *routerAdapter) RouteAsync(method, path string) bool {
+	return a.server.router.routeAsync(method, path)
+}
+
+// HasAsyncRoutes reports whether any route opted into async dispatch.
+func (a *routerAdapter) HasAsyncRoutes() bool {
+	return a.server.router.hasAsyncRoutes()
+}
+
+// AsyncRouteCount returns the number of routes registered with .Async(true).
+// Engines expose this through Metrics().AsyncRoutes for diagnostics.
+func (a *routerAdapter) AsyncRouteCount() int {
+	return a.server.router.asyncRouteCount
+}
+
+var (
+	_ stream.Handler            = (*routerAdapter)(nil)
+	_ stream.AsyncRouteResolver = (*routerAdapter)(nil)
+)

@@ -1,0 +1,383 @@
+package store
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/goceleris/celeris/middleware/internal/fnv1a"
+)
+
+// MemoryKVConfig configures the in-memory [MemoryKV] store.
+type MemoryKVConfig struct {
+	// Shards is the number of lock shards. Default: runtime.NumCPU(),
+	// rounded up to the next power of two.
+	Shards int
+
+	// CleanupInterval is how often expired entries are evicted.
+	// Default: 1 minute. Zero is replaced with the default.
+	CleanupInterval time.Duration
+
+	// CleanupContext, if set, controls the cleanup goroutine lifetime.
+	// When the context is cancelled, the goroutine stops. If nil,
+	// [MemoryKV.Close] is the only way to stop the goroutine.
+	CleanupContext context.Context
+}
+
+// MemoryKV is an in-memory, sharded implementation of [KV]. It also
+// implements [GetAndDeleter], [Scanner], [PrefixDeleter], and [SetNXer].
+//
+// MemoryKV is intended as the default/test backend and for single-process
+// deployments. For multi-instance deployments, use a driver-backed adapter
+// (middleware/session/redisstore, etc.).
+//
+// MemoryKV keeps its own copy of every key it stores (see [KV]): callers
+// pass request strings, such as an Idempotency-Key header or a session ID
+// from a cookie, which on epoll and io_uring are views of the connection's
+// receive buffer and change once the request is over (celeris#719). A key is
+// copied once, when it is first stored; reads, deletes and updates of a key
+// already stored copy nothing.
+type MemoryKV struct {
+	shards []memShard
+	mask   uint64
+	cancel context.CancelFunc
+}
+
+type memShard struct {
+	mu    sync.Mutex
+	items map[string]*memItem
+}
+
+type memItem struct {
+	value  []byte
+	expiry int64 // UnixNano; 0 means no expiry
+}
+
+// NewMemoryKV returns a new [MemoryKV] with a running cleanup goroutine.
+// Call [MemoryKV.Close] when the store is no longer needed, or pass a
+// cancellable [MemoryKVConfig.CleanupContext].
+func NewMemoryKV(config ...MemoryKVConfig) *MemoryKV {
+	var cfg MemoryKVConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	if cfg.Shards <= 0 {
+		cfg.Shards = runtime.NumCPU()
+	}
+	if cfg.CleanupInterval <= 0 {
+		cfg.CleanupInterval = time.Minute
+	}
+
+	n := fnv1a.NextPow2(cfg.Shards)
+
+	ctx := cfg.CleanupContext
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+
+	m := &MemoryKV{
+		shards: make([]memShard, n),
+		mask:   uint64(n - 1),
+		cancel: cancel,
+	}
+	for i := range m.shards {
+		m.shards[i].items = make(map[string]*memItem)
+	}
+
+	go m.cleanup(ctx, cfg.CleanupInterval)
+
+	return m
+}
+
+// Close stops the cleanup goroutine. Safe to call multiple times. After
+// Close, Get/Set/Delete still work but expired entries are not reaped.
+func (m *MemoryKV) Close() {
+	m.cancel()
+}
+
+func (m *MemoryKV) shard(key string) *memShard {
+	return &m.shards[fnv1a.Hash(key)&m.mask]
+}
+
+// Get implements [KV].
+func (m *MemoryKV) Get(_ context.Context, key string) ([]byte, error) {
+	s := m.shard(key)
+	s.mu.Lock()
+	item, ok := s.items[key]
+	if !ok {
+		s.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	if item.expiry > 0 && time.Now().UnixNano() > item.expiry {
+		delete(s.items, key)
+		s.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	out := make([]byte, len(item.value))
+	copy(out, item.value)
+	s.mu.Unlock()
+	return out, nil
+}
+
+// Set implements [KV]. A ttl <= 0 stores the value with no expiry.
+func (m *MemoryKV) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
+	var exp int64
+	if ttl > 0 {
+		exp = time.Now().Add(ttl).UnixNano()
+	}
+	s := m.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Update-in-place: if an entry already exists and its backing
+	// array is large enough, reuse it. Session middleware's per-request
+	// Save hits this path repeatedly on the same session id.
+	if existing, ok := s.items[key]; ok {
+		if cap(existing.value) >= len(value) {
+			existing.value = existing.value[:len(value)]
+			copy(existing.value, value)
+		} else {
+			cp := make([]byte, len(value))
+			copy(cp, value)
+			existing.value = cp
+		}
+		existing.expiry = exp
+		return nil
+	}
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	s.items[strings.Clone(key)] = &memItem{value: cp, expiry: exp}
+	return nil
+}
+
+// Delete implements [KV].
+func (m *MemoryKV) Delete(_ context.Context, key string) error {
+	s := m.shard(key)
+	s.mu.Lock()
+	delete(s.items, key)
+	s.mu.Unlock()
+	return nil
+}
+
+// GetAndDelete implements [GetAndDeleter] atomically under the shard lock.
+// Returns nil, [ErrNotFound] on a missing or expired key.
+func (m *MemoryKV) GetAndDelete(_ context.Context, key string) ([]byte, error) {
+	s := m.shard(key)
+	s.mu.Lock()
+	item, ok := s.items[key]
+	if !ok {
+		s.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	delete(s.items, key)
+	if item.expiry > 0 && time.Now().UnixNano() > item.expiry {
+		s.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	out := make([]byte, len(item.value))
+	copy(out, item.value)
+	s.mu.Unlock()
+	return out, nil
+}
+
+// Scan implements [Scanner]. Returns all non-expired keys with the given
+// prefix. Scan is a point-in-time snapshot; concurrent Set/Delete may or
+// may not be reflected.
+func (m *MemoryKV) Scan(_ context.Context, prefix string) ([]string, error) {
+	var out []string
+	nowNano := time.Now().UnixNano()
+	for i := range m.shards {
+		s := &m.shards[i]
+		s.mu.Lock()
+		for k, it := range s.items {
+			if it.expiry > 0 && nowNano > it.expiry {
+				continue
+			}
+			if strings.HasPrefix(k, prefix) {
+				out = append(out, k)
+			}
+		}
+		s.mu.Unlock()
+	}
+	return out, nil
+}
+
+// DeletePrefix implements [PrefixDeleter].
+func (m *MemoryKV) DeletePrefix(_ context.Context, prefix string) error {
+	for i := range m.shards {
+		s := &m.shards[i]
+		s.mu.Lock()
+		for k := range s.items {
+			if strings.HasPrefix(k, prefix) {
+				delete(s.items, k)
+			}
+		}
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+// SetNX implements [SetNXer]. Acquires the key only if it does not
+// already exist (or has expired). Returns (true, nil) on acquisition,
+// (false, nil) on contention.
+func (m *MemoryKV) SetNX(_ context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	s := m.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Check contention under the lock BEFORE copying — a contended
+	// SetNX otherwise pays for a defensive value copy it throws away.
+	// Idempotency middleware's lock-vs-replay contention path hits
+	// this frequently.
+	it, ok := s.items[key]
+	if ok && (it.expiry == 0 || time.Now().UnixNano() <= it.expiry) {
+		return false, nil
+	}
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	var exp int64
+	if ttl > 0 {
+		exp = time.Now().Add(ttl).UnixNano()
+	}
+	if ok {
+		// An expired entry is taken over in place: assigning to the map
+		// would replace the key the map holds with the caller's.
+		it.value, it.expiry = cp, exp
+		return true, nil
+	}
+	s.items[strings.Clone(key)] = &memItem{value: cp, expiry: exp}
+	return true, nil
+}
+
+// Increment atomically increments the integer counter at key by 1,
+// returning the post-increment value. Implements the [Counter]
+// extension. The stored value is the decimal-string encoding of the
+// current count; this matches the wire format Redis INCR returns and
+// keeps the on-disk shape compatible across backends.
+//
+// Namespace: Increment shares the key namespace with [MemoryKV.Set] —
+// they are not separate maps. A key that holds a non-integer value
+// previously written via Set returns an error on the next Increment
+// (matching Redis "ERR value is not an integer or out of range"). A
+// Set on a key currently used as a counter overwrites the counter
+// state atomically, so the next Increment starts from the new value
+// (or errors if the new value is non-integer).
+//
+// TTL: ttl == 0 preserves any existing expiry on the key (matches
+// Redis INCR semantics, which never clears an existing TTL). ttl > 0
+// resets the expiry to now+ttl on every call — useful when the
+// counter's lifetime is bounded by recent activity (sliding window).
+// If the key did not previously exist, ttl == 0 stores the counter
+// with no expiry.
+func (m *MemoryKV) Increment(_ context.Context, key string, ttl time.Duration) (int64, error) {
+	s := m.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var (
+		cur     int64
+		prevExp int64
+		hadKey  bool
+	)
+	it, present := s.items[key]
+	if present {
+		if it.expiry == 0 || time.Now().UnixNano() <= it.expiry {
+			n, err := strconv.ParseInt(string(it.value), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("store: counter at %q has non-integer value: %w", key, err)
+			}
+			cur = n
+			prevExp = it.expiry
+			hadKey = true
+		}
+	}
+	cur++
+	encoded := strconv.AppendInt(nil, cur, 10)
+	// Match Redis INCR: ttl=0 preserves existing expiry; ttl>0 resets.
+	// When the key did not previously exist (or had expired), there is
+	// nothing to preserve and exp stays 0 (no expiry).
+	var exp int64
+	switch {
+	case ttl > 0:
+		exp = time.Now().Add(ttl).UnixNano()
+	case hadKey:
+		exp = prevExp
+	}
+	if present {
+		// Updated in place, live or expired: assigning to the map would
+		// replace the key the map holds with the caller's.
+		it.value, it.expiry = encoded, exp
+		return cur, nil
+	}
+	s.items[strings.Clone(key)] = &memItem{value: encoded, expiry: exp}
+	return cur, nil
+}
+
+// Sweep bounds (celeris#493). A shard is never ranged in full under its
+// lock: every lock acquisition scans at most sweepBatch entries, and a shard
+// pass runs at most sweepMaxRounds such rounds, stopping early once a round
+// finds fewer than sweepMinHitPct percent expired entries. Go map iteration
+// starts at a random bucket on every range, so successive bounded rounds
+// sample different regions and expiry converges across passes; Get and Set
+// also expire lazily. The bound is the invariant: on the 2026-09-04 soak the
+// unbounded range over a multi-million-entry shard held the lock for seconds
+// and every io_uring worker, calling Set inline from the session middleware,
+// stalled behind it (new connections unserved for up to 10 s).
+const (
+	sweepBatch     = 2048
+	sweepMaxRounds = 64
+	sweepMinHitPct = 5
+)
+
+func (m *MemoryKV) cleanup(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	shardIdx := 0
+	perTick := 4
+	if len(m.shards) < perTick {
+		perTick = len(m.shards)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			nowNano := now.UnixNano()
+			for range perTick {
+				m.sweepShard(&m.shards[shardIdx%len(m.shards)], nowNano)
+				shardIdx++
+			}
+		}
+	}
+}
+
+// sweepShard expires entries of one shard in bounded rounds (see the sweep
+// constants). Returns the number of entries deleted.
+func (m *MemoryKV) sweepShard(s *memShard, nowNano int64) int {
+	deleted := 0
+	for round := 0; round < sweepMaxRounds; round++ {
+		scanned, hits := 0, 0
+		s.mu.Lock()
+		for k, it := range s.items {
+			if scanned >= sweepBatch {
+				break
+			}
+			scanned++
+			if it.expiry > 0 && nowNano > it.expiry {
+				delete(s.items, k)
+				hits++
+			}
+		}
+		s.mu.Unlock()
+		deleted += hits
+		if scanned < sweepBatch || hits*100 < scanned*sweepMinHitPct {
+			// Shard exhausted in one round, or too few expired entries to
+			// justify another lock acquisition now; the next tick continues.
+			break
+		}
+		runtime.Gosched()
+	}
+	return deleted
+}

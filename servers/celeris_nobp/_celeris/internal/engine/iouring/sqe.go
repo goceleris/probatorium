@@ -1,0 +1,248 @@
+//go:build linux
+
+package iouring
+
+import (
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+func prepAccept(sqePtr unsafe.Pointer, listenFD int, flags uint32) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opACCEPT
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(listenFD)
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = flags // accept_flags at offset 28
+	*(*uint64)(unsafe.Pointer(&sqe[8])) = 0
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = 0
+	*(*uint32)(unsafe.Pointer(&sqe[24])) = 0
+}
+
+// acceptFlags is the accept_flags of every accept that returns a descriptor of
+// the process (all but the fixed-file one below): the accepted socket is
+// non-blocking, so the engine's inline writes never wait for a client, and
+// close-on-exec. Nothing else sets either on it (sockopts.ApplyFD does not
+// set O_NONBLOCK), so an accept that passes 0 yields a blocking, inheritable
+// descriptor (celeris#884).
+const acceptFlags = uint32(unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC)
+
+// prepSingleShotAccept prepares the one-shot accept of a tier without
+// multishot accept, with the same flags as the multishot one.
+func prepSingleShotAccept(sqePtr unsafe.Pointer, listenFD int) {
+	prepAccept(sqePtr, listenFD, acceptFlags)
+}
+
+func prepMultishotAccept(sqePtr unsafe.Pointer, listenFD int) {
+	prepSingleShotAccept(sqePtr, listenFD)
+	sqe := (*[sqeSize]byte)(sqePtr)
+	*(*uint16)(unsafe.Pointer(&sqe[2])) = acceptMultishot // ioprio at offset 2
+}
+
+// prepMultishotAcceptDirect prepares a multishot accept that installs accepted
+// FDs directly into the io_uring fixed file table. The CQE result is a fixed
+// file index, not a regular FD.
+func prepMultishotAcceptDirect(sqePtr unsafe.Pointer, listenFD int) {
+	// SOCK_NONBLOCK only — NOT SOCK_CLOEXEC. io_accept_prep rejects a fixed
+	// file slot combined with SOCK_CLOEXEC with -EINVAL, because a direct
+	// descriptor lives in the ring's file table rather than the process fd
+	// table, so close-on-exec is meaningless for it. Building on
+	// prepMultishotAccept (which sets both flags) made every accept-direct
+	// probe fail, and the failure was read as "this kernel refuses
+	// ACCEPT_DIRECT" — see the probe's own comment. celeris#541.
+	prepAccept(sqePtr, listenFD, uint32(unix.SOCK_NONBLOCK))
+	sqe := (*[sqeSize]byte)(sqePtr)
+	*(*uint16)(unsafe.Pointer(&sqe[2])) = acceptMultishot // ioprio at offset 2
+	// file_index at offset 44: IORING_FILE_INDEX_ALLOC for auto-allocation.
+	*(*uint32)(unsafe.Pointer(&sqe[44])) = fileIndexAlloc
+}
+
+func prepRecv(sqePtr unsafe.Pointer, fd int, buf []byte) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opRECV
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	if len(buf) > 0 {
+		*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(unsafe.Pointer(&buf[0])))
+		*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(len(buf))
+	}
+}
+
+// prepMultishotRecv prepares a multishot recv that uses provided buffers from
+// the buffer ring identified by groupID. The kernel selects a buffer per
+// completion; the buffer ID is returned in the CQE flags.
+func prepMultishotRecv(sqePtr unsafe.Pointer, fd int, groupID uint16, fixedFile bool) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opRECV
+	flags := uint8(sqeBufferSelect)
+	if fixedFile {
+		flags |= sqeFixedFile
+	}
+	sqe[1] = flags
+	*(*uint16)(unsafe.Pointer(&sqe[2])) = recvMultishot // ioprio: multishot flag
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = 0 // addr: unused (provided buffers)
+	*(*uint32)(unsafe.Pointer(&sqe[24])) = 0 // len: unused (provided buffers)
+	// buf_group at offset 40
+	*(*uint16)(unsafe.Pointer(&sqe[40])) = groupID
+}
+
+func prepSend(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opSEND
+	if linked {
+		sqe[1] = sqeIOLink
+	}
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	if len(buf) > 0 {
+		*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(unsafe.Pointer(&buf[0])))
+		*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(len(buf))
+	}
+}
+
+// prepCloseDirect closes a fixed file entry by index. The fd field is unused
+// (set to 0); file_index identifies the slot.
+func prepCloseDirect(sqePtr unsafe.Pointer, fileIndex int) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opCLOSE
+	sqe[1] = sqeFixedFile | sqeCQESkipSuccess
+	*(*int32)(unsafe.Pointer(&sqe[4])) = 0 // unused for direct close
+	// file_index at offset 44 (0-based index + 1 for direct)
+	*(*uint32)(unsafe.Pointer(&sqe[44])) = uint32(fileIndex)
+}
+
+func setSQEUserData(sqePtr unsafe.Pointer, data uint64) {
+	*(*uint64)(unsafe.Pointer(uintptr(sqePtr) + 32)) = data
+}
+
+// prepTimeout prepares an IORING_OP_TIMEOUT SQE that fires after the
+// duration described by ts. The kernel reads ts at submission time and
+// schedules an internal timer; when the timer fires (or the requested
+// number of completions arrive) the kernel returns a CQE with res=
+// -ETIME for the time path. ts MUST remain valid through submission —
+// kept on the conn state (see connState.headerTimerSpec) to satisfy
+// this requirement without per-arm heap allocation.
+//
+// count = 0: timer fires only on deadline (relative).
+// flags = 0: relative timer; pass IORING_TIMEOUT_ABS (1) for absolute.
+//
+// All non-timeout fields of the SQE are explicitly zeroed because the
+// SQ ring is reused — stale bytes from a previous SQE (fd, ioprio,
+// rw_flags) would otherwise confuse the kernel's IORING_OP_TIMEOUT
+// handler. Mirrors the prepAccept/prepRecv pattern in this file.
+//
+// New in v1.4.11 for the per-conn ReadHeaderTimeout enforcement.
+func prepTimeout(sqePtr unsafe.Pointer, ts unsafe.Pointer, count uint32, flags uint32) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opTIMEOUT
+	sqe[1] = 0                                          // flags
+	*(*uint16)(unsafe.Pointer(&sqe[2])) = 0             // ioprio
+	*(*int32)(unsafe.Pointer(&sqe[4])) = 0              // fd (unused)
+	*(*uint64)(unsafe.Pointer(&sqe[8])) = uint64(count) // off = count
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(ts))
+	*(*uint32)(unsafe.Pointer(&sqe[24])) = 1     // len: must be 1
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = flags // timeout_flags
+}
+
+// setSQEFixedFile sets the IOSQE_FIXED_FILE flag on an SQE after initial prep.
+func setSQEFixedFile(sqePtr unsafe.Pointer) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[1] |= sqeFixedFile
+}
+
+// prepSendPlain prepares a SEND SQE for a regular (non-fixed) file descriptor.
+func prepSendPlain(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	prepSend(sqePtr, fd, buf, linked)
+}
+
+// prepSendFixed prepares a SEND SQE for a fixed file descriptor.
+func prepSendFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	prepSend(sqePtr, fd, buf, linked)
+	setSQEFixedFile(sqePtr)
+}
+
+// prepSendZC prepares a SEND_ZC (zero-copy send) SQE. The kernel avoids
+// copying the buffer and instead maps it for DMA. Two CQEs are produced:
+// the first with the send result, and a notification CQE (CQE_F_NOTIF)
+// when the buffer can be safely reused.
+func prepSendZC(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opSENDZC
+	if linked {
+		sqe[1] = sqeIOLink
+	}
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	if len(buf) > 0 {
+		*(*uint64)(unsafe.Pointer(&sqe[16])) = uint64(uintptr(unsafe.Pointer(&buf[0])))
+		*(*uint32)(unsafe.Pointer(&sqe[24])) = uint32(len(buf))
+	}
+}
+
+// prepSendZCFixed prepares a SEND_ZC SQE for a fixed file descriptor.
+func prepSendZCFixed(sqePtr unsafe.Pointer, fd int, buf []byte, linked bool) {
+	prepSendZC(sqePtr, fd, buf, linked)
+	setSQEFixedFile(sqePtr)
+}
+
+// prepPollAdd prepares a POLL_ADD SQE. The poll event mask goes in the
+// poll32_events field (offset 28). Used for eventfd wakeup monitoring.
+func prepPollAdd(sqePtr unsafe.Pointer, fd int, pollMask uint32) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opPOLLADD
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = pollMask // poll32_events at offset 28
+}
+
+// prepCancelFDSkipSuccess prepares an ASYNC_CANCEL SQE with CQE_SKIP_SUCCESS
+// to suppress the success CQE (P11).
+func prepCancelFDSkipSuccess(sqePtr unsafe.Pointer, fd int) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opASYNCCANCEL
+	sqe[1] = sqeCQESkipSuccess
+	*(*int32)(unsafe.Pointer(&sqe[4])) = int32(fd)
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelFD | cancelAll
+}
+
+// prepCancelUserDataSkipSuccess prepares an ASYNC_CANCEL SQE that matches the
+// in-flight op by its user_data (the kernel's default cancel key when no FD
+// flag is set), with CQE_SKIP_SUCCESS to suppress the success CQE.
+//
+// This is the fixed-file-safe way to cancel a pending recv: when fixed files
+// are enabled the recv SQE's "fd" field is a fixed-file INDEX, so cancelling
+// by raw fd (prepCancelFDSkipSuccess) matches nothing or the wrong file.
+// user_data is unambiguous regardless of fixed files (v1.5.0 review 2.5).
+// targetUD is the encodeUserDataGen(udRecv, fd, gen) value the recv SQE
+// carried — it MUST include the conn's generation (review 2.6) or the
+// kernel match finds nothing.
+func prepCancelUserDataSkipSuccess(sqePtr unsafe.Pointer, targetUD uint64) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opASYNCCANCEL
+	sqe[1] = sqeCQESkipSuccess
+	// addr (offset 16) holds the target user_data to match against.
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = targetUD
+	// cancel_flags (offset 28): cancelAll only — no cancelFD, so the kernel
+	// matches by user_data.
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelAll
+}
+
+// prepCancelUserDataReported is prepCancelUserDataSkipSuccess without
+// CQE_SKIP_SUCCESS, so the cancel ALWAYS posts its own CQE and the caller
+// learns what it did.
+//
+// Needed because with IORING_ASYNC_CANCEL_ALL the kernel reports a cancel
+// that matched nothing as res == 0 — a SUCCESS — so CQE_SKIP_SUCCESS
+// suppresses exactly the completion that says "nothing was cancelled".
+// Measured on Linux 7.0.12: a miss produces no CQE at all with skip-success,
+// and res == 0 without it. A caller that must know whether an -ECANCELED is
+// coming (the WS backpressure pause, celeris#596) therefore cannot use the
+// skip-success form; res > 0 is the number of ops cancelled, res <= 0 means
+// none were.
+//
+// Not for the close-path cancels (cancelConnOps): those conns are being torn
+// down and nothing reads the outcome, so they keep the suppressed form and
+// its one-CQE-per-close saving.
+func prepCancelUserDataReported(sqePtr unsafe.Pointer, targetUD uint64) {
+	sqe := (*[sqeSize]byte)(sqePtr)
+	sqe[0] = opASYNCCANCEL
+	sqe[1] = 0
+	*(*uint64)(unsafe.Pointer(&sqe[16])) = targetUD
+	*(*uint32)(unsafe.Pointer(&sqe[28])) = cancelAll
+}

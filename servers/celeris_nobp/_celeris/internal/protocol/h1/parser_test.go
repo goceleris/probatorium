@@ -1,0 +1,1029 @@
+package h1
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+func TestParseRequest_AllMethods(t *testing.T) {
+	methods := []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			raw := method + " /path HTTP/1.1\r\nHost: example.com\r\n\r\n"
+			p := NewParser()
+			p.Reset([]byte(raw))
+			var req Request
+			n, err := p.ParseRequest(&req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if n != len(raw) {
+				t.Fatalf("consumed %d, want %d", n, len(raw))
+			}
+			if req.Method != method {
+				t.Fatalf("method = %q, want %q", req.Method, method)
+			}
+			if req.Path != "/path" {
+				t.Fatalf("path = %q, want /path", req.Path)
+			}
+			if req.Version != "HTTP/1.1" {
+				t.Fatalf("version = %q, want HTTP/1.1", req.Version)
+			}
+			if req.Host != "example.com" {
+				t.Fatalf("host = %q, want example.com", req.Host)
+			}
+			if !req.HeadersComplete {
+				t.Fatal("headers not complete")
+			}
+		})
+	}
+}
+
+func TestParseRequest_HTTP10(t *testing.T) {
+	raw := "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	n, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != len(raw) {
+		t.Fatalf("consumed %d, want %d", n, len(raw))
+	}
+	if req.Version != "HTTP/1.0" {
+		t.Fatalf("version = %q, want HTTP/1.0", req.Version)
+	}
+	if req.KeepAlive {
+		t.Fatal("HTTP/1.0 should default to keep-alive=false")
+	}
+}
+
+func TestParseRequest_HTTP11KeepAlive(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !req.KeepAlive {
+		t.Fatal("HTTP/1.1 should default to keep-alive=true")
+	}
+}
+
+func TestParseRequest_ConnectionClose(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.KeepAlive {
+		t.Fatal("connection: close should set keep-alive=false")
+	}
+}
+
+func TestParseRequest_ConnectionKeepAlive(t *testing.T) {
+	raw := "GET / HTTP/1.0\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !req.KeepAlive {
+		t.Fatal("connection: keep-alive should set keep-alive=true")
+	}
+}
+
+func TestParseRequest_ContentLength(t *testing.T) {
+	raw := "POST /data HTTP/1.1\r\nHost: example.com\r\nContent-Length: 13\r\n\r\nHello, World!"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.ContentLength != 13 {
+		t.Fatalf("content-length = %d, want 13", req.ContentLength)
+	}
+	body := p.GetBody(req.ContentLength)
+	if string(body) != "Hello, World!" {
+		t.Fatalf("body = %q, want Hello, World!", body)
+	}
+}
+
+func TestParseRequest_ChunkedEncoding(t *testing.T) {
+	raw := "POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !req.ChunkedEncoding {
+		t.Fatal("chunked encoding not detected")
+	}
+	if req.ContentLength != -1 {
+		t.Fatalf("content-length = %d, want -1 for chunked", req.ContentLength)
+	}
+}
+
+func TestParseRequest_Pipelining(t *testing.T) {
+	raw := "GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n" +
+		"GET /second HTTP/1.1\r\nHost: example.com\r\n\r\n" +
+		"POST /third HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\nbody"
+	p := NewParser()
+	p.Reset([]byte(raw))
+
+	var req Request
+
+	// First request
+	n1, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("request 1: %v", err)
+	}
+	if req.Path != "/first" {
+		t.Fatalf("request 1 path = %q, want /first", req.Path)
+	}
+	if n1 == 0 {
+		t.Fatal("request 1 consumed 0 bytes")
+	}
+
+	// Second request
+	req.Reset()
+	n2, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("request 2: %v", err)
+	}
+	if req.Path != "/second" {
+		t.Fatalf("request 2 path = %q, want /second", req.Path)
+	}
+	if n2 == 0 {
+		t.Fatal("request 2 consumed 0 bytes")
+	}
+
+	// Third request
+	req.Reset()
+	_, err = p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("request 3: %v", err)
+	}
+	if req.Path != "/third" {
+		t.Fatalf("request 3 path = %q, want /third", req.Path)
+	}
+	if req.ContentLength != 4 {
+		t.Fatalf("request 3 content-length = %d, want 4", req.ContentLength)
+	}
+	body := p.GetBody(req.ContentLength)
+	if string(body) != "body" {
+		t.Fatalf("request 3 body = %q, want body", body)
+	}
+}
+
+func TestParseRequest_MalformedRequestLine(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		err  error
+	}{
+		{"no spaces", "GETHTTP/1.1\r\nHost: x\r\n\r\n", ErrInvalidRequestLine},
+		{"one space", "GET /path\r\nHost: x\r\n\r\n", ErrInvalidRequestLine},
+		{"bad version", "GET / HTTP/2.0\r\nHost: x\r\n\r\n", ErrUnsupportedVersion},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewParser()
+			p.Reset([]byte(tc.raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("got error %v, want %v", err, tc.err)
+			}
+		})
+	}
+}
+
+func TestParseRequest_MissingHost(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if !errors.Is(err, ErrMissingHost) {
+		t.Fatalf("got error %v, want %v", err, ErrMissingHost)
+	}
+}
+
+func TestParseRequest_InvalidHeader(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nBadHeader\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if !errors.Is(err, ErrInvalidHeader) {
+		t.Fatalf("got error %v, want %v", err, ErrInvalidHeader)
+	}
+}
+
+func TestParseRequest_InvalidContentLength(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: abc\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if !errors.Is(err, ErrInvalidContentLength) {
+		t.Fatalf("got error %v, want %v", err, ErrInvalidContentLength)
+	}
+}
+
+func TestParseRequest_CaseInsensitiveHeaders(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHOST: example.com\r\nCONTENT-LENGTH: 5\r\ntRANSFER-eNCODING: identity\r\nCONNECTION: keep-alive\r\n\r\nhello"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Host != "example.com" {
+		t.Fatalf("host = %q, want example.com", req.Host)
+	}
+	if req.ContentLength != 5 {
+		t.Fatalf("content-length = %d, want 5", req.ContentLength)
+	}
+	if !req.KeepAlive {
+		t.Fatal("keep-alive should be true")
+	}
+}
+
+func TestParseRequest_PartialData(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: exa"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	n, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error on partial data: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("consumed = %d, want 0 for partial", n)
+	}
+}
+
+func TestParseRequest_BufferExhausted(t *testing.T) {
+	p := NewParser()
+	p.Reset([]byte{})
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if !errors.Is(err, ErrBufferExhausted) {
+		t.Fatalf("got error %v, want %v", err, ErrBufferExhausted)
+	}
+}
+
+func TestParseRequest_ManyHeaders(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("GET / HTTP/1.1\r\n")
+	b.WriteString("Host: example.com\r\n")
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&b, "X-Header-%d: value-%d\r\n", i, i)
+	}
+	b.WriteString("\r\n")
+	raw := b.String()
+
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(req.Headers) != 101 {
+		t.Fatalf("header count = %d, want 101", len(req.Headers))
+	}
+}
+
+func TestParseRequest_InternedRoot(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Path != "/" {
+		t.Fatalf("path = %q, want /", req.Path)
+	}
+}
+
+func TestParseRequest_RawHeaders(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\nX-Custom: value\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(req.RawHeaders) != 2 {
+		t.Fatalf("raw header count = %d, want 2", len(req.RawHeaders))
+	}
+	if string(req.RawHeaders[1][0]) != "X-Custom" {
+		t.Fatalf("raw header name = %q, want X-Custom", req.RawHeaders[1][0])
+	}
+	if string(req.RawHeaders[1][1]) != "value" {
+		t.Fatalf("raw header value = %q, want value", req.RawHeaders[1][1])
+	}
+}
+
+func TestParseRequest_Remaining(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Remaining() != 5 {
+		t.Fatalf("remaining = %d, want 5", p.Remaining())
+	}
+}
+
+func TestParseRequest_ConsumeBody(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhelloextra"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	p.ConsumeBody(5)
+	if p.Remaining() != 5 {
+		t.Fatalf("remaining after consume = %d, want 5", p.Remaining())
+	}
+}
+
+func TestRequest_Reset(t *testing.T) {
+	req := &Request{
+		Method:          "GET",
+		Path:            "/",
+		Version:         "HTTP/1.1",
+		Headers:         make([][2]string, 5),
+		RawHeaders:      make([][2][]byte, 5),
+		Host:            "example.com",
+		ContentLength:   42,
+		ChunkedEncoding: true,
+		KeepAlive:       true,
+		HeadersComplete: true,
+		BodyRead:        100,
+	}
+	req.Reset()
+	if req.Method != "" || req.Path != "" || req.Version != "" {
+		t.Fatal("strings not cleared")
+	}
+	if len(req.Headers) != 0 || len(req.RawHeaders) != 0 {
+		t.Fatal("slices not cleared")
+	}
+	if req.Host != "" || req.ContentLength != 0 || req.ChunkedEncoding || req.KeepAlive || req.HeadersComplete || req.BodyRead != 0 {
+		t.Fatal("fields not cleared")
+	}
+	if cap(req.Headers) != 5 {
+		t.Fatal("headers backing array should be preserved")
+	}
+}
+
+func TestParseRequest_NoStringHeadersMode(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n"
+	p := NewParser()
+	p.noStringHeaders = true
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(req.Headers) != 0 {
+		t.Fatalf("string headers should be empty in noStringHeaders mode, got %d", len(req.Headers))
+	}
+	if req.Host != "example.com" {
+		t.Fatalf("host = %q, want example.com", req.Host)
+	}
+	if req.ContentLength != 0 {
+		t.Fatalf("content-length = %d, want 0", req.ContentLength)
+	}
+}
+
+func TestParseRequest_DefaultContentLengthMinusOne(t *testing.T) {
+	raw := "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.ContentLength != -1 {
+		t.Fatalf("default content-length = %d, want -1", req.ContentLength)
+	}
+}
+
+func TestParseRequest_DuplicateContentLength_Conflicting(t *testing.T) {
+	for _, zeroCopy := range []bool{false, true} {
+		name := "standard"
+		if zeroCopy {
+			name = "zerocopy"
+		}
+		t.Run(name, func(t *testing.T) {
+			raw := "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n"
+			p := NewParser()
+			if zeroCopy {
+				p.noStringHeaders = true
+			}
+			p.Reset([]byte(raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if !errors.Is(err, ErrDuplicateContentLength) {
+				t.Fatalf("got error %v, want %v", err, ErrDuplicateContentLength)
+			}
+		})
+	}
+}
+
+func TestParseRequest_DuplicateContentLength_Identical(t *testing.T) {
+	for _, zeroCopy := range []bool{false, true} {
+		name := "standard"
+		if zeroCopy {
+			name = "zerocopy"
+		}
+		t.Run(name, func(t *testing.T) {
+			raw := "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 42\r\nContent-Length: 42\r\n\r\n"
+			p := NewParser()
+			if zeroCopy {
+				p.noStringHeaders = true
+			}
+			p.Reset([]byte(raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if err != nil {
+				t.Fatalf("identical CL should be accepted, got: %v", err)
+			}
+			if req.ContentLength != 42 {
+				t.Fatalf("content-length = %d, want 42", req.ContentLength)
+			}
+		})
+	}
+}
+
+// TestParseRequest_ContentLengthAndChunked_Rejected covers RFC 9112 §6.3:
+// a message carrying BOTH Transfer-Encoding: chunked and Content-Length is
+// malformed and MUST be rejected (request-smuggling vector). This test
+// previously (as TestParseRequest_DuplicateContentLength_ChunkedIgnored)
+// asserted the OLD lax behavior — strip CL and let chunked win — which
+// finding 4.2 identifies as wrong; it is updated to require a 400.
+func TestParseRequest_ContentLengthAndChunked_Rejected(t *testing.T) {
+	for _, zeroCopy := range []bool{false, true} {
+		name := "standard"
+		if zeroCopy {
+			name = "zerocopy"
+		}
+		t.Run(name, func(t *testing.T) {
+			raw := "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 50\r\n\r\n"
+			p := NewParser()
+			if zeroCopy {
+				p.noStringHeaders = true
+			}
+			p.Reset([]byte(raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if !errors.Is(err, ErrConflictingFraming) {
+				t.Fatalf("got error %v, want %v", err, ErrConflictingFraming)
+			}
+		})
+	}
+}
+
+func TestParseRequest_H2CUpgrade(t *testing.T) {
+	cases := []struct {
+		name        string
+		raw         string
+		wantUpgrade bool
+		wantSet     string // expected HTTP2Settings value (may be empty)
+	}{
+		{
+			name: "happy path",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\n\r\n",
+			wantUpgrade: true,
+			wantSet:     "AAMAAABkAARAAAAAAAIAAAAA",
+		},
+		{
+			name: "case variations",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"CONNECTION: UPGRADE, http2-Settings\r\n" +
+				"UPGRADE: H2C\r\n" +
+				"Http2-SETTINGS: abc\r\n\r\n",
+			wantUpgrade: true,
+			wantSet:     "abc",
+		},
+		{
+			name: "reversed connection tokens",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: http2-settings, upgrade\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: true,
+			wantSet:     "abc",
+		},
+		{
+			name: "missing HTTP2-Settings",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "missing Upgrade token in Connection",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "missing HTTP2-Settings token in Connection",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "wrong Upgrade value (websocket)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: websocket\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "multiple upgrade tokens (ambiguous, reject)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: websocket, h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "h2c with trailing token (ambiguous, reject)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c, foo\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "empty HTTP2-Settings value",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: \r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			name: "no upgrade headers",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			// Regression: two separate Upgrade headers. The first is non-h2c
+			// (disqualifying); the second sets h2c. The one-way disqualifier
+			// latch must prevent the second header from re-enabling the flag
+			// (otherwise an attacker could smuggle an h2c upgrade past a
+			// reverse proxy that inspects only the first Upgrade line).
+			name: "multiple Upgrade headers: websocket then h2c (reject)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Upgrade: h2c\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+		{
+			// Symmetric case: h2c first, then a non-h2c header. The latch
+			// must disqualify because the presence of a second non-h2c
+			// Upgrade token means this is a multi-protocol upgrade, not a
+			// pure h2c upgrade.
+			name: "multiple Upgrade headers: h2c then websocket (reject)",
+			raw: "GET / HTTP/1.1\r\n" +
+				"Host: example.com\r\n" +
+				"Connection: Upgrade, HTTP2-Settings\r\n" +
+				"Upgrade: h2c\r\n" +
+				"Upgrade: websocket\r\n" +
+				"HTTP2-Settings: abc\r\n\r\n",
+			wantUpgrade: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewParser()
+			p.Reset([]byte(tc.raw))
+			var req Request
+			_, err := p.ParseRequest(&req)
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if req.UpgradeH2C != tc.wantUpgrade {
+				t.Fatalf("UpgradeH2C = %v, want %v", req.UpgradeH2C, tc.wantUpgrade)
+			}
+			if tc.wantSet != "" && req.HTTP2Settings != tc.wantSet {
+				t.Fatalf("HTTP2Settings = %q, want %q", req.HTTP2Settings, tc.wantSet)
+			}
+		})
+	}
+}
+
+func TestRequest_Reset_ClearsUpgrade(t *testing.T) {
+	var req Request
+	req.UpgradeH2C = true
+	req.HTTP2Settings = "abc"
+	req.Reset()
+	if req.UpgradeH2C {
+		t.Fatal("UpgradeH2C not cleared by Reset")
+	}
+	if req.HTTP2Settings != "" {
+		t.Fatalf("HTTP2Settings = %q, want empty", req.HTTP2Settings)
+	}
+}
+
+// 4.2: Transfer-Encoding must be parsed as a token list with "chunked" only
+// honored as the final coding; substrings and non-final chunked are rejected.
+func TestParseRequest_TransferEncodingTokenParse(t *testing.T) {
+	cases := []struct {
+		name        string
+		te          string
+		wantChunked bool
+		wantErr     error
+	}{
+		{"xchunkedx not chunked", "xchunkedx", false, nil},
+		{"chunked-not-last rejected", "chunked, gzip", false, ErrInvalidTransferEncoding},
+		{"gzip-then-chunked ok", "gzip, chunked", true, nil},
+		{"plain chunked ok", "chunked", true, nil},
+		{"chunked with OWS ok", "  chunked  ", true, nil},
+		{"gzip only not chunked", "gzip", false, nil},
+		{"empty not chunked", "", false, nil},
+	}
+	for _, zeroCopy := range []bool{false, true} {
+		mode := "standard"
+		if zeroCopy {
+			mode = "zerocopy"
+		}
+		for _, tc := range cases {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				raw := "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: " + tc.te + "\r\n\r\n"
+				p := NewParser()
+				if zeroCopy {
+					p.noStringHeaders = true
+				}
+				p.Reset([]byte(raw))
+				var req Request
+				_, err := p.ParseRequest(&req)
+				if tc.wantErr != nil {
+					if !errors.Is(err, tc.wantErr) {
+						t.Fatalf("got error %v, want %v", err, tc.wantErr)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if req.ChunkedEncoding != tc.wantChunked {
+					t.Fatalf("ChunkedEncoding = %v, want %v", req.ChunkedEncoding, tc.wantChunked)
+				}
+			})
+		}
+	}
+}
+
+// 4.2: a request carrying both Content-Length and Transfer-Encoding: chunked
+// is malformed and must be rejected, regardless of header order.
+func TestParseRequest_ContentLengthAndChunked_BothOrders(t *testing.T) {
+	orders := []struct {
+		name string
+		raw  string
+	}{
+		{"TE-then-CL", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"},
+		{"CL-then-TE", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"},
+	}
+	for _, zeroCopy := range []bool{false, true} {
+		mode := "standard"
+		if zeroCopy {
+			mode = "zerocopy"
+		}
+		for _, o := range orders {
+			t.Run(mode+"/"+o.name, func(t *testing.T) {
+				p := NewParser()
+				if zeroCopy {
+					p.noStringHeaders = true
+				}
+				p.Reset([]byte(o.raw))
+				var req Request
+				_, err := p.ParseRequest(&req)
+				if !errors.Is(err, ErrConflictingFraming) {
+					t.Fatalf("got error %v, want %v", err, ErrConflictingFraming)
+				}
+			})
+		}
+	}
+}
+
+// 4.3: whitespace between the header name and the colon is rejected (400);
+// value OWS is still trimmed.
+func TestParseRequest_WhitespaceBeforeColon(t *testing.T) {
+	bad := []struct {
+		name string
+		raw  string
+	}{
+		{"space before colon", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo : v\r\n\r\n"},
+		{"tab before colon", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo\t: v\r\n\r\n"},
+	}
+	for _, zeroCopy := range []bool{false, true} {
+		mode := "standard"
+		if zeroCopy {
+			mode = "zerocopy"
+		}
+		for _, tc := range bad {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				p := NewParser()
+				if zeroCopy {
+					p.noStringHeaders = true
+				}
+				p.Reset([]byte(tc.raw))
+				var req Request
+				_, err := p.ParseRequest(&req)
+				if !errors.Is(err, ErrInvalidHeader) {
+					t.Fatalf("got error %v, want %v", err, ErrInvalidHeader)
+				}
+			})
+		}
+	}
+
+	// Value OWS must still be trimmed.
+	t.Run("value OWS trimmed", func(t *testing.T) {
+		raw := "GET / HTTP/1.1\r\nHost: h\r\nX-Foo:   v  \r\n\r\n"
+		p := NewParser()
+		p.Reset([]byte(raw))
+		var req Request
+		_, err := p.ParseRequest(&req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var got string
+		for _, h := range req.Headers {
+			if h[0] == "x-foo" {
+				got = h[1]
+			}
+		}
+		if got != "v" {
+			t.Fatalf("value = %q, want %q", got, "v")
+		}
+	})
+}
+
+// 4.5: ParseRequest must reset RawHeaders so a reused *Request (without an
+// explicit Request.Reset between parses) does not leak the prior request's
+// raw headers.
+func TestParseRequest_RawHeadersResetWithoutReset(t *testing.T) {
+	p := NewParser()
+	var req Request
+
+	raw1 := "GET /one HTTP/1.1\r\nHost: a\r\nX-First: 1\r\n\r\n"
+	p.Reset([]byte(raw1))
+	if _, err := p.ParseRequest(&req); err != nil {
+		t.Fatalf("request 1 error: %v", err)
+	}
+
+	// Deliberately do NOT call req.Reset() between parses.
+	raw2 := "GET /two HTTP/1.1\r\nHost: b\r\nX-Second: 2\r\n\r\n"
+	p.Reset([]byte(raw2))
+	if _, err := p.ParseRequest(&req); err != nil {
+		t.Fatalf("request 2 error: %v", err)
+	}
+
+	for _, rh := range req.RawHeaders {
+		name := string(rh[0])
+		if name == "X-First" || name == "Host" && string(rh[1]) == "a" {
+			t.Fatalf("request 2 RawHeaders leaked request 1 header %q=%q", name, rh[1])
+		}
+	}
+	// Request 2 should have exactly its own two headers.
+	if len(req.RawHeaders) != 2 {
+		t.Fatalf("request 2 RawHeaders count = %d, want 2: %v", len(req.RawHeaders), rawNames(req.RawHeaders))
+	}
+}
+
+func rawNames(rh [][2][]byte) []string {
+	out := make([]string, len(rh))
+	for i, h := range rh {
+		out[i] = string(h[0])
+	}
+	return out
+}
+
+// 4.6: the request line / URI is bounded by MaxRequestLineSize.
+func TestParseRequest_RequestLineTooLong(t *testing.T) {
+	uri := "/" + strings.Repeat("a", 64<<10) // 64 KiB URI
+	raw := "GET " + uri + " HTTP/1.1\r\nHost: h\r\n\r\n"
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if !errors.Is(err, ErrRequestLineTooLong) {
+		t.Fatalf("got error %v, want %v", err, ErrRequestLineTooLong)
+	}
+}
+
+// 4.6: an over-long request line with no CRLF yet must also be rejected
+// promptly (not buffered unbounded).
+func TestParseRequest_RequestLineTooLong_NoCRLF(t *testing.T) {
+	raw := "GET /" + strings.Repeat("a", 64<<10) // no CRLF
+	p := NewParser()
+	p.Reset([]byte(raw))
+	var req Request
+	_, err := p.ParseRequest(&req)
+	if !errors.Is(err, ErrRequestLineTooLong) {
+		t.Fatalf("got error %v, want %v", err, ErrRequestLineTooLong)
+	}
+}
+
+// 4.7: control bytes (NUL, bare CR, other controls) in header names/values
+// are rejected; HTAB and mid-value SP are still accepted.
+func TestParseRequest_ControlBytesRejected(t *testing.T) {
+	bad := []struct {
+		name string
+		raw  string
+	}{
+		{"NUL in value", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo: a\x00b\r\n\r\n"},
+		{"NUL in name", "GET / HTTP/1.1\r\nHost: h\r\nX-\x00Foo: v\r\n\r\n"},
+		{"bare CR in value", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo: a\rb\r\n\r\n"},
+		{"control 0x01 in value", "GET / HTTP/1.1\r\nHost: h\r\nX-Foo: a\x01b\r\n\r\n"},
+		{"non-tchar in name", "GET / HTTP/1.1\r\nHost: h\r\nX(Foo): v\r\n\r\n"},
+	}
+	for _, zeroCopy := range []bool{false, true} {
+		mode := "standard"
+		if zeroCopy {
+			mode = "zerocopy"
+		}
+		for _, tc := range bad {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				p := NewParser()
+				if zeroCopy {
+					p.noStringHeaders = true
+				}
+				p.Reset([]byte(tc.raw))
+				var req Request
+				_, err := p.ParseRequest(&req)
+				if !errors.Is(err, ErrInvalidHeader) {
+					t.Fatalf("got error %v, want %v", err, ErrInvalidHeader)
+				}
+			})
+		}
+	}
+
+	// HTAB inside a value (mid-value, after OWS trim) and a normal SP-bearing
+	// value must still be accepted.
+	t.Run("HTAB and SP in value accepted", func(t *testing.T) {
+		raw := "GET / HTTP/1.1\r\nHost: h\r\nX-Foo: a\tb c\r\n\r\n"
+		p := NewParser()
+		p.Reset([]byte(raw))
+		var req Request
+		_, err := p.ParseRequest(&req)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var got string
+		for _, h := range req.Headers {
+			if h[0] == "x-foo" {
+				got = h[1]
+			}
+		}
+		if got != "a\tb c" {
+			t.Fatalf("value = %q, want %q", got, "a\tb c")
+		}
+	})
+}
+
+// TestParseRequest_LeadingCRLF: RFC 9112 section 2.2, a server SHOULD ignore at
+// least one empty line received before the request line. One is skipped and
+// counted in what the parse consumed; a second is an empty request line, which
+// is invalid. A request that is not complete yet is reported as such.
+func TestParseRequest_LeadingCRLF(t *testing.T) {
+	const req = "GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	cases := []struct {
+		name string
+		in   string
+		want error
+		n    int // consumed, when complete
+		done bool
+	}{
+		{"one-crlf", "\r\n" + req, nil, 2 + len(req), true},
+		{"one-crlf-then-pipelined", "\r\n" + req + req, nil, 2 + len(req), true},
+		{"two-crlf", "\r\n\r\n" + req, ErrInvalidRequestLine, 0, false},
+		{"crlf-only", "\r\n", nil, 0, false},
+		{"crlf-and-partial-line", "\r\nGET /pa", nil, 0, false},
+		{"lone-cr", "\r", nil, 0, false},
+		{"no-crlf", req, nil, len(req), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewParser()
+			p.Reset([]byte(tc.in))
+			var r Request
+			n, err := p.ParseRequest(&r)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if tc.want != nil {
+				return
+			}
+			if tc.done {
+				if n != tc.n || r.Method != "GET" || r.Path != "/path" || r.Host != "example.com" || !r.HeadersComplete {
+					t.Fatalf("consumed %d (want %d), method %q, path %q, host %q, complete %v", n, tc.n, r.Method, r.Path, r.Host, r.HeadersComplete)
+				}
+			} else if n != 0 {
+				t.Fatalf("an incomplete request consumed %d bytes", n)
+			}
+		})
+	}
+}
+
+// TestParseRequest_LeadingCRLFRetry: a caller that sees an incomplete request
+// resets the parser and parses again once more bytes have arrived, with the
+// CRLF still at the head of the buffer.
+func TestParseRequest_LeadingCRLFRetry(t *testing.T) {
+	const full = "\r\nGET /path HTTP/1.1\r\nHost: example.com\r\n\r\n"
+	for cut := 1; cut < len(full); cut++ {
+		p := NewParser()
+		var r Request
+		p.Reset([]byte(full[:cut]))
+		if n, err := p.ParseRequest(&r); err != nil || n != 0 {
+			t.Fatalf("cut %d: n=%d err=%v, want an incomplete request", cut, n, err)
+		}
+		p.Reset([]byte(full))
+		r = Request{}
+		if n, err := p.ParseRequest(&r); err != nil || n != len(full) || r.Path != "/path" {
+			t.Fatalf("cut %d: after the rest, n=%d err=%v path=%q", cut, n, err, r.Path)
+		}
+	}
+}
+
+// TestParseRequest_EmptyLineBetweenPipelinedRequests: the empty line is skipped
+// wherever a request line starts, not only at the head of the buffer: a second
+// ParseRequest on the same buffer (the parser keeps its position) meets it
+// after the first request.
+func TestParseRequest_EmptyLineBetweenPipelinedRequests(t *testing.T) {
+	const a = "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nab"
+	const b = "GET /b HTTP/1.1\r\nHost: h\r\n\r\n"
+	buf := []byte(a + "\r\n" + b)
+	p := NewParser()
+	p.Reset(buf)
+	var r Request
+	n, err := p.ParseRequest(&r)
+	if err != nil || r.Path != "/a" {
+		t.Fatalf("first request: n=%d err=%v path=%q", n, err, r.Path)
+	}
+	if body := p.GetBody(r.ContentLength); string(body) != "ab" {
+		t.Fatalf("body = %q", body)
+	}
+	r = Request{}
+	n2, err := p.ParseRequest(&r)
+	if err != nil || r.Path != "/b" || n2 != len(buf) {
+		t.Fatalf("second request after an empty line: n=%d (want %d) err=%v path=%q", n2, len(buf), err, r.Path)
+	}
+}

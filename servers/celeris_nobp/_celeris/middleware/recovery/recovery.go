@@ -1,0 +1,286 @@
+package recovery
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"runtime"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/validation"
+)
+
+var (
+	// ErrPanic is the base sentinel for all recovery-caught panics.
+	ErrPanic = errors.New("recovery: panic")
+
+	// ErrPanicContextCancelled is returned when a panic occurs after
+	// the request context has been cancelled.
+	ErrPanicContextCancelled = errors.New("recovery: panic (context cancelled)")
+
+	// ErrPanicResponseCommitted is returned when a panic occurs after
+	// the response has already been partially written.
+	ErrPanicResponseCommitted = errors.New("recovery: panic (response committed)")
+
+	// ErrBrokenPipe is returned when a panic is caused by a broken pipe
+	// or connection reset (client disconnected).
+	ErrBrokenPipe = errors.New("recovery: broken pipe")
+)
+
+var stackPool = sync.Pool{New: func() any {
+	buf := make([]byte, 4096)
+	return &buf
+}}
+
+// New creates a recovery middleware with the given config.
+//
+// Performance note: by default `cfg.Logger` falls back to `slog.Default()`,
+// which on most Go programs is the stdlib text-handler writing to
+// `os.Stderr`. Stderr writes serialize on a global mutex inside Go's
+// default handler. Under iouring/epoll's async-dispatch model the
+// dispatch goroutine holds `cs.detachMu` across the `ProcessH1` call,
+// so a synchronous `log.LogAttrs` here will gate the worker thread for
+// the duration of the stderr write — sustained panic loads can drop
+// engine throughput by an order of magnitude (~14×) and let
+// slowloris-defence header-deadlines slip past on concurrent conns.
+// If your handlers can panic at >100 req/sec (recovery middleware is
+// usually the only thing standing between a buggy handler and a
+// process crash), pass an explicit non-blocking Logger:
+//
+//	slog.New(slog.NewTextHandler(io.Discard, nil))  // drop logs
+//	slog.New(myAsyncHandler)                        // async sink
+//
+// or initialize `slog.SetDefault(...)` to a non-blocking handler at
+// process startup.
+func New(config ...Config) celeris.HandlerFunc {
+	cfg := defaultConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = applyDefaults(cfg)
+
+	handler := cfg.ErrorHandler
+	// ErrorHandlerErr takes precedence — wrap the panic value as an
+	// error and route through the typed handler. Non-error panic values
+	// (string / struct / etc.) are wrapped via fmt.Errorf so callers
+	// can use errors.Is / errors.As.
+	if cfg.ErrorHandlerErr != nil {
+		typedFn := cfg.ErrorHandlerErr
+		handler = func(c *celeris.Context, r any) error {
+			if e, ok := r.(error); ok {
+				return typedFn(c, e)
+			}
+			return typedFn(c, fmt.Errorf("recovery: panic: %v", r))
+		}
+	}
+	brokenPipeHandler := cfg.BrokenPipeHandler
+	stackSize := cfg.StackSize
+	logStack := !cfg.DisableLogStack
+	stackAll := cfg.StackAll
+	disableBrokenPipeLog := cfg.DisableBrokenPipeLog
+	log := cfg.Logger
+	logLevel := cfg.LogLevel
+
+	var skip celeris.SkipHelper
+	skip.Init(cfg.SkipPaths, cfg.Skip)
+
+	return func(c *celeris.Context) (retErr error) {
+		if skip.ShouldSkip(c) {
+			return c.Next()
+		}
+
+		defer func() {
+			if r := recover(); r != nil {
+				if err, ok := r.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+					panic(r)
+				}
+
+				// validation.RecordPanic is a zero-cost no-op in
+				// production builds; under -tags=validation it backs
+				// the "no panic escaped recovery" predicate.
+				validation.RecordPanic()
+
+				pl := panicLog{c: c, panicVal: formatPanic(r)}
+
+				if isBrokenPipe(r) {
+					retErr = handleBrokenPipe(c, r, &pl, log, brokenPipeHandler, disableBrokenPipeLog)
+					return
+				}
+
+				logPanic(c, log, logLevel, &pl, logStack, stackSize, stackAll)
+
+				if c.Context().Err() != nil {
+					ls := pl.own()
+					log.LogAttrs(c.Context(), slog.LevelWarn, "panic after context cancelled",
+						slog.String("request_id", ls.requestID),
+						slog.String("method", ls.method),
+						slog.String("path", ls.path),
+						slog.String("error", ls.panicVal),
+					)
+					retErr = fmt.Errorf("%w: %v", ErrPanicContextCancelled, r)
+					return
+				}
+
+				if c.IsWritten() {
+					ls := pl.own()
+					log.LogAttrs(c.Context(), logLevel, "panic after response committed",
+						slog.String("request_id", ls.requestID),
+						slog.String("method", ls.method),
+						slog.String("path", ls.path),
+						slog.String("error", ls.panicVal),
+					)
+					retErr = fmt.Errorf("%w: %v", ErrPanicResponseCommitted, r)
+					return
+				}
+
+				retErr = safeCallHandler(c, handler, r, &pl, log, logLevel)
+			}
+		}()
+
+		return c.Next()
+	}
+}
+
+// formatPanic converts a recovered panic value to a string.
+func formatPanic(r any) string {
+	switch v := r.(type) {
+	case string:
+		return v
+	case error:
+		return v.Error()
+	default:
+		return fmt.Sprint(r)
+	}
+}
+
+// panicLog holds what the middleware logs for one panic: the method, the
+// path, the request ID and the panic value, each a copy the record may keep.
+//
+// Config.Logger is any *slog.Logger, and slog lets a Handler keep a Record
+// after Handle returns by calling Record.Clone, which shares the strings;
+// asynchronous and batching handlers do, and New's doc recommends one. On
+// epoll and io_uring the method, the path, a request ID taken from a header
+// and a panic value read from the request are views of the connection's
+// receive buffer, which the engine reuses for the connection's next request
+// and, once the connection closes, for another connection: a kept record
+// would later format other request bytes, including another client's
+// headers (celeris#732, celeris#742). The copies share one allocation, made
+// the first time a record is written, so a panic that logs nothing copies
+// nothing.
+type panicLog struct {
+	c                                 *celeris.Context
+	owned                             bool
+	method, path, requestID, panicVal string
+}
+
+func (pl *panicLog) own() *panicLog {
+	if pl.owned {
+		return pl
+	}
+	pl.owned = true
+	pl.method, pl.path, pl.requestID = pl.c.Method(), pl.c.Path(), pl.c.RequestID()
+	n := len(pl.method) + len(pl.path) + len(pl.requestID) + len(pl.panicVal)
+	if n == 0 {
+		return pl
+	}
+	var b strings.Builder
+	b.Grow(n)
+	b.WriteString(pl.method)
+	b.WriteString(pl.path)
+	b.WriteString(pl.requestID)
+	b.WriteString(pl.panicVal)
+	rest := b.String()
+	for _, p := range [...]*string{&pl.method, &pl.path, &pl.requestID, &pl.panicVal} {
+		l := len(*p)
+		*p, rest = rest[:l], rest[l:]
+	}
+	return pl
+}
+
+// handleBrokenPipe handles panics caused by broken pipe / connection reset.
+func handleBrokenPipe(c *celeris.Context, r any, pl *panicLog, log *slog.Logger, brokenPipeHandler func(*celeris.Context, any) error, disableLog bool) error {
+	if !disableLog {
+		ls := pl.own()
+		log.LogAttrs(c.Context(), slog.LevelWarn, "broken pipe",
+			slog.String("request_id", ls.requestID),
+			slog.String("method", ls.method),
+			slog.String("path", ls.path),
+			slog.String("error", ls.panicVal),
+		)
+	}
+	if brokenPipeHandler != nil {
+		return brokenPipeHandler(c, r)
+	}
+	return fmt.Errorf("%w: %v", ErrBrokenPipe, r)
+}
+
+// logPanic logs the panic with an optional stack trace.
+func logPanic(c *celeris.Context, log *slog.Logger, level slog.Level, pl *panicLog, logStack bool, stackSize int, stackAll bool) {
+	if !logStack {
+		return
+	}
+	ls := pl.own()
+	if stackSize > 0 {
+		bufPtr := stackPool.Get().(*[]byte)
+		buf := *bufPtr
+		if cap(buf) > 2*stackSize {
+			buf = make([]byte, stackSize)
+		} else if len(buf) < stackSize {
+			buf = make([]byte, stackSize)
+		}
+		n := runtime.Stack(buf[:stackSize], stackAll)
+		log.LogAttrs(c.Context(), level, "panic recovered",
+			slog.String("request_id", ls.requestID),
+			slog.String("method", ls.method),
+			slog.String("path", ls.path),
+			slog.String("error", ls.panicVal),
+			slog.String("stack", string(buf[:n])),
+		)
+		*bufPtr = buf
+		stackPool.Put(bufPtr)
+	} else {
+		log.LogAttrs(c.Context(), level, "panic recovered",
+			slog.String("request_id", ls.requestID),
+			slog.String("method", ls.method),
+			slog.String("path", ls.path),
+			slog.String("error", ls.panicVal),
+		)
+	}
+}
+
+// safeCallHandler calls the error handler, recovering from panics within it.
+func safeCallHandler(c *celeris.Context, handler func(*celeris.Context, any) error, r any, pl *panicLog, log *slog.Logger, level slog.Level) (retErr error) {
+	defer func() {
+		if r2 := recover(); r2 != nil {
+			ls := pl.own()
+			log.LogAttrs(c.Context(), level, "panic in error handler",
+				slog.String("request_id", ls.requestID),
+				slog.String("method", ls.method),
+				slog.String("path", ls.path),
+				slog.String("error", fmt.Sprint(r2)),
+			)
+			retErr = defaultErrorHandler(c, r2)
+		}
+	}()
+	return handler(c, r)
+}
+
+func isBrokenPipe(v any) bool {
+	err, ok := v.(error)
+	if !ok {
+		return false
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return errors.Is(opErr.Err, syscall.EPIPE) || errors.Is(opErr.Err, syscall.ECONNRESET) || errors.Is(opErr.Err, syscall.ECONNABORTED)
+	}
+	return false
+}

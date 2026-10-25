@@ -1,0 +1,971 @@
+package conn
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/goceleris/celeris/internal/protocol/h2/frame"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/wakefd"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+)
+
+// frameBuffer wraps bytes.Buffer for incremental H2 frame parsing.
+type frameBuffer struct {
+	bytes.Buffer
+}
+
+// hasCompleteFrame peeks at the frame header to check if a complete frame
+// (9-byte header + payload) is available. This prevents the x/net framer
+// from consuming partial data on TCP segment boundaries, which would cause
+// io.ErrUnexpectedEOF and close the connection.
+//
+// A header that declares a frame longer than maxFrame, the SETTINGS_MAX_FRAME_SIZE
+// this server advertised, counts as complete: the framer, whose ceiling is the
+// same value, refuses it from the header alone (http2.ErrFrameTooLarge, which
+// ProcessH2 answers with GOAWAY FRAME_SIZE_ERROR), so the payload is not
+// waited for. The length is 24 bits: without this, a peer's 9 bytes made the
+// server buffer up to 16 MiB of that frame before it said anything.
+func (fb *frameBuffer) hasCompleteFrame(maxFrame uint32) bool {
+	b := fb.Bytes()
+	if len(b) < 9 {
+		return false
+	}
+	length := uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
+	return length > maxFrame || uint32(len(b)) >= 9+length
+}
+
+// hasMoreThanOneFrame checks if the buffer contains more than one complete frame.
+// Used to suppress inline handler execution when subsequent frames need processing.
+func (fb *frameBuffer) hasMoreThanOneFrame() bool {
+	b := fb.Bytes()
+	if len(b) < 9 {
+		return false
+	}
+	firstLen := uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
+	consumed := 9 + firstLen
+	return uint32(len(b)) > consumed+8 // room for at least another 9-byte header
+}
+
+// H2Config holds H2 connection configuration.
+type H2Config struct {
+	MaxConcurrentStreams uint32
+	InitialWindowSize    uint32
+	MaxFrameSize         uint32
+	MaxRequestBodySize   int64 // 0 = unlimited; resource.Config.WithDefaults resolves the default
+	// WriteTimeout bounds how long a worker-pool handler waits for the
+	// peer's flow-control window to send a response the connection's
+	// outbound budget would not let it hand off (celeris#893): then its
+	// stream is reset with INTERNAL_ERROR and its write returns an error
+	// wrapping os.ErrDeadlineExceeded. The engines pass the server's
+	// WriteTimeout. 0 = no bound.
+	WriteTimeout time.Duration
+	// Logger, when set, receives an Error record for each panic that escapes
+	// an HTTP/2 stream's handler (the celeris router answers a handler's
+	// panic with a 500 first, so this is a panic out of the router itself or
+	// of something outside it). The stream is dropped without a response or
+	// an RST_STREAM, as before, and the connection goes on. The record is
+	// written on the goroutine that ran the handler, which for an inline
+	// stream is the event loop with the connection's H2State lock held, so a
+	// slow log sink stalls the loop for each such panic. An
+	// engine may pass its own logger; none does yet. Nil logs nothing.
+	Logger *slog.Logger
+}
+
+// withDefaults returns a copy of cfg with zero fields set to RFC 7540 defaults.
+func (cfg H2Config) withDefaults() H2Config {
+	if cfg.MaxConcurrentStreams == 0 {
+		cfg.MaxConcurrentStreams = 100
+	}
+	if cfg.InitialWindowSize == 0 {
+		cfg.InitialWindowSize = 65535
+	}
+	if cfg.MaxFrameSize == 0 {
+		cfg.MaxFrameSize = 1 << 20 // 1 MiB — see internal/resource/config.go for rationale
+	}
+	return cfg
+}
+
+// h2FrameBufPool pools pre-encoded frame byte buffers to eliminate per-response allocations.
+var h2FrameBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, 256); return &b },
+}
+
+func getH2FrameBuf() *[]byte { return h2FrameBufPool.Get().(*[]byte) }
+func putH2FrameBuf(p *[]byte) {
+	if cap(*p) > 8192 {
+		return // don't pool oversized buffers
+	}
+	*p = (*p)[:0]
+	h2FrameBufPool.Put(p)
+}
+
+// h2QueueShards is the number of shards in the write queue.
+// 4 shards reduces contention by ~4x while preserving per-stream ordering.
+const h2QueueShards = 4
+
+// h2ShardedQueue is a sharded write queue for pre-encoded H2 frame bytes.
+// Handler goroutines enqueue response frame data; the event loop drains it.
+// Sharding by stream ID eliminates cross-stream lock contention.
+type h2ShardedQueue struct {
+	shards  [h2QueueShards]h2QueueShard
+	pending atomic.Bool
+	// wake is the event loop's wakeup eventfd, or nil when the engine has
+	// none. A handle, not a number: the engine closes it at shutdown, and a
+	// pool goroutine that enqueues a frame afterwards must not write a
+	// descriptor number that has since been recycled (celeris#655).
+	wake *wakefd.WakeFD
+}
+
+type h2QueueShard struct {
+	mu    sync.Mutex
+	bufs  []*[]byte
+	spare []*[]byte
+}
+
+// Enqueue appends pre-encoded frame bytes to the write queue.
+// Called from handler goroutines. Shards by stream ID.
+func (q *h2ShardedQueue) Enqueue(streamID uint32, data *[]byte) {
+	// Client request streams are always odd (RFC 9113 §5.1.1) and Celeris does
+	// no server push, so streamID%h2QueueShards would only ever hit the odd
+	// residues (shards 1,3) and leave 0,2 dead — a 2-shard queue in disguise.
+	// Shift off the constant low bit first so odd IDs 1,3,5,7,… spread across
+	// ALL shards. Still a pure function of streamID → every frame of a stream
+	// maps to one shard (per-stream HEADERS-before-DATA FIFO + single-writer
+	// drain preserved). See celeris#406.
+	shard := &q.shards[(streamID>>1)%h2QueueShards]
+	shard.mu.Lock()
+	shard.bufs = append(shard.bufs, data)
+	shard.mu.Unlock()
+	// CAS coalescing: only signal the event loop if no prior enqueue already
+	// set pending. If CAS fails, pending is already true: an enqueue since
+	// the last drain's clear wrote the eventfd, so a drain is still to come,
+	// and it takes this frame because DrainTo clears pending before it takes
+	// any shard (celeris#837).
+	if q.pending.CompareAndSwap(false, true) {
+		q.wake.Signal()
+	}
+}
+
+// enqueueFromLoop appends pre-encoded frame bytes for the event loop's own
+// flushes of buffered DATA (a WINDOW_UPDATE, a SETTINGS frame), which run inside
+// ProcessH2 (celeris#903). It sets pending but does not signal the loop's
+// wakeup: the loop is the caller, and ProcessH2 drains the queue after every
+// frame and again before it returns, so no eventfd write is needed to bring
+// the loop back. The frame goes to the same shard as the stream's HEADERS and
+// earlier DATA, so it follows them. Only for use inside ProcessH2; any other
+// caller must use Enqueue.
+func (q *h2ShardedQueue) enqueueFromLoop(streamID uint32, data *[]byte) {
+	shard := &q.shards[(streamID>>1)%h2QueueShards]
+	shard.mu.Lock()
+	shard.bufs = append(shard.bufs, data)
+	shard.mu.Unlock()
+	q.pending.Store(true)
+}
+
+// DrainTo drains all enqueued data by calling write for each buffer,
+// then returns buffers to the pool.
+// Called from the event loop thread. The write function must not block.
+//
+// pending is cleared BEFORE the shards are emptied, never after
+// (celeris#837). An Enqueue that lands while the drain is past its shard sees
+// pending false, sets it and signals the loop, so the loop's next drain (gated
+// on pending) takes the frame. Clearing it at the end lost that frame: the
+// Enqueue had seen pending still true and signalled nothing, and the clear
+// then left the frame in its shard with pending false. A streamed response
+// lost its last frames that way. An Enqueue between the clear and its shard's
+// swap is drained here and also signals: one spurious wakeup, one empty drain.
+func (q *h2ShardedQueue) DrainTo(write func([]byte)) {
+	q.pending.Store(false)
+	for i := range q.shards {
+		s := &q.shards[i]
+		s.mu.Lock()
+		s.spare, s.bufs = s.bufs, s.spare[:0]
+		s.mu.Unlock()
+		for _, buf := range s.spare {
+			write(*buf)
+			putH2FrameBuf(buf)
+		}
+		// Drop the drained pointers: putH2FrameBuf does not pool a buffer
+		// past 8 KiB, and a pointer left in the spare array kept that buffer
+		// (a whole response's DATA) reachable until a later drain overwrote
+		// its slot (celeris#893).
+		clear(s.spare)
+		// Reclaim capacity if it grew beyond steady-state.
+		if cap(s.spare) > 64 {
+			s.spare = make([]*[]byte, 0, 16)
+		} else {
+			s.spare = s.spare[:0]
+		}
+	}
+}
+
+// h2StreamEncoder provides goroutine-local HPACK encoding with dynamic table
+// size = 0, eliminating serialization requirements. Each goroutine gets its
+// own encoder from the pool, encodes independently, and returns it.
+type h2StreamEncoder struct {
+	hpackBuf bytes.Buffer
+	hpackEnc *hpack.Encoder
+}
+
+var h2StreamEncoderPool = sync.Pool{
+	New: func() any {
+		// hpackEnc is lazily initialized in encodeHeaders on the slow path
+		// so encoders returned to the pool on fast-path-only workloads
+		// don't carry a ~6 KB dynamic-table allocation they never used.
+		return &h2StreamEncoder{}
+	},
+}
+
+var (
+	hpackStatus200   []byte // :status: 200
+	hpackCTTextPlain []byte // content-type: text/plain
+	hpackCTAppJSON   []byte // content-type: application/json
+)
+
+func init() {
+	enc := &h2StreamEncoder{}
+	enc.hpackEnc = hpack.NewEncoder(&enc.hpackBuf)
+	enc.hpackEnc.SetMaxDynamicTableSize(0)
+
+	enc.hpackBuf.Reset()
+	_ = enc.hpackEnc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	hpackStatus200 = append([]byte(nil), enc.hpackBuf.Bytes()...)
+
+	enc.hpackBuf.Reset()
+	_ = enc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "text/plain"})
+	hpackCTTextPlain = append([]byte(nil), enc.hpackBuf.Bytes()...)
+
+	enc.hpackBuf.Reset()
+	_ = enc.hpackEnc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/json"})
+	hpackCTAppJSON = append([]byte(nil), enc.hpackBuf.Bytes()...)
+}
+
+// appendHPACKContentLength manually encodes "content-length: <value>" in HPACK
+// format (literal without indexing, indexed name). This avoids the full HPACK
+// encoder's static table lookup and Huffman decision overhead (~100-200ns).
+// content-length is static table index 28.
+func appendHPACKContentLength(buf *bytes.Buffer, value string) {
+	// Literal header field without indexing (0000 prefix), indexed name.
+	// Index 28 with 4-bit prefix: 28 > 14, so multi-byte: 0x0f, 28-15=13.
+	buf.Write([]byte{0x0f, 0x0d})
+	// Value: length-prefixed string, no Huffman (short digit strings are
+	// not compressible). Bit 7 = 0 (no Huffman), bits 6-0 = length.
+	n := len(value)
+	if n < 127 {
+		buf.WriteByte(byte(n))
+	} else {
+		// Multi-byte length (7-bit prefix overflow). Rare for content-length.
+		buf.WriteByte(0x7f)
+		rem := n - 127
+		for rem >= 128 {
+			buf.WriteByte(byte(rem&0x7f) | 0x80)
+			rem >>= 7
+		}
+		buf.WriteByte(byte(rem))
+	}
+	buf.WriteString(value)
+}
+
+func getH2StreamEncoder() *h2StreamEncoder {
+	return h2StreamEncoderPool.Get().(*h2StreamEncoder)
+}
+
+func putH2StreamEncoder(enc *h2StreamEncoder) {
+	// Discard encoders with bloated buffers instead of returning to pool.
+	if enc.hpackBuf.Cap() > 4096 {
+		return
+	}
+	enc.hpackBuf.Reset()
+	h2StreamEncoderPool.Put(enc)
+}
+
+// encodeHeaders HPACK-encodes response headers using dynamic table size = 0.
+// Returns a slice backed by the encoder's internal buffer (valid until Reset).
+// Lazily initializes e.hpackEnc the first time the slow path is taken, so the
+// pre-encoded fast path (status 200 + known content-type + content-length) can
+// return without ever allocating the encoder's internal dynamic table. On
+// workloads like the h2c upgrade bench (where every response matches the fast
+// path), this saves ~8% of server-side allocations per connection.
+func (e *h2StreamEncoder) encodeHeaders(headers [][2]string) ([]byte, error) {
+	if e.hpackEnc == nil {
+		e.hpackEnc = hpack.NewEncoder(&e.hpackBuf)
+		e.hpackEnc.SetMaxDynamicTableSize(0)
+	}
+	e.hpackBuf.Reset()
+	for _, h := range headers {
+		if err := e.hpackEnc.WriteField(hpack.HeaderField{Name: h[0], Value: h[1]}); err != nil {
+			return nil, err
+		}
+	}
+	return e.hpackBuf.Bytes(), nil
+}
+
+// H2 frame building helpers — produce raw frame bytes without shared state.
+// These replace the shared frame.Writer for the response hot path.
+
+const (
+	h2FrameData         byte = 0x00
+	h2FrameHeaders      byte = 0x01
+	h2FrameRSTStream    byte = 0x03
+	h2FrameSettings     byte = 0x04
+	h2FrameContinuation byte = 0x09
+
+	h2FlagEndStream  byte = 0x01
+	h2FlagAck        byte = 0x01 // overload: ACK on SETTINGS/PING frames
+	h2FlagEndHeaders byte = 0x04
+)
+
+// writeSettingsFrame emits a SETTINGS frame with the given parameters directly
+// to buf without going through the shared frame.Writer (which owns an
+// http2.Framer with its own buffers + hpack machinery). The handshake path
+// only needs server SETTINGS + SETTINGS_ACK, so bypassing the framer cuts
+// one large per-upgrade allocation.
+func writeSettingsFrame(buf *bytes.Buffer, params [][2]uint32) {
+	payloadLen := 6 * len(params)
+	var hdr [9]byte
+	hdr[0] = byte(payloadLen >> 16)
+	hdr[1] = byte(payloadLen >> 8)
+	hdr[2] = byte(payloadLen)
+	hdr[3] = h2FrameSettings
+	hdr[4] = 0 // no flags on server-sent initial SETTINGS
+	// streamID = 0 (already zero)
+	buf.Write(hdr[:])
+	var p [6]byte
+	for _, kv := range params {
+		id, val := kv[0], kv[1]
+		p[0] = byte(id >> 8)
+		p[1] = byte(id)
+		p[2] = byte(val >> 24)
+		p[3] = byte(val >> 16)
+		p[4] = byte(val >> 8)
+		p[5] = byte(val)
+		buf.Write(p[:])
+	}
+}
+
+// writeSettingsAckFrame emits the 9-byte SETTINGS ACK frame (empty payload,
+// flags=ACK) directly to buf. Used by the handshake path and by ProcessH2
+// after receiving client SETTINGS to avoid touching state.writer.
+func writeSettingsAckFrame(buf *bytes.Buffer) {
+	buf.Write([]byte{0, 0, 0, h2FrameSettings, h2FlagAck, 0, 0, 0, 0})
+}
+
+// writeH2FrameHeader writes a 9-byte H2 frame header directly to a Buffer.
+// For HEADERS frames, sets END_HEADERS. For DATA/HEADERS with endStream, sets END_STREAM.
+// Used by inline response adapters to avoid intermediate slice allocations.
+func writeH2FrameHeader(buf *bytes.Buffer, frameType byte, endStream bool, streamID uint32, payloadLen int) {
+	var flags byte
+	if endStream {
+		flags |= h2FlagEndStream
+	}
+	if frameType == h2FrameHeaders {
+		flags |= h2FlagEndHeaders
+	}
+	var hdr [9]byte
+	hdr[0] = byte(payloadLen >> 16)
+	hdr[1] = byte(payloadLen >> 8)
+	hdr[2] = byte(payloadLen)
+	hdr[3] = frameType
+	hdr[4] = flags
+	hdr[5] = byte(streamID >> 24)
+	hdr[6] = byte(streamID >> 16)
+	hdr[7] = byte(streamID >> 8)
+	hdr[8] = byte(streamID)
+	buf.Write(hdr[:])
+}
+
+// appendH2Frame appends a raw H2 frame (9-byte header + payload) to buf.
+func appendH2Frame(buf []byte, frameType byte, flags byte, streamID uint32, payload []byte) []byte {
+	length := len(payload)
+	buf = append(buf,
+		byte(length>>16), byte(length>>8), byte(length),
+		frameType,
+		flags,
+		byte(streamID>>24), byte(streamID>>16), byte(streamID>>8), byte(streamID),
+	)
+	return append(buf, payload...)
+}
+
+// appendH2Headers appends HEADERS (+ CONTINUATION if needed) frames to buf.
+func appendH2Headers(buf []byte, streamID uint32, endStream bool, headerBlock []byte, maxFrameSize uint32) []byte {
+	if maxFrameSize == 0 {
+		maxFrameSize = 16384
+	}
+
+	remaining := headerBlock
+	first := true
+	for len(remaining) > 0 {
+		chunkLen := int(maxFrameSize)
+		if len(remaining) < chunkLen {
+			chunkLen = len(remaining)
+		}
+		frag := remaining[:chunkLen]
+		remaining = remaining[chunkLen:]
+
+		if first {
+			var flags byte
+			if endStream {
+				flags |= h2FlagEndStream
+			}
+			if len(remaining) == 0 {
+				flags |= h2FlagEndHeaders
+			}
+			buf = appendH2Frame(buf, h2FrameHeaders, flags, streamID, frag)
+			first = false
+		} else {
+			var flags byte
+			if len(remaining) == 0 {
+				flags |= h2FlagEndHeaders
+			}
+			buf = appendH2Frame(buf, h2FrameContinuation, flags, streamID, frag)
+		}
+	}
+	return buf
+}
+
+// appendH2Data appends a DATA frame to buf.
+func appendH2Data(buf []byte, streamID uint32, endStream bool, data []byte) []byte {
+	var flags byte
+	if endStream {
+		flags |= h2FlagEndStream
+	}
+	return appendH2Frame(buf, h2FrameData, flags, streamID, data)
+}
+
+// appendH2DataFragmented appends one or more DATA frames, splitting data by
+// maxFrameSize. RFC 7540 §4.2 requires senders to respect the peer's
+// advertised SETTINGS_MAX_FRAME_SIZE, which defaults to 16 KiB. endStream is
+// applied only to the final fragment.
+func appendH2DataFragmented(buf []byte, streamID uint32, endStream bool, data []byte, maxFrameSize uint32) []byte {
+	if maxFrameSize == 0 {
+		maxFrameSize = 16384
+	}
+	if len(data) == 0 {
+		return appendH2Data(buf, streamID, endStream, data)
+	}
+	remaining := data
+	for len(remaining) > 0 {
+		chunkLen := int(maxFrameSize)
+		if len(remaining) < chunkLen {
+			chunkLen = len(remaining)
+		}
+		isLast := chunkLen == len(remaining)
+		var flags byte
+		if isLast && endStream {
+			flags |= h2FlagEndStream
+		}
+		buf = appendH2Frame(buf, h2FrameData, flags, streamID, remaining[:chunkLen])
+		remaining = remaining[chunkLen:]
+	}
+	return buf
+}
+
+// writeH2DataFragmented writes one or more DATA frames directly to buf,
+// splitting data by maxFrameSize. Used by the inline adapter which appends
+// straight to the connection's outBuf without going through a pooled []byte.
+func writeH2DataFragmented(buf *bytes.Buffer, streamID uint32, endStream bool, data []byte, maxFrameSize uint32) {
+	if maxFrameSize == 0 {
+		maxFrameSize = 16384
+	}
+	if len(data) == 0 {
+		writeH2FrameHeader(buf, h2FrameData, endStream, streamID, 0)
+		return
+	}
+	remaining := data
+	for len(remaining) > 0 {
+		chunkLen := int(maxFrameSize)
+		if len(remaining) < chunkLen {
+			chunkLen = len(remaining)
+		}
+		isLast := chunkLen == len(remaining)
+		writeH2FrameHeader(buf, h2FrameData, isLast && endStream, streamID, chunkLen)
+		buf.Write(remaining[:chunkLen])
+		remaining = remaining[chunkLen:]
+	}
+}
+
+// H2State holds per-connection H2 state.
+//
+// Sub-structures (outBuf, inBuf, wq, rw, inlineRW) are embedded as VALUES
+// rather than pointer fields so the whole struct is allocated in one heap
+// block instead of 8. Pointer callers take &s.outBuf etc; since heap
+// allocations don't move in Go, the inner pointers stay stable for the
+// lifetime of the H2State.
+//
+// `processor`, `parser`, and `writer` remain pointer fields — Processor
+// in particular is already large (sync.Mutex, multiple maps, hpack state)
+// and has its own lifecycle hooks, so collapsing it into the parent would
+// invert the existing layering.
+type H2State struct {
+	initialized       bool
+	serverPrefaceSent bool // true if server SETTINGS already written (h2c upgrade path)
+	prefaceBuf        []byte
+	processor         *stream.Processor
+	parser            *frame.Parser
+	writer            *frame.Writer
+	outBuf            bytes.Buffer
+	inBuf             frameBuffer
+	mu                sync.Mutex
+	adapter           h2ResponseAdapter
+	inlineAdapter     h2InlineResponseAdapter
+	writeQueue        h2ShardedQueue
+	cfg               H2Config // cached with defaults applied
+}
+
+// SetRemoteAddr sets the remote address on the H2 stream manager so that
+// all streams created on this connection inherit the peer address.
+func (s *H2State) SetRemoteAddr(addr string) {
+	s.processor.GetManager().RemoteAddr = addr
+}
+
+// WriteQueuePending returns true if the write queue has pending data.
+func (s *H2State) WriteQueuePending() bool {
+	return s.writeQueue.pending.Load()
+}
+
+// DrainWriteQueue drains async handler responses to the write function.
+// Called from the event loop thread (outside H2State.mu).
+func (s *H2State) DrainWriteQueue(write func([]byte)) {
+	if s.writeQueue.pending.Load() {
+		s.writeQueue.DrainTo(write)
+	}
+}
+
+// EnqueueWrite puts pre-encoded frame bytes on the write queue as a handler
+// goroutine's response does (the queue the engine drains with DrainWriteQueue),
+// on the shard of streamID. A copy is made, so frame belongs to the caller. It
+// is the seam for the engines' tests of their write-queue pass (celeris#889
+// item 1); nothing in the serving path calls it.
+func (s *H2State) EnqueueWrite(streamID uint32, frame []byte) {
+	p := getH2FrameBuf()
+	*p = append((*p)[:0], frame...)
+	s.writeQueue.Enqueue(streamID, p)
+}
+
+// NewH2State creates a new H2 connection state. wake is the event loop's
+// wakeup eventfd, signalled when handler goroutines enqueue responses (nil
+// to disable, falling back to polling).
+func NewH2State(handler stream.Handler, cfg H2Config, write func([]byte), wake *wakefd.WakeFD) *H2State {
+	cfg = cfg.withDefaults()
+
+	// Single heap allocation for the whole H2State. Substructures are
+	// embedded as values; we fill them in place and hand out pointers below.
+	s := &H2State{cfg: cfg}
+	s.writeQueue.wake = wake
+	s.adapter = h2ResponseAdapter{
+		write:        write,
+		outBuf:       &s.outBuf,
+		writeQueue:   &s.writeQueue,
+		maxFrameSize: cfg.MaxFrameSize,
+		writeTimeout: cfg.WriteTimeout,
+	}
+	s.inlineAdapter = h2InlineResponseAdapter{
+		outBuf:       &s.outBuf,
+		maxFrameSize: cfg.MaxFrameSize,
+	}
+
+	fw := frame.NewWriter(&s.outBuf)
+	// Start the writer at the RFC-default 16 KiB. Peer SETTINGS updates are
+	// propagated by the processor's SettingsMaxFrameSize handler.
+	fw.SetMaxFrameSize(16384)
+	s.writer = fw
+	s.adapter.writer = fw
+
+	// Processor stays as a pointer — it owns a hpack.Decoder, a mutex, and
+	// two maps; collapsing into the parent would cost more than it saves.
+	proc := stream.NewProcessor(handler, fw, &s.adapter)
+	proc.InlineWriter = &s.inlineAdapter
+	// The event loop's flushes of a stream's buffered DATA go through the
+	// write queue, behind the stream's HEADERS (celeris#903).
+	proc.SetOutboundSink(s.adapter.sendDataFromLoop)
+	proc.MaxRequestBodySize = cfg.MaxRequestBodySize
+	if lg := cfg.Logger; lg != nil {
+		proc.OnHandlerPanic = func(id uint32, r any, stack []byte) {
+			lg.Error("h2 handler panicked",
+				"stream", id,
+				"panic", panicText(r),
+				"stack", string(stack),
+			)
+		}
+		// celeris#889: runtime.Goexit cannot be recovered, so the panic hook
+		// never sees it. On the event loop the loop still ends (the engine
+		// logs that, celeris#848); on the pool the worker is replaced.
+		proc.OnHandlerGoexit = func(id uint32, stack []byte) {
+			lg.Error("h2 handler called runtime.Goexit",
+				"stream", id,
+				"stack", string(stack),
+			)
+		}
+		// A handler that returned without finishing its response. A stream
+		// the processor had to reset is a fault (Warn); one it ended because
+		// the handler forgot to close a complete response is the net/http
+		// model working as intended, and a per-request Warn for a handler that
+		// never closes would flood the log, so it is Debug.
+		proc.OnHandlerUnfinished = func(id uint32, reset bool, written, declared int64, err error) {
+			level, action := slog.LevelDebug, "end_stream"
+			if reset {
+				level, action = slog.LevelWarn, "rst_stream"
+			}
+			if !lg.Enabled(context.Background(), level) {
+				return
+			}
+			attrs := []slog.Attr{
+				slog.Uint64("stream", uint64(id)),
+				slog.String("action", action),
+				slog.Int64("written", written),
+			}
+			if declared >= 0 {
+				attrs = append(attrs, slog.Int64("content_length", declared))
+			} else if declared == stream.DeclaredInvalid {
+				attrs = append(attrs, slog.Bool("content_length_invalid", true))
+			}
+			if err != nil {
+				attrs = append(attrs, slog.String("error", err.Error()))
+			}
+			lg.LogAttrs(context.Background(), level, "h2 handler returned before finishing its response", attrs...)
+		}
+	}
+	mgr := proc.GetManager()
+	mgr.SetMaxConcurrentStreams(cfg.MaxConcurrentStreams)
+	// Tell the manager what we'll advertise in SETTINGS so inbound frame-size
+	// validation matches (peer may legitimately send frames up to cfg.MaxFrameSize).
+	mgr.SetLocalMaxFrameSize(cfg.MaxFrameSize)
+	s.processor = proc
+
+	// Wire the manager into both adapters so outbound DATA/HEADERS fragment
+	// by the peer's SETTINGS_MAX_FRAME_SIZE (RFC 7540 §4.2), not our own
+	// advertised MAX_FRAME_SIZE. The manager's default is 16 KiB until the
+	// peer's SETTINGS lands.
+	s.adapter.manager = mgr
+	s.inlineAdapter.manager = mgr
+	// The inline adapter delegates incremental streaming to the queue adapter
+	// so StreamWriter()-based responses stay safe on inline routes (celeris#408).
+	s.inlineAdapter.queue = &s.adapter
+
+	p := frame.NewParser()
+	p.InitReader(&s.inBuf)
+	// Raise the parser's ceiling to match what we advertise via
+	// SETTINGS_MAX_FRAME_SIZE — otherwise we advertise 1 MiB but reject
+	// anything over the RFC-default 16 KiB on receive, silently dropping
+	// compliant clients that send 16 KiB+1-byte frames. cfg.MaxFrameSize
+	// is already defaulted to 1 MiB by WithDefaults / this file's init
+	// block above; guard against 0 just in case a caller constructs an
+	// H2Config directly without it.
+	maxFrame := cfg.MaxFrameSize
+	if maxFrame < 16384 {
+		maxFrame = 16384
+	}
+	p.SetMaxReadFrameSize(maxFrame)
+	s.parser = p
+
+	return s
+}
+
+// panicText formats a panic value for a log record. fmt recovers a panic out
+// of the value's Error or String method, but only one level deep; the second
+// level is recovered here, and the type name stands in for the text (the
+// engines' abortAsyncHandler does the same, celeris#844).
+func panicText(r any) (msg string) {
+	defer func() {
+		if recover() != nil {
+			msg = fmt.Sprintf("%T (its Error or String method panicked)", r)
+		}
+	}()
+	return fmt.Sprint(r)
+}
+
+// NewH2StateFromUpgrade constructs an H2State that has already absorbed
+// the RFC 7540 §3.2 h2c upgrade: the server preface (SETTINGS + ACK) is
+// written synchronously, the client's HTTP2-Settings are applied, and the
+// original H1 request is injected as stream 1. The engine then feeds
+// info.Remaining — which may contain the expected H2 client preface and
+// initial SETTINGS frame — through ProcessH2 on the same iteration.
+//
+// Unlike NewH2State, this function writes to the connection directly
+// (before returning) because the 101 response has already been sent and
+// the client is entitled to see the server SETTINGS immediately.
+func NewH2StateFromUpgrade(handler stream.Handler, cfg H2Config, write func([]byte), wake *wakefd.WakeFD, info *UpgradeInfo) (*H2State, error) {
+	state := NewH2State(handler, cfg, write, wake)
+
+	// Apply client's settings from the HTTP2-Settings header. Settings
+	// payload is a sequence of {u16 id, u32 val} pairs (already validated
+	// by DecodeHTTP2Settings to be a multiple of 6 bytes).
+	mgr := state.processor.GetManager()
+	for i := 0; i+6 <= len(info.Settings); i += 6 {
+		id := uint16(info.Settings[i])<<8 | uint16(info.Settings[i+1])
+		val := uint32(info.Settings[i+2])<<24 | uint32(info.Settings[i+3])<<16 |
+			uint32(info.Settings[i+4])<<8 | uint32(info.Settings[i+5])
+		mgr.ApplySetting(id, val)
+	}
+
+	// Write server preface: a SETTINGS frame with our parameters, and a
+	// SETTINGS ACK for the client's settings we just applied. Order is
+	// not strictly specified (RFC 7540 §3.5: "The server connection
+	// preface consists of a potentially empty SETTINGS frame..."), but
+	// sending our SETTINGS first matches common server behavior.
+	//
+	// We bypass state.writer here so the handshake path never lazy-pays
+	// for an http2.Framer allocation. state.writer is still constructed
+	// in NewH2State for code paths that need it (WriteData on async
+	// response, WriteGoAway/WriteRSTStream on errors), but for the
+	// server preface frames we know the exact wire format.
+	writeSettingsFrame(&state.outBuf, [][2]uint32{
+		{uint32(http2.SettingMaxConcurrentStreams), state.cfg.MaxConcurrentStreams},
+		{uint32(http2.SettingInitialWindowSize), state.cfg.InitialWindowSize},
+		{uint32(http2.SettingMaxFrameSize), state.cfg.MaxFrameSize},
+		{uint32(http2.SettingMaxHeaderListSize), stream.MaxHeaderListSize},
+	})
+	writeSettingsAckFrame(&state.outBuf)
+	flushOutBuf(&state.outBuf, write)
+	state.serverPrefaceSent = true
+
+	// Extract authority (Host) from headers (lowercase).
+	authority := ""
+	for _, h := range info.Headers {
+		if h[0] == "host" {
+			authority = h[1]
+			break
+		}
+	}
+
+	// Build stream 1 header list: H2 pseudo-headers first, then regular
+	// headers (H2 requires pseudos precede all others).
+	h2Headers := make([][2]string, 0, len(info.Headers)+4)
+	h2Headers = append(h2Headers,
+		[2]string{":method", info.Method},
+		[2]string{":path", info.URI},
+		[2]string{":scheme", "http"},
+		[2]string{":authority", authority},
+	)
+	for _, h := range info.Headers {
+		// Skip Host — represented as :authority above. Other hop-by-hop
+		// headers were stripped at copyH2CHeaders time.
+		if h[0] == "host" {
+			continue
+		}
+		h2Headers = append(h2Headers, h)
+	}
+
+	// The H1 request was fully buffered before upgrade; whatever body we
+	// have is the complete body. Always end-stream on the injected stream.
+	if err := state.processor.InjectStreamHeaders(1, true, h2Headers, info.Body); err != nil {
+		return nil, fmt.Errorf("h2c upgrade: inject stream 1: %w", err)
+	}
+	// Drain any inline response that the handler produced (common case for
+	// simple GET handlers that write immediately).
+	flushOutBuf(&state.outBuf, write)
+	if state.writeQueue.pending.Load() {
+		state.writeQueue.DrainTo(write)
+	}
+	return state, nil
+}
+
+// ProcessH2 processes incoming H2 data.
+// On first call, validates the client preface and sends server settings.
+// PING, SETTINGS ACK) and falls back to x/net framer for complex types.
+func ProcessH2(ctx context.Context, data []byte, state *H2State, _ stream.Handler,
+	write func([]byte), _ H2Config) error {
+
+	state.mu.Lock()
+
+	if !state.initialized {
+		// h2c upgrade path writes the server preface (SETTINGS) synchronously
+		// in NewH2StateFromUpgrade, so skip the write if already done.
+		if !state.serverPrefaceSent {
+			writeSettingsFrame(&state.outBuf, [][2]uint32{
+				{uint32(http2.SettingMaxConcurrentStreams), state.cfg.MaxConcurrentStreams},
+				{uint32(http2.SettingInitialWindowSize), state.cfg.InitialWindowSize},
+				{uint32(http2.SettingMaxFrameSize), state.cfg.MaxFrameSize},
+				{uint32(http2.SettingMaxHeaderListSize), stream.MaxHeaderListSize},
+			})
+			flushOutBuf(&state.outBuf, write)
+			state.serverPrefaceSent = true
+		}
+
+		// Tolerate a partial client preface. The h2c upgrade seam often
+		// lands the trailing preface bytes across two recv buffers — when
+		// that happens we stash what we have and wait for more. Compare
+		// strictly: any byte that contradicts the preface is an immediate
+		// connection error.
+		combined := data
+		if len(state.prefaceBuf) > 0 {
+			combined = append(state.prefaceBuf, data...)
+		}
+		pfx := combined
+		if len(pfx) > len(frame.ClientPreface) {
+			pfx = pfx[:len(frame.ClientPreface)]
+		}
+		if string(pfx) != frame.ClientPreface[:len(pfx)] {
+			state.mu.Unlock()
+			return fmt.Errorf("invalid H2 client preface")
+		}
+		if len(combined) < len(frame.ClientPreface) {
+			// Buffer-and-wait: strict prefix match valid; need more bytes.
+			state.prefaceBuf = append(state.prefaceBuf[:0], combined...)
+			state.mu.Unlock()
+			state.DrainWriteQueue(write)
+			return nil
+		}
+		data = combined[len(frame.ClientPreface):]
+		state.prefaceBuf = nil
+		state.initialized = true
+	}
+
+	if len(data) == 0 {
+		state.mu.Unlock()
+		state.DrainWriteQueue(write)
+		return nil
+	}
+
+	state.inBuf.Write(data)
+
+	// The frame size a frame is held to is the one this server advertised in
+	// its SETTINGS (RFC 9113 section 4.2), the ceiling of the framer too, not
+	// the peer's SETTINGS_MAX_FRAME_SIZE, which limits what the server sends.
+	maxFrameSize := state.processor.GetManager().GetLocalMaxFrameSize()
+	for state.inBuf.hasCompleteFrame(maxFrameSize) {
+		// Tell the processor if more frames follow in this recv buffer.
+		// When true, canRunInline returns false to avoid sending the
+		// response before subsequent frames (WINDOW_UPDATE, PRIORITY)
+		// are processed — required for h2spec compliance.
+		state.processor.SetHasMoreFrames(state.inBuf.hasMoreThanOneFrame())
+
+		// Fast path: peek at frame header to detect simple HEADERS frames
+		// (END_HEADERS set, no PADDED, no PRIORITY, not in CONTINUATION).
+		// Bypasses x/net framer's ReadFrame which allocates *HeadersFrame.
+		var processErr error
+		raw := state.inBuf.Bytes()
+		frameType := raw[3]
+		frameFlags := raw[4]
+		frameLen := uint32(raw[0])<<16 | uint32(raw[1])<<8 | uint32(raw[2])
+		const (
+			flagEndStream  = 0x01
+			flagEndHeaders = 0x04
+			flagPadded     = 0x08
+			flagPriority   = 0x20
+			typeHeaders    = 0x01
+		)
+		if frameType == typeHeaders &&
+			frameFlags&flagEndHeaders != 0 &&
+			frameFlags&flagPadded == 0 &&
+			frameFlags&flagPriority == 0 &&
+			frameLen <= maxFrameSize &&
+			!state.processor.IsExpectingContinuation() {
+			// Zero-alloc HEADERS fast path.
+			rf, consumed, _ := frame.ReadRawFrame(raw)
+			state.inBuf.Next(consumed) // advance past frame
+			processErr = state.processor.ProcessRawHeaders(
+				rf.StreamID, rf.HasEndStream(), rf.Payload)
+		} else {
+			// Standard path: delegate to x/net framer for complex frames.
+			f, err := state.parser.ReadNextFrame()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				if ce, ok := err.(http2.ConnectionError); ok {
+					_ = state.processor.SendGoAway(
+						state.processor.GetManager().GetLastStreamID(),
+						http2.ErrCode(ce), []byte(ce.Error()))
+					flushOutBuf(&state.outBuf, write)
+				} else if errors.Is(err, http2.ErrFrameTooLarge) {
+					// A frame over the advertised size, from its header alone
+					// (hasCompleteFrame): RFC 9113 section 4.2 asks for
+					// FRAME_SIZE_ERROR, a connection error for a frame that
+					// carries a field block, a SETTINGS frame or stream 0.
+					_ = state.processor.SendGoAway(
+						state.processor.GetManager().GetLastStreamID(),
+						http2.ErrCodeFrameSize, []byte(err.Error()))
+					flushOutBuf(&state.outBuf, write)
+				}
+				state.mu.Unlock()
+				state.DrainWriteQueue(write)
+				return fmt.Errorf("frame read error: %w", err)
+			}
+			processErr = state.processor.ProcessFrame(ctx, f)
+		}
+		if processErr != nil {
+			flushOutBuf(&state.outBuf, write)
+			state.mu.Unlock()
+			state.DrainWriteQueue(write)
+			return processErr
+		}
+		flushOutBuf(&state.outBuf, write)
+		// Drain inline handler responses immediately so they're sent in the
+		// same event loop iteration. Without this, responses queue up and
+		// never flush until the frame loop exits (starving h2load clients).
+		if state.writeQueue.pending.Load() {
+			state.writeQueue.DrainTo(write)
+		}
+	}
+
+	// Clean up inline-completed streams that were deferred during the
+	// frame loop (pending outbound data or more frames to process).
+	state.processor.FlushInlineCleanup()
+
+	state.mu.Unlock()
+
+	// Drain async handler responses that completed during frame parsing.
+	state.DrainWriteQueue(write)
+
+	return nil
+}
+
+// PoolHandlersRunning reports whether a stream of this connection has a
+// handler running on the shared HTTP/2 worker pool (an async route), which
+// runs off the event loop (celeris#759). Safe from any goroutine.
+func (s *H2State) PoolHandlersRunning() bool {
+	return s.processor.PoolHandlersRunning()
+}
+
+// OutboundPending reports whether a stream of this connection has response
+// DATA buffered for the client's WINDOW_UPDATE: its handler has returned and
+// the rest of its response goes out as the client grants window
+// (celeris#759). Not for the hot path.
+func (s *H2State) OutboundPending() bool {
+	return s.processor.OutboundPending()
+}
+
+// GoAway starts a graceful close of the connection (celeris#759): it sends
+// GOAWAY(NO_ERROR) naming the last stream the client has opened, so the
+// client opens no new stream on the connection, and leaves the streams in
+// flight to finish. A stream the client opens above the one named anyway is
+// refused, not served (REFUSED_STREAM): the client counts it as not
+// processed and may retry it elsewhere. It reports false, sending nothing,
+// while the server's preface has not gone out yet. Called on the engine's
+// event loop thread, like ProcessH2.
+func (s *H2State) GoAway(write func([]byte)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.serverPrefaceSent {
+		return false
+	}
+	_ = s.processor.SendGoAway(s.processor.GetManager().GetLastClientStreamID(), http2.ErrCodeNo, nil)
+	flushOutBuf(&s.outBuf, write)
+	return true
+}
+
+// CloseH2 cleans up H2 state. Releases all streams still held by the
+// manager to prevent memory leaks on connection close.
+func CloseH2(state *H2State) {
+	state.processor.GetManager().Close()
+}
+
+func flushOutBuf(buf *bytes.Buffer, write func([]byte)) {
+	if buf.Len() > 0 {
+		// Write directly from buffer — safe because makeWriteFn copies into its
+		// own queue before returning. The buffer is reset after write returns.
+		write(buf.Bytes())
+		buf.Reset()
+	}
+}

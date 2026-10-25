@@ -1,0 +1,389 @@
+package resource
+
+import (
+	"fmt"
+	"log/slog"
+	"net"
+	"runtime"
+	"time"
+
+	"github.com/goceleris/celeris/internal/engine"
+)
+
+// defaultEngine returns Adaptive on Linux and Std on other platforms.
+func defaultEngine() engine.EngineType {
+	if runtime.GOOS == "linux" {
+		return engine.Adaptive
+	}
+	return engine.Std
+}
+
+// Config holds the internal server configuration used by engine implementations.
+// Users typically interact with the top-level celeris.Config instead.
+type Config struct {
+	// Protocol is the HTTP protocol version (HTTP1, H2C, or Auto).
+	Protocol engine.Protocol
+	// Engine is the I/O engine type (IOUring, Epoll, Adaptive, or Std).
+	Engine engine.EngineType
+	// Addr is the TCP address to listen on (e.g. ":8080"). With a port of 0
+	// the epoll and io_uring engines pick the port once, before any of their
+	// workers binds, and give every worker the concrete address (celeris#895);
+	// they keep the port, with a socket that never listens, until Listen
+	// returns, a pause of accepting included.
+	Addr string
+	// Resources holds worker, buffer, and connection limit overrides.
+	Resources Resources
+	// MaxHeaderBytes is the max header block size in bytes (min 4096 if set).
+	MaxHeaderBytes int
+	// MaxConcurrentStreams limits simultaneous H2 streams per connection.
+	MaxConcurrentStreams uint32
+	// MaxFrameSize is the max H2 frame payload size (range 16384-16777215).
+	MaxFrameSize uint32
+	// InitialWindowSize is the H2 initial stream flow-control window size.
+	InitialWindowSize uint32
+	// ReadTimeout is the max duration for reading the entire request.
+	// 0 asks for the default (60s); -1 disables it. After WithDefaults
+	// the field is either > 0 or 0, which every consumer reads as
+	// "disabled".
+	ReadTimeout time.Duration
+	// ReadHeaderTimeout is the max duration for reading the request
+	// headers ONLY (status line + headers + final CRLF). A short value
+	// here is the canonical defence against slowloris-style DoS:
+	// clients that dribble headers byte-by-byte get their connection
+	// killed within ReadHeaderTimeout instead of holding a goroutine
+	// and a listener-backlog slot for the full ReadTimeout. The std
+	// engine wires this to http.Server.ReadHeaderTimeout. The iouring
+	// and epoll engines enforce it inside their H1 header read loop.
+	// The io_uring engine also counts it from accept for a connection
+	// whose protocol is not detected yet (Auto, or H2C with the h2c
+	// upgrade), then restarts it at detection (so up to twice this value
+	// in all); epoll does not bound that first phase yet.
+	//
+	// Note: iouring/epoll's own SO_REUSEPORT-fronted multi-worker
+	// design absorbs a lot of slowloris pressure through queue
+	// scaling (16 workers × 4096 backlog ≈ 64 k slots). Std is on
+	// a single net.Listen() queue and falls over much sooner. The
+	// fix matters most for std but is sound on all engines.
+	//
+	// 0 asks for the default (10s); -1 disables it (0 after WithDefaults).
+	ReadHeaderTimeout time.Duration
+	// WriteTimeout is the max duration for writing the response, and bounds
+	// the wait for a closing connection's unsent bytes (see the public
+	// Config.WriteTimeout).
+	// 0 asks for the default (60s); -1 disables it (0 after WithDefaults).
+	WriteTimeout time.Duration
+	// IdleTimeout is the max duration a keep-alive connection may be idle.
+	// 0 asks for the default (600s); -1 disables it (0 after WithDefaults).
+	IdleTimeout time.Duration
+	// DisableKeepAlive disables HTTP keep-alive.
+	DisableKeepAlive bool
+	// DisableDeferAccept turns TCP_DEFER_ACCEPT off on the listen sockets the
+	// epoll and io_uring engines create. Default false: the option stays on.
+	//
+	// While the option is on, the kernel holds a connection whose handshake
+	// has completed but which has sent no data outside the accept queue: it
+	// stays a request socket and accept4 answers EAGAIN for it. A client that
+	// sends its request at once is then accepted with the request already
+	// queued, which saves the engine a wakeup per connection. A client that
+	// stays silent is promoted into the accept queue with no data about one
+	// second after its SYN, when the listener retransmits its SYN-ACK and
+	// the client's reply creates the connection; the engine accepts it then,
+	// and it is subject to ReadHeaderTimeout and the connection limits like
+	// any other.
+	//
+	// That hold is why a pause cannot simply close a listener that has the
+	// option: the close would reset every connection the kernel is still
+	// holding (celeris#662, celeris#675). PauseAccept therefore lingers. It
+	// clears the option on each pausing listener, so nothing that arrives
+	// afterwards is held, keeps the listener open and accepting for about
+	// 1.5 s after that clear, long enough for the kernel to promote what it
+	// held, and only then drains and closes it. A resume during that time
+	// puts the option back on the same listener. The adaptive engine pauses
+	// the sub-engine a switch leaves in the same way, without waiting for
+	// it.
+	//
+	// Set this field when a pause must be instant: with the option off a
+	// handshake-complete connection is always in the accept queue, and
+	// PauseAccept drains it and closes the listeners at once. What it gives
+	// up is the wakeup the option saves on each new connection, which is a
+	// cost on connection churn only; keep-alive traffic, where one accept is
+	// amortised over many requests, does not see it.
+	DisableDeferAccept bool
+	// Listener is an optional pre-existing listener for socket inheritance.
+	Listener net.Listener
+	// MaxRequestBodySize is the maximum allowed request body size in bytes.
+	// 0 uses the default (DefaultMaxRequestBodySize, 4 MiB). -1 disables the
+	// limit (unlimited).
+	MaxRequestBodySize int64
+	// AsyncHandlers dispatches HTTP handlers to spawned goroutines instead
+	// of inline execution on LockOSThread'd workers. See celeris.Config.
+	AsyncHandlers bool
+	// OnExpectContinue is called when an H1 request contains "Expect: 100-continue".
+	// If the callback returns false, the server responds with 417 Expectation Failed
+	// and skips reading the request body. If nil, the server always sends 100 Continue.
+	OnExpectContinue func(method, path string, headers [][2]string) bool
+	// OnConnect is called when a new connection is accepted.
+	OnConnect func(addr string)
+	// OnDisconnect is called when a connection is closed.
+	OnDisconnect func(addr string)
+	// Logger is the structured logger for engine diagnostics (default slog.Default()).
+	Logger *slog.Logger
+	// EnableH2Upgrade enables RFC 7540 §3.2 HTTP/1.1→H2C upgrades. Resolved
+	// from celeris.Config.EnableH2Upgrade (pointer, may be nil) and Protocol.
+	// Always a concrete value after WithDefaults.
+	//
+	// A bool cannot tell an explicit false from "unset", so a caller that
+	// has already resolved the value (celeris.Config does, from its *bool)
+	// must set it through SetH2Upgrade, which tells WithDefaults to leave it
+	// alone (celeris#964). A Config literal that sets the field directly is
+	// still resolved by WithDefaults: true on Protocol Auto, as given
+	// otherwise.
+	EnableH2Upgrade bool
+
+	// h2UpgradeResolved records that EnableH2Upgrade was resolved by the
+	// caller (SetH2Upgrade), so WithDefaults must not apply the Protocol
+	// Auto default to it. Unexported like defaulted: a Config built as a
+	// literal starts unresolved, and the marker travels with the value on
+	// copy, which keeps every later WithDefaults pass (the engine
+	// constructors, adaptive's sub-engines) from re-deciding it.
+	h2UpgradeResolved bool
+
+	// defaulted records that WithDefaults has already resolved this
+	// Config's sentinel fields, which is what makes a second pass a
+	// no-op (celeris#594).
+	//
+	// The timeouts and MaxRequestBodySize accept a negative sentinel
+	// meaning "disabled", and WithDefaults collapses it to 0 because 0
+	// is what every consumer already reads as "off" (`> 0` guards in
+	// the iouring/epoll loops, http.Server's own `d > 0` checks in std).
+	// But 0 on the way *in* means "give me the default", so the mapping
+	// is not idempotent on its own — and normalisation runs at least
+	// twice on every start: Server.doPrepare normalises, then each
+	// engine's New normalises again (three times through adaptive,
+	// which normalises before building its sub-engine). That turned a
+	// documented ReadHeaderTimeout=-1 into the 10s default.
+	//
+	// The marker distinguishes "0 = the caller wants the default" from
+	// "0 = already resolved to disabled". It is unexported, so a Config
+	// a caller builds as a literal always starts un-normalised and gets
+	// the full default pass; it travels with the value on copy.
+	defaulted bool
+}
+
+// Validate checks all config fields and returns any validation errors.
+func (c Config) Validate() []error {
+	var errs []error
+
+	if c.Addr != "" {
+		_, port, err := net.SplitHostPort(c.Addr)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("invalid addr %q: %w", c.Addr, err))
+		} else {
+			var p int
+			if _, err := fmt.Sscanf(port, "%d", &p); err != nil || p < 0 || p > 65535 {
+				errs = append(errs, fmt.Errorf("port must be 0-65535, got %q", port))
+			}
+		}
+	}
+
+	if c.MaxFrameSize != 0 && (c.MaxFrameSize < 16384 || c.MaxFrameSize > 16777215) {
+		errs = append(errs, fmt.Errorf("maxFrameSize must be 16384-16777215, got %d", c.MaxFrameSize))
+	}
+
+	if c.InitialWindowSize > 2147483647 {
+		errs = append(errs, fmt.Errorf("initialWindowSize must be 0-2147483647, got %d", c.InitialWindowSize))
+	}
+
+	if c.MaxConcurrentStreams > 0x7fffffff {
+		errs = append(errs, fmt.Errorf("maxConcurrentStreams must be <= 2147483647, got %d", c.MaxConcurrentStreams))
+	}
+
+	if c.MaxHeaderBytes != 0 && c.MaxHeaderBytes < 4096 {
+		errs = append(errs, fmt.Errorf("maxHeaderBytes must be >= 4096 if set, got %d", c.MaxHeaderBytes))
+	}
+
+	if c.Resources.Workers != 0 && c.Resources.Workers < MinWorkers {
+		errs = append(errs, fmt.Errorf("workers must be >= %d if set, got %d", MinWorkers, c.Resources.Workers))
+	}
+
+	if c.Resources.BufferSize != 0 && c.Resources.BufferSize < MinBufferSize {
+		errs = append(errs, fmt.Errorf("bufferSize must be >= %d if set, got %d", MinBufferSize, c.Resources.BufferSize))
+	}
+
+	if c.Resources.MemoryLimitBytes < 0 {
+		errs = append(errs, fmt.Errorf("memoryLimitBytes must be >= 0 (0 = unset), got %d", c.Resources.MemoryLimitBytes))
+	}
+
+	if c.ReadTimeout < -1 {
+		errs = append(errs, fmt.Errorf("readTimeout must be >= -1, got %v", c.ReadTimeout))
+	}
+	if c.WriteTimeout < -1 {
+		errs = append(errs, fmt.Errorf("writeTimeout must be >= -1, got %v", c.WriteTimeout))
+	}
+	if c.IdleTimeout < -1 {
+		errs = append(errs, fmt.Errorf("idleTimeout must be >= -1, got %v", c.IdleTimeout))
+	}
+
+	if runtime.GOOS != "linux" {
+		if c.Engine == engine.IOUring || c.Engine == engine.Epoll {
+			errs = append(errs, fmt.Errorf("engine %s requires Linux", c.Engine))
+		}
+		if c.Engine == engine.Adaptive {
+			errs = append(errs, fmt.Errorf("engine adaptive requires Linux"))
+		}
+	}
+
+	// Listener + explicit Addr with a concrete non-zero port is
+	// ambiguous — the runtime silently prefers Listener.Addr().
+	// Warn so the caller notices the discard at config time rather
+	// than observing a mismatched port in logs. Allow "<host>:0"
+	// (pick-any-port) since it's a common pattern when the caller
+	// intentionally delegates port selection to the pre-bound listener.
+	if c.Listener != nil && c.Addr != "" && c.Addr != ":8080" {
+		if _, port, splitErr := net.SplitHostPort(c.Addr); splitErr == nil && port != "0" {
+			if lnAddr := c.Listener.Addr().String(); lnAddr != c.Addr {
+				errs = append(errs, fmt.Errorf(
+					"ambiguous configuration: Addr=%q but Listener is bound to %q; the explicit Addr will be discarded",
+					c.Addr, lnAddr))
+			}
+		}
+	}
+
+	return errs
+}
+
+// SetH2Upgrade sets EnableH2Upgrade to a value the caller has already
+// resolved, explicit false included, and records that WithDefaults must leave
+// it as it is (celeris#964). celeris.Config calls it from toResourceConfig,
+// where the *bool still distinguishes nil from &false.
+func (c *Config) SetH2Upgrade(enable bool) {
+	c.EnableH2Upgrade = enable
+	c.h2UpgradeResolved = true
+}
+
+// AsyncH2Notice is what the native engines log at start-up when
+// AsyncHandlers is set and HTTP/2 is reachable (AsyncH2Reachable).
+const AsyncH2Notice = "AsyncHandlers applies to HTTP/1.1 connections only: " +
+	"an HTTP/2 stream runs inline on the worker unless its route is async, and then runs on the HTTP/2 worker pool"
+
+// AsyncH2Reachable reports whether AsyncHandlers is set and an HTTP/2
+// connection can reach the engine: by prior knowledge on Protocol Auto and H2C
+// (whatever EnableH2Upgrade says), or by the RFC 7540 section 3.2 upgrade on
+// any protocol that has it enabled, HTTP1 included. It is the std engine's own
+// rule for serving HTTP/2 (std/engine.go), and the one gate of the engines'
+// AsyncH2Notice: neither "EnableH2Upgrade" (misses prior-knowledge h2c with the
+// upgrade off) nor "Protocol != HTTP1" (misses HTTP1 with the upgrade on).
+// A zero Protocol is Auto, as WithDefaults resolves it.
+func (c Config) AsyncH2Reachable() bool {
+	return c.AsyncHandlers && (c.Protocol != engine.HTTP1 || c.EnableH2Upgrade)
+}
+
+// DefaultMaxRequestBodySize is what Config.MaxRequestBodySize resolves to when
+// it is 0: 4 MiB.
+const DefaultMaxRequestBodySize int64 = 4 << 20
+
+// WithDefaults returns a copy of Config with zero-value fields set to sensible
+// defaults.
+//
+// It is idempotent: WithDefaults(WithDefaults(c)) resolves to the same values
+// as WithDefaults(c). That matters because normalisation runs more than once
+// on every start — Server.doPrepare normalises, then the engine constructor
+// normalises again (adaptive a third time, before building its sub-engine) —
+// and the negative "disabled" sentinels (ReadTimeout, ReadHeaderTimeout,
+// WriteTimeout, IdleTimeout, MaxRequestBodySize) are carried internally as 0,
+// which is also the "unset" input. See the defaulted field (celeris#594).
+func (c Config) WithDefaults() Config {
+	if c.Addr == "" {
+		c.Addr = ":8080"
+	}
+	if c.Engine.IsDefault() {
+		c.Engine = defaultEngine()
+	}
+	// Resolve the h2c-upgrade default. A value the caller resolved through
+	// SetH2Upgrade (celeris.Config's *bool: nil, &true, &false) is final and
+	// is left alone, so an explicit false survives on Protocol Auto. For a
+	// Config literal, where false is indistinguishable from unset, Auto
+	// protocol (including the implicit default) enables h2c upgrade;
+	// HTTP1/H2C don't unless the caller set EnableH2Upgrade=true.
+	wasAutoOrDefault := c.Protocol.IsDefault() || c.Protocol == engine.Auto
+	if c.Protocol.IsDefault() {
+		c.Protocol = engine.Auto
+	}
+	if wasAutoOrDefault && !c.EnableH2Upgrade && !c.h2UpgradeResolved {
+		c.EnableH2Upgrade = true
+	}
+	if c.MaxFrameSize == 0 {
+		// 1 MiB matches golang.org/x/net/http2's defaultMaxReadFrameSize
+		// and fasthttp2 / hertz. RFC 7540 §4.2 permits up to 16 MiB. The
+		// 16 KiB default previously rejected 32 KiB+ DATA frames from
+		// clients that pre-negotiate their send size (Go std http2
+		// client, loadgen, browser upload flows over H2).
+		c.MaxFrameSize = 1 << 20
+	}
+	if c.InitialWindowSize == 0 {
+		// 1 MiB matches golang.org/x/net/http2 and fasthttp2: a 64 KiB +
+		// one-byte body POST would stall on the default 65 535-byte
+		// window because the server's WINDOW_UPDATE lands only after it
+		// finishes reading the full body. RFC 7540 allows up to 2^31-1.
+		c.InitialWindowSize = 1 << 20
+	}
+	if c.MaxConcurrentStreams == 0 {
+		c.MaxConcurrentStreams = 100
+	}
+	if c.MaxHeaderBytes == 0 {
+		c.MaxHeaderBytes = 16 << 20
+	}
+	switch {
+	case c.MaxRequestBodySize < 0:
+		c.MaxRequestBodySize = 0 // -1 → unlimited; 0 internally means unlimited
+	case c.MaxRequestBodySize == 0 && !c.defaulted:
+		// 4 MiB, as fasthttp and Fiber default to. The body is buffered whole
+		// in memory before the handler runs, so this times the number of
+		// requests in flight is what clients can make the server hold. It was
+		// 100 MB, a sanity ceiling hardcoded in the HTTP/2 processor since
+		// v1.0.0 and in the HTTP/1 parser since v1.1.0 (celeris#96 made it
+		// configurable and kept the value).
+		c.MaxRequestBodySize = DefaultMaxRequestBodySize
+	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
+	}
+	// Read/Write defaults. Previous 300s was too permissive for
+	// a latency-focused engine — a slow-loris client could hold a
+	// worker M / fd for 5 minutes before eviction. 60s matches
+	// nginx's client_header_timeout / client_body_timeout and
+	// covers legitimate slow-network cases. Users who need longer
+	// (streaming uploads, big downloads) should set explicit values.
+	c.ReadTimeout = resolveTimeout(c.ReadTimeout, 60*time.Second, c.defaulted)
+	// ReadHeaderTimeout default: 10s. Short enough to defeat slow-
+	// loris (whose canonical pattern is one byte every few hundred ms
+	// for tens of seconds), long enough that legitimate proxies +
+	// satellite clients still complete header reads. Mirrors nginx's
+	// client_header_timeout default of 60s/10s and Go's
+	// http.Server.ReadHeaderTimeout convention.
+	c.ReadHeaderTimeout = resolveTimeout(c.ReadHeaderTimeout, 10*time.Second, c.defaulted)
+	c.WriteTimeout = resolveTimeout(c.WriteTimeout, 60*time.Second, c.defaulted)
+	c.IdleTimeout = resolveTimeout(c.IdleTimeout, 600*time.Second, c.defaulted)
+	c.defaulted = true
+	return c
+}
+
+// resolveTimeout applies one timeout field's sentinel rules exactly once.
+//
+// A negative value is the documented "no timeout" sentinel and becomes 0,
+// the internal "disabled" encoding every consumer already tests with `> 0`.
+// A zero means "unset" only on the first pass: once normalised is true, 0 is
+// a disabled timeout this function must leave alone, otherwise the second
+// WithDefaults (in the engine constructor) reinstates the default over an
+// explicitly disabled timeout — celeris#594. Any positive value is kept
+// verbatim on every pass, so N stays N.
+func resolveTimeout(v, def time.Duration, normalised bool) time.Duration {
+	switch {
+	case v < 0:
+		return 0 // -1 → no timeout
+	case v == 0 && !normalised:
+		return def
+	default:
+		return v
+	}
+}

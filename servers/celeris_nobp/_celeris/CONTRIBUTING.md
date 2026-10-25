@@ -1,0 +1,213 @@
+# Contributing to Celeris
+
+Thank you for your interest in contributing to celeris!
+
+## Getting Started
+
+1. Fork the repository
+2. Clone your fork: `git clone https://github.com/<you>/celeris.git`
+3. Install dependencies: `go mod download`
+4. Run checks: `mage check`
+
+## Development
+
+### Prerequisites
+
+- Go 1.27.3+ — the `go` directive in `go.mod` is the single source of truth for the floor, and
+  CI pins the same version. Quote it from there rather than restating it here, so the two
+  cannot drift apart again.
+- [Mage](https://magefile.org) build tool, at the version CI runs: `GOWORK=off go install -modfile=.github/tools/go.mod tool`,
+  from the repository root. `.github/tools/go.mod` pins mage, actionlint, govulncheck and benchstat, Dependabot bumps
+  them, and this installs all four. `GOWORK=off` is there because go refuses `-modfile` in workspace mode, which a local
+  `go.work` turns on. `GOWORK=off go tool -modfile=.github/tools/go.mod mage <target>` runs mage without installing it
+- Linux (for io_uring/epoll engine tests) or macOS (std engine only)
+- [golangci-lint](https://golangci-lint.run/) v2.14, the version CI's lint job runs
+- [h2spec](https://github.com/summerwind/h2spec) 2.6.0: `mage tools` installs it and prints the version it
+  ended with
+
+### Build & Test
+
+```bash
+mage build     # Verify compilation
+mage lint      # Run linters (golangci-lint)
+mage test      # Run tests with race detection
+mage spec      # Run h2spec + h1spec compliance tests
+mage fuzz      # Run fuzz tests (30s default, set FUZZ_TIME to override)
+mage check     # Run all checks: lint + test + spec + build
+```
+
+### Cross-framework benchmarking
+
+Cross-framework performance and adversarial cluster validation live in
+[goceleris/probatorium](https://github.com/goceleris/probatorium), the
+authoritative bench harness (run on real hardware via its own cluster
+matrix). See that repo for the scenario × server × protocol matrix and
+release-gate numbers.
+
+### Sub-Module Testing
+
+The `middleware/compress`, `middleware/metrics`, and `middleware/otel` packages have their own `go.mod` files (to isolate heavy external dependencies from the core module). These are tested automatically in CI but require separate commands locally:
+
+```bash
+# Root module (includes all middleware except compress, metrics + otel)
+go test -race ./...
+
+# Sub-modules (separate go.mod)
+cd middleware/compress && go test -race ./...
+cd middleware/metrics && go test -race ./...
+cd middleware/otel && go test -race ./...
+```
+
+### Middleware Development
+
+All middleware lives under `middleware/`. Each package follows a consistent pattern:
+
+- `config.go` — Config struct with defaults, validation (panics on invalid config at init)
+- `<name>.go` — Middleware implementation using `New(config ...Config) celeris.HandlerFunc`
+- `doc.go` — Package-level godoc with usage examples and security notes
+- `<name>_test.go` — Comprehensive tests with race detection
+- `bench_test.go` — Benchmarks with `b.ReportAllocs()`
+- `example_test.go` — Runnable examples for godoc
+
+When adding middleware, use `celeris.SkipHelper` for skip logic (not manual `skipMap`). Reference implementations by complexity:
+
+- **Simple**: `middleware/recovery`, `middleware/cors` — basic middleware with no shared state
+- **Stateful**: `middleware/ratelimit`, `middleware/circuitbreaker` — shared state with atomic counters, background cleanup, sliding windows
+- **Response-transform**: `middleware/etag`, `middleware/compress` — BufferResponse/FlushResponse pattern
+- **Request-coalescing**: `middleware/singleflight` — embedded singleflight group with response fan-out
+- **Path-prefix interception**: `middleware/debug`, `middleware/pprof`, `middleware/swagger`
+- **Pre-routing URL manipulation**: `middleware/redirect`, `middleware/rewrite`
+- **Utility package**: `middleware/adapters` — conversion functions, not middleware constructor
+
+### Linux Testing from macOS
+
+The io_uring and epoll engines only compile and run on Linux. From macOS, run the tests in a
+Linux container. io_uring needs `seccomp=unconfined`, because Docker's default profile blocks its
+syscalls:
+
+```bash
+docker run --rm --platform linux/arm64 --security-opt seccomp=unconfined \
+  -v "$PWD":/src -w /src golang:1.27.3 \
+  go test -race ./internal/engine/epoll/... ./internal/engine/iouring/...
+```
+
+The image tag is the `go` directive of `go.mod` (an older Go refuses the module). `mage lintLinux`
+runs golangci-lint with `GOOS=linux`, which type-checks the Linux-only files without running anything.
+
+### Benchmarking
+
+```bash
+mage bench    # Run Go benchmarks (local, any OS)
+```
+
+To settle whether a change made a benchmark slower, use
+[`.github/scripts/bench-ab.sh`](.github/scripts/bench-ab.sh): an interleaved A/B between two refs with an
+A/A floor, whose header says how to read it. Cross-framework and cluster numbers come from
+[goceleris/probatorium](https://github.com/goceleris/probatorium) (see above).
+
+### Available Mage Targets
+
+```bash
+mage -l    # List all available targets
+```
+
+The targets live in `magefiles/` (mage's own layout). Run `mage` from the repository root: the targets use paths relative to it.
+
+## Pull Requests
+
+- Keep PRs focused on a single change
+- Include tests for new functionality
+- Run `mage check` before submitting (and the engine tests in a Linux container, as above, if touching engine code)
+- Follow existing code style (enforced by golangci-lint)
+- If the PR adds, removes or changes an exported identifier, run `mage api` and commit `api/` with it: the required **Lint** CI job fails at its step *api/ matches the exported API* until `api/` matches the exported API, and the diff of `api/` is how reviewers see the API change ([api/README.md](api/README.md))
+- Write clear commit messages following the `type: description` format (e.g., `feat:`, `fix:`, `perf:`, `security:`, `test:`, `chore:`)
+- Security-sensitive changes should note the CWE number in the commit message
+
+### How changes get merged
+
+The full rule lives in [GOVERNANCE.md](GOVERNANCE.md); the short version:
+
+- Every change to `main` goes through a pull request — maintainers included.
+- A PR merges when **all required checks are green**, **every review thread
+  is resolved**, and it has an **approving review from a code owner** of the
+  files it touches ([`.github/CODEOWNERS`](.github/CODEOWNERS)).
+- Three bots report on PRs, and none of them is a required check:
+  CodeRabbit (review; a draft once it is marked ready), Codecov (coverage)
+  and CodSpeed (benchmarks; only on a PR from a branch of this repository
+  that is ready for review and touches benchmarked code). Each inline
+  CodeRabbit comment opens a review thread, and the thread rule above applies
+  to it. CodeRabbit resolves its own thread when a later push fixes the
+  point; for one you disagree with, reply saying why and resolve it (or
+  comment `@coderabbitai resolve` to resolve all of its threads). A red
+  CodSpeed check is informational: the header of
+  [`.github/workflows/codspeed.yml`](.github/workflows/codspeed.yml) says how
+  to read it.
+- The author merges if they have write access (a member of the
+  `contributors` team or a maintainer); otherwise the approving maintainer
+  merges, usually via auto-merge.
+- **Nobody merges their own PR without a code-owner approval.** The
+  maintainer's admin bypass is reserved for release/infra emergencies and
+  is visible in the audit log.
+
+Who the maintainers and `contributors` members are, and how to become one,
+is in [MAINTAINERS.md](MAINTAINERS.md).
+
+### Labels and release notes
+
+Release notes are **generated from PR labels** (see
+[`.github/release.yml`](.github/release.yml)); GitHub Releases is the
+changelog and there is **no `CHANGELOG.md`**. Label every PR with the
+category it belongs to so it lands in the right section:
+
+| Label          | Release-notes section |
+|----------------|-----------------------|
+| `breaking`     | Breaking changes      |
+| `security`     | Security              |
+| `bug`          | Fixes                 |
+| `performance`  | Performance           |
+| `enhancement`  | Features              |
+| `dependencies` | excluded (dependabot) |
+
+Anything else lands under "Other". If a change is breaking, label it
+`breaking` *and* say so in the PR description.
+
+### Commit sign-off
+
+We recommend signing off your commits with `git commit -s`, which adds a
+`Signed-off-by:` trailer certifying the
+[Developer Certificate of Origin](https://developercertificate.org/). It is
+not mandatory yet, but it may become a required check in the future, so
+getting into the habit now costs nothing.
+
+## Code Style
+
+- Follow standard Go conventions
+- No unnecessary comments — code should be self-documenting
+- Only add comments where the logic is not self-evident
+- Use `mage lint` to verify (runs golangci-lint across darwin + linux)
+- Hot-path code: avoid allocations, avoid `defer` for Lock/Unlock, prefer inline fast-paths with fallback to function calls
+- Do not add redundant tests that only check constant values or duplicate existing test coverage
+
+## Testing
+
+- Unit tests go in `*_test.go` files alongside the code
+- Integration tests (multi-engine, adaptive, etc.) go in `test/integration/`
+- Conformance tests (HTTP/1.1 RFC 9112, HTTP/2 h2spec) go in `test/spec/`
+- Cross-framework performance benchmarks (scenario × server × protocol matrix driven by `loadgen`) live in [goceleris/probatorium](https://github.com/goceleris/probatorium); driver-isolation benchmarks go in `test/drivercmp/`; WebSocket comparisons in `test/benchcmp_ws/`.
+- Use the `celeristest` package for Context/ResponseRecorder test helpers
+- Run with `-race` flag (all CI runs use race detection)
+
+## Reporting Issues
+
+Use GitHub Issues with the provided forms for bug reports and feature
+requests. Bug reports ask for the engine (std / epoll / io_uring /
+adaptive), the architecture and a minimal reproduction — please fill them
+in, they decide how fast the bug gets fixed.
+
+For security vulnerabilities, **do not open an issue**: use the Security
+tab → "Report a vulnerability" as described in [SECURITY.md](SECURITY.md).
+
+## Project governance
+
+- [GOVERNANCE.md](GOVERNANCE.md) — roles, merge rule, decisions, releases
+- [MAINTAINERS.md](MAINTAINERS.md) — who maintains celeris and how to join
