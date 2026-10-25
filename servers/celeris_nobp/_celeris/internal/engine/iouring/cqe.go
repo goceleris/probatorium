@@ -1,0 +1,159 @@
+//go:build linux
+
+package iouring
+
+// completionEntry mirrors io_uring_cqe.
+type completionEntry struct {
+	UserData uint64
+	Res      int32
+	Flags    uint32
+}
+
+// UserData encoding (v1.5.0, review 2.6): a per-conn generation tag is
+// folded between the op and fd so a late/in-flight CQE from a CLOSED
+// connection cannot be misattributed to a NEW connection that has since
+// reused the same fd (or fixed-file slot).
+//
+//	bits 56-63 (8)  : op tag      (udMask)
+//	bits 24-55 (32) : generation  (genMask) — connState.generation, conn-bound ops only
+//	bits  0-23 (24) : fd / fixed-file index (fdMask)
+//
+// 24 bits comfortably covers every real fd and fixed-file index:
+// onAcceptedFD rejects any fd >= fixedFileTableSize (65536) outright, so
+// 2^24 is 256x the engine's own hard bound. gen=0 is used for ops that are
+// NOT bound to a connState (accept on listenFD, the H2 wakeup eventfd, the
+// udProvide cancel sentinel, and the driver ops which have their own
+// lifecycle).
+//
+// Under fd reuse a terminal CQE from a closed predecessor can collide
+// with the live occupant's (fd, gen) identity and be misattributed at
+// dispatch — misdecrementing the LIVE conn's kernelInflight and
+// re-opening the close-time early-release window (see staleConnCQE).
+// The generation was widened from 8 to 16 bits in v1.5.0, when it was
+// still a per-connState counter. celeris#470 made it the 32-bit field
+// above, drawn from the process-wide connGenSeq, so a collision now
+// needs 2^32 intervening accepts process-wide (see connGenSeq).
+const (
+	udAccept uint64 = 0x01 << 56
+	udRecv   uint64 = 0x02 << 56
+	udSend   uint64 = 0x03 << 56
+	udClose  uint64 = 0x04 << 56
+	// udProvide is a sentinel "ignore this CQE" tag: the main dispatcher's
+	// switch has no matching case, so the CQE is dropped on the floor
+	// instead of routing through handleRecv. cancelConnOps tags its
+	// close-path ASYNC_CANCELs with it. The recv-pause cancel used it too
+	// until celeris#596 gave that one its own tag (udRecvCancel) so its
+	// -ENOENT could be read. Name kept from the legacy PROVIDE_BUFFERS
+	// path (BufferGroup, removed in v1.5.0/celeris#320); the value
+	// (0x06 << 56) is unchanged to preserve the user-data tag layout for
+	// any persisted snapshots.
+	udProvide uint64 = 0x06 << 56
+	// udRecvCancel tags the ASYNC_CANCEL SQE that the WebSocket
+	// backpressure pause submits for the conn's armed recv, so its
+	// completion reaches handleRecvCancel instead of being dropped. It
+	// carried udProvide — the "drop this CQE" sentinel — until celeris#596:
+	// that threw away the only event that can say the cancel MISSED (the
+	// recv had already completed, so no -ECANCELED is coming), and
+	// cs.recvCancelPending stayed stale for the rest of the conn's life,
+	// over-counting the celeris#484 resume window ~1000x.
+	//
+	// Conn-bound, so it is stamped with the generation and passes the same
+	// stale-CQE gate as the recv it targets. It is NOT a terminalOp, so it
+	// stays outside the kernelInflight accounting exactly as the udProvide
+	// form did. The close path's cancels (cancelConnOps) keep udProvide and
+	// their suppressed CQE: their conn is being torn down and has no flag
+	// left to correct.
+	udRecvCancel uint64 = 0x05 << 56
+	udH2Wakeup   uint64 = 0x07 << 56
+	// udTransplantReap tags the reported ASYNC_CANCEL a hand-off submits for
+	// a connection's armed recv (celeris#657, the REAP half of the
+	// fd-lifetime rule): the connection is handed to epoll at that recv's
+	// own -ECANCELED, never while it can still complete. A tag of its own,
+	// not udRecvCancel's, so its miss can be told from the WebSocket
+	// pause's (celeris#596) and routed to handleTransplantReap. Conn-bound
+	// (stamped with the generation, so it passes the stale-CQE gate) and,
+	// like udRecvCancel, NOT a terminalOp: it stays outside the
+	// kernelInflight accounting.
+	udTransplantReap uint64 = 0x09 << 56
+	// udHeaderTimer tags IORING_OP_TIMEOUT SQEs submitted by initProtocol /
+	// ProcessH1's arm-callback to enforce ReadHeaderTimeout per-conn. The
+	// timer fires absolutely at the deadline; CQE handler closes the conn
+	// iff HeaderDeadlineNs is still > 0 and now > deadline (race-free
+	// against ClearHeaderDeadline). New in v1.4.11.
+	udHeaderTimer uint64 = 0x08 << 56
+	// udListenCancel tags the ASYNC_CANCEL that a close of the listen socket
+	// submits for the accept armed on it (celeris#896): worker shutdown's drain
+	// and cancelAccept, the pause's and stopAccepting's. Its CQE is read only by
+	// the wait that made it (endOwedOpsAtShutdown, cancelAccept); the main
+	// dispatcher has no case for it, so one that is read elsewhere is dropped. A tag of its
+	// own, not udProvide's, so it cannot be mistaken for a close-path cancel's.
+	udListenCancel uint64 = 0x0A << 56
+	// Driver tags for EventLoopProvider — kept non-overlapping with HTTP tags
+	// so the main CQE dispatch can route them to the driver path without
+	// consulting the driverConns map.
+	udDriverRecv  uint64 = 0x10 << 56
+	udDriverSend  uint64 = 0x11 << 56
+	udDriverClose uint64 = 0x12 << 56
+	udMask        uint64 = 0xFF << 56
+	genShift             = 24
+	genMask       uint64 = 0xFFFFFFFF << genShift
+	fdMask        uint64 = (1 << 24) - 1
+)
+
+// encodeUserData encodes a NON-conn-bound op (gen=0). Used for accept
+// (listenFD, no conn yet), udH2Wakeup (global eventfd), udProvide (the
+// cancel sentinel) and the driver ops (separate lifecycle).
+func encodeUserData(op uint64, fd int) uint64 {
+	return op | (uint64(fd) & fdMask)
+}
+
+// encodeUserDataGen encodes a CONN-BOUND op, stamping the owning
+// connState's generation so a stale CQE from a prior fd occupant is
+// detectable at dispatch (see decodeGen). gen=0 collapses to the same
+// value encodeUserData would produce.
+func encodeUserDataGen(op uint64, fd int, gen uint32) uint64 {
+	return op | (uint64(gen) << genShift) | (uint64(fd) & fdMask)
+}
+
+func decodeOp(userData uint64) uint64 {
+	return userData & udMask
+}
+
+func decodeGen(userData uint64) uint32 {
+	return uint32((userData & genMask) >> genShift)
+}
+
+func decodeFD(userData uint64) int {
+	return int(userData & fdMask)
+}
+
+// connOpKey strips the op tag from a conn-bound user_data, leaving the
+// (generation, fd) identity that every in-flight op of one conn shares.
+// Used as the Worker.closedOps map key so a terminal recv/send CQE
+// arriving AFTER its conn closed can still be attributed to the closed
+// connState for kernelInflight accounting (release gating).
+func connOpKey(userData uint64) uint64 {
+	return userData &^ udMask
+}
+
+// encodeConnOpKey builds the same (generation, fd) identity from a closed
+// conn's fields — the value connOpKey extracts from its ops' user_data.
+func encodeConnOpKey(fd int, gen uint32) uint64 {
+	return (uint64(gen) << genShift) | (uint64(fd) & fdMask)
+}
+
+func cqeBufferID(flags uint32) uint16 {
+	return uint16(flags >> 16)
+}
+
+func cqeHasMore(flags uint32) bool {
+	return flags&cqeFMore != 0
+}
+
+func cqeHasBuffer(flags uint32) bool {
+	return flags&cqeFBuffer != 0
+}
+
+func cqeIsNotif(flags uint32) bool {
+	return flags&cqeFNotif != 0
+}

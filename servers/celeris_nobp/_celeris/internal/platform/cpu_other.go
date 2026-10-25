@@ -1,0 +1,48 @@
+//go:build !linux
+
+// Package platform provides platform-specific CPU affinity and worker distribution utilities.
+package platform
+
+// PinToCPU is a no-op on non-Linux platforms.
+func PinToCPU(_ int) error {
+	return nil
+}
+
+// ThreadAffinity is empty on non-Linux platforms, where PinToCPU pins nothing.
+type ThreadAffinity struct{}
+
+// SaveThreadAffinity is a no-op on non-Linux platforms.
+func SaveThreadAffinity() (ThreadAffinity, error) {
+	return ThreadAffinity{}, nil
+}
+
+// Restore is a no-op on non-Linux platforms.
+func (ThreadAffinity) Restore() error {
+	return nil
+}
+
+// BindNumaNode is a no-op on non-Linux platforms.
+func BindNumaNode(_ int) error {
+	return nil
+}
+
+// ResetNumaPolicy is a no-op on non-Linux platforms.
+func ResetNumaPolicy() error {
+	return nil
+}
+
+// CPUForNode returns 0 on non-Linux platforms (no NUMA info).
+func CPUForNode(_ int) int {
+	return 0
+}
+
+// NUMATopology holds detected NUMA topology information.
+type NUMATopology struct {
+	NumNodes int
+	NodeCPUs [][]int
+}
+
+// DetectNUMA returns a single-node topology on non-Linux platforms.
+func DetectNUMA() NUMATopology {
+	return NUMATopology{NumNodes: 1}
+}

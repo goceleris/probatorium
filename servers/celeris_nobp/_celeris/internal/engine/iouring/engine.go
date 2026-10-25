@@ -1,0 +1,890 @@
+//go:build linux
+
+package iouring
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/goceleris/celeris/internal/deferlinger"
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/engine/internal/bindiag"
+	"github.com/goceleris/celeris/internal/engine/internal/errclass"
+	"github.com/goceleris/celeris/internal/platform"
+	"github.com/goceleris/celeris/internal/probe"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/resource"
+)
+
+// Engine implements the io_uring-based I/O engine.
+type Engine struct {
+	workers      []*Worker
+	tier         TierStrategy
+	profile      engine.CapabilityProfile
+	cfg          resource.Config
+	handler      stream.Handler
+	addr         atomic.Pointer[net.Addr]
+	mu           sync.Mutex
+	acceptPaused atomic.Bool
+	// abnormalWorkerExits counts the worker goroutines that ended without
+	// returning (runtime.Goexit or a panic in a synchronous handler,
+	// celeris#848). Unexported: it is read by tests; the Error log is the
+	// operator-facing record.
+	abnormalWorkerExits atomic.Uint64
+	// pause records the pause in progress for the workers' linger step
+	// (celeris#662): when it began and whether its listeners get the
+	// tcp_synack_retries=0 guard. Written by BeginPauseAccept before it sets
+	// acceptPaused.
+	pause   deferlinger.PauseState
+	metrics struct {
+		reqCount    atomic.Uint64
+		activeConns atomic.Int64
+		// errs is the per-cause ErrorCount breakdown (celeris#645).
+		// EngineMetrics.ErrorCount is its sum; no separate total exists.
+		errs errclass.Counters
+		// asyncPromoted counts the cumulative inline → dispatch-goroutine
+		// promotions across all workers (celeris #300).
+		asyncPromoted atomic.Uint64
+		// acceptCount / closeCount track cumulative connection lifecycle
+		// events; bytesRead / bytesWritten track cumulative payload bytes.
+		// All four feed the adaptive controller's load signals. Bytes are
+		// batched per-worker and flushed once per event-loop iteration
+		// (mirroring reqCount) to avoid hot-path cache-line bouncing;
+		// accepts/closes are infrequent so they increment directly like
+		// activeConns.
+		acceptCount  atomic.Uint64
+		closeCount   atomic.Uint64
+		bytesRead    atomic.Uint64
+		bytesWritten atomic.Uint64
+		// transplantCount / transplantRR support #383 connection transplant:
+		// the cumulative number of conns adopted from another engine, and a
+		// round-robin cursor for spreading adopts across workers.
+		transplantCount atomic.Uint64
+		transplantRR    atomic.Uint64
+		// transplantDetached / transplantSlotOccupied complete the #383
+		// hand-off ledger transplantCount starts (celeris#624):
+		// conns detached FOR epoll (reverse direction) and adoptions
+		// refused because the conn-table slot was taken. Neither side of a
+		// hand-off fires a lifecycle hook, so the pair is the only way to
+		// reconcile one from outside the engine.
+		transplantDetached     atomic.Uint64
+		transplantSlotOccupied atomic.Uint64
+		// The remaining silent drop points on the #383 path, one bucket
+		// each (celeris#624).
+		transplantHandoffRefused atomic.Uint64
+		transplantAdoptRefused   atomic.Uint64
+		// closeMissingConnState counts finishClose calls that moved the
+		// gauge and closeCount for an already-nil connState, which skips
+		// OnDisconnect — the silent close path of celeris#624.
+		closeMissingConnState atomic.Uint64
+		// recvArm holds the recv-arming witnesses (celeris#586).
+		recvArm recvArmStats
+		// detachedConns mirrors the sum of the workers' private detachedCount
+		// (one atomic add per detach and per detached close, none per
+		// request); detachWindowCloses counts closes that landed inside the
+		// celeris#549 window (Detach published, deferred count not yet
+		// taken). Both exist so the accounting can be observed from outside
+		// the worker thread (celeris#584).
+		detachedConns      atomic.Int64
+		detachWindowCloses atomic.Uint64
+		// zc holds the SEND_ZC exposure witnesses (celeris#591).
+		zc zcStats
+		// handoffLoss holds the celeris#657 hand-off loss witnesses: stale
+		// recv data by identity class, and hand-offs made with an op in
+		// flight.
+		handoffLoss handoffLossStats
+		// sweep holds the post-switch sweep's witnesses (celeris#657 P9):
+		// its pass count, and the live residue by refusal class, which
+		// every worker publishes as a delta so the sum is what the engine
+		// still holds against a drain.
+		sweep sweepCounters
+	}
+	// asyncRoutes is cached from the handler's HasAsyncRoutes/route count
+	// at construction so Metrics() doesn't pay the type-assertion per
+	// call. Snapshot-at-Listen — static post-Start.
+	asyncRoutes int
+	// asyncCancelFlags is whether probeAsyncCancelFlags found this kernel
+	// accepting IORING_ASYNC_CANCEL_* flags (5.19+): false when the kernel
+	// rejected them, when it answered in a way the probe does not recognise
+	// and when the probe got no answer. Every worker gets a copy; the
+	// hand-off's REAP needs them (celeris#657).
+	asyncCancelFlags bool
+	// multishotRecv is multishotRecvEnabled as New read it: the workers map
+	// their provided-buffer ring on it, and the start-up line prints it.
+	multishotRecv bool
+
+	// drainBudget is the ctx of the last Shutdown call: the budget of the
+	// wait for HTTP/2 pool handlers the workers run when Listen's context is
+	// cancelled (celeris#759; Worker.h2PoolSettled).
+	drainBudget atomic.Pointer[context.Context]
+}
+
+// New creates a new io_uring engine.
+func New(cfg resource.Config, handler stream.Handler) (*Engine, error) {
+	cfg = cfg.WithDefaults()
+	if errs := cfg.Validate(); len(errs) > 0 {
+		return nil, fmt.Errorf("config validation: %w", errs[0])
+	}
+
+	profile := probe.Probe()
+	if !profile.IOUringTier.Available() {
+		return nil, fmt.Errorf("io_uring not available on this system")
+	}
+
+	// Runtime feature probes: verify features actually work on this kernel,
+	// overriding version-based detection which is unreliable (e.g., AWS
+	// kernels may have features disabled or partially broken).
+	// SEND_ZC runtime probe with IORING_SEND_ZC_REPORT_USAGE.
+	// Distinguishes: unsupported, broken (ENA), copy fallback, true zero-copy.
+	if profile.SendZC {
+		zcResult, zcReason := probeSendZCCached()
+		functional := zcResult == SendZCTrueZeroCopy || zcResult == SendZCCopyFallback
+		switch zcResult {
+		case SendZCTrueZeroCopy:
+			cfg.Logger.Info("SEND_ZC probe result", "functional", true, "loopback", "true zero-copy")
+		case SendZCCopyFallback:
+			if zcReason != "" {
+				cfg.Logger.Info("SEND_ZC probe result", "functional", true, "loopback", "copy-fallback (expected)", "reason", zcReason)
+			} else {
+				cfg.Logger.Info("SEND_ZC probe result", "functional", true, "loopback", "copy-fallback (expected)")
+			}
+		default:
+			if zcReason != "" {
+				cfg.Logger.Info("SEND_ZC probe result", "functional", false, "result", zcResult.String(), "reason", zcReason)
+			} else {
+				cfg.Logger.Info("SEND_ZC probe result", "functional", false, "result", zcResult.String())
+			}
+		}
+		envVal := os.Getenv("CELERIS_IOURING_SEND_ZC")
+		enabled, recognized := resolveSendZCPolicy(functional, envVal)
+		if !recognized {
+			cfg.Logger.Warn("unrecognized CELERIS_IOURING_SEND_ZC value, falling back to auto", "value", envVal)
+		}
+		profile.SendZC = enabled
+	}
+	if profile.FixedFiles {
+		if ok, ffReason := probeFixedFilesCached(); !ok {
+			cfg.Logger.Info("fixed files runtime probe failed, disabling", "reason", ffReason)
+			profile.FixedFiles = false
+		}
+	}
+	// ProvidedBuffers: tested via IORING_REGISTER_PBUF_RING. Without it,
+	// multishot recv has no backing store, so MultishotRecv is also forced
+	// off when this probe fails.
+	if profile.ProvidedBuffers {
+		if ok, pbReason := probeProvidedBuffersCached(); !ok {
+			cfg.Logger.Info("provided buffers runtime probe failed, disabling (downgrades to base tier and disables multishot recv)", "reason", pbReason)
+			profile.ProvidedBuffers = false
+			profile.MultishotRecv = false
+		}
+	}
+	// MultishotAccept: kernel may advertise it but never set CQE_F_MORE,
+	// leaving accept stuck after the first completion. Probe submits a
+	// real multishot accept + dial and verifies the F_MORE flag.
+	if profile.MultishotAccept {
+		if ok, maReason := probeMultishotAcceptCached(); !ok {
+			cfg.Logger.Info("multishot accept runtime probe failed, disabling (worker will use single-shot accept)", "reason", maReason)
+			profile.MultishotAccept = false
+		}
+	}
+
+	// Every cancel the engine submits sets IORING_ASYNC_CANCEL flags, which
+	// exist from Linux 5.19: the close paths' (cancelConnOps), the accept
+	// pause's, the WebSocket backpressure pause's, the driver unregister's
+	// and the io_uring→epoll hand-off's REAP (celeris#657). A kernel that
+	// rejects them fails every one with -EINVAL and leaves its target
+	// running, so it gets no io_uring engine at all (celeris#682): see
+	// requireAsyncCancelFlags.
+	//
+	// From 5.19 a probe with no answer, or one it does not recognise, only
+	// keeps the hand-off's reap off: a sync connection whose recv is armed
+	// stays on io_uring until that recv completes on its own, and its next
+	// response is then HELD and handed off with nothing in flight. HOLD needs
+	// a worker without a provided-buffer ring; where one exists the
+	// connection is not held and stays on io_uring. A promoted async
+	// connection is never offered for the hand-off without the flags and
+	// stays too. Placement only, either way. Only the kernel's answer is
+	// cached: after a probe with no answer (or one it does not recognise) the
+	// next New probes again (celeris#681 N1).
+	asyncCancel, acReason := probeAsyncCancelFlagsCached()
+	asyncCancelFlags := asyncCancel == asyncCancelAccepted
+	logAsyncCancelProbe(cfg.Logger, asyncCancel, acReason, profile.KernelMajor, profile.KernelMinor)
+	if err := requireAsyncCancelFlags(asyncCancel, acReason, profile); err != nil {
+		return nil, err
+	}
+
+	tier := SelectTier(profile, 2*time.Second)
+	if tier == nil {
+		return nil, fmt.Errorf("no suitable io_uring tier available")
+	}
+	// Decided once, here: the start-up line and every worker's ring take this
+	// value, so a change of the environment after New reaches neither.
+	multishotRecv := multishotRecvEnabled(tier.SupportsMultishotRecv())
+
+	cfg.Logger.Info("io_uring engine selected",
+		"tier", tier.Tier().String(),
+		"multishot_accept", tier.SupportsMultishotAccept(),
+		// The EFFECTIVE values, as fixed_files below: the ring of provided
+		// buffers is mapped only where multishot recv is opted into
+		// (multishotRecvEnabled), so a default run says false, not the tier's
+		// capability. A worker whose NewBufferRing then fails falls back to
+		// per-connection buffers and logs its own Warn: the line is decided
+		// before any worker exists, so it stays optimistic about that one.
+		// One decision for both fields and for the workers (Engine.multishotRecv):
+		// multishot recv is backed by the provided-buffer ring and the two are
+		// forced off together (the ProvidedBuffers probe above), so no tier has
+		// one without the other.
+		"multishot_recv", multishotRecv,
+		"provided_buffers", multishotRecv,
+		// The EFFECTIVE value, not the tier capability: this used to print
+		// the capability and so reported fixed_files=true while the feature
+		// was gated off (celeris#541).
+		"fixed_files", fixedFilesEnabled(tier.SupportsFixedFiles()),
+		"send_zc", tier.SupportsSendZC(),
+		"async_cancel_flags", asyncCancelFlags,
+		"async_cancel_probe", asyncCancel.String(),
+	)
+
+	e := &Engine{
+		tier:             tier,
+		profile:          profile,
+		cfg:              cfg,
+		handler:          handler,
+		asyncCancelFlags: asyncCancelFlags,
+		multishotRecv:    multishotRecv,
+	}
+	// Snapshot the static AsyncRoutes count from the handler so
+	// Metrics() doesn't pay a type-assertion per call (#300 G3).
+	if r, ok := handler.(interface{ AsyncRouteCount() int }); ok {
+		e.asyncRoutes = r.AsyncRouteCount()
+	}
+	return e, nil
+}
+
+// requireAsyncCancelFlags is New's gate on the async-cancel-flags probe
+// (celeris#682, #872): io_uring needs Linux 5.19, the release that added the
+// IORING_ASYNC_CANCEL flags. Through 5.18 the kernel fails every cancel the
+// engine submits with -EINVAL and leaves its target running. On 5.15 the
+// recv of a connection the engine closes stays armed. On the H1 fast-close
+// path, close(2) alone, which the idle-timeout close takes, that recv keeps
+// the socket open and the peer gets no FIN (measured, celeris#792). On the
+// Base tier, which is every kernel below 5.19 (fixed files are off there), the
+// graceful close paths shut the connection down before the close, so they send
+// a FIN (read from code, not measured); the forced-RST close shuts both
+// directions and then closes, an abortive close by design. After the 5 s
+// release backstop the pool can hand that recv's buffer to another connection
+// while the recv can still complete into it (the #256 class, read from code).
+//
+// Below 5.19 the answer is the version, whatever the probe said. The probe
+// sends one of the four cancel forms the engine builds (by user_data with
+// CANCEL_ALL, no skip-success), so on a kernel that carries only some of the
+// flags (a partial vendor backport) it answers accepted while the close
+// path's skip-success form or the by-fd forms still fail with -EINVAL on
+// every close (celeris#872). Nothing below the floor is told apart from that
+// case by one form, and the supported floor is 5.19, so the engine is not
+// built there.
+//
+// From 5.19 the kernel's answer decides: it refuses io_uring, as
+// unavailable, where the kernel rejected the flags whatever version it
+// claims. A probe with no answer, or one it does not recognise, does not
+// refuse from 5.19: the flags exist there, and the probe's private ring can
+// fail with EMFILE or ENOMEM under load (celeris#681 N1); that engine only
+// keeps the hand-off's reap off. The error starts "io_uring not available on
+// this system", as New's error for a kernel with no io_uring does. No code
+// outside the tests reads that prefix (the tests' skip helpers do): the
+// adaptive engine falls back to epoll after any New error
+// (CELERIS_ADAPTIVE_START=iouring included), and an explicit io_uring engine
+// fails to start with the kernel requirement in its error.
+func requireAsyncCancelFlags(p asyncCancelProbe, reason string, profile engine.CapabilityProfile) error {
+	fromFloor := profile.KernelMajor > 5 || (profile.KernelMajor == 5 && profile.KernelMinor >= 19)
+	switch {
+	case p == asyncCancelRejected:
+		return fmt.Errorf("io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, "+
+			"and kernel %s rejects the IORING_ASYNC_CANCEL flags every connection close uses (%s); "+
+			"use the epoll engine (celeris#682)", profile.KernelVersion, reason)
+	case !fromFloor:
+		// The probe's answer and reason follow the version, which is the
+		// cause. Accepted is the one answer that needs explaining: it reads
+		// like a pass, and is why a version check is needed at all.
+		detail := "the IORING_ASYNC_CANCEL flags probe result: " + p.String()
+		if reason != "" {
+			detail += " (" + reason + ")"
+		}
+		if p == asyncCancelAccepted {
+			detail += ", which a kernel that carries only some of the flags can give while its other cancel forms fail"
+		}
+		return fmt.Errorf("io_uring not available on this system: the io_uring engine requires Linux 5.19 or later, "+
+			"and kernel %s predates it; %s; use the epoll engine (celeris#682, #872)", profile.KernelVersion, detail)
+	}
+	return nil
+}
+
+// logAsyncCancelProbe reports an async-cancel-flags probe that did not find
+// the flags accepted (celeris#681 R2). A rejection is the kernel's answer and
+// expected before 5.19: Info, and New then refuses io_uring
+// (requireAsyncCancelFlags). An answer the probe does not recognise is one
+// no kernel measured gives, on any version: Warn, with the reason, which
+// names the errno (celeris#681 N2). A probe that got no answer says nothing
+// about the kernel; on one whose version has the flags (5.19 and later) it is
+// unexpected, and it keeps the hand-off's reap off for the engine being built
+// (the next New probes again: probeAsyncCancelFlagsCached keeps only an
+// answer), so it is a Warn there and Info below.
+//
+// Before 5.19 New refuses io_uring whatever the probe said, right after this
+// log (requireAsyncCancelFlags), so the records of those two answers say that
+// and not that the hand-off will not cancel a recv: there is no hand-off
+// without an engine.
+func logAsyncCancelProbe(l *slog.Logger, p asyncCancelProbe, reason string, kernelMajor, kernelMinor int) {
+	kernel := fmt.Sprintf("%d.%d", kernelMajor, kernelMinor)
+	fromFloor := kernelMajor > 5 || (kernelMajor == 5 && kernelMinor >= 19)
+	consequence := "the io_uring→epoll hand-off will not cancel an armed recv (celeris#657)"
+	if !fromFloor {
+		consequence = "io_uring needs Linux 5.19 or later and is not used (celeris#682)"
+	}
+	switch p {
+	case asyncCancelRejected:
+		l.Info("async cancel flags rejected by the kernel: io_uring needs Linux 5.19 or later and is not used (celeris#682)",
+			"reason", reason, "kernel", kernel)
+	case asyncCancelUnexpected:
+		l.Warn("async cancel flags probe got an answer it does not recognise: "+consequence,
+			"reason", reason, "kernel", kernel)
+	case asyncCancelNoAnswer:
+		msg := "async cancel flags probe got no answer from the kernel: " + consequence
+		if fromFloor {
+			l.Warn(msg, "reason", reason, "kernel", kernel)
+		} else {
+			l.Info(msg, "reason", reason, "kernel", kernel)
+		}
+	}
+}
+
+// portHoldHook is called by Listen with the address a port 0 was resolved
+// to, while the hold on that port is held and no worker has bound it yet. A
+// test hook (celeris#895), nil outside tests.
+var portHoldHook func(addr string)
+
+// Listen starts the io_uring engine and blocks until context is canceled.
+func (e *Engine) Listen(ctx context.Context) error {
+	// If a listener was provided (StartWithListener), use its bound address
+	// and close the Go-managed listener so our raw sockets can bind with
+	// SO_REUSEPORT. Log the ownership transfer so users see it.
+	if e.cfg.Listener != nil {
+		e.cfg.Addr = e.cfg.Listener.Addr().String()
+		if e.cfg.Logger != nil {
+			e.cfg.Logger.Info("iouring: closing supplied listener to rebind via SO_REUSEPORT",
+				"addr", e.cfg.Addr)
+		}
+		_ = e.cfg.Listener.Close()
+		e.cfg.Listener = nil
+	}
+
+	// celeris#895: decide a port 0 once, before any worker binds. Every
+	// worker binds e.cfg.Addr itself, and so does a worker that re-creates
+	// its listen socket on ResumeAccept, so each bind of port 0 would pick a
+	// port of its own. The hold keeps the chosen port until Listen returns,
+	// not only until every worker is listening: a pause closes every listen
+	// socket and the resume binds the port again, which nothing else may have
+	// taken in between. It never listens, so it takes no connection.
+	concrete, hold, err := bindiag.ResolvePort0(e.cfg.Addr, parseAddr)
+	if err != nil {
+		return fmt.Errorf("io_uring: %w", err)
+	}
+	defer func() { _ = hold.Close() }()
+	e.cfg.Addr = concrete
+	if portHoldHook != nil {
+		portHoldHook(concrete)
+	}
+
+	resolved := e.cfg.Resources.Resolve()
+
+	// celeris#909: the CPU of worker i is the i-th member of the process's
+	// allowed set, and on a big.LITTLE host never a little CPU. The plan sets
+	// the worker count (celeris#1036): on a big.LITTLE host it holds at most
+	// one worker per non-little CPU, fewer than the default GOMAXPROCS, every
+	// one pinned.
+	//
+	// RLIMIT_MEMLOCK bounds the plan, not the request. Each worker locks ~12 MB
+	// for its ring + buffers; the systemd / kernel default of 8 MB only fits
+	// one. Without a cap, the engine would error out on the first worker past
+	// the limit with ENOMEM; capping lets a default-ulimit cloud VM keep
+	// running on fewer workers (and logs the cap, only when it binds, so the
+	// operator can raise the limit if they want full parallelism).
+	plan := planWithinMemlock(resolved.Workers, e.cfg.Resources.Workers > 0, e.cfg.Addr, e.cfg.Logger)
+	cpus := plan.CPUs
+	resolved.Workers = len(cpus)
+
+	// Probe for the highest working tier by test-creating a ring.
+	tier := e.tier
+	for {
+		testRing, err := NewRing(uint32(resolved.SQERingSize), tier.SetupFlags(), tier.SQPollIdle())
+		if err == nil {
+			_ = testRing.Close()
+			break
+		}
+		lower := fallbackTier(tier)
+		if lower == nil {
+			return fmt.Errorf("all io_uring tiers failed, last error: %w", err)
+		}
+		e.cfg.Logger.Warn("io_uring tier failed, falling back",
+			"failed_tier", tier.Tier().String(),
+			"fallback_tier", lower.Tier().String(),
+			"err", err,
+		)
+		tier = lower
+	}
+	workers, err := e.createWorkers(tier, cpus, resolved)
+	if err != nil {
+		return fmt.Errorf("worker init: %w", err)
+	}
+
+	// Inner context allows canceling workers if any fail during init.
+	innerCtx, innerCancel := context.WithCancel(ctx)
+	defer innerCancel()
+
+	var wg sync.WaitGroup
+	for _, w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.runWatched(innerCtx, w)
+		}()
+	}
+
+	// A start that fails drops the failures its workers recorded; the engine
+	// that serves takes them below.
+	defer func() { _ = takePinFailures(workers) }()
+
+	// Wait for all workers to finish ring initialization (done inside run()
+	// after LockOSThread, required by SINGLE_ISSUER).
+	for _, w := range workers {
+		if initErr := <-w.ready; initErr != nil {
+			// A worker failed to create its ring. Cancel all workers.
+			innerCancel()
+			wg.Wait()
+			return initErr
+		}
+	}
+	// Every worker has pinned (or failed to) before it reported ready.
+	platform.LogPinOutcome(e.cfg.Logger, "io_uring", nicIRQReport(e.cfg.Logger, plan, e.cfg.Addr), takePinFailures(workers))
+
+	// celeris#639: publish an address a worker recorded before it signalled
+	// ready, never getsockname on a listenFD the worker may have closed since,
+	// and refuse to start rather than publish nil: every caller that polls
+	// Addr() reads nil as "not bound yet" and waits.
+	var addr net.Addr
+	for _, w := range workers {
+		if w.listenAddr != nil {
+			addr = w.listenAddr
+			break
+		}
+	}
+	if len(workers) > 0 && addr == nil {
+		innerCancel()
+		wg.Wait()
+		return fmt.Errorf("io_uring: no worker could report the address it bound for %s", e.cfg.Addr)
+	}
+
+	e.mu.Lock()
+	e.tier = tier
+	e.workers = workers
+	e.mu.Unlock()
+	if addr != nil {
+		e.addr.Store(&addr)
+	}
+
+	e.cfg.Logger.Info("io_uring engine listening",
+		"addr", e.cfg.Addr,
+		"tier", tier.Tier().String(),
+		"workers", resolved.Workers,
+		"sqpoll", tier.SQPollIdle() > 0,
+		"send_zc", tier.SupportsSendZC(),
+		"fixed_files", fixedFilesEnabled(tier.SupportsFixedFiles()),
+		"numa_nodes", e.profile.NUMANodes,
+		"kernel", e.profile.KernelVersion,
+	)
+	if e.cfg.AsyncH2Reachable() {
+		e.cfg.Logger.Info(resource.AsyncH2Notice)
+	}
+
+	<-ctx.Done()
+	// Workers use SubmitAndWaitTimeout and check ctx.Err() on each iteration,
+	// so they will exit within ~100ms of context cancellation. Except the one
+	// that is waiting for SEND completions without a timeout (the loop's
+	// mode 3a), which a peer that does not read never gives: it is woken, once
+	// the workers' own context is cancelled (innerCancel; ctx's reaches it
+	// through a goroutine of its own, and a wake that came before it would find
+	// the context live and go back to the wait), through the wake eventfd whose
+	// POLL_ADD the loop keeps armed in every mode. From the next iteration on
+	// every wait is bounded (Worker.draining; celeris#806).
+	innerCancel()
+	for _, w := range workers {
+		w.wakeFD.Signal()
+	}
+	wg.Wait()
+	return nil
+}
+
+func (e *Engine) createWorkers(tier TierStrategy, cpus []int,
+	resolved resource.ResolvedResources) ([]*Worker, error) {
+	workers := make([]*Worker, len(cpus))
+	for i := range workers {
+		w, err := newWorker(i, cpus[i], tier, e.handler,
+			resolved, e.cfg,
+			&e.metrics.reqCount, &e.metrics.activeConns, &e.metrics.errs,
+			&e.metrics.asyncPromoted, &e.acceptPaused,
+			&e.metrics.acceptCount, &e.metrics.closeCount,
+			&e.metrics.bytesRead, &e.metrics.bytesWritten)
+		if err != nil {
+			// Clean up already-created workers.
+			for _, prev := range workers[:i] {
+				if prev != nil {
+					prev.shutdown()
+				}
+			}
+			return nil, err
+		}
+		w.transplantCount = &e.metrics.transplantCount // #383 transplant counter
+		w.recvArm = &e.metrics.recvArm                 // #586 recv-arming witnesses
+		w.detachedConns = &e.metrics.detachedConns
+		w.detachWindowCloses = &e.metrics.detachWindowCloses
+		w.zc = &e.metrics.zc // #591 SEND_ZC exposure witnesses
+		// The rest of the #383 hand-off ledger + the silent-close counter
+		// (celeris#624).
+		w.transplantDetached = &e.metrics.transplantDetached
+		w.transplantSlotOccupied = &e.metrics.transplantSlotOccupied
+		w.closeMissingConnState = &e.metrics.closeMissingConnState
+		w.transplantHandoffRefused = &e.metrics.transplantHandoffRefused
+		w.transplantAdoptRefused = &e.metrics.transplantAdoptRefused
+		w.handoffLoss = &e.metrics.handoffLoss // celeris#657 witnesses
+		w.sweepCnt = &e.metrics.sweep          // celeris#657 P9 sweep witnesses
+		w.asyncCancelFlags = e.asyncCancelFlags
+		w.multishotRecv = e.multishotRecv
+		w.pause = &e.pause // celeris#662 pause linger
+		w.drainBudget = &e.drainBudget
+		workers[i] = w
+	}
+	return workers, nil
+}
+
+// fallbackTier drops the current tier strategy one rung. Invoked when
+// NewRing fails (e.g. the kernel rejected a setup flag we asked for) so
+// the engine can re-attempt at a lower capability instead of refusing
+// to start.
+func fallbackTier(current TierStrategy) TierStrategy {
+	switch t := current.(type) {
+	case *optionalTier:
+		return &highTier{
+			deferTaskrun:    t.deferTaskrun,
+			fixedFiles:      t.fixedFiles,
+			sendZC:          t.sendZC,
+			multishotAccept: t.multishotAccept,
+			multishotRecv:   t.multishotRecv,
+		}
+	case *highTier:
+		return &baseTier{}
+	default:
+		return nil
+	}
+}
+
+// Shutdown does not stop the io_uring engine itself — graceful shutdown is
+// driven by context cancellation on Listen's parent context. Workers
+// exit their run loops on ctx.Done, drain the responses still queued for
+// the ring (Worker.hasPendingSends, celeris#595) and call Worker.shutdown,
+// which joins async dispatch goroutines via asyncWG. Server.Shutdown waits
+// for Listen to return before it runs the OnShutdown hooks (celeris#703).
+// See epoll engine Shutdown for the same rationale.
+//
+// That parent context is always cancellable: every Server.Start* entry
+// point owns one and Server.Shutdown cancels it after the graceful phase.
+// Handing Listen a context.Background() is what made Start hang here
+// (celeris#595), since this method cannot wake it.
+//
+// What Shutdown does is hand ctx to the workers as the budget of their wait
+// for the HTTP/2 stream handlers still running on the shared worker pool
+// when Listen's context is cancelled (celeris#759): Server.Shutdown calls it
+// before it cancels that context.
+func (e *Engine) Shutdown(ctx context.Context) error {
+	e.drainBudget.Store(&ctx)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return nil
+}
+
+// Metrics returns a snapshot of engine metrics.
+//
+// The worker count is read under e.mu. Listen starts the worker
+// goroutines before it assigns e.workers (it waits for every ring to
+// come up first), so a worker already serving a request can reach this
+// method through Server.EngineInfo while the slice is still being
+// written; the race detector reported exactly that pair in 7 of 16
+// io_uring cells of probatorium's first -race matrix run (celeris#578).
+func (e *Engine) Metrics() engine.EngineMetrics {
+	e.mu.Lock()
+	workers := len(e.workers)
+	e.mu.Unlock()
+	m := engine.EngineMetrics{
+		RequestCount:       e.metrics.reqCount.Load(),
+		ActiveConnections:  e.metrics.activeConns.Load(),
+		AsyncRoutes:        e.asyncRoutes,
+		AsyncPromotedConns: e.metrics.asyncPromoted.Load(),
+		Workers:            workers,
+		AcceptCount:        e.metrics.acceptCount.Load(),
+		CloseCount:         e.metrics.closeCount.Load(),
+		BytesRead:          e.metrics.bytesRead.Load(),
+		BytesWritten:       e.metrics.bytesWritten.Load(),
+
+		RecvResumeWhileCancelPending: e.metrics.recvArm.resumeWhileCancelPending.Load(),
+		RecvResumeWhileRecvInFlight:  e.metrics.recvArm.resumeWhileRecvInFlight.Load(),
+		RecvArmDeclined:              e.metrics.recvArm.armDeclined.Load(),
+		RecvDoubleArmed:              e.metrics.recvArm.doubleArmed.Load(),
+		RecvCQEUnaccounted:           e.metrics.recvArm.cqeUnaccounted.Load(),
+		RecvSQFull:                   e.metrics.recvArm.sqFullRecv.Load(),
+		RecvStallEpisodes:            e.metrics.recvArm.stallEpisodes.Load(),
+		RecvStallNanos:               e.metrics.recvArm.stallNanos.Load(),
+		RecvStallMaxNanos:            e.metrics.recvArm.stallMaxNanos.Load(),
+		RecvLinkedArms:               e.metrics.recvArm.linkedRecvArms.Load(),
+		RecvLinkedBlockedNanos:       e.metrics.recvArm.linkedRecvBlockedNanos.Load(),
+		RecvLinkedBlockedMaxNanos:    e.metrics.recvArm.linkedRecvBlockedMax.Load(),
+		DetachedConnections:          e.metrics.detachedConns.Load(),
+		DetachWindowCloses:           e.metrics.detachWindowCloses.Load(),
+		ZCSendsSubmitted:             e.metrics.zc.submits.Load(),
+		ZCNotifs:                     e.metrics.zc.notifs.Load(),
+		InlineBytes:                  e.metrics.zc.inlineBytes.Load(),
+		RingBytes:                    e.metrics.zc.ringBytes.Load(),
+
+		TransplantAdopted:           e.metrics.transplantCount.Load(),
+		TransplantDetached:          e.metrics.transplantDetached.Load(),
+		TransplantAdoptSlotOccupied: e.metrics.transplantSlotOccupied.Load(),
+		TransplantHandoffRefused:    e.metrics.transplantHandoffRefused.Load(),
+		TransplantAdoptRefused:      e.metrics.transplantAdoptRefused.Load(),
+		CloseMissingConnState:       e.metrics.closeMissingConnState.Load(),
+
+		StaleRecvDataClosed:       e.metrics.handoffLoss.staleRecvDataClosed.Load(),
+		StaleRecvDataTransplanted: e.metrics.handoffLoss.staleRecvDataTransplanted.Load(),
+		StaleRecvDataUnattributed: e.metrics.handoffLoss.staleRecvDataUnattributed.Load(),
+		TransplantHandoffInFlight: e.metrics.handoffLoss.handoffInFlight.Load(),
+		TransplantHeld:            e.metrics.handoffLoss.held.Load(),
+		TransplantReaps:           e.metrics.handoffLoss.reaps.Load(),
+		TransplantReapMisses:      e.metrics.handoffLoss.reapMisses.Load(),
+		TransplantHoldRescued:     e.metrics.handoffLoss.holdRescued.Load(),
+		TransplantDoubleClaim:     e.metrics.handoffLoss.doubleClaim.Load(),
+		TransplantClaimDeferred:   e.metrics.handoffLoss.claimDeferred.Load(),
+		TransplantReapFailed:      e.metrics.handoffLoss.reapFailed.Load(),
+		TransplantReapUnsupported: e.metrics.handoffLoss.reapUnsupported.Load(),
+		CloseFDDeferred:           e.metrics.handoffLoss.closeFDDeferred.Load(),
+		CloseFDForced:             e.metrics.handoffLoss.closeFDForced.Load(),
+		CloseZCNotifHeld:          e.metrics.handoffLoss.zcNotifHeld.Load(),
+		CloseZCNotifForced:        e.metrics.handoffLoss.zcNotifForced.Load(),
+		ShutdownZCBufRetained:     e.metrics.handoffLoss.zcBufRetained.Load(),
+		// Gauges: each worker takes off only what it added, after it, so
+		// neither goes below 0; the clamp only keeps a bug from showing
+		// as 2^64.
+		CloseZCNotifHeldNow:   uint64(max(0, e.metrics.handoffLoss.zcHeldNow.Load())),
+		CloseZCNotifHeldBytes: uint64(max(0, e.metrics.handoffLoss.zcHeldBytes.Load())),
+
+		TransplantSweepPasses:       e.metrics.sweep.passes.Load(),
+		TransplantResidualDetached:  e.metrics.sweep.residual[resDetached].Load(),
+		TransplantResidualH2:        e.metrics.sweep.residual[resH2].Load(),
+		TransplantResidualPinned:    e.metrics.sweep.residual[resPinned].Load(),
+		TransplantResidualUnstarted: e.metrics.sweep.residual[resUnstarted].Load(),
+		TransplantResidualBusy:      e.metrics.sweep.residual[resBusy].Load(),
+	}
+	// ErrorCount and its eleven buckets, together, from one snapshot
+	// (celeris#645).
+	engine.FillErrorClasses(&m, e.metrics.errs.Snapshot())
+	return m
+}
+
+// Type returns the engine type.
+func (e *Engine) Type() engine.EngineType {
+	return engine.IOUring
+}
+
+// BeginPauseAccept starts pausing accept and returns without waiting
+// (celeris#662). Each worker then, on its own thread, clears
+// TCP_DEFER_ACCEPT on its listener, keeps its accept armed and keeps
+// serving for the linger (about 1.5 s from that clear), and cancels the
+// accept and closes the listener once it has drained the accept queue. A
+// connection whose handshake completed before the pause but which has sent
+// nothing yet is promoted by the kernel during the linger and served like
+// any other, instead of being reset by the close.
+//
+// It does not promise a prompt start: a worker sees the flag at its next
+// ring wakeup, which on an idle plain-HTTP/1 worker can be up to 100 ms
+// away. Correctness does not depend on that, because each listener's
+// deadline is taken at its own clear.
+//
+// It reads net.ipv4.tcp_synack_retries once, here. When that reads 0, the
+// pausing listeners also get TCP_SYNCNT=1, without which the kernel would
+// drop the connections it deferred instead of promoting them. The adaptive
+// engine calls BeginPauseAccept for the sub-engine a switch leaves, so a
+// switch does not wait for the linger.
+func (e *Engine) BeginPauseAccept() {
+	e.pause.Begin(e.cfg.Logger, "io_uring")
+	e.acceptPaused.Store(true)
+}
+
+// PauseAccept stops accepting new connections. It is BeginPauseAccept
+// followed by a wait that returns once every worker has cancelled its
+// accept and closed its listen socket, so the SO_REUSEPORT group has shed
+// this engine; or once a ResumeAccept has withdrawn the pause; or once every
+// worker has exited; or, best effort, one second after the linger should
+// have ended.
+//
+// So it takes about 1.5 s, the linger, and the engine keeps admitting
+// connections meanwhile: that is how a connection that completed its
+// handshake before the pause but had not sent its request yet is served
+// rather than reset (celeris#662, celeris#675). Connections already
+// accepted continue to be served, and those still in a worker's accept
+// queue at the close are accepted and served too. A listener built with
+// resource.Config.DisableDeferAccept has nothing to linger for and closes
+// at once.
+func (e *Engine) PauseAccept() error {
+	e.BeginPauseAccept()
+	e.mu.Lock()
+	workers := append([]*Worker(nil), e.workers...)
+	e.mu.Unlock()
+	if len(workers) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(max(deferlinger.Linger(), 0) + time.Second)
+	for {
+		// Take the channel BEFORE reading the flags: a worker that closes
+		// its listener after the read below closes this channel, so the
+		// wait cannot miss it (deferlinger.PauseState.Changed).
+		changed := e.pause.Changed()
+		if !e.acceptPaused.Load() {
+			return nil // a ResumeAccept withdrew the pause
+		}
+		allClosed := true
+		for _, w := range workers {
+			if !w.listenFDClosed.Load() && !w.exited.Load() {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed {
+			return nil
+		}
+		// Blocks until a worker closes its listener or exits, a resume, or
+		// the re-check (deferlinger.WaitRecheck), instead of polling every
+		// millisecond through the linger (celeris#662 review: ~1,500
+		// wakeups per pause, 65-73 ms of CPU on an idle io_uring engine).
+		if !deferlinger.WaitChanged(changed, deadline) {
+			return nil // best-effort: do not surface the timeout, the FD will close shortly
+		}
+	}
+}
+
+// ResumeAccept starts accepting new connections again.
+// Wakes any suspended workers so they re-create listen sockets.
+func (e *Engine) ResumeAccept() error {
+	e.acceptPaused.Store(false)
+	// A PauseAccept still waiting returns now: its pause is withdrawn.
+	e.pause.Notify()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, w := range e.workers {
+		// Re-arm the close-confirmation flag so a subsequent Pause cycle
+		// blocks on the new listen FD rather than the previously-closed
+		// one. A worker that has exited is re-armed too, and has nothing to
+		// close again: PauseAccept counts it by exited.
+		w.listenFDClosed.Store(false)
+		w.wakeIfSuspended()
+		// A worker that has not parked closed its listener at the pause and
+		// went back to its ring wait, which is up to a second long with no
+		// listener (Worker.baseTimeout). That is a worker that holds a
+		// connection, and also an idle one in the second after the pause
+		// (it parks at the iteration after the close, which is after that
+		// first wait). wakeIfSuspended does not reach it: the wake eventfd,
+		// whose POLL_ADD the worker keeps armed in every mode, does
+		// (celeris#886). A leaf lock and one write(2); a worker that is
+		// running just reads the counter at its next wakeup.
+		w.wakeFD.Signal()
+	}
+	return nil
+}
+
+// wakeIfSuspended ends a DRAINING→SUSPENDED park: if the worker is parked,
+// close its wake channel, give it a fresh one and clear suspended. Safe from
+// any goroutine; a no-op on a worker that is running. A running worker (one
+// that holds a connection, or has not yet reached the park) is reached by the
+// wake eventfd instead, which ResumeAccept signals after this call
+// (celeris#886).
+//
+// The park waits on a Go channel, not on the ring, so an eventfd write does
+// not end it — only this does. ResumeAccept is one caller. The driver-action
+// queue is the other: AdoptConn (and a driver's RegisterConn / Write /
+// UnregisterConn) arrives from another goroutine while the worker has no
+// connection and no listener to wake it for, and without the kick a standby
+// worker slept through a transplanted descriptor until the next ResumeAccept —
+// forever, if the engine stayed the standby — while the source already counted
+// the hand-off done (celeris#658).
+//
+// No wakeup can be lost. A waker publishes its work — sets the flag the park
+// watches — BEFORE it takes wakeMu, and the worker re-checks those flags UNDER
+// wakeMu before it sets suspended. The mutex serialises the two: if the
+// worker's check runs first, the waker finds suspended set and closes wake; if
+// the waker's runs first, the flag is already set and the worker does not park.
+//
+// Lock order: e.mu → wakeMu (ResumeAccept) is the only nesting. wakeMu is a
+// leaf — nothing is acquired while it is held — so no caller may hold
+// driverActionMu or detachQMu when it calls this.
+func (w *Worker) wakeIfSuspended() {
+	w.wakeMu.Lock()
+	if w.suspended.Load() {
+		close(w.wake)
+		w.wake = make(chan struct{})
+		w.suspended.Store(false)
+	}
+	w.wakeMu.Unlock()
+}
+
+var (
+	_ engine.Engine            = (*Engine)(nil)
+	_ engine.AcceptController  = (*Engine)(nil)
+	_ engine.EventLoopProvider = (*Engine)(nil)
+)
+
+// NumWorkers returns the number of worker event loops available for
+// driver FD registration.
+func (e *Engine) NumWorkers() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.workers)
+}
+
+// WorkerLoop returns the WorkerLoop for worker n. Out-of-range n is
+// reduced modulo NumWorkers so callers can hash a connection / FD across
+// the available pool without first reading NumWorkers — important now
+// that workers can be capped below NumCPU by RLIMIT_MEMLOCK.
+// Negative n is mirrored to the positive side first. Panics only when
+// the engine has no workers (i.e. Listen has not yet started).
+func (e *Engine) WorkerLoop(n int) engine.WorkerLoop {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	count := len(e.workers)
+	if count == 0 {
+		panic("celeris/iouring: WorkerLoop called before Listen")
+	}
+	idx := n % count
+	if idx < 0 {
+		idx += count
+	}
+	return e.workers[idx]
+}
+
+// Addr returns the bound listener address.
+func (e *Engine) Addr() net.Addr {
+	if p := e.addr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}

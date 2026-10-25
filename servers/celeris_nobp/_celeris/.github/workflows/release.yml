@@ -1,0 +1,151 @@
+name: Release
+
+# Follow-through for a release you publish by hand.
+#
+# There is deliberately no automation that CREATES a release. That was tried
+# and removed: GitHub fires no workflow for the created, edited or deleted
+# activity types on DRAFT releases, so nothing can prepare anything while a
+# release is still a draft, and the tag exists the instant Publish is
+# clicked. A stale version stamp at that moment could only be repaired by
+# moving the tag, and a published tag must never move -- every one is in
+# sum.golang.org, where a moved tag gives existing consumers a checksum
+# mismatch that reads as a supply-chain compromise.
+#
+# So the stamps have to be right BEFORE the tag exists. That is what the
+# Release Checklist workflow is for: it opens a reminder when the milestone
+# is created, listing every version and where it lives.
+#
+# What is left here is the part that cannot get the version wrong, because it
+# reads it off the tag you created: verify the stamps, then tag the
+# sub-modules and warm the Go module proxy. The gate still runs first, and
+# nothing downstream runs if it fails, because a sub-module tag pinning the
+# wrong celeris version cannot be corrected afterwards.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Version and semver format
+        id: v
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          TAG="$RELEASE_TAG"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+            echo "::error::Tag '$TAG' is not valid semver (expected vX.Y.Z or vX.Y.Z-beta.N)"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Following up on $TAG"
+
+  gate:
+    name: Version stamps agree
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # mage is a `tool` of .github/tools (pinned by its go.sum, bumped by
+      # Dependabot), so it needs Go but no install (celeris#890). This job
+      # used to rely on the runner image's Go.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # A release-triggered job does not restore a cache that other runs
+          # can write (zizmor cache-poisoning); building mage takes seconds.
+          cache: false
+      - name: mage CheckRelease
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: GOWORK=off go tool -modfile="$GITHUB_WORKSPACE/.github/tools/go.mod" mage CheckRelease
+
+  ci:
+    name: CI
+    needs: [resolve, gate]
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 rejects the `$/` form
+
+  tag-submodules:
+    name: Tag Sub-Modules
+    needs: [resolve, gate, ci]
+    # Nothing here runs unless the stamps agree and CI is green on the
+    # tagged commit. A sub-module tag pinning the wrong celeris version
+    # cannot be corrected once published: every tag is in sum.golang.org,
+    # and moving one gives existing consumers a checksum mismatch. So a
+    # release whose gate fails gets no sub-module tags and no proxy ping,
+    # and the recovery is a new version rather than a repair.
+    #
+    # Written as an explicit success check rather than `|| skipped`: an
+    # earlier version of this condition treated a skipped upstream job as
+    # permission to continue, which tagged the sub-modules and burned the
+    # version on the proxy after the gate had declined it.
+    if: always() && needs.gate.result == 'success' && needs.ci.result == 'success'
+    runs-on: ubuntu-latest
+    # The only job that pushes to the repository (sub-module tags).
+    permissions:
+      contents: write
+    steps:
+      # Keeps the job token: this is the one step that pushes (sub-module tags).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: # zizmor: ignore[artipacked]
+          fetch-depth: 0
+          ref: ${{ needs.resolve.outputs.version }}
+      - name: Create sub-module tags
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          SUBMODULES="middleware/compress middleware/metrics middleware/otel middleware/protobuf"
+          for sub in $SUBMODULES; do
+            TAG="${sub}/${VERSION}"
+            if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "Tag ${TAG} already exists, skipping"
+            else
+              echo "Creating tag ${TAG}"
+              git tag "${TAG}"
+            fi
+          done
+          git push origin --tags
+
+  notify-proxy:
+    name: Notify Go Proxy
+    needs: [resolve, tag-submodules]
+    if: always() && needs.tag-submodules.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+          cache: false
+      - name: Request the root module and the sub-modules from the proxy
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          for MODULE in github.com/goceleris/celeris github.com/goceleris/celeris/middleware/compress github.com/goceleris/celeris/middleware/metrics github.com/goceleris/celeris/middleware/otel github.com/goceleris/celeris/middleware/protobuf; do
+            echo "Notifying proxy for ${MODULE}@${VERSION}..."
+            for attempt in 1 2 3; do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://proxy.golang.org/${MODULE}/@v/${VERSION}.info")
+              if [ "$STATUS" = "200" ]; then
+                echo "Proxy responded with 200 for ${MODULE}@${VERSION}"
+                break
+              fi
+              echo "Attempt $attempt: proxy returned $STATUS, retrying in 10s..."
+              sleep 10
+            done
+          done
+      - name: Verify module availability
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          for MODULE in github.com/goceleris/celeris github.com/goceleris/celeris/middleware/compress github.com/goceleris/celeris/middleware/metrics github.com/goceleris/celeris/middleware/otel github.com/goceleris/celeris/middleware/protobuf; do
+            go list -m "${MODULE}@${VERSION}" || echo "${MODULE} not yet indexed"
+          done

@@ -1,0 +1,586 @@
+package redis
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/goceleris/celeris/driver/internal/async"
+)
+
+// Message is one pub/sub notification. Pattern is set only for PSUBSCRIBE
+// deliveries ("pmessage" push type). Shard is true for shard channel
+// deliveries ("smessage" push type, Redis 7+).
+type Message struct {
+	Channel string
+	Pattern string
+	Payload string
+	Shard   bool
+}
+
+// PubSub is a dedicated pub/sub connection. Callers read from [PubSub.Channel]
+// and use [PubSub.Subscribe] / [PubSub.Unsubscribe] / [PubSub.PSubscribe] /
+// [PubSub.PUnsubscribe] to alter the subscription set.
+//
+// The connection is re-established automatically on transport errors: a
+// hook registered with the underlying redisConn fires when the FD closes and
+// a background goroutine dials a replacement, re-sends SUBSCRIBE/PSUBSCRIBE
+// for every tracked channel/pattern, and resumes message delivery. Messages
+// arriving while the conn is down are lost (at-most-once delivery).
+//
+// Callers should treat subscribe/unsubscribe as "at most once" — the server
+// ack is not tracked synchronously. The channel returned by [PubSub.Channel]
+// is closed once [PubSub.Close] is called or the reconnect loop gives up.
+//
+// A subscribe/unsubscribe call on an open PubSub whose connection is down is
+// not sent: it returns [ErrPubSubConnDown] (match it with errors.Is; it is
+// neither [ErrClosed] nor [ErrUnknownFD], the error the engine's event loop
+// returns for a descriptor it has forgotten), the subscription set is updated
+// and the reconnect replays it, so the call need not be repeated, while the
+// [Client] is open. [Client.Close] does not close the PubSub (its conn is
+// checked out of the pool), but a Client that owns its event loop (no
+// WithEngine) releases the loop with it, which takes the PubSub's conn down at
+// once. After [Client.Close] the reconnect has no pool to dial: a PubSub whose
+// conn is down then returns [ErrPubSubConnDown] from its control calls until
+// [PubSub.Close], and the replay never happens. The constructors
+// [Client.Subscribe], [Client.PSubscribe] and [ClusterClient.SSubscribe] apply
+// the same rule to their first call: they return the PubSub and a nil error,
+// not [ErrPubSubConnDown]; the PubSub then retries the address of that one
+// node (it does not follow a cluster slot move). Any other error
+// from the write (for example [ErrQueueFull] on a live connection) means the
+// command was not sent and nothing replays it before the next reconnect.
+// [ErrClosed] means the PubSub itself is closed, also when [PubSub.Close] raced
+// the call. [PubSub.Close] waits for a control call that is already writing to
+// return before it releases the connection.
+type PubSub struct {
+	client *Client
+
+	// ctlMu keeps a control write and the release of its conn apart
+	// (celeris#929). A conn is written by its file-descriptor number, and the
+	// number goes back to the kernel the moment the conn is closed, so a write
+	// that reaches loop.Write after that lands on whichever socket took the
+	// number. Every control write (Subscribe, Unsubscribe, ...) and every
+	// resubscribe of the reconnect loop holds ctlMu from before it reads
+	// ps.conn until its write has returned. Whoever takes a conn out of
+	// ps.conn (Close, the reconnect loop) releases it only after it has
+	// passed through ctlMu with the conn already out, so no write that read
+	// the conn is still in flight.
+	//
+	// Lock order: ctlMu, then mu. Never take ctlMu from deliver, onRecv,
+	// onClose or the close hook: the worker goroutine runs those. A ctlMu
+	// holder waits for no worker: the loops' Write and UnregisterConn take a
+	// per-conn lock that no loop holds across onRecv, and the standalone
+	// non-Linux loop's blocking Write is cut short by UnregisterConn, which
+	// Close runs before it waits for ctlMu (detach). mu is held across no
+	// write and no release, so deliver, which takes mu on the worker, is
+	// never delayed by I/O.
+	ctlMu     sync.Mutex
+	mu        sync.Mutex
+	conn      *redisConn
+	subs      map[string]struct{}
+	psubs     map[string]struct{}
+	shardSubs map[string]struct{}
+	msgCh     chan *Message
+	closeCh   chan struct{}
+	closed    atomic.Bool
+
+	// reconnecting is set while a reconnect goroutine is active. Guards
+	// against double-fires from both onRecv-error and onClose in the same
+	// conn teardown.
+	reconnectingMu sync.Mutex
+	reconnecting   bool
+
+	closeMsgOnce sync.Once
+
+	backoff *async.Backoff
+	// drops counts Messages dropped because msgCh was full.
+	drops atomic.Uint64
+}
+
+// Subscribe opens a pub/sub conn and subscribes to channels. With no channels
+// it only opens the conn. If the conn is found down on the first SUBSCRIBE
+// (the call would return [ErrPubSubConnDown] on an open PubSub) Subscribe
+// still returns the PubSub and a nil error: the channels are tracked and the
+// reconnect replays them, as for any later control call.
+func (c *Client) Subscribe(ctx context.Context, channels ...string) (*PubSub, error) {
+	ps, err := c.newPubSub(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(channels) > 0 {
+		return ps.firstControl(ps.Subscribe(ctx, channels...))
+	}
+	return ps, nil
+}
+
+// PSubscribe opens a pub/sub conn and subscribes to patterns. With no patterns
+// it only opens the conn. Like [Client.Subscribe], it returns the PubSub and a
+// nil error when the conn is found down on the first PSUBSCRIBE: the reconnect
+// replays the patterns.
+func (c *Client) PSubscribe(ctx context.Context, patterns ...string) (*PubSub, error) {
+	ps, err := c.newPubSub(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(patterns) > 0 {
+		return ps.firstControl(ps.PSubscribe(ctx, patterns...))
+	}
+	return ps, nil
+}
+
+// firstControl is the tail of a constructor that made one control call on the
+// PubSub it just built. [ErrPubSubConnDown] means the call was not sent but the
+// subscription set holds it and the reconnect replays it (every conn that goes
+// down reaches onConnDrop: the loop's close hook, or the re-check in
+// newPubSub), so the PubSub is kept and returned, as the [PubSub] doc promises
+// for a control call (celeris#887 item 12). Any other error means the command
+// was not sent and nothing replays it: the PubSub is closed and not returned.
+// A caller that must not keep a PubSub whose first call was not sent (the
+// sentinel caller: its reconnect would retry one address for ever) does not
+// use this: it calls newPubSub and the control method itself and reads the
+// error.
+func (ps *PubSub) firstControl(err error) (*PubSub, error) {
+	if err == nil || errors.Is(err, ErrPubSubConnDown) {
+		return ps, nil
+	}
+	_ = ps.Close()
+	return nil, err
+}
+
+// testHookBeforeBind, when non-nil, runs in newPubSub after the pool handed
+// out the conn and before bindConn. It is nil in production; a test sets it to
+// stage a conn that closes in that window (celeris#887 item 14). newPubSub
+// loads it atomically, so a leftover goroutine of an earlier test that builds
+// a PubSub cannot race with a test that sets or resets it; a test that sets it
+// still must not run beside another test that builds a PubSub it does not want
+// the hook to fire on (no t.Parallel), and resets it to nil when it is done.
+var testHookBeforeBind atomic.Pointer[func(conn *redisConn)]
+
+func (c *Client) newPubSub(ctx context.Context) (*PubSub, error) {
+	conn, err := c.pool.acquirePubSub(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if h := testHookBeforeBind.Load(); h != nil {
+		(*h)(conn)
+	}
+	ps := &PubSub{
+		client:    c,
+		conn:      conn,
+		subs:      map[string]struct{}{},
+		psubs:     map[string]struct{}{},
+		shardSubs: map[string]struct{}{},
+		msgCh:     make(chan *Message, defaultPubSubChanBuf),
+		closeCh:   make(chan struct{}),
+		backoff:   async.NewBackoff(50*time.Millisecond, 5*time.Second),
+	}
+	ps.bindConn(conn)
+	// The conn may have closed while the pool was handing it out, before the
+	// close hook was set above (the loop's teardown runs the hook once, and a
+	// conn with no hook does not keep it for later): the hook would never
+	// fire and no reconnect would start, so the control calls would return
+	// ErrPubSubConnDown for ever (celeris#887 item 14). conn.closed is stored
+	// before the hook runs, so a close after this check reaches the hook, and
+	// one before it is seen here; onConnDrop ignores the second of two drops.
+	if conn.closed.Load() {
+		ps.onConnDrop(nil)
+	}
+	return ps, nil
+}
+
+// bindConn wires ps into conn: router + close hook.
+func (ps *PubSub) bindConn(conn *redisConn) {
+	conn.state.router.set(ps)
+	conn.setPubSubCloseHook(ps.onConnDrop)
+}
+
+// Channel returns the read-only message stream. It remains open until Close
+// is called or the reconnect loop exhausts its retries.
+func (ps *PubSub) Channel() <-chan *Message {
+	return ps.msgCh
+}
+
+// Drops returns the number of messages dropped because the channel buffer was
+// full.
+func (ps *PubSub) Drops() uint64 { return ps.drops.Load() }
+
+// Subscribe adds channels to the subscription set. The ctx argument is kept
+// for API symmetry with [Client.Subscribe]; cancellation is not honored.
+func (ps *PubSub) Subscribe(_ context.Context, channels ...string) error {
+	return ps.control("SUBSCRIBE", channels, func() {
+		for _, ch := range channels {
+			ps.subs[ch] = struct{}{}
+		}
+	})
+}
+
+// Unsubscribe removes channels. Empty list unsubscribes all. The ctx argument
+// is kept for API symmetry; cancellation is not honored.
+func (ps *PubSub) Unsubscribe(_ context.Context, channels ...string) error {
+	return ps.control("UNSUBSCRIBE", channels, func() {
+		if len(channels) == 0 {
+			ps.subs = map[string]struct{}{}
+			return
+		}
+		for _, ch := range channels {
+			delete(ps.subs, ch)
+		}
+	})
+}
+
+// PSubscribe adds patterns to the subscription set. The ctx argument is kept
+// for API symmetry; cancellation is not honored.
+func (ps *PubSub) PSubscribe(_ context.Context, patterns ...string) error {
+	return ps.control("PSUBSCRIBE", patterns, func() {
+		for _, p := range patterns {
+			ps.psubs[p] = struct{}{}
+		}
+	})
+}
+
+// PUnsubscribe removes patterns. Empty list unsubscribes all patterns. The
+// ctx argument is kept for API symmetry; cancellation is not honored.
+func (ps *PubSub) PUnsubscribe(_ context.Context, patterns ...string) error {
+	return ps.control("PUNSUBSCRIBE", patterns, func() {
+		if len(patterns) == 0 {
+			ps.psubs = map[string]struct{}{}
+			return
+		}
+		for _, p := range patterns {
+			delete(ps.psubs, p)
+		}
+	})
+}
+
+// SSubscribe adds shard channels (Redis 7+ SSUBSCRIBE) to the subscription
+// set. Shard channels are scoped to the cluster slot of the channel name. The
+// ctx argument is kept for API symmetry; cancellation is not honored.
+func (ps *PubSub) SSubscribe(_ context.Context, channels ...string) error {
+	return ps.control("SSUBSCRIBE", channels, func() {
+		for _, ch := range channels {
+			ps.shardSubs[ch] = struct{}{}
+		}
+	})
+}
+
+// SUnsubscribe removes shard channels. Empty list unsubscribes all shard
+// channels. The ctx argument is kept for API symmetry; cancellation is not
+// honored.
+func (ps *PubSub) SUnsubscribe(_ context.Context, channels ...string) error {
+	return ps.control("SUNSUBSCRIBE", channels, func() {
+		if len(channels) == 0 {
+			ps.shardSubs = map[string]struct{}{}
+			return
+		}
+		for _, ch := range channels {
+			delete(ps.shardSubs, ch)
+		}
+	})
+}
+
+// control applies update to the tracked sets under mu, then sends verb with
+// names on the conn ps holds at that moment. The send runs under ctlMu, so
+// the conn cannot be released while it is in flight: the write goes to the
+// conn it was issued on or fails, and never reaches another socket that took
+// the conn's number (celeris#929). When ps has no conn (it is closed, or the
+// reconnect loop has not yet replaced a dropped one) the sets are still
+// updated, so the reconnect replays them, and the call returns
+// [ErrPubSubConnDown] (not ErrClosed: ErrClosed is final, and the PubSub is
+// open). ErrClosed is returned only when the PubSub is closed, including when
+// its Close raced the write and made it fail.
+func (ps *PubSub) control(verb string, names []string, update func()) error {
+	if ps.closed.Load() {
+		return ErrClosed
+	}
+	ps.ctlMu.Lock()
+	defer ps.ctlMu.Unlock()
+	ps.mu.Lock()
+	update()
+	conn := ps.conn
+	ps.mu.Unlock()
+	err := sendPubSubControl(conn, append([]string{verb}, names...))
+	if err == nil {
+		return nil
+	}
+	if ps.closed.Load() {
+		// Close raced the write (it unregisters the conn, which makes an
+		// in-flight write fail with the engine's internal error).
+		return ErrClosed
+	}
+	// ps is open. No conn (ps.conn is nil only while a reconnect attempt
+	// that failed is backing off: Close sets closed before it takes the
+	// conn), a conn already closed, or a conn the loop has forgotten before
+	// its onClose stored closed (ErrUnknownFD) all mean the conn is down and
+	// the reconnect loop replays the sets: tell the caller the write was not
+	// sent, but not that ps is closed.
+	if conn == nil || errors.Is(err, ErrClosed) || errors.Is(err, ErrUnknownFD) {
+		return ErrPubSubConnDown
+	}
+	return err
+}
+
+// ErrPubSubConnDown is what a control call (Subscribe, Unsubscribe,
+// PSubscribe, PUnsubscribe, SSubscribe, SUnsubscribe) returns on an open
+// PubSub whose conn is down: the command was not sent, but the subscription
+// set is updated, and the reconnect replays it while the [Client] is open, so
+// the caller need not repeat the call. After [Client.Close] the reconnect has
+// no pool to dial and nothing replays it (see the [PubSub] doc). The
+// constructors [Client.Subscribe], [Client.PSubscribe] and
+// [ClusterClient.SSubscribe] do not return it: they keep the PubSub and return
+// it with a nil error. It is not [ErrClosed] (the PubSub is open) and not
+// [ErrUnknownFD] (the driver maps that to this error when the loop forgot the
+// conn). Match it with errors.Is. Messages published while the conn is down are
+// lost, as the [PubSub] doc says.
+var ErrPubSubConnDown = errors.New("celeris-redis: pubsub conn down")
+
+// sendPubSubControl writes a control command without tracking a reply (pubsub
+// control frames are delivered as push). The caller holds ps.ctlMu and read
+// conn from ps.conn under it.
+func sendPubSubControl(conn *redisConn, args []string) error {
+	if conn == nil {
+		return ErrClosed
+	}
+	_, err := conn.writeCommand(args...)
+	return err
+}
+
+// Close tears down the pubsub conn and closes msgCh. It waits for a control
+// write that is in flight (Subscribe and the others) to return before it
+// releases the conn's descriptor; that write returns ErrClosed or succeeds.
+func (ps *PubSub) Close() error {
+	if !ps.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(ps.closeCh)
+	ps.mu.Lock()
+	conn := ps.conn
+	ps.conn = nil
+	ps.mu.Unlock()
+	if conn != nil {
+		// Detach first: unregistering the conn fails a control write that
+		// is still in flight on it (or unblocks one that waits on a full
+		// send buffer), and the number is still the conn's own, so that
+		// write cannot reach another socket. Then wait for every writer
+		// that read conn before it was taken out (ctlMu), and release the
+		// number under it, so none can start after the release either.
+		ps.detach(conn)
+		ps.ctlMu.Lock()
+		ps.client.pool.releasePubSub(conn)
+		ps.ctlMu.Unlock()
+	}
+	ps.closeMsgCh()
+	return nil
+}
+
+// detach unhooks conn from ps and removes it from its worker's interest set.
+// It does not release the conn's number; releasePubSub does, once.
+func (ps *PubSub) detach(conn *redisConn) {
+	conn.state.router.clear()
+	conn.setPubSubCloseHook(nil)
+	conn.unregister()
+}
+
+// takeConn clears ps.conn if it is still conn and reports whether the caller
+// now owns conn. Whoever takes a conn out of ps.conn is the one that releases
+// it, so every conn the pool handed out is released exactly once.
+func (ps *PubSub) takeConn(conn *redisConn) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.conn != conn {
+		return false
+	}
+	ps.conn = nil
+	return true
+}
+
+// closeMsgCh closes msgCh exactly once. Holds ps.mu to serialize with deliver.
+func (ps *PubSub) closeMsgCh() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.closeMsgOnce.Do(func() { close(ps.msgCh) })
+}
+
+// deliver pushes a message to msgCh; drops if the buffer is full. Holds ps.mu
+// to serialize with closeMsgCh, preventing sends on a closed channel.
+func (ps *PubSub) deliver(m *Message) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if ps.closed.Load() {
+		return false
+	}
+	select {
+	case ps.msgCh <- m:
+		return true
+	default:
+		ps.drops.Add(1)
+		// Drop oldest to make room.
+		select {
+		case <-ps.msgCh:
+		default:
+		}
+		select {
+		case ps.msgCh <- m:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+// onConnDrop is invoked (on its own goroutine) by the underlying conn's close
+// hook. It spawns the reconnect loop unless one is already running or the
+// PubSub is closed.
+//
+// It does not look at which conn dropped, and that is deliberate (celeris#887
+// item 9). The reconnect loop detaches the conn it replaces (detach clears its
+// close hook) before it releases it, and a hook fires once, so a hook that
+// reaches here for a conn that is no longer ps.conn can only be one that was
+// already running when the conn was replaced. The worst it does is start one
+// reconnect that replaces a live conn with a fresh one and releases the old,
+// once: harmless. Comparing the dropped conn with ps.conn would avoid that
+// extra dial and cost a signature change in the hook plumbing and a second
+// lock on this path. No subscription is lost by the extra reconnect; a message
+// published in the swap window (the new conn's SUBSCRIBE is sent without
+// waiting for the server's reply, then the old, live conn is released) may be
+// lost, and one published just before the old conn is released may arrive
+// twice, as on any reconnect.
+func (ps *PubSub) onConnDrop(_ error) {
+	if ps.closed.Load() {
+		return
+	}
+	ps.reconnectingMu.Lock()
+	if ps.reconnecting {
+		ps.reconnectingMu.Unlock()
+		return
+	}
+	ps.reconnecting = true
+	ps.reconnectingMu.Unlock()
+	go ps.reconnectLoop()
+}
+
+// reconnectLoop re-dials the pubsub conn and replays subscriptions with
+// exponential backoff. It terminates when the pubsub is closed or the backoff
+// reaches its cap and a configured retry budget is exhausted (here we keep
+// retrying indefinitely, but every iteration honors closeCh).
+func (ps *PubSub) reconnectLoop() {
+	defer func() {
+		ps.reconnectingMu.Lock()
+		ps.reconnecting = false
+		ps.reconnectingMu.Unlock()
+		// A close hook that fired while reconnecting was set (the new conn
+		// died during the handover) was ignored by onConnDrop, and the hook
+		// fires once: look at the conn now, after the flag is down. The
+		// conn's closed flag is stored before its hook runs, so no drop is
+		// missed between the two.
+		ps.mu.Lock()
+		cur := ps.conn
+		ps.mu.Unlock()
+		if cur != nil && cur.closed.Load() {
+			ps.onConnDrop(nil)
+		}
+	}()
+	for attempt := 0; ; attempt++ {
+		if ps.closed.Load() {
+			return
+		}
+		delay := ps.backoff.Next(attempt)
+		select {
+		case <-time.After(delay):
+		case <-ps.closeCh:
+			return
+		}
+		if ps.closed.Load() {
+			return
+		}
+		// Give the dial a bounded window so a hard-down server doesn't
+		// block reconnect forever on a single attempt.
+		dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := ps.client.pool.acquirePubSub(dialCtx)
+		cancel()
+		if err != nil {
+			continue
+		}
+		ps.ctlMu.Lock()
+		ps.mu.Lock()
+		if ps.closed.Load() {
+			ps.mu.Unlock()
+			ps.ctlMu.Unlock()
+			// Never installed: nothing else holds conn.
+			ps.client.pool.releasePubSub(conn)
+			return
+		}
+		// Install conn under ctlMu and mu together, and resubscribe on it
+		// before ctlMu is let go: a caller's control write then goes to
+		// conn, after the replay, and Close cannot release conn under the
+		// replay's writes.
+		old := ps.conn
+		// Bind first, so a Close that takes conn as soon as it is published
+		// detaches a conn that is already bound, and cannot be re-bound
+		// after its detach.
+		ps.bindConn(conn)
+		ps.conn = conn
+		subs := make([]string, 0, len(ps.subs))
+		for s := range ps.subs {
+			subs = append(subs, s)
+		}
+		psubs := make([]string, 0, len(ps.psubs))
+		for p := range ps.psubs {
+			psubs = append(psubs, p)
+		}
+		ssubs := make([]string, 0, len(ps.shardSubs))
+		for s := range ps.shardSubs {
+			ssubs = append(ssubs, s)
+		}
+		ps.mu.Unlock()
+		ok := true
+		for _, r := range [...]struct {
+			verb  string
+			names []string
+		}{{"SUBSCRIBE", subs}, {"PSUBSCRIBE", psubs}, {"SSUBSCRIBE", ssubs}} {
+			if len(r.names) == 0 {
+				continue
+			}
+			if ps.closed.Load() {
+				ok = false
+				break
+			}
+			if err := sendPubSubControl(conn, append([]string{r.verb}, r.names...)); err != nil {
+				ok = false
+				break
+			}
+		}
+		// conn may have died while the replay was being written. Its close
+		// hook (set by bindConn above) fired once and was ignored, because
+		// reconnecting is still set, so look: a conn that died counts as a
+		// failed attempt, and the loop goes on with the next, longer,
+		// backoff. The deferred re-check above would also notice the dead
+		// conn, but only after this loop returned ok and reset the backoff:
+		// its new loop starts at attempt 0, and a server that accepts and
+		// hangs up at once is retried at the base delay for ever (celeris#887
+		// item 15; TestReconnectLoopCountsAConnThatDiesDuringTheReplayAsFailed887).
+		if ok && conn.closed.Load() {
+			ok = false
+		}
+		var failed *redisConn
+		if !ok && ps.takeConn(conn) {
+			failed = conn // else Close took it and releases it
+		}
+		ps.ctlMu.Unlock()
+		// The dropped conn is out of ps.conn, no writer can hold it (writers
+		// hold ctlMu and read ps.conn under it): release it, once.
+		if old != nil {
+			ps.detach(old)
+			ps.client.pool.releasePubSub(old)
+		}
+		if failed != nil {
+			ps.detach(failed)
+			ps.client.pool.releasePubSub(failed)
+		}
+		if ok {
+			ps.backoff.Reset()
+			return
+		}
+	}
+}

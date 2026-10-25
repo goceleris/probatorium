@@ -1,0 +1,160 @@
+package std
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/resource"
+)
+
+type okStreamHandler struct{}
+
+func (okStreamHandler) HandleStream(_ context.Context, s *stream.Stream) error {
+	return s.ResponseWriter.WriteResponse(s, 200, [][2]string{{"content-type", "text/plain"}}, []byte("ok"))
+}
+
+type discardResponseWriter struct{ h http.Header }
+
+func (w *discardResponseWriter) Header() http.Header         { return w.h }
+func (w *discardResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *discardResponseWriter) WriteHeader(int)             {}
+
+// BenchmarkBridgeServeHTTP measures one request through the std bridge, over
+// HTTP/1.1 and over HTTP/2 (an h2c stream), whose in-handler count
+// celeris#759 adds (an atomic add and a deferred one, HTTP/2 only). The
+// Cancelable cases give the request a cancelable context, as net/http does;
+// HTTP/2 binds the stream's context to it (celeris#949), HTTP/1 does not.
+func BenchmarkBridgeServeHTTP(b *testing.B) {
+	for _, tc := range []struct {
+		name       string
+		major      int
+		cancelable bool
+	}{{"HTTP1", 1, false}, {"HTTP2", 2, false}, {"HTTP1Cancelable", 1, true}, {"HTTP2Cancelable", 2, true}} {
+		b.Run(tc.name, func(b *testing.B) {
+			e, err := New(resource.Config{Addr: "127.0.0.1:0", Engine: engine.Std, Protocol: engine.HTTP1}, okStreamHandler{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			br := &Bridge{engine: e, handler: okStreamHandler{}}
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.ProtoMajor = tc.major
+			if tc.cancelable {
+				// A request served by net/http has a cancelable context
+				// (its connection's, then its own): the binding of the
+				// stream's context to it (celeris#949) registers with it.
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				req = req.WithContext(ctx)
+			}
+			w := &discardResponseWriter{h: http.Header{}}
+			b.ReportAllocs()
+			for b.Loop() {
+				clear(w.h)
+				br.ServeHTTP(w, req)
+			}
+		})
+	}
+}
+
+// rewindBody is a request body that can be read again (Reset) without an
+// allocation.
+type rewindBody struct{ bytes.Reader }
+
+func (*rewindBody) Close() error { return nil }
+
+// BenchmarkBridgeServeHTTPBody measures the body block of Bridge.ServeHTTP
+// (celeris#889 item 25): a POST of 512 bytes with its Content-Length declared
+// (the declared-length check is one comparison on the way to the read), and a
+// POST declaring a body over MaxRequestBodySize, which is refused before it is
+// read (the read of up to the limit plus one was the cost before).
+func BenchmarkBridgeServeHTTPBody(b *testing.B) {
+	payload := make([]byte, 512)
+	for _, tc := range []struct {
+		name  string
+		major int
+		limit int64
+		cl    int64
+	}{
+		{"HTTP1Declared", 1, 4096, 512}, {"HTTP2Declared", 2, 4096, 512},
+		{"HTTP1UnknownLength", 1, 4096, -1},
+		{"HTTP1Refused", 1, 256, 512}, {"HTTP2Refused", 2, 256, 512},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			e, err := New(resource.Config{Addr: "127.0.0.1:0", Engine: engine.Std, Protocol: engine.HTTP1, MaxRequestBodySize: tc.limit}, okStreamHandler{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			br := &Bridge{engine: e, handler: okStreamHandler{}}
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.ProtoMajor, req.ContentLength = tc.major, tc.cl
+			body := &rewindBody{}
+			w := &discardResponseWriter{h: http.Header{}}
+			b.ReportAllocs()
+			for b.Loop() {
+				clear(w.h)
+				body.Reset(payload)
+				req.Body = body
+				br.ServeHTTP(w, req)
+			}
+		})
+	}
+}
+
+// BenchmarkBridgeServeHTTPContexts: the bridge with the request contexts
+// net/http gives it. Fresh: a new cancelable context per request, which is
+// what the HTTP/2 binding of the stream's context (celeris#949) registers
+// with for the first time (the parent's children map is allocated then).
+// PreCancelled: the context is over before the handler starts (the
+// rapid-reset shape). The WithCancel itself is in every variant alike.
+func BenchmarkBridgeServeHTTPContexts(b *testing.B) {
+	for _, tc := range []struct {
+		name         string
+		major        int
+		preCancelled bool
+	}{{"HTTP1Fresh", 1, false}, {"HTTP2Fresh", 2, false}, {"HTTP1PreCancelled", 1, true}, {"HTTP2PreCancelled", 2, true}} {
+		b.Run(tc.name, func(b *testing.B) {
+			e, err := New(resource.Config{Addr: "127.0.0.1:0", Engine: engine.Std, Protocol: engine.HTTP1}, okStreamHandler{})
+			if err != nil {
+				b.Fatal(err)
+			}
+			br := &Bridge{engine: e, handler: okStreamHandler{}}
+			base := httptest.NewRequest(http.MethodGet, "/", nil)
+			base.ProtoMajor = tc.major
+			w := &discardResponseWriter{h: http.Header{}}
+			b.ReportAllocs()
+			for b.Loop() {
+				ctx, cancel := context.WithCancel(context.Background())
+				if tc.preCancelled {
+					cancel()
+				}
+				clear(w.h)
+				br.ServeHTTP(w, base.WithContext(ctx))
+				cancel()
+			}
+		})
+	}
+}
+
+// BenchmarkH2CFrontServeHTTP measures one HTTP/1.1 request through the whole
+// handler chain of an H2C engine: the h2c front end's checks (is this the
+// preface? an upgrade?) and then the bridge. Every request on an H2C listener
+// pays them (celeris#878 replaced x/net's h2c handler with h2cHandler).
+func BenchmarkH2CFrontServeHTTP(b *testing.B) {
+	e, err := New(resource.Config{Addr: "127.0.0.1:0", Engine: engine.Std, Protocol: engine.H2C}, okStreamHandler{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	h := e.server.Handler
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := &discardResponseWriter{h: http.Header{}}
+	b.ReportAllocs()
+	for b.Loop() {
+		clear(w.h)
+		h.ServeHTTP(w, req)
+	}
+}

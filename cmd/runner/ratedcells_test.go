@@ -30,7 +30,7 @@ func realizedGrid(t *testing.T) []string {
 	}
 	srvs := make([]servers.Server, 0, len(advs))
 	for _, a := range advs {
-		if strings.HasPrefix(a.Name, "irqplace-") || strings.HasPrefix(a.Name, "pinplan6-") || strings.HasPrefix(a.Name, "pinp38-") || strings.HasPrefix(a.Name, "pinp38b-") {
+		if strings.HasPrefix(a.Name, "irqplace-") || strings.HasPrefix(a.Name, "pinplan6-") || strings.HasPrefix(a.Name, "pinp38-") || strings.HasPrefix(a.Name, "pinp38b-") || strings.HasPrefix(a.Name, "pinp38c-") {
 			continue // THROWAWAY ab/irqplace-v1, ab/pinplan-v6 and ab/p2-pinplan-confirm-38: the experiment's own columns are not part of the pinned full grid
 		}
 		srvs = append(srvs, &adapterServer{adapter: a, features: featureSetFor(a, false)})
@@ -130,7 +130,7 @@ func TestRatedScopeIsTheFourteenRowsAndWSEcho(t *testing.T) {
 	slices.Sort(gridWS)
 	var wsCols []string // the columns that declare WebSocket over HTTP/1.1
 	for _, a := range servers.AdaptersSorted() {
-		if strings.HasPrefix(a.Name, "irqplace-") || strings.HasPrefix(a.Name, "pinplan6-") || strings.HasPrefix(a.Name, "pinp38-") || strings.HasPrefix(a.Name, "pinp38b-") {
+		if strings.HasPrefix(a.Name, "irqplace-") || strings.HasPrefix(a.Name, "pinplan6-") || strings.HasPrefix(a.Name, "pinp38-") || strings.HasPrefix(a.Name, "pinp38b-") || strings.HasPrefix(a.Name, "pinp38c-") {
 			continue // THROWAWAY ab/irqplace-v1: not part of the pinned full grid
 		}
 		if fs := featureSetFor(a, false); a.Capabilities.WS && fs.HTTP1 {

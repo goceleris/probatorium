@@ -1,0 +1,751 @@
+package celeris
+
+import (
+	"context"
+	"math"
+	"mime/multipart"
+	"net"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/goceleris/celeris/internal/ctxkit"
+	"github.com/goceleris/celeris/internal/protocol/h2/stream"
+	"github.com/goceleris/celeris/internal/testhooks"
+)
+
+func init() {
+	// internal/conn/h1.go needs to release cached contexts on connection close
+	// but cannot import the root package (circular dependency). This single
+	// hook is the only remaining ctxkit indirection.
+	ctxkit.ReleaseContext = func(c any) {
+		releaseContext(c.(*Context))
+	}
+}
+
+// The functions below give the module's test infrastructure (celeristest,
+// and the tests of the middleware) access to a Context's internals. They
+// are not exported: init registers them in internal/testhooks, which
+// cannot import this package, so a *Context crosses it as any and a
+// handler chain as a []any of HandlerFunc values. End-user tests use
+// celeristest.
+
+// acquireTestContext returns a Context from the pool, bound to the given Stream.
+func acquireTestContext(s *stream.Stream) *Context { return acquireContext(s) }
+
+// releaseTestContext returns a Context to the pool, firing OnRelease callbacks.
+func releaseTestContext(c *Context) { releaseContext(c) }
+
+// testStream returns the underlying stream, or nil.
+func testStream(c *Context) *stream.Stream { return c.stream }
+
+// setTestStartTime sets the start time on a test context.
+func setTestStartTime(c *Context, t time.Time) { c.startTime = t }
+
+// setTestFullPath sets the full path on a test context.
+func setTestFullPath(c *Context, path string) { c.fullPath = path }
+
+// setTestTrustedNets sets the trusted proxy networks on a test context.
+func setTestTrustedNets(c *Context, nets []*net.IPNet) { c.trustedNets = nets }
+
+// addTestParam appends a route parameter to a test context.
+func addTestParam(c *Context, key, value string) {
+	c.params = append(c.params, Param{Key: key, Value: value})
+}
+
+// setTestHandlers installs a handler chain on a test context, using the
+// inline handlerBuf when the chain is small enough. Each element of
+// handlers is a HandlerFunc; the chain is copied, never retained.
+func setTestHandlers(c *Context, handlers []any) {
+	n := len(handlers)
+	if n <= len(c.handlerBuf) {
+		c.handlers = c.handlerBuf[:n]
+	} else {
+		c.handlers = make([]HandlerFunc, n)
+	}
+	for i, h := range handlers {
+		c.handlers[i] = h.(HandlerFunc)
+	}
+	c.index = -1
+}
+
+// setTestScheme sets the scheme override on a test context.
+func setTestScheme(c *Context, scheme string) {
+	c.extended = true
+	c.schemeOverride = scheme
+}
+
+func init() {
+	testhooks.AcquireContext = func(s *stream.Stream) any { return acquireTestContext(s) }
+	testhooks.ReleaseContext = func(c any) { releaseTestContext(c.(*Context)) }
+	testhooks.Stream = func(c any) *stream.Stream { return testStream(c.(*Context)) }
+	testhooks.SetStartTime = func(c any, t time.Time) { setTestStartTime(c.(*Context), t) }
+	testhooks.SetFullPath = func(c any, path string) { setTestFullPath(c.(*Context), path) }
+	testhooks.SetTrustedNets = func(c any, nets []*net.IPNet) { setTestTrustedNets(c.(*Context), nets) }
+	testhooks.AddParam = func(c any, key, value string) { addTestParam(c.(*Context), key, value) }
+	testhooks.SetHandlers = func(c any, handlers []any) { setTestHandlers(c.(*Context), handlers) }
+	testhooks.SetScheme = func(c any, scheme string) { setTestScheme(c.(*Context), scheme) }
+}
+
+// respHdrBufCap is the inline response-header buffer slot count. The
+// fast-path scratch array in context_response.go is derived from this
+// (respHdrBufCap-2) so the two can never drift apart and index-panic — Go
+// array sizes must be constants, so this is the single source of truth.
+const respHdrBufCap = 24
+
+// Context is the request context passed to handlers. It is pooled via sync.Pool.
+// A Context is obtained from the pool and must not be retained after the handler returns.
+type Context struct {
+	stream      *stream.Stream
+	index       int16
+	handlers    []HandlerFunc
+	handlerBuf  [8]HandlerFunc
+	params      Params
+	paramBuf    [4]Param
+	keys        map[string]any
+	ctx         context.Context
+	startTime   time.Time
+	startTimeNs int64 // primary representation; startTime is materialized lazily by StartTime()
+
+	method   string
+	path     string
+	rawQuery string
+	fullPath string
+
+	statusCode  int
+	respHeaders [][2]string
+	written     bool
+	aborted     bool
+	hijacked    bool // a Hijack succeeded: Detach leaves the connection to the caller
+
+	queryCache  url.Values
+	queryCached bool
+
+	cookieCache  [][2]string
+	cookieCached bool
+
+	formParsed    bool
+	formValues    url.Values
+	multipartForm *multipart.Form
+	maxFormSize   int64
+
+	captureBody    bool
+	capturedBody   []byte
+	capturedStatus int
+	capturedType   string
+
+	bufferDepth  int
+	buffered     bool
+	bytesWritten int
+	streamWriter *StreamWriter
+	// streamTakenOnly: StreamWriter was taken while nothing was written, so
+	// the response is marked written by the take alone. streamUsed: a
+	// StreamWriter taken on this request has been used (shared by all of
+	// them). Together they let an error before the first use still be
+	// answered (celeris#835, reclaimUnusedStreamWriter).
+	streamTakenOnly bool
+	streamUsed      atomic.Bool
+
+	detached bool
+	// detachGen is the stream's use token (Stream.Gen) when Detach ran, while
+	// the handler was still running. On HTTP/2 the stream ends with the
+	// handler and goes back to a pool shared by every connection, so a call a
+	// detached Context makes later that reads the stream at call time
+	// (StreamWriter) presents this token, not whatever the stream serves now,
+	// and is refused once the use is over (celeris#904).
+	detachGen uint64
+	// pooled guards against a double release. Returning one Context to
+	// contextPool twice lets two concurrent Get calls hand the SAME object
+	// to two goroutines, which then both write c.stream / c.index in
+	// acquireContext -- a data race whose symptom appears in whatever
+	// unrelated test or request next draws from the pool (celeris#512).
+	// Release is therefore idempotent: the second call is a no-op.
+	pooled     bool
+	detachDone chan struct{}
+	// detachSnap is allocated only when Detach() runs and stores the
+	// status + elapsed snapshot captured by done() so the metrics
+	// goroutine can read final values without racing late writes from
+	// a handler that touches the Context after calling done()
+	// (contract violation but seen in practice with deferred logger
+	// blocks). Heap allocation is acceptable here because Detach is
+	// the slow path; the alternative — embedding the fields directly —
+	// grows every pooled Context by 24 bytes and pessimizes the H1/H2
+	// hot path through cache pressure.
+	detachSnap *detachSnapshot
+
+	extended bool // true when keys/query/cookie/form/capture/buffer/detach/overrides were used
+
+	// requestID is the canonical request ID, set by middleware/requestid
+	// via [Context.SetRequestID]. Dedicated field so per-request writes
+	// skip the any-interface boxing that Set(RequestIDKey, id) would cost.
+	requestID string
+
+	// stringKeys stores string-valued per-request data without the
+	// any-interface boxing that c.Set would pay. Populated lazily on
+	// first [Context.SetString]. Preferred storage for auth principals,
+	// tenant IDs, trace correlators — any stringly-typed scalar that
+	// middleware wants to share downstream without an alloc per request.
+	stringKeys map[string]string
+
+	// workerID is the engine-supplied event-loop worker affinity for
+	// this request. Stored as a direct field (not via context.Value) so
+	// the routerAdapter avoids a context.WithValue allocation per
+	// request — that single alloc dominated the iouring-h1-sync profile.
+	// Zero-value safe: WorkerID() reports -1 when unset.
+	workerID    int32
+	workerIDSet bool
+
+	clientIPOverride string
+	schemeOverride   string
+	hostOverride     string
+
+	// respHdrBuf is the inline response-header buffer (avoids heap escape).
+	// Sized 24 to swallow the full middleware-stack header count without an
+	// overflow alloc: the fullstack chain emits ~18 user headers (recovery +
+	// requestid + secure×8 + cors + ratelimit×3 + etag + cache) and Blob then
+	// prepends content-type + content-length, so the per-request response
+	// reaches ~20 — under 24 with headroom. 16 left the dominant fullstack
+	// path one alloc short.
+	respHdrBuf [respHdrBufCap][2]string
+	// respHdrScratch retains the heap backing array the moment a middleware
+	// stack pushes respHeaders past respHdrBuf's 24 slots. Reused across
+	// requests so a >24-header route reallocates once per pooled Context, not
+	// once per request. nil until the first overflow.
+	respHdrScratch [][2]string
+	// blobHdrScratch is the reused assembly buffer for Blob's response header
+	// list (content-type + content-length + user headers) when the total exceeds
+	// respHdrBuf's 24 slots. Without it, Blob allocates make([][2]string,0,total)
+	// on EVERY many-header response (the dominant per-request alloc + GC
+	// pressure). Reused so it reallocates once per pooled Context, not once per
+	// request. nil until the first many-header Blob.
+	blobHdrScratch [][2]string
+
+	trustedNets []*net.IPNet
+
+	onRelease    []func()
+	onReleaseBuf [4]func()
+}
+
+var contextPool = sync.Pool{New: func() any {
+	c := &Context{keys: make(map[string]any, 4)}
+	c.params = c.paramBuf[:0]
+	c.respHeaders = c.respHdrBuf[:0]
+	c.onRelease = c.onReleaseBuf[:0]
+	return c
+}}
+
+const abortIndex int16 = math.MaxInt16 / 2
+
+// capturedBodyMaxRetained caps the backing array size kept across
+// Context pool cycles. Requests that produce larger bodies don't
+// retain their buffer (avoiding pool-wide memory bloat from outliers).
+const capturedBodyMaxRetained = 64 * 1024
+
+// RequestIDKey is the canonical context store key for the request ID.
+// Middleware that generates or reads request IDs should use this key
+// with [Context.Set] and [Context.Get] for interoperability.
+const RequestIDKey = "request_id"
+
+func acquireContext(s *stream.Stream) *Context {
+	var c *Context
+	if s.CachedCtx != nil {
+		c = s.CachedCtx.(*Context)
+	} else {
+		c = contextPool.Get().(*Context)
+		// Cache on H1 streams for per-connection reuse (keep-alive).
+		// H2 streams are ephemeral (released after one request), so caching
+		// would leak the context — releaseContext skips pool.Put for cached
+		// contexts, but stream.Release() nils CachedCtx, leaving the context
+		// unreachable. H2 inline handlers use InlineCachedCtx instead.
+		if s.IsH1() {
+			s.CachedCtx = c
+		}
+	}
+	c.pooled = false
+	c.stream = s
+	c.index = -1
+	c.statusCode = 200
+	c.maxFormSize = DefaultMaxFormSize
+	if s.IsH1() {
+		// context.Background(), set here as before: a detached HTTP/1
+		// handler may call Context() after the engine has released the
+		// stream, so Context() must not read it then.
+		c.ctx = s.Context()
+	}
+	// On HTTP/2 c.ctx stays nil: Context() asks the stream for its context
+	// only when something wants it, so a request that never does allocates
+	// none (celeris#836).
+	c.extractRequestInfo()
+	return c
+}
+
+func releaseContext(c *Context) {
+	// Idempotent: a second release is a no-op. Returning one Context to
+	// contextPool twice lets two concurrent Get calls hand the SAME object
+	// to two goroutines (celeris#512); the symptom then surfaces in whatever
+	// unrelated code next draws from the pool, which makes it very hard to
+	// trace back. Callers that release both explicitly and via a cleanup
+	// hook land here.
+	if c.pooled {
+		return
+	}
+	// If the context is cached on the stream for reuse, reset but
+	// do not return to the pool. The stream owns its lifecycle.
+	//
+	// Detached contexts (Server-Sent Events, WebSocket) are released
+	// from a goroutine that fires when the user-handler signals
+	// done(). At that point the engine's request-side stream cleanup
+	// may already be running (std engine: deferred Stream.Release in
+	// Bridge.ServeHTTP; iouring/epoll: closeConn → CloseH1 →
+	// stream.Release). Reading c.stream.CachedCtx here races those
+	// writers — and the caching optimisation is irrelevant for a
+	// detached context anyway because the conn is single-use SSE /
+	// long-lived WS, not pooled keep-alive H1. Always pool the
+	// Context directly in that case; see celeris#273 for the failure
+	// mode the race detector pinned.
+	cached := !c.detached && c.stream != nil && c.stream.CachedCtx == c
+	c.reset()
+	if !cached {
+		c.pooled = true
+		contextPool.Put(c)
+	}
+}
+
+func (c *Context) extractRequestInfo() {
+	// H1 dispatch primes Stream.Method / Stream.Path directly so we skip
+	// the s.Headers walk entirely. For H2 streams the pseudo-headers
+	// still arrive via HPACK in s.Headers — fall back to the headers
+	// walk in that case.
+	if c.stream.Method != "" {
+		c.method = c.stream.Method
+		p := c.stream.Path
+		if i := strings.IndexByte(p, '?'); i >= 0 {
+			c.path = p[:i]
+			c.rawQuery = p[i+1:]
+		} else {
+			c.path = p
+		}
+		return
+	}
+
+	headers := c.stream.Headers
+
+	// Direct index access: H2 HPACK usually places :method first and
+	// :path second.
+	if len(headers) >= 2 &&
+		len(headers[0][0]) > 1 && headers[0][0][1] == 'm' &&
+		len(headers[1][0]) > 1 && headers[1][0][1] == 'p' {
+		c.method = headers[0][1]
+		p := headers[1][1]
+		if i := strings.IndexByte(p, '?'); i >= 0 {
+			c.path = p[:i]
+			c.rawQuery = p[i+1:]
+		} else {
+			c.path = p
+		}
+		return
+	}
+
+	// Fallback: scan all headers (non-standard ordering or malformed).
+	for _, h := range headers {
+		switch h[0] {
+		case ":method":
+			c.method = h[1]
+		case ":path":
+			p := h[1]
+			if i := strings.IndexByte(p, '?'); i >= 0 {
+				c.path = p[:i]
+				c.rawQuery = p[i+1:]
+			} else {
+				c.path = p
+			}
+		}
+	}
+}
+
+// Next executes the next handler in the chain. It returns the first non-nil
+// error from a downstream handler, short-circuiting the remaining chain.
+// Middleware can inspect or swallow errors by checking the return value.
+//
+// A handler that answers the request ends the chain: once it has written the
+// response, had it captured by a buffering middleware (compress, etag,
+// cache, ...) or taken the connection over (Detach, Hijack), the handlers
+// after it do not run, although it returned without calling Next and
+// without Abort. So a middleware that serves its own paths (swagger, pprof,
+// healthcheck, static, cors' preflight) wins over a route that also
+// matches the request (celeris#927). A handler that returns without
+// answering and without calling Next still lets the chain continue.
+func (c *Context) Next() error {
+	c.index++
+	for c.index < int16(len(c.handlers)) {
+		if err := c.handlers[c.index](c); err != nil {
+			return err
+		}
+		if c.answered() {
+			// Every enclosing Next stops too.
+			c.index = abortIndex
+			return nil
+		}
+		c.index++
+	}
+	return nil
+}
+
+// answered reports whether a handler has answered the request: written the
+// response, had a buffering middleware capture it, or taken the connection
+// over.
+func (c *Context) answered() bool {
+	return c.written || c.buffered || c.detached
+}
+
+// Abort prevents pending handlers from being called.
+// Does not write a response. Use AbortWithStatus to abort and send a status code.
+func (c *Context) Abort() {
+	c.index = abortIndex
+	c.aborted = true
+}
+
+// AbortWithStatus calls Abort and writes a status code with no body.
+// It returns the error from NoContent for propagation.
+func (c *Context) AbortWithStatus(code int) error {
+	c.Abort()
+	return c.NoContent(code)
+}
+
+// IsAborted returns true if the handler chain was aborted.
+func (c *Context) IsAborted() bool {
+	return c.aborted
+}
+
+// Context returns the request's context.Context. The returned context is
+// always non-nil; it defaults to the stream's context. On HTTP/2 that context
+// is cancelled with the stream (the client resets it or goes away, on every
+// engine, std included), and it stays cancelled after the request is over: the
+// stream is pooled, its context is not (celeris#836). On HTTP/1 it is
+// context.Background() on every engine: an HTTP/1 client that disconnects does
+// not cancel it. [ToHandler] is the exception: there it ends with the
+// request's context (r.Context()), on HTTP/1 as well.
+func (c *Context) Context() context.Context {
+	if c.ctx != nil {
+		return c.ctx
+	}
+	if c.stream != nil {
+		return c.stream.Context()
+	}
+	return context.Background()
+}
+
+// SetContext sets the request's context. The provided ctx must be non-nil.
+func (c *Context) SetContext(ctx context.Context) {
+	c.ctx = ctx
+}
+
+// WorkerID returns the numeric ID of the event-loop worker handling this
+// request, or -1 if no worker identity is available (std engine, tests
+// constructing a Context without a Server, etc.). Handlers forwarding a
+// DB or cache call through a celeris driver pool can pass this to the
+// driver's WithWorker option to pin the pool conn to the same CPU,
+// preserving per-request locality end-to-end:
+//
+//	import "github.com/goceleris/celeris/driver/postgres"
+//
+//	func handler(c *celeris.Context) error {
+//	    ctx := postgres.WithWorker(c.Context(), c.WorkerID())
+//	    row, err := pool.QueryContext(ctx, "SELECT ...")
+//	    ...
+//	}
+//
+// Epoll and io_uring engines populate this at accept time; the std
+// engine (all platforms) returns -1 because Go's runtime scheduler
+// picks the goroutine and there is no meaningful worker identity.
+func (c *Context) WorkerID() int {
+	if c.workerIDSet {
+		return int(c.workerID)
+	}
+	// Fallback for synthetic contexts (tests etc.) that came in
+	// pre-populated via context.WithValue without going through
+	// routerAdapter.HandleStream. Production hot path uses the field
+	// above and never reaches this Value() walk.
+	// An HTTP/2 stream's own context carries no values, so it is not asked
+	// for (that would make it).
+	if c.ctx == nil {
+		return -1
+	}
+	id, _ := ctxkit.WorkerIDFrom(c.ctx)
+	return id
+}
+
+// StartTime returns the time at which request processing began. Set once by
+// the framework before the handler chain runs, so all middleware share the
+// same timestamp without calling time.Now() independently.
+func (c *Context) StartTime() time.Time {
+	// Materialize lazily from the raw ns set by routerAdapter.HandleStream.
+	// Most requests never call StartTime(), so the time.Unix division is
+	// deferred off the hot path.
+	if c.startTime.IsZero() && c.startTimeNs != 0 {
+		c.startTime = time.Unix(0, c.startTimeNs)
+	}
+	return c.startTime
+}
+
+// Set stores a key-value pair for this request.
+func (c *Context) Set(key string, value any) {
+	c.extended = true
+	c.keys[key] = value
+}
+
+// Get returns the value for a key.
+//
+// Consults c.keys first (values set via [Context.Set]), then the
+// dedicated string storage from [Context.SetString] and
+// [Context.SetRequestID]. The any-interface boxing on fallback paths
+// is re-done per Get call, so celeris-ecosystem code prefers the typed
+// [Context.GetString] and [Context.RequestID] getters for zero-alloc
+// reads.
+func (c *Context) Get(key string) (any, bool) {
+	if v, ok := c.keys[key]; ok {
+		return v, ok
+	}
+	if c.stringKeys != nil {
+		if s, ok := c.stringKeys[key]; ok {
+			return s, true
+		}
+	}
+	if key == RequestIDKey && c.requestID != "" {
+		return c.requestID, true
+	}
+	return nil, false
+}
+
+// Keys returns a copy of all key-value pairs stored on this context.
+// Returns nil if no values have been set. The map is a copy; the values in
+// it are the stored values themselves, so a string that came from the
+// request (a request ID, an API key, a token) is still a view of the
+// receive buffer on epoll, io_uring and Adaptive and must be copied before
+// it is kept past the handler (see the package documentation).
+//
+// Keys with the prefix "celeris." are reserved for the framework and its
+// middleware: compress, static and etag set two of them while a request is in
+// flight (so that the 304 of a compressed response carries the tag its 200
+// does), and they show up here. Do not use the prefix for your own keys; a
+// handler that sets one of them changes only how the ETag of its own response
+// is weakened.
+func (c *Context) Keys() map[string]any {
+	n := len(c.keys) + len(c.stringKeys)
+	if c.requestID != "" {
+		if _, inMap := c.stringKeys[RequestIDKey]; !inMap {
+			if _, inKeys := c.keys[RequestIDKey]; !inKeys {
+				n++
+			}
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	cp := make(map[string]any, n)
+	for k, v := range c.keys {
+		cp[k] = v
+	}
+	for k, v := range c.stringKeys {
+		if _, clash := cp[k]; !clash {
+			cp[k] = v
+		}
+	}
+	if c.requestID != "" {
+		if _, clash := cp[RequestIDKey]; !clash {
+			cp[RequestIDKey] = c.requestID
+		}
+	}
+	return cp
+}
+
+// RequestID returns the canonical request ID for this context, set by
+// middleware/requestid via [Context.SetRequestID]. Empty when no
+// requestid middleware is installed or it skipped this request.
+//
+// Prefer this over Get(RequestIDKey) in celeris-ecosystem middleware:
+// the underlying storage avoids the any-interface boxing that c.Get
+// has to re-create on every call.
+func (c *Context) RequestID() string { return c.requestID }
+
+// SetRequestID stores the canonical request ID for this context. The
+// value is exposed via both [Context.RequestID] (zero-alloc, preferred)
+// and Get(RequestIDKey) (back-compat; re-boxes per call).
+func (c *Context) SetRequestID(id string) {
+	c.extended = true
+	c.requestID = id
+}
+
+// SetString stores a string value on the context under key. Unlike
+// [Context.Set], the value is kept in typed string storage — no
+// any-interface boxing alloc per call.
+//
+// Reads: pair with [Context.GetString] for zero-alloc access. [Context.Get]
+// falls back to the string storage, but re-boxes the string into an
+// any on each call.
+func (c *Context) SetString(key, value string) {
+	c.extended = true
+	if c.stringKeys == nil {
+		c.stringKeys = make(map[string]string, 2)
+	}
+	c.stringKeys[key] = value
+}
+
+// GetString returns the string value stored under key by
+// [Context.SetString], or ("", false) if absent. Also falls back to
+// any-typed values written via [Context.Set] for back-compat, and to
+// [Context.SetRequestID] when key == [RequestIDKey].
+//
+// Unlike Gin's single-return GetString, celeris returns ("", false)
+// on absent keys so callers can distinguish "never set" from "set to
+// empty string".
+func (c *Context) GetString(key string) (string, bool) {
+	if c.stringKeys != nil {
+		if s, ok := c.stringKeys[key]; ok {
+			return s, true
+		}
+	}
+	if v, ok := c.keys[key]; ok {
+		if s, ok := v.(string); ok {
+			return s, true
+		}
+	}
+	if key == RequestIDKey && c.requestID != "" {
+		return c.requestID, true
+	}
+	return "", false
+}
+
+// OnRelease registers a function to be called when this Context is released
+// back to the pool. Callbacks fire in LIFO order (like defer), before fields
+// are cleared, so context state is still accessible. Panics in callbacks are
+// recovered and silently discarded.
+func (c *Context) OnRelease(fn func()) {
+	c.extended = true
+	c.onRelease = append(c.onRelease, fn)
+}
+
+func (c *Context) reset() {
+	for i := len(c.onRelease) - 1; i >= 0; i-- {
+		func() {
+			defer func() { _ = recover() }()
+			c.onRelease[i]()
+		}()
+	}
+	c.stream = nil
+	c.trustedNets = nil
+	c.index = -1
+	// Clear handler references so closures can be GCed, but only when
+	// the slice is owned by this context (backed by handlerBuf or a
+	// SetHandlers allocation). The production path assigns the router's
+	// pre-composed chain directly; nilling those would corrupt shared state.
+	if len(c.handlers) > 0 && cap(c.handlers) <= len(c.handlerBuf) &&
+		&c.handlers[:cap(c.handlers)][0] == &c.handlerBuf[0] {
+		for i := range c.handlers {
+			c.handlers[i] = nil
+		}
+	}
+	if cap(c.handlers) > 64 {
+		c.handlers = nil
+	} else {
+		c.handlers = c.handlers[:0]
+	}
+	if n := len(c.params); n > 0 {
+		clear(c.paramBuf[:n])
+	}
+	c.params = c.paramBuf[:0]
+	c.ctx = nil
+	c.method = ""
+	c.path = ""
+	c.rawQuery = ""
+	c.fullPath = ""
+	c.statusCode = 200
+	if n := len(c.respHeaders); n > 0 {
+		// When a middleware stack emits more response headers than respHdrBuf
+		// holds (secure + cache + ratelimit + etag + ... can exceed it),
+		// append() has moved respHeaders onto a heap backing array. Retain it
+		// as respHdrScratch and reuse it next request rather than dropping it
+		// (which forced a fresh alloc on every header-heavy request). The cap
+		// check is the correct discriminator: cap<=len(respHdrBuf) means
+		// respHeaders is still the inline buffer, so clear only its used
+		// prefix; a larger cap is a heap array, clear its full length. (This
+		// also removes the old clamp that papered over a
+		// clear(respHdrBuf[:n>len]) bounds panic.)
+		if cap(c.respHeaders) > len(c.respHdrBuf) {
+			clear(c.respHeaders)
+			c.respHdrScratch = c.respHeaders
+		} else {
+			clear(c.respHdrBuf[:n])
+		}
+	}
+	if c.respHdrScratch != nil {
+		c.respHeaders = c.respHdrScratch[:0]
+	} else {
+		c.respHeaders = c.respHdrBuf[:0]
+	}
+	c.written = false
+	c.aborted = false
+	c.hijacked = false
+	c.bytesWritten = 0
+	c.maxFormSize = 0
+	c.requestID = ""
+	c.workerID = 0
+	c.workerIDSet = false
+	c.startTimeNs = 0
+	c.startTime = time.Time{}
+	if c.extended {
+		clear(c.keys)
+		if c.stringKeys != nil {
+			clear(c.stringKeys)
+		}
+		c.queryCache = nil
+		c.queryCached = false
+		c.cookieCache = c.cookieCache[:0]
+		c.cookieCached = false
+		if c.multipartForm != nil {
+			_ = c.multipartForm.RemoveAll()
+			c.multipartForm = nil
+		}
+		c.formParsed = false
+		c.formValues = nil
+		c.captureBody = false
+		// Retain the capturedBody backing array across pool cycles so the
+		// next Buffer/Capture request's append doesn't start from nil.
+		// Cap retention at 64 KiB so an outlier response doesn't bloat
+		// every pooled Context forever.
+		if cap(c.capturedBody) > capturedBodyMaxRetained {
+			c.capturedBody = nil
+		} else {
+			c.capturedBody = c.capturedBody[:0]
+		}
+		c.capturedStatus = 0
+		c.capturedType = ""
+		c.bufferDepth = 0
+		c.buffered = false
+		c.streamWriter = nil
+		c.streamTakenOnly = false
+		c.streamUsed.Store(false)
+		c.detached = false
+		c.detachGen = 0
+		c.detachDone = nil
+		c.detachSnap = nil
+		c.clientIPOverride = ""
+		c.schemeOverride = ""
+		c.hostOverride = ""
+		for i := range c.onRelease {
+			c.onRelease[i] = nil
+		}
+		c.onRelease = c.onReleaseBuf[:0]
+		c.extended = false
+	}
+}
+
+// detachSnapshot captures the response status and request elapsed time
+// at the moment a detached handler signals completion via Detach's
+// returned done(). Allocated lazily so non-detached requests pay no cost.
+type detachSnapshot struct {
+	status  int
+	elapsed time.Duration
+}

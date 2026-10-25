@@ -1,0 +1,892 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/store"
+	"github.com/goceleris/celeris/validation"
+)
+
+// ErrSessionDestroyed is returned when Save is called after Destroy.
+var ErrSessionDestroyed = errors.New("session: cannot save a destroyed session")
+
+// droppedCookies counts requests on which a session cookie that would have
+// changed what the client holds could not be emitted because the response
+// body had already been written. See [DroppedCookies].
+var droppedCookies atomic.Uint64
+
+// DroppedCookies returns the number of requests on which the middleware had
+// a session cookie that would have CHANGED what the client holds — a new
+// session id (fresh session or [Session.Regenerate]) or the clearing cookie
+// ([Session.Destroy]); the session-id response header in extractor mode —
+// to send but could not, because the handler had already written the
+// response body. celeris puts the response headers on the wire the moment
+// a handler calls c.JSON/String/Blob, so nothing added afterwards can reach
+// the client. Such a request still persists (or deletes) the session
+// exactly as usual, but the client never learns the new id (or keeps the
+// destroyed one) and starts a new session on its next request; an orphaned
+// record idles out.
+//
+// Mutating a LOADED session after the body was written is not counted: the
+// client already holds exactly the cookie the middleware would re-send, and
+// the data is persisted under that same id, so nothing is orphaned — only
+// the cookie's Max-Age refresh is lost for that request.
+//
+// Mutate the session before writing the response body. The counter is
+// advanced once per affected request; a validation build (-tags=validation)
+// mirrors it into validation.SessionCookieDrops.
+func DroppedCookies() uint64 { return droppedCookies.Load() }
+
+var sessionPool = sync.Pool{New: func() any { return &Session{} }}
+
+// sessionDataPool recycles the decoded session map so repeat Get paths
+// avoid allocating a fresh map on every request. The map is cleared
+// before handing out and after the request releases the session, so
+// no data leaks between requests.
+var sessionDataPool = sync.Pool{New: func() any {
+	m := make(map[string]any, 8)
+	return &m
+}}
+
+// Session holds per-request session data backed by a [store.KV].
+//
+// Session is designed for single-goroutine-per-request access and is NOT
+// safe for concurrent use from multiple goroutines within the same request.
+// If you need to access the session from multiple goroutines (e.g., a
+// background task spawned mid-request), you must synchronize access
+// externally.
+type Session struct {
+	id           string
+	data         map[string]any
+	store        store.KV
+	ctx          context.Context
+	releaseCtx   *celeris.Context // set by middleware entry so returnToPool is a closureless method value
+	expiry       time.Duration
+	idleOverride time.Duration // per-session idle timeout override; 0 = use config default
+	keyGen       func() string
+	// onReleaseFn is a pre-bound method value pointing at returnToPool.
+	// Stored at pool.New time so the middleware hot path can register it
+	// with c.OnRelease without re-allocating a fresh funcval per request.
+	onReleaseFn func()
+	// dataPoolPtr is the original *map[string]any drawn from
+	// sessionDataPool; retained so returnToPool can Put the same pointer
+	// back, avoiding the classic Put(&localMap) heap alloc trap.
+	dataPoolPtr *map[string]any
+	modified    bool
+	fresh       bool // true for newly created sessions
+	destroyed   bool
+	readOnly    bool // true when session was obtained via Handler.GetByID
+	pooledMap   bool // data slice was drawn from sessionDataPool and must be returned
+
+	// Early cookie emission. The middleware installs the resolved cookie
+	// template before c.Next() so the FIRST mutation can put Set-Cookie on
+	// the response before the handler writes the body: celeris materialises
+	// the response headers on the wire the moment Blob/JSON/String is
+	// called, so a header added after the chain returns is silently
+	// dropped (the post-chain emission is kept only as a fallback for
+	// handlers that write no body).
+	cookie     *celeris.Cookie // template owned by the middleware; never mutated
+	cookieName string
+	useCookie  bool   // false: header-extractor mode, emit cookieName as a response header
+	emittedID  string // session id the response currently carries; "" = none
+	clearSent  bool   // the clearing cookie is already on the response
+	cookieDrop bool   // this request already counted a dropped cookie
+	// presentedID is the valid session id the request arrived with (the
+	// cookie the client already holds), "" for a fresh session. A cookie
+	// carrying this id only refreshes Max-Age: failing to send it is not a
+	// drop, and a failed save does not retract it.
+	presentedID string
+}
+
+// returnToPool is the cleanup hook registered with c.OnRelease on the
+// middleware entry. Converting the original closure to a method value
+// avoids capturing the celeris.Context in an anonymous function's
+// backing struct — the receiver (*Session) already carries everything
+// the cleanup needs (via s.releaseCtx). The method value allocation is
+// a single 2-word runtime.funcval; Go does not currently elide it
+// here, but it's smaller and more cache-friendly than the capture-
+// struct the closure generated.
+func (s *Session) returnToPool() {
+	if s.releaseCtx != nil {
+		s.releaseCtx.Set(ContextKey, nil) // issue #1: clear context key before pool Put
+	}
+	if s.data != nil && s.pooledMap {
+		clear(s.data)
+		if s.dataPoolPtr != nil {
+			*s.dataPoolPtr = s.data
+			sessionDataPool.Put(s.dataPoolPtr)
+		} else {
+			// Defensive: pooledMap set but no pool ptr (shouldn't
+			// happen after this refactor; handle gracefully anyway).
+			m := s.data
+			sessionDataPool.Put(&m)
+		}
+	}
+	s.data = nil
+	s.dataPoolPtr = nil
+	s.pooledMap = false
+	s.ctx = nil
+	s.releaseCtx = nil
+	s.cookie = nil
+	s.emittedID = ""
+	s.clearSent = false
+	s.cookieDrop = false
+	s.presentedID = ""
+	sessionPool.Put(s)
+}
+
+// markModified flags the session for the post-chain save and puts the
+// session cookie on the response if it is not there yet. Every mutator
+// funnels through here so the cookie goes out at the first mutation, while
+// the handler can still add headers.
+func (s *Session) markModified() {
+	s.modified = true
+	s.emitSessionCookie()
+}
+
+// emitSessionCookie emits the cookie carrying the current id unless the
+// response already carries it, the session is destroyed, or this Session is
+// not bound to a request (Handler.GetByID results and unit fixtures).
+func (s *Session) emitSessionCookie() {
+	if s.releaseCtx == nil || s.destroyed || s.emittedID == s.id {
+		return
+	}
+	s.emitCookie(s.id, false)
+}
+
+// emitCookie puts value on the response as the session cookie or, in
+// header-extractor mode, as the session-id response header. clearing selects
+// the deletion cookie (Max-Age=0). A session cookie emitted earlier in the
+// request (Regenerate after a mutation, Destroy after an early emission) is
+// replaced, never duplicated. When the response is already written nothing
+// can reach the client any more and the call is a no-op — mutating after the
+// body is not an error. It counts as a drop (once per request) only when the
+// undelivered header would have changed what the client holds: a new id or
+// the clearing cookie. Re-sending the id the request arrived with merely
+// refreshes Max-Age; losing that is harmless, so it is not counted.
+func (s *Session) emitCookie(value string, clearing bool) {
+	c := s.releaseCtx
+	if c.IsWritten() {
+		if !s.cookieDrop && (clearing || value != s.presentedID) {
+			s.cookieDrop = true
+			droppedCookies.Add(1)
+			validation.RecordSessionCookieDrop()
+		}
+		return
+	}
+	if s.useCookie {
+		ck := *s.cookie
+		ck.Value = value
+		if clearing {
+			ck.MaxAge = -1
+		}
+		if c.IsTLS() {
+			ck.Secure = true
+		}
+		if s.emittedID != "" || s.clearSent {
+			s.removeSessionCookie(c)
+		}
+		c.SetCookie(&ck)
+	} else {
+		// SetHeader replaces an existing value for the key, so the
+		// header-extractor mode never needs the removal step.
+		c.SetHeader(s.cookieName, value)
+	}
+	s.emittedID = value
+	s.clearSent = clearing
+}
+
+// retractCookie takes back a session cookie (or session-id header) emitted
+// earlier in the request whose id the store never received, because the
+// post-chain save failed. Without it the error response would hand the
+// client an id that does not exist server-side; with it the failed response
+// carries no session cookie, exactly as it did before the cookie moved to
+// the first mutation. A cookie carrying the id the request arrived with is
+// left alone — that id is still valid in the store and the client holds it
+// anyway — and nothing can be taken back once the headers are on the wire.
+func (s *Session) retractCookie() {
+	c := s.releaseCtx
+	if s.emittedID == "" || s.emittedID == s.presentedID || c.IsWritten() {
+		return
+	}
+	s.removeSessionCookie(c)
+	s.emittedID = ""
+}
+
+// removeSessionCookie drops the previously emitted Set-Cookie for the
+// session cookie name (or, in header-extractor mode, the session-id
+// response header) from the pending response headers. Other Set-Cookie
+// headers (CSRF, application cookies) are left untouched. This is the rare
+// path (a second emission in one request, or a retraction after a failed
+// save), so it rebuilds the header list through SetResponseHeaders rather
+// than mutating the slice ResponseHeaders returns.
+func (s *Session) removeSessionCookie(c *celeris.Context) {
+	hdrs := c.ResponseHeaders()
+	idx := -1
+	if s.useCookie {
+		prefix := s.cookieName + "="
+		for i, h := range hdrs {
+			if h[0] == "set-cookie" && strings.HasPrefix(h[1], prefix) {
+				idx = i
+				break
+			}
+		}
+	} else {
+		key := strings.ToLower(s.cookieName) // SetHeader lowercases keys
+		for i, h := range hdrs {
+			if h[0] == key {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	rebuilt := make([][2]string, 0, len(hdrs)-1)
+	rebuilt = append(rebuilt, hdrs[:idx]...)
+	rebuilt = append(rebuilt, hdrs[idx+1:]...)
+	c.SetResponseHeaders(rebuilt)
+}
+
+// Get returns the value for key from the session data.
+func (s *Session) Get(key string) (any, bool) {
+	v, ok := s.data[key]
+	return v, ok
+}
+
+// GetString returns the value for key as a string. Returns "" if the key
+// is missing or the value is not a string.
+func (s *Session) GetString(key string) string {
+	v := s.data[key]
+	str, _ := v.(string)
+	return str
+}
+
+// GetInt returns the value for key as an int. Returns 0 if the key is
+// missing or the value is not an int.
+func (s *Session) GetInt(key string) int {
+	v := s.data[key]
+	i, _ := v.(int)
+	return i
+}
+
+// GetBool returns the value for key as a bool. Returns false if the key
+// is missing or the value is not a bool.
+func (s *Session) GetBool(key string) bool {
+	v := s.data[key]
+	b, _ := v.(bool)
+	return b
+}
+
+// GetFloat64 returns the value for key as a float64. Returns 0 if the key
+// is missing or the value is not a float64.
+func (s *Session) GetFloat64(key string) float64 {
+	v := s.data[key]
+	f, _ := v.(float64)
+	return f
+}
+
+// Set stores a key-value pair in the session and marks it as modified.
+// The reserved key "_abs_exp" is silently rejected to protect internal
+// absolute-timeout bookkeeping.
+//
+// The first mutation of a request also puts the session cookie on the
+// response, so call Set (or any other mutator) BEFORE writing the response
+// body: once c.JSON/String/Blob has run, the headers are on the wire and the
+// cookie can no longer be sent (see [DroppedCookies]).
+func (s *Session) Set(key string, value any) {
+	if key == absExpKey {
+		return
+	}
+	s.data[key] = value
+	s.markModified()
+}
+
+// Delete removes a key from the session. The session is marked as modified
+// only if the key was actually present.
+func (s *Session) Delete(key string) {
+	if _, ok := s.data[key]; !ok {
+		return
+	}
+	delete(s.data, key)
+	s.markModified()
+}
+
+// Clear removes all user data from the session and marks it as modified.
+// The internal _abs_exp timestamp is preserved.
+func (s *Session) Clear() {
+	absExp, hasAbsExp := s.data[absExpKey]
+	clear(s.data)
+	if hasAbsExp {
+		s.data[absExpKey] = absExp
+	}
+	s.markModified()
+}
+
+// ID returns the session identifier.
+//
+// Under default lazy session creation ([Config.SaveUnmodified]=false), a fresh
+// session's ID is provisional until the session is modified (or explicitly saved);
+// if the request completes without writing, the ID is never stored or sent to
+// the client (celeris#487).
+//
+// The returned string is the session's own copy, never a view of the request,
+// so it may be kept after the request.
+func (s *Session) ID() string { return s.id }
+
+// IsFresh returns true if this is a newly created session (no prior valid cookie).
+//
+// When true under default lazy session creation, the session remains provisional
+// and will not be persisted unless modified during the request.
+func (s *Session) IsFresh() bool { return s.fresh }
+
+// Keys returns a sorted list of all user-visible keys in the session data.
+// The internal "_abs_exp" key is excluded.
+func (s *Session) Keys() []string {
+	keys := make([]string, 0, len(s.data))
+	for k := range s.data {
+		if k == absExpKey {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// Len returns the number of user-visible key-value pairs in the session.
+// The internal "_abs_exp" key is excluded from the count.
+func (s *Session) Len() int {
+	n := len(s.data)
+	if _, ok := s.data[absExpKey]; ok {
+		n--
+	}
+	return n
+}
+
+// Save persists the session data to the store. This is called automatically
+// after the handler chain when the session has been modified; call it
+// explicitly only if you need to guarantee persistence mid-handler. A
+// successful Save also puts the session cookie on the response if no
+// earlier mutation has done so already.
+// Returns [ErrSessionDestroyed] if the session has been destroyed.
+func (s *Session) Save() error {
+	if s.destroyed {
+		return ErrSessionDestroyed
+	}
+	if s.readOnly {
+		panic("session: Save called on a read-only session returned by GetByID; use the middleware pipeline for writes")
+	}
+	buf, err := store.EncodeJSON(s.data)
+	if err != nil {
+		return err
+	}
+	expiry := s.expiry
+	if s.idleOverride > 0 {
+		expiry = s.idleOverride
+	}
+	if err := s.store.Set(s.ctx, s.id, buf, expiry); err != nil {
+		return err
+	}
+	s.markModified()
+	return nil
+}
+
+// Destroy invalidates the session by clearing data and deleting it from
+// the store. The clearing cookie (Max-Age=0) is put on the response
+// immediately, replacing any session cookie emitted earlier in the request,
+// so Destroy too must run before the response body is written. No session
+// cookie is emitted for the rest of the request.
+func (s *Session) Destroy() error {
+	if s.readOnly {
+		panic("session: Destroy called on a read-only session returned by GetByID; use the middleware pipeline for writes")
+	}
+	s.data = make(map[string]any)
+	s.modified = false
+	s.destroyed = true
+	if s.releaseCtx != nil && !s.clearSent {
+		s.emitCookie("", true)
+	}
+	return s.store.Delete(s.ctx, s.id)
+}
+
+// Regenerate issues a new session ID while preserving data. The old session
+// is deleted from the store. The data is saved under the new ID by the
+// post-handler save (since modified is set to true), and the response
+// cookie is updated to carry the new ID right away (a cookie emitted
+// earlier in the request for the old ID is replaced, not duplicated).
+//
+// The internal _abs_exp timestamp is reset to the current time so the
+// regenerated session gets a fresh absolute timeout window.
+//
+// Applications MUST call Regenerate after authentication state changes
+// (e.g., login, privilege escalation) to prevent session fixation attacks.
+func (s *Session) Regenerate() error {
+	if s.readOnly {
+		panic("session: Regenerate called on a read-only session returned by GetByID; use the middleware pipeline for writes")
+	}
+	oldID := s.id
+	s.id = s.keyGen()
+	if err := s.store.Delete(s.ctx, oldID); err != nil {
+		return err
+	}
+	// Reset _abs_exp so the regenerated session gets a fresh absolute
+	// timeout window.
+	if _, ok := s.data[absExpKey]; ok {
+		s.data[absExpKey] = time.Now().UnixNano()
+	}
+	s.markModified()
+	return nil
+}
+
+// SetIdleTimeout overrides the idle timeout for this individual session.
+// The post-handler save uses this value instead of the config-level
+// [Config].IdleTimeout. Pass 0 to revert to the config default.
+func (s *Session) SetIdleTimeout(d time.Duration) {
+	s.idleOverride = d
+	s.markModified()
+}
+
+// Reset is a convenience method that combines [Session.Clear],
+// [Session.Regenerate], and marks the session as modified in a single call.
+// Useful for "log out and start fresh" flows.
+//
+// Note: Reset is not atomic. If Clear succeeds but Regenerate fails
+// (e.g., store error on Delete), the session data is already cleared
+// but the old session ID is retained. Callers should handle the returned
+// error accordingly.
+func (s *Session) Reset() error {
+	s.Clear()
+	return s.Regenerate()
+}
+
+// FromContext retrieves the [Session] from the request context.
+// Returns nil if the session middleware was not applied or the request was
+// skipped.
+func FromContext(c *celeris.Context) *Session {
+	v, ok := c.Get(ContextKey)
+	if !ok {
+		return nil
+	}
+	s, _ := v.(*Session)
+	return s
+}
+
+// validSessionID checks that s is exactly 64 lowercase hex characters
+// [0-9a-f]. Uppercase hex (A-F) is intentionally rejected because the
+// default [bufferedKeyGenerator] produces lowercase output; accepting
+// uppercase would double the ID space without security benefit and could
+// mask tampered cookies.
+func validSessionID(s string) bool {
+	if len(s) != sessionIDHexLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// Handler holds the session middleware and provides methods for out-of-band
+// session access (e.g., admin tools, background jobs).
+type Handler struct {
+	store store.KV
+	mw    celeris.HandlerFunc
+	wb    *writeBehindWriter // non-nil only when Config.WriteBehind is set
+}
+
+// Middleware returns the [celeris.HandlerFunc] to pass to server.Use().
+func (h *Handler) Middleware() celeris.HandlerFunc { return h.mw }
+
+// Close flushes any deferred write-behind session writes and stops the
+// background worker. When [Config].WriteBehind is false it is a no-op.
+//
+// Call this on graceful shutdown (e.g. from a server OnShutdown hook) to
+// guarantee no enqueued session write is lost: Close blocks until every
+// in-flight and queued store write has been applied. Safe to call multiple
+// times.
+func (h *Handler) Close() error {
+	if h.wb != nil {
+		return h.wb.Close()
+	}
+	return nil
+}
+
+// GetByID retrieves a session by its raw ID without an HTTP context.
+// This is intended for admin tools, background jobs, or WebSocket handlers
+// that need to inspect session data outside of the middleware pipeline.
+//
+// The returned [Session] is read-only: use Get, GetString, GetInt,
+// GetBool, GetFloat64, Keys, Len, ID, and IsFresh. Calling Save,
+// Regenerate, or Destroy on a GetByID session panics with a descriptive
+// message because no store or context is bound.
+// Returns nil and no error if the session does not exist.
+func (h *Handler) GetByID(ctx context.Context, id string) (*Session, error) {
+	raw, err := h.store.Get(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	data := make(map[string]any)
+	if derr := store.DecodeJSON(raw, &data); derr != nil {
+		return nil, derr
+	}
+	return &Session{
+		// The caller keeps the returned Session, often past the request it
+		// looked the ID up in, and a handler's id is typically what
+		// c.Cookie, c.Header or c.Query returned: on epoll and io_uring a
+		// view of the receive buffer, which the connection's next request
+		// overwrites. Keep a copy.
+		id:       strings.Clone(id),
+		data:     data,
+		readOnly: true,
+	}, nil
+}
+
+// NewHandler creates a session [Handler] that exposes both the middleware
+// and out-of-band session access via [Handler.GetByID].
+func NewHandler(config ...Config) *Handler {
+	cfg := defaultConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = applyDefaults(cfg)
+	cfg.validate()
+
+	h := &Handler{store: cfg.Store}
+	h.mw, h.wb = newMiddleware(cfg)
+	return h
+}
+
+// New creates a session middleware with the given config.
+//
+// Note: when [Config].WriteBehind is enabled, prefer [NewWithCloser] or
+// [NewHandler] so you have a handle to flush deferred writes on shutdown.
+// New on its own gives no such handle; a graceful stop cannot drain the
+// write-behind queue and the final updates of in-flight requests may be lost.
+func New(config ...Config) celeris.HandlerFunc {
+	cfg := defaultConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = applyDefaults(cfg)
+	cfg.validate()
+	mw, _ := newMiddleware(cfg)
+	return mw
+}
+
+// NewWithCloser creates a session middleware and returns it together with an
+// [io.Closer] that flushes the write-behind queue on graceful shutdown.
+//
+// When [Config].WriteBehind is false the returned closer is a no-op, so it is
+// always safe to wire into a shutdown hook regardless of configuration:
+//
+//	mw, closer := session.NewWithCloser(session.Config{WriteBehind: true})
+//	server.Use(mw)
+//	defer closer.Close() // drains pending session writes, loses nothing
+func NewWithCloser(config ...Config) (celeris.HandlerFunc, io.Closer) {
+	cfg := defaultConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = applyDefaults(cfg)
+	cfg.validate()
+	mw, wb := newMiddleware(cfg)
+	return mw, closerFunc(func() error {
+		if wb != nil {
+			return wb.Close()
+		}
+		return nil
+	})
+}
+
+// closerFunc adapts a func() error to io.Closer so NewWithCloser can return a
+// no-op closer when write-behind is disabled without allocating a struct.
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+func newMiddleware(cfg Config) (celeris.HandlerFunc, *writeBehindWriter) {
+	skipMap := make(map[string]struct{}, len(cfg.SkipPaths))
+	for _, p := range cfg.SkipPaths {
+		skipMap[p] = struct{}{}
+	}
+
+	cookieName := cfg.CookieName
+	keyGen := cfg.KeyGenerator
+	idleTimeout := cfg.IdleTimeout
+	absTimeout := cfg.AbsoluteTimeout
+	absDisabled := absTimeout < 0
+	errorHandler := cfg.ErrorHandler
+	if errorHandler == nil {
+		errorHandler = func(_ *celeris.Context, err error) error { return err }
+	}
+
+	extract := cfg.Extractor
+	useCookieExtractor := extract == nil
+	if useCookieExtractor {
+		extract = CookieExtractor(cookieName)
+	}
+
+	// cookie is the per-middleware template every request's Session points
+	// at (see Session.cookie). Value, Secure and MaxAge are resolved per
+	// emission on a copy; the template itself is never mutated.
+	cookie := &celeris.Cookie{
+		Name:     cfg.CookieName,
+		Path:     cfg.CookiePath,
+		Domain:   cfg.CookieDomain,
+		MaxAge:   *cfg.CookieMaxAge,
+		Secure:   cfg.CookieSecure,
+		HTTPOnly: *cfg.CookieHTTPOnly,
+		SameSite: cfg.CookieSameSite,
+	}
+
+	kv := cfg.Store
+
+	var wb *writeBehindWriter
+	if cfg.WriteBehind {
+		// onError surfaces deferred-write failures: the request goroutine has
+		// already returned, so the only path back to the application is the
+		// configured ErrorHandler (called with a nil Context — the request is
+		// gone). When no ErrorHandler is set, the failure is dropped, matching
+		// the "fire and forget" contract the flag opts into.
+		var onErr func(error)
+		if cfg.ErrorHandler != nil {
+			onErr = func(err error) { _ = cfg.ErrorHandler(nil, err) }
+		}
+		wb = newWriteBehindWriter(kv, onErr)
+	}
+
+	mw := func(c *celeris.Context) error {
+		if cfg.Skip != nil && cfg.Skip(c) {
+			return c.Next()
+		}
+
+		if _, ok := skipMap[c.Path()]; ok {
+			return c.Next()
+		}
+
+		reqCtx := c.Context()
+
+		sess := sessionPool.Get().(*Session)
+		sess.store = kv
+		sess.ctx = reqCtx
+		sess.expiry = idleTimeout
+		sess.keyGen = keyGen
+		sess.data = nil // set from store.Get or make below
+		sess.id = ""
+		sess.modified = false
+		sess.destroyed = false
+		sess.fresh = false
+		sess.idleOverride = 0
+		sess.readOnly = false
+		sess.cookie = cookie
+		sess.cookieName = cookieName
+		sess.useCookie = useCookieExtractor
+		sess.emittedID = ""
+		sess.clearSent = false
+		sess.cookieDrop = false
+		sess.presentedID = ""
+
+		// Register cleanup callback to return session to pool on all exit
+		// paths — including panics (issue #12: pool leak on error paths).
+		// Uses a method value over *Session (sess.releaseCtx provides the
+		// context back-pointer) instead of an anonymous closure so the
+		// escape cost is one funcval, not a multi-capture struct.
+		sess.releaseCtx = c
+		// Lazy-bind the method-value on first use of a pooled Session so
+		// subsequent requests reuse the stored funcval without
+		// re-materialising it. Go's init cycle detector prevents binding
+		// inside sessionPool.New since returnToPool references the pool.
+		if sess.onReleaseFn == nil {
+			sess.onReleaseFn = sess.returnToPool
+		}
+		c.OnRelease(sess.onReleaseFn)
+
+		loaded := false
+		sid := extract(c)
+		if sid != "" && !validSessionID(sid) {
+			sid = ""
+		}
+		if sid != "" {
+			raw, loadErr := kv.Get(reqCtx, sid)
+			var data map[string]any
+			if loadErr != nil && !errors.Is(loadErr, store.ErrNotFound) {
+				return errorHandler(c, loadErr)
+			}
+			if loadErr == nil {
+				mp := sessionDataPool.Get().(*map[string]any)
+				data = *mp
+				if derr := store.DecodeJSON(raw, &data); derr != nil {
+					clear(data)
+					sessionDataPool.Put(mp)
+					return errorHandler(c, derr)
+				}
+				sess.pooledMap = true
+				sess.dataPoolPtr = mp
+			}
+			if data != nil && !absDisabled {
+				// Check absolute timeout.
+				expired := false
+				ts, hasAbsExp := data[absExpKey]
+				if hasAbsExp {
+					// Handle both int64 (native) and float64 (JSON-decoded)
+					// type assertions (issue #4).
+					var created int64
+					switch v := ts.(type) {
+					case int64:
+						created = v
+					case float64:
+						created = int64(v)
+					}
+					if created > 0 && time.Since(time.Unix(0, created)) > absTimeout {
+						expired = true
+					}
+				} else {
+					// _abs_exp missing from a loaded session: treat as
+					// expired (issue #3).
+					expired = true
+				}
+				if expired {
+					_ = kv.Delete(reqCtx, sid)
+					data = nil
+				}
+			}
+			if data != nil {
+				// sid is what the extractor returned: c.Cookie, c.Header
+				// or c.Query, which on epoll and io_uring is a view of
+				// the connection's receive buffer. The engine receives
+				// the connection's next request into that buffer, and a
+				// closed connection's buffer serves the next connection.
+				// The session ID outlives this handler: the write-behind
+				// worker writes under it after the handler has returned
+				// (celeris#731), a detached stream keeps the Session
+				// through the Context, and ID() hands it to the
+				// application. So the Session keeps its own copy, and
+				// presentedID shares it. One copy, only when a stored
+				// session loads. kv.Get above and the expiry branch's
+				// kv.Delete return before the handler does, so they use
+				// the view.
+				id := strings.Clone(sid)
+				sess.id = id
+				sess.data = data
+				sess.presentedID = id
+				loaded = true
+			}
+		}
+
+		if !loaded {
+			sess.id = keyGen()
+			sess.fresh = true
+			// Reuse pooled maps on the fresh-session path too so both
+			// cold-start and warm sessions share alloc amortisation.
+			mp := sessionDataPool.Get().(*map[string]any)
+			sess.data = *mp
+			sess.pooledMap = true
+			sess.dataPoolPtr = mp
+			if !absDisabled {
+				sess.data[absExpKey] = time.Now().UnixNano()
+			}
+		}
+
+		c.Set(ContextKey, sess)
+
+		// Cookie timing: celeris writes the response headers to the wire
+		// the moment the handler calls c.JSON/String/Blob, so the session
+		// cookie has to be on the response BEFORE that. Every mutator
+		// (Set, Delete, Clear, SetIdleTimeout, Save, Regenerate, Destroy)
+		// emits it at the first mutation via markModified/emitCookie; a
+		// fresh session under SaveUnmodified is persisted no matter what
+		// the handler does, so its cookie goes out right here, before the
+		// handler runs. The post-chain emission below only remains as the
+		// fallback for handlers that write no body (the router materialises
+		// the headers afterwards) — it never emits a second header.
+		if sess.fresh && cfg.SaveUnmodified {
+			sess.emitSessionCookie()
+		}
+
+		chainErr := c.Next()
+
+		// validateAdmission is a no-op in production (see
+		// validation_default.go); under -tags=validation it asserts
+		// session-owner binding and increments
+		// validation.SessionOwnerMismatches on violation. Runs AFTER
+		// c.Next() so the handler chain has had a chance to populate
+		// the owner data the assertion compares against.
+		validateAdmission(sess)
+
+		if sess.destroyed {
+			if !sess.clearSent {
+				sess.emitCookie("", true)
+			}
+		} else if sess.modified || (sess.fresh && cfg.SaveUnmodified) {
+			expiry := idleTimeout
+			if sess.idleOverride > 0 {
+				expiry = sess.idleOverride
+			}
+			buf, encErr := store.EncodeJSON(sess.data)
+			if encErr != nil {
+				// Nothing was persisted: an id emitted at the first
+				// mutation must not reach the client (see retractCookie).
+				sess.retractCookie()
+				if chainErr != nil {
+					return errorHandler(c, fmt.Errorf("%w; handler chain error: %w", encErr, chainErr))
+				}
+				return errorHandler(c, encErr)
+			}
+			if wb != nil {
+				// Write-behind path: buf is a fresh json.Marshal snapshot,
+				// independent of sess.data (which returnToPool recycles), so
+				// handing it to the background worker cannot race the next
+				// request's reuse of the pooled map. The store write is moved
+				// off the response critical path; the cookie is still emitted
+				// synchronously (at the first mutation, or below) so the
+				// client's next request carries the (already-snapshotted)
+				// session ID. sess.id is safe to queue: it is the copy made
+				// when the session loaded, or a KeyGenerator result (fresh
+				// session, Regenerate), never a view of the request.
+				wb.enqueue(sess.id, buf, expiry)
+			} else {
+				saveErr := kv.Set(reqCtx, sess.id, buf, expiry)
+				if saveErr != nil {
+					// Issue #11: wrap chainErr with save error so neither
+					// is swallowed. A cookie emitted at the first mutation
+					// would point at a session the store never received;
+					// take it back so the failed response carries no
+					// session cookie, as before early emission. (The
+					// write-behind branch above cannot fail here: its store
+					// errors surface later through ErrorHandler, and the
+					// cookie stays, by design.)
+					sess.retractCookie()
+					if chainErr != nil {
+						return errorHandler(c, fmt.Errorf("%w; handler chain error: %w", saveErr, chainErr))
+					}
+					return errorHandler(c, saveErr)
+				}
+			}
+			// Fallback for no-body handlers; a no-op when the cookie for
+			// this id is already on the response, and a counted no-op when
+			// the body is already on the wire.
+			sess.emitSessionCookie()
+		}
+
+		return chainErr
+	}
+
+	return mw, wb
+}

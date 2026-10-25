@@ -1,0 +1,680 @@
+//go:build linux
+
+package websocket
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/goceleris/celeris"
+	celerisengine "github.com/goceleris/celeris/internal/engine"
+	"github.com/goceleris/celeris/internal/probe"
+)
+
+// closeHandshakeSlow is the point past which the client's wait for the
+// server's close is worth reporting. See the client loop for the measured
+// distribution behind it (celeris#566).
+const closeHandshakeSlow = 10 * time.Second
+
+// TestBackpressureInboundSequenceIntegrity (celeris#484 oracle): every inbound
+// frame carries a strictly increasing 64-bit sequence number and connection index,
+// so a lost, corrupted, or reordered frame is detected immediately. The client
+// floods without reading (forcing repeated pause/resume) and the server handler
+// validates sequence continuity per connection, payload content integrity, and
+// verifies the tail sequence number transmitted in the Close frame.
+//
+// The frame count measures DELIVERY: a handler whose echo write fails stops
+// echoing but keeps reading until the stream ends, so frames the engine did
+// deliver are never reported lost because the handler walked away from them
+// (celeris#611). The echo failure itself is judged, with its error and its
+// connection, when it came before its own client closed.
+//
+// After its flood the client holds the backpressure idle for wsoQuiet, as the
+// pause-cancel test does, so a connection the engine stopped reading behind its
+// blocked echo (celeris#607) stays unread long enough for the watch to see it.
+// With celeris#607 re-introduced (mutant m607) this fired on io_uring, in a
+// linux/arm64 container, at 16 connections and 2 bursts of 16000 frames, the
+// size ci.yml runs (not yet on amd64); it did not at 1000 frames per burst,
+// whose echo fits the socket buffers and never blocks a send (checklist #888
+// item 4). The io_uring/multishot_recv arm did not fire in those runs.
+//
+// The client finishes its writes and waits for the close on progress, reading
+// while it waits, like TestBackpressurePauseDoesNotCancelInflightSend's
+// (backpressure_oracle_linux_test.go, celeris#633), and the rig's watch fails
+// a connection the engine stops reading (WSO-STALL, the celeris#607 class). A
+// write timeout during the flood is the backpressure the test creates, not a
+// failure: it ends that burst, the next one resumes at the same wire
+// position, and the connection stays in every verdict (it used to be taken
+// out of the frame count). floodDeadlines on the verdict line counts those
+// bursts, so a run shows whether it exercised that path at all.
+func TestBackpressureInboundSequenceIntegrity(t *testing.T) {
+	conns := envInt("WS484_CONNS", 96)
+	// bpBuf is the chanReader backpressure buffer capacity (default 256, matching the
+	// original #484 reproduction fixture; verified at both 256 and 512).
+	bpBuf := envInt("WS484_BP", 256)
+	bursts := envInt("WS484_BURSTS", 4)
+	perBurst := envInt("WS484_BURST_FRAMES", 16000) // frames per burst per conn
+	if testing.Short() {
+		conns = envInt("WS484_CONNS", 16)
+		bursts = envInt("WS484_BURSTS", 2)
+		perBurst = envInt("WS484_BURST_FRAMES", 1000)
+	}
+	const plen = 120
+
+	expectedPad := bytes.Repeat([]byte{'x'}, plen-16)
+
+	for _, kind := range engineKinds(t) {
+		kind := kind
+		variants := []struct {
+			name     string
+			mshotEnv string
+		}{
+			{"defaults", ""},
+		}
+		if kind == celeris.IOUring {
+			variants = append(variants, struct {
+				name     string
+				mshotEnv string
+			}{"multishot_recv", "1"})
+		}
+		for _, v := range variants {
+			v := v
+			testName := kind.String()
+			if v.name != "defaults" {
+				testName += "/" + v.name
+			}
+			t.Run(testName, func(t *testing.T) {
+				if v.mshotEnv != "" {
+					t.Setenv("CELERIS_IOURING_MULTISHOT_RECV", v.mshotEnv)
+					p := probe.Probe()
+					t.Logf("%s: multishot_recv sub-run: kernel=%s tier=%s providedBuffers=%t multishotRecv=%t",
+						testName, p.KernelVersion, p.IOUringTier.String(), p.ProvidedBuffers, p.MultishotRecv)
+					if !p.ProvidedBuffers || p.IOUringTier < celerisengine.High {
+						t.Skip("skipping multishot_recv sub-run: kernel does not support provided buffers (need High tier + ProvidedBuffers)")
+					}
+				}
+
+				// Handler goroutines must NEVER call t.Errorf/t.Fatalf: they
+				// outlive the subtest (the engine is shut down in a defer,
+				// after the assertions), and testing panics with "Fail in
+				// goroutine after <test> has completed". That turned a
+				// perfectly ordinary parse error into a panic that took the
+				// whole package down with no summary at all — roughly one
+				// run in ten. Every one of these sites already bumps a
+				// counter that is asserted below, so the message is only a
+				// diagnostic: record it and let the counter fail the test.
+				var detailMu sync.Mutex
+				var details []string
+				note := func(format string, args ...any) {
+					detailMu.Lock()
+					if len(details) < 16 {
+						details = append(details, fmt.Sprintf(format, args...))
+					}
+					detailMu.Unlock()
+				}
+
+				rig := newWSORig(t)
+				var gaps, parseErr, overflowErr, protoErr, framesIn, framesSent, echoErr, slowClose, readAfterEchoErr atomic.Int64
+				// floodDeadlines: bursts a write deadline ended (the burst's
+				// backpressure); floodDeadlineConns: connections with one.
+				var floodDeadlines, floodDeadlineConns atomic.Int64
+				var closedOK, closeTimeout, dialFail, hsFail, clientCloseFail atomic.Int64
+				// An RST is NOT a clean close (celeris#530). Linux emits one
+				// when a socket is closed with unread data still in its
+				// receive queue, which is precisely the signature of a
+				// connection torn down mid-stream — the failure this oracle
+				// exists to catch. Both sides folded it into closedOK, so a
+				// hard teardown scored as success. Counted separately at both
+				// ends: serverRST when the handler's read is reset, clientRST
+				// when the client's is.
+				var serverRST, clientRST atomic.Int64
+
+				connLastSeq := make([]int64, conns)
+				for i := range conns {
+					connLastSeq[i] = -1
+				}
+				connFramesIn := make([]atomic.Int64, conns)
+				// Frames the server successfully echoed, and which conns saw an
+				// echo failure — the server-side half of every truncation report.
+				connEchoed := make([]atomic.Int64, conns)
+				connEchoErr := make([]atomic.Int64, conns)
+				connProtoErr := make([]atomic.Int64, conns)
+				// Frames the handler read after its own echo write failed
+				// (celeris#611): delivered, and counted in connFramesIn.
+				connReadAfterEchoErr := make([]atomic.Int64, conns)
+				connSent := make([]atomic.Int64, conns)
+				connPort := make([]atomic.Int64, conns) // the client's local port: the connection's address
+				clientFailed := make([]atomic.Bool, conns)
+
+				// Handlers must finish before the engine goes away — see settle().
+				var handlerWG sync.WaitGroup
+				addr, shutdown, srv := startNativeServerWithHandle(t, kind, Config{
+					CheckOrigin:           func(*celeris.Context) bool { return true },
+					ReadLimit:             256 * 1024,
+					MaxBackpressureBuffer: bpBuf,
+					Handler: func(c *Conn) {
+						handlerWG.Add(1)
+						defer handlerWG.Done()
+						s := rig.attach(c)
+						defer s.exited("returned", nil)
+						var myConnIdx = -1
+						// echoing goes false when an echo write fails. The
+						// handler then stops writing and keeps READING to the
+						// end of the stream, so the frame count measures what
+						// the engine delivered, not where the handler gave up
+						// (celeris#611: 99.8-99.9% of the frames it reported
+						// missing were still queued, unread, at handler exit).
+						echoing := true
+						for {
+							s.phase.Store(1)
+							mt, msg, err := c.ReadMessage()
+							if err != nil {
+								s.exited("read", err)
+								if ce, ok := err.(*CloseError); ok {
+									if len(ce.Text) == 8 && myConnIdx >= 0 {
+										finalCount := int64(binary.BigEndian.Uint64([]byte(ce.Text)))
+										expectedCount := connLastSeq[myConnIdx] + 1
+										if expectedCount != finalCount {
+											note("conn %d: tail loss: last seq=%d, client sent=%d",
+												myConnIdx, connLastSeq[myConnIdx], finalCount)
+											gaps.Add(1)
+										}
+									}
+								} else if errors.Is(err, ErrReadLimit) {
+									// Channel capacity overflow at chanReader.Append when async pause latency
+									// outpaces headroom. Tracked separately from wire frame corruption.
+									overflowErr.Add(1)
+								} else {
+									// noteReadErr records a reset and any other
+									// error for serverErrs to judge (a reset is
+									// excused only when its client gave up first).
+									switch s.noteReadErr(err) {
+									case srvReadReset:
+										serverRST.Add(1)
+									case srvReadOther:
+										protoErr.Add(1)
+										if myConnIdx >= 0 {
+											connProtoErr[myConnIdx].Add(1)
+										}
+										if isParseErr(err) {
+											parseErr.Add(1)
+											note("parse error on conn %d: %v", myConnIdx, err)
+										}
+									}
+								}
+								return
+							}
+
+							if len(msg) != plen {
+								parseErr.Add(1)
+								note("invalid frame length: got %d, want %d", len(msg), plen)
+								return
+							}
+
+							cIdx := int(binary.BigEndian.Uint64(msg[8:16]))
+							if cIdx < 0 || cIdx >= conns {
+								parseErr.Add(1)
+								note("invalid conn index in payload: %d", cIdx)
+								return
+							}
+							if myConnIdx < 0 {
+								myConnIdx = cIdx
+							} else if myConnIdx != cIdx {
+								parseErr.Add(1)
+								note("conn index mismatch: frame claimed %d, connection was %d", cIdx, myConnIdx)
+								return
+							}
+
+							if !bytes.Equal(msg[16:], expectedPad) {
+								parseErr.Add(1)
+								note("conn %d: payload padding corrupted", cIdx)
+								return
+							}
+
+							seq := int64(binary.BigEndian.Uint64(msg[:8]))
+							expectedSeq := connLastSeq[cIdx] + 1
+							if seq != expectedSeq {
+								gaps.Add(1)
+								note("conn %d: seq gap: got %d, want %d", cIdx, seq, expectedSeq)
+							}
+							connLastSeq[cIdx] = seq
+							connFramesIn[cIdx].Add(1)
+							framesIn.Add(1)
+
+							if !echoing {
+								connReadAfterEchoErr[cIdx].Add(1)
+								readAfterEchoErr.Add(1)
+								continue
+							}
+							s.phase.Store(2)
+							if err := c.WriteMessage(mt, msg); err != nil {
+								// The handler's own echo failure used to be
+								// swallowed here. A client reporting a truncated
+								// stream could not be told apart from a server
+								// that stopped writing, which is the ambiguity
+								// celeris#562 spent several rounds inside. It is
+								// recorded with its time and judged against its
+								// client's close; the handler keeps reading.
+								echoErr.Add(1)
+								connEchoErr[cIdx].Store(1)
+								s.noteErr("write", err)
+								note("conn %d: echo write failed after %d frames: %v",
+									cIdx, connEchoed[cIdx].Load(), err)
+								echoing = false
+								continue
+							}
+							s.echoed(len(msg))
+							connEchoed[cIdx].Add(1)
+						}
+					},
+				})
+				// Wait for the HANDLERS, then shut the engine down.
+				//
+				// Shutting down does not drain them, it truncates them.
+				// Worker.shutdown closes every detached connection, which
+				// closes its inbound reader with a bare io.EOF, and a handler
+				// sitting in io.ReadFull part-way through a frame turns that
+				// into io.ErrUnexpectedEOF — which isParseErr scores as frame
+				// corruption. The clients joining does not mean the handlers
+				// have: under the backpressure this test creates on purpose, a
+				// handler can be several frames behind.
+				//
+				// Joined by peer address over 36 runs: 4789 connections closed
+				// by the normal per-connection path produced no truncation, and
+				// all 6 closed by Worker.shutdown truncated — 6 of 6. Draining
+				// first takes that to 0 of 36 (celeris#562).
+				//
+				// A handler that will not finish is reported as exactly that,
+				// so a genuinely stuck one still fails, and loudly.
+				var shutdownOnce sync.Once
+				settle := func() {
+					shutdownOnce.Do(func() {
+						handlersDrained := make(chan struct{})
+						go func() { handlerWG.Wait(); close(handlersDrained) }()
+						select {
+						case <-handlersDrained:
+						case <-time.After(20 * time.Second):
+							t.Errorf("%s: handlers still running 20s after the clients "+
+								"finished; shutting down now would truncate them", testName)
+						}
+						done := make(chan struct{})
+						go func() { shutdown(); close(done) }()
+						select {
+						case <-done:
+						case <-time.After(20 * time.Second):
+							t.Errorf("engine shutdown did not complete within 20s")
+						}
+					})
+				}
+				defer settle()
+
+				hostPort := strings.TrimSuffix(strings.TrimPrefix(addr, "ws://"), "/ws")
+				rig.setServer(hostPort)
+				stopWatch := rig.watch()
+				dialer := net.Dialer{Timeout: 3 * time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
+					var serr error
+					_ = rc.Control(func(fd uintptr) { serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 32<<10) })
+					return serr
+				}}
+
+				var wg sync.WaitGroup
+				for i := range conns {
+					connID := i
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						c, err := dialer.Dial("tcp", hostPort)
+						if err != nil {
+							dialFail.Add(1)
+							clientFailed[connID].Store(true)
+							return
+						}
+						cl := rig.client(c)
+						connPort[connID].Store(int64(cl.port))
+						defer rig.closeClient(cl, c)
+						if err := cl.handshake(c, hostPort); err != nil {
+							hsFail.Add(1)
+							clientFailed[connID].Store(true)
+							return
+						}
+
+						m := [4]byte{0x11, 0x22, 0x33, 0x44}
+						encode := func(seq uint64) []byte {
+							f := make([]byte, 6+plen)
+							f[0], f[1] = 0x82, 0x80|byte(plen) // BINARY: payload carries 64-bit seq + connID
+							copy(f[2:6], m[:])
+							var payload [plen]byte
+							binary.BigEndian.PutUint64(payload[:8], seq)
+							binary.BigEndian.PutUint64(payload[8:16], uint64(connID))
+							for j := 16; j < plen; j++ {
+								payload[j] = 'x'
+							}
+							for j := 0; j < plen; j++ {
+								f[6+j] = payload[j] ^ m[j%4]
+							}
+							return f
+						}
+
+						var seq uint64
+						cur, off := encode(0), 0
+						deadlines := 0
+						for b := 0; b < bursts; b++ {
+							budget := perBurst * (6 + plen)
+							for budget > 0 {
+								_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+								n, err := c.Write(cur[off:])
+								off += n
+								budget -= n
+								if off == len(cur) {
+									seq++
+									cur, off = encode(seq), 0
+								}
+								if err != nil {
+									if errors.Is(err, os.ErrDeadlineExceeded) {
+										// Backpressure, which is what the
+										// test creates: this burst ends here
+										// and the next resumes at the same
+										// wire position. It used to fail the
+										// connection, taking exactly the
+										// backpressured connections out of
+										// the frame-count verdict.
+										deadlines++
+										floodDeadlines.Add(1)
+										break
+									}
+									clientFailed[connID].Store(true)
+									clientCloseFail.Add(1)
+									cl.giveUp(t, c, testName, fmt.Sprintf("flood write failed: %v", err))
+									return
+								}
+							}
+							time.Sleep(200 * time.Millisecond)
+						}
+						if deadlines > 0 {
+							floodDeadlineConns.Add(1)
+						}
+						cl.mark("flood end seq=%d off=%d burstsEndedByDeadline=%d", seq, off, deadlines)
+						cl.sample(c, "flood end")
+						// Hold the backpressure with the client idle (wsoQuiet), as
+						// TestBackpressurePauseDoesNotCancelInflightSend does: a
+						// healthy engine reads what this connection's socket holds
+						// or pauses it; one that stopped reading it behind the blocked
+						// echo SEND (celeris#607) cannot, and the watch sees that
+						// stretch pass wsoRecvStall. Without it the client reads again
+						// at once and the stretch never lasts (celeris#888 item 4).
+						time.Sleep(wsoQuiet)
+						cl.mark("quiet end")
+						buf := make([]byte, 64<<10)
+						if off > 0 {
+							if w := cl.write(c, "fc", cur[off:], buf); !w.ok {
+								clientFailed[connID].Store(true)
+								clientCloseFail.Add(1)
+								cl.giveUp(t, c, testName, "gave up finishing its last frame: "+w.String())
+								return
+							}
+							seq++
+						}
+						connSent[connID].Store(int64(seq))
+						framesSent.Add(int64(seq))
+
+						for {
+							_ = c.SetReadDeadline(time.Now().Add(1 * time.Second))
+							if _, err := c.Read(buf); err != nil {
+								break
+							}
+						}
+
+						cl.mark("drained; writing Close")
+						if w := cl.write(c, "cw", maskedCloseFrameWithCount(seq), buf); !w.ok {
+							clientFailed[connID].Store(true)
+							clientCloseFail.Add(1)
+							cl.giveUp(t, c, testName, "gave up writing its Close frame: "+w.String())
+							return
+						}
+						cl.mark("Close sent")
+
+						// The server routinely takes ~12s to close after the
+						// client's Close frame on this workload: 96 connections
+						// are driven into backpressure on purpose, so a handler
+						// is still draining its queue when the client stops.
+						// Measured over 48 runs, every late close landed between
+						// 11.88s and 12.91s and none exceeded it — a tight
+						// cluster just past the old 10s deadline, not a tail.
+						// At 10s the oracle reported "the server never closed
+						// its side" for a server that closes two seconds later
+						// (celeris#566).
+						//
+						// The wait gives up only after wsoCloseIdle with no
+						// byte from the server (re-armed by every byte), at
+						// wsoWaitCap, or at the rig's -timeout budget, so a
+						// genuine hang is still what fails,
+						// and the latency is recorded so a regression shows up
+						// as a number rather than as a boolean that silently
+						// starts tripping.
+						r := cl.closeWait(c, buf)
+						if r.dur > closeHandshakeSlow {
+							slowClose.Add(1)
+							note("conn %d: server closed %v after the client's Close (%s)",
+								connID, r.dur.Round(time.Millisecond), r)
+						}
+						// A connection that did not close cleanly fails below with
+						// its record, and leaves the frame count: frames still in
+						// the client's own send queue when it gave up, or thrown
+						// away with a reset, were never the engine's to deliver.
+						switch r.outcome {
+						case "eof":
+							closedOK.Add(1)
+							// A silence over wsoCloseSlow is printed with both
+							// ends' timeline (WSO-CLOSESLOW), not asserted
+							// (celeris#633).
+							cl.closeSlow(t, c, testName, r)
+						case "rst":
+							clientFailed[connID].Store(true)
+							clientRST.Add(1)
+							cl.giveUp(t, c, testName, "was RESET instead of closed: "+r.String())
+						default:
+							clientFailed[connID].Store(true)
+							closeTimeout.Add(1)
+							cl.giveUp(t, c, testName, "gave up waiting for the server's close: "+r.String())
+						}
+					}()
+				}
+				wg.Wait()
+				stalls := stopWatch()
+
+				if dialFail.Load()+hsFail.Load() > 0 {
+					t.Fatalf("environment: %d dial/handshake failures", dialFail.Load()+hsFail.Load())
+				}
+
+				// Drain the handlers, then assert on settled counters.
+				settle()
+
+				// The summary belongs AFTER settle(), not before it. Printed
+				// ahead of the drain it is a snapshot of counters the handler
+				// goroutines are still incrementing, so it disagrees with the
+				// assertions below on exactly the runs that matter: six runs
+				// whose summary read parseErr=0 went on to fail the parse-error
+				// assertion. Anyone comparing two builds by grepping this line
+				// is reading stale numbers.
+				judged, excused := rig.serverErrs()
+				var echoJudged int64
+				for _, e := range judged {
+					if e.kind == "write" {
+						echoJudged++
+					}
+				}
+				t.Logf("%s: conns=%d framesSent=%d framesIn=%d seqGaps=%d parseErr=%d overflowErr=%d protocolErrors=%d clientCloseFail=%d closedOK=%d clientRST=%d serverRST=%d closeTimeout=%d dialFail=%d hsFail=%d echoErrJudged=%d readAfterEchoErr=%d serverErrsExcused=%d floodDeadlines=%d floodDeadlineConns=%d recvStalls=%d",
+					testName, conns, framesSent.Load(), framesIn.Load(), gaps.Load(), parseErr.Load(), overflowErr.Load(), protoErr.Load(), clientCloseFail.Load(), closedOK.Load(), clientRST.Load(), serverRST.Load(), closeTimeout.Load(), dialFail.Load(), hsFail.Load(),
+					echoJudged, readAfterEchoErr.Load(), len(excused), floodDeadlines.Load(), floodDeadlineConns.Load(), len(stalls))
+				t.Logf("%s: %s", testName, rig.waitStats())
+				t.Logf("%s: %s", testName, rig.longestStretch())
+				for _, e := range excused {
+					t.Logf("%s: not judged, its client gave up: %s", testName, e.line)
+				}
+
+				detailMu.Lock()
+				for _, d := range details {
+					t.Logf("%s: %s", testName, d)
+				}
+				detailMu.Unlock()
+
+				t.Logf("%s: echoWriteErrors=%d slowCloses=%d (>%v; the close wait gives up after %v without a byte, or at %v)",
+					testName, echoErr.Load(), slowClose.Load(), closeHandshakeSlow, wsoCloseIdle, wsoWaitCap)
+
+				// Recv-arming witnesses (celeris#586), read AFTER settle() so
+				// every worker has left its loop. RecvLinkedArms is not a
+				// direct atomic: flushSendLink counts it in the worker-local
+				// linkArmBatch, flushed to the shared counter once per
+				// iteration and by flushBatches at shutdown (celeris#874), so
+				// the read below sees the arms of the last iteration too.
+				// RecvResumeWhileCancelPending says the load reached the
+				// celeris#484 window at all; RecvDoubleArmed (a second recv
+				// SQE placed) and RecvCQEUnaccounted (a terminal recv CQE the
+				// bookkeeping did not expect — the kernel-side witness) are
+				// per-event invariants and one event fails the run.
+				if kind == celeris.IOUring {
+					info := srv.EngineInfo()
+					if info == nil {
+						t.Fatalf("%s: EngineInfo() is nil after shutdown; cannot read the recv-arming witnesses", testName)
+					}
+					m := info.Metrics
+					t.Logf("%s: RECVARM bp=%d resumeWhileCancelPending=%d resumeWhileRecvInFlight=%d armDeclined=%d doubleArmed=%d cqeUnaccounted=%d parseErr=%d",
+						testName, bpBuf, m.RecvResumeWhileCancelPending, m.RecvResumeWhileRecvInFlight, m.RecvArmDeclined,
+						m.RecvDoubleArmed, m.RecvCQEUnaccounted, parseErr.Load())
+					t.Logf("%s: LINKBLOCK arms=%d blockedTotalMs=%d blockedMaxMs=%d",
+						testName, m.RecvLinkedArms, m.RecvLinkedBlockedNanos/1e6, m.RecvLinkedBlockedMaxNanos/1e6)
+					wsoAssertNoLinkedRecv(t, testName, m.RecvLinkedArms, m.RecvLinkedBlockedMaxNanos)
+					if m.RecvDoubleArmed != 0 {
+						t.Errorf("%s: RecvDoubleArmed=%d — a second recv SQE was placed on a connection that already had one (celeris#484)",
+							testName, m.RecvDoubleArmed)
+					}
+					if m.RecvCQEUnaccounted != 0 {
+						t.Errorf("%s: RecvCQEUnaccounted=%d — the kernel completed a recv the engine had not counted (celeris#586)",
+							testName, m.RecvCQEUnaccounted)
+					}
+				}
+				for i := range conns {
+					if connEchoErr[i].Load() != 0 {
+						t.Logf("%s: conn %d (127.0.0.1:%d) echo state: echoed=%d in=%d (read after the echo failed %d) sent=%d",
+							testName, i, connPort[i].Load(), connEchoed[i].Load(), connFramesIn[i].Load(), connReadAfterEchoErr[i].Load(), connSent[i].Load())
+					}
+				}
+				// celeris#611: every mismatched connection in 34 failing runs
+				// was also an echo-write failure, logged and never judged, so
+				// three investigations went looking at the read path. An echo
+				// failure is the engine closing or failing a connection it
+				// should have kept: judged here, with its error and its
+				// connection's address, unless its client gave up on the
+				// connection (which fails below) and it came after that
+				// client closed: then it is that client's teardown (printed
+				// above).
+				if len(judged) != 0 {
+					for _, e := range judged {
+						t.Logf("%s: %s", testName, e.line)
+					}
+					t.Errorf("%s: %d handler error(s) (%d echo write, %d read) on connections whose client did not give up, or "+
+						"before it did: the engine failed or tore down a connection it should have kept alive; each is listed "+
+						"above with its error and address", testName, len(judged), echoJudged, int64(len(judged))-echoJudged)
+				}
+				wsoAssertNoStalls(t, testName, stalls)
+				// A connection that never finished its writes was counted
+				// and not judged, like the sibling oracle's (celeris#623).
+				if n := clientCloseFail.Load(); n != 0 {
+					t.Errorf("%s: %d client(s) never finished writing: a flood write failed, or nothing moved for %v "+
+						"(or the wait ran past %v, or %s) finishing the last frame or the Close frame; each WSO-GIVEUP "+
+						"record above has the connection's timeline from both ends", testName, n, wsoWriteIdle, wsoWaitCap, rig.budgetNote())
+				}
+				if n := clientRST.Load(); n != 0 {
+					t.Errorf("%s: %d connection(s) were RESET rather than closed cleanly after the client's Close "+
+						"(celeris#530); each WSO-GIVEUP record above has its state", testName, n)
+				}
+				if parseErr.Load() != 0 {
+					t.Errorf("%s: %d frame parse error(s) observed — frames were corrupted", testName, parseErr.Load())
+				}
+				if gaps.Load() != 0 {
+					t.Errorf("%s: %d sequence gap(s) observed — frames were dropped or reordered", testName, gaps.Load())
+				}
+				if closeTimeout.Load() != 0 {
+					t.Errorf("%s: %d connection(s) timed out waiting for Close handshake: no byte and no close for %v "+
+						"(or the wait ran past %v, or %s); each WSO-GIVEUP record above has the state of both ends",
+						testName, closeTimeout.Load(), wsoCloseIdle, wsoWaitCap, rig.budgetNote())
+				}
+				if bpBuf >= 256 && overflowErr.Load() != 0 {
+					t.Errorf("%s: %d channel overflow error(s) observed at buffer capacity %d", testName, overflowErr.Load(), bpBuf)
+				}
+
+				for i := range conns {
+					if !clientFailed[i].Load() {
+						in := connFramesIn[i].Load()
+						sent := connSent[i].Load()
+						if in != sent {
+							// The handler reads to the end of the stream even
+							// after its echo fails, so these frames were never
+							// delivered: the engine lost them (celeris#611
+							// separates the two populations).
+							t.Errorf("%s conn %d (127.0.0.1:%d): frame count mismatch: sent=%d delivered=%d, never delivered %d "+
+								"(of the delivered, %d were read after the handler's echo failed)",
+								testName, i, connPort[i].Load(), sent, in, sent-in, connReadAfterEchoErr[i].Load())
+						}
+						if pe := connProtoErr[i].Load(); pe != 0 {
+							t.Errorf("%s conn %d: protocol error on unfailed client: %d", testName, i, pe)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// maskedCloseFrameWithCount builds a client->server Close frame (opcode 8, masked)
+// carrying a 10-byte payload: 2 bytes status 1000 + 8 bytes uint64 sequence count.
+func maskedCloseFrameWithCount(finalCount uint64) []byte {
+	m := [4]byte{0x11, 0x22, 0x33, 0x44}
+	var payload [10]byte
+	binary.BigEndian.PutUint16(payload[:2], 1000)
+	binary.BigEndian.PutUint64(payload[2:], finalCount)
+
+	f := make([]byte, 6+10)
+	f[0] = 0x88      // FIN + opcode 8 (Close)
+	f[1] = 0x80 | 10 // Masked + payload len 10
+	copy(f[2:6], m[:])
+	for j := 0; j < 10; j++ {
+		f[6+j] = payload[j] ^ m[j%4]
+	}
+	return f
+}
+
+func isCloseErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	if _, ok := err.(*CloseError); ok {
+		return true
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, ErrClosed) ||
+		errors.Is(err, ErrWriteClosed)
+}
+
+func isParseErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrProtocol) ||
+		errors.Is(err, ErrReservedBits) ||
+		errors.Is(err, ErrInvalidUTF8) ||
+		errors.Is(err, ErrFrameTooLarge) ||
+		errors.Is(err, io.ErrUnexpectedEOF)
+}
