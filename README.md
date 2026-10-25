@@ -722,38 +722,59 @@ exposures above) are in [`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSIO
 
 `Benchmark Tier` brackets `mage BenchTier` with `mage HostSamplerStart` / `HostSamplerStop`, as the race and weekend
 tiers do (the nightly tier runs `mage Validate`, not the bench, and has the race tier's path). Before this a bench
-had no series of its own: the forensics artifact fetched whatever the last weekend soak had left on the hosts, and
+ran no host sampler at all, so it had no series of its own: the forensics artifact fetched whatever the last weekend soak had left on the hosts, and
 a 60 s cadence could not see the 1-3 s stalls of the io512 cell (celeris#1036). Two read-only processes run on
 each host of the run (`BENCH_TARGET` limits the playbook to the target and the loadgen, as `Deploy` does):
 
-- the 60 s shell sampler (`ops/host-sampler/celeris-host-sampler`, unchanged): memory, load, the OOM and link-flap
-  counters, the boot id, the kernel log;
+- the 60 s shell sampler (`ops/host-sampler/celeris-host-sampler`, the script unchanged; this tier starts it for the
+  first time): memory, load, the OOM and link-flap counters, the boot id, the kernel log;
 - the **fine series** (`ops/host-sampler/celeris-host-sampler-fine`, python3, no subprocess), at the `sampler_interval`
   dispatch input: `1` s (the default, also on a schedule), `0.5`, `0.2`, `0.1` or `0.05` s (20 Hz). One text line per
   tick: the per-CPU deltas of user+system, irq, softirq and steal, the NET_RX softirq runs and the `ksoftirqd`
-  run time of every CPU that did anything, the CPU pressure total, the run queue and the load. A second file
-  records, for the whole run, every second in which a CPU spent 95 % or more in softirq and 3 % or less in
-  user+system (a pinned thread that is runnable and not running) and every tick the sampler itself was late
-  for. `fine.stats` has the achieved rate, the interval percentiles and the sampler's own CPU.
+  run time of every CPU that did anything, the CPU pressure total, the run queue and the load; plus the two
+  whole-run files below. `fine.stats` has the achieved rate, the interval percentiles and the sampler's own CPU.
 
-**Load.** The sampler runs beside the bench, not in it: `BenchTier`, `bench.yml` and `run_bench_cell.yml` are not
-touched, no BenchTier variable is added, and the SUT is not told. It is a separate process at `nice 10`
-(never raised; under contention the SUT keeps the CPU and the sampler's starvation shows as a gap in its own
-series), reads four `/proc` files and each `ksoftirqd` thread's `schedstat` per tick with `pread` and forks nothing. Measured over 60 s with the
-real playbook on an 8-CPU Linux container (2 busy CPUs): **0.03 % of one CPU at 1 s (about 0.3 ms a tick) and 0.35 % at 0.05 s (about 0.2 ms a tick)**, 10-11 MiB RSS,
-9 descriptors. The 60 s shell sampler costs about 24 ms per sample (0.04 % of a CPU).
-Output goes to tmpfs (`/run/celeris/fine`) and is capped at two generations of 16 MiB. A tick is about 45 bytes
-plus 18 per CPU that did anything, so the series keeps the last 90 h at 1 s on a quiet host, 36 h with 12 busy CPUs
-and 15 h with all 32 CPUs of the loadgen busy, and 45 minutes to 6 hours at 0.05 s; the event log (4 MiB cap) covers
-the whole run. Use 0.05 s for a scoped run (`cells=...`), not for a multi-day grid. The CPU figures were measured on
-8 CPUs; `self_cpu_pct` in each host's `fine/fine.stats` is the figure of the real run.
+**Not in the measurement path.** `BenchTier`, `bench.yml` and `run_bench_cell.yml` are not touched, no BenchTier
+variable is added, and the SUT is not told. Placement: both processes run under `SCHED_IDLE` (the fine one sets it
+itself after `nice 10`, falling back to `SCHED_BATCH` at nice 19 if refused, and says which took in `fine-run.txt`;
+the 60 s shell sampler is launched `nice -n 19 chrt -i 0` by the bench tier only, and its children inherit it; the
+race and weekend starts are unchanged). A `SCHED_IDLE` task never preempts a normal one on wake-up and its CPU counts
+as idle to the load balancer. It is not pinned to a CPU set: on msr1 every CPU hosts a loop. The price is visible, not
+silent: a starved sampler shows as a gap in its own series (`gap` events, interval p99 and max in `fine.stats`). On a
+container with 8 spinning loops on 2 CPUs of quota it got 0.94 Hz of a 1 Hz target (max interval 3.6 s) and 2.6 Hz
+of 20: if a scoped io512 run shows many `gap` lines inside the cell's window, switch the class to `SCHED_BATCH` + nice 19
+(one line in `lower_priority`) and judge the cell, not the whole run.
 
-**Lifetime.** `SAMPLER_DURATION` is keyed like the job's `timeout-minutes` (the largest budget the key admits plus
-3 h, inside the ceiling). The stop step (`if: always()`, `continue-on-error`, 5 minutes) ends both processes with a
-sentinel file and fetches the series into `results/host-sampler/<host>/` (fine files in `fine/`) before the upload.
-If the runner dies and the stop step never runs, the fine sampler ends 60 s after its `Runner.Listener` is gone, and
-any later `HostSamplerStart` / `Stop` (the race and weekend tiers) retires it too. A host without python3 gets the
-60 s sampler only, with a warning.
+**Load.** Reads four `/proc` files and each `ksoftirqd` thread's `schedstat` per tick (4 + nCPU `pread`s, a 64 KiB
+buffer reused, no fork). Measured by the review with `ksoftirqd` visible, on 8 CPUs, contended: **0.051 % of one CPU at
+1 s and 0.711 % at 20 Hz**; expect about 0.1-0.2 % and 1.5-2 % on a 32-CPU host. (The first figures, 0.03 % and
+0.35 %, came from a container that could not see `ksoftirqd`.) `self_cpu_pct` in each host's `fine/fine.stats` is the
+figure of the real run. The 60 s shell sampler costs about 24 ms per sample (25-30 fork/execs; 0.04 % of a CPU) and
+this tier starts it for the first time.
+
+**Retention.** A tick is about 45 bytes plus 18-23 per CPU that did anything (every CPU, on msr1 with RPS on all 12 and
+on the loadgen). The open generation is plain text on tmpfs (`/run/celeris/fine`); at 16 MiB it is closed into
+`fine.<seq>.log.z` (zlib level 1, 4-5.6x measured, about 50 ms of CPU per generation) and compressed generations are
+kept up to 128 MiB, the oldest dropped *and counted* (`generations_dropped`, a `generation_dropped` event). For a 65 h
+bench at 1 s that is 234,000 ticks: msr1 (12 CPUs, 261-321 B) 61-75 MB of text, **11-19 MB** compressed; a 32-CPU host
+(621-781 B) 145-183 MB, **26-46 MB**: the whole run is kept, well under the cap (and under 0.8 % of the hosts' RAM at the
+worst). At 0.05 s the ticks are 20 times as many and the cap holds the last 23-33 h on msr1 and 9-13 h on a 32-CPU host:
+use 0.05 s for a scoped run (`cells=...`). Whatever the cadence, two files are never rotated: `fine-minute.log`
+(per CPU and minute: the highest softirq percent of a tick, the lowest user+system percent, the minute's softirq percent,
+the longest tick interval; about 1-2 MB for 65 h) and `fine-events.log` (starvation episodes as a begin/end pair, the
+sampler's own gaps, dropped generations; 4 MiB with a drop counter). A 1 to 2 s stall is seen by a tick only part of the
+time at 1 s, which is why the minute record exists: it is meant to be re-cut offline with any criterion.
+
+**Lifetime and the artifact.** `SAMPLER_DURATION` is keyed like the job's `timeout-minutes` (the largest budget the key
+admits plus 3 h, inside the ceiling). The stop step (`if: always()`, `continue-on-error`, 10 minutes: the compressed
+series goes through ansible's `fetch`, in memory under `become`) ends both processes with a sentinel file and fetches into
+`results/host-sampler/<host>/` (fine files in `fine/`) before the upload. The fine files are fetched only if the host's
+`fine-run.txt` carries this run's tag (`bench-<run id>`), so a Deploy that failed before the start step cannot hand over the
+previous bench's series, and the race and weekend stops fetch no fine file; a new start deletes the files of the previous
+run in its directory. If the runner dies and the stop step never runs, the fine sampler ends 60 s after its
+`Runner.Listener` is gone, any later `HostSamplerStart` / `Stop` (the race and weekend tiers) retires it too, and the
+forensics play fetches its events, minute record, stats and run file. A host without python3 gets the 60 s sampler only,
+with a warning.
 
 ### Result: latency at SLO
 

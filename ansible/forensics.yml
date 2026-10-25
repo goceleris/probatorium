@@ -163,7 +163,9 @@
         validate_checksum: false
       loop:
         - fine-events.log
+        - fine-minute.log
         - fine.stats
+        - fine-run.txt
       failed_when: false
       when: forensics.stdout is defined
 

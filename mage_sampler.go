@@ -90,7 +90,34 @@ const (
 var (
 	samplerIntRE  = regexp.MustCompile(`^[0-9]{1,4}$`)
 	samplerFineRE = regexp.MustCompile(`^[0-9]{1,2}(\.[0-9]{1,3})?$`)
+	// The tag reaches an ansible --extra-vars string and a shell grep: letters,
+	// digits, dot, dash and underscore only (weekend-123, bench-123, run-123, local).
+	samplerTagRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 )
+
+// samplerTagChecked is samplerTag, refused when it holds anything else.
+func samplerTagChecked() (string, error) {
+	t := samplerTag()
+	if !samplerTagRE.MatchString(t) {
+		return "", fmt.Errorf("SAMPLER_TAG must be 1 to 64 of [A-Za-z0-9._-] (got %q)", t)
+	}
+	return t, nil
+}
+
+// samplerLowPriority resolves SAMPLER_LOW_PRIORITY: "" (unset) or "1". With 1 the
+// 60 s shell sampler is launched at nice 19 under SCHED_IDLE (chrt -i 0), which
+// the bench tier sets and the race and weekend tiers do not: their start is
+// byte-for-byte what it was.
+func samplerLowPriority() (bool, error) {
+	switch v := os.Getenv("SAMPLER_LOW_PRIORITY"); v {
+	case "":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("SAMPLER_LOW_PRIORITY must be empty or 1 (got %q)", v)
+	}
+}
 
 // samplerInterval resolves SAMPLER_INTERVAL, the full sample's cadence: a
 // positive integer of seconds, at most an hour. Unset is 60, which the race and
@@ -134,14 +161,25 @@ func samplerStartVars() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	tag, err := samplerTagChecked()
+	if err != nil {
+		return nil, err
+	}
+	low, err := samplerLowPriority()
+	if err != nil {
+		return nil, err
+	}
 	vars := []string{
 		"sampler_action=start",
 		"sampler_interval=" + interval,
 		"sampler_duration_seconds=" + strconv.Itoa(secs),
-		"sampler_tag=" + samplerTag(),
+		"sampler_tag=" + tag,
 	}
 	if fine != "" {
 		vars = append(vars, "sampler_fine_interval="+fine)
+	}
+	if low {
+		vars = append(vars, "sampler_low_priority=true")
 	}
 	return vars, nil
 }
@@ -190,6 +228,7 @@ func runSamplerPlaybook(extra ...string) error {
 //	                    (0.05 to 10, unset = none); see celeris-host-sampler-fine
 //	SAMPLER_TAG=        label recorded in every line (defaults to the run id)
 //	CLUSTER_USE_LAN=1   LAN fabric instead of Tailscale
+//	SAMPLER_LOW_PRIORITY=1  launch the 60 s sampler at nice 19 under SCHED_IDLE (bench tier)
 //	BENCH_TARGET=       msr1 | msa2-server limits the playbook to that host
 //	                    and the loadgen (as Deploy does); both or unset = all
 //
@@ -218,6 +257,23 @@ func HostSamplerStart() error {
 	return runSamplerPlaybook(vars...)
 }
 
+// samplerStopVars is the --extra-vars of a stop. When the step names its run
+// (SAMPLER_TAG set, as the bench tier's stop step does), the fine series is
+// fetched only if its fine-run.txt carries that tag: a start that never ran
+// (Deploy failed) cannot hand the previous bench's series to this run. A stop
+// that names no tag (race, weekend) fetches no fine file at all.
+func samplerStopVars(fetchDir string) ([]string, error) {
+	vars := []string{"sampler_action=stop", "sampler_fetch_dir=" + fetchDir}
+	if os.Getenv("SAMPLER_TAG") != "" {
+		tag, err := samplerTagChecked()
+		if err != nil {
+			return nil, err
+		}
+		vars = append(vars, "sampler_fetch_tag="+tag)
+	}
+	return vars, nil
+}
+
 // HostSamplerStop asks the sampler to finish and fetches its series into
 // results/host-sampler/<host>/ so the run's own artifact carries it.
 //
@@ -234,6 +290,7 @@ func HostSamplerStart() error {
 //	                    (default results/host-sampler)
 //	CLUSTER_USE_LAN=1   LAN fabric instead of Tailscale
 //	BENCH_TARGET=       as for HostSamplerStart
+//	SAMPLER_TAG=        when set, the fine series is fetched only if it is this run's
 func HostSamplerStop() error {
 	fetch := envOrDefault("SAMPLER_FETCH_DIR", filepath.Join("results", "host-sampler"))
 	abs, err := filepath.Abs(fetch)
@@ -243,10 +300,11 @@ func HostSamplerStop() error {
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return err
 	}
+	vars, err := samplerStopVars(abs)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("\n=== HostSamplerStop ===\n")
 	fmt.Printf("  series -> %s\n\n", abs)
-	return runSamplerPlaybook(
-		"sampler_action=stop",
-		"sampler_fetch_dir="+abs,
-	)
+	return runSamplerPlaybook(vars...)
 }

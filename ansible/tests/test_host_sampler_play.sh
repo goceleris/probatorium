@@ -52,6 +52,12 @@ play() { # play <extra-vars...>; the log of the last run is $work/last.log
 refused() { ! play "$@"; }
 alive() { local p; p=$(cat "$1" 2> /dev/null) && [ -n "$p" ] && [ -d "/proc/$p" ]; }
 finepid() { cat "$run/host-sampler-fine.pid" 2> /dev/null; }
+statf() { # statf <pid> <field no. of proc(5)>: fields counted as proman does, comm may hold spaces
+  sed 's/^.*) //' "/proc/$1/stat" 2> /dev/null | awk -v n="$2" '{print $(n - 2)}'
+}
+zhead_has() { # zhead_has <file.z> <text>: the first 200 bytes of the decompressed stream hold <text>
+  python3 -c 'import sys,zlib; print(zlib.decompress(open(sys.argv[1], "rb").read()).decode()[:200])' "$1" | grep -q "$2"
+}
 gone() { # gone <pid>: up to 20 s
   local n=0
   while [ -d "/proc/$1" ] && [ "$n" -lt 40 ]; do sleep 0.5; n=$((n + 1)); done
@@ -61,6 +67,8 @@ gone() { # gone <pid>: up to 20 s
 echo "--- a start without a fine cadence (the race and weekend tiers)"
 check "start without a fine cadence succeeds" play sampler_action=start sampler_interval=2 sampler_duration_seconds=300 sampler_tag=race-1
 check "  the 60 s sampler is alive" alive "$run/host-sampler.pid"
+sp=$(cat "$run/host-sampler.pid" 2> /dev/null)
+check "  and runs at the priority it was started with (policy 0, nice 0)" test "$(statf "$sp" 41)/$(statf "$sp" 19)" = "0/0"
 check "  no fine sampler was started" test ! -e "$run/host-sampler-fine.pid"
 check "  no fine sampler was staged" test ! -e "$run/celeris-host-sampler-fine"
 check "  no fine directory was written" test -z "$(ls -A "$fine")"
@@ -71,22 +79,42 @@ sp=$(cat "$run/host-sampler.pid" 2> /dev/null)
 [ -z "$sp" ] || gone "$sp"
 
 echo "--- a start with a fine cadence (the bench tier)"
-check "start with sampler_fine_interval=0.1 succeeds" play sampler_action=start sampler_interval=2 sampler_fine_interval=0.1 sampler_duration_seconds=300 sampler_tag=bench-1
+check "start with sampler_fine_interval=0.1 and low priority succeeds" play sampler_action=start sampler_interval=2 sampler_fine_interval=0.1 sampler_low_priority=true sampler_duration_seconds=300 sampler_tag=bench-1
 check "  the report says it is alive" grep -q "fine sampler pid=[0-9]* alive" "$work/last.log"
 check "  the fine sampler is alive" alive "$run/host-sampler-fine.pid"
 fp=$(finepid)
-check "  it runs at a lower priority (nice 10)" test "$(awk '{print $19}' "/proc/$fp/stat" 2> /dev/null)" = 10
-check "  its header carries the run's tag and cadence" grep -q "^# fine-sampler format=1 .* tag=bench-1 interval_s=0.1 " "$fine/fine.log"
+sp=$(cat "$run/host-sampler.pid" 2> /dev/null)
+check "  the fine sampler says which scheduling class it took" grep -q "sched=[a-z0-9+-]*" "$fine/fine-run.txt"
+if grep -q "sched=idle" "$fine/fine-run.txt"; then
+  check "  and it is SCHED_IDLE (policy 5)" test "$(statf "$fp" 41)" = 5
+else
+  echo "note: SCHED_IDLE was refused here ($(cat "$fine/fine-run.txt")); policy $(statf "$fp" 41)"
+fi
+if command -v chrt > /dev/null; then
+  check "  the 60 s sampler is SCHED_IDLE too (policy 5, bench tier only)" test "$(statf "$sp" 41)" = 5
+else
+  check "  the 60 s sampler is at nice 19 (no chrt here)" test "$(statf "$sp" 19)" = 19
+fi
+check "  its header carries the run's tag, cadence and class" grep -q "^# fine-sampler format=1 .* tag=bench-1 interval_s=0.1 .* sched=" "$fine/fine.log"
+check "  its run file carries the tag" grep -q "^tag=bench-1 " "$fine/fine-run.txt"
 # the series is buffered and flushed every 5 s
 n=0
 while [ "$(wc -l < "$fine/fine.log")" -lt 10 ] && [ "$n" -lt 30 ]; do sleep 0.5; n=$((n + 1)); done
 check "  it is writing ticks" test "$(wc -l < "$fine/fine.log")" -ge 10
-check "stop succeeds with a fine sampler" play sampler_action=stop "sampler_fetch_dir=$fetch"
+check "stop with another run's tag succeeds" play sampler_action=stop "sampler_fetch_dir=$fetch/other" sampler_fetch_tag=bench-OTHER
+check "  and fetches nothing of the fine series" test ! -e "$fetch/other/localhost/fine"
 check "  the fine sampler exited" gone "$fp"
-check "  the stats say it was asked to stop" grep -q "final=1 exit_reason=stop_requested" "$fine/fine.stats"
-check "  fine.log was fetched into fine/" test -s "$fetch/localhost/fine/fine.log"
+check "stop without a tag succeeds" play sampler_action=stop "sampler_fetch_dir=$fetch/notag"
+check "  and fetches nothing of the fine series (race and weekend stops)" test ! -e "$fetch/notag/localhost/fine"
+check "stop naming this run succeeds" play sampler_action=stop "sampler_fetch_dir=$fetch" sampler_fetch_tag=bench-1
+check "  the stats say it was asked to stop" grep -q "final=1 .*exit_reason=stop_requested" "$fine/fine.stats"
+check "  the open generation was compressed at the end" test ! -e "$fine/fine.log"
+check "  a compressed generation was fetched" test -s "$fetch/localhost/fine/fine.00000.log.z"
+check "  and it holds the series (zlib, header with the tag)" zhead_has "$fetch/localhost/fine/fine.00000.log.z" "tag=bench-1"
+check "  fine-minute.log was fetched" test -s "$fetch/localhost/fine/fine-minute.log"
 check "  fine-events.log was fetched" test -s "$fetch/localhost/fine/fine-events.log"
 check "  fine.stats was fetched" test -s "$fetch/localhost/fine/fine.stats"
+check "  fine-run.txt was fetched" test -s "$fetch/localhost/fine/fine-run.txt"
 sp=$(cat "$run/host-sampler.pid" 2> /dev/null)
 [ -z "$sp" ] || gone "$sp"
 

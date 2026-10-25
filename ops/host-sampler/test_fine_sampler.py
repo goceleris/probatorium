@@ -10,7 +10,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import random
+import re
 import unittest
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "celeris-host-sampler-fine")
@@ -127,8 +130,25 @@ class Base(unittest.TestCase):
             return f.read()
 
     def lines(self, name="fine.log"):
-        with open(os.path.join(self.out, name)) as f:
-            return f.read().splitlines()
+        if name != "fine.log":
+            with open(os.path.join(self.out, name)) as f:
+                return f.read().splitlines()
+        return self.series_text().splitlines()
+
+    def generations(self):
+        return sorted(n for n in os.listdir(self.out) if n.startswith("fine.") and n.endswith(".log.z"))
+
+    def series_text(self):
+        """every closed generation (decompressed, oldest first) and the open one"""
+        out = []
+        for n in self.generations():
+            with open(os.path.join(self.out, n), "rb") as f:
+                out.append(zlib.decompress(f.read()).decode())
+        p = os.path.join(self.out, "fine.log")
+        if os.path.exists(p):
+            with open(p) as f:
+                out.append(f.read())
+        return "".join(out)
 
 
 class ConfigTest(Base):
@@ -233,7 +253,7 @@ class SeriesTest(Base):
         self.assertIn("psi=0", self.lines()[1])
         self.assertEqual(s.ksoftirqd, {})
 
-    def test_rotation_keeps_two_generations_each_with_a_header(self):
+    def test_closed_generations_are_compressed_and_each_has_a_header(self):
         fp = FakeProc(self.proc)
         clock = Clock()
         s = fine.Sampler(fine.Config(self.env(SAMPLER_FINE_MAXBYTES="65536")), wall=clock.wall, mono=clock.mono)
@@ -244,12 +264,149 @@ class SeriesTest(Base):
             fp.flush()
             s.tick()
         s.close()
-        sizes = [os.path.getsize(os.path.join(self.out, n)) for n in ("fine.log", "fine.log.1")]
-        self.assertTrue(all(0 < z <= 65536 for z in sizes), sizes)
-        self.assertTrue(s.series.rotations >= 1)
-        for n in ("fine.log", "fine.log.1"):
-            self.assertTrue(self.lines(n)[0].startswith("# fine-sampler format=1"), n)
-        self.assertFalse(os.path.exists(os.path.join(self.out, "fine.log.2")))
+        gens = self.generations()
+        self.assertTrue(len(gens) >= 3, gens)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "fine.log")), "the open generation is compressed at the end")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "fine.log.1")))
+        for n in gens:
+            raw = zlib.decompress(open(os.path.join(self.out, n), "rb").read()).decode()
+            self.assertTrue(raw.startswith("# fine-sampler format=1"), n)
+            self.assertTrue(len(raw) <= 65536 + 200, (n, len(raw)))
+        text = self.series_text()
+        self.assertEqual(text.count("\n"), 3000 + len(gens), "every tick, plus one header per generation")
+        st = self.stats()
+        self.assertIn("generations=%d " % len(gens), st)
+        self.assertIn("generations_dropped=0", st)
+
+
+class RetentionTest(Base):
+    """A 65 h bench at a coarse clock: the detail of the early hours may go, the per-minute record may not."""
+
+    def run_long(self, hours, **env):
+        fp = FakeProc(self.proc, ncpu=8)
+        clock = Clock(epoch=1761400020.0)  # 20 s into a minute
+        s = fine.Sampler(fine.Config(self.env(SAMPLER_FINE_INTERVAL="10", **env)), wall=clock.wall, mono=clock.mono)
+        rnd = random.Random(7)
+        s.tick()
+        for i in range(int(hours * 360)):
+            clock.advance(10)
+            for c in range(8):
+                if i == 100 and c == 3:  # a stall in the first hour: CPU 3 is all softirq for this tick
+                    fp.cpu[3][6] += 1000
+                    continue
+                fp.cpu[c][0] += rnd.randint(0, 600)
+                fp.cpu[c][2] += rnd.randint(0, 300)
+                fp.cpu[c][3] += rnd.randint(0, 100)
+                fp.rx[c] += rnd.randint(0, 99999)
+                fp.kd[c] += rnd.randint(0, 900_000_000)
+            fp.flush()
+            s.tick()
+        s.close()
+        return s
+
+    def test_the_first_hour_survives_a_65_hour_run_in_the_minute_log(self):
+        s = self.run_long(65, SAMPLER_FINE_MAXBYTES="65536", SAMPLER_FINE_TOTAL_MAXBYTES=str(1 << 20))
+        self.assertGreaterEqual(s.series.dropped, 1, "the test must drive the detail past its cap")
+        self.assertLessEqual(s.series.closed_bytes, 1 << 20)
+        minute = [x for x in self.lines("fine-minute.log") if not x.startswith("#")]
+        self.assertGreaterEqual(len(minute), 65 * 60 - 1, "one line per minute of the run")
+        first = int(minute[0].split()[0])
+        self.assertEqual(first, 1761400020 // 60 * 60)
+        self.assertEqual(len({int(x.split()[0]) for x in minute}), len(minute), "no minute twice")
+        # the detail of the first hour is gone (dropped, and counted) ...
+        self.assertNotIn("fine.00000.log.z", self.generations())
+        self.assertNotIn("1761400000", self.series_text()[:200])
+        ev = "\n".join(self.lines("fine-events.log"))
+        self.assertIn("generation_dropped file=fine.00000.log.z", ev)
+        # ... and the stall of the first hour is still in the minute record, at 100 % softirq on CPU 3
+        stall = [x for x in minute if int(x.split()[0]) <= 1761400020 + 3600 and " c3=100," in x]
+        self.assertEqual(len(stall), 1, stall)
+        self.assertIn("generations_dropped=", self.stats())
+
+    def test_nothing_is_dropped_when_the_cap_holds_the_run(self):
+        s = self.run_long(6, SAMPLER_FINE_MAXBYTES="65536")
+        self.assertEqual(s.series.dropped, 0)
+        text = self.series_text()
+        data = [x for x in text.splitlines() if not x.startswith("#")]
+        self.assertEqual(len(data), 6 * 360)
+        self.assertTrue(data[0].startswith("1761400030.000 "), data[0])
+
+    def test_the_minute_log_is_capped_with_a_drop_counter(self):
+        s = self.run_long(2, SAMPLER_FINE_MINUTE_MAXBYTES="4096")
+        self.assertGreater(s.minutes.out.dropped, 0)
+        self.assertRegex(self.lines("fine-minute.log")[-1], r"^# minutes_dropped=\d+$")
+        self.assertIn("minutes_dropped=%d" % s.minutes.out.dropped, self.stats())
+
+    def test_a_minute_line_holds_the_peak_softirq_and_the_lowest_user_time(self):
+        fp, clock, s = self.sampler(ncpu=2, SAMPLER_FINE_INTERVAL="1", )
+        clock.epoch = 1761400020.0 - 0  # 20 s into the minute
+        s.tick()
+        for sirq, usr in ((10, 80), (96, 2), (20, 70)):
+            clock.advance(1)
+            fp.cpu[1][6] += sirq
+            fp.cpu[1][0] += usr
+            fp.cpu[1][3] += 100 - sirq - usr
+            fp.flush()
+            s.tick()
+        clock.advance(60)  # next minute: flushes the first
+        fp.flush()
+        s.tick()
+        s.close()
+        first = [x for x in self.lines("fine-minute.log") if not x.startswith("#")][0]
+        # peak 96 %, lowest user 2 %, whole-minute softirq (10+96+20)/300 = 42 %
+        self.assertTrue(first.startswith("1761400020 n=3 "), first)
+        self.assertIn(" c1=96,2,42", first)
+        self.assertNotIn("c0=", first, "an idle CPU is not listed")
+
+
+class SchedulingTest(unittest.TestCase):
+    class FakeOS:
+        SCHED_IDLE = 5
+        SCHED_BATCH = 3
+
+        def __init__(self, refuse_idle=False, refuse_batch=False):
+            self.calls = []
+            self.refuse_idle, self.refuse_batch = refuse_idle, refuse_batch
+
+        def nice(self, n):
+            self.calls.append(("nice", n))
+            return n
+
+        def sched_param(self, p):
+            return p
+
+        def sched_setscheduler(self, pid, policy, param):
+            self.calls.append(("sched", pid, policy, param))
+            if (policy == 5 and self.refuse_idle) or (policy == 3 and self.refuse_batch):
+                raise PermissionError("refused")
+
+    def test_sched_idle_after_nice_10(self):
+        o = self.FakeOS()
+        self.assertEqual(fine.lower_priority(10, o), "idle")
+        self.assertEqual(o.calls, [("nice", 10), ("sched", 0, 5, 0)])
+
+    def test_batch_at_nice_19_when_idle_is_refused(self):
+        o = self.FakeOS(refuse_idle=True)
+        self.assertEqual(fine.lower_priority(10, o), "batch+nice19")
+        self.assertEqual(o.calls, [("nice", 10), ("sched", 0, 5, 0), ("nice", 9), ("sched", 0, 3, 0)])
+
+    def test_nice_only_when_no_scheduler_call_works(self):
+        o = self.FakeOS(refuse_idle=True, refuse_batch=True)
+        self.assertEqual(fine.lower_priority(10, o), "nice-only")
+
+        class NoSched:  # a platform without the scheduler calls (macOS): nice alone
+            def nice(self, n):
+                return n
+
+        self.assertEqual(fine.lower_priority(10, NoSched()), "nice-only")
+
+    def test_the_priority_is_never_raised(self):
+        for kw in ({}, {"refuse_idle": True}, {"refuse_idle": True, "refuse_batch": True}):
+            for nice in (0, 10, 19):
+                o = self.FakeOS(**kw)
+                fine.lower_priority(nice, o)
+                self.assertTrue(all(c[1] >= 0 for c in o.calls if c[0] == "nice"), o.calls)
+                self.assertTrue(all(c[2] in (3, 5) for c in o.calls if c[0] == "sched"), o.calls)
 
 
 class EventsTest(Base):
@@ -261,16 +418,38 @@ class EventsTest(Base):
             fp.flush()
             s.tick()
 
-    def test_the_starvation_signature_is_logged_once_a_second(self):
+    def starve_lines(self):
+        return [x for x in self.lines("fine-events.log") if " starve_" in x]
+
+    def test_the_starvation_signature_is_one_episode_not_a_line_a_second(self):
         fp, clock, s = self.sampler(ncpu=2)
         s.tick()
-        # CPU 1 spends the whole second in softirq (5 jiffies of 5 per 50 ms), CPU 0 is busy in user
+        # CPU 1 spends 3 s in softirq (5 jiffies of 5 per 50 ms), CPU 0 is busy in user
         self.ticks(fp, s, clock, 60, 0.05, a=(1, 6, 5), b=(0, 0, 5))
+        # then CPU 1 runs user code again
+        self.ticks(fp, s, clock, 60, 0.05, a=(1, 0, 5), b=(0, 0, 5))
         s.close()
-        ev = [x for x in self.lines("fine-events.log") if " starve " in x]
-        self.assertTrue(2 <= len(ev) <= 3, ev)  # rate limited: ~1 per second over 3 s
-        self.assertTrue(all("cpu=1 " in x for x in ev), ev)
-        self.assertIn("softirq_pct=100.0 usrsys_pct=0.0", ev[0])
+        ev = self.starve_lines()
+        self.assertEqual(len(ev), 2, ev)
+        self.assertIn(" starve_begin cpu=1 softirq_pct=100.0 usrsys_pct=0.0", ev[0])
+        self.assertRegex(ev[1], r" starve_end cpu=1 duration_s=[23]\.\d\d peak_softirq_pct=100\.0 ticks=\d+$")
+
+    def test_an_episode_still_open_at_the_end_is_closed_and_marked(self):
+        fp, clock, s = self.sampler(ncpu=1)
+        s.tick()
+        self.ticks(fp, s, clock, 5, 1.0, a=(0, 6, 100))
+        s.close()
+        ev = self.starve_lines()
+        self.assertEqual(len(ev), 2, ev)
+        self.assertTrue(ev[1].endswith("open_at_exit=1"), ev[1])
+
+    def test_a_cpu_stuck_for_hours_costs_two_lines(self):
+        fp, clock, s = self.sampler(ncpu=1)
+        s.tick()
+        self.ticks(fp, s, clock, 3600, 1.0, a=(0, 6, 100))  # an hour at 1 s
+        s.close()
+        self.assertEqual(len(self.starve_lines()), 2)
+        self.assertLess(os.path.getsize(os.path.join(self.out, "fine-events.log")), 1000)
 
     def test_a_busy_cpu_and_a_mixed_cpu_are_not_starved(self):
         fp, clock, s = self.sampler(ncpu=2)
@@ -278,7 +457,7 @@ class EventsTest(Base):
         # CPU 0: user busy; CPU 1: 80 % softirq, 20 % user: heavy softirq but the thread runs
         self.ticks(fp, s, clock, 60, 0.05, a=(0, 0, 5), b=(1, 6, 4), c=(1, 0, 1))
         s.close()
-        self.assertEqual([x for x in self.lines("fine-events.log") if " starve " in x], [])
+        self.assertEqual(self.starve_lines(), [])
 
     def test_90_percent_softirq_is_not_the_signature(self):
         fp, clock, s = self.sampler(ncpu=1)
@@ -286,7 +465,7 @@ class EventsTest(Base):
         # 90 % softirq, 10 % idle, no user time: heavy, but under the 95 % of the signature
         self.ticks(fp, s, clock, 5, 1.0, a=(0, 6, 90), b=(0, 3, 10))
         s.close()
-        self.assertEqual([x for x in self.lines("fine-events.log") if " starve " in x], [])
+        self.assertEqual(self.starve_lines(), [])
 
     def test_96_percent_softirq_with_4_percent_user_is_not_the_signature(self):
         fp, clock, s = self.sampler(ncpu=1)
@@ -294,14 +473,14 @@ class EventsTest(Base):
         # the thread got 4 % of the CPU: above the 3 % of the signature even though softirq is over 95 %
         self.ticks(fp, s, clock, 5, 1.0, a=(0, 6, 96), b=(0, 0, 4))
         s.close()
-        self.assertEqual([x for x in self.lines("fine-events.log") if " starve " in x], [])
+        self.assertEqual(self.starve_lines(), [])
 
     def test_96_percent_softirq_with_2_percent_user_is(self):
         fp, clock, s = self.sampler(ncpu=1)
         s.tick()
         self.ticks(fp, s, clock, 3, 1.0, a=(0, 6, 97), b=(0, 0, 2), c=(0, 3, 1))
         s.close()
-        self.assertEqual(len([x for x in self.lines("fine-events.log") if " starve " in x]), 3)
+        self.assertEqual(len(self.starve_lines()), 2)  # begin and end(open at exit)
 
     def test_a_signature_shorter_than_the_window_is_not_logged(self):
         fp, clock, s = self.sampler(ncpu=1)
@@ -309,14 +488,29 @@ class EventsTest(Base):
         self.ticks(fp, s, clock, 8, 0.05, a=(0, 6, 5))  # 0.4 s of softirq
         self.ticks(fp, s, clock, 40, 0.05, b=(0, 0, 5))  # then user
         s.close()
-        self.assertEqual([x for x in self.lines("fine-events.log") if " starve " in x], [])
+        self.assertEqual(self.starve_lines(), [])
 
     def test_the_signature_works_at_one_hz(self):
         fp, clock, s = self.sampler(ncpu=1)
         s.tick()
         self.ticks(fp, s, clock, 3, 1.0, a=(0, 6, 100))
         s.close()
-        self.assertEqual(len([x for x in self.lines("fine-events.log") if " starve " in x]), 3)
+        self.assertEqual(len(self.starve_lines()), 2)
+        self.assertIn(" starve_begin cpu=0 ", self.starve_lines()[0])  # begin and end(open at exit)
+
+    def test_late_ticks_within_a_second_are_one_burst_line(self):
+        fp, clock, s = self.sampler(ncpu=1, SAMPLER_FINE_INTERVAL="0.05")
+        s.tick()
+        for _ in range(30):  # a sampler that is starved for good: every tick 0.4 s late
+            self.ticks(fp, s, clock, 1, 0.4)
+        s.close()
+        ev = [x for x in self.lines("fine-events.log") if " gap" in x]
+        gaps = [x for x in ev if " gap " in x]
+        bursts = [x for x in ev if " gap_burst " in x]
+        self.assertLess(len(ev), 30, ev)
+        self.assertEqual(len(gaps) + sum(int(re.search(r"n=(\d+)", b).group(1)) for b in bursts), 30)
+        self.assertIn("max_dt_ms=400.0", bursts[0])
+        self.assertIn("gap_events=30", self.stats())
 
     def test_a_late_tick_is_a_gap_event(self):
         fp, clock, s = self.sampler(ncpu=1)
@@ -329,15 +523,35 @@ class EventsTest(Base):
         self.assertEqual(len(gaps), 1, gaps)
         self.assertIn("dt_ms=3500.0 expected_ms=1000.0", gaps[0])
 
-    def test_the_event_log_is_capped_not_rotated(self):
+    def test_the_event_log_is_capped_and_says_how_much_it_dropped(self):
         fp, clock, s = self.sampler(ncpu=1, SAMPLER_FINE_EVENTS_MAXBYTES="4096")
         s.tick()
         for _ in range(400):
             self.ticks(fp, s, clock, 1, 3.5)  # a gap each time
         s.close()
         self.assertLessEqual(os.path.getsize(os.path.join(self.out, "fine-events.log")), 4096 + 100)
-        self.assertEqual(self.lines("fine-events.log")[-1], "# event log full: later events are not recorded")
+        last = self.lines("fine-events.log")[-1]
+        self.assertRegex(last, r"^# events_dropped=\d+$")
+        n = int(last.split("=")[1])
+        written = len([x for x in self.lines("fine-events.log") if " gap " in x])
+        self.assertEqual(written + n, 400, "every gap is either written or counted")
+        self.assertIn("events_dropped=%d" % n, self.stats())
         self.assertFalse(os.path.exists(os.path.join(self.out, "fine-events.log.1")))
+
+    def test_system_time_counts_as_the_thread_running(self):
+        fp, clock, s = self.sampler(ncpu=1)
+        s.tick()
+        # 96 % softirq and 4 % SYSTEM time (idx 2): the thread ran: not the signature
+        self.ticks(fp, s, clock, 5, 1.0, a=(0, 6, 96), b=(0, 2, 4))
+        s.close()
+        self.assertEqual(self.starve_lines(), [])
+
+    def test_nice_time_counts_as_the_thread_running(self):
+        fp, clock, s = self.sampler(ncpu=1)
+        s.tick()
+        self.ticks(fp, s, clock, 5, 1.0, a=(0, 6, 96), b=(0, 1, 4))
+        s.close()
+        self.assertEqual(self.starve_lines(), [])
 
 
 class RunLoopTest(Base):
@@ -501,17 +715,121 @@ class EndToEndTest(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("exit_reason=max_ticks", self.stats())
 
-    def test_the_process_runs_at_a_lower_priority_than_it_was_started_at(self):
+    def test_main_lowers_the_priority_and_says_which_class_took(self):
         FakeProc(self.proc, ncpu=1)
-        probe = ("import os,sys,importlib.machinery,importlib.util as u;"
-                 "l=importlib.machinery.SourceFileLoader('f',%r);m=u.module_from_spec(u.spec_from_loader('f',l));l.exec_module(m);"
-                 "b=os.nice(0);m.os.nice(m.Config({'SAMPLER_FINE_INTERVAL':'1','SAMPLER_NICE':'0'}).nice);a=os.nice(0);"
-                 "m.os.nice(m.Config({'SAMPLER_FINE_INTERVAL':'1'}).nice);c=os.nice(0);print(b,a,c)") % SCRIPT
-        r = subprocess.run([sys.executable, "-I", "-c", probe], capture_output=True, text=True, timeout=30)
+        r = self.run_script(SAMPLER_FINE_INTERVAL="0.05", SAMPLER_FINE_MAX_TICKS="3")
         self.assertEqual(r.returncode, 0, r.stderr)
-        b, a, c = (int(x) for x in r.stdout.split())
-        self.assertEqual(a, b)  # SAMPLER_NICE=0 changes nothing
-        self.assertEqual(c, min(19, b + 10))  # the default adds 10
+        st, hdr = self.stats(), self.lines()[0]
+        m = re.search(r"sched=(\S+)", st)
+        self.assertIsNotNone(m, st)
+        self.assertIn("sched=" + m.group(1), hdr)
+        self.assertIn("sched=" + m.group(1), open(os.path.join(self.out, "fine-run.txt")).read())
+        if sys.platform.startswith("linux"):
+            self.assertEqual(m.group(1), "idle", "an unprivileged process may enter SCHED_IDLE")
+        else:
+            self.assertEqual(m.group(1), "nice-only")
+
+    def test_the_run_file_carries_the_tag_the_stop_matches_on(self):
+        FakeProc(self.proc, ncpu=1)
+        r = self.run_script(SAMPLER_FINE_INTERVAL="0.05", SAMPLER_FINE_MAX_TICKS="2", SAMPLER_TAG="bench-4242")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.out, "fine-run.txt")) as f:
+            self.assertTrue(f.read().startswith("tag=bench-4242 host="))
+
+    def test_files_of_an_earlier_run_do_not_survive_a_new_start(self):
+        FakeProc(self.proc, ncpu=1)
+        os.makedirs(self.out)
+        stale = ["fine.00007.log.z", "fine.00001.log.z", "fine.log", "fine-events.log", "fine-minute.log", "fine.stats",
+                 "fine-run.txt", "fine.00002.log.z.tmp"]
+        for n in stale:
+            with open(os.path.join(self.out, n), "w") as f:
+                f.write("tag=bench-OLDRUN\n")
+        with open(os.path.join(self.out, "notes.txt"), "w") as f:
+            f.write("not ours\n")
+        r = self.run_script(SAMPLER_FINE_INTERVAL="0.05", SAMPLER_FINE_MAX_TICKS="2", SAMPLER_TAG="bench-NEW")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.generations().count("fine.00007.log.z"), 0)
+        for n in os.listdir(self.out):
+            if n == "notes.txt":
+                continue
+            p = os.path.join(self.out, n)
+            if n.endswith(".z"):
+                self.assertNotIn("OLDRUN", zlib.decompress(open(p, "rb").read()).decode(), n)
+            else:
+                self.assertNotIn("OLDRUN", open(p).read(), n)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "notes.txt")), "only its own files are removed")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "fine.00002.log.z.tmp")))
+
+
+class RobustnessTest2(Base):
+    def test_a_tick_that_overran_by_less_than_an_interval_is_not_followed_by_a_burst(self):
+        fp = FakeProc(self.proc, ncpu=1)
+        clock = Clock()
+        s = fine.Sampler(fine.Config(self.env(SAMPLER_FINE_INTERVAL="0.5", SAMPLER_FINE_MAX_TICKS="6")),
+                         wall=clock.wall, mono=clock.mono)
+        orig = s.tick
+        done = [False]
+
+        def slow_tick():
+            orig()
+            if s.ticks == 2 and not done[0]:
+                done[0] = True
+                clock.advance(0.6)  # the tick took longer than the interval
+
+        s.tick = slow_tick
+        s.run(sleep=lambda d: clock.advance(d))
+        s.close()
+        dts = [float(x.split()[1]) for x in self.lines()[1:]]
+        self.assertTrue(all(d >= 490 for d in dts[2:]), dts)  # no tick follows the late one at once
+
+
+class RobustnessTest(Base):
+    def test_a_huge_intr_line_does_not_cost_a_big_read(self):
+        fp, clock, s = self.sampler(ncpu=2)
+        self.assertLessEqual(fine.PROC_READ, 65536)
+        with open(os.path.join(self.proc, "stat"), "w") as f:
+            f.write("cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 1 0 0 9 0 0 0 0\ncpu1 1 0 0 9 0 0 0 0\nintr " + "7 " * 200000 + "\nprocs_running 3\n")
+        s.tick()
+        clock.advance(1)
+        with open(os.path.join(self.proc, "stat"), "w") as f:
+            f.write("cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 6 0 0 14 0 0 0 0\ncpu1 1 0 0 9 0 0 0 0\nintr " + "7 " * 200000 + "\nprocs_running 3\n")
+        s.tick()
+        s.close()
+        self.assertIn("c0=5,0,0,0,0,0", self.lines()[1])
+
+    def test_a_clock_step_does_not_end_the_run(self):
+        fp = FakeProc(self.proc, ncpu=1)
+        clock = Clock()
+        s = fine.Sampler(fine.Config(self.env(SAMPLER_DURATION="600", SAMPLER_FINE_MAX_TICKS="10")),
+                         wall=clock.wall, mono=clock.mono)
+
+        def sleep(d):
+            clock.advance(d)
+            clock.epoch += 10**6  # NTP steps the wall clock forward by 11 days
+
+        self.assertEqual(s.run(sleep=sleep), "max_ticks")
+        s.close()
+
+    def test_a_late_tick_is_not_followed_by_a_burst_of_catch_up_ticks(self):
+        fp = FakeProc(self.proc, ncpu=1)
+        clock = Clock()
+        s = fine.Sampler(fine.Config(self.env(SAMPLER_FINE_INTERVAL="0.5", SAMPLER_FINE_MAX_TICKS="8")),
+                         wall=clock.wall, mono=clock.mono)
+        orig = s.tick
+        first = [True]
+
+        def slow_tick():
+            orig()
+            if s.ticks == 2 and first[0]:
+                first[0] = False
+                clock.advance(2.3)  # the host froze
+
+        s.tick = slow_tick
+        s.run(sleep=lambda d: clock.advance(d))
+        s.close()
+        dts = [float(x.split()[1]) for x in self.lines()[1:]]
+        self.assertTrue(all(d >= 450 for d in dts[3:]), dts)  # after the freeze every interval is a whole one
+        self.assertGreaterEqual(s.skipped, 4)
 
 
 if __name__ == "__main__":

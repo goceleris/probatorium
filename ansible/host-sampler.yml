@@ -54,20 +54,33 @@
 # not made faster: at 1 s it would cost 24 ms of CPU per second (2.4 % of a core,
 # fifteen forks a tick); the fine one is a read-only /proc parser that costs
 # 0.03 % of ONE core at 1 s (about 0.3 ms of CPU per tick) and 0.35 % at 0.05 s
-# (20 Hz), measured over 60 s with this playbook on an 8-CPU Linux container with two
-# busy CPUs (fine.stats of every run reports the real figure); 10-11 MiB of RSS and
-# 9 descriptors. Output: about 45 bytes a tick plus 18 per CPU that did anything.
+# (20 Hz) in the first measurement, over 60 s with this playbook on an 8-CPU Linux container with two
+# busy CPUs, but with the container's pid namespace hiding ksoftirqd/N; with
+# ksoftirqd visible (--pid=host, 8 CPUs, contended) the review measured 0.051 % at 1 s
+# and 0.711 % at 20 Hz, and 4 + nCPU reads a tick extrapolates to about 0.1-0.2 %
+# at 1 s and 1.5-2 % at 20 Hz on 32 CPUs. fine.stats of every run reports the real
+# figure (self_cpu_pct). 10-13 MiB of RSS, 9 descriptors. The text is about 45 bytes
+# a tick plus 18-23 per CPU that did anything; closed generations compress about 5x.
 #
-# It runs at nice 10 (never raised), so under contention the SUT keeps the CPU
-# and the sampler shows the starvation as a gap in its own series instead of
-# taking CPU from the measurement. It writes to tmpfs (/run/celeris/fine), caps
-# its series at 2 x 16 MiB and its event log at 4 MiB, and ends at its deadline,
-# at the stop sentinel, and when the runner that started it is gone.
+# It runs under SCHED_IDLE (after nice 10; SCHED_BATCH at nice 19 if refused),
+# so it never preempts the SUT on a wake-up and a CPU that runs only the sampler
+# counts as idle to the scheduler; under contention it loses the CPU and shows
+# the starvation as a gap in its own series. No cpuset: on msr1 every CPU hosts
+# a loop. With sampler_low_priority (the bench tier) the 60 s shell sampler,
+# 25-30 forks a sample, is launched the same way (nice -n 19 chrt -i 0); without
+# it (race, weekend) its launch is what it was. The fine files are on tmpfs
+# (/run/celeris/fine); the run ends at its deadline, at the stop sentinel, and
+# when the runner that started it is gone.
 #
-# Outputs, fetched by the stop action into <fetch dir>/<host>/fine/:
-#   fine.log (+ .1)    the series, one line per tick, see the script header
-#   fine-events.log    starvation signatures and sampler gaps, the whole run
+# Outputs, fetched by the stop action into <fetch dir>/<host>/fine/ (only for a
+# stop that names its run, sampler_fetch_tag, and only if fine-run.txt carries it):
+#   fine.<seq>.log.z   the per-tick series, closed generations, zlib (16 MiB of text
+#                      each, kept up to 128 MiB compressed, oldest dropped and counted)
+#   fine-minute.log    one line per minute for the WHOLE run, never rotated: the
+#                      record that survives when the detail of the early hours is gone
+#   fine-events.log    starvation episodes, sampler gaps and dropped generations
 #   fine.stats         achieved rate, interval percentiles, the sampler's own CPU
+#   fine-run.txt       the tag, host, start and scheduling class (idle, batch+nice19, nice-only)
 
 - name: Host sampler lifecycle
   hosts: cluster
@@ -90,6 +103,13 @@
     # 10, at most three decimals; checked below and by mage HostSamplerStart.
     sampler_fine_interval: ""
     sampler_fine_dir: /run/celeris/fine
+    # The bench tier sets this: the 60 s shell sampler is launched at nice 19 under
+    # SCHED_IDLE (chrt -i 0, children inherit it), so its forks never preempt the
+    # SUT. The race and weekend tiers leave it false and start exactly what they did.
+    sampler_low_priority: false
+    # A stop that names its run (the bench tier) fetches the fine series only if
+    # its fine-run.txt carries this tag; "" = no fine file is fetched.
+    sampler_fetch_tag: ""
   tasks:
     - name: Validate the requested action
       ansible.builtin.assert:
@@ -110,6 +130,9 @@
           - (sampler_interval | int) >= 1
           - (sampler_interval | int) <= 3600
           - sampler_fine_interval | string is match('^([0-9]{1,2}([.][0-9]{1,3})?)?$')
+          - sampler_low_priority | string | lower in ['true', 'false']
+          - sampler_fetch_tag | string is match('^([A-Za-z0-9._-]{1,64})?$')
+          - sampler_tag | string is match('^[A-Za-z0-9._-]{1,64}$')
           - (sampler_fine_interval | string | length == 0) or ((sampler_fine_interval | float) >= 0.05 and (sampler_fine_interval | float) <= 10)
         fail_msg: >-
           sampler_interval must be an integer of 1 to 3600 seconds and
@@ -148,7 +171,11 @@
     # about it, and never has to kill anything.
     - name: Start | launch the sampler, detached
       ansible.builtin.shell: |
-        setsid nohup "{{ sampler_rundir }}/celeris-host-sampler" >/dev/null 2>&1 </dev/null &
+        pfx=""
+        if [ "{{ sampler_low_priority | bool | lower }}" = "true" ]; then
+          if command -v chrt >/dev/null 2>&1; then pfx="nice -n 19 chrt -i 0"; else pfx="nice -n 19"; fi
+        fi
+        setsid nohup $pfx "{{ sampler_rundir }}/celeris-host-sampler" >/dev/null 2>&1 </dev/null &
         echo "launched"
       args:
         executable: /bin/bash
@@ -260,7 +287,7 @@
         n=0
         while [ "$n" -lt 30 ]; do
           pid=$(cat "{{ sampler_rundir }}/host-sampler-fine.pid" 2>/dev/null || true)
-          if [ -n "$pid" ] && [ -d "/proc/$pid" ] && [ -s "{{ sampler_fine_dir }}/fine.log" ]; then
+          if [ -n "$pid" ] && [ -d "/proc/$pid" ] && grep -q "^tag={{ sampler_tag }} " "{{ sampler_fine_dir }}/fine-run.txt" 2>/dev/null; then
             echo "fine sampler pid=$pid alive"
             exit 0
           fi
@@ -431,6 +458,35 @@
         msg: "{{ inventory_hostname }}: {{ sampler_fine_gone.stdout | default('') | trim }}"
       when: sampler_action == 'stop'
 
+    # The fine files are fetched only for a stop that names its run, and only
+    # when the run file on the host carries that tag: a start that never ran
+    # (Deploy failed) must not hand the previous bench's series to this run, and
+    # a stop that names none (race, weekend) fetches no fine file at all.
+    - name: Stop | is the fine series on the host this run's
+      ansible.builtin.shell: grep -q "^tag={{ sampler_fetch_tag }} " "{{ sampler_fine_dir }}/fine-run.txt"
+      args:
+        executable: /bin/bash
+      register: sampler_fine_mine
+      changed_when: false
+      failed_when: false
+      when:
+        - sampler_action == 'stop'
+        - sampler_fetch_dir | length > 0
+        - sampler_fetch_tag | length > 0
+
+    # Closed generations are zlib streams (a few MB each, 5x smaller than text),
+    # named fine.<seq>.log.z and not known in advance: list them. The fetch goes
+    # through ansible's slurp (the whole file in memory under become), which is
+    # why the series is compressed before it is fetched, not after.
+    - name: Stop | list the closed generations of the fine series
+      ansible.builtin.find:
+        paths: "{{ sampler_fine_dir }}"
+        patterns: "fine.*.log.z"
+      register: sampler_fine_gens
+      when:
+        - sampler_action == 'stop'
+        - sampler_fine_mine.rc | default(1) == 0
+
     # A host that never ran a fine sampler has none of these; fail_on_missing
     # is false, so nothing is fetched and nothing fails.
     - name: Stop | fetch the fine series into the run's results dir
@@ -440,11 +496,7 @@
         flat: true
         fail_on_missing: false
         validate_checksum: false
-      loop:
-        - fine.log
-        - fine.log.1
-        - fine-events.log
-        - fine.stats
+      loop: "{{ ['fine-run.txt', 'fine.stats', 'fine-events.log', 'fine-minute.log', 'fine.log'] + (sampler_fine_gens.files | default([]) | map(attribute='path') | map('basename') | list) }}"
       when:
         - sampler_action == 'stop'
-        - sampler_fetch_dir | length > 0
+        - sampler_fine_mine.rc | default(1) == 0

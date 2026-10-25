@@ -161,3 +161,60 @@ func TestSamplerStartVars(t *testing.T) {
 		t.Errorf("with SAMPLER_FINE_INTERVAL=0.05: %v", vars)
 	}
 }
+
+func TestSamplerTagIsRestricted(t *testing.T) {
+	for _, bad := range []string{"a b", "x=y", "a;b", "a$b", "a\nb", strings.Repeat("a", 65), "'q'", "a,b"} {
+		t.Setenv("SAMPLER_TAG", bad)
+		if _, err := samplerStartVars(); err == nil {
+			t.Errorf("start accepted SAMPLER_TAG=%q", bad)
+		}
+		if _, err := samplerStopVars("/tmp/x"); err == nil {
+			t.Errorf("stop accepted SAMPLER_TAG=%q", bad)
+		}
+	}
+	for _, ok := range []string{"bench-40230062997", "weekend-1", "race-2", "run-3", "local", "a.b_c-d"} {
+		t.Setenv("SAMPLER_TAG", ok)
+		if _, err := samplerStartVars(); err != nil {
+			t.Errorf("start refused SAMPLER_TAG=%q: %v", ok, err)
+		}
+	}
+}
+
+// The bench tier's stop names its run; race and weekend do not, and then no
+// fine file is fetched (a leftover bench series cannot ride into their artifact).
+func TestSamplerStopVarsFetchTag(t *testing.T) {
+	t.Setenv("SAMPLER_TAG", "")
+	vars, err := samplerStopVars("/r")
+	if err != nil || !slices.Equal(vars, []string{"sampler_action=stop", "sampler_fetch_dir=/r"}) {
+		t.Errorf("stop without a tag: %v, %v", vars, err)
+	}
+	t.Setenv("SAMPLER_TAG", "bench-9")
+	vars, err = samplerStopVars("/r")
+	if err != nil || !slices.Equal(vars, []string{"sampler_action=stop", "sampler_fetch_dir=/r", "sampler_fetch_tag=bench-9"}) {
+		t.Errorf("stop with a tag: %v, %v", vars, err)
+	}
+}
+
+// Low priority is the bench tier's alone: unset leaves the start as it was.
+func TestSamplerLowPriority(t *testing.T) {
+	t.Setenv("SAMPLER_FINE_INTERVAL", "")
+	t.Setenv("SAMPLER_TAG", "x")
+	t.Setenv("SAMPLER_LOW_PRIORITY", "")
+	vars, _ := samplerStartVars()
+	for _, v := range vars {
+		if strings.HasPrefix(v, "sampler_low_priority") {
+			t.Errorf("unset SAMPLER_LOW_PRIORITY passed %q", v)
+		}
+	}
+	t.Setenv("SAMPLER_LOW_PRIORITY", "1")
+	vars, err := samplerStartVars()
+	if err != nil || !slices.Contains(vars, "sampler_low_priority=true") {
+		t.Errorf("SAMPLER_LOW_PRIORITY=1: %v, %v", vars, err)
+	}
+	for _, bad := range []string{"0", "true", "yes", " 1", "1 x=2"} {
+		t.Setenv("SAMPLER_LOW_PRIORITY", bad)
+		if _, err := samplerStartVars(); err == nil {
+			t.Errorf("SAMPLER_LOW_PRIORITY=%q accepted", bad)
+		}
+	}
+}

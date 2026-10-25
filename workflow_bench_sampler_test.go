@@ -57,7 +57,9 @@ func TestBenchTierBracketsTheRunWithTheSampler(t *testing.T) {
 // step must run (and fetch) when the bench failed.
 func TestBenchSamplerStepsCannotFailTheRun(t *testing.T) {
 	src := mustRead(t, benchTier)
-	for _, run := range []string{"mage HostSamplerStart", "mage HostSamplerStop"} {
+	// the stop fetches the compressed series through ansible's slurp (in memory
+	// under become): 10 minutes, deliberately; the start stays at 5
+	for run, bound := range map[string]string{"mage HostSamplerStart": "5", "mage HostSamplerStop": "10"} {
 		blk := stepRunning(src, run)
 		if blk == "" {
 			t.Fatalf("no step runs %q", run)
@@ -65,8 +67,8 @@ func TestBenchSamplerStepsCannotFailTheRun(t *testing.T) {
 		if !strings.Contains(blk, "continue-on-error: true") {
 			t.Errorf("%s is not continue-on-error:\n%s", run, blk)
 		}
-		if !strings.Contains(blk, "timeout-minutes: 5\n") {
-			t.Errorf("%s has no timeout-minutes: 5:\n%s", run, blk)
+		if !strings.Contains(blk, "timeout-minutes: "+bound+"\n") {
+			t.Errorf("%s has no timeout-minutes: %s:\n%s", run, bound, blk)
 		}
 	}
 	if blk := stepRunning(src, "mage HostSamplerStop"); !strings.Contains(blk, "        if: always()\n") {
@@ -81,13 +83,30 @@ func TestBenchSamplerStepsCannotFailTheRun(t *testing.T) {
 // tier's tag, so a series that outlives a run can be cut into the run that
 // made it.
 func TestBenchSamplerIsTaggedForThisRun(t *testing.T) {
-	blk := stepRunning(mustRead(t, benchTier), "mage HostSamplerStart")
-	if !strings.Contains(blk, "SAMPLER_TAG: bench-${{ github.run_id }}\n") {
-		t.Errorf("the start step does not tag the series with this run:\n%s", blk)
+	src := mustRead(t, benchTier)
+	// the stop names the same run: the fine series is fetched only if its
+	// fine-run.txt carries the tag, so a failed Deploy (no start) fetches nothing
+	for _, run := range []string{"mage HostSamplerStart", "mage HostSamplerStop"} {
+		blk := stepRunning(src, run)
+		if !strings.Contains(blk, "SAMPLER_TAG: bench-${{ github.run_id }}\n") {
+			t.Errorf("%s does not tag the series with this run:\n%s", run, blk)
+		}
+		for _, other := range []string{"weekend-", "race-"} {
+			if strings.Contains(blk, other) {
+				t.Errorf("the bench sampler carries another tier's tag %q:\n%s", other, blk)
+			}
+		}
 	}
-	for _, other := range []string{"weekend-", "race-"} {
-		if strings.Contains(blk, other) {
-			t.Errorf("the bench sampler carries another tier's tag %q:\n%s", other, blk)
+}
+
+// Only the bench tier launches the 60 s shell sampler under SCHED_IDLE.
+func TestBenchSamplerLaunchesTheShellSamplerAtLowPriority(t *testing.T) {
+	if blk := stepRunning(mustRead(t, benchTier), "mage HostSamplerStart"); !strings.Contains(blk, "SAMPLER_LOW_PRIORITY: \"1\"\n") {
+		t.Errorf("the bench start step does not set SAMPLER_LOW_PRIORITY=1:\n%s", blk)
+	}
+	for _, wf := range []string{raceTier, weekendWorkflow} {
+		if strings.Contains(mustRead(t, wf), "SAMPLER_LOW_PRIORITY") {
+			t.Errorf("%s sets SAMPLER_LOW_PRIORITY: the race and weekend starts are meant to stay what they were", wf)
 		}
 	}
 }
@@ -181,7 +200,7 @@ func TestBenchSamplerCadenceIsAnInputDefaultingToOneSecond(t *testing.T) {
 	if in == nil {
 		t.Fatal("no `sampler_interval` dispatch input (string, default \"1\")")
 	}
-	for _, want := range []string{"0.05", "1 s", "% of one CPU at 1 s", "% at 0.05 s (20 Hz)", "nice 10"} {
+	for _, want := range []string{"0.05", "1 s", "% of one CPU at 1 s", "% at 0.05 s (20 Hz)", "SCHED_IDLE", "65 h", "per-minute record"} {
 		if !strings.Contains(in[1], want) {
 			t.Errorf("the sampler_interval input text lacks %q (it must state the load it adds):\n%s", want, in[1])
 		}

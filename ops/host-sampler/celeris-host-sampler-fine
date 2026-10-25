@@ -25,13 +25,20 @@
 #     subprocess at all (no fork, no exec, no shell): every input is a read of
 #     a file under /proc, held open and re-read with pread.
 #   - It writes only to its own directory (SAMPLER_FINE_DIR, on tmpfs) and its
-#     own pid file. A rotation caps the series at 2 x SAMPLER_FINE_MAXBYTES, the
-#     event log at SAMPLER_FINE_EVENTS_MAXBYTES.
-#   - It runs at a LOWER priority than the processes it observes (nice 10 by
-#     default, never negative): under contention the SUT keeps the CPU. The
-#     price is visible, not silent: a tick the sampler was starved of is a
+#     own pid file. Closed generations of the series are compressed and kept up
+#     to SAMPLER_FINE_TOTAL_MAXBYTES (the oldest is dropped past it, and the
+#     drop is counted, never silent); the event log is capped at
+#     SAMPLER_FINE_EVENTS_MAXBYTES with a drop counter.
+#   - It runs at the LOWEST scheduling class the kernel has: SCHED_IDLE (a
+#     SCHED_IDLE task never preempts a normal one on wake-up, and a CPU running
+#     only SCHED_IDLE tasks counts as idle to the load balancer), after nice 10.
+#     If the kernel refuses SCHED_IDLE it falls back to SCHED_BATCH at nice 19,
+#     and to nice 10 alone if there is no scheduler call; which one took is in
+#     the header ("sched=") and in fine.stats. Never negative, never raised.
+#     The price is visible, not silent: a tick the sampler was starved of is a
 #     gap in the series and in fine.stats (interval p99 / max, skipped
-#     deadlines, gap events).
+#     deadlines, gap events). Pinning it to a CPU set is not done: on msr1
+#     every CPU hosts a loop.
 #   - It stops when asked (the stop sentinel is a FILE, polled every tick), at
 #     its hard deadline, and when the runner that started it is gone: if the
 #     Runner.Listener it saw is absent for 60 s it exits, so a runner that died
@@ -54,18 +61,45 @@
 #           in USER_HZ ticks, 1/100 s), rx = NET_RX softirq runs, kd = ms the
 #           ksoftirqd/N thread ran. A CPU that is not listed did nothing.
 #
-# fine-events.log holds the events that matter for the whole run, kept apart
-# from the rotating series so the series cannot push them out:
+# THE WHOLE-RUN FILES (never rotated, so the early part of a 65 h bench is not
+# lost when the detail of its first hours is dropped)
 #
-#   <epoch> starve cpu=N softirq_pct=P usrsys_pct=P window_s=W
+# fine-minute.log, one line per wall-clock minute:
+#
+#   <minute epoch> n=<ticks> dtmax_ms=<max tick interval> runmax=<max run queue> psi_us=<pressure> | c<N>=<a>,<b>,<c> ...
+#
+#   a = the highest softirq percent of any tick of the minute on CPU N
+#   b = the lowest user+nice+system percent of any tick of the minute
+#   c = the softirq percent of the whole minute
+#   A CPU that is not listed was idle all minute. A stall shows as a minute
+#   whose a is near 100 and b near 0 on one CPU, at any tick rate.
+#
+# fine-events.log, the starvation episodes and the sampler's own gaps:
+#
+#   <epoch> starve_begin cpu=N softirq_pct=P usrsys_pct=P window_s=W
 #       a CPU spent >= 95 % of the last >= 1 s in softirq and <= 3 % in
 #       user+nice+system (the signature of a pinned thread that is runnable and
-#       not running: the stalls of celeris#1036), at most once a second per CPU
+#       not running: the stalls of celeris#1036)
+#   <epoch> starve_end cpu=N duration_s=D peak_softirq_pct=P ticks=T
+#       it stopped holding (or the sampler ended: open_at_exit=1). One pair per
+#       episode, not one line per second, so a CPU stuck in softirq for 15 h is
+#       two lines. At 1 s a stall of 1 to 2 s is seen by a tick only part of the
+#       time, which is why fine-minute.log exists.
 #   <epoch> gap dt_ms=D expected_ms=E
-#       the sampler itself was late by more than 3 intervals (or 250 ms)
+#       the sampler itself was late by more than 3 intervals (or 250 ms); later
+#       late ticks within the next second are folded into
+#   <epoch> gap_burst n=N max_dt_ms=D expected_ms=E
+#   # events_dropped=N
+#       the last line, when the cap was reached: N events were not written
 #
-# fine.stats is rewritten every 10 s and at exit: achieved rate, interval
-# percentiles, the sampler's own CPU (self_cpu_pct) and why it stopped.
+# fine.log (the open generation) and fine.<seq>.log.z (closed generations: one
+# zlib stream each, `python3 -c "import zlib,sys;sys.stdout.buffer.write(zlib.decompress(open(sys.argv[1],'rb').read()))" F`):
+# the per-tick series, one line per tick, header "# fine-sampler format=1 ..."
+#
+# fine-run.txt: tag, host, start, interval, scheduling class. fine.stats is
+# rewritten every 10 s and at exit: achieved rate, interval percentiles, the
+# sampler's own CPU (self_cpu_pct), the generations kept and dropped, and why
+# it stopped.
 #
 # USAGE (environment)
 #
@@ -74,15 +108,18 @@
 #   SAMPLER_TAG             free-form label recorded in the header
 #   SAMPLER_FINE_DIR        output directory, default /run/celeris/fine
 #   SAMPLER_RUNDIR          pid / stop sentinel dir, default /run/celeris
-#   SAMPLER_FINE_MAXBYTES   rotate the series past this size, default 16777216
+#   SAMPLER_FINE_MAXBYTES   close (compress) a generation past this size, default 16777216
+#   SAMPLER_FINE_TOTAL_MAXBYTES  compressed generations kept, default 134217728
 #   SAMPLER_NICE            0 .. 19, default 10
 #   SAMPLER_EXIT_WITHOUT_RUNNER=1   exit when the Runner.Listener is gone
 #   SAMPLER_PROCROOT        default /proc (tests point it at a fixture)
 #   SAMPLER_FINE_MAX_TICKS  stop after this many ticks (tests), default 0 = no limit
 import collections
 import os
+import re
 import sys
 import time
+import zlib
 
 FORMAT = 1
 SIG_SIRQ = 95.0  # percent of the window in softirq
@@ -93,7 +130,8 @@ RUNNER_ABSENT_S = 60.0
 RUNNER_CHECK_S = 30.0
 STATS_EVERY_S = 10.0
 FLUSH_EVERY_S = 5.0
-EVENT_RATE_S = 1.0
+PROC_READ = 65536  # the cpu lines and the softirq rows are in the first few KB
+OWN_FILES = re.compile(r"^fine(\.[0-9]{5}\.log\.z(\.tmp)?|\.log|-events\.log|-minute\.log|\.stats(\.tmp)?|-run\.txt)$")
 
 
 class ConfigError(Exception):
@@ -123,13 +161,45 @@ class Config:
         self.outdir = env.get("SAMPLER_FINE_DIR", "/run/celeris/fine")
         self.rundir = env.get("SAMPLER_RUNDIR", "/run/celeris")
         self.maxbytes = _number(env, "SAMPLER_FINE_MAXBYTES", 16 * 1024 * 1024, 65536, 1 << 30, int)
+        self.total_maxbytes = _number(env, "SAMPLER_FINE_TOTAL_MAXBYTES", 128 * 1024 * 1024, 1 << 20, 1 << 32, int)
         self.events_maxbytes = _number(env, "SAMPLER_FINE_EVENTS_MAXBYTES", 4 * 1024 * 1024, 4096, 1 << 30, int)
+        self.minute_maxbytes = _number(env, "SAMPLER_FINE_MINUTE_MAXBYTES", 32 * 1024 * 1024, 4096, 1 << 30, int)
         self.nice = _number(env, "SAMPLER_NICE", 10, 0, 19, int)
         self.exit_without_runner = env.get("SAMPLER_EXIT_WITHOUT_RUNNER", "") == "1"
         self.procroot = env.get("SAMPLER_PROCROOT", "/proc")
         self.max_ticks = _number(env, "SAMPLER_FINE_MAX_TICKS", 0, 0, 10**9, int)
         self.pidfile = os.path.join(self.rundir, "host-sampler-fine.pid")
         self.stopfile = os.path.join(self.rundir, "host-sampler-fine-stop")
+
+
+def remove_quiet(path):
+    """Delete one of this sampler's own files (pid file, sentinel, series files)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def lower_priority(nice, osmod=os):
+    """Lowest scheduling class available; returns which one took. Never raises priority."""
+    try:
+        osmod.nice(nice)
+    except OSError:
+        pass
+    try:
+        osmod.sched_setscheduler(0, osmod.SCHED_IDLE, osmod.sched_param(0))
+        return "idle"
+    except (AttributeError, OSError):
+        pass
+    try:
+        osmod.nice(max(0, 19 - nice))
+    except OSError:
+        pass
+    try:
+        osmod.sched_setscheduler(0, osmod.SCHED_BATCH, osmod.sched_param(0))
+        return "batch+nice19"
+    except (AttributeError, OSError):
+        return "nice-only"
 
 
 class Proc:
@@ -145,7 +215,7 @@ class Proc:
             if fd is None:
                 fd = os.open(os.path.join(self.root, rel), os.O_RDONLY)
                 self.fds[rel] = fd
-            return os.pread(fd, 1 << 20, 0)
+            return os.pread(fd, PROC_READ, 0)
         except OSError:
             if fd is not None:
                 self.fds.pop(rel, None)
@@ -246,21 +316,47 @@ def parse_schedstat_run_ns(b):
         return None
 
 
-class Series:
-    """An append-only text file that rotates to <path>.1 past maxbytes."""
+def compress_file(src, dst):
+    """zlib level 1 of src into dst, streamed (bounded memory); returns the size of dst."""
+    c = zlib.compressobj(1)
+    tmp = dst + ".tmp"
+    with open(src, "rb") as fi, open(tmp, "wb") as fo:
+        while True:
+            b = fi.read(1 << 20)
+            if not b:
+                break
+            fo.write(c.compress(b))
+        fo.write(c.flush())
+    os.replace(tmp, dst)
+    return os.path.getsize(dst)
 
-    def __init__(self, path, maxbytes, header):
-        self.path = path
+
+class Series:
+    """The per-tick series. The open generation is plain text (fine.log); a
+    generation that reaches maxbytes is compressed into fine.<seq>.log.z and a
+    new one is opened. Compressed generations are kept up to total_maxbytes;
+    past it the oldest is deleted, counted in dropped and reported through
+    on_drop (the whole-run files still cover the dropped hours)."""
+
+    def __init__(self, outdir, maxbytes, total_maxbytes, header, on_drop):
+        self.dir = outdir
+        self.path = os.path.join(outdir, "fine.log")
         self.maxbytes = maxbytes
+        self.total_maxbytes = total_maxbytes
         self.header = header
+        self.on_drop = on_drop
+        self.seq = 0
+        self.closed = collections.deque()  # (path, size)
+        self.closed_bytes = 0
+        self.generations = 0
+        self.dropped = 0
         self.size = 0
-        self.rotations = 0
         self.total = 0
         self.f = None
-        self._open("w")
+        self._open()
 
-    def _open(self, mode):
-        self.f = open(self.path, mode, buffering=1 << 16)
+    def _open(self):
+        self.f = open(self.path, "w", buffering=1 << 16)
         self.size = 0
         self._raw(self.header)
         self.f.flush()  # the header at once: it is what says the sampler is up
@@ -270,43 +366,61 @@ class Series:
         self.size += len(line)
         self.total += len(line)
 
+    def _close_generation(self):
+        self.f.close()
+        dst = os.path.join(self.dir, "fine.%05d.log.z" % self.seq)
+        self.seq += 1
+        size = compress_file(self.path, dst)
+        remove_quiet(self.path)
+        self.closed.append((dst, size))
+        self.closed_bytes += size
+        self.generations += 1
+        while self.closed_bytes > self.total_maxbytes and len(self.closed) > 1:
+            old, osize = self.closed.popleft()
+            remove_quiet(old)
+            self.closed_bytes -= osize
+            self.dropped += 1
+            self.on_drop(os.path.basename(old), osize)
+
     def write(self, line):
         if self.size + len(line) > self.maxbytes:
-            self.f.close()
-            os.replace(self.path, self.path + ".1")
-            self.rotations += 1
-            self._open("w")
+            self._close_generation()
+            self._open()
         self._raw(line)
 
     def flush(self):
         self.f.flush()
 
     def close(self):
-        try:
+        """End of the run: the open generation is compressed too, so what is fetched is small."""
+        if self.f is None:
+            return
+        if self.size > len(self.header):
+            self._close_generation()
+        else:
             self.f.close()
-        except OSError:
-            pass
+            remove_quiet(self.path)
+        self.f = None
 
 
-class Events:
-    """The event log: capped, never rotated, so it covers the whole run."""
+class Capped:
+    """A text file that is never rotated: past maxbytes later lines are
+    counted, not written, and the count is the file's last line."""
 
-    def __init__(self, path, maxbytes, header):
+    def __init__(self, path, maxbytes, header, what):
         self.f = open(path, "w", buffering=1 << 12)
         self.maxbytes = maxbytes
+        self.what = what
         self.size = 0
-        self.full = False
         self.count = 0
+        self.dropped = 0
         self.f.write(header)
         self.f.flush()
         self.size += len(header)
 
     def write(self, line):
-        if self.full:
-            return
         if self.size + len(line) > self.maxbytes:
-            self.full = True
-            self.f.write("# event log full: later events are not recorded\n")
+            self.dropped += 1
             return
         self.f.write(line)
         self.size += len(line)
@@ -316,31 +430,95 @@ class Events:
         self.f.flush()
 
     def close(self):
+        if self.dropped:
+            self.f.write("# %s_dropped=%d\n" % (self.what, self.dropped))
         try:
             self.f.close()
         except OSError:
             pass
 
 
+class Minutes:
+    """One line per wall-clock minute: per CPU the highest softirq percent of a
+    tick, the lowest user+system percent of a tick and the softirq percent of
+    the minute. This is the record that is never rotated."""
+
+    def __init__(self, out):
+        self.out = out
+        self.minute = None
+        self.reset()
+
+    def reset(self):
+        self.n = 0
+        self.dtmax = 0.0
+        self.runmax = 0
+        self.psi = 0
+        self.cpu = {}
+
+    def add(self, wall, dt, run, psi, ticks):
+        """ticks: {cpu: (total, softirq, usrsys)} jiffy deltas of this tick"""
+        m = int(wall // 60)
+        if self.minute is not None and m != self.minute:
+            self.flush_minute()
+        self.minute = m
+        self.n += 1
+        self.dtmax = max(self.dtmax, dt)
+        self.runmax = max(self.runmax, run)
+        self.psi += psi
+        for cpu, (total, sirq, usr) in ticks.items():
+            if total <= 0:
+                continue
+            c = self.cpu.setdefault(cpu, [0.0, 100.0, 0, 0])  # sirq max, usr min, sirq sum, total sum
+            c[0] = max(c[0], 100.0 * sirq / total)
+            c[1] = min(c[1], 100.0 * usr / total)
+            c[2] += sirq
+            c[3] += total
+
+    def flush_minute(self):
+        if self.minute is None or self.n == 0:
+            return
+        fields = []
+        for cpu in sorted(self.cpu):
+            smax, umin, ssum, tsum = self.cpu[cpu]
+            a, b, c = int(round(smax)), int(round(umin)), int(round(100.0 * ssum / tsum)) if tsum else 0
+            if a or b or c:
+                fields.append("c%d=%d,%d,%d" % (cpu, a, b, c))
+        self.out.write("%d n=%d dtmax_ms=%.1f runmax=%d psi_us=%d | %s\n" % (
+            self.minute * 60, self.n, self.dtmax * 1000, self.runmax, self.psi, " ".join(fields)))
+        self.reset()
+
+
 class Sampler:
-    def __init__(self, cfg, host="unknown", wall=time.time, mono=time.monotonic, cpu_time=time.process_time):
+    def __init__(self, cfg, host="unknown", sched="unset", wall=time.time, mono=time.monotonic, cpu_time=time.process_time):
         self.cfg = cfg
         self.proc = Proc(cfg.procroot)
         self.wall = wall
         self.mono = mono
         self.cpu_time = cpu_time
+        self.sched = sched
         self.tick_hz = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
         os.makedirs(cfg.outdir, exist_ok=True)
-        header = "# fine-sampler format=%d host=%s tag=%s interval_s=%s duration_s=%d user_hz=%d\n" % (
-            FORMAT, host, cfg.tag, repr(cfg.interval), cfg.duration, int(self.tick_hz))
-        self.series = Series(os.path.join(cfg.outdir, "fine.log"), cfg.maxbytes, header)
-        self.events = Events(os.path.join(cfg.outdir, "fine-events.log"), cfg.events_maxbytes, header)
+        # a new run starts clean: no file of an earlier run survives to be fetched as this one's
+        for name in os.listdir(cfg.outdir):
+            if OWN_FILES.match(name):
+                remove_quiet(os.path.join(cfg.outdir, name))
+        header = "# fine-sampler format=%d host=%s tag=%s interval_s=%s duration_s=%d user_hz=%d sched=%s\n" % (
+            FORMAT, host, cfg.tag, repr(cfg.interval), cfg.duration, int(self.tick_hz), sched)
+        with open(os.path.join(cfg.outdir, "fine-run.txt"), "w") as f:
+            f.write("tag=%s host=%s start_epoch=%.0f interval_s=%s duration_s=%d sched=%s pid=%d\n" % (
+                cfg.tag, host, wall(), repr(cfg.interval), cfg.duration, sched, os.getpid()))
         self.statspath = os.path.join(cfg.outdir, "fine.stats")
+        self.events = Capped(os.path.join(cfg.outdir, "fine-events.log"), cfg.events_maxbytes, header, "events")
+        self.minutes = Minutes(Capped(os.path.join(cfg.outdir, "fine-minute.log"), cfg.minute_maxbytes, header, "minutes"))
+        self.series = Series(cfg.outdir, cfg.maxbytes, cfg.total_maxbytes, header, self._dropped_generation)
         self.ksoftirqd = self._find_ksoftirqd()
         self.prev = None
         self.prev_mono = None
         self.hist = collections.defaultdict(collections.deque)
-        self.last_event = {}
+        self.episode = {}  # cpu -> [begin wall, peak softirq pct, ticks]
+        self.last_gap_wall = None
+        self.burst_n = 0
+        self.burst_max = 0.0
         self.intervals = collections.deque(maxlen=20000)
         self.max_dt = 0.0
         self.ticks = 0
@@ -355,6 +533,10 @@ class Sampler:
         self.runner_absent_since = None
         self.last_runner_check = None
         self.exit_reason = "running"
+
+    def _dropped_generation(self, name, size):
+        self.events.write("%.3f generation_dropped file=%s bytes=%d (total cap %d; fine-minute.log still covers its minutes)\n" % (
+            self.wall(), name, size, self.cfg.total_maxbytes))
 
     def _find_ksoftirqd(self):
         out = {}
@@ -405,14 +587,16 @@ class Sampler:
         self.max_dt = max(self.max_dt, dt)
         if dt > max(0.25, 3 * self.cfg.interval):
             self.gaps += 1
-            self.events.write("%.3f gap dt_ms=%.1f expected_ms=%.1f\n" % (wall, dt * 1000, self.cfg.interval * 1000))
+            self._gap(wall, dt)
         fields = []
+        per_tick = {}
         for cpu in sorted(snap["cpu"]):
             cur, old = snap["cpu"][cpu], prev["cpu"].get(cpu)
             if old is None:
                 continue
             d = [max(0, a - b) for a, b in zip(cur, old)]
             u, irq, sirq, steal = d[0] + d[1] + d[2], d[5], d[6], d[7]
+            per_tick[cpu] = (sum(d), sirq, u)
             rx = max(0, snap["rx"].get(cpu, 0) - prev["rx"].get(cpu, 0))
             kd = 0
             if cpu in snap["kd"] and cpu in prev["kd"]:
@@ -424,13 +608,33 @@ class Sampler:
             psi = max(0, snap["psi"] - prev["psi"])
         self.series.write("%.3f %.1f run=%d l1=%.2f psi=%d | %s\n" % (
             wall, dt * 1000, snap["run"], snap["l1"], psi, " ".join(fields)))
+        self.minutes.add(wall, dt, snap["run"], psi, per_tick)
         self._starve(mono, wall, snap)
         if mono - self.last_flush >= FLUSH_EVERY_S:
             self.series.flush()
             self.events.flush()
+            self.minutes.out.flush()
             self.last_flush = mono
         if mono - self.last_stats >= STATS_EVERY_S:
             self.write_stats(final=False)
+
+    def _gap(self, wall, dt):
+        """One line for the first late tick; later ones within a second are folded into a gap_burst line
+        (a sampler that is starved for good would otherwise fill the event log with its own lateness)."""
+        if self.last_gap_wall is None or wall - self.last_gap_wall >= 1.0:
+            self._flush_gap_burst()
+            self.last_gap_wall = wall
+            self.events.write("%.3f gap dt_ms=%.1f expected_ms=%.1f\n" % (wall, dt * 1000, self.cfg.interval * 1000))
+        else:
+            self.burst_n += 1
+            self.burst_max = max(self.burst_max, dt)
+
+    def _flush_gap_burst(self):
+        if self.burst_n:
+            self.events.write("%.3f gap_burst n=%d max_dt_ms=%.1f expected_ms=%.1f\n" % (
+                self.last_gap_wall, self.burst_n, self.burst_max * 1000, self.cfg.interval * 1000))
+        self.burst_n = 0
+        self.burst_max = 0.0
 
     def _starve_history(self, mono, snap):
         for cpu, v in snap["cpu"].items():
@@ -459,10 +663,21 @@ class Sampler:
             usr_pct = 100.0 * (h[-1][2] - base[2]) / total
             if sirq_pct >= SIG_SIRQ and usr_pct <= SIG_USRSYS:
                 self.starves += 1
-                if wall - self.last_event.get(cpu, -1e9) >= EVENT_RATE_S:
-                    self.last_event[cpu] = wall
-                    self.events.write("%.3f starve cpu=%d softirq_pct=%.1f usrsys_pct=%.1f window_s=%.2f\n" % (
+                ep = self.episode.get(cpu)
+                if ep is None:
+                    self.episode[cpu] = [wall, sirq_pct, 1]
+                    self.events.write("%.3f starve_begin cpu=%d softirq_pct=%.1f usrsys_pct=%.1f window_s=%.2f\n" % (
                         wall, cpu, sirq_pct, usr_pct, mono - base[0]))
+                else:
+                    ep[1] = max(ep[1], sirq_pct)
+                    ep[2] += 1
+            elif cpu in self.episode:
+                self._end_episode(cpu, wall, False)
+
+    def _end_episode(self, cpu, wall, at_exit):
+        begin, peak, ticks = self.episode.pop(cpu)
+        self.events.write("%.3f starve_end cpu=%d duration_s=%.2f peak_softirq_pct=%.1f ticks=%d%s\n" % (
+            wall, cpu, wall - begin, peak, ticks, " open_at_exit=1" if at_exit else ""))
 
     def runner_gone(self, mono):
         """True once a Runner.Listener that was seen has been absent for RUNNER_ABSENT_S."""
@@ -492,23 +707,29 @@ class Sampler:
             return s[int(q * (len(s) - 1))] * 1000 if s else 0.0
 
         line = ("ticks=%d span_s=%.2f achieved_hz=%.3f target_hz=%.3f interval_ms median=%.1f p99=%.1f max=%.1f "
-                "skipped_deadlines=%d gap_events=%d starve_ticks=%d events=%d self_cpu_pct=%.3f "
-                "bytes_written=%d rotations=%d final=%d exit_reason=%s\n") % (
+                "skipped_deadlines=%d gap_events=%d starve_ticks=%d events=%d events_dropped=%d self_cpu_pct=%.3f "
+                "bytes_written=%d generations=%d generations_dropped=%d closed_bytes=%d minutes=%d minutes_dropped=%d "
+                "sched=%s final=%d exit_reason=%s\n") % (
             self.ticks, span, self.ticks / span, 1.0 / self.cfg.interval, pct(0.5), pct(0.99),
-            self.max_dt * 1000, self.skipped, self.gaps, self.starves, self.events.count,
-            100.0 * (self.cpu_time() - self.start_cpu) / span, self.series.total, self.series.rotations,
-            1 if final else 0, self.exit_reason)
+            self.max_dt * 1000, self.skipped, self.gaps, self.starves, self.events.count, self.events.dropped,
+            100.0 * (self.cpu_time() - self.start_cpu) / span, self.series.total, self.series.generations,
+            self.series.dropped, self.series.closed_bytes, self.minutes.out.count, self.minutes.out.dropped,
+            self.sched, 1 if final else 0, self.exit_reason)
         tmp = self.statspath + ".tmp"
         with open(tmp, "w") as f:
             f.write(line)
         os.replace(tmp, self.statspath)
 
     def close(self):
-        self.series.flush()
-        self.events.flush()
-        self.write_stats(final=True)
+        wall = self.wall()
+        for cpu in list(self.episode):
+            self._end_episode(cpu, wall, True)
+        self._flush_gap_burst()
+        self.minutes.flush_minute()
         self.series.close()
+        self.write_stats(final=True)
         self.events.close()
+        self.minutes.out.close()
         for fd in self.proc.fds.values():
             try:
                 os.close(fd)
@@ -518,12 +739,12 @@ class Sampler:
     def run(self, sleep=time.sleep):
         """Deadline-scheduled loop. Returns the reason it stopped."""
         cfg = self.cfg
-        deadline = self.wall() + cfg.duration
+        deadline = self.mono() + cfg.duration  # monotonic: a clock step does not move it
         nxt = self.mono()
         while True:
             if os.path.exists(cfg.stopfile):
                 return "stop_requested"
-            if self.wall() >= deadline:
+            if self.mono() >= deadline:
                 return "deadline"
             if cfg.max_ticks and self.ticks >= cfg.max_ticks:
                 return "max_ticks"
@@ -535,8 +756,9 @@ class Sampler:
             self.tick()
             nxt += cfg.interval
             now = self.mono()
-            if now >= nxt + cfg.interval:
-                self.skipped += int((now - nxt) / cfg.interval)
+            if now >= nxt:
+                # late by a whole interval: skip the ticks that were missed instead of firing them back to back
+                self.skipped += int((now - nxt) / cfg.interval) + 1
                 nxt = now + cfg.interval
 
 
@@ -553,10 +775,7 @@ def takeover(cfg, proc_alive, sleep=time.sleep, waited_max=15):
         while proc_alive(old) and waited < waited_max:
             sleep(0.5)
             waited += 0.5
-    try:
-        os.remove(cfg.stopfile)
-    except OSError:
-        pass
+    remove_quiet(cfg.stopfile)
 
 
 def main(env=os.environ):
@@ -567,17 +786,14 @@ def main(env=os.environ):
         return 2
     os.makedirs(cfg.rundir, exist_ok=True)
     takeover(cfg, lambda pid: os.path.isdir(os.path.join(cfg.procroot, pid)))
-    try:
-        os.nice(cfg.nice)  # only ever lowers the priority
-    except OSError:
-        pass
+    sched = lower_priority(cfg.nice)
     with open(cfg.pidfile, "w") as f:
         f.write("%d\n" % os.getpid())
     try:
         host = os.uname().nodename
     except AttributeError:
         host = "unknown"
-    s = Sampler(cfg, host=host)
+    s = Sampler(cfg, host=host, sched=sched)
     try:
         s.exit_reason = s.run()
     finally:
@@ -588,7 +804,7 @@ def main(env=os.environ):
             with open(cfg.pidfile) as f:
                 mine = f.read().strip() == str(os.getpid())
             if mine:
-                os.remove(cfg.pidfile)
+                remove_quiet(cfg.pidfile)
         except OSError:
             pass
     return 0
