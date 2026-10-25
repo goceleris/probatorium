@@ -454,6 +454,9 @@ func TestCancelledRunIsRecordedHonestly(t *testing.T) {
 		if str(e, "status") != "skipped" || str(e, "reason") != "interrupted" {
 			t.Errorf("later pass %d = %q/%q, want skipped/interrupted (not zero_requests)", i, str(e, "status"), str(e, "reason"))
 		}
+		if str(e, "detail") != "was zero_requests" {
+			t.Errorf("later pass %d detail = %q, want the original reason kept (\"was zero_requests\")", i, str(e, "detail"))
+		}
 	}
 }
 
@@ -475,6 +478,10 @@ func TestFullWindowPassUnderACancelledRunIsNotTagged(t *testing.T) {
 	}
 	if rec := newRatedPassRecord(0.5, 500, window, nil, nil, true, time.Time{}, time.Time{}); rec.Status != report.RatedPassSkipped || rec.Reason != report.RatedReasonInterrupted {
 		t.Errorf("nil result under a cancelled run = %+v, want skipped/interrupted", rec)
+	}
+	failed := errors.New("pass aborted")
+	if rec := newRatedPassRecord(0.5, 500, window, nil, failed, true, time.Time{}, time.Time{}); rec.Reason != report.RatedReasonInterrupted || rec.Detail != "was run_error: pass aborted" {
+		t.Errorf("run error under a cancelled run = reason %q detail %q, want interrupted, \"was run_error: pass aborted\"", rec.Reason, rec.Detail)
 	}
 }
 

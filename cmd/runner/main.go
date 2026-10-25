@@ -1809,8 +1809,13 @@ func newRatedPassRecord(frac, target float64, window time.Duration, res *loadgen
 	if interrupted {
 		switch {
 		case rec.Status != report.RatedPassOK:
-			rec.Reason = report.RatedReasonInterrupted
-		case res.Duration < window*95/100:
+			// Keep what the pass was before the cancel took its name.
+			was := rec.Reason
+			if rec.Detail != "" {
+				was += ": " + rec.Detail
+			}
+			rec.Reason, rec.Detail = report.RatedReasonInterrupted, "was "+was
+		case rec.Status == report.RatedPassOK && res.Duration < window*95/100:
 			rec.Reason = report.RatedReasonInterrupted
 			rec.Detail = fmt.Sprintf("the run was cancelled mid-pass: measured %s of %s; kept, as the keep rule has always done", res.Duration.Round(time.Millisecond), window)
 		}

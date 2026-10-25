@@ -78,18 +78,22 @@ type RatedPassRecord struct {
 	// AchievedRPS is loadgen's requests per second over the measured window
 	// and AchievedRatio is AchievedRPS / TargetRPS. Both read slightly low:
 	// requests counts successes only, and loadgen's elapsed time runs to after
-	// its workers have stopped, so it includes teardown (about teardown / 30 s).
+	// its workers have stopped, so it includes teardown (about teardown / the rated window, which the profiles set to 20 s or 30 s).
 	// Set any validity line (the 0.98 of #441) knowing that. A ratio below 1 is load
 	// loadgen never sent: the p99 of such a pass is the pass's backlog, not the
 	// server's latency (probatorium#441, loadgen#102).
 	AchievedRPS   float64 `json:"achieved_rps,omitempty"`
 	AchievedRatio float64 `json:"achieved_ratio,omitempty"`
 	// Requests (successes) and Errors (failed requests) are loadgen's counts
-	// for the window. ConnectErrors is a separate counter of dial/handshake
-	// failures that overlaps Errors only where a failed dial also failed a
-	// request (the h1 reconnect path), so it is not a subset of Errors and
-	// Errors - ConnectErrors can be negative. DialRetries and CloseAborts are
-	// loadgen's own counters.
+	// for the window. ConnectErrors counts the dial/handshake failures (TCP
+	// connect, TLS, WS/SSE upgrade, H1 reconnect dials). In loadgen v1.4.14
+	// every such site also fails the request and the worker counts that in
+	// Errors, so ConnectErrors sits inside Errors, "give or take a few attempts
+	// cut off at phase boundaries" in loadgen's own words (results.go): it is
+	// counted at the driver, so it can differ from the matching Errors
+	// increments by a few. Errors ~ ConnectErrors means the server was
+	// unreachable, not misbehaving. DialRetries and CloseAborts are loadgen's
+	// own counters.
 	Requests      int64  `json:"requests,omitempty"`
 	Errors        int64  `json:"errors,omitempty"`
 	ConnectErrors uint64 `json:"connect_errors,omitempty"`
