@@ -860,7 +860,7 @@
 
     d, guard, nics = sys.argv[1], int(sys.argv[2]), sys.argv[3].split()
     hz = float(sys.argv[4]) if len(sys.argv) > 4 else 20.0
-    PORT = os.environ.get('SAMPLER_PORT', '8080')    # the SUT's port (stalldump.sh finds the SUT pid from it)
+    PORT = os.environ.get('SAMPLER_PORT', '8080')    # the SUT port (stalldump.sh finds the SUT pid from it)
     SIG_SOFT, SIG_USRSYS, SIG_WIN, DUMP_COOLDOWN, DUMP_MAX = float(os.environ.get('SAMPLER_SIG_SOFT', '0.95')), float(os.environ.get('SAMPLER_SIG_USRSYS', '0.03')), 1.0, 15.0, 3   # env: tests only
     period = 1.0 / hz
     os.chdir(d)
