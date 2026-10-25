@@ -100,7 +100,7 @@
 # Set `--extra-vars celeris_needs_root=true` to put the SUT back on root.
 - name: "{{ cell.1 }} run={{ cell.0 }} | resolve privilege for this column"
   ansible.builtin.set_fact:
-    cell_needs_root: "{{ cell_bin in ['celeris', 'celeris_v1511', 'celeris_vnv'] and (celeris_needs_root | default(false) | bool) }}"
+    cell_needs_root: "{{ cell_bin in ['celeris', 'celeris_v1511', 'celeris_vnv', 'celeris_mainb', 'celeris_pr1105'] and (celeris_needs_root | default(false) | bool) }}"
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
   ansible.builtin.file:
