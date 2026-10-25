@@ -171,6 +171,22 @@ func BuildDocument(in BuildInput) *Document {
 		}
 		if p99, ok := ratedHeadlineP99(c.RatedP99ByTarget); ok {
 			sr.RatedModeP99AtTargetRPS[c.ScenarioName] = p99
+			if c.RatedHeadlineTargetRPS > 0 {
+				if sr.RatedHeadlineTargetRPS == nil {
+					sr.RatedHeadlineTargetRPS = map[string]int{}
+				}
+				sr.RatedHeadlineTargetRPS[c.ScenarioName] = c.RatedHeadlineTargetRPS
+			}
+		}
+		// Every rated pass of the cell, kept or not (schema 5.24,
+		// probatorium#441): the achieved rate and errors of the passes the
+		// numbers above come from, and a status for each that is missing from
+		// them. Lazily allocated so a run without rated data emits no key.
+		if len(c.RatedPasses) > 0 {
+			if sr.RatedPasses == nil {
+				sr.RatedPasses = map[string][]RatedPassResult{}
+			}
+			sr.RatedPasses[c.ScenarioName] = c.RatedPasses
 		}
 
 		if c.MergedHistogramB64 != "" {
@@ -347,4 +363,18 @@ func ratedHeadlineP99(byTarget map[int]time.Duration) (time.Duration, bool) {
 		return 0, false
 	}
 	return byTarget[best], true
+}
+
+// ratedHeadlineTarget is the target ratedHeadlineP99 read its p99 at: the
+// highest target among the kept passes, 0 when there is none. When the cell's
+// top fraction was skipped this is a lower pass than the one the label
+// "at target RPS" suggests, and the document says which (rated_headline_target_rps).
+func ratedHeadlineTarget(byTarget map[int]time.Duration) int {
+	best := 0
+	for t := range byTarget {
+		if t > best {
+			best = t
+		}
+	}
+	return best
 }
