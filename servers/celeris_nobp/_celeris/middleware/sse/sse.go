@@ -1,0 +1,720 @@
+package sse
+
+import (
+	"context"
+	"errors"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/goceleris/celeris"
+)
+
+// Handler is the function signature for SSE endpoint handlers.
+// The Client is valid for the duration of the call. When Handler returns,
+// the SSE stream is closed automatically.
+//
+// Handler MUST return when client.Context() is done or when Send returns
+// an error. On epoll/io_uring the engine cancels client.Context() as soon
+// as it detects the peer went away (celeris#494); on std the request
+// context does the same and a broken pipe additionally surfaces through
+// Send (or the heartbeat). A handler that ignores both keeps its goroutine
+// and the detached celeris.Context alive for the life of the process.
+type Handler func(client *Client)
+
+// Client provides the API for sending SSE events to a connected client.
+// It wraps a [celeris.StreamWriter] and manages event formatting, heartbeat,
+// and disconnect detection.
+type Client struct {
+	sw          *celeris.StreamWriter
+	ctx         context.Context
+	cancel      context.CancelFunc
+	lastEventID string
+	buf         []byte
+	mu          sync.Mutex
+	closed      bool
+
+	// Queued-send mode (Config.MaxQueueDepth > 0). queue is nil in legacy
+	// blocking mode; a non-nil queue selects the asynchronous drain path.
+	// queueClosed flips to true the instant the handler defer is about to
+	// close c.queue, so a Send racing the defer observes "closed" and
+	// returns ErrClientClosed instead of panicking on send-to-closed-chan.
+	queue         chan Event
+	queueClosed   atomic.Bool
+	drainDone     chan struct{}
+	onSlowClient  func(*Client, Event) ClientPolicy
+	droppedEvents atomic.Uint64
+
+	// replayStore, when non-nil, captures every Event Send writes so the
+	// next reconnect can resume via Last-Event-ID. Set per-handler from
+	// [Config.ReplayStore] in [New].
+	replayStore ReplayStore
+
+	// brokerRefs counts a [Broker]'s slow-path goroutines that still use
+	// this Client. A publisher adds to it while the Client is subscribed
+	// (under the broker's lock, so before the handler's unsubscribe can
+	// complete), and releaseClient waits for it, so the pooled Client is
+	// never handed to another connection while one of them can still
+	// close it (celeris#926).
+	brokerRefs sync.WaitGroup
+}
+
+// Send sends a complete SSE event. Thread-safe (serialized with heartbeat writes).
+//
+// Return contract:
+//   - non-nil error: the event was NOT delivered (closed, context cancelled,
+//     or write failed); the caller may retry on a new connection.
+//   - nil error in blocking mode (MaxQueueDepth = 0): the event was handed
+//     to the connection and flushed. On epoll, io_uring and adaptive over
+//     HTTP/1.1 that means the engine accepted the bytes for sending: a
+//     write after the engine has noticed a reset is dropped without an
+//     error, and the disconnect arrives through [Client.Context], not
+//     through Send.
+//   - nil error in queued mode (MaxQueueDepth > 0): the event was enqueued
+//     OR dropped silently per the [Config.OnSlowClient] policy; check
+//     [Client.DroppedEvents] to detect drops.
+//
+// When [Config.MaxQueueDepth] is zero (default), Send writes directly to the
+// wire — historical blocking semantics. When MaxQueueDepth is positive Send
+// enqueues onto a bounded channel that a per-client goroutine drains; if the
+// queue is full Send dispatches the configured [Config.OnSlowClient] policy.
+//
+// Send must NOT be called after the user's [Handler] has returned. The
+// handler defer closes the per-client queue; a Send racing that close
+// observes the queueClosed flag and returns [ErrClientClosed] instead of
+// panicking, but the contract still belongs to the caller — spawned
+// goroutines that publish into a Client must be joined before the handler
+// returns.
+//
+// e's strings may be another request's strings, as when a handler relays
+// c.Param or c.Query to a connected Client. What Send keeps after it returns
+// is a copy: the event on the queue in queued mode, and the entry of a
+// [NewRingBuffer] replay store (celeris#732). A custom [ReplayStore] is
+// handed that copy in queued mode, but e as given in blocking mode; see
+// [ReplayStore.Append]. In queued mode the copy is made once the event is
+// going to be queued: a Send that finds the queue full under the default
+// policy (no [Config.OnSlowClient]) drops the event without copying it, while
+// with OnSlowClient set the callback is handed the copy, as it can keep it.
+func (c *Client) Send(e Event) error {
+	if c.queue != nil {
+		return c.sendQueued(e)
+	}
+	return c.sendBlocking(e)
+}
+
+func (c *Client) sendBlocking(e Event) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrClientClosed
+	}
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+
+	// Append under the same lock that serialises the wire write so the
+	// store's monotonic ID order matches the on-wire order even with
+	// concurrent Send callers. Failed writes cancel the connection;
+	// the appended event is still in the store and will replay on the
+	// next reconnect — strictly correct (every appended event is
+	// either delivered now OR delivered on reconnect).
+	if c.replayStore != nil {
+		id, err := c.replayStore.Append(c.ctx, e)
+		if err != nil {
+			return err
+		}
+		e.ID = id
+	}
+
+	c.buf = formatEvent(c.buf, &e)
+	if _, err := c.sw.Write(c.buf); err != nil {
+		c.cancel()
+		return err
+	}
+	if err := c.sw.Flush(); err != nil {
+		c.cancel()
+		return err
+	}
+	return nil
+}
+
+func (c *Client) sendQueued(e Event) error {
+	if c.queueClosed.Load() {
+		return ErrClientClosed
+	}
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	// With the default policy a full queue drops the event, which nothing
+	// keeps, so a drop costs no copy (celeris#888). The check is a hint: a
+	// slot the drain frees right after it only makes this Send drop an
+	// event that would just have fit, as a Send that lost the race for
+	// that slot would. With OnSlowClient set the callback can keep e, so
+	// that case copies below.
+	if c.onSlowClient == nil && len(c.queue) == cap(c.queue) {
+		c.droppedEvents.Add(1)
+		return nil
+	}
+	// The queue keeps e until the drain writes it, after Send has returned
+	// and possibly after the sender's request has ended: keep a copy.
+	e = ownEvent(e)
+	select {
+	case c.queue <- e:
+		return nil
+	default:
+	}
+
+	action := ClientPolicyDrop
+	if c.onSlowClient != nil {
+		action = c.onSlowClient(c, e)
+	}
+	switch action {
+	case ClientPolicyClose:
+		c.droppedEvents.Add(1)
+		c.cancel()
+		return ErrClientClosed
+	case ClientPolicyBlock:
+		// Re-check queueClosed inside the select so a defer that fires
+		// between the top-of-function check and here doesn't park the
+		// caller on a closed-chan send forever.
+		if c.queueClosed.Load() {
+			return ErrClientClosed
+		}
+		select {
+		case c.queue <- e:
+			return nil
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		}
+	default: // ClientPolicyDrop and any unknown value
+		c.droppedEvents.Add(1)
+		return nil
+	}
+}
+
+// drain pulls events off the per-client queue and writes them to the wire.
+// Started by [New] when Config.MaxQueueDepth > 0. The range exits when the
+// queue is closed by the handler defer (graceful close, remaining events
+// flushed) or when the closed flag flips after [Client.Close] (unhealthy
+// close, remaining events dropped — the connection is already gone).
+func (c *Client) drain() {
+	defer close(c.drainDone)
+	for e := range c.queue {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return
+		}
+		// Append under the wire-write lock so store order matches the
+		// on-wire order even when Send + drain race. A failing Append
+		// proceeds with the wire-write using the user-supplied e.ID —
+		// a transient store hiccup must not kill an otherwise healthy
+		// connection. The next successful Send recovers the order.
+		if c.replayStore != nil {
+			if id, err := appendQueued(c.ctx, c.replayStore, e); err == nil {
+				e.ID = id
+			}
+		}
+		c.buf = formatEvent(c.buf, &e)
+		_, err := c.sw.Write(c.buf)
+		if err == nil {
+			err = c.sw.Flush()
+		}
+		c.mu.Unlock()
+		if err != nil {
+			c.cancel()
+			return
+		}
+	}
+}
+
+// appendQueued appends an event the drain took off the queue. sendQueued
+// copied it before it queued it, so the ring store keeps it without a
+// second copy; any other store gets it through Append. A store that wraps
+// a ring is not a *ringStore, so its ring copies the event a second time.
+func appendQueued(ctx context.Context, s ReplayStore, e Event) (string, error) {
+	if r, ok := s.(*ringStore); ok {
+		return r.appendOwned(e), nil
+	}
+	return s.Append(ctx, e)
+}
+
+// DroppedEvents returns the cumulative count of events dropped under
+// [ClientPolicyDrop] (or [ClientPolicyClose]) since this client connected.
+// Always zero when [Config.MaxQueueDepth] is zero.
+func (c *Client) DroppedEvents() uint64 {
+	return c.droppedEvents.Load()
+}
+
+// QueueDepth returns the current outbound-queue length, or zero when the
+// client is in legacy blocking mode.
+func (c *Client) QueueDepth() int {
+	if c.queue == nil {
+		return 0
+	}
+	return len(c.queue)
+}
+
+// SendData is a convenience for sending a data-only event.
+// Equivalent to Send(Event{Data: data}).
+func (c *Client) SendData(data string) error {
+	return c.Send(Event{Data: data})
+}
+
+// SendComment sends a comment line. Useful for custom keep-alives.
+func (c *Client) SendComment(text string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed {
+		return ErrClientClosed
+	}
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+
+	c.buf = formatComment(c.buf, text)
+	if _, err := c.sw.Write(c.buf); err != nil {
+		c.cancel()
+		return err
+	}
+	if err := c.sw.Flush(); err != nil {
+		c.cancel()
+		return err
+	}
+	return nil
+}
+
+// Close closes the SSE stream. Safe to call multiple times.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	c.cancel()
+	return c.sw.Close()
+}
+
+// Context returns a context.Context that is cancelled when the client
+// disconnects or the stream is closed.
+func (c *Client) Context() context.Context {
+	return c.ctx
+}
+
+// LastEventID returns the value of the Last-Event-ID header sent by the
+// client on reconnection. Returns empty string for initial connections.
+func (c *Client) LastEventID() string {
+	return c.lastEventID
+}
+
+const maxPooledBufSize = 4096
+
+var clientPool = sync.Pool{New: func() any {
+	return &Client{buf: make([]byte, 0, 256)}
+}}
+
+func acquireClient(ctx context.Context, sw *celeris.StreamWriter, cancel context.CancelFunc, lastEventID string) *Client {
+	c := clientPool.Get().(*Client)
+	c.sw = sw
+	c.ctx = ctx
+	c.cancel = cancel
+	c.lastEventID = lastEventID
+	c.buf = c.buf[:0]
+	c.closed = false
+	return c
+}
+
+func releaseClient(c *Client) {
+	c.brokerRefs.Wait()
+	c.sw = nil
+	c.ctx = nil
+	c.cancel = nil
+	c.lastEventID = ""
+	c.queue = nil
+	c.queueClosed.Store(false)
+	c.drainDone = nil
+	c.onSlowClient = nil
+	c.droppedEvents.Store(0)
+	c.replayStore = nil
+	if cap(c.buf) <= maxPooledBufSize {
+		clientPool.Put(c)
+	}
+}
+
+// New creates an SSE handler with the given config.
+//
+// Usage:
+//
+//	server.GET("/events", sse.New(sse.Config{
+//	    Handler: func(client *sse.Client) {
+//	        for msg := range messages {
+//	            if err := client.Send(sse.Event{Data: msg}); err != nil {
+//	                return
+//	            }
+//	        }
+//	    },
+//	}))
+func New(config ...Config) celeris.HandlerFunc {
+	cfg := defaultConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = applyDefaults(cfg)
+	cfg.validate()
+
+	handler := cfg.Handler
+	heartbeatInterval := cfg.HeartbeatInterval
+	onConnect := cfg.OnConnect
+	onDisconnect := cfg.OnDisconnect
+
+	// Pre-format retry line if configured.
+	var retryLine []byte
+	if cfg.RetryInterval > 0 {
+		retryLine = []byte("retry: " + strconv.Itoa(cfg.RetryInterval) + "\n\n")
+	}
+
+	var skip celeris.SkipHelper
+	skip.Init(cfg.SkipPaths, cfg.Skip)
+
+	// SSE response headers. Shared across handlers; safe because both
+	// the H1 and H2 StreamWriter.WriteHeader implementations copy values
+	// out of this slice synchronously and do not retain a reference.
+	// See TestSSEStreamWriterDoesNotRetainHeaders in sse_test.go for the
+	// pinned regression check.
+	sseHeaders := [][2]string{
+		{"content-type", "text/event-stream"},
+		{"cache-control", "no-cache"},
+		{"x-accel-buffering", "no"},
+	}
+
+	return func(c *celeris.Context) error {
+		if skip.ShouldSkip(c) {
+			return c.Next()
+		}
+
+		// Last-Event-ID is kept in the Client for the whole stream, so it is
+		// cloned. On epoll and io_uring c.Header returns a view of the
+		// engine's receive buffer: safe to compare while the request is
+		// handled, unsafe to keep after it. Context.Detach below clones the
+		// stream's header slice, not a string already read out of it, and
+		// the engine keeps receiving into that buffer on a detached
+		// connection.
+		lastEventID := strings.Clone(c.Header("last-event-id"))
+
+		sw := c.StreamWriter()
+		if sw == nil {
+			return celeris.NewHTTPError(500, "SSE requires streaming support")
+		}
+
+		// celeris#421: HEAD is answered by the GET route. A HEAD client
+		// wants the headers of the stream, not a stream that runs until it
+		// goes away (and, detached, keeps its connection from serving the
+		// next request). OnConnect still runs, and its rejection (auth) is
+		// returned exactly as for GET (what reaches the wire then is
+		// celeris#835). When it accepts, the headers are sent, the response
+		// ends there and OnDisconnect runs at once; the Handler does not
+		// run. The engine sends no body for HEAD.
+		if c.Method() == "HEAD" {
+			// The client's context is cancelled before this returns.
+			ctx, cancel := context.WithCancel(c.Context())
+			client := acquireClient(ctx, sw, cancel, lastEventID)
+			if onConnect != nil {
+				if err := onConnect(c, client); err != nil {
+					cancel()
+					releaseClient(client)
+					return err
+				}
+			}
+			err := sw.WriteHeader(200, sseHeaders)
+			if cerr := client.Close(); err == nil {
+				err = cerr
+			}
+			if onDisconnect != nil {
+				onDisconnect(c, client)
+			}
+			releaseClient(client)
+			return err
+		}
+
+		// Run OnConnect before writing headers so rejection can return
+		// a proper HTTP error code to the client.
+		ctx, cancel := context.WithCancel(c.Context())
+		client := acquireClient(ctx, sw, cancel, lastEventID)
+
+		if onConnect != nil {
+			if err := onConnect(c, client); err != nil {
+				cancel()
+				releaseClient(client)
+				return err
+			}
+		}
+
+		// celeris#494: on epoll/io_uring the H1 StreamWriter can never
+		// fail — h1ResponseAdapter.Write/Flush/Close return nil over an
+		// error-less engine writeFn whose post-Detach guard silently
+		// drops bytes once the engine has closed the conn — and
+		// c.Context() is context.Background() for every H1 stream. A
+		// client that goes away is therefore invisible to this
+		// middleware unless the engine says so. It already does, through
+		// the two detached-conn callbacks the WebSocket middleware relies
+		// on: H1State.OnError (recv EOF/ECONNRESET, send EPIPE, parse
+		// error — fired before closeConn) and H1State.OnDetachClose
+		// (fired inside closeConn/shutdown for every close cause,
+		// including EPOLLERR/HUP-only closes, send-cap overflow, the idle
+		// deadline and engine shutdown; gated on H1State.WSReady, which
+		// the SetWSDetachClose setter itself stores). Route both into the
+		// local cancel: client.Context() fires, Send returns ctx.Err(),
+		// the heartbeat goroutine exits, the user handler returns and
+		// runStream's defer tears down and calls done().
+		//
+		// Contract: both callbacks run on the engine thread UNDER
+		// cs.detachMu and must not block. cancel() takes no celeris lock —
+		// in particular not client.mu, which sits above detachMu in the
+		// write path (sendBlocking holds client.mu while sw.Write → the
+		// guarded writeFn → detachMu.Lock). Capture only the local
+		// `cancel`: the Client is pooled and releaseClient nils
+		// client.cancel, while the engine keeps OnError installed for the
+		// conn's remaining lifetime, so a late fire must be a harmless
+		// no-op on a finished ctx. Never call done(), client.Close() or
+		// close(client.queue) from here — the defer chain owns teardown.
+		//
+		// Ordering: installed AFTER OnConnect, so a rejected request
+		// leaves no stale hook on a keep-alive conn that keeps serving,
+		// and BEFORE Detach, so a peer RST landing in the Detach window
+		// is not lost. That is safe because in async mode the dispatch
+		// goroutine holds cs.detachMu across ProcessH1 until OnDetach
+		// publishes Detached and unlocks, so these writes are serialised
+		// against every closeConn/OnError read; sync mode runs on the
+		// engine thread itself. SetWSDetachClose goes last because its
+		// setter publishes WSReady, whose only other effect is nil-ing
+		// PauseRecv/ResumeRecv in closeConn — which SSE never reads.
+		// On std SetWSErrorHandler is a no-op and SetWSDetachClose is
+		// backed by net/http's request context (internal/engine/std/bridge.go),
+		// so a client that goes away cancels the ctx there as well.
+		// Both are no-ops on H2 streams (no OnWS* hooks).
+		c.SetWSErrorHandler(func(_ error) { cancel() })
+		c.SetWSDetachClose(cancel)
+
+		done := c.Detach()
+
+		// Engine asymmetry (celeris#273):
+		//
+		//   - native engines (epoll, io_uring): the handler runs on the
+		//     event-loop thread (sync) or the per-conn dispatch
+		//     goroutine (AsyncHandlers=true). A handler that blocks —
+		//     and every SSE handler blocks until the client disconnects
+		//     — blocks the engine from processing this conn's writes,
+		//     so the response headers and every Send sit in the engine
+		//     buffer forever. The middleware therefore spawns its own
+		//     goroutine to drive the stream and returns from the
+		//     request handler immediately, freeing the engine thread.
+		//   - std engine: the handler runs in net/http's per-request
+		//     goroutine. Returning from the request handler signals
+		//     "response complete" and net/http closes the conn. The
+		//     middleware must run the stream inline.
+		//
+		// Pre-v1.4.4 the middleware always ran inline, which manifested
+		// as the SSE row of celeris#273's repro matrix
+		// (iouring|epoll × any AsyncHandlers → TIMEOUT on /events).
+		//
+		// Disconnect detection on the native engines is engine-driven
+		// via the SetWSErrorHandler/SetWSDetachClose hooks installed
+		// above (celeris#494); the heartbeat keeps proxies/NATs from
+		// idling the stream out and is how std notices a dead peer, not
+		// the primary liveness signal.
+		// heartbeatDone is closed by the heartbeat goroutine on exit so the
+		// defer can wait for it before returning the Client to the pool.
+		// Without this, the goroutine could read client.closed after a
+		// future test reused the pooled Client (data race).
+		var heartbeatDone chan struct{}
+
+		// writeErr captures the first error from sw.WriteHeader /
+		// sw.Write / sw.Flush during the bootstrap (pre-handler) phase
+		// so the inline std-engine path can surface it as the request
+		// handler's return value — preserves the v1.4.3 contract that
+		// TestWriteErrorOnHeaders pins. The native-engine goroutine
+		// path returns nil from the request handler before bootstrap
+		// runs, so it discards writeErr (the engine has already
+		// committed to "this conn is detached and the stream owns it").
+		var writeErr error
+
+		runStream := func() {
+			defer func() {
+				// Tear-down ordering — load-bearing:
+				//
+				//   1. queueClosed.Store(true) — fast-path Send check.
+				//   2. cancel() — wakes any Send parked in
+				//      ClientPolicyBlock's select on c.ctx.Done(). MUST
+				//      precede close(c.queue): a producer that observed
+				//      queueClosed==false in the fast path can be in the
+				//      select at the moment we close the queue, and would
+				//      panic on send-to-closed-chan if ctx was not
+				//      already done. With cancel ahead of close, the
+				//      ctx.Done() arm of the select wins instead.
+				//   3. close(c.queue) — drain goroutine ranges to
+				//      completion, flushing in-queue events.
+				//   4. <-c.drainDone — join the drain.
+				//   5. client.Close() — idempotent; cancel already fired,
+				//      so this is just the sw.Close + closed=true bookkeeping.
+				if client.queue != nil {
+					client.queueClosed.Store(true)
+					cancel()
+					close(client.queue)
+				}
+				if client.drainDone != nil {
+					<-client.drainDone
+				}
+				_ = client.Close()
+				if heartbeatDone != nil {
+					<-heartbeatDone
+				}
+				if onDisconnect != nil {
+					onDisconnect(c, client)
+				}
+				releaseClient(client)
+				// Ask the engine to reap the connection now that the
+				// stream is over. After Detach the native engines apply
+				// none of their configured timeouts to this conn
+				// (checkTimeouts honours only IdleDeadlineNs on Detached
+				// conns) and never serve another request on it, so without
+				// this a finished SSE conn stays open, holding its fd and
+				// connState, until the peer happens to close. This is not
+				// what protects the stream from bytes the peer sends on the
+				// conn while it is live, or after it: ProcessH1 closes a
+				// Detached conn that has no WebSocket sink with
+				// errConnectionClose instead of parsing those bytes as a
+				// new request on the cached stream/Context (celeris#497,
+				// internal/conn/h1.go).
+				// A 1 ns deadline makes the next idle sweep run closeConn:
+				// OnDetachClose fires our (idempotent, already spent)
+				// cancel and the engine sends FIN after the terminal chunk
+				// (io_uring defers the fd close until pending sends drain;
+				// epoll's guarded fn flushed inline). Atomic store; MUST
+				// precede done() because c is returned to the pool once
+				// detachDone closes. No-op on std and H2 (no hook).
+				c.SetWSIdleDeadline(1)
+				done()
+			}()
+
+			if err := sw.WriteHeader(200, sseHeaders); err != nil {
+				writeErr = err
+				cancel()
+				return
+			}
+
+			// Flush the SSE response headers immediately so EventSource
+			// clients can begin reading. Without this, the std engine
+			// buffers headers until the first body byte — fine for
+			// handlers that Send right away, but a deadlock for broker
+			// patterns that Subscribe and wait for the next Publish.
+			// The retry line piggybacks on the same flush when set.
+			client.mu.Lock()
+			var err error
+			if len(retryLine) > 0 {
+				_, err = sw.Write(retryLine)
+			}
+			if err == nil {
+				err = sw.Flush()
+			}
+			client.mu.Unlock()
+			if err != nil {
+				writeErr = err
+				return
+			}
+
+			// Bind the replay store to the client BEFORE the drain goroutine
+			// starts so an event enqueued the instant the handler runs hits
+			// Append on its way to the wire.
+			client.replayStore = cfg.ReplayStore
+
+			// Replay missed events from the previous session, if any.
+			// ErrLastIDUnknown is the documented "fresh start" signal:
+			// silently fall through and let Handler decide; the user's
+			// Handler can still consult client.LastEventID() to react to
+			// the unknown cursor itself.
+			//
+			// Holding client.mu across the entire replay loop is
+			// load-bearing for Last-Event-ID monotonicity: a concurrent
+			// Send (e.g. via a Broker.Publish that fires before the
+			// handler reaches its Subscribe) would otherwise interleave
+			// a newer event mid-replay; if the client disconnects mid-
+			// replay it would record the newer event's ID and skip the
+			// still-pending replay tail on next reconnect.
+			if cfg.ReplayStore != nil && lastEventID != "" {
+				missed, err := cfg.ReplayStore.Since(ctx, lastEventID)
+				if err != nil && !errors.Is(err, ErrLastIDUnknown) {
+					return
+				}
+				client.mu.Lock()
+				for i := range missed {
+					client.buf = formatEvent(client.buf, &missed[i])
+					_, werr := sw.Write(client.buf)
+					if werr == nil {
+						werr = sw.Flush()
+					}
+					if werr != nil {
+						client.mu.Unlock()
+						return
+					}
+				}
+				client.mu.Unlock()
+			}
+
+			// Start per-client drain goroutine when queued-send mode is active.
+			// Stays in lockstep with the handler lifecycle: started after the
+			// retry line so the channel cannot leak events written before the
+			// client even saw the response, joined in the defer above.
+			if cfg.MaxQueueDepth > 0 {
+				client.queue = make(chan Event, cfg.MaxQueueDepth)
+				client.drainDone = make(chan struct{})
+				client.onSlowClient = cfg.OnSlowClient
+				go client.drain()
+			}
+
+			// Start heartbeat goroutine.
+			if heartbeatInterval > 0 {
+				heartbeatDone = make(chan struct{})
+				go func() {
+					defer close(heartbeatDone)
+					ticker := time.NewTicker(heartbeatInterval)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-ticker.C:
+							client.mu.Lock()
+							if client.closed {
+								client.mu.Unlock()
+								return
+							}
+							_, err := sw.Write(heartbeatBytes)
+							if err == nil {
+								err = sw.Flush()
+							}
+							client.mu.Unlock()
+							if err != nil {
+								cancel()
+								return
+							}
+						}
+					}
+				}()
+			}
+
+			handler(client)
+		}
+
+		if c.EngineSupportsAsyncDetach() {
+			go runStream()
+			return nil
+		}
+		runStream()
+		return writeErr
+	}
+}

@@ -1,0 +1,902 @@
+package celeris
+
+import (
+	"fmt"
+	"log/slog"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// nowNano returns the current time in Unix nanoseconds. A package var so the
+// adaptive promotion TTL (celeris#364) can be exercised deterministically in
+// tests without sleeping.
+var nowNano = func() int64 { return time.Now().UnixNano() }
+
+// staticEntry holds the pre-composed handler chain and full path for a fully
+// static route, enabling O(1) map lookup instead of a trie walk.
+type staticEntry struct {
+	handlers []HandlerFunc
+	fullPath string
+	async    bool
+}
+
+// asyncSetting is the tri-state per-route/per-group dispatch override
+// carried from the registration API down to the router. asyncDefault
+// means "inherit the server default (Config.AsyncHandlers)"; asyncOn /
+// asyncOff are explicit overrides set by .Async(true) / .Async(false).
+type asyncSetting int8
+
+const (
+	asyncDefault asyncSetting = iota
+	asyncOn
+	asyncOff
+)
+
+// resolveAsync collapses a setting against the router's server default.
+func (r *router) resolveAsync(s asyncSetting) bool {
+	switch s {
+	case asyncOn:
+		return true
+	case asyncOff:
+		return false
+	default:
+		return r.defaultAsync
+	}
+}
+
+// Method index constants for array-indexed trees and static routes.
+// Standard HTTP methods use O(1) array indexing; custom methods fall back to maps.
+const (
+	mGET = iota
+	mPOST
+	mPUT
+	mDELETE
+	mPATCH
+	mHEAD
+	mOPTIONS
+	nMethods
+)
+
+var methodNames = [nMethods]string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+
+func methodIndex(method string) int {
+	switch method {
+	case "GET":
+		return mGET
+	case "POST":
+		return mPOST
+	case "PUT":
+		return mPUT
+	case "DELETE":
+		return mDELETE
+	case "PATCH":
+		return mPATCH
+	case "HEAD":
+		return mHEAD
+	case "OPTIONS":
+		return mOPTIONS
+	default:
+		return -1
+	}
+}
+
+// router is a compressed radix trie router with a separate tree per HTTP method.
+// Standard methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS) use fixed-size
+// arrays for O(1) method dispatch, avoiding map hash overhead on the hot path.
+type router struct {
+	trees        [nMethods]*node
+	staticRoutes [nMethods]map[string]staticEntry
+	customTrees  map[string]*node                  // overflow for non-standard methods
+	customStatic map[string]map[string]staticEntry // overflow for non-standard methods
+	namedRoutes  map[string]*Route
+	namedMu      sync.RWMutex
+
+	// defaultAsync is the server-level dispatch default, set from
+	// Config.AsyncHandlers at server construction. Routes/groups that
+	// don't override inherit it.
+	defaultAsync bool
+	// asyncRouteCount tracks how many registered routes resolve to
+	// async dispatch. hasAsyncRoutes() reads it to let the engine
+	// decide whether the async dispatch infrastructure is needed at
+	// all (a server with zero async routes keeps the inline fast path).
+	asyncRouteCount int
+
+	// adaptiveRoutes (celeris#356) holds the fullPaths of routes that
+	// inherited the server-level AsyncHandlers=true default (rather than an
+	// explicit .Async()). They start INLINE (ring-batched send, the cheap
+	// path) and are promoted to async dispatch only when an inline run is
+	// observed to block — so trivial handlers keep io_uring's syscall
+	// batching while genuinely-blocking handlers still get goroutine
+	// isolation. Built at registration; read-only while serving.
+	adaptiveRoutes map[string]bool
+	// unmatchedAdaptive (celeris#852) dispatches a request no route matches
+	// (a 404, a 405, an automatic OPTIONS answer) like a route that inherits
+	// the AsyncHandlers=true default: its chain runs the global middleware
+	// and any NotFound / MethodNotAllowed handler, which can block, so it
+	// starts inline and is promoted, under unmatchedAdaptiveKey, once an
+	// inline run is observed to block. Set by buildUnmatchedChains when the
+	// server default is async and that chain runs more than the built-in
+	// answer; read-only while serving.
+	unmatchedAdaptive bool
+	// promoted records adaptive fullPaths that have been promoted to async
+	// after sustained blocking inline runs. sync.Map: concurrent reads on the
+	// hot path, rare writes at promotion time.
+	promoted sync.Map
+	// slowStreak tracks consecutive slow inline runs per adaptive fullPath
+	// (fullPath -> *atomic.Int32). Hysteresis: a one-off cold/GC outlier must
+	// not poison a fast route; only a handler that blocks on EVERY run (DB/
+	// cache) accumulates adaptivePromoteStreak slow runs and gets promoted. A
+	// fast run resets the streak.
+	slowStreak sync.Map
+	// fastStreak tracks consecutive FAST inline runs per adaptive fullPath
+	// (fullPath -> *atomic.Int32). Once a route is fast on adaptiveSettleStreak
+	// consecutive runs it is provably non-blocking and gets SETTLED — future
+	// requests skip the per-request inline timing (two time.Now() vDSO calls)
+	// entirely (celeris#361). A slow run resets it.
+	fastStreak sync.Map
+	// settled holds adaptive fullPaths proven non-blocking (see fastStreak).
+	// A settled route is no longer timed/promotable; it runs inline like a
+	// plain sync route. Explicit .Async()/.Sync() clears it (setAsync), and
+	// the background re-opener clears it every adaptiveSettleTTL so a route
+	// whose backend later turns slow is re-timed (celeris#592).
+	settled sync.Map
+
+	// reopenMu guards reopenStop, the stop channel of the settle re-opener
+	// goroutine (celeris#592). Start and stop run on different goroutines
+	// (Server.doPrepare vs Server.Shutdown) and both must be idempotent.
+	reopenMu   sync.Mutex
+	reopenStop chan struct{}
+}
+
+// Route is an opaque handle to a registered route. Use the Name method to
+// assign a name for reverse lookup via [Server.URL].
+type Route struct {
+	method string
+	path   string
+	name   string
+	router *router
+	node   *node
+}
+
+// Name sets a name for this route, enabling reverse URL generation via
+// [Server.URL]. Panics if a route with the same name is already registered.
+func (r *Route) Name(name string) *Route {
+	r.name = name
+	if r.router != nil {
+		r.router.namedMu.Lock()
+		if _, exists := r.router.namedRoutes[name]; exists {
+			r.router.namedMu.Unlock()
+			panic("celeris: duplicate route name: " + name)
+		}
+		r.router.namedRoutes[name] = r
+		r.router.namedMu.Unlock()
+	}
+	return r
+}
+
+// TryName is like [Route.Name] but returns an error instead of panicking when
+// a route with the same name already exists.
+func (r *Route) TryName(name string) error {
+	if r.router == nil {
+		r.name = name
+		return nil
+	}
+	r.router.namedMu.Lock()
+	defer r.router.namedMu.Unlock()
+	if _, exists := r.router.namedRoutes[name]; exists {
+		return fmt.Errorf("%w: %s", ErrDuplicateRouteName, name)
+	}
+	r.name = name
+	r.router.namedRoutes[name] = r
+	return nil
+}
+
+// Use prepends middleware to this specific route's handler chain.
+// Must be called before [Server.Start]. Panics if the route has no handlers.
+func (r *Route) Use(middleware ...HandlerFunc) *Route {
+	if r.node == nil || len(r.node.handlers) == 0 {
+		panic("celeris: Use called on route with no handlers")
+	}
+	n := len(r.node.handlers)
+	final := r.node.handlers[n-1]
+	chain := make([]HandlerFunc, 0, n+len(middleware))
+	chain = append(chain, r.node.handlers[:n-1]...)
+	chain = append(chain, middleware...)
+	chain = append(chain, final)
+	r.node.handlers = chain
+
+	// Keep the static fast-path map in sync with the updated chain,
+	// preserving the route's resolved async flag.
+	if r.router != nil {
+		if m := r.router.getStaticMap(r.method); m != nil {
+			if _, ok := m[r.path]; ok {
+				m[r.path] = staticEntry{handlers: chain, fullPath: r.path, async: r.node.async}
+			}
+		}
+	}
+	return r
+}
+
+// Async marks this route for the per-conn dispatch goroutine, overriding
+// any group-level or server-level (Config.AsyncHandlers) default.
+// SAFETY: do NOT call .Sync() (or .Async(false)) on a WebSocket / SSE
+// handler — detached flows run async by construction.
+//
+// An async route's handler does not run on the event loop, so a
+// [runtime.Goexit] in it (t.FailNow, t.Fatal and t.SkipNow in a test's
+// handler, or a library that does) does not end the loop; the loop keeps
+// serving. What the Goexit costs depends on the protocol. On HTTP/1.1 the
+// native engines (epoll, io_uring, adaptive) close that connection and log an
+// Error; on [Std], where Async is a no-op, net/http closes it and nothing is
+// logged. On HTTP/2 the stream's goroutine ends, the stream gets no response
+// and no RST_STREAM, nothing is logged, and the connection stays open: the
+// client waits until its own timeout. A route that runs inline must not call
+// Goexit: see [Route.Sync].
+//
+// Precedence is route > group > server default. Must be called before
+// [Server.Start]. Chainable. Async() with no argument means true; the
+// variadic-bool form is kept for back-compat — prefer .Sync() to opt a
+// single route out of an async-default group/server.
+//
+//	srv.GET("/users/:id", userHandler).Async()      // async, this route
+//	api.GET("/cached", cachedHandler).Sync()        // opt out of group async
+//
+// See [Config.AsyncHandlers] for the server-level default and the
+// per-handler async design overview.
+func (r *Route) Async(opt ...bool) *Route {
+	want := true
+	if len(opt) > 0 {
+		want = opt[0]
+	}
+	return r.setAsync(want)
+}
+
+// Sync forces this route to run inline on the worker / event-loop thread,
+// overriding any group-level or server-level async default. Equivalent to
+// .Async(false) but reads more naturally at the call site:
+//
+//	api := srv.Group("/api").Async()
+//	api.GET("/products", productHandler)            // async (from group)
+//	api.GET("/healthz", healthHandler).Sync()       // opt this one back to sync
+//
+// SAFETY: do NOT call .Sync() on a handler that hijacks/detaches the
+// connection (WebSocket upgrade, SSE). Detached flows run async by
+// construction (a middleware goroutine owns the connection after Detach),
+// so the per-route flag cannot downgrade them to sync.
+//
+// SAFETY: a handler that runs inline must not call [runtime.Goexit], which is
+// what t.FailNow, t.Fatal and t.SkipNow in a test's handler do, and what some
+// libraries do. A route runs inline when it is marked Sync, when it is not
+// marked and [Config.AsyncHandlers] is false, and, with AsyncHandlers, until
+// a timed run of it promotes it (a promotion lasts a few seconds, after which
+// the route is timed inline again). On the epoll and io_uring engines (and
+// [Adaptive], which runs both) an inline handler runs on the event-loop
+// goroutine, and a Goexit cannot be recovered: it ends that loop for good.
+// Every connection the loop owns goes unserved, and the loop's own
+// SO_REUSEPORT listener stops accepting, so a share of new connections hang.
+// The engine logs an Error ("... ended without returning", with the engine,
+// the loop or worker id, the number of connections it owned and the stack of
+// the Goexit) and cannot recover. On HTTP/2 the same holds for a stream of a
+// sync route, whether its request has a body, trailers or a header block
+// split by CONTINUATION frames or not; the stream, the other streams of its
+// connection and the other connections of that loop get no answer. The one
+// exception is a connection that already holds 4 MiB of response data it
+// could not send for the peer's window: there the stream runs on the h2
+// worker pool, and its Goexit ends silently (see [Route.Async]). Mark a route
+// that may Goexit [Route.Async]: the loop survives a Goexit there (on
+// HTTP/1.1 the native engines close that connection and log an Error; on
+// HTTP/2 the stream gets no answer and nothing is logged). Marking routes
+// does not cover a request that matches no route: its global middleware and
+// its NotFound or MethodNotAllowed handler run inline whatever the routes are
+// marked (see [Config.AsyncHandlers]), and a Goexit in them ends the loop the
+// same way. The [Std] engine runs each request on its own goroutine, where a
+// Goexit ends that request's goroutine (net/http closes an HTTP/1.1
+// connection). Panics are different: the router answers a panic in a handler
+// with a 500.
+func (r *Route) Sync() *Route {
+	return r.setAsync(false)
+}
+
+// UsesDriver marks a route whose handler performs a blocking backend round-trip
+// via a celeris driver (postgres / redis / memcached) opened WithEngine(srv).
+// It is exactly equivalent to .Async() — the route is dispatched off the worker
+// so the blocking call parks the handler goroutine on netpoll instead of
+// stalling an I/O worker — but reads as intent at the call site and is the
+// recommended way to mark driver routes:
+//
+//	srv.GET("/users/:id", getUser).UsesDriver()   // == .Async(), clearer intent
+//
+// The adaptive safety net (Config.AsyncHandlers=true) only auto-promotes
+// handlers slower than ~300µs, so a fast localhost driver call (sub-300µs) would
+// otherwise keep blocking a worker every request — mark such routes explicitly.
+func (r *Route) UsesDriver() *Route {
+	return r.setAsync(true)
+}
+
+// setAsync is the shared implementation of [Route.Async] and [Route.Sync].
+// Updates the node, the router's asyncRouteCount, and the static-fast-path
+// map entry so all three observers see the same async flag.
+func (r *Route) setAsync(want bool) *Route {
+	if r.node == nil {
+		return r
+	}
+	if r.router != nil {
+		// celeris#356: an explicit .Async()/.Sync() overrides the adaptive
+		// (server-default) classification — the route is no longer
+		// inline-first-with-promotion, so drop it from the adaptive set and
+		// clear any prior promotion.
+		if r.router.adaptiveRoutes[r.path] {
+			delete(r.router.adaptiveRoutes, r.path)
+			r.router.promoted.Delete(r.path)
+			r.router.settled.Delete(r.path)
+			r.router.fastStreak.Delete(r.path)
+			r.router.slowStreak.Delete(r.path)
+			// Adaptive routes were already counted (they may promote): keep the
+			// count when the explicit choice is async, drop it when sync.
+			if !want && r.router.asyncRouteCount > 0 {
+				r.router.asyncRouteCount--
+			}
+		} else if r.node.async != want {
+			if want {
+				r.router.asyncRouteCount++
+			} else if r.router.asyncRouteCount > 0 {
+				r.router.asyncRouteCount--
+			}
+		}
+	}
+	r.node.async = want
+	// Keep the static fast-path map in sync.
+	if r.router != nil {
+		if m := r.router.getStaticMap(r.method); m != nil {
+			if e, ok := m[r.path]; ok {
+				e.async = want
+				m[r.path] = e
+			}
+		}
+	}
+	return r
+}
+
+func newRouter() *router {
+	return &router{
+		namedRoutes:    make(map[string]*Route),
+		adaptiveRoutes: make(map[string]bool),
+	}
+}
+
+// isPromoted reports whether an adaptive route (celeris#356) is currently
+// promoted to async dispatch.
+//
+// Promotion is REVERSIBLE (celeris#364): it expires after adaptivePromoteTTL.
+// Once expired, the route is dropped from the promoted set and its slow streak
+// is cleared, so the next request runs INLINE again and is re-timed — both the
+// routing decision (adaptivePromoted) and the per-request timing decision
+// (adaptiveLearning) key off this method, so they flip back together. A route
+// that is genuinely blocking re-promotes within adaptivePromoteStreak runs; a
+// route that was promoted by a transient load/jitter spike (a CPU-bound chain
+// whose inline wall-clock briefly crossed the threshold under contention) stays
+// inline. Without this, a single spike pinned a route to the slower async path
+// until process restart (the intermittent ~32% chain collapse).
+//
+// The clock is read only for routes actually in the promoted set, so learning
+// and settled routes pay nothing here.
+func (r *router) isPromoted(fullPath string) bool {
+	v, ok := r.promoted.Load(fullPath)
+	if !ok {
+		return false
+	}
+	if nowNano()-v.(int64) > int64(adaptivePromoteTTL) {
+		// Expired: re-enter the learning/inline path to re-evaluate.
+		r.promoted.Delete(fullPath)
+		if sv, ok := r.slowStreak.Load(fullPath); ok {
+			sv.(*atomic.Int32).Store(0)
+		}
+		return false
+	}
+	return true
+}
+
+// promoteRoute marks an adaptive route as async after sustained blocking inline
+// runs, stamped with the promotion time so isPromoted can expire it
+// (celeris#364). Re-promotion refreshes the stamp.
+func (r *router) promoteRoute(fullPath string) {
+	r.promoted.Store(fullPath, nowNano())
+}
+
+// promoteRouteImmediate promotes an adaptive route after a single
+// unambiguously-blocking inline run (> adaptiveBlockingThreshold), skipping the
+// adaptivePromoteStreak hysteresis. The fast streak is cleared so a burst of
+// prior fast runs cannot settle the route once the promotion TTL expires and it
+// re-enters the learning path.
+func (r *router) promoteRouteImmediate(fullPath string) {
+	if fv, ok := r.fastStreak.Load(fullPath); ok {
+		fv.(*atomic.Int32).Store(0)
+	}
+	r.promoteRoute(fullPath)
+}
+
+// recordInlineRun feeds one inline-run observation into the adaptive
+// classifier (celeris#356). A fast run resets the slow streak; a slow run
+// increments it, and once a route is slow on adaptivePromoteStreak CONSECUTIVE
+// runs it is promoted to async. The consecutive requirement makes a single cold
+// start / GC pause harmless while a genuinely-blocking handler (slow on every
+// run) promotes within a handful of requests.
+func (r *router) recordInlineRun(fullPath string, slow bool) {
+	if !slow {
+		if v, ok := r.slowStreak.Load(fullPath); ok {
+			v.(*atomic.Int32).Store(0)
+		}
+		// celeris#361: a route fast on adaptiveSettleStreak CONSECUTIVE runs is
+		// provably non-blocking — settle it so adaptiveLearning short-circuits
+		// and handler.go stops timing every request forever.
+		//
+		// celeris#592: CLAMP at the threshold. Settling used to be terminal,
+		// so this counter stopped being incremented the moment it first
+		// reached adaptiveSettleStreak. Now the re-opener returns the route to
+		// the timed path every adaptiveSettleTTL, so an unclamped Add would
+		// keep growing for the life of the process — one per re-open at least,
+		// more when several requests are in flight in the re-open window — and
+		// on int32 wrap it would go NEGATIVE, at which point `>= streak` stops
+		// holding and the route could never settle again: the fix would have
+		// turned into a permanent re-introduction of the per-request timing it
+		// exists to avoid. Storing the threshold keeps the counter saturated,
+		// so the invariant is 0 <= fastStreak <= adaptiveSettleStreak forever
+		// and "already at the threshold ⇒ re-settles on the next fast run"
+		// still holds.
+		fv, _ := r.fastStreak.LoadOrStore(fullPath, new(atomic.Int32))
+		if c := fv.(*atomic.Int32); c.Add(1) >= adaptiveSettleStreak {
+			c.Store(adaptiveSettleStreak)
+			r.settled.Store(fullPath, struct{}{})
+		}
+		return
+	}
+	if v, ok := r.fastStreak.Load(fullPath); ok {
+		v.(*atomic.Int32).Store(0)
+	}
+	v, _ := r.slowStreak.LoadOrStore(fullPath, new(atomic.Int32))
+	if v.(*atomic.Int32).Add(1) >= adaptivePromoteStreak {
+		r.promoteRoute(fullPath)
+	}
+}
+
+// adaptiveLearning reports whether an adaptive route is still being observed —
+// i.e. neither settled (proven non-blocking, celeris#361) nor promoted (proven
+// blocking, celeris#356). Only learning routes pay the per-request inline
+// timing in handler.go; once decided, the hot path skips it. Steady state is a
+// single sync.Map.Load (settled), the same lookup cost the prior isPromoted
+// check carried, but without the two time.Now() vDSO calls per request.
+func (r *router) adaptiveLearning(fullPath string) bool {
+	if _, ok := r.settled.Load(fullPath); ok {
+		return false
+	}
+	return !r.isPromoted(fullPath)
+}
+
+// reopenSettled returns every settled adaptive route to the timed learning
+// path (celeris#592). Settling used to be terminal, so a route that settled
+// while its backend was fast and whose backend later turned slow ran inline on
+// the engine worker forever — see the adaptiveSettleTTL doc for the mechanism
+// and the measured stall.
+//
+// The fast STREAK is intentionally left alone: a route that is still fast is
+// already at adaptiveSettleStreak (clamped there — see recordInlineRun), so its
+// very next inline run re-settles it. The gate is therefore open for exactly
+// one handler run, and the cost of the re-timing is one timed inline run per
+// CONCURRENTLY-EXECUTING inline handler — measured at a maximum of K per
+// re-open at K concurrent runners, ~120 ns each, in
+// TestRouteAdaptive_SettleReopenCost. Nothing at all is added to the settled
+// fast path.
+func (r *router) reopenSettled() {
+	r.settled.Clear()
+}
+
+// startSettleReopener starts the background goroutine that calls
+// reopenSettled every adaptiveSettleTTL (celeris#592). Called from
+// Server.doPrepare; a no-op when the server has no adaptive routes and no
+// adaptive unmatched chain (nothing can settle) or when the re-opener is
+// already running. Idempotent.
+//
+// Off the request path by construction: the alternative designs (sample every
+// Nth request, or stamp the settled entry with a deadline and compare a clock)
+// both put work back on the hot path that celeris#361 removed, for the same
+// detection bound.
+func (r *router) startSettleReopener(interval time.Duration) {
+	if (len(r.adaptiveRoutes) == 0 && !r.unmatchedAdaptive) || interval <= 0 {
+		return
+	}
+	r.reopenMu.Lock()
+	defer r.reopenMu.Unlock()
+	if r.reopenStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	r.reopenStop = stop
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				r.reopenSettled()
+			}
+		}
+	}()
+}
+
+// stopSettleReopener stops the re-opener goroutine (celeris#592). Called from
+// Server.Shutdown so a stopped server leaves no goroutine behind; idempotent
+// and safe on a router whose re-opener was never started.
+func (r *router) stopSettleReopener() {
+	r.reopenMu.Lock()
+	defer r.reopenMu.Unlock()
+	if r.reopenStop != nil {
+		close(r.reopenStop)
+		r.reopenStop = nil
+	}
+}
+
+// addRoute registers a route inheriting the server-level async default.
+// Kept as the 3-arg form for existing callers/tests; addRouteWithAsync is
+// the underlying implementation that also accepts a per-route/group
+// dispatch override.
+func (r *router) addRoute(method, path string, handlers []HandlerFunc) *Route {
+	return r.addRouteWithAsync(method, path, handlers, asyncDefault)
+}
+
+func (r *router) addRouteWithAsync(method, path string, handlers []HandlerFunc, as asyncSetting) *Route {
+	if path == "" || path[0] != '/' {
+		panic("path must begin with '/'")
+	}
+	validatePath(path)
+
+	async := r.resolveAsync(as)
+	// celeris#356: a route that inherits the server-level AsyncHandlers=true
+	// default (rather than an explicit .Async()) starts INLINE and is promoted
+	// to async only when an inline run is observed to block. Explicit
+	// .Async(true)/.Async(false) is honored verbatim.
+	adaptive := as == asyncDefault && r.defaultAsync
+	if adaptive {
+		async = false
+		r.adaptiveRoutes[path] = true
+	}
+
+	root := r.getTree(method)
+	if root == nil {
+		root = &node{path: "/"}
+		r.setTree(method, root)
+	}
+
+	route := &Route{method: method, path: path, router: r}
+
+	if path == "/" {
+		if root.handlers != nil {
+			warnDuplicateRoute(method, "/")
+		}
+		root.handlers = handlers
+		root.fullPath = "/"
+		root.async = async
+		route.node = root
+		r.setStaticEntry(method, "/", staticEntry{handlers: handlers, fullPath: "/", async: async})
+		if async || adaptive {
+			r.asyncRouteCount++
+		}
+		return route
+	}
+
+	// Split path into segments for insertion.
+	segments := splitPath(path)
+	current := root
+	for _, seg := range segments {
+		current = insertChild(current, seg)
+	}
+	if current.handlers != nil {
+		warnDuplicateRoute(method, path)
+	}
+	current.handlers = handlers
+	current.fullPath = path
+	current.async = async
+	route.node = current
+
+	// Register in static map for O(1) lookup on fully static paths.
+	if isStaticPath(path) {
+		r.setStaticEntry(method, path, staticEntry{handlers: handlers, fullPath: path, async: async})
+	}
+
+	if async || adaptive {
+		r.asyncRouteCount++
+	}
+
+	return route
+}
+
+// hasAsyncRoutes reports whether any registered route, or the unmatched
+// chain (unmatchedAdaptive), can resolve to async dispatch. The engine uses
+// this (OR'd with the server default) to decide whether to wire up the async
+// dispatch infrastructure at all.
+func (r *router) hasAsyncRoutes() bool {
+	return r.asyncRouteCount > 0 || r.unmatchedAdaptive
+}
+
+// unmatchedAdaptiveKey is the adaptive key every request no route matches
+// shares (celeris#852): routeAsync cannot tell a 404 from a 405 without the
+// allowed-methods walk, so the dispatch decision is one for all of them. It
+// cannot collide with a route pattern, which starts with '/'.
+const unmatchedAdaptiveKey = "<unmatched>"
+
+// unmatchedPromoted reports whether a request no route matches is dispatched
+// async: unmatchedAdaptive, and an inline run of the unmatched chain blocked
+// (celeris#852).
+func (r *router) unmatchedPromoted() bool {
+	return r.unmatchedAdaptive && r.isPromoted(unmatchedAdaptiveKey)
+}
+
+// routeAsync resolves whether the route matching method+path runs async,
+// without filling a Params slice for the caller. Fully static routes (the
+// common async-annotated case, e.g. /api/...) resolve via the O(1) static
+// map with zero allocation; parameterised routes pay a scratch Params walk.
+// When no route matches, the request runs the unmatched chain, which is
+// dispatched like a route inheriting the server default (unmatchedPromoted,
+// celeris#852).
+func (r *router) routeAsync(method, path string) bool {
+	idx := methodIndex(method)
+	if idx >= 0 {
+		if m := r.staticRoutes[idx]; m != nil {
+			if e, ok := m[path]; ok {
+				return e.async || r.adaptivePromoted(e.fullPath)
+			}
+		}
+	} else if r.customStatic != nil {
+		if m := r.customStatic[method]; m != nil {
+			if e, ok := m[path]; ok {
+				return e.async || r.adaptivePromoted(e.fullPath)
+			}
+		}
+	}
+	var params Params
+	handlers, fullPath, async := r.find(method, path, &params)
+	if handlers == nil && method == "HEAD" {
+		handlers, fullPath, async = r.findHEADAsGET(path, &params, 0)
+	}
+	if handlers == nil {
+		return r.unmatchedPromoted()
+	}
+	return async || r.adaptivePromoted(fullPath)
+}
+
+// adaptivePromoted reports whether an adaptive (server-default-async) route has
+// been promoted to async dispatch after a blocking inline run (celeris#356).
+// The adaptiveRoutes map is read-only while serving, so the lookup is a plain
+// (lock-free) map read followed by a sync.Map load only for adaptive routes;
+// non-adaptive configs (no AsyncHandlers default) keep the empty-map fast path.
+func (r *router) adaptivePromoted(fullPath string) bool {
+	return r.adaptiveRoutes[fullPath] && r.isPromoted(fullPath)
+}
+
+// warnDuplicateRoute emits a warning when a route is registered twice for
+// the same method+path. The second registration silently overwrites the
+// first, which is almost always a bug (typo, accidental duplicate, or a
+// merge that kept two copies). We log instead of panicking to preserve
+// back-compat for apps that intentionally rebuild their routing table.
+func warnDuplicateRoute(method, path string) {
+	slog.Default().Warn("celeris: duplicate route registration; previous handler overwritten",
+		"method", method, "path", path)
+}
+
+// isStaticPath reports whether path contains no parameter (`:`) or catchAll
+// (`*`) segments, making it eligible for the O(1) static fast path.
+func isStaticPath(path string) bool {
+	for i := range len(path) {
+		if path[i] == ':' || path[i] == '*' {
+			return false
+		}
+	}
+	return true
+}
+
+// findHEADAsGET answers a HEAD request whose path has no HEAD route with the
+// path's GET route (celeris#421; RFC 9110 §9.3.2: HEAD is GET without the
+// content, which the engines drop). find stays the exact lookup, and its two
+// request-path callers call this only after find missed a HEAD, so a hit
+// costs what it did: HandleStream (and so the per-connection route cache,
+// keyed by method) and routeAsync (the dispatch decision), which must agree
+// on the route. n is the length params had before the failed walk.
+func (r *router) findHEADAsGET(path string, params *Params, n int) ([]HandlerFunc, string, bool) {
+	*params = (*params)[:n]
+	return r.find("GET", path, params)
+}
+
+// find returns the handler chain, route pattern and async flag of the route
+// registered for exactly method+path; see findHEADAsGET for HEAD.
+func (r *router) find(method, path string, params *Params) ([]HandlerFunc, string, bool) {
+	idx := methodIndex(method)
+	var root *node
+
+	// Fast path: standard HTTP methods use array indexing (no hash).
+	if idx >= 0 {
+		if m := r.staticRoutes[idx]; m != nil {
+			if e, ok := m[path]; ok {
+				return e.handlers, e.fullPath, e.async
+			}
+		}
+		root = r.trees[idx]
+	} else {
+		// Slow path: custom methods use maps.
+		if r.customStatic != nil {
+			if m := r.customStatic[method]; m != nil {
+				if e, ok := m[path]; ok {
+					return e.handlers, e.fullPath, e.async
+				}
+			}
+		}
+		if r.customTrees != nil {
+			root = r.customTrees[method]
+		}
+	}
+
+	if root == nil {
+		return nil, "", false
+	}
+
+	// Collapse consecutive slashes: "//a///b" → "/a/b".
+	path = cleanPath(path)
+
+	if path == "/" {
+		return root.handlers, root.fullPath, root.async
+	}
+	if len(path) > 1 && path[0] == '/' {
+		path = path[1:]
+	}
+
+	return search(root, path, params)
+}
+
+// allowedMethods returns the methods the path answers, for the Allow header
+// of a 405 and of the automatic OPTIONS answer (celeris#421; RFC 9110
+// §10.2.1), excluding except: every method with a route for the path, HEAD
+// when the path has a GET or HEAD route (a HEAD without its own route is
+// answered by the GET route, findHEADAsGET), and OPTIONS (answered
+// automatically when the path has no OPTIONS route). The order is GET, POST,
+// PUT, DELETE, PATCH, HEAD, OPTIONS, then custom methods sorted. A path with
+// no route at all returns nil, and a path with one returns at least OPTIONS
+// (when except is not "OPTIONS" itself), so with except "" an empty result
+// means the path is unrouted (handleUnmatched relies on it to walk once).
+func (r *router) allowedMethods(path string, except string) []string {
+	var params Params
+	has := func(method string) bool {
+		params = params[:0]
+		handlers, _, _ := r.find(method, path, &params)
+		return handlers != nil
+	}
+	var found [nMethods]bool
+	routed := false
+	for i, root := range r.trees {
+		if root != nil && has(methodNames[i]) {
+			found[i] = true
+			routed = true
+		}
+	}
+	var custom []string
+	for method := range r.customTrees {
+		if has(method) {
+			custom = append(custom, method)
+			routed = true
+		}
+	}
+	if !routed {
+		return nil
+	}
+	found[mHEAD] = found[mHEAD] || found[mGET]
+	found[mOPTIONS] = true
+	allowed := make([]string, 0, nMethods+len(custom))
+	for i, ok := range found {
+		if ok && methodNames[i] != except {
+			allowed = append(allowed, methodNames[i])
+		}
+	}
+	slices.Sort(custom)
+	for _, method := range custom {
+		if method != except {
+			allowed = append(allowed, method)
+		}
+	}
+	return allowed
+}
+
+// walk returns all registered routes sorted by method then path for
+// deterministic output.
+func (r *router) walk() []RouteInfo {
+	var routes []RouteInfo
+	methods := make([]string, 0, nMethods)
+	for i, root := range r.trees {
+		if root != nil {
+			methods = append(methods, methodNames[i])
+		}
+	}
+	for method := range r.customTrees {
+		methods = append(methods, method)
+	}
+	slices.Sort(methods)
+	for _, method := range methods {
+		root := r.getTree(method)
+		if root.handlers != nil {
+			routes = append(routes, RouteInfo{
+				Method:       method,
+				Path:         root.fullPath,
+				HandlerCount: len(root.handlers),
+			})
+		}
+		walkNode(method, root, &routes)
+	}
+	return routes
+}
+
+func walkNode(method string, n *node, routes *[]RouteInfo) {
+	for _, ch := range n.children {
+		if ch.handlers != nil {
+			*routes = append(*routes, RouteInfo{
+				Method:       method,
+				Path:         ch.fullPath,
+				HandlerCount: len(ch.handlers),
+			})
+		}
+		walkNode(method, ch, routes)
+	}
+}
+
+// getTree returns the radix trie root for the given method.
+func (r *router) getTree(method string) *node {
+	if idx := methodIndex(method); idx >= 0 {
+		return r.trees[idx]
+	}
+	if r.customTrees == nil {
+		return nil
+	}
+	return r.customTrees[method]
+}
+
+// setTree sets the radix trie root for the given method.
+func (r *router) setTree(method string, root *node) {
+	if idx := methodIndex(method); idx >= 0 {
+		r.trees[idx] = root
+		return
+	}
+	if r.customTrees == nil {
+		r.customTrees = make(map[string]*node)
+	}
+	r.customTrees[method] = root
+}
+
+// getStaticMap returns the static route map for the given method.
+func (r *router) getStaticMap(method string) map[string]staticEntry {
+	if idx := methodIndex(method); idx >= 0 {
+		return r.staticRoutes[idx]
+	}
+	if r.customStatic == nil {
+		return nil
+	}
+	return r.customStatic[method]
+}
+
+// setStaticEntry registers a static route entry for the given method and path.
+func (r *router) setStaticEntry(method, path string, entry staticEntry) {
+	if idx := methodIndex(method); idx >= 0 {
+		if r.staticRoutes[idx] == nil {
+			r.staticRoutes[idx] = make(map[string]staticEntry)
+		}
+		r.staticRoutes[idx][path] = entry
+		return
+	}
+	if r.customStatic == nil {
+		r.customStatic = make(map[string]map[string]staticEntry)
+	}
+	m := r.customStatic[method]
+	if m == nil {
+		m = make(map[string]staticEntry)
+		r.customStatic[method] = m
+	}
+	m[path] = entry
+}

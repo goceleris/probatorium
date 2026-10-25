@@ -100,7 +100,7 @@
 # Set `--extra-vars celeris_needs_root=true` to put the SUT back on root.
 - name: "{{ cell.1 }} run={{ cell.0 }} | resolve privilege for this column"
   ansible.builtin.set_fact:
-    cell_needs_root: "{{ cell_bin in ['celeris', 'celeris_v1511', 'celeris_vnv'] and (celeris_needs_root | default(false) | bool) }}"
+    cell_needs_root: "{{ cell_bin in ['celeris', 'celeris_v1511', 'celeris_vnv', 'celeris_noc8', 'celeris_nobp'] and (celeris_needs_root | default(false) | bool) }}"
 
 - name: "{{ cell.1 }} run={{ cell.0 }} | mkdir per-cell output"
   ansible.builtin.file:
@@ -848,11 +848,20 @@
     #                  BQL inflight/limit/hold_time/stall_cnt/stall_max/stall_thrs, tx-0 tx_timeout (the netdev watchdog counter), carrier_changes
     #   softirq20.log  one line per tick: epoch TX <12 per-CPU counts> RX <12 per-CPU counts> (/proc/softirqs NET_TX, NET_RX)
     #   tc20.log       per tick `== epoch` and the `tc -s qdisc show` lines of the NICs (backlog, requeues, drops), when tc exists
-    #   irq1.log       once per second `== epoch` and the NIC vector lines of /proc/interrupts (per-CPU counts)
-    import os, sys, time, signal, subprocess, shutil, statistics
+    #   irq1.log       once per second `== epoch` and the NIC vector lines of /proc/interrupts (per-CPU counts), P2c: plus the IPI0/IPI1 and the arch_timer lines
+    # P2c additions (celeris stall investigation, probatorium branch ab/p2c-io512-discriminate-38; every one is a read, each is wrapped so that a failure only drops its own file):
+    #   softirqall20.log  one line per tick: epoch, then NAME=c0,c1,.. for EVERY row of /proc/softirqs (HI TIMER NET_TX NET_RX BLOCK IRQ_POLL TASKLET SCHED HRTIMER RCU)
+    #   cpustat20.log     one line per tick: epoch, then cN=user+nice,system,irq,softirq,idle+iowait,steal (jiffies, /proc/stat)
+    #   softnet20.log     one line per tick: epoch, then per row of /proc/net/softnet_stat cN=processed,dropped,time_squeeze,received_rps,backlog_len (decimal)
+    #   ksoftirqd20.log   one line per tick: epoch, then cN=run_ns,wait_ns,slices of /proc/<ksoftirqd/N pid>/schedstat
+    #   starve.log        one line (at most one per second per CPU) while a CPU shows the STARVATION SIGNATURE over the last second: softirq >= 95 % and user+nice+system <= 3 % of all time
+    #   dump-<n>-cpu<c>/  written by stalldump.sh, spawned fire-and-forget (own session, timeout 12 s) at the first signature and then at most every 15 s, at most 3 per cell
+    import os, sys, time, signal, subprocess, shutil, statistics, collections
 
     d, guard, nics = sys.argv[1], int(sys.argv[2]), sys.argv[3].split()
     hz = float(sys.argv[4]) if len(sys.argv) > 4 else 20.0
+    PORT = os.environ.get('SAMPLER_PORT', '8080')    # the SUT's port (stalldump.sh finds the SUT pid from it)
+    SIG_SOFT, SIG_USRSYS, SIG_WIN, DUMP_COOLDOWN, DUMP_MAX = float(os.environ.get('SAMPLER_SIG_SOFT', '0.95')), float(os.environ.get('SAMPLER_SIG_USRSYS', '0.03')), 1.0, 15.0, 3   # env: tests only
     period = 1.0 / hz
     os.chdir(d)
     try: os.nice(-10)
@@ -885,17 +894,103 @@
     f_txq = open('txq20.log', 'a', buffering=1 << 16); f_sirq = open('softirq20.log', 'a', buffering=1 << 16)
     f_tc = open('tc20.log', 'a', buffering=1 << 16) if tcbin else None; f_irq = open('irq1.log', 'a', buffering=1 << 16)
     f_softirqs = os.open('/proc/softirqs', os.O_RDONLY); f_ints = '/proc/interrupts'
+    def opt_open(p):
+        try: return os.open(p, os.O_RDONLY)
+        except OSError: return None
+    f_stat = opt_open('/proc/stat'); f_snet = opt_open('/proc/net/softnet_stat')
+    f_all = open('softirqall20.log', 'a', buffering=1 << 16); f_cpu = open('cpustat20.log', 'a', buffering=1 << 16)
+    f_snl = open('softnet20.log', 'a', buffering=1 << 16); f_ksd = open('ksoftirqd20.log', 'a', buffering=1 << 16); f_starve = open('starve.log', 'a', buffering=1 << 12)
+    def find_ksoftirqd():
+        out = {}
+        try: names = os.listdir('/proc')
+        except OSError: return out
+        for p in names:
+            if not p.isdigit(): continue
+            try:
+                with open('/proc/%s/comm' % p) as fc: c = fc.read().strip()
+            except OSError: continue
+            if c.startswith('ksoftirqd/'):
+                try: out[int(c[10:])] = opt_open('/proc/%s/schedstat' % p)
+                except ValueError: pass
+        return out
+    ksd = find_ksoftirqd()
+    f_ksd.write('# ksoftirqd found for cpus: %s\n' % ' '.join(str(c) for c in sorted(ksd)))
+    def rd_all(fd, n=1 << 16):
+        os.lseek(fd, 0, 0); return os.read(fd, n).decode(errors='replace')
+    hist = collections.deque(); last_starve_log = {}; last_dump = -1e9; dumps = 0; starve_ticks = 0; dump_procs = []
     stamps = []; stop = False; last_stats = 0.0; skipped = 0
     def write_stats(final=False):
         iv = [(b - a) * 1e3 for a, b in zip(stamps, stamps[1:])]
         with open('sampler20.stats.tmp', 'w') as f:
             if iv:
                 s = sorted(iv)
-                f.write('ticks=%d span_s=%.2f achieved_hz=%.2f target_hz=%.1f interval_ms median=%.1f p90=%.1f p99=%.1f max=%.1f skipped_deadlines=%d final=%s\n' % (
+                f.write('ticks=%d span_s=%.2f achieved_hz=%.2f target_hz=%.1f interval_ms median=%.1f p90=%.1f p99=%.1f max=%.1f skipped_deadlines=%d final=%s starve_ticks=%d dumps=%d\n' % (
                     len(stamps), stamps[-1] - stamps[0], (len(stamps) - 1) / max(stamps[-1] - stamps[0], 1e-9), hz, statistics.median(s),
-                    s[int(0.9 * (len(s) - 1))], s[int(0.99 * (len(s) - 1))], s[-1], skipped, final))
+                    s[int(0.9 * (len(s) - 1))], s[int(0.99 * (len(s) - 1))], s[-1], skipped, final, starve_ticks, dumps))
             else: f.write('ticks=0\n')
         os.replace('sampler20.stats.tmp', 'sampler20.stats')
+    def p2c_tick(t):
+        """The P2c captures of one tick. Never raises."""
+        global last_dump, dumps, starve_ticks
+        try:
+            raw = rd_all(f_softirqs)
+            f_all.write('%.6f ' % t + ' '.join('%s=%s' % (ln.split()[0].rstrip(':'), ','.join(ln.split()[1:])) for ln in raw.splitlines()[1:] if ln.split()) + '\n')
+        except (OSError, IndexError): pass
+        cur = {}
+        if f_stat is not None:
+            try:
+                parts = []
+                for ln in rd_all(f_stat).splitlines():
+                    if not (ln.startswith('cpu') and ln[3:4].isdigit()): continue
+                    f = ln.split(); c = int(f[0][3:]); v = [int(x) for x in f[1:]]
+                    v += [0] * (8 - len(v))
+                    us, sy, irq, sirq, idle, steal = v[0] + v[1], v[2], v[5], v[6], v[3] + v[4], v[7]
+                    cur[c] = (us + sy + irq + sirq + idle + steal, us + sy, sirq)
+                    parts.append('c%d=%d,%d,%d,%d,%d,%d' % (c, us, sy, irq, sirq, idle, steal))
+                f_cpu.write('%.6f ' % t + ' '.join(parts) + '\n')
+            except (OSError, ValueError, IndexError): cur = {}
+        if f_snet is not None:
+            try:
+                parts = []
+                for i, ln in enumerate(rd_all(f_snet).splitlines()):
+                    f = [int(x, 16) for x in ln.split()]
+                    if len(f) >= 3: parts.append('c%d=%d,%d,%d,%d,%d' % (i, f[0], f[1], f[2], f[9] if len(f) > 9 else 0, f[11] if len(f) > 11 else 0))
+                f_snl.write('%.6f ' % t + ' '.join(parts) + '\n')
+            except (OSError, ValueError): pass
+        if ksd:
+            try:
+                parts = []
+                for c in sorted(ksd):
+                    fd = ksd[c]
+                    if fd is None: continue
+                    f = rd_all(fd, 256).split()
+                    if len(f) >= 3: parts.append('c%d=%s,%s,%s' % (c, f[0], f[1], f[2]))
+                f_ksd.write('%.6f ' % t + ' '.join(parts) + '\n')
+            except OSError: pass
+        # starvation signature: over the last >= SIG_WIN seconds a CPU spent >= 95 % in softirq and <= 3 % in user+system
+        if cur:
+            hist.append((t, cur))
+            while len(hist) > 2 and t - hist[1][0] >= SIG_WIN: hist.popleft()
+            t0, old = hist[0]
+            if t - t0 >= SIG_WIN:
+                for c, (tot, us, sirq) in cur.items():
+                    if c not in old: continue
+                    dt = tot - old[c][0]
+                    if dt < 80: continue                     # fewer than 0.8 s of CPU time counted (CPU offline, or the window is short)
+                    ds, du = sirq - old[c][2], us - old[c][1]
+                    if ds >= SIG_SOFT * dt and du <= SIG_USRSYS * dt:
+                        starve_ticks += 1
+                        if t - last_starve_log.get(c, -1e9) >= 1.0:
+                            last_starve_log[c] = t
+                            f_starve.write('%.6f cpu=%d softirq_pct=%.1f usrsys_pct=%.1f window_s=%.2f\n' % (t, c, 100.0 * ds / dt, 100.0 * du / dt, t - t0))
+                        if dumps < DUMP_MAX and t - last_dump >= DUMP_COOLDOWN:
+                            last_dump = t; dumps += 1
+                            try:
+                                dump_procs.append(subprocess.Popen(['timeout', '-s', 'KILL', '12', 'bash', 'stalldump.sh', d, str(dumps), str(c), '%.6f' % t, PORT],
+                                                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True))
+                            except OSError as e: f_starve.write('%.6f dump spawn failed: %s\n' % (t, e))
+        for p in dump_procs[:]:
+            if p.poll() is not None: dump_procs.remove(p)       # reap
     def term(*_):
         global stop; stop = True
     signal.signal(signal.SIGTERM, term); signal.signal(signal.SIGINT, term)
@@ -919,6 +1014,7 @@
                 if p and p[0] in ('NET_TX:', 'NET_RX:'): row[p[0][:6]] = p[1:]
             f_sirq.write('%.6f TX %s RX %s\n' % (t, ' '.join(row.get('NET_TX', [])), ' '.join(row.get('NET_RX', []))))
         except OSError: pass
+        p2c_tick(t)
         if tcbin:
             try:
                 out = subprocess.run([tcbin, '-s', 'qdisc', 'show'], capture_output=True, timeout=1.0).stdout.decode(errors='replace')
@@ -930,19 +1026,58 @@
             except (subprocess.SubprocessError, OSError): pass
         if n % int(hz) == 0:
             try:
-                with open(f_ints) as fi: lines = [l for l in fi if ('enp' in l or 'IPI0' in l or 'IPI1' in l)]
+                with open(f_ints) as fi: lines = [l for l in fi if ('enp' in l or 'IPI0' in l or 'IPI1' in l or 'arch_timer' in l)]
                 f_irq.write('== %.6f\n' % t + ''.join(lines))
             except OSError: pass
         n += 1
         if time.time() - last_stats > 5:
             last_stats = time.time(); write_stats()
-            for f in (f_txq, f_sirq, f_irq): f.flush()
+            for f in (f_txq, f_sirq, f_irq, f_all, f_cpu, f_snl, f_ksd, f_starve): f.flush()
             if f_tc: f_tc.flush()
-    for f in (f_txq, f_sirq, f_irq): f.flush()
+    for f in (f_txq, f_sirq, f_irq, f_all, f_cpu, f_snl, f_ksd, f_starve): f.flush()
     if f_tc: f_tc.flush()
     write_stats(True)
     EOP
-        nohup python3 sampler20.py "$d" "$guard" "$nics" 20 > sampler20.out 2>&1 &
+        cat > stalldump.sh <<"EODUMP"
+    #!/bin/bash
+    # stalldump.sh DIR N CPU EPOCH PORT
+    # One-shot, READ-ONLY dump written by sampler20.py (fire-and-forget, own session, killed after 12 s) when it sees the starvation signature on CPU: over the last second the CPU spent
+    # >= 95 % in softirq and <= 3 % in user+system (the stalls of P2/P2b: the pinned loop is runnable but not on a CPU). Writes DIR/dump-N-cpuCPU/. Nothing is written to the kernel
+    # (no sysrq, no dmesg -c), nothing is signalled. Every command is bounded by `timeout 3`.
+    d=$1/dump-$2-cpu$3; cpu=$3; port=$5
+    mkdir -p "$d" || exit 1
+    cd "$d" || exit 1
+    echo "trigger cpu=$cpu sampler_epoch=$4 now=$EPOCHREALTIME rule=softirq>=95%,usr+sys<=3%,window=1s" > trigger.txt
+    for f in /proc/softirqs /proc/interrupts /proc/stat /proc/net/softnet_stat /proc/loadavg /proc/pressure/cpu /proc/pressure/irq /proc/schedstat; do
+      { echo "== $f $EPOCHREALTIME"; timeout 3 cat "$f"; } > "$(echo "$f" | tr / _ | sed 's/^_//').txt" 2>&1
+    done
+    { echo "== TcpExt (BusyPollRxPackets, TCPTimeouts, ...) $EPOCHREALTIME"; grep -E '^(TcpExt|IpExt):' /proc/net/netstat; } > netstat.txt 2>&1
+    pid=$(timeout 3 ss -ltnpH "( sport = :$port )" 2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+    echo "sut_pid=${pid:-unknown}" >> trigger.txt
+    if [ -n "$pid" ]; then
+      # tid, last CPU, state, wait channel, command: every thread of the SUT
+      timeout 3 ps -Leo pid,tid,psr,stat,wchan:32,pcpu,comm 2>&1 | awk -v p="$pid" 'NR==1 || $1==p' > ps-sut.txt
+      : > sched-threads.txt
+      for t in /proc/$pid/task/*; do
+        tid=${t##*/}
+        {
+          echo "=== tid $tid affinity=$(grep Cpus_allowed_list $t/status 2>/dev/null | cut -f2) $EPOCHREALTIME"
+          timeout 2 cat $t/sched 2>&1 | head -60
+          echo "schedstat: $(timeout 2 cat $t/schedstat 2>&1)"
+          echo "--- stack"; timeout 2 cat $t/stack 2>&1 | head -25
+        } >> sched-threads.txt
+      done
+    fi
+    # the softirq daemon of the victim CPU and the NAPI/IRQ threads
+    : > ksoftirqd.txt
+    for p in $(pgrep -x "ksoftirqd/$cpu"); do
+      { echo "=== ksoftirqd/$cpu pid $p"; timeout 2 cat /proc/$p/stat | cut -d' ' -f1-3,14-17,39; timeout 2 cat /proc/$p/sched 2>&1 | head -40; echo "--- stack"; timeout 2 cat /proc/$p/stack 2>&1 | head -25; } >> ksoftirqd.txt
+    done
+    timeout 3 ps -eLo pid,tid,psr,stat,wchan:32,pcpu,comm --sort=-pcpu 2>/dev/null | head -40 > ps-top40.txt
+    { echo "== dmesg tail (read only) $EPOCHREALTIME"; timeout 3 dmesg --time-format iso 2>&1 | tail -60; } > dmesg-tail.txt
+    echo "done $EPOCHREALTIME" > done.txt
+    EODUMP
+        SAMPLER_PORT="$port" nohup python3 sampler20.py "$d" "$guard" "$nics" 20 > sampler20.out 2>&1 &
       else
         echo "python3 missing: bash fallback at about 16 Hz" > sampler20.missing
         ( while [ "${EPOCHREALTIME%.*}" -lt "$endsec" ]; do
@@ -986,6 +1121,19 @@
           for i in $(awk "/enp/{sub(\":\",\"\",\$1);print \$1}" /proc/interrupts); do echo "$i $(cat /proc/irq/$i/effective_affinity_list 2>&1) $(cat /proc/irq/$i/smp_affinity_list 2>&1)"; done
           echo "== tc"; for n in $nics bond0; do tc -s qdisc show dev $n 2>&1; done
           echo "== tx queue sysfs"; grep -H . /sys/class/net/*/queues/tx-*/tx_timeout /sys/class/net/*/queues/tx-*/byte_queue_limits/* 2>/dev/null
+          # P2c: all softirq types per CPU, per-CPU softnet_stat (NAPI/RPS work, time_squeeze), per-CPU time split, TcpExt/IpExt (BusyPollRxPackets), every interrupt row
+          echo "== proc softirqs"; cat /proc/softirqs
+          echo "== proc stat (cpu rows)"; grep -E '^cpu' /proc/stat
+          echo "== proc net softnet_stat (hex: processed dropped time_squeeze 0 0 0 0 0 cpu_collision received_rps flow_limit backlog_len index)"; cat /proc/net/softnet_stat
+          echo "== proc net netstat TcpExt IpExt"; grep -E '^(TcpExt|IpExt):' /proc/net/netstat
+          echo "== proc interrupts (all rows)"; cat /proc/interrupts
+          echo "== NIC napi/defer settings"; grep -H . /sys/class/net/*/napi_defer_hard_irqs /sys/class/net/*/gro_flush_timeout /sys/class/net/*/threaded 2>/dev/null
+          if [ "$tag" = end ]; then
+            ws=$(( $(cat rendezvous$sfx.us 2>/dev/null || echo 0) / 1000000 ))
+            echo "== kernel log since 60 s before the window start (journalctl -k, read only; dmesg tail if journalctl is missing)"
+            if command -v journalctl >/dev/null 2>&1 && [ "$ws" -gt 0 ]; then timeout 5 journalctl -k --no-pager -o short-iso-precise --since "@$((ws - 60))" 2>&1 | tail -400
+            else timeout 5 dmesg --time-format iso 2>&1 | tail -200; fi
+          fi
           for n in $nics bond0; do echo "=== ethtool -S $n"; ethtool -S $n 2>&1; done
         fi
         echo "== end of snapshot $tag $EPOCHREALTIME"

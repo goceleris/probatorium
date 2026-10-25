@@ -1,0 +1,342 @@
+# Coverage: runs the unit suites of ci.yml's `unit` job -- the same packages,
+# the same exclusions, -race, and the runner's own memlock -- with a coverage
+# profile per module, and uploads each module to Codecov as its own flag
+# (celeris#690). It is informational: codecov.yml marks every status
+# informational, and this workflow is not a required check.
+#
+# The package selection is a copy of ci.yml's, which this workflow cannot
+# share without editing ci.yml (see below). The "Same packages as ci.yml"
+# step fails when the two select different packages, so a change there has
+# to be made here too (celeris#725).
+#
+# It is a separate workflow rather than new steps in ci.yml on purpose:
+# ci.yml's unit steps are held by PASS-count interlocks and edited by
+# in-flight pull requests. The cost is that the unit suites run twice per
+# push; GitHub-hosted minutes are free for public repositories.
+#
+# What is NOT in the profile, and why (so a low number is read correctly):
+# ./test/... (integration/spec harness, not library code; ./test/server is the
+# exception, see below), ./internal/adaptive/..., and ./middleware/websocket. ./internal/adaptive/... runs in ci.yml's `adaptive` job:
+# it needs memlock raised with sudo, and its switch tests are load- and
+# timing-bound, with RESULT-line tallies that the job checks. Instrumenting
+# them would risk what happened to websocket (next sentence) and add the
+# adaptive job's run time to every push, so they stay out of the profile,
+# and codecov.yml has no adaptive component (celeris#725).
+# ci.yml runs only websocket's backpressure tests on GitHub-hosted runners,
+# and those are timing-bound: under coverage instrumentation
+# TestBackpressurePauseDoesNotCancelInflightSend failed on both engines
+# (close-timeouts, write errors) on the same commit whose uninstrumented
+# `unit` job passed (celeris#699), so they are left to ci.yml. ./internal/engine/iouring
+# runs at the runner's 8 MiB memlock, where io_uring gets one worker, so its
+# multi-worker paths read as uncovered here although the
+# goceleris/probatorium cluster runs them. Coverage is per package (no
+# -coverpkg), as `go test` reports it, with one exception: ./test/server holds
+# the root package's tests that need only the exported API (they used to sit in
+# the repository root and count toward the root package), so it runs with
+# -coverpkg=github.com/goceleris/celeris and its profile is attributed to the
+# root package alone, exactly as before the move. No other package gets -coverpkg.
+#
+# (The file is test-coverage.yml, not coverage.yml: .gitignore ignores
+# `coverage.*` for local coverage output.)
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  coverage:
+    name: Coverage (root + middleware sub-modules)
+    runs-on: ubuntu-latest
+    # 40: the root step may run 540 s twice (the other packages, then ./test/server,
+    # each with its own -timeout=540s), the iouring step up to 600 s and the four
+    # middleware steps up to 120 s each, which is 36 min at their own limits before
+    # checkout and setup-go (it was 30 before ./test/server got an invocation of
+    # its own, and 40 while the root step's limit was 1200 s). The job takes about
+    # 20 min (19.5 to 19.8 min in runs 39408130885, 39404206705 and 39331135786),
+    # the iouring step 411 to 437 s of it (see its comment below). Refs #890.
+    timeout-minutes: 40
+    env:
+      # ci.yml's unit selection (see "Same packages as ci.yml" below).
+      COVER_EXCLUDE: "/test/|/adaptive($|/)|/middleware/websocket($|/)"
+      # Of those packages, the one that runs in a step of its own, after the
+      # others (see "internal/engine/iouring" below); its profile is added to
+      # the root profile, so the root upload covers the same packages.
+      COVER_OWN_STEP: "/internal/engine/iouring$"
+      # The root package's tests of the exported API (ci.yml's unit job adds
+      # ./test/server back after its /test/ exclusion). It runs in its own
+      # invocation of the root step, with -coverpkg on the root package.
+      COVER_SERVER_STEP: "./test/server"
+    # A fork pull request gets no OIDC token. codecov-action (v7.1.1) sees the
+    # fork itself (head repository != this repository), skips OIDC even with
+    # use_oidc: true, and uploads tokenless, which Codecov accepts for public
+    # repositories.
+    permissions:
+      contents: read # checkout
+      id-token: write # Codecov upload over OIDC, so no CODECOV_TOKEN secret is stored
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+
+      # ci.yml's unit job takes `go list ./...` minus the pattern on its one
+      # `go list ./... | grep -vE '...'` line, and runs ./internal/engine/iouring in a
+      # step of its own; so does this job (COVER_OWN_STEP), and both steps
+      # write to the root profile. The step fails, with the diff, when the two
+      # package sets differ, when COVER_OWN_STEP selects anything but
+      # ./internal/engine/iouring, and when ci.yml no longer has exactly one
+      # such line or `go list` fails. ./test/server is the other package both jobs
+      # add: ci.yml's unit step appends `go list ./test/server` after its grep,
+      # and the check below requires that line and adds the package to both sets.
+      - name: Same packages as ci.yml's unit job
+        run: |
+          set -euo pipefail
+          ci_lines=$(sed -nE "s/.*go list [.]\/[.][.][.] [|] grep -vE '([^']+)'.*/\1/p" .github/workflows/ci.yml)
+          if [ "$(printf '%s\n' "$ci_lines" | grep -c .)" != 1 ]; then
+            echo "::error::ci.yml should have exactly one \`go list ./... | grep -vE '...'\` line (its unit job's); found: ${ci_lines:-none}. Re-derive COVER_EXCLUDE."
+            exit 1
+          fi
+          ci_exclude=$ci_lines
+          echo "ci.yml excludes:        $ci_exclude (+ ./internal/engine/iouring in its own step)"
+          echo "test-coverage excludes: $COVER_EXCLUDE"
+          # Outside a process substitution, so that set -e sees a failure.
+          # shellcheck disable=SC2016  # the text is searched for literally, not expanded
+          if ! grep -qF 'pkgs="$pkgs $(go list ./test/server)"' .github/workflows/ci.yml; then
+            echo "::error::ci.yml's unit step should add ./test/server to its packages (pkgs=\"\$pkgs \$(go list ./test/server)\"); this job runs it with -coverpkg on the root package"
+            exit 1
+          fi
+          all=$(go list ./...)
+          iouring=$(go list ./internal/engine/iouring)
+          server=$(go list "$COVER_SERVER_STEP")
+          ci_pkgs=$({ grep -vE "$ci_exclude" <<< "$all" || true; echo "$iouring"; echo "$server"; } | sort -u)
+          own=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; } | { grep -E "$COVER_OWN_STEP" || true; })
+          if [ "$own" != "$iouring" ]; then
+            echo "::error::COVER_OWN_STEP should select $iouring alone; it selects: ${own:-nothing}"
+            exit 1
+          fi
+          cover_pkgs=$({ grep -vE "$COVER_EXCLUDE" <<< "$all" || true; echo "$server"; } | sort -u)
+          echo "packages: ci.yml $(grep -c . <<< "$ci_pkgs"), this job $(grep -c . <<< "$cover_pkgs")"
+          if ! diff <(echo "$ci_pkgs") <(echo "$cover_pkgs"); then
+            echo "::error::test-coverage.yml and ci.yml's unit job select different packages (diff above: < ci.yml, > this job)"
+            exit 1
+          fi
+
+      - name: Root module (ci.yml unit package set)
+        run: |
+          # A `go list` failure must stop the job, not hand grep a partial list.
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          pkgs=$(go list ./... | grep -vE "$COVER_EXCLUDE" | grep -vE "$COVER_OWN_STEP")
+          # celeris#890: the 41 slowest root-package tests (.github/root-test-shards.txt)
+          # run in the `coverage-root-shard` jobs, each with its own profile and its
+          # own upload under the `root` flag; Codecov adds the uploads of one commit
+          # together. Everything NOT listed runs here. The guard is ci.yml's.
+          # This step runs without -v and has no tally: that each shard test runs once,
+          # in its shard only, rests on `-skip` below (which ci.yml's Unit step
+          # checks with `tally-rest` on a -v log, same regex) and on the shards' own
+          # `tally-shard`, not on a check here.
+          .github/scripts/root-shards.sh check
+          skip=$(.github/scripts/root-shards.sh skip-regex)
+          # -timeout=540s: the tests that stay here took 176.4 s under coverage on the
+          # runner (run 38348908034; 620.8 s for the whole package before the shards,
+          # run 38327908174), so 540 s keeps a margin of 3x. A new root test that is
+          # in no shard lands here until it is listed in .github/root-test-shards.txt.
+          # Refs #890.
+          # shellcheck disable=SC2086  # word-splitting is intentional -- `go test` wants one package per arg
+          go test -race -count=1 -timeout=540s -covermode=atomic -skip "$skip" \
+            -coverprofile="$RUNNER_TEMP/cover-root.out" $pkgs
+          # The root package's tests of the exported API, in ./test/server. -coverpkg
+          # puts their coverage on the root package, where it was counted while they sat
+          # in the root directory; its own invocation keeps the other packages' numbers
+          # per package. A second profile of the same upload (the root upload below
+          # names both files), so the upload count stays what codecov.yml waits for.
+          # -p 1 is moot with one package; the skip regex is the same as above.
+          go test -race -count=1 -timeout=540s -covermode=atomic -skip "$skip" \
+            -coverpkg=github.com/goceleris/celeris \
+            -coverprofile="$RUNNER_TEMP/cover-root-server.out" "$COVER_SERVER_STEP"
+      # ./internal/engine/iouring on its own, as ci.yml's unit job runs it.
+      # io_uring charges ring memory to the user, so every test process of the
+      # runner user shares one 8 MiB memlock budget. In the root step, the
+      # package's tests ran beside other packages' io_uring servers (the root
+      # package's, for its whole run) and failed with io_uring_setup ENOMEM
+      # (celeris#938: 3 of 7 attempts). Its profile is added to the root one:
+      # the packages are disjoint, so the blocks are appended after the mode
+      # line.
+      #
+      # -timeout=600s, the unit job's own for this package. Under -race and
+      # -covermode=atomic the package took 291.9 s on main (61ea3cb) and 296.7 s
+      # on celeris#990's branch, of a 300 s timeout; the celeris#895/#896 tests
+      # add about 12 s, and the run ended in a timeout panic. 309.9 s on main
+      # (3cfee4b) and 341.7 s with celeris#811's tests (PR #994 at 5adaf15: the
+      # WriteTimeout bound test alone is about 16 s), of 420 s: under 25%
+      # margin, so 480 s (40%). Since then it has grown to 410.8 to 426.2 s in seven
+      # Coverage runs on main from 13fa176 (2026-10-18) to 6ab5c28 (2026-10-20)
+      # (run 39331135786: 425.6 s), and 437.3 s in an eighth (run 39334596754,
+      # which failed on a test, not on the timeout): 480 s was 10% over that, 600 s
+      # is 37% over (celeris#890 item 66; the unit job's step has the same limit
+      # and its figures).
+      - name: internal/engine/iouring (own step, ci.yml unit set)
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          go test -race -count=1 -timeout=600s -covermode=atomic \
+            -coverprofile="$RUNNER_TEMP/cover-iouring.out" ./internal/engine/iouring/
+          root="$RUNNER_TEMP/cover-root.out"
+          own="$RUNNER_TEMP/cover-iouring.out"
+          if [ "$(head -n1 "$own")" != "$(head -n1 "$root")" ]; then
+            echo "::error::mode lines differ: $(head -n1 "$own") vs $(head -n1 "$root")"
+            exit 1
+          fi
+          blocks=$(grep -vc '^mode: ' "$own" || true)
+          echo "cover-iouring.out: $blocks blocks, appended to cover-root.out"
+          [ "$blocks" -gt 0 ]
+          tail -n +2 "$own" >> "$root"
+      - name: middleware/compress
+        working-directory: middleware/compress
+        run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-compress.out" ./...
+      - name: middleware/metrics
+        working-directory: middleware/metrics
+        run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-metrics.out" ./...
+      - name: middleware/otel
+        working-directory: middleware/otel
+        run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-otel.out" ./...
+      - name: middleware/protobuf
+        working-directory: middleware/protobuf
+        run: go test -race -count=1 -timeout=120s -covermode=atomic -coverprofile="$RUNNER_TEMP/cover-protobuf.out" ./...
+
+      # An empty profile is absent, never a pass: every file must hold the
+      # mode line plus at least one counted block, or nothing is uploaded.
+      - name: Every profile is non-empty
+        run: |
+          fail=0
+          for m in root root-server compress metrics otel protobuf; do
+            f="$RUNNER_TEMP/cover-$m.out"
+            blocks=0
+            [ -f "$f" ] && blocks=$(grep -vc '^mode: ' "$f" || true)
+            echo "cover-$m.out: $blocks blocks"
+            [ "$blocks" -gt 0 ] || fail=1
+          done
+          exit "$fail"
+
+      # fail_ci_if_error: a failed upload turns this workflow red rather than
+      # leaving a stale number. During a Codecov outage that includes main.
+      # This workflow is not a required check, so nothing is blocked, but
+      # whoever sweeps main after a merge should expect it (celeris#725).
+      - name: Upload root
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-root.out,${{ runner.temp }}/cover-root-server.out
+          flags: root
+          name: root
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: true
+      - name: Upload middleware/compress
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-compress.out
+          flags: compress
+          name: compress
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: true
+      - name: Upload middleware/metrics
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-metrics.out
+          flags: metrics
+          name: metrics
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: true
+      - name: Upload middleware/otel
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-otel.out
+          flags: otel
+          name: otel
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: true
+      - name: Upload middleware/protobuf
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-protobuf.out
+          flags: protobuf
+          name: protobuf
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: true
+
+  # celeris#890: the root package's slowest tests (.github/root-test-shards.txt),
+  # one shard per runner, as ci.yml's `unit-root-shard` runs them (own runner,
+  # own 8 MiB memlock). Each shard writes a profile of the root package for its
+  # tests and uploads it under the `root` flag; the `coverage` job uploads the
+  # rest under the same flag, and Codecov adds the uploads of a commit together
+  # (codecov.yml waits for all seven). The shard's tests must each run and PASS
+  # by name, as in ci.yml. Not a required check, like the job above.
+  #
+  # -timeout=660s: the shards took 215.5 s (a) and 221.2 s (b) under coverage on
+  # the runner (run 38348908034), so 660 s keeps a margin of 3x.
+  coverage-root-shard:
+    name: Coverage root shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every shard named in .github/root-test-shards.txt (the guard in the
+        # `coverage` job's root step fails when the two differ).
+        shard: [a, b]
+    permissions:
+      contents: read # checkout
+      id-token: write # Codecov upload over OIDC, as the job above
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.3"
+      - name: Root package — shard tests with a coverage profile
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          echo "memlock (KiB): $(ulimit -l)"
+          run=$(.github/scripts/root-shards.sh run-regex "$SHARD")
+          # The root package and ./test/server (`root-shards.sh pkgs`), one process at a
+          # time (-p 1: one memlock budget per runner). -coverpkg puts the coverage of both
+          # on the root package, where the tests of ./test/server were counted before they
+          # moved; the root package's own tests cover it as they always did.
+          # shellcheck disable=SC2046  # the packages are word-split on purpose
+          go test -p 1 -race -count=1 -timeout=660s -covermode=atomic -v -run "$run" \
+            -coverpkg=github.com/goceleris/celeris \
+            -coverprofile="$RUNNER_TEMP/cover-root-$SHARD.out" $(.github/scripts/root-shards.sh pkgs) 2>&1 | tee /tmp/shard.log
+          .github/scripts/root-shards.sh tally-shard "$SHARD" /tmp/shard.log
+          blocks=$(grep -vc '^mode: ' "$RUNNER_TEMP/cover-root-$SHARD.out" || true)
+          echo "cover-root-$SHARD.out: $blocks blocks"
+          [ "$blocks" -gt 0 ]
+      - name: Upload root (shard)
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cover-root-${{ matrix.shard }}.out
+          flags: root
+          name: root-shard-${{ matrix.shard }}
+          disable_search: true
+          fail_ci_if_error: true
+          use_oidc: true

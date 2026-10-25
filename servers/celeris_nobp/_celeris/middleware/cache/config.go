@@ -1,0 +1,156 @@
+package cache
+
+import (
+	"time"
+
+	"github.com/goceleris/celeris"
+	"github.com/goceleris/celeris/middleware/store"
+)
+
+// Config defines the cache middleware configuration.
+type Config struct {
+	// Store is the cache backend. Default: [NewMemoryStore].
+	//
+	// Two fills of one key can overlap (concurrent misses with
+	// DisableSingleflight, or a coalesced call that was replaced once its
+	// result expired while its Set hung). The cache's own [MemoryStore]
+	// applies each fill's write in order: an entry written by a fill whose
+	// handler started later is not replaced by an earlier fill's write that
+	// lands after it. Any other store, including a type that embeds
+	// *MemoryStore, gets plain Set calls (its own Set override runs), so the
+	// entry that remains is the one whose Set the store applied last.
+	Store store.KV
+
+	// TTL is the default cache entry lifetime. Default: 1 minute.
+	// Per-response Cache-Control: max-age directives, when respected,
+	// cap the effective TTL to min(TTL, max-age).
+	TTL time.Duration
+
+	// KeyGenerator derives the cache key from a request. When nil, the
+	// default uses method + path + sorted query string + values of every
+	// header listed in [VaryHeaders].
+	KeyGenerator func(*celeris.Context) string
+
+	// DisableSingleflight turns off the coalescing of concurrent cache
+	// misses. By default (false) concurrent requests that miss on the same
+	// key coalesce: only one handler invocation runs, and the waiters
+	// reuse the resulting response. When the handler returns an error,
+	// each waiter returns a copy of it made before the leader returns, as
+	// middleware/singleflight does: its message is copied, it unwraps to
+	// the leader's error ([errors.Is] and [errors.As] find what it holds),
+	// and it is not == to it. When the handler (or the store's Set)
+	// panics, the panic is the leader's, and each waiter runs its own
+	// handler. So does each waiter when the leader's handler failed
+	// because the leader's own request context ended (its client went
+	// away, its deadline passed): that error is the leader's client's.
+	// (A client that cancels its request again and again can therefore
+	// defeat the coalescing for the others, at the price of one handler
+	// run per waiter, as without singleflight.) A waiter waits only as long
+	// as its request context lives; on epoll and io_uring an HTTP/1 request
+	// context does not end unless a middleware such as timeout gives it a
+	// deadline, so there a waiter waits for the handler. A request that
+	// arrives during the leader's store Set takes the response too, within
+	// the response's TTL.
+	//
+	// It replaces the Singleflight field, which a Config literal that did
+	// not set it turned off (celeris#922).
+	DisableSingleflight bool
+
+	// Methods lists HTTP methods eligible for caching. Default: GET, HEAD.
+	// Methods not in this list pass through without interacting with
+	// the cache.
+	Methods []string
+
+	// StatusFilter decides whether a computed response should be stored.
+	// When nil, only 2xx responses are cached. A 206 Partial Content or a
+	// 416 Range Not Satisfiable is never stored, whatever the filter says,
+	// even when the key includes Range (in VaryHeaders or a KeyGenerator):
+	// both answer one request's Range, and a replay would skip the
+	// handler's If-Range check, which can make the same Range get the whole
+	// representation.
+	StatusFilter func(status int) bool
+
+	// VaryHeaders are included in the default cache key. Callers who
+	// provide their own [KeyGenerator] can ignore this field.
+	VaryHeaders []string
+
+	// HeaderName is the response header populated with "HIT" or "MISS".
+	// Default: "X-Cache". Set to "" to disable.
+	HeaderName string
+
+	// MaxBodyBytes caps the response body size eligible for caching.
+	// Responses larger than this pass through uncached. Default: 1 MiB.
+	MaxBodyBytes int
+
+	// IncludeHeaders, when non-empty, whitelists response headers that
+	// are stored alongside the body. When nil, all response headers
+	// are stored except those in [ExcludeHeaders] (default: Set-Cookie).
+	IncludeHeaders []string
+
+	// ExcludeHeaders, when non-empty, is subtracted from the stored
+	// header set after applying [IncludeHeaders]. Default: "set-cookie".
+	ExcludeHeaders []string
+
+	// IgnoreCacheControl, when true, stores responses whatever their
+	// Cache-Control says. By default (false) the response's Cache-Control
+	// directive is honoured:
+	//   - no-store, private or no-cache → skip caching
+	//   - max-age=0                     → skip caching
+	//   - max-age=N (N > 0)             → cap TTL to min(cfg.TTL, N seconds)
+	//   - a max-age that is not digits  → skip caching (max-age=abc, max-age=60abc)
+	//   - "private" or "no-store" anywhere in the value → skip caching, always
+	//   - not a comma-separated list    → skip caching (public; max-age=3600)
+	//
+	// No-cache and max-age=0 are not stored because a stored response would
+	// be served without the revalidation the origin asked for, and this
+	// middleware does not revalidate (celeris#888 item 27).
+	//
+	// It replaces the RespectCacheControl field, whose false had no effect
+	// (celeris#922).
+	IgnoreCacheControl bool
+
+	// Skip defines a function to skip this middleware for certain
+	// requests.
+	Skip func(*celeris.Context) bool
+
+	// SkipPaths lists paths to skip (exact match).
+	SkipPaths []string
+}
+
+// defaultConfig holds the defaults. Every bool field's default is false, so
+// a Config literal that leaves one out gets its default (celeris#922).
+var defaultConfig = Config{
+	TTL:          time.Minute,
+	Methods:      []string{"GET", "HEAD"},
+	HeaderName:   "X-Cache",
+	MaxBodyBytes: 1 << 20,
+}
+
+func applyDefaults(cfg Config) Config {
+	if cfg.Store == nil {
+		cfg.Store = NewMemoryStore()
+	}
+	if cfg.TTL <= 0 {
+		cfg.TTL = defaultConfig.TTL
+	}
+	if cfg.Methods == nil {
+		cfg.Methods = defaultConfig.Methods
+	}
+	if cfg.HeaderName == "" {
+		cfg.HeaderName = defaultConfig.HeaderName
+	}
+	if cfg.MaxBodyBytes == 0 {
+		cfg.MaxBodyBytes = defaultConfig.MaxBodyBytes
+	}
+	if cfg.StatusFilter == nil {
+		cfg.StatusFilter = defaultStatusFilter
+	}
+	if cfg.ExcludeHeaders == nil {
+		cfg.ExcludeHeaders = []string{"set-cookie"}
+	}
+	return cfg
+}
+
+func defaultStatusFilter(status int) bool {
+	return status >= 200 && status < 300
+}

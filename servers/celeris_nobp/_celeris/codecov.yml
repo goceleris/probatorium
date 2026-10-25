@@ -1,0 +1,153 @@
+# Codecov configuration (celeris#690). Reference:
+# https://docs.codecov.com/docs/codecovyml-reference
+# Validate a change before pushing it:
+#   curl --data-binary @codecov.yml https://codecov.io/validate
+#
+# Coverage is REPORTED, not enforced: every status below is informational, so
+# Codecov can never turn a pull request red. The profiles come from
+# .github/workflows/test-coverage.yml, which also says what they leave out.
+
+codecov:
+  # Report as soon as this commit's uploads are in. Do not wait for, or depend
+  # on, unrelated CI (the driver matrix, the CodSpeed job that queues for a
+  # macro runner): coverage is informational and must not stall behind them.
+  require_ci_to_pass: false
+  notify:
+    wait_for_ci: false
+    # Seven uploads per commit: root (the coverage job's), the two root-package
+    # shards (coverage-root-shard jobs, also flagged root; celeris#890),
+    # compress, metrics, otel, protobuf. Waiting for all seven keeps Codecov
+    # from posting a partial, misleading number. The root upload carries two
+    # profile files (the root step's and ./test/server's, which run with
+    # -coverpkg on the root package); that is still one upload.
+    after_n_builds: 7
+
+coverage:
+  precision: 2
+  round: down
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+        informational: true
+    patch:
+      default:
+        target: auto
+        informational: true
+    changes: false
+
+# Go writes module-qualified paths (github.com/goceleris/celeris/router.go,
+# github.com/goceleris/celeris/middleware/compress/compress.go); strip the
+# module prefix so every path is relative to the repository root. The
+# middleware sub-modules live under the root module's path, so one rule
+# covers all five.
+fixes:
+  - "github.com/goceleris/celeris/::"
+
+ignore:
+  # Separate harness modules and integration/spec suites, not library code.
+  - "test/**"
+  # Fuzz seed corpora and fixtures.
+  - "**/testdata/**"
+  # Generated protobuf code, should any be committed.
+  - "**/*.pb.go"
+  # Test-support packages: only _test.go files import them, so their lines
+  # would count as uncovered library code (celeris#907's patch read 3.52%,
+  # 218 of 219 missing lines in pintest_linux.go). celeristest (public API)
+  # and internal/testhooks (imported by the root package's context.go) stay
+  # counted.
+  - "internal/platform/pintest/**"
+  - "middleware/internal/testutil/**"
+  - "middleware/internal/fakeredis/**"
+  - "middleware/internal/fakememcached/**"
+
+# One flag per Go module, so a sub-module's number is not diluted by the
+# root module's and each can be made blocking on its own later.
+flag_management:
+  default_rules:
+    # Every module is uploaded on every run (test-coverage.yml has no paths
+    # filter), so there is nothing to carry forward, and a stale number
+    # would hide a module whose tests stopped running.
+    carryforward: false
+  # `root` needs no paths: `go list ./...` in the root module never reaches
+  # the four sub-modules, so its uploads hold root-module files only.
+  individual_flags:
+    - name: root
+    - name: compress
+      paths:
+        - "middleware/compress/"
+    - name: metrics
+      paths:
+        - "middleware/metrics/"
+    - name: otel
+      paths:
+        - "middleware/otel/"
+    - name: protobuf
+      paths:
+        - "middleware/protobuf/"
+
+# Coverage by area, whichever module's upload it came from. There is no
+# adaptive component: ./internal/adaptive/... is not in the coverage profile (it runs
+# in ci.yml's `adaptive` job at raised memlock; test-coverage.yml says why),
+# so the component could only ever be empty (celeris#725).
+component_management:
+  individual_components:
+    - component_id: core
+      name: core (router, context, internal)
+      # core's own internal packages, listed one by one: internal/** would also
+      # count the engines, protocol and driver codecs, which have their own
+      # components below (celeris#443 moved them under internal/).
+      paths:
+        - "^[^/]+\\.go$"
+        - "^internal/[^/]+\\.go$"
+        - "internal/conn/**"
+        - "internal/cpumon/**"
+        - "internal/ctxkit/**"
+        - "internal/deferlinger/**"
+        - "internal/httprange/**"
+        - "internal/negotiate/**"
+        - "internal/platform/**"
+        - "internal/recvtheft/**"
+        - "internal/release/**"
+        - "internal/sockopts/**"
+        - "internal/testhooks/**"
+        - "internal/wakefd/**"
+        - "internal/zcwindow/**"
+        - "celeristest/**"
+        - "observe/**"
+        - "internal/resource/**"
+        - "validation/**"
+        - "internal/probe/**"
+    - component_id: engines
+      name: engines (epoll, io_uring, std)
+      paths:
+        - "internal/engine/**"
+    - component_id: protocol
+      name: protocol (h1, h2, detect)
+      paths:
+        - "internal/protocol/**"
+    - component_id: middleware
+      name: middleware
+      paths:
+        - "middleware/**"
+    - component_id: drivers
+      name: drivers
+      paths:
+        - "driver/**"
+        - "internal/driver/**"
+
+comment:
+  layout: "condensed_header, diff, flags, components, condensed_files, condensed_footer"
+  # One comment per pull request, edited in place on every push.
+  behavior: default
+  require_changes: false
+  # The same seven uploads as codecov.notify.after_n_builds above: a comment
+  # posted after five would show a partial number.
+  after_n_builds: 7
+
+github_checks:
+  # No per-line "not covered" annotations in the Files tab. Many io_uring and
+  # adaptive paths only run on the cluster or at raised memlock, so here they
+  # would be flagged as untested when they are not.
+  annotations: false

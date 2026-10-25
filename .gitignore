@@ -17,6 +17,8 @@
 /servers/celeris/celeris
 /servers/celeris_v1511/celeris_v1511
 /servers/celeris_vnv/celeris_vnv
+/servers/celeris_noc8/celeris_noc8
+/servers/celeris_nobp/celeris_nobp
 /servers/chi/chi
 /servers/echo/echo
 /servers/fasthttp/fasthttp

@@ -1,0 +1,780 @@
+//go:build linux
+
+package epoll
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/goceleris/celeris/internal/engine"
+)
+
+// driverWriteCap bounds the pending outbound bytes per driver FD before
+// Write returns engine.ErrQueueFull. Matches the detached-conn ceiling so
+// long-lived driver sessions (postgres, redis) can amortize larger bursts.
+const driverWriteCap = 64 << 20 // 64 MiB
+
+// driverReadBufSize is the scratch buffer the worker uses to drain data
+// from a driver FD on EPOLLIN. The buffer is reused across FDs since the
+// onRecv callback runs synchronously on the worker goroutine and copies
+// out anything it wants to retain.
+const driverReadBufSize = 32 << 10 // 32 KiB
+
+// driverReadBudget is the number of read(2) calls the loop spends on one
+// driver conn in one turn: up to 256 KiB with the 32 KiB buffer. A conn whose
+// peer keeps its socket full would otherwise hold the loop in driverRead, and
+// every other conn on the loop, driver or HTTP, would wait for its socket to
+// empty (celeris#930, the engine twin of celeris#881). A conn that uses up its
+// budget with bytes possibly left gets its next turn in the loop's next
+// round, after the events of the next epoll_wait (see serveDriverReadQ).
+const driverReadBudget = 8
+
+// driverConn holds per-FD state for a driver-registered connection.
+//
+// Callbacks onRecv and onClose execute on the worker's goroutine (the same
+// goroutine that runs the epoll_wait loop); they must not block and must
+// not call back into [Loop.RegisterConn] / [Loop.UnregisterConn] /
+// [Loop.Write] for the same FD.
+type driverConn struct {
+	fd int
+	// gen is the generation of this registration of fd, unique on the loop
+	// and never 0. Every epoll_event of the registration carries it in Pad
+	// (the ADD and every MOD; see epollEvent), and the worker dispatches an
+	// event only to the conn whose gen it carries: an event the worker
+	// collected for a conn that has since been unregistered must not reach
+	// the conn that took its number (celeris#771). Set before the conn is
+	// published, then read-only.
+	gen     uint32
+	onRecv  func([]byte)
+	onClose func(error)
+
+	mu       sync.Mutex
+	writeBuf []byte // pending bytes enqueued by Write; drained by flushDriverSend
+	sendPos  int    // offset into writeBuf; mirrors flushWrites' writePos pattern
+	sending  bool   // at most one write(2) in flight per FD (invariant)
+	closed   bool   // true once onClose has been dispatched; guards double-close
+	epollOut bool   // true while EPOLLOUT is armed so ResetWrite can disarm it
+
+	// readQueued is set while dc is in the loop's driverReadQ, and readEvents
+	// holds the teardown flags (EPOLLRDHUP, EPOLLHUP, EPOLLERR) of the events
+	// whose turn it is owed. readErr is the error of a flush that failed while
+	// the conn was owed a turn: the close waits for the bytes in the socket
+	// like the flags do, with that error as its cause. Loop thread only
+	// (celeris#930).
+	readQueued bool
+	readEvents uint32
+	readErr    error
+}
+
+// errLoopShutdown is what a driver gets when it reaches this loop after
+// shutdown closed its epoll descriptor.
+var errLoopShutdown = errors.New("celeris/epoll: worker loop has shut down")
+
+// driverEpollCtl runs an epoll_ctl on the loop's epoll descriptor for a
+// caller that is not necessarily the loop thread.
+//
+// celeris#655, the epoll driver path. Loop.shutdown closes l.epollFD, and a
+// driver goroutine's RegisterConn / UnregisterConn / Write can run at any
+// time afterwards — deterministically so, because shutdownDrivers sets
+// l.driverConns = nil and RegisterConn rebuilds the map from nil. The number
+// is by then free to be recycled, and the epoll_ctl lands on whatever
+// inherited it: another worker's epoll set silently gains or loses a
+// descriptor nobody asked it to watch. Exactly the defect the wakeup eventfd
+// had, on the other descriptor a driver can reach.
+//
+// The rule is the same one WakeFD applies: the operation happens under a
+// lock the close takes first, so it either completes before the close or is
+// refused. ctlMu is a LEAF — callers hold driverMu (RegisterConn) or dc.mu
+// (flushDriverSendLocked), and nothing is acquired while it is held.
+func (l *Loop) driverEpollCtl(op, fd int, ev *unix.EpollEvent) error {
+	l.ctlMu.RLock()
+	defer l.ctlMu.RUnlock()
+	if l.ctlClosed {
+		return errLoopShutdown
+	}
+	return unix.EpollCtl(l.epollFD, op, fd, ev)
+}
+
+// closeEpollFD closes the loop's epoll descriptor and refuses every later
+// driver epoll_ctl. Runs on the loop thread at the very end of shutdown,
+// holding no other lock. Idempotent.
+func (l *Loop) closeEpollFD() {
+	l.ctlMu.Lock()
+	fd := l.epollFD
+	l.ctlClosed = true
+	l.epollFD = -1
+	l.ctlMu.Unlock()
+	if fd >= 0 {
+		_ = unix.Close(fd)
+	}
+}
+
+// epollEvent returns the epoll_event for dc's registration with the given
+// interest: the number in Fd, and the registration's generation in Pad, which
+// the kernel hands back with each event it reports for the descriptor. Every
+// EPOLL_CTL_ADD and EPOLL_CTL_MOD of a driver conn uses it: a MOD replaces the
+// whole event data, and one without the generation would make the worker drop
+// every later event of the conn (celeris#771).
+func (dc *driverConn) epollEvent(events uint32) unix.EpollEvent {
+	return unix.EpollEvent{Events: events, Fd: int32(dc.fd), Pad: int32(dc.gen)}
+}
+
+// testHookCloseDriverClaimed, when non-nil, runs in closeDriver once the conn
+// is claimed closed and removed from the interest set, with no lock held, and
+// before the conn leaves driverConns: where UnregisterConn can return, the
+// caller can close the descriptor and register another conn on its number. Tests
+// only (celeris#771): a test sets it before it creates the engine and clears
+// it after the engine is stopped.
+var testHookCloseDriverClaimed func(dc *driverConn)
+
+// testHookDriverReadChecked, when non-nil, runs in driverRead after the conn's
+// closed check and before its read(2), with dc.mu held: the one place where an
+// UnregisterConn that is not made to wait for the read could return, so that
+// the caller closes the number and another file takes it before the read goes
+// out (celeris#710, #885 item 3). A reader that checks and reads in two
+// critical sections, or reads and then checks, lets a test do exactly that
+// from inside the hook, and the test sees the bytes of the file that took the
+// number. Tests only: a test sets it before it starts the loop's reads and
+// clears it after they have stopped. Costs one load and one nil test per read
+// when unset.
+var testHookDriverReadChecked func(dc *driverConn)
+
+// testHookCloseDriverDeleted, when non-nil, runs in closeDriver in the
+// critical section that claims the conn closed, right after the
+// EPOLL_CTL_DEL, with dc.mu held: the descriptor must already be out of the
+// interest set there, or an UnregisterConn(A) that returns between the unlock
+// and a later DEL lets the caller close the number and register another conn
+// on it, which that DEL then removes (celeris#771, #885 item 23). Tests only:
+// a test sets it before it creates the engine and clears it after the engine
+// is stopped.
+var testHookCloseDriverDeleted func(dc *driverConn)
+
+// testHookConnClosed, when non-nil, runs in closeConn on the loop's goroutine
+// right after the descriptor is closed, with no lock held: the number is free
+// and a driver may take it, so the slot l.conns[fd] must already be clear
+// (celeris#775). Tests only: a test sets it before it creates the engine and
+// clears it after the engine is stopped.
+var testHookConnClosed func(l *Loop, fd int)
+
+// testHookDriverQueueWait, when non-nil, runs on the loop's goroutine before
+// an epoll_wait made while a driver conn is owed a read turn, with the number
+// of conns owed and the timeout the loop is about to wait with. Tests only
+// (celeris#930): a test sets it before it creates the engine and clears it
+// after the engine is stopped.
+var testHookDriverQueueWait func(queued, timeoutMs int)
+
+// lookupDriver returns the driverConn for fd, or nil if none is registered.
+// Safe to call from the worker goroutine during dispatch.
+func (l *Loop) lookupDriver(fd int) *driverConn {
+	l.driverMu.RLock()
+	dc := l.driverConns[fd]
+	l.driverMu.RUnlock()
+	return dc
+}
+
+// dispatchDriver hands one epoll event to the driver conn it was collected
+// for, and reports whether the event was a driver's, delivered or dropped, so
+// that the caller does not give it to the HTTP path. Runs on the worker
+// goroutine.
+//
+// The event names its conn by the descriptor number (Fd) and the generation of
+// its registration (Pad; an HTTP conn's has bit 31 set, see httpGenBit). The
+// worker collects a batch of
+// events and dispatches it one by one, so an event of a conn can be dispatched
+// after the conn has gone and its number has been taken: by a driver conn
+// registered since, which has another generation, or by nothing. Applied to
+// the conn found by number, A's EPOLLRDHUP closed X (celeris#771). So the
+// event goes to the conn found only if the generations are equal, and is
+// dropped otherwise, as is a driver event whose conn has gone. An HTTP conn's
+// event (Pad 0 or its generation) on a number that is a driver conn's is dropped
+// too: RegisterConn
+// refuses a number that is an HTTP conn's, so that event was collected for an
+// HTTP conn that has since gone. The converse is not enforced: acceptAll does
+// not look at driverConns, and a conn that closeDriver closed on the caller's
+// goroutine stays in the map until its entry is deleted, so an HTTP conn can
+// be accepted on its number meanwhile and have its first event dropped. That is
+// a rule the worker applies (the base dispatched the same event to the closed
+// conn's no-op handler), not an invariant the loop guarantees.
+func (l *Loop) dispatchDriver(fd int, gen uint32, events uint32) bool {
+	dc := l.lookupDriver(fd)
+	if dc == nil {
+		// Nothing is registered on the number. An event with a driver
+		// generation is a driver conn's that has gone: dropped, not an HTTP
+		// conn's. An HTTP conn's (Pad 0, or its generation, bit 31 set) is
+		// the HTTP path's.
+		return isDriverGen(gen)
+	}
+	if dc.gen != gen {
+		return true
+	}
+	l.handleDriverEvent(dc, events)
+	return true
+}
+
+// driverCandidate reports whether an event with this Pad may be a driver
+// conn's, so that the worker looks it up: it carries a registration's
+// generation, or a driver conn is registered. The HTTP path's whole cost.
+func (l *Loop) driverCandidate(gen uint32) bool {
+	return isDriverGen(gen) || l.hasDriverConns.Load()
+}
+
+// The generations in the Pad of an epoll_event, by who made the registration
+// (celeris#771, celeris#885):
+//
+//	0                           nobody's: the listen socket, the timer and
+//	                            wake descriptors, and a pre-generation conn
+//	1 .. maxDriverGen           a driver conn's (RegisterConn)
+//	httpGenBit .. 0xffffffff    an HTTP conn's (nextHTTPGen), bit 31 set
+//
+// so the two never collide, and driver generations are the positive int32s.
+const (
+	httpGenBit   uint32 = 1 << 31
+	maxDriverGen uint32 = httpGenBit - 1
+)
+
+// isDriverGen reports whether pad is a driver registration's generation.
+func isDriverGen(pad uint32) bool { return int32(pad) > 0 }
+
+// nextHTTPGen draws the generation for an HTTP conn about to be registered:
+// the next of the loop's 31-bit count, with bit 31 set, so never 0 and never a
+// driver's. The count wraps after 2^31 registrations on this loop; an event
+// reaches the wrong conn only if the conn now on its number was registered a
+// multiple of 2^31 registrations after the one the event was collected for,
+// while the event waits to be dispatched. Loop thread only.
+func (l *Loop) nextHTTPGen() uint32 {
+	l.httpGen = (l.httpGen + 1) & maxDriverGen
+	return httpGenBit | l.httpGen
+}
+
+// httpEpollEvent is the epoll_event for an HTTP conn's registration of fd with
+// the given interest: the number in Fd, and the registration's generation in
+// Pad, which the kernel hands back with each event it reports for the
+// descriptor. Every EPOLL_CTL_ADD and EPOLL_CTL_MOD of an HTTP conn uses it
+// (through connState.epollEvent once the conn exists): a MOD replaces the whole
+// event data, and one without the generation would make the conn's later
+// events skip the run loop's identity check (celeris#885 item 18).
+func httpEpollEvent(fd int, gen uint32, events uint32) unix.EpollEvent {
+	return unix.EpollEvent{Events: events, Fd: int32(fd), Pad: int32(gen)}
+}
+
+// epollEvent is httpEpollEvent for cs's own registration.
+func (cs *connState) epollEvent(events uint32) unix.EpollEvent {
+	return httpEpollEvent(cs.fd, cs.gen, events)
+}
+
+// RegisterConn adds fd to this worker's interest set and installs the
+// data and close callbacks. fd must already be in non-blocking mode; the
+// caller retains ownership of the fd (UnregisterConn does not close it).
+//
+// Returns an error if fd is already registered as an HTTP conn on this
+// worker or already registered as a driver conn.
+//
+// A loop that PauseAccept has parked is woken (wakeIfSuspended) and does not
+// park again while a driver conn is registered on it: the conn's bytes would
+// otherwise wait for a ResumeAccept (celeris#885 item 39).
+func (l *Loop) RegisterConn(fd int, onRecv func([]byte), onClose func(error)) error {
+	if fd < 0 {
+		return fmt.Errorf("celeris/epoll: invalid fd %d", fd)
+	}
+	if onRecv == nil || onClose == nil {
+		return errors.New("celeris/epoll: onRecv and onClose must be non-nil")
+	}
+
+	// driverMu is held by a closure, released by its defer: no return or
+	// panic in the section can leave it held, and the wake below still runs
+	// after the unlock.
+	err := func() error {
+		l.driverMu.Lock()
+		defer l.driverMu.Unlock()
+
+		// HTTP accept path writes l.conns[fd] on the worker goroutine; a concurrent
+		// driver registration for the same fd would race. Re-check under the lock
+		// to close the TOCTOU window — a racy accept could have run between an
+		// earlier unlocked check and this lock acquisition.
+		if fd < len(l.conns) && l.conns[fd] != nil {
+			return fmt.Errorf("celeris/epoll: fd %d is already an HTTP connection", fd)
+		}
+
+		if l.driverConns == nil {
+			l.driverConns = make(map[int]*driverConn)
+		}
+		if _, exists := l.driverConns[fd]; exists {
+			return fmt.Errorf("celeris/epoll: fd %d is already registered", fd)
+		}
+
+		// The registration's generation, set before the conn is published
+		// (celeris#771). Under driverMu, which RegisterConn holds. 0 never names a
+		// registration, and neither does a value with bit 31 set (an HTTP conn's,
+		// see httpGenBit): the count wraps after maxDriverGen (2^31-1)
+		// registrations on this loop, and an event reaches the wrong conn only if
+		// the conn now on its number has the event's generation: a multiple of
+		// 2^31-1 registrations would have to come between the two while the event
+		// waits to be dispatched.
+		l.driverGen++
+		if l.driverGen > maxDriverGen {
+			l.driverGen = 1
+		}
+		dc := &driverConn{
+			fd:      fd,
+			gen:     l.driverGen,
+			onRecv:  onRecv,
+			onClose: onClose,
+		}
+		// Publish the conn before arming the descriptor (celeris#770). The
+		// worker looks a driver conn up only while hasDriverConns is set, and
+		// the event is edge triggered: armed first, a first event the worker
+		// took before hasDriverConns was set went to the HTTP path, which read
+		// nothing, and never came again. Published first, a racing worker finds
+		// hasDriverConns set and waits in lookupDriver for driverMu, which is
+		// held here until the conn is in the map.
+		l.driverConns[fd] = dc
+		l.hasDriverConns.Store(true)
+		// Level-triggered EPOLLOUT is added lazily (on EAGAIN) by
+		// flushDriverSendLocked so idle driver conns don't wake the loop on every
+		// send-buffer drain.
+		ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
+		if err := l.driverEpollCtl(unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
+			delete(l.driverConns, fd)
+			if len(l.driverConns) == 0 {
+				l.hasDriverConns.Store(false)
+			}
+			return fmt.Errorf("celeris/epoll: epoll_ctl ADD fd %d: %w", fd, err)
+		}
+		return nil
+	}()
+	if err != nil {
+		return err
+	}
+	// A loop that PauseAccept parked is in no epoll_wait, so the ADD above
+	// reaches nobody: a conn registered after the park would wait for the next
+	// ResumeAccept (celeris#885 item 39). hasDriverConns is published, and the
+	// descriptor armed, before this; the park re-checks the flag under wakeMu,
+	// so either it sees the flag and stays out, or it set suspended first and
+	// this call finds it (see wakeIfSuspended). After driverMu is released:
+	// wakeMu is a leaf lock, taken with nothing held. A no-op on a loop that is
+	// running, and on the failure paths above, which published nothing a loop
+	// could be left waiting for.
+	l.wakeIfSuspended()
+	return nil
+}
+
+// UnregisterConn removes fd from this worker's interest set and fires the
+// onClose callback (with a nil error) on the caller's goroutine before it
+// returns, unless the conn was already closed. The fd itself is NOT closed —
+// the driver owns its lifetime.
+//
+// Once UnregisterConn has returned, the worker reads fd no more, even when
+// it is inside the conn's read loop at the time (celeris#710): every read
+// checks, under dc.mu, the closed flag this sets under dc.mu. A read that
+// completed before UnregisterConn took dc.mu is still delivered, though: the
+// worker calls onRecv outside dc.mu, so onRecv can run once more, concurrently
+// with or after onClose (celeris#885 item 4).
+func (l *Loop) UnregisterConn(fd int) error {
+	l.driverMu.Lock()
+	dc, ok := l.driverConns[fd]
+	if !ok {
+		l.driverMu.Unlock()
+		return engine.ErrUnknownFD
+	}
+	delete(l.driverConns, fd)
+	if len(l.driverConns) == 0 {
+		l.hasDriverConns.Store(false)
+	}
+	l.driverMu.Unlock()
+
+	_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, fd, nil)
+
+	// Synchronous close: the caller is typically the driver's own goroutine
+	// (not the worker). A deferred dispatch via eventfd would require the
+	// worker to own a scheduled-callback queue; for now, we invoke onClose
+	// on the caller's goroutine after marking the conn closed so the worker
+	// sees a no-op if it concurrently observes an event for this fd.
+	dc.mu.Lock()
+	already := dc.closed
+	dc.closed = true
+	cb := dc.onClose
+	dc.mu.Unlock()
+
+	if !already && cb != nil {
+		cb(nil)
+	}
+	return nil
+}
+
+// Write enqueues data for transmission on fd. Returns engine.ErrUnknownFD
+// if fd is not registered on this worker or is already closing (after
+// UnregisterConn, or after the conn failed), or engine.ErrQueueFull if the
+// pending backlog would exceed driverWriteCap.
+//
+// The call is non-blocking: it performs at most one write(2) inline when
+// the socket is idle and otherwise arms EPOLLOUT so the worker flushes the
+// remainder on the next iteration.
+func (l *Loop) Write(fd int, data []byte) error {
+	dc := l.lookupDriver(fd)
+	if dc == nil {
+		return engine.ErrUnknownFD
+	}
+
+	dc.mu.Lock()
+	if dc.closed {
+		dc.mu.Unlock()
+		return engine.ErrUnknownFD
+	}
+	pending := len(dc.writeBuf) - dc.sendPos
+	if pending+len(data) > driverWriteCap {
+		dc.mu.Unlock()
+		return engine.ErrQueueFull
+	}
+	dc.writeBuf = append(dc.writeBuf, data...)
+
+	// If another caller already holds the "sending" slot, piggy-back: that
+	// caller's flushDriverSend will drain the newly-appended bytes before
+	// returning. This preserves the one-write-in-flight-per-FD invariant.
+	if dc.sending {
+		dc.mu.Unlock()
+		return nil
+	}
+	dc.sending = true
+	err := l.flushDriverSendLocked(dc)
+	dc.sending = false
+	dc.mu.Unlock()
+	if err != nil {
+		// Non-EAGAIN write error: tear down the conn so the driver sees
+		// onClose. Without this, the conn stays "registered" forever and
+		// future Writes return the same error indefinitely.
+		l.closeDriver(dc, err)
+	}
+	return err
+}
+
+// flushDriverSendLocked drains dc.writeBuf to the kernel. Caller MUST hold
+// dc.mu and MUST have set dc.sending = true before entry. On EAGAIN we
+// arm EPOLLOUT (level-triggered) so the worker resumes on the next kernel
+// buffer-available signal.
+func (l *Loop) flushDriverSendLocked(dc *driverConn) error {
+	for dc.sendPos < len(dc.writeBuf) {
+		n, err := unix.Write(dc.fd, dc.writeBuf[dc.sendPos:])
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				if !dc.epollOut {
+					// No EPOLLET: it is a flag of the whole registration, so
+					// while EPOLLOUT is armed EPOLLIN is level-triggered too.
+					// EPOLLOUT fires as long as the socket is writable, so
+					// there is no risk of a missed wakeup after sending
+					// clears; EPOLLIN is reported again each epoll_wait while
+					// bytes are unread, which handleDriverEvent merges into the
+					// conn's queued read turn (celeris#930).
+					ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP)
+					modErr := l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &ev)
+					if modErr == nil {
+						dc.epollOut = true
+					}
+				}
+				return nil
+			}
+			// Non-EAGAIN error: the write failed and the caller alone can't
+			// recover — the conn is still registered but no further I/O
+			// will succeed. Clear pending data and return the error; the
+			// caller path invokes closeDriver to fire onClose and unregister.
+			dc.writeBuf = dc.writeBuf[:0]
+			dc.sendPos = 0
+			return err
+		}
+		dc.sendPos += n
+	}
+	// Fully flushed: reset and disarm EPOLLOUT so idle FDs don't wake.
+	dc.writeBuf = dc.writeBuf[:0]
+	dc.sendPos = 0
+	if dc.epollOut {
+		ev := dc.epollEvent(unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP)
+		_ = l.driverEpollCtl(unix.EPOLL_CTL_MOD, dc.fd, &ev)
+		dc.epollOut = false
+	}
+	return nil
+}
+
+// CPUID returns the CPU the worker is pinned to, or -1 if the worker was
+// not successfully pinned (the kernel refused the pin, or a test plan left it
+// out; the planner plans none unpinned since celeris#1036).
+// The loop thread settles it as it starts, so the value is valid only once
+// Listen has reported the engine ready; before that it may still change.
+func (l *Loop) CPUID() int {
+	return l.cpuID
+}
+
+// handleDriverEvent dispatches an epoll event to a registered driver conn.
+// Runs on the worker goroutine. EPOLLIN is edge-triggered while EPOLLOUT is
+// not armed (level-triggered while it is, see flushDriverSendLocked), so a
+// turn reads at most driverReadBudget times (see driverRead) and a conn that
+// used its budget up is queued instead of drained; EPOLLOUT resumes a
+// pending Write. On error/hangup the onClose callback is invoked and the conn
+// is removed from the interest set.
+//
+// A turn that stops at its budget leaves the conn queued (driverReadQ), and
+// so does an event of a conn that is queued already. The teardown that
+// follows the event, the event's EPOLLRDHUP/EPOLLHUP/EPOLLERR and the error
+// of a failed flush, waits for the turn that drains the socket (readEvents,
+// readErr): bytes the peer sent before it closed are still read and delivered
+// first, as they were when the one turn drained the socket (celeris#930).
+func (l *Loop) handleDriverEvent(dc *driverConn, events uint32) {
+	const closeFlags = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP
+	if dc.readQueued {
+		// The conn is owed a read turn, which reads this event's bytes too
+		// and runs its teardown: a conn gets one turn per round however many
+		// events it has in the batch. EPOLLOUT is not read-related and is
+		// served now.
+		dc.readEvents |= events & closeFlags
+		events &^= unix.EPOLLIN | closeFlags
+		if events == 0 {
+			return
+		}
+	}
+	// Read first: a peer may send data and immediately close, producing
+	// both EPOLLIN and EPOLLRDHUP in one event batch.
+	more := false
+	if events&unix.EPOLLIN != 0 {
+		more = l.driverRead(dc)
+	}
+	if events&unix.EPOLLOUT != 0 {
+		dc.mu.Lock()
+		if !dc.sending && !dc.closed && dc.readErr == nil {
+			dc.sending = true
+			if err := l.flushDriverSendLocked(dc); err != nil {
+				dc.sending = false
+				dc.mu.Unlock()
+				if more || dc.readQueued {
+					// The bytes the read turn left in the socket come first, as
+					// they did when the one event read them before it flushed.
+					dc.readEvents |= events & closeFlags
+					dc.readErr = err
+					if !dc.readQueued {
+						l.queueDriverRead(dc)
+					}
+					return
+				}
+				l.closeDriver(dc, err)
+				return
+			}
+			dc.sending = false
+		}
+		dc.mu.Unlock()
+	}
+	if more {
+		// Budget used up with bytes possibly left: the teardown waits for the
+		// turn that drains them.
+		dc.readEvents |= events & closeFlags
+		l.queueDriverRead(dc)
+		return
+	}
+	if events&closeFlags != 0 {
+		l.closeDriver(dc, nil)
+	}
+}
+
+// queueDriverRead owes dc a read turn in the loop's next round. Loop thread.
+func (l *Loop) queueDriverRead(dc *driverConn) {
+	dc.readQueued = true
+	l.driverReadQ = append(l.driverReadQ, dc)
+}
+
+// serveDriverReadQ gives the first owed conns of driverReadQ, the ones queued
+// before this round's batch, the read turn they are owed. The conns queued
+// during the batch stay queued for the next round, and so does a conn that
+// uses up its budget again: each backlogged conn gets one turn per round.
+// The turn of a conn that has been torn down since reads nothing (driverRead's
+// closed check, celeris#710); the queue holds conns, not numbers. The caller
+// calls it only with owed > 0. Loop thread.
+func (l *Loop) serveDriverReadQ(owed int) {
+	q := l.driverReadQ
+	// shutdownDrivers clears the queue; it runs on this goroutine, never
+	// inside a batch.
+	owed = min(owed, len(q))
+	l.driverReadQ = append(l.driverReadQNext[:0], q[owed:]...)
+	for i, dc := range q[:owed] {
+		q[i] = nil
+		flags, cause := dc.readEvents, dc.readErr
+		dc.readQueued, dc.readEvents, dc.readErr = false, 0, nil
+		if l.driverRead(dc) {
+			dc.readEvents, dc.readErr = flags, cause
+			l.queueDriverRead(dc)
+		} else if flags != 0 || cause != nil {
+			l.closeDriver(dc, cause)
+		}
+	}
+	clear(q[owed:])
+	l.driverReadQNext = q[:0]
+}
+
+// driverRead reads fd with edge-triggered reads into the per-loop scratch
+// buffer and fans each chunk out to onRecv, for at most driverReadBudget
+// reads. It reports whether the budget stopped it with bytes possibly left in
+// the socket: edge-triggered epoll does not report those again, so the caller
+// owes the conn another turn (queueDriverRead). The callback runs on this
+// goroutine; the slice is invalidated on return.
+//
+// Each read is issued under dc.mu, after checking dc.closed (celeris#710).
+// The read names the caller's descriptor number, and UnregisterConn sets
+// closed under dc.mu before it returns, after which the caller may close fd
+// and the number may name another file. The loop reads again after onRecv
+// whenever a read filled the buffer, and onRecv, or anything else the
+// worker does between two reads, can run while the caller unregisters: a
+// check after the read let the worker read, and drop, the bytes of the file
+// that took the number, or block in it if it was a blocking descriptor.
+// With the check and the read in one critical section, a read either
+// completes before UnregisterConn returns or is not issued. dc.mu is held
+// across the read syscall only (fd is non-blocking, RegisterConn's
+// contract), never across onRecv or closeDriver, and nothing else is
+// acquired while it is held here.
+func (l *Loop) driverRead(dc *driverConn) (more bool) {
+	if l.driverReadBuf == nil {
+		l.driverReadBuf = make([]byte, driverReadBufSize)
+	}
+	for reads := 0; reads < driverReadBudget; reads++ {
+		dc.mu.Lock()
+		if dc.closed {
+			dc.mu.Unlock()
+			return false
+		}
+		if h := testHookDriverReadChecked; h != nil {
+			h(dc)
+		}
+		n, err := unix.Read(dc.fd, l.driverReadBuf)
+		cb := dc.onRecv
+		dc.mu.Unlock()
+		if err != nil {
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				return false
+			}
+			l.closeDriver(dc, err)
+			return false
+		}
+		if n == 0 {
+			l.closeDriver(dc, nil)
+			return false
+		}
+		if cb != nil {
+			cb(l.driverReadBuf[:n])
+		}
+		if n < len(l.driverReadBuf) {
+			// Short read implies the socket is drained; ET epoll will
+			// notify on the next arrival. Skip the EAGAIN-producing read.
+			return false
+		}
+	}
+	return true
+}
+
+// closeDriver removes dc from the worker's interest set and invokes
+// onClose exactly once. Safe to call concurrently; the dc.closed flag
+// serializes the close path.
+//
+// dc.fd is the caller's descriptor number and is the caller's to close once
+// UnregisterConn has returned (celeris#771; same rule as celeris#710 for
+// reads). So the EPOLL_CTL_DEL runs in the critical section that claims
+// closed: UnregisterConn takes dc.mu before it returns, hence cannot return,
+// nor the caller close the number, between the claim and the DEL. And the
+// map entry is deleted only if it is still dc: UnregisterConn may have
+// removed it, and another conn registered on the number since.
+func (l *Loop) closeDriver(dc *driverConn, cause error) {
+	dc.mu.Lock()
+	if dc.closed {
+		dc.mu.Unlock()
+		return
+	}
+	dc.closed = true
+	cb := dc.onClose
+	_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil)
+	if h := testHookCloseDriverDeleted; h != nil {
+		h(dc)
+	}
+	dc.mu.Unlock()
+
+	if h := testHookCloseDriverClaimed; h != nil {
+		h(dc)
+	}
+
+	l.driverMu.Lock()
+	if l.driverConns[dc.fd] == dc {
+		delete(l.driverConns, dc.fd)
+		if len(l.driverConns) == 0 {
+			l.hasDriverConns.Store(false)
+		}
+	}
+	l.driverMu.Unlock()
+
+	if cb != nil {
+		cb(cause)
+	}
+}
+
+// shutdownDrivers closes every registered driver conn during Loop.shutdown.
+// Invoked from the worker goroutine; onClose callbacks fire synchronously.
+func (l *Loop) shutdownDrivers() {
+	l.driverReadQ, l.driverReadQNext = nil, nil // owed turns end with the conns
+	l.driverMu.Lock()
+	if len(l.driverConns) == 0 {
+		l.driverMu.Unlock()
+		return
+	}
+	conns := make([]*driverConn, 0, len(l.driverConns))
+	for _, dc := range l.driverConns {
+		conns = append(conns, dc)
+	}
+	l.driverConns = nil
+	l.hasDriverConns.Store(false)
+	l.driverMu.Unlock()
+
+	for _, dc := range conns {
+		dc.mu.Lock()
+		if dc.closed {
+			dc.mu.Unlock()
+			continue
+		}
+		dc.closed = true
+		cb := dc.onClose
+		_ = l.driverEpollCtl(unix.EPOLL_CTL_DEL, dc.fd, nil) // under dc.mu: see closeDriver
+		dc.mu.Unlock()
+		if cb != nil {
+			cb(nil)
+		}
+	}
+}
+
+// NumWorkers returns the number of worker event loops. Required by
+// [engine.EventLoopProvider].
+func (e *Engine) NumWorkers() int {
+	e.mu.Lock()
+	n := len(e.loops)
+	e.mu.Unlock()
+	return n
+}
+
+// WorkerLoop returns the worker loop at index n. Out-of-range n is
+// reduced modulo NumWorkers so callers can hash a connection / FD across
+// the available pool without first reading NumWorkers. Negative n is
+// mirrored to the positive side. Panics only when the engine has no
+// loops (i.e. Listen has not yet started).
+func (e *Engine) WorkerLoop(n int) engine.WorkerLoop {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	count := len(e.loops)
+	if count == 0 {
+		panic("celeris/epoll: WorkerLoop called before Listen")
+	}
+	idx := n % count
+	if idx < 0 {
+		idx += count
+	}
+	return e.loops[idx]
+}
+
+var (
+	_ engine.EventLoopProvider = (*Engine)(nil)
+	_ engine.WorkerLoop        = (*Loop)(nil)
+)
