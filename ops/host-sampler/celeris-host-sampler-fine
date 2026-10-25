@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+# celeris-host-sampler-fine: a strictly read-only, sub-minute host sampler that
+# runs BESIDE a bench (probatorium host-sampler, fine series).
+#
+# WHY THIS EXISTS
+#
+# celeris-host-sampler samples once a minute, which is right for a 24 h soak
+# (what died, did the host reboot) and cannot see a 1-3 s event. The io512 cell
+# of the bench loses its pinned event-loop thread for 1-3 s (celeris#1036): the
+# thread is runnable and not on a CPU, the CPU is spent in softirq. A series
+# whose points are 60 s apart has at most one point inside such a stall's
+# minute and nothing that says what the CPU was doing. This samples, at 1 s or
+# finer, the few counters that answer "which CPU, doing what": the per-CPU time
+# split of /proc/stat, the NET_RX softirq count of /proc/softirqs, the run time
+# of the ksoftirqd threads, the CPU pressure total and the load.
+#
+# The design follows the capture of the P2c run (20 Hz sampler, softirq,
+# ksoftirqd, starvation trigger), minus everything that is not a read: it does
+# not run at a raised priority and it does not spawn a dump (both of those
+# touch the SUT's CPUs).
+#
+# WHAT MAKES IT SAFE TO RUN BESIDE A MEASUREMENT
+#
+#   - It never signals, kills, restarts or reconfigures anything. There is no
+#     subprocess at all (no fork, no exec, no shell): every input is a read of
+#     a file under /proc, held open and re-read with pread.
+#   - It writes only to its own directory (SAMPLER_FINE_DIR, on tmpfs) and its
+#     own pid file. A rotation caps the series at 2 x SAMPLER_FINE_MAXBYTES, the
+#     event log at SAMPLER_FINE_EVENTS_MAXBYTES.
+#   - It runs at a LOWER priority than the processes it observes (nice 10 by
+#     default, never negative): under contention the SUT keeps the CPU. The
+#     price is visible, not silent: a tick the sampler was starved of is a
+#     gap in the series and in fine.stats (interval p99 / max, skipped
+#     deadlines, gap events).
+#   - It stops when asked (the stop sentinel is a FILE, polled every tick), at
+#     its hard deadline, and when the runner that started it is gone: if the
+#     Runner.Listener it saw is absent for 60 s it exits, so a runner that died
+#     (the stop step never ran) cannot leave a sampler writing into the next
+#     tier. Reading /proc/<pid>/comm is the whole test.
+#
+# THE SERIES (fine.log, one text line per tick; the first line of every file
+# generation is a "# fine-sampler format=1 ..." header)
+#
+#   <epoch> <dt_ms> run=<R> l1=<load1> psi=<D> | c<N>=<u>,<i>,<s>,<st>,<rx>,<kd> ...
+#
+#   epoch   wall clock, seconds, 3 decimals (joins on the bench's own logs)
+#   dt_ms   time since the previous tick, 0.1 ms
+#   run     runnable tasks (/proc/loadavg), the sampler itself counts 1
+#   l1      1-minute load average
+#   psi     CPU pressure total (/proc/pressure/cpu "some"), microseconds
+#           spent stalled since the previous tick; 0 when the kernel has no PSI
+#   c<N>    CPU N, written ONLY when something in it changed: deltas over the
+#           tick of u = user+nice+system, i = irq, s = softirq, st = steal (all
+#           in USER_HZ ticks, 1/100 s), rx = NET_RX softirq runs, kd = ms the
+#           ksoftirqd/N thread ran. A CPU that is not listed did nothing.
+#
+# fine-events.log holds the events that matter for the whole run, kept apart
+# from the rotating series so the series cannot push them out:
+#
+#   <epoch> starve cpu=N softirq_pct=P usrsys_pct=P window_s=W
+#       a CPU spent >= 95 % of the last >= 1 s in softirq and <= 3 % in
+#       user+nice+system (the signature of a pinned thread that is runnable and
+#       not running: the stalls of celeris#1036), at most once a second per CPU
+#   <epoch> gap dt_ms=D expected_ms=E
+#       the sampler itself was late by more than 3 intervals (or 250 ms)
+#
+# fine.stats is rewritten every 10 s and at exit: achieved rate, interval
+# percentiles, the sampler's own CPU (self_cpu_pct) and why it stopped.
+#
+# USAGE (environment)
+#
+#   SAMPLER_FINE_INTERVAL   seconds between ticks, 0.05 .. 10 (required)
+#   SAMPLER_DURATION        seconds to live, hard deadline (default 90000)
+#   SAMPLER_TAG             free-form label recorded in the header
+#   SAMPLER_FINE_DIR        output directory, default /run/celeris/fine
+#   SAMPLER_RUNDIR          pid / stop sentinel dir, default /run/celeris
+#   SAMPLER_FINE_MAXBYTES   rotate the series past this size, default 16777216
+#   SAMPLER_NICE            0 .. 19, default 10
+#   SAMPLER_EXIT_WITHOUT_RUNNER=1   exit when the Runner.Listener is gone
+#   SAMPLER_PROCROOT        default /proc (tests point it at a fixture)
+#   SAMPLER_FINE_MAX_TICKS  stop after this many ticks (tests), default 0 = no limit
+import collections
+import os
+import sys
+import time
+
+FORMAT = 1
+SIG_SIRQ = 95.0  # percent of the window in softirq
+SIG_USRSYS = 3.0  # percent of the window in user+nice+system
+SIG_WINDOW = 0.95  # seconds the signature must hold over
+RUNNER_COMM = "Runner.Listener"
+RUNNER_ABSENT_S = 60.0
+RUNNER_CHECK_S = 30.0
+STATS_EVERY_S = 10.0
+FLUSH_EVERY_S = 5.0
+EVENT_RATE_S = 1.0
+
+
+class ConfigError(Exception):
+    pass
+
+
+def _number(env, name, default, lo, hi, cast):
+    raw = env.get(name, "")
+    if raw == "":
+        return default
+    try:
+        v = cast(raw)
+    except ValueError:
+        raise ConfigError("%s=%r is not a number" % (name, raw))
+    if not (lo <= v <= hi):  # NaN fails every comparison
+        raise ConfigError("%s=%r is outside %s..%s" % (name, raw, lo, hi))
+    return v
+
+
+class Config:
+    def __init__(self, env):
+        if env.get("SAMPLER_FINE_INTERVAL", "") == "":
+            raise ConfigError("SAMPLER_FINE_INTERVAL is required")
+        self.interval = _number(env, "SAMPLER_FINE_INTERVAL", 0.0, 0.05, 10.0, float)
+        self.duration = _number(env, "SAMPLER_DURATION", 90000, 1, 10**7, int)
+        self.tag = env.get("SAMPLER_TAG", "untagged")
+        self.outdir = env.get("SAMPLER_FINE_DIR", "/run/celeris/fine")
+        self.rundir = env.get("SAMPLER_RUNDIR", "/run/celeris")
+        self.maxbytes = _number(env, "SAMPLER_FINE_MAXBYTES", 16 * 1024 * 1024, 65536, 1 << 30, int)
+        self.events_maxbytes = _number(env, "SAMPLER_FINE_EVENTS_MAXBYTES", 4 * 1024 * 1024, 4096, 1 << 30, int)
+        self.nice = _number(env, "SAMPLER_NICE", 10, 0, 19, int)
+        self.exit_without_runner = env.get("SAMPLER_EXIT_WITHOUT_RUNNER", "") == "1"
+        self.procroot = env.get("SAMPLER_PROCROOT", "/proc")
+        self.max_ticks = _number(env, "SAMPLER_FINE_MAX_TICKS", 0, 0, 10**9, int)
+        self.pidfile = os.path.join(self.rundir, "host-sampler-fine.pid")
+        self.stopfile = os.path.join(self.rundir, "host-sampler-fine-stop")
+
+
+class Proc:
+    """Re-reads files under the proc root through descriptors held open."""
+
+    def __init__(self, root):
+        self.root = root
+        self.fds = {}
+
+    def read(self, rel):
+        fd = self.fds.get(rel)
+        try:
+            if fd is None:
+                fd = os.open(os.path.join(self.root, rel), os.O_RDONLY)
+                self.fds[rel] = fd
+            return os.pread(fd, 1 << 20, 0)
+        except OSError:
+            if fd is not None:
+                self.fds.pop(rel, None)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            return None
+
+    def pids(self):
+        try:
+            return [n for n in os.listdir(self.root) if n.isdigit()]
+        except OSError:
+            return []
+
+    def comm(self, pid):
+        # opened and closed, not held: a scan touches every process
+        try:
+            fd = os.open(os.path.join(self.root, pid, "comm"), os.O_RDONLY)
+        except OSError:
+            return ""
+        try:
+            return os.pread(fd, 64, 0).decode("ascii", "replace").strip()
+        except OSError:
+            return ""
+        finally:
+            os.close(fd)
+
+
+def parse_stat(b):
+    """{cpu: [user, nice, system, idle, iowait, irq, softirq, steal]}"""
+    cpus = {}
+    for line in b.split(b"\n"):
+        if not line.startswith(b"cpu"):
+            break
+        parts = line.split()
+        if parts[0] == b"cpu":
+            continue
+        try:
+            n = int(parts[0][3:])
+            v = [int(x) for x in parts[1:9]]
+        except ValueError:
+            continue
+        v += [0] * (8 - len(v))
+        cpus[n] = v
+    return cpus
+
+
+def parse_softirq_row(b, row):
+    """{cpu: count} for one row (NET_RX) of /proc/softirqs"""
+    lines = b.split(b"\n")
+    if not lines:
+        return {}
+    cols = []
+    for name in lines[0].split():
+        try:
+            cols.append(int(name[3:]))
+        except ValueError:
+            cols.append(-1)
+    want = row.encode() + b":"
+    for line in lines[1:]:
+        s = line.strip()
+        if s.startswith(want):
+            out = {}
+            for cpu, v in zip(cols, s[len(want):].split()):
+                try:
+                    out[cpu] = int(v)
+                except ValueError:
+                    pass
+            return out
+    return {}
+
+
+def parse_loadavg(b):
+    parts = b.split()
+    try:
+        return float(parts[0]), int(parts[3].split(b"/")[0])
+    except (IndexError, ValueError):
+        return 0.0, 0
+
+
+def parse_psi_total(b):
+    for line in b.split(b"\n"):
+        if line.startswith(b"some"):
+            for tok in line.split():
+                if tok.startswith(b"total="):
+                    try:
+                        return int(tok[6:])
+                    except ValueError:
+                        return None
+    return None
+
+
+def parse_schedstat_run_ns(b):
+    try:
+        return int(b.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+class Series:
+    """An append-only text file that rotates to <path>.1 past maxbytes."""
+
+    def __init__(self, path, maxbytes, header):
+        self.path = path
+        self.maxbytes = maxbytes
+        self.header = header
+        self.size = 0
+        self.rotations = 0
+        self.total = 0
+        self.f = None
+        self._open("w")
+
+    def _open(self, mode):
+        self.f = open(self.path, mode, buffering=1 << 16)
+        self.size = 0
+        self._raw(self.header)
+        self.f.flush()  # the header at once: it is what says the sampler is up
+
+    def _raw(self, line):
+        self.f.write(line)
+        self.size += len(line)
+        self.total += len(line)
+
+    def write(self, line):
+        if self.size + len(line) > self.maxbytes:
+            self.f.close()
+            os.replace(self.path, self.path + ".1")
+            self.rotations += 1
+            self._open("w")
+        self._raw(line)
+
+    def flush(self):
+        self.f.flush()
+
+    def close(self):
+        try:
+            self.f.close()
+        except OSError:
+            pass
+
+
+class Events:
+    """The event log: capped, never rotated, so it covers the whole run."""
+
+    def __init__(self, path, maxbytes, header):
+        self.f = open(path, "w", buffering=1 << 12)
+        self.maxbytes = maxbytes
+        self.size = 0
+        self.full = False
+        self.count = 0
+        self.f.write(header)
+        self.f.flush()
+        self.size += len(header)
+
+    def write(self, line):
+        if self.full:
+            return
+        if self.size + len(line) > self.maxbytes:
+            self.full = True
+            self.f.write("# event log full: later events are not recorded\n")
+            return
+        self.f.write(line)
+        self.size += len(line)
+        self.count += 1
+
+    def flush(self):
+        self.f.flush()
+
+    def close(self):
+        try:
+            self.f.close()
+        except OSError:
+            pass
+
+
+class Sampler:
+    def __init__(self, cfg, host="unknown", wall=time.time, mono=time.monotonic, cpu_time=time.process_time):
+        self.cfg = cfg
+        self.proc = Proc(cfg.procroot)
+        self.wall = wall
+        self.mono = mono
+        self.cpu_time = cpu_time
+        self.tick_hz = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
+        os.makedirs(cfg.outdir, exist_ok=True)
+        header = "# fine-sampler format=%d host=%s tag=%s interval_s=%s duration_s=%d user_hz=%d\n" % (
+            FORMAT, host, cfg.tag, repr(cfg.interval), cfg.duration, int(self.tick_hz))
+        self.series = Series(os.path.join(cfg.outdir, "fine.log"), cfg.maxbytes, header)
+        self.events = Events(os.path.join(cfg.outdir, "fine-events.log"), cfg.events_maxbytes, header)
+        self.statspath = os.path.join(cfg.outdir, "fine.stats")
+        self.ksoftirqd = self._find_ksoftirqd()
+        self.prev = None
+        self.prev_mono = None
+        self.hist = collections.defaultdict(collections.deque)
+        self.last_event = {}
+        self.intervals = collections.deque(maxlen=20000)
+        self.max_dt = 0.0
+        self.ticks = 0
+        self.skipped = 0
+        self.starves = 0
+        self.gaps = 0
+        self.start_mono = self.mono()
+        self.start_cpu = self.cpu_time()
+        self.last_flush = self.start_mono
+        self.last_stats = self.start_mono
+        self.seen_runner = False
+        self.runner_absent_since = None
+        self.last_runner_check = None
+        self.exit_reason = "running"
+
+    def _find_ksoftirqd(self):
+        out = {}
+        for pid in self.proc.pids():
+            c = self.proc.comm(pid)
+            if c.startswith("ksoftirqd/"):
+                try:
+                    out[int(c[10:])] = os.path.join(pid, "schedstat")
+                except ValueError:
+                    pass
+        return out
+
+    def snapshot(self):
+        stat = self.proc.read("stat")
+        if stat is None:
+            return None
+        snap = {"cpu": parse_stat(stat), "rx": {}, "kd": {}, "psi": None, "l1": 0.0, "run": 0}
+        b = self.proc.read("softirqs")
+        if b is not None:
+            snap["rx"] = parse_softirq_row(b, "NET_RX")
+        for cpu, rel in self.ksoftirqd.items():
+            b = self.proc.read(rel)
+            if b is not None:
+                v = parse_schedstat_run_ns(b)
+                if v is not None:
+                    snap["kd"][cpu] = v
+        b = self.proc.read("pressure/cpu")
+        if b is not None:
+            snap["psi"] = parse_psi_total(b)
+        b = self.proc.read("loadavg")
+        if b is not None:
+            snap["l1"], snap["run"] = parse_loadavg(b)
+        return snap
+
+    def tick(self):
+        mono, wall = self.mono(), self.wall()
+        snap = self.snapshot()
+        if snap is None:
+            return
+        prev, prev_mono = self.prev, self.prev_mono
+        self.prev, self.prev_mono = snap, mono
+        if prev is None:
+            self._starve_history(mono, snap)
+            return
+        dt = mono - prev_mono
+        self.ticks += 1
+        self.intervals.append(dt)
+        self.max_dt = max(self.max_dt, dt)
+        if dt > max(0.25, 3 * self.cfg.interval):
+            self.gaps += 1
+            self.events.write("%.3f gap dt_ms=%.1f expected_ms=%.1f\n" % (wall, dt * 1000, self.cfg.interval * 1000))
+        fields = []
+        for cpu in sorted(snap["cpu"]):
+            cur, old = snap["cpu"][cpu], prev["cpu"].get(cpu)
+            if old is None:
+                continue
+            d = [max(0, a - b) for a, b in zip(cur, old)]
+            u, irq, sirq, steal = d[0] + d[1] + d[2], d[5], d[6], d[7]
+            rx = max(0, snap["rx"].get(cpu, 0) - prev["rx"].get(cpu, 0))
+            kd = 0
+            if cpu in snap["kd"] and cpu in prev["kd"]:
+                kd = max(0, snap["kd"][cpu] - prev["kd"][cpu]) // 1000000
+            if u or irq or sirq or steal or rx or kd:
+                fields.append("c%d=%d,%d,%d,%d,%d,%d" % (cpu, u, irq, sirq, steal, rx, kd))
+        psi = 0
+        if snap["psi"] is not None and prev["psi"] is not None:
+            psi = max(0, snap["psi"] - prev["psi"])
+        self.series.write("%.3f %.1f run=%d l1=%.2f psi=%d | %s\n" % (
+            wall, dt * 1000, snap["run"], snap["l1"], psi, " ".join(fields)))
+        self._starve(mono, wall, snap)
+        if mono - self.last_flush >= FLUSH_EVERY_S:
+            self.series.flush()
+            self.events.flush()
+            self.last_flush = mono
+        if mono - self.last_stats >= STATS_EVERY_S:
+            self.write_stats(final=False)
+
+    def _starve_history(self, mono, snap):
+        for cpu, v in snap["cpu"].items():
+            h = self.hist[cpu]
+            h.append((mono, sum(v), v[0] + v[1] + v[2], v[6]))
+
+    def _starve(self, mono, wall, snap):
+        for cpu, v in snap["cpu"].items():
+            h = self.hist[cpu]
+            h.append((mono, sum(v), v[0] + v[1] + v[2], v[6]))
+            while len(h) > 2 and mono - h[1][0] >= 2.0:
+                h.popleft()
+            # the oldest entry that is at least SIG_WINDOW seconds back
+            base = None
+            for e in h:
+                if mono - e[0] >= SIG_WINDOW:
+                    base = e
+                else:
+                    break
+            if base is None:
+                continue
+            total = h[-1][1] - base[1]
+            if total <= 0:
+                continue
+            sirq_pct = 100.0 * (h[-1][3] - base[3]) / total
+            usr_pct = 100.0 * (h[-1][2] - base[2]) / total
+            if sirq_pct >= SIG_SIRQ and usr_pct <= SIG_USRSYS:
+                self.starves += 1
+                if wall - self.last_event.get(cpu, -1e9) >= EVENT_RATE_S:
+                    self.last_event[cpu] = wall
+                    self.events.write("%.3f starve cpu=%d softirq_pct=%.1f usrsys_pct=%.1f window_s=%.2f\n" % (
+                        wall, cpu, sirq_pct, usr_pct, mono - base[0]))
+
+    def runner_gone(self, mono):
+        """True once a Runner.Listener that was seen has been absent for RUNNER_ABSENT_S."""
+        if not self.cfg.exit_without_runner:
+            return False
+        if self.last_runner_check is not None and mono - self.last_runner_check < RUNNER_CHECK_S:
+            return False
+        self.last_runner_check = mono
+        present = any(self.proc.comm(p) == RUNNER_COMM for p in self.proc.pids())
+        if present:
+            self.seen_runner = True
+            self.runner_absent_since = None
+            return False
+        if not self.seen_runner:
+            return False
+        if self.runner_absent_since is None:
+            self.runner_absent_since = mono
+        return mono - self.runner_absent_since >= RUNNER_ABSENT_S
+
+    def write_stats(self, final):
+        now = self.mono()
+        self.last_stats = now
+        span = max(now - self.start_mono, 1e-9)
+        s = sorted(self.intervals)
+
+        def pct(q):
+            return s[int(q * (len(s) - 1))] * 1000 if s else 0.0
+
+        line = ("ticks=%d span_s=%.2f achieved_hz=%.3f target_hz=%.3f interval_ms median=%.1f p99=%.1f max=%.1f "
+                "skipped_deadlines=%d gap_events=%d starve_ticks=%d events=%d self_cpu_pct=%.3f "
+                "bytes_written=%d rotations=%d final=%d exit_reason=%s\n") % (
+            self.ticks, span, self.ticks / span, 1.0 / self.cfg.interval, pct(0.5), pct(0.99),
+            self.max_dt * 1000, self.skipped, self.gaps, self.starves, self.events.count,
+            100.0 * (self.cpu_time() - self.start_cpu) / span, self.series.total, self.series.rotations,
+            1 if final else 0, self.exit_reason)
+        tmp = self.statspath + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(line)
+        os.replace(tmp, self.statspath)
+
+    def close(self):
+        self.series.flush()
+        self.events.flush()
+        self.write_stats(final=True)
+        self.series.close()
+        self.events.close()
+        for fd in self.proc.fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def run(self, sleep=time.sleep):
+        """Deadline-scheduled loop. Returns the reason it stopped."""
+        cfg = self.cfg
+        deadline = self.wall() + cfg.duration
+        nxt = self.mono()
+        while True:
+            if os.path.exists(cfg.stopfile):
+                return "stop_requested"
+            if self.wall() >= deadline:
+                return "deadline"
+            if cfg.max_ticks and self.ticks >= cfg.max_ticks:
+                return "max_ticks"
+            if self.runner_gone(self.mono()):
+                return "runner_gone"
+            now = self.mono()
+            if now < nxt:
+                sleep(nxt - now)
+            self.tick()
+            nxt += cfg.interval
+            now = self.mono()
+            if now >= nxt + cfg.interval:
+                self.skipped += int((now - nxt) / cfg.interval)
+                nxt = now + cfg.interval
+
+
+def takeover(cfg, proc_alive, sleep=time.sleep, waited_max=15):
+    """Ask an older instance to finish (sentinel file, never a signal) and wait."""
+    try:
+        with open(cfg.pidfile) as f:
+            old = f.read().strip()
+    except OSError:
+        old = ""
+    if old.isdigit() and old != str(os.getpid()) and proc_alive(old):
+        open(cfg.stopfile, "w").close()
+        waited = 0.0
+        while proc_alive(old) and waited < waited_max:
+            sleep(0.5)
+            waited += 0.5
+    try:
+        os.remove(cfg.stopfile)
+    except OSError:
+        pass
+
+
+def main(env=os.environ):
+    try:
+        cfg = Config(env)
+    except ConfigError as e:
+        sys.stderr.write("celeris-host-sampler-fine: %s\n" % e)
+        return 2
+    os.makedirs(cfg.rundir, exist_ok=True)
+    takeover(cfg, lambda pid: os.path.isdir(os.path.join(cfg.procroot, pid)))
+    try:
+        os.nice(cfg.nice)  # only ever lowers the priority
+    except OSError:
+        pass
+    with open(cfg.pidfile, "w") as f:
+        f.write("%d\n" % os.getpid())
+    try:
+        host = os.uname().nodename
+    except AttributeError:
+        host = "unknown"
+    s = Sampler(cfg, host=host)
+    try:
+        s.exit_reason = s.run()
+    finally:
+        if s.exit_reason == "running":
+            s.exit_reason = "error"
+        s.close()
+        try:
+            with open(cfg.pidfile) as f:
+                mine = f.read().strip() == str(os.getpid())
+            if mine:
+                os.remove(cfg.pidfile)
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 )
 
@@ -72,19 +73,106 @@ func samplerTag() string {
 	return "local"
 }
 
-// runSamplerPlaybook is the shared body of the two targets.
-func runSamplerPlaybook(extra ...string) error {
-	if err := requireAnsible(); err != nil {
-		return err
+// Bounds of the two cadences. SAMPLER_INTERVAL is the full sample of the shell
+// sampler (about 24 ms of CPU each: ansible/host-sampler.yml); SAMPLER_FINE_INTERVAL
+// is the lean series of the python sampler (ops/host-sampler/celeris-host-sampler-fine),
+// which is what can see a 1-3 s event. The fine floor is 0.05 s (20 Hz): below it
+// the sampler's own wake-ups become the load. The ceiling is 10 s so a stop
+// request, a file the sampler polls every tick, lands inside the 30 s the stop
+// task waits. Both are used in an ansible --extra-vars string, which splits on
+// spaces, so only digits and one decimal point reach it.
+const (
+	samplerMaxInterval = 3600
+	samplerFineMin     = 0.05
+	samplerFineMax     = 10.0
+)
+
+var (
+	samplerIntRE  = regexp.MustCompile(`^[0-9]{1,4}$`)
+	samplerFineRE = regexp.MustCompile(`^[0-9]{1,2}(\.[0-9]{1,3})?$`)
+)
+
+// samplerInterval resolves SAMPLER_INTERVAL, the full sample's cadence: a
+// positive integer of seconds, at most an hour. Unset is 60, which the race and
+// weekend tiers rely on.
+func samplerInterval() (string, error) {
+	v := envOrDefault("SAMPLER_INTERVAL", "60")
+	n, err := strconv.Atoi(v)
+	if !samplerIntRE.MatchString(v) || err != nil || n < 1 || n > samplerMaxInterval {
+		return "", fmt.Errorf("SAMPLER_INTERVAL must be an integer of 1 to %d seconds (got %q)", samplerMaxInterval, v)
 	}
+	return strconv.Itoa(n), nil
+}
+
+// samplerFineInterval resolves SAMPLER_FINE_INTERVAL: empty (the default: no
+// fine series, the sampler is exactly the 60 s one) or seconds from 0.05 to 10
+// with at most three decimals. The result is normalised ("1.0" -> "1").
+func samplerFineInterval() (string, error) {
+	v := os.Getenv("SAMPLER_FINE_INTERVAL")
+	if v == "" {
+		return "", nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if !samplerFineRE.MatchString(v) || err != nil || f < samplerFineMin || f > samplerFineMax {
+		return "", fmt.Errorf("SAMPLER_FINE_INTERVAL must be %g to %g seconds with at most 3 decimals (got %q)", samplerFineMin, samplerFineMax, v)
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64), nil
+}
+
+// samplerStartVars is the --extra-vars of a start. The fine cadence is passed
+// only when asked for, so a start without it is what it always was.
+func samplerStartVars() ([]string, error) {
+	secs, err := samplerDurationSeconds()
+	if err != nil {
+		return nil, err
+	}
+	interval, err := samplerInterval()
+	if err != nil {
+		return nil, err
+	}
+	fine, err := samplerFineInterval()
+	if err != nil {
+		return nil, err
+	}
+	vars := []string{
+		"sampler_action=start",
+		"sampler_interval=" + interval,
+		"sampler_duration_seconds=" + strconv.Itoa(secs),
+		"sampler_tag=" + samplerTag(),
+	}
+	if fine != "" {
+		vars = append(vars, "sampler_fine_interval="+fine)
+	}
+	return vars, nil
+}
+
+// samplerPlaybookArgs is the ansible-playbook command line for the sampler
+// playbook. A bench scoped to one arch (BENCH_TARGET=msr1|msa2-server, a
+// job-level variable of the bench tier) is limited to the hosts it uses, like
+// Deploy and Bench: without it a target=msr1 bench would open SSH to
+// msa2-server, which may be down for unrelated work, and the best-effort
+// sampler would stall on it (mage_helpers.go clusterLimitForTarget). The race
+// and weekend tiers set no BENCH_TARGET and keep every host.
+func samplerPlaybookArgs(extra ...string) []string {
 	args := []string{"-i", "inventory.yml", samplerPlaybook}
+	if limit := clusterLimitForTarget(os.Getenv("BENCH_TARGET")); limit != "" {
+		args = append(args, "--limit", limit)
+	}
 	for _, e := range extra {
 		args = append(args, "--extra-vars", e)
 	}
 	if os.Getenv("CLUSTER_USE_LAN") == "1" {
 		args = append(args, "--extra-vars", "use_lan=true")
 	}
-	cmd := exec.Command("ansible-playbook", args...)
+	return args
+}
+
+// runSamplerPlaybook is the shared body of the two targets.
+func runSamplerPlaybook(extra ...string) error {
+	if err := requireAnsible(); err != nil {
+		return err
+	}
+	cmd := exec.Command("ansible-playbook", samplerPlaybookArgs(extra...)...)
 	cmd.Dir = ansibleDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -97,33 +185,37 @@ func runSamplerPlaybook(extra ...string) error {
 // Env knobs:
 //
 //	SAMPLER_DURATION=   explicit lifetime; otherwise SOAK_DURATION + 2h
-//	SAMPLER_INTERVAL=60 seconds between samples
+//	SAMPLER_INTERVAL=60 seconds between full samples (integer, 1 to 3600)
+//	SAMPLER_FINE_INTERVAL=  seconds between ticks of the lean fine series
+//	                    (0.05 to 10, unset = none); see celeris-host-sampler-fine
 //	SAMPLER_TAG=        label recorded in every line (defaults to the run id)
 //	CLUSTER_USE_LAN=1   LAN fabric instead of Tailscale
+//	BENCH_TARGET=       msr1 | msa2-server limits the playbook to that host
+//	                    and the loadgen (as Deploy does); both or unset = all
 //
 // Starting it is best-effort by design: the playbook warns and continues when
 // a host will not take it. Instrumentation that can fail a 24 h soak is worse
 // than no instrumentation.
 func HostSamplerStart() error {
-	secs, err := samplerDurationSeconds()
+	vars, err := samplerStartVars()
 	if err != nil {
 		return err
 	}
-	interval := envOrDefault("SAMPLER_INTERVAL", "60")
-	if n, err := strconv.Atoi(interval); err != nil || n < 1 {
-		return fmt.Errorf("SAMPLER_INTERVAL must be a positive integer (got %q)", interval)
-	}
-	tag := samplerTag()
+	fine, _ := samplerFineInterval()
+	interval, _ := samplerInterval()
+	secs, _ := samplerDurationSeconds()
 	fmt.Printf("\n=== HostSamplerStart ===\n")
 	fmt.Printf("  interval:  %ss\n", interval)
+	if fine != "" {
+		fmt.Printf("  fine:      %ss (lean series, nice 10; see ansible/host-sampler.yml for its cost)\n", fine)
+	}
 	fmt.Printf("  lifetime:  %ds (self-terminating hard deadline)\n", secs)
-	fmt.Printf("  tag:       %s\n\n", tag)
-	return runSamplerPlaybook(
-		"sampler_action=start",
-		"sampler_interval="+interval,
-		"sampler_duration_seconds="+strconv.Itoa(secs),
-		"sampler_tag="+tag,
-	)
+	fmt.Printf("  tag:       %s\n", samplerTag())
+	if limit := clusterLimitForTarget(os.Getenv("BENCH_TARGET")); limit != "" {
+		fmt.Printf("  hosts:     %s (BENCH_TARGET scoped)\n", limit)
+	}
+	fmt.Println()
+	return runSamplerPlaybook(vars...)
 }
 
 // HostSamplerStop asks the sampler to finish and fetches its series into
@@ -141,6 +233,7 @@ func HostSamplerStart() error {
 //	SAMPLER_FETCH_DIR=  where to place the fetched series
 //	                    (default results/host-sampler)
 //	CLUSTER_USE_LAN=1   LAN fabric instead of Tailscale
+//	BENCH_TARGET=       as for HostSamplerStart
 func HostSamplerStop() error {
 	fetch := envOrDefault("SAMPLER_FETCH_DIR", filepath.Join("results", "host-sampler"))
 	abs, err := filepath.Abs(fetch)
