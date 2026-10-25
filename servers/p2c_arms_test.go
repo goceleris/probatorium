@@ -13,21 +13,21 @@ import (
 	"github.com/goceleris/probatorium/servers"
 )
 
-// THROWAWAY (ab/p2c-io512-discriminate-38, not for merge). Pins the layout of the P2c run (PREREG-P2C.md; user decision U-13, 2026-10-25): the exact (scenario, column) pairs the one
-// dispatch glob selects (32 columns, one cell each), four arms (main = celeris main 713b40d = servers/celeris, unmodified; noc8 = the same 713b40d with the Listen thread narrowed to
-// every CPU but 8 = servers/celeris_noc8; nobp = the same 713b40d with the busy-poll socket options disabled by a one-line patch of a pinned module copy = servers/celeris_nobp;
-// base = celeris v1.5.11 = servers/celeris_v1511, a reference arm), the single vector position (the standing CPU 1), the seeded Williams rotation, and that the noc8 and nobp
-// modules are the main module plus the arm and nothing else.
+// THROWAWAY (ab/p2c-io512-discriminate-38, not for merge). Pins the layout of the P2c run (PREREG-P2C.md; user decision U-13, 2026-10-25; n = 16 per arm and no base arm by the
+// coordinator's answers before any data): the exact (scenario, column) pairs the one dispatch glob selects (48 columns, one cell each), three arms (main = celeris main 713b40d =
+// servers/celeris, unmodified; noc8 = the same 713b40d with the Listen thread narrowed to every CPU but 8 = servers/celeris_noc8; nobp = the same 713b40d with the busy-poll socket
+// options disabled by a one-line patch of a pinned module copy = servers/celeris_nobp), the single vector position (the standing CPU 1), the seeded rotation, and that the noc8 and
+// nobp modules are the main module plus the arm and nothing else.
 const (
 	p2cGlob = "get-simple-512c/pinp38c-*-io512"
-	p2cWant = 32 // 8 reps x 4 arms
+	p2cWant = 48 // 16 reps x 3 arms
 )
 
 var (
-	p2cArms = []string{"base", "main", "noc8", "nobp"}
-	p2cMod  = map[string]string{"base": "celeris_v1511", "main": "celeris", "noc8": "celeris_noc8", "nobp": "celeris_nobp"}
-	p2cPin  = map[string]string{"base": p2PinBase, "main": p2PinMain, "noc8": p2PinMain, "nobp": p2PinMain}
-	p2cFW   = map[string]string{"base": "celeris-pp-base", "main": "celeris-pp-main", "noc8": "celeris-pp-noc8", "nobp": "celeris-pp-nobp"}
+	p2cArms = []string{"main", "noc8", "nobp"}
+	p2cMod  = map[string]string{"main": "celeris", "noc8": "celeris_noc8", "nobp": "celeris_nobp"}
+	p2cPin  = map[string]string{"main": p2PinMain, "noc8": p2PinMain, "nobp": p2PinMain}
+	p2cFW   = map[string]string{"main": "celeris-pp-main", "noc8": "celeris-pp-noc8", "nobp": "celeris-pp-nobp"}
 )
 
 type p2cCol struct {
@@ -37,7 +37,7 @@ type p2cCol struct {
 
 func p2cCols(t *testing.T) []p2cCol {
 	t.Helper()
-	re := regexp.MustCompile(`^pinp38c-(\d{3})-r(\d)-(base|main|noc8|nobp)-io512$`)
+	re := regexp.MustCompile(`^pinp38c-(\d{3})-r(\d+)-(main|noc8|nobp)-io512$`)
 	var cols []p2cCol
 	for name := range servers.Registry {
 		if !strings.HasPrefix(name, "pinp38c-") {
@@ -45,7 +45,7 @@ func p2cCols(t *testing.T) []p2cCol {
 		}
 		m := re.FindStringSubmatch(name)
 		if m == nil {
-			t.Errorf("column %s does not match the naming pinp38c-<seq>-r<rep>-<base|main|noc8|nobp>-io512", name)
+			t.Errorf("column %s does not match the naming pinp38c-<seq>-r<rep>-<main|noc8|nobp>-io512", name)
 			continue
 		}
 		seq, _ := strconv.Atoi(m[1])
@@ -87,7 +87,7 @@ func TestP2cLayout(t *testing.T) {
 	if len(cols) != p2cWant {
 		t.Fatalf("%d P2c columns, want %d", len(cols), p2cWant)
 	}
-	const reps, k = 8, 4
+	const reps, k = 16, 3
 	var sched [][]string
 	for i, c := range cols { // sorted name order is the execution order
 		if c.seq != 1+i {
@@ -104,7 +104,7 @@ func TestP2cLayout(t *testing.T) {
 	if len(sched) != reps {
 		t.Fatalf("%d reps, want %d", len(sched), reps)
 	}
-	for r, s := range sched { // every rep holds the four arms once
+	for r, s := range sched { // every rep holds the three arms once
 		c, w := slices.Clone(s), slices.Clone(p2cArms)
 		slices.Sort(c)
 		slices.Sort(w)
@@ -112,7 +112,17 @@ func TestP2cLayout(t *testing.T) {
 			t.Errorf("rep %d holds %v, want one slot per arm %v", r+1, s, p2cArms)
 		}
 	}
-	// every arm holds every slot exactly twice; leads twice; is last twice
+	// reps 1-6 and reps 7-12 are each the six distinct permutations
+	for b, blk := range [][][]string{sched[:6], sched[6:12]} {
+		seen := map[string]bool{}
+		for _, s := range blk {
+			seen[strings.Join(s, ",")] = true
+		}
+		if len(seen) != 6 {
+			t.Errorf("block %d (reps %d-%d) holds %d distinct permutations, want all 6", b+1, 6*b+1, 6*b+6, len(seen))
+		}
+	}
+	// every arm holds every slot 5 or 6 times of 16, leads 5 or 6, is last 5 or 6
 	for pos := 0; pos < k; pos++ {
 		for _, a := range p2cArms {
 			n := 0
@@ -121,25 +131,8 @@ func TestP2cLayout(t *testing.T) {
 					n++
 				}
 			}
-			if n != 2 {
-				t.Errorf("arm %s holds slot %d in %d of 8 reps, want 2", a, pos+1, n)
-			}
-		}
-	}
-	// each half (reps 1-4, reps 5-8) is a Williams design: every ordered pair of arms is adjacent exactly once
-	for h, half := range [][][]string{sched[:4], sched[4:]} {
-		adj := map[[2]string]int{}
-		for _, s := range half {
-			for i := 0; i+1 < k; i++ {
-				adj[[2]string{s[i], s[i+1]}]++
-			}
-		}
-		if len(adj) != k*(k-1) {
-			t.Errorf("half %d: %d distinct ordered adjacent pairs, want %d", h+1, len(adj), k*(k-1))
-		}
-		for p, n := range adj {
-			if n != 1 {
-				t.Errorf("half %d: the pair %v is adjacent %d times, want 1", h+1, p, n)
+			if n != 5 && n != 6 {
+				t.Errorf("arm %s holds slot %d in %d of 16 reps, want 5 or 6", a, pos+1, n)
 			}
 		}
 	}
