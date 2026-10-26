@@ -331,6 +331,30 @@ class RetentionTest(Base):
         self.assertEqual(len(data), 6 * 360)
         self.assertTrue(data[0].startswith("1761400030.000 "), data[0])
 
+    def test_the_last_partial_minute_is_written_at_exit(self):
+        s = self.run_long(1.0)  # starts 20 s into a minute and ends mid-minute
+        minute = [x for x in self.lines("fine-minute.log") if not x.startswith("#")]
+        last_tick = 1761400020.0 + 1.0 * 3600
+        self.assertEqual(int(minute[-1].split()[0]), int(last_tick // 60 * 60), minute[-1])
+        self.assertEqual(self.lines("fine-minute.log")[-1], minute[-1], "no drop line: nothing was lost")
+
+    def test_the_newest_closed_generation_is_never_dropped(self):
+        fp = FakeProc(self.proc, ncpu=1)
+        os.makedirs(self.out)
+        dropped = []
+        ser = fine.Series(self.out, 65536, 1, "# h\n", lambda name, size: dropped.append(name))
+        for i in range(20000):
+            ser.write("%d %s\n" % (i, "x" * (i % 37)))
+        ser.close()
+        gens = self.generations()
+        self.assertTrue(len(gens) >= 1 and len(dropped) >= 1, (gens, dropped))
+        self.assertEqual(gens[-1], "fine.%05d.log.z" % (ser.seq - 1), "the newest generation survives a cap smaller than itself")
+        self.assertNotIn(gens[-1], dropped)
+
+    def test_the_default_cap_holds_the_longest_deadline(self):
+        # 111 h at 1 s on 32 CPUs, 791 B a tick, compressed 2.1x (high entropy): 148 MB
+        self.assertEqual(fine.Config({"SAMPLER_FINE_INTERVAL": "1"}).total_maxbytes, 256 * 1024 * 1024)
+
     def test_the_minute_log_is_capped_with_a_drop_counter(self):
         s = self.run_long(2, SAMPLER_FINE_MINUTE_MAXBYTES="4096")
         self.assertGreater(s.minutes.out.dropped, 0)
@@ -533,8 +557,9 @@ class EventsTest(Base):
         last = self.lines("fine-events.log")[-1]
         self.assertRegex(last, r"^# events_dropped=\d+$")
         n = int(last.split("=")[1])
-        written = len([x for x in self.lines("fine-events.log") if " gap " in x])
-        self.assertEqual(written + n, 400, "every gap is either written or counted")
+        written = len([x for x in self.lines("fine-events.log") if not x.startswith("#")])
+        # 400 gaps plus the generation_closed event of the final compression: each written or counted
+        self.assertEqual(written + n, 400 + 1, "every event is either written or counted")
         self.assertIn("events_dropped=%d" % n, self.stats())
         self.assertFalse(os.path.exists(os.path.join(self.out, "fine-events.log.1")))
 
@@ -759,6 +784,51 @@ class EndToEndTest(Base):
                 self.assertNotIn("OLDRUN", open(p).read(), n)
         self.assertTrue(os.path.exists(os.path.join(self.out, "notes.txt")), "only its own files are removed")
         self.assertFalse(os.path.exists(os.path.join(self.out, "fine.00002.log.z.tmp")))
+
+
+class GenerationEventTest(Base):
+    def test_closing_a_generation_is_an_event_so_its_pause_is_not_read_as_starvation(self):
+        fp = FakeProc(self.proc)
+        clock = Clock()
+        s = fine.Sampler(fine.Config(self.env(SAMPLER_FINE_MAXBYTES="65536")), wall=clock.wall, mono=clock.mono)
+        s.tick()
+        for _ in range(3000):
+            clock.advance(0.05)
+            fp.cpu[0][0] += 3
+            fp.flush()
+            s.tick()
+        s.close()
+        ev = [x for x in self.lines("fine-events.log") if " generation_closed " in x]
+        self.assertEqual(len(ev), len(self.generations()), ev)
+        self.assertRegex(ev[0], r" generation_closed file=fine\.00000\.log\.z bytes=\d+ ms=\d+\.\d$")
+
+
+class TakeoverRefusalTest(Base):
+    def test_a_new_instance_does_not_start_over_one_that_is_still_closing(self):
+        cfg = fine.Config(self.env())
+        os.makedirs(os.path.join(self.proc, "4321"))
+        with open(cfg.pidfile, "w") as f:
+            f.write("4321\n")
+        self.assertFalse(fine.takeover(cfg, lambda pid: True, sleep=lambda d: None, waited_max=2))
+
+    def test_main_leaves_the_old_runs_files_alone_and_exits_3(self):
+        FakeProc(self.proc, ncpu=1)
+        os.makedirs(os.path.join(self.proc, str(os.getpid())), exist_ok=True)  # the old instance: this very process
+        os.makedirs(self.out)
+        with open(os.path.join(self.out, "fine-run.txt"), "w") as f:
+            f.write("tag=bench-OLD host=x\n")
+        # the old instance is a live pid named in the pid file (a sibling process that sleeps)
+        old = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"])
+        self.addCleanup(old.wait)
+        self.addCleanup(old.terminate)
+        os.makedirs(os.path.join(self.proc, str(old.pid)), exist_ok=True)
+        with open(os.path.join(self.run_dir, "host-sampler-fine.pid"), "w") as f:
+            f.write("%d\n" % old.pid)
+        env = {"PATH": os.environ.get("PATH", ""), **self.env(SAMPLER_FINE_TAKEOVER_WAIT="1")}
+        r = subprocess.run([sys.executable, "-I", SCRIPT], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("still closing", r.stderr)
+        self.assertEqual(open(os.path.join(self.out, "fine-run.txt")).read(), "tag=bench-OLD host=x\n")
 
 
 class RobustnessTest2(Base):

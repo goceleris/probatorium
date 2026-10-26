@@ -169,6 +169,45 @@
       failed_when: false
       when: forensics.stdout is defined
 
+    # The per-tick generations, for a sampler nobody stopped. When the runner
+    # dies the bench tier's stop step never runs, and the next fine start
+    # deletes these files: this play is then the only collector. A sampler that
+    # was stopped (exit_reason=stop_requested: by the stop step, which fetched
+    # it, or by a later tier's start) is not fetched again, so a leftover series
+    # does not ride into every later tier's artifact. Bounded: the newest 24
+    # generations (16 MiB of text each, 2-5x smaller) and the open fine.log.
+    - name: Is the fine sampler already stopped
+      ansible.builtin.shell: grep -q "exit_reason=stop_requested" "{{ sampler_fine_dir }}/fine.stats"
+      args:
+        executable: /bin/bash
+      register: sampler_fine_stopped
+      changed_when: false
+      failed_when: false
+      when: forensics.stdout is defined
+
+    - name: List the fine sampler generations
+      ansible.builtin.find:
+        paths: "{{ sampler_fine_dir }}"
+        patterns: "fine.*.log.z"
+      register: sampler_fine_gens
+      failed_when: false
+      when:
+        - forensics.stdout is defined
+        - sampler_fine_stopped.rc | default(0) != 0
+
+    - name: Fetch the fine sampler per-tick series of a sampler nobody stopped
+      ansible.builtin.fetch:
+        src: "{{ sampler_fine_dir }}/{{ item }}"
+        dest: "{{ forensics_local_dir }}/{{ inventory_hostname }}/fine/{{ item }}"
+        flat: true
+        fail_on_missing: false
+        validate_checksum: false
+      loop: "{{ ['fine.log'] + (sampler_fine_gens.files | default([]) | sort(attribute='mtime') | reverse | list)[:24] | map(attribute='path') | map('basename') | list }}"
+      failed_when: false
+      when:
+        - forensics.stdout is defined
+        - sampler_fine_stopped.rc | default(0) != 0
+
     # Past this point a host that never answered is allowed back into the
     # play, so that its silence is RECORDED rather than just skipped. An
     # unreachable host is not a gap in the evidence; it is evidence.

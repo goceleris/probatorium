@@ -59,8 +59,9 @@
 # ksoftirqd visible (--pid=host, 8 CPUs, contended) the review measured 0.051 % at 1 s
 # and 0.711 % at 20 Hz, and 4 + nCPU reads a tick extrapolates to about 0.1-0.2 %
 # at 1 s and 1.5-2 % at 20 Hz on 32 CPUs. fine.stats of every run reports the real
-# figure (self_cpu_pct). 10-13 MiB of RSS, 9 descriptors. The text is about 45 bytes
-# a tick plus 18-23 per CPU that did anything; closed generations compress about 5x.
+# figure (self_cpu_pct). 10-13 MiB of RSS and 4 + nCPU + 3 descriptors (about 19 on msr1,
+# 39 on 32 CPUs). The text is about 45 bytes a tick plus 18-23 per CPU that did anything;
+# closed generations compress 2-5x (2.1-2.4x with high-entropy counters, 5x on a quiet host).
 #
 # It runs under SCHED_IDLE (after nice 10; SCHED_BATCH at nice 19 if refused),
 # so it never preempts the SUT on a wake-up and a CPU that runs only the sampler
@@ -75,7 +76,7 @@
 # Outputs, fetched by the stop action into <fetch dir>/<host>/fine/ (only for a
 # stop that names its run, sampler_fetch_tag, and only if fine-run.txt carries it):
 #   fine.<seq>.log.z   the per-tick series, closed generations, zlib (16 MiB of text
-#                      each, kept up to 128 MiB compressed, oldest dropped and counted)
+#                      each, kept up to 256 MiB compressed, oldest dropped and counted)
 #   fine-minute.log    one line per minute for the WHOLE run, never rotated: the
 #                      record that survives when the detail of the early hours is gone
 #   fine-events.log    starvation episodes, sampler gaps and dropped generations
@@ -259,7 +260,8 @@
 
     # Same detached launch as the 60 s sampler. python3 -I: no PYTHONPATH, no
     # site customisation, nothing but the script. The script lowers its own
-    # priority (nice 10) and takes over from an older instance by sentinel file.
+    # scheduling class (nice 10 then SCHED_IDLE) and takes over from an older instance by
+    # sentinel file; if the older one is still closing its files after 25 s it exits 3.
     - name: Start | launch the fine sampler, detached
       ansible.builtin.shell: |
         setsid nohup python3 -I "{{ sampler_rundir }}/celeris-host-sampler-fine" >/dev/null 2>&1 </dev/null &
@@ -287,7 +289,7 @@
         n=0
         while [ "$n" -lt 30 ]; do
           pid=$(cat "{{ sampler_rundir }}/host-sampler-fine.pid" 2>/dev/null || true)
-          if [ -n "$pid" ] && [ -d "/proc/$pid" ] && grep -q "^tag={{ sampler_tag }} " "{{ sampler_fine_dir }}/fine-run.txt" 2>/dev/null; then
+          if [ -n "$pid" ] && [ -d "/proc/$pid" ] && head -n 1 "{{ sampler_fine_dir }}/fine-run.txt" 2>/dev/null | tr " " "\n" | head -n 1 | grep -qxF "tag={{ sampler_tag }}"; then
             echo "fine sampler pid=$pid alive"
             exit 0
           fi
@@ -311,7 +313,7 @@
         msg: >-
           fine sampler on {{ inventory_hostname }}:
           {{ sampler_fine_alive.stdout | default('python3 is missing; no fine series') | trim }}
-          (interval={{ sampler_fine_interval }}s out={{ sampler_fine_dir }}, nice 10)
+          (interval={{ sampler_fine_interval }}s out={{ sampler_fine_dir }}, SCHED_IDLE)
       when:
         - sampler_action == 'start'
         - sampler_fine_interval | string | length > 0
@@ -463,7 +465,7 @@
     # (Deploy failed) must not hand the previous bench's series to this run, and
     # a stop that names none (race, weekend) fetches no fine file at all.
     - name: Stop | is the fine series on the host this run's
-      ansible.builtin.shell: grep -q "^tag={{ sampler_fetch_tag }} " "{{ sampler_fine_dir }}/fine-run.txt"
+      ansible.builtin.shell: head -n 1 "{{ sampler_fine_dir }}/fine-run.txt" | tr " " "\n" | head -n 1 | grep -qxF "tag={{ sampler_fetch_tag }}"
       args:
         executable: /bin/bash
       register: sampler_fine_mine
@@ -474,7 +476,7 @@
         - sampler_fetch_dir | length > 0
         - sampler_fetch_tag | length > 0
 
-    # Closed generations are zlib streams (a few MB each, 5x smaller than text),
+    # Closed generations are zlib streams (a few MB each, 2-5x smaller than text),
     # named fine.<seq>.log.z and not known in advance: list them. The fetch goes
     # through ansible's slurp (the whole file in memory under become), which is
     # why the series is compressed before it is fetched, not after.

@@ -145,5 +145,23 @@ done
 check "  and nothing started (60 s sampler)" test ! -e "$run/host-sampler.pid"
 check "a bad action is refused" refused sampler_action=restart
 
+echo "--- the 60 s sampler finds its pids without pgrep / ps (SCHED_IDLE hazard: they open every process's cmdline)"
+stub=$work/stub
+mkdir -p "$stub" "$work/sample-out" "$work/sample-run"
+for tool in pgrep ps pidof; do
+  printf '#!/bin/sh\necho %s >> "%s/tool-called"\nexit 1\n' "$tool" "$work" > "$stub/$tool"
+  chmod +x "$stub/$tool"
+done
+cp "$(command -v sleep)" "$work/validator" # a process whose comm is validator
+"$work/validator" 60 &
+vpid=$!
+SAMPLER_OUTDIR=$work/sample-out SAMPLER_RUNDIR=$work/sample-run PATH="$stub:$PATH" \
+  "$here/../ops/host-sampler/celeris-host-sampler" --sample > /dev/null 2>&1
+check "  a sample was written" test -s "$work/sample-out/samples.jsonl"
+check "  it found the validator by comm" grep -q "\"validator_pid\":$vpid," "$work/sample-out/samples.jsonl"
+check "  and called neither pgrep, ps nor pidof" test ! -e "$work/tool-called"
+kill "$vpid" 2> /dev/null
+wait "$vpid" 2> /dev/null
+
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

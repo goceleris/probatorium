@@ -736,7 +736,7 @@ each host of the run (`BENCH_TARGET` limits the playbook to the target and the l
 
 **Not in the measurement path.** `BenchTier`, `bench.yml` and `run_bench_cell.yml` are not touched, no BenchTier
 variable is added, and the SUT is not told. Placement: both processes run under `SCHED_IDLE` (the fine one sets it
-itself after `nice 10`, falling back to `SCHED_BATCH` at nice 19 if refused, and says which took in `fine-run.txt`;
+itself (after `nice 10`), falling back to `SCHED_BATCH` at nice 19 if refused, and says which took in `fine-run.txt`;
 the 60 s shell sampler is launched `nice -n 19 chrt -i 0` by the bench tier only, and its children inherit it; the
 race and weekend starts are unchanged). A `SCHED_IDLE` task never preempts a normal one on wake-up and its CPU counts
 as idle to the load balancer. It is not pinned to a CPU set: on msr1 every CPU hosts a loop. The price is visible, not
@@ -746,7 +746,9 @@ of 20: if a scoped io512 run shows many `gap` lines inside the cell's window, sw
 (one line in `lower_priority`) and judge the cell, not the whole run.
 
 **Load.** Reads four `/proc` files and each `ksoftirqd` thread's `schedstat` per tick (4 + nCPU `pread`s, a 64 KiB
-buffer reused, no fork). Measured by the review with `ksoftirqd` visible, on 8 CPUs, contended: **0.051 % of one CPU at
+buffer reused, no fork). The 60 s sampler finds its three pids by reading `/proc/*/comm`, not with `pgrep` (which opens every process's
+`cmdline`, taking its `mmap_lock`: under `SCHED_IDLE` it can be preempted holding it and stall the SUT for hundreds of
+ms); a test forbids `pgrep`, `ps`, `cmdline`, `maps` and the like in both samplers. Measured by the review with `ksoftirqd` visible, on 8 CPUs, contended: **0.051 % of one CPU at
 1 s and 0.711 % at 20 Hz**; expect about 0.1-0.2 % and 1.5-2 % on a 32-CPU host. (The first figures, 0.03 % and
 0.35 %, came from a container that could not see `ksoftirqd`.) `self_cpu_pct` in each host's `fine/fine.stats` is the
 figure of the real run. The 60 s shell sampler costs about 24 ms per sample (25-30 fork/execs; 0.04 % of a CPU) and
@@ -754,26 +756,40 @@ this tier starts it for the first time.
 
 **Retention.** A tick is about 45 bytes plus 18-23 per CPU that did anything (every CPU, on msr1 with RPS on all 12 and
 on the loadgen). The open generation is plain text on tmpfs (`/run/celeris/fine`); at 16 MiB it is closed into
-`fine.<seq>.log.z` (zlib level 1, 4-5.6x measured, about 50 ms of CPU per generation) and compressed generations are
-kept up to 128 MiB, the oldest dropped *and counted* (`generations_dropped`, a `generation_dropped` event). For a 65 h
-bench at 1 s that is 234,000 ticks: msr1 (12 CPUs, 261-321 B) 61-75 MB of text, **11-19 MB** compressed; a 32-CPU host
-(621-781 B) 145-183 MB, **26-46 MB**: the whole run is kept, well under the cap (and under 0.8 % of the hosts' RAM at the
-worst). At 0.05 s the ticks are 20 times as many and the cap holds the last 23-33 h on msr1 and 9-13 h on a 32-CPU host:
-use 0.05 s for a scoped run (`cells=...`). Whatever the cadence, two files are never rotated: `fine-minute.log`
-(per CPU and minute: the highest softirq percent of a tick, the lowest user+system percent, the minute's softirq percent,
-the longest tick interval; about 1-2 MB for 65 h) and `fine-events.log` (starvation episodes as a begin/end pair, the
-sampler's own gaps, dropped generations; 4 MiB with a drop counter). A 1 to 2 s stall is seen by a tick only part of the
-time at 1 s, which is why the minute record exists: it is meant to be re-cut offline with any criterion.
+`fine.<seq>.log.z` (zlib level 1, about 50 ms of CPU per generation, logged as a `generation_closed` event so its pause
+is not read as starvation). **The compression ratio is 2-5x, depending on how much the counters vary:** 5x on a quiet
+host, 2.1-2.4x with bench-like counters (NET_RX runs in the tens of thousands, user and system in the tens of percent).
+Compressed generations are kept up to 256 MiB, the oldest dropped *and counted* (`generations_dropped`, a
+`generation_dropped` event); the newest is never dropped. At 1 s, 234,000 ticks for a 65 h bench:
+
+| host | bytes a tick | text, 65 h | compressed, 65 h | 111 h (the `all` deadline) |
+|---|---|---|---|---|
+| msr1 (12 CPUs) | 261-321 | 61-75 MB | 13-35 MB | 23-60 MB |
+| 32 CPUs (msa2-server, msa2-client) | 621-791 | 145-185 MB | 33-87 MB | 55-148 MB |
+
+All of it fits in 256 MiB, so the whole run is kept at 1 s (at the pessimistic ratio a 111 h run on 32 CPUs is 148 MB; with
+half this cap it would have dropped its oldest generations). The artifact of a 65 h single-arch run is about
+50-175 MB for the two hosts (already compressed). The tmpfs worst case is 256 MiB + 16 MiB + the minute and event logs,
+about 0.6 % of msa2-client's RAM. At 0.05 s the ticks are 20 times as many and the cap holds the last 23-55 h on msr1 and
+9-23 h on a 32-CPU host: use 0.05 s for a scoped run (`cells=...`). Whatever the cadence, two files are never rotated:
+`fine-minute.log` (per CPU and minute: the highest softirq percent of a tick, the lowest user+system percent, the minute's
+softirq percent, the longest tick interval; about 1-2 MB for 65 h) and `fine-events.log` (starvation episodes as a
+begin/end pair, the sampler's own gaps, generations closed and dropped; 4 MiB with a drop counter). A 1 to 2 s stall is
+seen by a tick only part of the time at 1 s (a stall that straddles a tick boundary reads about 70 % on two ticks), which
+is why the full series is kept at 1 s and the minute record is a coarse index into it, not a substitute: it is meant to be
+re-cut offline with any criterion.
 
 **Lifetime and the artifact.** `SAMPLER_DURATION` is keyed like the job's `timeout-minutes` (the largest budget the key
 admits plus 3 h, inside the ceiling). The stop step (`if: always()`, `continue-on-error`, 10 minutes: the compressed
 series goes through ansible's `fetch`, in memory under `become`) ends both processes with a sentinel file and fetches into
 `results/host-sampler/<host>/` (fine files in `fine/`) before the upload. The fine files are fetched only if the host's
 `fine-run.txt` carries this run's tag (`bench-<run id>`), so a Deploy that failed before the start step cannot hand over the
-previous bench's series, and the race and weekend stops fetch no fine file; a new start deletes the files of the previous
+previous bench's series (the tag carries the run attempt, `bench-<run id>-<attempt>`, so a re-run does not take its
+first attempt's), and the race and weekend stops fetch no fine file; a new start deletes the files of the previous
 run in its directory. If the runner dies and the stop step never runs, the fine sampler ends 60 s after its
 `Runner.Listener` is gone, any later `HostSamplerStart` / `Stop` (the race and weekend tiers) retires it too, and the
-forensics play fetches its events, minute record, stats and run file. A host without python3 gets the 60 s sampler only,
+forensics play fetches its events, minute record, stats and run file, and, if nobody stopped the sampler, its newest 24
+per-tick generations (at most about 150 MB a host). A host without python3 gets the 60 s sampler only,
 with a warning.
 
 ### Result: latency at SLO

@@ -72,7 +72,9 @@
 #   b = the lowest user+nice+system percent of any tick of the minute
 #   c = the softirq percent of the whole minute
 #   A CPU that is not listed was idle all minute. A stall shows as a minute
-#   whose a is near 100 and b near 0 on one CPU, at any tick rate.
+#   whose a is near 100 and b near 0 on one CPU when the tick is well under the
+#   stall's length; at 1 s a 1.4-1.7 s stall that straddles a tick boundary reads
+#   about 70/30 on two ticks, which is why the full series is kept at 1 s.
 #
 # fine-events.log, the starvation episodes and the sampler's own gaps:
 #
@@ -109,8 +111,10 @@
 #   SAMPLER_FINE_DIR        output directory, default /run/celeris/fine
 #   SAMPLER_RUNDIR          pid / stop sentinel dir, default /run/celeris
 #   SAMPLER_FINE_MAXBYTES   close (compress) a generation past this size, default 16777216
-#   SAMPLER_FINE_TOTAL_MAXBYTES  compressed generations kept, default 134217728
-#   SAMPLER_NICE            0 .. 19, default 10
+#   SAMPLER_FINE_TOTAL_MAXBYTES  compressed generations kept, default 268435456 (256 MiB)
+#   SAMPLER_NICE            0 .. 19, default 10 (then SCHED_IDLE)
+#   SAMPLER_FINE_TAKEOVER_WAIT  seconds to wait for an older instance, default 25; if it is
+#                           still there the new one exits 3 and writes nothing
 #   SAMPLER_EXIT_WITHOUT_RUNNER=1   exit when the Runner.Listener is gone
 #   SAMPLER_PROCROOT        default /proc (tests point it at a fixture)
 #   SAMPLER_FINE_MAX_TICKS  stop after this many ticks (tests), default 0 = no limit
@@ -161,10 +165,11 @@ class Config:
         self.outdir = env.get("SAMPLER_FINE_DIR", "/run/celeris/fine")
         self.rundir = env.get("SAMPLER_RUNDIR", "/run/celeris")
         self.maxbytes = _number(env, "SAMPLER_FINE_MAXBYTES", 16 * 1024 * 1024, 65536, 1 << 30, int)
-        self.total_maxbytes = _number(env, "SAMPLER_FINE_TOTAL_MAXBYTES", 128 * 1024 * 1024, 1 << 20, 1 << 32, int)
+        self.total_maxbytes = _number(env, "SAMPLER_FINE_TOTAL_MAXBYTES", 256 * 1024 * 1024, 1 << 20, 1 << 32, int)
         self.events_maxbytes = _number(env, "SAMPLER_FINE_EVENTS_MAXBYTES", 4 * 1024 * 1024, 4096, 1 << 30, int)
         self.minute_maxbytes = _number(env, "SAMPLER_FINE_MINUTE_MAXBYTES", 32 * 1024 * 1024, 4096, 1 << 30, int)
         self.nice = _number(env, "SAMPLER_NICE", 10, 0, 19, int)
+        self.takeover_wait = _number(env, "SAMPLER_FINE_TAKEOVER_WAIT", 25, 0, 120, int)
         self.exit_without_runner = env.get("SAMPLER_EXIT_WITHOUT_RUNNER", "") == "1"
         self.procroot = env.get("SAMPLER_PROCROOT", "/proc")
         self.max_ticks = _number(env, "SAMPLER_FINE_MAX_TICKS", 0, 0, 10**9, int)
@@ -338,13 +343,14 @@ class Series:
     past it the oldest is deleted, counted in dropped and reported through
     on_drop (the whole-run files still cover the dropped hours)."""
 
-    def __init__(self, outdir, maxbytes, total_maxbytes, header, on_drop):
+    def __init__(self, outdir, maxbytes, total_maxbytes, header, on_drop, on_close=None):
         self.dir = outdir
         self.path = os.path.join(outdir, "fine.log")
         self.maxbytes = maxbytes
         self.total_maxbytes = total_maxbytes
         self.header = header
         self.on_drop = on_drop
+        self.on_close = on_close
         self.seq = 0
         self.closed = collections.deque()  # (path, size)
         self.closed_bytes = 0
@@ -370,8 +376,12 @@ class Series:
         self.f.close()
         dst = os.path.join(self.dir, "fine.%05d.log.z" % self.seq)
         self.seq += 1
+        t0 = time.perf_counter()
         size = compress_file(self.path, dst)
+        took = (time.perf_counter() - t0) * 1000
         remove_quiet(self.path)
+        if self.on_close:
+            self.on_close(os.path.basename(dst), size, took)
         self.closed.append((dst, size))
         self.closed_bytes += size
         self.generations += 1
@@ -510,7 +520,8 @@ class Sampler:
         self.statspath = os.path.join(cfg.outdir, "fine.stats")
         self.events = Capped(os.path.join(cfg.outdir, "fine-events.log"), cfg.events_maxbytes, header, "events")
         self.minutes = Minutes(Capped(os.path.join(cfg.outdir, "fine-minute.log"), cfg.minute_maxbytes, header, "minutes"))
-        self.series = Series(cfg.outdir, cfg.maxbytes, cfg.total_maxbytes, header, self._dropped_generation)
+        self.series = Series(cfg.outdir, cfg.maxbytes, cfg.total_maxbytes, header, self._dropped_generation,
+                             self._closed_generation)
         self.ksoftirqd = self._find_ksoftirqd()
         self.prev = None
         self.prev_mono = None
@@ -533,6 +544,10 @@ class Sampler:
         self.runner_absent_since = None
         self.last_runner_check = None
         self.exit_reason = "running"
+
+    def _closed_generation(self, name, size, ms):
+        # compressing 16 MiB takes tens of ms at SCHED_IDLE and shows as a late tick: say what it was
+        self.events.write("%.3f generation_closed file=%s bytes=%d ms=%.1f\n" % (self.wall(), name, size, ms))
 
     def _dropped_generation(self, name, size):
         self.events.write("%.3f generation_dropped file=%s bytes=%d (total cap %d; fine-minute.log still covers its minutes)\n" % (
@@ -762,8 +777,10 @@ class Sampler:
                 nxt = now + cfg.interval
 
 
-def takeover(cfg, proc_alive, sleep=time.sleep, waited_max=15):
-    """Ask an older instance to finish (sentinel file, never a signal) and wait."""
+def takeover(cfg, proc_alive, sleep=time.sleep, waited_max=25):
+    """Ask an older instance to finish (sentinel file, never a signal) and wait.
+    False if it is still there afterwards (it may be closing a generation under
+    SCHED_IDLE): the caller must not start over its files."""
     try:
         with open(cfg.pidfile) as f:
             old = f.read().strip()
@@ -775,7 +792,10 @@ def takeover(cfg, proc_alive, sleep=time.sleep, waited_max=15):
         while proc_alive(old) and waited < waited_max:
             sleep(0.5)
             waited += 0.5
+    if old.isdigit() and old != str(os.getpid()) and proc_alive(old):
+        return False
     remove_quiet(cfg.stopfile)
+    return True
 
 
 def main(env=os.environ):
@@ -785,7 +805,9 @@ def main(env=os.environ):
         sys.stderr.write("celeris-host-sampler-fine: %s\n" % e)
         return 2
     os.makedirs(cfg.rundir, exist_ok=True)
-    takeover(cfg, lambda pid: os.path.isdir(os.path.join(cfg.procroot, pid)))
+    if not takeover(cfg, lambda pid: os.path.isdir(os.path.join(cfg.procroot, pid)), waited_max=cfg.takeover_wait):
+        sys.stderr.write("celeris-host-sampler-fine: the previous instance is still closing its files after %d s; not starting\n" % cfg.takeover_wait)
+        return 3
     sched = lower_priority(cfg.nice)
     with open(cfg.pidfile, "w") as f:
         f.write("%d\n" % os.getpid())

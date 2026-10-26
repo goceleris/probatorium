@@ -386,7 +386,7 @@ jobs:
         run: bash ansible/tests/test_reboot_play.sh
       # The host sampler lifecycle (ansible/host-sampler.yml), the real playbook on a local
       # connection: a start without a fine cadence starts no fine sampler, a start with one
-      # launches the python sampler (nice 10, its series, stats), the stop fetches it into
+      # launches the python sampler (SCHED_IDLE, its series, stats), the stop fetches it into
       # fine/, a start without one retires a stale one, a cadence out of bounds is refused.
       - name: ansible/tests/test_host_sampler_play.sh
         run: bash ansible/tests/test_host_sampler_play.sh

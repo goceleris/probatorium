@@ -246,7 +246,7 @@ func HostSamplerStart() error {
 	fmt.Printf("\n=== HostSamplerStart ===\n")
 	fmt.Printf("  interval:  %ss\n", interval)
 	if fine != "" {
-		fmt.Printf("  fine:      %ss (lean series, nice 10; see ansible/host-sampler.yml for its cost)\n", fine)
+		fmt.Printf("  fine:      %ss (lean series, SCHED_IDLE; see ansible/host-sampler.yml for its cost)\n", fine)
 	}
 	fmt.Printf("  lifetime:  %ds (self-terminating hard deadline)\n", secs)
 	fmt.Printf("  tag:       %s\n", samplerTag())

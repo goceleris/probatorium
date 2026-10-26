@@ -84,11 +84,12 @@ func TestBenchSamplerStepsCannotFailTheRun(t *testing.T) {
 // made it.
 func TestBenchSamplerIsTaggedForThisRun(t *testing.T) {
 	src := mustRead(t, benchTier)
-	// the stop names the same run: the fine series is fetched only if its
+	// the stop names the same run AND attempt (a re-run keeps the run id: attempt 2 must not
+	// fetch attempt 1's series when its Deploy fails): the fine series is fetched only if its
 	// fine-run.txt carries the tag, so a failed Deploy (no start) fetches nothing
 	for _, run := range []string{"mage HostSamplerStart", "mage HostSamplerStop"} {
 		blk := stepRunning(src, run)
-		if !strings.Contains(blk, "SAMPLER_TAG: bench-${{ github.run_id }}\n") {
+		if !strings.Contains(blk, "SAMPLER_TAG: bench-${{ github.run_id }}-${{ github.run_attempt }}\n") {
 			t.Errorf("%s does not tag the series with this run:\n%s", run, blk)
 		}
 		for _, other := range []string{"weekend-", "race-"} {
