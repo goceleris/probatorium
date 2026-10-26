@@ -527,8 +527,12 @@ The validation run of 2026-10-21 showed the arch lock holds on the scoped rows (
 exemption of light cells did not (P6 fails on arm64), so the default policy is now `all`
 ([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md), "Verdict"). #442 stays open for the
 three rows only a full both-arch run reads (get-simple-1024c, get-json-h2, post-4k-h2), so dispatch headline and
-full with `publish=false` until both are settled. The runner keeps no achieved rate per pass, so no rated number
-can tell a slow server from load that loadgen never sent (#441).
+full with `publish=false` until both are settled. Since schema 5.24 the artifact keeps the achieved rate, the
+errors and a status for every rated pass ([#441](https://github.com/goceleris/probatorium/issues/441),
+see "Result: latency at SLO"), so a rated number can be read against the load loadgen actually sent. #441
+stays open for the rest: no pass is yet marked invalid for a shortfall, `latency_at_slo` still counts every
+kept pass whatever it achieved, and loadgen does not export its end-of-window schedule lag (loadgen#102).
+Until those land, read `achieved_ratio` before you read a rated p99 as the server's.
 
 ### A both-arch run: the two arches share one client (#442)
 
@@ -714,6 +718,80 @@ does not flag it yet; that is for goceleris/docs.
 default policy and `all`, about 3.6 h of bench together, criteria pre-registered, including the three
 exposures above) are in [`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md).
 
+### The host sampler beside a bench
+
+`Benchmark Tier` brackets `mage BenchTier` with `mage HostSamplerStart` / `HostSamplerStop`, as the race and weekend
+tiers do (the nightly tier runs `mage Validate`, not the bench, and has the race tier's path). Before this a bench
+ran no host sampler at all, so it had no series of its own: the forensics artifact fetched whatever the last weekend soak had left on the hosts, and
+a 60 s cadence could not see the 1-3 s stalls of the io512 cell (celeris#1036). Two read-only processes run on
+each host of the run (`BENCH_TARGET` limits the playbook to the target and the loadgen, as `Deploy` does):
+
+- the 60 s shell sampler (`ops/host-sampler/celeris-host-sampler`, the script unchanged; this tier starts it for the
+  first time): memory, load, the OOM and link-flap counters, the boot id, the kernel log;
+- the **fine series** (`ops/host-sampler/celeris-host-sampler-fine`, python3, no subprocess), at the `sampler_interval`
+  dispatch input: `1` s (the default, also on a schedule), `0.5`, `0.2`, `0.1` or `0.05` s (20 Hz). One text line per
+  tick: the per-CPU deltas of user+system, irq, softirq and steal, the NET_RX softirq runs and the `ksoftirqd`
+  run time of every CPU that did anything, the CPU pressure total, the run queue and the load; plus the two
+  whole-run files below. `fine.stats` has the achieved rate, the interval percentiles and the sampler's own CPU.
+
+**Not in the measurement path.** `BenchTier`, `bench.yml` and `run_bench_cell.yml` are not touched, no BenchTier
+variable is added, and the SUT is not told. Placement: both processes run under `SCHED_IDLE` (the fine one sets it
+itself (after `nice 10`), falling back to `SCHED_BATCH` at nice 19 if refused, and says which took in `fine-run.txt`;
+the 60 s shell sampler is launched `nice -n 19 chrt -i 0` by the bench tier only, and its children inherit it; the
+race and weekend starts are unchanged). A `SCHED_IDLE` task never preempts a normal one on wake-up and its CPU counts
+as idle to the load balancer. It is not pinned to a CPU set: on msr1 every CPU hosts a loop. The price is visible, not
+silent: a starved sampler shows as a gap in its own series (`gap` events, interval p99 and max in `fine.stats`). On a
+container with 8 spinning loops on 2 CPUs of quota it got 0.94 Hz of a 1 Hz target (max interval 3.6 s) and 2.6 Hz
+of 20: if a scoped io512 run shows many `gap` lines inside the cell's window, switch the class to `SCHED_BATCH` + nice 19
+(one line in `lower_priority`) and judge the cell, not the whole run.
+
+**Load.** Reads four `/proc` files and each `ksoftirqd` thread's `schedstat` per tick (4 + nCPU `pread`s, a 64 KiB
+buffer reused, no fork). The 60 s sampler finds its three pids by reading `/proc/*/comm`, not with `pgrep` (which opens every process's
+`cmdline`, taking its `mmap_lock`: under `SCHED_IDLE` it can be preempted holding it and stall the SUT for hundreds of
+ms); a test forbids `pgrep`, `ps`, `cmdline`, `maps` and the like in both samplers. Measured by the review with `ksoftirqd` visible, on 8 CPUs, contended: **0.051 % of one CPU at
+1 s and 0.711 % at 20 Hz**; expect about 0.1-0.2 % and 1.5-2 % on a 32-CPU host. (The first figures, 0.03 % and
+0.35 %, came from a container that could not see `ksoftirqd`.) `self_cpu_pct` in each host's `fine/fine.stats` is the
+figure of the real run. The 60 s shell sampler costs about 24 ms per sample (25-30 fork/execs; 0.04 % of a CPU) and
+this tier starts it for the first time.
+
+**Retention.** A tick is about 45 bytes plus 18-23 per CPU that did anything (every CPU, on msr1 with RPS on all 12 and
+on the loadgen). The open generation is plain text on tmpfs (`/run/celeris/fine`); at 16 MiB it is closed into
+`fine.<seq>.log.z` (zlib level 1, about 50 ms of CPU per generation, logged as a `generation_closed` event so its pause
+is not read as starvation). **The compression ratio is 2-5x, depending on how much the counters vary:** 5x on a quiet
+host, 2.1-2.4x with bench-like counters (NET_RX runs in the tens of thousands, user and system in the tens of percent).
+Compressed generations are kept up to 256 MiB, the oldest dropped *and counted* (`generations_dropped`, a
+`generation_dropped` event); the newest is never dropped. At 1 s, 234,000 ticks for a 65 h bench:
+
+| host | bytes a tick | text, 65 h | compressed, 65 h | 111 h (the `all` deadline) |
+|---|---|---|---|---|
+| msr1 (12 CPUs) | 261-321 | 61-75 MB | 13-35 MB | 23-60 MB |
+| 32 CPUs (msa2-server, msa2-client) | 621-791 | 145-185 MB | 33-87 MB | 55-148 MB |
+
+All of it fits in 256 MiB, so the whole run is kept at 1 s (at the pessimistic ratio a 111 h run on 32 CPUs is 148 MB; with
+half this cap it would have dropped its oldest generations). The artifact of a 65 h single-arch run is about
+50-175 MB for the two hosts (already compressed). The tmpfs worst case is 256 MiB + 16 MiB + the minute and event logs,
+about 0.6 % of msa2-client's RAM. At 0.05 s the ticks are 20 times as many and the cap holds the last 23-55 h on msr1 and
+9-23 h on a 32-CPU host: use 0.05 s for a scoped run (`cells=...`). Whatever the cadence, two files are never rotated:
+`fine-minute.log` (per CPU and minute: the highest softirq percent of a tick, the lowest user+system percent, the minute's
+softirq percent, the longest tick interval; about 1-2 MB for 65 h) and `fine-events.log` (starvation episodes as a
+begin/end pair, the sampler's own gaps, generations closed and dropped; 4 MiB with a drop counter). A 1 to 2 s stall is
+seen by a tick only part of the time at 1 s (a stall that straddles a tick boundary reads about 70 % on two ticks), which
+is why the full series is kept at 1 s and the minute record is a coarse index into it, not a substitute: it is meant to be
+re-cut offline with any criterion.
+
+**Lifetime and the artifact.** `SAMPLER_DURATION` is keyed like the job's `timeout-minutes` (the largest budget the key
+admits plus 3 h, inside the ceiling). The stop step (`if: always()`, `continue-on-error`, 10 minutes: the compressed
+series goes through ansible's `fetch`, in memory under `become`) ends both processes with a sentinel file and fetches into
+`results/host-sampler/<host>/` (fine files in `fine/`) before the upload. The fine files are fetched only if the host's
+`fine-run.txt` carries this run's tag (`bench-<run id>`), so a Deploy that failed before the start step cannot hand over the
+previous bench's series (the tag carries the run attempt, `bench-<run id>-<attempt>`, so a re-run does not take its
+first attempt's), and the race and weekend stops fetch no fine file; a new start deletes the files of the previous
+run in its directory. If the runner dies and the stop step never runs, the fine sampler ends 60 s after its
+`Runner.Listener` is gone, any later `HostSamplerStart` / `Stop` (the race and weekend tiers) retires it too, and the
+forensics play fetches its events, minute record, stats and run file, and, if nobody stopped the sampler, its newest 24
+per-tick generations (at most about 150 MB a host). A host without python3 gets the 60 s sampler only,
+with a warning.
+
 ### Result: latency at SLO
 
 In the rated sweep, each cell gets four constant-rate passes at 25, 50, 75 and 90 % of that cell's
@@ -728,6 +806,61 @@ concurrency sweep, `get-json-1k`, the H2 rows, `ws-large-echo`, and the WS hub a
 publish saturation data only; [`budget/profiles.go`](budget/profiles.go) gives the measured reason for
 each. Datasets published before [#418](https://github.com/goceleris/probatorium/issues/418) also carry
 rated data for those scenarios.
+
+#### What the artifact records per rated pass (schema 5.24, #441)
+
+Every fraction the sweep plans leaves exactly one record, whatever became of it. `benchmarks[].rated_passes`
+maps a scenario to the list of its passes, one entry per pass per run. `run` counts the runs of the cell that carried rated
+data, from 0: it is not the cell's run index (a DNF run takes no number), so it does not join to `cell_run_statuses`:
+
+| field | meaning |
+| --- | --- |
+| `fraction`, `target_rps` | the offered load: the fraction of the cell's saturation rate, and the rate |
+| `achieved_rps`, `achieved_ratio` | requests per second loadgen delivered over the measured window, and that over the target. Below 1 is load loadgen never sent: the p99 of that pass is its backlog (about 0.99 x window x (1 - ratio)), not the server's latency. The ratio reads slightly low: `requests` counts successes only and loadgen's elapsed time includes teardown, so set any validity line (the 0.98 of #441) knowing that |
+| `requests`, `errors`, `connect_errors`, `dial_retries`, `close_aborts` | loadgen's counts. `requests` are successes, `errors` failed requests, `connect_errors` the dial/handshake failures (TCP connect, TLS, WS/SSE upgrade, H1 reconnect dials). In loadgen v1.4.14 each also fails the request and is counted in `errors`, so `connect_errors` sits inside `errors`, give or take a few attempts cut off at phase boundaries (loadgen's own description: counted at the driver, it can differ from the matching `errors` increments by a few); `errors` close to `connect_errors` means the server was unreachable, not misbehaving |
+| `shortfall_requests` | target x duration - requests - errors: the slots of the schedule loadgen did not fill |
+| `p99` (ns), `p50`, `p99_9`, `max`, `duration`, `start`, `end`, `loadgen_version` | the pass's latency, window and loadgen build (`start`/`end` are on the loadgen host's clock, warmup included, the same clock as `load_windows`) |
+| `status` | `ok`: counted in `latency_at_slo` and the headline. `skipped`: the pass ran and produced nothing usable. `not_run`: it never started |
+| `reason`, `detail` | for a pass that is not `ok` (and `interrupted` on a cut-short `ok` one): `loadgen_new` (loadgen would not build), `run_error`, `nil_result`, `zero_requests`, `interrupted` (the run was cancelled: any pass after the cancel, and also an `ok` pass cut short, which loadgen returns as a short, error-free result and which stays `ok` and kept, as it always was, with the measured window in `detail`), `cell_flagged` (the cell's saturation pass was flagged suspect, so no sweep ran), `no_saturation_rate`, `non_positive_target`; and the error text |
+
+`rated_headline_target_rps` names the target `rated_mode_p99_at_target_rps` was read at: the highest target
+among the `ok` passes. When the 0.9 pass was lost it is the 0.75 pass's (or lower), and this says so; compare
+it with the `fraction` of the cell's passes. A cell with no `ok` pass has records and no
+`latency_at_slo`, headline or `rated_headline_target_rps`.
+
+`mage Publish` prints a rated line in its integrity summary (passes by status, `ok` passes below 98 % of their
+target, and the cells whose headline is not their top planned pass). It is informational: nothing is refused
+for it, because the validity rule is still open on #441. `summary.json` carries `rated_passes`: a full record is about 0.7 KB
+indented, so about 1.1 MB per arch for a full rated run (about 6 % of the 18 MB `summary.json` of 38431303162).
+
+**Records from runs that predate 5.24.** A pass record without `status` was written by a runner before 5.24:
+only `target_rps` and `p99`, kept, and the merge does not fill the status in. Such a run never recorded a pass it
+dropped, so a document merged from it (a re-merge of bench 38431303162, whose stderr shows 41 skipped passes)
+says nothing about lost passes. `mage Publish` counts those records as `legacy=N`, prints a `RATED LEGACY`
+line, and its `skipped=0` is not a statement that none was lost.
+
+**For a reader that predates 5.24.** Nothing it reads changes. `latency_at_slo` and
+`rated_mode_p99_at_target_rps` are built from the `ok` passes exactly as they were built from the kept passes;
+`saturation_mode_rps` and every other key are untouched; the two new keys are ignored. In the runner's per-cell
+JSON and `raw/<host>.json`, `rated_passes` still holds only the passes the runner kept (each now with the added
+keys, `target_rps` and `p99` as before); the passes it did not keep are a separate array,
+`rated_passes_not_kept`, so a script that reads `target_rps` and `p99` out of `rated_passes` never counts a
+pass that sent nothing as a pass with a p99 of zero. A script that wants the full picture reads both arrays.
+A cell in the rated scope whose saturation pass was flagged now has `rated_passes_not_kept` with `not_run`
+records where it used to have no rated key at all. A cell that failed before its saturation pass finished
+(`dnf`, `not_applicable`) has no rated record: its status in `cell_statuses` is the explicit record.
+
+**Two single-arch artifacts and `mage Publish`.** `Publish` takes ONE results file per call (`PUBLISH_RESULTS`,
+or the newest `results/*-bench-*/results.json`; the arch tag comes from the document's own `host_arch_pair`) and
+writes `results/<version>/<date>/<arch>/`. It merges nothing: two single-arch artifacts (a `target=msa2-server`
+run and a `target=msr1` run, each with `publish=false`) are two calls, each with its artifact unpacked under
+`results/<ts>-bench-<version>/` and `PUBLISH_VERSION` set, and they land in two arch directories of the same
+version. Set `BENCH_START_DATE` to the same day on both calls if you want them in the same date directory;
+the date only names the directory. The docs build ([goceleris/docs](https://github.com/goceleris/docs),
+`scripts/build-data.ts`, `src/lib/results/aggregate.ts`) groups the cells by (version, arch) over every date
+and run and AVERAGES them, so the two arches compose into one release dataset by version, and a second publish
+of the same version and arch, on any date, is averaged with the first, not a replacement for it. (Checked by
+`PUBLISH_DRYRUN=1` on both arch files of run 37091941051, and by reading the docs build.)
 
 ## Validation tier
 
@@ -820,6 +953,7 @@ What a race run records about itself (schema 5.23, record only, nothing new is g
   it (`validation/refapp/internal/debugvars`), a change to the refapp build that is not made here.
 - **The race tier runs the host sampler** (`HostSamplerStart` / `HostSamplerStop`, tag
   `race-<run id>`, lifetime fixed at 150m inside the job's 180 minute limit, each step bounded to 5 minutes), as the weekend soak does.
+  The bench tier runs it too, with a 1 s fine series by default (tag `bench-<run id>`; [details](#the-host-sampler-beside-a-bench)).
 
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
@@ -1016,7 +1150,7 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `ValidateGate` | The absolute gate over the most recent run's `validate-results.json` on every host | `VALIDATE_GATE_EXPECT_CELLS`, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`, `VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW` (race tier only) |
 | `ValidateDiff` | The cross-engine and cross-arch gate | `VALIDATE_DIFF_STRICT=1` (MEDIUM fails too), `VALIDATE_DIFF_HOSTS=a,b` |
 | `BuildRaceRefapps` | Cross-build the `-race` reference apps (the race runtime needs cgo) | |
-| `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host | `SAMPLER_DURATION`, `SAMPLER_INTERVAL`, `SAMPLER_TAG` |
+| `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host (or, with `BENCH_TARGET=msr1\|msa2-server`, the target and the loadgen) | `SAMPLER_DURATION`, `SAMPLER_INTERVAL` (full sample, integer 1-3600 s, default 60), `SAMPLER_FINE_INTERVAL` (fine series, 0.05-10 s, unset = none; [details](#the-host-sampler-beside-a-bench)), `SAMPLER_TAG` |
 | `Publish` | Write the newest bench run into goceleris/docs and fire the `benchmark-published` pointer | `PUBLISH_VERSION`, `PUBLISH_VIA=git\|contents`, `PUBLISH_DRYRUN=1`, `DOCS_REPO_DIR`, `DOCS_TOKEN`, `BENCH_PUBLISH_FORCE` |
 | `PublishValidate` | Kept for callers; it runs `Publish` | |
 | `BenchAndValidate` | `Validate` → `ValidateDiff` (when `VALIDATE_TARGET=both`) → `Bench` → `Publish` | the knobs of each |
