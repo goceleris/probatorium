@@ -718,6 +718,80 @@ does not flag it yet; that is for goceleris/docs.
 default policy and `all`, about 3.6 h of bench together, criteria pre-registered, including the three
 exposures above) are in [`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md).
 
+### The host sampler beside a bench
+
+`Benchmark Tier` brackets `mage BenchTier` with `mage HostSamplerStart` / `HostSamplerStop`, as the race and weekend
+tiers do (the nightly tier runs `mage Validate`, not the bench, and has the race tier's path). Before this a bench
+ran no host sampler at all, so it had no series of its own: the forensics artifact fetched whatever the last weekend soak had left on the hosts, and
+a 60 s cadence could not see the 1-3 s stalls of the io512 cell (celeris#1036). Two read-only processes run on
+each host of the run (`BENCH_TARGET` limits the playbook to the target and the loadgen, as `Deploy` does):
+
+- the 60 s shell sampler (`ops/host-sampler/celeris-host-sampler`, the script unchanged; this tier starts it for the
+  first time): memory, load, the OOM and link-flap counters, the boot id, the kernel log;
+- the **fine series** (`ops/host-sampler/celeris-host-sampler-fine`, python3, no subprocess), at the `sampler_interval`
+  dispatch input: `1` s (the default, also on a schedule), `0.5`, `0.2`, `0.1` or `0.05` s (20 Hz). One text line per
+  tick: the per-CPU deltas of user+system, irq, softirq and steal, the NET_RX softirq runs and the `ksoftirqd`
+  run time of every CPU that did anything, the CPU pressure total, the run queue and the load; plus the two
+  whole-run files below. `fine.stats` has the achieved rate, the interval percentiles and the sampler's own CPU.
+
+**Not in the measurement path.** `BenchTier`, `bench.yml` and `run_bench_cell.yml` are not touched, no BenchTier
+variable is added, and the SUT is not told. Placement: both processes run under `SCHED_IDLE` (the fine one sets it
+itself (after `nice 10`), falling back to `SCHED_BATCH` at nice 19 if refused, and says which took in `fine-run.txt`;
+the 60 s shell sampler is launched `nice -n 19 chrt -i 0` by the bench tier only, and its children inherit it; the
+race and weekend starts are unchanged). A `SCHED_IDLE` task never preempts a normal one on wake-up and its CPU counts
+as idle to the load balancer. It is not pinned to a CPU set: on msr1 every CPU hosts a loop. The price is visible, not
+silent: a starved sampler shows as a gap in its own series (`gap` events, interval p99 and max in `fine.stats`). On a
+container with 8 spinning loops on 2 CPUs of quota it got 0.94 Hz of a 1 Hz target (max interval 3.6 s) and 2.6 Hz
+of 20: if a scoped io512 run shows many `gap` lines inside the cell's window, switch the class to `SCHED_BATCH` + nice 19
+(one line in `lower_priority`) and judge the cell, not the whole run.
+
+**Load.** Reads four `/proc` files and each `ksoftirqd` thread's `schedstat` per tick (4 + nCPU `pread`s, a 64 KiB
+buffer reused, no fork). The 60 s sampler finds its three pids by reading `/proc/*/comm`, not with `pgrep` (which opens every process's
+`cmdline`, taking its `mmap_lock`: under `SCHED_IDLE` it can be preempted holding it and stall the SUT for hundreds of
+ms); a test forbids `pgrep`, `ps`, `cmdline`, `maps` and the like in both samplers. Measured by the review with `ksoftirqd` visible, on 8 CPUs, contended: **0.051 % of one CPU at
+1 s and 0.711 % at 20 Hz**; expect about 0.1-0.2 % and 1.5-2 % on a 32-CPU host. (The first figures, 0.03 % and
+0.35 %, came from a container that could not see `ksoftirqd`.) `self_cpu_pct` in each host's `fine/fine.stats` is the
+figure of the real run. The 60 s shell sampler costs about 24 ms per sample (25-30 fork/execs; 0.04 % of a CPU) and
+this tier starts it for the first time.
+
+**Retention.** A tick is about 45 bytes plus 18-23 per CPU that did anything (every CPU, on msr1 with RPS on all 12 and
+on the loadgen). The open generation is plain text on tmpfs (`/run/celeris/fine`); at 16 MiB it is closed into
+`fine.<seq>.log.z` (zlib level 1, about 50 ms of CPU per generation, logged as a `generation_closed` event so its pause
+is not read as starvation). **The compression ratio is 2-5x, depending on how much the counters vary:** 5x on a quiet
+host, 2.1-2.4x with bench-like counters (NET_RX runs in the tens of thousands, user and system in the tens of percent).
+Compressed generations are kept up to 256 MiB, the oldest dropped *and counted* (`generations_dropped`, a
+`generation_dropped` event); the newest is never dropped. At 1 s, 234,000 ticks for a 65 h bench:
+
+| host | bytes a tick | text, 65 h | compressed, 65 h | 111 h (the `all` deadline) |
+|---|---|---|---|---|
+| msr1 (12 CPUs) | 261-321 | 61-75 MB | 13-35 MB | 23-60 MB |
+| 32 CPUs (msa2-server, msa2-client) | 621-791 | 145-185 MB | 33-87 MB | 55-148 MB |
+
+All of it fits in 256 MiB, so the whole run is kept at 1 s (at the pessimistic ratio a 111 h run on 32 CPUs is 148 MB; with
+half this cap it would have dropped its oldest generations). The artifact of a 65 h single-arch run is about
+50-175 MB for the two hosts (already compressed). The tmpfs worst case is 256 MiB + 16 MiB + the minute and event logs,
+about 0.6 % of msa2-client's RAM. At 0.05 s the ticks are 20 times as many and the cap holds the last 23-55 h on msr1 and
+9-23 h on a 32-CPU host: use 0.05 s for a scoped run (`cells=...`). Whatever the cadence, two files are never rotated:
+`fine-minute.log` (per CPU and minute: the highest softirq percent of a tick, the lowest user+system percent, the minute's
+softirq percent, the longest tick interval; about 1-2 MB for 65 h) and `fine-events.log` (starvation episodes as a
+begin/end pair, the sampler's own gaps, generations closed and dropped; 4 MiB with a drop counter). A 1 to 2 s stall is
+seen by a tick only part of the time at 1 s (a stall that straddles a tick boundary reads about 70 % on two ticks), which
+is why the full series is kept at 1 s and the minute record is a coarse index into it, not a substitute: it is meant to be
+re-cut offline with any criterion.
+
+**Lifetime and the artifact.** `SAMPLER_DURATION` is keyed like the job's `timeout-minutes` (the largest budget the key
+admits plus 3 h, inside the ceiling). The stop step (`if: always()`, `continue-on-error`, 10 minutes: the compressed
+series goes through ansible's `fetch`, in memory under `become`) ends both processes with a sentinel file and fetches into
+`results/host-sampler/<host>/` (fine files in `fine/`) before the upload. The fine files are fetched only if the host's
+`fine-run.txt` carries this run's tag (`bench-<run id>`), so a Deploy that failed before the start step cannot hand over the
+previous bench's series (the tag carries the run attempt, `bench-<run id>-<attempt>`, so a re-run does not take its
+first attempt's), and the race and weekend stops fetch no fine file; a new start deletes the files of the previous
+run in its directory. If the runner dies and the stop step never runs, the fine sampler ends 60 s after its
+`Runner.Listener` is gone, any later `HostSamplerStart` / `Stop` (the race and weekend tiers) retires it too, and the
+forensics play fetches its events, minute record, stats and run file, and, if nobody stopped the sampler, its newest 24
+per-tick generations (at most about 150 MB a host). A host without python3 gets the 60 s sampler only,
+with a warning.
+
 ### Result: latency at SLO
 
 In the rated sweep, each cell gets four constant-rate passes at 25, 50, 75 and 90 % of that cell's
@@ -879,6 +953,7 @@ What a race run records about itself (schema 5.23, record only, nothing new is g
   it (`validation/refapp/internal/debugvars`), a change to the refapp build that is not made here.
 - **The race tier runs the host sampler** (`HostSamplerStart` / `HostSamplerStop`, tag
   `race-<run id>`, lifetime fixed at 150m inside the job's 180 minute limit, each step bounded to 5 minutes), as the weekend soak does.
+  The bench tier runs it too, with a 1 s fine series by default (tag `bench-<run id>`; [details](#the-host-sampler-beside-a-bench)).
 
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
@@ -1075,7 +1150,7 @@ signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
 | `ValidateGate` | The absolute gate over the most recent run's `validate-results.json` on every host | `VALIDATE_GATE_EXPECT_CELLS`, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`, `VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW` (race tier only) |
 | `ValidateDiff` | The cross-engine and cross-arch gate | `VALIDATE_DIFF_STRICT=1` (MEDIUM fails too), `VALIDATE_DIFF_HOSTS=a,b` |
 | `BuildRaceRefapps` | Cross-build the `-race` reference apps (the race runtime needs cgo) | |
-| `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host | `SAMPLER_DURATION`, `SAMPLER_INTERVAL`, `SAMPLER_TAG` |
+| `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host (or, with `BENCH_TARGET=msr1\|msa2-server`, the target and the loadgen) | `SAMPLER_DURATION`, `SAMPLER_INTERVAL` (full sample, integer 1-3600 s, default 60), `SAMPLER_FINE_INTERVAL` (fine series, 0.05-10 s, unset = none; [details](#the-host-sampler-beside-a-bench)), `SAMPLER_TAG` |
 | `Publish` | Write the newest bench run into goceleris/docs and fire the `benchmark-published` pointer | `PUBLISH_VERSION`, `PUBLISH_VIA=git\|contents`, `PUBLISH_DRYRUN=1`, `DOCS_REPO_DIR`, `DOCS_TOKEN`, `BENCH_PUBLISH_FORCE` |
 | `PublishValidate` | Kept for callers; it runs `Publish` | |
 | `BenchAndValidate` | `Validate` → `ValidateDiff` (when `VALIDATE_TARGET=both`) → `Bench` → `Publish` | the knobs of each |

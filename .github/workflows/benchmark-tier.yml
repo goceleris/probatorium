@@ -103,6 +103,11 @@ on:
         required: false
         type: string
         default: ""
+      sampler_interval:
+        description: "Cadence of the fine host sampler that runs beside the bench (SAMPLER_FINE_INTERVAL), in seconds: 1 (DEFAULT, also for a scheduled run) | 0.5 | 0.2 | 0.1 | 0.05 (20 Hz). A read-only python3 process on each host of the run (ops/host-sampler/celeris-host-sampler-fine) under SCHED_IDLE, which never preempts the SUT: one line of /proc counters per tick (per-CPU time split, NET_RX and ksoftirqd, CPU pressure, load), a per-minute record of the whole run, and a starvation / gap episode log: it sees the 1-3 s stalls of celeris#1036 that the 60 s sampler cannot. Load it adds: 0.05% of one CPU at 1 s and 0.7% at 0.05 s (20 Hz) measured on 8 CPUs, expect about 0.1-0.2% and 1.5-2% on a 32-CPU host (fine.stats self_cpu_pct has the real figure). The per-tick series is compressed (2-5x, depending on how much the counters vary) in 16 MiB generations on tmpfs and kept up to 256 MiB: a 65 h bench at 1 s is about 13-35 MB on msr1 (12 CPUs) and 33-87 MB on a 32-CPU host, so the whole run is kept (a 111 h run, the longest deadline, is up to about 150 MB on 32 CPUs, still kept); at 0.05 s only the last 9-23 h (32 CPUs) to 23-55 h (12 CPUs) are, with the per-minute record covering the rest, so use 0.05 for a scoped run (cells=...). The 60 s sampler (previously not run by this tier) is started by this tier at nice 19 under SCHED_IDLE. Results: results/host-sampler/<host>/ in the artifact."
+        required: false
+        type: string
+        default: "1"
 
 permissions:
   contents: read
@@ -140,6 +145,7 @@ jobs:
           IN_ARCH: ${{ github.event.inputs.arch_exclusive }}
           IN_BASELINE: ${{ github.event.inputs.baseline }}
           IN_PUBLISH: ${{ github.event.inputs.publish }}
+          IN_SAMPLER_INTERVAL: ${{ github.event.inputs.sampler_interval }}
         run: |
           fail=0
           check() {
@@ -153,6 +159,7 @@ jobs:
           check target "$IN_TARGET" both msa2-server msr1
           check arch_exclusive "$IN_ARCH" all heavy off
           check baseline "$IN_BASELINE" true false
+          check sampler_interval "$IN_SAMPLER_INTERVAL" 1 0.5 0.2 0.1 0.05
           publishes=1
           [ "${IN_PROFILE:-full}" = fast ] && publishes=0
           [ "$IN_PUBLISH" = false ] && publishes=0
@@ -359,6 +366,39 @@ jobs:
           DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
 
+      # The host sampler (probatorium#354, #481) beside the bench: the race and
+      # weekend tiers had it, the bench tier did not, so a bench had no series of
+      # its own (the forensics artifact fetched the last weekend soak's files)
+      # and the 60 s cadence could not have seen the 1-3 s stalls of celeris#1036.
+      # Two processes per host, both read-only (ansible/host-sampler.yml): the 60 s
+      # shell sampler (kernel log, OOM / link-flap counters, boot id) and, at
+      # SAMPLER_FINE_INTERVAL (the sampler_interval input, 1 s by default, also on
+      # a schedule, which has no inputs), the lean python3 series under SCHED_IDLE with a
+      # starvation / gap event log and a per-minute record that covers the whole run.
+      # SAMPLER_LOW_PRIORITY launches the 60 s shell sampler at nice 19 under
+      # SCHED_IDLE (this tier only: the race and weekend starts are unchanged); the
+      # fine one puts itself under SCHED_IDLE. Hosts: BENCH_TARGET (job-level) limits the
+      # playbook to the target and the loadgen like Deploy does.
+      #
+      # SAMPLER_DURATION is the sampler's own hard deadline, keyed like this job's
+      # timeout-minutes: the largest BENCH_BUDGET the key admits plus 3 h, inside
+      # the ceiling (workflow_bench_sampler_test.go checks both). The stop step
+      # below ends it earlier on every path that reaches it; if the runner dies the
+      # fine sampler also ends when the Runner.Listener is gone, and the next tier
+      # that starts a sampler retires it. Best-effort, bounded to 5 minutes: it can
+      # fail neither the bench nor the job. Not in the BenchTier step: nothing here
+      # is in the measurement path (the sampler is a separate process, not a
+      # BenchTier variable, ansible task or SUT setting).
+      - name: Start the host sampler (read-only; 60 s full sample + fine series)
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SAMPLER_DURATION: ${{ fromJSON('{"heavy":"5580m","off":"4980m","single":"4980m","all":"6660m"}')[(github.event.inputs.target || 'both') != 'both' && 'single' || github.event.inputs.arch_exclusive || 'all'] }}
+          SAMPLER_TAG: bench-${{ github.run_id }}-${{ github.run_attempt }}
+          SAMPLER_FINE_INTERVAL: ${{ github.event.inputs.sampler_interval || '1' }}
+          SAMPLER_LOW_PRIORITY: "1"
+        run: mage HostSamplerStart
+
       - name: mage BenchTier (curated matrix, amd64, single pass, publish run-1)
         env:
           CLUSTER_USE_LAN: "1"
@@ -412,6 +452,22 @@ jobs:
           BENCH_BUDGET: ${{ fromJSON('{"fast":{"false":{"heavy":"24h","off":"24h","single":"24h","all":"34h"},"true":{"heavy":"24h","off":"24h","single":"24h","all":"43h"}},"headline":{"false":{"heavy":"40h","off":"36h","single":"36h","all":"72h"},"true":{"heavy":"52h","off":"48h","single":"48h","all":"92h"}},"full":{"false":{"heavy":"69h","off":"60h","single":"60h","all":"108h"},"true":{"heavy":"90h","off":"80h","single":"80h","all":"112h"}}}')[github.event.inputs.profile || 'full'][github.event.inputs.baseline == 'true' && 'true' || 'false'][(github.event.inputs.target || 'both') != 'both' && 'single' || github.event.inputs.arch_exclusive || 'all'] }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
+
+      # Before the upload, so the series travels with the run's results
+      # (results/host-sampler/<host>/); `if: always()` so it runs when the bench
+      # failed. Never fails the run. 10 minutes, not 5: the fetch of the compressed
+      # series goes through ansible's slurp (in memory under become), about 15-90 MB
+      # a host for a 65 h bench. The run tag below makes the fetch this run's only: the
+      # fine series is taken only if its fine-run.txt carries bench-<run id>-<attempt> (a re-run keeps the run id), so a
+      # Deploy that failed before the start step cannot hand over the previous
+      # bench's series.
+      - name: Stop the host sampler and collect its series
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          SAMPLER_TAG: bench-${{ github.run_id }}-${{ github.run_attempt }}
+        run: mage HostSamplerStop
 
       - name: Upload results
         if: always()

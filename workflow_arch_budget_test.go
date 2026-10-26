@@ -63,8 +63,10 @@ func TestWorkflowDefaultPolicyIsTheMageDefault(t *testing.T) {
 	}
 	re := regexp.MustCompile(`github\.event\.inputs\.arch_exclusive \|\| '([a-z]+)'\]`)
 	ms := re.FindAllSubmatch(src, -1)
-	if len(ms) != 2 {
-		t.Fatalf("want the policy fallback in the budget and timeout expressions (2), found %d", len(ms))
+	// BENCH_BUDGET, the job's timeout-minutes and the host sampler's
+	// SAMPLER_DURATION (keyed like the timeout, workflow_bench_sampler_test.go).
+	if len(ms) != 3 {
+		t.Fatalf("want the policy fallback in the budget, timeout and sampler duration expressions (3), found %d", len(ms))
 	}
 	mage, err := os.ReadFile("mage_bench_archexcl.go")
 	if err != nil {
