@@ -158,6 +158,7 @@ func stripComments(src string) string {
 func TestMonitoringCannotDisturbACluster(t *testing.T) {
 	for _, path := range []string{
 		"ops/host-sampler/celeris-host-sampler",
+		"ops/host-sampler/celeris-host-sampler-fine",
 		"ops/forensics/cluster-forensics",
 		"ansible/host-sampler.yml",
 		"ansible/forensics.yml",
@@ -212,6 +213,74 @@ func TestWeekendSoakBracketsTheRunWithTheSampler(t *testing.T) {
 		if !strings.Contains(src[from:i], "continue-on-error: true") {
 			t.Errorf("step %q is not marked continue-on-error; a sampler that cannot start "+
 				"must not fail a 24 h soak", step)
+		}
+	}
+}
+
+// pythonDisturbers are the python spellings of what the shell guard above
+// forbids, plus the ones that would make a sampler intrude on the SUT's CPUs:
+// a signal, a child process, a raised priority, a scheduling or affinity
+// change. The fine sampler is a read of /proc and a write to its own files;
+// the C-level calls that change a process are not in it.
+var pythonDisturbers = []*regexp.Regexp{
+	regexp.MustCompile(`\bimport\s+(subprocess|signal|shutil|ctypes|socket|multiprocessing|pty|fcntl)\b`),
+	regexp.MustCompile(`\bfrom\s+(subprocess|signal|shutil|ctypes|socket|multiprocessing)\b`),
+	regexp.MustCompile(`\bos\.(kill|killpg|system|fork|forkpty|popen|spawn\w*|exec\w*|abort|chmod|chown|setsid|setuid|setgid|mkfifo|symlink|link|truncate)\s*\(`),
+	regexp.MustCompile(`\bos\.(setpriority|sched_setaffinity|sched_setparam|ioprio\w*|sync|rmdir|removedirs|rename)\s*\(`),
+	regexp.MustCompile(`\bos\.nice\(\s*-`), // a raised priority
+	regexp.MustCompile(`\bPopen\b|\bshutil\.|\bsubprocess\.`),
+	regexp.MustCompile(`\bos\.O_(WRONLY|RDWR|APPEND|CREAT|TRUNC)\b`), // a descriptor opened for writing
+}
+
+// The only scheduling call is the one that LOWERS the class (SCHED_IDLE, or
+// SCHED_BATCH after nice 19): never a real-time class, never another pid.
+var pythonSchedCall = regexp.MustCompile(`osmod\.sched_setscheduler\(0, osmod\.SCHED_(IDLE|BATCH), osmod\.sched_param\(0\)\)`)
+
+// pythonAllowedRemovals are the only files the script deletes: through one
+// helper (remove_quiet), and only its own pid file, stop sentinel, series
+// files (self.path, and the older ones by name in its own directory) and the
+// files of an earlier run found by their names in its own directory.
+var pythonAllowedRemovals = regexp.MustCompile(
+	`remove_quiet\((cfg\.stopfile|cfg\.pidfile|self\.path|old|path|os\.path\.join\(cfg\.outdir, name\))\)`)
+
+var pythonAllowedReplaces = regexp.MustCompile(`os\.replace\((tmp, dst|tmp, self\.statspath)\)`)
+
+func TestFineHostSamplerCannotDisturbAHost(t *testing.T) {
+	src := stripComments(mustRead(t, "ops/host-sampler/celeris-host-sampler-fine"))
+	for _, re := range pythonDisturbers {
+		if m := re.FindString(src); m != "" {
+			t.Errorf("celeris-host-sampler-fine uses %q; the fine sampler is a read of /proc and a write to its own files (probatorium#354)", m)
+		}
+	}
+	if n := strings.Count(src, "os.remove("); n != 1 || !strings.Contains(src, "def remove_quiet(path):\n    \"\"\"Delete one of this sampler's own files (pid file, sentinel, series files).\"\"\"\n    try:\n        os.remove(path)") {
+		t.Errorf("os.remove is called %d times; the one allowed call is inside remove_quiet", n)
+	}
+	for _, m := range regexp.MustCompile(`remove_quiet\([^\n]*\)`).FindAllString(src, -1) {
+		if strings.HasPrefix(m, "remove_quiet(path):") {
+			continue
+		}
+		if !pythonAllowedRemovals.MatchString(m) {
+			t.Errorf("celeris-host-sampler-fine deletes %q: only its own pid file, stop sentinel and series files may be", m)
+		}
+	}
+	for _, m := range regexp.MustCompile(`os\.(unlink|replace)\([^\n]*\)`).FindAllString(src, -1) {
+		if !pythonAllowedReplaces.MatchString(m) {
+			t.Errorf("celeris-host-sampler-fine renames or unlinks %q", m)
+		}
+	}
+	for _, m := range regexp.MustCompile(`\w+\.sched_setscheduler\([^\n]*\)`).FindAllString(src, -1) {
+		if !pythonSchedCall.MatchString(m) {
+			t.Errorf("celeris-host-sampler-fine calls %q: the only scheduling call is SCHED_IDLE or SCHED_BATCH for this process", m)
+		}
+	}
+	// Every file it reads from the proc root is opened read-only, by one
+	// function, so there is one place to look.
+	if n := strings.Count(src, "os.open("); n != 2 {
+		t.Errorf("os.open is called %d times, want the 2 read-only calls of Proc.read and Proc.comm", n)
+	}
+	for _, m := range regexp.MustCompile(`os\.open\([^\n]*\)`).FindAllString(src, -1) {
+		if !strings.Contains(m, "os.O_RDONLY") {
+			t.Errorf("os.open without O_RDONLY: %s", m)
 		}
 	}
 }

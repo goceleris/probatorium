@@ -384,6 +384,12 @@ jobs:
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ runner.temp }}/collections
         run: bash ansible/tests/test_reboot_play.sh
+      # The host sampler lifecycle (ansible/host-sampler.yml), the real playbook on a local
+      # connection: a start without a fine cadence starts no fine sampler, a start with one
+      # launches the python sampler (SCHED_IDLE, its series, stats), the stop fetches it into
+      # fine/, a start without one retires a stale one, a cadence out of bounds is refused.
+      - name: ansible/tests/test_host_sampler_play.sh
+        run: bash ansible/tests/test_host_sampler_play.sh
       # The sanctioned OS survey and upgrade (ansible/os-upgrade.yml): the script against a
       # fake host with stub grub/apt/dkms commands, the real Jinja judgement (every refusal) and the
       # whole playbook on local connections, under the cluster's ansible pin.

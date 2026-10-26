@@ -124,20 +124,23 @@ read_num() {
 }
 
 # pid_of <comm> — the pid of a process whose (15-char-truncated) comm matches,
-# or empty. pgrep only LISTS; it sends nothing. If procps is absent we fall
-# back to reading /proc, which is also a pure read.
+# or empty. It reads /proc/<pid>/comm, one small file per process, and nothing
+# else: no pgrep. pgrep opens /proc/<pid>/cmdline of every process, which takes
+# that process's mmap_lock; when the sampler runs under SCHED_IDLE (the bench
+# tier launches it with chrt -i 0) it can be preempted while holding the lock,
+# and the SUT's mmap / munmap / mprotect then wait for it (hundreds of ms
+# measured). comm is read under task_lock, a spinlock that is never held across
+# a sleep. The read builtin forks nothing.
 pid_of() {
-    _p=$(pgrep -x "$1" 2>/dev/null | head -1)
-    if [ -z "${_p:-}" ]; then
-        for _d in /proc/[0-9]*; do
-            [ -r "$_d/comm" ] || continue
-            read -r _c <"$_d/comm" 2>/dev/null || continue
-            if [ "$_c" = "$1" ]; then
-                _p=${_d#/proc/}
-                break
-            fi
-        done
-    fi
+    _p=""
+    for _d in /proc/[0-9]*; do
+        [ -r "$_d/comm" ] || continue
+        read -r _c <"$_d/comm" 2>/dev/null || continue
+        if [ "$_c" = "$1" ]; then
+            _p=${_d#/proc/}
+            break
+        fi
+    done
     printf '%s' "${_p:-}"
 }
 
