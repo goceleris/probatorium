@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -709,7 +710,22 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 			}
 			add(c, "tier_1.adaptive_switches", 0,
 				fmt.Sprintf("this tier expects every adaptive cell to promote at least once (VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH) and the engine never left its start engine; the cell validated epoll, not the adaptive path. Offered load, as the property loop measured it: peak %.1f conns/worker, mean %.0f bytes/req -- the controller's own two signals, so a peak below its conns/worker threshold is a sizing bug here and a bytes/req above its large-payload threshold is a deliberate suppression, not a defect",
-					c.Tier1.PeakConnsPerWorker, c.Tier1.MeanBytesPerReq))
+					c.Tier1.PeakConnsPerWorker, c.Tier1.MeanBytesPerReq)+loadShapingSuffix(c.Tier1.LoadShaping))
+		}
+	}
+	// A paced cell is the race tier's (probatorium#481): the pause exists for
+	// the detector's slowdown, and a cell that was paced without one is a
+	// nightly validated at a fraction of its load. Same test as the SLOW
+	// tolerance: I-RACE declared by a property loop that ran.
+	for _, c := range cells {
+		if c.Tier1 == nil || c.Tier1.LoadShaping == nil {
+			continue
+		}
+		switch {
+		case !ranPropertyLoop(c):
+			add(c, "tier_1.load_shaping", c.Tier1.LoadShaping.MarkovMinPeriodUs, loadShapingNoLoopWhy)
+		case slices.Contains(c.PropertiesNotInstrumented, "I-RACE"):
+			add(c, "tier_1.load_shaping", c.Tier1.LoadShaping.MarkovMinPeriodUs, loadShapingNoRaceWhy)
 		}
 	}
 	// Must-stay-zero engine witnesses. No option guards these: each counts
@@ -811,4 +827,24 @@ func Gate(cells []ValidationCellResult, soaks map[string]*SoakSummary, opts Gate
 		return a.Field < b.Field
 	})
 	return out
+}
+
+// The two reasons a paced cell fails the race-build rule, kept apart because
+// they have different causes: a property loop that never ran (the refapp died or
+// /debug/vars was unreachable, which the cell fails for anyway) is not a refapp
+// without the detector.
+const (
+	loadShapingNoLoopWhy = "this cell's Markov walkers were paced (load shaping, a race-tier measure for the detector's slowdown) but its property loop did not run, so I-RACE could not be declared and the cell cannot be shown to be a -race build"
+	loadShapingNoRaceWhy = "this cell's Markov walkers were paced (load shaping, a race-tier measure for the detector's slowdown) but the cell does not show a -race build (I-RACE not declared by its property loop): it was validated at a fraction of the load it is gated for"
+)
+
+// loadShapingSuffix is what a missed promotion of a paced cell adds to the
+// ExpectAdaptiveSwitch row: empty for an unpaced cell, so every other row reads
+// exactly as it did.
+func loadShapingSuffix(l *LoadShaping) string {
+	if l == nil {
+		return ""
+	}
+	return fmt.Sprintf(". This cell's load was shaped (load shaping, tier_1.load_shaping): %d of its %d walkers started a request at most once every %s ms while the walker, worker and connection counts were unchanged, so look at that pacing first -- the controller also refuses to promote when a tick's bytes/req is large, and a fleet paced below the echo's bytes gives it that",
+		l.MarkovWalkers, l.Walkers, strconv.FormatFloat(float64(l.MarkovMinPeriodUs)/1000, 'f', -1, 64))
 }
