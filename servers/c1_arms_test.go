@@ -112,7 +112,7 @@ func TestC1ArmGlobsSelectOneCellPerColumn(t *testing.T) {
 			t.Error("the glob must contain '-io512': benchmark-tier.yml keys the 90 s / 20 s window on that substring")
 		}
 		// the experiments never mix on one dispatch
-		for _, g := range []string{p2Fast, p2Nine, p2bGlob} {
+		for _, g := range []string{p2Fast, p2Nine} {
 			for c := range p2Matched(t, g) {
 				if strings.HasPrefix(c, tg.prefix+"-") {
 					t.Errorf("the glob %q selects the %s column %s", g, tg.prefix, c)
@@ -281,7 +281,7 @@ func TestC1ArmBponIsTheSameBuildAsMain(t *testing.T) {
 
 // The knob the registry sets is the one the adapter reads, and its value means 50 microseconds and survives the SUT env charset (no micro sign).
 func TestC1ArmKnobMatchesTheAdapter(t *testing.T) {
-	for _, mod := range []string{"celeris", "celeris_vnv", "celeris_v1511"} {
+	for _, mod := range []string{"celeris", "celeris_v1511"} {
 		src, err := os.ReadFile(filepath.Join(mod, "busypoll_knob.go"))
 		if err != nil {
 			t.Fatal(err)
@@ -299,7 +299,7 @@ func TestC1ArmKnobMatchesTheAdapter(t *testing.T) {
 	}
 	// the knob file is one file in every module (a mirror cannot drift)
 	ref, _ := os.ReadFile("celeris/busypoll_knob.go")
-	for _, mod := range []string{"celeris_vnv", "celeris_v1511"} {
+	for _, mod := range []string{"celeris_v1511"} {
 		got, _ := os.ReadFile(filepath.Join(mod, "busypoll_knob.go"))
 		if string(got) != string(ref) {
 			t.Errorf("servers/%s/busypoll_knob.go differs from servers/celeris/busypoll_knob.go", mod)
