@@ -481,10 +481,12 @@
         case "$cmd" in
           *competitors/*)
             # Go competitor launched directly from competitors/: require the
-            # exact binary, and the exact -engine when the column carries one
+            # exact binary (the trailing space ends the path token: every launch line is
+            # competitors/BIN -bind ADDR, see mage_bench_portguard_test.go, so celeris never
+            # accepts a leftover celeris_v158 or celeris_9f4d89b), and the exact -engine when the column carries one
             # (trailing space pins it to a whole argv token, so -engine h1 is
             # never accepted for an -engine h2c column).
-            if printf '%s' "$cmd" | grep -qF -- "$want_bin"; then
+            if printf '%s' "$cmd" | grep -qF -- "$want_bin "; then
               if [ -z "$want_engine" ] || printf '%s' "$cmd" | grep -qF -- "-engine $want_engine "; then
                 if env_ok "$holder"; then
                   exit 0
@@ -1226,6 +1228,7 @@
     src: "{{ playbook_dir }}/files/pprofcap.py"
     dest: "{{ cell_dir }}/pprofcap.py"
     mode: '0755'
+  failed_when: false
   when:
     - inventory_hostname == bench_target
     - cell_bound | bool

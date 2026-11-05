@@ -194,9 +194,13 @@ func sutEnvExtraVars(env map[string]string) string {
 	return string(b)
 }
 
-// armColumnPrefixes are the registry prefixes of the v1.6.0 attribution columns: the arm columns of servers/c1_arms.go and servers/c2x86_arms.go, the #858 ladder columns of servers/c2lad_arms.go (the fcbpon slot is told apart by its column env), and the repinned P2 columns of
+// armColumnPrefixes are the registry prefixes of the v1.6.0 attribution columns: the arm columns of servers/c1_arms.go and servers/c2x86_arms.go, the #858 ladder columns of servers/c2lad_arms.go (the fcbpon slot is told apart by its column env), the ARMED diagnostic columns of servers/c1pp_arms.go (told apart by the pprof gate in their column env), and the repinned P2 columns of
 // servers/p2_arms.go (1a, main vs v1.5.11), which have no validator yet and must not be turned into a different arm by an override either.
-var armColumnPrefixes = []string{"c1arm-", "c2x86-", "c2lad-", "pinp38-"}
+var armColumnPrefixes = []string{"c1arm-", "c2x86-", "c2lad-", "c1pp-", "pinp38-"}
+
+// pprofGateEnv arms ansible/files/pprofcap.py (servers/celeris/pprof_sidecar.go); only a registry column env (the c1pp- columns) may set it, so a dispatch-wide override can never arm a
+// column together with its twins and peers.
+const pprofGateEnv = "PROBATORIUM_PPROF"
 
 // busyPollKnobEnv is the busy-poll arm's knob (servers/celeris/busypoll_knob.go); only a registry column env may set it.
 const busyPollKnobEnv = "PROBATORIUM_SOCKET_BUSY_POLL"
@@ -211,6 +215,9 @@ func refuseSUTEnvOnArmColumns(slugs []string, sutEnv map[string]string) error {
 	}
 	if v, ok := sutEnv[busyPollKnobEnv]; ok {
 		return fmt.Errorf("BENCH_SUT_ENV sets %s=%s: the busy-poll arm comes only from the registry column env (servers/c1_arms.go), never from a dispatch-wide override", busyPollKnobEnv, v)
+	}
+	if v, ok := sutEnv[pprofGateEnv]; ok {
+		return fmt.Errorf("BENCH_SUT_ENV sets %s=%s: the pprof collector is armed only by the registry column env of the c1pp- columns (servers/c1pp_arms.go), never by a dispatch-wide override that would arm every column, twins and peers included", pprofGateEnv, v)
 	}
 	for _, slug := range slugs {
 		for _, p := range armColumnPrefixes {

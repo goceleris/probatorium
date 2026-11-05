@@ -18,15 +18,27 @@ file; the sampler then re-baselines (the dump itself must not be read as the nex
 
 The window: rendezvous on the first sample with ActiveConnections >= --min-conns (the same event the stall captures use, ssh-free); window = [t0 + warm, t0 + warm + dur].
 
+Durable evidence (review r5 P4): pprofcap.meta.json is written atomically at the start (outcome "started"), after the rendezvous ("running") and at the end; SIGTERM (the teardown task
+stops a slow collector after 45 s) is turned into an orderly exit that writes the meta with outcome "terminated: ...". An armed column without a meta whose outcome is "done" is
+CAPTURE-MISSING (reported by the reader; it does not void the bench numbers).
+
+Request/response guard (review r5 P3): the zero-second proxy reads the engine request counter, which only moves under request/response load. The trigger measures the counter over the
+warmup (rendezvous to window start); below --min-warmup-requests (default 100) it writes outcome note "trigger_skipped" and never dumps, so a WebSocket or SSE window (a flat counter with
+open connections) cannot collect dumps.
+
 Nothing here fails the column: every error becomes a line in pprofcap.meta.json and the process exits 0. A SUT without the gate (404 on /debug/pprof/) or without a side listener (a non-Go
 peer in the same dispatch) is recorded as "skipped".
 usage: pprofcap.py --addr HOST:PORT --mode dump|profile|both --out DIR --warm S --dur S [--pid N] [--guard S] [--profile-seconds 30] [--min-conns 16] [--max-dumps 3] [--min-gap 15]
-Tested by workflow_pprofcap_test.go (the real script against a scripted fake side listener). One window: the first measurement window after the rendezvous. A column that runs several
-scenarios, or a rated sweep with several passes, is profiled in its FIRST pass only; a matched-rate profile (celeris#857) needs a single-pass fixed-rate cell, fixed in the PREREG.
+Tested by workflow_pprofcap_test.go (the real script against a scripted fake side listener).
+WHICH WINDOW: exactly one, the FIRST measurement window after the rendezvous (the first sample with ActiveConnections >= --min-conns). The runner runs a column's scenarios in name order, so
+a column watched by this script must run ONE scenario: the armed c1pp-* columns (servers/c1pp_arms.go) are dispatched with cells=<cell>/c1pp-<mode>-*, and servers/c1pp_arms_test.go proves
+that this glob selects exactly one scenario per column. A rated sweep with several passes is watched in its FIRST pass only; a matched-rate profile (celeris#857) needs a single-pass
+fixed-rate cell, fixed in the PREREG.
 """
 import argparse
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -44,6 +56,7 @@ class Collector:
         self.lock = threading.Lock()
         self.t_end = time.monotonic() + a.guard
         self.rc = []  # (epoch, RequestCount, ActiveConnections)
+        self.rendezvous_count = None
 
     # ---- plumbing
     def get(self, path, timeout, limit=None):
@@ -55,6 +68,20 @@ class Collector:
         with self.lock:
             self.meta["errors"].append("%.3f %s" % (time.time(), msg))
 
+    def flush_meta(self):
+        """atomic write of the meta as it stands (called at every phase: a killed collector leaves its last state)"""
+        try:
+            with self.lock:
+                data = json.dumps(self.meta, indent=1, sort_keys=True).encode()
+            p = os.path.join(self.a.out, "pprofcap.meta.json")
+            with open(p + ".part", "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(p + ".part", p)
+        except Exception:  # noqa: BLE001
+            pass
+
     def save(self, name, data):
         p = os.path.join(self.a.out, name)
         tmp = p + ".part"
@@ -63,6 +90,8 @@ class Collector:
         os.replace(tmp, p)
         with self.lock:
             self.meta["files"].append({"name": name, "bytes": len(data)})
+        if name != "pprofcap.meta.json":
+            self.flush_meta()
 
     def vars(self, timeout=2.0):
         """-> (RequestCount, ActiveConnections, pid) or None"""
@@ -118,6 +147,7 @@ class Collector:
         while time.monotonic() < deadline and time.monotonic() < self.t_end:
             v = self.vars()
             if v is not None and v[1] >= a.min_conns:
+                self.rendezvous_count = v[0]
                 return time.monotonic()
             time.sleep(0.2)
         return None
@@ -158,6 +188,13 @@ class Collector:
         if not self.sleep_until(start):
             return
         events = os.path.join(a.out, "pprofcap.events.jsonl")
+        # request/response guard: the counter must have moved over the warmup, or this is not a load the proxy can read
+        w = self.vars()
+        if w is not None and self.rendezvous_count is not None and w[0] - self.rendezvous_count < a.min_warmup_requests:
+            with self.lock:
+                self.meta["trigger_skipped"] = "the request counter moved by %d over the warmup (floor %d): not a request/response load" % (w[0] - self.rendezvous_count, a.min_warmup_requests)
+            self.flush_meta()
+            return
         prev, prev_t = None, None
         last_dump = -1e9
         nxt = time.monotonic()
@@ -217,6 +254,7 @@ class Collector:
         try:
             with open(os.path.join(a.out, "pprofcap.pid"), "w") as f:
                 f.write(str(os.getpid()))
+            self.flush_meta()
             if not self.attach():
                 return
             t0 = self.rendezvous()
@@ -225,7 +263,8 @@ class Collector:
                 return
             start = t0 + a.warm
             end = start + a.dur
-            self.meta.update(rendezvous_epoch=time.time() - (time.monotonic() - t0), window_start_in_s=a.warm, window_s=a.dur)
+            self.meta.update(rendezvous_epoch=time.time() - (time.monotonic() - t0), window_start_in_s=a.warm, window_s=a.dur, outcome="running")
+            self.flush_meta()
             ths = []
             if a.mode in ("profile", "both"):
                 ths.append(threading.Thread(target=self.profile, args=(start,), daemon=True))
@@ -236,9 +275,11 @@ class Collector:
             for t in ths:
                 t.join(max(1.0, self.t_end - time.monotonic()))
             self.meta["outcome"] = "done"
-        except Exception as e:  # noqa: BLE001
-            self.meta["outcome"] = "error: %r" % (e,)
+        except BaseException as e:  # noqa: BLE001 - SystemExit from the SIGTERM handler lands here too
+            self.meta["outcome"] = ("terminated: %s" % (e,)) if isinstance(e, SystemExit) else "error: %r" % (e,)
         finally:
+            if self.meta["outcome"] in ("started", "running"):
+                self.meta["outcome"] = "terminated: ended while " + self.meta["outcome"]
             try:
                 with self.lock:
                     rc = list(self.rc)
@@ -263,6 +304,7 @@ def parse(argv):
     p.add_argument("--max-dumps", type=int, default=3)
     p.add_argument("--min-gap", type=float, default=15.0)
     p.add_argument("--dump-timeout", type=float, default=20.0)
+    p.add_argument("--min-warmup-requests", type=int, default=100)
     p.add_argument("--attach-timeout", type=float, default=30.0)
     p.add_argument("--rendezvous-timeout", type=float, default=240.0)
     return p.parse_args(argv)
@@ -270,6 +312,11 @@ def parse(argv):
 
 def main(argv):
     a = parse(argv)
+
+    def on_term(signum, _frame):  # the teardown task sends SIGTERM to a collector that is still attaching or waiting for the rendezvous
+        raise SystemExit("signal %d" % signum)
+
+    signal.signal(signal.SIGTERM, on_term)
     Collector(a).run()
     return 0
 
