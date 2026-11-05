@@ -172,7 +172,8 @@ jobs:
           fi
           # sut_env is a dispatch-wide override of the SUT environment. The v1.6.0 attribution columns (c1arm-, c2x86-, c2lad-, c1pp-, and the repinned P2 columns pinp38-) are told apart by their
           # column env alone and are validated against exactly the expected launched env, so no sut_env may ride with them; and the busy-poll knob may only come from the registry.
-          # mage Bench refuses the same combination (refuseSUTEnvOnArmColumns, also for cells globs this shell cannot read); this step fails first, before a runner is provisioned.
+          # mage Bench refuses the same combination (refuseSUTEnvOnArmColumns), also for cells globs this shell cannot read ('*/*', an empty cells input, 'c1arm*' without the dash), but only
+          # after the runners are up and after the workflow's `mage Deploy` step; THIS step is the cheap first gate for the literal prefixes, before a runner is provisioned.
           if [ -n "$IN_SUT_ENV" ]; then
             sut_nospace=${IN_SUT_ENV// /}   # mage trims the entries, so " A=1 , PROBATORIUM_SOCKET_BUSY_POLL=50us" is the same set
             case ",$sut_nospace," in
