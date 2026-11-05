@@ -13,8 +13,8 @@ import (
 )
 
 // THROWAWAY (ab/c1-harness-h0h8-20261105, not for merge). H8, the dispatcher half of the attribution validators' "exact launched env" rule: every path that can put a key into the
-// SUT's environment besides the column's own env is closed or empty by default, and the one open path (the workflow's sut_env input -> BENCH_SUT_ENV -> bench_sut_env) is refused at
-// mage start for the arm columns.
+// SUT's environment besides the column's own env is closed or empty by default, and the one open path (the workflow's sut_env input -> BENCH_SUT_ENV -> bench_sut_env) is refused for the
+// arm columns twice: by the setup job's input check (literal prefixes, before a runner is provisioned) and by mage Bench (any glob, after the workflow's mage Deploy step, before any column runs).
 func firstWithPrefix(t *testing.T, p string) string {
 	t.Helper()
 	var best string

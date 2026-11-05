@@ -201,7 +201,7 @@ var armColumnPrefixes = []string{"c1arm-", "c2x86-", "pinp38-"}
 // busyPollKnobEnv is the busy-poll arm's knob (servers/celeris/busypoll_knob.go); only a registry column env may set it.
 const busyPollKnobEnv = "PROBATORIUM_SOCKET_BUSY_POLL"
 
-// refuseSUTEnvOnArmColumns fails the dispatch, at mage start and not on the cluster, when a dispatch-wide BENCH_SUT_ENV (the workflow's sut_env input) is combined with an attribution
+// refuseSUTEnvOnArmColumns fails the dispatch, at the start of mage Bench (before any column runs or any SUT starts, but AFTER the workflow's `mage Deploy` step), when a dispatch-wide BENCH_SUT_ENV (the workflow's sut_env input) is combined with an attribution
 // column, or sets the busy-poll knob at all. The arm columns are told apart ONLY by their column env, and arm-validate.py / x86-validate.py require the launched environment to be
 // exactly the base env plus the column's own keys: any override (CELERIS_IOURING_FIXED_FILES=1 would even silence SocketBusyPoll while the startup line still reads 50us) would void
 // every column after the hours are spent, and a knob in sut_env would make the default arm busy-poll. slugs are the columns the dispatch will bench.
