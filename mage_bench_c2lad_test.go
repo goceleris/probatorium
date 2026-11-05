@@ -56,3 +56,47 @@ func TestResolveBenchColumnsForTheLadder(t *testing.T) {
 		}
 	}
 }
+
+// H7' armed columns (servers/c1pp_arms.go): the playbook receives exactly the gate as the column env, and a dispatch-wide sut_env can neither arm anything (the key is refused) nor ride with them.
+func TestResolveBenchColumnsForTheArmedPprofColumns(t *testing.T) {
+	var dump, prof string
+	for name := range servers.Registry {
+		if strings.HasPrefix(name, "c1pp-dump-r1-main-epoll-h1-async") {
+			dump = name
+		}
+		if strings.HasPrefix(name, "c1pp-profile-r1-main-epoll-h1-async") {
+			prof = name
+		}
+	}
+	if dump == "" || prof == "" {
+		t.Fatal("no c1pp r1 main epoll-h1-async dump/profile column")
+	}
+	cols, err := resolveBenchColumns(dump + "," + prof)
+	if err != nil || len(cols) != 2 {
+		t.Fatalf("%v, %d columns", err, len(cols))
+	}
+	for _, c := range cols {
+		want := map[string]string{"PROBATORIUM_PPROF": "dump"}
+		if c.Slug == prof {
+			want["PROBATORIUM_PPROF"] = "profile"
+		}
+		if c.Bin != "celeris" || c.Engine != "epoll-h1-async" || !reflect.DeepEqual(c.Env, want) {
+			t.Errorf("%s resolves to %+v, want bin celeris, engine epoll-h1-async, env %v", c.Slug, c, want)
+		}
+		if err := validateSUTEnvMap(c.Env); err != nil {
+			t.Errorf("%s: %v", c.Slug, err)
+		}
+		if err := refuseSUTEnvOnArmColumns([]string{c.Slug}, map[string]string{"A": "1"}); err == nil {
+			t.Errorf("%s accepts a dispatch-wide sut_env", c.Slug)
+		}
+	}
+	// the gate is refused in sut_env for ANY column, ordinary ones included
+	for _, slug := range []string{"celeris-epoll-h1-async", dump} {
+		if err := refuseSUTEnvOnArmColumns([]string{slug}, map[string]string{"PROBATORIUM_PPROF": "dump"}); err == nil || !strings.Contains(err.Error(), "PROBATORIUM_PPROF") {
+			t.Errorf("sut_env PROBATORIUM_PPROF on %s: err = %v, want a refusal", slug, err)
+		}
+	}
+	if _, err := parseSUTEnv("PROBATORIUM_PPROF=dump"); err != nil {
+		t.Errorf("the key itself must stay a legal SUT env key for a registry column: %v", err)
+	}
+}

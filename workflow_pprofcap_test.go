@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -397,6 +398,114 @@ func TestPprofcapSkipsWhatItCannotCollect(t *testing.T) {
 	})
 }
 
+// R5: a second in which every connection closed (the end of a scenario inside the window) with a flat counter is NOT a zero second: connections must be open at BOTH ends.
+func TestPprofcapConnectionsClosingInsideTheWindowIsNotAStall(t *testing.T) {
+	t.Parallel()
+	out := t.TempDir()
+	f := newFakeSUT(t, func(el time.Duration) (uint64, int64, bool) {
+		n, _, _ := steady([2]float64{4.5, 60})(el)
+		if el.Seconds() >= 4.5 {
+			return n, 0, true // all connections closed together with the last request
+		}
+		return n, 8, true
+	})
+	meta := runPprofcap(t, f, out, "--mode", "dump", "--warm", "3", "--dur", "5", "--min-gap", "1")
+	if meta["outcome"] != "done" || num(meta, "zero_seconds") != 0 || num(meta, "dumps") != 0 || len(f.dumpAt) != 0 {
+		t.Errorf("outcome %v zero_seconds %d dumps %d: closing the connections must not read as a stall", meta["outcome"], num(meta, "zero_seconds"), num(meta, "dumps"))
+	}
+}
+
+// P3: a load under which the request counter does not move although connections are open (a WebSocket or SSE window) never arms the dump.
+func TestPprofcapSkipsALoadWhoseRequestCounterDoesNotMove(t *testing.T) {
+	t.Parallel()
+	out := t.TempDir()
+	f := newFakeSUT(t, func(time.Duration) (uint64, int64, bool) { return 500, 8, true })
+	meta := runPprofcap(t, f, out, "--mode", "dump", "--warm", "2", "--dur", "5", "--min-gap", "1")
+	if _, ok := meta["trigger_skipped"].(string); !ok || num(meta, "dumps") != 0 || num(meta, "zero_seconds") != 0 || len(f.dumpAt) != 0 {
+		t.Errorf("meta %v: want trigger_skipped, no zero seconds, no dump", meta)
+	}
+	if exists(filepath.Join(out, "pprofcap.events.jsonl")) {
+		t.Error("an events file exists for a load the proxy cannot read")
+	}
+}
+
+func startPprofcap(t *testing.T, f *fakeSUT, out string, extra ...string) *exec.Cmd {
+	t.Helper()
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not installed")
+	}
+	f.events = filepath.Join(out, "pprofcap.events.jsonl")
+	args := append([]string{"-I", "ansible/files/pprofcap.py", "--addr", f.addr(), "--out", out, "--pid", fmt.Sprint(f.pid), "--min-conns", "4", "--guard", "90", "--attach-timeout", "3"}, extra...)
+	cmd := exec.Command(py, args...)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	return cmd
+}
+
+func readMeta(t *testing.T, out string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(out, "pprofcap.meta.json"))
+	if err != nil {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("pprofcap.meta.json is not valid JSON (a torn write): %v\n%s", err, b)
+	}
+	return m
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// P4: the teardown task stops a slow collector with SIGTERM. A collector still waiting for its rendezvous must leave its meta (outcome terminated), not nothing.
+func TestPprofcapSigtermLeavesTheMeta(t *testing.T) {
+	t.Parallel()
+	out := t.TempDir()
+	f := newFakeSUT(t, func(time.Duration) (uint64, int64, bool) { return 1, 0, true }) // never reaches the rendezvous
+	cmd := startPprofcap(t, f, out, "--mode", "dump", "--warm", "1", "--dur", "4", "--rendezvous-timeout", "60")
+	waitFor(t, "the early meta", func() bool { m := readMeta(t, out); return m != nil && m["outcome"] == "started" })
+	time.Sleep(700 * time.Millisecond) // inside the rendezvous loop
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the collector did not exit on SIGTERM")
+	}
+	m := readMeta(t, out)
+	if o, _ := m["outcome"].(string); !strings.HasPrefix(o, "terminated") {
+		t.Errorf("outcome %q after SIGTERM, want terminated...", o)
+	}
+}
+
+// P4: even a SIGKILL (nothing runs) leaves the last atomic write: the meta says "running" with the window it was watching.
+func TestPprofcapSigkillLeavesTheLastMeta(t *testing.T) {
+	t.Parallel()
+	out := t.TempDir()
+	f := newFakeSUT(t, steady())
+	cmd := startPprofcap(t, f, out, "--mode", "dump", "--warm", "1", "--dur", "30", "--rendezvous-timeout", "20")
+	waitFor(t, "the running meta", func() bool { m := readMeta(t, out); return m != nil && m["outcome"] == "running" })
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+	m := readMeta(t, out)
+	if m["outcome"] != "running" || num(m, "window_s") != 30 {
+		t.Errorf("after SIGKILL the meta is %v, want outcome running with window_s 30", m)
+	}
+}
+
 // The wiring in run_bench_cell.yml: the gate is the SUT env key (merge of bench_sut_env and the column env), the collector exists only for dump|profile|both, runs on the SUT, is never
 // root, and the free-form shell has no apostrophe (ansible's splitter).
 func TestRunBenchCellStartsThePprofCollectorOnlyWhenTheColumnEnvAsks(t *testing.T) {
@@ -429,6 +538,22 @@ func TestRunBenchCellStartsThePprofCollectorOnlyWhenTheColumnEnvAsks(t *testing.
 		if !strings.Contains(m[1], want) {
 			t.Errorf("collector command lacks %q", want)
 		}
+	}
+	// R7: the collector's window is the runner's window: --warm and --dur are the SAME expressions as the runner's -warmup and -duration
+	runner := y[j:]
+	for _, tc := range []struct{ flag, runnerFlag string }{{"--warm", "-warmup"}, {"--dur", "-duration"}} {
+		cm := regexp.MustCompile(regexp.QuoteMeta(tc.flag) + ` (\{\{ [a-z_]+ \| default\(\d+\) \}\})`).FindStringSubmatch(m[1])
+		rm := regexp.MustCompile(regexp.QuoteMeta(tc.runnerFlag) + ` (\{\{ [a-z_]+ \| default\(\d+\) \}\})s`).FindStringSubmatch(runner)
+		if cm == nil || rm == nil || cm[1] != rm[1] {
+			t.Errorf("collector %s %v and runner %s %v must be the same expression: a misaligned window profiles the wrong seconds", tc.flag, cm, tc.runnerFlag, rm)
+		}
+	}
+	// R10: a failing collector must never drop the bench target from the play
+	if strings.Count(block, "failed_when: false") != 2 {
+		t.Error("both the copy and the start task of the collector must carry failed_when: false")
+	}
+	if !strings.Contains(y[k:k+1500], "failed_when: false") {
+		t.Error("the stop task of the collector must carry failed_when: false")
 	}
 	// the debug address the collector reads is the one the server binds, loopback only
 	if !strings.Contains(y, `PROBATORIUM_DEBUG_ADDR: "127.0.0.1:{{ bench_debug_port | default(18089) }}"`) {
