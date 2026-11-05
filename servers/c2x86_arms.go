@@ -9,6 +9,7 @@ import "fmt"
 // PROBATORIUM_SOCKET_BUSY_POLL=50us (servers/celeris/busypoll_knob.go sets Config.SocketBusyPoll = 50us and logs the resolved value at startup, the direct manipulation check); v1511 = celeris v1.5.11
 // (servers/celeris_v1511, which busy-polls unconditionally and logs resolved_us=absent). Columns run in sorted-name order, so the name carries the schedule:
 // c2x86-<seq>-r<arm replicate>-<arm>-io512. Framework is NOT "celeris" (the report builders stamp the main pin on Framework==celeris rows). No AB_IRQ_VECTOR_CPU: it switches on the msr1-only IRQPLACE block of run_bench_cell.yml, which would fail the column on msa2-server.
+// PLACEHOLDER (amd64): C2' of the plan (#858 ws-hub-broadcast, 5 shas) is harness change H6 and needs its own cells; no planned dispatch consumes these io512 columns yet.
 
 func init() {
 	type arm struct {
