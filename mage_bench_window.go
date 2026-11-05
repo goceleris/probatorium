@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -225,6 +226,38 @@ func refuseSUTEnvOnArmColumns(slugs []string, sutEnv map[string]string) error {
 				return fmt.Errorf("BENCH_SUT_ENV (%s) must be empty for the attribution columns (%s is one): the arms differ only by their column env and the validators require the launched environment to be exactly the expected keys",
 					sutEnvString(sutEnv), slug)
 			}
+		}
+	}
+	return nil
+}
+
+// armedScenarios are the scenarios an armed pprof column (servers/c1pp_arms.go) may run, by mode: the #854 dump is for the redis Pipeline stall, the #857 profile for the memcached rows.
+var armedScenarios = map[string][]string{
+	"dump":    {"driver-redis-pipeline"},
+	"profile": {"driver-mc-get", "driver-mc-multiget", "driver-mc-set"},
+}
+
+// refuseArmedColumnsOnManyScenarios fails the dispatch, at mage start, when any in-scope c1pp-<mode>-* column would run anything but exactly one scenario of its mode. ansible/files/pprofcap.py
+// watches the first measurement window after its rendezvous and the runner runs a column's scenarios in name order, so an armed column that also matches driver-mc-get would dump (or profile) the
+// memcached GET window instead of the Pipeline stall. The plan's own LF-1 selection (driver-redis-pipeline/* plus driver-mc-*/*) selects every c1pp column with four scenarios and is refused;
+// the working shape is driver-redis-pipeline/celeris-*,driver-mc-*/celeris-*,driver-redis-pipeline/c1pp-dump-*. Empty or "*" cells select every scenario and are refused too.
+func refuseArmedColumnsOnManyScenarios(slugs []string, cells string) error {
+	for _, slug := range slugs {
+		if !strings.HasPrefix(slug, "c1pp-") {
+			continue
+		}
+		mode, _, _ := strings.Cut(strings.TrimPrefix(slug, "c1pp-"), "-")
+		allowed, ok := armedScenarios[mode]
+		if !ok {
+			return fmt.Errorf("armed column %s has no known mode (%q): expected c1pp-dump-... or c1pp-profile-...", slug, mode)
+		}
+		got, err := cellsGlobScenarios(cells, slug)
+		if err != nil {
+			return err
+		}
+		if len(got) != 1 || !slices.Contains(allowed, got[0]) {
+			return fmt.Errorf("armed column %s would run %d scenario(s) %v under cells %q: the pprof collector watches the first window of a column, so it must run exactly one of %v "+
+				"(select it with cells=%s/c1pp-%s-*, and keep the unarmed columns on their own /celeris-* globs)", slug, len(got), got, cells, allowed, allowed[0], mode)
 		}
 	}
 	return nil

@@ -472,6 +472,13 @@
       for kv in $want_env; do
         tr '\0' '\n' < /proc/$1/environ 2>/dev/null | grep -qxF -- "$kv" || return 1
       done
+      # The two arm keys must also be ABSENT when the column does not set them: a leftover armed
+      # process (PROBATORIUM_PPROF) or busy-poll-on process (PROBATORIUM_SOCKET_BUSY_POLL) of the same
+      # binary and engine must not pass for the plain column.
+      for k in PROBATORIUM_PPROF PROBATORIUM_SOCKET_BUSY_POLL; do
+        case " $want_env" in *" $k="*) continue ;; esac
+        if tr '\0' '\n' < /proc/$1/environ 2>/dev/null | grep -q "^$k="; then return 1; fi
+      done
       return 0
     }
     for i in $(seq 1 40); do
