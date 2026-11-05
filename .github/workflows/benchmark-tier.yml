@@ -170,7 +170,7 @@ jobs:
             echo "::error::arch_exclusive=$IN_ARCH on target=both would publish documents the publish gate refuses (policy heavy failed P6 on arm64, policy off lets the arches overlap; docs/ARCH-EXCLUSION-VALIDATION.md). Dispatch with publish=false, or use the default policy."
             fail=1
           fi
-          # sut_env is a dispatch-wide override of the SUT environment. The v1.6.0 attribution columns (c1arm-, c2x86-, and the repinned P2 columns pinp38-) are told apart by their
+          # sut_env is a dispatch-wide override of the SUT environment. The v1.6.0 attribution columns (c1arm-, c2x86-, c2lad-, and the repinned P2 columns pinp38-) are told apart by their
           # column env alone and are validated against exactly the expected launched env, so no sut_env may ride with them; and the busy-poll knob may only come from the registry.
           # mage Bench refuses the same combination (refuseSUTEnvOnArmColumns, also for cells globs this shell cannot read); this step fails first, before a runner is provisioned.
           if [ -n "$IN_SUT_ENV" ]; then
@@ -181,8 +181,8 @@ jobs:
                 fail=1 ;;
             esac
             case "$IN_CELLS,$IN_COMPETITORS" in
-              *c1arm-*|*c2x86-*|*pinp38-*)
-                echo "::error::sut_env must be empty for the attribution columns (c1arm-, c2x86-, pinp38-): they differ only by their column env and the validators require the exact launched environment"
+              *c1arm-*|*c2x86-*|*c2lad-*|*pinp38-*)
+                echo "::error::sut_env must be empty for the attribution columns (c1arm-, c2x86-, c2lad-, pinp38-): they differ only by their column env and the validators require the exact launched environment"
                 fail=1 ;;
             esac
           fi
