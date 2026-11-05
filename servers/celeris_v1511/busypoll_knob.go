@@ -11,8 +11,8 @@ package main
 // This file is deliberately the ONLY place that names the field, and it reaches it by reflection,
 // for three reasons:
 //
-//   - it compiles against every celeris this module (or a mirror of it: servers/celeris_vnv,
-//     servers/celeris_v1511, the H6 sha copies) may pin, including the 713b40d pin of the P2c-P2h
+//   - it compiles against every celeris this module (or a mirror of it: servers/celeris_v1511,
+//     the H6 sha copies) may pin, including the 713b40d pin of the P2c-P2h
 //     lineage and v1.5.11, whose Config has no SocketBusyPoll and whose engines hard-code 50us;
 //   - an API drift (the field renamed or retyped) cannot silently turn a bpon column into a
 //     default one: the env set on a celeris without the field is a fatal start error;
