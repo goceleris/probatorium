@@ -139,8 +139,9 @@ func TestSUTEnvInputDefaultsToEmptyAndIsTheOnlyPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(pb), "PROBATORIUM_SOCKET_BUSY_POLL") || strings.Contains(string(pb), "CELERIS_IOURING_FIXED_FILES") {
-		t.Error("run_bench_cell.yml sets a busy-poll or fixed-files knob itself")
+	// SETTING is what is forbidden (a yaml key, an assignment or an export); the port-ownership probe READS the busy-poll key to require its absence from a holder (review r6 F5)
+	if regexp.MustCompile(`PROBATORIUM_SOCKET_BUSY_POLL\s*[:=]|export\s+PROBATORIUM_SOCKET_BUSY_POLL|PROBATORIUM_PPROF\s*[:=]|export\s+PROBATORIUM_PPROF`).MatchString(string(pb)) || strings.Contains(string(pb), "CELERIS_IOURING_FIXED_FILES") {
+		t.Error("run_bench_cell.yml sets a busy-poll, pprof or fixed-files knob itself")
 	}
 }
 
