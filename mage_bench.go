@@ -305,6 +305,11 @@ func Bench() error {
 	if err != nil {
 		return fmt.Errorf("resolve cells glob %q: %w", cells, err)
 	}
+	// The attribution columns refuse a dispatch-wide sut_env (see refuseSUTEnvOnArmColumns). Checked HERE, before the auto-deploy below, on the slugs the bench will run (the cells
+	// glob narrowed by an explicit competitors list), so a refused dispatch has touched nothing.
+	if err := refuseSUTEnvOnArmColumns(scopeSlugs(competitors, cellsSlugs), sutEnv); err != nil {
+		return err
+	}
 
 	// Auto-deploy when neither bench target has a manifest yet. Cheap
 	// pre-flight: SSH to both bench_targets; if neither has the
