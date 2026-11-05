@@ -1214,6 +1214,48 @@
   when:
     - (inventory_hostname == bench_target and (cell_bound | bool)) or (inventory_hostname == "msa2-client" and (hostvars[bench_target].cell_bound | default(false) | bool))
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | copy the pprof collector (SUT, only when the column env PROBATORIUM_PPROF asks)"
+  # PPROF-1 / harness change H7 (v1.6.0 attribution plan). The gate is the SUT env key PROBATORIUM_PPROF (dump, profile or both), read from the SAME merge the server is
+  # launched with (bench_sut_env, then the column env winning), so a column that does not carry it costs nothing here and the collector never runs for the D9 columns
+  # (c1arm-*), whose env cannot carry it (BENCH_SUT_ENV must be empty for the attribution columns). The server mounts net/http/pprof on its loopback side listener only
+  # (servers/celeris/pprof_sidecar.go); ansible/files/pprofcap.py reads that listener from the SUT host, writes into the cell directory, and bench.yml tars the cell directory
+  # with everything else, so no workflow change is needed to get its files into the benchmark-tier-results artifact.
+  vars:
+    cell_pprof_mode: "{{ ((bench_sut_env | default({})) | combine(cell_col_env | default({}))).get('PROBATORIUM_PPROF', '') | string }}"
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/files/pprofcap.py"
+    dest: "{{ cell_dir }}/pprofcap.py"
+    mode: '0755'
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+    - cell_pprof_mode in ['dump', 'profile', 'both']
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | start the pprof collector (SUT, in-window profile and zero-completion goroutine dump)"
+  vars:
+    cell_pprof_mode: "{{ ((bench_sut_env | default({})) | combine(cell_col_env | default({}))).get('PROBATORIUM_PPROF', '') | string }}"
+  ansible.builtin.shell: |
+    cd {{ cell_dir }}
+    setsid nohup python3 pprofcap.py \
+      --addr 127.0.0.1:{{ bench_debug_port | default(18089) }} \
+      --mode {{ cell_pprof_mode }} \
+      --out {{ cell_dir }} \
+      --warm {{ bench_warmup_seconds | default(5) }} \
+      --dur {{ bench_duration_seconds | default(30) }} \
+      --pid $(cat {{ cell_dir }}/server.pid) \
+      --guard {{ cell_guard_seconds }} \
+      > pprofcap.out 2>&1 &
+    disown
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+    - cell_pprof_mode in ['dump', 'profile', 'both']
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | run runner against bench target"
   # Flag names must match the runner CLI in cmd/runner/main.go:
   #   -target / -server-name / -runs / -duration / -warmup /
@@ -1318,6 +1360,23 @@
     - (runner_run.rc | default(0)) != 0
 
 # ---------- teardown for this cell ----------
+- name: "{{ cell.1 }} run={{ cell.0 }} | stop the pprof collector (SUT)"
+  # The collector ends by itself a few seconds after the measurement window (a CPU profile of at most 30 s, then one goroutine profile). Give it up to 45 s to finish writing
+  # pprofcap.meta.json, then stop it; it is read-only and holds no lock the next column needs.
+  ansible.builtin.shell: |
+    f={{ cell_dir }}/pprofcap.pid
+    [ -f $f ] || exit 0
+    pid=$(cat $f)
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ $i -lt 90 ]; do sleep 0.5; i=$((i + 1)); done
+    kill -TERM "$pid" 2>/dev/null
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == bench_target
+
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop stall captures (both hosts)"
   # The window-end snapshot is written to a temporary file and moved into place when complete, then a .done marker is
   # created. Wait for that marker (at most 45 s, only when the rendezvous happened) BEFORE anything is killed: X1 lost the end
