@@ -1411,6 +1411,11 @@ type runnerCellFile struct {
 	// derived from it. SaturationModeRPS echoes the saturation scale anchor.
 	SaturationModeRPS float64         `json:"saturation_mode_rps,omitempty"`
 	RatedPasses       []ratedPassWire `json:"rated_passes,omitempty"`
+	// RatedPassesNotKept are the passes of that sweep the runner did not keep:
+	// skipped (loadgen ran, nothing usable came back) or never run, each with
+	// a status and a reason (schema 5.24, probatorium#441). A separate array
+	// so that RatedPasses means what it always did to a reader that predates it.
+	RatedPassesNotKept []ratedPassWire `json:"rated_passes_not_kept,omitempty"`
 
 	// StartedAt / CompletedAt are the runner's per-scenario wall-clock
 	// bounds (cmd/runner cellResultFile, UTC). They window the column's
@@ -1435,12 +1440,11 @@ type passWindowWire struct {
 	End       time.Time `json:"end"`
 }
 
-// ratedPassWire mirrors cmd/runner's ratedPassFile: one rated pass's offered
-// load and CO-corrected P99.
-type ratedPassWire struct {
-	TargetRPS float64       `json:"target_rps"`
-	P99       time.Duration `json:"p99"`
-}
+// ratedPassWire is cmd/runner's ratedPassFile: one rated pass, with its offered
+// load, CO-corrected P99 and (schema 5.24) the rate loadgen achieved, its
+// errors and a status. Both sides are report.RatedPassRecord, so the two cannot
+// drift.
+type ratedPassWire = report.RatedPassRecord
 
 // readRunnerCellResults walks one ansible cell dir's runner output
 // (run*/<scenario>/<server>.json) and lifts each per-scenario result
@@ -1535,6 +1539,9 @@ func readRunnerCellResults(cellDir string, runIdx int, competitor string) ([]cel
 				rec.LoadClass, rec.ClientLockWaitS, rec.PassWindows = cf.LoadClass, cf.ClientLockWaitS, cf.PassWindows
 				if len(cf.RatedPasses) > 0 {
 					rec.RatedPasses = append(rec.RatedPasses, cf.RatedPasses...)
+				}
+				if len(cf.RatedPassesNotKept) > 0 {
+					rec.RatedPassesNotKept = append(rec.RatedPassesNotKept, cf.RatedPassesNotKept...)
 				}
 				out = append(out, rec)
 			}
@@ -1633,6 +1640,12 @@ type cellRecord struct {
 	// merged Document's latency_at_slo by mergeBenchResults so the gate has
 	// a live signal.
 	RatedPasses []ratedPassWire `json:"rated_passes,omitempty"`
+
+	// RatedPassesNotKept are the sweep's passes that were skipped or never
+	// ran, each with a status and a reason (schema 5.24, probatorium#441).
+	// mergeBenchResults lists them beside the kept ones in the merged
+	// document and never counts them in latency_at_slo.
+	RatedPassesNotKept []ratedPassWire `json:"rated_passes_not_kept,omitempty"`
 
 	// SaturationModeRPS echoes the runner's measured open-loop saturation
 	// RPS so the rated pass's per-fraction targets stay interpretable as
@@ -2052,6 +2065,12 @@ func mergeBenchResultsFor(resultsDir, target string, p benchParams, onlyHost, ou
 					rs = append(rs, report.RatedSample{TargetRPS: rp.TargetRPS, P99: rp.P99})
 				}
 				cr.RatedSamples = append(cr.RatedSamples, rs)
+			}
+			// Every pass of the sweep, kept or not (schema 5.24,
+			// probatorium#441): what keeps a skipped pass from being silent.
+			// It does not feed latency_at_slo; RatedSamples above does.
+			if recs := report.MergeRatedPassRecords(cell.RatedPasses, cell.RatedPassesNotKept); len(recs) > 0 {
+				cr.RatedPassRecords = append(cr.RatedPassRecords, recs)
 			}
 		}
 	}

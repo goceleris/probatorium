@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -431,7 +432,31 @@ type publishIntegrity struct {
 	// that recovered on a rerun still appears here — its suspect status
 	// keeps the evidence, and publishing it needs an explicit force.
 	ServerDied []string
+
+	// RatedPasses counts every rated pass of the Document by status (ok,
+	// skipped, not_run), RatedBelowTarget the ok ones that delivered less than
+	// publishRatedMinAchieved of their target, and RatedHeadlineLow the cells
+	// whose headline p99 was read at a lower target than their top planned
+	// pass (probatorium#441, schema 5.24). Informational: none is a violation,
+	// because the validity rule for a pass is still open on #441. They are
+	// printed so a publish after a green run is never blind to a pass that was
+	// lost or under-delivered.
+	RatedPasses      map[string]int
+	RatedBelowTarget int
+	// RatedLegacy counts rated passes recorded by a run that predates 5.24
+	// (no status): kept, with nothing known about the passes that run dropped.
+	// A document built from such runs, such as a re-merge of bench
+	// 38431303162, shows skipped=0 and that is NOT a statement that no pass was
+	// lost. RatedInterruptedKept counts ok passes cut short by a cancelled run.
+	RatedLegacy          int
+	RatedInterruptedKept int
+	RatedHeadlineLow     []string
 }
+
+// publishRatedMinAchieved is the achieved/target ratio below which the
+// integrity summary lists a kept rated pass as under-delivered. It is the
+// 0.98 of #441 item 3, used here to print, not to refuse or to exclude.
+const publishRatedMinAchieved = 0.98
 
 // collectPublishIntegrity audits resultsDir + the merged Document.
 // Structural inputs (column dirs, raw payloads) are best-effort: an old
@@ -491,6 +516,43 @@ func collectPublishIntegrity(resultsDir string, doc *report.Document) publishInt
 			pi.TotalCells++
 		}
 	}
+
+	// Rated passes (schema 5.24): the census of what became of each pass.
+	pi.RatedPasses = map[string]int{}
+	for _, b := range doc.Benchmarks {
+		for sc, passes := range b.RatedPasses {
+			top := 0.0
+			for _, p := range passes {
+				if p.Status == "" {
+					pi.RatedLegacy++
+				} else {
+					pi.RatedPasses[p.Status]++
+				}
+				if p.Status == report.RatedPassOK && p.Reason == report.RatedReasonInterrupted {
+					pi.RatedInterruptedKept++
+				}
+				if p.Fraction > top {
+					top = p.Fraction
+				}
+				if p.Kept() && p.AchievedRatio > 0 && p.AchievedRatio < publishRatedMinAchieved {
+					pi.RatedBelowTarget++
+				}
+			}
+			// The headline sits at the highest KEPT target. Find the pass it
+			// was read at: if that is not the cell's top planned fraction, the
+			// top pass was lost (or did not agree) and the headline is a
+			// lower load than the label suggests.
+			if head, ok := b.RatedHeadlineTargetRPS[sc]; ok {
+				for _, p := range passes {
+					if p.Kept() && math.Abs(p.TargetRPS-float64(head)) <= 1 && p.Fraction > 0 && p.Fraction < top {
+						pi.RatedHeadlineLow = append(pi.RatedHeadlineLow, b.Name+"/"+sc)
+						break
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(pi.RatedHeadlineLow)
 
 	// Dead-SUT evidence + reconstruction marks live on the per-run raw
 	// records (the Document carries statuses, not error strings).
@@ -572,6 +634,17 @@ func renderPublishIntegrity(pi publishIntegrity) string {
 	}
 	for _, s := range pi.ServerDied {
 		fmt.Fprintf(&sb, "  SERVER DIED     %s\n", s)
+	}
+	if total := pi.RatedPasses[report.RatedPassOK] + pi.RatedPasses[report.RatedPassSkipped] + pi.RatedPasses[report.RatedPassNotRun] + pi.RatedLegacy; total > 0 {
+		fmt.Fprintf(&sb, "  rated passes: %d total  ok=%d skipped=%d not_run=%d legacy=%d  ok below %.0f%% of target=%d  ok but interrupted=%d\n",
+			total, pi.RatedPasses[report.RatedPassOK], pi.RatedPasses[report.RatedPassSkipped],
+			pi.RatedPasses[report.RatedPassNotRun], pi.RatedLegacy, publishRatedMinAchieved*100, pi.RatedBelowTarget, pi.RatedInterruptedKept)
+		if pi.RatedLegacy > 0 {
+			fmt.Fprintf(&sb, "  RATED LEGACY    %d pass(es) come from runs that predate schema 5.24: a pass such a run dropped was never recorded, so skipped=0 above does not say none was lost\n", pi.RatedLegacy)
+		}
+		for _, c := range pi.RatedHeadlineLow {
+			fmt.Fprintf(&sb, "  RATED HEADLINE  %s: the headline p99 is not at the cell's top planned pass (it was not kept)\n", c)
+		}
 	}
 	if v := pi.violations(); len(v) > 0 {
 		for _, msg := range v {

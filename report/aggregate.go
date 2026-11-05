@@ -56,6 +56,15 @@ type CellResult struct {
 	// sees no signal for this cell.
 	RatedSamples [][]RatedSample
 
+	// RatedPassRecords is the same sweep as RatedSamples with every pass
+	// recorded whatever became of it (schema 5.24, probatorium#441): per run,
+	// the kept passes with the rate loadgen achieved and its errors, and the
+	// passes that were skipped or never ran with a status and a reason. Not
+	// parallel to Samples: a run without rated data adds nothing. Aggregate
+	// lists them in CellAggregate.RatedPasses; RatedSamples alone still drives
+	// latency_at_slo and the headline p99.
+	RatedPassRecords [][]RatedPassRecord
+
 	// Resources is the per-run server-side resource aggregate (#154):
 	// one [ResourceStats] per run that captured an observer.sqlite + cpu.log
 	// sidecar (cluster path), reduced across runs by [Aggregate] into
@@ -197,6 +206,13 @@ type CellAggregate struct {
 	// rated mode was off, so a non-rated run emits no fake gate signal.
 	LatencyAtSLO map[int]int
 
+	// RatedPasses lists every rated pass of every run of the cell, kept or
+	// not (schema 5.24). RatedHeadlineTargetRPS is the target of the pass the
+	// headline p99 came from: the highest kept target, which is the cell's
+	// highest fraction only when that pass was kept. Zero when no pass was.
+	RatedPasses            []RatedPassResult
+	RatedHeadlineTargetRPS int
+
 	// Resources is the across-runs reduction of the cell's server-side
 	// resource sampling (#154): median of each scalar across the runs that
 	// reported it, plus the last run's downsampled series. Nil when no run
@@ -306,6 +322,7 @@ func Aggregate(cells []CellResult) map[string]CellAggregate {
 		}
 
 		reduceRated(cell.RatedSamples, &agg)
+		agg.RatedPasses = ratedPassResults(cell.RatedPassRecords)
 
 		// Server-side resource reduction (#154): median each scalar across
 		// the runs that captured an observer sidecar. Nil when none did.
@@ -342,6 +359,7 @@ func reduceRated(runs [][]RatedSample, agg *CellAggregate) {
 		medByTarget[t] = time.Duration(medianInt64(ps))
 	}
 	agg.RatedP99ByTarget = medByTarget
+	agg.RatedHeadlineTargetRPS = ratedHeadlineTarget(medByTarget)
 
 	slo := make(map[int]int, len(SLOThresholds))
 	for _, ms := range SLOThresholds {

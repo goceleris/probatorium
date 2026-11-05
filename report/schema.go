@@ -336,7 +336,28 @@ import (
 //     refused, a subset of ws_echo_timeout (which still fails and is still
 //     the only one gated). Nothing new is gated. Additive; older readers
 //     ignore every field.
-const SchemaVersion = "5.23"
+//   - 5.24 — every rated pass is recorded (probatorium#441, refs; the validity
+//     rule and the schedule lag remain open there). The runner kept
+//     {target_rps, p99} for a pass that returned requests and dropped any
+//     other with one stderr line, so a run could not say how much load
+//     loadgen delivered, how many requests failed, or that a pass was
+//     missing. Adds ServerResult.RatedPasses (rated_passes: scenario ->
+//     one RatedPassResult per pass per run: fraction, target_rps,
+//     achieved_rps, achieved_ratio, requests, errors, connect_errors,
+//     dial_retries, close_aborts, shortfall_requests, duration, p50, p99,
+//     p99_9, max, start, end, loadgen_version, and a status ok | skipped |
+//     not_run with a reason and the error text for a pass that is not ok)
+//     and ServerResult.RatedHeadlineTargetRPS (rated_headline_target_rps:
+//     the target rated_mode_p99_at_target_rps was read at, the highest KEPT
+//     target). On the runner's per-cell JSON and raw/<host>.json the passes
+//     that are not kept are a separate array, rated_passes_not_kept, and
+//     rated_passes keeps its pre-5.24 meaning (kept passes, now with the
+//     added fields), so a reader that predates 5.24 sees the same
+//     rated_passes entries it always did and ignores the rest.
+//     latency_at_slo and rated_mode_p99_at_target_rps are built from the
+//     kept passes exactly as before: nothing published changes value.
+//     Additive; older readers ignore both fields.
+const SchemaVersion = "5.24"
 
 // SchemaAtLeast reports whether version (a "major.minor" string as
 // emitted in SchemaVersion) is at least want. Malformed input is
@@ -677,6 +698,22 @@ type ServerResult struct {
 	// RPS. The key is Scenario.Name(); the value is the merged-across-
 	// runs P99 in nanoseconds (time.Duration's wire encoding).
 	RatedModeP99AtTargetRPS map[string]time.Duration `json:"rated_mode_p99_at_target_rps"`
+
+	// RatedHeadlineTargetRPS is, per scenario, the target the entry of
+	// RatedModeP99AtTargetRPS was measured at: the highest target among the
+	// KEPT passes (schema 5.24, probatorium#441). It is the cell's top
+	// fraction only if that pass was kept; when the 0.9 pass was skipped the
+	// headline is the 0.75 pass's, and this says so. Omitted for a cell with
+	// no kept pass.
+	RatedHeadlineTargetRPS map[string]int `json:"rated_headline_target_rps,omitempty"`
+
+	// RatedPasses lists, per scenario, every rated pass of every run of the
+	// cell, whatever became of it (schema 5.24, probatorium#441): target,
+	// the rate loadgen achieved, its errors, and for a pass that was skipped
+	// or never ran a status and a reason, so no pass is missing without a
+	// record. latency_at_slo and the headline are built from the passes with
+	// status "ok" only. Omitted for a cell with no rated record.
+	RatedPasses map[string][]RatedPassResult `json:"rated_passes,omitempty"`
 
 	// LatencyAtSLO is the headline metric: per-scenario, the maximum
 	// sustained RPS at which the merged-across-runs P99 stays under the

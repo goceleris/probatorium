@@ -135,6 +135,39 @@
     }
   },
   "$defs": {
+    "ratedPass": {
+      "type": "object",
+      "required": ["run", "target_rps", "p99"],
+      "description": "One rated pass of one run of a cell (v5.24). Counts that are absent are zero when status is present.",
+      "properties": {
+        "run": { "type": "integer", "minimum": 0, "description": "Counts the cell's runs that carried rated data, from 0. It is NOT the cell's run index (a DNF run or one without a sweep takes no number), so it does not join to cell_run_statuses." },
+        "fraction": { "type": "number", "description": "Fraction of the cell's saturation rate this pass offered." },
+        "target_rps": { "type": "number", "description": "Offered rate. Zero on a not_run pass whose target was never computed." },
+        "p99": { "type": "integer", "description": "Coordinated-omission-corrected p99, nanoseconds. Zero for a pass that is not ok." },
+        "status": { "type": "string", "enum": ["ok", "skipped", "not_run"], "description": "ok: counted in latency_at_slo and the headline. skipped: the pass ran and produced no usable result. not_run: the pass never started. Absent on a record from a run that predates 5.24 (kept, nothing else known)." },
+        "reason": {
+          "type": "string",
+          "description": "Why a pass is not ok. On an ok pass, only interrupted: the run was cancelled mid-pass, the pass was cut short and kept (the keep rule is unchanged).",
+          "enum": ["loadgen_new", "run_error", "nil_result", "zero_requests", "interrupted", "cell_flagged", "no_saturation_rate", "non_positive_target"]
+        },
+        "detail": { "type": "string", "description": "Error text where there is one." },
+        "achieved_rps": { "type": "number", "description": "loadgen requests per second over the measured window." },
+        "achieved_ratio": { "type": "number", "description": "achieved_rps / target_rps. Below 1 is load loadgen never sent: the p99 is then the pass's backlog, not the server's latency. It reads slightly low: requests counts successes only and loadgen's elapsed time includes teardown (about teardown / the rated window, 20 s or 30 s)." },
+        "requests": { "type": "integer" },
+        "errors": { "type": "integer" },
+        "connect_errors": { "type": "integer", "minimum": 0, "description": "Dial/handshake failures (TCP connect, TLS, WS/SSE upgrade, H1 reconnect dials). In loadgen v1.4.14 each such failure also fails the request and is counted in errors, so connect_errors sits inside errors, give or take a few attempts cut off at phase boundaries (loadgen results.go: counted at the driver, it can differ from the matching errors increments by a few). errors ~ connect_errors means the server was unreachable, not misbehaving." },
+        "dial_retries": { "type": "integer", "minimum": 0 },
+        "close_aborts": { "type": "integer", "minimum": 0 },
+        "shortfall_requests": { "type": "integer", "description": "target x duration - requests - errors; negative when over-delivered." },
+        "duration": { "type": "integer", "description": "Measured window, nanoseconds." },
+        "p50": { "type": "integer" },
+        "p99_9": { "type": "integer" },
+        "max": { "type": "integer" },
+        "start": { "type": "string", "format": "date-time" },
+        "end": { "type": "string", "format": "date-time" },
+        "loadgen_version": { "type": "string" }
+      }
+    },
     "nic_irq_affinity": {
       "type": "object",
       "required": ["affinity", "effective"],
@@ -180,6 +213,16 @@
           "type": "object",
           "description": "Per-scenario merged-across-runs P99 latency, encoded as time.Duration (nanoseconds).",
           "additionalProperties": { "type": "integer" }
+        },
+        "rated_headline_target_rps": {
+          "type": "object",
+          "description": "Per-scenario target RPS that rated_mode_p99_at_target_rps was read at (v5.24, probatorium#441): the highest target among the KEPT rated passes. It is the cell's top fraction only if that pass was kept. Omitted for a cell with no kept pass.",
+          "additionalProperties": { "type": "integer" }
+        },
+        "rated_passes": {
+          "type": "object",
+          "description": "Per-scenario list of every rated pass of every run of the cell, kept or not (v5.24, probatorium#441): the rate loadgen achieved, its errors, and for a pass that is not ok a status and a reason. latency_at_slo and rated_mode_p99_at_target_rps are built from the passes with status 'ok' only; a record WITHOUT status comes from a run that predates 5.24, in the raw files and in this merged document alike (the merge does not fill it in): only target_rps and p99 were recorded, it was kept, and a pass the old runner dropped was never recorded, so a document built from such runs cannot say that no pass was lost (mage Publish counts these records as legacy, not as ok). Omitted for a cell with no rated record. Older readers ignore the field.",
+          "additionalProperties": { "type": "array", "items": { "$ref": "#/$defs/ratedPass" } }
         },
         "latency_at_slo": {
           "type": "object",

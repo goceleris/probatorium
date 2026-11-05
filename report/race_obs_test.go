@@ -220,8 +220,8 @@ func TestGate_SpansDoNotChangeTheH2CAndWSViolations(t *testing.T) {
 // Schema 5.23 is additive: the new fields validate, round-trip, and are
 // omitted when empty so every older reader and document is unaffected.
 func TestSchema523SpansAndSchedRoundTrip(t *testing.T) {
-	if SchemaVersion != "5.23" {
-		t.Fatalf("SchemaVersion %q, want 5.23", SchemaVersion)
+	if !SchemaAtLeast(SchemaVersion, "5.23") {
+		t.Fatalf("SchemaVersion %q, want at least 5.23", SchemaVersion)
 	}
 	sch := loadSchema(t)
 	st := EventStamp{TS: "2026-10-21T09:36:10.123456789Z", SinceReadyMs: 31000, Cause: "eof", Err: "EOF", LocalAddr: "127.0.0.1:50000", RemoteAddr: "127.0.0.1:2059"}
