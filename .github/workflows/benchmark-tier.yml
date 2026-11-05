@@ -140,6 +140,9 @@ jobs:
           IN_ARCH: ${{ github.event.inputs.arch_exclusive }}
           IN_BASELINE: ${{ github.event.inputs.baseline }}
           IN_PUBLISH: ${{ github.event.inputs.publish }}
+          IN_SUT_ENV: ${{ github.event.inputs.sut_env }}
+          IN_CELLS: ${{ github.event.inputs.cells }}
+          IN_COMPETITORS: ${{ github.event.inputs.competitors }}
         run: |
           fail=0
           check() {
@@ -159,6 +162,22 @@ jobs:
           if { [ "$IN_ARCH" = heavy ] || [ "$IN_ARCH" = off ]; } && [ "${IN_TARGET:-both}" = both ] && [ "$publishes" = 1 ]; then
             echo "::error::arch_exclusive=$IN_ARCH on target=both would publish documents the publish gate refuses (policy heavy failed P6 on arm64, policy off lets the arches overlap; docs/ARCH-EXCLUSION-VALIDATION.md). Dispatch with publish=false, or use the default policy."
             fail=1
+          fi
+          # sut_env is a dispatch-wide override of the SUT environment. The v1.6.0 attribution columns (c1arm-, c2x86-, and the repinned P2 columns pinp38-) are told apart by their
+          # column env alone and are validated against exactly the expected launched env, so no sut_env may ride with them; and the busy-poll knob may only come from the registry.
+          # mage Bench refuses the same combination (refuseSUTEnvOnArmColumns, also for cells globs this shell cannot read); this step fails first, before a runner is provisioned.
+          if [ -n "$IN_SUT_ENV" ]; then
+            sut_nospace=${IN_SUT_ENV// /}   # mage trims the entries, so " A=1 , PROBATORIUM_SOCKET_BUSY_POLL=50us" is the same set
+            case ",$sut_nospace," in
+              *,PROBATORIUM_SOCKET_BUSY_POLL=*)
+                echo "::error::sut_env sets PROBATORIUM_SOCKET_BUSY_POLL: the busy-poll arm comes only from the registry column env, never from a dispatch-wide override"
+                fail=1 ;;
+            esac
+            case "$IN_CELLS,$IN_COMPETITORS" in
+              *c1arm-*|*c2x86-*|*pinp38-*)
+                echo "::error::sut_env must be empty for the attribution columns (c1arm-, c2x86-, pinp38-): they differ only by their column env and the validators require the exact launched environment"
+                fail=1 ;;
+            esac
           fi
           [ "$fail" = 0 ] || exit 1
 

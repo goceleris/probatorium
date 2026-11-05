@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/goceleris/probatorium/report"
+	"github.com/goceleris/probatorium/servers"
 )
 
 // mage_bench_window.go — the two harness prerequisites for the
@@ -191,6 +192,47 @@ func sutEnvExtraVars(env map[string]string) string {
 		panic(fmt.Sprintf("marshal bench_sut_env: %v", err))
 	}
 	return string(b)
+}
+
+// armColumnPrefixes are the registry prefixes of the v1.6.0 attribution columns: the arm columns of servers/c1_arms.go and servers/c2x86_arms.go, and the repinned P2 columns of
+// servers/p2_arms.go (1a, main vs v1.5.11), which have no validator yet and must not be turned into a different arm by an override either.
+var armColumnPrefixes = []string{"c1arm-", "c2x86-", "pinp38-"}
+
+// busyPollKnobEnv is the busy-poll arm's knob (servers/celeris/busypoll_knob.go); only a registry column env may set it.
+const busyPollKnobEnv = "PROBATORIUM_SOCKET_BUSY_POLL"
+
+// refuseSUTEnvOnArmColumns fails the dispatch, at mage start and not on the cluster, when a dispatch-wide BENCH_SUT_ENV (the workflow's sut_env input) is combined with an attribution
+// column, or sets the busy-poll knob at all. The arm columns are told apart ONLY by their column env, and arm-validate.py / x86-validate.py require the launched environment to be
+// exactly the base env plus the column's own keys: any override (CELERIS_IOURING_FIXED_FILES=1 would even silence SocketBusyPoll while the startup line still reads 50us) would void
+// every column after the hours are spent, and a knob in sut_env would make the default arm busy-poll. slugs are the columns the dispatch will bench.
+func refuseSUTEnvOnArmColumns(slugs []string, sutEnv map[string]string) error {
+	if len(sutEnv) == 0 {
+		return nil
+	}
+	if v, ok := sutEnv[busyPollKnobEnv]; ok {
+		return fmt.Errorf("BENCH_SUT_ENV sets %s=%s: the busy-poll arm comes only from the registry column env (servers/c1_arms.go), never from a dispatch-wide override", busyPollKnobEnv, v)
+	}
+	for _, slug := range slugs {
+		for _, p := range armColumnPrefixes {
+			if strings.HasPrefix(slug, p) {
+				return fmt.Errorf("BENCH_SUT_ENV (%s) must be empty for the attribution columns (%s is one): the arms differ only by their column env and the validators require the launched environment to be exactly the expected keys",
+					sutEnvString(sutEnv), slug)
+			}
+		}
+	}
+	return nil
+}
+
+// scopeSlugs is the set of column slugs a dispatch will bench, before the registry expansion: an explicit competitors CSV, else the slugs the cells glob matches, else (nil: "*"
+// or empty cells) every registered column.
+func scopeSlugs(competitors string, cellsSlugs []string) []string {
+	if c := strings.TrimSpace(competitors); c != "" && c != "all" {
+		return splitTrimNonEmpty(competitors)
+	}
+	if cellsSlugs != nil {
+		return cellsSlugs
+	}
+	return servers.Names()
 }
 
 // sutEnvString renders the override set as sorted "KEY=VALUE KEY=VALUE"
