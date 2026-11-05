@@ -194,9 +194,9 @@ func sutEnvExtraVars(env map[string]string) string {
 	return string(b)
 }
 
-// armColumnPrefixes are the registry prefixes of the v1.6.0 attribution columns: the arm columns of servers/c1_arms.go and servers/c2x86_arms.go, and the repinned P2 columns of
+// armColumnPrefixes are the registry prefixes of the v1.6.0 attribution columns: the arm columns of servers/c1_arms.go and servers/c2x86_arms.go, the #858 ladder columns of servers/c2lad_arms.go (the fcbpon slot is told apart by its column env), and the repinned P2 columns of
 // servers/p2_arms.go (1a, main vs v1.5.11), which have no validator yet and must not be turned into a different arm by an override either.
-var armColumnPrefixes = []string{"c1arm-", "c2x86-", "pinp38-"}
+var armColumnPrefixes = []string{"c1arm-", "c2x86-", "c2lad-", "pinp38-"}
 
 // busyPollKnobEnv is the busy-poll arm's knob (servers/celeris/busypoll_knob.go); only a registry column env may set it.
 const busyPollKnobEnv = "PROBATORIUM_SOCKET_BUSY_POLL"
