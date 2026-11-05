@@ -3,7 +3,9 @@
 package main
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -133,4 +135,112 @@ func TestPortOwnershipProbeAcceptsOnlyTheLaunchedBinaryForEveryColumn(t *testing
 		t.Fatal("the probe line differs from the one executed above")
 	}
 	t.Logf("%d native-shape binaries, %d runtime-class binaries (never reach the match), %d pairs", len(names), len(runtime), len(pairs))
+}
+
+// probeScript extracts the WHOLE port-ownership probe from the playbook (the shell block of the "wait for OUR server to own the bench port" task), renders its Jinja inputs for one column and
+// points /proc at a fixture tree, so the test runs the real binary match, engine match, env match and listener walk, not a copy of one line (review r6 F4: mutations of want_bin, of the
+// cmdline separator and of the -engine token boundary stayed green when only the token line was run).
+func probeScript(t *testing.T, y, bin, engine, wantEnv string) string {
+	t.Helper()
+	i := strings.Index(y, `| wait for OUR server to own the bench port"`)
+	if i < 0 {
+		t.Fatal("the probe task is gone")
+	}
+	blk := y[i:]
+	const head = "ansible.builtin.shell: |\n"
+	a := strings.Index(blk, head)
+	b := strings.Index(blk[a:], "\n  args:")
+	if a < 0 || b < 0 {
+		t.Fatal("the probe shell block is not where it was")
+	}
+	var lines []string
+	for _, l := range strings.Split(blk[a+len(head):a+b], "\n") {
+		lines = append(lines, strings.TrimPrefix(l, "    "))
+	}
+	script := strings.Join(lines, "\n")
+	script = regexp.MustCompile(`want_env="\{% for .*%\}"`).ReplaceAllString(script, `want_env="`+wantEnv+`"`)
+	script = strings.NewReplacer(
+		"{{ bench_port | default(8080) }}", "8080",
+		"{{ cell_bin }}", bin,
+		"{{ cell_engine | default('') }}", engine,
+		"{{ cell.1 }}", "fixture-column",
+		"{{ cell_dir }}", "$FAKEDIR",
+		"/proc/", "$FAKEPROC/",
+		"seq 1 40", "seq 1 2",
+		"sleep 0.25", "sleep 0",
+	).Replace(script)
+	if strings.Contains(script, "{{") || strings.Contains(script, "{%") {
+		t.Fatalf("the probe has Jinja this test does not render:\n%s", script)
+	}
+	return `ss() { echo "State Recv-Q Send-Q Local Peer Process"; for p in $FAKE_PIDS; do echo "LISTEN 0 128 0.0.0.0:8080 0.0.0.0:* users:((\"srv\",pid=$p,fd=3))"; done; }` + "\n" + script
+}
+
+func TestPortOwnershipProbeAsAWhole(t *testing.T) {
+	y := readRepoFile(t, "ansible/tasks/run_bench_cell.yml")
+	bash := needBash(t)
+	type holder struct {
+		pid     string
+		cmd     string // space separated, becomes NUL separated
+		environ string // space separated KEY=VALUE
+	}
+	cl := func(bin, extra string) string {
+		return "/opt/bench/competitors/" + bin + " -bind 0.0.0.0:8080 " + extra
+	}
+	for _, tc := range []struct {
+		name            string
+		bin, engine, ev string // the column: binary, -engine value, wanted env ("K=V K=V ")
+		holders         []holder
+		want            int // exit code of the probe: 0 = ours
+	}{
+		{"own binary and engine", "celeris", "epoll-h1-async", "", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "A=1"}}, 0},
+		{"a leftover celeris_v158 for celeris", "celeris", "epoll-h1-async", "", []holder{{"11", cl("celeris_v158", "-engine epoll-h1-async "), "A=1"}}, 1},
+		{"a leftover celeris_9f4d89b for celeris", "celeris", "epoll-h1-async", "", []holder{{"11", cl("celeris_9f4d89b", "-engine epoll-h1-async "), "A=1"}}, 1},
+		{"a leftover celeris for celeris_v158", "celeris_v158", "epoll-h1-async", "", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "A=1"}}, 1},
+		{"engine h2c-noupg for a column of engine h2c", "stdhttp", "h2c", "", []holder{{"11", cl("stdhttp", "-engine h2c-noupg "), "A=1"}}, 1},
+		{"engine h2c for a column of engine h2c", "stdhttp", "h2c", "", []holder{{"11", cl("stdhttp", "-engine h2c "), "A=1"}}, 0},
+		{"another engine of the same binary", "celeris", "epoll-h1-async", "", []holder{{"11", cl("celeris", "-engine iouring-h1-async "), "A=1"}}, 1},
+		{"bpon column, holder has the knob", "celeris", "epoll-h1-async", "PROBATORIUM_SOCKET_BUSY_POLL=50us ", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "A=1 PROBATORIUM_SOCKET_BUSY_POLL=50us"}}, 0},
+		{"bpon column, holder lacks the knob", "celeris", "epoll-h1-async", "PROBATORIUM_SOCKET_BUSY_POLL=50us ", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "A=1"}}, 1},
+		{"plain column, leftover busy-poll-on holder", "celeris", "epoll-h1-async", "", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "A=1 PROBATORIUM_SOCKET_BUSY_POLL=50us"}}, 1},
+		{"plain column, leftover ARMED holder", "celeris", "epoll-h1-async", "", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "A=1 PROBATORIUM_PPROF=dump"}}, 1},
+		{"armed column, holder is armed", "celeris", "epoll-h1-async", "PROBATORIUM_PPROF=dump ", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "A=1 PROBATORIUM_PPROF=dump"}}, 0},
+		{"armed column, holder is not armed", "celeris", "epoll-h1-async", "PROBATORIUM_PPROF=dump ", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "A=1"}}, 1},
+		{"a key that only ends in the arm key is not the key", "celeris", "epoll-h1-async", "", []holder{{"11", cl("celeris", "-engine epoll-h1-async "), "XPROBATORIUM_PPROF=dump"}}, 0},
+		{"runtime-class listener (no competitors/ in argv) is accepted loosely", "hono", "", "", []holder{{"11", "/opt/bench/bun/bin/bun run /opt/bench/competitors-src/hono/dist/server -bind 0.0.0.0:8080 ", "A=1"}}, 0},
+		{"no listener", "celeris", "epoll-h1-async", "", nil, 1},
+		{"the wrong process first, ours second", "celeris", "epoll-h1-async", "", []holder{{"11", cl("celeris_v158", "-engine epoll-h1-async "), "A=1"}, {"12", cl("celeris", "-engine epoll-h1-async "), "A=1"}}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			var pids []string
+			for _, h := range tc.holders {
+				pids = append(pids, h.pid)
+				d := filepath.Join(dir, "proc", h.pid)
+				if err := os.MkdirAll(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				nul := func(s string) []byte { return []byte(strings.Join(strings.Fields(s), "\x00") + "\x00") }
+				if err := os.WriteFile(filepath.Join(d, "cmdline"), nul(h.cmd), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(d, "environ"), nul(h.environ), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command(bash, "-c", probeScript(t, y, tc.bin, tc.engine, tc.ev))
+			cmd.Env = append(os.Environ(), "FAKEPROC="+filepath.Join(dir, "proc"), "FAKEDIR="+dir, "FAKE_PIDS="+strings.Join(pids, " "))
+			out, err := cmd.CombinedOutput()
+			rc := 0
+			if err != nil {
+				ee, ok := err.(*exec.ExitError)
+				if !ok {
+					t.Fatal(err)
+				}
+				rc = ee.ExitCode()
+			}
+			if rc != tc.want {
+				t.Errorf("probe exit %d, want %d\n%s", rc, tc.want, out)
+			}
+		})
+	}
 }

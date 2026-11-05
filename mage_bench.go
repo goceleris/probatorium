@@ -310,6 +310,10 @@ func Bench() error {
 	if err := refuseSUTEnvOnArmColumns(scopeSlugs(competitors, cellsSlugs), sutEnv); err != nil {
 		return err
 	}
+	// The armed pprof columns (c1pp-) are watched in the FIRST window of the column only, so each must run exactly one scenario, the one its mode is for. Same place, same reason: before Deploy.
+	if err := refuseArmedColumnsOnManyScenarios(scopeSlugs(competitors, cellsSlugs), cells); err != nil {
+		return err
+	}
 
 	// Auto-deploy when neither bench target has a manifest yet. Cheap
 	// pre-flight: SSH to both bench_targets; if neither has the
@@ -841,6 +845,31 @@ func cellsGlobServers(cells string) ([]string, error) {
 	if cells == "" || cells == "*" {
 		return nil, nil
 	}
+	matches, err := parseCellsGlob(cells)
+	if err != nil {
+		return nil, err
+	}
+	scs := scenarios.Registry()
+	advs := servers.AdaptersSorted()
+	keep := map[string]bool{}
+	for _, s := range scs {
+		for _, a := range advs {
+			if matches(s.Name() + "/" + a.Name) {
+				keep[a.Name] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(keep))
+	for n := range keep {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// parseCellsGlob returns the "<scenario>/<server>" predicate of a cells glob with the runner's include/exclude semantics (comma-separated path.Match patterns, "!" excludes, no include
+// means "*"). cellsGlobServers and cellsGlobScenarios share it, so the server set and the scenario set of a dispatch come from one parser.
+func parseCellsGlob(cells string) (func(id string) bool, error) {
 	var include, exclude []string
 	for _, part := range strings.Split(cells, ",") {
 		p := strings.TrimSpace(part)
@@ -872,24 +901,24 @@ func cellsGlobServers(cells string) ([]string, error) {
 		}
 		return false
 	}
-	scs := scenarios.Registry()
-	advs := servers.AdaptersSorted()
-	keep := map[string]bool{}
-	for _, s := range scs {
-		for _, a := range advs {
-			id := s.Name() + "/" + a.Name
-			if !matchAny(include, id) {
-				continue
-			}
-			if matchAny(exclude, id) {
-				continue
-			}
-			keep[a.Name] = true
-		}
+	return func(id string) bool { return matchAny(include, id) && !matchAny(exclude, id) }, nil
+}
+
+// cellsGlobScenarios returns the sorted scenario names the cells glob schedules for the column slug (empty or "*" cells select every scenario), in the order the runner runs them.
+func cellsGlobScenarios(cells, slug string) ([]string, error) {
+	cells = strings.TrimSpace(cells)
+	if cells == "" {
+		cells = "*"
 	}
-	out := make([]string, 0, len(keep))
-	for n := range keep {
-		out = append(out, n)
+	matches, err := parseCellsGlob(cells)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, s := range scenarios.Registry() {
+		if matches(s.Name() + "/" + slug) {
+			out = append(out, s.Name())
+		}
 	}
 	sort.Strings(out)
 	return out, nil
