@@ -7,7 +7,7 @@ writes lands in the cell directory, which ansible/bench.yml tars and fetches wit
 
   mode profile: a CPU profile (default 30 s) centred in the measurement window, then a binary goroutine profile  ->  cpu.pb.gz, goroutine.pb.gz      (celeris#857)
   mode dump:    a goroutine?debug=2 text dump after a SECOND WITH ZERO COMPLETIONS inside the window            ->  pprofcap.events.jsonl, goroutine-dump-<n>.txt   (celeris#854)
-  mode both:    both. The CPU profile is in-process SIGPROF (about 1-3 % CPU while it runs); no kernel setting is touched, perf_event_paranoid stays as it is.
+  mode both:    both. The CPU profile is in-process SIGPROF (its overhead is not measured and is not claimed anywhere); no kernel setting is touched, perf_event_paranoid stays as it is.
 
 "Second with zero completions". The SUT cannot see the loadgen's completions, so the trigger reads the engine's own request counter from /debug/vars once a second
 (celeris.engine_metrics.RequestCount) together with ActiveConnections. The loadgen is closed-loop (one request outstanding per connection): a connection sends its next request only
@@ -54,6 +54,7 @@ class Collector:
         self.base = "http://" + a.addr
         self.meta = {"mode": a.mode, "addr": a.addr, "outcome": "started", "files": [], "errors": [], "samples": 0, "zero_seconds": 0, "dumps": 0, "sample_errors": 0}
         self.lock = threading.Lock()
+        self.meta_lock = threading.Lock()
         self.t_end = time.monotonic() + a.guard
         self.rc = []  # (epoch, RequestCount, ActiveConnections)
         self.rendezvous_count = None
@@ -69,29 +70,31 @@ class Collector:
             self.meta["errors"].append("%.3f %s" % (time.time(), msg))
 
     def flush_meta(self):
-        """atomic write of the meta as it stands (called at every phase: a killed collector leaves its last state)"""
+        """atomic write of the meta as it stands (called at every phase: a killed collector leaves its last state). One writer at a time (meta_lock) and a tmp name per
+        thread, so two workers (mode both) or a SIGTERM during a save can neither tear the file nor write an older snapshot over a newer one."""
         try:
-            with self.lock:
-                data = json.dumps(self.meta, indent=1, sort_keys=True).encode()
-            p = os.path.join(self.a.out, "pprofcap.meta.json")
-            with open(p + ".part", "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(p + ".part", p)
+            with self.meta_lock:
+                with self.lock:
+                    data = json.dumps(self.meta, indent=1, sort_keys=True).encode()
+                p = os.path.join(self.a.out, "pprofcap.meta.json")
+                tmp = "%s.%d.%d.part" % (p, os.getpid(), threading.get_ident())
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, p)
         except Exception:  # noqa: BLE001
             pass
 
     def save(self, name, data):
         p = os.path.join(self.a.out, name)
-        tmp = p + ".part"
+        tmp = "%s.%d.%d.part" % (p, os.getpid(), threading.get_ident())
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, p)
         with self.lock:
             self.meta["files"].append({"name": name, "bytes": len(data)})
-        if name != "pprofcap.meta.json":
-            self.flush_meta()
+        self.flush_meta()
 
     def vars(self, timeout=2.0):
         """-> (RequestCount, ActiveConnections, pid) or None"""
@@ -285,7 +288,7 @@ class Collector:
                     rc = list(self.rc)
                 if rc:
                     self.save("pprofcap.requests.csv", ("epoch,request_count,active_connections\n" + "".join("%.3f,%d,%d\n" % r for r in rc)).encode())
-                self.save("pprofcap.meta.json", json.dumps(self.meta, indent=1, sort_keys=True).encode())
+                self.flush_meta()
             except Exception:  # noqa: BLE001
                 pass
 
