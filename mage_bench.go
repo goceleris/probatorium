@@ -305,8 +305,9 @@ func Bench() error {
 	if err != nil {
 		return fmt.Errorf("resolve cells glob %q: %w", cells, err)
 	}
-	// The attribution columns refuse a dispatch-wide sut_env (see refuseSUTEnvOnArmColumns). Checked HERE, before the auto-deploy below, on the slugs the bench will run (the cells
-	// glob narrowed by an explicit competitors list), so a refused dispatch has touched nothing.
+	// The attribution columns refuse a dispatch-wide sut_env (see refuseSUTEnvOnArmColumns). Checked HERE, before this function's own auto-deploy below, on the slugs the bench will run
+	// (the cells glob narrowed by an explicit competitors list). In the workflow the separate `mage Deploy` step has ALREADY run when this point is reached, and the runners are up:
+	// only the literal-prefix forms are refused earlier, by the setup job's input check. What this guarantees is that no column runs and no SUT starts.
 	if err := refuseSUTEnvOnArmColumns(scopeSlugs(competitors, cellsSlugs), sutEnv); err != nil {
 		return err
 	}
