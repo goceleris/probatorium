@@ -398,14 +398,16 @@ func TestPprofcapSkipsWhatItCannotCollect(t *testing.T) {
 	})
 }
 
-// R5: a second in which every connection closed (the end of a scenario inside the window) with a flat counter is NOT a zero second: connections must be open at BOTH ends.
+// R5: a second in which every connection closed (the end of a scenario inside the window) with a flat counter is NOT a zero second: connections must be open at BOTH ends. The counter
+// freezes at 3.8 s and the connections close at 4.8 s, reopening (with the counter moving again) at 5.8 s: whatever the phase of the collector's 1 Hz grid, exactly one sample falls into
+// [3.8, 4.8) (connections open, counter flat since 3.8) and the next one into [4.8, 5.8) (connections closed, counter equal), the pair a trigger without the end-of-second check would fire on.
 func TestPprofcapConnectionsClosingInsideTheWindowIsNotAStall(t *testing.T) {
 	t.Parallel()
 	out := t.TempDir()
 	f := newFakeSUT(t, func(el time.Duration) (uint64, int64, bool) {
-		n, _, _ := steady([2]float64{4.5, 60})(el)
-		if el.Seconds() >= 4.5 {
-			return n, 0, true // all connections closed together with the last request
+		n, _, _ := steady([2]float64{3.8, 5.8})(el)
+		if s := el.Seconds(); s >= 4.8 && s < 5.8 {
+			return n, 0, true // all connections closed, no request
 		}
 		return n, 8, true
 	})
