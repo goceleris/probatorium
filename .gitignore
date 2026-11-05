@@ -106,3 +106,7 @@ servers/_docker/**/*.tar
 /servers/**/__pycache__/
 /servers/*/server
 /servers/actix/target/
+# BEGIN ladder-gen (ladder-gen.py, evidence lanes-20261105/H6H7; do not edit by hand)
+/servers/celeris_v158/celeris_v158
+/servers/celeris_9f4d89b/celeris_9f4d89b
+# END ladder-gen
