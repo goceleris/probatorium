@@ -159,7 +159,7 @@
         <!-- MUST track vertx-core's netty (vert.x 5.0.0 → netty 4.2.0.Final).
              EpollIoHandler exists only in 4.2.x; an older pin → NoClassDefFoundError
              at startup. Bump in lockstep when vertx.version is bumped. -->
-        <netty.epoll.version>4.2.19.Final</netty.epoll.version>
+        <netty.epoll.version>4.2.20.Final</netty.epoll.version>
         <netty.epoll.classifier>linux-x86_64</netty.epoll.classifier>
       </properties>
     </profile>
