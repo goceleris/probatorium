@@ -120,10 +120,10 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 		}
 	}
 
-	// Redis client, pool size 16, engine-integrated.
+	// Redis client, pool size 64 (A/B PREREG-B854-POOL; reference is 16), engine-integrated.
 	if cfg.redisAddr != "" {
 		if rdb, err := redis.NewClient(cfg.redisAddr,
-			redis.WithPoolSize(16),
+			redis.WithPoolSize(64),
 			redis.WithEngine(srv),
 		); err == nil {
 			c.redis = rdb
