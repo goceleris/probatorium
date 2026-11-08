@@ -109,6 +109,28 @@ class Collector:
             self.last_err = repr(e)
             return None
 
+    def snap(self, label):
+        """DIAGNOSTIC (never merged, celeris#854): store the SUT's "celeris_redis_directwait" document (servers/celeris/debugvars.go copies the expvar of
+        driver/redis into /debug/vars) in meta["directwait"][label], with the epoch of the read. A SUT whose celeris has no such var (v1.5.11) stores null; a failed read stores
+        the error. Never raises into the bench."""
+        ent = {"epoch": time.time(), "monotonic_s": time.monotonic()}
+        try:
+            _, b = self.get("/debug/vars", 5.0)
+            ent["directwait"] = json.loads(b).get("celeris_redis_directwait")
+        except Exception as e:  # noqa: BLE001
+            ent["directwait"] = None
+            ent["error"] = repr(e)
+        with self.lock:
+            self.meta.setdefault("directwait", {})[label] = ent
+        self.flush_meta()
+
+    def window_snaps(self, start, end):
+        """the counters at the collector's window start and window end, whatever the mode (kept out of trigger(): its request/response guard returns early)"""
+        for label, t in (("window_start", start), ("window_end", end)):
+            if not self.sleep_until(t):
+                return
+            self.snap(label)
+
     def sleep_until(self, t):
         d = min(t, self.t_end) - time.monotonic()
         if d > 0:
@@ -264,11 +286,12 @@ class Collector:
             if t0 is None:
                 self.meta["outcome"] = "skipped: no rendezvous (ActiveConnections never reached %d within %ss)" % (a.min_conns, a.rendezvous_timeout)
                 return
+            self.snap("rendezvous")
             start = t0 + a.warm
             end = start + a.dur
             self.meta.update(rendezvous_epoch=time.time() - (time.monotonic() - t0), window_start_in_s=a.warm, window_s=a.dur, outcome="running")
             self.flush_meta()
-            ths = []
+            ths = [threading.Thread(target=self.window_snaps, args=(start, end), daemon=True)]
             if a.mode in ("profile", "both"):
                 ths.append(threading.Thread(target=self.profile, args=(start,), daemon=True))
             if a.mode in ("dump", "both"):

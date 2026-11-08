@@ -121,14 +121,11 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 	}
 
 	// Redis client, pool size 16, engine-integrated.
-	// A/B PREREG-B854-AUTO: opt into the adaptive direct-wait mode of
-	// celeris#1271 (read lazily at the first direct Exec; sync-mode
-	// clients never read it). The six ARMED columns (PROBATORIUM_PPROF
-	// set) stay on the default netpoll wait: an in-run, same-binary control.
+	// DIAGNOSTIC (never merged, celeris#854): the direct-wait mode is set for EVERY column,
+	// armed (PROBATORIUM_PPROF) ones included; the three variants of this diff differ only in
+	// the constant below. Read lazily at the first direct Exec; sync-mode clients never read it.
 	if cfg.redisAddr != "" {
-		if os.Getenv("PROBATORIUM_PPROF") == "" {
-			_ = os.Setenv("CELERIS_REDIS_DIRECT_WAIT", "auto")
-		}
+		_ = os.Setenv("CELERIS_REDIS_DIRECT_WAIT", "auto")
 		if rdb, err := redis.NewClient(cfg.redisAddr,
 			redis.WithPoolSize(16),
 			redis.WithEngine(srv),

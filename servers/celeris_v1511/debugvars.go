@@ -37,6 +37,7 @@ package main
 
 import (
 	"encoding/json"
+	"expvar"
 	"log"
 	"net"
 	"net/http"
@@ -103,6 +104,13 @@ func debugVarsDocument(srv *celeris.Server) map[string]any {
 	if info := srv.EngineInfo(); info != nil {
 		doc["celeris.engine"] = info.Type.String()
 		doc["celeris.engine_metrics"] = info.Metrics
+	}
+	// DIAGNOSTIC (never merged, celeris#854): the redis direct-wait mode and counters. This
+	// document is hand-built, not expvar.Handler, so a celeris expvar is invisible here unless it
+	// is copied in. expvar.Get keeps this compiling against any celeris pin; a pin without the
+	// var (v1.5.11) simply has no such key. pprofcap.py stores it before/after the window.
+	if v := expvar.Get("celeris_redis_directwait"); v != nil {
+		doc["celeris_redis_directwait"] = json.RawMessage(v.String())
 	}
 	return doc
 }

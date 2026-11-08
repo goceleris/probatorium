@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"expvar"
 	"io"
 	"net"
 	"net/http"
@@ -135,5 +136,28 @@ func TestDebugVarsBindFailureIsNotFatal(t *testing.T) {
 	defer stop()
 	if addr != "" {
 		t.Fatalf("side listener claims %s although the port is taken", addr)
+	}
+}
+
+// TestDebugVarsCarriesTheDirectWaitExpvar: DIAGNOSTIC (celeris#854). The document is hand-built, so a
+// celeris expvar reaches pprofcap.py only through debugVarsDocument. A pin without the var (before the
+// diagnostic commit) has no such key, and the test then only logs.
+func TestDebugVarsCarriesTheDirectWaitExpvar(t *testing.T) {
+	srv, _ := startStd(t)
+	t.Setenv(debugAddrEnv, "127.0.0.1:0")
+	addr, stop := startDebugVars(srv)
+	defer stop()
+	_, doc := getJSON(t, "http://"+addr+"/debug/vars")
+	got, has := doc["celeris_redis_directwait"].(map[string]any)
+	if expvar.Get("celeris_redis_directwait") == nil {
+		t.Skipf("the pinned celeris publishes no celeris_redis_directwait expvar; key present=%v", has)
+	}
+	if !has {
+		t.Fatalf("celeris_redis_directwait missing or not an object: %v", doc["celeris_redis_directwait"])
+	}
+	for _, k := range []string{"mode", "blocks", "slice_expiries", "handoffs", "netpoll_parks"} {
+		if _, ok := got[k]; !ok {
+			t.Errorf("celeris_redis_directwait.%s missing: %v", k, got)
+		}
 	}
 }

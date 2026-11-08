@@ -32,6 +32,7 @@ type fakeSUT struct {
 	pid     int
 	events  string // path of pprofcap.events.jsonl, read at dump time to prove the order
 	dumpErr bool
+	dwOn    bool // serve a "celeris_redis_directwait" document whose counters grow with every /debug/vars read (DIAGNOSTIC, celeris#854)
 
 	mu          sync.Mutex
 	dumpAt      []time.Duration
@@ -51,7 +52,11 @@ func newFakeSUT(t *testing.T, load func(el time.Duration) (uint64, int64, bool))
 			http.Error(w, "boom", 500)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"pid": f.pid, "celeris.engine_metrics": map[string]any{"RequestCount": n, "ActiveConnections": a}})
+		doc := map[string]any{"pid": f.pid, "celeris.engine_metrics": map[string]any{"RequestCount": n, "ActiveConnections": a}}
+		if f.dwOn {
+			doc["celeris_redis_directwait"] = map[string]any{"mode": "auto", "blocks": f.varsCalls.Load()}
+		}
+		_ = json.NewEncoder(w).Encode(doc)
 	})
 	mux.HandleFunc("/debug/pprof/", func(w http.ResponseWriter, r *http.Request) {
 		if !f.pprofOn {
@@ -202,6 +207,43 @@ func TestPprofcapDumpsAfterTheZeroSecondIsWritten(t *testing.T) {
 	if !exists(filepath.Join(out, "pprofcap.requests.csv")) {
 		t.Error("no pprofcap.requests.csv: a run without a dump could not prove the trigger was armed")
 	}
+}
+
+// DIAGNOSTIC (celeris#854): the counters are stored at the rendezvous and at the window start and end, in every mode, also when the trigger's guard returns early; a SUT without the var gets null.
+func TestPprofcapStoresTheDirectWaitCountersAtTheWindowEdges(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"dump", "profile"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			f := newFakeSUT(t, steady())
+			f.dwOn = true
+			meta := runPprofcap(t, f, t.TempDir(), "--mode", mode, "--warm", "1", "--dur", "4", "--profile-seconds", "1")
+			dw, _ := meta["directwait"].(map[string]any)
+			var blocks []float64
+			for _, k := range []string{"rendezvous", "window_start", "window_end"} {
+				ent, _ := dw[k].(map[string]any)
+				d, _ := ent["directwait"].(map[string]any)
+				b, ok := d["blocks"].(float64)
+				if !ok || d["mode"] != "auto" {
+					t.Fatalf("%s: no counters stored: %v (meta %v)", k, dw[k], meta)
+				}
+				blocks = append(blocks, b)
+			}
+			if !(blocks[0] < blocks[1] && blocks[1] < blocks[2]) {
+				t.Errorf("counters %v are not increasing rendezvous < window_start < window_end", blocks)
+			}
+		})
+	}
+	t.Run("absent", func(t *testing.T) {
+		t.Parallel()
+		f := newFakeSUT(t, steady())
+		meta := runPprofcap(t, f, t.TempDir(), "--mode", "dump", "--warm", "1", "--dur", "3")
+		dw, _ := meta["directwait"].(map[string]any)
+		ent, _ := dw["window_end"].(map[string]any)
+		if v, present := ent["directwait"]; !present || v != nil {
+			t.Errorf("window_end directwait = %v (present %v), want an explicit null: %v", v, present, dw)
+		}
+	})
 }
 
 // A healthy run, a stall before the window, a stall after it, a flat counter with no open connection, and a failing sample are NOT triggers.
