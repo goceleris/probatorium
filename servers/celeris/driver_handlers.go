@@ -125,7 +125,7 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 	// armed (PROBATORIUM_PPROF) ones included; the three variants of this diff differ only in
 	// the constant below. Read lazily at the first direct Exec; sync-mode clients never read it.
 	if cfg.redisAddr != "" {
-		_ = os.Setenv("CELERIS_REDIS_DIRECT_WAIT", "auto")
+		_ = os.Setenv("CELERIS_REDIS_DIRECT_WAIT", "block")
 		if rdb, err := redis.NewClient(cfg.redisAddr,
 			redis.WithPoolSize(16),
 			redis.WithEngine(srv),
