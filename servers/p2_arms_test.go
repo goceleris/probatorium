@@ -26,7 +26,7 @@ const (
 	p2WantNine = 8  // 4 reps x 2 arms x io512
 
 	p2PinBase = "v1.5.11"
-	p2PinMain = "v1.5.12-0.20261105005529-f8d6ad07f47b" // H0 of the v1.6.0 attribution plan: celeris f8d6ad07f47b
+	p2PinMain = "v1.5.12-0.20261109111008-29babc9f2643" // LF-2 arm64: celeris 29babc9f2643 (rc1, the #854 default flip)
 )
 
 var (
