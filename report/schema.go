@@ -1255,6 +1255,15 @@ type Tier1Summary struct {
 	// run and not only a stall-capture one. Omitted when no refapp pid was
 	// seen. See RefappSched for what it can and cannot say.
 	RefappSched *RefappSched `json:"refapp_sched,omitempty"`
+	// LoadShaping records that the cell's walkers were paced below their
+	// closed-loop rate, and by how much (probatorium#481, celeris#871). Omitted
+	// when nothing was shaped, which is every cell outside the race tier's
+	// adaptive cell. Additive WITHOUT a schema bump, on purpose: the bump would
+	// re-stamp schema_version in every nightly, checkptr, weekend and bench
+	// document, which this change is meant to leave byte-identical; the field's
+	// presence is what tells a shaped cell from an unshaped one, in any 5.23
+	// document. See LoadShaping.
+	LoadShaping *LoadShaping `json:"load_shaping,omitempty"`
 	// ReadyAt is the UTC instant (RFC3339Nano) the refapp announced its
 	// bound address, i.e. the origin of every SlowFire.SinceReadyMs and
 	// of the mod-60 phase histogram the design computes offline.
@@ -1322,6 +1331,25 @@ type EventSpan struct {
 	Count int64      `json:"count"`
 	First EventStamp `json:"first"`
 	Last  EventStamp `json:"last"`
+}
+
+// LoadShaping is the pacing a cell's Markov walkers ran under. It exists so a
+// reader of a race-tier cell can see that its load was shaped, and by how much,
+// without reading the validator's source.
+//
+// Walkers is the whole fleet's count (Config.ConcurrencyFloor applied) and
+// MarkovWalkers the part of it that was paced; both are the counts the cell ran
+// with, so a shaped cell can be compared walker for walker with an unshaped one.
+// MarkovMinPeriodUs is the pacing, in microseconds: the least time between the
+// STARTS of two requests of one Markov walker (open loop: a slow response does
+// not make the next start earlier, and nothing is caught up afterwards). The
+// fleet therefore offers at most MarkovWalkers / MarkovMinPeriodUs requests per
+// microsecond, whatever the response time.
+type LoadShaping struct {
+	Reason            string `json:"reason"`
+	Walkers           int    `json:"walkers"`
+	MarkovWalkers     int    `json:"markov_walkers"`
+	MarkovMinPeriodUs int64  `json:"markov_min_period_us"`
 }
 
 // RefappSched is what the validator read of the refapp's CPU placement.

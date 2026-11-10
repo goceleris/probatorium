@@ -551,6 +551,7 @@ func runMatrixCell(parent context.Context, cfg Config, matrix MatrixConfig,
 		RefappWorkers:       cellRefappWorkers(mc.Engine, cfg.RefappWorkers),
 		ConcurrencyFloor:    cellConcurrencyFloor(mc.Engine),
 		WSEchoSlowTolerance: wsEchoSlowTolerance(cfg.RaceTier),
+		MarkovMinPeriod:     cellMarkovMinPeriod(mc.Refapp, mc.Engine, cfg.RaceTier),
 		DriverMode:          cfg.DriverMode,
 		DriverSSHUser:       cfg.DriverSSHUser,
 		DriverSSHHost:       cfg.DriverSSHHost,
@@ -732,6 +733,86 @@ func cellRefappWorkers(engine string, capFromFlag int) int {
 func wsEchoSlowTolerance(raceTier bool) int {
 	if raceTier {
 		return report.WSEchoSlowTolerance
+	}
+	return 0
+}
+
+// raceAdaptiveMarkovMinPeriod is the least time between the STARTS of two
+// requests of one Markov walker in ONE cell of the race tier: the ADAPTIVE cell
+// of auth_session_ratelimit (raceShapedRefapp), on both arches. Every other cell
+// of the matrix is untouched. Nothing else is paced in that cell: the worker
+// count (2), the walker count (110) and the connections they hold are exactly the
+// sizing above, because the controller promotes on conns per worker, and each
+// walker keeps its keep-alive connection while it waits.
+//
+// WHY. That sizing is closed-loop: 67 Markov walkers each send the next request
+// the instant the last one is answered. Without the detector that is a rate the
+// two engine loops carry (nightly 39599497495: the same cell, same sizing, every
+// gated signal zero). Under -race every request costs several times the CPU, and
+// the cell saturates its loops: auth_session_ratelimit/adaptive/amd64 failed the
+// race gate in every run since 39560945814, with a fourth SLOW_CLASS ws_echo
+// timeout over the tolerated N = 3 and, now and then, a reset-type counter
+// (h2c_hang, ws_handshake_fail, sse_handshake_fail, ws_echo_missing), always
+// with the loops busy and the refapp alive. The same race build as a pure engine
+// (4 to 16 loops, 10 walkers) passes. The echo and the connection churners are
+// the victims, not the load: the Markov fleet is the one slice with no pacing.
+//
+// WHY OPEN LOOP. A pause after the response (a think time) leaves the offered
+// rate at 67 / (pause + response time), and the response time was mostly
+// queueing on the saturated loops: 4 ms of think time would still have allowed
+// 67 / 4 ms = 16.75k requests a second, the rate that saturated. A minimum
+// period between STARTS caps the fleet at 67 / period whatever the loops do.
+//
+// THE NUMBERS (run 39560945814, msa2-server adaptive/amd64 cell, from its
+// properties_series.csv and tier1_tally.json; derivation in RACESHAPE/PREREG.md).
+//   - Measured: the 67 Markov walkers sent 16.56k requests a second over the 38
+//     loaded ticks (requests_sent 629112), 93.5% of the engine's 17.7k; closed
+//     loop that is ~4.05 ms a request, mostly queueing. The pure engines that
+//     pass carry ~3.6k a loop on 16 loops; this cell carried ~8.9k a loop on 2.
+//   - Floor: the controller refuses to promote on a tick whose bytes per request
+//     (engine read+written bytes over engine requests) is >= 8192, and a healthy
+//     64 KiB echo adds up to ~49 MB a tick without counting a request. With the
+//     717 B/request of a pure epoll cell: >= 6.6k requests a second; with the
+//     1452 B/request this cell ran at: >= 7.3k; with that cell's ~13 MB a second
+//     of bytes that do not scale with requests stacked on top: >= 8.35k. Taken
+//     as the floor: 8.35k.
+//   - Chosen: 6.5 ms. The ceiling is 67 / 6.5 ms = 10.3k a second; a start is
+//     booked from the actual start of the last, so timer lateness (0.1 to 0.4 ms)
+//     only lowers it, to ~9.7 to 10.1k: 16 to 21% above the floor, and 61% of the
+//     rate that saturated. Predicted, not measured: the acceptance read decides.
+//
+// Promotion is still checked by the gate in every default race run
+// (ExpectAdaptiveSwitch), and a shaped cell that misses it says it was shaped.
+//
+// WHY ONE CELL. Shaping costs race-detector coverage (fewer interleavings
+// under load) and only the cell with measured saturation pays for it. The other
+// seven refapps' adaptive cells are green at full load, and they run 77 Markov
+// walkers (no /ws, so the ws and sse slots go back to the Markov mix), not 67: a
+// 6.5 ms period would have kept only 21 to 46% of their request volume on amd64
+// (postgres 21%, swagger 23%, memcached 33%, kitchen_sink 34%, jwt 35%,
+// observability 39%, redis 46%) and left the arm64 redis, memcached and
+// observability cells (closed-loop 7 to 9 ms a request) effectively unshaped:
+// a cost with no evidence behind it, unevenly spread. The arm64 cell of the
+// shaped refapp carried 18.6k requests a second with a healthy echo and passed;
+// the ceiling (10.3k) cuts it, which it has headroom for. Another refapp's
+// adaptive cell joins the shaped set only if a run shows a SLOW or reset-type
+// counter in THAT cell with the loops busy (PREREG.md), never pre-emptively.
+//
+// This is a load shape, not a threshold: no tolerance, no N, no timeout and no
+// oracle moves (probatorium#481).
+const raceAdaptiveMarkovMinPeriod = 6500 * time.Microsecond
+
+// raceShapedRefapp is the one refapp whose adaptive cell is shaped.
+const raceShapedRefapp = "auth_session_ratelimit"
+
+// cellMarkovMinPeriod is the Markov walkers' minimum period between request
+// starts for a cell: the race tier's adaptive cell of auth_session_ratelimit
+// only (-race-tier is passed by the playbook for the -race refapp set only, like
+// WSEchoSlowTolerance), zero for every other cell, which keeps every other cell's
+// walkers closed-loop exactly as they have always run.
+func cellMarkovMinPeriod(refapp, engine string, raceTier bool) time.Duration {
+	if raceTier && engine == "adaptive" && refapp == raceShapedRefapp {
+		return raceAdaptiveMarkovMinPeriod
 	}
 	return 0
 }

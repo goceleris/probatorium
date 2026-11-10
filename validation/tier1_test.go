@@ -220,7 +220,7 @@ func TestRunMarkovWalker_LoginThenCookieFlow(t *testing.T) {
 		return loginPosts >= 1 && authedReqs >= wantAuthed
 	})
 	defer cancel()
-	runMarkovWalker(ctx, ctx, parent, srv.URL, minimalMatrix(t), 0xa11ce, &tally)
+	runMarkovWalker(ctx, ctx, parent, srv.URL, minimalMatrix(t), 0xa11ce, 0, &tally)
 
 	mu.Lock()
 	defer mu.Unlock()
