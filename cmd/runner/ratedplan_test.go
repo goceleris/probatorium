@@ -260,6 +260,9 @@ func TestP3aColumnsResolveToValidPlans(t *testing.T) {
 			continue
 		}
 		n++
+		if strings.Contains(name, "-g0-") || strings.Contains(name, "-g2-") || strings.Contains(name, "-g4-") {
+			continue // the guard columns carry no plan: TestP3aGuardColumnsAreSaturationOnly
+		}
 		if len(a.RatedPlans) != 1 {
 			t.Errorf("%s: %d plans, want exactly one (a column runs one scenario)", name, len(a.RatedPlans))
 			continue
@@ -277,5 +280,109 @@ func TestP3aColumnsResolveToValidPlans(t *testing.T) {
 	}
 	if n == 0 {
 		t.Skip("no p3a column in the registry")
+	}
+}
+
+// The guard columns (Opus r45 R6, G2: g0 / g2 / g4 on get-json / epoll-h1-sync) are saturation-only columns: an EXPLICIT empty registry plan entry (RatedPlan{SaturationOnly}), the guard
+// glob is in `cells` and NOT in `rated_cells`, so under the dispatch's rated_cells the runner leaves the config alone, says so, and the cell is not rated (a saturation pass, zero rated records).
+func TestP3aGuardColumnsAreSaturationOnly(t *testing.T) {
+	n := 0
+	for name, a := range servers.Registry {
+		if !strings.HasPrefix(name, "p3a-") || !(strings.Contains(name, "-g0-") || strings.Contains(name, "-g2-") || strings.Contains(name, "-g4-")) {
+			continue
+		}
+		n++
+		if p, ok := a.RatedPlans["get-json"]; len(a.RatedPlans) != 1 || !ok || !p.SaturationOnly || validateRatedPlan(p) != nil {
+			t.Errorf("%s: RatedPlans %v, want exactly the explicit saturation-only get-json entry", name, a.RatedPlans)
+		}
+		for _, d := range []string{"1", "2"} {
+			ratedCells := "ws-large-echo/p3a-" + d + "-*-k?-epoll-h1-sync,ws-large-echo/p3a-" + d + "-*-ctl-std-h1,get-json-h2/p3a-" + d + "-*-k?-epoll-auto+upg-async,get-json-h2/p3a-" + d + "-*-ctl-hertz-h2"
+			cfg := ratedCfg(ratedCells)
+			cfg.DryRun = false // a real (remote-target) run
+			before := slices.Clone(cfg.RatedFractions)
+			var logb bytes.Buffer
+			if err := resolveRatedPlan(&cfg, []interleave.Cell{plannedCell(t, "get-json", name)}, &logb); err != nil {
+				t.Errorf("%s: resolveRatedPlan: %v (a guard column must not be refused)", name, err)
+			}
+			if !slices.Equal(cfg.RatedFractions, before) || cfg.RatedAbsoluteRPS != nil || cfg.RatedPlanFrom != "" {
+				t.Errorf("%s: a saturation-only guard column rewrote the config: %v %v %q", name, cfg.RatedFractions, cfg.RatedAbsoluteRPS, cfg.RatedPlanFrom)
+			}
+			if !strings.Contains(logb.String(), "saturation-only column "+name+" (registry plan entry SaturationOnly): zero rated passes") {
+				t.Errorf("%s: the run does not say it is saturation-only: %q", name, logb.String())
+			}
+			if cfg.ratesCell("get-json/" + name) {
+				t.Errorf("%s: the guard cell is in rated_cells %q: it would get the default 0.25..0.9 sweep", name, ratedCells)
+			}
+		}
+	}
+	if n != 18 {
+		t.Errorf("%d guard columns in the registry, want 18", n)
+	}
+}
+
+// Loudly, not silently: the explicit saturation-only entry is the ONLY way a p3a column runs without rated passes. A p3a column with no plan entry at all is refused (it would run
+// the default 0.25..0.9 sweep), in a real run and in a remote-target dry run; a saturation-only column with a cell in -rated-cells, with a mixed plan, or with a scenario that has no
+// entry is refused too; a non-p3a column without a plan is unchanged (TestResolveRatedPlanLeavesOtherColumnsAlone).
+func TestResolveRatedPlanP3aNoPlanFailsLoudly(t *testing.T) {
+	fakePlanned(t, "p3a-zz-noplan", nil)
+	if _, ok := servers.Registry["p3a-zz-noplan"]; !ok {
+		t.Fatal("fixture not registered")
+	}
+	for _, dry := range []bool{false, true} {
+		cfg := ratedCfg("*/p3a-*")
+		cfg.DryRun = dry
+		err := resolveRatedPlan(&cfg, []interleave.Cell{plannedCell(t, "get-json", "p3a-zz-noplan")}, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "has NO rated plan entry") {
+			t.Errorf("dry=%v: a p3a column with no plan entry must be refused, got %v", dry, err)
+		}
+	}
+	// the local cross-product dry run (no -target) is information only and does not refuse
+	loc := ratedCfg("*/p3a-*")
+	loc.Target, loc.DryRun = "", true
+	if err := resolveRatedPlan(&loc, []interleave.Cell{plannedCell(t, "get-json", "p3a-zz-noplan")}, &bytes.Buffer{}); err != nil {
+		t.Errorf("local dry run: %v", err)
+	}
+	// rated mode off: unchanged
+	off := ratedCfg("*/p3a-*")
+	off.RatedMode = false
+	if err := resolveRatedPlan(&off, []interleave.Cell{plannedCell(t, "get-json", "p3a-zz-noplan")}, &bytes.Buffer{}); err != nil {
+		t.Errorf("rated off: %v", err)
+	}
+}
+
+func TestResolveRatedPlanSaturationOnlyRules(t *testing.T) {
+	sat := map[string]servers.RatedPlan{"get-json": {SaturationOnly: true}}
+	fakePlanned(t, "p3a-zz-sat", sat)
+	cell := []interleave.Cell{plannedCell(t, "get-json", "p3a-zz-sat")}
+	// ok: the cell is outside rated_cells; cfg untouched; the log says zero rated passes
+	cfg := ratedCfg("ws-large-echo/p3a-*")
+	var logb bytes.Buffer
+	if err := resolveRatedPlan(&cfg, cell, &logb); err != nil || !strings.Contains(logb.String(), "zero rated passes") || cfg.RatedAbsoluteRPS != nil || cfg.RatedPlanFrom != "" || !slices.Equal(cfg.RatedFractions, defaultRatedFractions) {
+		t.Errorf("saturation-only column: err %v log %q cfg %v %v %q", err, logb.String(), cfg.RatedFractions, cfg.RatedAbsoluteRPS, cfg.RatedPlanFrom)
+	}
+	// refused: its cell is in rated_cells
+	in := ratedCfg("get-json/p3a-*")
+	if err := resolveRatedPlan(&in, cell, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "default sweep") {
+		t.Errorf("a saturation-only cell inside rated_cells must be refused, got %v", err)
+	}
+	// refused: another rated cell shares the run
+	cfg2 := ratedCfg("ws-large-echo/other")
+	two := append([]interleave.Cell{plannedCell(t, "ws-large-echo", "other")}, cell...)
+	if err := resolveRatedPlan(&cfg2, two, &bytes.Buffer{}); err == nil {
+		t.Error("a saturation-only column sharing the run with a rated cell must be refused")
+	}
+	// refused: a scenario without an entry
+	cfg3 := ratedCfg("ws-large-echo/p3a-*")
+	if err := resolveRatedPlan(&cfg3, []interleave.Cell{plannedCell(t, "get-simple", "p3a-zz-sat")}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "no plan entry") {
+		t.Errorf("a saturation-only column on a scenario without an entry must be refused, got %v", err)
+	}
+	// refused: a mixed plan; and the plan itself must be empty
+	fakePlanned(t, "p3a-zz-mixed", map[string]servers.RatedPlan{"get-json": {SaturationOnly: true}, "get-simple": okPlan})
+	cfg4 := ratedCfg("ws-large-echo/p3a-*")
+	if err := resolveRatedPlan(&cfg4, []interleave.Cell{plannedCell(t, "get-json", "p3a-zz-mixed")}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "mixes") {
+		t.Errorf("a mixed plan must be refused, got %v", err)
+	}
+	if validateRatedPlan(servers.RatedPlan{SaturationOnly: true, AbsoluteRPS: []float64{1}}) == nil || validateRatedPlan(servers.RatedPlan{SaturationOnly: true}) != nil {
+		t.Error("validateRatedPlan: a saturation-only plan must hold no pass")
 	}
 }

@@ -181,6 +181,9 @@ type RatedPlan struct {
 	AbsoluteRPS []float64
 	// Placeholder marks AbsoluteRPS as FILL placeholders (the source run of the real rates is not chosen yet): a real run REFUSES to start, a -dry-run says so loudly.
 	Placeholder bool
+	// SaturationOnly is the EXPLICIT empty plan of a saturation-only column (the P3a guard columns g0 / g2 / g4): the plan entry exists, holds zero rated passes (Fractions and
+	// AbsoluteRPS empty), and the runner checks that the column's cell is NOT in -rated-cells. A p3a column with no plan entry at all fails loudly (cmd/runner resolveRatedPlan).
+	SaturationOnly bool
 }
 
 // Capabilities is an adapter's declared Phase-2 capability manifest. Each

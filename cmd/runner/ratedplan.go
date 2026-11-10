@@ -44,6 +44,12 @@ func (c Config) ratedPasses() []ratedPass {
 // validateRatedPlan checks one (column, scenario) plan.
 func validateRatedPlan(p servers.RatedPlan) error {
 	n := len(p.Fractions) + len(p.AbsoluteRPS)
+	if p.SaturationOnly {
+		if n != 0 || p.Placeholder {
+			return fmt.Errorf("a saturation-only plan has no rated pass (%d given) and is no placeholder", n)
+		}
+		return nil
+	}
 	if n == 0 {
 		return fmt.Errorf("the plan has no pass")
 	}
@@ -70,7 +76,10 @@ func validateRatedPlan(p servers.RatedPlan) error {
 // column cannot be run exactly as planned:
 //   - a planned column has a cell outside -rated-cells, or its rated cells span more than one scenario, or it shares the run with another column;
 //   - the rated scenario has no plan entry;
-//   - the plan is invalid, or its absolute rates are FILL placeholders (a real run only: -dry-run lists everything and says so loudly).
+//   - the plan is invalid, or its absolute rates are FILL placeholders (a real run only: -dry-run lists everything and says so loudly);
+//   - a p3a- column of the schedule has NO plan entry at all (RatedPlans nil): every p3a column is either planned or EXPLICITLY saturation-only (PREREG-P3A statement 10);
+//   - a saturation-only column (RatedPlan.SaturationOnly: the guard columns g0 / g2 / g4) has a cell inside -rated-cells (it would run the default 0.25..0.9 sweep).
+//     A saturation-only column leaves cfg untouched: its manifest carries the runner's default sweep list, no absolute rates and no plan source, and no cell of it is rated.
 //
 // It does nothing when rated mode is off or no scheduled cell belongs to a planned column.
 func resolveRatedPlan(cfg *Config, schedule []interleave.Cell, logw io.Writer) error {
@@ -79,8 +88,13 @@ func resolveRatedPlan(cfg *Config, schedule []interleave.Cell, logw io.Writer) e
 	}
 	planned := map[string]bool{}
 	for _, cell := range schedule {
-		if r, ok := servers.Registry[cell.Server.Name()]; ok && r.RatedPlans != nil {
-			planned[cell.Server.Name()] = true
+		name := cell.Server.Name()
+		r, ok := servers.Registry[name]
+		if ok && r.RatedPlans != nil {
+			planned[name] = true
+		} else if strings.HasPrefix(name, "p3a-") && (cfg.Target != "" || !cfg.DryRun) {
+			// a p3a column with no plan entry (not even the explicit saturation-only one) would silently run the default sweep: refuse, in every mode but the local cross-product dry run
+			return fmt.Errorf("rated plan: p3a column %s has NO rated plan entry (every p3a column is planned or explicitly saturation-only, servers.RatedPlan.SaturationOnly): refusing to run it with the default sweep", name)
 		}
 	}
 	if len(planned) == 0 {
@@ -100,6 +114,12 @@ func resolveRatedPlan(cfg *Config, schedule []interleave.Cell, logw io.Writer) e
 	}
 	slug := names[0]
 	real := servers.Registry[slug]
+	if satOnly, err := saturationOnlyColumn(slug, real, schedule, *cfg); err != nil {
+		return err
+	} else if satOnly {
+		fmt.Fprintf(logw, "probatorium-runner: saturation-only column %s (registry plan entry SaturationOnly): zero rated passes, no cell of it is in -rated-cells; the sweep config is left as is and is never run\n", slug)
+		return nil
+	}
 	scs := map[string]bool{}
 	for _, cell := range schedule {
 		id := cell.Scenario.Name() + "/" + cell.Server.Name()
@@ -150,4 +170,34 @@ func resolveRatedPlan(cfg *Config, schedule []interleave.Cell, logw io.Writer) e
 	fmt.Fprintf(logw, "probatorium-runner: rated plan from the registry column %s, scenario %s: fractions=%v absolute_rps=%v passes=%d (replaces -rated-fractions)\n",
 		slug, scenario, cfg.RatedFractions, cfg.RatedAbsoluteRPS, len(cfg.ratedPasses()))
 	return nil
+}
+
+// saturationOnlyColumn reports whether the planned column slug is an EXPLICIT saturation-only column (every plan entry has SaturationOnly: the P3a guard columns). A mix of
+// saturation-only and rated entries is an error; so is a saturation-only column with a scheduled cell of its own (or of another column of the run) inside -rated-cells, or
+// with a scheduled scenario that has no plan entry.
+func saturationOnlyColumn(slug string, real servers.Adapter, schedule []interleave.Cell, cfg Config) (bool, error) {
+	n := 0
+	for _, p := range real.RatedPlans {
+		if p.SaturationOnly {
+			n++
+		}
+	}
+	if n == 0 {
+		return false, nil
+	}
+	if n != len(real.RatedPlans) {
+		return false, fmt.Errorf("rated plan: column %s mixes saturation-only and rated plan entries", slug)
+	}
+	for _, cell := range schedule {
+		id := cell.Scenario.Name() + "/" + cell.Server.Name()
+		if cfg.ratesCell(id) {
+			return false, fmt.Errorf("rated plan: saturation-only column %s has the rated cell %s in the run (-rated-cells %q): it would run the default sweep (fix rated_cells: the guard glob belongs to cells only)", slug, id, cfg.RatedCells)
+		}
+		if cell.Server.Name() == slug {
+			if _, ok := real.RatedPlans[cell.Scenario.Name()]; !ok {
+				return false, fmt.Errorf("rated plan: saturation-only column %s runs scenario %s, which has no plan entry", slug, cell.Scenario.Name())
+			}
+		}
+	}
+	return true, nil
 }
