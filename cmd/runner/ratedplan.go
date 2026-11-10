@@ -92,9 +92,9 @@ func resolveRatedPlan(cfg *Config, schedule []interleave.Cell, logw io.Writer) e
 		r, ok := servers.Registry[name]
 		if ok && r.RatedPlans != nil {
 			planned[name] = true
-		} else if strings.HasPrefix(name, "p3a-") && (cfg.Target != "" || !cfg.DryRun) {
-			// a p3a column with no plan entry (not even the explicit saturation-only one) would silently run the default sweep: refuse, in every mode but the local cross-product dry run
-			return fmt.Errorf("rated plan: p3a column %s has NO rated plan entry (every p3a column is planned or explicitly saturation-only, servers.RatedPlan.SaturationOnly): refusing to run it with the default sweep", name)
+		} else if (strings.HasPrefix(name, "p3a-") || strings.HasPrefix(name, "d757-")) && (cfg.Target != "" || !cfg.DryRun) {
+			// a p3a / d757 column with no plan entry (not even the explicit saturation-only one) would silently run the default sweep: refuse, in every mode but the local cross-product dry run
+			return fmt.Errorf("rated plan: p3a column %s has NO rated plan entry (every p3a / d757 column is planned or explicitly saturation-only, servers.RatedPlan.SaturationOnly): refusing to run it with the default sweep", name)
 		}
 	}
 	if len(planned) == 0 {

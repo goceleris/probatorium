@@ -302,7 +302,7 @@ func TestP3aRatedPlans(t *testing.T) {
 	}
 	// no other column of the registry carries a plan (their runner behaviour is unchanged)
 	for name, a := range servers.Registry {
-		if !strings.HasPrefix(name, p3aPrefix+"-") && a.RatedPlans != nil {
+		if !strings.HasPrefix(name, p3aPrefix+"-") && !strings.HasPrefix(name, "d757-") && a.RatedPlans != nil {
 			t.Errorf("%s (not a p3a column) carries a rated plan", name)
 		}
 	}

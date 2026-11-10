@@ -386,3 +386,43 @@ func TestResolveRatedPlanSaturationOnlyRules(t *testing.T) {
 		t.Error("validateRatedPlan: a saturation-only plan must hold no pass")
 	}
 }
+
+// D757 (ab/d757-<date>): the same refusal for the d757- columns. Every d757 column carries an ABSOLUTE-ONLY plan (Fractions nil, two absolute rates); one with NO plan entry at all would silently
+// run the default 0.25..0.9 sweep, so it is refused in a real run and in a remote-target dry run (never in the local cross-product dry run, never with rated mode off).
+func TestResolveRatedPlanD757NoPlanFailsLoudly(t *testing.T) {
+	fakePlanned(t, "d757-zz-noplan", nil)
+	for _, dry := range []bool{false, true} {
+		cfg := ratedCfg("*/d757-*")
+		cfg.DryRun = dry
+		err := resolveRatedPlan(&cfg, []interleave.Cell{plannedCell(t, "get-json-h2", "d757-zz-noplan")}, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "has NO rated plan entry") {
+			t.Errorf("dry=%v: a d757 column with no plan entry must be refused, got %v", dry, err)
+		}
+	}
+	loc := ratedCfg("*/d757-*")
+	loc.Target, loc.DryRun = "", true
+	if err := resolveRatedPlan(&loc, []interleave.Cell{plannedCell(t, "get-json-h2", "d757-zz-noplan")}, &bytes.Buffer{}); err != nil {
+		t.Errorf("local dry run: %v", err)
+	}
+	off := ratedCfg("*/d757-*")
+	off.RatedMode = false
+	if err := resolveRatedPlan(&off, []interleave.Cell{plannedCell(t, "get-json-h2", "d757-zz-noplan")}, &bytes.Buffer{}); err != nil {
+		t.Errorf("rated off: %v", err)
+	}
+}
+
+// An absolute-only celeris plan (Fractions nil) resolves like the hertz control of P3a did: the manifest carries RatedFractions [] and the two absolute rates.
+func TestResolveRatedPlanD757AbsoluteOnlyCelerisColumn(t *testing.T) {
+	fakePlanned(t, "d757-zz-abs", map[string]servers.RatedPlan{"get-json-h2": {AbsoluteRPS: []float64{300321, 450481}}})
+	cfg := ratedCfg("get-json-h2/d757-*")
+	var logb bytes.Buffer
+	if err := resolveRatedPlan(&cfg, []interleave.Cell{plannedCell(t, "get-json-h2", "d757-zz-abs")}, &logb); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RatedFractions) != 0 || !slices.Equal(cfg.RatedAbsoluteRPS, []float64{300321, 450481}) || cfg.RatedPlanFrom != "registry:d757-zz-abs:get-json-h2" {
+		t.Errorf("cfg after resolve: %v %v %q", cfg.RatedFractions, cfg.RatedAbsoluteRPS, cfg.RatedPlanFrom)
+	}
+	if n := len(cfg.ratedPasses()); n != 2 {
+		t.Errorf("%d passes, want 2 (the two absolute rates, no fraction pass)", n)
+	}
+}
