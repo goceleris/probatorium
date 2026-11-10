@@ -17,7 +17,7 @@ import (
 func TestResolveBenchColumnsForD757(t *testing.T) {
 	const (
 		sched = "PROBATORIUM_SCHED_SAMPLE"
-		gate  = "PROBATORIUM_RESID_STAMPS"
+		gate  = "CELERIS_DIAG_RESID"
 	)
 	var names []string
 	for name := range servers.Registry {

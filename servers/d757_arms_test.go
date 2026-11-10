@@ -95,18 +95,17 @@ func TestD757Layout(t *testing.T) {
 	}
 }
 
-// The env names of the registry are the constants of the knob sources, character for character (the gate name is decided by the sibling celeris builder: until servers/celeris/resid_knob.go
-// exists the gate tie is only logged, never skipped silently).
+// The env names of the registry are the constants of the knob sources, character for character (the gate belongs to celeris itself; the sampler file that prints `[res]` does not exist on the P3a head).
 func TestD757EnvAndPlans(t *testing.T) {
 	sched := regexp.MustCompile(`(?m)^const schedSampleEnv = "([A-Z0-9_]+)"`).FindStringSubmatch(readFile(t, "celeris", "sched_sampler.go"))
 	if sched == nil {
 		t.Fatal("servers/celeris/sched_sampler.go has no const schedSampleEnv")
 	}
-	const gate = "PROBATORIUM_RESID_STAMPS"
-	if b, err := os.ReadFile(filepath.Join("celeris", "resid_knob.go")); err != nil {
-		t.Logf("servers/celeris/resid_knob.go is not present (the sibling builder's file): the gate name %s is NOT tied to the knob source yet", gate)
-	} else if !strings.Contains(string(b), `"`+gate+`"`) {
-		t.Errorf("servers/celeris/resid_knob.go does not carry the gate name %q", gate)
+	const gate = "CELERIS_DIAG_RESID" // read by celeris itself (internal/diag/resid EnvGate, stamps branch diag/757-residence-stamps); the probatorium side only passes it through the column env
+	if b, err := os.ReadFile(filepath.Join("celeris", "resid_sampler.go")); err != nil {
+		t.Logf("servers/celeris/resid_sampler.go is not present (PATCHLIST.md item 3 of the D757 tool set): the gate %s is only passed through the column env", gate)
+	} else if !strings.Contains(string(b), gate) {
+		t.Errorf("servers/celeris/resid_sampler.go does not carry the gate name %q", gate)
 	}
 	pin := celerisRequire(t, "celeris")
 	for _, c := range d757Cols(t) {

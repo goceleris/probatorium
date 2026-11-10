@@ -382,7 +382,7 @@ func TestWorkflowValidatesItsInputsBeforeProvisioning(t *testing.T) {
 		{"empty sut_env with the p3a glob", []string{"IN_CELLS=ws-large-echo/p3a-1-*-k?-epoll-h1-sync"}, true},
 		{"sut_env with the d757 glob", []string{"IN_SUT_ENV=A=1", "IN_CELLS=get-json-h2/d757-*-a0-epoll-auto+upg-async"}, false},
 		{"sut_env with a d757 competitor", []string{"IN_SUT_ENV=A=1", "IN_COMPETITORS=d757-001-r1-a0-epoll-auto+upg-async"}, false},
-		{"sut_env carrying the d757 gate env", []string{"IN_SUT_ENV=PROBATORIUM_RESID_STAMPS=1", "IN_CELLS=get-json-h2/d757-*-a0-epoll-auto+upg-async"}, false},
+		{"sut_env carrying the d757 gate env", []string{"IN_SUT_ENV=CELERIS_DIAG_RESID=1", "IN_CELLS=get-json-h2/d757-*-a0-epoll-auto+upg-async"}, false},
 		{"empty sut_env with the d757 glob", []string{"IN_CELLS=get-json-h2/d757-*-a0-epoll-auto+upg-async,get-json-h2/d757-*-dx-epoll-auto+upg-async,get-json-h2/d757-*-ctl-hertz-h2"}, true},
 		{"sut_env with the c1pp glob", []string{"IN_SUT_ENV=A=1", "IN_CELLS=driver-redis-pipeline/c1pp-dump-*"}, false},
 		{"empty sut_env with the c1pp glob", []string{"IN_CELLS=driver-redis-pipeline/c1pp-dump-*"}, true},
