@@ -24,8 +24,8 @@ const c2ladPrefix = "c2lad"
 // The files a generated module carries. server.go is compared after its header (the generator replaces it); debugvars_test.go comes from servers/celeris_v1511.
 var (
 	// P3a (ab/p3a-rc1-20261110): workers_knob.go and sched_sampler.go (and their tests) are copies in the two generated mirrors too; they are not in the frozen v1.5.11 module.
-	c2ladSources = []string{"server.go", "chain_handlers.go", "driver_handlers.go", "streaming_handlers.go", "debugvars.go", "busypoll_knob.go", "pprof_sidecar.go", "workers_knob.go", "sched_sampler.go"}
-	c2ladTests   = []string{"busypoll_knob_test.go", "pprof_sidecar_test.go", "workers_knob_test.go", "sched_sampler_test.go"}
+	c2ladSources = []string{"server.go", "chain_handlers.go", "driver_handlers.go", "streaming_handlers.go", "debugvars.go", "busypoll_knob.go", "pprof_sidecar.go", "workers_knob.go", "sched_sampler.go", "resid_sampler.go"}
+	c2ladTests   = []string{"busypoll_knob_test.go", "pprof_sidecar_test.go", "workers_knob_test.go", "sched_sampler_test.go", "resid_sampler_test.go"}
 	// byte-equal in EVERY module that has them (servers/celeris, servers/celeris_v1511, the generated ones): the two knob files must not drift in a mirror.
 	c2ladWholeFile = []string{"busypoll_knob.go", "pprof_sidecar.go", "busypoll_knob_test.go", "pprof_sidecar_test.go"}
 )

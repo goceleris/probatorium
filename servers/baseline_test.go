@@ -282,6 +282,7 @@ func TestBaselineRoutesMatchTheMainModule(t *testing.T) {
 	}
 	// Same sources: the handler files are byte-identical bar the documented
 	// differences (server.go's header comment, debugvars_test.go).
+	// D757 (ab/d757-<date>): the same for the residence exporter lines of servers/celeris/server.go ("// D757" marker or a comment starting "// D757").
 	// P3a (ab/p3a-rc1-20261110): the knob and sampler lines of servers/celeris/server.go carry a "// P3A" marker (or are a comment starting "// P3a"); the frozen v1.5.11
 	// module is NOT touched, so they are the documented difference and only they are dropped before the comparison.
 	body := func(s string) string {
@@ -290,7 +291,7 @@ func TestBaselineRoutesMatchTheMainModule(t *testing.T) {
 		}
 		var keep []string
 		for _, ln := range strings.Split(s, "\n") {
-			if strings.Contains(ln, "// P3A") || strings.HasPrefix(strings.TrimSpace(ln), "// P3a") {
+			if strings.Contains(ln, "// P3A") || strings.Contains(ln, "// D757") || strings.HasPrefix(strings.TrimSpace(ln), "// P3a") || strings.HasPrefix(strings.TrimSpace(ln), "// D757") {
 				continue
 			}
 			keep = append(keep, ln)

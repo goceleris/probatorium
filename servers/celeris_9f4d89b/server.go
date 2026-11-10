@@ -122,6 +122,8 @@ func main() {
 	log.Print(wk.line()) // P3A: [workers] env=<raw|unset> config=<int|absent>, always printed, after the [busypoll] line
 	// P3a: PROBATORIUM_SCHED_SAMPLE=1 starts the 1 Hz scheduler sampler (sched_sampler.go); it is stopped, synchronously, BEFORE the signal line below.
 	stopSched := mustStartSchedSampler() // P3A
+	// D757 (THROWAWAY ab/d757-<date>): prints `[res-env] env= level=` ALWAYS and, with CELERIS_DIAG_RESID on, the 1 Hz `[res]` snapshot line (resid_sampler.go); stopped BEFORE the signal line like the sched sampler.
+	stopResid := mustStartResidSampler() // D757
 	registerRoutes(srv)
 
 	// lifetime bounds background goroutines owned by the chain middleware
@@ -146,6 +148,7 @@ func main() {
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		<-sig
 		stopSched() // P3A: the sampler must not write after (or at) the signal line: the CRASH rule needs that line last before [respawn]
+		stopResid() // D757: the same for the [res] exporter
 		log.Printf("celeris: signal received, shutting down")
 		stopDebugVars()
 		cancelLifetime()
