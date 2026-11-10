@@ -114,9 +114,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("celeris: busy-poll knob: %v", err)
 	}
+	// P3a (THROWAWAY ab/p3a-rc1-20261110): PROBATORIUM_WORKERS sets Config.Workers (workers_knob.go; unset = the celeris default).
+	wk := mustApplyWorkersKnob(&cfg) // P3A
 	srv := celeris.New(cfg)
 	bp.resolveBusyPoll(srv)
 	log.Print(bp.line()) // the direct manipulation check: read by arm-validate.py / x86-validate.py
+	log.Print(wk.line()) // P3A: [workers] env=<raw|unset> config=<int|absent>, always printed, after the [busypoll] line
+	// P3a: PROBATORIUM_SCHED_SAMPLE=1 starts the 1 Hz scheduler sampler (sched_sampler.go); it is stopped, synchronously, BEFORE the signal line below.
+	stopSched := mustStartSchedSampler() // P3A
 	registerRoutes(srv)
 
 	// lifetime bounds background goroutines owned by the chain middleware
@@ -140,6 +145,7 @@ func main() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		<-sig
+		stopSched() // P3A: the sampler must not write after (or at) the signal line: the CRASH rule needs that line last before [respawn]
 		log.Printf("celeris: signal received, shutting down")
 		stopDebugVars()
 		cancelLifetime()

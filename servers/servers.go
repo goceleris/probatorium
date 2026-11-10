@@ -166,6 +166,21 @@ type Adapter struct {
 	// a Registry member but is left out of Names and AdaptersSorted, so out
 	// of every "all" / "*/*" expansion, unless BENCH_BASELINE is on.
 	Baseline bool
+
+	// RatedPlans, when non-nil, is the rated-sweep plan this column carries, keyed by SCENARIO name (P3a, THROWAWAY ab/p3a-rc1-20261110, servers/p3a_arms.go). The
+	// runner (cmd/runner resolveRatedPlan) reads it by -server-name and replaces the sweep it would otherwise run (-rated-fractions, default 0.25/0.5/0.75/0.9) for the
+	// rated scenario of the column BEFORE the manifest is written, so manifest.json tells the truth. Nil for every column the registry shipped before P3a: their
+	// runner behaviour is unchanged.
+	RatedPlans map[string]RatedPlan
+}
+
+// RatedPlan is the rated-sweep plan of one (column, scenario): Fractions (of the cell's own saturation rate) run first, in order, then AbsoluteRPS (offered
+// rates, req/s), in order. Both may be non-empty; at least one pass is required, and no more than the hang guard budgets (budget.DefaultRatedPasses).
+type RatedPlan struct {
+	Fractions   []float64
+	AbsoluteRPS []float64
+	// Placeholder marks AbsoluteRPS as FILL placeholders (the source run of the real rates is not chosen yet): a real run REFUSES to start, a -dry-run says so loudly.
+	Placeholder bool
 }
 
 // Capabilities is an adapter's declared Phase-2 capability manifest. Each

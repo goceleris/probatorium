@@ -132,7 +132,8 @@ func TestBaselineColumnsMirrorTheirMainTwin(t *testing.T) {
 	}
 	// Every main celeris loop-engine column has a baseline twin except std.
 	for n, a := range servers.Registry {
-		if a.Category != "celeris" || n == "celeris-std-h1" {
+		// P3a (ab/p3a-rc1-20261110): the std engine has no baseline column, so neither has its copy p3a-*-ctl-std-h1 (a.Engine == "std-h1"); the exemption was by name only.
+		if a.Category != "celeris" || n == "celeris-std-h1" || a.Engine == "std-h1" {
 			continue
 		}
 		if _, ok := servers.Registry[servers.BaselineName(a.Engine)]; !ok {
@@ -281,11 +282,20 @@ func TestBaselineRoutesMatchTheMainModule(t *testing.T) {
 	}
 	// Same sources: the handler files are byte-identical bar the documented
 	// differences (server.go's header comment, debugvars_test.go).
+	// P3a (ab/p3a-rc1-20261110): the knob and sampler lines of servers/celeris/server.go carry a "// P3A" marker (or are a comment starting "// P3a"); the frozen v1.5.11
+	// module is NOT touched, so they are the documented difference and only they are dropped before the comparison.
 	body := func(s string) string {
 		if i := strings.Index(s, "package main"); i >= 0 {
-			return s[i:]
+			s = s[i:]
 		}
-		return s
+		var keep []string
+		for _, ln := range strings.Split(s, "\n") {
+			if strings.Contains(ln, "// P3A") || strings.HasPrefix(strings.TrimSpace(ln), "// P3a") {
+				continue
+			}
+			keep = append(keep, ln)
+		}
+		return strings.Join(keep, "\n")
 	}
 	for _, f := range []string{"server.go", "chain_handlers.go", "driver_handlers.go", "streaming_handlers.go", "debugvars.go"} {
 		if body(readFile(t, "celeris", f)) != body(readFile(t, "celeris_v1511", f)) {
