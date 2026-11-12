@@ -1337,6 +1337,7 @@
     # ws-hub-broadcast-1024, now that the fanout fix maps Connections
     # onto Workers) exhaust FDs before opening their last streams.
     ulimit -n 65535 2>/dev/null || true
+    {% if cell.1 is search('-dxs-|-ctls-') %}rm -f {{ cell_dir }}/client-stamps.jsonl; export LOADGEN_CLIENT_STAMPS=300321 LOADGEN_CLIENT_STAMPS_FILE={{ cell_dir }}/client-stamps.jsonl; {% endif %}
     timeout --foreground --kill-after=60 {{ cell_guard_seconds }} ./runner \
       -target http://{{ target_ip }}:{{ bench_port | default(8080) }} \
       -target-arch {{ hostvars[bench_target].arch }} \
