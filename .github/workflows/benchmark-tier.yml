@@ -185,7 +185,7 @@ jobs:
                 fail=1 ;;
             esac
             case "$IN_CELLS,$IN_COMPETITORS" in
-              *c1arm-*|*c2x86-*|*c2lad-*|*c1pp-*|*pinp38-*)
+              *c1arm-*|*c2x86-*|*c2lad-*|*c1pp-*|*pinp38-*|*lf2f-*)
                 echo "::error::sut_env must be empty for the attribution columns (c1arm-, c2x86-, c2lad-, c1pp-, pinp38-): they differ only by their column env and the validators require the exact launched environment"
                 fail=1 ;;
             esac

@@ -132,7 +132,8 @@ func TestBaselineColumnsMirrorTheirMainTwin(t *testing.T) {
 	}
 	// Every main celeris loop-engine column has a baseline twin except std.
 	for n, a := range servers.Registry {
-		if a.Category != "celeris" || n == "celeris-std-h1" {
+		// LF2F (ab/lf2f-diag-20261113): the std engine has no baseline column, so neither has its copy lf2f-755-std-h1 (a.Engine == "std-h1"); the exemption was by name only.
+		if a.Category != "celeris" || n == "celeris-std-h1" || a.Engine == "std-h1" {
 			continue
 		}
 		if _, ok := servers.Registry[servers.BaselineName(a.Engine)]; !ok {
