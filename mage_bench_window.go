@@ -8,11 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/goceleris/probatorium/report"
+	"github.com/goceleris/probatorium/servers"
 )
 
 // mage_bench_window.go — the two harness prerequisites for the
@@ -191,6 +193,86 @@ func sutEnvExtraVars(env map[string]string) string {
 		panic(fmt.Sprintf("marshal bench_sut_env: %v", err))
 	}
 	return string(b)
+}
+
+// armColumnPrefixes are the registry prefixes of the v1.6.0 attribution columns: the arm columns of servers/c1_arms.go and servers/c2x86_arms.go, the #858 ladder columns of servers/c2lad_arms.go (the fcbpon slot is told apart by its column env), the ARMED diagnostic columns of servers/c1pp_arms.go (told apart by the pprof gate in their column env), and the repinned P2 columns of
+// servers/p2_arms.go (1a, main vs v1.5.11), which have no validator yet and must not be turned into a different arm by an override either.
+var armColumnPrefixes = []string{"c1arm-", "c2x86-", "c2lad-", "c1pp-", "pinp38-"}
+
+// pprofGateEnv arms ansible/files/pprofcap.py (servers/celeris/pprof_sidecar.go); only a registry column env (the c1pp- columns) may set it, so a dispatch-wide override can never arm a
+// column together with its twins and peers.
+const pprofGateEnv = "PROBATORIUM_PPROF"
+
+// busyPollKnobEnv is the busy-poll arm's knob (servers/celeris/busypoll_knob.go); only a registry column env may set it.
+const busyPollKnobEnv = "PROBATORIUM_SOCKET_BUSY_POLL"
+
+// refuseSUTEnvOnArmColumns fails the dispatch, at the start of mage Bench (before any column runs or any SUT starts, but AFTER the workflow's `mage Deploy` step), when a dispatch-wide BENCH_SUT_ENV (the workflow's sut_env input) is combined with an attribution
+// column, or sets the busy-poll knob at all. The arm columns are told apart ONLY by their column env, and arm-validate.py / x86-validate.py require the launched environment to be
+// exactly the base env plus the column's own keys: any override (CELERIS_IOURING_FIXED_FILES=1 would even silence SocketBusyPoll while the startup line still reads 50us) would void
+// every column after the hours are spent, and a knob in sut_env would make the default arm busy-poll. slugs are the columns the dispatch will bench.
+func refuseSUTEnvOnArmColumns(slugs []string, sutEnv map[string]string) error {
+	if len(sutEnv) == 0 {
+		return nil
+	}
+	if v, ok := sutEnv[busyPollKnobEnv]; ok {
+		return fmt.Errorf("BENCH_SUT_ENV sets %s=%s: the busy-poll arm comes only from the registry column env (servers/c1_arms.go), never from a dispatch-wide override", busyPollKnobEnv, v)
+	}
+	if v, ok := sutEnv[pprofGateEnv]; ok {
+		return fmt.Errorf("BENCH_SUT_ENV sets %s=%s: the pprof collector is armed only by the registry column env of the c1pp- columns (servers/c1pp_arms.go), never by a dispatch-wide override that would arm every column, twins and peers included", pprofGateEnv, v)
+	}
+	for _, slug := range slugs {
+		for _, p := range armColumnPrefixes {
+			if strings.HasPrefix(slug, p) {
+				return fmt.Errorf("BENCH_SUT_ENV (%s) must be empty for the attribution columns (%s is one): the arms differ only by their column env and the validators require the launched environment to be exactly the expected keys",
+					sutEnvString(sutEnv), slug)
+			}
+		}
+	}
+	return nil
+}
+
+// armedScenarios are the scenarios an armed pprof column (servers/c1pp_arms.go) may run, by mode: the #854 dump is for the redis Pipeline stall, the #857 profile for the memcached rows.
+var armedScenarios = map[string][]string{
+	"dump":    {"driver-redis-pipeline"},
+	"profile": {"driver-mc-get", "driver-mc-multiget", "driver-mc-set"},
+}
+
+// refuseArmedColumnsOnManyScenarios fails the dispatch, at mage start, when any in-scope c1pp-<mode>-* column would run anything but exactly one scenario of its mode. ansible/files/pprofcap.py
+// watches the first measurement window after its rendezvous and the runner runs a column's scenarios in name order, so an armed column that also matches driver-mc-get would dump (or profile) the
+// memcached GET window instead of the Pipeline stall. The plan's own LF-1 selection (driver-redis-pipeline/* plus driver-mc-*/*) selects every c1pp column with four scenarios and is refused;
+// the working shape is driver-redis-pipeline/celeris-*,driver-mc-*/celeris-*,driver-redis-pipeline/c1pp-dump-*. Empty or "*" cells select every scenario and are refused too.
+func refuseArmedColumnsOnManyScenarios(slugs []string, cells string) error {
+	for _, slug := range slugs {
+		if !strings.HasPrefix(slug, "c1pp-") {
+			continue
+		}
+		mode, _, _ := strings.Cut(strings.TrimPrefix(slug, "c1pp-"), "-")
+		allowed, ok := armedScenarios[mode]
+		if !ok {
+			return fmt.Errorf("armed column %s has no known mode (%q): expected c1pp-dump-... or c1pp-profile-...", slug, mode)
+		}
+		got, err := cellsGlobScenarios(cells, slug)
+		if err != nil {
+			return err
+		}
+		if len(got) != 1 || !slices.Contains(allowed, got[0]) {
+			return fmt.Errorf("armed column %s would run %d scenario(s) %v under cells %q: the pprof collector watches the first window of a column, so it must run exactly one of %v "+
+				"(select it with cells=%s/c1pp-%s-*, and keep the unarmed columns on their own /celeris-* globs)", slug, len(got), got, cells, allowed, allowed[0], mode)
+		}
+	}
+	return nil
+}
+
+// scopeSlugs is the set of column slugs a dispatch will bench, before the registry expansion: an explicit competitors CSV, else the slugs the cells glob matches, else (nil: "*"
+// or empty cells) every registered column.
+func scopeSlugs(competitors string, cellsSlugs []string) []string {
+	if c := strings.TrimSpace(competitors); c != "" && c != "all" {
+		return splitTrimNonEmpty(competitors)
+	}
+	if cellsSlugs != nil {
+		return cellsSlugs
+	}
+	return servers.Names()
 }
 
 // sutEnvString renders the override set as sorted "KEY=VALUE KEY=VALUE"

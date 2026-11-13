@@ -11,6 +11,11 @@ updates:
   # are .github/tools, which has its own entry below, and
   # /servers/celeris_v1511, the frozen baseline pinned at celeris v1.5.11
   # (servers/baseline.go), which Dependabot must never move.
+  # BEGIN ladder-gen (ladder-gen.py, evidence lanes-20261105/H6H7; do not edit by hand)
+  # ladder modules (celeris pinned at one commit each, generated, never moved by Dependabot; NOT in `directories:`):
+  # /servers/celeris_v158
+  # /servers/celeris_9f4d89b
+  # END ladder-gen
   - package-ecosystem: gomod
     directories:
       - /
