@@ -66,7 +66,7 @@ var reprobeAfterLockWait = 5 * time.Second
 func (c Config) clientLockLimits() (maxHold, maxWait time.Duration) {
 	maxHold = 5*c.Warmup + 2*c.Duration + 60*time.Second
 	if c.RatedMode {
-		maxHold += time.Duration(len(c.RatedFractions)) * (5*c.Warmup + 2*c.RatedDuration + 60*time.Second)
+		maxHold += time.Duration(len(c.RatedFractions)+len(c.RatedAbsoluteRPS)) * (5*c.Warmup + 2*c.RatedDuration + 60*time.Second)
 	}
 	maxHold += time.Minute
 	return maxHold, maxHold + 2*time.Minute

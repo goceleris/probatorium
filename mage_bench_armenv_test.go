@@ -30,7 +30,7 @@ func firstWithPrefix(t *testing.T, p string) string {
 }
 
 func TestSUTEnvIsRefusedForTheAttributionColumnsOnly(t *testing.T) {
-	for _, want := range []string{"c1arm-", "c2x86-", "c2lad-", "c1pp-", "pinp38-"} { // the protected set is stated here, not derived from the code under test
+	for _, want := range []string{"c1arm-", "c2x86-", "c2lad-", "c1pp-", "pinp38-", "lf2f-"} { // the protected set is stated here, not derived from the code under test
 		if !slices.Contains(armColumnPrefixes, want) {
 			t.Errorf("armColumnPrefixes lacks %q", want)
 		}
