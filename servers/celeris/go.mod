@@ -3,7 +3,7 @@ module github.com/goceleris/probatorium/servers/celeris
 go 1.27.3
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20261109111008-29babc9f2643
+	github.com/goceleris/celeris v1.5.12-0.20261111121706-4bc7372ea80b
 	github.com/goceleris/probatorium v0.0.0-00010101000000-000000000000
 )
 
