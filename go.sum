@@ -17,6 +17,8 @@ github.com/goceleris/loadgen v1.4.14 h1:dkXcKzRnQWtMPRfxMyK+RK2/3JD3pIkMzj1KIEbD
 github.com/goceleris/loadgen v1.4.14/go.mod h1:0nzz//z5rwt2LfPNZXS/kElvyfCeLVUs6YSxLK0kymk=
 github.com/goceleris/loadgen v1.4.15-0.20261112080914-dd065eebe6e1 h1:puXxizos6Ix2ojYEDzynxNeZ8eF5OTuWh6S3mhOPmsg=
 github.com/goceleris/loadgen v1.4.15-0.20261112080914-dd065eebe6e1/go.mod h1:MF6i/MLX0uqvxWdgVhtWnAemuWGX2pgDOOKxTXu1B2o=
+github.com/goceleris/loadgen v1.4.15-0.20261113023329-d3d5f9651a3b h1:WfwygPqPxPdy8oQ18Pb2lVBOLS3IDIVMx5c0AhxTsYo=
+github.com/goceleris/loadgen v1.4.15-0.20261113023329-d3d5f9651a3b/go.mod h1:MF6i/MLX0uqvxWdgVhtWnAemuWGX2pgDOOKxTXu1B2o=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/google/gofuzz v1.2.0 h1:xRy4A+RhZaiKjJ1bPfwQ8sedCA+YS2YcCHW6ec7JMi0=

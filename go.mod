@@ -5,7 +5,7 @@ go 1.27.3
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.4.0
 	github.com/bradfitz/gomemcache v0.0.0-20260422231931-4d751bb6e37c
-	github.com/goceleris/loadgen v1.4.15-0.20261112080914-dd065eebe6e1
+	github.com/goceleris/loadgen v1.4.15-0.20261113023329-d3d5f9651a3b
 	github.com/google/gofuzz v1.2.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/pierrec/lz4/v4 v4.1.33
