@@ -304,12 +304,30 @@
         bench_schedule: >-
           {{ [0] | product(bench_competitors) | list }}
 
-    - name: Iterate bench cells
-      ansible.builtin.include_tasks: tasks/run_bench_cell.yml
-      loop: "{{ bench_schedule }}"
-      loop_control:
-        loop_var: cell
-        label: "run={{ cell.0 }} comp={{ cell.1 }}"
+    - name: Iterate bench cells (IRQPLACE block, so the vector goes back to the standing CPU whatever happens inside)
+      block:
+        - name: Iterate bench cells
+          ansible.builtin.include_tasks: tasks/run_bench_cell.yml
+          loop: "{{ bench_schedule }}"
+          loop_control:
+            loop_var: cell
+            label: "run={{ cell.0 }} comp={{ cell.1 }}"
+      always:
+        # THROWAWAY (ab/irqplace-v1, celeris#1036). Layer 2 of 4 (the cell restore, this block, cleanup.yml, the watchdog). Idempotent:
+        # a no-op unless a column left the armed marker (the vector moved off the standing CPU and not yet verified back).
+        - name: IRQPLACE restore the explicit standing CPU (always; no-op when nothing was moved)
+          become: true
+          ansible.builtin.shell: >-
+            [ -f /tmp/celeris-irqplace/irqplace.sh ] &&
+            bash /tmp/celeris-irqplace/irqplace.sh restore always
+            {{ (nic_irq_placement.iface | default('enp1s0')) | string | quote }}
+            {{ (nic_irq_placement.vector | default('enp1s0-8')) | string | quote }}
+            {{ (nic_irq_placement.cpu | default(1)) | string | quote }}
+            0 {{ bench_run_dir | quote }} || [ ! -f /tmp/celeris-irqplace/irqplace.sh ]
+          args:
+            executable: /bin/bash
+          changed_when: false
+          when: inventory_hostname == bench_target
 
 - name: Collect bench artefacts
   hosts: cluster

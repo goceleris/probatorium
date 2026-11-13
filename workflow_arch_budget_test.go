@@ -372,6 +372,24 @@ func TestWorkflowValidatesItsInputsBeforeProvisioning(t *testing.T) {
 		{"heavy on fast never publishes", []string{"IN_PROFILE=fast", "IN_ARCH=heavy"}, true},
 		{"heavy on a single arch is ignored", []string{"IN_PROFILE=full", "IN_TARGET=msr1", "IN_ARCH=heavy"}, true},
 		{"padded publish=false still publishes", []string{"IN_PROFILE=full", "IN_ARCH=heavy", "IN_PUBLISH= false"}, false},
+		// H8: a dispatch-wide sut_env and the attribution columns (v1.6.0 plan)
+		{"sut_env on an ordinary column (the celeris#585 A/B)", []string{"IN_SUT_ENV=CELERIS_IOURING_SEND_ZC=off", "IN_CELLS=get-simple/celeris-iouring-h1-async"}, true},
+		{"sut_env with the c1arm glob", []string{"IN_SUT_ENV=CELERIS_IOURING_FIXED_FILES=1", "IN_CELLS=get-simple-512c/c1arm-*-io512"}, false},
+		{"sut_env with the c2x86 glob", []string{"IN_SUT_ENV=A=1", "IN_CELLS=get-simple-512c/c2x86-*-io512"}, false},
+		{"sut_env with the c2lad glob", []string{"IN_SUT_ENV=A=1", "IN_CELLS=ws-hub-broadcast-128/c2lad-*"}, false},
+		{"sut_env with a c2lad competitor", []string{"IN_SUT_ENV=A=1", "IN_COMPETITORS=c2lad-001-r1-v158-epoll-h1-async"}, false},
+		{"empty sut_env with the c2lad glob", []string{"IN_CELLS=ws-hub-broadcast-128/c2lad-*"}, true},
+		{"sut_env with the c1pp glob", []string{"IN_SUT_ENV=A=1", "IN_CELLS=driver-redis-pipeline/c1pp-dump-*"}, false},
+		{"empty sut_env with the c1pp glob", []string{"IN_CELLS=driver-redis-pipeline/c1pp-dump-*"}, true},
+		{"the pprof gate in sut_env, any cells", []string{"IN_SUT_ENV=PROBATORIUM_PPROF=dump", "IN_CELLS=driver-redis-pipeline/celeris-epoll-h1-async"}, false},
+		{"the pprof gate second in sut_env", []string{"IN_SUT_ENV=A=1,PROBATORIUM_PPROF=dump"}, false},
+		{"a key that merely ends in the pprof gate name is a different key", []string{"IN_SUT_ENV=XPROBATORIUM_PPROF=1", "IN_CELLS=get-simple/celeris-iouring-h1-async"}, true},
+		{"sut_env with a pinp38 competitor", []string{"IN_SUT_ENV=A=1", "IN_COMPETITORS=pinp38-001-r1-main-io256"}, false},
+		{"empty sut_env with the c1arm glob", []string{"IN_CELLS=get-simple-512c/c1arm-*-io512"}, true},
+		{"the busy-poll knob in sut_env, any cells", []string{"IN_SUT_ENV=PROBATORIUM_SOCKET_BUSY_POLL=50us", "IN_CELLS=get-simple/celeris-iouring-h1-async"}, false},
+		{"the busy-poll knob second in sut_env", []string{"IN_SUT_ENV=A=1,PROBATORIUM_SOCKET_BUSY_POLL=50us"}, false},
+		{"the busy-poll knob with mage-trimmed spaces", []string{"IN_SUT_ENV=A=1 , PROBATORIUM_SOCKET_BUSY_POLL=50us"}, false},
+		{"a key that merely ends in the knob name is a different key", []string{"IN_SUT_ENV=XPROBATORIUM_SOCKET_BUSY_POLL=1", "IN_CELLS=get-simple/celeris-iouring-h1-async"}, true},
 	} {
 		if got := run(c.env...) == nil; got != c.ok {
 			t.Errorf("%s: accepted=%v, want %v", c.name, got, c.ok)
