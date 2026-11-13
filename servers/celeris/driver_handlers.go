@@ -130,10 +130,17 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 		}
 	}
 
-	// Memcached client, max 16 open conns, engine-integrated.
-	if cfg.mcAddr != "" {
+	// Memcached client, max 16 open conns by default, engine-integrated.
+	// L857F: PROBATORIUM_MC_MAXOPEN / PROBATORIUM_MC_CLIENT (mc_knobs.go); both unset = exactly the
+	// client this adapter always opened (WithMaxOpen(16), the celeris handlers below).
+	mcK := resolveMCKnobs()
+	mcGet, mcMulti, mcSet := c.mcHandler, c.mcMultiGetHandler, c.mcSetHandler
+	if mcK.client == mcClientGomemcache {
+		gm := newGomemcacheMC(cfg.mcAddr)
+		mcGet, mcMulti, mcSet = gm.getHandler, gm.multiGetHandler, gm.setHandler
+	} else if cfg.mcAddr != "" {
 		if mc, err := memcached.NewClient(cfg.mcAddr,
-			memcached.WithMaxOpen(16),
+			memcached.WithMaxOpen(mcK.maxOpen),
 			memcached.WithEngine(srv),
 		); err == nil {
 			c.mc = mc
@@ -142,7 +149,7 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 
 	srv.GET("/db/user/:id", c.dbUserHandler).Async()
 	srv.GET("/cache/:key", c.cacheHandler).Async()
-	srv.GET("/mc/:key", c.mcHandler).Async()
+	srv.GET("/mc/:key", mcGet).Async()
 
 	// v1.5.4 driver-depth routes (writes / transaction / range / pipeline /
 	// multiget). Same WithEngine().Async() discipline as the reads above.
@@ -151,8 +158,8 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 	srv.GET("/db/users", c.dbUsersRangeHandler).Async()
 	srv.POST("/cache", c.cacheSetHandler).Async()
 	srv.GET("/cache-pipeline", c.cachePipelineHandler).Async()
-	srv.GET("/mc-multiget", c.mcMultiGetHandler).Async()
-	srv.POST("/mc", c.mcSetHandler).Async()
+	srv.GET("/mc-multiget", mcMulti).Async()
+	srv.POST("/mc", mcSet).Async()
 
 	srv.POST("/session", c.sessionHandler).Async()
 

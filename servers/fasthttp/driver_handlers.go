@@ -103,6 +103,7 @@ func mountDriverHandlers(s *Server) {
 	if addr := os.Getenv(envRedisAddr); addr != "" {
 		mountedDrivers.rdb = goredis.NewClient(&goredis.Options{Addr: addr, PoolSize: driverPoolSize})
 	}
+	resolveMCCap() // L857F: PROBATORIUM_MC_CAP (mc_cap.go), unset = no cap
 	if addr := os.Getenv(envMCAddr); addr != "" {
 		mc := memcache.New(addr)
 		mc.MaxIdleConns = driverPoolSize
@@ -277,7 +278,10 @@ func mcSetHandler() fasthttp.RequestHandler {
 			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
 			return
 		}
-		if err := mc.Set(&memcache.Item{Key: "demo-write", Value: rc.PostBody()}); err != nil {
+		mcAcquire()
+		err := mc.Set(&memcache.Item{Key: "demo-write", Value: rc.PostBody()})
+		mcRelease()
+		if err != nil {
 			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
 			return
 		}
@@ -342,7 +346,9 @@ func mcMultiGetHandler() fasthttp.RequestHandler {
 		for i := 0; i < n; i++ {
 			keys[i] = "user:" + strconv.Itoa(i+1) + ":session"
 		}
+		mcAcquire()
 		items, err := mc.GetMulti(keys)
+		mcRelease()
 		if err != nil {
 			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
 			return
@@ -428,7 +434,9 @@ func mcHandler(prefix string) fasthttp.RequestHandler {
 			rc.SetStatusCode(fasthttp.StatusBadRequest)
 			return
 		}
+		mcAcquire()
 		item, err := mc.Get(key)
+		mcRelease()
 		if err != nil {
 			rc.SetStatusCode(fasthttp.StatusServiceUnavailable)
 			return
