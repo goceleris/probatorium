@@ -74,3 +74,27 @@ func TestAnsibleLoadCheckRunsInCI(t *testing.T) {
 		}
 	}
 }
+
+// P2c dispatch 40235051270 died at task load on one apostrophe ("the SUT's port") inside the free-form shell block of run_bench_cell.yml. ansible/tests/test_split_args.py runs
+// ansible's own splitter over every such string (with a self-test that it is live); the ansible job of test.yml must run both, and the script must cover the same files
+// load-check.sh does.
+func TestAnsibleSplitArgsGuardRunsInCI(t *testing.T) {
+	wf, err := os.ReadFile(filepath.Join(".github", "workflows", "test.yml"))
+	if err != nil {
+		t.Fatalf("read test.yml: %v", err)
+	}
+	for _, want := range []string{"python3 ansible/tests/test_split_args.py --selftest", "python3 ansible/tests/test_split_args.py\n"} {
+		if !strings.Contains(string(wf), want) {
+			t.Errorf("test.yml does not run %q", strings.TrimSpace(want))
+		}
+	}
+	py, err := os.ReadFile(filepath.Join("ansible", "tests", "test_split_args.py"))
+	if err != nil {
+		t.Fatalf("read test_split_args.py: %v", err)
+	}
+	for _, want := range []string{"from ansible.parsing.splitter import split_args", `"tasks", "*.yml"`, `"roles", "*", "tasks", "*.yml"`, `"*.yml"`, "--selftest"} {
+		if !strings.Contains(string(py), want) {
+			t.Errorf("test_split_args.py lacks %q", want)
+		}
+	}
+}
