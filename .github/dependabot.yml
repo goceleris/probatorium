@@ -15,6 +15,7 @@ updates:
   # ladder modules (celeris pinned at one commit each, generated, never moved by Dependabot; NOT in `directories:`):
   # /servers/celeris_v158
   # /servers/celeris_9f4d89b
+  # /servers/celeris_pr1306
   # END ladder-gen
   - package-ecosystem: gomod
     directories:
