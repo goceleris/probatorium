@@ -126,9 +126,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("celeris: busy-poll knob: %v", err)
 	}
+	// L756E (THROWAWAY ab/l756e-diag-20261114): PROBATORIUM_WORKERS sets Config.Workers (workers_knob.go, byte copy of the P3a knob; unset = the celeris default), and
+	// PROBATORIUM_AFFINITY=<lo>-<hi> restricts EVERY thread of this process to that CPU range BEFORE celeris.New, so the engine's own CPU plan sees the restricted mask
+	// (l756e_knobs.go). The Go runtime's own processor-count env is never touched here; l756e_knobs.go only reports it.
+	wk := mustApplyWorkersKnob(&cfg) // L756E
+	af := mustApplyAffinityKnob()    // L756E
 	srv := celeris.New(cfg)
 	bp.resolveBusyPoll(srv)
-	log.Print(bp.line()) // the direct manipulation check: read by arm-validate.py / x86-validate.py
+	log.Print(bp.line())        // the direct manipulation check: read by arm-validate.py / x86-validate.py
+	log.Print(wk.line())        // L756E: [workers] env=<raw|unset> config=<int|absent>, always printed, after the [busypoll] line
+	log.Print(af.line())        // L756E: [affinity] ...
+	log.Print(gomaxprocsLine()) // L756E: [gomaxprocs] ...
+	// L756E: PROBATORIUM_SCHED_SAMPLE=1 starts the 1 Hz scheduler sampler (sched_sampler.go); it is stopped, synchronously, BEFORE the signal line below.
+	stopSched := mustStartSchedSampler() // L756E
 	registerRoutes(srv)
 
 	// lifetime bounds background goroutines owned by the chain middleware
@@ -152,6 +162,7 @@ func main() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		<-sig
+		stopSched() // L756E: the sampler must not write after (or at) the signal line: the CRASH rule needs that line last before [respawn]
 		log.Printf("celeris: signal received, shutting down")
 		stopDebugVars()
 		cancelLifetime()

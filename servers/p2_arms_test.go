@@ -231,6 +231,11 @@ func TestP2ArmsLeaveTheWorkerPlanToTheEngine(t *testing.T) {
 			if !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
 				continue
 			}
+			// L756E (ab/l756e-diag-20261114): workers_knob.go (byte copy of the P3a knob) and l756e_knobs.go are env-gated: with PROBATORIUM_WORKERS / PROBATORIUM_AFFINITY unset (every column but
+			// the l756e-* arms) they leave the worker plan to the engine, as before; this head is THROWAWAY and is not the P2 head.
+			if mod == "celeris" && (e.Name() == "workers_knob.go" || e.Name() == "l756e_knobs.go") {
+				continue
+			}
 			src, _ := os.ReadFile(filepath.Join(mod, e.Name()))
 			s := string(src)
 			if strings.Contains(s, "Workers:") || strings.Contains(s, "GOMAXPROCS") || strings.Contains(s, "CELERIS_WORKERS") || strings.Contains(s, "CELERIS_AB_PLAN_CPUS") {
