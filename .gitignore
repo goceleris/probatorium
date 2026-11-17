@@ -112,4 +112,5 @@ servers/_docker/**/*.tar
 /servers/celeris_pr1306/celeris_pr1306
 /servers/celeris_pr1307/celeris_pr1307
 /servers/celeris_pr_c/celeris_pr_c
+/servers/celeris_pr_y/celeris_pr_y
 # END ladder-gen
