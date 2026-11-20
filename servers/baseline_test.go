@@ -287,8 +287,42 @@ func TestBaselineRoutesMatchTheMainModule(t *testing.T) {
 		}
 		return s
 	}
+	//
+	// The one documented difference: the opt-in GC option (celeris#756,
+	// celeris#1310). servers/celeris wires Config.GCPercent from
+	// PROBATORIUM_CELERIS_GC_PERCENT inside "gc-option:begin" ... "gc-option:end"
+	// blocks (server.go, debugvars.go); v1.5.11 has no such Config field, so the
+	// frozen fork must carry no block and no marker. Everything outside the
+	// blocks must still be byte-identical.
+	const gcBegin, gcEnd = "// gc-option:begin", "// gc-option:end"
+	stripGCOption := func(s string) string {
+		var out []string
+		skip := false
+		for _, ln := range strings.Split(s, "\n") {
+			switch tl := strings.TrimSpace(ln); {
+			case strings.HasPrefix(tl, gcBegin):
+				skip = true
+			case strings.HasPrefix(tl, gcEnd):
+				skip = false
+			case !skip:
+				out = append(out, ln)
+			}
+		}
+		return strings.Join(out, "\n")
+	}
 	for _, f := range []string{"server.go", "chain_handlers.go", "driver_handlers.go", "streaming_handlers.go", "debugvars.go"} {
-		if body(readFile(t, "celeris", f)) != body(readFile(t, "celeris_v1511", f)) {
+		// The exact number of blocks per file, so a future change cannot hide
+		// inside a gc-option block: server.go has two (the env parse, the Config
+		// field), debugvars.go one (the /debug/vars keys), the rest none.
+		mainSrc := readFile(t, "celeris", f)
+		wantBlocks := map[string]int{"server.go": 2, "debugvars.go": 1}[f]
+		if nb, ne := strings.Count(mainSrc, gcBegin), strings.Count(mainSrc, gcEnd); nb != wantBlocks || ne != wantBlocks {
+			t.Errorf("servers/celeris/%s has %d %q and %d %q markers, want %d of each", f, nb, gcBegin, ne, gcEnd, wantBlocks)
+		}
+		if strings.Contains(readFile(t, "celeris_v1511", f), "gc-option") {
+			t.Errorf("servers/celeris_v1511/%s carries a gc-option block: the frozen v1.5.11 fork must not (it has no Config.GCPercent)", f)
+		}
+		if body(stripGCOption(mainSrc)) != body(readFile(t, "celeris_v1511", f)) {
 			t.Errorf("%s differs between servers/celeris and servers/celeris_v1511 after the package clause: a main-module change must be mirrored (or the difference documented here)", f)
 		}
 	}
