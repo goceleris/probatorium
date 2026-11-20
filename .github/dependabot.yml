@@ -18,7 +18,6 @@ updates:
   # /servers/celeris_pr1306
   # /servers/celeris_pr1307
   # /servers/celeris_pr_c
-  # /servers/celeris_pr_y
   # END ladder-gen
   - package-ecosystem: gomod
     directories:
