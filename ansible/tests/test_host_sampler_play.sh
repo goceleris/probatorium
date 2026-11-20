@@ -152,8 +152,19 @@ for tool in pgrep ps pidof; do
   printf '#!/bin/sh\necho %s >> "%s/tool-called"\nexit 1\n' "$tool" "$work" > "$stub/$tool"
   chmod +x "$stub/$tool"
 done
-cp "$(command -v sleep)" "$work/validator" # a process whose comm is validator
-"$work/validator" 60 &
+# a process whose comm is validator: a bash script named validator (the kernel takes a script's comm from its file name, but only for a direct
+# #!/bin/bash: through #!/usr/bin/env the comm becomes bash)
+# that waits with builtins only, so it is ONE process with no forked child that could also carry the comm. Not a copy of
+# sleep: on a multicall coreutils (uutils, the ubuntu-26.04 runner) sleep is a symlink to the multicall binary and a copy
+# of it named validator dies with "unknown program 'validator'".
+mkfifo "$work/validator.fifo"
+cat > "$work/validator" << 'EOT'
+#!/bin/bash
+exec 3<> "$1"
+read -r -t 60 -u 3
+EOT
+chmod +x "$work/validator"
+"$work/validator" "$work/validator.fifo" &
 vpid=$!
 SAMPLER_OUTDIR=$work/sample-out SAMPLER_RUNDIR=$work/sample-run PATH="$stub:$PATH" \
   "$here/../ops/host-sampler/celeris-host-sampler" --sample > /dev/null 2>&1
