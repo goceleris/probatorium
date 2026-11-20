@@ -95,6 +95,14 @@ func debugVarsDocument(srv *celeris.Server) map[string]any {
 	doc := map[string]any{
 		"pid":        os.Getpid(),
 		"goroutines": runtime.NumGoroutine(),
+		// gc-option:begin
+		// The GC target in force (runtime/metrics /gc/gogc:percent, read-only,
+		// -1 when GC is off) and the adapter switch as configured: with the
+		// NumGC counter below they are the witness that the opt-in option
+		// reached the process (celeris#756).
+		"gc_percent":     effectiveGCPercent(),
+		"gc_percent_env": os.Getenv(gcPercentEnv),
+		// gc-option:end
 		"memstats": map[string]any{
 			"HeapInuse": heap,
 			"NumGC":     gcs,
