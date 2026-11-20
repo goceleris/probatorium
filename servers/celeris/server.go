@@ -109,6 +109,16 @@ func main() {
 		log.Fatalf("celeris: unknown -engine %q", *engineName)
 	}
 
+	// gc-option:begin
+	// Opt-in GC target (celeris#756): unset/0 leaves the library, and so the
+	// process, exactly as before; see gcpercent.go. Absent from
+	// servers/celeris_v1511 (v1.5.11 has no Config.GCPercent): the drift guard
+	// in servers/baseline_test.go strips these blocks and checks the fork has none.
+	gcPercent, err := gcPercentFromEnv(os.Getenv)
+	if err != nil {
+		log.Fatalf("celeris: %v", err)
+	}
+	// gc-option:end
 	srv := celeris.New(celeris.Config{
 		Addr:            *bind,
 		Engine:          spec.engineType,
@@ -118,6 +128,9 @@ func main() {
 		WriteTimeout:    30 * time.Second,
 		IdleTimeout:     120 * time.Second,
 		ShutdownTimeout: 10 * time.Second,
+		// gc-option:begin
+		GCPercent: gcPercent,
+		// gc-option:end
 	})
 	registerRoutes(srv)
 
