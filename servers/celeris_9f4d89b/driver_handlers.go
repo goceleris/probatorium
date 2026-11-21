@@ -16,7 +16,7 @@
 // path and the handler goroutine parks on Go netpoll instead of blocking
 // an I/O worker (see Config.AsyncHandlers doc). Pool size 16 per driver
 // keeps the bench server-bound, matching the reference's
-// WithMaxOpen(16)/WithPoolSize(16).
+// WithMaxOpen(16)/WithPoolSize(16) (memcached: mcMaxOpen, see below).
 //
 // Backends are addressed via the same PROBATORIUM_* environment variables
 // the chi / gin / echo adapters document, because the probatorium binary
@@ -101,6 +101,9 @@ type driverClients struct {
 	mc    *memcached.Client
 }
 
+// mcMaxOpen is the memcached client connection cap (celeris#857).
+const mcMaxOpen = 128
+
 // mountDriverHandlers opens the celeris drivers and attaches the four
 // driver routes onto srv. A failed open leaves the handle nil and the
 // route answers 503 (deterministic error), never a panic. The returned
@@ -130,10 +133,14 @@ func mountDriverHandlers(srv *celeris.Server) *driverClients {
 		}
 	}
 
-	// Memcached client, max 16 open conns, engine-integrated.
+	// Memcached client, max 128 open conns, engine-integrated. The comparator
+	// clients (gomemcache and friends) open as many conns as the load needs and
+	// keep 16 idle; a celeris cap of 16 made the cap, not the engine, the limit on
+	// mc-get/mc-set (celeris#857 lane L857F: raising 16 -> 128 gave 1.45x/1.54x).
+	// Postgres and Redis stay at 16 (no measurement says otherwise).
 	if cfg.mcAddr != "" {
 		if mc, err := memcached.NewClient(cfg.mcAddr,
-			memcached.WithMaxOpen(16),
+			memcached.WithMaxOpen(mcMaxOpen),
 			memcached.WithEngine(srv),
 		); err == nil {
 			c.mc = mc
