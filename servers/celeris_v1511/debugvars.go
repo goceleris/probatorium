@@ -26,6 +26,9 @@ package main
 // runtime/metrics replaces runtime.ReadMemStats, whose stop-the-world at
 // 1 Hz would otherwise sit inside every saturation window.
 //
+// The same mux also serves net/http/pprof when PROBATORIUM_PPROF asks for it
+// (pprof_sidecar.go: loopback only, off by default).
+//
 // The engine block is published as the whole engine.EngineMetrics struct
 // under "celeris.engine_metrics" (Go field names), not as a hand list of
 // keys, so this file compiles against every celeris version the bench
@@ -67,9 +70,19 @@ func startDebugVars(srv *celeris.Server) (addr string, stop func()) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(debugVarsDocument(srv))
 	})
+	// net/http/pprof on THIS mux only, behind PROBATORIUM_PPROF (pprof_sidecar.go). A bad value
+	// or a non-loopback listener is fatal, unlike a bind failure: it is a requested capture that
+	// would otherwise silently not happen.
+	pprofMode, err := mountPprofFromEnv(mux, ln.Addr().String())
+	if err != nil {
+		log.Fatalf("celeris: pprof side listener: %v", err)
+	}
 	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = hs.Serve(ln) }()
 	log.Printf("celeris: /debug/vars side listener on %s", ln.Addr())
+	if pprofMode != "" {
+		log.Printf("[pprof] mode=%s addr=%s", pprofMode, ln.Addr())
+	}
 	return ln.Addr().String(), func() { _ = hs.Close() }
 }
 

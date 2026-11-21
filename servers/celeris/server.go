@@ -119,7 +119,7 @@ func main() {
 		log.Fatalf("celeris: %v", err)
 	}
 	// gc-option:end
-	srv := celeris.New(celeris.Config{
+	cfg := celeris.Config{
 		Addr:            *bind,
 		Engine:          spec.engineType,
 		Protocol:        spec.protocol,
@@ -131,7 +131,17 @@ func main() {
 		// gc-option:begin
 		GCPercent: gcPercent,
 		// gc-option:end
-	})
+	}
+	// The busy-poll arm of the v1.6.0 attribution campaign: PROBATORIUM_SOCKET_BUSY_POLL=50us
+	// sets Config.SocketBusyPoll (busypoll_knob.go); unset = the celeris default. A bad value, or
+	// the env on a celeris without the field, is a fatal start error, never a silent default.
+	bp, err := applyBusyPollKnob(&cfg)
+	if err != nil {
+		log.Fatalf("celeris: busy-poll knob: %v", err)
+	}
+	srv := celeris.New(cfg)
+	bp.resolveBusyPoll(srv)
+	log.Print(bp.line()) // the direct manipulation check: read by arm-validate.py / x86-validate.py
 	registerRoutes(srv)
 
 	// lifetime bounds background goroutines owned by the chain middleware
