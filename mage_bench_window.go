@@ -197,7 +197,7 @@ func sutEnvExtraVars(env map[string]string) string {
 
 // armColumnPrefixes are the registry prefixes of the v1.6.0 attribution columns: the arm columns of servers/c1_arms.go and servers/c2x86_arms.go, the #858 ladder columns of servers/c2lad_arms.go (the fcbpon slot is told apart by its column env), the ARMED diagnostic columns of servers/c1pp_arms.go (told apart by the pprof gate in their column env), and the repinned P2 columns of
 // servers/p2_arms.go (1a, main vs v1.5.11), which have no validator yet and must not be turned into a different arm by an override either.
-var armColumnPrefixes = []string{"c1arm-", "c2x86-", "c2lad-", "c1pp-", "pinp38-"}
+var armColumnPrefixes = []string{"c1arm-", "c2x86-", "c2lad-", "c1pp-", "pinp38-", "l755a-"}
 
 // pprofGateEnv arms ansible/files/pprofcap.py (servers/celeris/pprof_sidecar.go); only a registry column env (the c1pp- columns) may set it, so a dispatch-wide override can never arm a
 // column together with its twins and peers.

@@ -162,6 +162,11 @@ type Config struct {
 	// targets stay comparable across servers of wildly different throughput).
 	RatedFractions []float64
 
+	// RatedAbsoluteRPS are absolute offered rates (req/s) run AFTER the fraction passes (P3a). Empty for every column without a registry rated plan. There is no flag:
+	// it is set only by resolveRatedPlan from servers.Adapter.RatedPlans, and RatedPlanFrom names where ("registry:<column>:<scenario>"), so manifest.json is truthful.
+	RatedAbsoluteRPS []float64
+	RatedPlanFrom    string
+
 	// TLSTerminator is the https base URL of the shared TLS terminator that
 	// fronts the cleartext adapters for the tls-* scenarios. Empty (default)
 	// means no terminator is wired, so TLS-capable adapters do NOT advertise
@@ -648,6 +653,10 @@ func run(cfg Config) error {
 	schedule := interleave.Schedule(cfg.Runs, effSc, srvs)
 	schedule, err = orderSchedule(schedule, cfg.CellOrder)
 	if err != nil {
+		return err
+	}
+	// P3a: the registry column's own rated plan replaces the sweep, before anything reads cfg.RatedFractions (manifest, hang-guard limits, the sweep itself).
+	if err := resolveRatedPlan(&cfg, schedule, os.Stderr); err != nil {
 		return err
 	}
 	lock, err := newClientLock(cfg.ClientLock, cfg.ClientLockPolicy, os.Stderr)
@@ -1723,8 +1732,12 @@ func (sw *ratedSweep) add(rec ratedPassFile) {
 // build) has no pass window.
 func runRatedSweep(parent context.Context, cfg Config, base loadgen.Config, saturationRPS float64) ratedSweep {
 	var sw ratedSweep
-	for _, frac := range cfg.RatedFractions {
-		target := saturationRPS * frac
+	for _, rp := range cfg.ratedPasses() {
+		frac, target := rp.Fraction, saturationRPS*rp.Fraction
+		if rp.AbsoluteRPS != 0 { // an absolute pass records fraction = target / saturation (the validators' invariant target = fraction x saturation)
+			target = rp.AbsoluteRPS
+			frac = target / saturationRPS
+		}
 		if target <= 0 {
 			sw.add(ratedPassFile{Fraction: frac, TargetRPS: target, Status: report.RatedPassNotRun,
 				Reason: report.RatedReasonBadTarget, Detail: fmt.Sprintf("target %.0f", target),
@@ -1826,9 +1839,10 @@ func newRatedPassRecord(frac, target float64, window time.Duration, res *loadgen
 // notRunRatedPasses is the record of a sweep that did not start: one not_run
 // pass per configured fraction, with the reason the sweep was skipped.
 func notRunRatedPasses(cfg Config, reason, detail string) []ratedPassFile {
-	out := make([]ratedPassFile, 0, len(cfg.RatedFractions))
-	for _, frac := range cfg.RatedFractions {
-		out = append(out, ratedPassFile{Fraction: frac, Status: report.RatedPassNotRun, Reason: reason, Detail: detail})
+	out := make([]ratedPassFile, 0, len(cfg.RatedFractions)+len(cfg.RatedAbsoluteRPS))
+	for _, rp := range cfg.ratedPasses() {
+		// a fraction pass has no target (the saturation rate is unknown); an absolute pass keeps its target and has no fraction
+		out = append(out, ratedPassFile{Fraction: rp.Fraction, TargetRPS: rp.AbsoluteRPS, Status: report.RatedPassNotRun, Reason: reason, Detail: detail})
 	}
 	return out
 }
