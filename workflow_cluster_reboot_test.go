@@ -370,6 +370,7 @@ type snapshotRecord struct {
 	Btime                 int64  `json:"btime"`
 	UptimeS               int64  `json:"uptime_s"`
 	Kernel                string `json:"kernel"`
+	BootCmdline           string `json:"boot_cmdline"`
 	NewestInstalledKernel string `json:"newest_installed_kernel"`
 	NICs                  []struct {
 		Iface  string `json:"iface"`
@@ -469,6 +470,9 @@ func TestRebootSnapshotRecordMatchesWhatIsRead(t *testing.T) {
 	mk("proc/irq/167/effective_affinity_list", "1\n")
 	mk("proc/sys/kernel/random/boot_id", "abc\n")
 	mk("proc/sys/kernel/osrelease", "7.0.0-1\n")
+	// a long, padded command line: the record keeps all of it, whitespace-normalised, never truncated
+	longArg := strings.Repeat("x", 600)
+	mk("proc/cmdline", "BOOT_IMAGE=/vmlinuz-7.0.0-1  root=UUID=u\tro quiet "+longArg+" \n")
 	mk("proc/uptime", "10.5 1\n")
 	mk("proc/stat", "btime 1700000000\n")
 	cmd := exec.Command(bash, filepath.Join("ansible", "files", "reboot_snapshot.sh"), "/tmp/m", "/tmp/r", "enp1s0-8", "-", "-")
@@ -483,6 +487,9 @@ func TestRebootSnapshotRecordMatchesWhatIsRead(t *testing.T) {
 	var rec snapshotRecord
 	if err := dec.Decode(&rec); err != nil {
 		t.Fatalf("the script's record does not decode into the fields the playbook reads: %v\n%s", err, stdout.String())
+	}
+	if want := "BOOT_IMAGE=/vmlinuz-7.0.0-1 root=UUID=u ro quiet " + longArg; rec.BootCmdline != want {
+		t.Errorf("boot_cmdline = %q, want %q", rec.BootCmdline, want)
 	}
 	if rec.BootID != "abc" || rec.Kernel != "7.0.0-1" || len(rec.NICVectors) != 1 || rec.NICVectors[0].Total != 12 ||
 		rec.PlacementVectorPresent == nil || !*rec.PlacementVectorPresent {

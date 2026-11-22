@@ -29,6 +29,7 @@ nocheck() {
 	if has "$2"; then bad "$1: found $2 in: $out"; else ok "$1"; fi
 }
 
+long_arg=$(printf 'x%.0s' $(seq 1 700))
 # mkroot DIR - an msr1-shaped host: two r8127 ports in a bond, vectors enp1s0-8 (irq 167) and enp49s0-8 (irq 135),
 # a vector of ANOTHER device whose name merely resembles a NIC's (nvme0q1), one runner listener.
 mkroot() {
@@ -60,6 +61,8 @@ EOT
 	echo 8 > "$r/proc/irq/135/effective_affinity_list"
 	echo 4f8d7e5a-1111-2222-3333-444455556666 > "$r/proc/sys/kernel/random/boot_id"
 	echo 7.0.0-14-generic > "$r/proc/sys/kernel/osrelease"
+	# a padded command line with a tab and a double space, and one argument longer than any limit a reader might apply
+	printf 'BOOT_IMAGE=/vmlinuz-7.0.0-14-generic  root=UUID=48ead342 ro\tquiet splash %s \n' "$long_arg" > "$r/proc/cmdline"
 	echo "12345.67 99999.00" > "$r/proc/uptime"
 	printf 'cpu 1 2 3\nbtime 1700000000\n' > "$r/proc/stat"
 	cat > "$r/proc/net/bonding/bond0" << 'EOT'
@@ -106,6 +109,7 @@ after=$(digest "$R")
 check "boot id" '"boot_id":"4f8d7e5a-1111-2222-3333-444455556666"'
 check "kernel" '"kernel":"7.0.0-14-generic"'
 check "btime" '"btime":1700000000'
+check "boot command line: whitespace-normalised and never truncated" '"boot_cmdline":"BOOT_IMAGE=/vmlinuz-7.0.0-14-generic root=UUID=48ead342 ro quiet splash '"$long_arg"'",'
 check "uptime" '"uptime_s":12345'
 check "newest installed kernel is the highest version, not the last in the directory" '"newest_installed_kernel":"7.0.0-14-generic"'
 check "r8127 seen" '"r8127":true'
@@ -137,6 +141,16 @@ for v in enp1s0 enp1s0-80 1s0-8 nvme; do
 done
 run "$R" /tmp/m /tmp/r - - -
 check "no placement vector asked: null, not false" '"placement_vector_present":null'
+
+# the command line is quoted and escaped like any string; no /proc/cmdline is an empty string (the key is always there)
+R3=$work/quoted
+mkroot "$R3"
+printf 'a="b c" d\\e\n' > "$R3/proc/cmdline"
+run "$R3" /tmp/m /tmp/r - - -
+check "a quote and a backslash in the command line are escaped" '"boot_cmdline":"a=\"b c\" d\\e",'
+rm -f "$R3/proc/cmdline"
+run "$R3" /tmp/m /tmp/r - - -
+check "an unreadable command line is the empty string, the key stays" '"boot_cmdline":"",'
 
 # in-flight state a reboot must not interrupt or destroy
 mkdir -p "$R/tmp/celeris-results/20261020T010101-bench-msr1" "$R/var/crash/202610201200" "$R/var/lib/celeris-power" "$R/tmp/actions-runner-msr1" "$R/proc/4343"

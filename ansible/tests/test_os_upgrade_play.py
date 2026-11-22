@@ -1584,6 +1584,13 @@ PATH=%s:$PATH STUB_STATE=%s STUB_LOG=%s OSU_ROOT=$root HOST_SNAPSHOT_ROOT=$root 
         before = self.h.snapshot()
         self.play("survey", {"os_mode": "survey", "os_host": "-", "os_confirm": ""})
         self.assertEqual(self.rc, 0, self.log[-2500:])
+        # the boot command line (publish rule R7: same kernel AND same command line) is in BOTH records of every host, and is the stand-in's /proc/cmdline
+        with open(self.h.root + "/proc/cmdline") as f:
+            cmdline = " ".join(f.read().split())
+        self.assertIn("BOOT_IMAGE=", cmdline)
+        for host in ("msa2-server", "msr1", "msa2-client"):
+            self.assertEqual(self.j(host, "survey.json")["boot_cmdline"], cmdline, host)
+            self.assertEqual(self.j(host, "preflight-snapshot.json")["boot_cmdline"], cmdline, host)
         for host in ("msa2-server", "msr1", "msa2-client"):
             s = self.j(host, "survey.json")
             self.assertEqual(s["kernel"], "7.0.0-31-generic")

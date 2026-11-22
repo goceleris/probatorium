@@ -190,6 +190,19 @@ def running_kernel():
     return rd("/proc/sys/kernel/osrelease") if ROOT else os.uname().release
 
 
+def boot_cmdline():
+    """/proc/cmdline as ONE line: runs of whitespace become one space, none at the ends, nothing truncated, and a byte outside
+    printable ASCII (never on a GRUB host) becomes "?". The same string as the "boot_cmdline" of files/reboot_snapshot.sh, so
+    the two records of a host compare equal: a reboot is "the same boot" only when the kernel and this line match."""
+    try:
+        with open(p("/proc/cmdline"), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return ""
+    raw = re.sub(rb"[ \t\n\r\f\v]+", b" ", raw).strip(b" ")
+    return re.sub(rb"[^ -~]", b"?", raw).decode("ascii")
+
+
 def installed_kernels():
     rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n", "linux-image-*"])
     found = set()
@@ -919,6 +932,7 @@ def survey():
         "host": rd("/etc/hostname"),
         "os_release": osr,
         "kernel": running,
+        "boot_cmdline": boot_cmdline(),
         "arch": os.uname().machine,
         "kernel_flavor": flavor(running),
         "installed_kernels": kernels,

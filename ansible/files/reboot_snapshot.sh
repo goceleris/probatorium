@@ -51,6 +51,15 @@ jlines() {
 
 boot_id=$(rd "$R/proc/sys/kernel/random/boot_id")
 kernel=$(rd "$R/proc/sys/kernel/osrelease")
+# The kernel boot command line, whitespace-normalised (runs of whitespace become one space, none at the ends) and NEVER
+# truncated: a reboot is only "the same boot" when kernel AND command line match. A byte outside printable ASCII (never
+# on a GRUB host) becomes "?" so that one odd byte cannot make the whole record invalid JSON.
+boot_cmdline=""
+if [ -r "$R/proc/cmdline" ]; then
+	boot_cmdline=$(LC_ALL=C tr -s '[:space:]' ' ' < "$R/proc/cmdline" | LC_ALL=C tr -c ' -~' '?')
+	boot_cmdline=${boot_cmdline# }
+	boot_cmdline=${boot_cmdline% }
+fi
 btime=""
 if [ -r "$R/proc/stat" ]; then btime=$(awk '$1 == "btime" { print $2; exit }' "$R/proc/stat"); fi
 uptime_s=$(awk '{ print int($1); exit }' "$R/proc/uptime" 2> /dev/null)
@@ -235,8 +244,8 @@ if command -v systemctl > /dev/null 2>&1; then
 	failed_units=$(systemctl --failed --no-legend --plain 2> /dev/null | awk '{ print $1 }' | jlines)
 fi
 
-printf '{"boot_id":%s,"boot_time":%s,"btime":%s,"uptime_s":%s,"kernel":%s,"newest_installed_kernel":%s,' \
-	"$(js "$boot_id")" "$(js "$boot_time")" "$btime" "$uptime_s" "$(js "$kernel")" "$(js "$newest_kernel")"
+printf '{"boot_id":%s,"boot_time":%s,"btime":%s,"uptime_s":%s,"kernel":%s,"boot_cmdline":%s,"newest_installed_kernel":%s,' \
+	"$(js "$boot_id")" "$(js "$boot_time")" "$btime" "$uptime_s" "$(js "$kernel")" "$(js "$boot_cmdline")" "$(js "$newest_kernel")"
 printf '"nics":[%s],"nic_vectors":[%s],"max_vector_total":%s,"placement_vector":%s,"placement_vector_present":%s,"bonds":[%s],' \
 	"$nics" "$vectors" "$max_total" "$(js "$placement_vector")" "$placement_json" "$bonds"
 printf '"lan_ip":%s,"lan_ip_present":%s,"peer_ip":%s,"peer_ping_ok":%s,"peer_probe":%s,' \
