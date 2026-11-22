@@ -633,7 +633,7 @@ dispatched again).
 
 1. **The switch (enforced by the `plan` job).** Settings, Secrets and variables, Actions, Variables: create the repository variable
    `OS_UPGRADE_ALLOWED_HOSTS`, a comma or space separated list of hosts, for the window: `msa2-server` for the first step. Add `msr1`
-   only after the survey has answered the questions of the lane PLAN (d.2 does it boot through GRUB, d.3 the in-tree r8169, d.7 Secure
+   only after the survey has answered its open questions ( GRUB boot, the in-tree r8169 driver and Secure
    Boot) and a person is at the rack; `msa2-client` last. Empty or missing (the default) means every host-changing dispatch is refused
    in `plan`, before any approval is asked and before any host is touched. The `plan` job also reads the environment of step 2 through the API and
    refuses unless it exists WITH a required reviewer and a deployment branch policy (if the workflow token may not read environments, it
