@@ -51,7 +51,7 @@ publish (`BENCH_PUBLISH_FORCE=1` overrides) and the workflow refuses a `heavy` d
 stays available with `publish=false` for data-only runs.
 
 The default policy when this page was written, `heavy`, keeps heavy cells of the two arches apart and leaves three exposures
-unmeasured (README, "What it does not do"): an x86 heavy cell sharing the client with the arm64 light rows
+unmeasured (BENCH.md, "A both-arch run", "What `heavy` does not do"): an x86 heavy cell sharing the client with the arm64 light rows
 (3.5-6% by the one coefficient we have, which was never measured on those rows), an arm64 heavy cell sharing
 it with the x86 light rows (unquantified, 6-11% if the coefficient were symmetric), and the light rows' own
 rated passes running under the other arch's heavy cells (173 rated light cells per arch in the default
@@ -218,4 +218,4 @@ say so in the verdict, and a backlog clock that remains is then not evidence abo
 ## Owed, not run
 
 Everything above; also an amd64 native timing of the runner and a real both-arch run of the full grid, whose
-wall-clock the PR estimates at about 54 h (a model, README "A both-arch run"). The arms C and D are optional.
+wall-clock the PR estimates at about 54 h (a model, BENCH.md "A both-arch run"). The arms C and D are optional.
