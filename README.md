@@ -968,7 +968,7 @@ walkers, and a 6.5 ms period would have kept only 21-46% of their request volume
 and every non-race tier. Shaping costs race-detector coverage, so another refapp's adaptive cell joins only if
 a run shows a SLOW or reset-type counter in that cell with the loops busy, never pre-emptively. The cell
 says so: `tier_1.load_shaping` has the reason, `walkers`, `markov_walkers` and `markov_min_period_us`, and is
-omitted everywhere else. The field is additive in schema 5.23 and does not bump it, so the documents of
+omitted everywhere else. The field is additive and does not bump the schema version (5.24), so the documents of
 every other tier are byte-identical to before. Promotion is still gated in every default race run
 (`VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`); a shaped cell that misses it says it was shaped, and a shaped cell
 without a `-race` build (`I-RACE`) fails the gate.

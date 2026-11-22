@@ -18,8 +18,8 @@ func shapedCell() ValidationCellResult {
 // document is byte-identical to before (a bump would re-stamp schema_version in
 // all of them). The field's presence is what marks a shaped cell.
 func TestLoadShapingRoundTripsAndIsOmittedWhenAbsent(t *testing.T) {
-	if SchemaVersion != "5.23" {
-		t.Fatalf("SchemaVersion %q, want 5.23: shaping must not re-stamp the documents of tiers it does not touch", SchemaVersion)
+	if SchemaVersion != "5.24" {
+		t.Fatalf("SchemaVersion %q, want 5.24 (main's version, no bump by the shaping): shaping must not re-stamp the documents of tiers it does not touch", SchemaVersion)
 	}
 	sch := loadSchema(t)
 	now := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
