@@ -20,7 +20,7 @@ func TestGitHarnessDiffManual(t *testing.T) {
 	if why := classifyHarnessDiff(names); why != "" {
 		t.Fatalf("%s..%s: %s", a, b, why)
 	}
-	t.Logf("%s..%s differ only in servers/celeris/go.mod and go.sum (%d files)", a, b, len(names))
+	t.Logf("%s..%s differ only in go.mod and go.sum under servers/celeris/ and validation/refapp/ (%d files)", a, b, len(names))
 	if _, err := gitHarnessDiff(repo)(a, "no-such-ref"); err == nil {
 		t.Fatal("a bad ref must be an error")
 	}

@@ -286,8 +286,8 @@ func TestIdenticalDocumentsRefused(t *testing.T) {
 	}
 }
 
-// R3: harness commits may differ only in servers/celeris/go.mod and go.sum (the
-// celeris pin lives there and only the candidate dispatch carries celeris columns).
+// R3: harness commits may differ only in go.mod and go.sum under servers/celeris/
+// and validation/refapp/ (adapter code must be identical in both dispatches).
 func TestHarnessScope(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -295,10 +295,13 @@ func TestHarnessScope(t *testing.T) {
 		ok    bool
 	}{
 		{"pin bump", []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}, true},
+		{"pin bump with the refapps (7cf6dff, 6a08c78)", []string{"servers/celeris/go.mod", "servers/celeris/go.sum", "validation/refapp/kitchen_sink/go.mod", "validation/refapp/internal/debugvars/go.sum"}, true},
 		{"adapter code in the module directory is not the pin", []string{"servers/celeris/go.sum", "servers/celeris/main.go"}, false},
+		{"refapp code", []string{"validation/refapp/kitchen_sink/main.go"}, false},
 		{"another module", []string{"servers/celeris_v1511/go.mod"}, false},
 		{"sibling directory with the same prefix", []string{"servers/celeris-extra/go.mod"}, false},
-		{"validation refapp go.mod", []string{"servers/celeris/go.mod", "validation/refapp/kitchen_sink/go.mod"}, false},
+		{"root go.mod", []string{"go.mod"}, false},
+		{"another adapter's go.mod", []string{"servers/gin/go.mod"}, false},
 		{"mage code", []string{"mage_bench.go"}, false},
 		{"identical trees", nil, false},
 	}
@@ -330,7 +333,7 @@ func TestHarnessScope(t *testing.T) {
 		case tc.want == nil:
 			found := false
 			for _, w := range res.Comp.Warnings {
-				found = found || strings.Contains(w, "only in servers/celeris/go.mod")
+				found = found || strings.Contains(w, "only in go.mod and go.sum under servers/celeris/")
 			}
 			if !found {
 				t.Errorf("%s: an accepted difference must be recorded in the warnings", tc.name)

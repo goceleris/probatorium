@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path"
 	"reflect"
 	"regexp"
 	"sort"
@@ -264,7 +265,7 @@ func Compose(c, p *Dispatch, opt Options) (*Result, error) {
 			c.Doc.BenchmarkConfig.CelerisVer, p.Doc.BenchmarkConfig.CelerisVer))
 	}
 	if !sameCommit(c.Meta.HarnessCommit, p.Meta.HarnessCommit) {
-		comp.Warnings = append(comp.Warnings, fmt.Sprintf("harness commits differ (%s, %s) only in servers/celeris/go.mod and go.sum (proved with --harness-repo)", c.Meta.HarnessCommit, p.Meta.HarnessCommit))
+		comp.Warnings = append(comp.Warnings, fmt.Sprintf("harness commits differ (%s, %s) only in go.mod and go.sum under servers/celeris/ and validation/refapp/ (proved with --harness-repo)", c.Meta.HarnessCommit, p.Meta.HarnessCommit))
 	}
 	if gap := p.Doc.BenchmarkConfig.StartedAt.Sub(c.Doc.BenchmarkConfig.FinishedAt); gap > 0 {
 		comp.GapHours = gap.Hours()
@@ -586,17 +587,17 @@ func sameCommit(a, b string) bool {
 	return len(a) >= 7 && strings.HasPrefix(b, a)
 }
 
-// harnessFiles are the only files in which two harness commits may differ (R3):
-// the celeris adapter module's go.mod and go.sum, where the celeris pin lives.
-// Only the candidate dispatch carries celeris columns, so a pin bump there cannot
-// touch what the frameworks dispatch measured.
-var harnessFiles = []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}
+// harnessScopes are the directory trees in which two harness commits may differ
+// (R3), and only in their go.mod and go.sum files: the celeris adapter module and the
+// validation reference apps, where the celeris pin lives (bot ruling msg_259b3b2617d1:
+// adapter code must be identical in both dispatches).
+var harnessScopes = []string{"servers/celeris/", "validation/refapp/"}
 
 // harnessVerdict says whether two different harness commits differ only inside
 // the allowed files. reason is non-empty when that cannot be established.
 func harnessVerdict(opt Options, a, b string) (ok bool, reason string) {
 	if opt.HarnessDiff == nil {
-		return false, "no --harness-repo was given to prove that they differ only in " + strings.Join(harnessFiles, " and ")
+		return false, "no --harness-repo was given to prove that they differ only in go.mod and go.sum under " + strings.Join(harnessScopes, " and ")
 	}
 	names, err := opt.HarnessDiff(a, b)
 	if err != nil {
@@ -608,18 +609,21 @@ func harnessVerdict(opt Options, a, b string) (ok bool, reason string) {
 	return true, ""
 }
 
-// classifyHarnessDiff returns "" when every differing file is one of harnessFiles.
+// classifyHarnessDiff returns "" when every differing file is a go.mod or go.sum
+// under one of harnessScopes.
 func classifyHarnessDiff(names []string) string {
 	if len(names) == 0 {
 		return "no file differs (the commits have identical trees)"
 	}
 	for _, n := range names {
 		ok := false
-		for _, f := range harnessFiles {
-			ok = ok || n == f
+		if b := path.Base(n); b == "go.mod" || b == "go.sum" {
+			for _, s := range harnessScopes {
+				ok = ok || strings.HasPrefix(n, s)
+			}
 		}
 		if !ok {
-			return "file " + n + " differs, outside " + strings.Join(harnessFiles, " and ")
+			return "file " + n + " differs, and only go.mod and go.sum under " + strings.Join(harnessScopes, " and ") + " may"
 		}
 	}
 	return ""

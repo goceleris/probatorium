@@ -27,12 +27,12 @@ The probatorium commit that ran the dispatch (gh run `headSha`, the `head=`
 line of the read-wrapper params.txt, or `harness_commit` in a meta file)
 differs between the two dispatches (an abbreviation of 7+ hex digits of the
 other counts as equal). The one accepted difference is a celeris pin bump:
-every differing file must be `servers/celeris/go.mod` or `servers/celeris/go.sum`
-(the pin lives there, and only the candidate dispatch carries celeris columns, so
-such a bump cannot touch what the frameworks dispatch measured), proved with
-`--harness-repo DIR` (a probatorium checkout) by `git diff --name-only A B`.
-Any other file (adapter code in `servers/celeris/`, `servers/celeris_v1511/`,
-`validation/`, mage code) is refused, as are identical trees, a missing
+only `go.mod` and `go.sum` files under `servers/celeris/` and `validation/refapp/`
+(any depth) may differ, proved with `--harness-repo DIR` (a probatorium
+checkout) by `git diff --name-only A B`; adapter and application code must be
+identical in both dispatches (bot ruling msg_259b3b2617d1). Any other file
+(including `.go` files in those directories, `servers/celeris_v1511/`, other
+adapters, mage code) is refused, as are identical trees, a missing
 `--harness-repo`, and a git failure. The
 celeris pin of the documents is checked separately in R10.
 
