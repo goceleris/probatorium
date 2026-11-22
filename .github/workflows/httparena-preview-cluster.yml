@@ -82,7 +82,12 @@ jobs:
       # the runner context is not available in jobs.<id>.env, so the work directory is set from a step
       - name: Set the work directory
         shell: bash
-        run: echo "WORK=$RUNNER_TEMP/httparena-preview" >> "$GITHUB_ENV"
+        run: |
+          set -euo pipefail
+          # the teardown's rescue play copies results_root (/tmp/celeris-results, ansible/inventory.yml) into a 90-day artifact:
+          # the preview's files must never live there
+          case "$RUNNER_TEMP/" in /tmp/celeris-results/*) echo "::error::runner temp is under results_root"; exit 1;; esac
+          echo "WORK=$RUNNER_TEMP/httparena-preview" >> "$GITHUB_ENV"
       - name: Check out the preview tools (and the entry patch)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -149,14 +154,19 @@ jobs:
         run: |
           set +e
           cd "$WORK"
+          T="$GITHUB_WORKSPACE/probatorium/tools/httparena-preview"
           docker ps -aq --filter 'name=httparena-' | xargs -r docker rm -f -v
-          # every image whose ID was not there before (by ID: untagged leftovers of rebuilds included)
-          docker images -q | sort -u > "$WORK/state/ids-now.txt"
-          awk '{print $2}' "$WORK/state/before/docker-images.txt" | sort -u > "$WORK/state/ids-before.txt"
-          comm -13 "$WORK/state/ids-before.txt" "$WORK/state/ids-now.txt" | xargs -r docker rmi
-          # build cache is NOT pruned (a prune is host-wide and could take other users' cache); it is listed in the after-state's docker system df
-          docker network rm httparena-net 2>/dev/null
-          bash "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/capture-state.sh" after "$WORK/state"
+          # Remove every image whose ID is not in the committed baseline (the images that were on the host before the first run).
+          # Tags first: an image with several tags (h2load-h3:local and ubuntu:24.04 share one ID) cannot be removed by ID alone.
+          grep -v -E '^\s*(#|$)' "$T/images-baseline.ids" | awk '{print $1}' | sort -u > "$WORK/baseline.ids"
+          docker images --format '{{.ID}} {{.Repository}}:{{.Tag}}' | while read -r id ref; do
+            grep -qxF "$id" "$WORK/baseline.ids" && continue
+            [ "$ref" = "<none>:<none>" ] || docker rmi "$ref" > /dev/null 2>&1
+          done
+          docker images -q | sort -u | while read -r id; do grep -qxF "$id" "$WORK/baseline.ids" || docker rmi "$id" > /dev/null 2>&1; done
+          # the legacy builder keeps no cache; if a BuildKit cache ever shows up it is reported by capture-state (docker-system-df.txt), not pruned (a prune is host-wide)
+          docker network rm httparena-net > /dev/null 2>&1
+          bash "$T/capture-state.sh" after "$WORK/state" "$T/images-baseline.ids"
           echo "$?" > "$WORK/state/after-rc.txt"
       # RESULTS are never uploaded in the clear. The archive is CMS-encrypted to the PUBLIC certificate committed beside this
       # workflow (tools/httparena-preview/results-cert.pem); the private key lives only on the maintainer's Mac, so the runner

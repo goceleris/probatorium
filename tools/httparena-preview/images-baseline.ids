@@ -1,0 +1,7 @@
+# Docker image IDs present on msa2-server BEFORE the first preview run (the smoke run 45036491996's before-capture, 2026-11-22T15:11Z).
+# The preview's cleanup removes every image not listed here and fails if any remains. Add an ID only for an image that is not ours.
+28bd5fe8b56d  alpine:3
+65c80b311a96  memcached:1.6.41-alpine
+f9cf3e1f0066  postgres:17-alpine
+ff02b58f971e  redis:7-alpine
+da23c2478319  redis:8.2-alpine

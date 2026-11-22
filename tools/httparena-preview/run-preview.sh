@@ -21,7 +21,7 @@ bench() { local fw=$1 list=$2 log=$3 rc
   echo "$(date -u +%FT%TZ) STOP  $fw rc=$rc" | tee -a "logs/$log.log"; }
 phase=${1:?phase}
 case "$phase" in
-  smoke) RUNS=1 DURATION=3s bench celeris baseline,baseline-h2c,echo-ws,async-db smoke
+  smoke) RUNS=1 DURATION=3s bench celeris baseline,pipelined,json-comp,latency-10k,baseline-h2c,echo-ws,async-db,fortunes,json-tls,8gbit,baseline-h2,static-h2 smoke   # covers every load generator: gcannon, h2load, wrk (json-tls), zrk (latency-10k, 8gbit)
          # what the cpusets actually were (benchmark.sh logs the DB split; the profile table sets the server's)
          grep -h -E "cpus: server|cpuset|available CPUs|pinned" logs/smoke.celeris.log | tee -a logs/smoke.log ;;
   clear) bench celeris "$CLEAR" clear; for fw in $REFS; do bench "$fw" "$CLEAR" clear; done ;;
@@ -30,10 +30,13 @@ case "$phase" in
          # shown restored by capture-state.sh. Without PORTRANGE_OK=1 the profile is skipped (1 of 10 H/1.1 scored profiles).
          if [ "${PORTRANGE_OK:-0}" != 1 ]; then echo "async skipped: PORTRANGE_OK=1 not set"; exit 0; fi
          old=$(cat /proc/sys/net/ipv4/ip_local_port_range); echo "$(date -u +%FT%TZ) port range was: $old" | tee -a logs/async.log
-         trap 'sudo -n sysctl -w net.ipv4.ip_local_port_range="$old" >/dev/null; echo "$(date -u +%FT%TZ) port range restored: $(cat /proc/sys/net/ipv4/ip_local_port_range)" | tee -a logs/async.log' EXIT
-         sudo -n sysctl -w net.ipv4.ip_local_port_range='1024 65535' >/dev/null 2>&1
-         now=$(cat /proc/sys/net/ipv4/ip_local_port_range | tr -s '[:space:]' ' ' | sed 's/ $//')
-         if [ "$now" != "1024 65535" ]; then echo "async skipped: port range is '$now' after sudo -n sysctl (no passwordless sudo?)" | tee -a logs/async.log; exit 0; fi
+         now=$(echo "$old" | tr -s '[:space:]' ' ' | sed 's/ $//')
+         if [ "$now" != "1024 65535" ]; then   # on msa2-server it already is (smoke 45036491996): then no sysctl is touched at all
+           trap 'sudo -n sysctl -w net.ipv4.ip_local_port_range="$old" >/dev/null; echo "$(date -u +%FT%TZ) port range restored: $(cat /proc/sys/net/ipv4/ip_local_port_range)" | tee -a logs/async.log' EXIT
+           sudo -n sysctl -w net.ipv4.ip_local_port_range='1024 65535' >/dev/null 2>&1
+           now=$(cat /proc/sys/net/ipv4/ip_local_port_range | tr -s '[:space:]' ' ' | sed 's/ $//')
+           if [ "$now" != "1024 65535" ]; then echo "async skipped: port range is '$now' after sudo -n sysctl (no passwordless sudo?)" | tee -a logs/async.log; exit 0; fi
+         fi
          bench celeris async async; for fw in $REFS; do bench "$fw" async async; done ;;
   supp)  bench go-stdlib baseline-h2c,json-h2c supp; bench fiber-websocket echo-ws,echo-ws-pipeline,echo-ws-limited supp ;;
   tls)   bench celeris json-tls,8gbit,baseline-h2,static-h2 tls; for fw in $REFS; do bench "$fw" json-tls,8gbit tls; done
