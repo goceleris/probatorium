@@ -1263,6 +1263,9 @@ class Rehearsal(Base):
         long_arg = "x" * 700
         self.h.w("/proc/cmdline", "BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic  root=UUID=u\tro quiet %s \n" % long_arg)
         self.assertEqual(self.run_ok("survey")["boot_cmdline"], "BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic root=UUID=u ro quiet " + long_arg)
+        with open(self.h.root + "/proc/cmdline", "wb") as f:  # a byte outside printable ASCII becomes "?", as in reboot_snapshot.sh
+            f.write(b"BOOT_IMAGE=/vmlinuz a\xffb\xc3\xa9 ro\n")
+        self.assertEqual(self.run_ok("survey")["boot_cmdline"], "BOOT_IMAGE=/vmlinuz a?b?? ro")
         os.remove(self.h.root + "/proc/cmdline")  # unreadable: the key is still there, empty
         self.assertEqual(self.run_ok("survey")["boot_cmdline"], "")
 
