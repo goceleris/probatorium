@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -54,8 +55,7 @@ func (e *RefusalError) IDs() []string {
 }
 
 func idNum(id string) int {
-	n := 0
-	fmt.Sscanf(strings.TrimPrefix(id, "R"), "%d", &n)
+	n, _ := strconv.Atoi(strings.TrimPrefix(id, "R"))
 	return n
 }
 

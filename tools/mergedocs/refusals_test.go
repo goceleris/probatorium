@@ -222,7 +222,7 @@ func TestRefusalWritesNothing(t *testing.T) {
 	f.PMeta["boot_id"] = "boot-2"
 	c, p, cr, pr := f.load(t)
 	out := filepath.Join(t.TempDir(), "out")
-	rc := run([]string{"--candidate", cr, "--peers", pr, "--out", out, "--meta-candidate", filepath.Join(filepath.Dir(cr), "meta.txt"), "--meta-peers", filepath.Join(filepath.Dir(pr), "meta.txt")}, os.Stdout, os.Stderr)
+	rc := run([]string{"--candidate", cr, "--peers", pr, "--out", out, "--date", "20261122", "--meta-candidate", filepath.Join(filepath.Dir(cr), "meta.txt"), "--meta-peers", filepath.Join(filepath.Dir(pr), "meta.txt")}, os.Stdout, os.Stderr)
 	_ = c
 	_ = p
 	if rc != 2 {
@@ -252,5 +252,78 @@ func TestIdenticalDocumentsRefused(t *testing.T) {
 	}
 	if !found {
 		t.Fatal(re)
+	}
+}
+
+// R3: a harness commit that differs only by the celeris pin is accepted when
+// the checkout proves it; anything else, or no checkout, is refused.
+func TestHarnessPinOnly(t *testing.T) {
+	pinDiff := "--- a/go.mod\n+++ b/go.mod\n@@ -5 +5 @@\n-\tgithub.com/goceleris/celeris v1.5.12-0.2026\n+\tgithub.com/goceleris/celeris v1.5.12-0.2027\n" +
+		"--- a/go.sum\n+++ b/go.sum\n@@ -1 +1 @@\n-github.com/goceleris/celeris v1.5.12-0.2026 h1:x=\n+github.com/goceleris/celeris v1.5.12-0.2027 h1:y=\n"
+	cases := []struct {
+		name  string
+		names []string
+		diff  string
+		ok    bool
+	}{
+		{"pin bump", []string{"go.mod", "go.sum"}, pinDiff, true},
+		{"pin bump in servers/celeris", []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}, pinDiff, true},
+		{"other file", []string{"go.mod", "mage_bench.go"}, pinDiff, false},
+		{"pin bump of a celeris submodule", []string{"servers/celeris/go.mod"}, "-\tgithub.com/goceleris/celeris/middleware/metrics v1.5.12-0.1\n+\tgithub.com/goceleris/celeris/middleware/metrics v1.5.12-0.2\n", true},
+		{"other module line", []string{"go.mod"}, "-\tgithub.com/goceleris/loadgen v1.4.15\n+\tgithub.com/goceleris/loadgen v1.4.16\n", false},
+		{"similarly named module", []string{"go.mod"}, "-\tgithub.com/goceleris/celeris-extra v1\n+\tgithub.com/goceleris/celeris-extra v2\n", false},
+		{"identical trees", nil, "", false},
+	}
+	for _, c := range cases {
+		if got := classifyHarnessDiff(c.names, c.diff) == ""; got != c.ok {
+			t.Errorf("%s: pin-only=%v want %v", c.name, got, c.ok)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		hd   func(a, b string) ([]string, string, error)
+		want []string
+	}{
+		{"proved", func(a, b string) ([]string, string, error) { return []string{"go.mod", "go.sum"}, pinDiff, nil }, nil},
+		{"not proved", func(a, b string) ([]string, string, error) { return []string{"magefile.go"}, "", nil }, []string{"R3"}},
+		{"git fails", func(a, b string) ([]string, string, error) { return nil, "", errors.New("bad object") }, []string{"R3"}},
+		{"no checkout", nil, []string{"R3"}},
+	} {
+		f := newFixture()
+		f.PMeta["harness_commit"] = "def456abc"
+		f.Opt.HarnessDiff = tc.hd
+		res, err := f.compose(t)
+		var re *RefusalError
+		switch {
+		case tc.want == nil && err != nil:
+			t.Errorf("%s: %v", tc.name, err)
+		case tc.want == nil:
+			found := false
+			for _, w := range res.Comp.Warnings {
+				found = found || strings.Contains(w, "celeris pin only")
+			}
+			if !found {
+				t.Errorf("%s: a pin-only difference must be recorded in the warnings", tc.name)
+			}
+		case !errors.As(err, &re) || !reflect.DeepEqual(re.IDs(), tc.want):
+			t.Errorf("%s: want %v, got %v", tc.name, tc.want, err)
+		}
+	}
+	// abbreviated and full forms of one commit are the same commit
+	if !sameCommit("d534a9f", "d534a9fbe181ab6133040594d6c8194aebbd7f0b") || sameCommit("abc", "abcd") || sameCommit("d534a9f", "d534a9e") {
+		t.Fatal("sameCommit")
+	}
+}
+
+// --date is required: both architectures must publish under one date.
+func TestDateRequired(t *testing.T) {
+	for _, d := range []string{"", "2026-11-22", "261122"} {
+		f := newFixture()
+		f.Opt.Date = d
+		_, err := f.compose(t)
+		var re *RefusalError
+		if err == nil || errors.As(err, &re) || !strings.Contains(err.Error(), "--date") {
+			t.Fatalf("date %q: want a usage error, got %v", d, err)
+		}
 	}
 }

@@ -102,14 +102,10 @@ func newFixture() *fixture {
 		PMeta:  map[string]string{"run_id": "222", "harness_commit": "abc123", "profile": "full", "kernel": "7.0.0-38-generic", "boot_id": "boot-1"},
 		CBench: "20261122T060000-bench-msa2-server",
 		PBench: "20261123T150000-bench-msa2-server",
-		Opt:    Options{Now: func() time.Time { return t0 }},
+		Opt:    Options{Date: "20261122", Now: func() time.Time { return t0 }},
 	}
-	for _, d := range []*report.Document{f.C, f.P} {
-		for i := range d.Benchmarks {
-			sort1(d)
-			_ = i
-		}
-	}
+	sort1(f.C)
+	sort1(f.P)
 	f.CTS = series([]string{"s1", "s2"}, sorted(cNames))
 	f.PTS = series([]string{"s1", "s2"}, sorted(pNames))
 	return f
@@ -158,9 +154,8 @@ func writeDispatch(t testing.TB, dir string, d *report.Document, ts *report.Time
 	bj, _ := json.Marshal(map[string]any{"competitor_columns": bv})
 	must(t, os.WriteFile(filepath.Join(run, "bench-vars.json"), bj, 0o644))
 	must(t, os.WriteFile(filepath.Join(run, "raw", "msa2-server.json"), []byte(`{"cells":[]}`), 0o644))
-	for i, r := range d.Benchmarks {
-		cd := filepath.Join(run, bench, fmt.Sprintf("%02d-%s", 0, r.Name))
-		_ = i
+	for _, r := range d.Benchmarks {
+		cd := filepath.Join(run, bench, "00-"+r.Name)
 		must(t, os.MkdirAll(cd, 0o755))
 		must(t, os.WriteFile(filepath.Join(cd, "results.json"), []byte(`{}`), 0o644))
 	}
@@ -207,5 +202,3 @@ func (f *fixture) compose(t testing.TB) (*Result, error) {
 	}
 	return Compose(c, p, opt)
 }
-
-func (f *fixture) rawBytes(t testing.TB) []byte { return nil }

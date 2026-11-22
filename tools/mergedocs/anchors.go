@@ -54,6 +54,10 @@ type AnchorSection struct {
 	Warnings       []string       `json:"-"`
 }
 
+// metricOrder is the fixed iteration order of the anchor metrics (output and
+// warnings must be deterministic).
+var metricOrder = []string{"saturation_mode_rps", "rated_mode_p99_at_target_rps", "latency_at_slo", "loadgen_cpu_p95"}
+
 // metricValues flattens an anchor row's per-scenario numbers by metric.
 func metricValues(r *report.ServerResult) map[string]map[string]float64 {
 	out := map[string]map[string]float64{
@@ -112,7 +116,8 @@ func buildAnchors(names []string, byC, byP map[string]*report.ServerResult) Anch
 		rc, rp := byC[n], byP[n]
 		ar := AnchorReport{Name: n, Metrics: map[string][]MetricPair{}}
 		mc, mp := metricValues(rc), metricValues(rp)
-		for metric, vc := range mc {
+		for _, metric := range metricOrder {
+			vc := mc[metric]
 			keys := map[string]bool{}
 			for k := range vc {
 				keys[k] = true

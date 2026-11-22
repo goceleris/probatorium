@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -58,7 +57,7 @@ func TestValidPairComposes(t *testing.T) {
 	if res.Comp.GapHours < 32 || res.Comp.GapHours > 33 {
 		t.Fatalf("gap %v", res.Comp.GapHours)
 	}
-	if res.Comp.Publish.Date != "20261122" {
+	if res.Comp.Publish.Date != "20261122" || res.Comp.Publish.RunID != "run-1" {
 		t.Fatal(res.Comp.Publish.Date)
 	}
 }
@@ -244,8 +243,6 @@ func TestNoOverrideFlags(t *testing.T) {
 		}
 	}
 }
-
-var _ = sort.Strings
 
 // Study case C2b: a union must not lose histograms. Every kept column keeps all
 // its histograms through WriteTree, and the sidecar has one key per column.

@@ -25,11 +25,17 @@ tag (x86_64 / arm64), or differs between the two sidecars (study case C4).
 ## R3 harness commit
 The probatorium commit that ran the dispatch (gh run `headSha`, the `head=`
 line of the read-wrapper params.txt, or `harness_commit` in a meta file)
-differs. Strict equality of the commit. The bot text "apart from the celeris
-pin" is implemented as: the celeris pin is checked separately in R10 and a
-harness SHA that differs only by a go.mod celeris bump is STILL refused here
-(the composer has no checkout to prove "only the pin"; a freeze at one SHA is
-what the study recommends). Relax this item by amending this file and its hash.
+differs between the two dispatches (an abbreviation of 7+ hex digits of the
+other counts as equal). The one accepted difference is the celeris pin: with
+`--harness-repo DIR` (a probatorium checkout) the composer runs
+`git diff --name-only A B`; the files must all be `go.mod` or `go.sum` files (the pin lives in
+`servers/celeris/go.mod`, not in the root module) and every changed line of
+`git diff -U0 A B -- <those files>` must name the module
+`github.com/goceleris/celeris` or one of its submodules
+(`github.com/goceleris/celeris/...`), which a pin bump moves together (seen on
+real commits, e.g. 018f2d9). Without `--harness-repo`, or when
+the diff names anything else, or when git fails, different commits are refused.
+The celeris pin of the documents is checked separately in R10.
 
 ## R4 loadgen version
 `benchmark_config.loadgen_version` differs. (It is the merge host's go.mod
@@ -78,8 +84,11 @@ by averaging, C6). The composer refuses when the two inputs are the same run
 (equal run id, or byte-identical results.json), or when their
 [started_at, finished_at] windows overlap (one cluster cannot run two
 dispatches at once, so an overlap means a copied or contaminated document).
-The composer emits one results.json and names ONE `publish_date` (UTC date of
-the earlier start unless `--date` is given).
+The composer emits one results.json and publishes it under ONE date that the
+operator passes with `--date` (required, no default: the README scripts read
+`results/<version>/<date>/{x86_64,arm64}`, so both architectures of a release
+must use the same date, and the two single-arch dispatch sequences start on
+different days). A missing or malformed `--date` is a usage error (exit 64).
 
 ## R13 duplicate column across documents
 A column name present in both documents that is not a declared drift anchor

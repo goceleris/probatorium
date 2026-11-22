@@ -33,7 +33,8 @@ func run(args []string, stdout, stderr *os.File) int {
 		mp      = fs.String("meta-peers", "", "meta file of d2")
 		anchors = fs.String("anchors", strings.Join(DefaultAnchors, ","), "drift anchors measured in both dispatches")
 		twin    = fs.String("twin", "separate", "v1.5.11 twin columns: separate (strip + comparison sidecar), strip, keep")
-		date    = fs.String("date", "", "publish date yyyymmdd (default: UTC date of the earlier start)")
+		date    = fs.String("date", "", "publish date yyyymmdd, REQUIRED, the same for both architectures of the release")
+		harness = fs.String("harness-repo", "", "probatorium checkout used to prove that two different harness commits differ only by the celeris pin (go.mod/go.sum)")
 		expect  = fs.String("expect-columns", "", "file listing the columns the merged document must hold (one per line)")
 		showRef = fs.Bool("print-refusals", false, "print REFUSALS.md and its sha256 and exit")
 	)
@@ -49,6 +50,9 @@ func run(args []string, stdout, stderr *os.File) int {
 		return 64
 	}
 	opt := Options{Twin: *twin, Date: *date}
+	if *harness != "" {
+		opt.HarnessDiff = gitHarnessDiff(*harness)
+	}
 	for _, a := range strings.Split(*anchors, ",") {
 		if a = strings.TrimSpace(a); a != "" {
 			opt.Anchors = append(opt.Anchors, a)

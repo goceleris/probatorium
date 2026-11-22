@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"sort"
 )
 
@@ -104,5 +103,3 @@ func dispatchRecord(d *Dispatch) DispatchRecord {
 		Competitors: comp, Columns: cols,
 	}
 }
-
-var _ = json.Marshal

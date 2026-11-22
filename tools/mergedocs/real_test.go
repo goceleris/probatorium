@@ -117,7 +117,7 @@ func piece(t *testing.T, src *Dispatch, dst string, keep func(string) bool, star
 func gunzip(t *testing.T, p string) []byte {
 	f, err := os.Open(p)
 	must(t, err)
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	zr, err := gzip.NewReader(f)
 	must(t, err)
 	b, err := io.ReadAll(zr)
@@ -171,7 +171,7 @@ func TestRealD1SplitMergeIsIdentity(t *testing.T) {
 	must(t, err)
 	p, err := LoadDispatch("peers", br, bm)
 	must(t, err)
-	res, err := Compose(c, p, Options{Anchors: []string{anchor}, Twin: "keep", Now: func() time.Time { return t0 }})
+	res, err := Compose(c, p, Options{Anchors: []string{anchor}, Twin: "keep", Date: "20261122", Now: func() time.Time { return t0 }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestRealL755ZDriftPair(t *testing.T) {
 	p, err := LoadDispatch("peers", br, bm)
 	must(t, err)
 	// a and b are different dispatches; their bench dirs have different <TS> names
-	res, err := Compose(c, p, Options{Anchors: []string{anchor}, Now: func() time.Time { return t0 }})
+	res, err := Compose(c, p, Options{Anchors: []string{anchor}, Date: "20261122", Now: func() time.Time { return t0 }})
 	if err != nil {
 		t.Fatal(err)
 	}

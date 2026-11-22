@@ -105,13 +105,13 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	o, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(o, in); err != nil {
-		o.Close()
+		_ = o.Close()
 		return err
 	}
 	return o.Close()

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path"
 	"reflect"
 	"regexp"
 	"sort"
@@ -26,9 +27,13 @@ var DefaultAnchors = []string{"gnet-h1", "fiber-h1", "stdhttp-h1"}
 
 // Options are the composer's knobs. There is no option that relaxes a refusal.
 type Options struct {
-	Anchors       []string
-	Twin          string // "separate" (default), "strip" or "keep"
-	Date          string // yyyymmdd; default: UTC date of the earlier start
+	Anchors []string
+	Twin    string // "separate" (default), "strip" or "keep"
+	Date    string // yyyymmdd, REQUIRED: the same date for both architectures
+	// HarnessDiff proves two differing harness commits differ only by the celeris
+	// pin: it returns the changed file names and the -U0 diff of go.mod/go.sum.
+	// nil means no checkout was given, so differing commits are a refusal.
+	HarnessDiff   func(a, b string) (names []string, diff string, err error)
 	ExpectColumns []string
 	Now           func() time.Time
 }
@@ -44,8 +49,8 @@ func (o *Options) normalise() error {
 	default:
 		return fmt.Errorf("--twin=%q: want separate, strip or keep", o.Twin)
 	}
-	if o.Date != "" && !dateRE.MatchString(o.Date) {
-		return fmt.Errorf("--date=%q: want yyyymmdd", o.Date)
+	if !dateRE.MatchString(o.Date) {
+		return fmt.Errorf("--date is required (yyyymmdd, got %q): publish both architectures of a release under the SAME date, because the README scripts read results/<version>/<date>/{x86_64,arm64}", o.Date)
 	}
 	if len(o.Anchors) == 0 {
 		return fmt.Errorf("at least one drift anchor is required (default %s)", strings.Join(DefaultAnchors, ","))
@@ -209,9 +214,6 @@ func Compose(c, p *Dispatch, opt Options) (*Result, error) {
 
 	anchors := buildAnchors(opt.Anchors, byNameC, byNameP)
 	date := opt.Date
-	if date == "" {
-		date = bc.StartedAt.UTC().Format("20060102")
-	}
 	comp := &Composition{
 		ComposerVersion: composerVersion,
 		GeneratedAt:     opt.Now().UTC().Format(time.RFC3339),
@@ -237,6 +239,9 @@ func Compose(c, p *Dispatch, opt Options) (*Result, error) {
 	if c.Doc.BenchmarkConfig.GitRef != p.Doc.BenchmarkConfig.GitRef || c.Doc.BenchmarkConfig.CelerisVer != p.Doc.BenchmarkConfig.CelerisVer {
 		comp.Warnings = append(comp.Warnings, fmt.Sprintf("celeris pin differs between the dispatches (candidate %s, peers %s); the peers document carries no celeris column",
 			c.Doc.BenchmarkConfig.CelerisVer, p.Doc.BenchmarkConfig.CelerisVer))
+	}
+	if !sameCommit(c.Meta.HarnessCommit, p.Meta.HarnessCommit) {
+		comp.Warnings = append(comp.Warnings, fmt.Sprintf("harness commits differ (%s, %s) by the celeris pin only (proved with --harness-repo)", c.Meta.HarnessCommit, p.Meta.HarnessCommit))
 	}
 	if gap := p.Doc.BenchmarkConfig.StartedAt.Sub(c.Doc.BenchmarkConfig.FinishedAt); gap > 0 {
 		comp.GapHours = gap.Hours()
@@ -363,7 +368,11 @@ func checkPair(rf *refusals, c, p *Dispatch, opt Options) {
 		}
 	}
 	same := func(a, b string) bool { return a == b }
-	cmp("R3", "harness commit", cm.HarnessCommit, pm.HarnessCommit, same)
+	if okA, okB := rf.need("candidate", "harness commit", cm.HarnessCommit), rf.need("peers", "harness commit", pm.HarnessCommit); okA && okB && !sameCommit(cm.HarnessCommit, pm.HarnessCommit) {
+		if _, why := harnessVerdict(opt, cm.HarnessCommit, pm.HarnessCommit); why != "" {
+			rf.add("R3", "harness commit %q (candidate) != %q (peers): %s", cm.HarnessCommit, pm.HarnessCommit, why)
+		}
+	}
 	cmp("R4", "loadgen_version", cd.BenchmarkConfig.LoadgenVer, pd.BenchmarkConfig.LoadgenVer, same)
 	cmp("R6", "kernel", cm.Kernel, pm.Kernel, kernelEq)
 	cmp("R7", "boot id", cm.BootID, pm.BootID, same)
@@ -531,6 +540,57 @@ func checkPair(rf *refusals, c, p *Dispatch, opt Options) {
 			rf.add("R18", "both run directories carry %q", bd.Name)
 		}
 	}
+}
+
+// sameCommit: equal, or one is an abbreviation (7+ hex) of the other.
+func sameCommit(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	return len(a) >= 7 && strings.HasPrefix(b, a)
+}
+
+// harnessVerdict says whether two different harness commits differ only by the
+// celeris pin (R3). reason is non-empty when that cannot be established.
+func harnessVerdict(opt Options, a, b string) (pinOnly bool, reason string) {
+	if opt.HarnessDiff == nil {
+		return false, "no --harness-repo was given to prove that they differ only by the celeris pin"
+	}
+	names, diff, err := opt.HarnessDiff(a, b)
+	if err != nil {
+		return false, "the diff could not be read: " + err.Error()
+	}
+	if why := classifyHarnessDiff(names, diff); why != "" {
+		return false, "the difference is not only the celeris pin: " + why
+	}
+	return true, ""
+}
+
+// classifyHarnessDiff returns "" when the commits differ only by the celeris
+// pin: the changed files are go.mod or go.sum files (the pin lives in
+// servers/celeris/go.mod, not in the root module) and every changed line of
+// them names the module github.com/goceleris/celeris. Otherwise the reason.
+func classifyHarnessDiff(names []string, diff string) string {
+	if len(names) == 0 {
+		return "no file differs (the commits have identical trees)"
+	}
+	for _, n := range names {
+		if b := path.Base(n); b != "go.mod" && b != "go.sum" {
+			return "file " + n + " differs"
+		}
+	}
+	for _, l := range strings.Split(diff, "\n") {
+		if l == "" || strings.HasPrefix(l, "+++") || strings.HasPrefix(l, "---") || (l[0] != '+' && l[0] != '-') {
+			continue
+		}
+		if !strings.Contains(l, "github.com/goceleris/celeris ") && !strings.Contains(l, "github.com/goceleris/celeris/") {
+			return "changed line outside the celeris pin: " + strings.TrimSpace(l)
+		}
+	}
+	return ""
 }
 
 func missingSide(c, p bool) string {

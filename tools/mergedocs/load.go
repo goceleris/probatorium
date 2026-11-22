@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -323,4 +325,36 @@ func parseForensics(s string) (kernel, bootID string) {
 	}
 	bootID = section("boot id")
 	return
+}
+
+// gitHarnessDiff returns the HarnessDiff of a probatorium checkout: the changed
+// file names between two commits and the -U0 diff of go.mod and go.sum.
+func gitHarnessDiff(repo string) func(a, b string) ([]string, string, error) {
+	git := func(args ...string) (string, error) {
+		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return string(out), nil
+	}
+	return func(a, b string) ([]string, string, error) {
+		names, err := git("diff", "--name-only", a, b)
+		if err != nil {
+			return nil, "", err
+		}
+		var mods []string
+		for _, n := range strings.Fields(names) {
+			if b := path.Base(n); b == "go.mod" || b == "go.sum" {
+				mods = append(mods, n)
+			}
+		}
+		diff := ""
+		if len(mods) > 0 {
+			diff, err = git(append([]string{"diff", "-U0", a, b, "--"}, mods...)...)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		return strings.Fields(names), diff, nil
+	}
 }
