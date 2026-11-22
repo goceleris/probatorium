@@ -7,7 +7,7 @@
 # What is compared (and what is deliberately not):
 #   compared   containers, processes a run can leave (load generators, servers, postgres), listening sockets, volumes,
 #              networks, /tmp names, links, mounts (except Docker's own netns mounts), the REGISTERED sysctl knobs below,
-#              the CPU governor, loopback MTU and THP: the settings HttpArena's tuner or this run could touch.
+#              the per-CPU governor / scaling driver / EPP (cpufreq.txt), loopback MTU and THP: the settings HttpArena's tuner or this run could touch.
 #   images     compared against a fixed BASELINE of image IDs (images-baseline.ids, committed beside this script), not against
 #              the before-capture: a leftover from an earlier run must not become the next run's "original".
 #   not compared  the full `sysctl -a` (kept in sysctl-a.txt for the record: it holds volatile counters such as fs.quota.*),
@@ -37,9 +37,11 @@ df -k / /tmp 2>/dev/null > "$O/df.txt"
 cat /proc/sys/net/ipv4/ip_local_port_range > "$O/port-range.txt" 2>/dev/null   # ONE line: the workflow restores from it
 ip -o link show 2>/dev/null | awk '{print $2,$3,$9}' | sort > "$O/links.txt"
 free -b > "$O/free.txt"
+# per-CPU governor, scaling_driver and EPP (+ pstate mode, boost): registered knobs, compared after the run (governor.sh record is read-only)
+bash "$(dirname "$0")/governor.sh" record "$O/cpufreq.txt" 2>/dev/null || : > "$O/cpufreq.txt"
 if [ "$phase" = after ]; then
   rc=0
-  for f in docker-ps-a docker-volumes docker-networks ps sysctl-knobs mounts listening tmp-names port-range links; do
+  for f in docker-ps-a docker-volumes docker-networks ps sysctl-knobs cpufreq mounts listening tmp-names port-range links; do
     if ! diff -u "$D/before/$f.txt" "$O/$f.txt" > "$O/diff-$f.txt" 2>&1; then
       echo "DIFF in $f (see $O/diff-$f.txt):"; head -20 "$O/diff-$f.txt"; rc=1
     fi

@@ -18,6 +18,9 @@ on:
       portrange_ok:
         type: boolean
         required: true
+      governor:
+        type: string
+        required: true
       guard_checked_at:
         type: string
         required: true
@@ -110,7 +113,7 @@ jobs:
           git checkout --quiet "$HTTPARENA_SHA"
           git apply "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/celeris-entry.patch"
           mkdir -p preview
-          cp "$GITHUB_WORKSPACE"/probatorium/tools/httparena-preview/{host_adapt.py,stage-images.sh,run-preview.sh,score_preview.py} preview/
+          cp "$GITHUB_WORKSPACE"/probatorium/tools/httparena-preview/{host_adapt.py,stage-images.sh,run-preview.sh,score_preview.py,governor.sh} preview/
           python3 -I -B preview/host_adapt.py .
       - name: Stage images and loadgens (no measuring yet)
         shell: bash
@@ -122,8 +125,20 @@ jobs:
         env:
           PHASES: ${{ inputs.phases }}
           PORTRANGE_OK: ${{ inputs.portrange_ok && '1' || '0' }}
+          GOVERNOR: ${{ inputs.governor }}
         run: |
           set -uo pipefail
+          if [ "$GOVERNOR" = performance ]; then
+            # Refuse if the host is not in the recorded original state (a dead earlier run could have left performance set: then
+            # "restore to the before-capture" would write a wrong original). Baseline: every CPU on powersave (smoke runs 1 and 2).
+            got=$(awk -F'\t' '!/^#/ {print $2}' "$WORK/state/before/cpufreq.txt" | sort -u | tr '\n' ' ')
+            want=$(grep -v -E '^\s*(#|$)' "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/cpufreq-baseline.txt" | tr '\n' ' ')
+            if [ "$got" != "$want" ]; then echo "::error::host governor set differs from the baseline: refusing to change it"; exit 1; fi
+            # EXIT trap restores on success, failure, and the runner's SIGTERM/SIGINT on cancel or timeout; the always() step below is the second line.
+            trap 'bash preview/run-preview.sh governor-restore' EXIT
+            trap 'exit 143' TERM; trap 'exit 130' INT
+            bash preview/run-preview.sh governor-set || { echo "::error::the CPU governor did not take effect: no benchmark was started"; exit 1; }
+          fi
           IFS=, read -ra ph <<< "$PHASES"
           # Everything the phases print is already limited to START/STOP + rc lines; per-profile output is in files.
           # Nothing below echoes a result, a rate or a score into this log.
@@ -134,6 +149,17 @@ jobs:
           mv logs-*.out logs/ 2>/dev/null
           echo "phases done: $PHASES (results are in the artifact only)"
           true
+      - name: Restore the CPU governor (second line; the phases step also restores in an EXIT trap)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          cd "$WORK/HttpArena" 2>/dev/null || { echo "governor: no work directory, nothing to restore"; exit 0; }
+          if [ -s logs/cpufreq-original.tsv ]; then
+            bash preview/run-preview.sh governor-restore || { echo "::error::CPU governor NOT restored"; exit 1; }
+          else
+            echo "governor: no record written, nothing to restore"
+          fi
       # Runs even when the async block, a phase or the job failed (if: always()). The async phase also restores in a trap; this
       # step is the second line and compares against the BEFORE capture, so it restores whatever differs, not only the value
       # this run wrote. A cancelled job still runs it; a dead host loses the setting at reboot (sysctl -w is not persistent).

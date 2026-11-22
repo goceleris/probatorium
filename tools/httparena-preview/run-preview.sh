@@ -6,6 +6,9 @@
 #   async   PHASE 1b: the 32,000-connection profile; needs PORTRANGE_OK=1 (see below), otherwise it is skipped
 #   supp    PHASE 2: profile-limited Go supplements (go-stdlib h2c, fiber-websocket ws)
 #   tls     PHASE 3: the TLS side (json-tls, 8gbit; celeris and go-stdlib also baseline-h2, static-h2)
+#   governor-set      set the CPU governor to performance (+EPP where present), record the original in logs/cpufreq-original.tsv,
+#                     read back; exit 1 if it did not take (nothing may be benchmarked then). Default for the full preview; smoke keeps the host as is.
+#   governor-restore  write the recorded governor/EPP back and verify (run it in an EXIT trap / an always() step)
 #   score   score tables (both pictures) from results/
 # Every call logs start/stop times to logs/<phase>.log and one log per entry under logs/.
 set -uo pipefail
@@ -45,5 +48,7 @@ case "$phase" in
            --entries celeris,gin,fiber,echo,go-fasthttp,fiber-websocket,go-stdlib --merge fiber-websocket=fiber \
            --rates latency-1m=$ZRK_RATE_LATENCY_1M,latency-10k=$ZRK_RATE_LATENCY_10K,8gbit=$ZRK_RATE_8GBIT \
            --tls-profiles json-tls,8gbit,baseline-h2,static-h2 | tee logs/score.txt ;;
+  governor-set)     bash "$(dirname "$0")/governor.sh" set "$HA/logs/cpufreq-original.tsv" ;;
+  governor-restore) bash "$(dirname "$0")/governor.sh" restore "$HA/logs/cpufreq-original.tsv" ;;
   *) echo "unknown phase $phase"; exit 2 ;;
 esac

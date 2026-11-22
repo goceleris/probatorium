@@ -12,7 +12,7 @@ name: HttpArena preview (private)
 #
 # Two ways to start it. (1) workflow_dispatch, once this file is on the default branch (GitHub lists dispatchable workflows from
 # the default branch only: GUESS, not tested here). (2) a push to the standing branch ab/httparena-preview-20261122 that changes
-# tools/httparena-preview/RUN (three lines: phases=..., portrange_ok=0|1, reason=...): the push event runs this file from the
+# tools/httparena-preview/RUN (three lines: phases=..., portrange_ok=0|1, [governor=performance|keep,] reason=...): the push event runs this file from the
 # branch, no merge to main needed. The initial push of the branch has no RUN file and starts nothing; a push that touches other
 # files starts nothing either (paths filter).
 #
@@ -46,6 +46,11 @@ on:
         type: boolean
         required: false
         default: false
+      governor:
+        description: "performance | keep | empty. Empty = performance when the phases include clear/async/supp/tls, keep for smoke. performance sets the CPU governor on msa2-server (sudo -n) for the run and RESTORES it (EXIT trap + always() step)."
+        type: string
+        required: false
+        default: ""
       reason:
         description: "Why (one line, up to 200 characters)."
         type: string
@@ -63,6 +68,7 @@ jobs:
     outputs:
       phases: ${{ steps.p.outputs.phases }}
       portrange_ok: ${{ steps.p.outputs.portrange_ok }}
+      governor: ${{ steps.p.outputs.governor }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,6 +81,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           IN_PHASES: ${{ inputs.phases }}
           IN_PORT: ${{ inputs.portrange_ok }}
+          IN_GOV: ${{ inputs.governor }}
           IN_REASON: ${{ inputs.reason }}
           REF: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -84,7 +91,7 @@ jobs:
             f=tools/httparena-preview/RUN
             [ -f "$f" ] || { echo "::error::no $f"; exit 1; }
             IN_PHASES=$(sed -n 's/^phases=//p' "$f" | head -1); IN_REASON=$(sed -n 's/^reason=//p' "$f" | head -1)
-            IN_PORT=$(sed -n 's/^portrange_ok=//p' "$f" | head -1)
+            IN_PORT=$(sed -n 's/^portrange_ok=//p' "$f" | head -1); IN_GOV=$(sed -n 's/^governor=//p' "$f" | head -1)
             [ "$IN_PORT" = 1 ] && IN_PORT=true || IN_PORT=false
           fi
           [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ] || { echo "::error::dispatch from a branch, not $DEFAULT_BRANCH"; exit 1; }
@@ -93,7 +100,9 @@ jobs:
           for x in "${ph[@]}"; do case "$x" in smoke|clear|async|supp|tls) ;; *) echo "::error::unknown phase: $x"; exit 1 ;; esac; done
           # tls never before clear in the same dispatch
           seen_clear=0; for x in "${ph[@]}"; do [ "$x" = clear ] && seen_clear=1; [ "$x" = tls ] && [ "$seen_clear" = 0 ] && case ",$IN_PHASES," in *,clear,*) echo "::error::order: clear before tls"; exit 1;; esac; done
-          echo "phases=$IN_PHASES" >> "$GITHUB_OUTPUT"; echo "portrange_ok=$IN_PORT" >> "$GITHUB_OUTPUT"
+          if [ -z "$IN_GOV" ]; then case ",$IN_PHASES," in *,clear,*|*,async,*|*,supp,*|*,tls,*) IN_GOV=performance;; *) IN_GOV=keep;; esac; fi
+          case "$IN_GOV" in performance|keep) ;; *) echo "::error::governor must be performance or keep"; exit 1;; esac
+          { echo "phases=$IN_PHASES"; echo "portrange_ok=$IN_PORT"; echo "governor=$IN_GOV"; } >> "$GITHUB_OUTPUT"
 
   cluster-guard:
     name: cluster-guard
@@ -144,6 +153,7 @@ jobs:
     with:
       phases: ${{ needs.plan.outputs.phases }}
       portrange_ok: ${{ needs.plan.outputs.portrange_ok == 'true' }}
+      governor: ${{ needs.plan.outputs.governor }}
       guard_checked_at: ${{ needs.cluster-guard.outputs.checked_at }}
     secrets:
       TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}

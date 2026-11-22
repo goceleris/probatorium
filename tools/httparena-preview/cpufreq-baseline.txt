@@ -1,0 +1,2 @@
+# governors expected on every CPU of msa2-server before a preview run (smoke runs 45036491996 and 45038450915: 16 CPUs powersave)
+powersave
