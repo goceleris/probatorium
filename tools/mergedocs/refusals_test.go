@@ -286,8 +286,8 @@ func TestIdenticalDocumentsRefused(t *testing.T) {
 	}
 }
 
-// R3: harness commits may differ only inside servers/celeris/ (the celeris pin
-// lives there and only the candidate dispatch carries celeris columns).
+// R3: harness commits may differ only in servers/celeris/go.mod and go.sum (the
+// celeris pin lives there and only the candidate dispatch carries celeris columns).
 func TestHarnessScope(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -295,7 +295,7 @@ func TestHarnessScope(t *testing.T) {
 		ok    bool
 	}{
 		{"pin bump", []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}, true},
-		{"anything inside the module directory", []string{"servers/celeris/go.sum", "servers/celeris/main.go"}, true},
+		{"adapter code in the module directory is not the pin", []string{"servers/celeris/go.sum", "servers/celeris/main.go"}, false},
 		{"another module", []string{"servers/celeris_v1511/go.mod"}, false},
 		{"sibling directory with the same prefix", []string{"servers/celeris-extra/go.mod"}, false},
 		{"validation refapp go.mod", []string{"servers/celeris/go.mod", "validation/refapp/kitchen_sink/go.mod"}, false},
@@ -312,7 +312,9 @@ func TestHarnessScope(t *testing.T) {
 		hd   func(a, b string) ([]string, error)
 		want []string
 	}{
-		{"proved", func(a, b string) ([]string, error) { return []string{"servers/celeris/go.mod"}, nil }, nil},
+		{"proved", func(a, b string) ([]string, error) {
+			return []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}, nil
+		}, nil},
 		{"not proved", func(a, b string) ([]string, error) { return []string{"magefile.go"}, nil }, []string{"R3"}},
 		{"git fails", func(a, b string) ([]string, error) { return nil, errors.New("bad object") }, []string{"R3"}},
 		{"no checkout", nil, []string{"R3"}},
@@ -328,7 +330,7 @@ func TestHarnessScope(t *testing.T) {
 		case tc.want == nil:
 			found := false
 			for _, w := range res.Comp.Warnings {
-				found = found || strings.Contains(w, "only inside servers/celeris/")
+				found = found || strings.Contains(w, "only in servers/celeris/go.mod")
 			}
 			if !found {
 				t.Errorf("%s: an accepted difference must be recorded in the warnings", tc.name)

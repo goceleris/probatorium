@@ -349,7 +349,7 @@ func TestNoHistogramOrSeriesLoss(t *testing.T) {
 
 // The published composition carries the drift figures, the per-scenario margins,
 // the reboot note and the column map, and nothing local; `install` attaches it
-// to the cell mage Publish wrote, and only to a cell with the same columns.
+// to the cell mage Publish will write (before it), and only for the same columns.
 func TestPublicCompositionAndInstall(t *testing.T) {
 	f := newFixture()
 	f.PMeta["boot_id"] = "boot-2"
@@ -384,33 +384,56 @@ func TestPublicCompositionAndInstall(t *testing.T) {
 		t.Fatal("twin.json missing with --twin=separate")
 	}
 
-	// publish through the real WriteTree, then install
+	// Install BEFORE publish (into the DOCS_REPO_DIR that mage Publish will use):
+	// publishViaGit writes the four files into the cell, deletes nothing and
+	// `git add`s the whole cell directory, so the extras ride in the same commit.
 	docs := t.TempDir()
+	got, err := Install(out, docs, "v1.6.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"composition.json", "twin.json"} {
+		if _, err := os.Stat(filepath.Join(got, n)); err != nil {
+			t.Error(err)
+		}
+	}
 	gz, _ := res.TS.MarshalGzip()
 	cell, err := report.WriteTree(filepath.Join(docs, "results"), res.Doc, gz, report.SplitMeta{Version: "v1.6.0", Arch: "x86_64", Date: "20261122", RunID: "run-1", GeneratedAt: t0})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := Install(out, docs, "v1.6.0")
-	if err != nil || got != cell {
-		t.Fatalf("%v %s", err, got)
+	if cell != got {
+		t.Fatalf("cell %s != install target %s", cell, got)
 	}
-	for _, n := range []string{"composition.json", "twin.json"} {
+	for _, n := range []string{"composition.json", "twin.json", "summary.json", "env.json", "histograms.json.gz", "timeseries.json.gz"} {
 		if _, err := os.Stat(filepath.Join(cell, n)); err != nil {
-			t.Error(err)
+			t.Errorf("after the publish write the cell lacks %s: %v", n, err)
 		}
 	}
-	// a cell with other columns refuses
+	// idempotent after publish, and it re-checks against the published summary.json
+	if _, err := Install(out, docs, "v1.6.0"); err != nil {
+		t.Fatal(err)
+	}
+	// a composed results.json that is not the composition's refuses
+	raw, err := os.ReadFile(filepath.Join(out, "results.json"))
+	must(t, err)
+	var d report.Document
+	must(t, json.Unmarshal(raw, &d))
+	d.Benchmarks = d.Benchmarks[1:]
+	tampered, _ := json.MarshalIndent(&d, "", "  ")
+	must(t, os.WriteFile(filepath.Join(out, "results.json"), tampered, 0o644))
+	if _, err := Install(out, t.TempDir(), "v1.6.0"); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("install of a tampered composition: %v", err)
+	}
+	must(t, os.WriteFile(filepath.Join(out, "results.json"), raw, 0o644))
+	// a published summary.json with other columns refuses too
+	docs2 := t.TempDir()
 	res2, err := newFixture().compose(t)
 	must(t, err)
 	res2.Doc.Benchmarks = res2.Doc.Benchmarks[1:]
-	docs2 := t.TempDir()
 	_, err = report.WriteTree(filepath.Join(docs2, "results"), res2.Doc, gz, report.SplitMeta{Version: "v1.6.0", Arch: "x86_64", Date: "20261122", RunID: "run-1", GeneratedAt: t0})
 	must(t, err)
 	if _, err := Install(out, docs2, "v1.6.0"); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("install into another cell: %v", err)
-	}
-	if _, err := Install(out, t.TempDir(), "v1.6.0"); err == nil {
-		t.Fatal("install without a published cell must fail")
 	}
 }

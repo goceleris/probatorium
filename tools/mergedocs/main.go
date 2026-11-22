@@ -130,12 +130,12 @@ func widestMargin(c *Composition) float64 {
 	return w
 }
 
-// runInstall: mergedocs install --composed DIR --docs DOCS_CLONE --version vX.Y.Z
+// runInstall: mergedocs install --composed DIR --docs DOCS_CLONE --version vX.Y.Z (before mage publish)
 func runInstall(args []string, stdout, stderr *os.File) int {
 	fs := flag.NewFlagSet("mergedocs install", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	composed := fs.String("composed", "", "the composed output directory")
-	docs := fs.String("docs", "", "goceleris/docs checkout in which mage Publish wrote the cell")
+	docs := fs.String("docs", "", "the goceleris/docs checkout that mage Publish will use (DOCS_REPO_DIR); run install BEFORE mage publish")
 	version := fs.String("version", "", "published version (the PUBLISH_VERSION of mage Publish)")
 	if err := fs.Parse(args); err != nil {
 		return 64
@@ -149,6 +149,6 @@ func runInstall(args []string, stdout, stderr *os.File) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "installed composition.json (+ twin.json) into %s; commit them in the docs checkout\n", cell)
+	fmt.Fprintf(stdout, "installed composition.json (+ twin.json) into %s; now run: DOCS_REPO_DIR=<same checkout> PUBLISH_VIA=git mage publish (the cell directory is added whole, so they ride in the same commit)\n", cell)
 	return 0
 }

@@ -26,14 +26,14 @@ tag (x86_64 / arm64), or differs between the two sidecars (study case C4).
 The probatorium commit that ran the dispatch (gh run `headSha`, the `head=`
 line of the read-wrapper params.txt, or `harness_commit` in a meta file)
 differs between the two dispatches (an abbreviation of 7+ hex digits of the
-other counts as equal). The one accepted difference is a change confined to
-the `servers/celeris/` module directory (the celeris pin lives there, and only
-the candidate dispatch carries celeris columns, so such a change cannot touch
-what the frameworks dispatch measured), proved with `--harness-repo DIR` (a
-probatorium checkout): every file of `git diff --name-only A B` must start with
-`servers/celeris/`. Without `--harness-repo`, when any file outside that
-directory differs (including `servers/celeris_v1511/` and `validation/`), when
-the trees are identical or when git fails, different commits are refused. The
+other counts as equal). The one accepted difference is a celeris pin bump:
+every differing file must be `servers/celeris/go.mod` or `servers/celeris/go.sum`
+(the pin lives there, and only the candidate dispatch carries celeris columns, so
+such a bump cannot touch what the frameworks dispatch measured), proved with
+`--harness-repo DIR` (a probatorium checkout) by `git diff --name-only A B`.
+Any other file (adapter code in `servers/celeris/`, `servers/celeris_v1511/`,
+`validation/`, mage code) is refused, as are identical trees, a missing
+`--harness-repo`, and a git failure. The
 celeris pin of the documents is checked separately in R10.
 
 ## R4 loadgen version

@@ -110,12 +110,17 @@ func writePublicExtras(res *Result, dir string) error {
 	return nil
 }
 
-// Install copies <composed>/publish-extras/* into the published cell
-// <docs>/results/<version>/<date>/<arch>/ after `mage Publish` wrote it. mage
-// Publish (frozen at the F5 SHA) writes four files and knows nothing of
-// composition.json, so this is a separate, explicit step. It refuses unless the
-// cell's summary.json holds exactly the columns of the composition, so the extras
-// cannot be attached to another cell.
+// Install copies <composed>/publish-extras/* into the cell directory
+// <docs>/results/<version>/<date>/<arch>/. Run it BEFORE `mage Publish`, with
+// --docs the DOCS_REPO_DIR that Publish will use: publishViaGit writes the four
+// files into that cell (it never deletes) and `git add`s the whole cell
+// directory, so the extras travel in the same commit, before the pointer dispatch
+// fires the docs build. (The contents-API path PUTs four named files only and
+// cannot carry them; running Install after Publish needs a second docs commit and
+// the docs sync workflow only builds on the dispatch.) It refuses unless the
+// composed results.json holds exactly the columns of the composition (and, when
+// the cell already has a summary.json, that one too), so the extras cannot be
+// attached to another cell.
 func Install(composed, docs, version string) (string, error) {
 	var pc PublicComposition
 	b, err := os.ReadFile(filepath.Join(composed, "publish-extras", publicCompositionFile))
@@ -126,36 +131,50 @@ func Install(composed, docs, version string) (string, error) {
 		return "", err
 	}
 	cell := filepath.Join(docs, "results", version, pc.PublishDate, pc.Arch)
-	sb, err := os.ReadFile(filepath.Join(cell, "summary.json"))
+	rb, err := os.ReadFile(filepath.Join(composed, "results.json"))
 	if err != nil {
-		return "", fmt.Errorf("the published cell %s has no summary.json (run mage Publish first): %w", cell, err)
-	}
-	var s struct {
-		Benchmarks []struct {
-			Name string `json:"name"`
-		} `json:"benchmarks"`
-	}
-	if err := json.Unmarshal(sb, &s); err != nil {
 		return "", err
 	}
-	have := map[string]bool{}
-	for _, x := range s.Benchmarks {
-		have[x.Name] = true
+	check := func(what string, raw []byte) error {
+		var s struct {
+			Benchmarks []struct {
+				Name string `json:"name"`
+			} `json:"benchmarks"`
+		}
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return err
+		}
+		have := map[string]bool{}
+		for _, x := range s.Benchmarks {
+			have[x.Name] = true
+		}
+		var diff []string
+		for n := range pc.Columns {
+			if !have[n] {
+				diff = append(diff, "missing in "+what+": "+n)
+			}
+		}
+		for n := range have {
+			if _, ok := pc.Columns[n]; !ok {
+				diff = append(diff, "not in the composition: "+n)
+			}
+		}
+		if len(diff) > 0 {
+			sort.Strings(diff)
+			return fmt.Errorf("%s does not match the composition: %v", what, diff)
+		}
+		return nil
 	}
-	var diff []string
-	for n := range pc.Columns {
-		if !have[n] {
-			diff = append(diff, "missing in summary.json: "+n)
+	if err := check("the composed results.json", rb); err != nil {
+		return "", err
+	}
+	if sb, err := os.ReadFile(filepath.Join(cell, "summary.json")); err == nil {
+		if err := check("the cell's summary.json", sb); err != nil {
+			return "", err
 		}
 	}
-	for n := range have {
-		if _, ok := pc.Columns[n]; !ok {
-			diff = append(diff, "not in the composition: "+n)
-		}
-	}
-	if len(diff) > 0 {
-		sort.Strings(diff)
-		return "", fmt.Errorf("the cell %s does not match the composition: %v", cell, diff)
+	if err := os.MkdirAll(cell, 0o755); err != nil {
+		return "", err
 	}
 	es, err := os.ReadDir(filepath.Join(composed, "publish-extras"))
 	if err != nil {
