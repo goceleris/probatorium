@@ -24,6 +24,22 @@
   <a href="https://goceleris.dev/methodology/">Methodology</a>
 </p>
 
+## At a glance
+
+**What it is.** probatorium is the benchmark and validation harness for celeris. On a three-host cluster (x86-64 and arm64) it measures celeris against 29 other frameworks under load, and it runs celeris reference apps on every engine against malformed traffic, connection churn and injected faults to judge correctness.
+
+**Run it.** The deterministic parts run on a laptop with Go, with no cluster, docker or root:
+
+```sh
+git clone https://github.com/goceleris/probatorium && cd probatorium
+go run ./cmd/runner -dry-run -cells '*/*' -runs 1   # list every benchmark cell a full run schedules
+go test ./budget ./scenarios ./interleave ./report  # the smallest test slice
+```
+
+Measuring or validating needs the cluster; see [Reproduce a run](#reproduce-a-run).
+
+**Where the results are.** Benchmark results are published in the [goceleris/docs results tree](https://github.com/goceleris/docs/tree/main/results) and shown on [goceleris.dev/benchmarks](https://goceleris.dev/benchmarks/). Validation results are the run pages of this repository's workflows. The cluster workflows are started by hand today. What the v1.6.0 runs showed: [What v1.6.0 proved](#what-v160-proved).
+
 ## Why probatorium
 
 celeris has its own unit tests. probatorium tests it from the outside, as a deployed server on real
