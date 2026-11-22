@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -24,6 +23,7 @@ type Meta struct {
 	SUTHost       string            `json:"sut_host"`
 	Kernel        string            `json:"kernel"`
 	BootID        string            `json:"boot_id"`
+	BootCmdline   string            `json:"boot_cmdline"`
 	Sources       map[string]string `json:"sources"`
 	conflicts     []string
 }
@@ -233,6 +233,7 @@ func loadMeta(runDir, metaPath string, d *Dispatch) Meta {
 	set("sut_host", &m.SUTHost, f["sut_host"], eq)
 	set("kernel", &m.Kernel, f["kernel"], kernelEq)
 	set("boot_id", &m.BootID, f["boot_id"], eq)
+	set("boot_cmdline", &m.BootCmdline, f["boot_cmdline"], eq)
 	return m
 }
 
@@ -285,6 +286,7 @@ func parseMetaFile(p string) (map[string]string, error) {
 		"sut_host":       first("sut_host", "host"),
 		"kernel":         first("kernel"),
 		"boot_id":        first("boot_id"),
+		"boot_cmdline":   first("boot_cmdline", "cmdline"),
 	}, nil
 }
 
@@ -327,34 +329,14 @@ func parseForensics(s string) (kernel, bootID string) {
 	return
 }
 
-// gitHarnessDiff returns the HarnessDiff of a probatorium checkout: the changed
-// file names between two commits and the -U0 diff of go.mod and go.sum.
-func gitHarnessDiff(repo string) func(a, b string) ([]string, string, error) {
-	git := func(args ...string) (string, error) {
-		out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+// gitHarnessDiff returns the HarnessDiff of a probatorium checkout: the files
+// that differ between two commits.
+func gitHarnessDiff(repo string) func(a, b string) ([]string, error) {
+	return func(a, b string) ([]string, error) {
+		out, err := exec.Command("git", "-C", repo, "diff", "--name-only", a, b).CombinedOutput()
 		if err != nil {
-			return "", fmt.Errorf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+			return nil, fmt.Errorf("git diff --name-only %s %s: %v: %s", a, b, err, strings.TrimSpace(string(out)))
 		}
-		return string(out), nil
-	}
-	return func(a, b string) ([]string, string, error) {
-		names, err := git("diff", "--name-only", a, b)
-		if err != nil {
-			return nil, "", err
-		}
-		var mods []string
-		for _, n := range strings.Fields(names) {
-			if b := path.Base(n); b == "go.mod" || b == "go.sum" {
-				mods = append(mods, n)
-			}
-		}
-		diff := ""
-		if len(mods) > 0 {
-			diff, err = git(append([]string{"diff", "-U0", a, b, "--"}, mods...)...)
-			if err != nil {
-				return nil, "", err
-			}
-		}
-		return strings.Fields(names), diff, nil
+		return strings.Fields(string(out)), nil
 	}
 }

@@ -23,6 +23,9 @@ import (
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 func run(args []string, stdout, stderr *os.File) int {
+	if len(args) > 0 && args[0] == "install" {
+		return runInstall(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("mergedocs", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
@@ -102,8 +105,8 @@ func run(args []string, stdout, stderr *os.File) int {
 func printSummary(stdout, stderr *os.File, res *Result, out string) {
 	c := res.Comp
 	fmt.Fprintf(stdout, "merged %d columns (%s) -> %s\n", c.ColumnsN, c.Arch, out)
-	fmt.Fprintf(stdout, "anchors %s: max_anchor_drift %.4f (%s), tie_margin %.4f\n",
-		strings.Join(c.Anchors.Names, ","), c.MaxAnchorDrift, c.Anchors.MaxDriftAnchor, c.TieMargin)
+	fmt.Fprintf(stdout, "anchors %s: max_anchor_drift %.4f (%s); tie margins per scenario: %d scenarios, widest %.4f\n",
+		strings.Join(c.Anchors.Names, ","), c.MaxAnchorDrift, c.Anchors.MaxDriftAnchor, len(c.TieMarginByScenario), widestMargin(c))
 	fmt.Fprintf(stdout, "twin %s: %d column(s)\n", c.Twin.Mode, len(c.Twin.Columns))
 	fmt.Fprintf(stdout, "publish as ONE cell on date %s:\n  PUBLISH_RESULTS=%s/results.json BENCH_START_DATE=%s PUBLISH_RUN_ID=run-1 PUBLISH_VERSION=<version> mage publish\n", c.Publish.Date, out, c.Publish.Date)
 	for _, w := range c.Warnings {
@@ -112,7 +115,40 @@ func printSummary(stdout, stderr *os.File, res *Result, out string) {
 	if c.Anchors.DriftWarning {
 		fmt.Fprintf(stderr, "\n############################################################\n"+
 			"# ANCHOR DRIFT ABOVE %.0f%% on %s: cross-dispatch comparisons\n"+
-			"# are not same-run. tie_margin is %.4f. Tell the release bot.\n"+
-			"############################################################\n", driftWarnThreshold*100, c.Arch, c.TieMargin)
+			"# are not same-run. widest tie margin is %.4f. Tell the release bot.\n"+
+			"############################################################\n", driftWarnThreshold*100, c.Arch, widestMargin(c))
 	}
+}
+
+func widestMargin(c *Composition) float64 {
+	w := 0.0
+	for _, v := range c.TieMarginByScenario {
+		if v > w {
+			w = v
+		}
+	}
+	return w
+}
+
+// runInstall: mergedocs install --composed DIR --docs DOCS_CLONE --version vX.Y.Z
+func runInstall(args []string, stdout, stderr *os.File) int {
+	fs := flag.NewFlagSet("mergedocs install", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	composed := fs.String("composed", "", "the composed output directory")
+	docs := fs.String("docs", "", "goceleris/docs checkout in which mage Publish wrote the cell")
+	version := fs.String("version", "", "published version (the PUBLISH_VERSION of mage Publish)")
+	if err := fs.Parse(args); err != nil {
+		return 64
+	}
+	if *composed == "" || *docs == "" || *version == "" {
+		fmt.Fprintln(stderr, "usage: mergedocs install --composed DIR --docs DIR --version vX.Y.Z")
+		return 64
+	}
+	cell, err := Install(*composed, *docs, *version)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "installed composition.json (+ twin.json) into %s; commit them in the docs checkout\n", cell)
+	return 0
 }

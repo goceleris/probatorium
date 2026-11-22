@@ -11,11 +11,11 @@ import (
 
 // Drift constants fixed by the release bot (msg_ccb8c21ee221).
 const (
-	tieMarginFloor     = 0.05 // tie_margin = max(tieMarginFloor, max_anchor_drift)
+	tieMarginFloor     = 0.05 // margin(scenario) = max(tieMarginFloor, largest anchor drift on that scenario)
 	driftWarnThreshold = 0.15 // a larger anchor drift prints a loud warning
 	driftMetric        = "saturation_mode_rps"
 	driftDefinition    = "max(r, 1/r) - 1 with r = d1/d2 (d1 = candidate+twin dispatch, d2 = frameworks dispatch); " +
-		"per anchor the maximum over the scenarios measured ok in both dispatches; max_anchor_drift is the maximum over the anchors"
+		"measured per anchor and scenario on the scenarios measured ok in both dispatches; the tie margin of a scenario is the largest drift any anchor showed on THAT scenario, floored; max_anchor_drift is the maximum over all anchors and scenarios (reporting only)"
 )
 
 // MetricPair is one d1/d2 measurement of an anchor.
@@ -48,10 +48,22 @@ type AnchorSection struct {
 	MaxAnchorDrift float64        `json:"max_anchor_drift"`
 	MaxDriftAnchor string         `json:"max_drift_anchor"`
 	TieMarginFloor float64        `json:"tie_margin_floor"`
-	TieMargin      float64        `json:"tie_margin"`
-	WarnThreshold  float64        `json:"warn_threshold"`
-	DriftWarning   bool           `json:"drift_warning"`
-	Warnings       []string       `json:"-"`
+	// ByScenario is the tie margin of every scenario of the merged document.
+	ByScenario    map[string]ScenarioMargin `json:"tie_margin_by_scenario"`
+	WarnThreshold float64                   `json:"warn_threshold"`
+	DriftWarning  bool                      `json:"drift_warning"`
+	Warnings      []string                  `json:"-"`
+}
+
+// ScenarioMargin is one scenario's tie margin: max(floor, the largest drift any
+// anchor showed on it). A scenario no anchor measured in both dispatches has no
+// drift evidence: it takes the largest margin of the architecture (NoAnchor).
+type ScenarioMargin struct {
+	Margin   float64 `json:"margin"`
+	DrivenBy string  `json:"driven_by,omitempty"` // the anchor with the largest drift, when above the floor
+	Anchors  int     `json:"anchors_paired"`
+	NoAnchor bool    `json:"no_anchor,omitempty"`
+	MaxDrift float64 `json:"max_anchor_drift"`
 }
 
 // metricOrder is the fixed iteration order of the anchor metrics (output and
@@ -107,11 +119,13 @@ func symDrift(r float64) float64 {
 	return r - 1
 }
 
-func buildAnchors(names []string, byC, byP map[string]*report.ServerResult) AnchorSection {
+func buildAnchors(names []string, scenarios []string, byC, byP map[string]*report.ServerResult) AnchorSection {
 	sec := AnchorSection{
 		Names: names, RowSource: "candidate", Metric: driftMetric, Definition: driftDefinition,
 		TieMarginFloor: tieMarginFloor, WarnThreshold: driftWarnThreshold,
+		ByScenario: map[string]ScenarioMargin{},
 	}
+	scDrift := map[string]ScenarioMargin{}
 	for _, n := range names {
 		rc, rp := byC[n], byP[n]
 		ar := AnchorReport{Name: n, Metrics: map[string][]MetricPair{}}
@@ -165,6 +179,12 @@ func buildAnchors(names []string, byC, byP map[string]*report.ServerResult) Anch
 			}
 			dr := symDrift(*mp.Ratio)
 			drifts = append(drifts, dr)
+			sm := scDrift[sc]
+			sm.Anchors++
+			if dr >= sm.MaxDrift {
+				sm.MaxDrift, sm.DrivenBy = dr, n
+			}
+			scDrift[sc] = sm
 			ar.Paired++
 			if dr >= ar.MaxDrift {
 				ar.MaxDrift, ar.MaxDriftAt = dr, sc
@@ -188,7 +208,25 @@ func buildAnchors(names []string, byC, byP map[string]*report.ServerResult) Anch
 		}
 		sec.Per = append(sec.Per, ar)
 	}
-	sec.TieMargin = math.Max(tieMarginFloor, sec.MaxAnchorDrift)
+	widest := tieMarginFloor
+	for _, sc := range scenarios {
+		if sm, ok := scDrift[sc]; ok {
+			widest = math.Max(widest, sm.MaxDrift)
+		}
+	}
+	for _, sc := range scenarios {
+		sm, ok := scDrift[sc]
+		if !ok {
+			sec.ByScenario[sc] = ScenarioMargin{Margin: widest, NoAnchor: true}
+			sec.Warnings = append(sec.Warnings, fmt.Sprintf("scenario %s: no anchor measured ok in both dispatches; its tie margin is the architecture's widest (%.4f)", sc, widest))
+			continue
+		}
+		sm.Margin = math.Max(tieMarginFloor, sm.MaxDrift)
+		if sm.MaxDrift <= tieMarginFloor {
+			sm.DrivenBy = ""
+		}
+		sec.ByScenario[sc] = sm
+	}
 	return sec
 }
 

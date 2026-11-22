@@ -186,8 +186,8 @@ func TestRealD1SplitMergeIsIdentity(t *testing.T) {
 			t.Errorf("%s differs after merge(split(x)): %d vs %d bytes", f, len(want[f]), len(got[f]))
 		}
 	}
-	if res.Comp.MaxAnchorDrift != 0 || res.Comp.TieMargin != 0.05 {
-		t.Fatalf("an anchor identical in both pieces has drift 0: %v %v", res.Comp.MaxAnchorDrift, res.Comp.TieMargin)
+	if res.Comp.MaxAnchorDrift != 0 || res.Comp.TieMarginByScenario["ws-echo"] != 0.05 {
+		t.Fatalf("an anchor identical in both pieces has drift 0: %v %v", res.Comp.MaxAnchorDrift, res.Comp.TieMarginByScenario)
 	}
 	// and the output directory carries the audit inputs of both pieces
 	out := filepath.Join(root, "out")
@@ -258,7 +258,7 @@ func TestRealL755ZDriftPair(t *testing.T) {
 	if an.Paired != 1 || res.Comp.MaxAnchorDrift <= 0 {
 		t.Fatalf("anchor %+v", an)
 	}
-	t.Logf("L755Z anchor %s: d1/d2 = %v, drift %.4f, tie_margin %.4f, warnings %v", anchor, *an.Metrics["saturation_mode_rps"][0].Ratio, res.Comp.MaxAnchorDrift, res.Comp.TieMargin, res.Comp.Warnings)
+	t.Logf("L755Z anchor %s: d1/d2 = %v, drift %.4f, tie margins %v, warnings %v", anchor, *an.Metrics["saturation_mode_rps"][0].Ratio, res.Comp.MaxAnchorDrift, res.Comp.TieMarginByScenario, res.Comp.Warnings)
 }
 
 func TestRealForensicsDiscovery(t *testing.T) {

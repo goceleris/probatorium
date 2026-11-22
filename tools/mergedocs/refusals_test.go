@@ -36,10 +36,41 @@ var refusalCases = map[string]map[string]func(f *fixture){
 				f.P.Benchmarks[i].LanguageVersion = "go1.27.4"
 			}
 		},
-		"two toolchains inside one document": func(f *fixture) { f.C.Benchmarks[0].LanguageVersion = "go1.27.4" },
+		"two toolchains inside one document": func(f *fixture) {
+			for i := range f.C.Benchmarks {
+				if f.C.Benchmarks[i].Name == "celeris-a" {
+					f.C.Benchmarks[i].LanguageVersion = "go1.27.4"
+				}
+			}
+		},
 	},
 	"R6": {"kernel differs": func(f *fixture) { f.PMeta["kernel"] = "7.0.0-40-generic" }},
-	"R7": {"boot id differs": func(f *fixture) { f.PMeta["boot_id"] = "boot-2" }},
+	"R7": {
+		"reboot, boot command line missing": func(f *fixture) {
+			f.PMeta["boot_id"] = "boot-2"
+			delete(f.PMeta, "boot_cmdline")
+		},
+		"reboot, boot command line differs": func(f *fixture) {
+			f.PMeta["boot_id"] = "boot-2"
+			f.PMeta["boot_cmdline"] = "BOOT_IMAGE=/vmlinuz root=UUID=x ro quiet mitigations=off"
+		},
+		"reboot, an anchor above the floor on one scenario": func(f *fixture) {
+			f.PMeta["boot_id"] = "boot-2"
+			for i := range f.P.Benchmarks {
+				if f.P.Benchmarks[i].Name == "h2o" {
+					f.P.Benchmarks[i].SaturationModeRPS["s2"] *= 0.9
+				}
+			}
+		},
+		"reboot, an anchor cell not ok": func(f *fixture) {
+			f.PMeta["boot_id"] = "boot-2"
+			for i := range f.P.Benchmarks {
+				if f.P.Benchmarks[i].Name == "actix" {
+					f.P.Benchmarks[i].CellStatuses = map[string]string{"s1": "dnf"}
+				}
+			}
+		},
+	},
 	"R8": {"profile differs": func(f *fixture) { f.PMeta["profile"] = "headline" }},
 	"R9": {
 		"duration":         func(f *fixture) { f.P.BenchmarkConfig.Duration = 60 * time.Second },
@@ -206,12 +237,12 @@ func TestRefusalsFileCoverage(t *testing.T) {
 // All violated items are reported, not only the first.
 func TestAllRefusalsReported(t *testing.T) {
 	f := newFixture()
-	f.PMeta["boot_id"] = "boot-2"
+	f.PMeta["kernel"] = "7.0.0-40-generic"
 	f.PMeta["profile"] = "headline"
 	f.P.SchemaVersion = "5.23"
 	_, err := f.compose(t)
 	var re *RefusalError
-	if !errors.As(err, &re) || !reflect.DeepEqual(re.IDs(), []string{"R2", "R7", "R8"}) {
+	if !errors.As(err, &re) || !reflect.DeepEqual(re.IDs(), []string{"R2", "R6", "R8"}) {
 		t.Fatalf("%v", err)
 	}
 }
@@ -219,7 +250,7 @@ func TestAllRefusalsReported(t *testing.T) {
 // A refusal writes nothing.
 func TestRefusalWritesNothing(t *testing.T) {
 	f := newFixture()
-	f.PMeta["boot_id"] = "boot-2"
+	f.PMeta["kernel"] = "7.0.0-40-generic"
 	c, p, cr, pr := f.load(t)
 	out := filepath.Join(t.TempDir(), "out")
 	rc := run([]string{"--candidate", cr, "--peers", pr, "--out", out, "--date", "20261122", "--meta-candidate", filepath.Join(filepath.Dir(cr), "meta.txt"), "--meta-peers", filepath.Join(filepath.Dir(pr), "meta.txt")}, os.Stdout, os.Stderr)
@@ -255,38 +286,35 @@ func TestIdenticalDocumentsRefused(t *testing.T) {
 	}
 }
 
-// R3: a harness commit that differs only by the celeris pin is accepted when
-// the checkout proves it; anything else, or no checkout, is refused.
-func TestHarnessPinOnly(t *testing.T) {
-	pinDiff := "--- a/go.mod\n+++ b/go.mod\n@@ -5 +5 @@\n-\tgithub.com/goceleris/celeris v1.5.12-0.2026\n+\tgithub.com/goceleris/celeris v1.5.12-0.2027\n" +
-		"--- a/go.sum\n+++ b/go.sum\n@@ -1 +1 @@\n-github.com/goceleris/celeris v1.5.12-0.2026 h1:x=\n+github.com/goceleris/celeris v1.5.12-0.2027 h1:y=\n"
+// R3: harness commits may differ only inside servers/celeris/ (the celeris pin
+// lives there and only the candidate dispatch carries celeris columns).
+func TestHarnessScope(t *testing.T) {
 	cases := []struct {
 		name  string
 		names []string
-		diff  string
 		ok    bool
 	}{
-		{"pin bump", []string{"go.mod", "go.sum"}, pinDiff, true},
-		{"pin bump in servers/celeris", []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}, pinDiff, true},
-		{"other file", []string{"go.mod", "mage_bench.go"}, pinDiff, false},
-		{"pin bump of a celeris submodule", []string{"servers/celeris/go.mod"}, "-\tgithub.com/goceleris/celeris/middleware/metrics v1.5.12-0.1\n+\tgithub.com/goceleris/celeris/middleware/metrics v1.5.12-0.2\n", true},
-		{"other module line", []string{"go.mod"}, "-\tgithub.com/goceleris/loadgen v1.4.15\n+\tgithub.com/goceleris/loadgen v1.4.16\n", false},
-		{"similarly named module", []string{"go.mod"}, "-\tgithub.com/goceleris/celeris-extra v1\n+\tgithub.com/goceleris/celeris-extra v2\n", false},
-		{"identical trees", nil, "", false},
+		{"pin bump", []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}, true},
+		{"anything inside the module directory", []string{"servers/celeris/go.sum", "servers/celeris/main.go"}, true},
+		{"another module", []string{"servers/celeris_v1511/go.mod"}, false},
+		{"sibling directory with the same prefix", []string{"servers/celeris-extra/go.mod"}, false},
+		{"validation refapp go.mod", []string{"servers/celeris/go.mod", "validation/refapp/kitchen_sink/go.mod"}, false},
+		{"mage code", []string{"mage_bench.go"}, false},
+		{"identical trees", nil, false},
 	}
 	for _, c := range cases {
-		if got := classifyHarnessDiff(c.names, c.diff) == ""; got != c.ok {
-			t.Errorf("%s: pin-only=%v want %v", c.name, got, c.ok)
+		if got := classifyHarnessDiff(c.names) == ""; got != c.ok {
+			t.Errorf("%s: ok=%v want %v", c.name, got, c.ok)
 		}
 	}
 	for _, tc := range []struct {
 		name string
-		hd   func(a, b string) ([]string, string, error)
+		hd   func(a, b string) ([]string, error)
 		want []string
 	}{
-		{"proved", func(a, b string) ([]string, string, error) { return []string{"go.mod", "go.sum"}, pinDiff, nil }, nil},
-		{"not proved", func(a, b string) ([]string, string, error) { return []string{"magefile.go"}, "", nil }, []string{"R3"}},
-		{"git fails", func(a, b string) ([]string, string, error) { return nil, "", errors.New("bad object") }, []string{"R3"}},
+		{"proved", func(a, b string) ([]string, error) { return []string{"servers/celeris/go.mod"}, nil }, nil},
+		{"not proved", func(a, b string) ([]string, error) { return []string{"magefile.go"}, nil }, []string{"R3"}},
+		{"git fails", func(a, b string) ([]string, error) { return nil, errors.New("bad object") }, []string{"R3"}},
 		{"no checkout", nil, []string{"R3"}},
 	} {
 		f := newFixture()
@@ -300,10 +328,10 @@ func TestHarnessPinOnly(t *testing.T) {
 		case tc.want == nil:
 			found := false
 			for _, w := range res.Comp.Warnings {
-				found = found || strings.Contains(w, "celeris pin only")
+				found = found || strings.Contains(w, "only inside servers/celeris/")
 			}
 			if !found {
-				t.Errorf("%s: a pin-only difference must be recorded in the warnings", tc.name)
+				t.Errorf("%s: an accepted difference must be recorded in the warnings", tc.name)
 			}
 		case !errors.As(err, &re) || !reflect.DeepEqual(re.IDs(), tc.want):
 			t.Errorf("%s: want %v, got %v", tc.name, tc.want, err)

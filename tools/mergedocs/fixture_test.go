@@ -83,23 +83,30 @@ func newFixture() *fixture {
 				m[sc] = v * rps
 			}
 			cat, fw := "framework", n
+			lang := "go"
+			switch n {
+			case "lithium", "h2o":
+				lang = "c"
+			case "actix":
+				lang = "rust"
+			}
 			if strings.HasPrefix(n, "celeris-") {
 				cat, fw = "celeris", "celeris"
 			}
 			if strings.HasPrefix(n, twinPrefix) {
 				cat, fw = twinCategory, twinCategory
 			}
-			rs = append(rs, row(n, cat, fw, "go", m))
+			rs = append(rs, row(n, cat, fw, lang, m))
 		}
 		return rs
 	}
-	cNames := []string{"celeris-a", "celeris-b", twinPrefix + "a", twinPrefix + "b", "gnet-h1", "fiber-h1", "stdhttp-h1"}
-	pNames := []string{"gin-h1", "echo-h1", "gnet-h1", "fiber-h1", "stdhttp-h1"}
+	cNames := []string{"celeris-a", "celeris-b", twinPrefix + "a", twinPrefix + "b", "gnet-h1", "fiber-h1", "stdhttp-h1", "lithium", "h2o", "actix"}
+	pNames := []string{"gin-h1", "echo-h1", "gnet-h1", "fiber-h1", "stdhttp-h1", "lithium", "h2o", "actix"}
 	f := &fixture{
 		C:      baseDoc(t0, mk(1, cNames...)),
 		P:      baseDoc(t0.Add(33*time.Hour), mk(1.01, pNames...)),
-		CMeta:  map[string]string{"run_id": "111", "harness_commit": "abc123", "profile": "full", "kernel": "7.0.0-38-generic", "boot_id": "boot-1"},
-		PMeta:  map[string]string{"run_id": "222", "harness_commit": "abc123", "profile": "full", "kernel": "7.0.0-38-generic", "boot_id": "boot-1"},
+		CMeta:  map[string]string{"run_id": "111", "harness_commit": "abc123", "profile": "full", "kernel": "7.0.0-38-generic", "boot_id": "boot-1", "boot_cmdline": "BOOT_IMAGE=/vmlinuz root=UUID=x ro quiet"},
+		PMeta:  map[string]string{"run_id": "222", "harness_commit": "abc123", "profile": "full", "kernel": "7.0.0-38-generic", "boot_id": "boot-1", "boot_cmdline": "BOOT_IMAGE=/vmlinuz root=UUID=x ro quiet"},
 		CBench: "20261122T060000-bench-msa2-server",
 		PBench: "20261123T150000-bench-msa2-server",
 		Opt:    Options{Date: "20261122", Now: func() time.Time { return t0 }},

@@ -26,16 +26,15 @@ tag (x86_64 / arm64), or differs between the two sidecars (study case C4).
 The probatorium commit that ran the dispatch (gh run `headSha`, the `head=`
 line of the read-wrapper params.txt, or `harness_commit` in a meta file)
 differs between the two dispatches (an abbreviation of 7+ hex digits of the
-other counts as equal). The one accepted difference is the celeris pin: with
-`--harness-repo DIR` (a probatorium checkout) the composer runs
-`git diff --name-only A B`; the files must all be `go.mod` or `go.sum` files (the pin lives in
-`servers/celeris/go.mod`, not in the root module) and every changed line of
-`git diff -U0 A B -- <those files>` must name the module
-`github.com/goceleris/celeris` or one of its submodules
-(`github.com/goceleris/celeris/...`), which a pin bump moves together (seen on
-real commits, e.g. 018f2d9). Without `--harness-repo`, or when
-the diff names anything else, or when git fails, different commits are refused.
-The celeris pin of the documents is checked separately in R10.
+other counts as equal). The one accepted difference is a change confined to
+the `servers/celeris/` module directory (the celeris pin lives there, and only
+the candidate dispatch carries celeris columns, so such a change cannot touch
+what the frameworks dispatch measured), proved with `--harness-repo DIR` (a
+probatorium checkout): every file of `git diff --name-only A B` must start with
+`servers/celeris/`. Without `--harness-repo`, when any file outside that
+directory differs (including `servers/celeris_v1511/` and `validation/`), when
+the trees are identical or when git fails, different commits are refused. The
+celeris pin of the documents is checked separately in R10.
 
 ## R4 loadgen version
 `benchmark_config.loadgen_version` differs. (It is the merge host's go.mod
@@ -51,10 +50,17 @@ change between dispatches.
 The SUT host's kernel release differs (cluster-forensics `uname`, or `kernel=`
 of the meta file).
 
-## R7 boot id
+## R7 reboot between the dispatches
 The SUT host's boot id differs, i.e. the host rebooted between the dispatches.
-Decision: REFUSE, not record-and-warn (a reboot resets sysctls, THP state and
-NIC IRQ placement, which the document does not capture).
+A reboot is accepted ONLY when all of these hold: the kernel is the same (R6),
+the boot command line is the same in both (meta key `boot_cmdline`, the
+`/proc/cmdline` of the survey; missing on a side is a refusal), and every
+anchor's drift is within the 5 % floor of the tie margin on every scenario (an
+anchor scenario measured in one dispatch only, or not ok, cannot be verified and
+refuses too). When accepted, COMPOSITION.json (`reboot.between_dispatches`,
+`reboot.note`) and the published `composition.json` say that a reboot lay
+between the two halves. Schedule the two dispatches of one architecture as close
+together as the gates allow: that is the only mitigation this tool has.
 
 ## R8 profile
 The dispatch `profile` input differs. The profile is not stored in any
@@ -99,7 +105,7 @@ silently loses half of the histograms).
 A column name appears twice inside one document's `benchmarks`.
 
 ## R15 drift anchor
-A declared anchor (default gnet-h1, fiber-h1, stdhttp-h1) is missing from either
+A declared anchor (default gnet-h1, fiber-h1, stdhttp-h1, lithium, h2o, actix) is missing from either
 document; or the two rows differ in identity (`framework`, `framework_version`,
 `engine`, `compile_options`, `category`, `language`; the toolchain is R5); or the
 anchor has no saturation scenario measured ok in both documents, so no drift

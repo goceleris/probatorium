@@ -26,6 +26,9 @@ func sha256Hex(b []byte) string {
 //	                                   runner rollup results.json only), so the
 //	                                   integrity audit sees both
 //	COMPOSITION.json                   provenance + anchor drift + tie_margin
+//	publish-extras/composition.json    the published part of COMPOSITION.json (+ twin.json
+//	                                   with --twin=separate): `mergedocs install` puts them
+//	                                   next to summary.json in the docs cell
 //	twin-comparison.json, twin-rows.json  with --twin=separate
 func WriteOutput(res *Result, out string) error {
 	if es, err := os.ReadDir(out); err == nil && len(es) > 0 {
@@ -88,6 +91,9 @@ func WriteOutput(res *Result, out string) error {
 		if err := writeJSON(filepath.Join(out, "twin-rows.json"), res.Twin.Rows); err != nil {
 			return err
 		}
+	}
+	if err := writePublicExtras(res, filepath.Join(out, "publish-extras")); err != nil {
+		return err
 	}
 	return writeJSON(filepath.Join(out, "COMPOSITION.json"), res.Comp)
 }

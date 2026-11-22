@@ -15,12 +15,16 @@ type Composition struct {
 
 	Publish PublishRecord `json:"publish"`
 
-	// MaxAnchorDrift and TieMargin are the fields the README scripts read
-	// (celeris ahead of a framework from the OTHER dispatch only when its
-	// margin exceeds tie_margin). Columns says which dispatch each merged
-	// column came from; the anchors ship from the candidate dispatch.
-	MaxAnchorDrift float64 `json:"max_anchor_drift"`
-	TieMargin      float64 `json:"tie_margin"`
+	// TieMarginByScenario is what the README scripts and the docs read: celeris
+	// counts as ahead of a framework from the OTHER dispatch only when its margin
+	// exceeds the margin of that scenario (same-dispatch comparisons keep the
+	// 5 % band). Columns says which dispatch each merged column came from; the
+	// anchors ship from the candidate dispatch. MaxAnchorDrift is reporting only.
+	MaxAnchorDrift      float64            `json:"max_anchor_drift"`
+	TieMarginByScenario map[string]float64 `json:"tie_margin_by_scenario"`
+	// Reboot says whether the SUT host rebooted between the two dispatches
+	// (boot ids differ); accepted only under R7's conditions.
+	Reboot RebootRecord `json:"reboot"`
 
 	Dispatches map[string]DispatchRecord `json:"dispatches"`
 	GapHours   float64                   `json:"gap_hours_between_dispatches"`
@@ -29,6 +33,12 @@ type Composition struct {
 	ColumnsN   int                       `json:"columns_merged"`
 	Twin       TwinRecord                `json:"twin"`
 	Warnings   []string                  `json:"warnings,omitempty"`
+}
+
+// RebootRecord is the reboot note of a composition.
+type RebootRecord struct {
+	BetweenDispatches bool   `json:"between_dispatches"`
+	Note              string `json:"note,omitempty"`
 }
 
 // PublishRecord is the one cell the composition is published as.
@@ -54,6 +64,7 @@ type DispatchRecord struct {
 	SUTHost       string            `json:"sut_host"`
 	Kernel        string            `json:"kernel"`
 	BootID        string            `json:"boot_id"`
+	BootCmdline   string            `json:"boot_cmdline,omitempty"`
 	Sources       map[string]string `json:"meta_sources"`
 	StartedAt     string            `json:"started_at"`
 	FinishedAt    string            `json:"finished_at"`
@@ -97,7 +108,7 @@ func dispatchRecord(d *Dispatch) DispatchRecord {
 		Role: d.Role, RunID: d.Meta.RunID, Dir: d.Dir, ResultsSHA256: sha256Hex(d.DocRaw),
 		HarnessCommit: d.Meta.HarnessCommit, Profile: d.Meta.Profile,
 		LoadgenVer: bc.LoadgenVer, GoToolchain: toolchain, CelerisPin: bc.CelerisVer, GitRef: bc.GitRef,
-		SUTHost: d.Meta.SUTHost, Kernel: d.Meta.Kernel, BootID: d.Meta.BootID, Sources: d.Meta.Sources,
+		SUTHost: d.Meta.SUTHost, Kernel: d.Meta.Kernel, BootID: d.Meta.BootID, BootCmdline: d.Meta.BootCmdline, Sources: d.Meta.Sources,
 		StartedAt: bc.StartedAt.UTC().Format("2006-01-02T15:04:05Z"), FinishedAt: bc.FinishedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		Duration: bc.Duration.String(), Warmup: bc.Warmup.String(), Runs: bc.Runs,
 		Competitors: comp, Columns: cols,

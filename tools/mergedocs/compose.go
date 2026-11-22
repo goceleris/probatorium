@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"path"
 	"reflect"
 	"regexp"
 	"sort"
@@ -23,17 +22,16 @@ const twinPrefix = "baseline-celeris-v1511-"
 const twinCategory = "celeris-baseline"
 
 // DefaultAnchors are the saturation-only columns measured in both dispatches.
-var DefaultAnchors = []string{"gnet-h1", "fiber-h1", "stdhttp-h1"}
+var DefaultAnchors = []string{"gnet-h1", "fiber-h1", "stdhttp-h1", "lithium", "h2o", "actix"}
 
 // Options are the composer's knobs. There is no option that relaxes a refusal.
 type Options struct {
 	Anchors []string
 	Twin    string // "separate" (default), "strip" or "keep"
 	Date    string // yyyymmdd, REQUIRED: the same date for both architectures
-	// HarnessDiff proves two differing harness commits differ only by the celeris
-	// pin: it returns the changed file names and the -U0 diff of go.mod/go.sum.
+	// HarnessDiff returns the files that differ between two harness commits.
 	// nil means no checkout was given, so differing commits are a refusal.
-	HarnessDiff   func(a, b string) (names []string, diff string, err error)
+	HarnessDiff   func(a, b string) (names []string, err error)
 	ExpectColumns []string
 	Now           func() time.Time
 }
@@ -212,7 +210,25 @@ func Compose(c, p *Dispatch, opt Options) (*Result, error) {
 		}
 	}
 
-	anchors := buildAnchors(opt.Anchors, byNameC, byNameP)
+	scenarios := map[string]bool{}
+	for _, r := range rows {
+		for sc := range r.SaturationModeRPS {
+			scenarios[sc] = true
+		}
+	}
+	var scList []string
+	for sc := range scenarios {
+		scList = append(scList, sc)
+	}
+	sort.Strings(scList)
+	anchors := buildAnchors(opt.Anchors, scList, byNameC, byNameP)
+	reboot := c.Meta.BootID != p.Meta.BootID
+	if reboot {
+		if bad := rebootDrift(anchors); len(bad) > 0 {
+			rf.add("R7", "the SUT host rebooted between the dispatches and the anchors show more than the %.0f%% floor on: %s", tieMarginFloor*100, strings.Join(bad, ", "))
+			return nil, rf.err()
+		}
+	}
 	date := opt.Date
 	comp := &Composition{
 		ComposerVersion: composerVersion,
@@ -234,14 +250,21 @@ func Compose(c, p *Dispatch, opt Options) (*Result, error) {
 		ColumnsN: len(rows),
 	}
 	comp.MaxAnchorDrift = anchors.MaxAnchorDrift
-	comp.TieMargin = anchors.TieMargin
+	comp.TieMarginByScenario = map[string]float64{}
+	for sc, m := range anchors.ByScenario {
+		comp.TieMarginByScenario[sc] = m.Margin
+	}
+	if reboot {
+		comp.Reboot = RebootRecord{BetweenDispatches: true, Note: "The SUT host rebooted between the two dispatches of this architecture (same kernel, same boot command line; every anchor within the 5% floor on every scenario). Schedule the two dispatches of one architecture as close together as the gates allow."}
+		comp.Warnings = append(comp.Warnings, "a reboot lay between the two dispatches (accepted: same kernel and command line, anchors within the floor)")
+	}
 	comp.Warnings = append(comp.Warnings, anchors.Warnings...)
 	if c.Doc.BenchmarkConfig.GitRef != p.Doc.BenchmarkConfig.GitRef || c.Doc.BenchmarkConfig.CelerisVer != p.Doc.BenchmarkConfig.CelerisVer {
 		comp.Warnings = append(comp.Warnings, fmt.Sprintf("celeris pin differs between the dispatches (candidate %s, peers %s); the peers document carries no celeris column",
 			c.Doc.BenchmarkConfig.CelerisVer, p.Doc.BenchmarkConfig.CelerisVer))
 	}
 	if !sameCommit(c.Meta.HarnessCommit, p.Meta.HarnessCommit) {
-		comp.Warnings = append(comp.Warnings, fmt.Sprintf("harness commits differ (%s, %s) by the celeris pin only (proved with --harness-repo)", c.Meta.HarnessCommit, p.Meta.HarnessCommit))
+		comp.Warnings = append(comp.Warnings, fmt.Sprintf("harness commits differ (%s, %s) only inside servers/celeris/ (proved with --harness-repo)", c.Meta.HarnessCommit, p.Meta.HarnessCommit))
 	}
 	if gap := p.Doc.BenchmarkConfig.StartedAt.Sub(c.Doc.BenchmarkConfig.FinishedAt); gap > 0 {
 		comp.GapHours = gap.Hours()
@@ -375,7 +398,17 @@ func checkPair(rf *refusals, c, p *Dispatch, opt Options) {
 	}
 	cmp("R4", "loadgen_version", cd.BenchmarkConfig.LoadgenVer, pd.BenchmarkConfig.LoadgenVer, same)
 	cmp("R6", "kernel", cm.Kernel, pm.Kernel, kernelEq)
-	cmp("R7", "boot id", cm.BootID, pm.BootID, same)
+	// R7: a reboot between the dispatches is accepted only with the same kernel
+	// (R6), the same boot command line, and anchor drift within the floor on every
+	// scenario (checked in Compose, once the anchors are measured).
+	if okA, okB := rf.need("candidate", "boot id", cm.BootID), rf.need("peers", "boot id", pm.BootID); okA && okB && cm.BootID != pm.BootID {
+		switch {
+		case cm.BootCmdline == "" || pm.BootCmdline == "":
+			rf.add("R7", "the SUT host rebooted between the dispatches (boot id %q != %q) and the boot command line is missing on a side (meta key boot_cmdline), so a changed command line cannot be ruled out", cm.BootID, pm.BootID)
+		case cm.BootCmdline != pm.BootCmdline:
+			rf.add("R7", "the SUT host rebooted between the dispatches and the boot command line differs: %q != %q", cm.BootCmdline, pm.BootCmdline)
+		}
+	}
 	cmp("R8", "profile", cm.Profile, pm.Profile, same)
 	rf.need("candidate", "run id", cm.RunID)
 	rf.need("peers", "run id", pm.RunID)
@@ -553,44 +586,60 @@ func sameCommit(a, b string) bool {
 	return len(a) >= 7 && strings.HasPrefix(b, a)
 }
 
-// harnessVerdict says whether two different harness commits differ only by the
-// celeris pin (R3). reason is non-empty when that cannot be established.
-func harnessVerdict(opt Options, a, b string) (pinOnly bool, reason string) {
+// harnessScope is the one directory in which two harness commits may differ
+// (R3): the celeris adapter module, which holds the celeris pin. Only the
+// candidate dispatch carries celeris columns, so a change there cannot touch what
+// the frameworks dispatch measured.
+const harnessScope = "servers/celeris/"
+
+// harnessVerdict says whether two different harness commits differ only inside
+// harnessScope. reason is non-empty when that cannot be established.
+func harnessVerdict(opt Options, a, b string) (ok bool, reason string) {
 	if opt.HarnessDiff == nil {
-		return false, "no --harness-repo was given to prove that they differ only by the celeris pin"
+		return false, "no --harness-repo was given to prove that they differ only inside " + harnessScope
 	}
-	names, diff, err := opt.HarnessDiff(a, b)
+	names, err := opt.HarnessDiff(a, b)
 	if err != nil {
 		return false, "the diff could not be read: " + err.Error()
 	}
-	if why := classifyHarnessDiff(names, diff); why != "" {
-		return false, "the difference is not only the celeris pin: " + why
+	if why := classifyHarnessDiff(names); why != "" {
+		return false, why
 	}
 	return true, ""
 }
 
-// classifyHarnessDiff returns "" when the commits differ only by the celeris
-// pin: the changed files are go.mod or go.sum files (the pin lives in
-// servers/celeris/go.mod, not in the root module) and every changed line of
-// them names the module github.com/goceleris/celeris. Otherwise the reason.
-func classifyHarnessDiff(names []string, diff string) string {
+// classifyHarnessDiff returns "" when every differing file is inside harnessScope.
+func classifyHarnessDiff(names []string) string {
 	if len(names) == 0 {
 		return "no file differs (the commits have identical trees)"
 	}
 	for _, n := range names {
-		if b := path.Base(n); b != "go.mod" && b != "go.sum" {
-			return "file " + n + " differs"
-		}
-	}
-	for _, l := range strings.Split(diff, "\n") {
-		if l == "" || strings.HasPrefix(l, "+++") || strings.HasPrefix(l, "---") || (l[0] != '+' && l[0] != '-') {
-			continue
-		}
-		if !strings.Contains(l, "github.com/goceleris/celeris ") && !strings.Contains(l, "github.com/goceleris/celeris/") {
-			return "changed line outside the celeris pin: " + strings.TrimSpace(l)
+		if !strings.HasPrefix(n, harnessScope) {
+			return "file " + n + " differs, outside " + harnessScope
 		}
 	}
 	return ""
+}
+
+// rebootDrift lists the anchor/scenario cells that are not verifiably within the
+// floor: drift above it, or a scenario measured in one dispatch only or not ok.
+func rebootDrift(a AnchorSection) []string {
+	var bad []string
+	for _, p := range a.Per {
+		for _, mp := range p.Metrics[driftMetric] {
+			if mp.Ratio == nil || symDrift(*mp.Ratio) > tieMarginFloor {
+				bad = append(bad, p.Name+"/"+mp.Key)
+			}
+		}
+		for _, k := range p.Unpaired {
+			bad = append(bad, p.Name+"/"+k+" (one dispatch only)")
+		}
+		for _, k := range p.NotOK {
+			bad = append(bad, p.Name+"/"+k+" (not ok)")
+		}
+	}
+	sort.Strings(bad)
+	return bad
 }
 
 func missingSide(c, p bool) string {

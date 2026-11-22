@@ -13,15 +13,15 @@ func TestGitHarnessDiffManual(t *testing.T) {
 	if repo == "" || a == "" || b == "" {
 		t.Skip("MERGEDOCS_HARNESS_REPO, MERGEDOCS_PIN_A, MERGEDOCS_PIN_B not set")
 	}
-	names, diff, err := gitHarnessDiff(repo)(a, b)
+	names, err := gitHarnessDiff(repo)(a, b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if why := classifyHarnessDiff(names, diff); why != "" {
+	if why := classifyHarnessDiff(names); why != "" {
 		t.Fatalf("%s..%s: %s", a, b, why)
 	}
-	t.Logf("%s..%s differ only by the celeris pin (%d files)", a, b, len(names))
-	if _, _, err := gitHarnessDiff(repo)(a, "no-such-ref"); err == nil {
+	t.Logf("%s..%s differ only inside servers/celeris/ (%d files)", a, b, len(names))
+	if _, err := gitHarnessDiff(repo)(a, "no-such-ref"); err == nil {
 		t.Fatal("a bad ref must be an error")
 	}
 }
