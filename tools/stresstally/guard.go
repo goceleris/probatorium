@@ -52,6 +52,7 @@ var clusterGroupWorkflows = []string{
 	".github/workflows/benchmark-tier.yml",
 	".github/workflows/cluster-os-upgrade.yml",
 	".github/workflows/cluster-reboot.yml",
+	".github/workflows/httparena-preview.yml",
 	".github/workflows/matrix-checkptr-tier.yml",
 	".github/workflows/matrix-nightly-tier.yml",
 	".github/workflows/matrix-pr-tier.yml",

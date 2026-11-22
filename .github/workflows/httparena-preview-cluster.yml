@@ -1,0 +1,211 @@
+name: HttpArena preview (cluster)
+
+# DRAFT. The cluster half of httparena-preview.yml, called by its `cluster` job, which holds the matrix-tier-cluster
+# concurrency group for this whole workflow (this file declares none: a second hold would wait on the caller forever).
+#   bootstrap  hosted: cluster-runner-up (the tiers' composite), then fail unless the msa2-server runner is online.
+#   host       self-hosted on msa2-server ONLY (label msa2-server): records the before-state, clones MDA2AV/HttpArena at a
+#              pinned commit (inbound), applies the celeris entry patch, adapts the cpusets to this host's CPUs, stages
+#              the images, runs the requested phases with SKIP_TUNE=true, scores, records the after-state and FAILS if
+#              anything was left behind. No secret reaches this job (the four below are read only by bootstrap/teardown).
+#   teardown   hosted, always: the tiers' cluster-runner-down (forensics, rescue, cleanup, de-registration).
+
+on:
+  workflow_call:
+    inputs:
+      phases:
+        type: string
+        required: true
+      portrange_ok:
+        type: boolean
+        required: true
+      guard_checked_at:
+        type: string
+        required: true
+    secrets:
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_OAUTH_SECRET:
+        required: true
+      RUNNER_PAT:
+        required: true
+      CLUSTER_SSH_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+
+env:
+  HTTPARENA_REPO: https://github.com/MDA2AV/HttpArena.git
+  HTTPARENA_SHA: fc4f3dbfd7be987862eb7fac57e263432c0d68c0   # HttpArena main on 2026-11-22; the entry patch applies cleanly to it
+
+jobs:
+  bootstrap:
+    name: bootstrap cluster runners
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      attempt: ${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/cluster-runner-up
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          wait-for-manifest-clear:   "true"
+          wait-timeout-seconds:      "1800"
+      - name: Confirm the msa2-server runner is online
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+          REPO: ${{ github.repository }}
+          MATRIX: '{"include":[{"host":"msa2-server","arch":"amd64"}]}'
+        run: bash tools/stresstally/runners-online.sh
+
+  host:
+    name: host msa2-server
+    needs: bootstrap
+    if: ${{ needs.bootstrap.outputs.attempt == github.run_attempt }}
+    runs-on: [self-hosted, celeris-cluster, msa2-server]
+    timeout-minutes: 420
+    permissions:
+      contents: read
+    steps:
+      # the runner context is not available in jobs.<id>.env, so the work directory is set from a step
+      - name: Set the work directory
+        shell: bash
+        run: echo "WORK=$RUNNER_TEMP/httparena-preview" >> "$GITHUB_ENV"
+      - name: Check out the preview tools (and the entry patch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/httparena-preview
+          path: probatorium
+      - name: Record the before-state (start time, docker, ps, sysctl, mounts, ports, /tmp)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          bash probatorium/tools/httparena-preview/capture-state.sh before "$WORK/state"
+      - name: Clone HttpArena (inbound, pinned), apply the entry, adapt cpusets for this host
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          git clone --quiet "$HTTPARENA_REPO" HttpArena
+          cd HttpArena
+          git checkout --quiet "$HTTPARENA_SHA"
+          git apply "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/celeris-entry.patch"
+          mkdir -p preview
+          cp "$GITHUB_WORKSPACE"/probatorium/tools/httparena-preview/{host_adapt.py,stage-images.sh,run-preview.sh,score_preview.py} preview/
+          python3 -I -B preview/host_adapt.py .
+      - name: Stage images and loadgens (no measuring yet)
+        shell: bash
+        working-directory: ${{ env.WORK }}/HttpArena
+        run: bash preview/stage-images.sh
+      - name: Run the requested phases, in order
+        shell: bash
+        working-directory: ${{ env.WORK }}/HttpArena
+        env:
+          PHASES: ${{ inputs.phases }}
+          PORTRANGE_OK: ${{ inputs.portrange_ok && '1' || '0' }}
+        run: |
+          set -uo pipefail
+          IFS=, read -ra ph <<< "$PHASES"
+          # Everything the phases print is already limited to START/STOP + rc lines; per-profile output is in files.
+          # Nothing below echoes a result, a rate or a score into this log.
+          for p in smoke clear async supp tls; do
+            for x in "${ph[@]}"; do [ "$x" = "$p" ] && bash preview/run-preview.sh "$p" > "logs-phase-$p.out" 2>&1; done
+          done
+          case ",$PHASES," in *,clear,*|*,tls,*) bash preview/run-preview.sh score > logs-score.out 2>&1 ;; esac
+          mv logs-*.out logs/ 2>/dev/null
+          echo "phases done: $PHASES (results are in the artifact only)"
+          true
+      # Runs even when the async block, a phase or the job failed (if: always()). The async phase also restores in a trap; this
+      # step is the second line and compares against the BEFORE capture, so it restores whatever differs, not only the value
+      # this run wrote. A cancelled job still runs it; a dead host loses the setting at reboot (sysctl -w is not persistent).
+      - name: Restore net.ipv4.ip_local_port_range to the recorded value
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          orig=$(sed -n 1p "$WORK/state/before/port-range.txt" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/ $//')
+          cur=$(tr -s '[:space:]' ' ' < /proc/sys/net/ipv4/ip_local_port_range | sed 's/ $//')
+          if [ -z "$orig" ]; then echo "no recorded before-value: nothing to restore"; exit 0; fi
+          if [ "$cur" != "$orig" ]; then sudo -n sysctl -w net.ipv4.ip_local_port_range="$orig" > /dev/null 2>&1; fi
+          cur=$(tr -s '[:space:]' ' ' < /proc/sys/net/ipv4/ip_local_port_range | sed 's/ $//')
+          if [ "$cur" = "$orig" ]; then echo "ip_local_port_range: equal to the before-capture"; else echo "::error::ip_local_port_range NOT restored (differs from the before-capture)"; exit 1; fi
+      - name: Remove what the run pulled and built, then show nothing is left behind
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          cd "$WORK"
+          docker ps -aq --filter 'name=httparena-' | xargs -r docker rm -f -v
+          # every image whose ID was not there before (by ID: untagged leftovers of rebuilds included)
+          docker images -q | sort -u > "$WORK/state/ids-now.txt"
+          awk '{print $2}' "$WORK/state/before/docker-images.txt" | sort -u > "$WORK/state/ids-before.txt"
+          comm -13 "$WORK/state/ids-before.txt" "$WORK/state/ids-now.txt" | xargs -r docker rmi
+          # build cache is NOT pruned (a prune is host-wide and could take other users' cache); it is listed in the after-state's docker system df
+          docker network rm httparena-net 2>/dev/null
+          bash "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/capture-state.sh" after "$WORK/state"
+          echo "$?" > "$WORK/state/after-rc.txt"
+      # RESULTS are never uploaded in the clear. The archive is CMS-encrypted to the PUBLIC certificate committed beside this
+      # workflow (tools/httparena-preview/results-cert.pem); the private key lives only on the maintainer's Mac, so the runner
+      # holds nothing that can decrypt. Decrypt: openssl cms -decrypt -binary -inform DER -inkey RESULTS-PRIVATE-KEY.pem -in preview-data.cms -out preview-data.tar
+      - name: Encrypt the results archive to the public key (CMS, AES-256)
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          tar -cf preview-data.tar HttpArena/results HttpArena/logs HttpArena/preview-images.txt HttpArena/preview.env state 2>/dev/null || true
+          openssl cms -encrypt -binary -stream -aes256 -outform DER -in preview-data.tar -out preview-data.cms \
+            -recip "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/results-cert.pem"
+          rm -f preview-data.tar
+          echo "encrypted archive: $(stat -c %s preview-data.cms) bytes, sha256 $(sha256sum preview-data.cms | cut -d' ' -f1)"
+      - name: Upload the encrypted archive (the ONLY artifact of this workflow; retention 1 day; deleted by the main session after download and checksum)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: preview-data
+          path: ${{ env.WORK }}/preview-data.cms
+          if-no-files-found: error
+          retention-days: 1
+      - name: Fail when something was left behind
+        if: ${{ always() }}
+        shell: bash
+        run: test "$(cat "$WORK/state/after-rc.txt" 2>/dev/null || echo 1)" = 0
+      - name: Wipe the work directory
+        if: ${{ always() }}
+        shell: bash
+        run: rm -rf "$WORK"
+
+  teardown:
+    name: teardown cluster runners
+    needs: [bootstrap, host]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/cluster-runner-down
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          forensics-reason:          httparena-preview host=${{ needs.host.result }}

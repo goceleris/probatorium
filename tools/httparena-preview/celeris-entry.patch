@@ -1,0 +1,499 @@
+diff --git a/frameworks/celeris/Dockerfile b/frameworks/celeris/Dockerfile
+new file mode 100644
+index 0000000..9e3f090
+--- /dev/null
++++ b/frameworks/celeris/Dockerfile
+@@ -0,0 +1,11 @@
++FROM golang:1.27.4-alpine AS build
++WORKDIR /app
++COPY go.mod go.sum ./
++RUN go mod download
++COPY main.go fortunes.html ./
++RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o server .
++
++FROM alpine:3.23
++COPY --from=build /app/server /server
++EXPOSE 8080 8081 8082 8443
++CMD ["/server"]
+diff --git a/frameworks/celeris/README.md b/frameworks/celeris/README.md
+new file mode 100644
+index 0000000..5c94448
+--- /dev/null
++++ b/frameworks/celeris/README.md
+@@ -0,0 +1,46 @@
++# celeris
++
++[celeris](https://github.com/goceleris/celeris) is an HTTP engine and router for Go with an adaptive io_uring/epoll event loop on Linux. This entry is a framework entry (`type: emerging`, `mode: standard`): routes, middleware, query binding and JSON go through celeris's documented APIs.
++
++## Two engines serve this entry
++
++celeris is cleartext by design: its io_uring and epoll engines speak HTTP/1.1 and h2c only and have no TLS (celeris README, "TLS"). The entry therefore runs two kinds of listener, and the rows measure different engines:
++
++| Port | Protocol | celeris engine | Profiles |
++|------|----------|----------------|----------|
++| 8080 | HTTP/1.1 and WebSocket | **Adaptive** (io_uring/epoll), the default | baseline, pipelined, limited-conn, async, latency-1m, latency-10k, json-comp, async-db, fortunes, echo-ws, echo-ws-pipeline, echo-ws-limited |
++| 8082 | h2c prior knowledge (HTTP/1.1 kept on the port) | **Adaptive** (io_uring/epoll), the default | baseline-h2c, json-h2c |
++| 8081 | HTTP/1.1 over TLS (ALPN `http/1.1`) | **std engine** behind a `crypto/tls` listener | json-tls, 8gbit |
++| 8443 | h2 over TLS (ALPN `h2`, `http/1.1`) | **std engine** behind a `crypto/tls` listener | baseline-h2, static-h2 |
++
++The TLS rows are std-engine (`net/http` underneath) performance, which is what celeris documents for in-process HTTPS (`Engine: celeris.Std` with `StartWithListener(tls.NewListener(ln, cfg))`). They are not the headline engine's numbers. The 8081/8443 listeners open only when the harness mounts `/certs` (it does so for the TLS and h2 profiles), and they serve the certificate pair mounted at `/certs/server.crt` and `/certs/server.key` (TLS 1.2 minimum, so TLS 1.3 is negotiated with modern clients).
++
++## Not subscribed, and why
++
++- `connections-1m`, `connections-1m-tls`: not subscribed. Memory arithmetic for the 59.5 GiB preview host (GUESS marks my estimates): the generator alone holds about 41 GB for `connections-1m` (zrk, ~41 KiB per connection, profiles.sh:97-98) or about 19 GiB for the TLS one (common.sh), and on the TLS side the std engine keeps a goroutine, a `tls.Conn` and `net/http` buffers per connection (GUESS 30-50 KiB, i.e. 30-50 GB at a million), so the TLS case is about 49-69 GiB against 59.5 GiB: it does not fit with margin; the cleartext case is 41 GB plus the engine's per-connection state. celeris at a million connections has not been tried.
++- `static-tls`: reference-only for frameworks; skipped to keep the board entry small (the same handler serves it, so it can be added).
++- `baseline-h3`, `static-h3`, `unary-grpc`, `unary-grpc-tls`, `gateway-*`, `production-stack`: celeris has no HTTP/3, no gRPC and no compose stack.
++
++## Handlers
++
++| Endpoint | Implementation |
++|----------|----------------|
++| `GET /pipeline` | `c.String` |
++| `GET/POST /baseline11`, `GET /baseline2` | `c.QueryInt` for `a` and `b`, `c.Body()` for the POST body (Content-Length and chunked), `c.String` |
++| `GET /delay/:ms` | `Route.Async()` (the wait parks a goroutine, not a loop thread) |
++| `GET /json/:count` | `c.JSON`, compression by the `middleware/compress` default configuration (the middleware negotiates `Accept-Encoding`: it answers gzip to `gzip, br`) |
++| `POST /echo` | `c.Body()` back with `c.Blob` |
++| `GET /static/*` (TLS servers only) | `middleware/static` with `Compress: true` (serves the pre-compressed `.br`/`.gz` siblings) |
++| `GET /async-db` | `Route.Async()`, celeris's first-party `driver/postgres` pool (`postgres.Open`, `WithEngine`, `WithMaxOpen(DATABASE_MAX_CONN - 8)`) |
++| `GET /fortunes` | `Route.Async()`, same pool, `html/template` (embedded `fortunes.html`, auto-escaping), bytewise sort |
++| `GET /ws` | `middleware/websocket`, `ReadMessageReuse`/`WriteMessage` echo (the README's documented echo loop); a plain GET answers 426 |
++
++Notes:
++
++- Default configuration. `Config.GCPercent` and `Config.SocketBusyPoll` stay off (both are opt-in in celeris and neither is used here).
++- One async-db detail: scanning a `jsonb` column straight into a `*[]byte` or `*string` returns the binary wire form with its leading version byte (`0x01`) on the celeris version pinned here, so `tags` is scanned through a `database/sql`-style `Scanner` type, which decodes correctly. This is a celeris driver defect, not a harness issue.
++- The second `Adaptive` server on 8082 shares the cpuset with the one on 8080; both are idle when only one port is loaded.
++
++## Build
++
++`golang:1.27.4-alpine` build stage, `alpine:3.23` runtime; module versions are pinned in `go.mod`/`go.sum` (celeris `v1.5.12-0.20261120120335-fe2b5be71ebc` = main `fe2b5be71ebc`, `middleware/compress v1.5.11`).
+diff --git a/frameworks/celeris/fortunes.html b/frameworks/celeris/fortunes.html
+new file mode 100644
+index 0000000..7e47740
+--- /dev/null
++++ b/frameworks/celeris/fortunes.html
+@@ -0,0 +1,10 @@
++<!DOCTYPE html>
++<html>
++<head><title>Fortunes</title></head>
++<body>
++<table>
++<tr><th>id</th><th>message</th></tr>
++{{range .}}<tr><td>{{.ID}}</td><td>{{.Message}}</td></tr>
++{{end}}</table>
++</body>
++</html>
+diff --git a/frameworks/celeris/go.mod b/frameworks/celeris/go.mod
+new file mode 100644
+index 0000000..bb5e542
+--- /dev/null
++++ b/frameworks/celeris/go.mod
+@@ -0,0 +1,16 @@
++module httparena/celeris
++
++go 1.27.3
++
++require (
++	github.com/goceleris/celeris v1.5.12-0.20261120120335-fe2b5be71ebc
++	github.com/goceleris/celeris/middleware/compress v1.5.11
++)
++
++require (
++	github.com/andybalholm/brotli v1.2.3 // indirect
++	github.com/klauspost/compress v1.19.2 // indirect
++	golang.org/x/net v0.62.0 // indirect
++	golang.org/x/sys v0.49.0 // indirect
++	golang.org/x/text v0.43.0 // indirect
++)
+diff --git a/frameworks/celeris/go.sum b/frameworks/celeris/go.sum
+new file mode 100644
+index 0000000..37df6fb
+--- /dev/null
++++ b/frameworks/celeris/go.sum
+@@ -0,0 +1,16 @@
++github.com/andybalholm/brotli v1.2.3 h1:8H1qwOkl2LPfjf3YezB90JnCliZb6SInJ/OJkEbA5NQ=
++github.com/andybalholm/brotli v1.2.3/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
++github.com/goceleris/celeris v1.5.12-0.20261120120335-fe2b5be71ebc h1:SBTklw8wVo8SjdqmBjljDx5ItHkHmQBbV6LZOQCP58Q=
++github.com/goceleris/celeris v1.5.12-0.20261120120335-fe2b5be71ebc/go.mod h1:kFxLJNHBe9Y17VYQxnSmtI0Y2msdL6rjPGifqTGd43s=
++github.com/goceleris/celeris/middleware/compress v1.5.11 h1:K14DFN+706bTvBzCMF00wx+OVwtP/SOW9d0Q1Qcr7ik=
++github.com/goceleris/celeris/middleware/compress v1.5.11/go.mod h1:A0f9JqfZhT05V17k7syGYyLmlTSRG7c8cAQmgkE4irw=
++github.com/klauspost/compress v1.19.2 h1:hMRETovs/pu/dVWN7zIT1PGG8t509MwT6bO7XSi26R8=
++github.com/klauspost/compress v1.19.2/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
++github.com/xyproto/randomstring v1.0.5 h1:YtlWPoRdgMu3NZtP45drfy1GKoojuR7hmRcnhZqKjWU=
++github.com/xyproto/randomstring v1.0.5/go.mod h1:rgmS5DeNXLivK7YprL0pY+lTuhNQW3iGxZ18UQApw/E=
++golang.org/x/net v0.62.0 h1:18ELalfM5+XNRwzM2nYqXsZQ9ByS1uhj2O/U7+5jqRY=
++golang.org/x/net v0.62.0/go.mod h1:WgDCOTH8iwtB66T4/GfI94AHo/hhdb7Hah9NDseQfiI=
++golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=
++golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
++golang.org/x/text v0.43.0 h1:1QivrlhwAsnMOcqgOdl9my7s9OyZl8O5/UGUTJVXoWc=
++golang.org/x/text v0.43.0/go.mod h1:hbSIYA/amXcRXTFSZqh8tWHEoqRvvbKPJ2uz/KU+a+s=
+diff --git a/frameworks/celeris/main.go b/frameworks/celeris/main.go
+new file mode 100644
+index 0000000..d5a7233
+--- /dev/null
++++ b/frameworks/celeris/main.go
+@@ -0,0 +1,320 @@
++// HttpArena entry for celeris (https://github.com/goceleris/celeris).
++//
++// Two engines serve this entry, and the README says so:
++//   - 8080 (h1 + WebSocket) and 8082 (h2c prior knowledge) run on celeris's
++//     default Adaptive engine (io_uring/epoll on Linux).
++//   - 8081 (HTTP/1.1 over TLS) and 8443 (h2 over TLS) run on celeris's std
++//     engine behind a crypto/tls listener, because the native engines have no
++//     TLS (celeris README, "TLS"). Those rows measure the std engine.
++package main
++
++import (
++	"bytes"
++	"crypto/tls"
++	_ "embed"
++	"encoding/json"
++	"html/template"
++	"log"
++	"net"
++	"os"
++	"slices"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/goceleris/celeris"
++	"github.com/goceleris/celeris/driver/postgres"
++	"github.com/goceleris/celeris/middleware/compress"
++	"github.com/goceleris/celeris/middleware/static"
++	"github.com/goceleris/celeris/middleware/websocket"
++)
++
++type Rating struct {
++	Score int `json:"score"`
++	Count int `json:"count"`
++}
++
++type DatasetItem struct {
++	ID       int      `json:"id"`
++	Name     string   `json:"name"`
++	Category string   `json:"category"`
++	Price    int      `json:"price"`
++	Quantity int      `json:"quantity"`
++	Active   bool     `json:"active"`
++	Tags     []string `json:"tags"`
++	Rating   Rating   `json:"rating"`
++}
++
++type ProcessedItem struct {
++	DatasetItem
++	Total int `json:"total"`
++}
++
++type ProcessResponse struct {
++	Items []ProcessedItem `json:"items"`
++	Count int             `json:"count"`
++}
++
++// jsonbText receives a JSONB column through database/sql's Scanner contract
++// and writes it back out as raw JSON. Scanning a jsonb cell straight into a
++// *[]byte or *string hands back the binary wire form with its leading version
++// byte (0x01) on celeris v1.5.12-0.20261120120335-fe2b5be71ebc, while the
++// Scanner path decodes it correctly.
++type jsonbText []byte
++
++func (j *jsonbText) Scan(v any) error {
++	switch b := v.(type) {
++	case []byte:
++		*j = append((*j)[:0], b...)
++	case string:
++		*j = append((*j)[:0], b...)
++	default:
++		*j = (*j)[:0]
++	}
++	return nil
++}
++
++func (j jsonbText) MarshalJSON() ([]byte, error) {
++	if len(j) == 0 {
++		return []byte("[]"), nil
++	}
++	return j, nil
++}
++
++// DBItem is one async-db row. tags is a JSONB column, passed through as raw JSON.
++type DBItem struct {
++	ID       int       `json:"id"`
++	Name     string    `json:"name"`
++	Category string    `json:"category"`
++	Price    int       `json:"price"`
++	Quantity int       `json:"quantity"`
++	Active   bool      `json:"active"`
++	Tags     jsonbText `json:"tags"`
++	Rating   Rating    `json:"rating"`
++}
++
++type DBResponse struct {
++	Items []DBItem `json:"items"`
++	Count int      `json:"count"`
++}
++
++type Fortune struct {
++	ID      int
++	Message string
++}
++
++var (
++	dataset []DatasetItem
++	pool    *postgres.Pool
++
++	//go:embed fortunes.html
++	fortunesSrc string
++	fortunesTpl = template.Must(template.New("fortunes").Parse(fortunesSrc))
++)
++
++// A missing or unreadable dataset leaves the list empty, the server still starts.
++func loadDataset() {
++	path := os.Getenv("DATASET_PATH")
++	if path == "" {
++		path = "/data/dataset.json"
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return
++	}
++	_ = json.Unmarshal(data, &dataset)
++}
++
++func baseline(c *celeris.Context) error {
++	sum := c.QueryInt("a", 0) + c.QueryInt("b", 0)
++	if c.Method() == "POST" {
++		if n, err := strconv.Atoi(strings.TrimSpace(string(c.Body()))); err == nil {
++			sum += n
++		}
++	}
++	return c.String(200, "%d", sum)
++}
++
++func pipeline(c *celeris.Context) error { return c.String(200, "ok") }
++
++// Registered with Route.Async(): the wait parks a goroutine, not a loop thread.
++func delay(c *celeris.Context) error {
++	ms, _ := c.ParamInt("ms")
++	if ms > 0 {
++		time.Sleep(time.Duration(ms) * time.Millisecond)
++	}
++	return c.String(200, "%d", ms)
++}
++
++func jsonItems(c *celeris.Context) error {
++	count, _ := c.ParamInt("count")
++	count = min(max(count, 0), len(dataset))
++	m := c.QueryInt("m", 1)
++	if m == 0 {
++		m = 1
++	}
++	items := make([]ProcessedItem, count)
++	for i := range items {
++		d := dataset[i]
++		items[i] = ProcessedItem{DatasetItem: d, Total: d.Price * d.Quantity * m}
++	}
++	return c.JSON(200, ProcessResponse{Items: items, Count: count})
++}
++
++func echo(c *celeris.Context) error {
++	return c.Blob(200, "application/octet-stream", c.Body())
++}
++
++const emptyItems = `{"items":[],"count":0}`
++
++func asyncDB(c *celeris.Context) error {
++	if pool == nil {
++		return c.Blob(200, "application/json", []byte(emptyItems))
++	}
++	lo, hi := c.QueryInt("min", 10), c.QueryInt("max", 50)
++	limit := min(max(c.QueryInt("limit", 50), 1), 50)
++	rows, err := pool.QueryContext(c.Context(),
++		"SELECT id, name, category, price, quantity, active, tags, rating_score, rating_count FROM items WHERE price BETWEEN $1 AND $2 LIMIT $3",
++		lo, hi, limit)
++	if err != nil {
++		return c.Blob(200, "application/json", []byte(emptyItems))
++	}
++	defer rows.Close()
++	items := make([]DBItem, 0, limit)
++	for rows.Next() {
++		var it DBItem
++		if err := rows.Scan(&it.ID, &it.Name, &it.Category, &it.Price, &it.Quantity,
++			&it.Active, &it.Tags, &it.Rating.Score, &it.Rating.Count); err != nil {
++			continue
++		}
++		items = append(items, it)
++	}
++	return c.JSON(200, DBResponse{Items: items, Count: len(items)})
++}
++
++func fortunes(c *celeris.Context) error {
++	if pool == nil {
++		return c.String(500, "database unavailable")
++	}
++	rows, err := pool.QueryContext(c.Context(), "SELECT id, message FROM fortune")
++	if err != nil {
++		return c.String(500, "query failed")
++	}
++	defer rows.Close()
++	list := make([]Fortune, 0, 201)
++	for rows.Next() {
++		var f Fortune
++		if err := rows.Scan(&f.ID, &f.Message); err != nil {
++			continue
++		}
++		list = append(list, f)
++	}
++	list = append(list, Fortune{ID: 0, Message: "Additional fortune added at request time."})
++	slices.SortFunc(list, func(a, b Fortune) int { return strings.Compare(a.Message, b.Message) })
++	var buf bytes.Buffer
++	buf.Grow(32 << 10)
++	if err := fortunesTpl.Execute(&buf, list); err != nil {
++		return c.String(500, "render failed")
++	}
++	return c.Blob(200, "text/html; charset=utf-8", buf.Bytes())
++}
++
++// WebSocket echo: every text frame comes back as it came.
++func wsEcho(conn *websocket.Conn) {
++	for {
++		mt, msg, err := conn.ReadMessageReuse()
++		if err != nil {
++			return
++		}
++		if err := conn.WriteMessage(mt, msg); err != nil {
++			return
++		}
++	}
++}
++
++// register installs every route on one server; each listener serves the same
++// application, only the engine and protocol in front of it change.
++//
++// The static profiles (static-h2, and static-tls if subscribed) are TLS profiles, so the static
++// middleware is installed on the TLS servers only: the cleartext hot paths do not pass through it.
++func register(s *celeris.Server, withStatic bool) {
++	if withStatic {
++		s.Use(static.New(static.Config{Root: "/data/static", Prefix: "/static", Compress: true}))
++	}
++	s.GET("/pipeline", pipeline)
++	s.GET("/baseline11", baseline)
++	s.POST("/baseline11", baseline)
++	s.GET("/baseline2", baseline)
++	s.GET("/delay/:ms", delay).Async()
++	s.GET("/json/:count", compress.New(), jsonItems)
++	s.POST("/echo", echo)
++	s.GET("/async-db", asyncDB).Async()
++	s.GET("/fortunes", fortunes).Async()
++	// A plain GET on /ws is not an upgrade: the middleware passes it on, the next handler refuses it.
++	s.GET("/ws", websocket.New(websocket.Config{Handler: wsEcho}), func(c *celeris.Context) error {
++		return celeris.NewHTTPError(426, "WebSocket upgrade required")
++	})
++}
++
++func openDB(srv *celeris.Server) {
++	url := os.Getenv("DATABASE_URL")
++	if url == "" {
++		return
++	}
++	budget := 256
++	if v, err := strconv.Atoi(os.Getenv("DATABASE_MAX_CONN")); err == nil && v > 0 {
++		budget = v
++	}
++	// The pool is sized from the harness's connection budget (DATABASE_MAX_CONN),
++	// less headroom for the superuser slots Postgres reserves.
++	p, err := postgres.Open(url, postgres.WithEngine(srv), postgres.WithMaxOpen(max(budget-8, 1)))
++	if err != nil {
++		log.Printf("postgres: %v", err)
++		return
++	}
++	pool = p
++}
++
++// serveTLS runs the application on the std engine behind a crypto/tls listener.
++func serveTLS(addr string, cert tls.Certificate, protos []string, proto celeris.Protocol) {
++	ln, err := net.Listen("tcp", addr)
++	if err != nil {
++		log.Printf("tls listen %s: %v", addr, err)
++		return
++	}
++	s := celeris.New(celeris.Config{Engine: celeris.Std, Protocol: proto})
++	register(s, true)
++	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: protos, MinVersion: tls.VersionTLS12}
++	if err := s.StartWithListener(tls.NewListener(ln, cfg)); err != nil {
++		log.Printf("tls server %s: %v", addr, err)
++	}
++}
++
++func main() {
++	loadDataset()
++
++	// 8080: HTTP/1.1 and WebSocket on the default Adaptive engine.
++	main8080 := celeris.New(celeris.Config{Addr: ":8080"})
++	register(main8080, false)
++	openDB(main8080)
++
++	// 8082: HTTP/2 prior knowledge (h2c), HTTP/1.1 kept on the same port.
++	h2c := celeris.New(celeris.Config{Addr: ":8082", Protocol: celeris.Auto})
++	register(h2c, false)
++	go func() {
++		if err := h2c.Start(); err != nil {
++			log.Fatalf("h2c: %v", err)
++		}
++	}()
++
++	// 8081 (h1 over TLS) and 8443 (h2 over TLS) open only when the harness
++	// mounts /certs, which it does for the TLS and h2 profiles alone.
++	if cert, err := tls.LoadX509KeyPair("/certs/server.crt", "/certs/server.key"); err == nil {
++		go serveTLS(":8081", cert, []string{"http/1.1"}, celeris.HTTP1)
++		go serveTLS(":8443", cert, []string{"h2", "http/1.1"}, celeris.Auto)
++	}
++
++	if err := main8080.Start(); err != nil {
++		log.Fatalf("8080: %v", err)
++	}
++}
+diff --git a/frameworks/celeris/meta.json b/frameworks/celeris/meta.json
+new file mode 100644
+index 0000000..9d9fb35
+--- /dev/null
++++ b/frameworks/celeris/meta.json
+@@ -0,0 +1,38 @@
++{
++  "display_name": "celeris",
++  "language": "Go",
++  "type": "emerging",
++  "mode": "standard",
++  "completeness": {
++    "routing": true,
++    "middleware": true,
++    "request": true,
++    "response": true
++  },
++  "engine": "io_uring/epoll (adaptive); std on the TLS ports",
++  "description": "celeris, an HTTP engine and router for Go with an adaptive io_uring/epoll event loop. The cleartext rows (8080 HTTP/1.1 and WebSocket, 8082 h2c) run on celeris's default Adaptive engine; the TLS rows (8081 HTTP/1.1 over TLS, 8443 h2 over TLS) run on celeris's std engine behind a crypto/tls listener, because the io_uring and epoll engines have no TLS: those rows measure the std engine, not the headline engine. JSON through c.JSON, gzip/brotli through the compress middleware, static files through the static middleware, WebSocket through the websocket middleware, PostgreSQL through celeris's own driver/postgres pool, fortunes through html/template. No HTTP/3, no gRPC. Default configuration (GCPercent and busy polling stay off).",
++  "repo": "https://github.com/goceleris/celeris",
++  "website": "https://goceleris.dev",
++  "enabled": true,
++  "tests": [
++    "baseline",
++    "pipelined",
++    "limited-conn",
++    "async",
++    "latency-1m",
++    "latency-10k",
++    "json-comp",
++    "async-db",
++    "fortunes",
++    "baseline-h2c",
++    "json-h2c",
++    "echo-ws",
++    "echo-ws-pipeline",
++    "echo-ws-limited",
++    "json-tls",
++    "8gbit",
++    "baseline-h2",
++    "static-h2"
++  ],
++  "maintainers": []
++}

@@ -1,0 +1,152 @@
+name: HttpArena preview (private)
+
+# DRAFT, never dispatched. A PRIVATE preview of the celeris entry for MDA2AV/HttpArena on msa2-server: celeris plus four Go
+# references, cleartext profiles first, SKIP_TUNE=true. Nothing leaves the goceleris organization: HttpArena is cloned
+# INBOUND (read-only, pinned commit), the entry is applied as a local patch (tools/httparena-preview/celeris-entry.patch),
+# results go only to this run's ONE artifact (retention 1 day, deleted by the main session after download). PUBLIC repo: the log
+# carries progress and pass/fail only (no scores, rates, rankings or per-profile numbers; all tool output goes to files in the
+# artifact); the entry's source is in the branch in plain text (the intent to enter is already public); RESULTS are not: the host
+# job CMS-encrypts the results archive to the public certificate tools/httparena-preview/results-cert.pem before upload, the
+# private key is on the maintainer's Mac only. No repository secret is used. No fork, no PR, no issue, no message to HttpArena's
+# repositories.
+#
+# Two ways to start it. (1) workflow_dispatch, once this file is on the default branch (GitHub lists dispatchable workflows from
+# the default branch only: GUESS, not tested here). (2) a push to the standing branch ab/httparena-preview-20261122 that changes
+# tools/httparena-preview/RUN (three lines: phases=..., portrange_ok=0|1, reason=...): the push event runs this file from the
+# branch, no merge to main needed. The initial push of the branch has no RUN file and starts nothing; a push that touches other
+# files starts nothing either (paths filter).
+#
+# Shape (the celeris-stress.yml cluster path): plan -> cluster-guard -> cluster (holds matrix-tier-cluster for the whole
+# run: bootstrap, host, teardown, in httparena-preview-cluster.yml) -> summary. Dispatch from a branch, never from main
+# (the host job runs a patch on bare metal as a user with sudo). Runs serially like any leg, behind the group.
+# HOLD-CLUSTER and the arm64 legs are honoured by whoever dispatches; this workflow cannot see the marker file.
+#
+#   (1) gh workflow run httparena-preview.yml --repo goceleris/probatorium --ref ab/httparena-preview-20261122 \
+#         -f phases=smoke -f reason="HttpArena preview smoke"
+#   (2) printf 'phases=smoke\nportrange_ok=0\nreason=HttpArena preview smoke\n' > tools/httparena-preview/RUN
+#       git add tools/httparena-preview/RUN && git commit -m "preview: smoke" && git push origin ab/httparena-preview-20261122
+#   Then phases=clear,async,supp,tls (portrange_ok=1 to include async). Each run stages from scratch and REMOVES what it
+#   pulled/built at the end (capture-state.sh before/after must match, else the host job fails).
+
+run-name: "HttpArena preview [${{ inputs.phases || 'push RUN file' }}]"
+
+on:
+  push:
+    branches: [ab/httparena-preview-20261122]
+    paths: [tools/httparena-preview/RUN]
+  workflow_dispatch:
+    inputs:
+      phases:
+        description: "Comma list from: smoke, clear, async, supp, tls (run in this order). Cleartext (clear) always before tls."
+        type: string
+        required: true
+        default: smoke
+      portrange_ok:
+        description: "Allow ONE sysctl (net.ipv4.ip_local_port_range 1024-65535) around the async profile, restored and shown restored. Default no: async is skipped."
+        type: boolean
+        required: false
+        default: false
+      reason:
+        description: "Why (one line, up to 200 characters)."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      phases: ${{ steps.p.outputs.phases }}
+      portrange_ok: ${{ steps.p.outputs.portrange_ok }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/httparena-preview
+      - id: p
+        name: Refuse a malformed or main-branch request before any host is touched
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_PHASES: ${{ inputs.phases }}
+          IN_PORT: ${{ inputs.portrange_ok }}
+          IN_REASON: ${{ inputs.reason }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then
+            f=tools/httparena-preview/RUN
+            [ -f "$f" ] || { echo "::error::no $f"; exit 1; }
+            IN_PHASES=$(sed -n 's/^phases=//p' "$f" | head -1); IN_REASON=$(sed -n 's/^reason=//p' "$f" | head -1)
+            IN_PORT=$(sed -n 's/^portrange_ok=//p' "$f" | head -1)
+            [ "$IN_PORT" = 1 ] && IN_PORT=true || IN_PORT=false
+          fi
+          [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ] || { echo "::error::dispatch from a branch, not $DEFAULT_BRANCH"; exit 1; }
+          [ -n "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ] && [ "${#IN_REASON}" -le 200 ] || { echo "::error::reason empty or over 200 characters"; exit 1; }
+          IFS=, read -ra ph <<< "$IN_PHASES"
+          for x in "${ph[@]}"; do case "$x" in smoke|clear|async|supp|tls) ;; *) echo "::error::unknown phase: $x"; exit 1 ;; esac; done
+          # tls never before clear in the same dispatch
+          seen_clear=0; for x in "${ph[@]}"; do [ "$x" = clear ] && seen_clear=1; [ "$x" = tls ] && [ "$seen_clear" = 0 ] && case ",$IN_PHASES," in *,clear,*) echo "::error::order: clear before tls"; exit 1;; esac; done
+          echo "phases=$IN_PHASES" >> "$GITHUB_OUTPUT"; echo "portrange_ok=$IN_PORT" >> "$GITHUB_OUTPUT"
+
+  cluster-guard:
+    name: cluster-guard
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      checked_at: ${{ steps.guard.outputs.checked_at }}
+      attempt: ${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/stresstally
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Refuse if a run is pending in the cluster group
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          GUARD_DIR: ${{ runner.temp }}/guard
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/stresstally" ./tools/stresstally
+          bash tools/stresstally/guard.sh
+          "$RUNNER_TEMP/stresstally" guard -dir "$GUARD_DIR" -self "$RUN_ID"
+
+  cluster:
+    name: cluster
+    needs: [plan, cluster-guard]
+    # never on an old guard verdict (see celeris-stress.yml): a re-run dispatches anew
+    if: ${{ needs.cluster-guard.result == 'success' && needs.cluster-guard.outputs.attempt == github.run_attempt }}
+    concurrency:
+      group: matrix-tier-cluster
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/httparena-preview-cluster.yml
+    with:
+      phases: ${{ needs.plan.outputs.phases }}
+      portrange_ok: ${{ needs.plan.outputs.portrange_ok == 'true' }}
+      guard_checked_at: ${{ needs.cluster-guard.outputs.checked_at }}
+    secrets:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+      RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+      CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}

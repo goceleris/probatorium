@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Per-family HttpArena composite for a PRIVATE preview run (celeris + references on one box).
+
+Formula (HttpArena site/content/docs/scoring/composite-score.md, gen_leaderboard_data.py badge_composite):
+  per profile  avgRps over the profile's scored connection counts; score = avgRps / best_avgRps_in_league * 1000
+  json-comp    avgRps is first multiplied by (minBpr / myBpr)^2, bpr = avg bandwidth / avg rps
+  fixed-rate   latency-1m, latency-10k, 8gbit, connections-1m(-tls): latency_score.score_rows on the run's row,
+               then score / best_score_in_league * 1000
+  family       = SUM of its scored profiles (no weights); a profile an entry lacks adds 0
+  Overall      = H/1.1 + H/2 + WebSocket (H/3 and gRPC are not served by celeris); Database is its own board
+  completeness multiplier x(1 - 0.025 * number of false axes) on the family sum (celeris declares all true: x1.00)
+The league here is ONLY the entries in --results (celeris + the references run on the same box), NOT HttpArena's
+250-entry field: every 1000 means "best of this private group". Never quote it as a board position.
+
+Usage:
+  score_preview.py --results HttpArena/results --hepa HttpArena --entries celeris,gin,fiber,echo,go-fasthttp,fiber-websocket,go-stdlib --rates latency-1m=125000,8gbit=6250 --tls-profiles json-tls,8gbit,baseline-h2,static-h2 --merge fiber-websocket=fiber
+  score_preview.py --published HttpArena/site/data/results --entries gin,fiber,echo,go-fasthttp      (self-test on published rows)
+"""
+import argparse, json, math, re, sys
+from pathlib import Path
+
+FAMILIES = {
+ "H/1.1": [("baseline",[4096]),("limited-conn",[4096]),("async",[32000]),("latency-10k",[1024]),("latency-1m",[1024]),
+           ("connections-1m",[1000000]),("connections-1m-tls",[1000000]),("json-comp",[4096,16384]),("json-tls",[4096]),("8gbit",[512])],
+ "H/2":   [("baseline-h2",[256,1024]),("static-h2",[256,1024]),("baseline-h2c",[256,1024,4096]),("json-h2c",[1024,4096])],
+ "WebSocket": [("echo-ws",[512,4096,16384]),("echo-ws-pipeline",[512,4096,16384]),("echo-ws-limited",[512,4096])],
+ "Database":  [("async-db",[1024]),("fortunes",[1024])],
+}
+OVERALL = ["H/1.1", "H/2", "WebSocket"]
+FIXED = {"latency-1m","latency-10k","8gbit","connections-1m","connections-1m-tls"}
+
+def unit(v, table):
+    m = re.match(r"\s*([\d.]+)\s*([A-Za-z/]*)", str(v or ""))
+    return float(m.group(1)) * table.get(m.group(2), 1.0) if m else 0.0
+BW = {"B/s":1,"KB/s":1e3,"MB/s":1e6,"GB/s":1e9}
+def to_us(v):
+    if isinstance(v,(int,float)): return float(v)
+    return unit(v, {"us":1.0,"ms":1e3,"s":1e6})
+
+def load_layout(results, entries):
+    """-> rows[(entry, profile, conns)] = json row"""
+    rows = {}
+    for e in entries:
+        for p in Path(results).glob(f"*/*/{e}.json"):
+            rows[(e, p.parts[-3], int(p.parts[-2]))] = json.load(open(p))
+    return rows
+
+def load_published(d, entries):
+    rows = {}
+    for e in entries:
+        f = Path(d)/f"{e}.json"
+        if not f.exists(): continue
+        for k, r in json.load(open(f))["results"].items():
+            m = re.match(r"(.+)-(\d+)$", k)
+            if m: rows[(e, m.group(1), int(m.group(2)))] = r
+    return rows
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results"); ap.add_argument("--published"); ap.add_argument("--hepa")
+    ap.add_argument("--entries", default=""); ap.add_argument("--entry", default="celeris")
+    ap.add_argument("--rates", default="", help="offered rates actually used, e.g. latency-1m=125000,8gbit=6250,latency-10k=10000,connections-1m=250000 (HttpArena defaults 1000000/10000/50000/250000); FULL_RATE = 95%% of each")
+    ap.add_argument("--tls-profiles", default="json-tls,8gbit,baseline-h2,static-h2,connections-1m-tls")
+    ap.add_argument("--merge", default="", help="fold a profile-limited supplement into its entry, e.g. fiber-websocket=fiber (HttpArena merges by display_name)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    hepa = Path(a.hepa or (Path(a.results).parent if a.results else ".")).resolve()
+    sys.path.insert(0, str(hepa/"scripts"))
+    import latency_score as L
+    for kv in filter(None, a.rates.split(",")):
+        k, v = kv.split("="); L.FULL_RATE[k] = 0.95 * float(v)
+    entries = [e for e in a.entries.split(",") if e] or None
+    if a.published:
+        entries = entries or sorted(p.stem for p in Path(a.published).glob("*.json"))
+        rows = load_published(a.published, entries)
+    else:
+        entries = entries or sorted({p.stem for p in Path(a.results).glob("*/*/*.json")})
+        rows = load_layout(a.results, entries)
+    for kv in filter(None, a.merge.split(",")):
+        src, dst = kv.split("=")
+        for (e, p, c) in [k for k in rows if k[0] == src]:
+            rows.setdefault((dst, p, c), rows.pop((e, p, c)))
+        entries = [e for e in entries if e != src]
+    tls = set(a.tls_profiles.split(","))
+
+    # per (profile, entry): effective avg rps or fixed-rate score
+    eff = {}
+    for fam, profs in FAMILIES.items():
+        for pid, conns in profs:
+            have = {e: [rows[(e,pid,c)] for c in conns if (e,pid,c) in rows] for e in entries}
+            have = {e: r for e, r in have.items() if r}
+            if pid in FIXED:
+                for c in conns:
+                    rs = [{"entry": e, "rps": rows[(e,pid,c)]["rps"], "cpu": rows[(e,pid,c)].get("cpu_per_req_us"),
+                           "p99": to_us(rows[(e,pid,c)].get("p99_latency")), "mean": to_us(rows[(e,pid,c)].get("avg_latency"))}
+                          for e in entries if (e,pid,c) in rows]
+                    L.score_rows(rs, pid)
+                    for r in rs: eff[(pid, r["entry"])] = r["score"]
+            else:
+                avg = {e: (sum(r["rps"] for r in rs)/len(rs), sum(unit(r.get("bandwidth"), BW) for r in rs)/len(rs)) for e, rs in have.items()}
+                if pid == "json-comp" and avg:
+                    bpr = {e: (bw/rps if rps else 0) for e,(rps,bw) in avg.items()}
+                    best = min(v for v in bpr.values() if v > 0)
+                    for e,(rps,bw) in avg.items(): eff[(pid,e)] = rps*(best/bpr[e])**2 if bpr[e] > 0 else 0
+                else:
+                    for e,(rps,bw) in avg.items(): eff[(pid,e)] = rps
+    # Three pictures. eff holds one number per (profile, entry); a view drops some pairs and re-normalizes
+    # against the best that is left, exactly as the board would if those rows did not exist.
+    def view(drop):
+        res = {}
+        for e in entries:
+            fam_tot = {}; detail = {}
+            for fam, profs in FAMILIES.items():
+                t = 0.0
+                for pid, _ in profs:
+                    vals = [v for (p, en), v in eff.items() if p == pid and (p, en) not in drop]
+                    best = max(vals, default=0)
+                    s_ = (eff.get((pid, e), 0)/best*1000) if best > 0 and (pid, e) not in drop else 0
+                    detail[pid] = round(s_, 1); t += s_
+                fam_tot[fam] = round(t, 1)
+            res[e] = (fam_tot, detail)
+        return res
+    V_ALL = view(set())
+    V_CLR = view({(p, a.entry) for p in tls})                    # celeris ships cleartext-only: the references keep their TLS rows
+    V_SUB = view({(p, e) for p in tls for e in entries})         # profile subset: the TLS profiles removed for everyone
+    out = {}
+    for e in entries:
+        out[e] = {"profiles": V_ALL[e][1],
+                  "family_with_tls": V_ALL[e][0], "family_celeris_cleartext_only": V_CLR[e][0], "family_cleartext_profiles_only": V_SUB[e][0]}
+        for k, v in (("with_tls", V_ALL), ("celeris_cleartext_only", V_CLR), ("cleartext_profiles_only", V_SUB)):
+            out[e]["overall_" + k] = round(sum(v[e][0][f] for f in OVERALL), 1)
+    if a.json: print(json.dumps(out, indent=1)); return
+    print("League = only these entries (private group, NOT the HttpArena field): " + ", ".join(entries))
+    print("Views: A = all rows (celeris with its TLS side); B = %s ships cleartext-only (its TLS rows 0, the others keep theirs: the board picture);" % a.entry)
+    print("       C = the TLS profiles (%s) removed for everyone (a profile subset)." % ", ".join(sorted(tls)))
+    for fam in FAMILIES:
+        print(f"\n[{fam}]  profile score 0-1000 in view A (best of the group = 1000); '-' = profile not run")
+        pids = [p for p,_ in FAMILIES[fam]]
+        print("%-14s" % "entry" + "".join("%-18s" % p for p in pids) + "SUM A    SUM B    SUM C")
+        for e in entries:
+            cells = "".join("%-18s" % (out[e]["profiles"][p] if (p, e) in eff else "-") for p in pids)
+            print("%-14s%s%-8s %-8s %s" % (e, cells, out[e]["family_with_tls"][fam], out[e]["family_celeris_cleartext_only"][fam], out[e]["family_cleartext_profiles_only"][fam]))
+    print("\nOverall (H/1.1 + H/2 + WebSocket):")
+    for e in entries:
+        print("  %-14s A %8s   B %8s   C %8s" % (e, out[e]["overall_with_tls"], out[e]["overall_celeris_cleartext_only"], out[e]["overall_cleartext_profiles_only"]))
+main()
