@@ -190,6 +190,13 @@ def running_kernel():
     return rd("/proc/sys/kernel/osrelease") if ROOT else os.uname().release
 
 
+def boot_cmdline():
+    """/proc/cmdline, whitespace-normalised (runs of whitespace become one space, none at the ends) and never truncated.
+    The same string as the "boot_cmdline" of files/reboot_snapshot.sh: a reboot is "the same boot" only when the
+    kernel and this line match."""
+    return re.sub(r"[ \t\n\r\f\v]+", " ", rd("/proc/cmdline")).strip(" ")
+
+
 def installed_kernels():
     rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n", "linux-image-*"])
     found = set()
@@ -919,6 +926,7 @@ def survey():
         "host": rd("/etc/hostname"),
         "os_release": osr,
         "kernel": running,
+        "boot_cmdline": boot_cmdline(),
         "arch": os.uname().machine,
         "kernel_flavor": flavor(running),
         "installed_kernels": kernels,

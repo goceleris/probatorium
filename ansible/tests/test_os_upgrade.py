@@ -1258,6 +1258,14 @@ class Rehearsal(Base):
         self.assertEqual(r["next_entry"], r["saved_entry"])
         self.assertEqual(self.run_ok("survey")["boot"]["entry0_kernel"], "7.0.0-31-generic")
 
+    def test_the_survey_records_the_boot_command_line_normalised_and_never_truncated(self):
+        self.h.save()
+        long_arg = "x" * 700
+        self.h.w("/proc/cmdline", "BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic  root=UUID=u\tro quiet %s \n" % long_arg)
+        self.assertEqual(self.run_ok("survey")["boot_cmdline"], "BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic root=UUID=u ro quiet " + long_arg)
+        os.remove(self.h.root + "/proc/cmdline")  # unreadable: the key is still there, empty
+        self.assertEqual(self.run_ok("survey")["boot_cmdline"], "")
+
     def test_the_survey_names_the_kernel_that_grub_boots_when_it_ignores_the_environment_block(self):
         self.h.save()
         b = self.run_ok("survey")["boot"]
