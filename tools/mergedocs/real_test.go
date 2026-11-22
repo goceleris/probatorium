@@ -186,7 +186,7 @@ func TestRealD1SplitMergeIsIdentity(t *testing.T) {
 			t.Errorf("%s differs after merge(split(x)): %d vs %d bytes", f, len(want[f]), len(got[f]))
 		}
 	}
-	if res.Comp.MaxAnchorDrift != 0 || res.Comp.TieMarginByScenario["ws-echo"] != 0.05 {
+	if res.Comp.MaxAnchorDrift != 0 || len(res.Comp.TieMarginByScenario) == 0 || res.Comp.TieMarginByScenario["driver-redis-pipeline"] != 0.05 {
 		t.Fatalf("an anchor identical in both pieces has drift 0: %v %v", res.Comp.MaxAnchorDrift, res.Comp.TieMarginByScenario)
 	}
 	// and the output directory carries the audit inputs of both pieces
