@@ -1,3 +1,4 @@
 phases=smoke
 portrange_ok=0
-reason=HttpArena preview smoke 2
+governor=performance
+reason=governor smoke: prove sudo can write cpufreq, set/readback/restore
