@@ -8,24 +8,25 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/pandatix/go-abnf v0.5.3 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
-	github.com/prometheus/common v0.72.1 // indirect
+	github.com/prometheus/common v0.73.1 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.47.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
-	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
 require (
-	github.com/goceleris/celeris v1.5.12-0.20261021042539-713b40dfdd0d
-	github.com/goceleris/celeris/middleware/metrics v1.5.12-0.20261021042539-713b40dfdd0d
-	github.com/goceleris/celeris/middleware/otel v1.5.12-0.20261021042539-713b40dfdd0d
+	github.com/goceleris/celeris v1.5.12-0.20261120120335-fe2b5be71ebc
+	github.com/goceleris/celeris/middleware/metrics v1.5.12-0.20261120120335-fe2b5be71ebc
+	github.com/goceleris/celeris/middleware/otel v1.5.12-0.20261120120335-fe2b5be71ebc
 	github.com/goceleris/probatorium/validation/refapp/internal/debugvars v0.0.0
 	github.com/prometheus/client_golang v1.25.0
 )
