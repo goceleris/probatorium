@@ -1,4 +1,4 @@
-phases=smoke
+phases=clear,async,supp,tls
 portrange_ok=0
 governor=performance
-reason=governor smoke: prove sudo can write cpufreq, set/readback/restore
+reason=HttpArena preview full dispatch
