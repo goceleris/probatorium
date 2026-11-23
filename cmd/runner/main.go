@@ -162,6 +162,10 @@ type Config struct {
 	// targets stay comparable across servers of wildly different throughput).
 	RatedFractions []float64
 
+	// RatedPlanFrom names where RatedFractions came from when a registry plan replaced the sweep ("registry:<column>:<scenario>", GOVAB); empty = the flag / default sweep.
+	// There is no flag: only resolveRatedPlan sets it, so manifest.json is truthful.
+	RatedPlanFrom string
+
 	// TLSTerminator is the https base URL of the shared TLS terminator that
 	// fronts the cleartext adapters for the tls-* scenarios. Empty (default)
 	// means no terminator is wired, so TLS-capable adapters do NOT advertise
@@ -648,6 +652,10 @@ func run(cfg Config) error {
 	schedule := interleave.Schedule(cfg.Runs, effSc, srvs)
 	schedule, err = orderSchedule(schedule, cfg.CellOrder)
 	if err != nil {
+		return err
+	}
+	// GOVAB: the registry column's own rated plan replaces the sweep, before anything reads cfg.RatedFractions (hang-guard limits, the sweep itself, the manifest).
+	if err := resolveRatedPlan(&cfg, schedule, os.Stderr); err != nil {
 		return err
 	}
 	lock, err := newClientLock(cfg.ClientLock, cfg.ClientLockPolicy, os.Stderr)

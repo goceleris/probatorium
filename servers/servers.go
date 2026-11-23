@@ -166,6 +166,18 @@ type Adapter struct {
 	// a Registry member but is left out of Names and AdaptersSorted, so out
 	// of every "all" / "*/*" expansion, unless BENCH_BASELINE is on.
 	Baseline bool
+
+	// RatedPlans, when non-nil, is the rated-sweep plan this column carries, keyed by SCENARIO name (GOVAB, THROWAWAY ab/gov-ab-20261122, servers/gov_ab_arms.go; the
+	// same shape as the L755A registry plan, fractions only). The runner (cmd/runner resolveRatedPlan) reads it by -server-name and replaces the sweep it would otherwise
+	// run (-rated-fractions, default 0.25/0.5/0.75/0.9) for the rated scenario of the column BEFORE the manifest is written, so manifest.json tells the truth. Nil for every
+	// column the registry shipped before GOVAB: their runner behaviour is unchanged.
+	RatedPlans map[string]RatedPlan
+}
+
+// RatedPlan is the rated-sweep plan of one (column, scenario): Fractions of the cell's own saturation rate, run in order. At least one and no more than the hang guard
+// budgets (budget.DefaultRatedPasses).
+type RatedPlan struct {
+	Fractions []float64
 }
 
 // Capabilities is an adapter's declared Phase-2 capability manifest. Each

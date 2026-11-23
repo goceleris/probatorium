@@ -231,6 +231,17 @@ rotate_if_big() {
     mv -f "$1" "$1.1" 2>/dev/null || true
 }
 
+# cpu_json — the CPU frequency state of the host as four JSON members: "cpu_mhz_min/med/max" (the /proc/cpuinfo `cpu MHz` of every CPU: 0 on a host that prints none,
+# as arm64 does) and "governor" (the scaling_governor of every CPU with a cpufreq directory as name=count, joined with +, "none" without cpufreq). READ-ONLY, one small
+# pipeline a sample (GOVAB, ab/gov-ab-20261122: the leg records never had a frequency or governor field). Every numeric member degrades to 0, never to an empty token.
+cpu_json() {
+    _cm=$(awk '/^cpu MHz/ {print $4}' /proc/cpuinfo 2>/dev/null | sort -n | awk '{a[NR]=$1} END{if (NR) printf "%d %d %d", a[1], a[int((NR+1)/2)], a[NR]; else printf "0 0 0"}') || _cm="0 0 0"
+    # shellcheck disable=SC2086  # deliberate: split the awk-produced triple
+    set -- $_cm
+    _cgov=$(cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor 2>/dev/null | sort | uniq -c | awk '{printf "%s%s=%s", (n++ ? "+" : ""), $2, $1}') || _cgov=""
+    printf '"cpu_mhz_min":%s,"cpu_mhz_med":%s,"cpu_mhz_max":%s,"governor":"%s"' "${1:-0}" "${2:-0}" "${3:-0}" "${_cgov:-none}"
+}
+
 emit_sample() {
     _i=$1
     read -r _up _idle </proc/uptime 2>/dev/null || { _up=0; _idle=0; }
@@ -274,7 +285,7 @@ emit_sample() {
     set -- $_dm
     _dmtotal=${1:-0}; _dmnew=${2:-0}
 
-    printf '{"ts":"%s","epoch":%s,"host":"%s","tag":"%s","i":%d,"boot_id":"%s","uptime_s":%s,"load1":%s,"load5":%s,"load15":%s,"procs_running":%s,"procs_total":%s,"mem_total_kb":%s,"mem_available_kb":%s,"mem_free_kb":%s,"swap_total_kb":%s,"swap_free_kb":%s,"dirty_kb":%s,"oom_kill":%s,"pgmajfault":%s,"pswpin":%s,"pswpout":%s,"fd_allocated":%s,%s,%s,%s,"dmesg_lines":%s,"dmesg_new":%s,"net":%s}\n' \
+    printf '{"ts":"%s","epoch":%s,"host":"%s","tag":"%s","i":%d,"boot_id":"%s","uptime_s":%s,"load1":%s,"load5":%s,"load15":%s,"procs_running":%s,"procs_total":%s,"mem_total_kb":%s,"mem_available_kb":%s,"mem_free_kb":%s,"swap_total_kb":%s,"swap_free_kb":%s,"dirty_kb":%s,"oom_kill":%s,"pgmajfault":%s,"pswpin":%s,"pswpout":%s,"fd_allocated":%s,%s,%s,%s,%s,"dmesg_lines":%s,"dmesg_new":%s,"net":%s}\n' \
         "$(now_iso)" "$(now_epoch)" "$HOST" "$TAG" "$_i" "${_bootid:-unknown}" \
         "${_up:-0}" "${_l1:-0}" "${_l5:-0}" "${_l15:-0}" "${_running:-0}" "${_total:-0}" \
         "$_mtotal" "$_mavail" "$_mfree" "$_stotal" "$_sfree" "$_dirty" \
@@ -282,6 +293,7 @@ emit_sample() {
         "$(proc_json runner Runner.Listener)" \
         "$(proc_json validator validator)" \
         "$(proc_json refapp probatorium-runner)" \
+        "$(cpu_json)" \
         "$_dmtotal" "$_dmnew" "$(net_json)" \
         >>"$SERIES" 2>/dev/null
 }

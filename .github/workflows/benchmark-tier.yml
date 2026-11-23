@@ -399,7 +399,12 @@ jobs:
           SAMPLER_LOW_PRIORITY: "1"
         run: mage HostSamplerStart
 
-      - name: mage BenchTier (curated matrix, amd64, single pass, publish run-1)
+      # GOVAB (THROWAWAY ab/gov-ab-20261122, not for merge): the benchmark step is ONE run: step that calls .github/scripts/gov-ab-arms.sh. A competitors value that does not start
+      # with `gab` is ONE plain `mage BenchTier` (exec); a `gab...` value must be an exact line of .github/gov-ab-arms.tsv and runs one `mage BenchTier` per CPU power arm
+      # (as-found / performance / performance + C2 and C3 off / as-found again) with the hosts moved to each arm from their recorded original state and read back first. The step
+      # timeout bounds a hung arm; the per-arm BenchTier timeout is the table's third column. The restore step below always runs.
+      - name: mage BenchTier (curated matrix, amd64, single pass, publish run-1; GOVAB arm loop for gab columns)
+        timeout-minutes: ${{ startsWith(github.event.inputs.competitors, 'gab') && 300 || 6600 }}
         env:
           CLUSTER_USE_LAN: "1"
           # BENCH_TARGET is set at JOB level (above) so mage Deploy sees it too.
@@ -451,7 +456,17 @@ jobs:
           # rather than overrunning it.
           BENCH_BUDGET: ${{ fromJSON('{"fast":{"false":{"heavy":"24h","off":"24h","single":"24h","all":"34h"},"true":{"heavy":"24h","off":"24h","single":"24h","all":"43h"}},"headline":{"false":{"heavy":"40h","off":"36h","single":"36h","all":"72h"},"true":{"heavy":"52h","off":"48h","single":"48h","all":"92h"}},"full":{"false":{"heavy":"69h","off":"60h","single":"60h","all":"108h"},"true":{"heavy":"90h","off":"80h","single":"80h","all":"112h"}}}')[github.event.inputs.profile || 'full'][github.event.inputs.baseline == 'true' && 'true' || 'false'][(github.event.inputs.target || 'both') != 'both' && 'single' || github.event.inputs.arch_exclusive || 'all'] }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
-        run: mage BenchTier
+        run: bash .github/scripts/gov-ab-arms.sh
+
+      # GOVAB: right after the arm loop (also when it failed or timed out), before the sampler stop and the upload: restore msa2-server and msa2-client from the recorded original
+      # state, read it back, take the `final` record and COMPARE it with the original; any difference fails the job. A no-op when nothing was recorded or the loop's own trap
+      # already restored and compared equal.
+      - name: Restore the CPU power state (GOVAB; no-op for a plain dispatch)
+        if: always()
+        timeout-minutes: 20
+        env:
+          CLUSTER_USE_LAN: "1"
+        run: bash .github/scripts/gov-ab-arms.sh restore
 
       # Before the upload, so the series travels with the run's results
       # (results/host-sampler/<host>/); `if: always()` so it runs when the bench

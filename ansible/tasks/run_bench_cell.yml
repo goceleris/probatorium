@@ -496,6 +496,26 @@
     - inventory_hostname == bench_target
     - cell_bound | bool
 
+- name: "{{ cell.1 }} run={{ cell.0 }} | CPU power snap + 1 Hz frequency log (server side; only while the GOVAB recorder is staged)"
+  # GOVAB (THROWAWAY ab/gov-ab-20261122): ansible/files/cpu_power.py is staged on tmpfs by cpu-power.yml for the length of a GOVAB run and removed after it; with no staged
+  # script this task does nothing (so every other dispatch is byte-for-byte what it was). READ-ONLY: governor / driver / EPP / frequency / cpuidle states of every CPU before
+  # the cell (cpupower.start.json) and a 1 Hz log of the cur_freq and /proc/cpuinfo MHz min/med/max DURING it (cpufreq.log, SCHED_IDLE). Server-side names; the loadgen host's
+  # files carry `.loadgen` (bench.yml extracts both hosts into the same cell dir).
+  ansible.builtin.shell: |
+    rec={{ cpu_power_run_dir | default('/run/celeris') }}/cpu_power.py
+    [ -x "$rec" ] || exit 0
+    python3 -I -B "$rec" snap --out {{ cell_dir }}/cpupower.start.json
+    nohup python3 -I -B "$rec" log --out {{ cell_dir }}/cpufreq.log --seconds {{ cell_guard_seconds }} > /dev/null 2>&1 &
+    disown
+    echo $! > {{ cell_dir }}/cpufreq.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == bench_target
+    - cell_bound | bool
+
 # ---------- loadgen side: mpstat + runner ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | start mpstat sampler (loadgen side)"
   # Distinct filenames from the server-side sampler ON PURPOSE. bench.yml
@@ -514,6 +534,22 @@
   args:
     executable: /bin/bash
   changed_when: false
+  when:
+    - inventory_hostname == "msa2-client"
+    - hostvars[bench_target].cell_bound | default(false) | bool
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | CPU power snap + 1 Hz frequency log (loadgen side; only while the GOVAB recorder is staged)"
+  ansible.builtin.shell: |
+    rec={{ cpu_power_run_dir | default('/run/celeris') }}/cpu_power.py
+    [ -x "$rec" ] || exit 0
+    python3 -I -B "$rec" snap --out {{ cell_dir }}/cpupower.start.loadgen.json
+    nohup python3 -I -B "$rec" log --out {{ cell_dir }}/cpufreq.loadgen.log --seconds {{ cell_guard_seconds }} > /dev/null 2>&1 &
+    disown
+    echo $! > {{ cell_dir }}/cpufreq.loadgen.pid
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
   when:
     - inventory_hostname == "msa2-client"
     - hostvars[bench_target].cell_bound | default(false) | bool
@@ -620,6 +656,36 @@
     - inventory_hostname == "msa2-client"
     - hostvars[bench_target].cell_bound | default(false) | bool
     - (runner_run.rc | default(0)) != 0
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | CPU power snap at the end + stop the frequency log (loadgen side; GOVAB recorder only)"
+  ansible.builtin.shell: |
+    rec={{ cpu_power_run_dir | default('/run/celeris') }}/cpu_power.py
+    [ -x "$rec" ] || exit 0
+    python3 -I -B "$rec" snap --out {{ cell_dir }}/cpupower.end.loadgen.json
+    if [ -f {{ cell_dir }}/cpufreq.loadgen.pid ]; then
+      kill -TERM "$(cat {{ cell_dir }}/cpufreq.loadgen.pid)" 2>/dev/null
+    fi
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == "msa2-client"
+
+- name: "{{ cell.1 }} run={{ cell.0 }} | CPU power snap at the end + stop the frequency log (server side; GOVAB recorder only)"
+  ansible.builtin.shell: |
+    rec={{ cpu_power_run_dir | default('/run/celeris') }}/cpu_power.py
+    [ -x "$rec" ] || exit 0
+    python3 -I -B "$rec" snap --out {{ cell_dir }}/cpupower.end.json
+    if [ -f {{ cell_dir }}/cpufreq.pid ]; then
+      kill -TERM "$(cat {{ cell_dir }}/cpufreq.pid)" 2>/dev/null
+    fi
+    true
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == bench_target
 
 # ---------- teardown for this cell ----------
 - name: "{{ cell.1 }} run={{ cell.0 }} | stop mpstat sampler (loadgen side)"

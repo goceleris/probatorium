@@ -23,11 +23,19 @@ import (
 
 const benchTier = ".github/workflows/benchmark-tier.yml"
 
+// GOVAB (THROWAWAY ab/gov-ab-20261122, NAMED DEVIATION from the pins of main, never merged): the benchmark step is ONE `run:` step that calls the arm-loop script, which runs
+// `mage BenchTier` itself (once for a plain dispatch, once per CPU power arm for a gab dispatch). The pins below keep their intent: one sampler start before the benchmark step,
+// the stop after it, the BenchTier step (the one with BENCH_BUDGET and DOCS_TOKEN) free of sampler variables. TestGovabArmLoop* pin the new structure.
+const (
+	benchStepRun = "bash .github/scripts/gov-ab-arms.sh"
+	govabScript  = ".github/scripts/gov-ab-arms.sh"
+)
+
 func TestBenchTierBracketsTheRunWithTheSampler(t *testing.T) {
 	src := mustRead(t, benchTier)
 	deploy := mustIndex(t, src, "run: mage Deploy\n", "explicit mage Deploy step")
 	start := mustIndex(t, src, "run: mage HostSamplerStart\n", "sampler start step")
-	bench := mustIndex(t, src, "run: mage BenchTier\n", "mage BenchTier step")
+	bench := mustIndex(t, src, "run: "+benchStepRun+"\n", "benchmark step (GOVAB: the arm loop script, which runs mage BenchTier)")
 	stop := mustIndex(t, src, "run: mage HostSamplerStop\n", "sampler stop step")
 	upload := mustIndex(t, src, "name: Upload results", "results upload step")
 	cleanup := mustIndex(t, src, "run: mage Cleanup", "mage Cleanup step")
@@ -258,7 +266,7 @@ func TestBenchSamplerStepsDoNotShadowTheTarget(t *testing.T) {
 // bench, and the BenchTier step itself is untouched by them (it is still the
 // one that carries BENCH_BUDGET and DOCS_TOKEN, and no sampler variable).
 func TestBenchTierStepCarriesNoSamplerVariable(t *testing.T) {
-	blk := stepRunning(mustRead(t, benchTier), "mage BenchTier")
+	blk := stepRunning(mustRead(t, benchTier), benchStepRun)
 	if strings.Contains(blk, "SAMPLER_") {
 		t.Errorf("the BenchTier step carries a sampler variable; the sampler must run beside the bench, not inside it:\n%s", blk)
 	}
@@ -273,4 +281,65 @@ func pathEnv() string {
 		return "/usr/bin:/bin"
 	}
 	return p[:strings.LastIndex(p, "/")] + ":/usr/bin:/bin"
+}
+
+// GOVAB: the arm loop is ONE step, the restore is an always-run step right after it (before the sampler stop, the upload and Cleanup), and the script runs `mage BenchTier` from exactly
+// two places: the plain dispatch (exec) and the arm loop (under a timeout).
+func TestGovabArmLoopStructure(t *testing.T) {
+	src := mustRead(t, benchTier)
+	if n := strings.Count(src, "run: "+benchStepRun+"\n"); n != 1 {
+		t.Fatalf("%d arm-loop steps, want exactly 1", n)
+	}
+	if strings.Contains(src, "run: mage BenchTier") {
+		t.Error("a bare `run: mage BenchTier` step is back: the benchmark must go through the arm-loop script")
+	}
+	blk := stepRunning(src, benchStepRun)
+	if !strings.Contains(blk, "timeout-minutes: ${{ startsWith(github.event.inputs.competitors, 'gab') && 300 || 6600 }}\n") {
+		t.Errorf("the arm-loop step has no timeout bounding a hung gab dispatch:\n%s", blk)
+	}
+	rest := stepRunning(src, benchStepRun+" restore")
+	if rest == "" || !strings.Contains(rest, "        if: always()\n") {
+		t.Fatalf("no always-run restore step:\n%s", rest)
+	}
+	if !strings.Contains(rest, "timeout-minutes:") {
+		t.Errorf("the restore step has no timeout:\n%s", rest)
+	}
+	bench := strings.Index(src, "run: "+benchStepRun+"\n")
+	restore := strings.Index(src, "run: "+benchStepRun+" restore\n")
+	stop := mustIndex(t, src, "run: mage HostSamplerStop\n", "sampler stop step")
+	upload := mustIndex(t, src, "name: Upload results", "results upload step")
+	cleanup := mustIndex(t, src, "run: mage Cleanup", "mage Cleanup step")
+	if !(bench < restore && restore < stop && stop < upload && upload < cleanup) {
+		t.Errorf("step order wrong: bench %d restore %d sampler stop %d upload %d cleanup %d", bench, restore, stop, upload, cleanup)
+	}
+	script := mustRead(t, govabScript)
+	if n := strings.Count(script, `"$MAGE" BenchTier`); n != 2 {
+		t.Errorf("%d BenchTier call sites in the arm-loop script, want 2 (the plain exec and the arm loop)", n)
+	}
+	if !strings.Contains(script, "trap on_exit EXIT") || !strings.Contains(script, "trap 'exit 143' TERM") {
+		t.Error("the arm-loop script has no restore trap on EXIT / TERM")
+	}
+	for _, arm := range []string{"as-found", "performance", "performance-c2off"} {
+		if !strings.Contains(mustRead(t, ".github/gov-ab-arms.tsv"), arm) {
+			t.Errorf("arm %s is in no table line", arm)
+		}
+	}
+}
+
+// The dispatcher (evidence/lanes-20261105/H8/cluster-sequence-v160.sh) refuses any workflow_dispatch field outside its list: the arm loop must be selected by a field it already
+// sends, so no new input is declared for it.
+func TestGovabArmsAreSelectedByTheCompetitorsValueNotByANewInput(t *testing.T) {
+	src := mustRead(t, benchTier)
+	if strings.Contains(src, "cpu_power_arms") {
+		t.Error("benchmark-tier.yml declares a cpu_power_arms input: the cluster dispatcher would refuse the queue line")
+	}
+	for _, line := range strings.Split(mustRead(t, ".github/gov-ab-arms.tsv"), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Split(line, "\t")
+		if len(f) != 4 || !strings.HasPrefix(f[0], "gab") {
+			t.Errorf("table line %q: want 4 TAB fields and a competitors value that starts with gab", line)
+		}
+	}
 }

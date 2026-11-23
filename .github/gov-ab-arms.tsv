@@ -1,0 +1,5 @@
+# GOVAB arm table (THROWAWAY ab/gov-ab-20261122): the exact `competitors` dispatch value -> the CPU power arms the benchmark job runs, in order. Columns (TAB): competitors, arms, per-arm BenchTier timeout in minutes, name.
+# A competitors value that starts with gab and is NOT an exact line here fails the job before anything is changed; any other value runs ONE plain `mage BenchTier` as before.
+# arms: as-found | performance | performance-c2off (ansible/files/cpu_power.py). The cells are the dispatch's own `cells` / `rated_cells` (the same cells in every arm).
+gabw-std-h1	performance,performance-c2off	30	GOVAB-PROOF
+gabw-std-h1,gabw-adaptive-h1-async,gabw-epoll-h1-async,gabl-std-h1,gabl-adaptive-h1-async	as-found,performance,performance-c2off,as-found	60	GOVAB

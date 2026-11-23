@@ -1,0 +1,15 @@
+---
+# cpu-power.yml: record, change and restore the CPU frequency governor and the deep idle states of msa2-server and msa2-client (GOVAB, THROWAWAY ab/gov-ab-20261122, not for merge).
+#
+#   ansible-playbook -i inventory.yml cpu-power.yml -e cpu_power_action=record  -e cpu_power_label=orig   -e cpu_power_dir=/abs/results/cpu-power
+#   ansible-playbook -i inventory.yml cpu-power.yml -e cpu_power_action=apply   -e cpu_power_label=pre-1  -e cpu_power_arm=performance -e cpu_power_dir=...
+#   ansible-playbook -i inventory.yml cpu-power.yml -e cpu_power_action=restore -e cpu_power_label=final  -e cpu_power_dir=...
+#
+# The logic lives in files/cpu_power.py (tested against a fake sysfs); tasks/cpu_power.yml stages it on tmpfs and runs it with `become: true`. Nothing persistent is installed on a host
+# (/run/celeris is tmpfs). The original record lives on the CONTROLLER (cpu_power_dir/orig/<host>.json), write-once; every arm and the restore are derived from it.
+- name: CPU power state (GOVAB)
+  hosts: msa2-server:msa2-client
+  gather_facts: false
+  tasks:
+    - name: Run the requested action
+      ansible.builtin.include_tasks: tasks/cpu_power.yml

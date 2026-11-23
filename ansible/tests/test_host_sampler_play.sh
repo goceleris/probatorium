@@ -170,6 +170,8 @@ SAMPLER_OUTDIR=$work/sample-out SAMPLER_RUNDIR=$work/sample-run PATH="$stub:$PAT
   "$here/../ops/host-sampler/celeris-host-sampler" --sample > /dev/null 2>&1
 check "  a sample was written" test -s "$work/sample-out/samples.jsonl"
 check "  it found the validator by comm" grep -q "\"validator_pid\":$vpid," "$work/sample-out/samples.jsonl"
+check "  it carries the CPU frequency members (GOVAB): MHz min/med/max and the governor summary, as one parseable line" \
+  python3 -c 'import json,sys; d=json.loads(open(sys.argv[1]).read().splitlines()[-1]); assert all(isinstance(d[k], (int, float)) for k in ("cpu_mhz_min", "cpu_mhz_med", "cpu_mhz_max")) and isinstance(d["governor"], str) and d["governor"]' "$work/sample-out/samples.jsonl"
 check "  and called neither pgrep, ps nor pidof" test ! -e "$work/tool-called"
 kill "$vpid" 2> /dev/null
 wait "$vpid" 2> /dev/null

@@ -132,7 +132,8 @@ func TestBaselineColumnsMirrorTheirMainTwin(t *testing.T) {
 	}
 	// Every main celeris loop-engine column has a baseline twin except std.
 	for n, a := range servers.Registry {
-		if a.Category != "celeris" || n == "celeris-std-h1" {
+		// GOVAB (ab/gov-ab-20261122): the gab* columns are throwaway clones of the main columns (Framework celeris-govab) and have no twin of their own
+		if a.Category != "celeris" || n == "celeris-std-h1" || a.Framework == "celeris-govab" {
 			continue
 		}
 		if _, ok := servers.Registry[servers.BaselineName(a.Engine)]; !ok {
