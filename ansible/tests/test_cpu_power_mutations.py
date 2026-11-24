@@ -21,7 +21,9 @@ PY_MUTANTS = [
     ("restore never writes idle flags back", PY, "                err = wr(os.path.join(sysfs(), name, \"cpuidle\", have[s][\"state\"], \"disable\"), v)\n", "                err = None\n"),
     ("restore never writes the scaling limits back", PY, "                    err = wr(d + \"/\" + fn, w)\n", "                    err = None\n"),
     ("the read-back is not compared", PY, "    for line in diff_views(want, got):\n", "    for line in []:\n"),
-    ("performance writes idle flags too (disables C3)", PY, "                    view[\"cpus\"][name][\"idle\"][s] = 1", "                    view[\"cpus\"][name][\"idle\"][s] = 1"),
+    ("performance writes idle flags too (disables C3)", PY,
+     "    for c in cpus:\n        name = \"cpu%d\" % c\n        have = {s[\"name\"]: s for s in idle_states(c)}\n        for s, v in want[\"cpus\"][name][\"idle\"].items():\n            if s in have and have[s][\"disable\"] != v and v is not None:",
+     "    for c in cpus:\n        name = \"cpu%d\" % c\n        have = {s[\"name\"]: s for s in idle_states(c)}\n        if arm == \"performance\":\n            want[\"cpus\"][name][\"idle\"][\"C3\"] = 1\n        for s, v in want[\"cpus\"][name][\"idle\"].items():\n            if s in have and have[s][\"disable\"] != v and v is not None:"),
     ("the already-equal governor is written anyway", PY, "        if rd(d + \"/scaling_governor\") != g:\n", "        if True:\n"),
     ("compare ignores the governor", PY, "for k in (\"driver\", \"governor\", \"epp\", \"min_khz\", \"max_khz\"):", "for k in (\"driver\", \"epp\", \"min_khz\", \"max_khz\"):"),
     ("compare ignores EPP", PY, "for k in (\"driver\", \"governor\", \"epp\", \"min_khz\", \"max_khz\"):", "for k in (\"driver\", \"governor\", \"min_khz\", \"max_khz\"):"),
@@ -52,12 +54,6 @@ SH_MUTANTS = [
     ("the restore skips the results copy", SH, "collect() { # copy the records to the results directory the job uploads; never fails the step\n", "collect() { return 0\n"),
     ("an unknown governor is accepted", SH, "case \"$GOV\" in performance | keep) ;; *) die", "case \"$GOV\" in performance | keep | *) ;; *) die"),
 ]
-# a mutant that does not change anything (the idle-write mutant is replaced below by a behavioural one)
-PY_MUTANTS[7] = ("performance writes idle flags too (disables C3)", PY,
-                 "    for c in cpus:\n        name = \"cpu%d\" % c\n        have = {s[\"name\"]: s for s in idle_states(c)}\n        for s, v in want[\"cpus\"][name][\"idle\"].items():\n            if s in have and have[s][\"disable\"] != v and v is not None:",
-                 "    for c in cpus:\n        name = \"cpu%d\" % c\n        have = {s[\"name\"]: s for s in idle_states(c)}\n        if arm == \"performance\":\n            want[\"cpus\"][name][\"idle\"][\"C3\"] = 1\n        for s, v in want[\"cpus\"][name][\"idle\"].items():\n            if s in have and have[s][\"disable\"] != v and v is not None:")
-
-
 def suite(kind, path):
     env = dict(os.environ)
     if kind == "py":
