@@ -6,15 +6,18 @@
 #                            BEFORE anything is measured. Records the ORIGINAL state of every host of the run (write-once, orig/<host>.json: scaling driver, governor, EPP, limits,
 #                            frequency, boost, cpuidle driver / governor and every idle state with its disable flag), then, for CPU_GOVERNOR=performance, writes `performance` on every
 #                            CPU that has a governor (a CPU already on it is not written) and records the result (applied/<host>.json, applied/<host>.apply.json).
-#                            CPU_GOVERNOR=keep records only and changes nothing. Idle states are never written (left AS FOUND, recorded).
-#   cpu-governor.sh restore  `if: always()` after the measured step, before the sampler stop, the upload and `mage Cleanup`: writes every recorded value back (governor first, then EPP,
-#                            limits, idle flags), reads it back, records final/<host>.json and COMPARES it with orig/<host>.json: any difference fails the job (restore-status.txt =
+#                            CPU_GOVERNOR=keep records only and changes nothing. Idle states and scaling limits are never written (left AS FOUND, recorded).
+#                            Refuses (exit 3, STOP-RULE) a host of CPUGOV_EXPECT_NOT_PERFORMANCE (default msa2-server msa2-client: powersave as found) whose ORIGINAL record already shows
+#                            `performance` on a CPU: something left it changed, and it must not be taken as the original. msr1 is performance as found and exempt.
+#   cpu-governor.sh restore  `if: always()` after the measured step, before the sampler stop, the upload and `mage Cleanup`: records end/<host>.json (the state just before the restore: the
+#                            governor must still be performance), writes the recorded governor, EPP and idle flags back (never the scaling limits), reads it back, records final/<host>.json
+#                            and COMPARES it (limits included) with orig/<host>.json: any difference fails the job (restore-status.txt =
 #                            NOT-RESTORED or NOT-EQUAL). A no-op when nothing was recorded (the set step never ran) or it already restored. keep: records final, restore-status.txt =
 #                            KEPT-EQUAL | KEPT-CHANGED | KEPT-UNVERIFIED (never fails: nothing was changed by this run).
 #
 # The hosts are the run's own: BENCH_TARGET msa2-server|msr1 = that host plus the loadgen msa2-client (the ansible --limit of mage Deploy, clusterLimitForTarget), both / unset = every
 # cluster host. Records and verdict are collected in $RUNNER_TEMP/cpu-power and copied to results/cpu-power (uploaded with the results) by the restore step:
-#   orig/ applied/ final/ (<host>.json = the record, <host>.apply.json = what the change did and read back), mode.txt, summary.txt (one line per host and label: the governor / driver /
+#   orig/ applied/ end/ final/ (<host>.json = the record, <host>.apply.json = what the change did and read back), mode.txt, summary.txt (one line per host and label: the governor / driver /
 #   idle setting the run was measured with), restore-status.txt (RESTORED-EQUAL | KEPT-EQUAL | ...). Test hooks: ANSIBLE, PY, CPUGOV_DIR, CPUGOV_RESULTS, CPUGOV_ANSIBLE_DIR.
 # shellcheck disable=SC2310  # a function's status is read on purpose in `||` lists
 set -u
@@ -27,6 +30,8 @@ CPPY=$ADIR/files/cpu_power.py
 DIR=${CPUGOV_DIR:-${RUNNER_TEMP:-/tmp}/cpu-power}
 RES=${CPUGOV_RESULTS:-$PWD/results/cpu-power}
 TAG=${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}
+NOTPERF=${CPUGOV_EXPECT_NOT_PERFORMANCE-msa2-server msa2-client}
+ALLHOSTS="msa2-server msr1 msa2-client"
 
 say() { echo "cpu-governor: $*"; }
 die() { say "FAIL: $*"; exit "${2:-1}"; }
@@ -76,8 +81,22 @@ if [ "$MODE" = set ]; then
     echo "started	$(date -u +%FT%TZ)"
   } > "$DIR/mode.txt"
   say "mode $GOV, hosts: ${BENCH_TARGET:-every cluster host}$([ -n "$(limit)" ] && echo " (limit $(limit))"), tag $TAG"
-  ap record orig || die "cannot record the original state: nothing was changed"
+  ap record orig || die "cannot record the original state of every host. If the play above says the original record already exists on a host (/run/celeris-cpu-power/records/orig.json), a PREVIOUS run did not restore it and that host may STILL BE CHANGED: do not dispatch more runs, recover the host by rebooting it (cluster-reboot.yml clears tmpfs, the latch included, and gives the boot-default governor) and confirm with a survey (cpu_power). Otherwise nothing was changed by this run"
+  want_hosts=$(limit | tr ',' ' ')
+  [ -n "$want_hosts" ] || want_hosts=$ALLHOSTS
+  for h in $want_hosts; do
+    [ -s "$DIR/orig/$h.json" ] || die "no original record for $h after the record play: the host set of this run is not the intended one"
+  done
   summarize orig
+  if [ "$GOV" = performance ]; then
+    for h in $NOTPERF; do
+      [ -s "$DIR/orig/$h.json" ] || continue
+      "$PY" -I -B "$CPPY" stop-rule --orig "$DIR/orig/$h.json" || {
+        echo "$h: a CPU is already on the performance governor as found, but this host's as-found state is powersave: something left it changed (a previous run that did not restore?). Nothing was changed by this run." > "$DIR/stop-rule.txt"
+        die "STOP RULE on $h: its original record already shows performance (see above): not taking a changed state as the original; HOLD the cluster, reboot the host (cluster-reboot.yml) and confirm with a survey" 3
+      }
+    done
+  fi
   if [ "$GOV" = performance ]; then
     ap apply applied performance || {
       summarize applied
@@ -102,8 +121,16 @@ if [ "$MODE" = restore ]; then
     collect
     exit 0
   fi
+  if [ -f "$DIR/stop-rule.txt" ]; then
+    verdict "STOP-RULE $(date -u +%FT%TZ): $(cat "$DIR/stop-rule.txt")"
+    say "stop rule: this run changed nothing; the records are the evidence"
+    ap unstage x > /dev/null 2>&1 || true
+    collect
+    exit 0
+  fi
   mode=$(awk -F'\t' '$1 == "governor" {print $2; exit}' "$DIR/mode.txt" 2> /dev/null)
   rc=0
+  [ "$mode" = keep ] || ap record end || say "warning: the end record could not be taken"
   if [ "$mode" = keep ]; then
     ap record final || rc=$?
   else
@@ -133,15 +160,13 @@ if [ "$MODE" = restore ]; then
   fi
   if [ "$rc" -ne 0 ]; then
     verdict "NOT-RESTORED $stamp: the restore play failed (rc=$rc); a host may be left changed: read final/ and the next survey"
-    say "NOT RESTORED (rc=$rc)"
-    ap unstage x > /dev/null 2>&1 || true
+    say "NOT RESTORED (rc=$rc): the host-side original stays as the latch (no unstage)"
     collect
     exit 1
   fi
   if [ "$cmp_rc" -ne 0 ]; then
     verdict "NOT-EQUAL $stamp: a host differs from its original record after the restore (see the lines above)"
-    say "LEFT BEHIND: the final record differs from the original"
-    ap unstage x > /dev/null 2>&1 || true
+    say "LEFT BEHIND: the final record differs from the original (the host-side original stays as the latch: no unstage)"
     collect
     exit 1
   fi

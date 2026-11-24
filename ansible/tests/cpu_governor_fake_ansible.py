@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A stand-in for `ansible-playbook -i inventory.yml cpu-power.yml ...` used by test_cpu_governor.sh: it models the PLAYBOOK PROTOCOL of ansible/tasks/cpu_power.yml per host
-(record: orig is write-once and fetched to <dir>/<label>/<host>.json; apply: needs the controller's original, runs the REAL cpu_power.py against that host's fake sysfs, fetches the
-result and the record even when it failed, then fails; restore = apply as-found; unstage = no-op; a host without an original is skipped on restore) so the real
+(record: orig is write-once, on the CONTROLLER and on the HOST (the latch <run dir>/records/orig.json, modelled as <host>.run/orig.latch), and fetched to <dir>/<label>/<host>.json; apply: needs the controller's original, runs the REAL cpu_power.py against that host's fake sysfs, fetches the
+result and the record even when it failed, then fails; restore = apply as-found; unstage removes the host-side latch and files ONLY for a host with an original record of this run (the playbook's `when`); a host without an original is skipped on restore) so the real
 .github/scripts/cpu-governor.sh runs end to end. Per host fake sysfs: $FAKE_SYS_ROOT/<host>/cpu (CPU_SYSFS), cpuinfo next to it. $FAKE_ANSIBLE_LOG gets one line per call.
 FAKE_RESTORE_NOOP=1: the restore does nothing but still records and exits 0 (a restore that silently did not restore)."""
 import json
@@ -47,9 +47,11 @@ def main(argv):
                 shutil.copy(src, dst)
 
         if action == "unstage":
+            if os.path.exists(orig):
+                shutil.rmtree(host_tmp, ignore_errors=True)
             continue
         if action == "record":
-            if label == "orig" and os.path.exists(orig):
+            if label == "orig" and (os.path.exists(orig) or os.path.exists(host_tmp + "/orig.latch")):
                 print("%s: the original record exists: write-once" % h)
                 rc = 2
                 continue
@@ -59,6 +61,9 @@ def main(argv):
                 rc = 2
                 continue
             fetch(host_tmp + "/rec.json", "%s/%s/%s.json" % (d, label, h))
+            if label == "orig":
+                with open(host_tmp + "/orig.latch", "w") as fh:
+                    fh.write("latch\n")
         elif action in ("apply", "restore"):
             if not os.path.exists(orig):
                 if action == "restore":

@@ -20,7 +20,7 @@ export ANSIBLE=$here/tests/cpu_governor_fake_ansible.py PY=$py CPUGOV_ANSIBLE_DI
 
 mkhost() { # mkhost <host> <ncpu> <governor> <driver> <epp|->
   local h=$1 n=$2 g=$3 drv=$4 epp=$5 c i d s
-  rm -rf "${FAKE_SYS_ROOT:?}/$h"
+  rm -rf "${FAKE_SYS_ROOT:?}/${h:?}" "${FAKE_SYS_ROOT:?}/${h:?}.run"
   for ((c = 0; c < n; c++)); do
     d=$FAKE_SYS_ROOT/$h/cpu/cpu$c
     mkdir -p "$d/cpufreq" "$d/cpuidle"
@@ -70,7 +70,9 @@ check "restore" run restore
 check "  RESTORED-EQUAL in the results copy" test "$(status)" = RESTORED-EQUAL
 check "  governors back to as found" test "$(govs msa2-server)$(govs msa2-client)" = "powersave powersave "
 check "  EPP back" grep -q balance_performance "$FAKE_SYS_ROOT/msa2-client/cpu/cpu5/cpufreq/energy_performance_preference"
-check "  the results copy carries orig applied final summary mode" test -s "$CPUGOV_RESULTS/orig/msa2-server.json" -a -s "$CPUGOV_RESULTS/applied/msa2-server.json" -a -s "$CPUGOV_RESULTS/final/msa2-client.json" -a -s "$CPUGOV_RESULTS/summary.txt" -a -s "$CPUGOV_RESULTS/mode.txt"
+check "  the results copy carries orig applied end final summary mode" test -s "$CPUGOV_RESULTS/orig/msa2-server.json" -a -s "$CPUGOV_RESULTS/applied/msa2-server.json" -a -s "$CPUGOV_RESULTS/end/msa2-server.json" -a -s "$CPUGOV_RESULTS/final/msa2-client.json" -a -s "$CPUGOV_RESULTS/summary.txt" -a -s "$CPUGOV_RESULTS/mode.txt"
+check "  the end record (just before the restore) says performance" grep -q '"governor": "performance"' "$CPUGOV_RESULTS/end/msa2-server.json"
+check "  after RESTORED-EQUAL the host-side original latch is gone (unstaged)" test ! -e "$FAKE_SYS_ROOT/msa2-server.run/orig.latch"
 check "  summary.txt has the final lines" grep -q 'msa2-server.final.*governor=powersave=4' "$CPUGOV_RESULTS/summary.txt"
 check "  msr1 byte-identical" bash -c "[ \"\$($(declare -f snapshot); FAKE_SYS_ROOT='$FAKE_SYS_ROOT'; snapshot msr1)\" = \"\$(cat '$work/msr1.before')\" ]"
 check "a second restore is a no-op" run restore
@@ -120,6 +122,7 @@ if [ "$(id -u)" != 0 ]; then
   chmod 444 "$FAKE_SYS_ROOT/msa2-server/cpu/cpu1/cpufreq/scaling_governor"
   check "a restore whose write is refused fails the step" bash -c "bash '$script' restore > '$work/out.log' 2>&1; [ \$? = 1 ]"
   check "  NOT-RESTORED" test "$(status)" = NOT-RESTORED
+  check "  the host-side original latch stays after NOT-RESTORED (no unstage)" test -e "$FAKE_SYS_ROOT/msa2-server.run/orig.latch"
   chmod 644 "$FAKE_SYS_ROOT/msa2-server/cpu/cpu1/cpufreq/scaling_governor"
 fi
 reset
@@ -129,7 +132,43 @@ export FAKE_RESTORE_NOOP=1
 check "a restore that silently restored nothing is caught by the compare (rc 1)" bash -c "bash '$script' restore > '$work/out.log' 2>&1; [ \$? = 1 ]"
 check "  NOT-EQUAL" test "$(status)" = NOT-EQUAL
 check "  the differences are named" grep -q "cpu0.governor: 'powersave' -> 'performance'" "$work/out.log"
+check "  the host-side original latch stays after NOT-EQUAL (no unstage)" test -e "$FAKE_SYS_ROOT/msa2-server.run/orig.latch"
 unset FAKE_RESTORE_NOOP
+CPUGOV_DIR=$work/rt2/cpu-power CPUGOV_RESULTS=$work/res2/cpu-power
+export CPUGOV_DIR CPUGOV_RESULTS
+check "the NEXT run's set after a red restore FAILS (a changed host is not taken as the original)" bash -c "bash '$script' set > '$work/out.log' 2>&1; [ \$? != 0 ]"
+check "  with the message that names the previous run" grep -q "PREVIOUS run" "$work/out.log"
+check "  and nothing is called RESTORED-EQUAL for it" bash -c "bash '$script' restore > '$work/out.log' 2>&1; [ \"\$(cut -d' ' -f1 '$CPUGOV_RESULTS/restore-status.txt')\" = NOTHING-RECORDED ]"
+check "  the host is still changed and the latch is still there" bash -c "[ \"\$(cat '$FAKE_SYS_ROOT'/msa2-server/cpu/cpu0/cpufreq/scaling_governor)\" = performance ] && [ -e '$FAKE_SYS_ROOT/msa2-server.run/orig.latch' ]"
+
+echo "--- one host latched, the other recorded"
+reset
+export BENCH_TARGET=msr1 CPU_GOVERNOR=performance
+run set
+export FAKE_RESTORE_NOOP=1
+run restore   # NOT-EQUAL: msa2-client stays changed and keeps its latch
+unset FAKE_RESTORE_NOOP
+export CPUGOV_DIR=$work/rt3/cpu-power CPUGOV_RESULTS=$work/res3/cpu-power BENCH_TARGET=msa2-server
+check "a second run whose loadgen is latched fails its set" bash -c "bash '$script' set > '$work/out.log' 2>&1; [ \$? != 0 ]"
+run restore
+check "  the host it did record is restored (nothing was changed on it)" test "$(govs msa2-server)" = "powersave "
+check "  and the latched loadgen keeps its latch (the unstage skips a host this run did not record)" test -e "$FAKE_SYS_ROOT/msa2-client.run/orig.latch"
+check "  while the recorded host's latch was removed" test ! -e "$FAKE_SYS_ROOT/msa2-server.run/orig.latch"
+
+echo "--- stop rule: a powersave-as-found host that is already on performance"
+reset
+export BENCH_TARGET=msa2-server CPU_GOVERNOR=performance
+echo performance | tee "$FAKE_SYS_ROOT"/msa2-server/cpu/cpu0/cpufreq/scaling_governor > /dev/null
+check "set refuses (rc 3) and names the stop rule" bash -c "bash '$script' set > '$work/out.log' 2>&1; [ \$? = 3 ] && grep -q 'STOP RULE' '$work/out.log'"
+check "  nothing was written (applied record absent)" test ! -e "$CPUGOV_DIR/applied"
+check "  restore reports STOP-RULE and does not claim a restore" bash -c "bash '$script' restore > '$work/out.log' 2>&1; [ \"\$(cut -d' ' -f1 '$CPUGOV_RESULTS/restore-status.txt')\" = STOP-RULE ]"
+reset
+export BENCH_TARGET=msr1 CPU_GOVERNOR=performance
+check "msr1 (performance as found) is exempt from the stop rule" run set
+reset
+export BENCH_TARGET=msa2-server CPU_GOVERNOR=keep
+echo performance | tee "$FAKE_SYS_ROOT"/msa2-server/cpu/cpu0/cpufreq/scaling_governor > /dev/null
+check "keep does not apply the stop rule (it changes nothing)" run set
 
 echo "--- guards"
 reset

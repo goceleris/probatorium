@@ -182,17 +182,40 @@ class CpuPowerTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("EQUAL", out)
 
-    def test_the_restore_writes_back_a_changed_idle_flag_and_a_changed_limit(self):
-        """a restore is from the record, not from what this run changed: whatever differs at the end is put back"""
+    def test_the_restore_writes_back_a_changed_idle_flag_but_never_a_scaling_limit(self):
+        """a restore is from the record, not from what this run changed: a flag that differs is put back; a moved limit is NOT written (not an A/B write) and fails the restore loudly"""
         self.assertEqual(self.apply("performance")[0], 0)
         w(self.f.sys + "/cpu1/cpuidle/state3/disable", "1\n")  # something else disabled C3 meanwhile
-        w(self.f.sys + "/cpu2/cpufreq/scaling_min_freq", "800000\n")  # and a limit moved
-        w(self.f.sys + "/cpu3/cpufreq/scaling_max_freq", "2000000\n")
         rc, out = self.apply("as-found")
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.disables(3), {"0"})
-        self.assertEqual((self.f.rdf("cpu2/cpufreq/scaling_min_freq"), self.f.rdf("cpu3/cpufreq/scaling_max_freq")), ("400000", "3500000"))
-        self.assertEqual(self.f.run("compare", "--a", self.orig, "--b", self.record_now("after.json"))[0], 0)
+        w(self.f.sys + "/cpu2/cpufreq/scaling_min_freq", "800000\n")  # a limit moved
+        w(self.f.sys + "/cpu3/cpufreq/scaling_max_freq", "2000000\n")
+        rc, out = self.apply("as-found")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("cpu2.min_khz", out)
+        self.assertIn("cpu3.max_khz", out)
+        self.assertEqual((self.f.rdf("cpu2/cpufreq/scaling_min_freq"), self.f.rdf("cpu3/cpufreq/scaling_max_freq")), ("800000", "2000000"))  # untouched
+        rc, out = self.f.run("compare", "--a", self.orig, "--b", self.record_now("after.json"))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("cpu2.min_khz", out)
+
+    def test_performance_does_not_write_an_idle_flag_that_moved_between_the_record_and_the_apply(self):
+        w(self.f.sys + "/cpu1/cpuidle/state3/disable", "1\n")  # moved after record orig
+        rc, out = self.apply("performance")
+        self.assertEqual(rc, 1, out)  # the read-back names it
+        self.assertIn("cpu1.idle[C3].disable", out)
+        self.assertEqual(self.f.rdf("cpu1/cpuidle/state3/disable"), "1")  # and the performance arm did not write it back
+        self.assertEqual(jload(self.f.path("res-performance.json"))["ok"], False)
+
+    def test_stop_rule(self):
+        rc, out = self.f.run("stop-rule", "--orig", self.orig)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.apply("performance")[0], 0)
+        rc, out = self.f.run("stop-rule", "--orig", self.record_now("perf.json"))
+        self.assertEqual(rc, 3, out)
+        self.assertIn("4 of 4", out)
+        self.assertEqual(self.f.run("stop-rule", "--orig", self.f.path("nope.json"))[0], 2)
 
     def test_performance_never_writes_an_idle_state_even_when_one_was_disabled_as_found(self):
         self.f.close()
@@ -296,6 +319,8 @@ class CpuPowerTest(unittest.TestCase):
         if governor == "performance":
             self.assertEqual(self.apply("performance")[0], 0)
             shutil.copy(self.record_now("applied.json"), d + "/applied/msa2-server.json")
+            os.makedirs(d + "/end", exist_ok=True)
+            shutil.copy(self.record_now("end.json"), d + "/end/msa2-server.json")
             if restore:
                 self.assertEqual(self.apply("as-found")[0], 0)
         shutil.copy(self.record_now("final.json"), d + "/final/msa2-server.json")
@@ -330,6 +355,33 @@ class CpuPowerTest(unittest.TestCase):
         rc, out = self.f.run("gate", "--dir", d)
         self.assertEqual(rc, 1, out)
         self.assertIn("applied governor is powersave, not performance", out)
+
+    def test_gate_fails_when_the_governor_did_not_hold_until_the_end_or_the_host_rebooted(self):
+        d = self.make_run()
+        for label in ("orig", "end"):  # a Linux host has a boot id; the fake's /proc may not
+            rec = jload("%s/%s/msa2-server.json" % (d, label))
+            rec["boot_id"] = "boot-a"
+            with open("%s/%s/msa2-server.json" % (d, label), "w") as fh:
+                json.dump(rec, fh)
+        self.assertEqual(self.f.run("gate", "--dir", d)[0], 0)
+        end = jload(d + "/end/msa2-server.json")
+        end["cpus"]["cpu2"]["governor"] = "powersave"  # something put it back mid-run
+        with open(d + "/end/msa2-server.json", "w") as fh:
+            json.dump(end, fh)
+        rc, out = self.f.run("gate", "--dir", d)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("just before the restore, not performance", out)
+        end["cpus"]["cpu2"]["governor"] = "performance"
+        end["boot_id"] = "another-boot"
+        with open(d + "/end/msa2-server.json", "w") as fh:
+            json.dump(end, fh)
+        rc, out = self.f.run("gate", "--dir", d)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("boot id changed", out)
+        os.remove(d + "/end/msa2-server.json")
+        rc, out = self.f.run("gate", "--dir", d)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no end record", out)
 
     def test_gate_keep(self):
         d = self.make_run(governor="keep")

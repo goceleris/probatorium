@@ -13,7 +13,7 @@
 # apply    = copy the ORIGINAL record to the host, move the host to the arm FROM THAT RECORD, read every value back (the task FAILS when one did not take: the caller runs no
 #            benchmark), fetch the result, then take a full record under the label (3 frequency instants after the change = the settle time).
 # restore  = apply as-found (every recorded value written back and read back equal) + a full record + fetch; a host with no original record is a no-op (nothing was changed).
-# unstage  = remove the script and the host directory from tmpfs.
+# unstage  = remove the script and the host directory from tmpfs, ONLY on a host with an original record of this run (see the Unstage block).
 # The script runs under `become: true` (sudo -n, ansible's become): the mechanism bench_tuning.yml uses for its sysctl writes; sysfs writes under it were proven on msa2-server and
 # msa2-client (governor A/B proof run 45367906598, restored equal). On msr1 (already on `performance` as found) a performance apply makes no write at all.
 - name: Facts of the run
@@ -166,9 +166,14 @@
     - not cpu_power_orig_stat.stat.exists
 
 # ---------------------------------------------------------------- unstage
+# Only a host THIS run recorded (the controller has its original) is unstaged. The host-side original (<run dir>/records/orig.json, written with --once) is the latch that makes the NEXT
+# run's `record orig` fail closed on a host that was left changed; a host whose record was refused because of that latch, or whose restore failed (the caller does not unstage then),
+# keeps it, so a changed state can never be taken as a later run's original.
 - name: Unstage the recorder
   become: true
-  when: cpu_power_action == 'unstage'
+  when:
+    - cpu_power_action == 'unstage'
+    - cpu_power_orig_stat.stat.exists
   block:
     - name: Unstage | remove the script
       ansible.builtin.file:

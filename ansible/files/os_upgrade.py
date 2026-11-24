@@ -203,6 +203,14 @@ def boot_cmdline():
     return re.sub(rb"[^ -~]", b"?", raw).decode("ascii")
 
 
+def cpu_power_safe():
+    """cpu_power() isolated: a record of what the host is must never void the whole survey of the host (the play asserts one from every host)"""
+    try:
+        return cpu_power()
+    except Exception as e:  # noqa: BLE001 - any failure of a read-only record becomes data
+        return {"error": repr(e), "cpus": {}}
+
+
 def cpu_power():
     """The CPU frequency / idle state of the host, READ ONLY: per CPU with a cpufreq or cpuidle directory the scaling driver, governor, energy_performance_preference (null when the
     file is absent), scaling_{min,max,cur}_freq and the cpuidle states (name, disable, latency, residency); host-wide boost / no_turbo / pstate status / cpuidle driver and governor; and
@@ -973,7 +981,7 @@ def survey():
         "os_release": osr,
         "kernel": running,
         "boot_cmdline": boot_cmdline(),
-        "cpu_power": cpu_power(),
+        "cpu_power": cpu_power_safe(),
         "arch": os.uname().machine,
         "kernel_flavor": flavor(running),
         "installed_kernels": kernels,

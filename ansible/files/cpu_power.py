@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """cpu_power.py: record, set and restore the CPU frequency governor of ONE host, and record its idle states (python3, stdlib only).
 
-The release runs (benchmark-tier, matrix-race-tier, celeris-stress cluster) put the CPU governor on `performance` before the run starts and put it back afterwards; every host of a run
-is RECORDED (scaling driver, governor, energy_performance_preference, min/max/cur frequency, boost, cpuidle driver/governor and every idle state with its `disable` flag) before, after
-the change and after the restore. Idle states are never written by a `performance` run: they are left AS FOUND and recorded. Staged by ansible/tasks/cpu_power.yml onto tmpfs; read-only
-modes (record, summary, compare) need no privilege, apply needs root (ansible `become: true`, or `sudo -n` in the stress host job).
+The release runs (benchmark-tier, matrix-race-tier) put the CPU governor on `performance` before the run starts and put it back afterwards; every host of a run is RECORDED (scaling
+driver, governor, energy_performance_preference, min/max/cur frequency, boost, cpuidle driver/governor and every idle state with its `disable` flag) before, after the change, before the
+restore and after it. Idle states and the scaling limits are NEVER written by a `performance` run (left as found, recorded); the restore writes back only the governor, EPP and idle flags
+(a moved scaling limit is not written: it fails the compare). Staged by ansible/tasks/cpu_power.yml onto tmpfs; read-only modes (record, summary, compare, gate, stop-rule) need no
+privilege, apply needs root (ansible `become: true`). The celeris-stress cluster host job is NOT wired.
 
   cpu_power.py record  --out F [--tag T] [--label L] [--samples N] [--gap S] [--once]
         full record of the host: per CPU the scaling driver, governor, available governors, energy_performance_preference, scaling_{min,max,cur}_freq and the cpuidle states
@@ -12,14 +13,16 @@ modes (record, summary, compare) need no privilege, apply needs root (ansible `b
         (scaling_cur_freq and /proc/cpuinfo MHz of every CPU; default 3 samples, 1 s apart). --once refuses to overwrite F (the ORIGINAL record is write-once).
         A host without cpufreq (no governor to set) is recorded with `has_cpufreq: false` and its cpuidle states; it is not an error.
   cpu_power.py apply   --arm ARM --orig F [--out R]   ARM = performance | as-found. Moves the host to the arm's state FROM THE ORIGINAL RECORD (never from the current state):
-        as-found = every recorded value written back (governor, then EPP, then scaling min/max, then idle `disable` flags); performance = governor `performance` on every CPU that has a
-        governor (EPP `performance` where the file exists, a warning when the kernel refuses it), every other recorded value (idle flags, limits) unchanged. A value that already equals
+        as-found = every recorded value written back (governor, then EPP, then idle `disable` flags); performance = governor `performance` on every CPU that has a
+        governor (EPP `performance` where the file exists, a warning when the kernel refuses it), every other recorded value (idle flags, limits) untouched. A value that already equals
         the wanted one is NOT written (a host already on performance gets zero writes). Every value is read back; exit 1 when one did not take. The result JSON R (ok, errors, warnings,
         expected, got, changed_writes) is written either way.
   cpu_power.py compare --a F --b G    exit 0 when the settable state (driver, governor, EPP, scaling min/max, idle flags by state name, host-wide settings) of the two records is equal
   cpu_power.py gate    --dir D [--governor performance|keep] [--hosts h1,h2]   the reader's hard gate on a run's results/cpu-power directory D: restore-status.txt is RESTORED-EQUAL
         (keep: KEPT-EQUAL), every host has orig / final records and they compare EQUAL (re-computed here, not taken from the status text), for performance every CPU that has a governor was
-        on `performance` in the applied record with its idle flags as found, --hosts (when given) names exactly the recorded hosts; prints one line per host and label; exit 0 only when all hold
+        on `performance` in the applied record AND in the `end` record (taken just before the restore, same boot id as the original) with its idle flags as found, --hosts (when given) names exactly the recorded hosts; prints one line per host and label; exit 0 only when all hold
+  cpu_power.py stop-rule --orig F     exit 0 when NO CPU of the record is on the performance governor, else 3: a host whose known as-found state is not performance (msa2-server, msa2-client)
+        that is ALREADY on performance was left changed by something else (a previous run that did not restore): the set step refuses it instead of taking it as the original
   cpu_power.py summary --rec F        one line: what the host runs on (driver, governor, EPP, boost, pstate, cpuidle driver/governor, idle states and their disable flags, frequency range)
 
 Frequencies, usage, time and MHz are measurements, never part of the state that is compared. Test hooks: CPU_SYSFS (default /sys/devices/system/cpu), CPUINFO (default /proc/cpuinfo).
@@ -143,7 +146,7 @@ def freq_sample(cpus):
 def record(tag="", label="", samples=3, gap=1.0):
     cpus = cpu_ids()
     rec = {"schema": 2, "host": socket.gethostname(), "tag": tag, "label": label, "epoch": round(time.time(), 3),
-           "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kernel": rd("/proc/sys/kernel/osrelease", ""),
+           "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kernel": rd("/proc/sys/kernel/osrelease", ""), "boot_id": rd("/proc/sys/kernel/random/boot_id", ""),
            "global": host_wide(), "cpus": {"cpu%d" % c: cpu_entry(c) for c in cpus}, "freq_samples": []}
     rec["has_cpufreq"] = any(e["governor"] != "-" for e in rec["cpus"].values())
     for i in range(max(1, samples)):
@@ -230,7 +233,7 @@ def apply_arm(arm, orig):
     if cpus != online:
         errors.append("the CPUs with cpufreq/cpuidle differ from the original record (record %d, now %d): an offline or hot-plugged CPU" % (len(cpus), len(online)))
     want, epp_perf = expected_state(orig, arm)
-    # 1. governor first, then EPP (writable again under powersave on a restore), then the scaling limits, then idle flags
+    # 1. governor first, then EPP (writable again under powersave on a restore), then (restore only) the idle flags; the scaling limits are never written
     for c in cpus:
         name = "cpu%d" % c
         d = os.path.join(sysfs(), name, "cpufreq")
@@ -258,23 +261,7 @@ def apply_arm(arm, orig):
         if err:
             # under the performance governor the kernel may refuse an EPP write (it pins the hint): a warning, never for the as-found restore
             (errors if arm == "as-found" else warnings).append("EPP write failed " + err)
-    if arm == "as-found":
-        # a governor switch is not expected to move the scaling limits; when one did, put it back (max first when it rises, min first when it falls), else the compare names it
-        for c in cpus:
-            name = "cpu%d" % c
-            d = os.path.join(sysfs(), name, "cpufreq")
-            wmin, wmax = want["cpus"][name]["min_khz"], want["cpus"][name]["max_khz"]
-            hmin, hmax = rdint(d + "/scaling_min_freq"), rdint(d + "/scaling_max_freq")
-            if wmin is None or wmax is None or hmin is None or hmax is None or (hmin, hmax) == (wmin, wmax):
-                continue
-            order = [("scaling_max_freq", wmax, hmax), ("scaling_min_freq", wmin, hmin)] if wmax > hmax else [("scaling_min_freq", wmin, hmin), ("scaling_max_freq", wmax, hmax)]
-            for fn, w, h in order:
-                if w != h:
-                    err = wr(d + "/" + fn, w)
-                    changed += 1
-                    if err:
-                        errors.append("write failed " + err)
-    for c in cpus:
+    for c in cpus if arm == "as-found" else []:  # a performance run NEVER writes an idle state (left as found); a flag that moved meanwhile fails the read-back below
         name = "cpu%d" % c
         have = {s["name"]: s for s in idle_states(c)}
         for s, v in want["cpus"][name]["idle"].items():
@@ -356,9 +343,9 @@ def cmd_gate(a):
         bad.append("recorded hosts %s != expected %s" % (hosts, sorted(a["--hosts"].split(","))))
     for h in hosts:
         recs = {}
-        for label in ("orig", "applied", "final"):
+        for label in ("orig", "applied", "end", "final"):
             path = os.path.join(d, label, h + ".json")
-            if label == "applied" and want == "keep":
+            if label in ("applied", "end") and want == "keep":
                 continue
             if not os.path.exists(path):
                 bad.append("%s: no %s record" % (h, label))
@@ -379,6 +366,16 @@ def cmd_gate(a):
                 bad.append("%s: the idle flags of the applied record differ from the original (idle states must be left as found)" % h)
             if set(recs["applied"]["cpus"]) != set(recs["orig"]["cpus"]):
                 bad.append("%s: the applied record has other CPUs than the original" % h)
+        if want == "performance" and "orig" in recs and "end" in recs:
+            for name, e in recs["end"]["cpus"].items():
+                if e.get("governor") not in ("performance", "-"):
+                    bad.append("%s.%s: the governor was %s just before the restore, not performance (it did not hold for the whole run)" % (h, name, e.get("governor")))
+            ie = {n: {s["name"]: s["disable"] for s in e.get("idle", [])} for n, e in recs["end"]["cpus"].items()}
+            io = {n: {s["name"]: s["disable"] for s in e.get("idle", [])} for n, e in recs["orig"]["cpus"].items()}
+            if ie != io:
+                bad.append("%s: the idle flags just before the restore differ from the original" % h)
+            if recs["orig"].get("boot_id") and recs["end"].get("boot_id") != recs["orig"].get("boot_id"):
+                bad.append("%s: the boot id changed during the run (the host rebooted; the governor of the run is not proven)" % h)
     for b in bad:
         print("gate: FAIL: " + b)
     print("gate: %s" % ("OK" if not bad else "FAILED (%d)" % len(bad)))
@@ -433,6 +430,17 @@ def main(argv):
             print("cpu_power: differs: " + line)
         print("cpu_power: compare %s" % ("EQUAL" if not d else "%d difference(s)" % len(d)))
         return 0 if not d else 1
+    if mode == "stop-rule":
+        if "--orig" not in a:
+            print(__doc__)
+            return 2
+        rec = load(a["--orig"])
+        perf = sorted(n for n, e in rec["cpus"].items() if e.get("governor") == "performance")
+        if perf:
+            print("cpu_power: STOP RULE: %d of %d CPUs are already on the performance governor as found" % (len(perf), len(rec["cpus"])))
+            return 3
+        print("cpu_power: stop rule ok: governors as found = %s" % ",".join(sorted({str(e.get("governor")) for e in rec["cpus"].values()})))
+        return 0
     if mode == "gate":
         if "--dir" not in a or a.get("--governor", "performance") not in ("performance", "keep"):
             print(__doc__)

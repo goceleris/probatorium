@@ -84,10 +84,23 @@ echo "--- the final restore"
 check "restore" play restore final
 check "  every value equals the original" cp_py compare --a "$res/orig/msa2-server.json" --b "$res/final/msa2-server.json"
 check "  the summary of the original says powersave" bash -c "'$py' -I -B '$here/files/cpu_power.py' summary --rec '$res/orig/msa2-server.json' | grep -q governor=powersave=4"
+check "unstage after this run's own original removes the script" play unstage x
+check "  the script is gone" test ! -e "$run/cpu_power.py"
+check "  and the host-side records" test ! -e "$run/records"
 rm -rf "${res:?}"
 check "a restore with no original record is a no-op" play restore final2
-check "unstage removes the script" play unstage x
-check "  the script is gone" test ! -e "$run/cpu_power.py"
+
+echo "--- the latch: the host-side original is removed only by the run that recorded it"
+mkdir -p "$run/records"
+touch "$run/records/orig.json"
+check "a record orig on a host that still has the previous run's original is REFUSED" refused record orig
+check "  nothing was fetched" test ! -e "$res/orig/msa2-server.json"
+check "unstage for a host this run did not record leaves the latch" play unstage x
+check "  the latch is still there" test -e "$run/records/orig.json"
+rm -f "${run:?}/records/orig.json"
+check "after the latch is cleared (reboot) the host records its original again" play record orig
+check "unstage after it removes the latch" play unstage x
+check "  gone" test ! -e "$run/records"
 
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
