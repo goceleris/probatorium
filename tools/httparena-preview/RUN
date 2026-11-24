@@ -1,4 +1,4 @@
-phases=clear,async,supp,tls
-portrange_ok=0
+phases=async
+portrange_ok=1
 governor=performance
-reason=HttpArena preview full dispatch
+reason=HttpArena preview async re-run
