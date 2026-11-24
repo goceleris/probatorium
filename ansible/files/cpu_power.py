@@ -17,6 +17,9 @@ modes (record, summary, compare) need no privilege, apply needs root (ansible `b
         the wanted one is NOT written (a host already on performance gets zero writes). Every value is read back; exit 1 when one did not take. The result JSON R (ok, errors, warnings,
         expected, got, changed_writes) is written either way.
   cpu_power.py compare --a F --b G    exit 0 when the settable state (driver, governor, EPP, scaling min/max, idle flags by state name, host-wide settings) of the two records is equal
+  cpu_power.py gate    --dir D [--governor performance|keep] [--hosts h1,h2]   the reader's hard gate on a run's results/cpu-power directory D: restore-status.txt is RESTORED-EQUAL
+        (keep: KEPT-EQUAL), every host has orig / final records and they compare EQUAL (re-computed here, not taken from the status text), for performance every CPU that has a governor was
+        on `performance` in the applied record with its idle flags as found, --hosts (when given) names exactly the recorded hosts; prints one line per host and label; exit 0 only when all hold
   cpu_power.py summary --rec F        one line: what the host runs on (driver, governor, EPP, boost, pstate, cpuidle driver/governor, idle states and their disable flags, frequency range)
 
 Frequencies, usage, time and MHz are measurements, never part of the state that is compared. Test hooks: CPU_SYSFS (default /sys/devices/system/cpu), CPUINFO (default /proc/cpuinfo).
@@ -330,6 +333,58 @@ def summary(rec):
                min(cur) if cur else "n/a", max(cur) if cur else "n/a", g.get("cpuidle_driver"), g.get("cpuidle_governor"), idle_txt))
 
 
+def cmd_gate(a):
+    d = a["--dir"]
+    want = a.get("--governor", "performance")
+    bad = []
+    try:
+        with open(os.path.join(d, "restore-status.txt")) as f:
+            status = f.read().strip()
+    except OSError:
+        status = ""
+    need = "RESTORED-EQUAL" if want == "performance" else "KEPT-EQUAL"
+    print("gate: restore-status: %s" % (status or "MISSING"))
+    if not status.startswith(need):
+        bad.append("restore-status is not %s" % need)
+    try:
+        hosts = sorted(n[:-5] for n in os.listdir(os.path.join(d, "orig")) if n.endswith(".json"))
+    except OSError:
+        hosts = []
+    if not hosts:
+        bad.append("no orig record")
+    if "--hosts" in a and sorted(a["--hosts"].split(",")) != hosts:
+        bad.append("recorded hosts %s != expected %s" % (hosts, sorted(a["--hosts"].split(","))))
+    for h in hosts:
+        recs = {}
+        for label in ("orig", "applied", "final"):
+            path = os.path.join(d, label, h + ".json")
+            if label == "applied" and want == "keep":
+                continue
+            if not os.path.exists(path):
+                bad.append("%s: no %s record" % (h, label))
+                continue
+            recs[label] = load(path)
+            print("gate: %s %s: %s" % (h, label, summary(recs[label])))
+        if "orig" in recs and "final" in recs:
+            diff = diff_views(state_view(recs["orig"]), state_view(recs["final"]))
+            if diff:
+                bad.append("%s: final differs from orig: %s" % (h, "; ".join(diff[:5])))
+        if want == "performance" and "orig" in recs and "applied" in recs:
+            for name, e in recs["applied"]["cpus"].items():
+                if e.get("governor") not in ("performance", "-"):
+                    bad.append("%s.%s: applied governor is %s, not performance" % (h, name, e.get("governor")))
+            ia = {n: {s["name"]: s["disable"] for s in e.get("idle", [])} for n, e in recs["applied"]["cpus"].items()}
+            io = {n: {s["name"]: s["disable"] for s in e.get("idle", [])} for n, e in recs["orig"]["cpus"].items()}
+            if ia != io:
+                bad.append("%s: the idle flags of the applied record differ from the original (idle states must be left as found)" % h)
+            if set(recs["applied"]["cpus"]) != set(recs["orig"]["cpus"]):
+                bad.append("%s: the applied record has other CPUs than the original" % h)
+    for b in bad:
+        print("gate: FAIL: " + b)
+    print("gate: %s" % ("OK" if not bad else "FAILED (%d)" % len(bad)))
+    return 0 if not bad else 1
+
+
 def parse(argv):
     a, i = {}, 0
     while i < len(argv):
@@ -378,6 +433,11 @@ def main(argv):
             print("cpu_power: differs: " + line)
         print("cpu_power: compare %s" % ("EQUAL" if not d else "%d difference(s)" % len(d)))
         return 0 if not d else 1
+    if mode == "gate":
+        if "--dir" not in a or a.get("--governor", "performance") not in ("performance", "keep"):
+            print(__doc__)
+            return 2
+        return cmd_gate(a)
     if mode == "summary":
         if "--rec" not in a:
             print(__doc__)

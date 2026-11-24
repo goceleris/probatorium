@@ -287,6 +287,57 @@ class CpuPowerTest(unittest.TestCase):
         self.assertIn("not in scaling_available_governors", out)
         self.assertEqual(self.governors(), {"powersave"})
 
+    def make_run(self, governor="performance", restore=True):
+        """a results/cpu-power directory as the step script leaves it, built from this fake host"""
+        d = self.f.path("cp-%s-%s" % (governor, restore))
+        for label in ("orig", "applied", "final"):
+            os.makedirs("%s/%s" % (d, label), exist_ok=True)
+        shutil.copy(self.orig, d + "/orig/msa2-server.json")
+        if governor == "performance":
+            self.assertEqual(self.apply("performance")[0], 0)
+            shutil.copy(self.record_now("applied.json"), d + "/applied/msa2-server.json")
+            if restore:
+                self.assertEqual(self.apply("as-found")[0], 0)
+        shutil.copy(self.record_now("final.json"), d + "/final/msa2-server.json")
+        status = "RESTORED-EQUAL x" if (governor == "performance" and restore) else ("KEPT-EQUAL x" if governor == "keep" else "NOT-EQUAL x")
+        with open(d + "/restore-status.txt", "w") as fh:
+            fh.write(status + "\n")
+        return d
+
+    def test_gate_passes_a_restored_run_and_names_what_is_wrong_with_others(self):
+        d = self.make_run()
+        rc, out = self.f.run("gate", "--dir", d, "--hosts", "msa2-server")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("gate: OK", out)
+        self.assertIn("msa2-server applied: cpus=4 driver=amd-pstate-epp=4 governor=performance=4", out)
+        self.assertIn("msa2-server final: cpus=4 driver=amd-pstate-epp=4 governor=powersave=4", out)
+        rc, out = self.f.run("gate", "--dir", d, "--hosts", "msa2-server,msr1")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("!= expected", out)
+        rc, out = self.f.run("gate", "--dir", self.make_run(restore=False))  # the host was left on performance: final differs
+        self.assertEqual(rc, 1, out)
+        self.assertIn("final differs from orig", out)
+        self.assertIn("restore-status is not RESTORED-EQUAL", out)
+        with open(d + "/restore-status.txt", "w") as fh:
+            fh.write("NOT-EQUAL x\n")
+        rc, out = self.f.run("gate", "--dir", d)  # the records say equal but the status text does not: still a failure
+        self.assertEqual(rc, 1, out)
+        os.remove(d + "/restore-status.txt")
+        self.assertEqual(self.f.run("gate", "--dir", d)[0], 1)
+        shutil.copy(d + "/orig/msa2-server.json", d + "/applied/msa2-server.json")  # an applied record still on powersave
+        with open(d + "/restore-status.txt", "w") as fh:
+            fh.write("RESTORED-EQUAL x\n")
+        rc, out = self.f.run("gate", "--dir", d)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("applied governor is powersave, not performance", out)
+
+    def test_gate_keep(self):
+        d = self.make_run(governor="keep")
+        rc, out = self.f.run("gate", "--dir", d, "--governor", "keep")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.f.run("gate", "--dir", d)[0], 1)  # a keep run is not a performance run
+        self.assertEqual(self.f.run("gate", "--dir", d, "--governor", "turbo")[0], 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
