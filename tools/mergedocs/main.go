@@ -37,7 +37,7 @@ func run(args []string, stdout, stderr *os.File) int {
 		anchors = fs.String("anchors", strings.Join(DefaultAnchors, ","), "drift anchors measured in both dispatches")
 		twin    = fs.String("twin", "separate", "v1.5.11 twin columns: separate (strip + comparison sidecar), strip, keep")
 		date    = fs.String("date", "", "publish date yyyymmdd, REQUIRED, the same for both architectures of the release")
-		harness = fs.String("harness-repo", "", "probatorium checkout used to prove that two different harness commits differ only by the celeris pin (go.mod/go.sum)")
+		harness = fs.String("harness-repo", "", "probatorium checkout used to prove that two different harness commits differ only in paths that cannot change a measurement (REFUSALS.md R3: celeris pin bumps, readers, validators, tools, docs)")
 		expect  = fs.String("expect-columns", "", "file listing the columns the merged document must hold (one per line)")
 		showRef = fs.Bool("print-refusals", false, "print REFUSALS.md and its sha256 and exit")
 	)

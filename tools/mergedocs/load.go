@@ -330,13 +330,24 @@ func parseForensics(s string) (kernel, bootID string) {
 }
 
 // gitHarnessDiff returns the HarnessDiff of a probatorium checkout: the files
-// that differ between two commits.
+// that differ between two commits. --no-renames lists both paths of a rename
+// (otherwise only the destination shows and a deletion hides behind it), and -z
+// keeps names with spaces or non-ASCII characters intact.
 func gitHarnessDiff(repo string) func(a, b string) ([]string, error) {
 	return func(a, b string) ([]string, error) {
-		out, err := exec.Command("git", "-C", repo, "diff", "--name-only", a, b).CombinedOutput()
+		cmd := exec.Command("git", "-C", repo, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", a, b)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
 		if err != nil {
-			return nil, fmt.Errorf("git diff --name-only %s %s: %v: %s", a, b, err, strings.TrimSpace(string(out)))
+			return nil, fmt.Errorf("git diff --name-only %s %s: %v: %s", a, b, err, strings.TrimSpace(stderr.String()))
 		}
-		return strings.Fields(string(out)), nil
+		var names []string
+		for _, n := range strings.Split(string(out), "\x00") {
+			if n != "" {
+				names = append(names, n)
+			}
+		}
+		return names, nil
 	}
 }

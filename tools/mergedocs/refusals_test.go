@@ -286,41 +286,27 @@ func TestIdenticalDocumentsRefused(t *testing.T) {
 	}
 }
 
-// R3: harness commits may differ only in go.mod and go.sum under servers/celeris/
-// and validation/refapp/ (adapter code must be identical in both dispatches).
+// R3: harness commits may differ only in paths that cannot change a measurement
+// (harness_paths_test.go has the path classes); this is the composer wiring.
 func TestHarnessScope(t *testing.T) {
-	cases := []struct {
-		name  string
-		names []string
-		ok    bool
-	}{
-		{"pin bump", []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}, true},
-		{"pin bump with the refapps (7cf6dff, 6a08c78)", []string{"servers/celeris/go.mod", "servers/celeris/go.sum", "validation/refapp/kitchen_sink/go.mod", "validation/refapp/internal/debugvars/go.sum"}, true},
-		{"adapter code in the module directory is not the pin", []string{"servers/celeris/go.sum", "servers/celeris/main.go"}, false},
-		{"refapp code", []string{"validation/refapp/kitchen_sink/main.go"}, false},
-		{"another module", []string{"servers/celeris_v1511/go.mod"}, false},
-		{"sibling directory with the same prefix", []string{"servers/celeris-extra/go.mod"}, false},
-		{"root go.mod", []string{"go.mod"}, false},
-		{"another adapter's go.mod", []string{"servers/gin/go.mod"}, false},
-		{"mage code", []string{"mage_bench.go"}, false},
-		{"identical trees", nil, false},
-	}
-	for _, c := range cases {
-		if got := classifyHarnessDiff(c.names) == ""; got != c.ok {
-			t.Errorf("%s: ok=%v want %v", c.name, got, c.ok)
-		}
-	}
 	for _, tc := range []struct {
 		name string
 		hd   func(a, b string) ([]string, error)
 		want []string
+		warn string // in the warnings of an accepted composition
 	}{
-		{"proved", func(a, b string) ([]string, error) {
+		{"pin bump", func(a, b string) ([]string, error) {
 			return []string{"servers/celeris/go.mod", "servers/celeris/go.sum"}, nil
-		}, nil},
-		{"not proved", func(a, b string) ([]string, error) { return []string{"magefile.go"}, nil }, []string{"R3"}},
-		{"git fails", func(a, b string) ([]string, error) { return nil, errors.New("bad object") }, []string{"R3"}},
-		{"no checkout", nil, []string{"R3"}},
+		}, nil, "2 celeris pin bump file(s), 0 reader"},
+		{"reader fix after the screen", func(a, b string) ([]string, error) {
+			return []string{"tools/mergedocs/compose.go", "docs/STRESS.md", "mage_diff.go"}, nil
+		}, nil, "0 celeris pin bump file(s), 3 reader"},
+		{"adapter", func(a, b string) ([]string, error) { return []string{"servers/gin/main.go", "docs/STRESS.md"}, nil }, []string{"R3"}, ""},
+		{"mage runner", func(a, b string) ([]string, error) { return []string{"mage_bench.go"}, nil }, []string{"R3"}, ""},
+		{"unknown path", func(a, b string) ([]string, error) { return []string{"newthing/x.go"}, nil }, []string{"R3"}, ""},
+		{"identical trees", func(a, b string) ([]string, error) { return nil, nil }, []string{"R3"}, ""},
+		{"git fails", func(a, b string) ([]string, error) { return nil, errors.New("bad object") }, []string{"R3"}, ""},
+		{"no checkout", nil, []string{"R3"}, ""},
 	} {
 		f := newFixture()
 		f.PMeta["harness_commit"] = "def456abc"
@@ -333,14 +319,31 @@ func TestHarnessScope(t *testing.T) {
 		case tc.want == nil:
 			found := false
 			for _, w := range res.Comp.Warnings {
-				found = found || strings.Contains(w, "only in go.mod and go.sum under servers/celeris/")
+				found = found || strings.Contains(w, tc.warn)
 			}
 			if !found {
-				t.Errorf("%s: an accepted difference must be recorded in the warnings", tc.name)
+				t.Errorf("%s: an accepted difference must be recorded in the warnings (%q): %v", tc.name, tc.warn, res.Comp.Warnings)
+			}
+			if res.Comp.HarnessDiff == nil || res.Comp.HarnessDiff.FilesChanged == 0 {
+				t.Errorf("%s: an accepted difference must be recorded in harness_diff", tc.name)
 			}
 		case !errors.As(err, &re) || !reflect.DeepEqual(re.IDs(), tc.want):
 			t.Errorf("%s: want %v, got %v", tc.name, tc.want, err)
 		}
+	}
+	// the refusal names the offending file
+	f := newFixture()
+	f.PMeta["harness_commit"] = "def456abc"
+	f.Opt.HarnessDiff = func(a, b string) ([]string, error) {
+		return []string{"ansible/tasks/run_bench_cell.yml", "tools/mergedocs/compose.go"}, nil
+	}
+	if _, err := f.compose(t); err == nil || !strings.Contains(err.Error(), "ansible/tasks/run_bench_cell.yml") {
+		t.Errorf("the refusal must name the offending file: %v", err)
+	}
+	// the same commit twice has no harness diff to record
+	f = newFixture()
+	if res, err := f.compose(t); err != nil || res.Comp.HarnessDiff != nil {
+		t.Errorf("equal commits: %v %+v", err, res)
 	}
 	// abbreviated and full forms of one commit are the same commit
 	if !sameCommit("d534a9f", "d534a9fbe181ab6133040594d6c8194aebbd7f0b") || sameCommit("abc", "abcd") || sameCommit("d534a9f", "d534a9e") {

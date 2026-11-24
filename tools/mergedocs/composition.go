@@ -26,6 +26,10 @@ type Composition struct {
 	// (boot ids differ); accepted only under R7's conditions.
 	Reboot RebootRecord `json:"reboot"`
 
+	// HarnessDiff is set when the two dispatches ran different harness commits
+	// (R3): the files that differ, none of which can change a measurement.
+	HarnessDiff *HarnessDiff `json:"harness_diff,omitempty"`
+
 	Dispatches map[string]DispatchRecord `json:"dispatches"`
 	GapHours   float64                   `json:"gap_hours_between_dispatches"`
 	Anchors    AnchorSection             `json:"anchors"`
