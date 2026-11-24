@@ -1,3 +1,98 @@
+diff --git a/frameworks/celeris-ceiling/build.sh b/frameworks/celeris-ceiling/build.sh
+new file mode 100755
+index 0000000..292d322
+--- /dev/null
++++ b/frameworks/celeris-ceiling/build.sh
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++# PREVIEW VARIANT: the celeris entry built with CELERIS_PROCS=split (see ../celeris/README.md, "Process layout"). benchmark.sh and validate.sh call this instead of docker build.
++set -euo pipefail
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++docker build -t httparena-celeris-ceiling --build-arg CELERIS_PROCS=split "$here/celeris"
+diff --git a/frameworks/celeris-ceiling/meta.json b/frameworks/celeris-ceiling/meta.json
+new file mode 100644
+index 0000000..fcb49c8
+--- /dev/null
++++ b/frameworks/celeris-ceiling/meta.json
+@@ -0,0 +1,38 @@
++{
++  "display_name": "celeris-ceiling",
++  "language": "Go",
++  "type": "emerging",
++  "mode": "standard",
++  "completeness": {
++    "routing": true,
++    "middleware": true,
++    "request": true,
++    "response": true
++  },
++  "engine": "io_uring/epoll (adaptive); std on the TLS ports; one process per listener",
++  "description": "PREVIEW VARIANT, not for submission: the celeris entry's source built with CELERIS_PROCS=split, one process per listener so that no process holds two servers' pinned loops: process 1 runs 8080 (Adaptive, HTTP/1.1 and WebSocket, and the database pool), process 2 runs 8082 (Adaptive, h2c), process 3 runs the std-engine TLS servers (8081 and 8443). The children share the container's cpuset with the parent. Everything else is the celeris entry. Built from ../celeris by build.sh (--build-arg CELERIS_PROCS=split).",
++  "repo": "https://github.com/goceleris/celeris",
++  "website": "https://goceleris.dev",
++  "enabled": true,
++  "tests": [
++    "baseline",
++    "pipelined",
++    "limited-conn",
++    "async",
++    "latency-1m",
++    "latency-10k",
++    "json-comp",
++    "async-db",
++    "fortunes",
++    "baseline-h2c",
++    "json-h2c",
++    "echo-ws",
++    "echo-ws-pipeline",
++    "echo-ws-limited",
++    "json-tls",
++    "8gbit",
++    "baseline-h2",
++    "static-h2"
++  ],
++  "maintainers": []
++}
+diff --git a/frameworks/celeris-default/build.sh b/frameworks/celeris-default/build.sh
+new file mode 100755
+index 0000000..0c4f94a
+--- /dev/null
++++ b/frameworks/celeris-default/build.sh
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++# PREVIEW CONTROL: the celeris entry built with Config.Engine left unset. benchmark.sh and validate.sh call this instead of docker build.
++set -euo pipefail
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++docker build -t httparena-celeris-default --build-arg CELERIS_ENGINE=default "$here/celeris"
+diff --git a/frameworks/celeris-default/meta.json b/frameworks/celeris-default/meta.json
+new file mode 100644
+index 0000000..b811522
+--- /dev/null
++++ b/frameworks/celeris-default/meta.json
+@@ -0,0 +1,23 @@
++{
++  "display_name": "celeris-default",
++  "language": "Go",
++  "type": "emerging",
++  "mode": "standard",
++  "completeness": {
++    "routing": true,
++    "middleware": true,
++    "request": true,
++    "response": true
++  },
++  "engine": "adaptive (Config.Engine unset: the control)",
++  "description": "PREVIEW CONTROL, not for submission: the celeris entry's source built with Config.Engine left UNSET (CELERIS_ENGINE=default), which on Linux runs the same Adaptive engine as the celeris entry (which sets it explicitly) but makes a driver pool opened WithEngine take a slower path (async-db, fortunes). Runs baseline, async-db and fortunes only (baseline as the sanity row: same engine, same numbers expected). Built from ../celeris by build.sh (--build-arg CELERIS_ENGINE=default).",
++  "repo": "https://github.com/goceleris/celeris",
++  "website": "https://goceleris.dev",
++  "enabled": true,
++  "tests": [
++    "baseline",
++    "async-db",
++    "fortunes"
++  ],
++  "maintainers": []
++}
 diff --git a/frameworks/celeris-epoll/build.sh b/frameworks/celeris-epoll/build.sh
 new file mode 100755
 index 0000000..c603324
@@ -100,12 +195,67 @@ index 0000000..9ee301c
 +  ],
 +  "maintainers": []
 +}
+diff --git a/frameworks/celeris-tlschild/build.sh b/frameworks/celeris-tlschild/build.sh
+new file mode 100755
+index 0000000..4849331
+--- /dev/null
++++ b/frameworks/celeris-tlschild/build.sh
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++# PREVIEW VARIANT: the celeris entry built with CELERIS_PROCS=tls-child (see ../celeris/README.md, "Process layout"). benchmark.sh and validate.sh call this instead of docker build.
++set -euo pipefail
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++docker build -t httparena-celeris-tlschild --build-arg CELERIS_PROCS=tls-child "$here/celeris"
+diff --git a/frameworks/celeris-tlschild/meta.json b/frameworks/celeris-tlschild/meta.json
+new file mode 100644
+index 0000000..32e6d5d
+--- /dev/null
++++ b/frameworks/celeris-tlschild/meta.json
+@@ -0,0 +1,38 @@
++{
++  "display_name": "celeris-tlschild",
++  "language": "Go",
++  "type": "emerging",
++  "mode": "standard",
++  "completeness": {
++    "routing": true,
++    "middleware": true,
++    "request": true,
++    "response": true
++  },
++  "engine": "io_uring/epoll (adaptive); std on the TLS ports, in a second process",
++  "description": "PREVIEW VARIANT, not for submission: the celeris entry's source built with CELERIS_PROCS=tls-child. Process 1 runs the cleartext Adaptive servers (8080 HTTP/1.1 and WebSocket, 8082 h2c); process 2 (a child of process 1, same cpuset) runs the std-engine TLS servers (8081 HTTP/1.1 over TLS, 8443 h2 over TLS). Everything else is the celeris entry. Built from ../celeris by build.sh (--build-arg CELERIS_PROCS=tls-child).",
++  "repo": "https://github.com/goceleris/celeris",
++  "website": "https://goceleris.dev",
++  "enabled": true,
++  "tests": [
++    "baseline",
++    "pipelined",
++    "limited-conn",
++    "async",
++    "latency-1m",
++    "latency-10k",
++    "json-comp",
++    "async-db",
++    "fortunes",
++    "baseline-h2c",
++    "json-h2c",
++    "echo-ws",
++    "echo-ws-pipeline",
++    "echo-ws-limited",
++    "json-tls",
++    "8gbit",
++    "baseline-h2",
++    "static-h2"
++  ],
++  "maintainers": []
++}
 diff --git a/frameworks/celeris/Dockerfile b/frameworks/celeris/Dockerfile
 new file mode 100644
-index 0000000..6e373d5
+index 0000000..e70fcdf
 --- /dev/null
 +++ b/frameworks/celeris/Dockerfile
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,17 @@
 +FROM golang:1.27.4-alpine AS build
 +WORKDIR /app
 +COPY go.mod go.sum ./
@@ -114,18 +264,21 @@ index 0000000..6e373d5
 +RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o server .
 +
 +FROM alpine:3.23
-+# empty for the celeris entry (celeris default engine); the celeris-epoll / celeris-iouring entries build this same source with epoll / iouring
++# empty for the celeris entry (Config.Engine: Adaptive, set explicitly); the celeris-epoll / celeris-iouring entries build this same source with epoll / iouring, celeris-default with the engine left unset (control)
 +ARG CELERIS_ENGINE=
 +ENV CELERIS_ENGINE=$CELERIS_ENGINE
++# empty for the celeris entry (one process); the celeris-tlschild / celeris-ceiling variants build this same source with tls-child / split
++ARG CELERIS_PROCS=
++ENV CELERIS_PROCS=$CELERIS_PROCS
 +COPY --from=build /app/server /server
 +EXPOSE 8080 8081 8082 8443
 +CMD ["/server"]
 diff --git a/frameworks/celeris/README.md b/frameworks/celeris/README.md
 new file mode 100644
-index 0000000..4d88070
+index 0000000..88b32e8
 --- /dev/null
 +++ b/frameworks/celeris/README.md
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,64 @@
 +# celeris
 +
 +[celeris](https://github.com/goceleris/celeris) is an HTTP engine and router for Go with an adaptive io_uring/epoll event loop on Linux. This entry is a framework entry (`type: emerging`, `mode: standard`): routes, middleware, query binding and JSON go through celeris's documented APIs.
@@ -165,7 +318,7 @@ index 0000000..4d88070
 +
 +Notes:
 +
-+- Default configuration. `Config.GCPercent` and `Config.SocketBusyPoll` stay off (both are opt-in in celeris and neither is used here).
++- Default configuration, except that `Config.Engine` is set to `Adaptive` explicitly (the engine celeris runs on Linux when it is unset): with a driver pool opened `WithEngine`, an unset engine currently takes a slower driver path (see Engine pin). `Config.GCPercent` and `Config.SocketBusyPoll` stay off (both are opt-in in celeris and neither is used here).
 +- One async-db detail: scanning a `jsonb` column straight into a `*[]byte` or `*string` returns the binary wire form with its leading version byte (`0x01`) on the celeris version pinned here, so `tags` is scanned through a `database/sql`-style `Scanner` type, which decodes correctly. This is a celeris driver defect, not a harness issue.
 +- The second `Adaptive` server on 8082 shares the cpuset with the one on 8080; both are idle when only one port is loaded.
 +
@@ -175,7 +328,21 @@ index 0000000..4d88070
 +
 +## Engine pin (preview only)
 +
-+`CELERIS_ENGINE` is empty in this entry, so celeris's default engine (Adaptive on Linux) runs. The preview-only entries `celeris-epoll` and `celeris-iouring` (cleartext and WebSocket profiles, no TLS) build this same source through their `build.sh` with `--build-arg CELERIS_ENGINE=epoll|iouring`, which sets `Config.Engine` on the 8080 and 8082 servers. They exist to show which engine each profile prefers; they are not meant for submission.
++`CELERIS_ENGINE` is empty in this entry, so `Config.Engine` is `Adaptive`, set explicitly. The preview-only entries `celeris-epoll` and `celeris-iouring` (cleartext and WebSocket profiles, no TLS) and `celeris-default` (baseline, async-db and fortunes only) build this same source through their `build.sh` with `--build-arg CELERIS_ENGINE=epoll|iouring|default`, which sets `Config.Engine` on the 8080 and 8082 servers (`default` leaves it unset). `celeris-default` is the CONTROL: the same engine as this entry on Linux, but with the engine left unset, which makes the Postgres pool of async-db and fortunes take a slower, correct driver path (the unset engine is not recognised as an async-capable engine by the driver). The other two show which engine each profile prefers. None of them is meant for submission.
++
++## Process layout (preview only)
++
++`CELERIS_PROCS` is empty in this entry: one process serves all four ports, the two Adaptive servers (8080, 8082) beside the two std-engine TLS servers (8081, 8443). In a local measurement (Linux container, shared host) that layout cost the TLS rows (json-tls and h2 over TLS) throughput that the same TLS servers kept when they ran without the Adaptive servers in their process, at equal CPU per request and with several times the context switches per request; gin, whose two servers also share one process, showed no such loss. Every Adaptive server starts `GOMAXPROCS - max(1, GOMAXPROCS/8)` loops, each a `LockOSThread`'d thread pinned to a CPU that wakes every few ms with no traffic, and the entry runs two such servers (about 14 loops on 8 CPUs).
++
++The preview-only entries `celeris-tlschild` and `celeris-ceiling` build this same source through their `build.sh` with `--build-arg CELERIS_PROCS=tls-child|split`, which re-runs the binary as child processes (`CELERIS_ROLE=h2c|tls`; the child dies with the parent and a child that exits ends the parent):
++
++| Entry | 8080 (HTTP/1.1, WebSocket, Adaptive) | 8082 (h2c, Adaptive) | 8081 + 8443 (TLS, std engine) |
++|-------|-----|-----|-----|
++| `celeris` | process 1 | process 1 | process 1 |
++| `celeris-tlschild` | process 1 | process 1 | process 2 |
++| `celeris-ceiling` | process 1 | process 2 | process 3 |
++
++They show what the layout costs; they are not meant for submission.
 diff --git a/frameworks/celeris/fortunes.html b/frameworks/celeris/fortunes.html
 new file mode 100644
 index 0000000..7e47740
@@ -238,10 +405,10 @@ index 0000000..37df6fb
 +golang.org/x/text v0.43.0/go.mod h1:hbSIYA/amXcRXTFSZqh8tWHEoqRvvbKPJ2uz/KU+a+s=
 diff --git a/frameworks/celeris/main.go b/frameworks/celeris/main.go
 new file mode 100644
-index 0000000..263ff9a
+index 0000000..b18d013
 --- /dev/null
 +++ b/frameworks/celeris/main.go
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,400 @@
 +// HttpArena entry for celeris (https://github.com/goceleris/celeris).
 +//
 +// Two engines serve this entry, and the README says so:
@@ -262,9 +429,11 @@ index 0000000..263ff9a
 +	"log/slog"
 +	"net"
 +	"os"
++	"os/exec"
 +	"slices"
 +	"strconv"
 +	"strings"
++	"syscall"
 +	"time"
 +
 +	"github.com/goceleris/celeris"
@@ -535,45 +704,105 @@ index 0000000..263ff9a
 +	}
 +}
 +
-+// enginePin returns the engine named by CELERIS_ENGINE (epoll or iouring), or the zero value, which is celeris's own
-+// default (Adaptive on Linux). The variable is empty in the celeris entry; the celeris-epoll and celeris-iouring
-+// preview entries set it at build time (their build.sh passes --build-arg CELERIS_ENGINE=...).
++// enginePin returns the Config.Engine of the 8080 and 8082 servers.
++//
++// The celeris entry sets Adaptive EXPLICITLY (CELERIS_ENGINE empty). On Linux that is the engine celeris runs when
++// Config.Engine is left unset, but the two are not the same for a driver pool opened WithEngine: Server.AsyncHandlers()
++// matches only the four named engines, so on an unset Engine it answers false even with .Async() routes, and the
++// postgres pool takes its slower (correct) busy-poll path instead of the netpoll path an explicit engine gets. Server logs of both show the same engine (adaptive, same loops).
++// The preview-only entries set the variable at build time (their build.sh passes --build-arg CELERIS_ENGINE=...):
++// epoll and iouring pin those engines; "default" leaves Config.Engine unset (celeris-default, the control that shows
++// the cost of the unset engine on async-db and fortunes).
 +func enginePin() celeris.EngineType {
 +	switch os.Getenv("CELERIS_ENGINE") {
 +	case "epoll":
 +		return celeris.Epoll
 +	case "iouring":
 +		return celeris.IOUring
++	case "default":
++		return 0
 +	}
-+	return 0
++	return celeris.Adaptive
 +}
 +
 +// srvLogger is the default logger tagged with the port, so the engine's own log lines (start engine, "engine switch
 +// completed") say which of this process's servers they belong to. Logging only; it changes no behaviour.
 +func srvLogger(port string) *slog.Logger { return slog.Default().With("srv", port) }
 +
++// startChild runs this binary again as the listener process named role ("h2c" or "tls"). Pdeathsig ends the child with
++// the parent, and a child that exits ends the parent, so a dead listener fails the run instead of being measured as
++// zero requests per second.
++func startChild(role string) {
++	cmd := exec.Command(os.Args[0])
++	cmd.Env = append(os.Environ(), "CELERIS_ROLE="+role)
++	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
++	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
++	if err := cmd.Start(); err != nil {
++		log.Fatalf("child %s: %v", role, err)
++	}
++	go func() { log.Fatalf("child %s exited: %v", role, cmd.Wait()) }()
++}
++
++// serveH2C runs the 8082 server (HTTP/2 prior knowledge, HTTP/1.1 kept on the port) and blocks.
++func serveH2C() {
++	h2c := celeris.New(celeris.Config{Addr: ":8082", Protocol: celeris.Auto, Engine: enginePin(), Logger: srvLogger("8082")})
++	register(h2c, false)
++	if err := h2c.Start(); err != nil {
++		log.Fatalf("h2c: %v", err)
++	}
++}
++
++// serveTLSPorts runs the TLS servers: 8443 in a goroutine, 8081 on the calling one, which blocks.
++func serveTLSPorts(cert tls.Certificate) {
++	go serveTLS(":8443", cert, []string{"h2", "http/1.1"}, celeris.Auto)
++	serveTLS(":8081", cert, []string{"http/1.1"}, celeris.HTTP1)
++}
++
++// Process layout, from CELERIS_PROCS (empty in the celeris entry; set by the preview variants' build.sh):
++//
++//	""          one process serves all four ports (the entry)
++//	"tls-child" 8081 and 8443 run in a child process; 8080 and 8082 stay in the parent (celeris-tlschild)
++//	"split"     each listener has its own process: 8080 in the parent, 8082 and the TLS ports in one child each (celeris-ceiling)
++//
++// A child is this binary with CELERIS_ROLE=h2c or tls. Why: every Adaptive server pins LockOSThread'd loops that wake
++// every few ms even when idle; beside the std engine's TLS servers in one Go process they cost throughput.
 +func main() {
 +	loadDataset()
++	switch os.Getenv("CELERIS_ROLE") {
++	case "h2c":
++		serveH2C()
++		return
++	case "tls":
++		cert, err := tls.LoadX509KeyPair("/certs/server.crt", "/certs/server.key")
++		if err != nil {
++			log.Fatalf("tls role: %v", err)
++		}
++		serveTLSPorts(cert)
++		return
++	}
++	procs := os.Getenv("CELERIS_PROCS")
 +
-+	// 8080: HTTP/1.1 and WebSocket on the default Adaptive engine.
++	// 8080: HTTP/1.1 and WebSocket on the Adaptive engine (set explicitly, see enginePin).
 +	main8080 := celeris.New(celeris.Config{Addr: ":8080", Engine: enginePin(), Logger: srvLogger("8080")})
 +	register(main8080, false)
 +	openDB(main8080)
 +
 +	// 8082: HTTP/2 prior knowledge (h2c), HTTP/1.1 kept on the same port.
-+	h2c := celeris.New(celeris.Config{Addr: ":8082", Protocol: celeris.Auto, Engine: enginePin(), Logger: srvLogger("8082")})
-+	register(h2c, false)
-+	go func() {
-+		if err := h2c.Start(); err != nil {
-+			log.Fatalf("h2c: %v", err)
-+		}
-+	}()
++	if procs == "split" {
++		startChild("h2c")
++	} else {
++		go serveH2C()
++	}
 +
 +	// 8081 (h1 over TLS) and 8443 (h2 over TLS) open only when the harness
 +	// mounts /certs, which it does for the TLS and h2 profiles alone.
 +	if cert, err := tls.LoadX509KeyPair("/certs/server.crt", "/certs/server.key"); err == nil {
-+		go serveTLS(":8081", cert, []string{"http/1.1"}, celeris.HTTP1)
-+		go serveTLS(":8443", cert, []string{"h2", "http/1.1"}, celeris.Auto)
++		if procs == "tls-child" || procs == "split" {
++			startChild("tls")
++		} else {
++			go serveTLS(":8081", cert, []string{"http/1.1"}, celeris.HTTP1)
++			go serveTLS(":8443", cert, []string{"h2", "http/1.1"}, celeris.Auto)
++		}
 +	}
 +
 +	if err := main8080.Start(); err != nil {
@@ -582,7 +811,7 @@ index 0000000..263ff9a
 +}
 diff --git a/frameworks/celeris/meta.json b/frameworks/celeris/meta.json
 new file mode 100644
-index 0000000..9d9fb35
+index 0000000..741a1d4
 --- /dev/null
 +++ b/frameworks/celeris/meta.json
 @@ -0,0 +1,38 @@
@@ -598,7 +827,7 @@ index 0000000..9d9fb35
 +    "response": true
 +  },
 +  "engine": "io_uring/epoll (adaptive); std on the TLS ports",
-+  "description": "celeris, an HTTP engine and router for Go with an adaptive io_uring/epoll event loop. The cleartext rows (8080 HTTP/1.1 and WebSocket, 8082 h2c) run on celeris's default Adaptive engine; the TLS rows (8081 HTTP/1.1 over TLS, 8443 h2 over TLS) run on celeris's std engine behind a crypto/tls listener, because the io_uring and epoll engines have no TLS: those rows measure the std engine, not the headline engine. JSON through c.JSON, gzip/brotli through the compress middleware, static files through the static middleware, WebSocket through the websocket middleware, PostgreSQL through celeris's own driver/postgres pool, fortunes through html/template. No HTTP/3, no gRPC. Default configuration (GCPercent and busy polling stay off).",
++  "description": "celeris, an HTTP engine and router for Go with an adaptive io_uring/epoll event loop. The cleartext rows (8080 HTTP/1.1 and WebSocket, 8082 h2c) run on celeris's default Adaptive engine; the TLS rows (8081 HTTP/1.1 over TLS, 8443 h2 over TLS) run on celeris's std engine behind a crypto/tls listener, because the io_uring and epoll engines have no TLS: those rows measure the std engine, not the headline engine. JSON through c.JSON, gzip/brotli through the compress middleware, static files through the static middleware, WebSocket through the websocket middleware, PostgreSQL through celeris's own driver/postgres pool, fortunes through html/template. No HTTP/3, no gRPC. Config.Engine is set to Adaptive explicitly (the engine the default resolves to on Linux; left unset, a driver pool opened WithEngine takes a slower path, see README). GCPercent and busy polling stay off.",
 +  "repo": "https://github.com/goceleris/celeris",
 +  "website": "https://goceleris.dev",
 +  "enabled": true,

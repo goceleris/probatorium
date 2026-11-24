@@ -4,12 +4,13 @@
 #   smoke   one short celeris pass (baseline, h2c, ws, async-db), ~10 min: proves cpusets and the load generators work
 #   clear   PHASE 1: cleartext profiles, celeris then the four Go references            (no TLS row can start here)
 #   async   PHASE 1b: the 32,000-connection profile; runs when the host's ip_local_port_range is already 1024-65535 (no sysctl), else only with PORTRANGE_OK=1 (one recorded, restored sysctl), else skipped
-#   engines ENGINE-VARIANT PASS: celeris (default Adaptive) vs celeris-epoll vs celeris-iouring on the cleartext + WebSocket profiles (+ async by the same port-range rule); no TLS
+#   engines ENGINE-VARIANT PASS: celeris (Adaptive, set explicitly) vs celeris-default (Engine unset, control) vs celeris-epoll vs celeris-iouring on the cleartext + WebSocket profiles (+ async by the same port-range rule); no TLS
 #   supp    PHASE 2: profile-limited Go supplements (go-stdlib h2c, fiber-websocket ws)
 #   tls     PHASE 3: the TLS side (json-tls, 8gbit; celeris and go-stdlib also baseline-h2, static-h2)
 #   governor-set      set the CPU governor to performance (+EPP where present), record the original in logs/cpufreq-original.tsv,
 #                     read back; exit 1 if it did not take (nothing may be benchmarked then). Default for the full preview; smoke keeps the host as is.
 #   governor-restore  write the recorded governor/EPP back and verify (run it in an EXIT trap / an always() step)
+#   (engines also runs fiber-websocket's three WebSocket profiles and writes logs/ws_hist.txt: ws_hist.py over the pass's benchmark logs; it is part of the artifact)
 #   score   score tables (both pictures) from results/
 # Every call logs start/stop times to logs/<phase>.log and one log per entry under logs/.
 set -uo pipefail
@@ -42,7 +43,7 @@ portrange_prepare() {
   now=$(tr -s '[:space:]' ' ' < /proc/sys/net/ipv4/ip_local_port_range | sed 's/ $//')
   if [ "$now" != "1024 65535" ]; then echo "async skipped: port range is '$now' after sudo -n sysctl (no passwordless sudo?)" | tee -a logs/async.log; return 1; fi
 }
-ENGINES=${ENGINES:-"celeris celeris-epoll celeris-iouring"}
+ENGINES=${ENGINES:-"celeris celeris-default celeris-epoll celeris-iouring"}
 phase=${1:?phase}
 case "$phase" in
   smoke) RUNS=1 DURATION=3s bench celeris baseline,pipelined,json-comp,latency-10k,baseline-h2c,echo-ws,async-db,fortunes,json-tls,8gbit,baseline-h2,static-h2 smoke   # covers every load generator: gcannon, h2load, wrk (json-tls), zrk (latency-10k, 8gbit)
@@ -51,13 +52,18 @@ case "$phase" in
   clear) bench celeris "$CLEAR" clear; for fw in $REFS; do bench "$fw" "$CLEAR" clear; done ;;
   async) if portrange_prepare; then bench celeris async async; for fw in $REFS; do bench "$fw" async async; done; fi ;;
   engines) for fw in $ENGINES; do bench "$fw" "$CLEAR" engines; done
-         if portrange_prepare; then for fw in $ENGINES; do bench "$fw" async engines-async; done; fi ;;
+         bench fiber-websocket echo-ws,echo-ws-pipeline,echo-ws-limited engines   # the Go WebSocket reference, same governor and session: its per-run latency table (ws_hist) sits beside the celeris entries
+         if portrange_prepare; then for fw in $ENGINES; do bench "$fw" async engines-async; done; fi
+         # per-run latency table (mean, p50, p90, p99, p99.9, samples, >5 s overflow, p99<mean flag) from every log this pass wrote:
+         # gcannon clamps percentiles at 5 s but counts overflowed samples in the mean, so a p99 below the mean is expected on a bimodal tail
+         shopt -s nullglob; wslogs=(logs/engines.*.log logs/engines-async.*.log); shopt -u nullglob   # engines-async.* is absent when async was skipped
+         python3 -I -B preview/ws_hist.py "${wslogs[@]}" > logs/ws_hist.txt 2>&1 || echo "ws_hist.py failed" | tee -a logs/engines.log ;;
   supp)  bench go-stdlib baseline-h2c,json-h2c supp; bench fiber-websocket echo-ws,echo-ws-pipeline,echo-ws-limited supp ;;
   tls)   bench celeris json-tls,8gbit,baseline-h2,static-h2 tls; for fw in $REFS; do bench "$fw" json-tls,8gbit tls; done
          bench go-stdlib baseline-h2,static-h2 tls ;;
   score) ENGARGS=""
          if [ -d results/baseline/4096 ] && [ -f results/baseline/4096/celeris-epoll.json ]; then   # an engine-variant pass ran: add its section (the three views are unchanged)
-           ENGARGS="--engines celeris,celeris-epoll,celeris-iouring --container-logs site/static/logs --bench-logs logs/engines.celeris.log,logs/engines-async.celeris.log"; fi
+           ENGARGS="--engines celeris,celeris-default,celeris-epoll,celeris-iouring --container-logs site/static/logs --bench-logs logs/engines.celeris.log,logs/engines-async.celeris.log"; fi
          python3 -I -B preview/score_preview.py --results results --hepa . $ENGARGS \
            --entries celeris,gin,fiber,echo,go-fasthttp,fiber-websocket,go-stdlib --merge fiber-websocket=fiber \
            --rates latency-1m=$ZRK_RATE_LATENCY_1M,latency-10k=$ZRK_RATE_LATENCY_10K,8gbit=$ZRK_RATE_8GBIT \

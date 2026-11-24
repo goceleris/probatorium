@@ -113,7 +113,7 @@ jobs:
           git checkout --quiet "$HTTPARENA_SHA"
           git apply "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/celeris-entry.patch"
           mkdir -p preview
-          cp "$GITHUB_WORKSPACE"/probatorium/tools/httparena-preview/{host_adapt.py,stage-images.sh,run-preview.sh,score_preview.py,governor.sh} preview/
+          cp "$GITHUB_WORKSPACE"/probatorium/tools/httparena-preview/{host_adapt.py,stage-images.sh,run-preview.sh,score_preview.py,governor.sh,ws_hist.py} preview/
           python3 -I -B preview/host_adapt.py .
       - name: Stage images and loadgens (no measuring yet)
         shell: bash

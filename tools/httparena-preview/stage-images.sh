@@ -4,7 +4,7 @@
 # the zrk release tarball, `go mod download` inside the framework builds. Nothing is pushed anywhere.
 set -euo pipefail
 GCANNON_SHA=${GCANNON_SHA:-11b8f116958913f0c6e74a6fd6a73b5a12204b35}   # MDA2AV/gcannon main on 2026-11-22; the Dockerfile default is the moving `main`
-FWS=${FWS:-"celeris celeris-epoll celeris-iouring gin fiber echo go-fasthttp go-stdlib fiber-websocket"}
+FWS=${FWS:-"celeris celeris-default celeris-epoll celeris-iouring gin fiber echo go-fasthttp go-stdlib fiber-websocket"}
 docker pull golang:1.27.4-alpine; docker pull golang:1.26-alpine; docker pull golang:1.27.3-alpine
 docker pull alpine:3.23; docker pull ubuntu:24.04; docker pull postgres:18
 docker build -t gcannon:latest --build-arg GCANNON_REF="$GCANNON_SHA" -f docker/gcannon.Dockerfile docker
