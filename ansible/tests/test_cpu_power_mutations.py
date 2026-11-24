@@ -33,6 +33,10 @@ PY_MUTANTS = [
     ("the original record is not write-once", PY, "    if \"--once\" in a and os.path.exists(out):", "    if False:"),
     ("a CPU without cpufreq is given a governor to set", PY, "        if e.get(\"governor\") in (None, \"-\"):\n            continue", "        if False:\n            continue"),
     ("an unavailable governor is not refused", PY, "        if arm != \"as-found\" and g not in cpu_entry(c)[\"available_governors\"]:", "        if False:"),
+    ("the gate does not require the restore status", PY, "    if not status.startswith(need):\n", "    if False:\n"),
+    ("the gate does not recompute orig vs final", PY, "            diff = diff_views(state_view(recs[\"orig\"]), state_view(recs[\"final\"]))\n", "            diff = []\n"),
+    ("the gate accepts an applied governor that is not performance", PY, "                if e.get(\"governor\") not in (\"performance\", \"-\"):\n", "                if False:\n"),
+    ("the gate accepts changed idle flags in the applied record", PY, "            if ia != io:\n", "            if False:\n"),
     ("a vanished CPU is not noticed", PY, "    if cpus != online:\n", "    if False:\n"),
 ]
 SH_MUTANTS = [

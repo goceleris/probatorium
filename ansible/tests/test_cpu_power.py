@@ -338,6 +338,16 @@ class CpuPowerTest(unittest.TestCase):
         self.assertEqual(self.f.run("gate", "--dir", d)[0], 1)  # a keep run is not a performance run
         self.assertEqual(self.f.run("gate", "--dir", d, "--governor", "turbo")[0], 2)
 
+    def test_gate_fails_an_applied_record_whose_idle_flags_moved(self):
+        d = self.make_run()
+        rec = jload(d + "/applied/msa2-server.json")
+        rec["cpus"]["cpu1"]["idle"][3]["disable"] = 1
+        with open(d + "/applied/msa2-server.json", "w") as fh:
+            json.dump(rec, fh)
+        rc, out = self.f.run("gate", "--dir", d)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("idle flags of the applied record differ", out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
