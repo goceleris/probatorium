@@ -63,7 +63,7 @@ def main():
     ap.add_argument("--tls-profiles", default="json-tls,8gbit,baseline-h2,static-h2,connections-1m-tls")
     ap.add_argument("--merge", default="", help="fold a profile-limited supplement into its entry, e.g. fiber-websocket=fiber (HttpArena merges by display_name)")
     ap.add_argument("--json", action="store_true")
-    ap.add_argument("--engines", default="", help="ENGINE-VARIANT section after the three views: the Adaptive entry first (the reference for the switch log), then the others, e.g. celeris,celeris-default,celeris-epoll,celeris-iouring (their rows do not enter the three views)")
+    ap.add_argument("--engines", default="", help="ENGINE-VARIANT section after the three views: the Adaptive entry first (the reference for the switch log), then the others, e.g. celeris,celeris-default,celeris-epoll,celeris-iouring,celeris-tlschild,celeris-ceiling (their rows do not enter the three views)")
     ap.add_argument("--container-logs", default="", help="HttpArena/site/static/logs: the harness's per-profile container logs (the Adaptive engine's own switch lines)")
     ap.add_argument("--bench-logs", default="", help="comma list of the timestamped benchmark logs (logs/engines.<entry>.log, logs/engines-async.<entry>.log) to place the runs in time")
     a = ap.parse_args()
@@ -231,7 +231,7 @@ def switch_summary(entry, logs_dir, windows):
 def engine_section(rows, engine_names, L, logs_dir, bench_logs):
     ad = engine_names[0]; ents = engine_names
     eff = compute_eff(rows, ents, L)
-    print("\n[ENGINE VARIANTS] %s = Adaptive (Engine set explicitly), then the other entries (celeris-default = Engine unset, the control; epoll/io_uring pinned). Per profile: score 0-1000 against the best of these entries (1000 = best), best named; '-' = not run" % ad)
+    print("\n[ENGINE VARIANTS] %s = Adaptive (Engine set explicitly), then the other entries (celeris-default = Engine unset, the control; epoll/io_uring pinned; celeris-tlschild/celeris-ceiling = TLS servers in their own process / every listener in its own process). Per profile: score 0-1000 against the best of these entries (1000 = best), best named; '-' = not run" % ad)
     print("%-18s" % "profile" + "".join("%-18s" % e for e in ents) + "best             %s/best" % ad)
     sums = {e: 0.0 for e in ents}; wins = {e: 0 for e in ents}
     for fam, profs in FAMILIES.items():
