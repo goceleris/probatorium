@@ -46,10 +46,10 @@ func TestBenchTierSetsTheGovernorBeforeTheBenchAndRestoresAfterIt(t *testing.T) 
 	stop := mustIndex(t, src, "run: mage HostSamplerStop\n", "sampler stop step")
 	upload := mustIndex(t, src, "name: Upload results", "results upload step")
 	cleanup := mustIndex(t, src, "run: mage Cleanup", "mage Cleanup step")
-	if !(deploy < set && set < start && start < bench) {
+	if deploy >= set || set >= start || start >= bench {
 		t.Errorf("the governor must be set after Deploy and before the sampler and the bench: offsets deploy %d set %d sampler %d bench %d", deploy, set, start, bench)
 	}
-	if !(bench < back && back < stop && stop < upload && upload < cleanup) {
+	if bench >= back || back >= stop || stop >= upload || upload >= cleanup {
 		t.Errorf("the restore must follow the bench and precede the sampler stop, the upload (the records travel with the results) and Cleanup: bench %d restore %d stop %d upload %d cleanup %d", bench, back, stop, upload, cleanup)
 	}
 	for _, n := range []string{cpuGovSetup, cpuGovBack} {
@@ -133,11 +133,11 @@ func TestRaceTierBracketsTheGatesWithTheGovernor(t *testing.T) {
 	stop := mustIndex(t, src, "run: mage HostSamplerStop\n", "sampler stop step")
 	upload := mustIndex(t, src, "name: Upload results", "results upload step")
 	cleanup := mustIndex(t, src, "run: mage Cleanup", "mage Cleanup step")
-	if !(deploy < set && set < gate) {
+	if deploy >= set || set >= gate {
 		t.Errorf("the governor must be set after Deploy and before the gates: deploy %d set %d gate %d", deploy, set, gate)
 	}
 	// ValidateDiff reads every directory under results/: the copy of the records must come after it
-	if !(diff < back && back < stop && stop < upload && upload < cleanup) {
+	if diff >= back || back >= stop || stop >= upload || upload >= cleanup {
 		t.Errorf("the restore must follow ValidateDiff and precede the sampler stop, the upload and Cleanup: diff %d restore %d stop %d upload %d cleanup %d", diff, back, stop, upload, cleanup)
 	}
 	setBlk := stepBlock(t, src, "CPU governor (record, set performance, read back)")
