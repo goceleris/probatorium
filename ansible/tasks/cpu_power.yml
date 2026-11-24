@@ -1,0 +1,185 @@
+---
+# cpu_power.yml: the host-side half of the release CPU governor setting. Included by cpu-power.yml.
+#
+# vars:  cpu_power_action  record | apply | restore | unstage
+#        cpu_power_label   orig (write-once) | applied | final
+#        cpu_power_arm     apply only: performance (restore always uses as-found)
+#        cpu_power_dir     ABSOLUTE controller directory; files land at <dir>/<label>/<host>.json (record) and <dir>/<label>/<host>.apply.json (apply / restore result)
+#        cpu_power_tag     recorded in every record (the run id)
+#        cpu_power_run_dir / cpu_power_file_owner / cpu_power_file_group   test hooks only (default /run/celeris-cpu-power, root); a real run never sets them
+#
+# record   = the full record (per CPU driver / governor / EPP / limits / frequency / idle states, boost, 3 frequency instants), fetched. label `orig` is write-once: refused when the
+#            controller file exists. Read-only on the host.
+# apply    = copy the ORIGINAL record to the host, move the host to the arm FROM THAT RECORD, read every value back (the task FAILS when one did not take: the caller runs no
+#            benchmark), fetch the result, then take a full record under the label (3 frequency instants after the change = the settle time).
+# restore  = apply as-found (every recorded value written back and read back equal) + a full record + fetch; a host with no original record is a no-op (nothing was changed).
+# unstage  = remove the script and the host directory from tmpfs.
+# The script runs under `become: true` (sudo -n, ansible's become): the mechanism bench_tuning.yml uses for its sysctl writes; sysfs writes under it were proven on msa2-server and
+# msa2-client (governor A/B proof run 45367906598, restored equal). On msr1 (already on `performance` as found) a performance apply makes no write at all.
+- name: Facts of the run
+  ansible.builtin.set_fact:
+    cpu_power_run: "{{ cpu_power_run_dir | default('/run/celeris-cpu-power') }}"
+    cpu_power_script: "{{ cpu_power_run_dir | default('/run/celeris-cpu-power') }}/cpu_power.py"
+    cpu_power_host_dir: "{{ cpu_power_run_dir | default('/run/celeris-cpu-power') }}/records"
+    cpu_power_owner: "{{ cpu_power_file_owner | default('root') }}"
+    cpu_power_group: "{{ cpu_power_file_group | default('root') }}"
+    cpu_power_orig_local: "{{ cpu_power_dir }}/orig/{{ inventory_hostname }}.json"
+
+- name: Controller side | does the original record exist for this host
+  ansible.builtin.stat:
+    path: "{{ cpu_power_orig_local }}"
+  delegate_to: localhost
+  become: false
+  register: cpu_power_orig_stat
+
+- name: Refuse to overwrite the original record
+  ansible.builtin.fail:
+    msg: "the original record {{ cpu_power_orig_local }} exists: it is write-once (one original per run)"
+  when:
+    - cpu_power_action == 'record'
+    - cpu_power_label == 'orig'
+    - cpu_power_orig_stat.stat.exists
+
+- name: Apply needs an original record
+  ansible.builtin.fail:
+    msg: "no original record {{ cpu_power_orig_local }} for {{ inventory_hostname }}: record it first (label orig)"
+  when:
+    - cpu_power_action == 'apply'
+    - not cpu_power_orig_stat.stat.exists
+
+- name: Stage the recorder on tmpfs
+  become: true
+  when:
+    - cpu_power_action in ['record', 'apply', 'restore']
+    - cpu_power_action != 'restore' or cpu_power_orig_stat.stat.exists
+  block:
+    - name: Stage | directories (tmpfs, root)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ cpu_power_owner }}"
+        group: "{{ cpu_power_group }}"
+        mode: "0755"
+      loop:
+        - "{{ cpu_power_run }}"
+        - "{{ cpu_power_host_dir }}"
+    - name: Stage | the script
+      ansible.builtin.copy:
+        src: files/cpu_power.py
+        dest: "{{ cpu_power_script }}"
+        owner: "{{ cpu_power_owner }}"
+        group: "{{ cpu_power_group }}"
+        mode: "0755"
+
+# ---------------------------------------------------------------- record
+- name: Record
+  when: cpu_power_action == 'record'
+  become: true
+  block:
+    - name: Record | run (the host file of the original is write-once)
+      ansible.builtin.command:
+        argv: >-
+          {{ ['python3', '-I', '-B', cpu_power_script, 'record', '--out', cpu_power_host_dir ~ '/' ~ cpu_power_label ~ '.json',
+              '--tag', cpu_power_tag | default(''), '--label', cpu_power_label] + (['--once'] if cpu_power_label == 'orig' else []) }}
+      register: cpu_power_rec
+      changed_when: false
+    - name: Record | fetch
+      ansible.builtin.fetch:
+        src: "{{ cpu_power_host_dir }}/{{ cpu_power_label }}.json"
+        dest: "{{ cpu_power_dir }}/{{ cpu_power_label }}/{{ inventory_hostname }}.json"
+        flat: true
+
+# ---------------------------------------------------------------- apply / restore
+- name: Apply an arm (or restore as-found) from the original record
+  when:
+    - cpu_power_action in ['apply', 'restore']
+    - cpu_power_orig_stat.stat.exists
+  become: true
+  vars:
+    cpu_power_effective_arm: "{{ 'as-found' if cpu_power_action == 'restore' else cpu_power_arm }}"
+  block:
+    - name: Apply | the original record to the host (from the controller, the single source of truth)
+      ansible.builtin.copy:
+        src: "{{ cpu_power_orig_local }}"
+        dest: "{{ cpu_power_host_dir }}/orig.json"
+        owner: "{{ cpu_power_owner }}"
+        group: "{{ cpu_power_group }}"
+        mode: "0600"
+    - name: Apply | move to the arm and read every value back
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -B
+          - "{{ cpu_power_script }}"
+          - apply
+          - --arm
+          - "{{ cpu_power_effective_arm }}"
+          - --orig
+          - "{{ cpu_power_host_dir }}/orig.json"
+          - --out
+          - "{{ cpu_power_host_dir }}/{{ cpu_power_label }}.apply.json"
+      register: cpu_power_apply
+      changed_when: false
+      failed_when: false
+    - name: Apply | fetch the result (also when it failed)
+      ansible.builtin.fetch:
+        src: "{{ cpu_power_host_dir }}/{{ cpu_power_label }}.apply.json"
+        dest: "{{ cpu_power_dir }}/{{ cpu_power_label }}/{{ inventory_hostname }}.apply.json"
+        flat: true
+      failed_when: false
+    - name: Apply | print the script's account
+      ansible.builtin.debug:
+        msg: "{{ cpu_power_apply.stdout_lines | default([]) + cpu_power_apply.stderr_lines | default([]) }}"
+    - name: Apply | full record under this label (3 frequency instants after the change), also when the arm did not take
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -I
+          - -B
+          - "{{ cpu_power_script }}"
+          - record
+          - --out
+          - "{{ cpu_power_host_dir }}/{{ cpu_power_label }}.json"
+          - --tag
+          - "{{ cpu_power_tag | default('') }}"
+          - --label
+          - "{{ cpu_power_label }}"
+      changed_when: false
+      failed_when: false
+    - name: Apply | fetch the record
+      ansible.builtin.fetch:
+        src: "{{ cpu_power_host_dir }}/{{ cpu_power_label }}.json"
+        dest: "{{ cpu_power_dir }}/{{ cpu_power_label }}/{{ inventory_hostname }}.json"
+        flat: true
+      failed_when: false
+    - name: Apply | the arm did not take (no benchmark may run)
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }}: arm {{ cpu_power_effective_arm }} did not take (rc={{ cpu_power_apply.rc }})"
+      when: cpu_power_apply.rc != 0
+
+- name: Restore | no original record for this host, nothing was changed by this run
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: no original record: nothing to restore"
+  when:
+    - cpu_power_action == 'restore'
+    - not cpu_power_orig_stat.stat.exists
+
+# ---------------------------------------------------------------- unstage
+- name: Unstage the recorder
+  become: true
+  when: cpu_power_action == 'unstage'
+  block:
+    - name: Unstage | remove the script
+      ansible.builtin.file:
+        path: "{{ cpu_power_script }}"
+        state: absent
+    - name: Unstage | remove the host directory
+      ansible.builtin.file:
+        path: "{{ cpu_power_host_dir }}"
+        state: absent
+    - name: Unstage | remove the run directory (only when empty)
+      ansible.builtin.command:
+        argv: [rmdir, "{{ cpu_power_run }}"]
+      failed_when: false
+      changed_when: false

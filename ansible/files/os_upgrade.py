@@ -203,6 +203,46 @@ def boot_cmdline():
     return re.sub(rb"[^ -~]", b"?", raw).decode("ascii")
 
 
+def cpu_power():
+    """The CPU frequency / idle state of the host, READ ONLY: per CPU with a cpufreq or cpuidle directory the scaling driver, governor, energy_performance_preference (null when the
+    file is absent), scaling_{min,max,cur}_freq and the cpuidle states (name, disable, latency, residency); host-wide boost / no_turbo / pstate status / cpuidle driver and governor; and
+    the /proc/cpuinfo MHz of every CPU. A record of what the host IS, every host in every survey (the release runs set the governor to performance and record it per run:
+    .github/scripts/cpu-governor.sh). Never part of the "drifted" judgement and not of reboot_snapshot.sh / preflight-snapshot.json (a reboot is "the same boot" only on kernel +
+    command line: a runtime power state must not enter that compare). A host with neither reports {"cpus": {}}; a CPU without cpufreq has driver / governor null."""
+    base = "/sys/devices/system/cpu"
+
+    def num(path):
+        v = rd(path, None)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    cpus = {}
+    for d in sorted(glob.glob(p(base + "/cpu[0-9]*")), key=lambda x: int(re.sub(r"\D", "", os.path.basename(x)) or 0)):
+        name = os.path.basename(d)
+        if not re.fullmatch(r"cpu\d+", name) or not (os.path.isdir(d + "/cpufreq") or os.path.isdir(d + "/cpuidle")):
+            continue
+        f = base + "/" + name + "/cpufreq/"
+        idle = []
+        for sd in sorted(glob.glob(p(base + "/" + name + "/cpuidle/state[0-9]*")), key=lambda x: int(re.sub(r"\D", "", os.path.basename(x)) or 0)):
+            sp = base + "/" + name + "/cpuidle/" + os.path.basename(sd) + "/"
+            idle.append({"name": rd(sp + "name"), "disable": num(sp + "disable"), "latency": num(sp + "latency"), "residency": num(sp + "residency")})
+        cpus[name] = {"driver": rd(f + "scaling_driver"), "governor": rd(f + "scaling_governor"), "epp": rd(f + "energy_performance_preference", None),
+                      "min_khz": num(f + "scaling_min_freq"), "max_khz": num(f + "scaling_max_freq"), "cur_khz": num(f + "scaling_cur_freq"), "idle": idle}
+    mhz = []
+    for line in rd("/proc/cpuinfo").splitlines():
+        if line.startswith("cpu MHz"):
+            try:
+                mhz.append(float(line.split(":", 1)[1]))
+            except ValueError:
+                pass
+    return {"cpus": cpus, "cpuinfo_mhz": mhz,
+            "global": {"cpufreq_boost": rd(base + "/cpufreq/boost", None), "intel_pstate_no_turbo": rd(base + "/intel_pstate/no_turbo", None),
+                       "intel_pstate_status": rd(base + "/intel_pstate/status", None), "amd_pstate_status": rd(base + "/amd_pstate/status", None),
+                       "cpuidle_driver": rd(base + "/cpuidle/current_driver", None), "cpuidle_governor": rd(base + "/cpuidle/current_governor", None)}}
+
+
 def installed_kernels():
     rc, out, _ = run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n", "linux-image-*"])
     found = set()
@@ -933,6 +973,7 @@ def survey():
         "os_release": osr,
         "kernel": running,
         "boot_cmdline": boot_cmdline(),
+        "cpu_power": cpu_power(),
         "arch": os.uname().machine,
         "kernel_flavor": flavor(running),
         "installed_kernels": kernels,

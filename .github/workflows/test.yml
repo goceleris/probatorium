@@ -390,6 +390,19 @@ jobs:
       # fine/, a start without one retires a stale one, a cadence out of bounds is refused.
       - name: ansible/tests/test_host_sampler_play.sh
         run: bash ansible/tests/test_host_sampler_play.sh
+      # The release CPU governor (record / set performance / restore / compare; ansible/cpu-power.yml,
+      # ansible/files/cpu_power.py, .github/scripts/cpu-governor.sh): the script against a fake sysfs,
+      # the real playbook on a local connection, the step script end to end against per-host fake
+      # trees, and the mutation check that a restore which skips a CPU, EPP, an idle flag or a limit,
+      # or a compare that ignores a field, is caught.
+      - name: ansible/tests/test_cpu_power.py
+        run: python3 -I ansible/tests/test_cpu_power.py
+      - name: ansible/tests/test_cpu_power_play.sh
+        run: bash ansible/tests/test_cpu_power_play.sh
+      - name: ansible/tests/test_cpu_governor.sh
+        run: bash ansible/tests/test_cpu_governor.sh
+      - name: ansible/tests/test_cpu_power_mutations.py
+        run: python3 -I -B ansible/tests/test_cpu_power_mutations.py
       # The sanctioned OS survey and upgrade (ansible/os-upgrade.yml): the script against a
       # fake host with stub grub/apt/dkms commands, the real Jinja judgement (every refusal) and the
       # whole playbook on local connections, under the cluster's ansible pin.

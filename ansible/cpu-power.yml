@@ -1,0 +1,17 @@
+---
+# cpu-power.yml: record, set and restore the CPU frequency governor of the hosts of a run (release runs: .github/scripts/cpu-governor.sh drives it).
+#
+#   ansible-playbook -i inventory.yml cpu-power.yml --limit msa2-server,msa2-client -e cpu_power_action=record  -e cpu_power_label=orig    -e cpu_power_dir=/abs/cpu-power
+#   ansible-playbook -i inventory.yml cpu-power.yml --limit ...                     -e cpu_power_action=apply   -e cpu_power_label=applied -e cpu_power_arm=performance -e cpu_power_dir=...
+#   ansible-playbook -i inventory.yml cpu-power.yml --limit ...                     -e cpu_power_action=restore -e cpu_power_label=final   -e cpu_power_dir=...
+#   ansible-playbook -i inventory.yml cpu-power.yml --limit ...                     -e cpu_power_action=unstage -e cpu_power_label=x       -e cpu_power_dir=...
+#
+# The logic lives in files/cpu_power.py (tested against a fake sysfs); tasks/cpu_power.yml stages it on tmpfs and runs it with `become: true`. Nothing persistent is installed on a
+# host. The original record lives on the CONTROLLER (<cpu_power_dir>/orig/<host>.json), write-once; the apply and the restore are derived from it. The host set is the caller's
+# --limit (the bench target plus the loadgen, like mage Deploy); without one every cluster host is used.
+- name: CPU frequency governor (record / set / restore)
+  hosts: cluster
+  gather_facts: false
+  tasks:
+    - name: Run the requested action
+      ansible.builtin.include_tasks: tasks/cpu_power.yml

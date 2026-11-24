@@ -1269,6 +1269,43 @@ class Rehearsal(Base):
         os.remove(self.h.root + "/proc/cmdline")  # unreadable: the key is still there, empty
         self.assertEqual(self.run_ok("survey")["boot_cmdline"], "")
 
+    def test_the_survey_records_the_cpu_power_state_read_only_and_a_host_without_cpufreq_reports_none(self):
+        """the survey carries `cpu_power` (governor, driver, EPP, frequency, cpuidle states with their disable flags, boost, MHz); it is a record, not
+        part of the drifted judgement."""
+        self.h.save()
+        self.assertEqual(self.run_ok("survey")["cpu_power"], {"cpus": {}, "cpuinfo_mhz": [], "global": {k: None for k in (
+            "cpufreq_boost", "intel_pstate_no_turbo", "intel_pstate_status", "amd_pstate_status", "cpuidle_driver", "cpuidle_governor")}})
+        for c, (gov, c3) in enumerate([("powersave", "0"), ("powersave", "1")]):
+            d = "/sys/devices/system/cpu/cpu%d" % c
+            self.h.w(d + "/cpufreq/scaling_driver", "amd-pstate-epp\n")
+            self.h.w(d + "/cpufreq/scaling_governor", gov + "\n")
+            self.h.w(d + "/cpufreq/energy_performance_preference", "balance_performance\n")
+            self.h.w(d + "/cpufreq/scaling_min_freq", "400000\n")
+            self.h.w(d + "/cpufreq/scaling_max_freq", "3500000\n")
+            self.h.w(d + "/cpufreq/scaling_cur_freq", "1500000\n")
+            for i, (n, dis) in enumerate([("POLL", "0"), ("C1", "0"), ("C2", "0"), ("C3", c3)]):
+                self.h.w(d + "/cpuidle/state%d/name" % i, n + "\n")
+                self.h.w(d + "/cpuidle/state%d/disable" % i, dis + "\n")
+                self.h.w(d + "/cpuidle/state%d/latency" % i, "%d\n" % (i * 40))
+                self.h.w(d + "/cpuidle/state%d/residency" % i, "%d\n" % (i * 100))
+        self.h.w("/sys/devices/system/cpu/cpu10/cpufreq/scaling_governor", "performance\n")  # cpu10 sorts after cpu1: numeric order
+        self.h.w("/sys/devices/system/cpu/cpufreq/boost", "1\n")
+        self.h.w("/sys/devices/system/cpu/amd_pstate/status", "active\n")
+        self.h.w("/sys/devices/system/cpu/cpuidle/current_driver", "acpi_idle\n")
+        self.h.w("/sys/devices/system/cpu/cpuidle/current_governor", "menu\n")
+        self.h.w("/proc/cpuinfo", "processor\t: 0\ncpu MHz\t\t: 1499.999\n\nprocessor\t: 1\ncpu MHz\t\t: 3500.000\n")
+        r = self.run_ok("survey")
+        cp = r["cpu_power"]
+        self.assertEqual(list(cp["cpus"]), ["cpu0", "cpu1", "cpu10"])
+        self.assertEqual((cp["cpus"]["cpu0"]["driver"], cp["cpus"]["cpu0"]["governor"], cp["cpus"]["cpu0"]["epp"]), ("amd-pstate-epp", "powersave", "balance_performance"))
+        self.assertEqual([(s["name"], s["disable"]) for s in cp["cpus"]["cpu1"]["idle"]], [("POLL", 0), ("C1", 0), ("C2", 0), ("C3", 1)])
+        self.assertEqual(cp["cpus"]["cpu1"]["idle"][3]["latency"], 120)
+        self.assertEqual((cp["cpus"]["cpu0"]["min_khz"], cp["cpus"]["cpu0"]["max_khz"], cp["cpus"]["cpu0"]["cur_khz"]), (400000, 3500000, 1500000))
+        self.assertIsNone(cp["cpus"]["cpu10"]["epp"])  # the file is absent: null, not ""
+        self.assertEqual(cp["cpuinfo_mhz"], [1499.999, 3500.0])
+        self.assertEqual((cp["global"]["cpufreq_boost"], cp["global"]["amd_pstate_status"], cp["global"]["cpuidle_driver"], cp["global"]["cpuidle_governor"]), ("1", "active", "acpi_idle", "menu"))
+        self.assertNotIn("cpu_power", r.get("drifted", []))
+
     def test_the_survey_names_the_kernel_that_grub_boots_when_it_ignores_the_environment_block(self):
         self.h.save()
         b = self.run_ok("survey")["boot"]
