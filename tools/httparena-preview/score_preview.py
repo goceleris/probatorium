@@ -191,22 +191,30 @@ def bench_windows(paths):
             if m and cur: out[cur].append(secs(m.group(1)))
     return out
 
+H2C_PROFILES = {"baseline-h2c", "json-h2c"}   # served on 8082; every other profile of the entry is served on 8080
+
 def switch_summary(entry, logs_dir, windows):
-    """Per profile window of the Adaptive entry: the engine it started on and every 'engine switch completed' line, placed in the runs."""
-    lines = ["", f"[ADAPTIVE SWITCH LOG] {entry}: engine at start, and every switch the engine logged (celeris 'engine switch completed'), per profile window",
-             "profile / conns          start engine  switches  where"]
-    tot_sw = tot_in = nprof = 0
+    """Per profile window of the Adaptive entry: the engine the LOADED server started on and every 'engine switch completed' line it
+    logged, placed in the runs. The entry tags each server's logger with srv=<port> (8080 h1/ws, 8082 h2c): the other server's lines
+    (idle in that window) are counted on their own and never credited to the loaded one."""
+    lines = ["", f"[ADAPTIVE SWITCH LOG] {entry}: engine at start of the loaded server (8080; 8082 for the h2c profiles) and every switch it logged (celeris 'engine switch completed'), per profile window",
+             "profile / conns          start engine  switches  where  [other server's switches]"]
+    tot_sw = tot_in = nprof = other_tot = 0
     for logf in sorted(Path(logs_dir).glob(f"*/*/{entry}.log")):
         prof, conns = logf.parts[-3], int(logf.parts[-2])
+        want = "8082" if prof in H2C_PROFILES else "8080"
         text = logf.read_text(errors="replace").splitlines()
-        start = None; sw = []
+        start = None; sw = []; other = 0; tagged = False
         for l in text:
             m = re.match(r"\d{4}/\d\d/\d\d (\d\d:\d\d:\d\d) INFO (.*)", l)
             if not m: continue
             t, msg = m.group(1), m.group(2)
-            if start is None and "adaptive engine listening" in msg:
+            sm = re.search(r"\bsrv=(\d+)", msg); tagged = tagged or bool(sm)
+            srv = sm.group(1) if sm else want                      # untagged line (older entry): treated as the loaded server
+            if "adaptive engine listening" in msg and srv == want and start is None:
                 a_ = re.search(r"active=(\S+)", msg); start = a_.group(1) if a_ else "?"
             if msg.startswith("engine switch completed"):
+                if srv != want: other += 1; continue
                 a_ = re.search(r"now_active=(\S+)", msg); sw.append((t, a_.group(1) if a_ else "?"))
         runs = windows.get((prof, conns), []); dur = DUR.get(prof, 5)
         where = []
@@ -214,9 +222,10 @@ def switch_summary(entry, logs_dir, windows):
             ts = secs(t); k = next((i+1 for i, r0 in enumerate(runs) if r0 - 1 <= ts <= r0 + dur + 1), None)
             where.append(f"{t} -> {to} " + (f"(inside run {k})" if k else ("(before the first run)" if runs and ts < runs[0] else "(between/after runs)" if runs else "(runs not placed)")))
             tot_in += 1 if k else 0
-        tot_sw += len(sw); nprof += 1 if sw else 0
-        lines.append("%-24s %-13s %-9d %s" % (f"{prof} / {conns}", start or "?", len(sw), "; ".join(where) or "-"))
-    lines.append(f"profile windows with a switch: {nprof}; switches in total: {tot_sw}; inside a measured run: {tot_in}")
+        tot_sw += len(sw); nprof += 1 if sw else 0; other_tot += other
+        lines.append("%-24s %-13s %-9d %s%s%s" % (f"{prof} / {conns}", start or "?", len(sw), "; ".join(where) or "-",
+                                                   f"  [other server: {other}]" if other else "", "" if tagged else "  [UNTAGGED log: server not identifiable]"))
+    lines.append(f"profile windows with a switch on the loaded server: {nprof}; switches in total: {tot_sw}; inside a measured run: {tot_in}; switches on the idle server: {other_tot}")
     return lines
 
 def engine_section(rows, engine_names, L, logs_dir, bench_logs):

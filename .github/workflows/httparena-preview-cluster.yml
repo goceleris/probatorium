@@ -128,6 +128,7 @@ jobs:
           GOVERNOR: ${{ inputs.governor }}
         run: |
           set -uo pipefail
+          touch "$WORK/phases-start"   # marks which container logs under site/static/logs this run wrote
           if [ "$GOVERNOR" = performance ]; then
             # Refuse if the host is not in the recorded original state (a dead earlier run could have left performance set: then
             # "restore to the before-capture" would write a wrong original). Baseline: every CPU on powersave (smoke runs 1 and 2).
@@ -203,7 +204,12 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK"
-          tar -cf preview-data.tar HttpArena/results HttpArena/logs HttpArena/site/static/logs HttpArena/preview-images.txt HttpArena/preview.env state 2>/dev/null || true
+          # site/static/logs holds ~700 MB of UPSTREAM container logs (committed in HttpArena): only the files this run wrote
+          # (newer than the marker touched when the phases started) go into the archive
+          : > files.lst
+          [ -f phases-start ] && find HttpArena/site/static/logs -type f -newer phases-start >> files.lst 2>/dev/null
+          printf '%s\n' HttpArena/results HttpArena/logs HttpArena/preview-images.txt HttpArena/preview.env state >> files.lst
+          tar -cf preview-data.tar -T files.lst 2>/dev/null || true
           openssl cms -encrypt -binary -stream -aes256 -outform DER -in preview-data.tar -out preview-data.cms \
             -recip "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/results-cert.pem"
           rm -f preview-data.tar

@@ -238,10 +238,10 @@ index 0000000..37df6fb
 +golang.org/x/text v0.43.0/go.mod h1:hbSIYA/amXcRXTFSZqh8tWHEoqRvvbKPJ2uz/KU+a+s=
 diff --git a/frameworks/celeris/main.go b/frameworks/celeris/main.go
 new file mode 100644
-index 0000000..de19f6b
+index 0000000..263ff9a
 --- /dev/null
 +++ b/frameworks/celeris/main.go
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,338 @@
 +// HttpArena entry for celeris (https://github.com/goceleris/celeris).
 +//
 +// Two engines serve this entry, and the README says so:
@@ -259,6 +259,7 @@ index 0000000..de19f6b
 +	"encoding/json"
 +	"html/template"
 +	"log"
++	"log/slog"
 +	"net"
 +	"os"
 +	"slices"
@@ -526,7 +527,7 @@ index 0000000..de19f6b
 +		log.Printf("tls listen %s: %v", addr, err)
 +		return
 +	}
-+	s := celeris.New(celeris.Config{Engine: celeris.Std, Protocol: proto})
++	s := celeris.New(celeris.Config{Engine: celeris.Std, Protocol: proto, Logger: srvLogger(addr[1:])})
 +	register(s, true)
 +	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: protos, MinVersion: tls.VersionTLS12}
 +	if err := s.StartWithListener(tls.NewListener(ln, cfg)); err != nil {
@@ -547,16 +548,20 @@ index 0000000..de19f6b
 +	return 0
 +}
 +
++// srvLogger is the default logger tagged with the port, so the engine's own log lines (start engine, "engine switch
++// completed") say which of this process's servers they belong to. Logging only; it changes no behaviour.
++func srvLogger(port string) *slog.Logger { return slog.Default().With("srv", port) }
++
 +func main() {
 +	loadDataset()
 +
 +	// 8080: HTTP/1.1 and WebSocket on the default Adaptive engine.
-+	main8080 := celeris.New(celeris.Config{Addr: ":8080", Engine: enginePin()})
++	main8080 := celeris.New(celeris.Config{Addr: ":8080", Engine: enginePin(), Logger: srvLogger("8080")})
 +	register(main8080, false)
 +	openDB(main8080)
 +
 +	// 8082: HTTP/2 prior knowledge (h2c), HTTP/1.1 kept on the same port.
-+	h2c := celeris.New(celeris.Config{Addr: ":8082", Protocol: celeris.Auto, Engine: enginePin()})
++	h2c := celeris.New(celeris.Config{Addr: ":8082", Protocol: celeris.Auto, Engine: enginePin(), Logger: srvLogger("8082")})
 +	register(h2c, false)
 +	go func() {
 +		if err := h2c.Start(); err != nil {
