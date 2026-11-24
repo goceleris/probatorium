@@ -1,4 +1,4 @@
-phases=async
+phases=engines
 portrange_ok=1
 governor=performance
-reason=HttpArena preview async re-run
+reason=HttpArena preview engine variants
