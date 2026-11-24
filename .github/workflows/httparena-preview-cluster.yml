@@ -142,10 +142,10 @@ jobs:
           IFS=, read -ra ph <<< "$PHASES"
           # Everything the phases print is already limited to START/STOP + rc lines; per-profile output is in files.
           # Nothing below echoes a result, a rate or a score into this log.
-          for p in smoke clear async supp tls; do
+          for p in smoke clear async engines supp tls; do
             for x in "${ph[@]}"; do [ "$x" = "$p" ] && bash preview/run-preview.sh "$p" > "logs-phase-$p.out" 2>&1; done
           done
-          case ",$PHASES," in *,clear,*|*,tls,*) bash preview/run-preview.sh score > logs-score.out 2>&1 ;; esac
+          case ",$PHASES," in *,clear,*|*,tls,*|*,engines,*) bash preview/run-preview.sh score > logs-score.out 2>&1 ;; esac
           mv logs-*.out logs/ 2>/dev/null
           echo "phases done: $PHASES (results are in the artifact only)"
           true
@@ -203,7 +203,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK"
-          tar -cf preview-data.tar HttpArena/results HttpArena/logs HttpArena/preview-images.txt HttpArena/preview.env state 2>/dev/null || true
+          tar -cf preview-data.tar HttpArena/results HttpArena/logs HttpArena/site/static/logs HttpArena/preview-images.txt HttpArena/preview.env state 2>/dev/null || true
           openssl cms -encrypt -binary -stream -aes256 -outform DER -in preview-data.tar -out preview-data.cms \
             -recip "$GITHUB_WORKSPACE/probatorium/tools/httparena-preview/results-cert.pem"
           rm -f preview-data.tar

@@ -37,7 +37,7 @@ on:
   workflow_dispatch:
     inputs:
       phases:
-        description: "Comma list from: smoke, clear, async, supp, tls (run in this order). Cleartext (clear) always before tls."
+        description: "Comma list from: smoke, clear, async, engines, supp, tls (run in this order). Cleartext (clear) always before tls."
         type: string
         required: true
         default: smoke
@@ -97,10 +97,10 @@ jobs:
           [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ] || { echo "::error::dispatch from a branch, not $DEFAULT_BRANCH"; exit 1; }
           [ -n "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ] && [ "${#IN_REASON}" -le 200 ] || { echo "::error::reason empty or over 200 characters"; exit 1; }
           IFS=, read -ra ph <<< "$IN_PHASES"
-          for x in "${ph[@]}"; do case "$x" in smoke|clear|async|supp|tls) ;; *) echo "::error::unknown phase: $x"; exit 1 ;; esac; done
+          for x in "${ph[@]}"; do case "$x" in smoke|clear|async|engines|supp|tls) ;; *) echo "::error::unknown phase: $x"; exit 1 ;; esac; done
           # tls never before clear in the same dispatch
           seen_clear=0; for x in "${ph[@]}"; do [ "$x" = clear ] && seen_clear=1; [ "$x" = tls ] && [ "$seen_clear" = 0 ] && case ",$IN_PHASES," in *,clear,*) echo "::error::order: clear before tls"; exit 1;; esac; done
-          if [ -z "$IN_GOV" ]; then case ",$IN_PHASES," in *,clear,*|*,async,*|*,supp,*|*,tls,*) IN_GOV=performance;; *) IN_GOV=keep;; esac; fi
+          if [ -z "$IN_GOV" ]; then case ",$IN_PHASES," in *,clear,*|*,async,*|*,engines,*|*,supp,*|*,tls,*) IN_GOV=performance;; *) IN_GOV=keep;; esac; fi
           case "$IN_GOV" in performance|keep) ;; *) echo "::error::governor must be performance or keep"; exit 1;; esac
           { echo "phases=$IN_PHASES"; echo "portrange_ok=$IN_PORT"; echo "governor=$IN_GOV"; } >> "$GITHUB_OUTPUT"
 

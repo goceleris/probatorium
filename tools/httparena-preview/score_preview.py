@@ -63,7 +63,11 @@ def main():
     ap.add_argument("--tls-profiles", default="json-tls,8gbit,baseline-h2,static-h2,connections-1m-tls")
     ap.add_argument("--merge", default="", help="fold a profile-limited supplement into its entry, e.g. fiber-websocket=fiber (HttpArena merges by display_name)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--engines", default="", help="ENGINE-VARIANT section after the three views: adaptive,epoll,iouring entry names in that order, e.g. celeris,celeris-epoll,celeris-iouring (their rows do not enter the three views)")
+    ap.add_argument("--container-logs", default="", help="HttpArena/site/static/logs: the harness's per-profile container logs (the Adaptive engine's own switch lines)")
+    ap.add_argument("--bench-logs", default="", help="comma list of the timestamped benchmark logs (logs/engines.<entry>.log, logs/engines-async.<entry>.log) to place the runs in time")
     a = ap.parse_args()
+    engine_names = [e for e in a.engines.split(",") if e]
     hepa = Path(a.hepa or (Path(a.results).parent if a.results else ".")).resolve()
     sys.path.insert(0, str(hepa/"scripts"))
     import latency_score as L
@@ -76,6 +80,7 @@ def main():
     else:
         entries = entries or sorted({p.stem for p in Path(a.results).glob("*/*/*.json")})
         rows = load_layout(a.results, entries)
+        if engine_names: rows.update(load_layout(a.results, engine_names))
     for kv in filter(None, a.merge.split(",")):
         src, dst = kv.split("=")
         for (e, p, c) in [k for k in rows if k[0] == src]:
@@ -143,4 +148,97 @@ def main():
     print("\nOverall (H/1.1 + H/2 + WebSocket):")
     for e in entries:
         print("  %-14s A %8s   B %8s   C %8s" % (e, out[e]["overall_with_tls"], out[e]["overall_celeris_cleartext_only"], out[e]["overall_cleartext_profiles_only"]))
+    if engine_names: engine_section(rows, engine_names, L, a.container_logs, a.bench_logs.split(","))
+
+def compute_eff(rows, entries, L):
+    """Same arithmetic as the three views' eff table, for any subset of entries (used by the engine section only)."""
+    eff = {}
+    for fam, profs in FAMILIES.items():
+        for pid, conns in profs:
+            have = {e: [rows[(e,pid,c)] for c in conns if (e,pid,c) in rows] for e in entries}
+            have = {e: r for e, r in have.items() if r}
+            if pid in FIXED:
+                for c in conns:
+                    rs = [{"entry": e, "rps": rows[(e,pid,c)]["rps"], "cpu": rows[(e,pid,c)].get("cpu_per_req_us"),
+                           "p99": to_us(rows[(e,pid,c)].get("p99_latency")), "mean": to_us(rows[(e,pid,c)].get("avg_latency"))}
+                          for e in entries if (e,pid,c) in rows]
+                    L.score_rows(rs, pid)
+                    for r in rs: eff[(pid, r["entry"])] = r["score"]
+            else:
+                avg = {e: (sum(r["rps"] for r in rs)/len(rs), sum(unit(r.get("bandwidth"), BW) for r in rs)/len(rs)) for e, rs in have.items()}
+                if pid == "json-comp" and avg:
+                    bpr = {e: (bw/rps if rps else 0) for e,(rps,bw) in avg.items()}
+                    best = min((v for v in bpr.values() if v > 0), default=0)
+                    for e,(rps,bw) in avg.items(): eff[(pid,e)] = rps*(best/bpr[e])**2 if bpr[e] > 0 and best > 0 else 0
+                else:
+                    for e,(rps,bw) in avg.items(): eff[(pid,e)] = rps
+    return eff
+
+DUR = {"latency-1m": 20, "latency-10k": 20, "async": 10, "async-db": 10}   # seconds of one measured run (the rest: 5 s); +1 s grace (the cool-down between runs is 2 s; timestamps have 1 s resolution)
+
+def secs(hms): h, m, s_ = (int(x) for x in hms.split(":")); return h*3600 + m*60 + s_
+
+def bench_windows(paths):
+    """{(profile, conns): [run start seconds-of-day UTC]} from the timestamped benchmark logs (HH:MM:SS prefix)."""
+    out = {}; cur = None
+    for p in paths:
+        try: lines = open(p, errors="replace").read().splitlines()
+        except OSError: continue
+        for l in lines:
+            m = re.match(r"(\d\d:\d\d:\d\d) === \S+ / (\S+) / (\d+)c ", l)
+            if m: cur = (m.group(2), int(m.group(3))); out.setdefault(cur, []); continue
+            m = re.match(r"(\d\d:\d\d:\d\d) \[run (\d+)/(\d+)\]", l)
+            if m and cur: out[cur].append(secs(m.group(1)))
+    return out
+
+def switch_summary(entry, logs_dir, windows):
+    """Per profile window of the Adaptive entry: the engine it started on and every 'engine switch completed' line, placed in the runs."""
+    lines = ["", f"[ADAPTIVE SWITCH LOG] {entry}: engine at start, and every switch the engine logged (celeris 'engine switch completed'), per profile window",
+             "profile / conns          start engine  switches  where"]
+    tot_sw = tot_in = nprof = 0
+    for logf in sorted(Path(logs_dir).glob(f"*/*/{entry}.log")):
+        prof, conns = logf.parts[-3], int(logf.parts[-2])
+        text = logf.read_text(errors="replace").splitlines()
+        start = None; sw = []
+        for l in text:
+            m = re.match(r"\d{4}/\d\d/\d\d (\d\d:\d\d:\d\d) INFO (.*)", l)
+            if not m: continue
+            t, msg = m.group(1), m.group(2)
+            if start is None and "adaptive engine listening" in msg:
+                a_ = re.search(r"active=(\S+)", msg); start = a_.group(1) if a_ else "?"
+            if msg.startswith("engine switch completed"):
+                a_ = re.search(r"now_active=(\S+)", msg); sw.append((t, a_.group(1) if a_ else "?"))
+        runs = windows.get((prof, conns), []); dur = DUR.get(prof, 5)
+        where = []
+        for t, to in sw:
+            ts = secs(t); k = next((i+1 for i, r0 in enumerate(runs) if r0 - 1 <= ts <= r0 + dur + 1), None)
+            where.append(f"{t} -> {to} " + (f"(inside run {k})" if k else ("(before the first run)" if runs and ts < runs[0] else "(between/after runs)" if runs else "(runs not placed)")))
+            tot_in += 1 if k else 0
+        tot_sw += len(sw); nprof += 1 if sw else 0
+        lines.append("%-24s %-13s %-9d %s" % (f"{prof} / {conns}", start or "?", len(sw), "; ".join(where) or "-"))
+    lines.append(f"profile windows with a switch: {nprof}; switches in total: {tot_sw}; inside a measured run: {tot_in}")
+    return lines
+
+def engine_section(rows, engine_names, L, logs_dir, bench_logs):
+    ad = engine_names[0]; ents = engine_names
+    eff = compute_eff(rows, ents, L)
+    print("\n[ENGINE VARIANTS] %s = Adaptive (celeris default), then the pinned engines. Per profile: score 0-1000 against the best of these entries (1000 = best), best named; '-' = not run" % ad)
+    print("%-18s" % "profile" + "".join("%-18s" % e for e in ents) + "best             %s/best" % ad)
+    sums = {e: 0.0 for e in ents}; wins = {e: 0 for e in ents}
+    for fam, profs in FAMILIES.items():
+        for pid, _ in profs:
+            vals = {e: eff.get((pid, e)) for e in ents if eff.get((pid, e))}
+            if not vals: continue
+            best = max(vals.values()); win = max(vals, key=vals.get)
+            wins[win] += 1
+            cells = ""
+            for e in ents:
+                v = vals.get(e); sc = (v/best*1000) if v else None
+                if sc is not None: sums[e] += sc
+                cells += "%-18s" % ("-" if sc is None else f"{sc:.1f}")
+            print("%-18s%s%-16s %s" % (pid, cells, win, ("%.3f" % (vals[ad]/best)) if ad in vals else "-"))
+    print("%-18s" % "SUM over profiles" + "".join("%-18s" % f"{sums[e]:.1f}" for e in ents) + "wins: " + ", ".join(f"{e} {wins[e]}" for e in ents))
+    if logs_dir:
+        for l in switch_summary(ad, logs_dir, bench_windows([b for b in bench_logs if b])): print(l)
+
 main()

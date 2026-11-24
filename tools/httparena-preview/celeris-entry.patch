@@ -1,9 +1,111 @@
+diff --git a/frameworks/celeris-epoll/build.sh b/frameworks/celeris-epoll/build.sh
+new file mode 100755
+index 0000000..c603324
+--- /dev/null
++++ b/frameworks/celeris-epoll/build.sh
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++# PREVIEW VARIANT: the celeris entry built with the epoll engine pinned. benchmark.sh and validate.sh call this instead of docker build.
++set -euo pipefail
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++docker build -t httparena-celeris-epoll --build-arg CELERIS_ENGINE=epoll "$here/celeris"
+diff --git a/frameworks/celeris-epoll/meta.json b/frameworks/celeris-epoll/meta.json
+new file mode 100644
+index 0000000..742e061
+--- /dev/null
++++ b/frameworks/celeris-epoll/meta.json
+@@ -0,0 +1,34 @@
++{
++  "display_name": "celeris-epoll",
++  "language": "Go",
++  "type": "emerging",
++  "mode": "standard",
++  "completeness": {
++    "routing": true,
++    "middleware": true,
++    "request": true,
++    "response": true
++  },
++  "engine": "epoll (fixed)",
++  "description": "PREVIEW VARIANT, not for submission: the celeris entry's source built with the epoll engine pinned (Config.Engine) instead of the default Adaptive engine, on the cleartext and WebSocket profiles only (no TLS side). Built from ../celeris by build.sh (--build-arg CELERIS_ENGINE=epoll).",
++  "repo": "https://github.com/goceleris/celeris",
++  "website": "https://goceleris.dev",
++  "enabled": true,
++  "tests": [
++    "baseline",
++    "pipelined",
++    "limited-conn",
++    "async",
++    "latency-1m",
++    "latency-10k",
++    "json-comp",
++    "async-db",
++    "fortunes",
++    "baseline-h2c",
++    "json-h2c",
++    "echo-ws",
++    "echo-ws-pipeline",
++    "echo-ws-limited"
++  ],
++  "maintainers": []
++}
+diff --git a/frameworks/celeris-iouring/build.sh b/frameworks/celeris-iouring/build.sh
+new file mode 100755
+index 0000000..4540882
+--- /dev/null
++++ b/frameworks/celeris-iouring/build.sh
+@@ -0,0 +1,5 @@
++#!/usr/bin/env bash
++# PREVIEW VARIANT: the celeris entry built with the iouring engine pinned. benchmark.sh and validate.sh call this instead of docker build.
++set -euo pipefail
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++docker build -t httparena-celeris-iouring --build-arg CELERIS_ENGINE=iouring "$here/celeris"
+diff --git a/frameworks/celeris-iouring/meta.json b/frameworks/celeris-iouring/meta.json
+new file mode 100644
+index 0000000..9ee301c
+--- /dev/null
++++ b/frameworks/celeris-iouring/meta.json
+@@ -0,0 +1,34 @@
++{
++  "display_name": "celeris-iouring",
++  "language": "Go",
++  "type": "emerging",
++  "mode": "standard",
++  "completeness": {
++    "routing": true,
++    "middleware": true,
++    "request": true,
++    "response": true
++  },
++  "engine": "io_uring (fixed)",
++  "description": "PREVIEW VARIANT, not for submission: the celeris entry's source built with the io_uring engine pinned (Config.Engine) instead of the default Adaptive engine, on the cleartext and WebSocket profiles only (no TLS side). Built from ../celeris by build.sh (--build-arg CELERIS_ENGINE=iouring).",
++  "repo": "https://github.com/goceleris/celeris",
++  "website": "https://goceleris.dev",
++  "enabled": true,
++  "tests": [
++    "baseline",
++    "pipelined",
++    "limited-conn",
++    "async",
++    "latency-1m",
++    "latency-10k",
++    "json-comp",
++    "async-db",
++    "fortunes",
++    "baseline-h2c",
++    "json-h2c",
++    "echo-ws",
++    "echo-ws-pipeline",
++    "echo-ws-limited"
++  ],
++  "maintainers": []
++}
 diff --git a/frameworks/celeris/Dockerfile b/frameworks/celeris/Dockerfile
 new file mode 100644
-index 0000000..9e3f090
+index 0000000..6e373d5
 --- /dev/null
 +++ b/frameworks/celeris/Dockerfile
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,14 @@
 +FROM golang:1.27.4-alpine AS build
 +WORKDIR /app
 +COPY go.mod go.sum ./
@@ -12,15 +114,18 @@ index 0000000..9e3f090
 +RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o server .
 +
 +FROM alpine:3.23
++# empty for the celeris entry (celeris default engine); the celeris-epoll / celeris-iouring entries build this same source with epoll / iouring
++ARG CELERIS_ENGINE=
++ENV CELERIS_ENGINE=$CELERIS_ENGINE
 +COPY --from=build /app/server /server
 +EXPOSE 8080 8081 8082 8443
 +CMD ["/server"]
 diff --git a/frameworks/celeris/README.md b/frameworks/celeris/README.md
 new file mode 100644
-index 0000000..5c94448
+index 0000000..4d88070
 --- /dev/null
 +++ b/frameworks/celeris/README.md
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,50 @@
 +# celeris
 +
 +[celeris](https://github.com/goceleris/celeris) is an HTTP engine and router for Go with an adaptive io_uring/epoll event loop on Linux. This entry is a framework entry (`type: emerging`, `mode: standard`): routes, middleware, query binding and JSON go through celeris's documented APIs.
@@ -67,6 +172,10 @@ index 0000000..5c94448
 +## Build
 +
 +`golang:1.27.4-alpine` build stage, `alpine:3.23` runtime; module versions are pinned in `go.mod`/`go.sum` (celeris `v1.5.12-0.20261120120335-fe2b5be71ebc` = main `fe2b5be71ebc`, `middleware/compress v1.5.11`).
++
++## Engine pin (preview only)
++
++`CELERIS_ENGINE` is empty in this entry, so celeris's default engine (Adaptive on Linux) runs. The preview-only entries `celeris-epoll` and `celeris-iouring` (cleartext and WebSocket profiles, no TLS) build this same source through their `build.sh` with `--build-arg CELERIS_ENGINE=epoll|iouring`, which sets `Config.Engine` on the 8080 and 8082 servers. They exist to show which engine each profile prefers; they are not meant for submission.
 diff --git a/frameworks/celeris/fortunes.html b/frameworks/celeris/fortunes.html
 new file mode 100644
 index 0000000..7e47740
@@ -129,10 +238,10 @@ index 0000000..37df6fb
 +golang.org/x/text v0.43.0/go.mod h1:hbSIYA/amXcRXTFSZqh8tWHEoqRvvbKPJ2uz/KU+a+s=
 diff --git a/frameworks/celeris/main.go b/frameworks/celeris/main.go
 new file mode 100644
-index 0000000..d5a7233
+index 0000000..de19f6b
 --- /dev/null
 +++ b/frameworks/celeris/main.go
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,333 @@
 +// HttpArena entry for celeris (https://github.com/goceleris/celeris).
 +//
 +// Two engines serve this entry, and the README says so:
@@ -425,16 +534,29 @@ index 0000000..d5a7233
 +	}
 +}
 +
++// enginePin returns the engine named by CELERIS_ENGINE (epoll or iouring), or the zero value, which is celeris's own
++// default (Adaptive on Linux). The variable is empty in the celeris entry; the celeris-epoll and celeris-iouring
++// preview entries set it at build time (their build.sh passes --build-arg CELERIS_ENGINE=...).
++func enginePin() celeris.EngineType {
++	switch os.Getenv("CELERIS_ENGINE") {
++	case "epoll":
++		return celeris.Epoll
++	case "iouring":
++		return celeris.IOUring
++	}
++	return 0
++}
++
 +func main() {
 +	loadDataset()
 +
 +	// 8080: HTTP/1.1 and WebSocket on the default Adaptive engine.
-+	main8080 := celeris.New(celeris.Config{Addr: ":8080"})
++	main8080 := celeris.New(celeris.Config{Addr: ":8080", Engine: enginePin()})
 +	register(main8080, false)
 +	openDB(main8080)
 +
 +	// 8082: HTTP/2 prior knowledge (h2c), HTTP/1.1 kept on the same port.
-+	h2c := celeris.New(celeris.Config{Addr: ":8082", Protocol: celeris.Auto})
++	h2c := celeris.New(celeris.Config{Addr: ":8082", Protocol: celeris.Auto, Engine: enginePin()})
 +	register(h2c, false)
 +	go func() {
 +		if err := h2c.Start(); err != nil {
