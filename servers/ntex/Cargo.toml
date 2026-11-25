@@ -16,10 +16,10 @@
 #       The binary prints `ready addr=<final-bind-addr>` on stdout once
 #       the listener is up; SIGTERM triggers graceful shutdown within 5s.
 #
-# Dependency policy: the `>=` floors below are deliberately loose; the
-# COMMITTED Cargo.lock is the source of truth and builds run with
-# `cargo build --locked`. Versions move only through a reviewed
-# Dependabot PR, never resolved fresh at deploy time.
+# Dependency policy: the COMMITTED Cargo.lock is the source of truth and
+# builds run with `cargo build --locked`. Versions move only through a
+# reviewed Dependabot PR, never resolved fresh at deploy time. ntex itself
+# is capped at major 3 below (see the ntex entry).
 #
 # Runtime backend: we use the default tokio backend (the
 # `ntex/tokio` feature set) for wave 4a. ntex also offers `compio` and
@@ -43,10 +43,16 @@ name = "probatorium-ntex-server"
 path = "src/main.rs"
 
 [dependencies]
-# ntex — minimum version 3 so we get the stable post-2.x API (async
-# closures in HttpServer::new, content_type() on HttpResponseBuilder).
+# ntex — major 3 ONLY. src/main.rs is written against the ntex 3.x API
+# (App::state, the argument-less factory of HttpServer::new, the 3-argument
+# ServerBuilder::listen, ServerBuilder::shutdown_timeout). ntex 4.x changed
+# all of them (6 compile errors on 4.2.0 through 4.4.0), so an open-ended `>=3` let a lock-only Dependabot bump
+# (#517, 3.12.3 -> 4.2.0) break the adapter without touching Cargo.toml or
+# any source, and nothing in CI compiles the Rust adapters. `3` keeps
+# lock refreshes inside 3.x; moving to 4.x is a port of src/main.rs plus
+# a Cargo.toml edit, reviewed together.
 # The `tokio` feature pulls the tokio runtime + the http stack we need.
-ntex = { version = ">=3", features = ["tokio"] }
+ntex = { version = "3", features = ["tokio"] }
 # serde_json — reserved for wave 6 driver responses; not used by the
 # deterministic 1k/64k corpus (which is hand-emitted in src/payload.rs).
 serde_json = ">=1"
