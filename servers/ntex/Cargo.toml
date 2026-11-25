@@ -52,7 +52,7 @@ path = "src/main.rs"
 # lock refreshes inside 3.x; moving to 4.x is a port of src/main.rs plus
 # a Cargo.toml edit, reviewed together.
 # The `tokio` feature pulls the tokio runtime + the http stack we need.
-ntex = { version = "3", features = ["tokio"] }
+ntex = { version = "4", features = ["tokio"] }
 # serde_json — reserved for wave 6 driver responses; not used by the
 # deterministic 1k/64k corpus (which is hand-emitted in src/payload.rs).
 serde_json = ">=1"
