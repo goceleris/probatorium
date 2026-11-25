@@ -108,6 +108,11 @@ on:
         required: false
         type: string
         default: "1"
+      governor:
+        description: "CPU frequency governor of the run's hosts (the bench target plus the loadgen msa2-client; every cluster host on target=both). 'performance' (DEFAULT, also for a scheduled run): after mage Deploy and before anything is measured, every host's scaling driver / governor / EPP / limits / frequency / boost / idle states are RECORDED (results/cpu-power/orig/<host>.json), `performance` is written on every CPU that has a governor (a CPU already on it is not written; idle states are NEVER written, left as found) and READ BACK (a host that did not take fails the job before the bench), and after the run (also when it failed or was cancelled) every recorded value is written back, read back and COMPARED with the original: results/cpu-power/restore-status.txt = RESTORED-EQUAL, else the job is red. | keep: record only (orig and final, KEPT-EQUAL or KEPT-CHANGED), nothing is changed. results/cpu-power/summary.txt states the governor / driver / idle setting each host ran on (the methodology statement per published run). Not a measured-path input: no cell, load or timing parameter reads it."
+        required: false
+        type: string
+        default: performance
 
 permissions:
   contents: read
@@ -146,6 +151,7 @@ jobs:
           IN_BASELINE: ${{ github.event.inputs.baseline }}
           IN_PUBLISH: ${{ github.event.inputs.publish }}
           IN_SAMPLER_INTERVAL: ${{ github.event.inputs.sampler_interval }}
+          IN_GOVERNOR: ${{ github.event.inputs.governor }}
         run: |
           fail=0
           check() {
@@ -160,6 +166,7 @@ jobs:
           check arch_exclusive "$IN_ARCH" all heavy off
           check baseline "$IN_BASELINE" true false
           check sampler_interval "$IN_SAMPLER_INTERVAL" 1 0.5 0.2 0.1 0.05
+          check governor "$IN_GOVERNOR" performance keep
           publishes=1
           [ "${IN_PROFILE:-full}" = fast ] && publishes=0
           [ "$IN_PUBLISH" = false ] && publishes=0
@@ -366,6 +373,19 @@ jobs:
           DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
 
+      # CPU governor (release runs): record every host of the run, write `performance`, read it
+      # back, BEFORE the sampler and the bench start (.github/scripts/cpu-governor.sh, ansible/
+      # cpu-power.yml, ansible/files/cpu_power.py). No continue-on-error: a governor that did not
+      # take fails the job before anything is measured. The measured step below is unchanged
+      # (one `run: mage BenchTier`); nothing in it reads the governor input. governor=keep only
+      # records. The matching always() restore step follows the bench.
+      - name: CPU governor (record, set performance, read back)
+        timeout-minutes: 15
+        env:
+          CPU_GOVERNOR: ${{ github.event.inputs.governor || 'performance' }}
+          CLUSTER_USE_LAN: "1"
+        run: bash .github/scripts/cpu-governor.sh set
+
       # The host sampler (probatorium#354, #481) beside the bench: the race and
       # weekend tiers had it, the bench tier did not, so a bench had no series of
       # its own (the forensics artifact fetched the last weekend soak's files)
@@ -452,6 +472,19 @@ jobs:
           BENCH_BUDGET: ${{ fromJSON('{"fast":{"false":{"heavy":"24h","off":"24h","single":"24h","all":"34h"},"true":{"heavy":"24h","off":"24h","single":"24h","all":"43h"}},"headline":{"false":{"heavy":"40h","off":"36h","single":"36h","all":"72h"},"true":{"heavy":"52h","off":"48h","single":"48h","all":"92h"}},"full":{"false":{"heavy":"69h","off":"60h","single":"60h","all":"108h"},"true":{"heavy":"90h","off":"80h","single":"80h","all":"112h"}}}')[github.event.inputs.profile || 'full'][github.event.inputs.baseline == 'true' && 'true' || 'false'][(github.event.inputs.target || 'both') != 'both' && 'single' || github.event.inputs.arch_exclusive || 'all'] }}
           DOCS_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
         run: mage BenchTier
+
+      # Restore the governor: every recorded value written back, read back and COMPARED with the
+      # original (results/cpu-power/restore-status.txt: RESTORED-EQUAL, else this step and the job
+      # are red). `if: always()` (failed bench, cancel, timeout). Before the sampler stop, the
+      # upload (the records travel with the results as results/cpu-power/) and mage Cleanup. A
+      # no-op when the set step recorded nothing. With governor=keep it records the final state.
+      - name: CPU governor (restore, record, compare with the original)
+        if: always()
+        timeout-minutes: 20
+        env:
+          CPU_GOVERNOR: ${{ github.event.inputs.governor || 'performance' }}
+          CLUSTER_USE_LAN: "1"
+        run: bash .github/scripts/cpu-governor.sh restore
 
       # Before the upload, so the series travels with the run's results
       # (results/host-sampler/<host>/); `if: always()` so it runs when the bench

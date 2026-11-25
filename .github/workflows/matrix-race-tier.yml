@@ -88,6 +88,22 @@ on:
         required: false
         default: ""
         type: string
+      governor:
+        description: >-
+          CPU frequency governor of every cluster host (msa2-server, msr1,
+          msa2-client). performance (DEFAULT): after mage Deploy and before
+          the validate step every host's scaling driver / governor / EPP /
+          limits / frequency / boost / idle states are recorded
+          (results/cpu-power/orig/<host>.json), performance is written on
+          every CPU that has a governor and read back (a host that did not
+          take fails the job before the gate runs), and after the gate (also
+          when it failed or was cancelled) every recorded value is written
+          back, read back and compared with the original
+          (results/cpu-power/restore-status.txt: RESTORED-EQUAL, else the job
+          is red). Idle states are never written. keep: record only.
+        required: false
+        default: performance
+        type: string
 
 permissions:
   contents: read
@@ -113,8 +129,13 @@ jobs:
         env:
           REFAPP_CPUS: ${{ inputs.refapp_cpus }}
           REFAPP_WORKLOAD_HINT: ${{ inputs.refapp_workload_hint }}
+          GOVERNOR: ${{ inputs.governor }}
         run: |
           set -eu
+          case "${GOVERNOR:-}" in
+            ""|performance|keep) ;;
+            *) echo "governor must be performance or keep, got: $GOVERNOR" >&2; exit 1 ;;
+          esac
           case "$REFAPP_WORKLOAD_HINT" in
             ""|high|low) ;;
             *) echo "refapp_workload_hint must be high, low or empty, got: $REFAPP_WORKLOAD_HINT" >&2; exit 1 ;;
@@ -310,6 +331,17 @@ jobs:
           DEPLOY_NEEDS_DBSERVICES: "1"
         run: mage Deploy
 
+      # CPU governor (release runs): record every cluster host, write performance, read it back,
+      # before anything is validated (.github/scripts/cpu-governor.sh). No continue-on-error: a
+      # governor that did not take fails the job before the gate runs. The validate steps below
+      # are unchanged. The matching always() restore step follows the diff gate.
+      - name: CPU governor (record, set performance, read back)
+        timeout-minutes: 15
+        env:
+          CPU_GOVERNOR: ${{ inputs.governor || 'performance' }}
+          CLUSTER_USE_LAN: "1"
+        run: bash .github/scripts/cpu-governor.sh set
+
       - name: mage Validate (matrix mode, both archs)
         env:
           VALIDATE_DURATION: ${{ inputs.duration || '80m' }}
@@ -426,6 +458,18 @@ jobs:
           # check.
           VALIDATE_DIFF_STRICT: "1"
         run: mage ValidateDiff
+
+      # Restore the governor: every recorded value written back, read back and compared with the
+      # original (results/cpu-power/restore-status.txt: RESTORED-EQUAL, else this step and the job
+      # are red). After the judges (mage ValidateDiff reads results/ and must not meet the copy),
+      # before the upload; `if: always()`. A no-op when the set step recorded nothing.
+      - name: CPU governor (restore, record, compare with the original)
+        if: always()
+        timeout-minutes: 20
+        env:
+          CPU_GOVERNOR: ${{ inputs.governor || 'performance' }}
+          CLUSTER_USE_LAN: "1"
+        run: bash .github/scripts/cpu-governor.sh restore
 
       # Before the upload, so the series travels with the run's results;
       # `if: always()` so it runs when the gate failed. Never fails the run.
