@@ -11,80 +11,195 @@
 </p>
 
 <p align="center">
-  <strong>The benchmark and validation harness for <a href="https://github.com/goceleris/celeris">celeris</a>.</strong><br>
-  It drives a real three-host cluster, x86 and arm64, and asks every celeris build two questions:
-  how fast is it, and does it stay correct under stress?
+  <strong>The benchmark and validation harness for <a href="https://github.com/goceleris/celeris">celeris</a>: it drives a real three-host cluster, x86 and arm64, and asks every celeris build how fast it is and whether it stays correct under stress.</strong>
 </p>
 
 <p align="center">
-  <a href="#where-the-latest-results-live">Latest results</a> ·
+  <a href="#why-probatorium">Why</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#tiers">Tiers</a> ·
+  <a href="#results">Results</a> ·
+  <a href="#reproduce-a-run">Reproduce a run</a> ·
   <a href="https://goceleris.dev/benchmarks/">Benchmark dashboard</a> ·
-  <a href="https://goceleris.dev/methodology/">Methodology</a> ·
-  <a href="#reproduce-a-run">Reproduce a run</a>
+  <a href="https://goceleris.dev/methodology/">Methodology</a>
 </p>
 
-## What it proves
+## At a glance
 
-probatorium runs two kinds of tier on the same cluster: bench tiers measure, validation tiers judge.
+**What it is.** probatorium is the benchmark and validation harness for celeris. On a three-host cluster (x86-64 and arm64) it measures celeris against 29 other frameworks under load, and it runs celeris reference apps on every engine against malformed traffic, connection churn and injected faults to judge correctness.
 
-- **Speed (the bench tier).** celeris runs side by side with a field of 29 other frameworks in 10
-  languages and the Go `net/http` baseline: 52 server columns across up to 29 scenarios, 813 cells. The
-  load comes from [loadgen](https://github.com/goceleris/loadgen). Besides saturation throughput, the
-  headline metric is **`latency_at_slo`**: the highest request rate whose P99 stays within each latency
-  budget. Rated runs are published to [goceleris.dev](https://goceleris.dev/benchmarks/).
-- **Correctness (the validation tiers).** Every reference app (8 of them, covering celeris's middleware,
-  streaming and database drivers) runs on every engine (`iouring`, `epoll`, `std`, `adaptive`) on both
-  architectures: 64 cells per full matrix. Each cell is hit with session-shaped traffic, malformed
-  HTTP/1.1, h2c-upgrade churn, WebSocket frame torture, killed SSE streams and a replayed fault
-  schedule, while a per-second property loop checks invariants such as connection accounting, heap,
-  goroutine and RSS growth, and unexpected panics. `mage ValidateGate` fails the run on any violation,
-  dead cell or unexercised oracle. `mage ValidateDiff` fails it when one engine or one architecture
-  behaves differently from the others.
-- **The same checks under instrumented builds.** Race Validation rebuilds the reference apps with
-  `-race`; Checkptr Validation rebuilds them with the pointer checker, which also compiles in celeris's
-  own io_uring SQE checks.
-- **Flake rates, off the cluster.** Celeris Stress runs celeris's own tests many times on GitHub-hosted
-  x86 and arm64 runners and reports, per test and architecture, the per-process failure rate with an
-  exact 95 % interval ([`docs/STRESS.md`](docs/STRESS.md)).
-
-## Where the latest results live
-
-Every cluster tier is a GitHub Actions workflow in this repository. Its run page is the latest result:
-the gate steps (`mage ValidateGate`, `mage ValidateDiff`) give the verdict, and the full result tree is
-attached to the run as an artifact.
-
-> [!NOTE]
-> **The tiers are dispatched by hand.** Their schedules have been paused since
-> [#380](https://github.com/goceleris/probatorium/pull/380) (2026-09-15) to keep the cluster free for
-> the v1.6.0 release validation; [`workflow_schedule_paused_test.go`](workflow_schedule_paused_test.go) pins that state. The run lists
-> below show the most recent manual runs, not a nightly or weekly cadence.
-
-| Tier (links to its runs) | What it runs | Result artifact on each run (kept for) |
-| --- | --- | --- |
-| [Nightly Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml) | The full 64-cell matrix on both architectures | `matrix-nightly-results-<run id>` (30 days) |
-| [Weekend Soak](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml) | The same matrix over 24 h, long enough to judge slow leaks | `matrix-weekend-results-<run id>` (90 days) |
-| [Race Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-race-tier.yml) | The matrix with `-race` reference apps; it gates liveness and records the latency of a slow 64 KiB echo ([tier semantics](#race-tier-semantics-liveness-is-gated-latency-is-recorded)) | `matrix-race-results-<run id>` (30 days) |
-| [Checkptr Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-checkptr-tier.yml) | The matrix with pointer-checker reference apps | `matrix-checkptr-results-<run id>` (30 days) |
-| [PR Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-pr-tier.yml) | A 10-minute matrix on the amd64 host, for pull requests a maintainer labels `cluster-ok` | `matrix-pr-results-<run id>` (7 days) |
-| [Benchmark Tier](https://github.com/goceleris/probatorium/actions/workflows/benchmark-tier.yml) | `mage BenchTier` over the whole grid | `benchmark-tier-results-<run id>` (90 days); rated runs are also published to the [benchmark dashboard](https://goceleris.dev/benchmarks/) |
-
-Validation results are not published anywhere else: they are not in
-[goceleris/docs](https://github.com/goceleris/docs) or on goceleris.dev. Every cluster run also keeps
-a `cluster-forensics-*` and a `cluster-rescued-results-*` artifact for 90 days. How the benchmark
-numbers are made is described on the [methodology page](https://goceleris.dev/methodology/).
-
-## Reproduce a run
-
-**Without the cluster.** Two parts of the harness are deterministic and run on any machine with Go:
+**Run it.** The deterministic parts run on a laptop with Go, with no cluster, docker or root:
 
 ```sh
+git clone https://github.com/goceleris/probatorium && cd probatorium
+go run ./cmd/runner -dry-run -cells '*/*' -runs 1   # list every benchmark cell a full run schedules
+go test ./budget ./scenarios ./interleave ./report  # the smallest test slice
+```
+
+Measuring or validating needs the cluster; see [Reproduce a run](#reproduce-a-run).
+
+**Where the results are.** Benchmark results are published in the [goceleris/docs results tree](https://github.com/goceleris/docs/tree/main/results) and shown on [goceleris.dev/benchmarks](https://goceleris.dev/benchmarks/). Validation results are the run pages of this repository's workflows. The cluster workflows are started by hand today. What the v1.6.0 runs showed: [What v1.6.0 proved](#what-v160-proved).
+
+## Why probatorium
+
+celeris has its own unit tests. probatorium tests it from the outside, as a deployed server on real
+machines, and does two different jobs with the same cluster:
+
+- **It measures speed.** celeris runs beside 29 other frameworks in 10 languages and the Go `net/http`
+  baseline, under load from [loadgen](https://github.com/goceleris/loadgen). Besides saturation throughput,
+  the headline metric is **`latency_at_slo`**: the highest request rate whose P99 stays within each latency
+  budget.
+- **It judges correctness.** Every reference app (small celeris servers that exercise its middleware,
+  streaming and database drivers) runs on every engine (`iouring`, `epoll`, `std`, `adaptive`) on both
+  architectures. Each cell is hit with session-shaped traffic, malformed HTTP/1.1, h2c-upgrade churn,
+  WebSocket frame torture, killed SSE streams and a replayed fault schedule, while a per-second property
+  loop checks invariants: connection accounting, heap, goroutine and RSS growth, unexpected panics, and more.
+  A gate fails the run on any violation, dead cell or unexercised check, and a diff fails it when one engine
+  or one architecture behaves differently from the others.
+- **It repeats the checks under instrumented builds** (`-race`, and the pointer checker with celeris's own
+  io_uring SQE checks), and **measures flake rates** of celeris's own tests, by default on GitHub-hosted x86 and
+  arm64 runners ([`docs/STRESS.md`](docs/STRESS.md)).
+
+The cluster has three hosts (details in [The cluster](#the-cluster)): two servers under test, `msa2-server`
+(x86) and `msr1` (arm64), and one load generator, `msa2-client` (x86).
+
+What the harness contains today, counted from this repository at the time of writing (main at `014adb8`,
+2026-11-22), not from memory:
+
+| | Count | Where it comes from |
+| --- | --- | --- |
+| Bench server columns | 52: celeris 9, `net/http` 3, 40 for the 29 other frameworks | `servers.Registry` ([`servers/servers.go`](servers/servers.go)) |
+| Bench scenarios | 32 registered, 29 schedule cells (the three `tls-*` ones need a TLS terminator no run configures) | `scenarios/` |
+| Bench cells in a full run | 813 | `go run ./cmd/runner -dry-run -cells '*/*' -runs 1` |
+| Reference apps | 8 | [`validation/refapp/`](validation/refapp/) |
+| Engines per reference app | 4 on Linux (`std` only elsewhere) | |
+| Validation cells in a full matrix | 64 (8 apps × 4 engines × 2 architectures) | |
+| Invariant predicates (`I-*`) | 30 IDs | `validation/properties`, `validation/checker` |
+| Replay seeds | 100 | [`validation/corpus/seeds_initial.go`](validation/corpus/seeds_initial.go) |
+| Go version | 1.27.3 | [`go.mod`](go.mod) |
+
+## Quick start
+
+Everything here runs on a laptop with Go 1.27.3 or newer; no cluster, docker or root. It was checked on macOS
+arm64 (CONTRIBUTING.md says macOS is fine for `go build` and `go test ./...`); the cluster hosts themselves are Linux.
+
+```sh
+git clone https://github.com/goceleris/probatorium && cd probatorium
+go build ./...
+go vet ./...
+
+# The smallest unit-test slice (about 3 s). `go test ./...` runs everything.
+go test ./budget ./scenarios ./interleave ./report
+
 # The bench grid: every (scenario, server) cell a full run schedules (813 of them), without running any.
 go run ./cmd/runner -dry-run -cells '*/*' -runs 1
 
-# A validation seed: a found bug is the tuple (seed, celeris commit, host arch), and the seed expands
-# into the same workload and fault schedule every time.
-go run ./cmd/validator-replay -seed=0x1 -commit="$(git rev-parse HEAD)" -target=msa2-server -dry-run
+# A validation seed: a found bug is the tuple (seed, celeris commit, host arch), and the seed expands into
+# the same workload and fault schedule every time. -commit is only recorded; use the celeris commit under test.
+CELERIS_SHA=$(git ls-remote https://github.com/goceleris/celeris HEAD | cut -f1)
+go run ./cmd/validator-replay -seed=0x1 -commit="$CELERIS_SHA" -target=msa2-server -dry-run
 ```
+
+To list the mage targets (the cluster commands), install the pinned `mage` as in
+[CONTRIBUTING.md](CONTRIBUTING.md) and run `mage -l`. Reproducing a measured run needs the cluster; see
+[Reproduce a run](#reproduce-a-run).
+
+## Tiers
+
+The word "tier" means two things here. A **workflow tier** is one GitHub Actions workflow that drives the
+cluster. **Tier 1, 2 and 3** are the layers of testing inside every validation cell.
+
+**Workflow tiers.** Bench tiers measure, validation tiers judge. Each is dispatched by hand today (see
+[Results](#results)); the PR tier also runs for pull requests a maintainer labels `cluster-ok`.
+
+| Tier (workflow) | What it runs |
+| --- | --- |
+| [Benchmark Tier](.github/workflows/benchmark-tier.yml) | `mage BenchTier` over the whole grid, in a `fast`, `headline` or `full` profile ([bench tier reference](docs/BENCH.md)). A read-only host sampler runs beside it, with a per-CPU series at 1 s by default whose compressed generations shrink 2-5x ([details](docs/BENCH.md#the-host-sampler-beside-a-bench)) |
+| [Nightly Validation](.github/workflows/matrix-nightly-tier.yml) | The full 64-cell matrix on both architectures, then `ValidateGate` and `ValidateDiff` |
+| [Weekend Soak](.github/workflows/matrix-weekend-tier.yml) | The same matrix over 24 h by default, long enough to judge slow leaks |
+| [Race Validation](.github/workflows/matrix-race-tier.yml) | The matrix with `-race` reference apps; it gates liveness and records the latency of a slow 64 KiB echo ([semantics](docs/VALIDATION.md#race-tier-semantics-liveness-is-gated-latency-is-recorded)) |
+| [Checkptr Validation](.github/workflows/matrix-checkptr-tier.yml) | The matrix with pointer-checker reference apps |
+| [PR Validation](.github/workflows/matrix-pr-tier.yml) | A 10-minute matrix on the amd64 host, for pull requests a maintainer labels `cluster-ok` |
+| [Celeris Stress](.github/workflows/celeris-stress.yml) | Celeris's own tests run many times, per test and architecture, with an exact 95 % interval on the per-process failure rate: [`docs/STRESS.md`](docs/STRESS.md) |
+
+**Layers inside a validation cell** (full description: [validation reference](docs/VALIDATION.md)):
+
+| Layer | What it does |
+| --- | --- |
+| Tier 1: always-on property stress | Five traffic slices (session-shaped Markov traffic, raw-TCP malformed HTTP/1.1, h2c upgrade churn, WebSocket frame torture, SSE kill-mid-stream) plus a per-second property loop that judges the `I-*` invariants |
+| Tier 2: stateful API fuzzing | Not implemented: the tier is scaffolding and every `plan.json` marks it `DISABLED` |
+| Tier 3: deterministic seed replay | A seed expands into a workload plus a fault schedule (`iptables` drops, `tc netem` loss and delay), on a real kernel with no mocking; a bug reproduces from `(seed, celeris commit, host arch)` |
+
+**Invariants.** The per-second property loop evaluates the registered `I-*` predicates against a rolling
+one-hour history of the reference app's `/debug/vars` and `/proc` RSS. In every cell it judges liveness and
+hang (`I-LIVENESS`, `I-HANG`), unexpected panics (`I-PANIC`), connection accounting (`I-CONN-2`:
+`accepted − closed − active == 0`) and the three growth slopes (`I-MEM-1` heap, `I-MEM-3` goroutines,
+`I-MEM-4` RSS). Others apply only where their data source exists (middleware `I-MW-*`, drivers `I-DRV`, RFC
+conformance `I-RFC-*`, race and checkptr builds, adaptive and io_uring engines). A predicate counts as
+passed only if it reached a verdict; one that never became judgeable is `not_judged`, and the gate also
+fails a cell that evaluated nothing. Thresholds, the false-positive guard and its measured cost:
+[`docs/VALIDATION.md`](docs/VALIDATION.md#invariants).
+
+A few signals are judged by the Tier 1 walkers themselves and stop the cell on the first hit: malformed bytes
+accepted (`I-ADV-ACCEPTED`), an engine answering an h2c upgrade with non-HTTP bytes (`I-H2C-CRASHED`), WebSocket
+violations accepted, hung or corrupted (`I-WS-*`), and a process that died or wedged. The full table of signals
+and their effect is in [`docs/VALIDATION.md`](docs/VALIDATION.md#tier-1-always-on-property-stress).
+
+**Gates.** `mage ValidateGate` is the absolute gate: zero violations, no dead cell, no oracle that never ran.
+`mage ValidateDiff` compares engines and architectures and fails on a divergence.
+
+## Results
+
+### Where the latest results live
+
+> [!NOTE]
+> **The cluster tiers are dispatched by hand.** Their schedules have been paused since
+> [#380](https://github.com/goceleris/probatorium/pull/380) (2026-09-15), to keep the cluster free for the
+> v1.6.0 release validation. In the workflow YAML the `schedule:` blocks of `matrix-nightly-tier.yml`
+> (Mon-Sat 02:00 UTC), `matrix-weekend-tier.yml` (Sunday 02:00) and `benchmark-tier.yml` (Wednesday 04:00)
+> are commented out, and no workflow has a live `schedule:` trigger (checked 2026-11-22);
+> [`workflow_schedule_paused_test.go`](workflow_schedule_paused_test.go) pins that state. A run list below
+> therefore shows the most recent manual runs, not a nightly or weekly cadence.
+
+**Benchmark results** are published by `mage Publish` into the `results/<version>/<date>/<arch>/` tree of
+[goceleris/docs](https://github.com/goceleris/docs) (`summary.json`, `timeseries.json.gz`,
+`histograms.json.gz`, `env.json` per architecture, `x86_64` or `arm64`), and the site
+[goceleris.dev/benchmarks](https://goceleris.dev/benchmarks/) is built from that tree.
+[How the numbers are made](https://goceleris.dev/methodology/). On 2026-11-22 the tree holds runs of
+v1.5.5, v1.5.6, v1.5.7 and v1.5.8 (the newest is `results/v1.5.8/20260829`); it holds no v1.5.11 or v1.6.0
+run yet, so this README quotes no benchmark number. Rated data is not publishable yet; see
+[Status and stability](#status-and-stability).
+
+**Validation results** are not published anywhere else: they are not in goceleris/docs or on goceleris.dev.
+Every cluster tier is a GitHub Actions workflow in this repository; its run page is the result. The gate steps
+(`mage ValidateGate`, `mage ValidateDiff`) give the verdict, and the full result tree is attached to the run
+as an artifact. Every cluster run also keeps a `cluster-forensics-*` and a `cluster-rescued-results-*`
+artifact for 90 days.
+
+| Tier (links to its runs) | Result artifact on each run (kept for) |
+| --- | --- |
+| [Nightly Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-nightly-tier.yml) | `matrix-nightly-results-<run id>` (30 days) |
+| [Weekend Soak](https://github.com/goceleris/probatorium/actions/workflows/matrix-weekend-tier.yml) | `matrix-weekend-results-<run id>` (90 days) |
+| [Race Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-race-tier.yml) | `matrix-race-results-<run id>` (30 days) |
+| [Checkptr Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-checkptr-tier.yml) | `matrix-checkptr-results-<run id>` (30 days) |
+| [PR Validation](https://github.com/goceleris/probatorium/actions/workflows/matrix-pr-tier.yml) | `matrix-pr-results-<run id>` (7 days) |
+| [Benchmark Tier](https://github.com/goceleris/probatorium/actions/workflows/benchmark-tier.yml) | `benchmark-tier-results-<run id>` (90 days); rated runs are also published to the [benchmark dashboard](https://goceleris.dev/benchmarks/) |
+
+### What v1.6.0 proved
+
+Not filled in yet: the final v1.6.0 validation and the two single-architecture full benches have not run.
+Nothing below is a result until its marker is replaced by a measured value and a run id.
+
+| Question | v1.6.0 result |
+| --- | --- |
+| Does the full 64-cell matrix pass `ValidateGate` and `ValidateDiff` on both architectures? | [[PLACEHOLDER: v1.6.0 nightly/matrix verdict, run id]] |
+| x86 full bench: headline `latency_at_slo` and saturation throughput of celeris against the field | [[PLACEHOLDER: v1.6.0 x86 full bench result, run id]] |
+| arm64 full bench: the same | [[PLACEHOLDER: v1.6.0 arm64 full bench result, run id]] |
+
+## Reproduce a run
+
+**Without the cluster**, the two deterministic parts of the harness are in the [Quick start](#quick-start):
+the bench grid dry run and a validation seed replay.
 
 **On the cluster.** Everything else drives the three hosts through [mage](https://magefile.org) targets
 and Ansible, so it needs Linux or macOS with `mage` and `ansible-playbook`, and SSH access to the
@@ -122,9 +237,67 @@ CLUSTER_USE_LAN=1 mage Cleanup
 
 A maintainer can also start any tier from its workflow page (**Run workflow**) or with
 `gh workflow run <workflow file> --repo goceleris/probatorium`. The tiers share one concurrency group,
-so a new run queues behind the one on the cluster.
+so a new run queues behind the one on the cluster. The target knobs are in [Mage targets](#mage-targets),
+the layout of what a run leaves is in [Result layout](#result-layout).
 
-## The cluster
+## Status and stability
+
+probatorium is a harness, not a library: it has no tagged releases and nothing in it ships in a production
+path ([SECURITY.md](SECURITY.md)). The limits that matter when reading its results:
+
+- **Cadence.** No tier runs on a schedule today (above). The latest result is the latest manual run.
+- **One specific rig.** Every cluster result comes from the same three hosts. The cluster is not something an outsider
+  can rent or recreate from this repository alone; the without-cluster commands reproduce the grid and the
+  seeds, not the measurements.
+- **Rated bench data is not publishable yet.** [#441](https://github.com/goceleris/probatorium/issues/441)
+  gates any rated publish and [#442](https://github.com/goceleris/probatorium/issues/442) does until it is
+  settled; read `achieved_ratio` before reading a rated p99 as the server's. Dispatch headline and full
+  benches with `publish=false` until then ([details](docs/BENCH.md#profiles)).
+- **Both architectures share one load generator** in a both-arch run, so the arches take turns on it
+  (`arch_exclusive=all`, about twice one arch's wall-clock) ([details](docs/BENCH.md#a-both-arch-run-the-two-arches-share-one-client-442)).
+- **Tier 2 (stateful API fuzzing) is not implemented**, and `mage Fuzz` does not work today: its playbook
+  passes validator flags (`-mode`, `-url`) that `cmd/validator` does not define.
+- **Not every scenario runs on every server, and the `tls-*` scenarios run on none.** The scheduler skips
+  capability mismatches, and no run configures the TLS terminator the three `tls-*` scenarios need.
+- **The memory oracles are blunt on short cells.** `I-MEM-1`, `I-MEM-3` and `I-MEM-4` need cells of 15 minutes
+  or more to judge at all (`I-MEM-1` about 25 minutes of load to keep its sensitivity), so they are
+  `not_judged` in the short nightly cells and judge in the weekend soak. The scatter floor that guards
+  `I-MEM-1` against false positives costs sensitivity, measured and accepted
+  ([cost list](docs/VALIDATION.md#invariants), probatorium#520).
+- **The race tier tolerates slow echoes, not wedged ones.** A late 64 KiB echo classed `SLOW_CLASS` is
+  recorded and gated at 3 per cell, in that tier only.
+- **Validation results live only in run artifacts**, kept 7 to 90 days (table above).
+- **Host tuning is a choice.** msr1's NIC interrupt vector is pinned before every bench run there; that is a
+  maintainer's tuning decision, not an established fact about the hardware
+  ([evidence and caveats](docs/BENCH.md#msr1-nic-interrupt-placement)).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks CI runs and the `cluster-ok` label.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) to report a vulnerability privately.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
+
+## Related projects
+
+| Project | What it is |
+| --- | --- |
+| [celeris](https://github.com/goceleris/celeris) | The HTTP engine for Go that probatorium benchmarks and validates |
+| [loadgen](https://github.com/goceleris/loadgen) | The HTTP/1.1 and HTTP/2 load generator the bench tier drives, as a library |
+| [docs](https://github.com/goceleris/docs) | The source of [goceleris.dev](https://goceleris.dev), where rated bench runs are published |
+
+## Reference
+
+Operational detail for people who run the cluster. Longer references live in [`docs/`](docs/):
+[bench tier](docs/BENCH.md), [validation tier](docs/VALIDATION.md), [arch-exclusion validation](docs/ARCH-EXCLUSION-VALIDATION.md)
+and [Celeris Stress](docs/STRESS.md).
+
+### The cluster
 
 Three hosts, defined in [`ansible/inventory.yml`](ansible/inventory.yml):
 
@@ -137,59 +310,104 @@ Three hosts, defined in [`ansible/inventory.yml`](ansible/inventory.yml):
 The validator runs on the bench target itself, next to the reference app it drives
 ([`ansible/validate.yml`](ansible/validate.yml)); msa2-client holds no validation state.
 
-### msr1 NIC interrupt placement
+The msr1 interrupt placement that every bench run on msr1 applies, and the evidence for it, are in
+[`docs/BENCH.md`](docs/BENCH.md#msr1-nic-interrupt-placement).
 
-msr1 has two bonded Realtek r8127 ports (enp1s0, enp49s0) with one RX and one TX queue each and no RSS.
-The bench pins the TX-completion vector of enp1s0 (interrupt name `enp1s0-8`; its IRQ number changes per boot)
-to CPU 1 before every bench run on msr1. This is a host-tuning choice made by the maintainer on 2026-10-17
-([goceleris/celeris#1036](https://github.com/goceleris/celeris/issues/1036)), not a measured fact about the
-hardware:
+### Mage targets
 
-- **What the evidence is.** It is exploratory and post hoc. X2: an extra loop on CPU 4 (where the vector sat)
-  cleared a whole-port TX stall of about 200 ms in 8 of 8 runs. X3 (run 39060669852): 21 of 21 columns with the
-  vector on a loop CPU were clean and 3 of 3 with it on CPU 4 stalled. But the pre-registered gate of that X3
-  run failed and its row was INCONCLUSIVE, and the h-irq4to1 arm always ran last, so order is not separated
-  from placement. The mechanism (a TX-completion vector serviced by a CPU without a loop stalls the port) is
-  the working explanation, not an established one. A +35% rps seen with the vector on CPU 1 is relative to
-  CPU 8 and is unexplained; do not quote it as an effect of this placement.
-- **What CPU 1 is.** A loop CPU only in celeris's #1049 (C1) layout. The non-celeris columns have no loops
-  there, so for them CPU 1 is simply the CPU the vector was put on, and the placement does not mean the same
-  thing across engines.
+| Target | What it does | Main knobs |
+| --- | --- | --- |
+| `Status` | Cluster reachability and manifest state | |
+| `Deploy` | Cross-compile and stage every binary | `CLUSTER_USE_LAN`, `DEPLOY_COMPETITORS=all\|go-only\|none\|<list>`, `DEPLOY_NEEDS_DBSERVICES` |
+| `Cleanup` | Undo what a run installed, per the host manifests | `CLEANUP_HOSTS=all\|<list>` |
+| `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_ARCH_EXCLUSIVE` (`both` only: `all` default, `heavy`, `off`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_RATED_CELLS` (default: the rated cells), `BENCH_SUT_ENV`, `CELERIS_VERSION` |
+| `BenchTier` | A profile-driven run over the whole grid; publishes it unless `BENCH_PUBLISH=0` | `BENCH_PROFILE=fast\|headline\|full`, `BENCH_BUDGET`, `BENCH_TARGET`, `BENCH_SKIP_RATED`, `BENCH_PUBLISH`, `BENCH_BASELINE=1` (see [Same-run celeris baseline](docs/BENCH.md#same-run-celeris-baseline)) |
+| `BenchArchOverlap` | Check a finished both-arch run for overlap between the arches' load windows (#442); fails on a forbidden overlap | `BENCH_RESULTS_DIR` (default the latest run), `BENCH_ARCH_EXCLUSIVE` |
+| `BenchSince` | Compare against a baseline version | `BASELINE_VERSION` (default `v1.4.2`), `REGRESSION_THRESHOLD` (default `0.05`) |
+| `Validate` | A validation run, one cell or the matrix | `VALIDATE_TARGET` (default `both`), `VALIDATE_DURATION` (default `6h`), `VALIDATE_MATRIX=1`, `VALIDATE_MATRIX_REFAPPS`, `VALIDATE_MATRIX_ENGINES`, `VALIDATE_PARALLEL=1`, `VALIDATE_DBSERVICES=1`, `VALIDATE_CONCURRENCY`, `VALIDATE_RESUME_FROM`, `CELERIS_VERSION`, `PROBATORIUM_VALIDATE_DRIVER=ssh` |
+| `Soak` | A long validation run | `SOAK_DURATION` (default `24h`), plus the `Validate` knobs |
+| `ValidateGate` | The absolute gate over the most recent run's `validate-results.json` on every host | `VALIDATE_GATE_EXPECT_CELLS`, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`, `VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW` (race tier only) |
+| `ValidateDiff` | The cross-engine and cross-arch gate | `VALIDATE_DIFF_STRICT=1` (MEDIUM fails too), `VALIDATE_DIFF_HOSTS=a,b` |
+| `BuildRaceRefapps` | Cross-build the `-race` reference apps (the race runtime needs cgo) | |
+| `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host (or, with `BENCH_TARGET=msr1\|msa2-server`, the target and the loadgen) | `SAMPLER_DURATION`, `SAMPLER_INTERVAL` (full sample, integer 1-3600 s, default 60), `SAMPLER_FINE_INTERVAL` (fine series, 0.05-10 s, unset = none; [details](docs/BENCH.md#the-host-sampler-beside-a-bench)), `SAMPLER_TAG` |
+| `Publish` | Write the newest bench run into goceleris/docs and fire the `benchmark-published` pointer | `PUBLISH_VERSION`, `PUBLISH_VIA=git\|contents`, `PUBLISH_DRYRUN=1`, `DOCS_REPO_DIR`, `DOCS_TOKEN`, `BENCH_PUBLISH_FORCE` |
+| `PublishValidate` | Kept for callers; it runs `Publish` | |
+| `BenchAndValidate` | `Validate` → `ValidateDiff` (when `VALIDATE_TARGET=both`) → `Bench` → `Publish` | the knobs of each |
+| `ValidateFaultControl` | Judges the celeris#588 capture control (probatorium#351) on the most recent run, in place of `ValidateGate`: a fault-injected run fails the absolute gate by design, so it must instead prove that the capture caught the injected stall and names it from the artifact alone | |
+| `Fuzz` | Hostile-input fuzzing through `ansible/fuzz.yml`. **Not working today:** the playbook passes validator flags (`-mode`, `-url`) that `cmd/validator` does not define | `FUZZ_DURATION`, `FUZZ_CORPUS` |
 
-- **Where.** `nic_irq_placement` on the msr1 entry of [`ansible/inventory.yml`](ansible/inventory.yml)
-  (`iface`, `vector`, `cpu`), applied by [`ansible/tasks/nic_irq_placement.yml`](ansible/tasks/nic_irq_placement.yml)
-  through [`ansible/files/nic_irq_pin.sh`](ansible/files/nic_irq_pin.sh) in the stage play of `bench.yml`.
-  Empty or unset means do nothing: msa2-server and msa2-client never have it. A one-off run without it:
-  `-e '{"nic_irq_placement": {}}'`. enp49s0's vector is not touched (the maintainer excluded it from the placement).
-- **How.** The vector is found by name in `/proc/interrupts`, an explicit single CPU is written to
-  `/proc/irq/N/smp_affinity_list`, and both `smp_affinity_list` and `effective_affinity_list` are read
-  back. IFACE is bound to the vector: it is accepted when either (a) each IRQ found by that name is listed
-  under `/sys/class/net/<iface>/device/msi_irqs/` or (b) the vector name starts with `<iface>-`, and refused
-  (exit 2, nothing written) only when both fail; the record says which check passed (`binding`: `msi_irqs` or
-  `name`). Either alone suffices because an out-of-tree driver may expose one of them differently. A readback that differs from the
-  CPU fails the play before the first cell. It is a pin, not a
-  restore: writing the old mask (0-11) back does not return the vector to its previous CPU, the kernel
-  picks one from the mask. Applying it again is a no-op. Nothing is undone at teardown.
-- **Record.** Every bench run on a host with the placement writes `nic-irq-placement.json` into its run
-  directory (interface, vector, binding, irq, cpu, the affinity found before and read back after, and a second
-  readback taken after the last cell) and prints the same in the log. `mage Bench` folds it into
-  `environment.nic_irq_placement` of the results document and so into `env.json` (schema 5.21); a
-  run without a placement has no such key.
-- **Where it applies.** Only `bench.yml` pins. `mage Validate` (PR, nightly and checkptr tiers) and the stress
-  playbooks do not, so on msr1 their vector placement depends on history: pinned if a bench ran since the
-  boot, else the boot default. It is not recorded for them. irqbalance is not handled: nothing stops or
-  configures it, so it can move the vector between the pin and the end of a run (the end-of-run readback
-  below only detects that).
-- **Invariant.** Every bench run records its placement, and a changed placement (another vector, another
-  CPU, none) changes comparability: runs are compared only across the same `nic_irq_placement`. The docs
-  site does not flag `nic_irq_placement` changes, so the first arm64 publish after this change crosses a
-  placement change unflagged. An end-of-run readback that differs from the pin (something moved the vector
-  mid-run) or that could not run at all (a become or transport failure) is logged as
-  `WARNING: NIC IRQ placement DRIFTED` and recorded as `at_end.verified: false`; treat that run as unplaced.
+`VALIDATE_PARALLEL=1` on a two-arch run drives the two targets concurrently, halving the wall-clock of
+long soaks.
 
-Tests: `bash ansible/tests/test_nic_irq_pin.sh` (the shell logic against a fake `/proc` and `/sys`; also
-runs in a plain container) and `bash ansible/tests/test_nic_irq_placement_play.sh` (the real tasks files
-under ansible, run by the ansible CI job; `PROBATORIUM_ANSIBLE_TESTS=1 go test` runs it too). `go test` runs the first.
+Matrix mode (`VALIDATE_MATRIX=1`), its cell statuses and the caps that stop a failing matrix early are in [`docs/VALIDATION.md`](docs/VALIDATION.md#matrix-mode-validate_matrix1).
+
+### Result layout
+
+The key files a run leaves under `results/`:
+
+```text
+results/<ts>-bench-<version>/
+  results.json                           # the run's roll-up (results-amd64.json + results-arm64.json with BENCH_TARGET=both)
+  <TS>-bench-<bench_target>/<RR>-<competitor>/
+    run0/<scenario>/<server>.json        # per-cell runner result: the ingested data
+    server.log, cpu.*.log
+
+results/<ts>-validate-<bench_target>-<refapp>/   # fetched back from the bench target
+  validate-results.json
+  cell-failures.txt                      # matrix runs: every cell that failed or never ran, with its reason
+  streaming-coverage.txt                 # matrix runs: per-app ws/sse routing table
+  cell-<NN>-<refapp>-<engine>/
+    validate-results.json                # the cell's own document
+    refapp_stderr_tail.txt               # the app's last words (why a not_run cell never started)
+    incidents/<ts>-<predicate>/          # forensics dossier per violation
+
+<parent of the two compared runs>/validate-diff/
+  diff.txt, diff.json                    # ValidateDiff findings
+```
+
+The document types and the current `SchemaVersion` live in [`report/schema.go`](report/schema.go). A
+single-cell run leaves `Cells[]` empty and fills `tier_1` / `tier_3` at the top level. Sub-tallies are
+`map[string]int64`, so the schema does not re-version when the validator grows a counter.
+
+### Continuous integration
+
+| Workflow | Trigger today | Runs on | Role |
+| --- | --- | --- | --- |
+| `test.yml` (Test) | push to `main`, pull requests | GitHub-hosted | `go test -race` over the root module, every adapter module, the reference apps, the mage-tagged files and the field guard, plus govulncheck. The `ci-ok` fan-in is a required check |
+| `lint.yml` (Lint) | push to `main`, pull requests | GitHub-hosted | `go vet`, golangci-lint, gofmt and actionlint (required) |
+| `coverage.yml` (Coverage) | push to `main`, pull requests | GitHub-hosted | Coverage upload to Codecov |
+| `matrix-pr-tier.yml` (PR Validation) | pull requests labeled `cluster-ok` (path-filtered), manual | cluster | 10-minute matrix on msa2-server, with `ValidateDiff` |
+| `matrix-nightly-tier.yml` (Nightly Validation) | manual (schedule paused) | cluster | Full matrix, both architectures, `ValidateGate` + `ValidateDiff` |
+| `matrix-weekend-tier.yml` (Weekend Soak) | manual (schedule paused) | cluster | The same over 24 h by default |
+| `matrix-race-tier.yml` (Race Validation) | manual | cluster; the `-race` apps are built on a GitHub-hosted runner | Full matrix with `-race` apps |
+| `matrix-checkptr-tier.yml` (Checkptr Validation) | manual | cluster | Full matrix with pointer-checker apps |
+| `benchmark-tier.yml` (Benchmark Tier) | manual (schedule paused) | cluster | `mage BenchTier`; publishes rated profiles |
+| `publish-results.yml` | manual; also logs `benchmark-published` dispatches | GitHub-hosted | Re-send the pointer for a cell already pushed to goceleris/docs |
+| `celeris-stress.yml` (Celeris Stress) | manual; pull requests that change it or `tools/stresstally` (self-test) | GitHub-hosted x86 and arm64 by default; `target=cluster` runs one host per arch on the cluster | Run celeris tests many times to measure a flake and its rate; see [`docs/STRESS.md`](docs/STRESS.md) |
+| `celeris-stress-cluster.yml` (Celeris Stress (cluster)) | called by `celeris-stress.yml` (`workflow_call`) | cluster | The cluster half of Celeris Stress |
+| `cluster-reboot.yml` (Cluster Reboot) | manual only | GitHub-hosted, on the tailnet | The one sanctioned way to reboot a cluster host ([runbook](#rebooting-a-cluster-host)) |
+| `cluster-os-upgrade.yml` (Cluster OS Upgrade) | manual only | GitHub-hosted, on the tailnet | The one sanctioned way to change a cluster host's kernel, packages and firmware ([runbook](#upgrading-a-cluster-hosts-os)) |
+
+The cluster tiers share `concurrency: matrix-tier-cluster` with `cancel-in-progress: false`, so they never
+overlap on the cluster. The group keeps only one pending run, so a newer queued run replaces an older
+one. Each tier provisions runners, runs on the cluster, then tears the runners down.
+
+### Self-hosted runner bootstrap
+
+Cluster runners are provisioned per run and torn down at the end:
+
+- [`.github/actions/cluster-runner-up/`](.github/actions/cluster-runner-up/) joins the tailnet with a
+  SHA-pinned `tailscale/github-action` (an ephemeral `tag:ci` node), mints a registration token, runs
+  [`ansible/runner-setup.yml`](ansible/runner-setup.yml) and checks that the runners came online.
+- [`.github/actions/cluster-runner-down/`](.github/actions/cluster-runner-down/) collects forensics,
+  rescues results to `/var/lib/celeris-rescue`, cleans the hosts, writes a "Resume candidates" job
+  summary, mints a removal token, runs [`ansible/runner-teardown.yml`](ansible/runner-teardown.yml) and
+  sweeps orphaned registrations.
+- Runners live under `/tmp/actions-runner-<host>/`, with no systemd unit and no package install.
+
+The one-time operator setup (four repository secrets and a Tailscale ACL rule) is documented in
+[`ansible/RUNNER_BOOTSTRAP.md`](ansible/RUNNER_BOOTSTRAP.md). Resuming an interrupted matrix after a power
+event is covered in [`ops/power/README.md`](ops/power/README.md).
 
 ### Rebooting a cluster host
 
@@ -431,7 +649,7 @@ dispatched again).
 
 1. **The switch (enforced by the `plan` job).** Settings, Secrets and variables, Actions, Variables: create the repository variable
    `OS_UPGRADE_ALLOWED_HOSTS`, a comma or space separated list of hosts, for the window: `msa2-server` for the first step. Add `msr1`
-   only after the survey has answered the questions of the lane PLAN (d.2 does it boot through GRUB, d.3 the in-tree r8169, d.7 Secure
+   only after the survey has answered its open questions ( GRUB boot, the in-tree r8169 driver and Secure
    Boot) and a person is at the rack; `msa2-client` last. Empty or missing (the default) means every host-changing dispatch is refused
    in `plan`, before any approval is asked and before any host is touched. The `plan` job also reads the environment of step 2 through the API and
    refuses unless it exists WITH a required reviewer and a deployment branch policy (if the workflow token may not read environments, it
@@ -458,841 +676,3 @@ Tests: `go test -run 'ClusterOSUpgrade|OSUpgrade|FreeText'`, and `python3 -I ans
 host), `python3 -I ansible/tests/test_os_upgrade_judge.py` (the real Jinja judgement under ansible, every refusal) and
 `python3 -I ansible/tests/test_os_upgrade_play.py` (the whole playbook on local connections, Linux only); the last two run
 in the ansible CI job.
-
-## Bench tier
-
-### The field
-
-The grid is capability-gated: 52 server columns from `servers.Registry` (the single source of truth,
-in [`servers/servers.go`](servers/servers.go)) × 32 registered scenarios, of which 29 schedule cells.
-The three `tls-*` scenarios need a TLS terminator that no run configures today.
-
-- **celeris** contributes **9 columns** that pick out an engine, a wire mode and a handler dispatch
-  mode: `iouring` (`h1-sync`, `h1-async`, `auto+upg-async`), `epoll` (`h1-sync`, `h1-async`,
-  `auto+upg-async`), `adaptive` (`h1-async`, `auto+upg-async`) and `std-h1`. This is how the grid
-  separates, for example, an io_uring regression from a wire-mode one.
-- **`stdhttp`** is the Go `net/http` baseline (`h1`, `h2`, `hybrid`).
-- **29 competitor frameworks across 10 languages** make up the rest:
-
-| Language | Frameworks |
-| --- | --- |
-| Go (10) | chi, echo, fasthttp, fiber, gin, gnet, gorilla, hertz, iris, nbio |
-| Rust (4) | actix-web, axum, hyper, ntex |
-| Bun (3) | bunraw, elysia, hono |
-| Node / JS (3) | express, fastify, uWebSockets.js |
-| C++ (2) | drogon, lithium |
-| Java (2) | netty, vertx |
-| Python (2) | fastapi, starlette |
-| C (1) | h2o |
-| C# (1) | aspnet |
-| Zig (1) | httpzig |
-
-Count from the registry, not from adapter directories: a directory can exist without being registered.
-Adding a framework takes a registry entry and an adapter directory, plus a `nativeBuildSpecs` entry in
-[`mage_cluster.go`](mage_cluster.go) for a non-Go adapter.
-
-### Capability gating
-
-Not every scenario runs against every server. Each adapter declares its `Capabilities`, which the runner
-projects into a `servers.FeatureSet`, and each scenario implements `Applicable(servers.FeatureSet) bool`.
-The scheduler skips the mismatches **before** dialing loadgen, so a framework with no native Postgres
-path never shows up as a spurious zero in the driver table. That is why a full run has 813 cells rather
-than the raw 52 × 32 product.
-
-### Profiles
-
-`mage BenchTier` runs a **profile** from `budget.ForProfile` ([`budget/`](budget/)). Every profile
-covers the same full grid in exactly one pass; they differ in the per-cell window and in whether the
-rated sweep runs.
-
-| Profile | Per-cell window | Rated sweep | Published by the Benchmark Tier workflow |
-| --- | --- | --- | --- |
-| **fast** (the `ForProfile` default) | 35 s active / 10 s warmup | off: saturation only | never (the workflow forces `BENCH_PUBLISH=0`) |
-| **headline** | 40 s / 12 s | on | yes, unless dispatched with `publish=false` |
-| **full** | 90 s / 20 s | on | yes, unless dispatched with `publish=false` |
-
-The workflow publishes only rated profiles, because saturation-only data would publish datasets with no
-`latency_at_slo`. `mage BenchTier` run by hand publishes unless `BENCH_PUBLISH=0`. The workflow sets
-`BENCH_BUDGET` from a table of profile, baseline switch and arch policy (single arch, no baseline: 24 h, 36 h
-and 60 h; the policies of a both-arch run and the baseline columns have their own entries, see below). The
-budget model projects about 30 h for headline and 51 h for full on one arch. A preset `cells` or `rated_cells`
-scope is projected from the runner's own dry run (the realized cell and rated cell counts, baseline columns
-included), not from those pins: `rated_cells='*'` rates every cell, about twice the model's 401, and a full
-both-arch dispatch with it no longer passes the gate at 101.9 h. A scope the dry run cannot resolve is refused. Runs before [#418](https://github.com/goceleris/probatorium/issues/418) measured about 53 h
-and 69 h, because they rated every clean cell.
-
-**Rated data is not publishable yet.** [#441](https://github.com/goceleris/probatorium/issues/441) gates
-any rated publish, and [#442](https://github.com/goceleris/probatorium/issues/442) does until it is settled.
-The validation run of 2026-10-21 showed the arch lock holds on the scoped rows (P1b, P2, P3, P5) and that the
-exemption of light cells did not (P6 fails on arm64), so the default policy is now `all`
-([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md), "Verdict"). #442 stays open for the
-three rows only a full both-arch run reads (get-simple-1024c, get-json-h2, post-4k-h2), so dispatch headline and
-full with `publish=false` until both are settled. Since schema 5.24 the artifact keeps the achieved rate, the
-errors and a status for every rated pass ([#441](https://github.com/goceleris/probatorium/issues/441),
-see "Result: latency at SLO"), so a rated number can be read against the load loadgen actually sent. #441
-stays open for the rest: no pass is yet marked invalid for a shortfall, `latency_at_slo` still counts every
-kept pass whatever it achieved, and loadgen does not export its end-of-window schedule lag (loadgen#102).
-Until those land, read `achieved_ratio` before you read a rated p99 as the server's.
-
-### A both-arch run: the two arches share one client (#442)
-
-`BENCH_TARGET=both` (the default) runs the x86 pass and the arm64 pass at the same time, and both are
-driven from the one loadgen host, msa2-client (#168 asked for a loadgen per arch; as landed they share
-it). One arch alone leaves msa2-client far from saturation, but two arches loading it together did not
-leave the heavy rows alone: in the 0829 run, x86 ws-large-echo passes that overlapped the arm64 run of
-the same row read a backlog clock of 1 s or more in 6 of 10 passes, against 0 of 42 for the rest, and in
-run 36441790519 the saturation numbers of the bandwidth rows moved with the other arch's load (the 2x10G
-bond carries both arches). A run made before the fix marks nothing of this.
-
-**What the harness does now.** The default policy is `all` (since the validation read of 2026-10-21): the
-arches take turns on the client and no pass of one arch overlaps any load of the other. The bullets below
-describe the lock; under `all` every cell takes it, under `heavy` (the previous default, still selectable)
-only the heavy ones.
-
-- Every scenario has a client-load class, `heavy` or `light` ([`scenarios/clientload.go`](scenarios/clientload.go),
-  the table, its demand figures and the rule). Light is a row whose p90 stays at or below 150k requests/s
-  and 4 Gbit/s on both arches in the published 0829 run: the 11 driver rows, churn-close, get-simple-1c,
-  ws-hub-broadcast-128 and sse-fanout-128 (369 of the 813 cells). Everything else, and any scenario the
-  table does not name, is heavy (a test fails until a new scenario is classified).
-- The runner holds a host-wide `flock` on msa2-client (`/tmp/probatorium-client.lock`) around every heavy
-  cell, saturation pass, rated sweep and warmups included ([`cmd/runner/clientlock.go`](cmd/runner/clientlock.go)).
-  A heavy cell of one arch therefore waits for the other arch's heavy cell. The wait polls once a second,
-  ends with the run context, and the kernel drops the lock when a runner dies, so a runner killed by its hang
-  guard frees the other. Neither arch can stall the other for more than a cell: the holder releases the lock
-  itself after the longest a cell can run when its own contexts work (its saturation pass plus every rated pass
-  at their timeouts, plus a minute: a wedged cell, loadgen workers blocked in reads, has driven nothing since
-  its context fired), and a waiter gives up after that plus two minutes and fails the cell as
-  `client-lock: ...` (a DNF with its wait recorded, not an "interrupted" cell). The checker still reads the
-  passes' own timestamps, so a cell that did overlap its peer is reported. `started_at` is stamped after a
-  wait, so the idle wait never lands in the per-scenario CPU window (`scenario_resources`); the wait is
-  recorded as `client_lock_wait_s` and is exactly 0 for a lock that was free at the first attempt. After a wait
-  of 5 s or more the runner probes the SUT again before it drives load. The column's hang guard grows by
-  `lockWaitAllowance` so a queued but healthy runner is not killed. The lock file is opened without following
-  symlinks, its times are refreshed at every acquire (a host that age-cleans `/tmp` must not unlink it
-  mid-run), and a lock taken on an inode the path no longer names is dropped and retaken.
-  Two things the wait does to a measurement. The SUT idles through it (minutes, 6.7 h in total per arch in the
-  model) where the only gap between cells used to be the 5 s cooldown; whether the first cell after a long
-  wait reads differently (CPU frequency, an adaptive engine's settled state) is not measured, and the
-  validation run has an item for it. And the column-wide `resources` mean (every scenario of the column,
-  not the window) now includes that idle time, diluting it by an amount that differs per column: read
-  `scenario_resources` for per-cell CPU. The lock is released when a cell's load ends, before the 5 s
-  cooldown, so the peer's heavy cell can start while the previous cell's sockets drain on the client; they
-  are connections to the other arch's SUT, so they share no 4-tuple with the next cell's, and the planner
-  models the release at the same point.
-- The arm64 pass walks each column's cells **in reverse** (`-cell-order reverse`). The registry order runs
-  churn-close and the driver rows (light) first and the static, h2 and WebSocket/SSE rows (mostly heavy)
-  after them; reversed on one arch, the two arches' heavy cells fall in different halves of a column and
-  the lock rarely makes one wait (it matters: 57.6 h against 65.9 h in the model below). The order is recorded
-  (`environment.arch_exclusion.cell_order`). It is a comparability change for arm64 only: its heavy rows now
-  run first on a freshly started SUT and its light rows last, where every earlier arm64 run did the opposite.
-  x86, the arch #442 contaminated and the one the single-arch references are for, keeps the registry order.
-  `all` reverses arm64 too: its wall-clock does not depend on the order (99.7 h either way in the model), and
-  it keeps every cell's position in its column the same under both policies, so a comparison of the two
-  (the validation's run A against run B) differs in what the arches shared, not in where a cell sat.
-- `BENCH_ARCH_EXCLUSIVE=all|heavy|off` (workflow input `arch_exclusive`) picks the policy. `all` is the
-  default for `target=both`: it locks every cell, so the arches take turns (about twice one arch's
-  wall-clock). `heavy` locks the heavy cells only (+14%, the previous default). `off` is the pre-fix
-  behaviour, kept as a control arm: the publish gate refuses its documents. A single-arch target has no
-  peer and ignores the knob.
-
-**What it costs.** `interleave.SimulateArchPlan` replays the two passes on the real 813-cell, 52-column
-grid at the `full` profile's window (`go test ./cmd/runner -run 'FullGridArchPlan|DriftSweep' -v`; the output
-of this change is in the PR). One arch alone is 50.9 h in the model (bench-full 38431303162 measured 47.6 h
-with both arches, so the model runs about 7% high). The first table starts both arches together with equal
-column set-up and walks the same order, which is the lockstep 36441790519 showed (the same cell +61 s apart);
-38431303162 was not in lockstep (median -247 s, same-row overlap fraction 0.06, #518), so "444 of 444" is the
-lockstep case, not every past run.
-
-| both-arch schedule (lockstep model) | model | vs one arch | heavy cells overlapping a heavy cell of the other arch |
-| --- | --- | --- | --- |
-| today: no lock | 50.9 h | +0% | 444 of 444 |
-| lock on heavy cells, both arches forward | 65.9 h | +30% | 0 |
-| lock on heavy cells, arm64 cells reversed (`heavy`, the previous default) | 57.6 h | +13% | 0 |
-| lock on heavy cells, arm64 columns reversed | 58.6 h | +15% | 0 |
-| **lock on every cell (`all`, the default)** | **99.7 h** | **+96%** | 0 |
-| option, not implemented: heavy cells and every rated sweep, arm64 cells reversed | 75.2 h | +48% | 0 |
-
-The lock's cost depends on how far apart the arches run. The drift sweep moves the arm64 start by 0 to 3 h
-and the column set-up time of each arch by 0-120 s (20 points):
-
-| makespan / one arch alone | min | mean | max |
-| --- | --- | --- | --- |
-| arm64 reversed, arches within 10 min (both full runs) | 1.12 | 1.14 | 1.17 |
-| arm64 reversed, arm64 1-3 h later | 1.16 | 1.22 | 1.25 |
-| both forward, arches within 10 min | 1.15 | 1.24 | 1.30 |
-| both forward, arm64 1-3 h later | 1.11 | 1.14 | 1.21 |
-
-So the reversal pays while the arches stay together, as in both full runs, and costs a few points if one
-falls hours behind the other. A `full` target=both run goes from the measured 47.6 h to about 54 h (the
-model's 1.14 mean times 47.6 h), 53-60 h across the sweep; `budget.FitWithin` projects 58 h
-(`ArchLockOverheadHeavy` = 14%, pinned to the lockstep planner by a test) and the workflow budgets
-(40 h headline, 69 h full) cover the sweep's 1.30 worst case. `headline` goes from about 30 h to about 34 h.
-`all`, the default, is about twice, and the workflow budgets it separately (the budget is a table of profile,
-baseline switch and policy and the job timeout a table of policy, `workflow_arch_budget_test.go`): 34 h fast,
-72 h headline, 108 h full under a 7080 min (118 h) job timeout, which sits under the 5-day (7200 min) limit. A
-default `full` dispatch therefore projects 101.9 h, so its budget has a 6% margin where every other entry has
-18% or more; the model ran 7% high against the one measured run, so about 95 h is the expectation, but it is
-the thinnest margin of any dispatch, and the weekly headline run, when its schedule is restored, projects 59.7 h
-under the default instead of 34 h. Projected hours of `profile=full` with the opt-in baseline columns
-(`baseline=true`, +222 saturation and +120 rated cells per arch), from the budget model and from the planner
-(`go test ./budget ./cmd/runner -run 'FullBaselineUnderAll|BaselineGridArchPlan' -v`):
-
-| `profile=full`, `baseline=true` | model | planner | job limit 120 h |
-| --- | --- | --- | --- |
-| one arch (`target=msa2-server` or `msr1`) | 65.5 h | 65.4 h | fits |
-| both arches, `heavy` | 74.6 h | 72.1 h | fits (budget 90 h) |
-| both arches, `all` (the default) | **130.9 h** | **128.0 h** | **does not fit** |
-
-`full` + `baseline=true` + `target=both` under `all` cannot be held by any job: the workflow refuses it at the
-start of the `setup` job, before any runner is provisioned and before Deploy (the run has already entered the
-workflow's cluster concurrency group, so it may have queued behind a running one; the step is guarded by exactly
-that dispatch and tested against the model). Dispatch it as two single-arch runs, `target=msa2-server` and then
-`target=msr1`. `arch_exclusive=heavy` is not an alternative for a published run: its documents are refused at
-publish (policy `heavy` failed P6), and the `setup` job refuses a `heavy` dispatch that would publish; `heavy` stays
-available with `publish=false`. These are a model of fixed window lengths and the lock's first-come order, not a
-cluster run: how often the lock really queues a runner is the first thing the validation run measures
-(`lock_wait_seconds`).
-
-**What `heavy` does not do** (the reason the default moved). Under `heavy` a heavy cell still shares the client with the other arch's light
-cells, and a light cell's own measurement runs under the other arch's heavy cells. Neither is measured.
-
-- *Heavy under light, x86 side.* The coefficient that chose the rule (an x86 cell lost 0.18-0.31 requests/s per
-  concurrent arm64 request, partial r -0.92 to -0.97, on static rows of 128 and 256 connections over arm64
-  demand of 174-321k requests/s; from run 36441790519, `evidence/bench-36441790519/rank/skeptic/
-  out_s18_cpu_contention2.txt`) was never measured on the light rows. At the arm64 light rows' demand
-  (p90 over columns, `out/demand_by_row.out` of the lane evidence): ws-hub-broadcast-128 122.5k frames/s and
-  sse-fanout-128 125.7k events/s cost an x86 heavy cell 22-39k requests/s, 3.5-6.0% of a 650k requests/s cell
-  (2.3-3.9% of a 1M one); every other light row stays at or below 30k, under 1.5%.
-- *Heavy under light, arm64 side.* The x86 light rows reach 120-140k (churn-close 140k, driver-mc-set 130k,
-  ws-hub-broadcast-128 127k). The coefficient was measured only as x86 loss per arm64 request. If it were
-  symmetric an arm64 heavy cell of about 400k requests/s would lose 25-43k, 6-11%. This direction is
-  unquantified.
-- *Light under heavy.* 12 of the 15 `RatedScenarios` rows are light (churn-close and the 11 driver rows,
-  ranked by latency at load). In the default order, 173 of each arch's rated light cells run their rated sweep
-  while a heavy cell of the other arch does (346 cells in the model, 15.7 h in total;
-  `go test ./cmd/runner -run FullGridArchPlan -v`). That is #442's own mechanism (rated passes under the other
-  arch's heavy load) on most of the rated rows. It is exposure, not measured contamination.
-
-`BENCH_ARCH_EXCLUSIVE=all` removes all three at about twice the wall-clock (99.7 h in the model, against
-57.6 h). A third option, not implemented, locks every rated sweep as well as every heavy cell: the planner
-prices it at 75.2 h (+48%) and it removes the third exposure only. The default order itself is a trade: with
-both arches forward there are 230 heavy+light cell overlaps at 65.9 h; reversing arm64 makes it 793 at 57.6 h.
-`all` removes that trade too. The validation run measured them
-([`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md), "Verdict"): P5 held (light rows'
-rated p99, A against B) and P6 failed on arm64 (a heavy cell under the x86 light rows, celeris-iouring post-4k,
-minimum rps ratio 0.827 against a 0.92 floor, median 1.001), so by the pre-registered rule the default is `all`.
-
-**The check on a finished run.** Every saturation and every rated pass records the interval it drove load
-in, on msa2-client's own clock (the same clock for both arches), kept or skipped
-(`cell.pass_windows` in `raw/<host>.json`). `Bench` folds them into `load_windows` of each
-`results-<arch>.json` and, since each arch is published alone, stamps the cross-arch verdict into both:
-`environment.arch_exclusion` (policy, peer arch, cell order, windows checked, `heavy_heavy_overlaps`,
-`heavy_light_overlaps`, `light_light_overlaps`, `violations`, `missing_timestamps`, `lock_wait_seconds`;
-schema 5.22). `report.CheckArchOverlap` is the check, with a fixture self-test (a clean pair, a pair with
-one overlapping heavy pass, the policies, windows with no usable timestamps). It runs three times:
-
-- in `Bench`, which prints the report after the merge;
-- in the publish gate (`checkDataCompleteness`): a document whose verdict shows a violation, a window that
-  could not be checked, or policy `off` is refused (`BENCH_PUBLISH_FORCE=1` overrides, as for the other
-  completeness checks);
-- on demand, `mage BenchArchOverlap` (`BENCH_RESULTS_DIR`, default the latest run; `BENCH_ARCH_EXCLUSIVE`
-  to check against another policy), which reads the two `results-<arch>.json` and fails on a forbidden
-  overlap, a window without timestamps, or documents with no `load_windows` at all.
-
-`load_windows` stays in `results-<arch>.json` (the run artifact); the published `summary.json` drops it,
-and `env.json` keeps the verdict.
-
-**Results from before the fix.** No earlier field says a document came from a both-arch run, so the mark is
-a rule, not a flag. A `results-<arch>.json` or published cell with **no `environment.arch_exclusion` and
-`schema_version` below 5.22** that came from a `target=both` run ran the arches concurrently with nothing
-excluded. Such a run is recognisable by its two arch documents carrying the same `benchmark_config.started_at`
-(Bench stamps one start for both; checked on the results of runs 33256654220 and 37091941051, where
-`started_at` is identical to the nanosecond and `finished_at` differs by under 3 s) and by the workflow's
-dispatch input `target`. The runs this applies to
-include 33256654220 (0829), 36441790519, 37091941051 (schema 5.18, identical `started_at`, checked) and
-38431303162 (bench-full). A post-fix both-arch document always
-carries `arch_exclusion`, whatever the policy, so absence can no longer be read two ways. The docs site
-does not flag it yet; that is for goceleris/docs.
-
-**Validation owed.** Nothing above has run on the cluster. The two scoped both-arch runs that check it (the
-default policy and `all`, about 3.6 h of bench together, criteria pre-registered, including the three
-exposures above) are in [`docs/ARCH-EXCLUSION-VALIDATION.md`](docs/ARCH-EXCLUSION-VALIDATION.md).
-
-### The host sampler beside a bench
-
-`Benchmark Tier` brackets `mage BenchTier` with `mage HostSamplerStart` / `HostSamplerStop`, as the race and weekend
-tiers do (the nightly tier runs `mage Validate`, not the bench, and has the race tier's path). Before this a bench
-ran no host sampler at all, so it had no series of its own: the forensics artifact fetched whatever the last weekend soak had left on the hosts, and
-a 60 s cadence could not see the 1-3 s stalls of the io512 cell (celeris#1036). Two read-only processes run on
-each host of the run (`BENCH_TARGET` limits the playbook to the target and the loadgen, as `Deploy` does):
-
-- the 60 s shell sampler (`ops/host-sampler/celeris-host-sampler`, the script unchanged; this tier starts it for the
-  first time): memory, load, the OOM and link-flap counters, the boot id, the kernel log;
-- the **fine series** (`ops/host-sampler/celeris-host-sampler-fine`, python3, no subprocess), at the `sampler_interval`
-  dispatch input: `1` s (the default, also on a schedule), `0.5`, `0.2`, `0.1` or `0.05` s (20 Hz). One text line per
-  tick: the per-CPU deltas of user+system, irq, softirq and steal, the NET_RX softirq runs and the `ksoftirqd`
-  run time of every CPU that did anything, the CPU pressure total, the run queue and the load; plus the two
-  whole-run files below. `fine.stats` has the achieved rate, the interval percentiles and the sampler's own CPU.
-
-**Not in the measurement path.** `BenchTier`, `bench.yml` and `run_bench_cell.yml` are not touched, no BenchTier
-variable is added, and the SUT is not told. Placement: both processes run under `SCHED_IDLE` (the fine one sets it
-itself (after `nice 10`), falling back to `SCHED_BATCH` at nice 19 if refused, and says which took in `fine-run.txt`;
-the 60 s shell sampler is launched `nice -n 19 chrt -i 0` by the bench tier only, and its children inherit it; the
-race and weekend starts are unchanged). A `SCHED_IDLE` task never preempts a normal one on wake-up and its CPU counts
-as idle to the load balancer. It is not pinned to a CPU set: on msr1 every CPU hosts a loop. The price is visible, not
-silent: a starved sampler shows as a gap in its own series (`gap` events, interval p99 and max in `fine.stats`). On a
-container with 8 spinning loops on 2 CPUs of quota it got 0.94 Hz of a 1 Hz target (max interval 3.6 s) and 2.6 Hz
-of 20: if a scoped io512 run shows many `gap` lines inside the cell's window, switch the class to `SCHED_BATCH` + nice 19
-(one line in `lower_priority`) and judge the cell, not the whole run.
-
-**Load.** Reads four `/proc` files and each `ksoftirqd` thread's `schedstat` per tick (4 + nCPU `pread`s, a 64 KiB
-buffer reused, no fork). The 60 s sampler finds its three pids by reading `/proc/*/comm`, not with `pgrep` (which opens every process's
-`cmdline`, taking its `mmap_lock`: under `SCHED_IDLE` it can be preempted holding it and stall the SUT for hundreds of
-ms); a test forbids `pgrep`, `ps`, `cmdline`, `maps` and the like in both samplers. Measured by the review with `ksoftirqd` visible, on 8 CPUs, contended: **0.051 % of one CPU at
-1 s and 0.711 % at 20 Hz**; expect about 0.1-0.2 % and 1.5-2 % on a 32-CPU host. (The first figures, 0.03 % and
-0.35 %, came from a container that could not see `ksoftirqd`.) `self_cpu_pct` in each host's `fine/fine.stats` is the
-figure of the real run. The 60 s shell sampler costs about 24 ms per sample (25-30 fork/execs; 0.04 % of a CPU) and
-this tier starts it for the first time.
-
-**Retention.** A tick is about 45 bytes plus 18-23 per CPU that did anything (every CPU, on msr1 with RPS on all 12 and
-on the loadgen). The open generation is plain text on tmpfs (`/run/celeris/fine`); at 16 MiB it is closed into
-`fine.<seq>.log.z` (zlib level 1, about 50 ms of CPU per generation, logged as a `generation_closed` event so its pause
-is not read as starvation). **The compression ratio is 2-5x, depending on how much the counters vary:** 5x on a quiet
-host, 2.1-2.4x with bench-like counters (NET_RX runs in the tens of thousands, user and system in the tens of percent).
-Compressed generations are kept up to 256 MiB, the oldest dropped *and counted* (`generations_dropped`, a
-`generation_dropped` event); the newest is never dropped. At 1 s, 234,000 ticks for a 65 h bench:
-
-| host | bytes a tick | text, 65 h | compressed, 65 h | 111 h (the `all` deadline) |
-|---|---|---|---|---|
-| msr1 (12 CPUs) | 261-321 | 61-75 MB | 13-35 MB | 23-60 MB |
-| 32 CPUs (msa2-server, msa2-client) | 621-791 | 145-185 MB | 33-87 MB | 55-148 MB |
-
-All of it fits in 256 MiB, so the whole run is kept at 1 s (at the pessimistic ratio a 111 h run on 32 CPUs is 148 MB; with
-half this cap it would have dropped its oldest generations). The artifact of a 65 h single-arch run is about
-50-175 MB for the two hosts (already compressed). The tmpfs worst case is 256 MiB + 16 MiB + the minute and event logs,
-about 0.6 % of msa2-client's RAM. At 0.05 s the ticks are 20 times as many and the cap holds the last 23-55 h on msr1 and
-9-23 h on a 32-CPU host: use 0.05 s for a scoped run (`cells=...`). Whatever the cadence, two files are never rotated:
-`fine-minute.log` (per CPU and minute: the highest softirq percent of a tick, the lowest user+system percent, the minute's
-softirq percent, the longest tick interval; about 1-2 MB for 65 h) and `fine-events.log` (starvation episodes as a
-begin/end pair, the sampler's own gaps, generations closed and dropped; 4 MiB with a drop counter). A 1 to 2 s stall is
-seen by a tick only part of the time at 1 s (a stall that straddles a tick boundary reads about 70 % on two ticks), which
-is why the full series is kept at 1 s and the minute record is a coarse index into it, not a substitute: it is meant to be
-re-cut offline with any criterion.
-
-**Lifetime and the artifact.** `SAMPLER_DURATION` is keyed like the job's `timeout-minutes` (the largest budget the key
-admits plus 3 h, inside the ceiling). The stop step (`if: always()`, `continue-on-error`, 10 minutes: the compressed
-series goes through ansible's `fetch`, in memory under `become`) ends both processes with a sentinel file and fetches into
-`results/host-sampler/<host>/` (fine files in `fine/`) before the upload. The fine files are fetched only if the host's
-`fine-run.txt` carries this run's tag (`bench-<run id>`), so a Deploy that failed before the start step cannot hand over the
-previous bench's series (the tag carries the run attempt, `bench-<run id>-<attempt>`, so a re-run does not take its
-first attempt's), and the race and weekend stops fetch no fine file; a new start deletes the files of the previous
-run in its directory. If the runner dies and the stop step never runs, the fine sampler ends 60 s after its
-`Runner.Listener` is gone, any later `HostSamplerStart` / `Stop` (the race and weekend tiers) retires it too, and the
-forensics play fetches its events, minute record, stats and run file, and, if nobody stopped the sampler, its newest 24
-per-tick generations (at most about 150 MB a host). A host without python3 gets the 60 s sampler only,
-with a warning.
-
-### Result: latency at SLO
-
-In the rated sweep, each cell gets four constant-rate passes at 25, 50, 75 and 90 % of that cell's
-saturation RPS, with loadgen's coordinated-omission correction. `latency_at_slo` maps each budget in
-`{10, 50, 100, 500, 1000}` ms to the highest pass target whose P99 (the median across runs) stayed within
-it. Bigger is better, and it ranks the field where saturation ceilings collapse together, such as the
-store-bound driver rows. Only the 401 cells of `budget.RatedScenarios` (every rated scenario on every
-server that can serve it) get the sweep: `BenchTier` passes their glob to the runner's `-rated-cells`
-(`BENCH_RATED_CELLS`), with the profile's pass window in `BENCH_RATED_DURATION`. The rated rows are the
-driver rows, `get-json`, `post-4k`, `churn-close` and `ws-echo`. The other scenarios (`get-simple` and its
-concurrency sweep, `get-json-1k`, the H2 rows, `ws-large-echo`, and the WS hub and SSE fan-out rows)
-publish saturation data only; [`budget/profiles.go`](budget/profiles.go) gives the measured reason for
-each. Datasets published before [#418](https://github.com/goceleris/probatorium/issues/418) also carry
-rated data for those scenarios.
-
-#### What the artifact records per rated pass (schema 5.24, #441)
-
-Every fraction the sweep plans leaves exactly one record, whatever became of it. `benchmarks[].rated_passes`
-maps a scenario to the list of its passes, one entry per pass per run. `run` counts the runs of the cell that carried rated
-data, from 0: it is not the cell's run index (a DNF run takes no number), so it does not join to `cell_run_statuses`:
-
-| field | meaning |
-| --- | --- |
-| `fraction`, `target_rps` | the offered load: the fraction of the cell's saturation rate, and the rate |
-| `achieved_rps`, `achieved_ratio` | requests per second loadgen delivered over the measured window, and that over the target. Below 1 is load loadgen never sent: the p99 of that pass is its backlog (about 0.99 x window x (1 - ratio)), not the server's latency. The ratio reads slightly low: `requests` counts successes only and loadgen's elapsed time includes teardown, so set any validity line (the 0.98 of #441) knowing that |
-| `requests`, `errors`, `connect_errors`, `dial_retries`, `close_aborts` | loadgen's counts. `requests` are successes, `errors` failed requests, `connect_errors` the dial/handshake failures (TCP connect, TLS, WS/SSE upgrade, H1 reconnect dials). In loadgen v1.4.14 each also fails the request and is counted in `errors`, so `connect_errors` sits inside `errors`, give or take a few attempts cut off at phase boundaries (loadgen's own description: counted at the driver, it can differ from the matching `errors` increments by a few); `errors` close to `connect_errors` means the server was unreachable, not misbehaving |
-| `shortfall_requests` | target x duration - requests - errors: the slots of the schedule loadgen did not fill |
-| `p99` (ns), `p50`, `p99_9`, `max`, `duration`, `start`, `end`, `loadgen_version` | the pass's latency, window and loadgen build (`start`/`end` are on the loadgen host's clock, warmup included, the same clock as `load_windows`) |
-| `status` | `ok`: counted in `latency_at_slo` and the headline. `skipped`: the pass ran and produced nothing usable. `not_run`: it never started |
-| `reason`, `detail` | for a pass that is not `ok` (and `interrupted` on a cut-short `ok` one): `loadgen_new` (loadgen would not build), `run_error`, `nil_result`, `zero_requests`, `interrupted` (the run was cancelled: any pass after the cancel, and also an `ok` pass cut short, which loadgen returns as a short, error-free result and which stays `ok` and kept, as it always was, with the measured window in `detail`), `cell_flagged` (the cell's saturation pass was flagged suspect, so no sweep ran), `no_saturation_rate`, `non_positive_target`; and the error text |
-
-`rated_headline_target_rps` names the target `rated_mode_p99_at_target_rps` was read at: the highest target
-among the `ok` passes. When the 0.9 pass was lost it is the 0.75 pass's (or lower), and this says so; compare
-it with the `fraction` of the cell's passes. A cell with no `ok` pass has records and no
-`latency_at_slo`, headline or `rated_headline_target_rps`.
-
-`mage Publish` prints a rated line in its integrity summary (passes by status, `ok` passes below 98 % of their
-target, and the cells whose headline is not their top planned pass). It is informational: nothing is refused
-for it, because the validity rule is still open on #441. `summary.json` carries `rated_passes`: a full record is about 0.7 KB
-indented, so about 1.1 MB per arch for a full rated run (about 6 % of the 18 MB `summary.json` of 38431303162).
-
-**Records from runs that predate 5.24.** A pass record without `status` was written by a runner before 5.24:
-only `target_rps` and `p99`, kept, and the merge does not fill the status in. Such a run never recorded a pass it
-dropped, so a document merged from it (a re-merge of bench 38431303162, whose stderr shows 41 skipped passes)
-says nothing about lost passes. `mage Publish` counts those records as `legacy=N`, prints a `RATED LEGACY`
-line, and its `skipped=0` is not a statement that none was lost.
-
-**For a reader that predates 5.24.** Nothing it reads changes. `latency_at_slo` and
-`rated_mode_p99_at_target_rps` are built from the `ok` passes exactly as they were built from the kept passes;
-`saturation_mode_rps` and every other key are untouched; the two new keys are ignored. In the runner's per-cell
-JSON and `raw/<host>.json`, `rated_passes` still holds only the passes the runner kept (each now with the added
-keys, `target_rps` and `p99` as before); the passes it did not keep are a separate array,
-`rated_passes_not_kept`, so a script that reads `target_rps` and `p99` out of `rated_passes` never counts a
-pass that sent nothing as a pass with a p99 of zero. A script that wants the full picture reads both arrays.
-A cell in the rated scope whose saturation pass was flagged now has `rated_passes_not_kept` with `not_run`
-records where it used to have no rated key at all. A cell that failed before its saturation pass finished
-(`dnf`, `not_applicable`) has no rated record: its status in `cell_statuses` is the explicit record.
-
-**Two single-arch artifacts and `mage Publish`.** `Publish` takes ONE results file per call (`PUBLISH_RESULTS`,
-or the newest `results/*-bench-*/results.json`; the arch tag comes from the document's own `host_arch_pair`) and
-writes `results/<version>/<date>/<arch>/`. It merges nothing: two single-arch artifacts (a `target=msa2-server`
-run and a `target=msr1` run, each with `publish=false`) are two calls, each with its artifact unpacked under
-`results/<ts>-bench-<version>/` and `PUBLISH_VERSION` set, and they land in two arch directories of the same
-version. Set `BENCH_START_DATE` to the same day on both calls if you want them in the same date directory;
-the date only names the directory. The docs build ([goceleris/docs](https://github.com/goceleris/docs),
-`scripts/build-data.ts`, `src/lib/results/aggregate.ts`) groups the cells by (version, arch) over every date
-and run and AVERAGES them, so the two arches compose into one release dataset by version, and a second publish
-of the same version and arch, on any date, is averaged with the first, not a replacement for it. (Checked by
-`PUBLISH_DRYRUN=1` on both arch files of run 37091941051, and by reading the docs build.)
-
-## Validation tier
-
-Each validation cell runs Tier 1 and Tier 3 against one reference app on one engine; Tier 2 is still
-scaffolding.
-
-### Tier 1: always-on property stress
-
-Five traffic slices fan out over `Concurrency` walker goroutines. The budget activates progressively, so
-small smoke runs don't pay for the expensive slices:
-
-| Slice | Share of walkers | Active at concurrency ≥ | What it does |
-| --- | --- | --- | --- |
-| Markov | ~60 % | 1 | Session-shaped traffic over the reference app's routes, with transitions weighted by `validation/markov/<refapp>.yaml` |
-| Adversarial | ~20 % | 1 | Raw-TCP malformed HTTP/1.1: bad chunks, oversized headers, NUL in a header, CRLF injection, slowloris, double Content-Length |
-| h2c upgrade churn | ~10 % | 10 | Valid h2c upgrade preambles, then an RST at three different stages. Only `kitchen_sink` runs on `Protocol: celeris.Auto`, so only it completes an upgrade; the other seven serve HTTP/1.1 and decline by design |
-| WS frame torture | ~5 % | 4 | A real RFC 6455 handshake, then one of: fragmented reserved opcode, oversize payload, unmasked client frame, ping flood, continuation without start, invalid UTF-8 |
-| SSE kill-mid-stream | ~5 % | 4 | Open an SSE stream, hold it 50 to 1500 ms, then RST; the broker must clean up the client slot |
-
-From concurrency 4, two more walkers run outside that budget. One is an RFC conformance scraper that
-reads the wire (`I-RFC-1`, `I-RFC-2`). The other is a 64 KiB WebSocket echo (`I-WS-ECHO`), which runs
-where `/ws` is routed. The echo holds no connection for the first 18 s of every 54 s: a native engine
-keeps each echo's backlog on the Go heap, and these gaps give every `I-MEM-1` trough bucket samples
-without one ([`validation/ws_echo_quiet.go`](validation/ws_echo_quiet.go), probatorium#478).
-
-In a stall-capture run (the `stall_capture` dispatch input), a 64 KiB echo fire that times out is held
-open: the sender stops, the walker keeps reading, and `ss -tmi` of both ends, the echo and byte
-counters, the refapp's per-thread CPU masks and states, its `GOMAXPROCS` and its engine counters are
-taken at t0 and t0 + 3 s. A record-only `I-WS-ECHO-STALL` dossier carries `ws-echo-diag.txt`, whose first
-line is `WS_ECHO_VERDICT=SLOW_CLASS` (the server application read bytes or wrote more than a control frame
-in the window, from the exact counters `bytes_received` less Recv-Q and `bytes_acked` plus Send-Q: slow),
-`WEDGE_CLASS` (neither moved while bytes sat unread in the server's receive queue) or `INDETERMINATE`
-(missing or contradictory data is never a wedge).
-The timeout is counted after the second instant. `mage` and the race tier also take two off-by-default
-experiment arms for msa2-server only, `refapp_cpus` (a `taskset -c` list of at least 2 CPUs) and
-`refapp_workload_hint` (`high` starts the adaptive engine on io_uring); each cell records the arm it
-actually ran under in `refapp_sched.txt` ([`validation/ws_echo_diag.go`](validation/ws_echo_diag.go),
-[`validation/refapparms`](validation/refapparms), probatorium#481).
-
-#### Race tier semantics: liveness is gated, latency is recorded
-
-The race tier's adaptive cell is deliberately small (`adaptiveCellWorkers` = 2 workers, a floor of
-`adaptiveCellConcurrencyFloor` = 110 walkers, to force the epoll-to-io_uring promotion) and runs under
-`-race` instrumentation, so a late 64 KiB echo there is a capacity and latency effect before it is a
-liveness defect. Its amd64 adaptive cell timed out in every run, and every timeout the two-instant
-capture classified was `SLOW_CLASS`: the server read and wrote, the echoes were only slower than the
-fire's deadline. The race tier therefore judges liveness and records latency:
-
-| In the race tier | Result |
-| --- | --- |
-| A `ws_echo` timeout classed `SLOW_CLASS` | not a failure: counted in `ws_echo_timeout_slow` (exported in `validate-results.json` under `tier_1.ws_echo`, printed by `mage ValidateGate`, which lists every cell that recorded one), and a record-only `I-WS-ECHO-SLOW` dossier whose `ws-echo-diag.txt` keeps `WS_ECHO_VERDICT` as its first line and adds `WS_ECHO_DISPOSITION=TOLERATED_SLOW` as its second |
-| `WEDGE_CLASS`, `INDETERMINATE` (no capture included) | `ws_echo_timeout` as before: hard `I-WS-ECHO`, the cell stops, the gate fails |
-| More than N = 3 `SLOW_CLASS` timeouts in one cell | the 4th is `ws_echo_timeout` (`WS_ECHO_DISPOSITION=FAIL reason=over_n`) |
-| A `SLOW_CLASS` timeout after the first with no fire in the cell having drained cleanly since the first | `ws_echo_timeout` (`reason=no_clean_fire_since_first_slow`): every fire after the first timed out, which is a server delivering nothing, not one that is late now and then |
-| Every other violation | unchanged |
-
-The tolerance is explicit and scoped to this tier. The validator takes `-race-tier`, which
-`ansible/validate.yml` passes only when `validate_race` is `1` (the `-race` refapp set), and
-`mage ValidateGate` takes `VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW=1`, which only `matrix-race-tier.yml`
-sets. The gate repeats the rule on the results: it tolerates `ws_echo_timeout_slow` only with that
-variable, only in a cell that declared `I-RACE` (a `-race` build), and only up to 3. Nightly, soak,
-weekend, checkptr and PR runs have neither switch, so a `SLOW_CLASS` ws_echo timeout in them stays
-`ws_echo_timeout` and fails: their timing budget is real. In the race tier the capture is armed by
-`-race-tier` itself, so `stall_capture` is not needed for the tolerance. `ValidateDiff` does not list
-`ws_echo_timeout_slow`, so an amd64-only slow echo is not a cross-arch divergence.
-
-`ws_echo_timeout_slow` is a measurement, not an exemption: watch its count per run. Before this change
-the first timeout ended its cell, so "one per run" was a censored count; the per-cell rate is now
-measured by the race tier itself.
-
-What a race run records about itself (schema 5.23, record only, nothing new is gated):
-
-- **Every diagnosed SLOW fire is counted** (the capture budget is N+1 = 4 per cell; a later timeout is counted in `ws_echo_timeout` alone). A `SLOW_CLASS` fire the guard refuses is still the failing
-  `ws_echo_timeout`; it is also counted by reason in `ws_echo_slow_over_n` and
-  `ws_echo_slow_no_clean_fire` (subsets of `ws_echo_timeout`). `mage ValidateGate` prints each cell's total
-  (tolerated plus refused) and lists the refused ones in a block of their own, marked FAILING, so the
-  failure reads as slow-class latency past N and not as a wedge. A document without these keys prints as
-  before.
-- **`h2c_hang` and `ws_handshake_fail` have an instant.** `tier_1.h2c_hang_span` and
-  `tier_1.ws_handshake_fail_span` hold the first and last event of the cell: UTC `ts`, `since_ready_ms`,
-  `cause` (eof, reset, timeout, status, other), the verbatim `err` and the addresses (`since_ready_ms` is omitted when 0, i.e. when the refapp's ready instant is unknown or the event is within the same millisecond). The slow ring keeps
-  only reads over one second, so a hang that closed in milliseconds had no timestamp anywhere. `ts` is UTC,
-  like `ready_at`, the slow ring and the epoch seconds of `properties_series.csv` (whose
-  `adaptive_switches` column steps at the switch), so the four join on one timeline; the refapp's own
-  stderr lines carry host-local time with no zone and join through `since_ready_ms`.
-- **The refapp's CPU placement is in the cell document in every run:** `tier_1.refapp_sched` has the
-  per-thread `Cpus_allowed_list` counts (`thread_masks`) read from `/proc` at ready, and the leader's mask
-  separately, which is not the process's mask. `gomaxprocs` is recorded only when the stall-capture side
-  listener answered (never under the ssh driver); otherwise it is 0 with a note. Recording it in every run needs the refapp to publish
-  it (`validation/refapp/internal/debugvars`), a change to the refapp build that is not made here.
-- **The race tier runs the host sampler** (`HostSamplerStart` / `HostSamplerStop`, tag
-  `race-<run id>`, lifetime fixed at 150m inside the job's 180 minute limit, each step bounded to 5 minutes), as the weekend soak does.
-  The bench tier runs it too, with a 1 s fine series by default (tag `bench-<run id>`; [details](#the-host-sampler-beside-a-bench)).
-
-The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
-exact request its walker sends, and skips the slice when the reference app answers 404; only
-`auth_session_ratelimit` routes them today. The verdict is recorded per cell (`ws_route_probed` /
-`ws_route_present` and the `sse_` pair), so a zero is attributable. A matrix run also writes a
-per-app coverage table to `streaming-coverage.txt`.
-
-The first time one of these signals appears, the orchestrator acts on it mid-run
-([`validation/runner.go`](validation/runner.go)):
-
-| Signal | Predicate | Meaning | On first hit |
-| --- | --- | --- | --- |
-| adversarial wrong-accepted > 0 | `I-ADV-ACCEPTED` | The server accepted malformed bytes: an RFC violation | hard fail: forensics first, then the cell stops |
-| h2c crashed > 0 | `I-H2C-CRASHED` | The engine answered an upgrade with non-HTTP bytes | hard fail: forensics first, then the cell stops |
-| WS accepted bad frame > 0 | `I-WS-ACCEPTED` | The server accepted an RFC 6455 violation | hard fail: forensics first, then the cell stops |
-| WS hang (no close) > 0 | `I-WS-HANG` | A WebSocket connection hung past the close timeout | hard fail: forensics first, then the cell stops |
-| 64 KiB echo corrupt / reordered / missing / timed out | `I-WS-ECHO` | WebSocket echoes were not byte-intact and in order | hard fail: forensics first, then the cell stops. In the race tier only, a timeout that the two-instant capture classed `SLOW_CLASS` is not this row: see the next one |
-| 64 KiB echo timed out, `SLOW_CLASS` (race tier only) | `I-WS-ECHO-SLOW` | The server read and wrote in the window; the echoes were only later than the fire's deadline | record-only dossier, counted in `ws_echo_timeout_slow`, the cell runs on; the gate fails past 3 per cell |
-| process died | `I-LIVENESS` | The reference app crashed mid-run | hard fail: forensics first, then the cell stops |
-| process alive but wedged | `I-HANG` | The reference app stopped responding | hard fail: forensics first, then the cell stops |
-| h2c hang > 0 | `I-H2C-HANG` | An upgrade was neither answered nor declined within 20 s | dossier without a core dump; the cell runs on |
-| WS handshake fail > 0 | `I-WS-HANDSHAKE` | A WebSocket upgrade did not complete within 2 s | dossier without a core dump; the cell runs on |
-
-A zero only means health when the oracle ran. `mage ValidateGate` therefore also fails a `kitchen_sink`
-cell whose `h2c_upgraded` is 0 after sending preambles: every churn mode would then have degenerated
-into a declined GET, and the h2c oracles would have judged a path the engine never entered. The same
-rule covers dead cells (`requests_sent == 0`) and properties that were never evaluated.
-
-### Tier 2: stateful API fuzzing (not implemented)
-
-The intent is RESTler-style producer/consumer inference from `validation/spec/<refapp>.openapi.yaml`, to
-catch API-level bugs Tier 1 misses. **The tier is scaffolding today:** `runTierRESTler` parks on the run
-context and sends nothing, and every `plan.json` marks the tier `DISABLED` with that reason. Only
-`auth_session_ratelimit` ships a spec.
-
-### Tier 3: deterministic seed replay
-
-This is a real kernel with no mocking. A seed expands into a workload plus a fault schedule
-(`iptables` drops, `tc netem` loss and delay), so a bug is the tuple `(seed, git_commit, host_arch)` and
-reproduces with `validator-replay` (see [Reproduce a run](#reproduce-a-run)). The corpus is the 100
-hand-authored seeds in [`validation/corpus/seeds_initial.go`](validation/corpus/seeds_initial.go). Each
-cell replays seeds for its whole window at 15 s per seed, looping over the corpus.
-
-### Invariants
-
-Beyond the Tier 1 signals, the orchestrator runs a **per-second property loop** inside every cell
-([`validation/propertyloop.go`](validation/propertyloop.go), with the shared evaluator in
-[`validation/checker`](validation/checker)). Once the reference app announces its address, the loop:
-
-- polls its `/debug/vars`, which every reference app serves through
-  `validation/refapp/internal/debugvars`, alongside `/debug/pprof` for forensics;
-- samples its RSS from `/proc`;
-- evaluates the registered `I-*` predicates against a rolling one-hour history.
-
-Every violation is counted into `tier_1.property_violations` / `property_violation_ids`, and
-`mage ValidateGate` fails on any of them. What the first violation does to the *cell* is a switch:
-
-- **Record-only** (the default): an incident dossier with live forensics (`/proc`, the `/debug/pprof`
-  profiles, gcore, dmesg) is written while the reference app is still running. The cell then continues to
-  its budget, so a leak's whole trajectory is on record.
-- **Hard fail** (the validator's `-property-hard-fail`, or `VALIDATE_PROPERTY_HARD_FAIL=1` in its
-  environment, which `ansible/validate.yml` sets from the `validate_property_hard_fail` extra-var): the
-  same dossier is captured *before* the tiers are torn down, then the cell is cancelled and the validator
-  exits non-zero.
-
-Each cell reports `properties_passed`, `properties_failed`, `properties_not_instrumented` and
-`properties_not_judged`. A predicate counts as passed only if it reached a **verdict** at least once and
-never failed. One that only ever skipped (its window never became judgeable) is `not_judged`; one with no
-data source is `not_instrumented`. By default the gate also fails a cell whose loop never evaluated
-anything (`/debug/vars` unreachable), unless `tier_1.property_loop_skipped` names a reason.
-
-Judged in every cell:
-
-- `I-LIVENESS` / `I-HANG`: the reference app stayed up and responsive (judged from the walkers, not the
-  snapshot loop).
-- `I-PANIC`: no *unexpected* panic. This is `celeris.panic_count` from `/debug/vars` minus the panics
-  the traffic corpus designs in, and it must persist for 3 samples.
-- `I-CONN-2`: `accepted − closed − active == 0`, judged only when the drift keeps the same sign for 30
-  samples.
-- `I-MEM-1`: the `heap_inuse` trough slope is at most 1 KB/s over the trailing min(1 h, elapsed), after a
-  5-minute warm-up, from 10 minutes of samples.
-- `I-MEM-3`: the goroutine-count trough slope is at most 0.2/s over the trailing 10 minutes after
-  warm-up.
-- `I-MEM-4`: the RSS trough slope is at most 64 KB/s over the trailing min(1 h, elapsed) after warm-up
-  (Linux, local driver).
-
-The three slope oracles share a false-positive guard:
-- The fit runs over per-150 s bucket **minima**, so a GC sawtooth cannot pass for a slope.
-- A slope above budget counts only if the rise across the window also clears a floor, so one legitimate
-  step (a cache filling once, a standby engine spinning up) cannot fire it. The floor is the larger of
-  budget × 10 minutes, a fraction of the series' level (3 % heap, 5 % goroutines and RSS) and, for the
-  heap, 8× its sampling noise and the rise the cell's own trough scatter can explain: the fitted slope
-  must be significant (one-sided 0.001, a critical value per trough count) against the scatter of the
-  window's troughs, estimated from their successive differences. **That is not free.** Measured against
-  the rule without the term on the weekend soaks' 45 minute cells (25 noisy observability cells, trough
-  sd 0.34-1.4 MB; 162 quiet cells; detected/sustained counts; all tables and the case definitions are in
-  probatorium#520):
-  - Noisy cells, straight leak from the end of warm-up: 1 KB/s is called in 9 of 25 cells (24 without
-    the term), 2 KB/s in 24 (25), and a 3 KB/s leak about 11 minutes later (median 17.5 -> 28.7 min).
-  - Noisy cells, a leak that starts late: from minute 20, 3 KB/s 25/25 -> 22/19; from minute 25, 3 KB/s
-    21/10 -> 12/3, 4 KB/s 25/22 -> 21/10, 6 KB/s 25/25 -> 24/21.
-  - Noisy cells, a stepped leak of 3 KB/s on average: 11 minutes later with a step every 15 minutes
-    (median 23.7 -> 35.0), sustained 21 -> 9 with a step every 30.
-  - Quiet cells, straight leak: 3 KB/s is called 3.7 minutes later at the median and 6.2 at most;
-    1 KB/s in 146 of 162 cells instead of 150. Late-start and stepped leaks: up to 2.5-5 minutes later.
-  - **Quiet cells, a leak that stops.** A leak that starts at the end of warm-up, runs 7.5 minutes and
-    then plateaus is lost: 3 KB/s 154/153 -> 64/18 (90 quiet cells lost), 4 KB/s 162/156 -> 125/75,
-    6 KB/s 162/162 -> 156/153; 3 KB/s for 10 minutes 162/162 -> 157/149. The estimator, not a floor
-    that is too high, is the cause: an instant 2 MB step is still called in 156 cells, as without the
-    term. After the leak stops, the shifted successive differences sit in windows of 6-8 troughs where
-    the 75 % trim drops only one difference, which inflates the scatter estimate. The other floors do
-    not catch it.
-  - A single low trough (a 2-4 MB dip at minute 10-15) delays a 3-5 KB/s call by a median of 7.5-11.2
-    minutes (max 11.2-13.7) on quiet cells, beyond the 10 minute maximum the straight-leak tests allow.
-  - A single 1 MB step is called in 139 of 150 quiet cells that the rule without the term calls.
-  - Cells that scatter heavily though quiet (1-2 MB of added trough scatter): 3 KB/s is lost in 19
-    (1 MB) to 123 (2 MB) of 162 cells, and a 4 MB sawtooth loses 161. In the same cells with no leak
-    the rule without the term trips falsely in 59 of 162 and this rule in none.
-  - Short cells: the scatter term needs the load phase to last long enough for windows of 8 or more
-    troughs. With the load phase cut to 20 minutes the quiet cells lose 99 of 162 at 3 KB/s, 75 at
-    5 KB/s and 32 at 10 KB/s (noisy cells 22-25 of 25); at 25 minutes none are lost.
-  - Windows of 5-8 troughs judge only a leak that is large against the scatter.
-  - Nothing the floor absolves is hidden. The validator runs I-MEM-1 as it was before the floor
-    beside the gated rule, on the same series, and records it per cell as `property_informational`
-    (schema 5.20) with its violation count, the evaluations the gated rule absolved and a flag for a
-    cell it absolved entirely. `mage ValidateGate` prints it on every run under "informational, NOT
-    gating (the pre-scatter-floor rule of I-MEM-1 ...)". The gate never reads it: the verdict is the
-    gated rule's alone. A reader of a soak sees every trip the floor absolved and can judge it.
-  - The maintainer accepted these costs on 2026-10-17 after five pre-registered attempts (probatorium#520;
-    the two later estimators that did not work, and why, are in its description).
-- A verdict must persist for 150 consecutive evaluations before it is declared.
-
-These oracles need cells of 15 minutes or more to judge at all, and I-MEM-1 needs about 25 minutes of
-sustained load to keep its sensitivity: a shorter load phase loses leaks (see the cost list above). They
-judge in the weekend soak's cells (about 45 minutes each: 24 h over 32 cells per architecture, which is
-unaffected), and are `not_judged` in the short nightly cells.
-
-Judged only where their data source exists, and reported as `not_instrumented` everywhere else:
-
-- `I-MW-*`: only the apps that install the middleware.
-- `I-DRV`: the three driver apps, which read every write back and publish the hit/miss tally.
-- `I-RFC-1` / `I-RFC-2`: the conformance scraper, at concurrency ≥ 4.
-- `I-CONN-1`: the per-connection last-byte table.
-- `I-CHECKPTR`: Checkptr Validation cells; `I-ENG-IOURING`: that tier's io_uring cells.
-- `I-RACE`: Race Validation cells, which count `WARNING: DATA RACE` reports on stderr.
-- `I-ENG-ADAPTIVE`: adaptive cells.
-- `I-MEM-2`: cells of 20 minutes or more, which idle the app twice, after a 60 s burst and at the end.
-
-### Cross-engine and cross-arch divergence
-
-A matrix run's `validate-results.json` holds one `Cells[]` entry per `(refapp, engine, arch)`.
-`mage ValidateDiff` compares the two latest matrix documents and reports:
-
-- **cross-engine** divergence: a counter non-zero on one engine (say `iouring`) but zero on another for
-  the same `(refapp, arch)`, which is typically an engine-specific bug;
-- **cross-arch** divergence: the same shape, comparing amd64 with arm64.
-
-It exits non-zero on HIGH severity, and on MEDIUM too with `VALIDATE_DIFF_STRICT=1` (which every
-validation tier sets). It writes `validate-diff/diff.{txt,json}`.
-
-## Reference apps
-
-Each reference app is a **separate Go module** under [`validation/refapp/`](validation/refapp/), so the
-validator never pulls in every middleware's dependency graph. The matrix runner discovers them at
-runtime.
-
-| Slug | Coverage |
-| --- | --- |
-| `auth_session_ratelimit` | Session cookie, rate limit, and the WebSocket / SSE detach paths (the only app that routes `/ws` and `/events`) |
-| `auth_jwt_csrf` | JWT (HS256), CSRF synchronizer token, keyauth |
-| `kitchen_sink` | 17 stateless middlewares (basicauth, bodylimit, cache, circuitbreaker, cors, etag, healthcheck, idempotency, methodoverride, ratelimit, recovery, redirect, requestid, rewrite, secure, singleflight, timeout). The only app on `Protocol: celeris.Auto`, so it is where the h1→h2c upgrade path is exercised |
-| `driver_postgres` | celeris's native Postgres driver, `session/postgresstore`, and the `I-DRV` read-after-write tally |
-| `driver_redis` | The native Redis driver, `session/redisstore` and a Redis-backed rate limiter |
-| `driver_memcached` | The native memcached driver, `session/memcachedstore` and a memcached-backed rate limiter |
-| `observability` | logger, metrics and otel middleware |
-| `static_swagger_proxy` | static (`embed.FS`), swagger (OpenAPI 3.0) and proxy (X-Forwarded-For trust) |
-
-Each follows the same shape: its own `go.mod`, `resolveEngine("auto")` (io_uring on Linux, std elsewhere),
-signal-driven graceful shutdown, and a `ready addr=<bind-addr>` startup line.
-
-## Mage targets
-
-| Target | What it does | Main knobs |
-| --- | --- | --- |
-| `Status` | Cluster reachability and manifest state | |
-| `Deploy` | Cross-compile and stage every binary | `CLUSTER_USE_LAN`, `DEPLOY_COMPETITORS=all\|go-only\|none\|<list>`, `DEPLOY_NEEDS_DBSERVICES` |
-| `Cleanup` | Undo what a run installed, per the host manifests | `CLEANUP_HOSTS=all\|<list>` |
-| `Bench` | One bench run | `BENCH_TARGET` (default `both`), `BENCH_ARCH_EXCLUSIVE` (`both` only: `all` default, `heavy`, `off`), `BENCH_CELLS`, `BENCH_COMPETITORS`, `BENCH_DURATION`, `BENCH_WARMUP`, `BENCH_RATED`, `BENCH_RATED_DURATION`, `BENCH_RATED_CELLS` (default: the rated cells), `BENCH_SUT_ENV`, `CELERIS_VERSION` |
-| `BenchTier` | A profile-driven run over the whole grid; publishes it unless `BENCH_PUBLISH=0` | `BENCH_PROFILE=fast\|headline\|full`, `BENCH_BUDGET`, `BENCH_TARGET`, `BENCH_SKIP_RATED`, `BENCH_PUBLISH`, `BENCH_BASELINE=1` (see [Same-run celeris baseline](#same-run-celeris-baseline)) |
-| `BenchArchOverlap` | Check a finished both-arch run for overlap between the arches' load windows (#442); fails on a forbidden overlap | `BENCH_RESULTS_DIR` (default the latest run), `BENCH_ARCH_EXCLUSIVE` |
-| `BenchSince` | Compare against a baseline version | `BASELINE_VERSION` (default `v1.4.2`), `REGRESSION_THRESHOLD` (default `0.05`) |
-| `Validate` | A validation run, one cell or the matrix | `VALIDATE_TARGET` (default `both`), `VALIDATE_DURATION` (default `6h`), `VALIDATE_MATRIX=1`, `VALIDATE_MATRIX_REFAPPS`, `VALIDATE_MATRIX_ENGINES`, `VALIDATE_PARALLEL=1`, `VALIDATE_DBSERVICES=1`, `VALIDATE_CONCURRENCY`, `VALIDATE_RESUME_FROM`, `CELERIS_VERSION`, `PROBATORIUM_VALIDATE_DRIVER=ssh` |
-| `Soak` | A long validation run | `SOAK_DURATION` (default `24h`), plus the `Validate` knobs |
-| `ValidateGate` | The absolute gate over the most recent run's `validate-results.json` on every host | `VALIDATE_GATE_EXPECT_CELLS`, `VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`, `VALIDATE_GATE_TOLERATE_WS_ECHO_SLOW` (race tier only) |
-| `ValidateDiff` | The cross-engine and cross-arch gate | `VALIDATE_DIFF_STRICT=1` (MEDIUM fails too), `VALIDATE_DIFF_HOSTS=a,b` |
-| `BuildRaceRefapps` | Cross-build the `-race` reference apps (the race runtime needs cgo) | |
-| `HostSamplerStart` / `HostSamplerStop` | Start and stop the read-only host sampler on every cluster host (or, with `BENCH_TARGET=msr1\|msa2-server`, the target and the loadgen) | `SAMPLER_DURATION`, `SAMPLER_INTERVAL` (full sample, integer 1-3600 s, default 60), `SAMPLER_FINE_INTERVAL` (fine series, 0.05-10 s, unset = none; [details](#the-host-sampler-beside-a-bench)), `SAMPLER_TAG` |
-| `Publish` | Write the newest bench run into goceleris/docs and fire the `benchmark-published` pointer | `PUBLISH_VERSION`, `PUBLISH_VIA=git\|contents`, `PUBLISH_DRYRUN=1`, `DOCS_REPO_DIR`, `DOCS_TOKEN`, `BENCH_PUBLISH_FORCE` |
-| `PublishValidate` | Kept for callers; it runs `Publish` | |
-| `BenchAndValidate` | `Validate` → `ValidateDiff` (when `VALIDATE_TARGET=both`) → `Bench` → `Publish` | the knobs of each |
-| `Fuzz` | Hostile-input fuzzing through `ansible/fuzz.yml`. **Not working today:** the playbook passes validator flags (`-mode`, `-url`) that `cmd/validator` does not define | `FUZZ_DURATION`, `FUZZ_CORPUS` |
-
-`VALIDATE_PARALLEL=1` on a two-arch run drives the two targets concurrently, halving the wall-clock of
-long soaks.
-
-### Matrix mode (`VALIDATE_MATRIX=1`)
-
-Matrix mode iterates the `(refapp × engine)` cells and runs a fresh orchestrator per cell with a budget
-of `total_duration / len(cells)`. It emits one `validate-results.json` with `Cells[]` populated. Filter
-the matrix with:
-
-- `VALIDATE_MATRIX_REFAPPS=driver_postgres,driver_redis` to limit the reference apps;
-- `VALIDATE_MATRIX_ENGINES=iouring,epoll` to limit the engines. The default is the OS production set:
-  iouring, epoll, std and adaptive on Linux, std elsewhere.
-
-**A failing cell does not stop the run**, because cluster time is the scarce resource. Every cell carries
-a `status`:
-- `ok`;
-- `failed`: it ran, then something failed it;
-- `not_run`: it produced no requests and no property verdicts, because its app never started.
-
-Each cell also carries the verbatim `failure_reason`. For a cell that never came up, that is the driver's
-own account of why. The ledger names the cell's evidence (`refapp_stderr_tail.txt`, else the incident
-dossier) only when that evidence has content. The end of the run prints the ledger and leaves it in
-`cell-failures.txt`. The exit status is still non-zero for any cell that did not pass: this is a gate,
-not a report.
-
-Three conditions stop the run immediately, because none of them leaves a later cell able to measure
-anything:
-- the remote driver cannot be built;
-- the reference-app staging directory is unreadable;
-- a write fails with `ENOSPC`.
-
-Two caps bound the damage when the matrix is failing wholesale:
-- **8 consecutive** failures;
-- **half the plan** failed in total.
-
-Override them with `PROBATORIUM_MATRIX_MAX_CONSECUTIVE_FAILURES` / `PROBATORIUM_MATRIX_MAX_FAILED_CELLS`
-(negative disables); `mage Validate` carries both across the SSH boundary. The weekend soak sets the
-total cap to 8. Whatever stops a run early, the summary names the cells it never attempted and prints the
-`-matrix-resume-from` line that finishes them.
-
-## Result layout
-
-The key files a run leaves under `results/`:
-
-```text
-results/<ts>-bench-<version>/
-  results.json                           # the run's roll-up (results-amd64.json + results-arm64.json with BENCH_TARGET=both)
-  <TS>-bench-<bench_target>/<RR>-<competitor>/
-    run0/<scenario>/<server>.json        # per-cell runner result: the ingested data
-    server.log, cpu.*.log
-
-results/<ts>-validate-<bench_target>-<refapp>/   # fetched back from the bench target
-  validate-results.json
-  cell-failures.txt                      # matrix runs: every cell that failed or never ran, with its reason
-  streaming-coverage.txt                 # matrix runs: per-app ws/sse routing table
-  cell-<NN>-<refapp>-<engine>/
-    validate-results.json                # the cell's own document
-    refapp_stderr_tail.txt               # the app's last words (why a not_run cell never started)
-    incidents/<ts>-<predicate>/          # forensics dossier per violation
-
-<parent of the two compared runs>/validate-diff/
-  diff.txt, diff.json                    # ValidateDiff findings
-```
-
-The document types and the current `SchemaVersion` live in [`report/schema.go`](report/schema.go). A
-single-cell run leaves `Cells[]` empty and fills `tier_1` / `tier_3` at the top level. Sub-tallies are
-`map[string]int64`, so the schema does not re-version when the validator grows a counter.
-
-## Continuous integration
-
-| Workflow | Trigger today | Runs on | Role |
-| --- | --- | --- | --- |
-| `test.yml` (Test) | push to `main`, pull requests | GitHub-hosted | `go test -race` over the root module, every adapter module, the reference apps, the mage-tagged files and the field guard, plus govulncheck. The `ci-ok` fan-in is a required check |
-| `lint.yml` (Lint) | push to `main`, pull requests | GitHub-hosted | `go vet`, golangci-lint, gofmt and actionlint (required) |
-| `coverage.yml` (Coverage) | push to `main`, pull requests | GitHub-hosted | Coverage upload to Codecov |
-| `matrix-pr-tier.yml` (PR Validation) | pull requests labeled `cluster-ok` (path-filtered), manual | cluster | 10-minute matrix on msa2-server, with `ValidateDiff` |
-| `matrix-nightly-tier.yml` (Nightly Validation) | manual (schedule paused) | cluster | Full matrix, both architectures, `ValidateGate` + `ValidateDiff` |
-| `matrix-weekend-tier.yml` (Weekend Soak) | manual (schedule paused) | cluster | The same over 24 h by default |
-| `matrix-race-tier.yml` (Race Validation) | manual | cluster; the `-race` apps are built on a GitHub-hosted runner | Full matrix with `-race` apps |
-| `matrix-checkptr-tier.yml` (Checkptr Validation) | manual | cluster | Full matrix with pointer-checker apps |
-| `benchmark-tier.yml` (Benchmark Tier) | manual (schedule paused) | cluster | `mage BenchTier`; publishes rated profiles |
-| `publish-results.yml` | manual; also logs `benchmark-published` dispatches | GitHub-hosted | Re-send the pointer for a cell already pushed to goceleris/docs |
-| `celeris-stress.yml` (Celeris Stress) | manual; pull requests that change it or `tools/stresstally` (self-test) | GitHub-hosted x86 and arm64 | Run celeris tests many times to measure a flake and its rate; see [`docs/STRESS.md`](docs/STRESS.md) |
-
-The cluster tiers share `concurrency: matrix-tier-cluster` with `cancel-in-progress: false`, so they never
-overlap on the cluster. The group keeps only one pending run, so a newer queued run replaces an older
-one. Each tier provisions runners, runs on the cluster, then tears the runners down.
-
-### Same-run celeris baseline
-
-`servers/celeris_v1511` is the bench server built against the released celeris v1.5.11 instead of the
-pinned main, registered as eight opt-in columns `baseline-celeris-v1511-<engine>` (epoll, iouring and adaptive in
-every protocol flavour the `celeris-*` columns have, without `celeris-std-h1`). They exist so one dispatch
-holds the same-run interleaved comparison against the v1.5.x release. They are left out of every "all"
-expansion (the `*/*` grid, the default competitor set, `DEPLOY_COMPETITORS=all`, the budget pins) unless
-`BENCH_BASELINE=1`, which `benchmark-tier.yml` sets from its `baseline` input (default `false`). Switched on it adds
-222 saturation and 120 rated cells per architecture (about +14.5 h projected on `full`, +8.5 h on
-`headline`) and the workflow raises `BENCH_BUDGET` for it, for every arch policy. With `target=both` under the default
-policy `all`, `profile=full` with the baseline projects 130.9 h and is refused by the `setup` job (above the
-7200 min job limit; see "A both-arch run"): dispatch it as two single-arch runs (`target=msa2-server`, then
-`target=msr1`; 65.5 h each). Columns run as blocks in list order, so
-`servers.InterleaveBaseline` places each baseline column directly beside its `celeris-*` twin (about 1.8 h
-apart, alternating which runs first) instead of the sorted `baseline-*` block fifteen hours earlier. Rows publish with framework `celeris-baseline`,
-framework_version `v1.5.11`. The module is a frozen fork of `servers/celeris` (go.mod pinned, not in
-Dependabot); `servers/baseline_test.go` fails when the two drift. Dry-run the extra cells with
-`BENCH_BASELINE=1 go run ./cmd/runner -dry-run -runs 1 -cells '*/*'`.
-
-### Self-hosted runner bootstrap
-
-Cluster runners are provisioned per run and torn down at the end:
-
-- [`.github/actions/cluster-runner-up/`](.github/actions/cluster-runner-up/) joins the tailnet with a
-  SHA-pinned `tailscale/github-action` (an ephemeral `tag:ci` node), mints a registration token, runs
-  [`ansible/runner-setup.yml`](ansible/runner-setup.yml) and checks that the runners came online.
-- [`.github/actions/cluster-runner-down/`](.github/actions/cluster-runner-down/) collects forensics,
-  rescues results to `/var/lib/celeris-rescue`, cleans the hosts, writes a "Resume candidates" job
-  summary, mints a removal token, runs [`ansible/runner-teardown.yml`](ansible/runner-teardown.yml) and
-  sweeps orphaned registrations.
-- Runners live under `/tmp/actions-runner-<host>/`, with no systemd unit and no package install.
-
-The one-time operator setup (four repository secrets and a Tailscale ACL rule) is documented in
-[`ansible/RUNNER_BOOTSTRAP.md`](ansible/RUNNER_BOOTSTRAP.md). Resuming an interrupted matrix after a power
-event is covered in [`ops/power/README.md`](ops/power/README.md).
-
-## Related projects
-
-| Project | What it is |
-| --- | --- |
-| [celeris](https://github.com/goceleris/celeris) | The HTTP engine for Go that probatorium benchmarks and validates |
-| [loadgen](https://github.com/goceleris/loadgen) | The HTTP/1.1 and HTTP/2 load generator the bench tier drives, as a library |
-| [docs](https://github.com/goceleris/docs) | The source of [goceleris.dev](https://goceleris.dev), where rated bench runs are published |
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks CI runs and the `cluster-ok` label, and
-[SECURITY.md](SECURITY.md) to report a vulnerability.
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE).
