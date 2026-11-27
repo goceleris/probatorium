@@ -783,7 +783,7 @@ var Registry = map[string]Adapter{
 	},
 	// uws — uWebSockets.js (NEW node role; launcher tier like bun). HTTP/1.1.
 	"uws": {
-		Name: "uws", Category: "node-uws", Language: "node", Framework: "uWebSockets.js", FrameworkVersion: "v20.68.0", Engine: "h1",
+		Name: "uws", Category: "node-uws", Language: "node", Framework: "uWebSockets.js", FrameworkVersion: "v20.70.0", Engine: "h1",
 		Bin: NativeBinary{
 			Lang:   "node",
 			RunCmd: "{name} -bind {bind}",
