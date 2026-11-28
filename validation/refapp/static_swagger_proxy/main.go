@@ -149,14 +149,14 @@ func main() {
 
 	// Per-handler async (celeris #300): this refapp keeps the ASYNC
 	// server default (Config.AsyncHandlers=true above) and opts the
-	// CPU-bound file/spec/health routes BACK to sync via .Async(false).
-	// Exercises the "async-default + per-route .Async(false) override"
+	// CPU-bound file/spec/health routes BACK to sync via .Sync().
+	// Exercises the "async-default + per-route .Sync() override"
 	// direction (the inverse of observability) across the matrix.
 
 	// /healthz — I-CONN-1 sentinel. Fast → sync override.
 	srv.GET("/healthz", func(c *celeris.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"ok": "true"})
-	}).Async(false)
+	}).Sync()
 
 	// /api/whoami — echo the resolved ClientIP. Walker sends
 	// requests with and without X-Forwarded-For and asserts the
@@ -175,13 +175,13 @@ func main() {
 	// The middlewares short-circuit any matching path.
 	srv.GET("/static/*filepath", func(c *celeris.Context) error {
 		return c.String(http.StatusNotFound, "static middleware did not intercept: %s", c.Path())
-	}).Async(false) // static file serving is CPU-bound → sync override
+	}).Sync() // static file serving is CPU-bound → sync override
 	srv.GET("/docs", func(c *celeris.Context) error {
 		return c.String(http.StatusNotFound, "swagger middleware did not intercept: %s", c.Path())
-	}).Async(false)
+	}).Sync()
 	srv.GET("/docs/*filepath", func(c *celeris.Context) error {
 		return c.String(http.StatusNotFound, "swagger middleware did not intercept: %s", c.Path())
-	}).Async(false)
+	}).Sync()
 
 	go func() {
 		sig := make(chan os.Signal, 1)

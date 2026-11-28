@@ -22,8 +22,12 @@
 // It fails, and changes nothing, when the controller at that commit is not what
 // the derivation assumes (the 8192 B/request refusal and the telemetry that
 // feeds it, shape.go), when a marker or constant it rewrites is missing, or when
-// no period fits the window. -dry-run prints what would change and changes
-// nothing. It never removes a file, never commits and never pushes.
+// no period fits the window. A failure after it has written files (go get, or
+// go build of the refapps against the new commit) says the tree is partly moved
+// and lists the git checkout that restores it; the refapps may need a source
+// change that lands in the same commit as the re-pin. -dry-run prints what
+// would change and changes nothing. It never removes a file, never commits and
+// never pushes.
 //
 // check verifies that the repository is consistent with its pin: the period
 // constant, the pin block and the refapp modules' celeris version agree.
@@ -43,11 +47,12 @@ import (
 	"strings"
 )
 
-// resolveCeleris and runGoGet are the two steps that need the network; tests
-// replace them.
+// resolveCeleris, runGoGet and runGoBuild are the steps that need the network
+// or a toolchain run; tests replace them.
 var (
 	resolveCeleris = ResolveCeleris
 	runGoGet       = goGet
+	runGoBuild     = goBuild
 )
 
 func main() {
@@ -359,27 +364,82 @@ func cmdRepin(args []string, out io.Writer) error {
 			return err
 		}
 	}
+	// Everything that can fail on its own has run, and the text files are
+	// written. From here a failure leaves a partly moved tree, so it says which
+	// files to restore. Every module is moved first and then every module is
+	// built, so one build failure does not hide the others.
+	restore := []string{}
+	for _, e := range edits {
+		restore = append(restore, relTo(root, e.path))
+	}
+	var moved []string
 	for _, m := range mods {
 		pins, err := celerisPins(m)
 		if err != nil {
 			return err
 		}
-		moved := false
+		need := false
 		for _, v := range pins {
-			moved = moved || v != version
+			need = need || v != version
 		}
-		if !moved {
+		if !need {
 			continue
 		}
-		if err := runGoGet(m, version, *noBuild, out); err != nil {
-			return err
+		restore = append(restore, relTo(root, filepath.Join(m, "go.mod")), relTo(root, filepath.Join(m, "go.sum")))
+		if err := runGoGet(m, version); err != nil {
+			return partlyMoved(root, restore, []string{err.Error()})
+		}
+		moved = append(moved, m)
+		_, _ = fmt.Fprintf(out, "moved %s\n", relTo(root, m))
+	}
+	if !*noBuild {
+		var fails []string
+		for _, m := range moved {
+			if err := runGoBuild(m); err != nil {
+				fails = append(fails, err.Error())
+				continue
+			}
+			_, _ = fmt.Fprintf(out, "builds %s\n", relTo(root, m))
+		}
+		if len(fails) > 0 {
+			return partlyMoved(root, restore, fails)
 		}
 	}
 	_, _ = fmt.Fprintf(out, "done: re-pinned to %s. Next: go test ./cmd/validator ./tools/raceshape ./report, review the diff, commit.\n", version)
 	return nil
 }
 
-func goGet(modDir, version string, noBuild bool, out io.Writer) error {
+func relTo(root, p string) string {
+	if r, err := filepath.Rel(root, p); err == nil {
+		return r
+	}
+	return p
+}
+
+// partlyMoved is the error for a failure after files were written: the build of
+// the refapps against the new commit, or a go get. The text files and the
+// modules that were moved stay as they are, for inspection.
+func partlyMoved(root string, restore, fails []string) error {
+	return fmt.Errorf("the re-pin went as far as writing files and then failed, so the tree is PARTLY MOVED:\n  - %s\nRestore it with: git -C %s checkout -- %s\n(a build failure means the refapps need a source change that lands in the same commit as the re-pin)",
+		strings.Join(fails, "\n  - "), root, strings.Join(restore, " "))
+}
+
+func goEnv(modDir string, args ...string) error {
+	cmd := exec.Command("go", args...)
+	cmd.Dir = modDir
+	cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod", "GOTOOLCHAIN=local")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		if len(lines) > 20 {
+			lines = append(lines[:20], "...")
+		}
+		return fmt.Errorf("go %s in %s: %w\n    %s", strings.Join(args, " "), modDir, err, strings.Join(lines, "\n    "))
+	}
+	return nil
+}
+
+// goGet moves every celeris requirement of the module that is not at version.
+func goGet(modDir, version string) error {
 	pins, err := celerisPins(modDir)
 	if err != nil {
 		return err
@@ -391,28 +451,10 @@ func goGet(modDir, version string, noBuild bool, out io.Writer) error {
 		}
 	}
 	sort.Strings(paths)
-	run := func(name string, args ...string) error {
-		cmd := exec.Command(name, args...)
-		cmd.Dir = modDir
-		cmd.Env = append(os.Environ(), "GOFLAGS=-mod=mod", "GOTOOLCHAIN=local")
-		if b, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("%s %s in %s: %w\n%s", name, strings.Join(args, " "), modDir, err, b)
-		}
-		return nil
-	}
-	if len(paths) > 0 {
-		if err := run("go", append([]string{"get"}, paths...)...); err != nil {
-			return err
-		}
-	}
-	if !noBuild {
-		if err := run("go", "build", "./..."); err != nil {
-			return err
-		}
-	}
-	_, _ = fmt.Fprintf(out, "ok %s\n", modDir)
-	return nil
+	return goEnv(modDir, append([]string{"get"}, paths...)...)
 }
+
+func goBuild(modDir string) error { return goEnv(modDir, "build", "./...") }
 
 // printDiff prints the lines that differ, a line at a time.
 func printDiff(out io.Writer, oldS, newS string) {

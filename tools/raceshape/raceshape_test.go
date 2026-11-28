@@ -3,9 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"go/parser"
 	"go/token"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -390,13 +390,14 @@ func snapshotTree(t *testing.T, root string) map[string]string {
 func withFakes(t *testing.T, tree string, version string) *[]string {
 	t.Helper()
 	var calls []string
-	oldResolve, oldGet := resolveCeleris, runGoGet
+	oldResolve, oldGet, oldBuild := resolveCeleris, runGoGet, runGoBuild
 	resolveCeleris = func(rev string) (string, string, error) { return tree, version, nil }
-	runGoGet = func(modDir, v string, noBuild bool, out io.Writer) error {
+	runGoGet = func(modDir, v string) error {
 		calls = append(calls, filepath.Base(modDir)+"@"+v)
 		return nil
 	}
-	t.Cleanup(func() { resolveCeleris, runGoGet = oldResolve, oldGet })
+	runGoBuild = func(modDir string) error { return nil }
+	t.Cleanup(func() { resolveCeleris, runGoGet, runGoBuild = oldResolve, oldGet, oldBuild })
 	return &calls
 }
 
@@ -540,5 +541,36 @@ func TestFloorIsTheLargestReading(t *testing.T) {
 	}
 	if c := r.scenario("C").FloorRPS; r.FloorRPS < c || r.FloorRPS >= c+FloorGranularity {
 		t.Errorf("floor %.0f is not reading C (%.0f) rounded up to %d", r.FloorRPS, c, FloorGranularity)
+	}
+}
+
+// A build failure after the files were written is not "changed nothing": the
+// error says so, lists every module that failed (not only the first) and names
+// the files to restore.
+func TestRepinReportsAPartlyMovedTreeOnABuildFailure(t *testing.T) {
+	ws := repinWorkspace(t)
+	const next = "v1.5.12-0.20261126122750-ff7df5231102"
+	withFakes(t, celerisTree(t, nil), next)
+	runGoBuild = func(modDir string) error { return errors.New("build failed in " + filepath.Base(modDir)) }
+	out, err := runRepin(t, "ff7df5231102", "-repo", ws)
+	if err == nil {
+		t.Fatalf("a build failure did not fail the re-pin:\n%s", out)
+	}
+	msg := err.Error()
+	for _, want := range []string{"PARTLY MOVED", "build failed in auth_session_ratelimit", "build failed in kitchen_sink",
+		"git -C " + ws + " checkout -- ", "cmd/validator/race_shape_test.go", "validation/refapp/kitchen_sink/go.mod", "validation/refapp/kitchen_sink/go.sum"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the error lacks %q:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(out, "done: re-pinned") {
+		t.Errorf("a failed re-pin said it was done:\n%s", out)
+	}
+	// A go get failure is the same kind of failure.
+	ws = repinWorkspace(t)
+	withFakes(t, celerisTree(t, nil), next)
+	runGoGet = func(modDir, v string) error { return errors.New("go get failed") }
+	if _, err := runRepin(t, "ff7df5231102", "-repo", ws); err == nil || !strings.Contains(err.Error(), "PARTLY MOVED") {
+		t.Fatalf("want a partly-moved error for a go get failure, got %v", err)
 	}
 }
