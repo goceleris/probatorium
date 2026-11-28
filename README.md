@@ -955,6 +955,32 @@ What a race run records about itself (schema 5.23, record only, nothing new is g
   `race-<run id>`, lifetime fixed at 150m inside the job's 180 minute limit, each step bounded to 5 minutes), as the weekend soak does.
   The bench tier runs it too, with a 1 s fine series by default (tag `bench-<run id>`; [details](#the-host-sampler-beside-a-bench)).
 
+**The race tier shapes the load of ONE cell (no schema bump).** The adaptive cell is sized 2 workers x
+110 walkers so the controller's promotion fires, and under the race detector's slowdown the closed-loop
+walker fleet of the `auth_session_ratelimit` adaptive cell saturated its two engine loops (a fourth
+`SLOW_CLASS` echo, now and then a reset-type counter). With `-race-tier`, in that cell only (both arches),
+each Markov walker now starts a request at most once per `raceAdaptiveMarkovMinPeriod`
+(`cmd/validator/matrix.go`, which carries the derivation): open loop, so the fleet offers at most
+67 walkers / period requests a second whatever the response time, where it had sent about 16.6k when the
+cell saturated. The worker, walker and connection counts are unchanged, no threshold, N or timeout moves,
+and every other cell is closed-loop exactly as before: the other seven refapps' adaptive cells (green at
+full load; they run 77 Markov walkers), every pure engine and every non-race tier. Shaping costs
+race-detector coverage, so another refapp's adaptive cell joins only if a run shows a SLOW or reset-type
+counter in that cell with the loops busy, never pre-emptively. The cell says so: `tier_1.load_shaping` has
+the reason, `walkers`, `markov_walkers` and `markov_min_period_us`, and is omitted everywhere else. The
+field is additive in schema 5.24 and does not bump it, so the documents of every other tier are
+byte-identical to before. Promotion is still gated in every default race run
+(`VALIDATE_GATE_EXPECT_ADAPTIVE_SWITCH`); a shaped cell that misses it says it was shaped, and a shaped cell
+without a `-race` build (`I-RACE`) fails the gate.
+
+The period is derived, not picked: the controller refuses to promote on a tick whose bytes per request are
+at or above 8192, which sets a floor on the engine's request rate while a healthy 64 KiB echo runs, and the
+period is the longest one whose fleet ceiling stays 15% above that floor (and clearly below the rate that
+saturated). `go run ./tools/raceshape repin <celeris commit>` re-derives both at another celeris commit and
+moves the celeris pin of the refapps to it in one step; it stops, changing nothing, if the controller there
+no longer matches what the derivation assumes. `go run ./tools/raceshape check` verifies the repository
+agrees with its pin.
+
 The two streaming slices are **routed**. Once per cell, the tier probes `/ws` and `/events` with the
 exact request its walker sends, and skips the slice when the reference app answers 404; only
 `auth_session_ratelimit` routes them today. The verdict is recorded per cell (`ws_route_probed` /

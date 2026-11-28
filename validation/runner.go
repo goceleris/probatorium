@@ -206,6 +206,14 @@ type Config struct {
 	// nothing. cmd/validator sets report.WSEchoSlowTolerance under
 	// -race-tier, which the playbook passes in the race tier only.
 	WSEchoSlowTolerance int
+
+	// MarkovMinPeriod, when > 0, is the least time between the STARTS of two
+	// requests of one Markov walker (open loop; see runMarkovWalker). Zero, the
+	// default and every cell but the race tier's adaptive one, leaves the
+	// walkers closed-loop exactly as they always ran. cmd/validator sets it
+	// (raceAdaptiveMarkovMinPeriod) and Tier 1 records it in the cell document
+	// (tier_1.load_shaping).
+	MarkovMinPeriod time.Duration
 }
 
 // Default returns Config defaults; CLI flag binders use these as the
@@ -1115,6 +1123,8 @@ func (o *Orchestrator) runTierProperty(ctx context.Context, violations chan<- In
 		Matrix:      o.matrix,
 		Seed:        0x6c656c6f, // 'lelo' — distinct from Tier 3's
 		Concurrency: concurrency,
+		// Zero for every cell but the race tier's adaptive one.
+		MarkovMinPeriod: o.cfg.MarkovMinPeriod,
 		// Driver.Start happens inside driveTier1 so the PID isn't
 		// available until after waitForReady. The PIDChan callback
 		// fires once the refapp is bound; the orchestrator stashes
@@ -2083,6 +2093,7 @@ func (s tier1TallySnapshot) Tier1Summary() *report.Tier1Summary {
 		H2CHangSpan:         s.H2CChurn.HangSpan,
 		WSHandshakeFailSpan: s.WSTorture.HandshakeFailSpan,
 		RefappSched:         cloneRefappSched(s.RefappSched),
+		LoadShaping:         cloneLoadShaping(s.LoadShaping),
 		RefappStderrTail:    append([]string(nil), s.RefappStderrTail...),
 		WSEcho: map[string]int64{
 			"ws_echo_route_probed":    b2i(s.WSEcho.RouteProbed),
@@ -2374,6 +2385,16 @@ func resolveConcurrency(d time.Duration, envOverride string, floor int) int {
 		concurrency = floor
 	}
 	return concurrency
+}
+
+// cloneLoadShaping copies the record so a cell document does not alias the live
+// snapshot; nil stays nil, which keeps the key out of every unshaped cell.
+func cloneLoadShaping(l *report.LoadShaping) *report.LoadShaping {
+	if l == nil {
+		return nil
+	}
+	c := *l
+	return &c
 }
 
 // informationalSummary projects the checker's informational twins onto the

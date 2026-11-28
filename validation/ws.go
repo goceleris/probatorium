@@ -313,6 +313,12 @@ func fireWSTorture(ctx context.Context, hostPort, path string,
 	readStart := time.Now()
 	nRead := 0
 	fail := func(err error, status string) {
+		if readErrorAfterCancel(ctx, err) {
+			// The walker's own context was cancelled before this read
+			// ended: the connection went with the harness's stop, not a
+			// server fault (probatorium#595). Nothing is counted or filed.
+			return
+		}
 		cause := tally.recordHandshakeFail(err, status)
 		at := time.Now()
 		tally.handshakeFailSpan.mark(at, tally.capture.stamp(at, cause, err, conn))
