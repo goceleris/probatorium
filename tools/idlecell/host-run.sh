@@ -2,6 +2,8 @@
 # The host half of idle-cell-baremetal.yml: runs ON the measured host (its self-hosted runner), one subcommand per
 # workflow step, so that each stage's artifact is uploaded when that stage ends.
 #
+#   host-run.sh preflight    every tool the job uses is on the host (named when not), before anything else: refuses a host that lacks one
+#   host-run.sh restore      put perf_event_paranoid back if this run lowered it (idempotent; the workflow runs it with if: always())
 #   host-run.sh facts        what the host is, as FOUND (nothing is changed); the CPU sets, power sources and perf probes
 #   host-run.sh stage a      the #1485 gate cells: main, head, head-aw, main-skip at 100/1,000/10,000/50,000 idle
 #                            keep-alive connections, epoll, IC_PASSES passes (pass 2 reversed), plus the idle baseline
@@ -23,7 +25,7 @@ mkdir -p "$IC_OUT/facts"
 if [ "$IC_DRY" = true ]; then
 	PASSES=1 PAIRS=1 NS="1000" VARIANTS="main" B1_ENGINES="epoll" B1_COUNT=3 DRY_STAGE_B_ONLY_B1=1
 else
-	PASSES=$IC_PASSES PAIRS=$IC_PAIRS NS="${IC_NS:-100 1000 10000 50000}" VARIANTS="main head head-aw main-skip" B1_ENGINES="epoll iouring adaptive" B1_COUNT=8 DRY_STAGE_B_ONLY_B1=0
+	PASSES=$IC_PASSES PAIRS=$IC_PAIRS NS="${IC_NS:-100 1000 10000 50000}" VARIANTS="main head head-aw main-skip main-twin" B1_ENGINES="epoll iouring adaptive" B1_COUNT=8 DRY_STAGE_B_ONLY_B1=0
 fi
 C_NS="${IC_C_NS:-10000 50000}" # IC_NS and IC_C_NS exist for the plumbing test in a container only; the workflow never sets them
 GAP=2
@@ -35,7 +37,7 @@ stop_tools() {
 	kill $(jobs -p) 2>/dev/null
 	pkill -f 'idlehold-server-|/idleclient|idlecost-' 2>/dev/null
 }
-trap 'stop_tools; echo "host-run.sh: stopped by a signal" >&2; exit 143' TERM INT HUP
+trap 'stop_tools; cmd_restore; echo "host-run.sh: stopped by a signal" >&2; exit 143' TERM INT HUP
 
 # the state a run must leave as it found it: governor, driver, boost, idle states, kernel. Read, never written.
 state_snapshot() {
@@ -54,6 +56,30 @@ state_snapshot() {
 	echo "cpuidle disable flags (all cpus, count of 1): $(cat /sys/devices/system/cpu/cpu*/cpuidle/state*/disable 2>/dev/null | grep -c 1)"
 	echo "smt: $(cat /sys/devices/system/cpu/smt/control 2>/dev/null || echo n/a)"
 	echo "thp: $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo n/a)"
+	echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo n/a)"
+}
+
+cmd_preflight() {
+	preflight_tools
+}
+
+# restore: put kernel.perf_event_paranoid back to the value found, if (and only if) this run lowered it. Idempotent; run by the workflow's
+# always() step, by finish, and by the trap of every stage on a signal. Failing to restore is loud.
+cmd_restore() {
+	local prevf=$IC_OUT/facts/paranoid-prev out=$IC_OUT/facts/paranoid.txt prev method cur
+	[ -f "$prevf" ] || { echo "restore: this run did not change perf_event_paranoid"; return 0; }
+	[ ! -f "$IC_OUT/facts/paranoid-restored" ] || { echo "restore: perf_event_paranoid was already restored"; return 0; }
+	read -r prev method <"$prevf"
+	cur=$(cat "$PARANOID" 2>/dev/null || echo n/a)
+	[ "$cur" = "$prev" ] || paranoid_write "$prev" "$method" || true
+	cur=$(cat "$PARANOID" 2>/dev/null || echo n/a)
+	if [ "$cur" = "$prev" ]; then
+		echo "perf_event_paranoid: restored to $prev (verified: it reads $cur) at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$out"
+		: >"$IC_OUT/facts/paranoid-restored"
+	else
+		echo "::error::perf_event_paranoid could NOT be restored: found $prev, it reads $cur now. Restore it by hand on ${IC_HOST:-the host}" | tee -a "$out"
+		return 1
+	fi
 }
 
 cmd_facts() {
@@ -86,11 +112,12 @@ cmd_facts() {
 	cpu_sets
 	discover_power
 	probe_perf
-	local nofile_ok=0 hard
+	nofile_ok=0
+	local hard
 	ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 	hard=$(ulimit -Sn)
 	{ [ "$hard" = unlimited ] || [ "$hard" -ge 120000 ]; } && nofile_ok=1
-	local iou=0
+	iou=0
 	[ "$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)" = 0 ] && iou=1
 	{
 		echo "== CPU sets chosen: server (4 physical cores) $SERVER_CPUS ; holder of the idle connections (other cores, same host) $CLIENT_CPUS"
@@ -104,10 +131,7 @@ cmd_facts() {
 		echo "== hwmon names:"
 		for d in /sys/class/hwmon/hwmon*; do echo "$(basename "$d"): $(cat "$d/name" 2>/dev/null)"; done 2>&1 | head -20
 	} >>"$f" 2>&1
-	{
-		printf 'export SERVER_CPUS=%q CLIENT_CPUS=%q POWER_SPEC=%q PERF_STAT=%q PERF_ENERGY=%q NOFILE_OK=%q IOURING_OK=%q\n' \
-			"$SERVER_CPUS" "$CLIENT_CPUS" "$POWER_SPEC" "$PERF_STAT" "$PERF_ENERGY" "$nofile_ok" "$iou"
-	} >"$IC_OUT/facts/env.sh"
+	write_env
 	state_snapshot >"$IC_OUT/facts/state-before.txt"
 	cat "$f"
 	# a host that is not quiet is not measured: refuse with the numbers, before any cell (and the load stays on record)
@@ -121,6 +145,79 @@ cmd_facts() {
 		waited=$((waited + 10))
 	done
 	echo "quiet check passed: load1 $(load1) <= $IC_MAXLOAD (waited ${waited}s)"
+	(cd "$IC_BIN" && sha256sum -- *) >"$IC_OUT/facts/binary-sha256.txt" 2>&1 || true
+	lower_paranoid_if_needed
+	write_availability
+	cat "$IC_OUT/facts/availability.txt"
+}
+
+write_env() {
+	printf 'export SERVER_CPUS=%q CLIENT_CPUS=%q POWER_SPEC=%q PERF_STAT=%q PERF_ENERGY=%q NOFILE_OK=%q IOURING_OK=%q\n' \
+		"$SERVER_CPUS" "$CLIENT_CPUS" "$POWER_SPEC" "$PERF_STAT" "$PERF_ENERGY" "$nofile_ok" "$iou" >"$IC_OUT/facts/env.sh"
+}
+
+# The one conditional change (see lib.sh): lower perf_event_paranoid for the job when perf is refused ONLY by it and this user may change it.
+lower_paranoid_if_needed() {
+	local out=$IC_OUT/facts/paranoid.txt prev method t need_kernel need_energy had_kernel=$PERF_KERNEL had_energy=0 improved=0
+	prev=$(cat "$PARANOID" 2>/dev/null || echo n/a)
+	echo "perf_event_paranoid as found: $prev" >"$out"
+	[ -z "$PERF_ENERGY" ] || had_energy=1
+	if ! command -v perf >/dev/null 2>&1; then echo "perf is not installed on this host: nothing to lower, the run is CPU-only" >>"$out"; return 0; fi
+	[ "$prev" != n/a ] || { echo "perf_event_paranoid is not readable: not changed" >>"$out"; return 0; }
+	want() { # sets need_kernel / need_energy from the current probe
+		need_kernel=0 need_energy=0
+		[ "$PERF_KERNEL" = 1 ] || need_kernel=1
+		if [ -z "$PERF_ENERGY" ] && ! grep -q 'counter:' <<<"$POWER_SPEC"; then need_energy=1; fi
+	}
+	want
+	if [ "$need_kernel" = 0 ] && [ "$need_energy" = 0 ]; then echo "perf already counts user and kernel instructions and an energy source is readable: not changed" >>"$out"; return 0; fi
+	if ! grep -qiE 'paranoid|permission|access to performance|not permitted' <<<"$PERF_ERR"; then
+		echo "perf is not refused by perf_event_paranoid (its output: $(printf '%s' "$PERF_ERR" | tr '\n' '|' | cut -c1-300)): not changed" >>"$out"
+		return 0
+	fi
+	method=$(paranoid_method)
+	if [ "$method" = no ]; then
+		echo "perf_event_paranoid=$prev refuses perf and the runner user may not change it (the file is not writable and there is no passwordless root): NOT changed. Where perf is refused the run is CPU-only" >>"$out"
+		return 0
+	fi
+	printf '%s %s\n' "$prev" "$method" >"$IC_OUT/facts/paranoid-prev" # the previous value is on record BEFORE the change
+	for t in 1 0; do
+		[ "$prev" -gt "$t" ] || continue
+		[ "$t" = 1 ] || [ "$need_energy" = 1 ] || break
+		paranoid_write "$t" "$method" || { echo "writing $t by $method failed" >>"$out"; break; }
+		echo "perf_event_paranoid lowered from $prev to $t by $method (for this job only; the always() restore step puts $prev back)" >>"$out"
+		probe_perf
+		want
+		[ "$need_kernel" = 1 ] || [ "$had_kernel" = 1 ] || improved=1
+		[ -z "$PERF_ENERGY" ] || [ "$had_energy" = 1 ] || improved=1
+		{ [ "$need_kernel" = 0 ] && [ "$need_energy" = 0 ]; } && break
+	done
+	if [ "$improved" = 0 ]; then
+		echo "lowering did not make perf count more: restoring now" >>"$out"
+		cmd_restore
+		probe_perf
+	fi
+	write_env
+}
+
+write_availability() {
+	local f=$IC_OUT/facts/availability.txt instr energy
+	if [ -n "$PERF_STAT" ]; then
+		if [ "$PERF_KERNEL" = 1 ]; then instr="instructions and cycles: counted for the server process, user AND kernel"
+		else instr="instructions and cycles: counted in USER MODE ONLY (kernel-side counting refused): kernel work is not seen"; fi
+	else
+		instr="instructions and cycles: NOT MEASURED ($(command -v perf >/dev/null 2>&1 && echo "perf refused: $(printf '%s' "$PERF_ERR" | tr '\n' '|' | cut -c1-160)" || echo 'perf is not installed'))"
+	fi
+	if [ -n "$POWER_SPEC" ]; then energy="energy: read from ${POWER_SPEC%%=*} (and the other readable sources of facts/host-facts.txt)"
+	elif [ -n "$PERF_ENERGY" ]; then energy="energy: perf power/energy-pkg (system-wide)"
+	else energy="energy: NOT MEASURED (no RAPL or hwmon source readable by this user, perf's energy event refused or absent)"; fi
+	{
+		echo "$instr"
+		echo "$energy"
+		if [ -z "$PERF_STAT" ] && [ -z "$POWER_SPEC" ] && [ -z "$PERF_ENERGY" ]; then
+			echo "THIS HOST RUNS CPU-ONLY: instructions and energy are NOT MEASURED; the verdicts can only be 'NO LOSS ON CPU ONLY' or UNDECIDED (or INCOMPLETE)"
+		fi
+	} >"$f"
 }
 
 load_env() {
@@ -171,6 +268,18 @@ cmd_stage_a() {
 		done
 	done
 	[ "$IC_DRY" = true ] || run_baseline "$out" "baseline-n0-pass$((PASSES + 1))"
+	if [ "$IC_DRY" = true ]; then
+		# the dry-run starts every other build too (head, head-aw, main-skip: one cell each at N=100, 5 s window), so that a broken
+		# isolation build fails the DRY RUN, not the real run; their sha256 were verified against the build job's record by the workflow
+		local sv
+		for sv in head head-aw main-skip; do
+			run_idle_cell "$IC_OUT/smoke" "$sv-n100-pass1" "$sv" epoll 100 5s 3s
+			if ! grep -q '^IDLE ' "$IC_OUT/smoke/$sv-n100-pass1.srv.txt" 2>/dev/null; then
+				echo "smoke $sv: no IDLE line: this build does not run"
+				echo "smoke-$sv" >>"$IC_OUT/FAILED-CELLS.txt"
+			fi
+		done
+	fi
 	stage_end a
 }
 
@@ -248,6 +357,7 @@ cmd_stage_c() {
 }
 
 cmd_finish() {
+	cmd_restore || true # idempotent: the workflow's always() step has normally done it already
 	state_snapshot >"$IC_OUT/facts/state-after.txt"
 	if diff -u "$IC_OUT/facts/state-before.txt" "$IC_OUT/facts/state-after.txt" >"$IC_OUT/facts/state-diff.txt"; then
 		echo "state (governor, driver, boost, idle states, kernel): identical before and after"
@@ -263,6 +373,8 @@ cmd_finish() {
 }
 
 case "${1:-}" in
+preflight) cmd_preflight ;;
+restore) cmd_restore ;;
 facts) cmd_facts ;;
 stage)
 	load_env

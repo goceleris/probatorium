@@ -30,7 +30,7 @@ Each stage's artifact exists as soon as the stage ends, while the job goes on: `
 `stages` takes `a,b,c` (default), `a,b`, `a`, `b,c`, `b`, `c` or `a,c`. The job ends cleanly after the last stage requested (the steps of the
 others are skipped), so `stages=a,b` frees the cluster after the first-request cells. Other inputs: `celeris_main_sha` (empty: origin/main at
 dispatch, recorded), `celeris_head_sha` (default `783d0019`), `celeris_old_sha` (default `ab0da663`), `passes` (3), `pairs` (10; `run` refuses
-fewer than 3 and 10), `max_load` (1.0), `server_cpus` / `client_cpus` (override of the CPU sets), `reason`.
+fewer than 3 and 10), `max_load` (1.0), `server_cpus` / `client_cpus` (override of the CPU sets), `require_perf` (default false: refuse a host without perf in the preflight), `reason`.
 
 ## Job graph, and why it cannot touch a run that is going
 
@@ -68,8 +68,13 @@ only between this run's bootstrap and teardown (runners are ephemeral and de-reg
 workflow can overlap it. The bootstrap registers a runner on every cluster host, as for the tiers (the idle ones are not measured). The host script records
 what else it sees (`ps` by CPU, `vmstat`, the timers, the load) before the first cell, and refuses to start if load1 stays above `max_load` for 180 s.
 
-It changes nothing on the host: no sudo, no package, no kernel parameter, no governor, no idle state, no IRQ, no file under `/sys` or `/proc` written
-(a test scans the scripts). It reads, pins its processes with `taskset`, and records what is missing. The governor, the cpuidle states, the kernel, the load
+It changes nothing on the host: no package, no governor, no idle state, no IRQ, no sysctl, no file under `/sys` or `/proc` written (a test scans the scripts),
+with ONE conditional exception, `kernel.perf_event_paranoid`: when perf is refused ONLY by it and the runner user may change it (the file is writable by that user, or the runner already has
+passwordless root, `sudo -n true`; it is never tried otherwise, and sudo is never used to install or prompt), the facts step lowers it (to 1 for kernel-side counting of the server, to 0 only when
+perf's system-wide energy is the only energy source) for the job's own duration. The previous value is written to `facts/paranoid-prev` BEFORE the change, both values are in `facts/paranoid.txt`
+and in the table header, and `host-run.sh restore` puts it back in a step with `if: always()` (failure, cancellation and timeout included), again in `finish`, and from a trap in every stage on a signal;
+failing to restore is a red error naming the value. `state-diff.txt` proves the host is as found (it includes the parameter). If it cannot be made readable the run is CPU-only, and the table header says so.
+It reads, pins its processes with `taskset`, and records what is missing. The governor, the cpuidle states, the kernel, the load
 average, the CPU model and frequency are recorded as FOUND, before and after (`facts/state-before.txt`, `state-after.txt`, `state-diff.txt`).
 
 Per cell: the server (`idlehold-server-<arm>`, epoll or io_uring, `Workers` unset) pinned to four CPUs on four distinct physical cores; the holder of the idle
@@ -84,13 +89,12 @@ above that baseline.
 
 | need | if missing |
 |---|---|
-| `taskset`, `timeout`, `ss`, `pgrep`, `vmstat` (util-linux, coreutils, iproute2, procps) | the job aborts with the missing name |
+| `taskset`, `timeout`, `ss`, `pgrep`, `pkill`, `vmstat`, `python3`, `awk`, `sort`, `ps`, `sha256sum`, bash 4+, `env --default-signal` (and `perf` when `require_perf=true`) | a PREFLIGHT, the first step on the host (before the download, the facts and any cell; the dry-run runs it too), stops the job naming every missing tool |
 | at least 6 CPUs allowed to the job (4 for the server, 2 for the holder) | aborts |
 | open-files limit (soft raised to the hard) of at least 120,000 | the 50,000-connection cells are skipped, INDEX says `SKIP-nofile` |
 | `kernel.io_uring_disabled=0` | io_uring cells are skipped (`SKIP-iouring`) |
-| `perf` (not installed by us) and `perf_event_paranoid` low enough | user-only (`instructions:u`, `cycles:u`) if kernel counting is refused; otherwise "none" in the table |
+| `perf` (not installed by us) and `perf_event_paranoid` low enough | lowered for the job only under the conditions above; else user-only (`instructions:u`, `cycles:u`) if kernel counting is refused; else CPU-only, and the table header says so |
 | RAPL powercap `energy_uj` readable (usually root-only on recent kernels), or `perf stat -a -e power/energy-pkg/` allowed | other readable hwmon `energy*_input` / `power*_input`; otherwise "none" |
-| `python3` | the stage's table is not rendered on the host; the collect job renders every table from the artifacts |
 
 ## Stages, and the expected minutes per host
 
@@ -100,28 +104,41 @@ hold and shutdown) and from the plumbing test in a container; the dry-run measur
 | stage | what | runs | expected | uploaded when it ends |
 |---|---|---|---|---|
 | setup | build (hosted, in parallel with nothing on the cluster), bootstrap of the runners, facts and the quiet check | | build 5, bootstrap 5 to 15 (a cold runner cache: 25), facts 1 | `idlecell-raw-<host>-facts-<run>` |
-| a | the #1485 gate: epoll, main / head / head-aw / main-skip at 100, 1,000, 10,000, 50,000 idle keep-alive connections, 3 passes (pass 2 reversed: N descending, the later builds first), an idle baseline at the start of each pass and at the end | 3 x 16 cells + 4 baselines | about 31 | `idlecell-raw-<host>-stage-a-<run>`: `a/` (INDEX, raw logs), `TABLE-a.md` (the gate table with the decision rule) |
+| a | the #1485 gate: epoll, main / head / head-aw / main-skip / **main-twin** (the main binary run a second time as its own variant: the noise) at 100, 1,000, 10,000, 50,000 idle keep-alive connections, 3 passes (pass 2 reversed: N descending, the later builds first), an idle baseline at the start of each pass and at the end | 3 x 20 cells + 4 baselines | about 39 | `idlecell-raw-<host>-stage-a-<run>`: `a/` (INDEX, raw logs), `TABLE-a.md` (the gate table with the decision rule) |
 | b | the paired first-request cells, 2 s gap, ABBA pairs, 10 pairs: b1 empty server, the OLD 4 ms build (ab0da663) against main, for epoll, io_uring and adaptive (60 runs); b2 1,000 connections held, main against head, epoll, for #1485 (20 runs) | 80 runs | about 33 (b1) + 18 (b2) = 51 | `idlecell-raw-<host>-stage-b-<run>`: `b1/`, `b2/`, `TABLE-b.md` |
 | c | io_uring, main against head, 10,000 and 50,000 connections, 3 passes (pass 2 reversed), for the record | 12 cells + 2 baselines | about 10 | `idlecell-raw-<host>-stage-c-<run>` |
 | end | the state as found against the state before, the verdict on the cells, teardown | | teardown 3 to 6 | `-final-`, then the report |
 
-Host job: about 95 minutes for `a,b,c` (ceiling 230: the job's `timeout-minutes` is 20 + 80 for a + 100 for b + 30 for c, per stages requested); the whole run about 2 hours. `stages=a`:
-about 35 minutes on the host. Dry-run: about 5 minutes on the host (ceiling 40), about 25 minutes whole.
+Host job: about 103 minutes for `a,b,c` (ceiling 250: the job's `timeout-minutes` is 20 + 100 for a + 100 for b + 30 for c, per stages requested); the whole run about 2 hours 10 minutes. `stages=a,b`: about 92 minutes on the host;
+`stages=a`: about 41. Dry-run: about 6 minutes on the host (ceiling 40: facts, one gate cell, the smoke start of head, head-aw and main-skip at N=100, one empty-server pair), about 26 minutes whole.
 
 ## The reader
 
-`tools/idlecell/reader.py` (standard library; `python3 -I`) turns the raw logs into the tables, on the host when a stage ends (`TABLE-<stage>.md`, also in the step summary)
+`tools/idlecell/reader.py` (builtins and a few core modules; `python3 -I`) turns the raw logs into the tables, on the host when a stage ends (`TABLE-<stage>.md`, also in the step summary)
 and in the `collect` job for the whole report (`REPORT.md` per host: host as found, every stage, data quality, the failed cells, and `PROVENANCE.txt`: the binaries' sha256 and what they are
 made of). Gate table, per N: process CPU for main / head / head-aw / main-skip with the per-pass values and the ranges, the head - main difference by pass, wake-ups per
 second per loop, loop-thread CPU, microseconds per wake, instructions and cycles per second (user and kernel), package energy in watts above the idle baseline; the paired
-first-request differences with n, median, spread and the sign test; and the bot's decision rule under the table:
+first-request differences with n, median, spread and the sign test; the twin's spread per count; and the decision rule under the table. **The tolerance is the main-against-main twin's spread, not a constant**:
+stage a runs the same main binary as two variants, `main` and `main-twin`, interleaved in the same passes (pass 2 reversed); the twin spread of a measure at a count is the **largest per-pass absolute
+difference between the two, max over the passes of |main - main-twin|** (CPU in points, instructions in M/s, energy in W), so with 3 passes it is the largest of 3 differences. A head - main difference inside it is
+"equal". "Higher" at a count needs the median over the passes above main's by more than the twin spread AND head above main in more than half of the same-pass pairs. Only when the twin spread is 0 (identical figures in every
+pass, a twin that cannot show noise) a documented floor is used and printed: one clock tick (0.05 point) for CPU, 1 % of main's for instructions, 0.05 W for energy. The CPU comparison is done in integer millionths, so float
+rounding cannot decide a one-tick difference. The numbers (main, head, the difference, the twin spread, the tolerance, the passes won) are printed beside every verdict.
 
-> head at or below main at every count (CPU, or instructions plus energy) => **no loss**; head's CPU higher but instructions and energy not higher => **accounting effect**;
-> instructions or energy higher on head => **real loss**; loss reproduced at 100 to 1,000 => **no merge: the bot takes the table to Albert**.
+The owner's rule:
+(i) head's CPU not above main's at every count => **NO LOSS** (when instructions and energy were not both measured: **NO LOSS ON CPU ONLY (instructions and energy not measured)**);
+(ii) head's CPU above main's at any count => **UNDECIDED**; **ACCOUNTING EFFECT** only when instructions (user AND kernel) and energy were measured and neither is higher;
+(iii) instructions or energy higher on head => **REAL LOSS**, only when they were measured, with the numbers beside the word; a real loss at 100 to 1,000 => **NO MERGE: the bot takes the table to Albert**.
+A count missing for main, head or the twin in any pass (skipped, failed) is named and the run reads **UNDECIDED, INCOMPLETE**, never "at every count". A figure the host could not measure is said so, never read as equal.
 
-"Higher" at a count means: the median over the passes is above main's by more than a tolerance (CPU 0.05 point, one clock tick over the window; instructions 1 %; energy 0.05 W)
-AND head is above main in more than half of the same-pass pairs. A figure the host could not measure is said so (`UNDECIDED`), never read as equal. The reader reproduces the
-figures of the laptop-VM measurement (`SUMMARY.md` of m1485, sections 2, 4 and 6) from its raw data: `tools/idlecell/reader_test.py` with the fixtures in `tools/idlecell/testdata`.
+| verdict, on each host | action |
+|---|---|
+| NO LOSS on both hosts (with or without "ON CPU ONLY") | merge #1485 through the chain with both tables in its body; then #1488 retargets and merges on green |
+| REAL LOSS on either host | no merge; the table goes to the bot |
+| UNDECIDED (CPU higher somewhere, nothing else measured), or INCOMPLETE | no merge tonight; the table plus the isolation builds' rows (head-aw, main-skip) go to the bot |
+
+The reader reproduces the figures of the laptop-VM measurement (`SUMMARY.md` of m1485, sections 2, 4 and 6) from its raw data (`tools/idlecell/reader_test.py`, fixtures in `tools/idlecell/testdata`; the laptop run had no twin,
+so its decision reads INCOMPLETE, which the test asserts), and every verdict of the rule on synthetic cells, including the one-tick edge (1.90 against 1.95, 0.25 against 0.30) and a clear-margin energy loss.
 
 ## Where the ruling could not be followed literally
 
@@ -129,15 +146,15 @@ figures of the laptop-VM measurement (`SUMMARY.md` of m1485, sections 2, 4 and 6
   instrumentation the laptop's builds carried. They test the same two hypotheses; their figures are not byte-comparable with the laptop's.
 - **The first-request cell on an empty server** uses `idlecost` as the existing paired design does (`curve-epoll/run.sh`): the client is in the same process, on the server's four CPUs; the run is
   8 requests on new connections after a 2 s gap, with a 10 s idle window in front (not the gate's 20 s). The 1,000-held cell uses a separate holder process on other cores (`firstreq-epoll.sh`).
-- **No main-vs-main twin pairs** (the noise calibration of m1485 section 4) are in the ruling and are not in the stages; they would add about 18 minutes to stage b if the bot wants them.
-- **Energy** may be "none": the kernel gives RAPL `energy_uj` to root only on recent kernels, and the ruling forbids changing the host (no sysctl, no chmod, no sudo). The same for perf's
-  kernel-side counting under a high `perf_event_paranoid`. The dry-run's facts say which on each host before the full run; msr1's board exposure (hwmon, powercap) is whatever it is.
+- **Stage b has no main-vs-main twin pairs** (the noise calibration of m1485 section 4): the twin is in stage a, where the decision is; stage b's paired differences carry their sign test and spread only.
+- **Energy** may be "none": the kernel gives RAPL `energy_uj` to root only on recent kernels, and nothing may be changed on the host for it (no chmod). perf's kernel-side counting and perf's energy may be refused
+  by `perf_event_paranoid`; the only change allowed is lowering that one parameter for the job under the conditions above. The dry-run's facts say which on each host before the full run; msr1's board exposure (hwmon, powercap) is whatever it is.
 - **The CPU sets** are chosen by the script: the server on 4 distinct physical cores (a core is the set of CPUs sharing `core_cpus_list`), the highest `cpu_capacity` first, so msr1's
   big.LITTLE SoC puts the server on its big cores; the holder on other cores. celeris plans its loops from the CPUs the process may use, so the taskset mask places them; each run's IDLE line
   records `loop_cpus`. `server_cpus` / `client_cpus` override. perf on a heterogeneous host prints one line per core type: the reader sums them.
-- **Likely outcome to expect**: if both unprivileged perf kernel-side counting and RAPL are denied on a host (RAPL's `energy_uj` is root-only on recent kernels; `perf_event_paranoid` is 2 or higher on
-  stock Ubuntu), the table has CPU, wake-ups and (user-only) instructions at best, and a head CPU that is higher at a count reads `UNDECIDED` or `ACCOUNTING EFFECT` on user instructions alone, never
-  `real loss` on kernel work or energy it could not see. The dry-run's facts show which it is on each host, before the full run; nothing may be changed on the host to improve it.
+- **Likely outcome to expect**: if kernel-side perf and RAPL are both unavailable on a host and cannot be made readable, the table header says `THIS HOST RUNS CPU-ONLY`; the verdict can then be only `NO LOSS ON CPU ONLY (instructions and energy
+  not measured)` (CPU not above main's, beyond the twin's spread, at every count), `UNDECIDED` (CPU higher somewhere) or `INCOMPLETE`, never `ACCOUNTING EFFECT` or `REAL LOSS` on work or energy it could not see.
+- **The dry-run starts every build** (head, head-aw, main-skip: one cell each at N=100, 5 s window, after the main cell) besides verifying every binary's sha256 against the build job's record, so a broken isolation build fails the DRY RUN.
 - **The load threshold** is 1.0 on a bare-metal host (4 on the laptop): a host above it waits, then runs `forced` (recorded per cell), and the job refuses to start above it.
 - **The bootstrap and teardown are the house ones** (cluster-runner-up / cluster-runner-down): they run Ansible against all three hosts before and after the job (runner install in the runner's directory,
   cleanup, forensics), never during the cells. They install no system package.

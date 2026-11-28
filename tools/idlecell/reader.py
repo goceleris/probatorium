@@ -19,11 +19,14 @@ import sys
 from math import comb
 
 # ---------------------------------------------------------------- the decision rule (the bot's ruling, 2026-11-27)
-TOL_CPU = 0.05      # process CPU is counted in clock ticks of 10 ms over a 20 s window: 0.05 point is one tick
-TOL_INS = 0.01      # instructions per second: 1 % of main's
-TOL_W = 0.05        # package power above the host's idle baseline, in W
+# No fixed tolerance decides anything: the tolerance is the main-against-main twin's spread (see decide). These are the floors used ONLY when
+# the twin's spread is 0 (identical figures in every pass), and are printed when used.
+TOL_CPU_FLOOR = 0.05  # CPU is counted in clock ticks of 10 ms over a 20 s window: 0.05 point is one tick
+INS_FLOOR_REL = 0.01  # instructions per second: 1 % of main's
+FLOOR_W = 0.05        # package power, W
 LOW_N = (100, 1000)  # "loss reproduced at 100 to 1,000"
-VARIANTS = ("main", "head", "head-aw", "main-skip")
+EXPECT_NS = (100, 1000, 10000, 50000)  # the counts of stage a
+VARIANTS = ("main", "head", "head-aw", "main-skip", "main-twin")
 
 
 def kv(line):
@@ -268,15 +271,33 @@ def gate_tables(d, alias=None, prefix="", only_n=None, title="Gate cells"):
     out.append("")
     # per-pass differences head - main, and the isolation builds against their base
     out.append("### CPU difference by pass (point of one CPU; same pass)\n")
-    out.append("| N | head - main | head-aw - head | main-skip - main |")
-    out.append("|---|---|---|---|")
+    out.append("| N | head - main | head-aw - head | main-skip - main | main-twin - main (the noise) |")
+    out.append("|---|---|---|---|---|")
     for n in ns:
         def diff(a, b):
             ca, cb = dict(cells.get((a, n), [])), dict(cells.get((b, n), []))
             x = [ca[p]["cpu"] - cb[p]["cpu"] for p in sorted(set(ca) & set(cb)) if ca[p].get("cpu") is not None and cb[p].get("cpu") is not None]
             return ", ".join("%+.2f" % y for y in x) if x else "-"
-        out.append("| %s | %s | %s | %s |" % ("{:,}".format(n), diff("head", "main"), diff("head-aw", "head"), diff("main-skip", "main")))
+        out.append("| %s | %s | %s | %s | %s |" % ("{:,}".format(n), diff("head", "main"), diff("head-aw", "head"), diff("main-skip", "main"), diff("main-twin", "main")))
     out.append("")
+    _all = [c for cs in cells.values() for _, c in cs]
+    src_ = pick_energy(_all + base) if base else pick_energy(_all)
+    if any(k[0] == "main-twin" for k in cells):
+        out.append("### The twin's spread: the tolerance of the decision (max over the passes of |main - main-twin|, same pass; 0 means the documented floor is used)\n")
+        out.append("| N | CPU (point) | instructions (M/s, user+kernel when counted) | energy (W) |")
+        out.append("|---|---|---|---|")
+        for n in ns:
+            cm_, ct_ = dict(cells.get(("main", n), [])), dict(cells.get(("main-twin", n), []))
+            common = sorted(set(cm_) & set(ct_))
+            if not common:
+                continue
+
+            def sp(fn, scale=1.0):
+                d = [abs(fn(ct_[p]) - fn(cm_[p])) for p in common if fn(ct_[p]) is not None and fn(cm_[p]) is not None]
+                return "%.3g" % (max(d) / scale) if d else "not measured"
+            ins = lambda c: (c["ins_u"] + c["ins_k"]) if c.get("ins_u") is not None and c.get("ins_k") is not None else c.get("ins_u")
+            out.append("| %s | %s | %s | %s |" % ("{:,}".format(n), sp(lambda c: c.get("cpu")), sp(ins, 1e6), sp(lambda c, s=src_: c["energy"].get(s)) if src_ else "not measured"))
+        out.append("")
     out.append("### Wake-ups, loop threads, time per wake (median [min..max] over passes)\n")
     out.append("| N | build | wake-ups/s per loop | loop-thread CPU % (sum) | us per wake (loop CPU / wake-ups) | other-thread switches/s | RSS MiB |")
     out.append("|---|---|---|---|---|---|---|")
@@ -342,77 +363,145 @@ def gate_tables(d, alias=None, prefix="", only_n=None, title="Gate cells"):
     if lc:
         out.append("- the loop threads were pinned to CPUs (loop_cpus, as the runs saw them): %s." % "; ".join(lc[:6]))
     out.append("- every run printed SHUTDOWN: %s." % ("yes" if not sd else "NO, %d did not: %s" % (len(sd), ", ".join(sorted({s[:40] for s in sd})))))
-    return out, {"cells": cells, "src": src, "base": bw}
+    return out, {"cells": cells, "src": src, "base": bw, "idx": idx}
 
 
-def decide(cells, src, base_w):
-    """the bot's decision rule, per N and overall. Returns lines."""
-    out = []
-    ns = sorted({n for (v, n) in cells if v == "main" and (("head", n) in cells)})
-    if not ns:
-        return ["(no N has both main and head: no decision)"]
-    verdicts = {}
-    for n in ns:
-        cm, ch = dict(cells[("main", n)]), dict(cells[("head", n)])
-        ps = sorted(set(cm) & set(ch))
-        if not ps:
+def gt(diff, tol):
+    """diff > tol, compared in millionths: the CPU figures come in steps of one clock tick (0.05 point over 20 s) and 1.95 - 1.90 must not
+    be 'more than one tick' because of how binary floats round (1.95 - 1.90 = 0.04999..., 2.45 - 2.40 = 0.05000...)"""
+    return round(diff * 1e6) > round(tol * 1e6)
+
+
+def decide(cells, src, base_w, expect_ns=EXPECT_NS, idx=None):
+    """The decision rule, per count and overall. The tolerance is NOT a constant: it is the spread of the main-against-main TWIN on this host at this
+    count: the same main binary run as the variants 'main' and 'main-twin', interleaved in the same passes, so the largest absolute per-pass difference
+    between the two, max over passes of |main_p - main-twin_p|, is what two identical builds differ by here. A head - main difference inside it is
+    'equal'. Only when that spread is 0 (identical figures in every pass: a twin that cannot show noise) a documented floor is used: one clock tick
+    (0.05 point) for CPU, 1 % of main for instructions, FLOOR_W for energy.
+    (i)   head's CPU not above main's at every count => NO LOSS ('NO LOSS ON CPU ONLY (instructions and energy not measured)' when they were not both measured);
+    (ii)  head's CPU above main's at any count => UNDECIDED, and ACCOUNTING EFFECT only when instructions (user AND kernel) and energy were measured
+          and neither is higher;
+    (iii) instructions or energy higher on head => REAL LOSS, only when measured, with the numbers beside the word.
+    A count missing for main, head or the twin in any pass is named and the whole reads UNDECIDED (INCOMPLETE), never 'at every count'."""
+    idx = idx or {}
+    seen = [p for cs in cells.values() for p, _ in cs] + [int(m.group(1)) for t in idx for m in [re.search(r"-pass(\d+)$", t)] if m and not t.startswith("baseline")]
+    passes_exp = max(seen or [1])
+    out, verdicts, missing = [], {}, []
+    fn_ = lambda n: "{:,}".format(n)
+
+    for n in expect_ns:
+        got = {v: dict(cells.get((v, n), [])) for v in ("main", "head", "main-twin")}
+        why = []
+        for var in ("main", "head", "main-twin"):
+            lost = [p for p in range(1, passes_exp + 1) if p not in got[var]]
+            if lost:
+                reasons = sorted({idx.get("%s-n%d-pass%d" % (var, n, p), {}).get("rc", "no result") for p in lost})
+                why.append("%s pass %s (%s)" % (var, ",".join(map(str, lost)), "; ".join(reasons)))
+        if why:
+            missing.append(n)
+            verdicts[n] = ("MISSING", "N = %s: NOT COMPARED, missing: %s." % (fn_(n), "; ".join(why)))
             continue
+        cm, ch, ct = got["main"], got["head"], got["main-twin"]
+        ps = sorted(set(cm) & set(ch) & set(ct))
 
-        def higher(key, tol, rel=False, fn=None):
-            f = fn or (lambda c, k=key: c.get(k))
-            pairs = [(f(ch[p]), f(cm[p])) for p in ps if f(ch[p]) is not None and f(cm[p]) is not None]
-            if not pairs:
-                return None, None
-            mh, mm = med([a for a, _ in pairs]), med([b for _, b in pairs])
-            t = tol * mm if rel else tol
-            wins = sum(1 for a, b in pairs if a > b)
-            return (mh - mm > t and wins * 2 > len(pairs)), (mh - mm, wins, len(pairs))
+        def prs(a, b, fn):
+            return [(fn(a[p]), fn(b[p])) for p in ps if fn(a[p]) is not None and fn(b[p]) is not None]
 
-        cpu_h, cpu_d = higher("cpu", TOL_CPU)
-        ins_h, ins_d = higher("ins", TOL_INS, rel=True, fn=lambda c: (c["ins_u"] + (c["ins_k"] or 0.0)) if c.get("ins_u") is not None else None)
-        if src:
-            en_h, en_d = higher("w", TOL_W, fn=lambda c, s=src: c["energy"].get(s))
+        def measure(fn, floor_of):
+            """(head-vs-main pairs, twin-vs-main pairs, tolerance, twin spread, floor used)"""
+            hp, tp = prs(ch, cm, fn), prs(ct, cm, fn)
+            if not hp or len(tp) != len(hp):
+                return None
+            mm = med([b for _, b in hp])
+            sp = max(abs(a - b) for a, b in tp)
+            floor_used = round(sp * 1e6) == 0
+            return hp, tp, (floor_of(mm) if floor_used else sp), sp, floor_used
+
+        def verdict_of(m):
+            hp = m[0]
+            mh, mm = med([a for a, _ in hp]), med([b for _, b in hp])
+            wins = sum(1 for a, b in hp if a > b)
+            return gt(mh - mm, m[2]) and wins * 2 > len(hp), mm, mh, wins, len(hp)
+
+        tw = lambda sp, fl, unit, scale=1.0: "twin spread %s%s%s" % ("%.3g" % (sp / scale), unit, " (0: the documented floor %.3g%s is used)" % (fl / scale, unit) if round(sp * 1e6) == 0 else "")
+        ins_fn = lambda c: (c["ins_u"] + c["ins_k"]) if c.get("ins_u") is not None and c.get("ins_k") is not None else None
+        cpu_m = measure(lambda c: c.get("cpu"), lambda mm: TOL_CPU_FLOOR)
+        ins_full = measure(ins_fn, lambda mm: INS_FLOOR_REL * mm)
+        ins_m = ins_full or measure(lambda c: c.get("ins_u"), lambda mm: INS_FLOOR_REL * mm)
+        en_m = measure(lambda c, s=src: c["energy"].get(s), lambda mm: FLOOR_W) if src else None
+        notm = []
+        if ins_m is None:
+            notm.append("instructions")
+        elif ins_full is None:
+            notm.append("kernel-side instructions (user mode only)")
+        if en_m is None:
+            notm.append("energy")
+        if cpu_m is None:
+            missing.append(n)
+            verdicts[n] = ("MISSING", "N = %s: NOT COMPARED, no CPU figure." % fn_(n))
+            continue
+        cpu_h, mc, hc, wc, nc = verdict_of(cpu_m)
+        nums = ["CPU main %.2f head %.2f point (head above main in %d of %d passes; %s; tolerance %.3g)" % (mc, hc, wc, nc, tw(cpu_m[3], TOL_CPU_FLOOR, " point"), cpu_m[2])]
+        ins_h = en_h = False
+        if ins_m:
+            ins_h, mi, hi, wi, ni = verdict_of(ins_m)
+            nums.append("instructions%s main %.2f head %.2f M/s (%+.1f %%, head above in %d of %d passes; twin spread %.3g M/s%s; tolerance %.3g M/s)"
+                        % ("" if ins_full else " (user mode only)", mi / 1e6, hi / 1e6, 100 * (hi - mi) / mi if mi else 0, wi, ni, ins_m[3] / 1e6, " (0: floor used)" if ins_m[4] else "", ins_m[2] / 1e6))
+        if en_m:
+            en_h, mw, hw, ww, nw = verdict_of(en_m)
+            nums.append("energy main %.3f head %.3f W (%+.3f W, head above in %d of %d passes; twin spread %.3f W%s; tolerance %.3f W)"
+                        % (mw, hw, hw - mw, ww, nw, en_m[3], " (0: floor used)" if en_m[4] else "", en_m[2]))
+        num_s = "; ".join(nums)
+        full = ins_full is not None and en_m is not None
+        if ins_h or en_h:
+            kinds = " and ".join(k for k, f in (("instructions", ins_h), ("energy", en_h)) if f)
+            verdicts[n] = ("REAL LOSS", "N = %s: REAL LOSS (%s higher on head, measured). %s." % (fn_(n), kinds, num_s))
+        elif cpu_h:
+            if full:
+                verdicts[n] = ("ACCOUNTING EFFECT", "N = %s: ACCOUNTING EFFECT (head's CPU is higher; instructions user+kernel and energy were measured and are not higher). %s." % (fn_(n), num_s))
+            else:
+                verdicts[n] = ("UNDECIDED", "N = %s: UNDECIDED (head's CPU is higher; NOT MEASURED: %s). %s." % (fn_(n), ", ".join(notm), num_s))
+        elif full:
+            verdicts[n] = ("NO LOSS", "N = %s: NO LOSS (head's CPU is not higher; instructions and energy are not higher). %s." % (fn_(n), num_s))
         else:
-            en_h, en_d = None, None
-        if cpu_h is None:
-            v = "NO DATA (no CPU figure)"
-        elif not cpu_h:
-            v = "NO LOSS (head's CPU is not higher than main's)"
-        elif ins_h or en_h:
-            v = "REAL LOSS (head's CPU is higher and %s higher)" % " and ".join(x for x, f in (("instructions", ins_h), ("energy", en_h)) if f)
-        elif ins_h is None and en_h is None:
-            v = "CPU HIGHER, UNDECIDED (instructions and energy were not measured on this host)"
-        else:
-            v = "ACCOUNTING EFFECT (head's CPU is higher, instructions %s and energy %s are not)" % ("measured" if ins_h is not None else "NOT MEASURED", "measured" if en_h is not None else "NOT MEASURED")
-        if ins_h is not None and not all(ch[p].get("ins_k") is not None and cm[p].get("ins_k") is not None for p in ps):
-            v += " [instructions counted in USER mode only: kernel-side work is not seen]"
-        verdicts[n] = v
+            verdicts[n] = ("NO LOSS ON CPU ONLY", "N = %s: NO LOSS ON CPU ONLY (head's CPU is not higher; NOT MEASURED: %s). %s." % (fn_(n), ", ".join(notm), num_s))
 
-        def fmt(x, unit):
-            return "n/a" if x is None else "%+.3g %s (head above main in %d of %d passes)" % (x[0], unit, x[1], x[2])
-        out.append("- N = %s: %s. CPU: %s; instructions: %s; energy: %s." % ("{:,}".format(n), v, fmt(cpu_d, "point"), fmt(ins_d, "instr/s"), fmt(en_d, "W")))
+    for n in expect_ns:
+        out.append("- " + verdicts[n][1])
     out.append("")
-    real_low = [n for n in ns if n in LOW_N and verdicts.get(n, "").startswith("REAL LOSS")]
-    real_any = [n for n in ns if verdicts.get(n, "").startswith("REAL LOSS")]
-    acct = [n for n in ns if verdicts.get(n, "").startswith("ACCOUNTING")]
-    undec = [n for n in ns if verdicts.get(n, "").startswith("CPU HIGHER")]
+    kinds = {n: verdicts[n][0] for n in expect_ns}
+    fmt = lambda ns: ", ".join(fn_(n) for n in ns)
+    real_low = [n for n in expect_ns if n in LOW_N and kinds[n] == "REAL LOSS"]
+    real_any = [n for n in expect_ns if kinds[n] == "REAL LOSS"]
+    undec = [n for n in expect_ns if kinds[n] == "UNDECIDED"]
+    acct = [n for n in expect_ns if kinds[n] == "ACCOUNTING EFFECT"]
+    cpu_only = [n for n in expect_ns if kinds[n] == "NO LOSS ON CPU ONLY"]
+    note = (" Counts NOT COMPARED: %s." % fmt(missing)) if missing else ""
     if real_low:
-        out.append("**OVERALL: REAL LOSS reproduced at %s. NO MERGE: the bot takes the table to Albert.**" % ", ".join("{:,}".format(n) for n in real_low))
+        out.append("**OVERALL: REAL LOSS reproduced at %s (numbers in the lines above). NO MERGE: the bot takes the table to Albert.**%s" % (fmt(real_low), note))
     elif real_any:
-        out.append("**OVERALL: REAL LOSS at %s (not at 100 to 1,000). The bot decides.**" % ", ".join("{:,}".format(n) for n in real_any))
+        out.append("**OVERALL: REAL LOSS at %s (not at 100 to 1,000; numbers above). No merge: the table goes to the bot.**%s" % (fmt(real_any), note))
+    elif missing:
+        out.append("**OVERALL: UNDECIDED, INCOMPLETE: not every count was compared, so there is no verdict for the run. Counts NOT COMPARED: %s (see the lines above for what is missing).**" % fmt(missing))
     elif undec:
-        out.append("**OVERALL: UNDECIDED at %s: head's CPU is higher and neither instructions nor energy could be measured on this host. The bot decides with the other host's table.**" % ", ".join("{:,}".format(n) for n in undec))
+        out.append("**OVERALL: UNDECIDED at %s: head's CPU is higher and instructions (user and kernel) or energy were NOT MEASURED, so neither a loss nor an accounting effect is shown. No merge tonight: the table plus the isolation builds' rows go to the bot.**" % fmt(undec))
     elif acct:
-        out.append("**OVERALL: ACCOUNTING EFFECT at %s (head's CPU is higher, instructions and energy are not); NO LOSS elsewhere.**" % ", ".join("{:,}".format(n) for n in acct))
-    elif verdicts:
-        out.append("**OVERALL: NO LOSS: head is at or below main at every count.**")
+        out.append("**OVERALL: ACCOUNTING EFFECT at %s (head's CPU is higher; instructions user+kernel and energy measured, not higher); no loss at the other counts.**" % fmt(acct))
+    elif cpu_only:
+        out.append("**OVERALL: NO LOSS ON CPU ONLY (instructions and energy not measured): head's CPU is not above main's, beyond the twin's spread, at any of %s. This is a CPU comparison, not a measurement of instructions or energy.**" % fmt(expect_ns))
+    else:
+        out.append("**OVERALL: NO LOSS: head is at or below main at every count (%s), instructions and energy measured and not higher.**" % fmt(expect_ns))
     return out
 
 
-RULE = """**The bot's decision rule** (reader.py, TOL_CPU = %.2f point = one clock tick over the window, TOL_INS = %d %% of main's, TOL_W = %.2f W): head at or below main at every
-count (CPU, or instructions plus energy) => **no loss**; head's CPU higher but instructions and energy not higher => **accounting effect**; instructions or energy higher on
-head => **real loss**; loss reproduced at 100 to 1,000 => **no merge: the bot takes the table to Albert**. "Higher" at a count means: the median over the passes is above
-main's by more than the tolerance AND head is above main in more than half of the same-pass pairs. A figure the host could not measure is said so, never read as equal.""" % (TOL_CPU, TOL_INS * 100, TOL_W)
+RULE = """**The decision rule** (reader.py). The tolerance is the spread of the MAIN-AGAINST-MAIN TWIN on this host at this count, not a constant: stage a runs the same main binary as two variants, `main` and `main-twin`, interleaved in the same passes (pass 2 reversed); the twin spread of a measure is the largest per-pass absolute difference between them, max over the passes of |main - main-twin| (CPU in points, instructions in M/s, energy in W); a head - main difference inside it is equal, and "higher" needs the median over the passes above main's by more than it AND head above main in more than half of the same-pass pairs. Only when the twin spread is 0 (identical figures in every pass) a documented floor is used and printed: one clock tick (%.2f point) for CPU, %d %% of main's for instructions, %.2f W for energy. CPU is compared in integer millionths, so float rounding cannot decide a one-tick difference.
+(i) head's CPU not above main's at every count => **NO LOSS** (when instructions and energy were not both measured: **NO LOSS ON CPU ONLY (instructions and energy not measured)**); (ii) head's CPU above main's at any count => **UNDECIDED**, and **ACCOUNTING EFFECT** only when instructions (user and kernel) and energy were measured and neither is higher; (iii) instructions or energy higher on head => **REAL LOSS**, only when measured, with the numbers beside the word; a real loss at 100 to 1,000 => **NO MERGE: the bot takes the table to Albert**. A count missing for main, head or the twin in any pass is named and the whole reads UNDECIDED (INCOMPLETE). A figure the host could not measure is said so, never read as equal.
+
+| verdict on a host | action |
+|---|---|
+| NO LOSS on both hosts (with or without "ON CPU ONLY") | merge #1485 through the chain with both tables in its body; then #1488 retargets and merges on green |
+| REAL LOSS on either host | no merge; the table goes to the bot |
+| UNDECIDED (CPU higher somewhere, nothing else measured), or INCOMPLETE | no merge tonight; the table plus the isolation builds' rows go to the bot |""" % (TOL_CPU_FLOOR, INS_FLOOR_REL * 100, FLOOR_W)
 
 
 # ---------------------------------------------------------------- first-request tables
@@ -502,6 +591,14 @@ def facts_summary(out):
     return ["```"] + keep + ["```"]
 
 
+def availability(out):
+    """what this host could measure, from facts/availability.txt (written by host-run.sh facts): the table's header says CPU-only when it was"""
+    t = read(os.path.join(out, "facts", "availability.txt"))
+    if not t:
+        return ["**Measurement availability: not recorded (facts/availability.txt is missing).**", ""]
+    return ["**Measurement availability on this host** (as the host job found it):", ""] + ["- " + l for l in t.strip().splitlines()] + [""]
+
+
 def wall(d):
     idx = read_index(d)
     tot = sum(num(r.get("wall_s")) or 0 for r in idx.values())
@@ -515,13 +612,14 @@ def stage_md(stage, out):
         if not os.path.isdir(d):
             return ["## Stage a: not run"]
         lines.append("## Stage a: the #1485 gate cells (epoll)\n")
+        lines += availability(out)
         t, n = wall(d)
         lines.append("%d cells, %.1f min of cell wall time.\n" % (n, t / 60))
-        g, info = gate_tables(d, title="main / head / head-aw / main-skip")
+        g, info = gate_tables(d, title="main / head / head-aw / main-skip / main-twin")
         lines += g
         lines.append("")
         if info:
-            lines += decide(info["cells"], info["src"], info["base"])
+            lines += decide(info["cells"], info["src"], info["base"], EXPECT_NS, info["idx"])
         lines.append("")
         lines.append(RULE)
     elif stage == "b":
@@ -539,6 +637,7 @@ def stage_md(stage, out):
         if not os.path.isdir(d):
             return ["## Stage c: not run"]
         lines.append("## Stage c: io_uring, main against head, for the record\n")
+        lines += availability(out)
         g, info = gate_tables(d, prefix="iouring-", title="io_uring, main / head")
         lines += g
         lines.append("\nFor the record only: the decision rule is for epoll (stage a).")
@@ -571,8 +670,12 @@ def main(argv):
                 only = [int(x) for x in argv[i + 1].split(",")]
         g, info = gate_tables(argv[2], alias, prefix, only)
         print("\n".join(g))
+        expect = EXPECT_NS
+        for i, a_ in enumerate(argv):
+            if a_ == "--expect":
+                expect = tuple(int(x) for x in argv[i + 1].split(","))
         if info:
-            print("\n".join(decide(info["cells"], info["src"], info["base"])))
+            print("\n".join(decide(info["cells"], info["src"], info["base"], expect, info["idx"])))
     elif len(argv) >= 3 and argv[1] == "empty":
         print("\n".join(empty_tables(argv[2])))
     elif len(argv) >= 5 and argv[1] == "held":

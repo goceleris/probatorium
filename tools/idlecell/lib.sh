@@ -104,28 +104,67 @@ discover_power() {
 }
 
 # probe_perf: does perf exist, and which of the events this run needs does it count for this user? Sets PERF_STAT and
-# PERF_ENERGY (command prefixes for the tool, empty when not usable) and PERF_NOTES. perf is never installed.
+# PERF_ENERGY (command prefixes for the tool, empty when not usable), PERF_KERNEL (1 when the user AND kernel counts work), PERF_NOTES (the
+# record) and PERF_ERR (perf's own refusals, without our header lines). perf is never installed.
 probe_perf() {
-	PERF_STAT="" PERF_ENERGY="" PERF_NOTES=""
+	PERF_STAT="" PERF_ENERGY="" PERF_NOTES="" PERF_ERR="" PERF_KERNEL=0
 	if ! command -v perf >/dev/null 2>&1; then PERF_NOTES="perf: not installed on this host (instructions, cycles and perf's energy: none)"; return; fi
 	PERF_NOTES="perf: $(perf --version 2>&1 | head -1); kernel.perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo '?')"$'\n'
 	local out ev
 	for ev in "duration_time,instructions:u,instructions:k,cycles:u,cycles:k" "duration_time,instructions:u,cycles:u"; do
 		out=$(perf stat -x, -e "$ev" -- true 2>&1 || true)
 		PERF_NOTES+="probe [$ev]:"$'\n'"$out"$'\n'
+		PERF_ERR+="$out"$'\n'
 		if ! grep -qE 'not supported|not counted|Permission|permission|Operation not|No such|Access to performance' <<<"$out" && grep -q instructions <<<"$out"; then
 			PERF_STAT="taskset -c $CLIENT_CPUS perf stat -x, -e $ev"
+			# shellcheck disable=SC2034
+			case "$ev" in *instructions:k*) PERF_KERNEL=1 ;; esac
 			break
 		fi
 	done
 	out=$(perf stat -a -x, -e duration_time,power/energy-pkg/ -- true 2>&1 || true)
 	PERF_NOTES+="probe [power/energy-pkg/ system-wide]:"$'\n'"$out"$'\n'
+	PERF_ERR+="$out"$'\n'
 	if ! grep -qE 'not supported|not counted|Permission|permission|Operation not|No such|Access to performance|invalid|Invalid|unknown' <<<"$out" && grep -q energy-pkg <<<"$out"; then
 		PERF_ENERGY="taskset -c $CLIENT_CPUS perf stat -x, -a -e duration_time,power/energy-pkg/"
 	fi
 }
 
-# run_idle_cell <dir> <tag> <variant> <engine> <N> [window] [settle]: ONE cell. The server is pinned to SERVER_CPUS, the
+# The ONE host setting this workflow may change, and only under conditions: kernel.perf_event_paranoid, lowered for the job's own duration
+# when perf is refused ONLY by it and the runner user is allowed to change it (the file is writable by the user, or the runner has passwordless
+# root: `sudo -n true`). It is never tried otherwise. The previous value is written to facts/paranoid-prev BEFORE the change, and restored by
+# `host-run.sh restore`, which the workflow runs in a step with if: always() and which a trap in every stage also runs on a signal.
+PARANOID=${IC_PARANOID_FILE:-/proc/sys/kernel/perf_event_paranoid} # IC_PARANOID_FILE: the plumbing test in a container only
+paranoid_method() { # direct | root (passwordless, already there) | no
+	if [ -w "$PARANOID" ]; then echo direct
+	elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then echo root
+	else echo no; fi
+}
+paranoid_write() { # value method: the only writes to /proc of this workflow
+	case "$2" in
+	direct) echo "$1" >"$PARANOID" ;; # paranoid-write
+	root) sudo -n sh -c "echo $1 >$PARANOID" ;; # paranoid-write
+	*) return 1 ;;
+	esac
+}
+
+# preflight_tools: every tool the host job uses, checked FIRST, with the missing names in the message, before any download, probe or cell.
+preflight_tools() {
+	local missing=() c
+	for c in taskset timeout ss pgrep pkill vmstat python3 awk sort ps sha256sum tr cut grep sed date; do
+		command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+	done
+	[ "${IC_REQUIRE_PERF:-false}" != true ] || command -v perf >/dev/null 2>&1 || missing+=("perf (require_perf=true)")
+	[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || missing+=("bash >= 4 (found ${BASH_VERSION:-unknown})")
+	env --default-signal=INT true >/dev/null 2>&1 || missing+=("env --default-signal (coreutils >= 8.31)")
+	if [ "${#missing[@]}" -gt 0 ]; then
+		die "preflight: the host lacks: ${missing[*]}. Nothing was run. This workflow installs nothing on a host: provide the tool, or the dry-run will keep refusing"
+	fi
+	echo "preflight ok: $(for c in taskset timeout ss pgrep vmstat python3; do printf '%s=%s ' "$c" "$(command -v "$c")"; done)perf=$(command -v perf || echo absent) (perf is optional unless require_perf=true)"
+}
+
+# run_idle_cell <dir> <tag> <variant> <engine> <N> [window] [settle]: ONE cell. The variant main-twin runs the binary of main: the same build
+# twice, interleaved, whose difference is the noise the decision's tolerance is taken from. The server is pinned to SERVER_CPUS, the
 # holder of the N idle keep-alive connections to CLIENT_CPUS of the same host; no container. Writes <tag>.srv.txt (the
 # tool's lines), .cli.txt, .perf.txt, .pe.txt, .srv.err, and an INDEX line. Never fails the script: rc is recorded.
 run_idle_cell() {
@@ -144,7 +183,7 @@ run_idle_cell() {
 	fi
 	cap=$(($(secs "$window") + $(secs "$settle") + 240))
 	w0=$(date +%s)
-	timeout -k 10 "$cap" taskset -c "$SERVER_CPUS" "$IC_BIN/idlehold-server-$v" -engine "$eng" -workers 0 -addr "$IC_ADDR" \
+	timeout -k 10 "$cap" taskset -c "$SERVER_CPUS" "$IC_BIN/idlehold-server-${v%-twin}" -engine "$eng" -workers 0 -addr "$IC_ADDR" \
 		-window "$window" -settle "$settle" -conns "$n" -power "$POWER_SPEC" \
 		-perf "$PERF_STAT" -perf-out "$dir/$tag.perf.txt" -perf-energy "$PERF_ENERGY" -perf-energy-out "$dir/$tag.pe.txt" \
 		>"$dir/$tag.srv.txt" 2>"$dir/$tag.srv.err" &

@@ -99,6 +99,11 @@ on:
         type: string
         required: false
         default: ""
+      require_perf:
+        description: "Refuse a host without perf in the preflight. Default false: perf is optional, and the run is CPU-only (the table header says so) where perf cannot count."
+        type: boolean
+        required: false
+        default: false
       reason:
         description: "Why (one line, up to 200 characters). Recorded in the step summary and the artifacts."
         type: string
@@ -185,7 +190,7 @@ jobs:
           [ "$IN_MODE" != dry-run ] || stages="a,b"
           # the host job's ceiling: 20 min of setup plus a generous bound per stage (docs/IDLE-CELL.md has the expected minutes)
           t=20
-          case ",$stages," in *,a,*) t=$((t + 80)) ;; esac
+          case ",$stages," in *,a,*) t=$((t + 100)) ;; esac
           case ",$stages," in *,b,*) t=$((t + 100)) ;; esac
           case ",$stages," in *,c,*) t=$((t + 30)) ;; esac
           [ "$IN_MODE" != dry-run ] || t=40
@@ -382,6 +387,7 @@ jobs:
       max_load: ${{ inputs.max_load }}
       server_cpus: ${{ inputs.server_cpus }}
       client_cpus: ${{ inputs.client_cpus }}
+      require_perf: ${{ inputs.require_perf }}
       host_timeout: ${{ fromJSON(needs.plan.outputs.host_timeout) }}
       guard_checked_at: ${{ needs.cluster-guard.outputs.checked_at }}
     secrets:

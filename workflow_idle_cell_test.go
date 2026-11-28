@@ -141,22 +141,87 @@ func TestIdleCellEntersTheGroupOnlyBehindTheGuards(t *testing.T) {
 	}
 }
 
-// What the host job may do to a host: nothing but read it.
+// What the host job may do to a host: nothing but read it, with ONE conditional exception: kernel.perf_event_paranoid, lowered for the job when
+// perf is refused by it and the runner user may change it (writable file, or passwordless root), restored by a step that always runs. The two
+// writes are the lines tagged `# paranoid-write` in tools/idlecell/lib.sh; everything else that changes or removes something is forbidden.
 func TestIdleCellHostScriptsChangeNothing(t *testing.T) {
 	files, _ := filepath.Glob("tools/idlecell/*.sh")
 	files = append(files, idleCellCluster)
 	forbidden := regexp.MustCompile(`(?m)(^|[^a-z_-])(sudo|apt-get|apt|dpkg|systemctl (start|stop|restart|enable|disable)|sysctl +-w|cpupower|modprobe|insmod|rmmod|grubby|update-grub|reboot|shutdown|rm +-|rm +/|git clean|chmod +-R|chown)( |$)`)
-	redirect := regexp.MustCompile(`>+ *"?/(sys|proc)/`)
+	redirect := regexp.MustCompile(`>+ *"?(/(sys|proc)/|\$PARANOID)`)
+	tagged := 0
 	for _, f := range files {
 		src := withoutComments(string(idleCellRead(t, f)))
 		for i, line := range strings.Split(src, "\n") {
-			if forbidden.MatchString(line) {
+			if strings.Contains(string(idleCellRead(t, f)), "# paranoid-write") && strings.Contains(line, "# paranoid-write") {
+				// withoutComments dropped the tag from src; this branch is for files where it survived
+				tagged++
+				continue
+			}
+			l := strings.ReplaceAll(strings.ReplaceAll(line, "sudo -n true", ""), "command -v sudo", "")
+			if forbidden.MatchString(l) {
 				t.Errorf("%s:%d changes or removes something on the host: %s", f, i+1, strings.TrimSpace(line))
 			}
 			if redirect.MatchString(line) {
 				t.Errorf("%s:%d writes under /sys or /proc: %s", f, i+1, strings.TrimSpace(line))
 			}
 		}
+	}
+	// the tagged writes: exactly the two of paranoid_write, in lib.sh, and nowhere else
+	raw := string(idleCellRead(t, "tools/idlecell/lib.sh"))
+	if n := strings.Count(raw, "# paranoid-write"); n != 2 {
+		t.Errorf("lib.sh has %d tagged paranoid writes, want exactly 2 (direct and sudo -n)", n)
+	}
+	for _, f := range files {
+		if f != "tools/idlecell/lib.sh" && strings.Contains(string(idleCellRead(t, f)), "paranoid-write") {
+			t.Errorf("%s carries a paranoid write tag: only lib.sh may write it", f)
+		}
+	}
+	// every use of sudo is `sudo -n` (passwordless root the runner already has: it never prompts and never installs anything) or the `command -v sudo` probe
+	for _, f := range files {
+		for i, line := range strings.Split(withoutComments(string(idleCellRead(t, f))), "\n") {
+			if strings.Contains(line, "sudo") && !strings.Contains(line, "sudo -n") && !strings.Contains(line, "command -v sudo") {
+				t.Errorf("%s:%d uses sudo other than `sudo -n`: %s", f, i+1, strings.TrimSpace(line))
+			}
+		}
+	}
+	_ = tagged
+}
+
+// The preflight is the very first thing the host job does on the host, the restore of perf_event_paranoid always runs, and finish restores too.
+func TestIdleCellPreflightAndRestoreSteps(t *testing.T) {
+	called := idleCellSrc(t, idleCellCluster)
+	host := jobSection(t, called, "host")
+	order := []string{"actions/checkout", "Set the run's paths and parameters", "Preflight, every tool the job uses", "Download the binaries", "Host facts as found, and the quiet check"}
+	last := -1
+	for _, o := range order {
+		i := strings.Index(host, o)
+		if i < 0 || i < last {
+			t.Fatalf("the host job's steps are not in the order %v (at %q)", order, o)
+		}
+		last = i
+	}
+	if !strings.Contains(host, "host-run.sh preflight") {
+		t.Error("the preflight step does not run host-run.sh preflight")
+	}
+	restore := host[strings.Index(host, "Restore perf_event_paranoid (always)"):]
+	if !strings.Contains(restore[:400], "if: ${{ always() && steps.facts.outcome != 'skipped' }}") || !strings.Contains(restore[:400], "host-run.sh restore") {
+		t.Errorf("the restore step does not run with always() after a facts step that started:\n%s", restore[:400])
+	}
+	for _, s := range []string{"a", "b", "c"} {
+		if strings.Index(host, "host-run.sh stage "+s) > strings.Index(host, "Restore perf_event_paranoid (always)") {
+			t.Errorf("stage %s comes after the restore step", s)
+		}
+	}
+	hr := string(idleCellRead(t, "tools/idlecell/host-run.sh"))
+	for _, want := range []string{"trap 'stop_tools; cmd_restore;", "cmd_restore || true # idempotent", `printf '%s %s\n' "$prev" "$method" >"$IC_OUT/facts/paranoid-prev"`} {
+		if !strings.Contains(hr, want) {
+			t.Errorf("host-run.sh lacks %q", want)
+		}
+	}
+	// the previous value is on record BEFORE the first write
+	if strings.Index(hr, "paranoid-prev\"") > strings.Index(hr, "paranoid_write \"$t\"") {
+		t.Error("the previous perf_event_paranoid is recorded after the first write")
 	}
 }
 
@@ -248,7 +313,7 @@ func TestIdleCellPlanRefusesAMalformedRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a good request was refused: %v\n%s", err, out)
 	}
-	for _, want := range []string{`matrix={"include":[{"host":"msr1","arch":"arm64"}]}`, "hosts=msr1", "stages=a,b,c", "dry=false", "probe=false", "main_sha=" + strings.Repeat("a", 40), "host_timeout=230"} {
+	for _, want := range []string{`matrix={"include":[{"host":"msr1","arch":"arm64"}]}`, "hosts=msr1", "stages=a,b,c", "dry=false", "probe=false", "main_sha=" + strings.Repeat("a", 40), "host_timeout=250"} {
 		if !strings.Contains(outputs, want) {
 			t.Errorf("outputs lack %q:\n%s", want, outputs)
 		}
@@ -260,7 +325,7 @@ func TestIdleCellPlanRefusesAMalformedRequest(t *testing.T) {
 	}
 	// stages=a,b stops after b: the ceiling does not include stage c
 	_, outputs, _ = run(map[string]string{"IN_STAGES": "a,b"})
-	if !strings.Contains(outputs, "host_timeout=200") {
+	if !strings.Contains(outputs, "host_timeout=220") {
 		t.Errorf("a,b ceiling:\n%s", outputs)
 	}
 	// both hosts: two host jobs, one group hold

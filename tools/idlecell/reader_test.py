@@ -20,7 +20,7 @@ def run(*args):
 
 class OldData(unittest.TestCase):
     def test_summary_section_2(self):
-        out = run("gate", os.path.join(TD, "m1485-b"))
+        out = run("gate", os.path.join(TD, "m1485-b"), "--expect", "0,1000,10000,50000")
         for want in ("| 1,000 | 1.90 [1.85..1.90] (1.85, 1.90, 1.90) | 2.45 [2.35..2.55] (2.45, 2.55, 2.35) |",
                      "| 10,000 | 3.05 [3.05..3.20]", "| 10,000 | 3.05 [3.05..3.20] (3.20, 3.05, 3.05) | 2.55 [2.40..2.75] (2.75, 2.55, 2.40) |",
                      "| 50,000 | main | 226.8 [225.7..227.9] | 18.304", "| 1,000 | head | 226.7 [225.0..226.9] | 1.275",
@@ -28,7 +28,9 @@ class OldData(unittest.TestCase):
             self.assertIn(want, out)
         self.assertIn("head - main | head-aw - head", out)
         self.assertIn("| 1,000 | +0.60, +0.65, +0.45 |", out)  # head higher in every pass (SUMMARY: -0.60, -0.65, -0.45 as main - head)
-        self.assertIn("**OVERALL: UNDECIDED at 1,000", out)  # no perf and no energy in the laptop VM
+        self.assertIn("**OVERALL: UNDECIDED, INCOMPLETE", out)  # the laptop run had no main-twin: no tolerance, so no decision
+        self.assertIn("main-twin pass 1,2,3 (no result)", out)
+        self.assertNotIn("at every count", out)
 
     def test_summary_section_6(self):
         out = run("gate", os.path.join(TD, "m1485-bdiag"), "--alias", "main-d=main,head-d=head")
@@ -46,8 +48,8 @@ class OldData(unittest.TestCase):
         self.assertIn("**+0.00 [-0.07..+0.10] ms** | 6 of 10 | p = 0.754", twin)
 
 
-def cell(d, tag, cpu, ins=None, w=None, wake=230.0):
-    """one synthetic cell: an IDLE line, and optionally perf (instructions, user only) and an energy line (W)"""
+def cell(d, tag, cpu, ins=None, w=None, wake=230.0, kern=True):
+    """one synthetic cell: an IDLE line, and optionally perf (user and kernel instructions, in M/s) and an energy line (W)"""
     lines = ["READY engine=epoll", "IDLE engine=epoll workers=0 cpus=4 conns=1000 window=20s loop_threads=3 process_cpu_pct=%.3f loop_wakeups_per_s=[%.1f %.1f %.1f] "
              "other_threads_voluntary_per_s=100.0 sched_cpu_pct=1.0 sched_loop_cpu_pct=0.6 sched_other_cpu_pct=0.4 rss_mib=20 win_start_ms=1 win_end_ms=2" % (cpu, wake, wake, wake),
              "SHUTDOWN engine=epoll shutdown=1ms start_err=<nil>"]
@@ -57,52 +59,107 @@ def cell(d, tag, cpu, ins=None, w=None, wake=230.0):
         f.write("\n".join(lines) + "\n")
     if ins is not None:
         with open(os.path.join(d, tag + ".perf.txt"), "w") as f:
-            f.write("20000000000,ns,duration_time,20000000000,100.00,,\n%d,,instructions:u,20000000000,100.00,,\n<not supported>,,instructions:k,0,100.00,,\n" % (ins * 20))
+            total = ins * 1e6 * 20  # M/s over the 20 s window
+            u, k_ = (total * 0.8, total * 0.2) if kern else (total, 0)
+            k = "%d,,instructions:k,20000000000,100.00,,\n" % k_ if kern else "<not supported>,,instructions:k,0,100.00,,\n"
+            f.write("20000000000,ns,duration_time,20000000000,100.00,,\n%d,,instructions:u,20000000000,100.00,,\n" % u + k)
+
+
+def three(x):
+    return x if isinstance(x, list) else [x] * 3
 
 
 class Decision(unittest.TestCase):
-    def verdict(self, main, head, n=1000, base=10.0):
-        """main/head: dict(cpu, ins, w) for three passes"""
+    def verdict(self, main, head, twin=None, n=1000, base=10.0, expect=None, skip_twin=False, extra_args=()):
+        """main/head/twin: dict(cpu=, ins=, w=, kern=) each a number or a list of three (one per pass); twin defaults to main"""
+        twin = twin or main
         with tempfile.TemporaryDirectory() as d:
             for p in (1, 2, 3):
                 if base is not None:
                     cell(d, "baseline-n0-pass%d" % p, 0.3, w=base)
-                for v, spec in (("main", main), ("head", head)):
-                    cell(d, "%s-n%d-pass%d" % (v, n, p), spec["cpu"][p - 1], spec.get("ins", [None] * 3)[p - 1], None if spec.get("w") is None else spec["w"][p - 1])
-            return run("gate", d)
+                for v, spec in (("main", main), ("head", head), ("main-twin", twin)):
+                    if v == "main-twin" and skip_twin:
+                        continue
+                    pick = lambda key: (three(spec[key])[p - 1] if spec.get(key) is not None else None)
+                    cell(d, "%s-n%d-pass%d" % (v, n, p), pick("cpu"), pick("ins"), pick("w"), kern=spec.get("kern", True))
+            return run("gate", d, "--expect", expect or str(n), *extra_args)
 
-    def test_no_loss(self):
-        out = self.verdict(dict(cpu=[2.0, 2.0, 2.0], ins=[5e6] * 3, w=[10.5] * 3), dict(cpu=[1.5, 1.6, 1.5], ins=[4e6] * 3, w=[10.4] * 3))
-        self.assertIn("**OVERALL: NO LOSS", out)
+    def test_no_loss_all_measured(self):
+        out = self.verdict(dict(cpu=2.0, ins=5.0, w=10.5), dict(cpu=1.5, ins=4.0, w=10.4))
+        self.assertIn("**OVERALL: NO LOSS: head is at or below main at every count (1,000)", out)
 
-    def test_accounting_effect(self):
-        out = self.verdict(dict(cpu=[1.9, 1.9, 1.9], ins=[5e6] * 3, w=[10.5] * 3), dict(cpu=[2.4, 2.5, 2.4], ins=[5e6] * 3, w=[10.5] * 3))
-        self.assertIn("ACCOUNTING EFFECT (head's CPU is higher, instructions measured and energy measured are not)", out)
+    def test_rule_i_cpu_only(self):
+        out = self.verdict(dict(cpu=2.0), dict(cpu=2.0), base=None)
+        self.assertIn("**OVERALL: NO LOSS ON CPU ONLY (instructions and energy not measured)", out)
+        self.assertNotIn("**OVERALL: NO LOSS:", out)
+
+    def test_rule_ii_cpu_higher_nothing_measured_is_undecided(self):
+        out = self.verdict(dict(cpu=1.9), dict(cpu=2.4), base=None)
+        self.assertIn("**OVERALL: UNDECIDED at 1,000", out)
+        self.assertIn("NOT MEASURED: instructions, energy", out)
+        self.assertNotIn("ACCOUNTING", out)
+        self.assertNotIn("REAL LOSS", out)
+
+    def test_cpu_higher_user_only_instructions_no_energy_is_undecided(self):
+        out = self.verdict(dict(cpu=1.9, ins=5.0, kern=False), dict(cpu=2.4, ins=5.0, kern=False), base=None)
+        self.assertIn("UNDECIDED (head's CPU is higher; NOT MEASURED: kernel-side instructions (user mode only), energy)", out)
+        self.assertNotIn("ACCOUNTING", out)
+
+    def test_accounting_effect_only_when_everything_is_measured(self):
+        out = self.verdict(dict(cpu=1.9, ins=5.0, w=10.5), dict(cpu=2.4, ins=5.0, w=10.5))
         self.assertIn("**OVERALL: ACCOUNTING EFFECT at 1,000", out)
 
-    def test_real_loss_at_low_n_is_no_merge(self):
-        out = self.verdict(dict(cpu=[1.9] * 3, ins=[5e6] * 3, w=[10.5] * 3), dict(cpu=[2.4] * 3, ins=[6e6] * 3, w=[10.5] * 3))
-        self.assertIn("REAL LOSS (head's CPU is higher and instructions higher)", out)
+    def test_rule_iii_real_loss_has_its_numbers_beside_it(self):
+        out = self.verdict(dict(cpu=1.9, ins=5.0, w=10.5), dict(cpu=2.4, ins=6.0, w=10.5))
+        self.assertIn("N = 1,000: REAL LOSS (instructions higher on head, measured). CPU main 1.90 head 2.40", out)
+        self.assertIn("instructions main 5.00 head 6.00 M/s (+20.0 %", out)
+        self.assertIn("twin spread", out)
         self.assertIn("NO MERGE: the bot takes the table to Albert", out)
-        self.assertIn("W above idle", out)
 
-    def test_user_only_instructions_are_said(self):
-        out = self.verdict(dict(cpu=[1.9] * 3, ins=[5e6] * 3, w=[10.5] * 3), dict(cpu=[2.4] * 3, ins=[5e6] * 3, w=[10.5] * 3))
-        self.assertIn("instructions counted in USER mode only", out)
+    def test_energy_clear_margin_is_a_real_loss_with_numbers(self):
+        out = self.verdict(dict(cpu=1.9, ins=5.0, w=10.50), dict(cpu=1.9, ins=5.0, w=11.20))
+        self.assertIn("REAL LOSS (energy higher on head, measured)", out)
+        self.assertIn("energy main 10.500 head 11.200 W (+0.700 W", out)
 
-    def test_energy_alone_is_a_real_loss(self):
-        out = self.verdict(dict(cpu=[1.9] * 3, ins=[5e6] * 3, w=[10.5] * 3), dict(cpu=[2.4] * 3, ins=[5e6] * 3, w=[10.8] * 3))
-        self.assertIn("higher and energy higher", out)
+    def test_user_only_instructions_higher_is_a_real_loss_and_says_user_only(self):
+        out = self.verdict(dict(cpu=1.9, ins=5.0, kern=False), dict(cpu=1.9, ins=6.0, kern=False), base=None)
+        self.assertIn("REAL LOSS (instructions higher on head, measured)", out)
+        self.assertIn("instructions (user mode only)", out)
 
-    def test_real_loss_only_at_high_n_is_not_a_merge_block(self):
-        out = self.verdict(dict(cpu=[19.0] * 3, ins=[5e6] * 3, w=[10.5] * 3), dict(cpu=[22.0] * 3, ins=[6e6] * 3, w=[10.5] * 3), n=10000)
-        self.assertIn("**OVERALL: REAL LOSS at 10,000 (not at 100 to 1,000). The bot decides.**", out)
+    def test_real_loss_only_at_high_n_does_not_say_no_merge(self):
+        out = self.verdict(dict(cpu=19.0, ins=5.0, w=10.5), dict(cpu=22.0, ins=6.0, w=10.5), n=10000)
+        self.assertIn("**OVERALL: REAL LOSS at 10,000 (not at 100 to 1,000; numbers above). No merge: the table goes to the bot.**", out)
 
-    def test_missing_measurements_are_never_read_as_equal(self):
-        out = self.verdict(dict(cpu=[1.9] * 3), dict(cpu=[2.4] * 3), base=None)
+    def test_one_tick_is_not_higher_whatever_the_float_rounding(self):
+        # twin identical to main: spread 0, the floor (one tick, 0.05) applies and a difference of exactly one tick is NOT higher
+        for m, h in ((1.90, 1.95), (0.25, 0.30), (2.40, 2.45), (1.05, 1.10), (2.35, 2.40)):
+            out = self.verdict(dict(cpu=m), dict(cpu=h), base=None)
+            self.assertIn("NO LOSS ON CPU ONLY", out, "main %.2f head %.2f" % (m, h))
+            self.assertIn("(0: the documented floor 0.05 point is used)", out)
+        out = self.verdict(dict(cpu=1.90), dict(cpu=2.00), base=None)
         self.assertIn("UNDECIDED", out)
-        self.assertIn("none: perf did not count", out)
-        self.assertIn("no power or energy source was readable", out)
+
+    def test_the_tolerance_is_the_twins_spread(self):
+        # the twin differs from main by 0.20 in one pass: head + 0.15 is inside the noise, head + 0.30 is outside
+        twin = dict(cpu=[2.2, 2.0, 2.0])
+        inside = self.verdict(dict(cpu=2.0), dict(cpu=2.15), twin, base=None)
+        self.assertIn("NO LOSS ON CPU ONLY", inside)
+        self.assertIn("twin spread 0.2 point", inside)
+        outside = self.verdict(dict(cpu=2.0), dict(cpu=2.30), twin, base=None)
+        self.assertIn("UNDECIDED", outside)
+
+    def test_a_missing_twin_or_count_is_named_and_never_reads_as_no_loss(self):
+        out = self.verdict(dict(cpu=2.0), dict(cpu=2.0), base=None, skip_twin=True)
+        self.assertIn("**OVERALL: UNDECIDED, INCOMPLETE", out)
+        self.assertIn("main-twin pass 1,2,3", out)
+        out = self.verdict(dict(cpu=2.0), dict(cpu=2.0), base=None, expect="100,1000")
+        self.assertIn("N = 100: NOT COMPARED", out)
+        self.assertIn("Counts NOT COMPARED: 100", out)
+        self.assertNotIn("at every count", out)
+
+    def test_head_above_in_only_one_pass_is_not_higher(self):
+        out = self.verdict(dict(cpu=2.0), dict(cpu=[2.6, 1.9, 1.9]), base=None)
+        self.assertIn("NO LOSS ON CPU ONLY", out)
 
     def test_heterogeneous_perf_lines_are_summed(self):
         ev = {"duration_time": 2e10, "cpu_core/instructions/u": 3e9, "cpu_atom/instructions/u": 1e9, "cpu_core/instructions/k": 5e8, "cpu_core/cycles/u": None, "instructions:k": None}
@@ -111,9 +168,11 @@ class Decision(unittest.TestCase):
         self.assertIsNone(reader.perf_sum(ev, "cycles", "u"))
         self.assertAlmostEqual(reader.per_second(ev, "instructions", "u", 20.0), 2e8)
 
-    def test_head_above_in_only_one_pass_is_not_higher(self):
-        out = self.verdict(dict(cpu=[2.0, 2.0, 2.0]), dict(cpu=[2.6, 1.9, 1.9]))
-        self.assertIn("NO LOSS (head's CPU is not higher than main's)", out)
+    def test_gt_is_exact_in_ticks(self):
+        self.assertFalse(reader.gt(1.95 - 1.90, 0.05))
+        self.assertFalse(reader.gt(2.45 - 2.40, 0.05))
+        self.assertFalse(reader.gt(0.30 - 0.25, 0.05))
+        self.assertTrue(reader.gt(2.00 - 1.90, 0.05))
 
 
 if __name__ == "__main__":
