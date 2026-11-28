@@ -15,7 +15,7 @@ import (
 // raceshape:pin begin
 // Written by `go run ./tools/raceshape repin`; do not edit by hand.
 const (
-	pinnedCelerisVersion    = "v1.5.12-0.20261021042539-713b40dfdd0d"
+	pinnedCelerisVersion    = "v1.5.12-0.20261128185115-ed5ada548037"
 	pinnedMarkovMinPeriod   = 6500 * time.Microsecond
 	pinnedPromotionFloorRPS = 8350.0
 )
