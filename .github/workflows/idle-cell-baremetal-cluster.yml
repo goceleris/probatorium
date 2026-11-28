@@ -1,0 +1,290 @@
+name: Idle Cell (bare metal, cluster half)
+
+# The cluster half of idle-cell-baremetal.yml, called by its `cluster` job, which holds the matrix-tier-cluster concurrency group
+# for this whole workflow (bootstrap, the host jobs, teardown). This file declares NO concurrency: a second hold of the same group here
+# would wait on the caller forever. It is never dispatched on its own (workflow_call only).
+#
+#   bootstrap  (hosted) reports any cluster run cancelled while this run entered the group (tools/stresstally/eviction-audit.sh), provisions
+#              a runner on every cluster host exactly as the tiers do (cluster-runner-up: ephemeral runners, no system package installed,
+#              waiting for a manual experiment's manifest to clear), and fails unless the runner of the measured host is online.
+#   host       (self-hosted, the measured host itself; one job per host of the matrix, in parallel on distinct hosts) one step per stage of tools/idlecell/host-run.sh, each stage uploading its
+#              artifact and its table when it ends. Steps of a stage that was not requested are skipped, so the job ends cleanly after the
+#              last requested stage. NOTHING else runs on the host while it does: the runner agent is the only other process; the host's
+#              runner exists only between this run's bootstrap and teardown (ephemeral runners, de-registered by the teardown), and every
+#              other cluster workflow holds the same group, so none can have a job on it.
+#   teardown   (hosted, always) the tiers' cluster-runner-down: forensics, rescue, cleanup, de-registration, orphan sweep.
+#
+# The host job changes nothing on the host: no sudo, no package, no kernel parameter, no governor, no idle state, no IRQ. It reads
+# /proc and /sys, runs the tools pinned with taskset, and records what is missing (perf, RAPL, a limit) instead of providing it.
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: The plan's host matrix ({"include":[{"host":..,"arch":..}]}), one host job per entry.
+        type: string
+        required: true
+      stages:
+        description: The stages to run, as a,b,c in order (a subset).
+        type: string
+        required: true
+      dry:
+        type: boolean
+        required: true
+      passes:
+        type: string
+        required: true
+      pairs:
+        type: string
+        required: true
+      max_load:
+        type: string
+        required: true
+      server_cpus:
+        type: string
+        required: false
+        default: ""
+      client_cpus:
+        type: string
+        required: false
+        default: ""
+      host_timeout:
+        description: The host job's ceiling in minutes (the plan's bound).
+        type: number
+        required: true
+      guard_checked_at:
+        description: When the caller's guard listed the open runs (UTC).
+        type: string
+        required: true
+    secrets:
+      TS_OAUTH_CLIENT_ID:
+        required: true
+      TS_OAUTH_SECRET:
+        required: true
+      RUNNER_PAT:
+        required: true
+      CLUSTER_SSH_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    name: bootstrap cluster runners
+    runs-on: ubuntu-24.04
+    # As every tier's bootstrap: a cold runner-tarball cache once took 13 minutes (probatorium#387).
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    # The attempt these runners were registered in (see the host job).
+    outputs:
+      attempt: ${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report any cluster run cancelled since the guard looked
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          CHECKED_AT: ${{ inputs.guard_checked_at }}
+        run: bash tools/stresstally/eviction-audit.sh
+      - uses: ./.github/actions/cluster-runner-up
+        # The composite reads env.CLUSTER_SSH_KEY; scoped to this step.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          wait-for-manifest-clear:   "true"
+          wait-timeout-seconds:      "1800"
+      # Each host job waits for ONE named runner; cluster-runner-up only warns when runners are missing. Fail here, so the host
+      # job is skipped and teardown runs, instead of a host job queueing for up to 24 h while this run holds matrix-tier-cluster.
+      - name: Confirm the measured hosts' runners are online
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+          REPO: ${{ github.repository }}
+          MATRIX: ${{ inputs.matrix }}
+        run: bash tools/stresstally/runners-online.sh
+
+  # A host job runs only on the runner its own attempt's bootstrap registered (a re-run alone would queue for a runner that the
+  # first attempt's teardown removed, holding the group for up to 24 h). It is skipped instead, and teardown still runs.
+  host:
+    name: host ${{ matrix.arch }} (${{ matrix.host }})
+    needs: bootstrap
+    if: ${{ needs.bootstrap.outputs.attempt == github.run_attempt }}
+    runs-on: [self-hosted, celeris-cluster, '${{ matrix.host }}']
+    timeout-minutes: ${{ inputs.host_timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the host scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: probatorium
+          sparse-checkout: tools/idlecell
+      - name: Set the run's paths and parameters
+        shell: bash
+        env:
+          IN_HOST: ${{ matrix.host }}
+          IN_ARCH: ${{ matrix.arch }}
+          IN_DRY: ${{ inputs.dry }}
+          IN_PASSES: ${{ inputs.passes }}
+          IN_PAIRS: ${{ inputs.pairs }}
+          IN_MAXLOAD: ${{ inputs.max_load }}
+          IN_SCPUS: ${{ inputs.server_cpus }}
+          IN_CCPUS: ${{ inputs.client_cpus }}
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/idlecell/out/facts"
+          {
+            echo "IC_OUT=$RUNNER_TEMP/idlecell/out"
+            echo "IC_BIN=$RUNNER_TEMP/idlecell/pkg/bin"
+            echo "IC_HOST=$IN_HOST"
+            echo "IC_ARCH=$IN_ARCH"
+            echo "IC_DRY=$IN_DRY"
+            echo "IC_PASSES=$IN_PASSES"
+            echo "IC_PAIRS=$IN_PAIRS"
+            echo "IC_MAXLOAD=$IN_MAXLOAD"
+            echo "IC_SERVER_CPUS=$IN_SCPUS"
+            echo "IC_CLIENT_CPUS=$IN_CCPUS"
+          } >>"$GITHUB_ENV"
+      - name: Download the binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: idlecell-bin-${{ matrix.arch }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/idlecell/pkg
+      - name: Verify every binary's sha256 against the build job's record
+        shell: bash
+        run: |
+          set -eu
+          chmod +x "$IC_BIN"/*
+          (cd "$IC_BIN" && sha256sum -c ../SHA256SUMS) | tee "$IC_OUT/facts/binary-check.txt"
+          cp "$RUNNER_TEMP/idlecell/pkg/BUILD-INFO.txt" "$IC_OUT/facts/" 2>/dev/null || true
+      # exec env --default-signal: as celeris-stress-cluster.yml (the runner starts steps with SIGINT ignored, so a cancel would
+      # not stop the script): reset here, host-run.sh's trap then stops the tool processes it started.
+      - name: Host facts as found, and the quiet check
+        id: facts
+        shell: bash
+        run: exec env --default-signal=INT,QUIT,HUP bash probatorium/tools/idlecell/host-run.sh facts
+      - name: Upload the host facts
+        if: ${{ always() && steps.facts.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idlecell-raw-${{ matrix.host }}-facts-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/idlecell/out/facts/
+            ${{ runner.temp }}/idlecell/out/ABORT.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: "Stage a: the #1485 gate cells (epoll)"
+        id: a
+        if: ${{ contains(format(',{0},', inputs.stages), ',a,') }}
+        shell: bash
+        run: exec env --default-signal=INT,QUIT,HUP bash probatorium/tools/idlecell/host-run.sh stage a
+      - name: Upload stage a (the gate table, the INDEX and the raw logs)
+        if: ${{ always() && steps.a.outcome != 'skipped' && steps.a.outcome != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idlecell-raw-${{ matrix.host }}-stage-a-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/idlecell/out/a/
+            ${{ runner.temp }}/idlecell/out/TABLE-a.md
+            ${{ runner.temp }}/idlecell/out/STAGE-a.done
+            ${{ runner.temp }}/idlecell/out/ABORT.txt
+            ${{ runner.temp }}/idlecell/out/FAILED-CELLS.txt
+            ${{ runner.temp }}/idlecell/out/facts/stage-a-end.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: "Stage b: the paired first-request cells"
+        id: b
+        if: ${{ contains(format(',{0},', inputs.stages), ',b,') }}
+        shell: bash
+        run: exec env --default-signal=INT,QUIT,HUP bash probatorium/tools/idlecell/host-run.sh stage b
+      - name: Upload stage b
+        if: ${{ always() && steps.b.outcome != 'skipped' && steps.b.outcome != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idlecell-raw-${{ matrix.host }}-stage-b-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/idlecell/out/b1/
+            ${{ runner.temp }}/idlecell/out/b2/
+            ${{ runner.temp }}/idlecell/out/TABLE-b.md
+            ${{ runner.temp }}/idlecell/out/STAGE-b.done
+            ${{ runner.temp }}/idlecell/out/ABORT.txt
+            ${{ runner.temp }}/idlecell/out/FAILED-CELLS.txt
+            ${{ runner.temp }}/idlecell/out/facts/stage-b-end.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+      # Stage c is separate and droppable: with stages=a,b the job ends after stage b and the cluster is free.
+      - name: "Stage c: io_uring, main against head, for the record"
+        id: c
+        if: ${{ contains(format(',{0},', inputs.stages), ',c,') }}
+        shell: bash
+        run: exec env --default-signal=INT,QUIT,HUP bash probatorium/tools/idlecell/host-run.sh stage c
+      - name: Upload stage c
+        if: ${{ always() && steps.c.outcome != 'skipped' && steps.c.outcome != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idlecell-raw-${{ matrix.host }}-stage-c-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/idlecell/out/c/
+            ${{ runner.temp }}/idlecell/out/TABLE-c.md
+            ${{ runner.temp }}/idlecell/out/STAGE-c.done
+            ${{ runner.temp }}/idlecell/out/ABORT.txt
+            ${{ runner.temp }}/idlecell/out/FAILED-CELLS.txt
+            ${{ runner.temp }}/idlecell/out/facts/stage-c-end.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: The state as found, and the verdict on the cells
+        id: finish
+        if: ${{ always() && steps.facts.outcome == 'success' }}
+        shell: bash
+        run: bash probatorium/tools/idlecell/host-run.sh finish
+      - name: Upload the final state
+        if: ${{ always() && steps.facts.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idlecell-raw-${{ matrix.host }}-final-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/idlecell/out/facts/state-after.txt
+            ${{ runner.temp }}/idlecell/out/facts/state-diff.txt
+            ${{ runner.temp }}/idlecell/out/FAILED-CELLS.txt
+          if-no-files-found: ignore
+          retention-days: 90
+
+  teardown:
+    name: teardown cluster runners
+    needs: [bootstrap, host]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/cluster-runner-down
+        # The composite reads env.CLUSTER_SSH_KEY; scoped to this step.
+        env:
+          CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret:    ${{ secrets.TS_OAUTH_SECRET }}
+          gh-runner-pat:             ${{ secrets.RUNNER_PAT }}
+          forensics-reason:          idle-cell host=${{ needs.host.result }}

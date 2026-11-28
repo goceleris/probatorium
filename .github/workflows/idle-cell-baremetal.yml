@@ -1,0 +1,477 @@
+name: Idle Cell (bare metal)
+
+# The bare-metal idle-CPU and first-request cells for the celeris#1485 decision (celeris epoll: sweep connections only when a
+# deadline is due), on msr1 (arm64), msa2-server (amd64) or both in parallel (host=both: one host job each, every measurement
+# local to its own host, the whole run holding the group once). The release bot's ruling is the design;
+# docs/IDLE-CELL.md has the stage list, the minutes, what the host must offer and where the ruling could not be followed literally.
+#
+# Dispatch (from main only; the main session dispatches, no agent does):
+#   gh workflow run idle-cell-baremetal.yml --repo goceleris/probatorium --ref main -f mode=guard-probe -f host=msr1 -f reason="show the guard refuses"
+#   gh workflow run idle-cell-baremetal.yml --repo goceleris/probatorium --ref main -f mode=dry-run -f host=msr1 -f reason="plumbing"
+#   gh workflow run idle-cell-baremetal.yml --repo goceleris/probatorium --ref main -f mode=run -f host=msr1 -f stages=a,b,c -f reason="#1485 bare-metal cells"
+#   gh workflow run idle-cell-baremetal.yml --repo goceleris/probatorium --ref main -f mode=run -f host=both -f stages=a,b,c -f reason="#1485 bare-metal cells"
+#
+# Job graph:  plan -> pre-guard -> build -> cluster-guard -> cluster (bootstrap -> host -> teardown) -> collect -> verdict
+#
+#   plan           refuses a malformed request (mode, host, stages, passes, pairs, load threshold, CPU sets, the three celeris commits,
+#                  a reason) and any ref but main, before anything else runs. Resolves celeris main to a sha when none is given.
+#   pre-guard      outside the group: lists every open run and refuses unless the cluster is IDLE (tools/stresstally guard -idle: a run
+#                  that holds matrix-tier-cluster refuses, and so does one that waits in it). It runs BEFORE the build, so a dispatch made
+#                  while another cluster run is going costs seconds and builds nothing.
+#   build          GitHub-hosted: the static linux binaries (CGO off) of every arm for the host's architecture, and their sha256.
+#   cluster-guard  the same look again, seconds before the cluster job is created (the build took minutes); its verdict is what the
+#                  cluster job requires and what the eviction audit reads.
+#   cluster        the ONLY job inside the matrix-tier-cluster concurrency group (job-level, never workflow-level): the called workflow
+#                  idle-cell-baremetal-cluster.yml (bootstrap of the runners, the host job on [self-hosted, celeris-cluster, <host>], teardown).
+#                  It is created only when cluster-guard succeeded, in this attempt, and the mode is not guard-probe.
+#   collect        GitHub-hosted: every stage's artifact and the report (facts, INDEX, binary hashes, the rendered tables, the decision rule).
+#   verdict        red unless the cluster job succeeded (a refused guard, a skipped cluster job and a failed cell are all red); green for a
+#                  guard-probe that was refused or found the cluster idle.
+#
+# WHAT THE GROUP DOES TO A SECOND DISPATCH, and why this workflow cannot touch a run that is already going (README, docs/IDLE-CELL.md):
+# GitHub lets matrix-tier-cluster hold ONE running job and ONE pending job; a job that requests the group while another is
+# pending CANCELS the pending one (cancel-in-progress: false only protects the RUNNING job). So the only way this workflow could
+# disturb a running cluster workflow (benchmark-tier and the other tiers all use the group) is by creating its `cluster` job. That job
+# needs cluster-guard, which needs build, which needs pre-guard; both guards run `guard -idle`, which fails while ANY run is running
+# or waiting in the group; the cluster job's `if` requires cluster-guard to have succeeded in this attempt. A refused guard therefore
+# leaves `cluster` skipped, and a skipped job never enters a concurrency group. No other job of this workflow declares a group, and
+# nothing here runs on a self-hosted runner outside `cluster`. mode=guard-probe has no cluster job at all (its `if` is false).
+# tools/stresstally lists this workflow among the cluster-group workflows, so the guards of the other workflows see it as a holder.
+
+run-name: Idle cell ${{ inputs.mode }} [${{ inputs.host }}] stages ${{ inputs.stages }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "guard-probe: runs plan and the guard only (shows the guard's verdict: refused while another cluster run is going; never builds, never enters the group). dry-run: 1 pass of ONE cell (main at 1,000 connections) plus one empty-server first-request pair, the whole plumbing (build, guard, runners, host facts, artifacts, reader, teardown), about 5 minutes on the host. run: the cells of the stages below."
+        type: choice
+        options: [guard-probe, dry-run, run]
+        required: true
+      host:
+        description: "The cluster host measured (the runner is the host: the runner agent is the only other thing on it). both: msr1 and msa2-server in parallel, one host job each."
+        type: choice
+        options: [msr1, msa2-server, both]
+        required: true
+      stages:
+        description: "run only. a = the #1485 gate cells (epoll; main, head, head-aw, main-skip at 100/1,000/10,000/50,000 connections, passes below). b = the paired first-request cells. c = io_uring main against head at 10,000 and 50,000, for the record. The job stops cleanly after the last stage requested, so the cluster is free again for another read. Each stage uploads its table when it ends."
+        type: choice
+        options: ["a,b,c", "a,b", "a", "b,c", "b", "c", "a,c"]
+        required: false
+        default: "a,b,c"
+      celeris_main_sha:
+        description: "celeris 'main': a full commit sha that is an ancestor of origin/main. Empty: origin/main at dispatch (resolved by plan, recorded). Code identical to 02744dd3; later commits are tests, CI and the Go floor (1.27.4)."
+        type: string
+        required: false
+        default: ""
+      celeris_head_sha:
+        description: "celeris 'head': the commit of branch fix/1430-epoll-sweep-when-due (783d0019), MERGED with main in the build job (nothing is pushed)."
+        type: string
+        required: false
+        default: "783d001931079303a400423111079b75350dc6e8"
+      celeris_old_sha:
+        description: "celeris 'old': the build with the 4 ms idle wait of before #1474 (ab0da663)."
+        type: string
+        required: false
+        default: "ab0da663b74b37da0fca8f227b10d0116f9d7e3c"
+      passes:
+        description: "Passes of stages a and c (the ruling: 3; pass 2 is reversed: N descending and the later builds first). run mode needs at least 3."
+        type: string
+        required: false
+        default: "3"
+      pairs:
+        description: "ABBA pairs per first-request cell (the ruling: at least 10). run mode needs at least 10."
+        type: string
+        required: false
+        default: "10"
+      max_load:
+        description: "load1 above which a cell waits (60 s) and then runs forced (recorded); the job refuses to start at all above it after 180 s. A quiet host sits near 0."
+        type: string
+        required: false
+        default: "1.0"
+      server_cpus:
+        description: "Override: the 4 CPUs of the server (taskset syntax). Empty: four CPUs on four distinct physical cores."
+        type: string
+        required: false
+        default: ""
+      client_cpus:
+        description: "Override: the CPUs of the holder of the idle connections (other cores of the same host). Empty: up to four other CPUs."
+        type: string
+        required: false
+        default: ""
+      reason:
+        description: "Why (one line, up to 200 characters). Recorded in the step summary and the artifacts."
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      hosts: ${{ steps.plan.outputs.hosts }}
+      stages: ${{ steps.plan.outputs.stages }}
+      dry: ${{ steps.plan.outputs.dry }}
+      probe: ${{ steps.plan.outputs.probe }}
+      main_sha: ${{ steps.plan.outputs.main_sha }}
+      head_sha: ${{ steps.plan.outputs.head_sha }}
+      old_sha: ${{ steps.plan.outputs.old_sha }}
+      host_timeout: ${{ steps.plan.outputs.host_timeout }}
+    steps:
+      - name: Refuse a malformed request before anything runs
+        id: plan
+        # The inputs reach the script only through env:, never through ${{ }} in run:.
+        env:
+          IN_MODE: ${{ inputs.mode }}
+          IN_HOST: ${{ inputs.host }}
+          IN_STAGES: ${{ inputs.stages }}
+          IN_MAIN: ${{ inputs.celeris_main_sha }}
+          IN_HEAD: ${{ inputs.celeris_head_sha }}
+          IN_OLD: ${{ inputs.celeris_old_sha }}
+          IN_PASSES: ${{ inputs.passes }}
+          IN_PAIRS: ${{ inputs.pairs }}
+          IN_MAXLOAD: ${{ inputs.max_load }}
+          IN_SCPUS: ${{ inputs.server_cpus }}
+          IN_CCPUS: ${{ inputs.client_cpus }}
+          IN_REASON: ${{ inputs.reason }}
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eu
+          if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "::error::dispatch from $DEFAULT_BRANCH only (got $REF): this workflow runs reviewed code on a cluster host"
+            exit 1
+          fi
+          case "$IN_MODE" in guard-probe | dry-run | run) ;; *) echo "::error::mode must be guard-probe, dry-run or run, got: $IN_MODE"; exit 1 ;; esac
+          case "$IN_HOST" in
+            msr1) matrix='{"include":[{"host":"msr1","arch":"arm64"}]}' hosts="msr1" ;;
+            msa2-server) matrix='{"include":[{"host":"msa2-server","arch":"amd64"}]}' hosts="msa2-server" ;;
+            both) matrix='{"include":[{"host":"msr1","arch":"arm64"},{"host":"msa2-server","arch":"amd64"}]}' hosts="msr1 msa2-server" ;;
+            *) echo "::error::host must be msr1, msa2-server or both, got: $IN_HOST"; exit 1 ;;
+          esac
+          case "$IN_STAGES" in "a,b,c" | "a,b" | "a" | "b,c" | "b" | "c" | "a,c") ;; *) echo "::error::stages must be one of a,b,c / a,b / a / b,c / b / c / a,c, got: $IN_STAGES"; exit 1 ;; esac
+          [[ "$IN_PASSES" =~ ^[1-9]$ ]] || { echo "::error::passes must be a digit 1 to 9"; exit 1; }
+          [[ "$IN_PAIRS" =~ ^[1-9][0-9]?$ ]] || { echo "::error::pairs must be a number 1 to 99"; exit 1; }
+          [[ "$IN_MAXLOAD" =~ ^[0-9](\.[0-9]+)?$ ]] || { echo "::error::max_load must be a number such as 1.0"; exit 1; }
+          if awk -v l="$IN_MAXLOAD" 'BEGIN{exit !(l>4)}'; then echo "::error::max_load above 4 is not a quiet host"; exit 1; fi
+          [[ "$IN_SCPUS" =~ ^[0-9,-]*$ && "$IN_CCPUS" =~ ^[0-9,-]*$ ]] || { echo "::error::server_cpus and client_cpus are taskset lists such as 0-3 or 2,4,6,8"; exit 1; }
+          if [ "$IN_MODE" = run ]; then
+            [ "$IN_PASSES" -ge 3 ] || { echo "::error::run mode needs passes >= 3 (the ruling)"; exit 1; }
+            [ "$IN_PAIRS" -ge 10 ] || { echo "::error::run mode needs pairs >= 10 (the ruling)"; exit 1; }
+          fi
+          if [ -z "$(printf '%s' "$IN_REASON" | tr -d '[:space:]')" ]; then echo "::error::reason is empty"; exit 1; fi
+          if [ "${#IN_REASON}" -gt 200 ]; then echo "::error::reason is longer than 200 characters"; exit 1; fi
+          if [ "$(printf '%s' "$IN_REASON" | wc -l)" -ne 0 ] || printf '%s' "$IN_REASON" | LC_ALL=C grep -q '[[:cntrl:]]'; then echo "::error::reason must be one line without control characters"; exit 1; fi
+          case "$IN_REASON" in *'{'* | *'}'*) echo "::error::reason must not contain braces"; exit 1 ;; esac
+          # the three celeris commits: full shas that exist in goceleris/celeris (the build job proves the ancestry)
+          if [ "$IN_MODE" != guard-probe ]; then
+            main_sha=$IN_MAIN
+            if [ -z "$main_sha" ]; then main_sha=$(gh api repos/goceleris/celeris/commits/main --jq .sha); fi
+            for s in "$main_sha" "$IN_HEAD" "$IN_OLD"; do
+              [[ "$s" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a full 40-character commit sha: $s"; exit 1; }
+              gh api "repos/goceleris/celeris/commits/$s" --jq .sha >/dev/null || { echo "::error::commit $s is not in goceleris/celeris"; exit 1; }
+            done
+          else
+            main_sha="" IN_HEAD="" IN_OLD=""
+          fi
+          # a dry-run is the plumbing: stages a and b, reduced inside the host script (1 pass, one cell; one empty-server pair)
+          stages=$IN_STAGES
+          [ "$IN_MODE" != dry-run ] || stages="a,b"
+          # the host job's ceiling: 20 min of setup plus a generous bound per stage (docs/IDLE-CELL.md has the expected minutes)
+          t=20
+          case ",$stages," in *,a,*) t=$((t + 80)) ;; esac
+          case ",$stages," in *,b,*) t=$((t + 100)) ;; esac
+          case ",$stages," in *,c,*) t=$((t + 30)) ;; esac
+          [ "$IN_MODE" != dry-run ] || t=40
+          {
+            echo "matrix=$matrix"
+            echo "hosts=$hosts"
+            echo "stages=$stages"
+            echo "dry=$([ "$IN_MODE" = dry-run ] && echo true || echo false)"
+            echo "probe=$([ "$IN_MODE" = guard-probe ] && echo true || echo false)"
+            echo "main_sha=$main_sha"
+            echo "head_sha=$IN_HEAD"
+            echo "old_sha=$IN_OLD"
+            echo "host_timeout=$t"
+          } >>"$GITHUB_OUTPUT"
+          {
+            echo "### Idle cell: $IN_MODE on $IN_HOST, stages $stages"
+            echo "- reason: $IN_REASON"
+            echo "- celeris main \`${main_sha:-n/a}\`, head \`${IN_HEAD:-n/a}\` (merged with main), old \`${IN_OLD:-n/a}\`"
+            echo "- host job ceiling: $t minutes"
+          } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+  # Outside matrix-tier-cluster. The first look: a dispatch made while another cluster run is going stops here, in seconds,
+  # before anything is built. In guard-probe mode this is the whole run: a verdict that is shown, not enforced.
+  pre-guard:
+    name: pre-guard
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      refused: ${{ steps.guard.outputs.refused }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/stresstally
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Refuse unless the cluster is idle
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          GUARD_DIR: ${{ runner.temp }}/guard
+          PROBE: ${{ needs.plan.outputs.probe }}
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/stresstally" ./tools/stresstally
+          bash tools/stresstally/guard.sh
+          set +e
+          "$RUNNER_TEMP/stresstally" guard -idle -dir "$GUARD_DIR" -self "$RUN_ID"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "refused=false" >>"$GITHUB_OUTPUT"
+            echo "### guard: the cluster is IDLE (nothing holds or waits in matrix-tier-cluster)" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "refused=true" >>"$GITHUB_OUTPUT"
+            { echo "### guard: REFUSED (exit $rc): another cluster run holds or waits in matrix-tier-cluster, or the look could not tell"; echo '```'; cat "$GUARD_DIR/decision.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+          fi
+          # a probe shows the verdict and ends green either way; every other mode refuses here, before the build
+          if [ "$PROBE" = true ]; then exit 0; fi
+          exit "$rc"
+      - name: Upload the guard's evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idle-cell-pre-guard-${{ github.run_id }}
+          path: ${{ runner.temp }}/guard/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # GitHub-hosted. Never runs after a refused guard, and never in guard-probe mode.
+  build:
+    name: build ${{ matrix.arch }}
+    needs: [plan, pre-guard]
+    if: ${{ needs.plan.outputs.probe != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/idlecell
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: goceleris/celeris
+          path: celeris
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: celeris/go.mod
+          cache: false
+      - name: Check the reader and the scripts
+        run: |
+          set -eu
+          python3 -I tools/idlecell/reader_test.py
+          bash -n tools/idlecell/host-run.sh
+          bash -n tools/idlecell/lib.sh
+          bash -n tools/idlecell/build.sh
+      - name: Build the arms (static, CGO off) and record their sha256
+        env:
+          ARCH: ${{ matrix.arch }}
+          MAIN_SHA: ${{ needs.plan.outputs.main_sha }}
+          HEAD_SHA: ${{ needs.plan.outputs.head_sha }}
+          OLD_SHA: ${{ needs.plan.outputs.old_sha }}
+        run: bash tools/idlecell/build.sh "$PWD/celeris" "$PWD/idlecell-bin" "$ARCH" "$MAIN_SHA" "$HEAD_SHA" "$OLD_SHA"
+      - name: Upload the binaries and the build record
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idlecell-bin-${{ matrix.arch }}-${{ github.run_id }}
+          path: idlecell-bin/
+          if-no-files-found: error
+          retention-days: 30
+
+  # The second look, seconds before the cluster job is created. Its name is what tools/stresstally/eviction-audit.sh reads.
+  cluster-guard:
+    name: cluster-guard
+    needs: [plan, pre-guard, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      checked_at: ${{ steps.guard.outputs.checked_at }}
+      # The attempt this verdict belongs to: the cluster job enters the group only on a verdict from its own attempt.
+      attempt: ${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/stresstally
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Refuse unless the cluster is idle
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          GUARD_DIR: ${{ runner.temp }}/guard
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/stresstally" ./tools/stresstally
+          bash tools/stresstally/guard.sh
+          "$RUNNER_TEMP/stresstally" guard -idle -dir "$GUARD_DIR" -self "$RUN_ID"
+      - name: Upload the guard's evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idle-cell-cluster-guard-${{ github.run_id }}
+          path: ${{ runner.temp }}/guard/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The cluster run, inside matrix-tier-cluster for its whole length (bootstrap, host, teardown). Job-level concurrency
+  # only: a workflow-level group would enter at dispatch, before any guard looked. The called workflow declares no group of
+  # its own (a second hold of the same group would wait on the caller forever).
+  #
+  # A re-run never re-enters the group on an old verdict: "re-run failed jobs" reuses the result of a cluster-guard that
+  # succeeded, which may be hours old, and this job would then cancel whatever is pending in the group now. So it runs
+  # only when cluster-guard ran in this same attempt. Never re-run a cluster run: dispatch a new one.
+  cluster:
+    name: cluster
+    needs: [plan, pre-guard, build, cluster-guard]
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.plan.outputs.probe != 'true' && needs.cluster-guard.result == 'success' && needs.cluster-guard.outputs.attempt == github.run_attempt && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    concurrency:
+      group: matrix-tier-cluster
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/idle-cell-baremetal-cluster.yml
+    with:
+      matrix: ${{ needs.plan.outputs.matrix }}
+      stages: ${{ needs.plan.outputs.stages }}
+      dry: ${{ needs.plan.outputs.dry == 'true' }}
+      passes: ${{ inputs.passes }}
+      pairs: ${{ inputs.pairs }}
+      max_load: ${{ inputs.max_load }}
+      server_cpus: ${{ inputs.server_cpus }}
+      client_cpus: ${{ inputs.client_cpus }}
+      host_timeout: ${{ fromJSON(needs.plan.outputs.host_timeout) }}
+      guard_checked_at: ${{ needs.cluster-guard.outputs.checked_at }}
+    secrets:
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+      RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+      CLUSTER_SSH_KEY: ${{ secrets.CLUSTER_SSH_KEY }}
+
+  # GitHub-hosted, outside the group: the report from every stage's artifact.
+  collect:
+    name: collect
+    needs: [plan, cluster]
+    if: ${{ !cancelled() && needs.cluster.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools/idlecell
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: idlecell-raw-*-${{ github.run_id }}
+          path: collected
+          merge-multiple: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: idlecell-bin-*-${{ github.run_id }}
+          path: collected-bin
+          merge-multiple: false
+      - name: Render the report of each host
+        env:
+          HOSTS: ${{ needs.plan.outputs.hosts }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -eu
+          mkdir -p report
+          for host in $HOSTS; do
+            case "$host" in msr1) arch=arm64 ;; msa2-server) arch=amd64 ;; *) echo "::error::unknown host $host"; exit 1 ;; esac
+            mkdir -p "report/$host/out"
+            # every stage artifact of this host is a directory of the host's output root: merge them back into one tree
+            for d in collected/idlecell-raw-"$host"-*/; do [ -d "$d" ] && cp -R "$d". "report/$host/out/"; done
+            for f in BUILD-INFO.txt SHA256SUMS merge-head.log; do cp "collected-bin/idlecell-bin-$arch-$GITHUB_RUN_ID/$f" "report/$host/" 2>/dev/null || true; done
+            cp -R "collected-bin/idlecell-bin-$arch-$GITHUB_RUN_ID/patch" "report/$host/patch" 2>/dev/null || true
+            {
+              echo "reason: $REASON"
+              echo "host: $host ($arch)  run: $GITHUB_RUN_ID  attempt: $GITHUB_RUN_ATTEMPT"
+              echo
+              echo "binaries (sha256) and what they are made of:"
+              cat "report/$host/BUILD-INFO.txt" 2>/dev/null || echo "(no BUILD-INFO in the artifacts)"
+              echo
+              echo "sha256 of the binaries as the host verified them before running:"
+              cat "report/$host/out/facts/binary-check.txt" 2>/dev/null || echo "(not recorded)"
+            } >"report/$host/PROVENANCE.txt"
+            python3 -I tools/idlecell/reader.py report "report/$host/out" >"report/$host/REPORT.md"
+            cat "report/$host/out"/*/INDEX.tsv >"report/$host/INDEX-all.tsv" 2>/dev/null || true
+            { echo "## $host"; cat "report/$host/PROVENANCE.txt"; echo; cat "report/$host/REPORT.md"; } >>"$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: idle-cell-report-${{ inputs.host }}-${{ github.run_id }}
+          path: report/
+          retention-days: 90
+
+  verdict:
+    name: verdict
+    needs: [plan, pre-guard, build, cluster-guard, cluster, collect]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Red unless the cells ran, or the probe showed its verdict
+        env:
+          MODE: ${{ inputs.mode }}
+          PLAN: ${{ needs.plan.result }}
+          PRE: ${{ needs.pre-guard.result }}
+          REFUSED: ${{ needs.pre-guard.outputs.refused }}
+          BUILD: ${{ needs.build.result }}
+          GUARD: ${{ needs.cluster-guard.result }}
+          CLUSTER: ${{ needs.cluster.result }}
+          COLLECT: ${{ needs.collect.result }}
+        run: |
+          echo "plan=$PLAN pre-guard=$PRE (refused=${REFUSED:-n/a}) build=$BUILD cluster-guard=$GUARD cluster=$CLUSTER collect=$COLLECT"
+          if [ "$MODE" = guard-probe ]; then
+            [ "$PLAN" = success ] && [ "$PRE" = success ] || { echo "::error::the probe did not run (plan $PLAN, pre-guard $PRE)"; exit 1; }
+            if [ "$REFUSED" = true ]; then echo "guard probe: the guard REFUSED, as it must while another cluster run is going; no build, no cluster job, nothing queued"; else echo "guard probe: the cluster is IDLE: a real dispatch would proceed"; fi
+            exit 0
+          fi
+          if [ "$CLUSTER" != success ]; then
+            echo "::error::the cells did not run to the end (plan $PLAN, pre-guard $PRE, build $BUILD, cluster-guard $GUARD, cluster $CLUSTER). If a guard refused, the cluster was busy: nothing was built or queued. A re-run never reuses an old idle verdict: dispatch a new run."
+            exit 1
+          fi
+          [ "$COLLECT" = success ] || { echo "::error::the report was not collected (collect $COLLECT); the stage artifacts are on the cluster job"; exit 1; }
