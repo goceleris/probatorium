@@ -12,6 +12,16 @@ import (
 	"time"
 )
 
+// raceshape:pin begin
+// Written by `go run ./tools/raceshape repin`; do not edit by hand.
+const (
+	pinnedCelerisVersion    = "v1.5.12-0.20261021042539-713b40dfdd0d"
+	pinnedMarkovMinPeriod   = 6500 * time.Microsecond
+	pinnedPromotionFloorRPS = 8350.0
+)
+
+// raceshape:pin end
+
 // The race tier's adaptive cell keeps its sizing and paces its Markov walkers
 // (probatorium#481, celeris#871). Promotion depends on the NUMBER of open
 // connections (conns per worker), so the walker and worker counts stay; what
@@ -25,11 +35,11 @@ func TestRaceAdaptiveCellKeepsItsCountsAndPacesItsWalkers(t *testing.T) {
 	if got := cellConcurrencyFloor("adaptive"); got != 110 {
 		t.Errorf("race adaptive walker floor = %d, want 110 (unchanged)", got)
 	}
-	if got := cellMarkovMinPeriod("auth_session_ratelimit", "adaptive", true); got != 6500*time.Microsecond {
-		t.Errorf("race adaptive Markov min period = %v, want 6.5ms", got)
+	if got := cellMarkovMinPeriod("auth_session_ratelimit", "adaptive", true); got != pinnedMarkovMinPeriod {
+		t.Errorf("race adaptive Markov min period = %v, want the pinned %v", got, pinnedMarkovMinPeriod)
 	}
-	if raceAdaptiveMarkovMinPeriod != 6500*time.Microsecond {
-		t.Errorf("raceAdaptiveMarkovMinPeriod = %v, want 6.5ms", raceAdaptiveMarkovMinPeriod)
+	if raceAdaptiveMarkovMinPeriod != pinnedMarkovMinPeriod {
+		t.Errorf("raceAdaptiveMarkovMinPeriod = %v, want the pinned %v", raceAdaptiveMarkovMinPeriod, pinnedMarkovMinPeriod)
 	}
 }
 
@@ -77,7 +87,7 @@ func TestExactlyOneCellIsShaped(t *testing.T) {
 			for _, raceTier := range []bool{false, true} {
 				want := time.Duration(0)
 				if refapp == "auth_session_ratelimit" && engine == "adaptive" && raceTier {
-					want = 6500 * time.Microsecond
+					want = pinnedMarkovMinPeriod
 				}
 				got := cellMarkovMinPeriod(refapp, engine, raceTier)
 				if got != want {
@@ -197,7 +207,7 @@ func TestMarkovMinPeriodReachesTheMatrixCellConfigOnly(t *testing.T) {
 
 // The period is derived, not picked (PREREG.md, run 39560945814): the fleet's
 // ceiling, 67 Markov walkers / period, must stay at least 15% above the
-// promotion floor (8.35k requests a second: below it a healthy 64 KiB echo
+// promotion floor (pinnedPromotionFloorRPS, derived from the controller at the pinned celeris: below it a healthy 64 KiB echo
 // pushes a tick's bytes per request to the controller's 8192 refusal) and clearly
 // below the 16.56k a second the same walkers sent closed-loop when the cell
 // saturated. A change of the period that leaves this window is a change of the
@@ -205,7 +215,7 @@ func TestMarkovMinPeriodReachesTheMatrixCellConfigOnly(t *testing.T) {
 func TestRaceAdaptivePeriodSitsBetweenThePromotionFloorAndTheSaturatingRate(t *testing.T) {
 	const (
 		markovWalkers = 67 // 110 walkers less 22 adversarial, 11 h2c, 5 ws, 5 sse
-		floor         = 8350.0
+		floor         = pinnedPromotionFloorRPS
 		saturating    = 16560.0
 	)
 	ceiling := markovWalkers / raceAdaptiveMarkovMinPeriod.Seconds()

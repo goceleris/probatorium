@@ -1,0 +1,35 @@
+// Excerpt of celeris internal/adaptive/telemetry.go at v1.5.12-0.20261021042539-713b40dfdd0d
+// (713b40dfdd0d): the lines tools/raceshape reads, copied unchanged. Not compiled.
+package adaptive
+
+		Timestamp:         now,
+		ActiveConnections: m.ActiveConnections,
+	}
+
+	// ConnsPerWorker is a point-in-time ratio (not a delta), so it needs no
+	// prior sample. max(Workers, 1) guards the pre-Listen window where the
+	// worker count is still zero.
+	snap.ConnsPerWorker = float64(m.ActiveConnections) / float64(max(m.Workers, 1))
+
+	prev, hasPrev := s.prevMetrics[et]
+	prevT, hasT := s.prevTime[et]
+	if hasPrev && hasT {
+		elapsed := now.Sub(prevT).Seconds()
+		if elapsed > 0 {
+			deltaReqs := satSub(m.RequestCount, prev.RequestCount)
+			deltaErrs := satSub(revertErrors(m), revertErrors(prev))
+			deltaAccepts := satSub(m.AcceptCount, prev.AcceptCount)
+			deltaBytes := satSub(m.BytesRead+m.BytesWritten, prev.BytesRead+prev.BytesWritten)
+			snap.ThroughputRPS = float64(deltaReqs) / elapsed
+			snap.AcceptRate = float64(deltaAccepts) / elapsed
+			snap.ErrorDelta = errorDeltas(&m, &prev)
+			snap.ConnSeconds = connSeconds(prev.ActiveConnections, m.ActiveConnections, elapsed)
+			snap.ErrorRate, snap.RateDenominator = faultRate(deltaErrs, deltaReqs, snap.ConnSeconds)
+			if deltaReqs > 0 {
+				snap.BytesPerReq = float64(deltaBytes) / float64(deltaReqs)
+			}
+		}
+	}
+
+	s.prevMetrics[et] = m
+	s.prevTime[et] = now

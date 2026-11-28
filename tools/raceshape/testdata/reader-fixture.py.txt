@@ -1,0 +1,6 @@
+# read-shaped-cell.py fixture: the lines of the reader that carry the numbers.
+#   (options: --period-us 6500 --walkers 110 --markov-walkers 67)
+FLOOR = 8350.0           # promotion floor on engine R, requests/s (PREREG.md)
+def load_cell(cell, period_us=6500, walkers=110, markov_walkers=67):
+    pass
+m = load_cell(args[0], opt("--period-us", 6500), opt("--walkers", 110), opt("--markov-walkers", 67))
