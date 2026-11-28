@@ -1,0 +1,24 @@
+diff --git a/internal/engine/epoll/loop.go b/internal/engine/epoll/loop.go
+index 084486d..e8be468 100644
+--- a/internal/engine/epoll/loop.go
++++ b/internal/engine/epoll/loop.go
+@@ -773,7 +773,9 @@ func (l *Loop) run(ctx context.Context) {
+ 			if fd == l.timerFD && l.timerFD >= 0 {
+ 				var buf [8]byte
+ 				_, _ = unix.Read(l.timerFD, buf[:])
+-				l.checkTimeouts()
++				if mono.Now()-l.lastSweep >= 1_000_000_000 { // ISOLATION BUILD main-skip (never pushed): main's code, one walk a second
++					l.checkTimeouts()
++				}
+ 				timerOnly = n == 1
+ 				continue
+ 			}
+@@ -990,7 +992,7 @@ func (l *Loop) run(ctx context.Context) {
+ 		const gate = uint32(0x1F)
+ 		if l.tickCounter&gate == 0 {
+ 			// The clock is read at a gate hit only, one iteration in 32.
+-			if d := mono.Now() - l.lastSweep; d >= int64(sweepFloor) || d < 0 {
++			if d := mono.Now() - l.lastSweep; d >= 1_000_000_000 || d < 0 { // ISOLATION BUILD main-skip: one walk a second
+ 				l.checkTimeouts()
+ 			}
+ 		}

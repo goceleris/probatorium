@@ -1,0 +1,6 @@
+READY engine=epoll workers=0 cpus=4 conns=100 unix_ms=1795814643041
+HELD engine=epoll workers=0 cpus=4 conns=100 counted=100 unix_ms=1795814643293
+SCHED2 engine=epoll workers=0 cpus=4 conns=100 loops: cpu_ms_per_s=11.17 runq_wait_ms_per_s=0.380 timeslices_per_s=678.7 us_per_slice=16.46 | others: cpu_ms_per_s=11.70 runq_wait_ms_per_s=0.426 timeslices_per_s=2515.0
+IDLE engine=epoll workers=0 cpus=4 conns=100 window=20.001s loop_threads=3 process_cpu_pct=2.350 loop_wakeups_per_s=[230.6 222.6 225.1] other_threads_voluntary_per_s=2514.9 sched_cpu_pct=2.3114 sched_loop_cpu_pct=1.1170 sched_other_cpu_pct=1.1944 sched_per_loop_cpu_pct=[0.364 0.371 0.382] rss_mib=12 tcp_before=inuse=203 tcp_after=inuse=203 win_start_ms=1795814655295 win_end_ms=1795814675297
+SHUTDOWN_BEGIN engine=epoll workers=0 cpus=4 conns=100 unix_ms=1795814677300
+SHUTDOWN engine=epoll workers=0 cpus=4 conns=100 shutdown=3.27ms start_err=<nil>

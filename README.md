@@ -459,6 +459,14 @@ host), `python3 -I ansible/tests/test_os_upgrade_judge.py` (the real Jinja judge
 `python3 -I ansible/tests/test_os_upgrade_play.py` (the whole playbook on local connections, Linux only); the last two run
 in the ansible CI job.
 
+### Bare-metal idle cell (celeris#1485)
+
+[`Idle Cell (bare metal)`](.github/workflows/idle-cell-baremetal.yml) measures the idle CPU, wake-ups, instructions and energy of the celeris
+epoll engine, and the first request after an idle gap, on msr1 and msa2-server (one workflow, `tools/idlecell/`; [docs/IDLE-CELL.md](docs/IDLE-CELL.md)
+has the dispatch lines, the stages and their minutes, what the host must offer and the decision rule the reader prints). It is a cluster workflow like the
+tiers: its one `cluster` job holds `matrix-tier-cluster`, behind two `guard -idle` looks that refuse while any other cluster run holds or waits in the
+group, and `mode=guard-probe` shows the refusal without building or queueing anything. Dispatch it only from `main`, and only when the cluster is idle.
+
 ## Bench tier
 
 ### The field

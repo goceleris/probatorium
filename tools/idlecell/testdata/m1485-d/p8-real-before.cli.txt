@@ -1,0 +1,4 @@
+OPENED n=1000 opened=1000 failed=0 in=33ms unix_ms=1795808421259
+PROBE new gap=2s n=8 min=310µs median=670µs max=1.97ms all_us=[313 421 442 465 672 847 1541 1970]
+PROBE held gap=2s n=8 min=100µs median=190µs max=350µs all_us=[95 130 170 186 187 191 302 354]
+CLOSED closed=992 first_close_unix_ms=1795808475269 last_unix_ms=1795808475274

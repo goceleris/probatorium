@@ -1,0 +1,12 @@
+diff --git a/internal/engine/epoll/sweep_due_1430.go b/internal/engine/epoll/sweep_due_1430.go
+index 17e5c79..13f78f2 100644
+--- a/internal/engine/epoll/sweep_due_1430.go
++++ b/internal/engine/epoll/sweep_due_1430.go
+@@ -71,6 +71,7 @@ const sweepHorizonMax = time.Second
+ // sweepDue reports whether the loop's tick or gate should walk the live
+ // connections now. Loop thread.
+ func (l *Loop) sweepDue(now int64) bool {
++	return true // ISOLATION BUILD head-aw (never pushed): head's code, a walk at every tick; nextDue is still computed by checkTimeouts
+ 	// A clock that stepped back: the next-due time was set against the old
+ 	// one, and the walk must not wait for the new one to catch up.
+ 	return now >= l.nextDue || now < l.lastSweep ||
