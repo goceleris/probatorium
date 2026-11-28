@@ -335,6 +335,12 @@ func fireH2CChurn(ctx context.Context, hostPort string,
 	n, err := conn.Read(buf)
 	disarm()
 	readD := time.Since(readStart)
+	if readErrorAfterCancel(ctx, err) {
+		// The walker's own context was cancelled before this read ended:
+		// the connection went with the harness's stop, not a server fault
+		// (probatorium#595). Nothing is counted or filed.
+		return
+	}
 	if err != nil || n == 0 {
 		// Read EOF / timeout before any bytes. If we never saw bytes
 		// after a valid upgrade request, that's the server hanging on
